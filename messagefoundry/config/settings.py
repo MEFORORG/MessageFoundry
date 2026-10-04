@@ -5122,6 +5122,12 @@ class CertMonitorSettings(_Section):
 
     warn_days: int = 30  # alert this many days before expiry (0 = monitor off)
     check_interval_seconds: float = 43_200.0  # rescan cadence (default 12h)
+    #: BACKLOG #299: how many replaced copies of one CRL file a running hop's TLS context takes
+    #: before the reload refuses the next and asks for a restart. A context can only add CRLs, so
+    #: each reload stays in it. 10,000 outlasts a year of hourly CRLs (8,760). What each held copy
+    #: costs, measured, is in docs/CONFIGURATION.md under this key. Read by the reload, which runs
+    #: whatever ``warn_days`` is.
+    crl_max_reloads: int = 10_000
 
     @field_validator("warn_days")
     @classmethod
@@ -5135,6 +5141,13 @@ class CertMonitorSettings(_Section):
     def _check_interval(cls, v: float) -> float:
         if v <= 0:
             raise ValueError("cert_monitor.check_interval_seconds must be > 0")
+        return v
+
+    @field_validator("crl_max_reloads")
+    @classmethod
+    def _check_crl_max_reloads(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("cert_monitor.crl_max_reloads must be > 0")
         return v
 
 

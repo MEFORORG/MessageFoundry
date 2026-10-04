@@ -38,6 +38,7 @@ from messagefoundry.parsing.x12.delimiters import DEFAULT_MAX_INTERCHANGE_BYTES
 from messagefoundry.parsing.x12.errors import X12FrameError, X12PeekError
 from messagefoundry.parsing.x12.interchange import X12FrameReader
 from messagefoundry.parsing.x12.message import X12Message
+from messagefoundry.parsing.x12.peek import X12Peek
 from messagefoundry.redaction import safe_exc
 from messagefoundry.transports.admission import FrameClock, ListenerAdmission
 from messagefoundry.transports.base import (
@@ -79,6 +80,63 @@ _CLIENT_SHUTDOWN_GRACE = 5.0
 # reopen the hole through a supported setting.
 _REPLY_DRAIN_GRACE = _CLIENT_SHUTDOWN_GRACE
 
+# An interchange control number (ISA13, IEA02, TA101) is X12 data type N0, min/max 9/9.
+_CONTROL_NUMBER_WIDTH = 9
+
+# How many TA1 segments of one reply are searched for the one naming the interchange sent. Each lookup
+# rescans the reply, so the cap keeps a reply packed with TA1s from stalling the event loop.
+_MAX_TA1_SCANNED = 32
+
+
+def _control_number(value: str | None) -> str | None:
+    """``value`` as a nine-digit interchange control number, or ``None`` when it is not one.
+
+    Leading/trailing spaces are dropped and a shorter all-digit value is zero-padded to nine, so a
+    partner that writes ``1`` for ``000000001`` still correlates. Anything else (a letter, a sign, more
+    than nine digits, a non-ASCII digit) is refused rather than coerced, because the result is compared
+    for equality to decide whether a TA1 is the acknowledgement of the interchange just sent."""
+    if value is None:
+        return None
+    stripped = value.strip(" ")
+    if not (
+        0 < len(stripped) <= _CONTROL_NUMBER_WIDTH and stripped.isascii() and stripped.isdigit()
+    ):
+        return None
+    return stripped.zfill(_CONTROL_NUMBER_WIDTH)
+
+
+def _sent_isa13(payload: str) -> str | None:
+    """ISA13 of the interchange this destination sent, space-trimmed (``""`` when blank), or ``None``
+    when the payload has no parseable ISA. Read by fixed offset through the pure codec
+    (:class:`X12Peek`), the same way the codec reads every ISA field."""
+    try:
+        return X12Peek.parse(payload, max_bytes=None).control_number or ""
+    except X12PeekError:
+        return None
+
+
+def _names_sent_interchange(ta101: str | None, sent_isa13: str) -> bool:
+    """Whether a TA1-01 names the interchange whose ISA13 is ``sent_isa13``. Compared as nine-digit
+    control numbers when the sent ISA13 is one; when it is not (an authoring error upstream), only an
+    exact echo matches, so a partner that names our malformed ISA13 back still correlates."""
+    sent = _control_number(sent_isa13)
+    if sent is not None:
+        return _control_number(ta101) == sent
+    echo = sent_isa13.strip(" ")
+    return bool(echo) and ta101 is not None and ta101.strip(" ") == echo
+
+
+def _loggable_control(value: str | None) -> str:
+    """A partner-written control number fit for a log line or an error message: the normalized nine
+    digits, or a shape description. Never the raw value (log injection)."""
+    return _control_number(value) or "not a nine-digit control number"
+
+
+def _loggable_sent(sent_isa13: str) -> str:
+    """The engine's own ISA13 for a log line: the nine digits, or ``repr`` of the at most nine fixed-width
+    characters it was read from (``repr`` escapes any control character)."""
+    return _control_number(sent_isa13) or repr(sent_isa13)
+
 
 # --- destination -------------------------------------------------------------
 
@@ -92,8 +150,8 @@ class X12Destination(DestinationConnector):
     as confirmation — **not** parsed. *Synchronous request/response* (``capture_response``/``reingress_to``,
     ADR 0016): it blocks for the returned interchange on the same socket, classifies a **TA1** interchange
     acknowledgement (``_check_ta1``: TA1*A → accepted; TA1*R → permanent reject → dead-letter; TA1*E →
-    accepted-with-warning, *not* retried), and **returns** the reply as a :class:`DeliveryResponse` for the
-    delivery worker to capture (ADR 0013). A business response (271/277/278) returned *instead of* a TA1
+    accepted-with-warning, *not* retried) when its TA1-01 names the interchange sent, and
+    **returns** the reply as a :class:`DeliveryResponse` for the delivery worker to capture (ADR 0013). A business response (271/277/278) returned *instead of* a TA1
     is itself the confirmation. ``ta1_required`` makes a no-reply a retry. At-least-once: a lost reply
     re-delivers, so the receiver must be idempotent."""
 
@@ -217,7 +275,7 @@ class X12Destination(DestinationConnector):
                 # _check_ta1 returns the captured reply, raises on a TA1 reject/error, and returns None
                 # for a non-capturing accept (a ta1_required-only outbound still fails fast on a reject).
                 if self.capture_response or self.ta1_required:
-                    response = self._check_ta1(interchange)
+                    response = self._check_ta1(interchange, payload=payload)
                     if self.capture_response:
                         return response
         except TimeoutError as exc:
@@ -321,12 +379,14 @@ class X12Destination(DestinationConnector):
         if need_reply and interchange is not None and (self.capture_response or self.ta1_required):
             response: DeliveryResponse | None = None
             try:
-                response = self._check_ta1(interchange)
+                response = self._check_ta1(interchange, payload=payload)
             except NegativeAckError:
                 raise  # a complete transaction on a healthy transport — connection fate decided above
             except DeliveryError:
-                # An unparseable interchange (non-capturing) means the transaction was NOT fully
-                # successful — discard the cached connection rather than trust a peer talking garbage.
+                # An unparseable interchange (non-capturing), or a TA1 acknowledging some OTHER
+                # interchange, means the transaction was NOT fully successful — discard the cached
+                # connection rather than trust a peer talking garbage or a stream that may be out of
+                # step (a stale TA1 left on the socket would otherwise answer the next send too).
                 await self._discard_after_bad_reply(conn, writer)
                 raise
             if response is not None and response.outcome == "unparseable":
@@ -341,14 +401,15 @@ class X12Destination(DestinationConnector):
         conn: tuple[asyncio.StreamReader, asyncio.StreamWriter],
         writer: asyncio.StreamWriter,
     ) -> None:
-        """Discard the cached connection after a read-but-unparseable interchange (both the raising
-        non-capturing path and the captured ``outcome='unparseable'`` path). Mirrors MLLP's
+        """Discard the cached connection after a reply that cannot be trusted as this send's: a
+        read-but-unparseable interchange (both the raising non-capturing path and the captured
+        ``outcome='unparseable'`` path), or a TA1 naming another interchange. Mirrors MLLP's
         ``_discard_unparseable``; fixed reason in the log (a parse error can embed a reply fragment)."""
         if self._conn is conn:
             self._conn = None
             self.reconnects += 1
             logger.warning(
-                "X12 %s:%d persistent connection discarded after delivery failure: unparseable reply",
+                "X12 %s:%d persistent connection discarded after delivery failure: unusable reply",
                 self.host,
                 self.port,
             )
@@ -373,13 +434,20 @@ class X12Destination(DestinationConnector):
             except X12FrameError as exc:
                 raise DeliveryError(f"reply exceeded max interchange size: {exc}") from exc
 
-    def _check_ta1(self, interchange: bytes) -> DeliveryResponse | None:
+    def _check_ta1(self, interchange: bytes, *, payload: str) -> DeliveryResponse | None:
         """Classify a fully-read returned interchange (ADR 0016 Q2), modelled on MLLP ``_check_ack``.
 
         Only a **TA1** (interchange acknowledgement) is a transport-level retry gate; a 999/997 functional
         ack or a 271/277/278 application response is **content** that rides re-ingress. Uses only the
         existing ``parsing/x12`` codec (separators discovered from the ISA, never hardcoded — CLAUDE.md §8);
-        the socket read and retry decision stay in the transport, so ``parsing/x12`` gains nothing."""
+        the socket read and retry decision stay in the transport, so ``parsing/x12`` gains nothing.
+
+        ``payload`` is the interchange just written; a TA1 is acted on only when it names that
+        interchange. The matching rule is stated in the X12 section of ``docs/CONNECTIONS.md``. A TA1
+        naming another interchange raises a retryable :class:`DeliveryError` in both modes rather than
+        a captured outcome, because the disposition of the interchange just sent is unknown: that is
+        the read-failure arm of the ADR 0013/0016 read/parse split, not the captured ``unparseable``
+        arm, which is a reply known to answer this send."""
         text = interchange.decode(self.encoding, errors="replace")
         try:
             msg = X12Message.parse(interchange)
@@ -395,12 +463,52 @@ class X12Destination(DestinationConnector):
             raise DeliveryError(f"unparseable X12 reply: {exc}") from exc
         functional = [sid for sid in msg.segment_ids() if sid != "ISA"]
         if functional and functional[0] == "TA1":
-            ta104 = (msg.get("TA1-04") or "").upper()
-            control = msg.get("ISA-13") or "?"  # interchange control number — not PHI
+            sent_isa13 = _sent_isa13(payload)
+            occurrence = 1
+            if sent_isa13 is None:
+                logger.warning(
+                    "X12 %s:%d sent interchange has no readable ISA; TA1 correlation skipped",
+                    self.host,
+                    self.port,
+                )
+            else:
+                scanned = min(msg.count_segments("TA1"), _MAX_TA1_SCANNED)
+                match = next(
+                    (
+                        n
+                        for n in range(1, scanned + 1)
+                        if _names_sent_interchange(msg.get("TA1-01", occurrence=n), sent_isa13)
+                    ),
+                    None,
+                )
+                if match is None:
+                    received = _loggable_control(msg.get("TA1-01"))
+                    sent = _loggable_sent(sent_isa13)
+                    # Control numbers only, never the reply (CLAUDE.md §9); TA1-01 is partner data.
+                    logger.warning(
+                        "X12 %s:%d returned no TA1 naming the interchange sent (first TA1-01=%s, "
+                        "sent ISA-13=%s); not acted on, delivery retried",
+                        self.host,
+                        self.port,
+                        received,
+                        sent,
+                    )
+                    raise DeliveryError(
+                        f"X12 TA1 does not name the interchange sent (first TA1-01={received}, "
+                        f"sent ISA-13={sent}); delivery indeterminate"
+                    )
+                occurrence = match
+            ta104 = (msg.get("TA1-04", occurrence=occurrence) or "").upper()
+            # The acknowledged interchange's control number — not PHI. Once matched it is our own ISA13.
+            control = (
+                _loggable_sent(sent_isa13)
+                if sent_isa13 is not None
+                else _loggable_control(msg.get("TA1-01"))
+            )
             if ta104 == "R":
                 # Interchange rejected: the partner will never accept it → permanent dead-letter (AR).
                 raise NegativeAckError(
-                    f"X12 TA1 interchange rejected (TA1-04=R, ISA-13={control})",
+                    f"X12 TA1 interchange rejected (TA1-04=R, TA1-01={control})",
                     code="AR",
                     permanent=True,
                 )
@@ -410,7 +518,7 @@ class X12Destination(DestinationConnector):
                 # for operators (code + control id only, never the body); a structured AlertSink for
                 # delivered-with-warning is a follow-up.
                 logger.warning(
-                    "X12 TA1 accepted-with-errors (TA1-04=E, ISA-13=%s) — delivered, not retried",
+                    "X12 TA1 accepted-with-errors (TA1-04=E, TA1-01=%s) — delivered, not retried",
                     control,
                 )
                 if self.capture_response:

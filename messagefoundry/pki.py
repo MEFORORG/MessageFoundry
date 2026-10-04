@@ -32,9 +32,11 @@ from messagefoundry.keywrap import refuse_weak_pkcs12
 
 __all__ = [
     "CertFacts",
+    "CrlBlock",
     "CrlFacts",
+    "crl_signature_refusal",
+    "judge_every_crl",
     "read_crl_facts",
-    "read_every_crl_facts",
     "read_soonest_crl_facts",
     "soonest_crl",
     "ca_chain_to_pem",
@@ -159,25 +161,37 @@ def read_crl_facts(pem: bytes, *, now: float) -> CrlFacts:
 
     Tolerates certificate blocks in the same file: the FIRST ``X509 CRL`` block is read and any
     certificate blocks are skipped. So this judges one CRL, never a whole file: a file-level caller
-    wants :func:`read_every_crl_facts` or :func:`read_soonest_crl_facts`. ``harden_crl_check`` is
+    wants :func:`judge_every_crl` or :func:`read_soonest_crl_facts`. ``harden_crl_check`` is
     stricter again, and refuses a file whose certificates the hop does not already trust (BACKLOG
     #1890).
 
     Raises ``ValueError`` when the bytes carry no CRL at all -- a configured-but-CRL-less file must
     never degrade to "revocation checking silently off"."""
-    start = pem.find(_CRL_BEGIN)
-    if start < 0:
+    crl, nxt = _parse_first_crl(pem)
+    return _crl_facts(crl, nxt, now)
+
+
+def _parse_first_crl(
+    pem: bytes,
+) -> tuple[x509.CertificateRevocationList, datetime.datetime]:
+    """The first ``X509 CRL`` block of ``pem`` that OpenSSL would load (:func:`_crl_blocks`),
+    parsed, with its ``nextUpdate``."""
+    block = next(_crl_blocks(pem), None)
+    if block is None:
         raise ValueError(_NO_CRL)
-    stop = pem.find(_CRL_END, start)
-    if stop < 0:
+    if _CRL_END not in block:
         raise ValueError("truncated CRL: an 'X509 CRL' block opened but never closed")
-    crl = x509.load_pem_x509_crl(pem[start : stop + len(_CRL_END)])
+    crl = x509.load_pem_x509_crl(block)
     nxt = crl.next_update_utc
     if nxt is None:
         # RFC 5280 makes nextUpdate optional, but OpenSSL treats a CRL without one as never
         # expiring, which would silence the freshness control entirely. Refuse rather than
         # inherit an unbounded lifetime.
         raise ValueError("the CRL carries no nextUpdate, so its freshness cannot be checked")
+    return crl, nxt
+
+
+def _crl_facts(crl: x509.CertificateRevocationList, nxt: datetime.datetime, now: float) -> CrlFacts:
     return CrlFacts(
         issuer=crl.issuer.rfc4514_string(),
         next_update_iso=nxt.isoformat(),
@@ -191,8 +205,8 @@ def read_soonest_crl_facts(pem: bytes, *, now: float) -> CrlFacts:
     A CRL file may hold one CRL per issuer -- ``[tls].crl_file`` is documented that way -- and
     OpenSSL loads every one of them. So the file fails a handshake as soon as ANY of its CRLs
     lapses, and a freshness check that read only the first block would stay silent while a later
-    issuer's CRL had already expired. This reads every ``X509 CRL`` block and returns the one that
-    expires first.
+    issuer's CRL had already expired. This reads every ``X509 CRL`` block OpenSSL would load
+    (:func:`_crl_blocks`) and returns the one that expires first.
 
     Each block is judged on its own by :func:`read_crl_facts`. A block that cannot be judged (no
     ``nextUpdate``, or unparseable) is skipped, so one such block cannot hide a sibling that is about
@@ -212,42 +226,177 @@ def read_soonest_crl_facts(pem: bytes, *, now: float) -> CrlFacts:
     raise ValueError(_NO_CRL)
 
 
-def read_every_crl_facts(pem: bytes, *, now: float) -> list[CrlFacts]:
-    """The facts of EVERY CRL in ``pem``, in file order, refusing any block it cannot judge.
+@dataclass(frozen=True)
+class CrlBlock:
+    """One CRL in a file, in the terms OpenSSL uses to choose between CRLs (BACKLOG #299).
 
-    The strict sibling of :func:`read_soonest_crl_facts`, for the context builder
-    (``harden_crl_check``, BACKLOG #299). The monitor skips a block it cannot judge so one bad block
-    cannot hide a sibling that is about to lapse. A context build must not skip it: OpenSSL loads
-    that block too, and a CRL with no ``nextUpdate`` is one OpenSSL treats as never expiring. So
-    here any such block raises, naming its position, and a file with no CRL raises as
-    :func:`read_crl_facts` does.
+    A running context can only gain CRLs. For one issuer, OpenSSL first scores each CRL it holds,
+    and a CRL scores lower when it is out of time, when its scope (the Issuing Distribution Point)
+    or its Authority Key Identifier does not fit, or when it carries a critical extension OpenSSL
+    does not handle. Among equal scores it takes the latest ``thisUpdate``. So ``selection`` holds
+    the scope, the key identifier and the critical extension OIDs, and two CRLs score alike only when
+    those match. ``fingerprint`` is the SHA-256 of the CRL's DER, so an unchanged CRL is recognised
+    however its PEM is wrapped."""
+
+    issuer: str
+    this_update: datetime.datetime
+    next_update: datetime.datetime
+    fingerprint: bytes
+    selection: tuple[bytes | None, bytes | None, frozenset[str]] = (None, None, frozenset())
+
+
+def judge_every_crl(pem: bytes, *, now: float) -> list[tuple[CrlFacts, CrlBlock]]:
+    """The facts and the :class:`CrlBlock` of EVERY CRL in ``pem``, in file order, refusing any block
+    it cannot judge. One parse per block.
+
+    The strict sibling of :func:`read_soonest_crl_facts`, for a context load (``harden_crl_check``)
+    and the running-hop reload (BACKLOG #299). The monitor skips a block it cannot judge so one bad
+    block cannot hide a sibling that is about to lapse. A context load must not skip it: OpenSSL
+    loads that block too, and a CRL with no ``nextUpdate`` is one OpenSSL treats as never expiring.
+    So here any such block raises, naming its position, and a file with no CRL raises as
+    :func:`read_crl_facts` does. So does a BEGIN marker :func:`_crl_blocks` does not count. That is
+    a model of OpenSSL, not a proof, so a load still counts what OpenSSL took
+    (:func:`messagefoundry.config.tls_policy.crl_scratch_context`).
 
     **A delta CRL refuses too.** The engine turns on no extended CRL support, and without it
     OpenSSL was measured to use a newer delta CRL as if it were complete. Revocations listed only
     in the base CRL were then dropped, and a revoked client was accepted. Give the setting base
     CRLs only."""
     blocks = list(_crl_blocks(pem))
+    if len(blocks) != pem.count(_CRL_BEGIN):
+        raise ValueError(
+            "it has a '-----BEGIN X509 CRL-----' marker that does not start a line, so OpenSSL "
+            "does not load that CRL. The marker must be the first thing on its line, after a line "
+            "feed: no space, tab or other text before it, and no line that ends in a carriage "
+            "return alone"
+        )
     if not blocks:
         raise ValueError(_NO_CRL)
-    facts: list[CrlFacts] = []
+    judged: list[tuple[CrlFacts, CrlBlock]] = []
     for index, block in enumerate(blocks, start=1):
         where = f"CRL block {index} of {len(blocks)}"
         try:
-            facts.append(read_crl_facts(block, now=now))
-            if _is_delta_crl(block):
+            crl, nxt = _parse_first_crl(block)
+            if _is_delta_crl(crl):
                 raise ValueError(
                     "it is a delta CRL, which OpenSSL would read as a complete CRL and so drop "
                     "every revocation listed only in its base CRL; give base CRLs only"
                 )
+            judged.append(
+                (
+                    _crl_facts(crl, nxt, now),
+                    CrlBlock(
+                        issuer=crl.issuer.rfc4514_string(),
+                        this_update=crl.last_update_utc,
+                        next_update=nxt,
+                        fingerprint=crl.fingerprint(hashes.SHA256()),
+                        selection=_selection(crl),
+                    ),
+                )
+            )
         except ValueError as exc:
             raise ValueError(f"{where} cannot be judged: {exc}") from exc
-    return facts
+    return judged
 
 
-def _is_delta_crl(block: bytes) -> bool:
-    """Whether the PEM CRL ``block`` carries a Delta CRL Indicator (RFC 5280 section 5.2.4)."""
+def _selection(
+    crl: x509.CertificateRevocationList,
+) -> tuple[bytes | None, bytes | None, frozenset[str]]:
+    """What OpenSSL scores a CRL on besides time and issuer; :class:`CrlBlock` says why."""
+    scope: bytes | None = None
+    key_id: bytes | None = None
+    critical: set[str] = set()
+    for ext in crl.extensions:
+        if ext.critical:
+            critical.add(ext.oid.dotted_string)
+        if isinstance(ext.value, x509.IssuingDistributionPoint):
+            scope = ext.value.public_bytes()
+        elif isinstance(ext.value, x509.AuthorityKeyIdentifier):
+            # The whole AKID: OpenSSL matches its issuer and serial to the CA too, when present.
+            key_id = ext.value.public_bytes()
+    return scope, key_id, frozenset(critical)
+
+
+def crl_signature_refusal(pem: bytes, ca_ders: Iterable[bytes]) -> tuple[str, bool] | None:
+    """Why some CRL in ``pem`` is not signed by a CA in ``ca_ders``, or ``None`` when each one is.
+
+    The flag is True when a CA for the CRL's issuer was found and its key does not verify the CRL,
+    and False when no such CA was found. A block that fails to verify is reported over one whose CA
+    was not found, wherever it sits in the file. OpenSSL checks a CRL's signature at the handshake, not at
+    the load. So a CRL with the right issuer name and Authority Key Identifier but a bad signature
+    loads cleanly, and then every handshake it judges fails with ``CRL signature failure``. The
+    running-hop reload calls this before a live load, because a load cannot be undone (BACKLOG #299).
+
+    A CA counts as a CRL's issuer when its subject equals the CRL's issuer name exactly, it fits the
+    CRL's AKID, and its key verifies the CRL. A CA that does not parse is ignored. ``pem`` must be
+    bytes :func:`judge_every_crl` accepted; a block that does not parse raises ``ValueError``."""
+    cas: list[x509.Certificate] = []
+    for der in ca_ders:
+        try:
+            cas.append(x509.load_der_x509_certificate(der))
+        except ValueError:
+            continue
+    blocks = list(_crl_blocks(pem))
+    unlisted: str | None = None
+    for index, block in enumerate(blocks, start=1):
+        crl = x509.load_pem_x509_crl(block)
+        where = f"CRL block {index} of {len(blocks)} (issuer {crl.issuer.rfc4514_string()!r})"
+        issuers = [ca for ca in cas if ca.subject == crl.issuer and _fits_akid(crl, ca)]
+        if not issuers:
+            # Go on: a block that is known to be badly signed is the stronger finding.
+            unlisted = unlisted or f"{where} names no CA certificate this hop lists as its issuer"
+            continue
+        if not any(_signed_by(crl, ca) for ca in issuers):
+            return (
+                f"{where} does not verify against the key of the CA certificate this hop trusts "
+                "for that issuer. Loaded, it would make every handshake it judges fail with "
+                "'CRL signature failure'",
+                True,
+            )
+    return None if unlisted is None else (unlisted, False)
+
+
+def _fits_akid(crl: x509.CertificateRevocationList, ca: x509.Certificate) -> bool:
+    """Whether ``ca`` fits ``crl``'s Authority Key Identifier, the way OpenSSL's
+    ``X509_check_akid`` matches one: each part the AKID carries must match the CA."""
     try:
-        x509.load_pem_x509_crl(block).extensions.get_extension_for_class(x509.DeltaCRLIndicator)
+        akid = crl.extensions.get_extension_for_class(x509.AuthorityKeyIdentifier).value
+    except x509.ExtensionNotFound:
+        return True
+    except x509.DuplicateExtension:
+        return False
+    if akid.key_identifier is not None:
+        try:
+            ski = ca.extensions.get_extension_for_class(x509.SubjectKeyIdentifier).value.digest
+        except x509.ExtensionNotFound:
+            ski = None
+        except (x509.DuplicateExtension, ValueError):
+            return False
+        if ski is not None and ski != akid.key_identifier:
+            return False
+    serial = akid.authority_cert_serial_number
+    if serial is not None and serial != ca.serial_number:
+        return False
+    names = [
+        name.value
+        for name in akid.authority_cert_issuer or ()
+        if isinstance(name, x509.DirectoryName)
+    ]
+    return not names or ca.issuer in names
+
+
+def _signed_by(crl: x509.CertificateRevocationList, ca: x509.Certificate) -> bool:
+    """Whether ``ca``'s key verifies ``crl``. A key type the CRL cannot be checked with is False."""
+    try:
+        return crl.is_signature_valid(ca.public_key())  # type: ignore[arg-type]
+    except (ValueError, TypeError, UnsupportedAlgorithm):
+        return False
+
+
+def _is_delta_crl(crl: x509.CertificateRevocationList) -> bool:
+    """Whether ``crl`` carries a Delta CRL Indicator (RFC 5280 section 5.2.4)."""
+    try:
+        crl.extensions.get_extension_for_class(x509.DeltaCRLIndicator)
     except x509.ExtensionNotFound:
         return False
     except x509.DuplicateExtension as exc:
@@ -271,14 +420,38 @@ _CRL_END = b"-----END X509 CRL-----"
 _NO_CRL = "no CRL found in the supplied PEM (expected an 'X509 CRL' block)"
 
 
+_UTF8_BOM = b"\xef\xbb\xbf"
+
+
+def _begins_line(pem: bytes, at: int) -> bool:
+    """Whether offset ``at`` of ``pem`` starts a line as OpenSSL reads one: the file's start or just
+    after a LF, with at most one UTF-8 byte order mark before it."""
+    if pem[at - len(_UTF8_BOM) : at] == _UTF8_BOM:
+        at -= len(_UTF8_BOM)
+    return at == 0 or pem[at - 1 : at] == b"\n"
+
+
 def _crl_blocks(pem: bytes) -> Iterator[bytes]:
-    """Yield each ``X509 CRL`` PEM block in ``pem``, in file order."""
+    """Yield each ``X509 CRL`` PEM block in ``pem`` whose BEGIN marker starts a line, in file order.
+
+    **OpenSSL skips a block whose BEGIN marker does not start a line** (BACKLOG #299). This is the
+    one place that measurement is recorded. On CPython 3.14.6 / OpenSSL 3.5.7, through
+    ``load_verify_locations(cafile=)``, at least these were measured. Skipped: a marker after a
+    space, a tab, other text, a lone CR, or two byte order marks. Loaded: a marker after one UTF-8
+    byte order mark at a line start, trailing spaces on the BEGIN line, and CRLF line ends. A parser
+    that counted a skipped block would judge a CRL the context never holds.
+
+    This models that rule; it is not OpenSSL's reader. OpenSSL splits a line longer than its buffer,
+    so a marker after 254 bytes of text on one line was measured to load. Such a file is refused
+    here, which fails closed. The authority is what OpenSSL loads, which
+    :func:`messagefoundry.config.tls_policy.crl_scratch_context` counts."""
     start = pem.find(_CRL_BEGIN)
     while start >= 0:
-        stop = pem.find(_CRL_END, start)
-        # Slice to this block's own bounds: a copy of the rest of the file per block grows with
-        # file size times block count. A truncated last block keeps the tail, so it still raises.
-        yield pem[start:] if stop < 0 else pem[start : stop + len(_CRL_END)]
+        if _begins_line(pem, start):
+            stop = pem.find(_CRL_END, start)
+            # Slice to this block's own bounds: a copy of the rest of the file per block grows with
+            # file size times block count. A truncated last block keeps the tail, so it still raises.
+            yield pem[start:] if stop < 0 else pem[start : stop + len(_CRL_END)]
         start = pem.find(_CRL_BEGIN, start + len(_CRL_BEGIN))
 
 

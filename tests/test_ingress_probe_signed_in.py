@@ -10,15 +10,66 @@ the repeat returns.
 
 from __future__ import annotations
 
+import ast
+import importlib.util
 import ssl
+import sys
 import urllib.error
 import urllib.request
+from pathlib import Path
+from types import ModuleType
 
 import pytest
 
 import harness.load.ingress_probe as ingress_probe
 from harness.load import rigadmin
 from harness.load.failover import EngineNode
+
+_SUMMARY_SCRIPT = (
+    Path(__file__).resolve().parents[1] / "scripts" / "ci" / "ingress_probe_summary.py"
+)
+
+
+def _load_summary() -> ModuleType:
+    """The workflow's RESULT parser, imported by path -- ``scripts/`` is not a package."""
+    spec = importlib.util.spec_from_file_location(
+        "ingress_probe_summary_engine_leg", _SUMMARY_SCRIPT
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    # Registered before it runs: @dataclass resolves the module's namespace through sys.modules.
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_summary = _load_summary()
+
+
+def test_the_setup_failure_line_is_one_the_workflow_parser_accepts(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Round trip of the probe's ERROR shape through ``ingress-rate-probe.yml``'s parser."""
+    assert ingress_probe._setup_failed(20.0, "provision_failed", OSError("boom")) == 2
+    result = _summary.summarise(capsys.readouterr().out, rate=20.0, repeat=3)
+    assert result.errors == [] and len(result.rows) == 1 and result.measured == 0, result
+
+
+def test_every_setup_failure_reason_matches_the_workflow_parser() -> None:
+    """Each reason the probe can print must pass the parser's ERROR pattern, or a real setup
+    failure on a runner would read as a broken pipeline. Read from the probe's call sites."""
+    tree = ast.parse(Path(ingress_probe.__file__).read_text(encoding="utf-8"))
+    reasons = [
+        node.args[1].value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_setup_failed"
+        and isinstance(node.args[1], ast.Constant)
+    ]
+    assert len(reasons) >= 4, reasons  # positive control: the four call sites read on 2026-10-03
+    for reason in reasons:
+        assert _summary._REASON.fullmatch(reason), reason
 
 
 @pytest.fixture
@@ -76,3 +127,7 @@ def test_one_repeat_signs_in_and_stops_its_engine(
     assert len(nodes) == 1
     assert unsigned_status == [401], "the probe's engine answered /stats with no session"
     assert not nodes[0].alive, "the probe returned with its engine still running"
+    # The line the workflow's parser must accept: a drift in the probe's RESULT grammar reds here,
+    # on the engine leg that a change to the probe runs.
+    result = _summary.summarise(out, rate=20.0, repeat=1)
+    assert result.errors == [] and result.measured == 1, (result, out)

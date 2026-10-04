@@ -18,6 +18,7 @@ from typing import Any
 import pytest
 
 import messagefoundry.parsing.x12.message as x12_message_mod
+import messagefoundry.transports.x12 as x12_transport_mod
 from messagefoundry.config.models import ConnectorType, ContentType, Destination, Source
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
@@ -34,7 +35,13 @@ from messagefoundry.parsing.x12.peek import X12Peek
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus, Stage
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import DeliveryError, DeliveryResponse, NegativeAckError
-from messagefoundry.transports.x12 import X12Destination, X12Source
+from messagefoundry.transports.x12 import (
+    X12Destination,
+    X12Source,
+    _control_number,
+    _names_sent_interchange,
+    _sent_isa13,
+)
 
 
 def _isa(*, control: str = "000000001") -> str:
@@ -118,41 +125,188 @@ def _source() -> X12Source:
 
 
 def test_ta1_accepted_capturing() -> None:
-    r = _dest(capture_response=True)._check_ta1(_ta1("A"))
+    r = _dest(capture_response=True)._check_ta1(_ta1("A"), payload=EDI)
     assert isinstance(r, DeliveryResponse) and r.outcome == "accepted" and r.detail == "TA1*A"
 
 
 def test_ta1_accepted_non_capturing_returns_none() -> None:
-    assert _dest(capture_response=False)._check_ta1(_ta1("A")) is None
+    assert _dest(capture_response=False)._check_ta1(_ta1("A"), payload=EDI) is None
 
 
 def test_ta1_reject_is_permanent_both_modes() -> None:
     for capturing in (True, False):
         with pytest.raises(NegativeAckError) as ei:
-            _dest(capture_response=capturing)._check_ta1(_ta1("R"))
+            _dest(capture_response=capturing)._check_ta1(_ta1("R"), payload=EDI)
         assert ei.value.permanent is True and ei.value.code == "AR"
 
 
 def test_ta1_error_is_accepted_with_warning_not_retried() -> None:
     # Resolved decision (ADR 0016): TA1*E = accepted-with-warning, NOT a retry (the interchange WAS
     # accepted). Capturing → accepted reply; non-capturing → None. Never a NegativeAckError.
-    r = _dest(capture_response=True)._check_ta1(_ta1("E"))
+    r = _dest(capture_response=True)._check_ta1(_ta1("E"), payload=EDI)
     assert isinstance(r, DeliveryResponse) and r.outcome == "accepted"
     assert "E" in (r.detail or "")
-    assert _dest(capture_response=False)._check_ta1(_ta1("E")) is None
+    assert _dest(capture_response=False)._check_ta1(_ta1("E"), payload=EDI) is None
 
 
 def test_business_response_instead_of_ta1_is_accepted() -> None:
-    r = _dest(capture_response=True)._check_ta1(_271())
+    r = _dest(capture_response=True)._check_ta1(_271(), payload=EDI)
     assert isinstance(r, DeliveryResponse) and r.outcome == "accepted"
     assert "271" in r.body  # the application response is carried back for re-ingress
 
 
 def test_unparseable_reply_capturing_vs_not() -> None:
-    r = _dest(capture_response=True)._check_ta1(b"NOT-AN-INTERCHANGE~")
+    r = _dest(capture_response=True)._check_ta1(b"NOT-AN-INTERCHANGE~", payload=EDI)
     assert isinstance(r, DeliveryResponse) and r.outcome == "unparseable"
     with pytest.raises(DeliveryError):  # non-capturing: a retryable transport error
-        _dest(capture_response=False)._check_ta1(b"NOT-AN-INTERCHANGE~")
+        _dest(capture_response=False)._check_ta1(b"NOT-AN-INTERCHANGE~", payload=EDI)
+
+
+# --- TA1-01 must name the interchange sent (a TA1 for another one is never acted on) ------------
+
+
+def _ta1_for(code: str, acknowledged: str) -> bytes:
+    """A TA1-only interchange whose TA1-01 names ``acknowledged`` (its own ISA13 stays 000000001)."""
+    return (_isa() + f"TA1*{acknowledged}*240101*1200*{code}*000~" + "IEA*1*000000001~").encode()
+
+
+def test_ta1_reject_for_another_interchange_is_retried_not_dead_lettered(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A TA1*R whose TA1-01 names a different interchange (stale, misdirected, or a partner echoing
+    # the wrong field) says nothing about the one just sent, so it must not dead-letter it. Before
+    # the fix this raised a permanent NegativeAckError. Both modes: a retryable DeliveryError.
+    for capturing in (True, False):
+        with (
+            caplog.at_level(logging.WARNING, logger="messagefoundry.transports.x12"),
+            pytest.raises(DeliveryError) as ei,
+        ):
+            _dest(capture_response=capturing)._check_ta1(_ta1_for("R", "000000777"), payload=EDI)
+        assert not isinstance(ei.value, NegativeAckError)
+        assert "TA1-01=000000777" in str(ei.value) and "ISA-13=000000001" in str(ei.value)
+    warnings = [rec.getMessage() for rec in caplog.records if rec.levelno == logging.WARNING]
+    assert any("no TA1 naming the interchange sent" in m for m in warnings)
+
+
+def test_ta1_accept_for_another_interchange_is_not_an_accept() -> None:
+    # The same rule cuts the other way: a stale TA1*A must not confirm an interchange it never named.
+    with pytest.raises(DeliveryError) as ei:
+        _dest(capture_response=True)._check_ta1(_ta1_for("A", "000000002"), payload=EDI)
+    assert not isinstance(ei.value, NegativeAckError)
+
+
+def test_ta1_mismatch_log_never_echoes_a_malformed_ta101(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # TA1-01 is partner-written: a value that is not a nine-digit control number is named by its
+    # shape, never echoed into a log line or an exception message.
+    with (
+        caplog.at_level(logging.WARNING, logger="messagefoundry.transports.x12"),
+        pytest.raises(DeliveryError) as ei,
+    ):
+        _dest(capture_response=True)._check_ta1(_ta1_for("R", "EVILTOKEN"), payload=EDI)
+    assert not isinstance(ei.value, NegativeAckError)
+    assert "EVILTOKEN" not in str(ei.value)
+    assert all("EVILTOKEN" not in rec.getMessage() for rec in caplog.records)
+
+
+def test_ta1_for_a_sent_isa13_that_is_not_a_control_number_correlates_by_exact_echo() -> None:
+    # An ISA13 that is not N0 is an upstream authoring error, but a partner that rejects it while
+    # naming it back still dead-letters it at once; a TA1 naming anything else is still retried.
+    bad = _270().replace("000000001", "00000ABC1", 1)
+    with pytest.raises(NegativeAckError) as ei:
+        _dest(capture_response=False)._check_ta1(_ta1_for("R", "00000ABC1"), payload=bad)
+    assert ei.value.permanent is True
+    with pytest.raises(DeliveryError) as ei2:
+        _dest(capture_response=False)._check_ta1(_ta1_for("R", "000000001"), payload=bad)
+    assert not isinstance(ei2.value, NegativeAckError)
+
+
+def test_ta1_for_a_payload_with_no_isa_skips_correlation() -> None:
+    # Nothing to correlate against (as MLLP does for an unreadable MSH-10): classified on TA1-04.
+    with pytest.raises(NegativeAckError):
+        _dest(capture_response=False)._check_ta1(_ta1("R"), payload="NOT-AN-INTERCHANGE~")
+
+
+def test_the_ta1_naming_the_sent_interchange_is_the_one_acted_on() -> None:
+    # One reply may acknowledge several interchanges; the TA1 naming ours decides, wherever it sits.
+    reply = (
+        _isa()
+        + "TA1*000000005*240101*1200*A*000~"
+        + "TA1*000000001*240101*1200*R*000~"
+        + "IEA*1*000000001~"
+    ).encode()
+    with pytest.raises(NegativeAckError) as ei:
+        _dest(capture_response=True)._check_ta1(reply, payload=EDI)
+    assert ei.value.permanent is True
+
+
+def test_ta1_scan_is_capped() -> None:
+    # A TA1 naming ours past the scan cap is not found: a retry, never a reject.
+    reply = (
+        _isa()
+        + "TA1*000000005*240101*1200*A*000~" * x12_transport_mod._MAX_TA1_SCANNED
+        + "TA1*000000001*240101*1200*R*000~"
+        + "IEA*1*000000001~"
+    ).encode()
+    with pytest.raises(DeliveryError) as ei:
+        _dest(capture_response=True)._check_ta1(reply, payload=EDI)
+    assert not isinstance(ei.value, NegativeAckError)
+
+
+def test_ta1_for_a_blank_sent_isa13_is_never_a_reject() -> None:
+    # A readable ISA with a blank ISA13 has nothing a TA1 can name: correlation fails, it is retried.
+    blank = _270().replace("000000001", " " * 9, 1)
+    assert _sent_isa13(blank) == ""
+    with pytest.raises(DeliveryError) as ei:
+        _dest(capture_response=False)._check_ta1(_ta1("R"), payload=blank)
+    assert not isinstance(ei.value, NegativeAckError)
+
+
+def test_ta101_short_form_is_compared_as_a_nine_digit_control_number() -> None:
+    r = _dest(capture_response=True)._check_ta1(_ta1_for("A", "1"), payload=EDI)
+    assert isinstance(r, DeliveryResponse) and r.outcome == "accepted" and r.detail == "TA1*A"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("000000001", "000000001"),
+        (" 000000001 ", "000000001"),
+        ("42", "000000042"),
+        ("", None),
+        ("0000000001", None),  # ten digits
+        ("00000000A", None),
+        ("-00000001", None),
+        ("\u0661\u0662", None),  # non-ASCII digits
+        (None, None),
+    ],
+)
+def test_control_number_normalization(value: str | None, expected: str | None) -> None:
+    assert _control_number(value) == expected
+
+
+def test_sent_isa13_reads_the_payload_header() -> None:
+    assert _sent_isa13(EDI) == "000000001"
+    assert _sent_isa13("NOT-AN-INTERCHANGE~") is None
+
+
+@pytest.mark.parametrize(
+    ("ta101", "sent", "expected"),
+    [
+        ("000000001", "000000001", True),
+        ("1", "000000001", True),
+        ("000000002", "000000001", False),
+        (None, "000000001", False),
+        ("00000ABC1", "00000ABC1", True),
+        ("000000001", "00000ABC1", False),
+        (None, "00000ABC1", False),
+        ("", "", False),
+        (None, "", False),
+    ],
+)
+def test_names_sent_interchange(ta101: str | None, sent: str, expected: bool) -> None:
+    assert _names_sent_interchange(ta101, sent) is expected
 
 
 # --- real-socket integration -------------------------------------------------
@@ -184,6 +338,13 @@ async def test_ta1_required_reject_fails_fast() -> None:
     with pytest.raises(NegativeAckError) as ei:
         await _round_trip(_ta1("R"), ta1_required=True)
     assert ei.value.permanent is True
+
+
+async def test_ta1_required_reject_for_another_interchange_retries() -> None:
+    # Real socket: the peer answers EDI (ISA13 000000001) with a TA1*R naming 000000777.
+    with pytest.raises(DeliveryError) as ei:
+        await _round_trip(_ta1_for("R", "000000777"), ta1_required=True)
+    assert not isinstance(ei.value, NegativeAckError)
 
 
 async def test_ta1_required_no_reply_retries() -> None:
@@ -232,7 +393,7 @@ def test_x12_codec_stays_pure() -> None:
 # --- X12-16: TA1 classifier PHI-in-log guard + the both-present TA1+271 rule --------------------
 #
 # _check_ta1 is a transport-level retry gate that MUST NOT leak the interchange body (PHI) into a log
-# line or an exception message — only the non-PHI control identifiers (TA1-04 + ISA-13). These build a
+# line or an exception message — only the non-PHI control identifiers (TA1-04 + TA1-01). These build a
 # single interchange whose first functional segment is a TA1 followed by a co-present 271 carrying a
 # PHI-shaped subscriber name, so "the body is excluded" is a real assertion, not vacuous.
 
@@ -244,19 +405,19 @@ def _ta1_with_271_phi(code: str) -> bytes:
     271 whose NM1 carries a PHI-shaped subscriber name. Models a partner that returns a TA1 ack ahead of
     the business response in one interchange — the classifier must treat it as the TA1 (first wins)."""
     return (
-        _isa()
+        _isa(control="000000009")
         + f"TA1*000000001*240101*1200*{code}*000~"
         + "GS*HB*SAPP*RAPP*20240101*1200*1*X*005010X279A1~"
         + "ST*271*0001~BHT*0022*11*10001234*20240101*1200~"
         + f"NM1*IL*1*{_PHI_TOKEN}*JANE~"
-        + "SE*4*0001~GE*1*1~IEA*1*000000001~"
+        + "SE*4*0001~GE*1*1~IEA*1*000000009~"
     ).encode()
 
 
 def test_ta1_present_with_271_classifies_as_ta1_not_business_response() -> None:
     # The first functional segment wins: a TA1*A ahead of a 271 in one interchange is the interchange
     # ACK (detail "TA1*A"), NOT a "business response". The whole interchange still rides re-ingress.
-    r = _dest(capture_response=True)._check_ta1(_ta1_with_271_phi("A"))
+    r = _dest(capture_response=True)._check_ta1(_ta1_with_271_phi("A"), payload=EDI)
     assert isinstance(r, DeliveryResponse) and r.outcome == "accepted"
     assert r.detail == "TA1*A"  # classified as the TA1 ack, not the co-present 271
     assert (
@@ -265,12 +426,12 @@ def test_ta1_present_with_271_classifies_as_ta1_not_business_response() -> None:
 
 
 def test_ta1_reject_message_carries_only_control_ids_not_body() -> None:
-    # A TA1*R reject is a permanent NAK; its message names ONLY TA1-04 + ISA-13, never the co-present
+    # A TA1*R reject is a permanent NAK; its message names ONLY TA1-04 + TA1-01, never the co-present
     # 271's PHI (count-and-log: operators reconcile from the control id + disposition, not a leaked body).
     with pytest.raises(NegativeAckError) as ei:
-        _dest(capture_response=True)._check_ta1(_ta1_with_271_phi("R"))
+        _dest(capture_response=True)._check_ta1(_ta1_with_271_phi("R"), payload=EDI)
     text = str(ei.value)
-    assert "TA1-04=R" in text and "ISA-13=000000001" in text
+    assert "TA1-04=R" in text and "TA1-01=000000001" in text and "000000009" not in text
     assert ei.value.permanent is True and ei.value.code == "AR"
     assert _PHI_TOKEN not in text and "271" not in text and "NM1" not in text
 
@@ -278,16 +439,16 @@ def test_ta1_reject_message_carries_only_control_ids_not_body() -> None:
 def test_ta1_error_warning_carries_only_control_ids_not_body(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    # TA1*E (accepted-with-errors) emits an operator warning; it must name ONLY TA1-04 + ISA-13, never
+    # TA1*E (accepted-with-errors) emits an operator warning; it must name ONLY TA1-04 + TA1-01, never
     # the co-present 271 body. caplog proves the emitted record excludes the segment/PHI content.
     with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.x12"):
-        r = _dest(capture_response=True)._check_ta1(_ta1_with_271_phi("E"))
+        r = _dest(capture_response=True)._check_ta1(_ta1_with_271_phi("E"), payload=EDI)
     assert isinstance(r, DeliveryResponse) and r.outcome == "accepted"
     warnings = [rec for rec in caplog.records if rec.levelno == logging.WARNING]
     assert warnings, "TA1*E must emit an operator warning"
     for rec in warnings:
         msg = rec.getMessage()
-        assert "TA1-04=E" in msg and "ISA-13=000000001" in msg
+        assert "TA1-04=E" in msg and "TA1-01=000000001" in msg and "000000009" not in msg
         assert _PHI_TOKEN not in msg and "271" not in msg and "NM1" not in msg
 
 
@@ -296,7 +457,7 @@ def test_unparseable_reply_detail_is_safe_exc_scrubbed() -> None:
     # safe_exc renders "<ExcType>: <redacted msg>", so the exception TYPE survives while a malformed
     # reply's content is redacted — the type prefix is proof the detail is routed through safe_exc (the
     # non-capturing path uses a raw {exc} render, which would NOT carry the type name).
-    r = _dest(capture_response=True)._check_ta1(b"NOT-AN-INTERCHANGE~")
+    r = _dest(capture_response=True)._check_ta1(b"NOT-AN-INTERCHANGE~", payload=EDI)
     assert isinstance(r, DeliveryResponse) and r.outcome == "unparseable"
     assert r.detail is not None and r.detail.startswith("unparseable X12 reply: ")
     assert "X12PeekError" in r.detail  # safe_exc's "<type>: <msg>" signature — the scrub ran

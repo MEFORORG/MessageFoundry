@@ -507,16 +507,27 @@ def test_the_tcp_destination_check_frame_refuses_with_its_label() -> None:
 
 
 @pytest.mark.parametrize(
-    ("body", "expected", "field"),
+    ("body", "expected", "field", "reason"),
     [
-        pytest.param(SMUGGLED, DEAD, {}, id="smuggled"),
-        pytest.param(CLEAN, DONE, {}, id="clean-control"),
-        # A rewrite failure is not a frame refusal: shadow keeps it a completed delivery.
-        pytest.param("plain text, no MSH", DONE, {"hl7_raw_separators": True}, id="unparseable"),
+        pytest.param(SMUGGLED, DEAD, {}, "frame", id="smuggled"),
+        pytest.param(CLEAN, DONE, {}, "", id="clean-control"),
+        # A live send refuses a payload its rewrite cannot re-encode, permanently (ADR 0204,
+        # ADR 0206), and check_frame shares that rewrite, so shadow dead-letters it too.
+        pytest.param(
+            "plain text, no MSH",
+            DEAD,
+            {"hl7_raw_separators": True},
+            "emit failed",
+            id="unparseable",
+        ),
     ],
 )
 async def test_a_shadow_outbound_records_what_a_live_send_would(
-    store: MessageStore, body: str, expected: tuple[str, str], field: dict[str, Any]
+    store: MessageStore,
+    body: str,
+    expected: tuple[str, str],
+    field: dict[str, Any],
+    reason: str,
 ) -> None:
     # Rule 1 runs inside connector.send(), which a simulate outbound skips. Before the fix shadow
     # marked the smuggled row PROCESSED, where a live send would have dead-lettered it. The batch
@@ -537,7 +548,7 @@ async def test_a_shadow_outbound_records_what_a_live_send_would(
     (row,) = await store.outbox_for(mid)
     assert msg is not None and (msg["status"], row["status"]) == expected
     error = str(row["last_error"] or "")
-    assert "DOE" not in error and (expected == DONE or "frame" in error)
+    assert "DOE" not in error and reason in error
 
 
 # --- the reply path: a listener's reply is one frame, and framing it never raises ---------------

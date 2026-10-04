@@ -4,9 +4,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 from harness.reconcile.compare import ReconcileResult
+from messagefoundry.terminal_text import escape_for_terminal
 
 
 def render_json(result: ReconcileResult) -> dict[str, Any]:
@@ -47,6 +49,12 @@ def render_json(result: ReconcileResult) -> dict[str, Any]:
     }
 
 
+def _keys(keys: Sequence[str]) -> str:
+    # A key is a control id read from a captured message, and this text is printed (ASVS 1.1.2).
+    # A difference's line is escaped the same way where it is built, for its segment id.
+    return ", ".join(escape_for_terminal(key) for key in keys)
+
+
 def render_text(result: ReconcileResult, *, max_diffs: int = 20) -> str:
     """A terminal summary: the per-connection counts, then up to ``max_diffs`` mismatched messages with
     their field-level differences (``left`` = MEFOR, ``right`` = Corepoint)."""
@@ -60,14 +68,14 @@ def render_text(result: ReconcileResult, *, max_diffs: int = 20) -> str:
         f"duplicate_keys={len(result.duplicate_keys)}",
     ]
     for pair in result.mismatched[:max_diffs]:
-        lines.append(f"  ✗ {pair.key}:")
+        lines.append(f"  ✗ {escape_for_terminal(pair.key)}:")
         for d in pair.differences:
-            lines.append(f"      {d.describe()}")
+            lines.append(f"      {escape_for_terminal(d.describe())}")
     if len(result.mismatched) > max_diffs:
         lines.append(f"  … and {len(result.mismatched) - max_diffs} more mismatched message(s)")
     if result.mefor_only:
-        lines.append(f"  MEFOR-only keys: {', '.join(result.mefor_only[:20])}")
+        lines.append(f"  MEFOR-only keys: {_keys(result.mefor_only[:20])}")
     if result.corepoint_only:
-        lines.append(f"  Corepoint-only keys: {', '.join(result.corepoint_only[:20])}")
+        lines.append(f"  Corepoint-only keys: {_keys(result.corepoint_only[:20])}")
     lines.append(f"  RESULT: {'CLEAN ✓' if result.clean else 'DIFFERENCES ✗'}")
     return "\n".join(lines)

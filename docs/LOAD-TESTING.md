@@ -65,7 +65,7 @@ python -m harness.load.rigadmin provision --db ./load.db
 MEFOR_LOAD_FANOUT=20 MEFOR_LOAD_TRANSFORM=edit MEFOR_LOAD_SINK_PORT=2700 \
   python -m messagefoundry serve --config harness/config/load --db ./load.db --env dev
 
-# 3) Drive it, signed in. `run` signs in and appends --token <session> to the command after `--`.
+# 3) Drive it, signed in. `run` signs in and appends --token=<session> to the command after `--`.
 #    --sink-port must match MEFOR_LOAD_SINK_PORT above.
 python -m harness.load.rigadmin run --engine https://127.0.0.1:8765 --cacert ./api-generated-cert.pem -- \
   python -m harness --load fanout-baseline --engine https://127.0.0.1:8765 --cacert ./api-generated-cert.pem \
@@ -74,7 +74,8 @@ python -m harness.load.rigadmin run --engine https://127.0.0.1:8765 --cacert ./a
 
 `python -m harness --list-profiles` lists the built-ins. `--load` accepts a built-in name **or** a
 path to a `.toml`. To run as an account you already hold, skip `rigadmin` and pass its session as
-`--token`.
+`--token=<session>`, in one argument: a session can start with `-`, which argparse would otherwise
+read as an option.
 
 ### Rigs sign in
 

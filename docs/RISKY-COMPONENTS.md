@@ -26,9 +26,10 @@ That is **34 distributions**, recorded in
 | Names in `pyproject.toml`, core plus every extra | 45 | Still direct-only, and mixes in extras nobody enabled. |
 | **Core runtime closure** | **34** | **Used for the tiers below.** What a default install actually executes. |
 | **`sqlserver` runtime closure** | **36** | **Used for the `sqlserver` section only.** The core closure plus what that extra adds. |
+| **`harness` runtime closure** | **38** | **Used for the `harness` section only.** The core closure plus what that extra adds. |
 | `requirements.lock` | A superset | Exported with `--all-extras`, so it carries the dev toolchain. Designating packages no production install has weakens the signal for the ones it does. |
 
-One extra is assessed as well. The `sqlserver` runtime closure is **36 distributions**, recorded in
+Two extras are assessed as well. The `sqlserver` runtime closure is **36 distributions**, recorded in
 [`security/runtime-closure-sqlserver.txt`](../security/runtime-closure-sqlserver.txt). It has its
 own section below, which classifies only the names the extra adds to the core closure.
 
@@ -36,9 +37,23 @@ It is assessed because the SQL Server store is the deployment the project's secu
 names. This page chose its own scope; covering the extra here does not decide what that assessment
 grades.
 
+The `harness` runtime closure is **38 distributions**, recorded in
+[`security/runtime-closure-harness.txt`](../security/runtime-closure-harness.txt). Installing the
+harness wheel brings in these names, because the wheel's only dependency is
+`messagefoundry[harness]`. The versions are the lock's; an install resolved from an index can take
+newer ones, and a few names apply to one platform only. It has its own section below, which
+classifies only the names the extra adds to the core closure.
+
+It is assessed because the project's security assessment brought the harness wheel into its scope,
+by owner ruling R1 of 2026-10-02, which
+[`ASVS-ASSESSMENT-METHOD.md`](ASVS-ASSESSMENT-METHOD.md) section 2 records. The harness also imports
+at least `paramiko`, `pydicom`, `pynetdicom`, `openpyxl`, `pyodbc` and `asyncpg` when a feature needs
+one. The harness wheel declares none of them, so they are not in its closure and not assessed here
+for it. `pyodbc` is assessed in the `sqlserver` section, for the engine.
+
 An install that enables any other extra (`postgres`, `sftp`, `dicom`, `fhir`, `xml`, `x12`,
-`webauthn`, `otel`, `vault`, `harness`) carries dependencies **outside** both sets. Those are not
-assessed here, and that is a gap rather than an assertion of safety.
+`webauthn`, `otel`, `vault`) carries dependencies **outside** all three sets. Those are not assessed
+here, and that is a gap rather than an assertion of safety.
 
 ## The criterion
 
@@ -183,6 +198,74 @@ regression in an 18.6 release of ODBC Driver 18, not in `pyodbc`. It says Micros
 So the defect to track is the driver's, which is one more reason to keep the driver current.
 `pyodbc` 5.3.0 was still its newest release on that date.
 
+## The `harness` extra
+
+The test harness is a desktop tool, shipped as its own wheel, that sends test traffic to the engine,
+receives what the engine delivers, and monitors the engine through its API. Its window is Qt, through
+PySide6, and the `harness` extra is that dependency. These four names are what the extra adds to the
+core closure. The same criterion applies.
+
+On the reading of 2026-10-03, the harness imports four Qt modules: `QtCore`, `QtGui`, `QtNetwork` and
+`QtWidgets`. All four ship in `pyside6-essentials`. That split decides the tables below.
+
+### Designated
+
+| Component | Tier | Why | Native |
+|---|---|---|---|
+| `pyside6-essentials` | 1, 2 and 3 | Qt itself, for the modules the harness uses. Its `QTcpServer` is the harness's MLLP receiver: it accepts the connection an engine outbound connection dials, and reads every byte that arrives. Its text engine then lays out and draws what arrives: the fields of each received message in a table, and the whole message once it is selected. It draws the messages the monitor fetches from the engine API the same way. Its sign-in dialog holds the engine password and authenticator code the operator types | **yes** |
+| `shiboken6` | 1, 2 and 3 | the compiled binding runtime under PySide6. Every Qt call the harness makes goes through it, including the bytes the listener reads, the strings the widgets draw and the password the sign-in dialog returns. It plays the part `cffi` plays in tier 2 | **yes** |
+
+### Assessed and NOT designated
+
+| Component | Why not |
+|---|---|
+| `pyside6` | a metadistribution: the `PySide6` package initialiser, typing stubs and tool launchers. It ships no compiled module and parses no input. It exists to pull in the other three |
+| `pyside6-addons` | compiled, but it holds only Qt modules the harness never imports, among them the web engine, multimedia, PDF, serial port and HTTP server modules. None of them runs, so none sees input. A harness change that imports one needs this row read again |
+
+So 2 plus 2 is 4, and 34 plus 4 is 38.
+
+### Why the listener meets tiers 1 and 3
+
+The listener binds the loopback address only, so a peer has to be on the same host. The harness is
+meant for synthetic traffic, too. Neither fact takes it out of the criterion:
+
+1. **Hostile input.** The bytes it reads were chosen by whatever connected. In the harness's own use,
+   that is an engine delivering a message that a sending system chose. Nothing in Qt or the listener
+   checks that the traffic is synthetic, and any process on the host can connect.
+2. **Protocol termination.** It terminates the TCP connection that an engine outbound connection
+   dials. MLLP framing and the ACK are engine code, `messagefoundry.mllpcodec`, so the protocol Qt
+   speaks is TCP itself.
+
+Tier 2 comes from the sign-in dialog, not from the network. The harness signs in to the engine
+through Qt input fields, so the password and the authenticator code pass through Qt and `shiboken6`
+before `httpx` sends them. That is the same ground `aioodbc` is designated on: it holds a credential.
+`pyside6-essentials` also ships Qt's TLS backends, but the harness opens no TLS connection through
+Qt. Its HTTPS client for the engine API is `httpx`, already in the core closure, so Qt decides
+nothing about trust.
+
+All of Qt is compiled C++, so a fault in its socket or text handling is a memory-safety event in the
+harness's process, not a Python exception.
+
+### Read on ASVS's examples by hand, and the part not read
+
+The generated reading further down covers the `sqlserver` closure only, so these four names are not
+in its snapshot. Each was read by hand on 2026-10-03, against the same tests that reading applies,
+from the PyPI JSON and Simple APIs:
+
+| Component | Newest release | Releases in the 730 days before | Project status | Development Status | Pinned 6.11.2 yanked |
+|---|---|---|---|---|---|
+| `pyside6` | 2026-08-18 | 19 | `active` | 5 - Production/Stable | no |
+| `pyside6-addons` | 2026-08-18 | 19 | `active` | 5 - Production/Stable | no |
+| `pyside6-essentials` | 2026-08-18 | 19 | `active` | 5 - Production/Stable | no |
+| `shiboken6` | 2026-08-18 | 19 | `active` | 5 - Production/Stable | no |
+
+So none of the four is risky on maintenance or on support, on that date.
+
+**The vulnerability-history example was NOT read for them.** The OSV API, which that example reads,
+was not reachable from the session that wrote this section. That is a gap, not a clean result. It
+closes when `scripts/security/component_readings.py` reads this closure as well, and the guard
+described under *Keeping it true* goes red when it does, so this paragraph cannot outlive it.
+
 ## Risky by ASVS's own examples, read from public data
 
 The tiers above ask where a flaw would hurt most. ASVS asks something else. Its V15.1 chapter calls
@@ -205,8 +288,9 @@ The readings, their sources and their windows are recorded in
 ### What is read, and the test for each example
 
 All 36 distributions in the `sqlserver` closure are read: the 34 in the core closure and the 2 the
-extra adds. That is the whole assessed set, not only the designated part. A library can be risky on
-these examples even where the tiers did not designate it.
+extra adds. That is not only the designated part. A library can be risky on these examples even
+where the tiers did not designate it. The names the `harness` extra adds are not in this snapshot.
+The `harness` section above reads them itself, and says what it could not read.
 
 | Example | A component is risky on it when | Source |
 |---|---|---|
@@ -307,7 +391,7 @@ against these components are handled through the process in
 **It is not the consolidated threat-model table.** That document is withheld from public checkouts
 by policy. This page is derived independently and stands on its own.
 
-**It does not cover the extras other than `sqlserver`.** See the scope note above.
+**It does not cover the extras other than `sqlserver` and `harness`.** See the scope note above.
 
 ## Keeping it true
 
@@ -316,7 +400,9 @@ by policy. This page is derived independently and stands on its own.
 that enters the closure without being classified here, or a name here that is not in the closure,
 turns it red. It holds the `sqlserver` section to
 [`security/runtime-closure-sqlserver.txt`](../security/runtime-closure-sqlserver.txt) the same way,
-over the names that file adds to the core. The test is the reason the arithmetic above can be
+over the names that file adds to the core, and the `harness` section to
+[`security/runtime-closure-harness.txt`](../security/runtime-closure-harness.txt), over the names
+that one adds. The test is the reason the arithmetic above can be
 trusted after the next dependency bump.
 
 The same test holds each closure file to the lock it copies, in every name and version (BACKLOG

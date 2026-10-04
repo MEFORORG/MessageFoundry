@@ -562,14 +562,16 @@ class LoggingAlertSink:
         # the hop is effectively down, not merely approaching a deadline (BACKLOG #1005). The wording
         # names no direction, because the same CRL may guard a listener or an outbound hop (#299):
         # a listener refuses every client, and an outbound hop cannot connect to its peer.
-        # Both lines say to restart, not just to replace the file: a hop reads its CRL when it builds
-        # its TLS context and keeps that copy. The scan judges the copies live contexts hold as well
-        # as the file (BACKLOG #299), so replacing the file alone does not clear this alert.
+        # A hop reads its CRL when it builds its TLS context and keeps that copy. The reload pass
+        # (pipeline/crl_reload.py) applies a replaced file to a running hop within about a minute,
+        # and the scan judges the copies live contexts hold as well as the file (BACKLOG #299). So a
+        # copy the reload refused keeps this alert up, and the scan's own warning says why.
         if days_remaining < 0:
             log.error(
                 "crl_expiry: %r CRL expired at %s (%d day(s) ago) — every TLS handshake it "
                 "verifies fails (a listener refuses every client; an outbound hop cannot connect to "
-                "its peer). Replace the file and restart the engine: %s",
+                "its peer). Replace the file, and restart the engine if the scan still reports a running "
+                "hop holding the old copy: %s",
                 name,
                 not_after,
                 -days_remaining,
@@ -577,8 +579,9 @@ class LoggingAlertSink:
             )
         else:
             log.warning(
-                "crl_expiry: %r CRL expires at %s (%d day(s) left). Replace the file and restart "
-                "the engine before then, or every TLS handshake it verifies will fail: %s",
+                "crl_expiry: %r CRL expires at %s (%d day(s) left). Replace the file before then, "
+                "or every TLS handshake it verifies will fail, and restart the engine if the scan "
+                "still reports a running hop holding the old copy: %s",
                 name,
                 not_after,
                 days_remaining,

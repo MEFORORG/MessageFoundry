@@ -51,6 +51,7 @@ def _logical_fields(msg: Message) -> dict[str, object]:
         "pid3_4_first": msg.field("PID-3.4"),
         "pid5": (msg.field("PID-5.1"), msg.field("PID-5.2"), msg.field("PID-5.3")),
         "znm3": (msg.field("ZNM-3.1"), msg.field("ZNM-3.2"), msg.field("ZNM-3.3")),
+        "nte3": msg.field("NTE-3.1"),
     }
 
 
@@ -81,7 +82,9 @@ def test_reencode_to_alt_delimiters_preserves_logical_fields() -> None:
     out = reencode_delimiters(ADT_DEFAULT, parse_encoding_characters(ALT_OVERRIDE))
     # The header advertises the new delimiters and the body uses them, not the originals.
     assert out.startswith("MSH#@*!%#")
-    assert "|" not in out  # the old field separator is gone everywhere
+    # The old field separator is gone from the structure. It survives only in NTE-3, where the source
+    # escaped it as data and the target set carries it as a plain character (ADR 0206 rule 4).
+    assert all("|" not in line for line in out.split("\r") if not line.startswith("NTE"))
     assert "^" not in out  # the old component separator too
     # A downstream re-parse sees the SAME logical fields under the new delimiters.
     reparsed = Message.parse(out)
@@ -99,11 +102,16 @@ def test_reencode_preserves_non_ascii_names() -> None:
     assert "Müller" in out
 
 
-def test_reencode_translates_escape_character_but_not_named_escapes() -> None:
-    # \F\ / \T\ are delimiter-agnostic named escapes — only the surrounding escape char changes.
+def test_reencode_decodes_separator_escapes_so_they_read_the_same() -> None:
+    # \F\ and \T\ name the source field and subcomponent characters, '|' and '&'. Under the target set
+    # the same letters name '#' and '%', so keeping them would change what a receiver reads. Each is
+    # decoded and re-escaped against the target set instead (ADR 0206 rule 4); '|' and '&' are plain
+    # data there, so they are written as themselves.
     out = reencode_delimiters(ADT_DEFAULT, parse_encoding_characters(ALT_OVERRIDE))
-    assert "!F!" in out and "!T!" in out  # escape char rewritten \ -> !
+    assert "NTE#1##field-escape | and unit & markers" in out
+    assert "!F!" not in out and "!T!" not in out
     assert "\\F\\" not in out  # no stale old-escape sequence left behind
+    assert Message.parse(out).field("NTE-3.1") == "field-escape | and unit & markers"
 
 
 def test_reencode_handles_source_already_non_default() -> None:
@@ -155,11 +163,11 @@ def test_reencode_rejects_unparseable_payload(garbage: str) -> None:
         (
             "BHS|^~\\&|A|B\\E\\x\rMSH|^~\\&|A|B|C|D|1||ADT^A01|1|P|2.5.1\r"
             "PID|1|a\\E\\b^c~d&e\rBTS|1\r",
-            "BHS#|#^~^&#A#B^E^x\rMSH#@$^%#A#B#C#D#1##ADT@A01#1#P#2.5.1\rPID#1#a^E^b@c$d%e\rBTS#1\r",
+            "BHS#|#^~^&#A#B\\x\rMSH#@$^%#A#B#C#D#1##ADT@A01#1#P#2.5.1\rPID#1#a\\b@c$d%e\rBTS#1\r",
         ),
         (
             "MSH|^~\\&|A|B|C|D|1||ADT^A01|1|P|2.5.1\r\rPID|1||a^b~c&d\\F\\x\r",
-            "MSH#@$^%#A#B#C#D#1##ADT@A01#1#P#2.5.1\r\rPID#1##a@b$c%d^F^x\r",
+            "MSH#@$^%#A#B#C#D#1##ADT@A01#1#P#2.5.1\r\rPID#1##a@b$c%d|x\r",
         ),
     ],
     ids=["batch-header", "blank-line"],

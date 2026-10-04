@@ -1094,3 +1094,52 @@ def test_an_unloadable_cacert_is_an_api_error(tmp_path: pathlib.Path) -> None:
             EngineClient("https://127.0.0.1:8765", cacert=str(bad))
     # CONTROL: over http no context is built, so the same bad path is never read.
     EngineClient("http://127.0.0.1:8765", cacert=str(tmp_path / "missing.pem")).close()
+
+
+# --- frame release on a transport error (the truststore raise-a-local cycle) ---------------------
+
+
+class _Held:
+    """A plain object a frame keeps as a local, so a weak reference shows when the frame let go."""
+
+
+def _raise_a_local(held: _Held) -> None:
+    # The way truststore refuses a certificate on Windows and macOS: the frame holds the error and
+    # the error's traceback holds the frame. ``held`` rides along in the same frame.
+    err = OSError("certificate refused")
+    raise err
+
+
+def test_release_raising_frames_breaks_a_raise_a_local_cycle_and_spares_the_caller() -> None:
+    """RED when: ``_release_raising_frames`` stops clearing the raising frames, so ``held`` is kept
+    by the frame-and-error cycle; or walks past ``stop`` and clears the caller's in-flight frames."""
+    import gc
+    import weakref
+
+    from messagefoundry.apiclient.client import _release_raising_frames
+
+    was_enabled = gc.isenabled()
+    gc.disable()  # an automatic collection would free the cycle and pass this without the fix
+    try:
+        outer_held = _Held()
+        try:
+            _raise_a_local(outer_held)
+        except OSError as outer:
+            held = _Held()
+            alive = weakref.ref(held)
+            try:
+                _raise_a_local(held)
+            except OSError as exc:
+                # Reachable through __context__ only, as httpcore leaves it.
+                inner = exc
+                assert inner.__context__ is outer
+            del held
+            _release_raising_frames(inner, stop=outer)
+            del inner
+            assert alive() is None, "the raising frame still holds the error that holds it"
+            outer_tb = outer.__traceback__
+            assert outer_tb is not None and outer_tb.tb_next is not None
+            assert outer_tb.tb_next.tb_frame.f_locals["held"] is outer_held  # caller's frame kept
+    finally:
+        if was_enabled:
+            gc.enable()

@@ -172,6 +172,10 @@ no new helper in `parsing/x12/`:
       semantics ([base.py:98](../../messagefoundry/transports/base.py), [mllp.py:478](../../messagefoundry/transports/mllp.py)).
     - `E` (accepted with errors / interchange note) → **transient** `NegativeAckError(code="AE",
       permanent=False)` → retry, the conservative choice (mirrors MLLP AE/CE).
+  - *Amendment 2026-10-03:* TA104 is acted on only when the TA1's **TA1-01 names the ISA13 just
+    sent**; a reply with no TA1 naming it is a retryable `DeliveryError`, never a reject or an
+    accept. The rule and its edge cases are stated once, in the X12 section of
+    [`docs/CONNECTIONS.md`](../CONNECTIONS.md).
   - **It is a business 271 (or 277/278 response) returned *instead of* a TA1** — the success body itself
     (first functional segment is `GS`/`ST`, not `TA1`). → `DeliveryResponse(body=interchange,
     outcome="accepted", detail="271")`. The TA1 was either omitted (many real-time partners skip it) or

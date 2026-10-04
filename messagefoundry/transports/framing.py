@@ -5,9 +5,10 @@
 The codec moved out of ``transports/`` so a client can import it without registering every
 connector (BACKLOG #1697). Engine callers keep importing it from here.
 
-The MLLP and TCP destinations and listeners frame through the two functions defined here (ADR
-0205). :meth:`FrameCodec.frame` stays unchecked, because a client such as the test harness frames
-hostile bytes on purpose.
+The MLLP and TCP destinations and listeners frame through the functions defined here (ADR 0205). :meth:`FrameCodec.frame` stays unchecked, because a client such as the test harness frames
+hostile bytes on purpose. What counts as a frame byte, and the refusal's wording, are defined once in
+the leaf (:meth:`FrameCodec.find_frame_byte`, :meth:`FrameCodec.neutralise`), which the harness's own
+senders and ACK writers use too.
 """
 
 from __future__ import annotations
@@ -18,15 +19,21 @@ from messagefoundry.framing import (
     MLLP_CODEC,
     PRESETS,
     STX_ETX_CODEC,
+    FrameByteFault,
     FrameCodec,
     FrameDecoder,
+    FrameEncodeError,
     FrameError,
+    FramePayloadError,
     codec_for,
 )
 from messagefoundry.transports.base import NegativeAckError, encode_wire_body
 
 __all__ = [
     "FrameError",
+    "FrameByteFault",
+    "FramePayloadError",
+    "FrameEncodeError",
     "FrameCodec",
     "FrameDecoder",
     "MLLP_CODEC",
@@ -64,15 +71,11 @@ def check_frame_bytes(codec: FrameCodec, payload: str, encoding: str, *, transpo
     ``check_frame``, where no single-payload send runs: on each member of an MLLP batch, and on a
     shadow (simulate) outbound, so both record the disposition a live send would."""
     body = encode_wire_body(payload, encoding, transport=transport)
-    for role, byte in (("start", codec.start), ("end", codec.end)):
-        position = body.find(byte)
-        if position >= 0:
-            raise NegativeAckError(
-                f"{transport}: payload holds the frame {role} byte 0x{byte:02X} at byte "
-                f"{position}; it would not arrive as one message, so it is not sent",
-                code="framing",
-                permanent=True,
-            )
+    # The judgement and its wording are the leaf's (FrameCodec.find_frame_byte), shared with the test
+    # harness; what is engine-only is the permanent delivery failure it becomes here.
+    fault = codec.find_frame_byte(body)
+    if fault is not None:
+        raise NegativeAckError(fault.describe(transport), code="framing", permanent=True)
     return body
 
 
@@ -91,5 +94,5 @@ def frame_reply(codec: FrameCodec, reply: str, encoding: str) -> bytes:
         logger.warning(
             "reply held a frame start or end byte; each was replaced by a space before framing"
         )
-        body = body.replace(bytes([codec.start]), b" ").replace(bytes([codec.end]), b" ")
-    return codec.frame(body)
+    # The replacement is the leaf's rule, shared with the test harness's ACK writers.
+    return codec.frame(codec.neutralise(body))

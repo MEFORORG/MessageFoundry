@@ -1,14 +1,15 @@
 name: Dependabot lock resync
 
-# Re-exports the SEVEN committed "uv export" artifacts (requirements.lock +
-# docker/locks/requirements-core.lock + docker/locks/requirements-sqlserver.lock + the HASHLESS
+# Re-exports the EIGHT committed "uv export" artifacts (requirements.lock +
+# docker/locks/requirements-core.lock + docker/locks/requirements-sqlserver.lock +
+# security/locks/requirements-harness.lock + the HASHLESS
 # constraints.lock + the two PEP 735 CI-toolchain locks ci/locks/ci-scanners.lock and
 # ci/locks/ci-quality.lock, and the release-signing lock ci/locks/release-tools.lock) on a Dependabot PR that touched uv.lock / pyproject.toml, and commits them
 # back to the PR branch so the DEP-1 drift gate (security.yml -> pip-audit job, step "Check the
 # lockfile is in sync with pyproject (DEP-1)") goes green WITHOUT a human re-export.
 #
 # WHY: the native "uv" Dependabot ecosystem regenerates uv.lock + pyproject.toml in its PR, but NOT
-# the exported lock artifacts. The DEP-1 gate re-runs "uv lock --check" + all seven "uv export"s and
+# the exported lock artifacts. The DEP-1 gate re-runs "uv lock --check" + all eight "uv export"s and
 # "git diff --exit-code"s the result, so a Dependabot uv PR would otherwise leave the exports stale
 # and red the gate. This workflow runs the IDENTICAL commands and pushes the refreshed exports onto
 # the Dependabot branch.
@@ -34,8 +35,8 @@ name: Dependabot lock resync
 #    attacker-controlled build backend ever runs while the token is on the runner.
 #  - ONE repository script runs: scripts/security/runtime_closure.py (BACKLOG #1812, #1955), under
 #    the runner's own python3 with nothing installed. It is standard-library only (import names
-#    checked by tests/test_dep1_lock_resync_lockstep.py; its gaps are listed there), reads four files,
-#    writes at most two. The checkout pins the SHA that triggered the run, and a "pull_request" run
+#    checked by tests/test_dep1_lock_resync_lockstep.py; its gaps are listed there), reads six files,
+#    writes at most three. The checkout pins the SHA that triggered the run, and a "pull_request" run
 #    takes THIS workflow's definition from that same PR, so anyone able to change the script could
 #    already change the steps around it.
 
@@ -142,11 +143,13 @@ jobs:
           uv export --all-extras --no-emit-project --format requirements.txt -o requirements.lock
           uv export --no-emit-project --no-dev --format requirements.txt -o docker/locks/requirements-core.lock
           uv export --no-emit-project --no-dev --extra sqlserver --format requirements.txt -o docker/locks/requirements-sqlserver.lock
+          # Not an image lock: the harness closure (security/runtime-closure-harness.txt) copies it.
+          uv export --no-emit-project --no-dev --extra harness --format requirements.txt -o security/locks/requirements-harness.lock
           # The hashless constraint export every CI install pins against (`--constraint constraints.lock`,
           # ci.yml). Same lock, --no-hashes; omitted here it would stay stale and red DEP-1 forever.
           uv export --all-extras --no-emit-project --no-hashes --format requirements.txt -o constraints.lock
           # The CI TOOLCHAIN locks (PEP 735 dependency groups, ADR 0034 §3). Same lockstep rule as the
-          # four above: the gate diffs them, so the bot must re-export them or the PR has no path green.
+          # five above: the gate diffs them, so the bot must re-export them or the PR has no path green.
           uv export --only-group ci-scanners --format requirements.txt -o ci/locks/ci-scanners.lock
           uv export --only-group ci-quality --format requirements.txt -o ci/locks/ci-quality.lock
           uv export --only-group release-tools --format requirements.txt -o ci/locks/release-tools.lock
@@ -154,17 +157,18 @@ jobs:
       # security/runtime-closure-core.txt is the risky-component inventory's denominator, a copy of the
       # core lock's pins, and tests/test_risky_component_designation.py fails when the two differ
       # (BACKLOG #1812). security/runtime-closure-sqlserver.txt is the same copy of the sqlserver lock
-      # (BACKLOG #1955), and the script, run with no arguments, rewrites both. A PR that moves a core
-      # or sqlserver package would otherwise be red with no bot-reachable path to green.
-      # dependabot.yml's exclude-paths keeps the version track from editing either file; the security
+      # (BACKLOG #1955), and security/runtime-closure-harness.txt the same copy of the harness lock.
+      # The script, run with no arguments, rewrites all three. A PR that moves a core, sqlserver or
+      # harness package would otherwise be red with no bot-reachable path to green.
+      # dependabot.yml's exclude-paths keeps the version track from editing any of them; the security
       # track may ignore that key, so this rewrite is what actually holds each file to its lock.
       #
       # It runs after the exports, so it copies the fresh locks. It may FAIL: a per-platform fork in
-      # either lock, which needs a human, or a PR head from before the script existed. Either way the
+      # any lock, which needs a human, or a PR head from before the script existed. Either way the
       # re-exported locks must still be pushed, so a failure here does not skip the commit. The last
       # step marks THIS run red. That red sits on the pre-push commit; on the new head, the signal is
       # the closure test failing in the required test legs.
-      - name: Regenerate the runtime-closure inventories from the core and sqlserver locks
+      - name: Regenerate the runtime-closure inventories from the core, sqlserver and harness locks
         id: closure
         if: steps.creds.outputs.present == 'true'
         continue-on-error: true
@@ -182,11 +186,11 @@ jobs:
           set -euo pipefail
           git config user.name 'dependabot[bot]'
           git config user.email '49699333+dependabot[bot]@users.noreply.github.com'
-          if git diff --quiet -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock security/runtime-closure-core.txt security/runtime-closure-sqlserver.txt; then
+          if git diff --quiet -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock security/locks/requirements-harness.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock security/runtime-closure-core.txt security/runtime-closure-sqlserver.txt security/runtime-closure-harness.txt; then
             echo 'Exported lock files and the closure files already in sync; nothing to push.'
             exit 0
           fi
-          git add requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock security/runtime-closure-core.txt security/runtime-closure-sqlserver.txt
+          git add requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock security/locks/requirements-harness.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock security/runtime-closure-core.txt security/runtime-closure-sqlserver.txt security/runtime-closure-harness.txt
           git commit -m 'chore(deps): resync exported lock files (DEP-1)'
           # Push with the persisted App-token credential (NOT GITHUB_TOKEN). An App-token push emits a
           # synchronize event so the required checks (DEP-1, ci.yml) re-run on the new commit; a

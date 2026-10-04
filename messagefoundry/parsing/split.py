@@ -21,12 +21,20 @@ primitive — never raw string-slicing of structured HL7.
 
 from __future__ import annotations
 
+import codecs
 import re
 
 from messagefoundry.parsing.message import Message
-from messagefoundry.parsing.peek import normalize
+from messagefoundry.parsing.peek import normalize, starts_with_msh
+from messagefoundry.parsing.sniff import _LEADING_WS_STR
 
-__all__ = ["encode_batch", "split_batch", "split_by_obr"]
+__all__ = [
+    "encode_batch",
+    "split_batch",
+    "split_batch_bytes",
+    "one_message_bytes",
+    "split_by_obr",
+]
 
 # Split a normalized (``\r``-delimited) payload before each non-leading ``MSH`` segment. We match
 # ``\rMSH`` *without* the trailing field separator so a batch whose MSH-1 isn't ``|`` (e.g.
@@ -34,27 +42,109 @@ __all__ = ["encode_batch", "split_batch", "split_by_obr"]
 # segment id is always exactly three chars, so only an ``MSH`` segment starts with the literal "MSH".
 _MSH_BOUNDARY = re.compile(r"(?=\rMSH)")
 
+#: A UTF-8 byte order mark after the leading whitespace the content sniff tolerates. A match, not a
+#: strip, so a file led by whitespace is not copied whole to look at its first bytes. In a bytes
+#: pattern ``\s`` is exactly the bytes of ``sniff._LEADING_WS``; a test pins the two.
+_LEADING_BOM = re.compile(rb"\s*\xef\xbb\xbf")
+
+#: The batch-envelope header lines a first chunk may open with; neither is a message.
+_ENVELOPE_HEADERS = ("FHS", "BHS")
+
+#: Codecs (by ``codecs.lookup`` name) that write every ASCII character as that one byte and use no
+#: ASCII byte for anything else, so a byte scan for a later ``MSH`` answers what a decode would.
+_ASCII_SAFE_CODECS = frozenset({"utf-8", "ascii"})
+_ASCII_SAFE_PREFIXES = ("iso8859-", "cp125")
+
 
 def split_batch(raw: str | bytes) -> list[str]:
     """Split a possibly-batched HL7 payload into individual messages on ``MSH`` boundaries.
 
     A real file connection delivers each ``MSH``-delimited message separately; mirror that so a
     batch file (or an ``FHS``/``BHS`` envelope wrapping several messages) yields every message, in
-    file order — not just the first. Each returned message is ``\r``-delimited and starts at its
-    ``MSH`` (any ``FHS``/``BHS``/``FTS``/``BTS`` batch-envelope lines around the messages are dropped,
-    since each split message is routed on its own and the batch framing has no per-message meaning).
+    file order, not just the first. Each returned message is ``\r``-delimited. The leading
+    ``FHS``/``BHS`` envelope header lines before the first ``MSH`` are dropped, since each split
+    message is routed on its own and the batch framing has no per-message meaning.
+
+    **No message is dropped.** Only the first chunk can come before an ``MSH``. It is read past
+    whitespace, a byte order mark (U+FEFF) and those envelope header lines. What remains is a
+    message when it starts with ``MSH``, and is otherwise kept as one too, so the parser records its
+    ``ERROR`` rather than the split discarding what the sender sent.
 
     A payload with a single message round-trips unchanged (a one-element list); an empty/whitespace
     payload yields the normalized text as the sole element (the caller — e.g. the parser — then
     reports it as malformed rather than silently dropping it).
     """
     text = normalize(raw)  # \r-delimited, decoupled from the inbound line endings
-    chunks = _MSH_BOUNDARY.split(text)
-    # Keep only the MSH-led chunks: a leading FHS/BHS envelope (or stray whitespace) before the first
-    # MSH is not itself a message. ``lstrip("\r")`` strips the boundary's own leading CR; a chunk that
-    # isn't MSH-led after stripping (the batch header) is dropped.
-    messages = [c.lstrip("\r") for c in chunks if c.strip() and c.lstrip("\r").startswith("MSH")]
+    first, *rest = _MSH_BOUNDARY.split(text)
+    # Every later chunk is the boundary's own CR, then MSH.
+    messages = [chunk[1:] for chunk in rest]
+    head = first.lstrip(_LEADING_WS_STR)  # the leading noise the content sniff tolerates
+    while head.startswith(_ENVELOPE_HEADERS):
+        head = head.partition("\r")[2].lstrip(_LEADING_WS_STR)
+    if head.strip():  # a chunk of other whitespace alone is not a message either
+        messages.insert(0, head)
     return messages or [text]
+
+
+def split_batch_bytes(raw: bytes, encoding: str) -> list[bytes]:
+    """Split a received HL7 file's bytes into one byte string per message, for a source that reads
+    whole files and hands each message over on its own (ADR 0206 rule 5).
+
+    The bytes are decoded with the connection's declared ``encoding`` at ``errors="strict"`` so the
+    ``MSH`` boundaries are found in the right characters, split by :func:`split_batch`, and each
+    message is re-encoded in the same ``encoding``. A file holding one message is handed over as
+    :func:`one_message_bytes` says: as its own bytes, unless the parser would refuse what leads them.
+    A file that does not decode (or names an unknown codec) comes back as ``[raw]`` untouched, so
+    the listener's own strict decode records its ``ERROR``. Every message :func:`split_batch` finds
+    is handed back.
+
+    A file holding no ``MSH`` after a line break is one message the parser reads as it is. Under
+    UTF-8 only, it must also not open with a byte order mark, which the split reads past. Under a
+    single-byte charset the mark's bytes are three characters the split keeps. Where a byte scan
+    can tell (:func:`_needs_a_decode`), such a file is returned without a decode or a split, so the
+    common single-message file pays one scan."""
+    if not _needs_a_decode(raw, encoding):
+        return [raw]
+    try:
+        text = raw.decode(encoding)
+    except (UnicodeDecodeError, LookupError):
+        return [raw]
+    messages = split_batch(text)
+    if len(messages) == 1:
+        return [one_message_bytes(raw, text, messages[0], encoding)]
+    return [message.encode(encoding) for message in messages]
+
+
+def one_message_bytes(raw: bytes, text: str, message: str, encoding: str) -> bytes:
+    """What a whole-file source hands over for a file :func:`split_batch` read as one ``message``,
+    where ``text`` is ``raw`` decoded with ``encoding``.
+
+    ``raw`` itself, byte for byte, when the parser reads ``text`` as it is: ``text`` starts with
+    ``MSH`` after whitespace, or the split found no ``MSH``-led message in it either. Otherwise the
+    split read the message past leading noise the parser refuses, a byte order mark or an
+    ``FHS``/``BHS`` envelope header, so ``message`` is handed over re-encoded, as each member of a
+    batch is. Without this, one such message was an ``ERROR`` where the same message in a batch of
+    two was recorded."""
+    if starts_with_msh(text) or not message.startswith("MSH"):
+        return raw
+    return message.encode(encoding)
+
+
+def _needs_a_decode(raw: bytes, encoding: str) -> bool:
+    """Whether ``raw`` may hold an ``MSH`` after a line break, or, under UTF-8, may open with a
+    byte order mark the split reads past. It answers False only for an encoding that writes each
+    ASCII character as that one byte and uses no ASCII byte for anything else, with neither shape
+    present. Any other encoding answers True, so the caller decodes. Under a single-byte charset
+    the mark's bytes are three characters the split keeps, so they need no decode."""
+    try:
+        name = codecs.lookup(encoding).name
+    except LookupError:
+        return True
+    if name not in _ASCII_SAFE_CODECS and not name.startswith(_ASCII_SAFE_PREFIXES):
+        return True
+    if name == "utf-8" and _LEADING_BOM.match(raw):
+        return True
+    return b"\rMSH" in raw or b"\nMSH" in raw
 
 
 def encode_batch(messages: list[Message | str], *, control_id: str, timestamp: str) -> str:

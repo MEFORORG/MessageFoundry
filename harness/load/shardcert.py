@@ -75,6 +75,7 @@ from messagefoundry.pipeline.sharding import (
     owned_destination_set,
     shard_ids,
 )
+from messagefoundry.terminal_text import escape_for_terminal
 
 _CONFIG_DIR = "harness/config/shardcert"
 
@@ -841,6 +842,17 @@ async def _sign_in_before_load(urls: list[str]) -> None:
     await poller.close()
 
 
+def _shown_tail(node: EngineNode) -> str:
+    """``node``'s engine log tail, escaped for the traceback that prints it (ASVS 1.1.2).
+
+    A shard that never became healthy raises a ``RuntimeError`` carrying this tail, and nothing
+    catches it, so the traceback prints it to the operator's terminal. The engine wrote the log, so
+    it is escaped here, where the message is built, by the multi-line rule the connscale, estate,
+    multishard and failover setup errors use (``harness.__main__._exc_text``): a log tail keeps its
+    newlines, and a Windows tail's CRLF reads as one newline rather than a visible CR per line."""
+    return escape_for_terminal(node.log_tail().replace("\r\n", "\n"))
+
+
 class ShardCertNode(EngineNode):
     """An :class:`EngineNode` that serves ONE shard: injects ``--shard <id>`` into the argv (and keeps
     per-PID :meth:`kill` for the crash leg, which ``supervise()`` does not expose). Everything else —
@@ -1535,7 +1547,7 @@ async def run_shardcert(
             await node.start(provision=i == 0)
             nodes[s] = node
             if not await _await_health(node.url, timeout=60.0):
-                raise RuntimeError(f"shard {s} did not become healthy\n{node.log_tail()}")
+                raise RuntimeError(f"shard {s} did not become healthy\n{_shown_tail(node)}")
             # Each shard binds `lanes` inbound ports (base + i*lanes + l); wait for every one.
             for lane in range(lanes):
                 port = inbound_base + i * lanes + lane
@@ -1642,7 +1654,7 @@ async def run_shardcert(
             await restart.start(provision=False)
             nodes[killed] = restart
             if not await _await_health(restart.url, timeout=60.0):
-                raise RuntimeError(f"shard {killed} did not restart\n{restart.log_tail()}")
+                raise RuntimeError(f"shard {killed} did not restart\n{_shown_tail(restart)}")
             if kill_at is not None:
                 recovery_seconds = time.monotonic() - kill_at
 
@@ -2699,7 +2711,7 @@ async def _start_shards(
         await node.start(provision=i == 0)
         nodes[s] = node
         if not await _await_health(node.url, timeout=60.0):
-            raise RuntimeError(f"shard {s} did not become healthy\n{node.log_tail()}")
+            raise RuntimeError(f"shard {s} did not become healthy\n{_shown_tail(node)}")
         for lane in range(lanes):
             port = inbound_base + i * lanes + lane
             if not await _await_port(preflight_host, port, timeout=30.0):
@@ -3189,7 +3201,7 @@ async def run_shardcert_engine(
             # post-kill CPU sample attributes to the survivor process, not the reaped pre-kill one.
             node_pids[killed] = (restart.node_id, getattr(restart, "pid", None))
             if not await _await_health(restart.url, timeout=60.0):
-                raise RuntimeError(f"shard {killed} did not restart\n{restart.log_tail()}")
+                raise RuntimeError(f"shard {killed} did not restart\n{_shown_tail(restart)}")
             if kill_at is not None:
                 recovery_seconds = time.monotonic() - kill_at
 

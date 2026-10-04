@@ -29,11 +29,12 @@ Rules (ADR 0076 §2):
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from typing import Literal
 
 from messagefoundry.parsing.message import Message
+from messagefoundry.parsing.peek import parse_path
 from messagefoundry.timezone import parse_hl7_timestamp
 
 __all__ = [
@@ -58,13 +59,21 @@ __all__ = [
 _UNSET: object = object()
 
 
+def _writer(msg: Message, src: str) -> Callable[[str, str], None]:
+    """The write for a value read from ``src``: :meth:`Message.set_data` when ``src`` is a component
+    or subcomponent, whose read is decoded (ADR 0206 rule 1), otherwise :meth:`Message.set`, which
+    takes a whole field's raw text as the structure it already is."""
+    return msg.set_data if parse_path(src)[2] is not None else msg.set
+
+
 def copy_field(msg: Message, src: str, dst: str) -> None:
     """Copy the value at ``src`` into ``dst`` (Corepoint ``ItemCopy``).
 
-    An absent/empty ``src`` copies an empty value (clearing ``dst``). The write escapes structural
-    delimiters exactly as :meth:`Message.set`, so a component value carrying a ``^``/``&`` rides across
-    as data, not new structure."""
-    msg.set(dst, msg.field(src) or "")
+    An absent/empty ``src`` copies an empty value (clearing ``dst``). A component or subcomponent
+    ``src`` is read decoded, so it is written as data at every ``dst`` level, a whole field included:
+    a value carrying a ``^``, ``~`` or ``&`` rides across as data, not new structure (ADR 0206). A
+    whole-field ``src`` is raw text, structure and all, and is copied as it is."""
+    _writer(msg, src)(dst, msg.field(src) or "")
 
 
 def set_field(msg: Message, path: str, value: str) -> None:
@@ -123,10 +132,12 @@ def split_field(msg: Message, src: str, sep: str, dests: Sequence[str]) -> None:
 
     Positional: piece *i* goes to ``dests[i]``. Fewer pieces than destinations clears the trailing
     ``dests`` (written empty); extra pieces beyond ``dests`` are dropped. An absent ``src`` clears every
-    destination."""
+    destination. Pieces of a component or subcomponent ``src`` are decoded data, so each is written as
+    data at every destination level, as :func:`copy_field` does (ADR 0206)."""
+    write = _writer(msg, src)
     parts = (msg.field(src) or "").split(sep)
     for i, dest in enumerate(dests):
-        msg.set(dest, parts[i] if i < len(parts) else "")
+        write(dest, parts[i] if i < len(parts) else "")
 
 
 def code_lookup(

@@ -849,7 +849,9 @@ def test_the_engine_homes_still_export_the_moved_names() -> None:
         assert getattr(tmllp, name) is getattr(codec, name), name
     assert tmllp.MLLPFrameError is codec.MLLPFrameError
     # Every name the leaf exports, not every name the engine home exports: the engine home also
-    # defines its own delivery and reply framers (ADR 0205), which the leaf must not carry.
+    # defines its own delivery and reply framers (ADR 0205), which the leaf must not carry. The
+    # judgement they delegate to (FrameCodec.find_frame_byte / neutralise) is the leaf's, shared
+    # with the harness; the permanent NegativeAckError and the warning log stay engine-side.
     for name in framing.__all__:
         assert getattr(tframing, name) is getattr(framing, name), name
     for name in ("frame_for_delivery", "frame_reply", "check_frame_bytes"):

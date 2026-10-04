@@ -119,10 +119,16 @@ class _FakeSMTP:
         self.did_noop = True
         return (250, b"OK")
 
-    def send_message(self, msg: EmailMessage, to_addrs: list[str] | None = None) -> dict[str, Any]:
+    def send_message(
+        self,
+        msg: EmailMessage,
+        from_addr: str | None = None,
+        to_addrs: list[str] | None = None,
+    ) -> dict[str, Any]:
         if self.fail_at == "send":
             raise smtplib.SMTPRecipientsRefused({"x@y.z": (550, b"no")})
         self.sent.append(msg)
+        self.from_addr = from_addr
         self.to_addrs = to_addrs
         return {}
 
@@ -624,12 +630,14 @@ def test_the_rfc_5321_size_limits_are_the_boundary(
 
 
 class _WireCapture:
-    """A loopback SMTP listener that records each ``RCPT`` command line exactly as it arrives, so a
-    test reads the recipient the relay would act on rather than a list handed to a fake client."""
+    """A loopback SMTP listener that records each ``MAIL`` and ``RCPT`` command line exactly as it
+    arrives, so a test reads the envelope the relay would act on rather than a list handed to a fake
+    client."""
 
     def __init__(self) -> None:
         self._sock = socket.create_server(("127.0.0.1", 0))
         self.port: int = self._sock.getsockname()[1]
+        self.mail_lines: list[bytes] = []
         self.rcpt_lines: list[bytes] = []
         self.data: list[bytes] = []
         self.connections = 0
@@ -648,6 +656,8 @@ class _WireCapture:
                 for raw in reader:
                     line = raw.rstrip(b"\r\n")
                     verb = line[:4].upper()
+                    if verb == b"MAIL":
+                        self.mail_lines.append(line)
                     if verb == b"RCPT":
                         self.rcpt_lines.append(line)
                     if verb == b"DATA":
@@ -674,14 +684,16 @@ def wire() -> Iterator[_WireCapture]:
         capture.close()
 
 
-def _wire_dest(port: int, recipients: list[str]) -> Destination:
+def _wire_dest(
+    port: int, recipients: list[str], sender: str = "engine@hospital.example"
+) -> Destination:
     return Destination(
         name="OB_EMAIL",
         type=ConnectorType.EMAIL,
         settings={
             "host": "127.0.0.1",
             "port": port,
-            "sender": "engine@hospital.example",
+            "sender": sender,
             "recipients": recipients,
             "use_tls": False,
             "timeout_seconds": 5.0,
@@ -772,17 +784,19 @@ async def test_the_to_line_names_exactly_the_checked_addresses(wire: _WireCaptur
     assert to_line.rstrip(b"\r\n") == expected.encode()
 
 
-def test_a_to_header_that_parses_differently_is_refused_at_construction(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("field", ["recipients", "sender"])
+def test_a_header_that_parses_differently_is_refused_at_construction(
+    monkeypatch: pytest.MonkeyPatch, field: str
 ) -> None:
     # Simulates a later widening of the local-part allowlist: with the address rule switched off,
-    # an encoded-word local part reaches the To: header, whose parse would decode it. The
+    # an encoded-word local part reaches the To: or From: header, whose parse would decode it. The
     # construction-time comparison must refuse it, so the allowlist is not the only control.
     import messagefoundry.transports.email as email_mod
 
     monkeypatch.setattr(email_mod, "envelope_address_problem", lambda _address: None)
-    dest = _wire_dest(2525, [_ENCODED_LOCAL[0]])
-    with pytest.raises(ValueError, match="does not match the checked recipients"):
+    dest = _wire_dest(2525, ["a@hospital.example"])
+    dest.settings[field] = [_ENCODED_LOCAL[0]] if field == "recipients" else _ENCODED_LOCAL[0]
+    with pytest.raises(ValueError, match="does not match the checked " + field):
         EmailDestination(dest)
 
 
@@ -811,6 +825,84 @@ async def test_a_value_that_does_not_read_back_is_refused_before_any_rcpt(
         EmailDestination(dest)
     assert wire.connections == 0
     assert wire.rcpt_lines == []
+
+
+async def test_the_mail_from_line_and_from_header_name_exactly_the_checked_sender(
+    wire: _WireCapture,
+) -> None:
+    # Every character the allowlist admits, so a decoding or quoting step would show here.
+    sender = "a#b$c&d'e*f+g-h^i_j`k{l}m~n.o@Hospital.example"
+    dest = _wire_dest(wire.port, ["a@hospital.example"], sender=sender)
+    check_egress_allowed(dest, _wire_egress(wire.port))
+    await EmailDestination(dest).send("PID|1|synthetic")
+    assert wire.mail_lines == [("mail from:<" + sender + ">").encode()]
+    [from_line] = [line for line in wire.data if line.lower().startswith(b"from:")]
+    assert from_line.rstrip(b"\r\n") == ("From: " + sender).encode()
+
+
+async def test_send_passes_the_checked_sender_as_the_envelope_sender(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # MAIL FROM comes from the checked setting, never from a parse of the From header, so a header
+    # changed later cannot move it (vault BACKLOG #2841).
+    _install_fake(monkeypatch)
+    await EmailDestination(_dest()).send("PID|1|synthetic")
+    [smtp] = _FakeSMTP.instances
+    assert smtp.from_addr == "engine@hospital.org"
+
+
+async def test_the_mail_from_line_does_not_follow_the_from_header(
+    wire: _WireCapture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A plain sender reads the same either way, so change the header after it is built: MAIL FROM
+    # must still be the checked setting, which it is only when passed explicitly.
+    build = EmailDestination._build_message
+
+    def changed_from(self: EmailDestination, payload: str) -> EmailMessage:
+        msg = build(self, payload)
+        msg.replace_header("From", "another@hospital.example")
+        return msg
+
+    monkeypatch.setattr(EmailDestination, "_build_message", changed_from)
+    dest = _wire_dest(wire.port, ["a@hospital.example"])
+    await EmailDestination(dest).send("PID|1|synthetic")
+    assert wire.mail_lines == [b"mail from:<engine@hospital.example>"]
+
+
+def _sender_shapes() -> dict[str, str]:
+    """Sender values that are not one plain, checked address. Built from parts, so no literal reads
+    as a recipe; the ids are neutral."""
+    other = "other" + "@" + "partner.example"
+    own = "engine" + "@" + "hospital.example"
+    shapes = {
+        "shape-a": _b64_word(other),
+        "shape-b": _ENCODED_LOCAL[0],
+        "shape-c": _b64_word("Ops") + " <" + own + ">",
+        "shape-d": "grp" + ":" + " " + other + ";",
+        "shape-e": "grp" + ":" + " " + own + ";",
+        "shape-f": _quote() + own,
+        "shape-g": _quote() + "engine" + "@" + _quote() + "@" + "hospital.example",
+        "shape-h": own + ", " + other,
+        "shape-i": "Ops <" + own + ">",
+    }
+    # Every line break policy.default refuses, the three Unicode ones included.
+    for code in (13, 10, 0x85, 0x2028, 0x2029):
+        shapes[f"break-{code:04x}"] = "engine" + chr(code) + "x@hospital.example"
+    return shapes
+
+
+_SENDER_SHAPES = _sender_shapes()
+
+
+@pytest.mark.parametrize("value", list(_SENDER_SHAPES.values()), ids=list(_SENDER_SHAPES))
+async def test_a_sender_that_is_not_one_plain_address_is_refused_before_any_connection(
+    wire: _WireCapture, value: str
+) -> None:
+    dest = _wire_dest(wire.port, ["a@hospital.example"], sender=value)
+    with pytest.raises(ValueError, match="sender"):
+        EmailDestination(dest)
+    assert wire.connections == 0
+    assert wire.mail_lines == []
 
 
 def test_recipient_domains_do_not_gate_direct() -> None:

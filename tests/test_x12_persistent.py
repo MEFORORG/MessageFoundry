@@ -19,6 +19,7 @@ import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.parsing.x12.interchange import X12FrameReader
+from messagefoundry.parsing.x12.peek import X12Peek
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.x12 import X12Destination
 
@@ -75,9 +76,18 @@ def _interchange(control: str = "000000001") -> str:
     )
 
 
-def _ta1(code: str = "A", control: str = "000000009") -> str:
-    """A synthetic TA1 interchange acknowledgement (TA1-04 = A/R/E)."""
-    return _isa(control=control) + f"TA1*000000001*240101*1200*{code}~" + f"IEA*1*{control}~"
+def _ta1(code: str = "A", control: str = "000000009") -> Callable[[bytes], str]:
+    """A synthetic TA1 interchange acknowledgement (TA1-04 = A/R/E) builder. Its TA1-01 names the
+    ISA13 of the interchange it answers, as the destination requires before acting on a TA1; its own
+    ISA13 is ``control``."""
+
+    def build(received: bytes) -> str:
+        acknowledged = X12Peek.parse(received).control_number
+        return (
+            _isa(control=control) + f"TA1*{acknowledged}*240101*1200*{code}~" + f"IEA*1*{control}~"
+        )
+
+    return build
 
 
 def _dest(port: int, **overrides: object) -> X12Destination:
@@ -103,10 +113,11 @@ async def _until(cond: Callable[[], bool], timeout: float = 2.0) -> None:
 
 class _X12Peer:
     """Loopback X12 receiver: counts accepts, collects received interchanges, and optionally replies
-    with a TA1 interchange (``ta1``). ``trailing`` packs an extra interchange after the reply (desync
-    tests); ``close_clients`` simulates a partner idle-close."""
+    with a TA1 interchange that ``ta1`` builds from the interchange it answers. ``trailing`` packs an
+    extra interchange after the reply (desync tests); ``close_clients`` simulates a partner
+    idle-close."""
 
-    def __init__(self, *, ta1: str | None = None, trailing: bytes = b"") -> None:
+    def __init__(self, *, ta1: Callable[[bytes], str] | None = None, trailing: bytes = b"") -> None:
         self.ta1 = ta1
         self.trailing = trailing
         self.accepts = 0
@@ -134,7 +145,7 @@ class _X12Peer:
                 for interchange in decoder.feed(chunk):
                     self.received.append(interchange)
                     if self.ta1 is not None:
-                        writer.write(self.ta1.encode() + self.trailing)
+                        writer.write(self.ta1(interchange).encode() + self.trailing)
                         await writer.drain()
         except (OSError, ConnectionError):
             pass
@@ -244,6 +255,46 @@ async def test_ta1_reject_dead_letters_but_keeps_connection() -> None:
         # (mirrors MLLP's NAK-keeps-connection) — the reject did not discard it.
         assert dest._conn is not None
         assert peer.accepts == 1
+    finally:
+        await dest.aclose()
+        await peer.stop()
+
+
+async def test_ta1_for_another_interchange_retries_and_discards_connection() -> None:
+    # A TA1*R naming an interchange other than the one just sent is not this delivery's reject: it is
+    # a retryable DeliveryError (never a dead-letter), and the cached connection is discarded because
+    # a stale TA1 on the socket means the stream may be out of step.
+    def stale(received: bytes) -> str:
+        return _isa(control="000000009") + "TA1*000000777*240101*1200*R~" + "IEA*1*000000009~"
+
+    peer = _X12Peer(ta1=stale)
+    await peer.start()
+    dest = _dest(peer.port, capture_response=True)
+    try:
+        with pytest.raises(DeliveryError) as ei:
+            await dest.send(_interchange())
+        assert not isinstance(ei.value, NegativeAckError)
+        assert dest._conn is None
+        assert dest.reconnects == 1
+    finally:
+        await dest.aclose()
+        await peer.stop()
+
+
+async def test_ta1_for_another_interchange_retries_on_a_ta1_required_lane() -> None:
+    # The non-capturing arm of the same rule: a ta1_required-only lane retries and discards too.
+    def stale(received: bytes) -> str:
+        return _isa(control="000000009") + "TA1*000000777*240101*1200*A~" + "IEA*1*000000009~"
+
+    peer = _X12Peer(ta1=stale)
+    await peer.start()
+    dest = _dest(peer.port, ta1_required=True)
+    try:
+        with pytest.raises(DeliveryError) as ei:
+            await dest.send(_interchange())
+        assert not isinstance(ei.value, NegativeAckError)
+        assert dest._conn is None
+        assert dest.reconnects == 1
     finally:
         await dest.aclose()
         await peer.stop()

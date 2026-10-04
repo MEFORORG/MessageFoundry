@@ -6,7 +6,9 @@ The framing is :mod:`messagefoundry.framing`, the codec the engine's ``Tcp()`` o
 with. The engine does not parse a raw-TCP reply: with ``expect_reply`` it waits for one frame and
 treats any frame as confirmation. So the sink's answer is a choice of behaviour, not of content:
 
-- ``reply`` (default ``b"ACK"``) -- answer each frame with that payload, framed;
+- ``reply`` (default ``b"ACK"``) -- answer each frame with that payload, framed. A reply holding the
+  codec's own start or end byte is refused when the sink is built (``FramePayloadError``, a
+  ``ValueError``), because it would not reach the engine as one frame (ADR 0205);
 - ``reply=None`` -- answer nothing and keep the connection open (a fire-and-forget peer);
 - ``refuse=True`` -- record the frame, then close without answering. An outbound that expects a
   reply fails that delivery and retries, which is how a scenario drives retry and dead-letter.
@@ -41,6 +43,11 @@ class TcpSink(Sink):
         refuse: bool = False,
     ) -> None:
         super().__init__()
+        if reply is not None:
+            # Checked here, so a bad reply fails the scenario's setup loudly rather than reaching
+            # the engine as two frames on every delivery. Each reply is still framed (and checked)
+            # from the live attributes below, so a scenario may change them between deliveries.
+            codec.frame_checked(reply, transport="TCP sink reply")
         self.codec = codec
         self.reply = reply
         self.refuse = refuse
@@ -66,7 +73,9 @@ class TcpSink(Sink):
                     if self.refuse:
                         return  # the server closes the connection; no reply was sent
                     if self.reply is not None:
-                        conn.sendall(self.codec.frame(self.reply))
+                        conn.sendall(
+                            self.codec.frame_checked(self.reply, transport="TCP sink reply")
+                        )
             except FrameError:
                 return  # over the cap: drop the connection, as the engine's own listener does
             except OSError:

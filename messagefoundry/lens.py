@@ -291,21 +291,26 @@ def _recognize_native_method(call: ast.Call) -> _NativeAction | None:
 
     Recognizes exactly the ADR 0089 Phase A forms:
 
-    * ``msg.set(path, value)`` → ``set_field`` (path + value editable slots).
-    * ``msg.set(dst, msg.field(src))`` / ``msg.set(dst, msg.field(src) or "")`` → ``copy_field``.
-    * ``msg.delete_segments("SEG")`` / ``msg.delete_segment("SEG")`` → ``delete_segment``.
+    * ``msg.set(path, value)`` reads as ``set_field`` (path + value editable slots).
+    * ``msg.set(dst, msg.field(src))`` / ``msg.set(dst, msg.field(src) or "")`` read as ``copy_field``, and
+      the same two shapes through ``msg.set_data``, the write a copy from a leaf uses (ADR 0206).
+    * ``msg.delete_segments("SEG")`` / ``msg.delete_segment("SEG")`` read as ``delete_segment``.
 
     A ``*args`` / ``**kwargs`` splat, the wrong positional arity (``msg.set`` with != 2, ``delete`` with
     != 1), a non-``msg`` receiver, or any other method makes it unrecognized (→ a read-only ``code`` row):
     when unsure the lens degrades rather than risk a corrupting edit. ``occurrence=``/other keyword args
-    are preserved as read-only ``display`` fields (never dropped, never editable in Phase A)."""
+    are preserved as read-only ``display`` fields (never dropped, never editable in Phase A). A
+    ``msg.set_data`` call that is not a copy is a ``set_field`` when its destination is a literal
+    component or subcomponent path, where it writes what ``msg.set`` writes, or when its value is a
+    template the lens itself would write with ``set_data`` (:func:`_template_is_data`). Any other
+    one is a ``code`` row, because ``set_field`` otherwise means :meth:`Message.set`."""
     func = call.func
     if not isinstance(func, ast.Attribute) or not _is_msg_method(func, func.attr):
         return None
     display = _native_display(call)
     if display is None:
         return None
-    if func.attr == "set":
+    if func.attr in ("set", "set_data"):
         if len(call.args) != 2:
             return None
         dst_or_path, value = call.args[0], call.args[1]
@@ -316,6 +321,14 @@ def _recognize_native_method(call: ast.Call) -> _NativeAction | None:
             return _NativeAction(
                 "copy_field", [("src", field_call.args[0]), ("dst", dst_or_path)], display
             )
+        # At a literal leaf set_data writes what set writes, so any value there reads back as the
+        # Set Field it is; elsewhere only a template the lens itself writes with set_data does.
+        if (
+            func.attr == "set_data"
+            and not _is_leaf_literal(getattr(dst_or_path, "value", None))
+            and not _template_is_data(value)
+        ):
+            return None
         return _NativeAction("set_field", [("path", dst_or_path), ("value", value)], display)
     if func.attr in ("delete_segments", "delete_segment"):
         if len(call.args) != 1:
@@ -2575,7 +2588,144 @@ def _apply_set_params(
     result = _splice_slots(src, slots, params, moded=(row["kind"], row.get("action")))
     if any(isinstance(v, dict) and set(v) == {"parts"} for v in params.values()):
         _refuse_overlong_template_lines(src, result, line_start, line_end)
+    action = row.get("action")
+    if result != src and (
+        (action == "copy_field" and ("src" in params or "dst" in params))
+        or (action == "set_field" and ("value" in params or "path" in params))
+    ):
+        before = stmt.value if isinstance(stmt, ast.Expr) else stmt
+        repicked = _repick_write(result, line_start, line_end, before)
+        if repicked != result:
+            _refuse_overlong_repick(result, repicked, line_start, line_end)
+        result = repicked
     return result
+
+
+def _refuse_overlong_repick(result: str, repicked: str, line_start: int, line_end: int) -> None:
+    """Refuse a write re-pick that pushes one of the row's lines past the column limit.
+
+    ``set`` to ``set_data`` adds five columns, and the lens never wraps a line itself, so a line it
+    would push past the limit is refused rather than left for ``ruff format`` to re-wrap, as
+    :func:`_refuse_overlong_template_lines` refuses a template."""
+    old_lines, new_lines = _physical_lines(result), _physical_lines(repicked)
+    for i in range(line_start - 1, line_end):
+        new = _display_width(new_lines[i])
+        if new > _MAX_LINE_LENGTH and new > _display_width(old_lines[i]):
+            raise LensRewriteError(
+                f"this edit would make line {i + 1} {new} columns wide, past the "
+                f"{_MAX_LINE_LENGTH}-column limit: a value copied from a component or subcomponent "
+                "writes with msg.set_data (ADR 0206), which is longer than msg.set - shorten the "
+                "paths, or edit it as text",
+                code=REFUSAL_COLUMN_LIMIT,
+            )
+
+
+def _argument_dump(node: ast.AST) -> str:
+    """``ast.dump`` of ``node`` with every constant's ``kind`` left out.
+
+    ``kind`` records a ``u`` prefix, which is spelling and not a value. So an edit that only drops
+    one compares equal, as an edit that only respells a string's quotes already does."""
+    kinds = [(sub, sub.kind) for sub in ast.walk(node) if isinstance(sub, ast.Constant)]
+    try:
+        for sub, _ in kinds:
+            sub.kind = None
+        return ast.dump(node)
+    finally:
+        for sub, kind in kinds:
+            sub.kind = kind
+
+
+def _repick_write(source: str, line_start: int, line_end: int, before: ast.AST) -> str:
+    """Re-pick the write of the native Copy Field or Set Field at ``line_start``-``line_end`` of
+    ``source``, after an edit of a copy's ``src`` or ``dst`` or of a Set Field's ``path`` or ``value``
+    (ADR 0206 rule 1).
+
+    The write is the one an insert picks (:func:`_native_write_method`). Splicing only the arguments
+    would keep the old method: a leaf read left on ``set`` into a whole field turns its decoded
+    separators into structure, and authored text moved to ``set_data`` escapes the structure it
+    meant into one component. For a copy the two writes are the same at a literal leaf destination,
+    so there the method is left as written, and a source that is not a literal keeps its method. A
+    Set Field always takes the picked method, so the row keeps reading back as ``set_field``.
+    ``source`` is the already-spliced text, so the arguments read here are the ones the edit
+    wrote. ``before`` is the call before the edit, compared by :func:`_argument_dump`: an edit
+    that changed no argument, such as one that only respelled a string's quotes or dropped a ``u``
+    prefix, leaves the write as written.
+
+    A Set Field edit that moves its path off a literal leaf into a whole field and keeps its value
+    is refused when the picked write is ``set`` and the value is not plain text. At the leaf either
+    write escaped the value, so it was data, and ``set`` into a whole field would turn its
+    separators into structure. Keeping ``set_data`` instead would leave a line the recognizer reads
+    as code, so the edit is refused rather than guessed. Whether the value was kept is read from
+    the arguments, not from which parameters the edit named."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return source
+    # The write statement spanning exactly the row's lines. Two writes sharing those lines (``;``)
+    # cannot be told apart here, so neither is touched. The recognizer is not used to find it: a
+    # Set Field still spelled ``set_data`` around a value just edited to plain text reads as code.
+    found = [
+        stmt.value
+        for stmt in ast.walk(tree)
+        if isinstance(stmt, ast.Expr)
+        and stmt.lineno == line_start
+        and stmt.end_lineno == line_end
+        and isinstance(stmt.value, ast.Call)
+        and isinstance(stmt.value.func, ast.Attribute)
+        and stmt.value.func.attr in ("set", "set_data")
+        and _is_msg_method(stmt.value.func, stmt.value.func.attr)
+        and len(stmt.value.args) == 2
+        and _native_display(stmt.value) is not None
+    ]
+    if len(found) != 1:
+        return source
+    call = found[0]
+    if _argument_dump(call) == _argument_dump(before):
+        return source
+    func = call.func
+    assert isinstance(func, ast.Attribute)
+    dst, value = call.args
+    field_call = _msg_field_source(value)
+    if field_call is None:
+        want = _template_write_method(value, dst)
+        if want == "set" and _moves_data_off_a_leaf(before, dst, value):
+            raise LensRewriteError(
+                "this path edit would move a value written as data at a component or "
+                "subcomponent into a whole field, where msg.set would make its separators "
+                "structure - edit it as text"
+            )
+    else:
+        src = getattr(field_call.args[0], "value", None)
+        if not isinstance(src, str) or _is_leaf_literal(getattr(dst, "value", None)):
+            return source
+        want = _copy_write_method(src)
+    if func.attr == want or func.end_col_offset is None:
+        return source
+    data = source.encode("utf-8")
+    end = _line_byte_starts(data)[(func.end_lineno or func.lineno) - 1] + func.end_col_offset
+    return (data[: end - len(func.attr)] + want.encode("ascii") + data[end:]).decode("utf-8")
+
+
+def _moves_data_off_a_leaf(before: ast.AST, dst: ast.expr, value: ast.expr) -> bool:
+    """Whether an edit of a write ``before`` moved its destination off a literal leaf into a whole
+    field, to ``dst``, and kept a ``value`` that is not plain text.
+
+    Plain text is a string literal holding no separator the lens tests for, nor ``|``; ``set``
+    writes it the same at a leaf and in a whole field, so moving it changes nothing."""
+    if not isinstance(before, ast.Call) or len(before.args) != 2:
+        return False
+    old_dst, old_value = before.args
+    if not _is_leaf_literal(getattr(old_dst, "value", None)):
+        return False
+    if _is_leaf_literal(getattr(dst, "value", None)):
+        return False
+    if _argument_dump(old_value) != _argument_dump(value):
+        return False
+    text = getattr(value, "value", None) if isinstance(value, ast.Constant) else None
+    plain = isinstance(text, str) and not any(
+        char in _AUTHORED_STRUCTURE or char == "|" for char in text
+    )
+    return not plain
 
 
 def _refuse_overlong_template_lines(src: str, result: str, line_start: int, line_end: int) -> None:
@@ -4510,17 +4660,99 @@ _NATIVE_INSERT_ACTIONS = frozenset(
 )
 
 
+# A literal HL7 path to a component or subcomponent, the grammar of ``parsing.peek.parse_path``
+# restated because the lens stays stdlib-only. A malformed path simply does not match.
+_LEAF_PATH_RE = re.compile(r"^[A-Z][A-Z0-9]{2}-\d+\.\d+(?:\.\d+)?$")
+
+
+def _is_leaf_literal(value: Any) -> bool:
+    """Whether an insert parameter is a literal HL7 path to a component or subcomponent."""
+    return isinstance(value, str) and _LEAF_PATH_RE.match(value) is not None
+
+
+def _copy_write_method(src: Any) -> str:
+    """The ``Message`` write a native Copy Field from ``src`` uses (ADR 0206 rule 1): ``set_data`` for
+    a literal component or subcomponent path, whose read is decoded, as ``actions.copy_field`` does;
+    ``set`` otherwise. A ``src`` given as an expression cannot be classified and keeps ``set``; the
+    handler-security lint cannot see that one either."""
+    return "set_data" if _is_leaf_literal(src) else "set"
+
+
+#: The characters that template text carries as structure the author meant, in either format the
+#: lens writes for. The lens is static: it cannot tell an HL7 handler from an X12 one, and it cannot
+#: read a message's own separators. So the rule is one an author can predict: text holding a
+#: separator in common use in either format keeps ``set``.
+#:
+#: * HL7 component, repetition, subcomponent and escape: ``^ ~ & \``.
+#: * X12 separators in common use: ``:`` and ``>`` for a component, ``*`` for an element, ``^`` for
+#:   a repetition and ``~`` to end a segment. The component separator is the one that matters. An
+#:   X12 ``set_data`` refuses it in a whole element, because the value reaches it already built and
+#:   could hold one read from data, so a template whose text holds one would raise on every X12
+#:   message. The other X12 separators are refused by both writes.
+#:
+#: The HL7 field separator is not among them: a whole-field ``set`` refuses one anyway, so text
+#: holding it can only mean data. A separator outside this set is the miss, and it fails loud: X12
+#: ``set_data`` raises rather than write it. Each character added costs the other way, because an
+#: HL7 template that keeps ``set`` lets a decoded leaf's separators become structure, which the
+#: handler-security lint flags.
+_AUTHORED_STRUCTURE = frozenset("^~&" + chr(92) + ":>*")
+
+
+def _template_write_method(value: ast.expr, dst: ast.expr) -> str:
+    """The ``Message`` write a native Set Field writing ``value`` to ``dst`` uses (ADR 0206 rule 1).
+
+    ``set_data`` for a template whose every read is a literal component or subcomponent path, whose
+    read is decoded, and whose own text holds no character in :data:`_AUTHORED_STRUCTURE`; ``set``
+    for anything else. A whole-field read is raw text with its structure, which ``set_data`` would
+    escape into one component, and text holding one of those characters is structure the author
+    wrote, so either keeps ``set``, and the handler-security lint still flags a leaf such a template
+    copies. At a literal leaf destination the two writes are the same, so ``set`` is kept there
+    too."""
+    if _is_leaf_literal(getattr(dst, "value", None)) or not _template_is_data(value):
+        return "set"
+    return "set_data"
+
+
+def _template_is_data(value: ast.expr) -> bool:
+    """Whether ``value`` is a template whose every read is a literal component or subcomponent path
+    and whose own text holds no character in :data:`_AUTHORED_STRUCTURE`: the template
+    :func:`_template_write_method` writes with ``set_data`` at a whole-field destination. A
+    hand-written f-string may have no read at all, which is not one."""
+    parts = _template_parts(value)
+    if parts is None:
+        return False
+    paths = [part[PART_PATH] for part in parts if PART_PATH in part]
+    text = "".join(part.get(PART_TEXT, "") for part in parts)
+    return (
+        bool(paths)
+        and not any(char in _AUTHORED_STRUCTURE for char in text)
+        and all(_is_leaf_literal(path) for path in paths)
+    )
+
+
+def _native_write_method(value: ast.expr, dst: ast.expr) -> str:
+    """The ``Message`` write a native ``set_field`` or ``copy_field`` writing ``value`` to ``dst``
+    uses: a copy's by its source (:func:`_copy_write_method`), anything else by
+    :func:`_template_write_method`."""
+    field_call = _msg_field_source(value)
+    if field_call is not None:
+        return _copy_write_method(getattr(field_call.args[0], "value", None))
+    return _template_write_method(value, dst)
+
+
 def _render_native_insert_call(name: str, params: dict[str, Any], assign_to: Any) -> str:
     """Render the NATIVE Message-API form of an inserted ``set_field``/``copy_field``/``delete_segment``.
 
     The single source of truth for the inserted native text — chosen so that re-parsing the line
     recognizes the SAME editable action row (:func:`_recognize_native_method`):
 
-    * ``set_field {path, value}``     → ``msg.set(<path>, <value>)``
-    * ``copy_field {src, dst}``       → ``msg.set(<dst>, msg.field(<src>) or "")``
-    * ``delete_segment {segment_id}`` → ``msg.delete_segments(<segment_id>)``
-    * ``add_segment {line}``          → ``msg.add_segment(<line>)`` (ADR 0106 §3 Group 1)
-    * ``add_repetition {path, value}``→ ``msg.add_repetition(<path>, <value>)`` (ADR 0106 §3 Group 1)
+    * ``set_field {path, value}`` renders ``msg.set(<path>, <value>)``, or ``msg.set_data`` when the
+      value copies a decoded leaf (:func:`_native_write_method`, ADR 0206)
+    * ``copy_field {src, dst}`` renders ``msg.set(<dst>, msg.field(<src>) or "")``, or ``msg.set_data``
+      in place of ``msg.set`` when ``src`` is a literal component or subcomponent path (ADR 0206)
+    * ``delete_segment {segment_id}`` renders ``msg.delete_segments(<segment_id>)``
+    * ``add_segment {line}`` renders ``msg.add_segment(<line>)`` (ADR 0106 section 3, Group 1)
+    * ``add_repetition {path, value}`` renders ``msg.add_repetition(<path>, <value>)`` (ADR 0106 section 3, Group 1)
 
     Values are rendered via :func:`_render_insert_value` (literal-vs-``{"expr"}`` handling + the single-
     line invariant are identical to the wrapper path). A missing/empty param renders as an empty string
@@ -4547,13 +4779,17 @@ def _render_native_insert_call(name: str, params: dict[str, Any], assign_to: Any
     if name == "set_field":
         path = _render_insert_value(params.get("path", ""), "path")
         value = _render_insert_value(params.get("value", ""), "value")
-        return f"msg.set({path}, {value}{suffix})"
+        write = _native_write_method(
+            ast.parse(value, mode="eval").body, ast.parse(path, mode="eval").body
+        )
+        return f"msg.{write}({path}, {value}{suffix})"
     if name == "copy_field":
         src = _render_insert_value(params.get("src", ""), "src")
         dst = _render_insert_value(params.get("dst", ""), "dst")
         # The occurrence applies to BOTH the inner read and the outer write, so the copy operates on the
         # loop's occurrence (not occurrence 1); the recognizer surfaces only the outer set's occurrence.
-        return f'msg.set({dst}, msg.field({src}{suffix}) or ""{suffix})'
+        write = _copy_write_method(params.get("src"))
+        return f'msg.{write}({dst}, msg.field({src}{suffix}) or ""{suffix})'
     if name == "add_segment":
         line = _render_insert_value(params.get("line", ""), "line")
         return f"msg.add_segment({line})"
