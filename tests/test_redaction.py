@@ -1289,15 +1289,6 @@ def test_no_token_survives_the_clamp_that_the_unbounded_scan_scrubs() -> None:
     assert not shipped, f"{shipped} of 1,500 trials kept a token the unbounded scan scrubs"
 
 
-#: Every public ``str`` method ``_MeteredText`` does not charge for. Reading the text through one of
-#: them is REFUSED rather than passed through, because an uncharged read is how a quadratic walk would
-#: come back with a linear count. The fix is to charge the method, not to drop it from this set.
-_UNMETERED_READS = frozenset(name for name in dir(str) if not name.startswith("_")) - {
-    "find",
-    "rfind",
-}
-
-
 class _MeteredText(str):
     """A ``str`` that counts the characters each read of it touches: the clamp's cost with the clock
     taken out.
@@ -1309,18 +1300,18 @@ class _MeteredText(str):
     **Why characters and not calls.** The two spellings of the name walk take the same number of
     steps. What separates them is how far each step reaches, so a step count reads them as equal.
 
-    **What it cannot see, which is less than everything.** A read made by the regex engine or by an
-    operator (``in``, ``+``) does not pass through a method, so it is charged nothing. Neither walk
-    reads the text that way on the fixture below, and ``_walk_growth`` refuses a count under one touch
-    per character, which is what a clamp moved wholesale onto such a read would produce."""
+    **What it cannot see, and what covers that.** A read made by the regex engine, by ``str(text)`` or
+    by an operator (``in``, ``+``) does not pass through a method, so it is charged nothing. A walk
+    moved onto one of those would read as free whatever it cost. ``_walk_cost`` therefore refuses a
+    walk charged under one touch per character it dropped, which is the least any walk can do."""
 
     touched = 0
 
     def __getattribute__(self, name: str) -> Any:
         if name in _UNMETERED_READS:
             raise AssertionError(
-                f"str.{name} read a _MeteredText, and the meter does not charge for it. Charge it in "
-                f"_MeteredText before trusting a count taken through it"
+                f"str.{name} read a _MeteredText, and the meter does not charge for it. Override it "
+                f"in _MeteredText with its cost before trusting a count taken through it"
             )
         return super().__getattribute__(name)
 
@@ -1346,10 +1337,18 @@ class _MeteredText(str):
         return at
 
 
-#: N and 2N for the two walk arms. **A quarter of the shipped window, on purpose.** The meter counts
-#: characters rather than seconds, so the growth it reads is the same at any size, and the quadratic
-#: control is still run for real: about 0.1 s here, over a second at the shipped window.
-_WALK_WINDOWS = (8_192, 16_384)
+#: Every public ``str`` method ``_MeteredText`` does not charge for. Reading the text through one of
+#: them is REFUSED rather than passed through, because an uncharged read is how a quadratic walk would
+#: come back with a linear count. **Derived from the class, so charging a method is one edit:**
+#: override it there and it leaves this set.
+_UNMETERED_READS = (
+    frozenset(name for name in dir(str) if not name.startswith("_")) - vars(_MeteredText).keys()
+)
+
+#: N for the two walk arms; 2N is twice it. **An eighth of the shipped window, on purpose.** The meter
+#: counts characters rather than seconds, so the growth it reads does not depend on the size, and the
+#: quadratic control is still run for real: about 0.1 s here, over a second at the shipped window.
+_WALK_WINDOW = 8_192
 
 #: The one line both walk arms are read against, in the shape ``_SCAN_BUDGET_SECONDS`` argues for: a
 #: shared line, so the control proves this exact number discriminates. A linear walk doubles when the
@@ -1365,27 +1364,38 @@ def _name_token_wall(window: int) -> str:
     return ("AA " * (window // 3 + 1))[:window] + "Q" * 200_000
 
 
-def _walk_growth() -> float:
-    """Characters ``redaction._clamp`` touches clamping ``_name_token_wall`` at 2N, over the same at
-    N. Near 2 is a walk linear in the window; near 4 is a quadratic one.
+def _walk_cost(window: int) -> int:
+    """Characters the name walk touches inside ``redaction._clamp``, on a ``_name_token_wall``.
 
-    Both readings are checked before they are divided, because a ratio hides a broken reading: two
-    walks that each stopped early, or two counts that each missed the work, divide to a clean 2."""
-    touched = []
-    for window in _WALK_WINDOWS:
-        text = _MeteredText(_name_token_wall(window))
-        head, _ = redaction._clamp(text, window)
-        assert not head, (
-            f"the walk stopped {len(head)} characters short of the start of a {window}-character "
-            f"run, so this reading is not of a full-window walk"
-        )
-        assert text.touched >= window, (
-            f"the meter charged {text.touched} characters for a walk back over {window}. Every one "
-            f"of them has to be read to judge its token, so the clamp is reading the text through "
-            f"something _MeteredText cannot see and the growth would measure nothing"
-        )
-        touched.append(text.touched)
-    return touched[1] / touched[0]
+    **The walk's own share, not the clamp's total.** ``_clamp`` opens with one ``_last_cut`` over the
+    window, and on this wall that single call is two thirds of everything charged. Left in, it hides
+    a walk the meter cannot see: such a walk reads as free, and the total still doubles with the
+    window. So the opening call is read on its own and taken off.
+
+    Both checks run before anything is divided, because a ratio hides a broken reading: two walks that
+    each stopped early, or two counts that each missed the walk, divide to a clean 2."""
+    wall = _name_token_wall(window)
+    text = _MeteredText(wall)
+    head, _ = redaction._clamp(text, window)
+    assert not head, (
+        f"the walk stopped {len(head)} characters short of the start of a {window}-character run, "
+        f"so this reading is not of a full-window walk"
+    )
+    opening = _MeteredText(wall)
+    cut = redaction._last_cut(opening, window)
+    walked = text.touched - opening.touched
+    assert walked >= cut, (
+        f"the meter charged the walk {walked} characters for dropping {cut}. A walk has to read "
+        f"every character it drops to judge its token, so this one reads the text through something "
+        f"_MeteredText cannot see and the growth would measure nothing"
+    )
+    return walked
+
+
+def _walk_growth() -> float:
+    """``_walk_cost`` at 2N over ``_walk_cost`` at N. Near 2 is a walk linear in the window; near 4 is
+    a quadratic one."""
+    return _walk_cost(2 * _WALK_WINDOW) / _walk_cost(_WALK_WINDOW)
 
 
 def test_the_token_walk_is_bounded_by_the_window_not_by_the_peer() -> None:
@@ -1402,24 +1412,24 @@ def test_the_token_walk_is_bounded_by_the_window_not_by_the_peer() -> None:
     6.2 ms on the author's box, against 630 ms for the ``_last_cut`` spelling. BACKLOG #2896 records it
     going red on loaded hosted runners with the walk unchanged. A fixed number of seconds is a claim
     about the machine as much as about the walk, and the property was never "under 50 ms". It is that
-    doubling the window doubles the work, so that is what is read now: the characters the clamp
+    doubling the window doubles the work, so that is what is read now: the characters the walk
     touches at 2N over the characters it touches at N (``_walk_growth``). No clock is involved, so
     load cannot move the answer.
 
-    Measured on the shipped walk: 60,071 characters at 8,192 and 120,147 at 16,384, a growth of 2.00.
+    Measured on the shipped walk: 19,108 characters at 8,192 and 38,225 at 16,384, a growth of 2.00.
     The control below reads 4.00 for the ``_last_cut`` spelling on the same meter and the same line."""
     growth = _walk_growth()
     assert growth < _WALK_GROWTH_LINE, (
-        f"doubling the window multiplied the characters the clamp touches by {growth:.2f}, over the "
+        f"doubling the window multiplied the characters the walk touches by {growth:.2f}, over the "
         f"{_WALK_GROWTH_LINE} line -- the walk is no longer linear in the window"
     )
-    # Non-vacuity at the SHIPPED window, through the public entry: a walk that stopped early would be
-    # cheap for the wrong reason. Every token here is name-shaped back to index 0, so a walk that ran
-    # to completion keeps nothing but the note.
+    # The same walk at the SHIPPED window, through the public entry. The growth is read at an eighth
+    # of it, and ``_walk_cost`` checks those two walks ran to index 0. This checks the one a peer
+    # reaches does too: every token is name-shaped back to index 0, so nothing is kept but the note.
     hostile = _name_token_wall(redaction._REDACT_WINDOW - redaction._CLAMP_MARKER_BUDGET)
     assert clamp_untrusted(hostile).strip().startswith("[redaction bound:"), (
-        "the walk stopped before the start of the run, so this fixture is not measuring a full-window "
-        "walk and the growth above proves nothing about one"
+        "the walk stopped before the start of the run at the shipped window, so the growth above is "
+        "of a walk the public entry does not finish"
     )
 
 
