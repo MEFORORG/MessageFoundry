@@ -2001,7 +2001,7 @@ class AuthStore(Protocol):
     # One row per (account id, host key). The caller folds the address to its host key; the store
     # compares it byte for byte. Both reads and writes go through the (user_id, address) primary key.
     #
-    # The addresses the account finished a sign-in from with ``last_seen >= since``, in no order.
+    # The host keys recorded for the account with ``last_seen >= since``, in no order.
     async def list_known_login_addresses(self, user_id: str, *, since: float) -> list[str]: ...
 
     # Upsert one address: ``first_seen`` kept, ``last_seen`` moved forward to ``now`` and never back.

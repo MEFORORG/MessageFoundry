@@ -235,7 +235,8 @@ _LOGIN_ADDRESS_LOOKBACK_SECONDS = 90 * 86400
 # column. An IP address's key is at most 45 characters; a longer key is not remembered, so it reads as
 # NEW at every sign-in.
 _LOGIN_ADDRESS_KEY_MAX = 256
-# One ``login_new_ip`` notice per account per this many seconds (see ``_login_new_ip_notice_due``).
+# One ``login_new_ip`` notice per account and address per this many seconds, in each engine process
+# (see ``_login_new_ip_notice_due``). The audit row is not debounced.
 _LOGIN_NEW_IP_NOTICE_SECONDS = 900.0
 
 
@@ -6933,8 +6934,19 @@ class AuthService:
         """Whether two client addresses denote the same host, by :func:`_host_key`. At least these
         match: an exact match, both loopback (this keeps the loopback default a genuine no-op
         rather than a string mismatch), and one the IPv4-mapped IPv6 form of the other. Both
-        address signals compare by :func:`_host_key`, so they agree on what counts as a new
-        address (BACKLOG #2159)."""
+        address signals compare by :func:`_host_key`, so they agree on when two addresses are one
+        host (BACKLOG #2159).
+
+        **THEY DO NOT SHARE A BASELINE, so they can disagree about which address is new.** This,
+        the mid-session signal, compares a request with its own session's anchor, which only a
+        credential re-proof moves (``mark_session_reauthed``). The sign-in signal compares a sign-in
+        with the account's known-address record (vault BACKLOG #2145). A passkey assertion at the
+        MFA gate and a first factor enrolment add their address to the record but leave the anchor
+        where it was. A passkey never re-anchors (ADR 0068 decision 1). An enrolment proves an
+        authenticator the caller has just chosen, not a credential the account already held, and a
+        holder of the password alone may make one (ADR 0197 Amendment A). So after either, an
+        address can be known to the sign-in signal and still new here. That is deliberate:
+        re-anchoring there would treat those ceremonies as a re-proof, which they are not."""
         return _host_key(a) == _host_key(b)
 
     def _first_new_ip_flag(self, token_hash: str, address_key: str) -> _NewIpFlag:
@@ -6970,7 +6982,9 @@ class AuthService:
         back."""
         self._new_ip_seen.pop(token_hash, None)
 
-    async def _classify_login_address(self, user: UserRecord, client: str | None) -> _LoginAddress:
+    async def _classify_login_address(
+        self, user: UserRecord, client: str | None, *, enrolment: bool = False
+    ) -> _LoginAddress:
         """The first-seen login-address signal's verdict for one sign-in (BACKLOG #288, ASVS 8.2.4).
 
         Call it BEFORE the mint and before :meth:`_mark_login_address_known` can run for this sign-in,
@@ -7010,9 +7024,14 @@ class AuthService:
             ):
                 return _LoginAddress.UNEVALUATED_NO_BASELINE
         except Exception:
+            # Two callers, two consequences: a sign-in goes on unchallenged, and an enrolment
+            # (``_mark_login_address_known``) leaves its address unrecorded. Say which.
             _log.exception(
-                "first-seen login-address read failed for %s; the sign-in proceeds unchallenged",
+                "first-seen login-address read failed for %s; %s",
                 user.username,
+                "the enrolment does not record its address"
+                if enrolment
+                else "the sign-in proceeds unchallenged",
             )
             return _LoginAddress.UNEVALUATED_READ_FAILED
         return _LoginAddress.NEW
@@ -7036,9 +7055,15 @@ class AuthService:
           yet, or when it was a combined sign-in that proved a TOTP code in the same request. A NEW
           address is not written there: that sign-in's challenge is the step-up it has not done yet;
         * a directory sign-in that owes nothing more, NEW included, because no directory session is
-          seeded whatever the verdict, so there is no challenge to bypass;
+          seeded whatever the verdict, so there is no challenge to bypass. Not after a failed read.
+          Under the shipped ``require_mfa`` every Kerberos session owes a factor, and so does an
+          OIDC one minted while ``oidc_require_mfa_claim`` is off. Such a sign-in writes nothing
+          here, and the factor leg below writes for it;
         * a second factor proved at the MFA gate (``verify_mfa``, ``finish_webauthn_assertion``),
-          once the session has rotated;
+          once the session has rotated. ``verify_mfa`` also re-anchors the session to this address;
+          a passkey assertion never does (ADR 0068 decision 1), and nor do the enrolments below. So
+          the record can hold an address the session's own new-address signal still reports. The
+          two signals are independent by design; :meth:`_same_host` says how;
         * a first factor enrolment confirmed (``confirm_mfa_enrollment``,
           ``finish_webauthn_registration``), which is how a first sign-in under ``require_mfa``
           finishes. Those callers pass the account as ``enrolment``, and an address that classifies
@@ -7070,7 +7095,7 @@ class AuthService:
                 if user is None or await self._unverified_session_owes_factor(user):
                     return
             if enrolment is not None and (
-                await self._classify_login_address(enrolment, client)
+                await self._classify_login_address(enrolment, client, enrolment=True)
                 not in _LOGIN_VERDICTS_THAT_SEED_THE_BASELINE
             ):
                 return
@@ -7079,7 +7104,9 @@ class AuthService:
         except (AttributeError, TypeError):
             raise
         except Exception:
-            _log.exception("could not record a known sign-in address; the sign-in stands")
+            _log.exception(
+                "could not record a known sign-in address; the ceremony it records stands"
+            )
             return
         try:
             await self._store.forget_login_addresses(
@@ -7738,19 +7765,29 @@ class AuthService:
                 elevation = await self._elevated(
                     token, ceremony="mfa_verify", actor=user.username, client=client
                 )
-                if elevation.ok:
-                    # vault BACKLOG #2145: the factor is proved from this address.
-                    await self._mark_login_address_known(user.id, client)
-                return elevation
-            # Wrong code: register the failure through the SAME machinery the password path uses, so
-            # the per-account lockout + ACCOUNT_LOCKED notification fire on sustained MFA guessing.
-            # On the SECOND-STEP counter: the caller holds a session, so it has proved the first step.
-            failure = await self._register_failure(user, now, counter="second_step")
-            await self._audit("auth.mfa_failed", actor=user.username, client=client)
-            await self._record_lock(
-                user, "second_step", failure, client=client, audit_detail=None, factor="first_step"
-            )
-            return Elevation()
+            else:
+                # Wrong code: register the failure through the SAME machinery the password path
+                # uses, so the per-account lockout + ACCOUNT_LOCKED notification fire on sustained
+                # MFA guessing. On the SECOND-STEP counter: the caller holds a session, so it has
+                # proved the first step.
+                failure = await self._register_failure(user, now, counter="second_step")
+                await self._audit("auth.mfa_failed", actor=user.username, client=client)
+                await self._record_lock(
+                    user,
+                    "second_step",
+                    failure,
+                    client=client,
+                    audit_detail=None,
+                    factor="first_step",
+                )
+                return Elevation()
+        if elevation.ok:
+            # vault BACKLOG #2145: the factor is proved from this address. Recorded AFTER the
+            # account's queue is released: the record's write and prune are two store commits that
+            # no check inside the queue reads, so holding the queue for them would only stall the
+            # next attempt on this account.
+            await self._mark_login_address_known(user.id, client)
+        return elevation
 
     async def _second_factor_too_early(
         self,
