@@ -2710,8 +2710,8 @@ def _moves_data_off_a_leaf(before: ast.AST, dst: ast.expr, value: ast.expr) -> b
     """Whether an edit of a write ``before`` moved its destination off a literal leaf into a whole
     field, to ``dst``, and kept a ``value`` that is not plain text.
 
-    Plain text is a string literal holding no separator the lens tests for, nor ``|``; ``set``
-    writes it the same at a leaf and in a whole field, so moving it changes nothing."""
+    Plain text is a string literal holding no character in :data:`_AUTHORED_STRUCTURE`, nor ``|``;
+    ``set`` writes it the same at a leaf and in a whole field, so moving it changes nothing."""
     if not isinstance(before, ast.Call) or len(before.args) != 2:
         return False
     old_dst, old_value = before.args
@@ -4678,24 +4678,21 @@ def _copy_write_method(src: Any) -> str:
     return "set_data" if _is_leaf_literal(src) else "set"
 
 
-#: The characters that template text carries as structure the author meant, in either format the
-#: lens writes for. The lens is static: it cannot tell an HL7 handler from an X12 one, and it cannot
-#: read a message's own separators. So the rule is one an author can predict: text holding a
-#: separator in common use in either format keeps ``set``.
+#: The characters that template text carries as structure the author meant: the HL7 component,
+#: repetition, subcomponent and escape characters ``^ ~ & \``. Text holding one keeps ``set``.
 #:
-#: * HL7 component, repetition, subcomponent and escape: ``^ ~ & \``.
-#: * X12 separators in common use: ``:`` and ``>`` for a component, ``*`` for an element, ``^`` for
-#:   a repetition and ``~`` to end a segment. The component separator is the one that matters. An
-#:   X12 ``set_data`` refuses it in a whole element, because the value reaches it already built and
-#:   could hold one read from data, so a template whose text holds one would raise on every X12
-#:   message. The other X12 separators are refused by both writes.
+#: The lens is static. It cannot tell an HL7 handler from an X12 one, and it cannot read a
+#: message's own separators. So it protects HL7, the default format, and holds no X12 separator
+#: (vault #2861, ADR 0206 amendment 2026-10-04). Each character here costs HL7 something: a
+#: template that keeps ``set`` lets a decoded leaf's separators become structure. ``MRN: `` around
+#: a leaf decoding to ``12^34`` wrote a second component while ``:`` was here. An X12 template
+#: gives up nothing it needs. Its ``set_data`` refuses the component separator in a whole element,
+#: so a template whose text holds one raises at once rather than split data such as ``12:30``
+#: into two components, as ``set`` would. Both writes already refuse the element separator.
 #:
-#: The HL7 field separator is not among them: a whole-field ``set`` refuses one anyway, so text
-#: holding it can only mean data. A separator outside this set is the miss, and it fails loud: X12
-#: ``set_data`` raises rather than write it. Each character added costs the other way, because an
-#: HL7 template that keeps ``set`` lets a decoded leaf's separators become structure, which the
-#: handler-security lint flags.
-_AUTHORED_STRUCTURE = frozenset("^~&" + chr(92) + ":>*")
+#: The HL7 field separator is not here either: a whole-field ``set`` refuses one anyway, so text
+#: holding it can only mean data.
+_AUTHORED_STRUCTURE = frozenset("^~&" + chr(92))
 
 
 def _template_write_method(value: ast.expr, dst: ast.expr) -> str:

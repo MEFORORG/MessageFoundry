@@ -1129,13 +1129,30 @@ def test_an_edit_that_only_drops_a_u_prefix_leaves_the_write_alone() -> None:
 
 
 @pytest.mark.parametrize("sep", [":", ">", "*"])
-def test_a_set_field_template_holding_an_x12_separator_keeps_set(sep: str) -> None:
-    # The lens cannot know whether the handler runs on X12, where these are structure the author
-    # typed, and X12 set_data refuses its component separator in a whole element.
+def test_a_set_field_template_holding_an_x12_separator_writes_with_set_data(sep: str) -> None:
+    # Vault #2861: the lens protects HL7, the default, and holds no X12 separator. On X12 the
+    # set_data line raises on a component separator rather than split it (tests/test_x12_parsing.py).
     parts = [{"path": "PID-3.1"}, {"text": f"{sep}B"}]
     out = _set_value(LENS_SOURCE + '    msg.set("PV1-19", "X")\n', {"parts": parts})
-    assert "set_data" not in out
-    assert _native_rows(out)[-1]["param_parts"]["value"] == parts
+    assert f"    msg.set_data(\"PV1-19\", f\"{{msg['PID-3.1'] or ''}}{sep}B\")\n" in out
+    row = _native_rows(out)[-1]
+    assert row["action"] == "set_field" and row["param_parts"]["value"] == parts
+
+
+@pytest.mark.parametrize("sep", [":", ">", "*"])
+def test_an_hl7_template_holding_an_x12_separator_keeps_an_escaped_leaf_as_data(sep: str) -> None:
+    # Vault #2861's reading: "MRN: {PID-3.1}" over PID-3.1 = 12\S\34. While these characters kept
+    # set, the decoded 12^34 landed as two components of PV1-19. set_data keeps it one.
+    body = MSH + CR + "PID|1||12" + _esc("S") + "34^^^MRN" + CR + "PV1|1|I" + CR
+    parts = [{"text": f"MRN{sep} "}, {"path": "PID-3.1"}]
+    out = _set_value(LENS_SOURCE + '    msg.set("PV1-19", "X")\n', {"parts": parts})
+    line = out.splitlines()[-1].strip()
+    assert line.startswith('msg.set_data("PV1-19", ')
+    msg = Message.parse(body)
+    exec(line, {"msg": msg})  # the lens's own output, run as the handler body would run it
+    assert msg.field("PV1-19.1") == f"MRN{sep} 12^34"
+    assert msg.field("PV1-19.2") is None
+    assert _segment(msg, 2).endswith(f"|MRN{sep} 12" + _esc("S") + "34")
 
 
 @pytest.mark.parametrize(
@@ -1157,7 +1174,6 @@ def test_any_set_data_value_into_a_leaf_reads_back_as_set_field(value: str) -> N
     "value",
     [
         pytest.param('"A^B"', id="literal-with-a-separator"),
-        pytest.param('"A:B"', id="literal-with-an-x12-separator"),
         pytest.param("family", id="expression"),
         pytest.param("f\"A^{msg['PID-3.1'] or ''}\"", id="authored-structure"),
     ],
@@ -1197,6 +1213,20 @@ def test_a_path_edit_never_moves_a_leafs_data_write_into_a_whole_field_as_set(
     ("line", "path", "want"),
     [
         pytest.param('msg.set("PV1-19.1", "AB")', "PV1-19", 'msg.set("PV1-19", "AB")', id="plain"),
+        # Vault #2861: an X12 separator is plain text to the lens, which HL7 writes the same at a
+        # leaf and in a whole field. So the move is not refused, and either write becomes set.
+        pytest.param(
+            'msg.set("PV1-19.1", "A:B")',
+            "PV1-19",
+            'msg.set("PV1-19", "A:B")',
+            id="plain-with-an-x12-separator",
+        ),
+        pytest.param(
+            'msg.set_data("PV1-19.1", "A:B")',
+            "PV1-19",
+            'msg.set("PV1-19", "A:B")',
+            id="plain-set-data-with-an-x12-separator",
+        ),
         pytest.param(
             "msg.set_data(\"PV1-19\", f\"{msg['PID-3.1'] or ''}\")",
             "PV1-20",
@@ -1219,10 +1249,13 @@ def test_a_path_edit_that_keeps_the_meaning_is_not_refused(line: str, path: str,
     assert out.splitlines()[-1] == f"    {want}"
 
 
-def test_a_set_data_template_holding_a_colon_is_a_code_row() -> None:
-    # The X12 separators keep set, so the lens never writes this line, and it reads as code.
+def test_a_set_data_template_holding_a_colon_reads_back_as_set_field() -> None:
+    # Vault #2861: a colon no longer keeps set, so this is the line the lens writes, and it reads
+    # back as the step that wrote it.
     source = LENS_SOURCE + "    msg.set_data(\"PV1-19\", f\"MRN: {msg['PID-3.1'] or ''}\")\n"
-    assert _native_rows(source)[-1]["kind"] == "code"
+    row = _native_rows(source)[-1]
+    assert row["action"] == "set_field"
+    assert row["param_parts"]["value"] == [{"text": "MRN: "}, {"path": "PID-3.1"}]
 
 
 def test_the_no_change_test_leaves_the_tree_it_reads_as_it_was() -> None:
