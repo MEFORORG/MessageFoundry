@@ -8465,7 +8465,7 @@ def _alert(args: argparse.Namespace) -> int:
                 try:
                     alerts = load_settings(config_path=path).alerts
                 except (OSError, ValueError):
-                    alerts = None  # no settings yet → no email transport to send to the override
+                    alerts = None  # no settings yet, so no email transport sends the override
                 if (
                     alerts is not None
                     and alerts.email_from
