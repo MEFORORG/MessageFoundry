@@ -4759,7 +4759,8 @@ CREATE INDEX IF NOT EXISTS ix_webauthn_credentials_user ON webauthn_credentials(
 CREATE UNIQUE INDEX IF NOT EXISTS ux_webauthn_label ON webauthn_credentials(user_id, label);
 
 -- The first-seen sign-in address baseline (BACKLOG #288, vault BACKLOG #2145). One row per account
--- and client host that finished a sign-in owing nothing more. Keyed on the account id, never the
+-- and client host where a sign-in finished owing nothing more, or a step-up or enrolment passed
+-- (AuthService._mark_login_address_known says when). Keyed on the account id, never the
 -- username, so a re-created namesake inherits nothing. The primary key serves the signal's one read
 -- (WHERE user_id), so audit_log, which has no actor index, is never scanned for it. Plaintext like
 -- sessions.client: a network address, not PHI (docs/PHI.md section 2). ON DELETE CASCADE because

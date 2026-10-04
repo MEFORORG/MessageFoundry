@@ -985,10 +985,15 @@ async def test_a_passkey_assertion_records_its_address_but_does_not_re_anchor() 
 
         assert await store.list_known_login_addresses(uid, since=0.0) == ["10.5.5.6"]
         assert await service.flag_new_client_ip(elevation.token, "10.5.5.6", path="/ui/x")
-        before = len(await store.list_audit(actor=ADMIN_USERNAME, action="auth.login_new_ip"))
+
+        async def _rows(action: str) -> int:
+            return len(await store.list_audit(actor=ADMIN_USERNAME, action=action))
+
+        before = (await _rows("auth.login_new_ip"), await _rows("auth.login_address_unevaluated"))
         again = await service.login(ADMIN_USERNAME, password, client="10.5.5.6")
         assert again.ok
-        after = len(await store.list_audit(actor=ADMIN_USERNAME, action="auth.login_new_ip"))
+        # Neither NEW nor failed open: the second count tells KNOWN apart from an unjudged verdict.
+        after = (await _rows("auth.login_new_ip"), await _rows("auth.login_address_unevaluated"))
         assert after == before
     finally:
         await store.close()
@@ -1051,8 +1056,9 @@ async def test_a_first_passkey_registration_finishes_the_first_sign_in_and_recor
 async def test_a_passkey_registered_from_a_first_seen_address_records_nothing() -> None:
     """The negative of the test above. ADR 0197 Amendment A lets a holder of the password alone
     enrol an authenticator, so a registration from a first-seen address proves nothing about that
-    address and must not make it known. The test above is the positive control: the same
-    registration from an account with no baseline yet does write."""
+    address and must not make it known. The directory test above shows a registration that does
+    write, from an account with no baseline yet; this one isolates the guard, and fails if the
+    registration leg stops passing the account as ``enrolment``."""
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store)

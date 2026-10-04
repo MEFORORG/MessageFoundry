@@ -1011,5 +1011,8 @@ async def test_a_step_up_from_a_roamed_address_records_it_and_moves_the_anchor()
         again = await service.login("oper", PW, client="198.51.100.80")
         assert again.ok and await _seeded(store, again.token)
         assert await store.list_audit(actor="oper", action="auth.login_new_ip") == []
+        # KNOWN, not failed open: only the first sign-in ever wrote an unevaluated row.
+        unevaluated = await store.list_audit(actor="oper", action="auth.login_address_unevaluated")
+        assert len(unevaluated) == 1
     finally:
         await store.close()

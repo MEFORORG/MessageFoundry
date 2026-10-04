@@ -259,8 +259,8 @@ class _LoginAddress(Enum):
     UNEVALUATED_READ_FAILED = "read_failed"
 
 
-#: The verdicts under which a LOCAL sign-in that owes no factor adds its address to the known record
-#: (vault BACKLOG #2145). Not ``NEW``: on the local leg that verdict withholds the step-up window, which
+#: The verdicts under which a LOCAL sign-in that owes no factor adds its address to the known record,
+#: and under which a factor enrolment does (vault BACKLOG #2145). Not ``NEW``: on the local leg that verdict withholds the step-up window, which
 #: is the challenge, and writing the address would let the next sign-in from it skip that challenge.
 #: Not ``UNEVALUATED_READ_FAILED``: a sign-in the signal could not judge is no evidence about its
 #: address. See ``_mark_login_address_known``.
@@ -6935,18 +6935,9 @@ class AuthService:
         match: an exact match, both loopback (this keeps the loopback default a genuine no-op
         rather than a string mismatch), and one the IPv4-mapped IPv6 form of the other. Both
         address signals compare by :func:`_host_key`, so they agree on when two addresses are one
-        host (BACKLOG #2159).
-
-        **THEY DO NOT SHARE A BASELINE, so they can disagree about which address is new.** This,
-        the mid-session signal, compares a request with its own session's anchor, which only a
-        credential re-proof moves (``mark_session_reauthed``). The sign-in signal compares a sign-in
-        with the account's known-address record (vault BACKLOG #2145). A passkey assertion at the
-        MFA gate and a first factor enrolment add their address to the record but leave the anchor
-        where it was. A passkey never re-anchors (ADR 0068 decision 1). An enrolment proves an
-        authenticator the caller has just chosen, not a credential the account already held, and a
-        holder of the password alone may make one (ADR 0197 Amendment A). So after either, an
-        address can be known to the sign-in signal and still new here. That is deliberate:
-        re-anchoring there would treat those ceremonies as a re-proof, which they are not."""
+        host (BACKLOG #2159). They share no baseline, so they can disagree about which address is
+        new; docs/SECURITY.md, item 6 of the administrative-interface defense-in-depth list, says
+        when and why (vault BACKLOG #2145)."""
         return _host_key(a) == _host_key(b)
 
     def _first_new_ip_flag(self, token_hash: str, address_key: str) -> _NewIpFlag:
@@ -6989,10 +6980,10 @@ class AuthService:
         or the login could find itself.
 
         **THE BASELINE IS THE ACCOUNT'S KNOWN-ADDRESS RECORD** (vault BACKLOG #2145): the host keys
-        where a sign-in finished every factor it owed, or a step-up or factor enrolment passed, read
-        through the record's primary key on the account id. It replaced a baseline read from ``audit_log``, which has no actor index and
-        could not tell a finished sign-in from one that stopped at the password on the directory leg.
-        Which events write the record is :meth:`_mark_login_address_known`'s to say. Keyed on the
+        that :meth:`_mark_login_address_known` writes, which says when, read through the record's
+        primary key on the account id. It replaced a baseline read from ``audit_log``, which has no
+        actor index and could not tell a finished sign-in from one that stopped at the password on
+        the directory leg. Keyed on the
         account id, so a re-created namesake inherits nothing, and the account's deletion removes it.
 
         Only rows seen within ``_LOGIN_ADDRESS_LOOKBACK_SECONDS`` count. Addresses compare by
@@ -7025,8 +7016,8 @@ class AuthService:
             # Worded for both callers: a sign-in goes on unchallenged, and an enrolment
             # (``_mark_login_address_known``) records nothing.
             _log.exception(
-                "first-seen login-address read failed for %s; the address is left unevaluated, "
-                "so it is neither challenged nor recorded",
+                "first-seen login-address read failed for %s; the address is left unevaluated: "
+                "it is not challenged, and only a proved factor will record it",
                 user.username,
             )
             return _LoginAddress.UNEVALUATED_READ_FAILED
@@ -7056,15 +7047,15 @@ class AuthService:
           OIDC one minted while ``oidc_require_mfa_claim`` is off. Such a sign-in writes nothing
           here, and the factor leg below writes for it;
         * a second factor proved at the MFA gate (``verify_mfa``, ``finish_webauthn_assertion``),
-          once the session has rotated. ``verify_mfa`` also re-anchors the session to this address;
-          a passkey assertion never does (ADR 0068 decision 1), and nor do the enrolments below. So
-          the record can hold an address the session's own new-address signal still reports. The
-          two signals are independent by design; :meth:`_same_host` says how;
-        * a first factor enrolment confirmed (``confirm_mfa_enrollment``,
-          ``finish_webauthn_registration``), which is how a first sign-in under ``require_mfa``
-          finishes. Those callers pass the account as ``enrolment``, and an address that classifies
-          NEW is not written: ADR 0197 Amendment A lets a holder of the password alone enrol an
-          authenticator they control, so the enrolment proves nothing about the address;
+          once the session has rotated, whether it finishes a sign-in or a step-up. Only
+          ``verify_mfa`` also moves the session's anchor (see :meth:`_same_host`);
+        * a factor enrolment confirmed, first or later (``confirm_mfa_enrollment``,
+          ``finish_webauthn_registration``); a first one is how a first sign-in under
+          ``require_mfa`` finishes. Those callers pass the account as ``enrolment``, and an address
+          that classifies NEW is not written: ADR 0197 Amendment A lets a holder of the password
+          alone enrol an authenticator they control, so the enrolment proves nothing about the
+          address. That only delays such a holder: a code from their own authenticator at the MFA
+          gate then records it, and the enrolment's own notice is the alarm for that case;
         * a step-up re-proof (``reauth``, ``complete_oidc_step_up``), once the session has rotated,
           with ``step_up`` set. It writes only for an account that owes no second factor. That is
           how a first-seen address on a no-factor sign-in passes its challenge. An account that owes
@@ -7647,10 +7638,6 @@ class AuthService:
         if not elevation.ok:
             return elevation
         await self._store.enable_totp(identity.user_id, recovery_code_hashes=hashes)
-        # vault BACKLOG #2145: a first sign-in under require_mfa finishes HERE, so without this it
-        # left no baseline and the account's next sign-in failed open again. Not for a NEW
-        # address: see _mark_login_address_known.
-        await self._mark_login_address_known(identity.user_id, client, enrolment=user)
         await self._audit("auth.mfa_enrolled", actor=identity.username, client=client)
         # ADR 0197 Amendment A: enrolment now comes BEFORE the first rotation, so whoever intercepts
         # an issued credential can enrol their own authenticator without rotating. The notice to a
@@ -7662,6 +7649,11 @@ class AuthService:
             client=client,
             detail={"issued_credential": True} if user.must_change_password else None,
         )
+        # vault BACKLOG #2145: a first sign-in under require_mfa finishes HERE, so without this it
+        # left no baseline and the account's next sign-in failed open again. Not for a NEW
+        # address: see _mark_login_address_known. Last, after the audit row and the notice, so a
+        # programming error it re-raises cannot drop either.
+        await self._mark_login_address_known(identity.user_id, client, enrolment=user)
         return elevation
 
     async def verify_mfa(
@@ -7766,9 +7758,10 @@ class AuthService:
                 )
                 if elevation.ok:
                     # vault BACKLOG #2145: the factor is proved from this address. Recorded INSIDE
-                    # the account's queue, two commits and all: ``login`` classifies a sign-in's
-                    # address under the same queue, so a sign-in queued behind this one must find
-                    # the address already written, or it reads NEW and is challenged for nothing.
+                    # the account's queue: a local ``login`` classifies under the same queue, so a
+                    # sign-in queued behind this one finds the address written rather than reading
+                    # NEW and writing a spurious ``auth.login_new_ip`` row and notice. Kerberos, OIDC
+                    # and passkey legs take no queue, so on those that race stays open.
                     await self._mark_login_address_known(user.id, client)
                 return elevation
             # Wrong code: register the failure through the SAME machinery the password path uses, so
@@ -8276,9 +8269,6 @@ class AuthService:
         elevation = await self._elevated(
             token, ceremony="webauthn_enroll", actor=identity.username, client=client
         )
-        if elevation.ok:
-            # vault BACKLOG #2145, as in confirm_mfa_enrollment.
-            await self._mark_login_address_known(identity.user_id, client, enrolment=user)
         await self._audit(
             "auth.webauthn_enrolled",
             actor=identity.username,
@@ -8288,6 +8278,9 @@ class AuthService:
         await self._notify_security(
             MFA_ENABLED, username=user.username, email=user.notify_email, client=client
         )
+        if elevation.ok:
+            # vault BACKLOG #2145, as in confirm_mfa_enrollment, and last for the same reason.
+            await self._mark_login_address_known(identity.user_id, client, enrolment=user)
         return elevation
 
     async def begin_webauthn_assertion(self, token: str | None, *, rp_id: str) -> str | None:
