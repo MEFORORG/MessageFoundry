@@ -644,6 +644,8 @@ _UNSENDABLE_ADDRESSES = {
     "non-ascii-local": "é" + "ops@example.invalid",
     "slash-local": "ops" + "/" + "team@example.invalid",
     "percent-local": "ops" + "%" + "relay@example.invalid",
+    # Passes the send rule but not the older shape half, so it pins that half on this command.
+    "host-only": "ops" + "@" + "localhost",
 }
 
 
@@ -666,7 +668,7 @@ def test_an_address_notices_could_not_be_sent_to_is_refused_before_the_prompt_an
     assert main([*argv, "--db", str(db), "--json"]) == 1
     error = json.loads(capsys.readouterr().out)["error"]
     assert "one email address" in error
-    assert address not in error  # the refusal names the problem, never the address
+    assert address.partition("@")[0] not in error  # names the problem, never the address
     assert not db.exists(), "a refused provision left a store behind"
 
 
@@ -675,12 +677,25 @@ def test_a_plain_address_still_provisions(
 ) -> None:
     # The control for the refusals above: the rule is not refusing every address.
     monkeypatch.chdir(tmp_path)
-    _key_in_this_shell(monkeypatch)
+    key = _key_in_this_shell(monkeypatch)
     _tty(monkeypatch, _PASSWORD, _PASSWORD)
     db = tmp_path / "plain.db"
-    argv = ["provision-admin", "--username", "site-admin", "--email", "ops.team@example.invalid"]
+    plain = "ops.team@example.invalid"
+    argv = ["provision-admin", "--username", "site-admin", "--email", plain]
     assert main([*argv, "--db", str(db)]) == 0
     assert "WARNING" not in capsys.readouterr().out
+
+    async def stored() -> str | None:
+        cipher = make_cipher(key)
+        store = await MessageStore.open(db, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
+        try:
+            row = await store.get_user_by_username("site-admin")
+            assert row is not None
+            return row.notify_email
+        finally:
+            await store.close()
+
+    assert asyncio.run(stored()) == plain
 
 
 def test_a_password_the_policy_refuses_leaves_no_store(

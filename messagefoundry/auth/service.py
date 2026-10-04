@@ -895,16 +895,21 @@ class InvalidNotifyEmail(ValueError):
 def _require_single_mailbox(value: str) -> str:
     """``value`` stripped, when it may become a notification address; else :class:`InvalidNotifyEmail`.
 
-    The check every surface that takes a typed address applies: the holder's own fill, an
-    administrator's explicit change, and the host commands ``admin-set-notify-email`` and
+    The check that surfaces taking a typed address apply. They include at least the holder's own
+    fill, an administrator's change, and the host commands ``admin-set-notify-email`` and
     ``provision-admin --email`` (vault BACKLOG #2870). Not blank (:func:`require_notify_email`),
-    and one plain mailbox (:func:`_is_single_mailbox`)."""
+    and one plain mailbox (:func:`_is_single_mailbox`). When the send rule is what refuses it, the
+    message carries that rule's reason, which never quotes the address."""
     try:
         address = require_notify_email(value)
     except ValueError as exc:
         raise InvalidNotifyEmail(str(exc)) from exc
     if not _is_single_mailbox(address):
-        raise InvalidNotifyEmail("enter one email address, such as name@example.org")
+        message = "enter one email address, such as name@example.org"
+        problem = envelope_address_problem(address)
+        if problem is not None:
+            message += f"; this one {problem}"
+        raise InvalidNotifyEmail(message)
     return address
 
 

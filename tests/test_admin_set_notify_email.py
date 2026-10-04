@@ -229,6 +229,8 @@ _UNSENDABLE_ADDRESSES = {
     "non-ascii-local": "é" + "ops@example.invalid",
     "slash-local": "ops" + "/" + "team@example.invalid",
     "percent-local": "ops" + "%" + "relay@example.invalid",
+    # Passes the send rule but not the older shape half, so it pins that half on this command.
+    "host-only": "ops" + "@" + "localhost",
 }
 
 
@@ -249,7 +251,7 @@ def test_an_address_notices_could_not_be_sent_to_is_refused_and_writes_nothing(
     assert main([_CMD, "--username", _ADMIN, "--email", address, "--db", str(db), "--json"]) == 1
     error = _error(capsys)
     assert "one email address" in error
-    assert address not in error  # the refusal names the problem, never the address
+    assert address.partition("@")[0] not in error  # names the problem, never the address
     assert _notify_email(db, _ADMIN) is None
     assert _audit_rows(db) == []
 

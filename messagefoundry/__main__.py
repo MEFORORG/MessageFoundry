@@ -869,15 +869,17 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         description="Set the engine-owned notification address (users.notify_email) on an enabled "
         "Administrator that has none, so a PHI instance under [security].enforcement=enforce can "
         "start. Runs against the store directly, on the same host gate as admin-unlock; run it with "
-        "the engine stopped. It refuses a blank address, a non-Administrator, a disabled account, "
-        "and an account that already has an address: change an existing address from the web "
-        "console, which notifies the old one.",
+        "the engine stopped. It refuses at least a blank address, an address that is not one plain "
+        "mailbox, a non-Administrator, a disabled account, and an account that already has an "
+        "address: change an existing address from the web console, which notifies the old one.",
     )
     admin_set_notify_email.add_argument(
         "--username", required=True, help="the enabled Administrator to address"
     )
     admin_set_notify_email.add_argument(
-        "--email", required=True, help="the notification address to set (must not be blank)"
+        "--email",
+        required=True,
+        help="the notification address to set: one plain mailbox, such as name@example.org",
     )
     admin_set_notify_email.add_argument(
         "--service-config",
@@ -6503,7 +6505,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
     # AC-15: the argument checks, before the prompt and before any open. The limits are the web
     # console's (`UserCreateRequest`), so this offline surface admits nothing the console refuses,
     # and the address limit is the one `admin-set-notify-email` applies. A blank address is still no
-    # address rather than a refusal (AC-9), so only its length is checked here.
+    # address rather than a refusal (AC-9). A non-blank one also gets the one-mailbox check below.
     username = args.username.strip()
     if not username:
         return _emit_error("a username is required and must not be blank", as_json=args.json)
@@ -6514,8 +6516,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
             f"the notification address is longer than {_NAME_MAX} characters", as_json=args.json
         )
     if args.email is not None and args.email.strip():
-        # The one-mailbox rule admin-set-notify-email and the API apply, so the Administrator is
-        # not given an address every security notice would fail to reach (vault BACKLOG #2870).
+        # The one-mailbox rule admin-set-notify-email and the API apply (vault BACKLOG #2870). It
+        # refuses an address the alert sender could never put on the RCPT TO line.
         try:
             _require_single_mailbox(args.email)
         except InvalidNotifyEmail as exc:
@@ -6935,10 +6937,9 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
     if isinstance(settings, int):
         return settings
     # Validated before the store opens, so a refusal touches nothing. The web console's length
-    # bound first, so an over-long value is named as that. Then the one-mailbox check the console's
-    # user form and POST /me/notify-email apply (BACKLOG #1139), which since vault BACKLOG #2870 also
-    # holds the address to the rule the alert sender applies to RCPT TO, so no notice to it would
-    # fail at send.
+    # bound comes first. Then comes the one-mailbox check the console and POST /me/notify-email
+    # apply (BACKLOG #1139). Since vault BACKLOG #2870 that check includes the rule the alert sender
+    # applies to RCPT TO. It checks the address's shape only, not that a relay will take it.
     if len(args.email) > _NAME_MAX:
         return _emit_error(
             f"the notification address is longer than {_NAME_MAX} characters", as_json=args.json
