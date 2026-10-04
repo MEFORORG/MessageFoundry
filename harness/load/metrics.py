@@ -184,6 +184,10 @@ class Counters:
     nak: int = 0  # ACKs whose MSA-1 is a reject/error (AE/AR/CE/CR)
     errors: int = 0  # transport failures (connection drop, write error)
     timeouts: int = 0  # in-flight at a connection close with no ACK seen
+    #: Payloads the sender refused to write because they would not arrive as one MLLP frame (ADR
+    #: 0205 rule 1) or could not be encoded. A HARNESS-side defect, never the engine's, so it is kept
+    #: out of ``errors`` and the error budget the SLOs read from it.
+    refused_sends: int = 0
     deferred: int = 0  # open-loop offers the pool could not accept (TOTAL = the two causes below)
     #: ⭐ THE TWO CAUSES OF A DEFERRAL, WHICH ARE OPPOSITE FINDINGS AND WERE THE SAME COUNTER.
     #:

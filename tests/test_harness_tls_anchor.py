@@ -123,8 +123,8 @@ def test_a_child_process_inherits_the_parents_anchor() -> None:
     [
         ("https://127.0.0.1:8765", True),
         ("https://localhost:8765", True),
-        # Plain http is the in-process uvicorn path (ingress_probe) -- httpx ignores TLS settings
-        # there and pinning would be meaningless.
+        # Plain http makes no handshake -- httpx ignores TLS settings there and pinning would be
+        # meaningless. (ingress_probe used this path until it moved to a signed-in serve.)
         ("http://127.0.0.1:8765", False),
         # An engine on ANOTHER box (shardcert's two-box rig) mints its own cert that this process
         # has never seen. Pinning ours would break a path that is not ours to fix here.

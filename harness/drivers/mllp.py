@@ -34,6 +34,8 @@ class MLLPDriver(Driver):
         try:
             with socket.create_connection((self.host, self.port), self.timeout) as sock:
                 sock.settimeout(self.timeout)
+                # Unchecked on purpose: the hostile scenarios inject MLLP frame bytes through this
+                # driver to drive the engine's ingress refusal (ADR 0205 rule 4).
                 sock.sendall(frame(payload))
                 return Injection(reply=_read_reply(sock))
         except MLLPFrameError as exc:

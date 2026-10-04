@@ -41,6 +41,7 @@ class SendPanel(QWidget):
         self._worker: SendWorker | None = None
         self._sent = 0
         self._ok = 0
+        self._not_sent = 0
         self._rng = random.Random()
 
         self._code = QComboBox()
@@ -109,7 +110,7 @@ class SendPanel(QWidget):
 
         self._results.setRowCount(0)
         self._results.setSortingEnabled(False)
-        self._sent = self._ok = 0
+        self._sent = self._ok = self._not_sent = 0
         self._summary.setText(f"sending {len(items)} {code} message(s)…")
 
         self._thread = QThread(self)
@@ -146,11 +147,17 @@ class SendPanel(QWidget):
         ]
         for col, value in enumerate(values):
             self._results.setItem(row, col, QTableWidgetItem(value))
-        self._sent += 1
-        self._ok += 1 if res.ok else 0
-        self._summary.setText(
-            f"sent {self._sent} · accepted {self._ok} · failed {self._sent - self._ok}"
-        )
+        # A payload refused before any dial (ADR 0205 rule 1) never reached the wire, so it is
+        # counted apart from what was sent.
+        if res.error.startswith("not sent:"):
+            self._not_sent += 1
+        else:
+            self._sent += 1
+            self._ok += 1 if res.ok else 0
+        summary = f"sent {self._sent} · accepted {self._ok} · failed {self._sent - self._ok}"
+        if self._not_sent:
+            summary += f"; not sent {self._not_sent}"
+        self._summary.setText(summary)
 
     def _on_finished(self) -> None:
         if self._thread is not None:

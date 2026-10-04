@@ -164,13 +164,15 @@ jobs:
           # match the header recorded in each committed file, so re-export is byte-identical when in sync.
           uv export --no-emit-project --no-dev --format requirements.txt -o docker/locks/requirements-core.lock
           uv export --no-emit-project --no-dev --extra sqlserver --format requirements.txt -o docker/locks/requirements-sqlserver.lock
+          # Not an image lock: the harness closure (security/runtime-closure-harness.txt) copies it.
+          uv export --no-emit-project --no-dev --extra harness --format requirements.txt -o security/locks/requirements-harness.lock
           # CI's own installs pass `--constraint constraints.lock` (see ci.yml): a HASHLESS export of this
           # same lock, so a fresh `uv pip install -e ".[extras]"` cannot drift to a newer upstream
           # release. Re-export it here so it can never fall out of step with uv.lock.
           uv export --all-extras --no-emit-project --no-hashes --format requirements.txt -o constraints.lock
           # The CI TOOLCHAIN locks (ADR 0034 §3): PEP 735 `[dependency-groups]`, so the scanners and the
           # quality tools flow through uv.lock and are consumed HASH-PINNED. Non-default groups, so they
-          # stay out of the four exports above (and out of the SBOM / image locks / audited runtime).
+          # stay out of the five exports above (and out of the SBOM / image locks / audited runtime).
           uv export --only-group ci-scanners --format requirements.txt -o ci/locks/ci-scanners.lock
           uv export --only-group ci-quality --format requirements.txt -o ci/locks/ci-quality.lock
           # The RELEASE SIGNING toolchain (BACKLOG #332). Same mechanism as the two above, and it is
@@ -178,7 +180,7 @@ jobs:
           # drift that lived there would first be observed during a release. Exported on every
           # security run instead, where it is cheap to catch.
           uv export --only-group release-tools --format requirements.txt -o ci/locks/release-tools.lock
-          git diff --exit-code -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock
+          git diff --exit-code -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock security/locks/requirements-harness.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock
       - name: Install from the hashed lockfile (DEP-1)
         run: |
           # --require-hashes enforces a hash for every requirement (the lockfile carries them): a
@@ -1615,13 +1617,15 @@ jobs:
           # match the header recorded in each committed file, so re-export is byte-identical when in sync.
           uv export --no-emit-project --no-dev --format requirements.txt -o docker/locks/requirements-core.lock
           uv export --no-emit-project --no-dev --extra sqlserver --format requirements.txt -o docker/locks/requirements-sqlserver.lock
+          # Not an image lock: the harness closure (security/runtime-closure-harness.txt) copies it.
+          uv export --no-emit-project --no-dev --extra harness --format requirements.txt -o security/locks/requirements-harness.lock
           # CI's own installs pass `--constraint constraints.lock` (see ci.yml): a HASHLESS export of this
           # same lock, so a fresh `uv pip install -e ".[extras]"` cannot drift to a newer upstream
           # release. Re-export it here so it can never fall out of step with uv.lock.
           uv export --all-extras --no-emit-project --no-hashes --format requirements.txt -o constraints.lock
           # The CI TOOLCHAIN locks (ADR 0034 §3): PEP 735 `[dependency-groups]`, so the scanners and the
           # quality tools flow through uv.lock and are consumed HASH-PINNED. Non-default groups, so they
-          # stay out of the four exports above (and out of the SBOM / image locks / audited runtime).
+          # stay out of the five exports above (and out of the SBOM / image locks / audited runtime).
           uv export --only-group ci-scanners --format requirements.txt -o ci/locks/ci-scanners.lock
           uv export --only-group ci-quality --format requirements.txt -o ci/locks/ci-quality.lock
           # The RELEASE SIGNING toolchain (BACKLOG #332). Same mechanism as the two above, and it is
@@ -1629,7 +1633,7 @@ jobs:
           # drift that lived there would first be observed during a release. Exported on every
           # security run instead, where it is cheap to catch.
           uv export --only-group release-tools --format requirements.txt -o ci/locks/release-tools.lock
-          git diff --exit-code -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock
+          git diff --exit-code -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock security/locks/requirements-harness.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock
       - name: Install from the hashed lockfile (DEP-1)
         if: ${{ !cancelled() }}
         run: |

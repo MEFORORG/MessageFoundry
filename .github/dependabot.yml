@@ -7,7 +7,8 @@ updates:
   # pyproject.toml + uv.lock and REGENERATES uv.lock IN its PRs (version updates GA 2025-03,
   # security updates GA 2025-12) — the old "pip" ecosystem updated requirements/pyproject but NOT
   # uv.lock. It still does not re-derive the EXPORTED locks (requirements.lock + docker/locks/* +
-  # constraints.lock + ci/locks/* — SEVEN artifacts, since a9354808e added ci/locks/release-tools.lock),
+  # security/locks/requirements-harness.lock + constraints.lock + ci/locks/* — EIGHT artifacts, since
+  # a9354808e added ci/locks/release-tools.lock and the harness lock joined them),
   # which the DEP-1 gate in security.yml byte-diffs;
   # .github/workflows/dependabot-lock-resync.yml re-exports those on the Dependabot branch so the
   # gate stays green.
@@ -37,9 +38,11 @@ updates:
     #
     # security/runtime-closure-sqlserver.txt is the same kind of inventory, copied from
     # docker/locks/requirements-sqlserver.lock (BACKLOG #1955), and is excluded for the same reason.
+    # So is security/runtime-closure-harness.txt, copied from security/locks/requirements-harness.lock.
     exclude-paths:
       - "security/runtime-closure-core.txt"
       - "security/runtime-closure-sqlserver.txt"
+      - "security/runtime-closure-harness.txt"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 10

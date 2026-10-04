@@ -8,8 +8,9 @@ each MEFOR Test outbound's ``env()`` host/port points at one of these sinks (one
 output), so the captured stream *is* that connection's output — without delivering duplicates to the real
 ancillaries/Epic.
 
-Reuses the engine's own MLLP framing/ACK primitives (``MLLPDecoder`` / ``build_ack`` / ``frame``) so the
-sink ACKs exactly as a real downstream would; it never touches the store. Each captured message is one
+Reuses the engine's own MLLP framing/ACK primitives (``MLLPDecoder`` / ``build_ack`` /
+``frame_neutralised``) so the sink ACKs as the engine's own listeners do, an echoed MLLP frame byte
+included (ADR 0205); it never touches the store. Each captured message is one
 JSON line ``{"control_id", "raw", "received_at"}`` (``raw`` is latin-1 — lossless byte⇄char — so the
 exact bytes round-trip into the offline normalizer). The reconciler reads these back via
 :func:`harness.reconcile.compare.load_messages`.
@@ -33,7 +34,7 @@ from messagefoundry.mllpcodec import (
     MLLPDecoder,
     MLLPFrameError,
     build_ack,
-    frame,
+    frame_neutralised,
 )
 from messagefoundry.parsing import Peek
 from messagefoundry.parsing.peek import HL7PeekError
@@ -156,7 +157,7 @@ class CaptureSink:
             self._write(None, raw)
             return
         self._write(peek.control_id, raw)
-        replies += frame(build_ack(peek, code="AA", ack_mode=self._ack_mode))
+        replies += frame_neutralised(build_ack(peek, code="AA", ack_mode=self._ack_mode))
 
     def _write(self, control_id: str | None, raw: str) -> None:
         assert self._file is not None, "CaptureSink.start() must be called before messages arrive"

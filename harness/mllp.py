@@ -4,8 +4,11 @@
 
 Sending runs in a worker thread (blocking sockets) so a burst of N messages never freezes the
 UI; receiving uses a ``QTcpServer`` (event-driven, mostly idle). Both reuse the engine's
-byte-level framing (:func:`frame` / :class:`MLLPDecoder`) and ACK builder (:func:`build_ack`),
-so the harness frames and acknowledges exactly like the engine.
+byte-level framing (:class:`MLLPDecoder`, and the frame-byte rule of ADR 0205) and ACK builder
+(:func:`build_ack`), so the harness frames and acknowledges like the engine: a send holding an MLLP
+frame byte is refused (:func:`frame_checked`), and an ACK echoing one is neutralised
+(:func:`frame_neutralised`). The Compose tab keeps the checked framer too unless the operator
+ticks its opt-in to send frame bytes on purpose; only then does it pass the bare framer.
 """
 
 from __future__ import annotations
@@ -14,6 +17,7 @@ import contextlib
 import socket
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -24,10 +28,13 @@ from harness.frame_cap import resolve_max_frame_bytes
 from messagefoundry.mllpcodec import (
     DEFAULT_MAX_FRAME_BYTES,
     AckMode,
+    FrameEncodeError,
+    FramePayloadError,
     MLLPDecoder,
     MLLPFrameError,
     build_ack,
-    frame,
+    frame_checked,
+    frame_neutralised,
 )
 from messagefoundry.parsing import HL7PeekError, Peek, normalize
 
@@ -101,8 +108,11 @@ class SendWorker(QObject):
         timeout: float,
         rate: float,
         expect_ack: bool = True,
+        framer: Callable[[str], bytes] = frame_checked,
     ) -> None:
         super().__init__()
+        # frame_checked unless the caller sends hostile framing on purpose (the Compose tab's opt-in).
+        self._framer = framer
         self._host = host
         self._port = port
         self._items = items
@@ -134,13 +144,21 @@ class SendWorker(QObject):
 
     def _send_one(self, item: SendItem) -> SendResult:
         start = time.monotonic()
+        # Framed before any dial: by default a payload holding an MLLP start or end byte would not
+        # arrive as one message, so it is refused here with the reason and no connection is opened
+        # (ADR 0205 rule 1, the engine's own delivery rule).
+        try:
+            wire = self._framer(item.payload)
+        except (FramePayloadError, FrameEncodeError) as exc:
+            latency = (time.monotonic() - start) * 1000.0
+            return SendResult(item, False, "-", latency, f"not sent: {exc}")
         try:
             with socket.create_connection((self._host, self._port), self._timeout) as sock:
                 with self._lock:
                     self._sock = sock  # publish so stop() can interrupt a blocking recv
                 try:
                     sock.settimeout(self._timeout)
-                    sock.sendall(frame(item.payload))
+                    sock.sendall(wire)
                     if not self._expect_ack:
                         return self._read_no_ack(item, sock, start)
                     # The reply is the engine's, another party's, so it is bounded like the receive
@@ -324,7 +342,9 @@ class MllpReceiver(QObject):
 
     @staticmethod
     def _write_ack(sock: QTcpSocket, text: str, code: str, ack_mode: AckMode) -> None:
-        sock.write(frame(build_ack(text, code=code, ack_mode=ack_mode, timestamp="")))
+        # The ACK echoes the inbound's header values, which may hold a start byte as data: neutralised
+        # so the engine always reads exactly one reply frame (the engine's own listeners do the same).
+        sock.write(frame_neutralised(build_ack(text, code=code, ack_mode=ack_mode, timestamp="")))
 
     @staticmethod
     def _describe(sock: QTcpSocket, text: str) -> Received:

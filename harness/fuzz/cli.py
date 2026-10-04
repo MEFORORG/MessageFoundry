@@ -13,6 +13,7 @@ from harness.endpoints import Endpoints
 from harness.fuzz.campaign import FuzzConfig, SetupError, replay, run
 from harness.fuzz.transport import build_transport
 from messagefoundry.apiclient import ApiError, EngineClient
+from messagefoundry.terminal_text import escape_for_terminal
 
 EXIT_PASS = 0
 EXIT_INVARIANT = 1
@@ -36,7 +37,9 @@ def main(
     replay_files: Sequence[str] = (),
 ) -> int:
     def fail_setup(message: str) -> int:
-        print(f"fuzz setup: {message}", file=sys.stderr)
+        # A SetupError can carry the engine API's own reply (an ApiFault's 4xx body), so the line
+        # is escaped, newline included, before the operator's terminal sees it (ASVS 1.1.2).
+        print(f"fuzz setup: {escape_for_terminal(message, single_line=True)}", file=sys.stderr)
         return EXIT_SETUP
 
     if not math.isfinite(reply_timeout) or reply_timeout <= 0:

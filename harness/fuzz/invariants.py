@@ -192,8 +192,17 @@ def check_stored(client: EngineClient, control_id: str, before: int, settle: flo
 
 
 def shown(value: str | None) -> str:
-    """A short, printable rendering of an identifier for a report line."""
+    """A short, quoted rendering of an identifier for a failure reason, its characters kept raw.
+
+    Raw on purpose: ``Failure.reason`` keeps the value as the peer sent it, and what prints it
+    escapes it once, by the shared rule (ASVS 1.1.2): at least ``campaign._Session._fail`` for a
+    failure line and ``cli.fail_setup`` for a :class:`~harness.fuzz.campaign.SetupError` built from
+    :func:`check_health`. A new sink for a reason must escape it the same way. Escaping here too, as
+    ``ascii()`` did, had the failure line escape the escape, so a real ESC printed as the text
+    ``\\\\x1b``. The quote is chosen as ``repr`` chooses it, so a value holding one kind still sits
+    inside a closed span; a value holding both kinds cannot, and reads as it came."""
     if value is None:
         return "None"
     text = value if len(value) <= _SHOWN else value[:_SHOWN] + "..."
-    return ascii(text)
+    quote = '"' if "'" in text and '"' not in text else "'"
+    return f"{quote}{text}{quote}"

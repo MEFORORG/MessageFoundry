@@ -57,6 +57,64 @@ $ErrorActionPreference = "Stop"
 # import would be invisible to it.
 $StoreLocation = "Cert:\LocalMachine\Root"
 
+# A certificate's Subject and Issuer are whatever its author wrote, and the file is one an operator
+# was handed. An ESC sequence there could rewrite what this prompt shows, and a bidirectional
+# override could reorder the name the operator is asked to trust, so every control character
+# (Cc) and every format character (Cf: the bidi overrides and isolates, zero-width marks) prints
+# as a visible \uXXXX before it reaches the console (ASVS 1.1.2). Line and paragraph separators,
+# private-use and unassigned code points go the same way -- the same categories as
+# CONTROL_CATEGORIES in messagefoundry/terminal_text.py, since this .NET runtime's tables cannot
+# vouch for an unassigned one. So does every surrogate: PowerShell walks UTF-16 code units, so a
+# character past the BMP prints as its escaped pair rather than being judged half at a time.
+# A run of backslashes is doubled whole where it stands before 'u' and four hex digits or before a
+# character about to be escaped, so a Subject spelling \u202e cannot pass for an escaped one.
+# Unlike that module this helper writes only \uXXXX escapes (an ESC shows as \u001b, not \x1b),
+# so 'u' is the only lookalike it guards.
+function Test-EscapedForConsole {
+    param([char]$C)
+    $cat = [System.Globalization.CharUnicodeInfo]::GetUnicodeCategory($C)
+    return ([char]::IsControl($C) -or
+        $cat -eq [System.Globalization.UnicodeCategory]::Format -or
+        $cat -eq [System.Globalization.UnicodeCategory]::LineSeparator -or
+        $cat -eq [System.Globalization.UnicodeCategory]::ParagraphSeparator -or
+        $cat -eq [System.Globalization.UnicodeCategory]::Surrogate -or
+        $cat -eq [System.Globalization.UnicodeCategory]::PrivateUse -or
+        $cat -eq [System.Globalization.UnicodeCategory]::OtherNotAssigned)
+}
+
+function ConvertTo-PrintableText {
+    param([AllowNull()][AllowEmptyString()][string]$Text)
+    if ($null -eq $Text) { return '' }
+    # 'u' and four hex digits, anchored (\G) at the index Match is handed.
+    $lookalike = [regex]::new('\Gu[0-9A-Fa-f]{4}')
+    $out = [System.Text.StringBuilder]::new($Text.Length)
+    $i = 0
+    while ($i -lt $Text.Length) {
+        $c = $Text[$i]
+        if ($c -eq [char]'\') {
+            $end = $i
+            while ($end -lt $Text.Length -and $Text[$end] -eq [char]'\') { $end++ }
+            $run = $Text.Substring($i, $end - $i)
+            # Only the characters at $end are read, never a copy of the rest, so a Subject of
+            # many short runs stays one linear pass.
+            if ($lookalike.Match($Text, $end).Success -or
+                ($end -lt $Text.Length -and (Test-EscapedForConsole $Text[$end]))) {
+                $run = $run + $run
+            }
+            [void]$out.Append($run)
+            $i = $end
+            continue
+        }
+        if (Test-EscapedForConsole $c) {
+            [void]$out.Append('\u').Append(([int]$c).ToString('x4'))
+        } else {
+            [void]$out.Append($c)
+        }
+        $i++
+    }
+    return $out.ToString()
+}
+
 # --- preflight ---------------------------------------------------------------
 
 $principal = [Security.Principal.WindowsPrincipal]::new(
@@ -82,12 +140,12 @@ try {
 }
 
 Write-Host "About to trust CA in $StoreLocation :"
-Write-Host "  Subject    : $($cert.Subject)"
-Write-Host "  Issuer     : $($cert.Issuer)"
+Write-Host "  Subject    : $(ConvertTo-PrintableText $cert.Subject)"
+Write-Host "  Issuer     : $(ConvertTo-PrintableText $cert.Issuer)"
 Write-Host "  Thumbprint : $($cert.Thumbprint)"
 Write-Host "  Not after  : $($cert.NotAfter.ToString('u'))"
 
-if ($PSCmdlet.ShouldProcess($StoreLocation, "Import CA '$($cert.Subject)'")) {
+if ($PSCmdlet.ShouldProcess($StoreLocation, "Import CA '$(ConvertTo-PrintableText $cert.Subject)'")) {
     # Import-Certificate keys on thumbprint, so re-importing the same CA is a no-op (idempotent).
     Import-Certificate -FilePath $CaPath -CertStoreLocation $StoreLocation | Out-Null
     Write-Host ""

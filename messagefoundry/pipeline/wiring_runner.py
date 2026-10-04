@@ -6611,8 +6611,11 @@ class RegistryRunner:
                 # hydrated payload, as a live send sees it: an explicit TCP codec may use a byte of
                 # the base64 alphabet a re-attached document carries. A connector that does not
                 # frame keeps the default no-op, so it pays no hydration.
-                # Shadow mirrors rule 1 only: a hydration or rewrite failure is not a frame
-                # refusal, so it stays what shadow made it before, a completed delivery.
+                # check_frame runs the same delimiter rewrite send() does, so on this single-row
+                # path a re-encode refusal (permanent, code "reencode": ADR 0204, ADR 0206)
+                # dead-letters in shadow as it would live. A shadow BATCH does not: it checks each
+                # member with rewrite=False and never rewrites the envelope. A hydration failure is
+                # not a refusal, so it stays what shadow made it before, a completed delivery.
                 if _frames(connector):
                     try:
                         connector.check_frame(await self._hydrate_payload(item.payload))

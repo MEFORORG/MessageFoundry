@@ -15,13 +15,19 @@ and records each interchange verbatim, capped at the engine's per-interchange ca
 - None -- answer nothing (a fire-and-forget peer).
 
 The TA1 names the received ISA13 in TA101 and carries a fresh ISA13 of its own. When the received
-interchange has no readable ISA13 the sink answers nothing rather than invent one.
+interchange has no readable ISA13 the sink answers nothing rather than invent one, and the same holds
+for an ISA13 that is not nine digits. ISA13 is read by fixed offset, so it can hold the element or
+segment separator; echoed into a reply written with fixed separators, ``1*0*0*R~Z`` would make an
+accepting TA1 parse as TA1-04 ``R``, which the engine dead-letters (ASVS 1.1.2). A TA1 with a made-up
+TA101 would acknowledge an interchange nobody sent, so silence is the answer. The interchange is
+still recorded, with the value read, as everything received is.
 """
 
 from __future__ import annotations
 
 import socket
 
+from harness.drivers._x12_interchange import is_control_number
 from harness.drivers._x12_interchange import ta1 as build_ta1
 from harness.endpoints import Endpoints
 from harness.sinks import LOOPBACK, Record, Sink
@@ -67,8 +73,16 @@ class X12Sink(Sink):
             try:
                 for interchange in reader.feed(chunk):
                     control = isa13_of(interchange)
-                    self._add(Record(interchange, {"peer": peer, "isa13": control or ""}))
-                    if self.ta1 is not None and control is not None:
+                    meta = {"peer": peer, "isa13": control or ""}
+                    answer = self.ta1 is not None
+                    # Never echo an ISA13 that is not nine digits (see the module docstring). The
+                    # record notes why no TA1 went back, for whoever reads it after a timeout.
+                    if answer and control is None:
+                        meta["ta1"], answer = "withheld: no readable ISA13", False
+                    elif answer and control is not None and not is_control_number(control):
+                        meta["ta1"], answer = "withheld: ISA13 is not nine digits", False
+                    self._add(Record(interchange, meta))  # recorded before any reply is built
+                    if answer and self.ta1 is not None and control is not None:
                         conn.sendall(build_ta1(control, self.ta1))
             except X12FrameError:
                 return  # over the cap: drop the connection, as the engine's own listener does
