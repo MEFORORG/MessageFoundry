@@ -1137,14 +1137,18 @@ async def _bounded[T](coro: Coroutine[Any, Any, T], timeout: float) -> T:
     Here the read runs as its own task, which is cancelled and left behind on a timeout, so the
     caller is never held past the bound. The left-behind task's outcome is retrieved, never raised."""
     task = asyncio.ensure_future(coro)
+
+    def _abandon() -> None:
+        task.cancel()
+        task.add_done_callback(lambda t: None if t.cancelled() else t.exception())
+
     try:
         done, _pending = await asyncio.wait({task}, timeout=timeout)
     except BaseException:
-        task.cancel()
+        _abandon()
         raise
     if not done:
-        task.cancel()
-        task.add_done_callback(lambda t: None if t.cancelled() else t.exception())
+        _abandon()
         raise TimeoutError(f"no answer within {timeout}s")
     if task.cancelled():
         # Cancelled by something other than this caller (a pool shutting down): a failed read,
@@ -8324,6 +8328,9 @@ def create_managed_app(
                 trust_anchor_specs, store, enforcing=trust_anchors_enforcing
             ),
         )
+        # Bound before the branch so no later read can meet an unbound name (the #1257 lesson below).
+        start_fingerprint_failure: str | None = None
+        start_config: _StartConfigComparison | None = None
         if config_dir is not None:
             # The first graph load, under the same teardown discipline as the preflights above: a
             # refusal here (a bad config, the shard guard, or the BACKLOG #1182 static-credential
@@ -8353,6 +8360,10 @@ def create_managed_app(
                 # loaded. Bounded and never raises: it costs only the comparison (vault BACKLOG
                 # #2597, step 5).
                 start_config = await _compare_start_config(engine, engine.loaded_config_fingerprint)
+                # Raised here, before engine.start(), so new bytes that make the start itself fail
+                # still page on every attempt of a crash loop. Never raises.
+                if start_config is not None and start_config.changed:
+                    _raise_config_changed(notifier or LoggingAlertSink(), engine, start_config)
             except BaseException:
                 if notifier is not None:
                     await notifier.aclose()
@@ -8417,10 +8428,6 @@ def create_managed_app(
                 if security_notifier is not None:
                     security_notifier.start()
             await engine.start()
-            # vault BACKLOG #2597: as soon as the changed config is serving, before any later startup
-            # step that could abort the start, so a crash loop on new bytes still pages each time.
-            if config_dir is not None and start_config is not None and start_config.changed:
-                _raise_config_changed(notifier or LoggingAlertSink(), engine, start_config)
             # #144 (ADR 0128): inject the connection-control callback INTO the notifier (the sink never imports
             # RegistryRunner). A rule's control_action then auto-remediates via restart_inbound/restart_outbound;
             # re-reading engine.registry_runner each call keeps it correct across a config reload that swaps the

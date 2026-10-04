@@ -1802,7 +1802,8 @@ class Engine:
         the same lock, and :attr:`loaded_config_fingerprint` moves to it, since the flag was
         reflected live. Otherwise some other edit sits on disk unloaded, and a digest of the whole
         directory would vouch for it, so the loaded digest is returned unchanged and the next start
-        reports the difference. ``None`` when no loaded digest exists; the write still stands.
+        reports the difference. ``None`` when no loaded digest exists, or when the toggle was the
+        one change but the digest after it could not be taken; the write still stands either way.
         """
         from messagefoundry.config import connections_edit
         from messagefoundry.config.connections_file import CONNECTIONS_FILE_NAME
@@ -1857,8 +1858,13 @@ class Engine:
         # the write itself runs off the event loop (file I/O + a full load_config in its validate callback).
         async with self._toml_write_lock:
             # vault BACKLOG #2597: whether the directory still holds the bytes the running graph
-            # loaded, read before this write changes it. See the return below.
-            before, _reason = await self.fingerprint_bundle(cfg_dir)
+            # loaded, read before this write changes it. See the return below. With no loaded
+            # digest there is nothing to vouch against, so the two reads are skipped.
+            loaded = self.loaded_config_fingerprint
+            loaded_fp = loaded.get("fingerprint") if loaded is not None else None
+            before = None
+            if isinstance(loaded_fp, str):
+                before, _reason = await self.fingerprint_bundle(cfg_dir)
             await asyncio.to_thread(_write)
 
             # Reflect it live, in place (cosmetic field only — no connector rebuild, no reload).
@@ -1876,20 +1882,27 @@ class Engine:
             # digest covers the whole directory, so it may vouch for this toggle only when the toggle
             # is the one change since the load. Otherwise another edit is on disk that the running
             # graph never loaded, and the row keeps the loaded digest, so the next start reports it.
-            after, _reason = await self.fingerprint_bundle(cfg_dir)
-            loaded = self.loaded_config_fingerprint
             if (
-                before is not None
-                and after is not None
-                and loaded is not None
-                and isinstance(loaded_fp := loaded.get("fingerprint"), str)
-                and fingerprint_matches(before.get("fingerprint"), loaded_fp)
+                before is None
+                or not isinstance(loaded_fp, str)
+                or not fingerprint_matches(before.get("fingerprint"), loaded_fp)
             ):
-                # The running graph now matches these bytes (the flag was reflected live), so the
-                # provenance baseline moves with it.
-                self.loaded_config_fingerprint = after
-                return after
-            return loaded
+                return loaded
+            # The write has landed, so an unexpected failure here is logged and costs the digest,
+            # never the answer: a raise would report a landed write as failed, with no audit row.
+            try:
+                after, _reason = await self.fingerprint_bundle(cfg_dir)
+            except Exception:  # noqa: BLE001 - see the comment above; logged, never silent
+                log.exception("connection flag written; its config fingerprint was not taken")
+                after = None
+            if after is None:
+                # No digest of what is on disk now. The loaded one would read as a change at the
+                # next start, so the row records none and that start compares nothing.
+                return None
+            # The running graph now matches these bytes (the flag was reflected live), so the
+            # provenance baseline moves with it.
+            self.loaded_config_fingerprint = after
+            return after
 
     @property
     def running_config_dir(self) -> Path | None:

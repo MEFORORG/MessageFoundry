@@ -429,6 +429,94 @@ async def test_a_flag_toggle_does_not_vouch_for_an_unloaded_edit(
     assert rows[-1]["changed"] is True
 
 
+async def test_a_failed_digest_after_the_toggle_vouches_for_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
+) -> None:
+    """The toggle was the one change, but its after-digest could not be taken. The row carries no
+    digest rather than the loaded one, which the next start would read as a change."""
+    cfg = _toml_config(tmp_path)
+    app = _app(tmp_path, cfg)
+    async with app.router.lifespan_context(app), _client(app) as c:
+        real = Engine.fingerprint_bundle
+        calls = 0
+
+        async def _second_fails(self: Engine, path: Path) -> Any:
+            nonlocal calls
+            calls += 1
+            return (None, "unreadable") if calls == 2 else await real(self, path)
+
+        monkeypatch.setattr(Engine, "fingerprint_bundle", _second_fails)
+        r = await c.post(
+            "/connections/OB_TOML/flag", json={"direction": "outbound", "flagged": True}
+        )
+        assert r.status_code == 200, r.text
+        monkeypatch.setattr(Engine, "fingerprint_bundle", real)
+        engine: Engine = app.state.engine
+        flag = json.loads(
+            (await engine.store.list_audit(action="connection_flag_set"))[0]["detail"]
+        )
+    assert calls == 2, "control: the before and after digests were both asked for"
+    assert "fingerprint" not in flag
+    rows = await _start(tmp_path, cfg)
+    assert alerts == []
+    assert rows[-1]["changed"] is None
+
+
+# --- the alert timing ----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("where", ["engine-start", "a-later-step"])
+async def test_the_alert_fires_even_when_the_start_then_fails(
+    tmp_path: Path,
+    cfg: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    alerts: list[dict[str, Any]],
+    where: str,
+) -> None:
+    """New bytes that make the start fail must still page, on every attempt of a crash loop."""
+    await _start(tmp_path, cfg)
+    _edit(cfg)
+
+    if where == "engine-start":
+
+        async def _refuse(self: Engine) -> None:
+            raise RuntimeError("a listener could not bind")
+
+        monkeypatch.setattr(Engine, "start", _refuse)
+    else:
+
+        def _refuse_gate(*_a: Any, **_kw: Any) -> Any:
+            raise RuntimeError("a later startup step failed")
+
+        monkeypatch.setattr(app_module, "_build_approval_gate", _refuse_gate)
+    for attempt in (1, 2):
+        app = _app(tmp_path, cfg)
+        with pytest.raises(RuntimeError):
+            async with app.router.lifespan_context(app):
+                pass
+        assert len(alerts) == attempt, "each failed attempt pages"
+    assert alerts[0]["fingerprint"] == config_fingerprint(cfg)
+
+
+async def test_bounded_turns_a_foreign_cancellation_into_a_failed_read() -> None:
+    """A read cancelled by something other than the caller must not surface as CancelledError,
+    which the start's teardown would treat as the start itself being cancelled."""
+
+    async def _cancelled_inside() -> None:
+        raise asyncio.CancelledError
+
+    with pytest.raises(RuntimeError, match="cancelled"):
+        await app_module._bounded(_cancelled_inside(), 1.0)
+
+
+async def test_bounded_abandons_a_read_past_its_bound() -> None:
+    loop = asyncio.get_running_loop()
+    began = loop.time()
+    with pytest.raises(TimeoutError):
+        await app_module._bounded(asyncio.sleep(30), 0.05)
+    assert loop.time() - began < 5
+
+
 # --- the alert kind ------------------------------------------------------------------------------
 
 
