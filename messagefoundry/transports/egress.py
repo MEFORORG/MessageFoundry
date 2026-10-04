@@ -543,7 +543,8 @@ def _check_email_recipient_domains(dest: Destination, allowed: list[str]) -> Non
     except ValueError as exc:
         # The transport's own construction message, so the operator fixes the connection rather
         # than the allowlist.
-        log.warning("egress denied: outbound %r EMAIL recipients are unreadable", dest.name)
+        # Empty, or an entry holds a control character (vault BACKLOG #2870); the error says which.
+        log.warning("egress denied: outbound %r EMAIL recipients are refused: %s", dest.name, exc)
         raise WiringError(f"outbound {dest.name!r}: {exc}") from exc
     if not addresses:
         # Fail closed without leaning on the parser: a gate that checked nothing has not passed.

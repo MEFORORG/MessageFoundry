@@ -18,7 +18,7 @@ import json
 import sys
 import time
 import types
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import pytest
@@ -42,6 +42,7 @@ from messagefoundry.pipeline.security_notify import _SUBJECTS, _build_body
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import MessageStore, WebAuthnCredential
 from tests._admin_account import PROVISION_TOTP_SECRET, provision_totp
+from tests._totp_clock import fresh_totp
 
 # The directory-sign-in precondition, imported rather than re-derived: that module is where it is
 # measured, and this one only builds on it. Same convention as its own `_BACKENDS` import.
@@ -636,6 +637,66 @@ def test_an_argument_it_will_refuse_is_refused_before_the_prompt_and_the_open(
     assert main(["provision-admin", *argv, "--db", str(db), "--json"]) == 1
     assert needle in json.loads(capsys.readouterr().out)["error"]
     assert not db.exists(), "a refused provision left a store behind"
+
+
+#: Notification addresses the API and self-service paths refuse, because the alert sender could
+#: never put them on the RCPT TO line (vault BACKLOG #2870). Built from parts; the ids are neutral.
+_UNSENDABLE_ADDRESSES = {
+    "non-ascii-local": "é" + "ops@example.invalid",
+    "slash-local": "ops" + "/" + "team@example.invalid",
+    "percent-local": "ops" + "%" + "relay@example.invalid",
+    # Passes the send rule but not the older shape half, so it pins that half on this command.
+    "host-only": "ops" + "@" + "localhost",
+}
+
+
+@pytest.mark.parametrize(
+    "address", list(_UNSENDABLE_ADDRESSES.values()), ids=list(_UNSENDABLE_ADDRESSES)
+)
+def test_an_address_notices_could_not_be_sent_to_is_refused_before_the_prompt_and_the_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    address: str,
+) -> None:
+    """The same one-mailbox rule the API and self-service paths apply, so the Administrator this
+    provisions is not given an address every security notice would fail to reach."""
+    monkeypatch.chdir(tmp_path)
+    _key_in_this_shell(monkeypatch)
+    _no_prompt(monkeypatch)
+    db = tmp_path / "never.db"
+    argv = ["provision-admin", "--username", "site-admin", "--email", address]
+    assert main([*argv, "--db", str(db), "--json"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert "one email address" in error
+    assert address.partition("@")[0] not in error  # names the problem, never the address
+    assert not db.exists(), "a refused provision left a store behind"
+
+
+def test_a_plain_address_still_provisions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The control for the refusals above: the rule is not refusing every address.
+    monkeypatch.chdir(tmp_path)
+    key = _key_in_this_shell(monkeypatch)
+    _tty(monkeypatch, _PASSWORD, _PASSWORD)
+    db = tmp_path / "plain.db"
+    plain = "ops.team@example.invalid"
+    argv = ["provision-admin", "--username", "site-admin", "--email", plain]
+    assert main([*argv, "--db", str(db)]) == 0
+    assert "WARNING" not in capsys.readouterr().out
+
+    async def stored() -> str | None:
+        cipher = make_cipher(key)
+        store = await MessageStore.open(db, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
+        try:
+            row = await store.get_user_by_username("site-admin")
+            assert row is not None
+            return row.notify_email
+        finally:
+            await store.close()
+
+    assert asyncio.run(stored()) == plain
 
 
 def test_a_password_the_policy_refuses_leaves_no_store(
@@ -1725,10 +1786,15 @@ _TERMINAL_SECRET = PROVISION_TOTP_SECRET
 
 class _Terminal:
     """A console for the TOTP prompt: ``isatty`` True, ``readline`` answers the queued codes, and
-    ``shown`` records what reached the console device (``_show_on_terminal``)."""
+    ``shown`` records what reached the console device (``_show_on_terminal``).
 
-    def __init__(self, codes: list[str]) -> None:
-        self._codes = codes
+    An entry is a fixed string, or a callable that ``readline`` calls when the prompt asks. The
+    callable form is how a LIVE code is queued: an operator reads the authenticator at the prompt,
+    not before the command starts, and a code computed earlier belongs to whatever 30 s step that
+    earlier moment fell in (BACKLOG #2556)."""
+
+    def __init__(self, codes: Sequence[str | Callable[[], str]]) -> None:
+        self._codes = list(codes)
         self.asked = 0
         self.shown: list[str] = []
 
@@ -1744,7 +1810,10 @@ class _Terminal:
 
     def readline(self) -> str:
         self.asked += 1
-        return self._codes.pop(0) + "\n" if self._codes else ""
+        if not self._codes:
+            return ""
+        entry = self._codes.pop(0)
+        return (entry if isinstance(entry, str) else entry()) + "\n"
 
 
 def _drive_the_real_prompt(
@@ -1752,14 +1821,21 @@ def _drive_the_real_prompt(
 ) -> _Terminal:
     """Replace the suite-wide stub with the REAL ``_enrol_totp_at_terminal``, pin the generated
     secret so a correct code can be computed, and present a terminal that answers ``codes`` (one
-    live code by default). ``getpass`` answers the two password prompts."""
+    live code by default). ``getpass`` answers the two password prompts.
+
+    The default code is computed WHEN THE PROMPT ASKS, through ``fresh_totp``. The CLI checks the
+    code at its own ``time.time()`` with a skew of zero steps, so a code computed here, before the
+    command ran its argument checks, its policy build and two password prompts, was refused
+    whenever a step boundary fell in between. The prompt then asked again, found the queue empty,
+    and the command stopped on "empty authenticator code" (BACKLOG #2556)."""
     import messagefoundry.__main__ as cli
     from messagefoundry.auth import totp
 
     real = cli._enrol_totp_at_terminal.__wrapped__  # type: ignore[attr-defined]
     monkeypatch.setattr(cli, "_enrol_totp_at_terminal", real)
     monkeypatch.setattr(totp, "generate_secret", lambda: _TERMINAL_SECRET)
-    terminal = _Terminal(codes if codes is not None else [totp.totp(_TERMINAL_SECRET)])
+    live: list[str | Callable[[], str]] = [lambda: fresh_totp(_TERMINAL_SECRET)]
+    terminal = _Terminal(codes if codes is not None else live)
     monkeypatch.setattr(sys, "stdin", terminal)
     monkeypatch.setattr(cli, "_show_on_terminal", terminal.show)
     queued = [_PASSWORD, _PASSWORD]
@@ -1826,6 +1902,28 @@ def test_the_cli_enrols_totp_and_the_administrator_passes_a_live_lock_with_a_com
             await store.close()
 
     asyncio.run(check())
+
+
+def test_the_default_prompt_code_is_computed_when_the_prompt_asks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The terminal stub answers with the code of the step the PROMPT falls in, not the step the
+    helper was called in. The two differ whenever a 30 s boundary falls between them, and the CLI
+    checks with no skew, so a code from the earlier step is refused (BACKLOG #2556).
+
+    RED when: ``_drive_the_real_prompt`` computes its default code up front."""
+    from messagefoundry.auth import totp
+    from tests._totp_clock import pin_totp_clock
+
+    set_up_at = 1_700_000_000.0
+    asked_at = set_up_at + totp.DEFAULT_PERIOD
+    stale = totp.totp(_TERMINAL_SECRET, now=set_up_at)
+    live = totp.totp(_TERMINAL_SECRET, now=asked_at)
+    assert stale != live, "the two pinned steps must give different codes for this to discriminate"
+    pin_totp_clock(monkeypatch, set_up_at)
+    terminal = _drive_the_real_prompt(monkeypatch)
+    pin_totp_clock(monkeypatch, asked_at)
+    assert terminal.readline().strip() == live
 
 
 def test_a_wrong_code_at_the_prompt_writes_nothing(

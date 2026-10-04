@@ -67,6 +67,15 @@ suite("engineClient — getJson timeout (F2)", () => {
     assert.ok(Date.now() - started < 4000, "rejects promptly at the injected timeout");
   });
 
+  test("a POST given a timeout rejects the same way (BACKLOG #2281: the sign-in passes one)", async () => {
+    const started = Date.now();
+    await assert.rejects(
+      () => postJson(url, "/auth/login", { username: "op" }, undefined, 80),
+      (e: unknown) => e instanceof NetworkError && e.code === TIMEOUT_CODE,
+    );
+    assert.ok(Date.now() - started < 4000, "rejects promptly at the injected timeout");
+  });
+
   test("a refused connection carries ECONNREFUSED, distinctly from a timeout", async () => {
     // Close the server first so the port is dead — the OS refuses immediately.
     await new Promise<void>((resolve) => server.close(() => resolve()));

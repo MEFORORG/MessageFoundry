@@ -254,8 +254,10 @@ async def test_a_non_ascii_profile_address_is_not_suggested(engine: Engine) -> N
             "alice@xn--exmple-4nf.org",  # the Cyrillic-a domain above, IDNA-encoded
             "alice@mail.XN--exmple-4nf.org",  # the same, upper case and not the first label
         ):
-            # The control: the shape check passes each one, so the refusal below is the new rule's.
-            assert _is_single_mailbox(value), ascii(value)
+            # The control: the shape check passes each ASCII one, so its refusal below is the
+            # lookalike rule's. Since vault BACKLOG #2870 the shape check itself refuses a non-ASCII
+            # address, because the alert sender could never put it on the RCPT TO line.
+            assert _is_single_mailbox(value) == value.isascii(), ascii(value)
             await engine.store.update_user_profile(user_id, display_name=None, email=value)
             page = await c.get(PAGE)
             assert page.status_code == 200, ascii(value)

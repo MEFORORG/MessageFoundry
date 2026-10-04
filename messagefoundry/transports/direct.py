@@ -81,6 +81,7 @@ from messagefoundry.transports.base import (
     encode_wire_body,
     register_destination,
 )
+from messagefoundry.transports.email import checked_envelope
 
 __all__ = ["DirectDestination"]
 
@@ -112,20 +113,6 @@ _BUILD_ERRORS: tuple[type[Exception], ...] = (
     UnsupportedAlgorithm,
     InternalError,
 )
-
-
-def _as_recipients(value: Any) -> list[str]:
-    """Coerce the ``recipients`` setting to a non-empty list of Direct address strings (a lone string
-    is one recipient). Mirrors :func:`messagefoundry.transports.email._as_recipients`."""
-    if isinstance(value, str):
-        recipients = [value] if value else []
-    elif isinstance(value, (list, tuple)):
-        recipients = [str(item) for item in value if str(item)]
-    else:
-        recipients = []
-    if not recipients:
-        raise ValueError("Direct destination requires a non-empty 'recipients' setting")
-    return recipients
 
 
 def _read_file(setting: str, value: Any) -> bytes:
@@ -249,7 +236,12 @@ class DirectDestination(DestinationConnector):
         self.host = host
         self.port = int(s.get("port", 587))
         self.sender = sender
-        self.recipients = _as_recipients(s.get("recipients"))
+        # The Email destination's address rule, for the sender and each recipient, with the headers
+        # built from the checked text. MAIL FROM and RCPT TO are then passed explicitly at send, so a
+        # header parse that decodes an encoded word or expands a group cannot move the envelope
+        # (vault BACKLOG #2870). Checked before the crypto material, so _probe_build uses it too.
+        self._envelope = checked_envelope("Direct destination", sender, s.get("recipients"))
+        self.recipients = list(self._envelope.recipients)
         self.subject = str(s.get("subject", ""))
         username = s.get("username")
         password = s.get("password")
@@ -257,8 +249,9 @@ class DirectDestination(DestinationConnector):
         self.password: str | None = str(password) if password else None
         self.use_tls = bool(s.get("use_tls", True))
         # #323: server-certificate verification on the TLS hop, kept byte-identical to
-        # EmailDestination's spelling (this connector's SMTP core is a deliberate copy, not an import —
-        # the one-way dependency rule — so the two must not drift).
+        # EmailDestination's spelling. This connector's TLS and AUTH handling is a copy of that
+        # connector's, so the two must not drift; its envelope check is imported from
+        # transports/email.py (checked_envelope, vault BACKLOG #2870).
         self.tls_verify = bool(s.get("tls_verify", True))
         tls_ca_file = s.get("tls_ca_file")
         self.tls_ca_file: str | None = str(tls_ca_file) if tls_ca_file else None
@@ -627,8 +620,7 @@ class DirectDestination(DestinationConnector):
         )
         msg = EmailMessage()
         msg["Subject"] = self.subject
-        msg["From"] = self.sender
-        msg["To"] = ", ".join(self.recipients)
+        self._envelope.address(msg)
         # RFC 5751 S/MIME enveloped-data content type; the enveloped DER is the body.
         msg.set_content(
             enveloped,
@@ -704,7 +696,7 @@ class DirectDestination(DestinationConnector):
                         channel_encrypted=self.use_tls,
                         cell="DIRECT outbound",
                     )
-                smtp.send_message(msg)
+                self._envelope.send(smtp, msg)
         except InsecureHopRefused as exc:
             # A POLICY refusal is not an internal code error. Unconverted it is a ValueError,
             # which escapes the arms below and lands in the delivery worker's catch-all --

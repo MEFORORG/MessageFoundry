@@ -356,7 +356,9 @@ async def test_an_administrator_typed_address_is_still_seeded_as_typed() -> None
     try:
         service = AuthService(store, _no_mfa(), security_notifier=_FakeNotifier())
         await service.initialize()
-        typed = _UNADOPTABLE_DIRECTORY_MAIL[0][1]
+        # The punycode entry, not the Cyrillic one: since vault BACKLOG #2870 a typed address must
+        # also pass the alert sender's RCPT TO rule, which refuses a non-ASCII local part.
+        typed = _UNADOPTABLE_DIRECTORY_MAIL[1][1]
         user_id = await _add_local(service, "typed", email=typed)
         user = await store.get_user(user_id)
         assert user is not None and user.notify_email == typed
@@ -567,7 +569,9 @@ async def test_the_service_refuses_a_malformed_address_before_any_write() -> Non
     try:
         service = AuthService(store, _no_mfa(), security_notifier=_FakeNotifier())
         await service.initialize()
-        for bad in ("", "  ", "a@b.org; c@d.org"):
+        # The last is one mailbox that the alert sender refuses as RCPT TO (vault BACKLOG #2870), so
+        # every notice to it would fail at send.
+        for bad in ("", "  ", "a@b.org; c@d.org", "first" + "/" + "last@b.org"):
             with pytest.raises(InvalidNotifyEmail):
                 await create_local_user_chosen(
                     service,

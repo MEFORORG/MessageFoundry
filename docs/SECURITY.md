@@ -115,9 +115,11 @@ flowchart TB
 Four more facts:
 
 - Egress is closed by default. Under the default posture `serve` refuses to start until the
-  operator says where the engine may send. That means at least one `[egress].allowed_*` list, or
-  `[security].block_unlisted_outbound = true`. With that setting left unset, `serve` turns it on.
-  A transport whose list is empty then refuses every destination of its type.
+  operator says where the engine may send. That means at least one `[egress]` destination list
+  the startup gate counts, or `[security].block_unlisted_outbound = true`.
+  [CONFIGURATION.md `[egress]`](CONFIGURATION.md#egress) says which lists count. That setting is on
+  unless it is written false, for every entry point and not only `serve` (vault BACKLOG #2605). A
+  transport whose list is empty refuses every destination of its type.
 - Full message bodies belong in the message store, not in the general log. Treat the log files and
   the off-box copy as sensitive all the same.
   [PHI.md section 7](PHI.md#7-logging--phi-redaction) covers redaction and the logging rules.
@@ -172,10 +174,13 @@ the route takes a body.
 
 - `create_app` sets the class on the app's router. Each route registered on the app gets the
   check with nothing to remember, and no list of routes is kept.
-- Some route shapes are not covered, and the engine has none of them. The class docstring is the
-  one list. It names at least a route added through `include_router`, a gate nested inside
-  another dependency, and an unmarked dependency ahead of a gate. An embedder who adds routes in
-  one of those ways must check them.
+- Some route shapes are not covered. The class docstring is the one list. It names at least a
+  route added through `include_router`, a gate nested inside another dependency, and an unmarked
+  dependency ahead of a gate. The engine adds no route through `include_router`, and every gated
+  engine HTTP route keeps its gate at the top level. The third shape is present. Every route carries
+  `refuse_undeclared_route`, described below, which never refuses a route that has a gate. Some
+  routes carry others, such as `_no_store_reply` in `messagefoundry/api/auth_routes.py`. An
+  embedder who adds routes in one of those ways must check them.
 - The gate itself does not change. After the body is read it runs in full, as before: sign-in
   again, then the password and factor checks, the permission check and its audit rows, pacing and
   step-up. So a signed-in caller that the gate then refuses still gets the parser's answer first
@@ -184,13 +189,44 @@ the route takes a body.
   arriving is refused by the gate. The price is one more identity lookup for a signed-in
   request to a route with a body. That lookup reads the session, its user and the user's roles.
   It writes nothing, so it does not move the session's idle clock.
-- A route with no gate is not touched. `POST /auth/login` has to parse a body from a caller with
-  no session. A gated route that declares no body is not touched either, because FastAPI already
+- A route with no gate that is declared public is not touched. `POST /auth/login` has to parse a
+  body from a caller with no session. A route with no gate and no declaration is refused before
+  its body is read, as described below. A gated route that declares no body is not touched either, because FastAPI already
   runs its gate first. That includes the web console's `/ui` routes, which read their forms
   inside the handler.
 
 `tests/test_auth_before_body.py` tests the mechanism. `tests/test_preauth_malformed_body.py` pins
 what an unauthenticated caller gets on every operation that takes a body.
+
+**A route that does not declare how it is authorized is refused (vault BACKLOG #2604).**
+`create_app` adds one app-level dependency, `refuse_undeclared_route`
+(`messagefoundry/api/security.py`). It applies to every FastAPI route registered on the app, web
+console routes included, and runs first among each route's dependencies. On a gated route that takes a
+body, the early sign-in check above still answers before it. A route passes in one of two ways:
+
+- It has a top-level gate dependency. Every `require*()` factory, and each of the web console's
+  `require_ui*()` factories, marks its gate with `mark_route_gate`. The check reads that mark,
+  never a function's name.
+- Its endpoint carries a declaration with a reason. `public_route` marks a route that no gate
+  dependency guards by design, such as sign-in. Some web console routes of this kind still read a
+  pending session inside the handler, such as `/ui/mfa`. `authorizes_in_body` marks a WebSocket
+  that authorizes the caller inside its own body, and `/ws/stats` is the engine route that uses it.
+  On an HTTP route with no gate, that mark does not count, so the route is refused.
+
+Any other route answers **403** `this route declares no authorization`, and a WebSocket is refused
+before it is accepted. The first refusal on a route is logged at ERROR, because such a route is a
+defect in the code that registered it. On a body-taking route built by the app's route class, the
+refusal comes before the body is read. The check asks only that a route declared a gate. It does not check that
+the gate is correct.
+
+- A route whose gate is nested inside another dependency, or added only by `include_router`, is
+  refused. That is the safe side.
+- At least two kinds of route sit outside the check, because they carry no dependencies. One is a
+  route inside a mounted application; `/ui/static` is the only mount. The other is a plain
+  Starlette route; the interactive docs and the schema that `expose_docs` turns on are the only ones.
+
+The route walk in `scripts/security/route_gates.py` reads the same mark. `tests/test_route_deny_default.py`
+checks that every shipped route declares itself and still answers an anonymous caller as before.
 
 **The proxy-to-engine hop is yours to secure, and `serve` makes you say so (BACKLOG #1179).** With
 `tls_terminated_upstream`, the proxy terminates TLS and the engine mints no certificate
@@ -1004,7 +1040,9 @@ not. Every one is listed below — none is collapsed away.
 
 #### Functions requiring no authorization
 
-These are the routes the requirement equally demands be defined.
+These are the routes the requirement equally demands be defined. Each endpoint carries a
+`public_route` declaration with its reason; without one the engine would refuse it, as
+[Enforcement model](#enforcement-model) says.
 
 | Method | Path | Why | Compensating control |
 |---|---|---|---|
@@ -2226,12 +2264,18 @@ alone:
    `POST /me/reauth` refuses an `oidc` session. Such a session can re-anchor through the IdP step-up.
    The operator's browser starts it at `POST /ui/reauth/oidc`. When the browser's return to
    `GET /ui/oidc/callback` succeeds, that request's address becomes the anchor. The
-   audit event + notice fire **once per (session, new address)** — a replayed token retrying from one
-   address is force-stepped-up each time but cannot inflate the audit log / notifications. It is
+   audit event + notice fire **once per (session, new address)** between re-verifications, in
+   each engine process. A re-verification starts the count over, so an address flagged before it
+   is reported again. Between re-verifications one session reports at most **eight** addresses
+   (`_NEW_IP_PER_SESSION_MAX` in `auth/service.py`), plus one row carrying `cap_reached` for the
+   first address past that, because the check runs on every sensitive request. So a replayed
+   token, retrying from one address or alternating between several, is force-stepped-up each time
+   but cannot inflate the audit log / notifications (BACKLOG #2159). It is
    **advisory + step-up-forcing only** — it never changes an RBAC allow/deny and never blocks the
    non-admin request path. **On by default** since BACKLOG #288, and a no-op on a single-host
    loopback bind (loopback addresses `127.0.0.1` and `::1` are treated as the same host, so a
-   dual-stack box never spuriously fires). Turning it off is a named loosening
+   dual-stack box never spuriously fires). An IPv4-mapped form such as `::ffff:10.0.0.5` compares
+   as its IPv4 address, as the sign-in signal's does. Turning it off is a named loosening
    ([SECURITY-LOOSENING.md](SECURITY-LOOSENING.md)).
 
 **Continuous identity verification** underpins all of the above: every HTTP request re-resolves the user
@@ -2510,7 +2554,7 @@ slack.
 | Login attempt rate, per client IP **and** globally | `request.client.host` (or the literal `"unknown"`) | > 10 attempts per IP (`login_rate_limit_per_ip`), or > 60 across all clients (`login_rate_limit_global`), in a rolling 60 s window (`login_rate_limit_window_seconds`); a refused attempt is not itself counted | **THROTTLE** — 429 `too many attempts` with **no** `Retry-After` on the three JSON routes; 429 + `Retry-After: 30` on `POST /ui/login`; a **303** redirect to `/ui/login?e=rate_limited` (no 429, no `Retry-After`) on `GET /ui/sso`, `POST /ui/oidc/start` and `GET /ui/oidc/callback`, and on `GET /ui/oidc/start` only when its interstitial is skipped (see the [Route → limiter map](#route--limiter-map)). WARNING-logged, deliberately **not** audited | on, 10 / 60 / 60 s | `[auth].login_rate_limit_enabled` |
 | Credential-ceremony rate, per **actor** | `identity.user_id` (**not** an IP) | > `login_rate_limit_per_ip` (10) ceremonies per actor per 60 s; **no** global dimension (`glob=0`, deliberately) | **THROTTLE** 429, logged | on with the row above | *gated by the same* `[auth].login_rate_limit_enabled` |
 | Consecutive credential failures on one account | the account's two failure counters (ADR 0197): the **sign-in** counter and the **second-step** counter | ≥ 5 consecutive failures on one counter locks for 15 minutes, with one exception: while the credential in force is engine-generated (set by an administrator's account creation, `POST /users`, and by both resets), sign-in failures are counted and audited but arm no sign-in lock (`lockout_arms`, ADR 0197 Amendment A); a lapsed window restarts the counter; the second-step lock on a local account, and the sign-in lock on a local account with TOTP enrolled, double per cycle up to 24 hours | **DENY** before any verify on the password and second-factor legs, plus an audit row whose name is leg-specific — on the password path the uniform `auth.login_failed` (`bad_credentials`) row every refused sign-in writes and then `auth.login_locked`, which only `users:manage` reads ([Audit](#audit)), `auth.mfa_failed` / `auth.webauthn_failed` with `reason=locked` on the TOTP/recovery and assertion legs (the sign-in password path still runs a dummy argon2 verify to keep timing flat). The second-step lock refuses every one of those legs. The sign-in lock has **two** exceptions: it does **not** refuse a combined sign-in (password and TOTP code in one request) on a local account with TOTP enrolled, and it refuses **no** second-factor leg. The Kerberos and OIDC sign-ins also refuse a row under either lock, but only **after** the ticket or token has verified, audited `auth.login_failed` with `reason=locked` (`_directory_login_refusal`, BACKLOG #1638); neither leg feeds the counter. The password legs of the post-session re-proofs, `POST /me/reauth` and `POST /me/password` and their console twins `POST /ui/reauth` and `POST /ui/account/password`, **feed** the sign-in counter but are **not** refused by either lock; the IdP step-up of an `oidc` session checks no engine credential and feeds neither counter; each **session** may fail `lockout_threshold` re-proofs (5 by default), and the failure that reaches it revokes that session, audited as `auth.reauth` with `session_revoked=true` or `auth.password_change_failed` with `reason=session_revoked` | 5 / 15 min | `[auth].lockout_threshold`, `lockout_minutes`, `lockout_max_minutes` |
-| New client IP during a session | this request's address vs `session.client` | knob on **and** a session exists, is unrevoked, has an anchor, and the two are not the same host (both-loopback counts as one host) | **CHALLENGE** — force a fresh step-up; first sighting also writes `auth.admin_action_new_ip` + an out-of-band notice; repeats WARNING-log only. **Never** an RBAC deny | **on**; `false` is a named loosening | `[auth].admin_new_ip_step_up` |
+| New client IP during a session | this request's address vs `session.client` | knob on **and** a session exists, is unrevoked, has an anchor, and the two are not the same host (as [Administrative-interface defense-in-depth](#administrative-interface-defense-in-depth-wp-l3-13-asvs-842) defines it) | **CHALLENGE** — force a fresh step-up; a first sighting also writes `auth.admin_action_new_ip` + an out-of-band notice, debounced and capped per session as that section states; repeats WARNING-log only. **Never** an RBAC deny | **on**; `false` is a named loosening | `[auth].admin_new_ip_step_up` |
 | First-seen sign-in address — sign-in owes no second factor (local leg) | the sign-in's client address vs the addresses on the account's own `auth.login_success` rows that owed no second factor, plus its `auth.mfa_verified` and `auth.webauthn_verified` rows (ADR 0150 `client`; an IPv4-mapped form compares as its IPv4 address). Each read is bounded in rows and to a lookback window no earlier than the account's creation; the bounds are `_LOGIN_ADDRESS_*` in `auth/service.py`. Read at session mint on the local, Kerberos and OIDC legs, after the first credential verified | no address in that history is the same host (both-loopback counts as one host) **and** the account has signed in before. With no history and no prior sign-in, no client address, or a failed read, the signal fails open and writes `auth.login_address_unevaluated` with `reason` `no_baseline`, `unknown_address` or `read_failed` | **CHALLENGE** — `auth.login_new_ip` + an out-of-band `login_new_ip` notice (at most one per account and address per 15 minutes; the audit row is written every time), and the session is minted **without** step-up freshness (`seed_reauth=False`), except a combined sign-in (password and TOTP code in one request, ADR 0197), which proved the second factor in the same request and is seeded as `verify_mfa` seeds it. **Never** refuses the login. The login's own row then counts as seen, so a second sign-in from that address is seeded (BACKLOG #288) | on | (no knob) |
 | First-seen sign-in address — sign-in owes a second factor, or any directory sign-in | as the row above | as the row above | **LOG** — the same audit row and notice, and nothing else changes. Such a session is born without step-up freshness anyway. A later proof stamps the window, for example a TOTP or recovery code, or a step-up (a passkey alone does not). A Kerberos or password session steps up with the account password; an `oidc` session steps up at the IdP. Under the shipped `require_mfa` scope (`every_local_account`) this is the path every password-only local sign-in takes. A combined sign-in (password and TOTP code in one request) owes nothing more, so it takes the row above instead and is seeded from any address. **Never** refuses the login (BACKLOG #288) | on | (no knob) |
 | Credential recency | age of `session.reauth_at` | `now − reauth_at > step_up_max_age_seconds`, or `reauth_at is None` | **DENY** 403 + `X-Step-Up-Required: 1` (console: 303 → `/ui/reauth`) | 300 s | `[auth].step_up_max_age_seconds` |
@@ -3219,8 +3263,9 @@ and stays valid until it expires. The two bearer sign-in routes, `POST /auth/log
 return a token and replace none, so ending a client's old token is the client's own act. On
 `POST /auth/login` the client can do it in the same request: a `supersedes` field in the body names
 the token being replaced, and the engine ends it as the console legs do, before the cap counts.
-`POST /auth/negotiate` has no body and revokes nothing. The VS Code extension still ends its old
-token with `POST /auth/logout` after it signs in again.
+`POST /auth/negotiate` has no body and revokes nothing. The VS Code extension and the Python
+engine client (`EngineClient.login`) both name the token they replace in `supersedes`. The Python
+client names only a token the engine issued to it, never one adopted with `set_token`.
 
 A session's `id` is its token hash, and that hash changes whenever the session completes MFA or a
 step-up. So an id shown on a sessions page can go stale. The console's revoke says "Nothing was
@@ -3876,7 +3921,7 @@ additionally front the API with a proxy/WAF limiter and TLS.
 | Egress response body | *(module constants in `transports/bounded_read.py`: `DEFAULT_MAX_RESPONSE_BYTES`, `MAX_TOKEN_RESPONSE_BYTES` — no knobs)* | 16 MiB; 256 KiB on a token endpoint | per response | no | no | no | **stateless** — a per-response test carrying no budget, applied at every outbound HTTP read: REST, SOAP, FHIR write, the `fhir_lookup` live read, DICOMweb STOW-RS, the OAuth2 and SMART token endpoints, the AI broker and the alert webhook, plus each of their reachability probes | the read stops at the bound plus one byte and raises `ResponseTooLargeError`, a `DeliveryError`, so the message retries and then dead-letters like any other reply the engine could not read; a `fhir_lookup` refusal is a `FhirLookupError` the Handler sees directly, and the two HTTP-error-body reads instead WARNING-log and classify on the status alone. 16 MiB is not a new number — it is `parsing/peek.DEFAULT_MAX_MESSAGE_BYTES`, the engine's existing one-message ceiling, so no honest clinical reply is refused. **Egress only:** this bounds a reply to a request the engine made, never a received message, so it cannot drop one (BACKLOG #1191) |
 | OIDC pending flows | `[auth].oidc_flow_cache_max` (global), `DEFAULT_PER_IP_CAP` (per-IP, no knob), `oidc_flow_ttl_seconds` | 512 / 16 / 300 s | 300 s TTL | no | **yes** (512) | **yes** (16) | **in-process** — `POST /ui/oidc/start`, and `GET /ui/oidc/start` when its interstitial is skipped, and the step-up start `POST /ui/reauth/oidc` (`begin_oidc_step_up`) — reject-when-full, never evict | 303 → `/ui/login?e=rate_limited` on the sign-in start; 429 re-rendering the step-up page, no `Retry-After`, on `POST /ui/reauth/oidc`; WARNING-logged, **never** audited |
 | WebAuthn pending ceremonies | `GLOBAL_PENDING_CAP`, `PER_USER_PENDING_CAP`, `CHALLENGE_TTL_SECONDS` (module constants, no knobs) | 4096 / 16 / 120 s | 120 s TTL | **yes** (16) | **yes** (4096) | no | **in-process** — every passkey registration + assertion ceremony | per-user: evicts that user's **own** oldest pending ceremony (silent); global: `ChallengeCacheFullError` naming the cause + the `admin_reset_mfa` recovery path |
-| **Ingest plane** | `max_messages_per_second`, `message_burst` (MLLP, raw-TCP, X12 and HTTP inbounds) | **off** (unset = no rate bound) | per message | no | no | no | **in-process** — one bucket per MLLP / raw-TCP / X12 **connection** and one per HTTP **listener**, so it neither coordinates across engine shards nor aggregates per peer | **Ships OFF, and the off default is ruled rather than accidental** — a rate on a clinical interface is only safe at a number taken from a real feed profile. **So a default install has NO message-RATE bound on the ingest plane**, and that is a deliberate posture, not a gap in the control. Both keys are parameters of the `MLLP()`, `Tcp()`, `X12()` and `Http()` factories, so **the code-first surface expresses them on all four**. `connections.toml` desugars through those same factories, so **the TOML surface expresses them on three of the four**: `X12` is absent from that loader's `_TRANSPORTS` map entirely, so **no** X12 setting is expressible in `connections.toml` and the pacing keys are not a special case of that. Closing it means adding the transport, which is a separate decision from this control; the gap is pinned with its own positive control at `tests/test_ingress_message_pacing.py::test_x12_has_no_toml_surface_at_all_which_is_a_separate_gap` (BACKLOG #1249 for MLLP, BACKLOG #1114 for the other three — until #1249 landed the pacer was built and no documented configuration could turn it on, and until #1114 landed the other three intakes had no rate control in **any** configuration, which is a different and worse thing than being off). *What it does when set:* the listener **pauses reading before its next read** so TCP back-pressures the sender; no message is dropped, refused, NAK'd, 429'd or reordered — the count-and-log invariant forbids accept-and-drop, so a discarding limiter was never available. **The HTTP bucket is listener-wide, not per-connection**, because that connector answers one request per connection; a `GET`/`HEAD` probe waits behind an outstanding debt but charges nothing. **Two SIBLING intake bounds on different units, added by BACKLOG #1114 — read them as separate controls, not as this row's keys reaching further.** (1) `max_associations_per_second` / `association_burst` bound the **DICOM C-STORE SCP**, and the unit is an **association**, not a message: `pynetdicom` owns the read loop, so by the time a C-STORE reaches the engine the object has already been read and decoded, and a pace after decode would delay a message the count-and-log invariant has already obliged us to account for. The pacer waits before reading the association request and never refuses one. The engine-wide intake pause is a separate control that does refuse a new association as busy while it holds (BACKLOG #290; the `[inbound].max_staged_depth` row of [CONFIGURATION.md](CONFIGURATION.md) says how). An established association is still **unbounded in the objects it may push** (`max_object_bytes` and `timeout_seconds` bound those instead). It **ships OFF**, for the reason in bold above, so it does not soften the sentence about a default install. (2) `poll_max_files` (the `File`, `Sftp` and `Ftp` sources) and `poll_max_rows` (the `DatabasePoll` source) cap how many items one **poll tick** takes, not how many it lists, and both **ship ON at 500**. That is the opposite default, deliberately, because a poll source has no sender to back-pressure. The excess is **deferred, not refused**: it stays in the drop directory or the table for a later tick. That holds on the Database source only under conditions, and a file source can still spend the cap on a file it leaves in place; [CONNECTIONS.md §*Per-tick poll ceilings*](CONNECTIONS.md#per-tick-poll-ceilings) states both, with what spends the cap on each source, why 500 and when to raise it. A negative or non-numeric value is **refused when the connection is built**, before it starts. **Still not covered even when set:** any **per-message** bound on the DICOM SCP, and any **per-peer MESSAGE-RATE** bound (MLLP, TCP and X12 peers are unauthenticated, so the only key would be source IP, which NAT collapses). **A per-peer CONNECTION bound does now ship on the MLLP listener** — `max_connections_per_host` (32), BACKLOG #1725 — and it is a different unit: it caps concurrent sockets from one address, refusing pre-ingress, and never bounds how fast an admitted peer may send. It keys on source IP, so the NAT objection still applies to it and is recorded at its constant; behind a source-NAT proxy set it to `None`/`0`. The raw-TCP, X12, HTTP and DICOM intakes carry no per-host term. **Resource bounds that DO ship on** — at least `max_connections` (256), the MLLP listener's `max_connections_per_host` (32) and `max_frame_seconds` (60.0 s, one frame start-byte to end-byte; `receive_timeout` resets on every byte received and so bounds only silence), `receive_timeout` (60.0 s), `max_frame_bytes` (16 MiB), per-connection `max_message_bytes`, `poll_max_files` and `poll_max_rows` (500, on the poll sources), `source_ip_allowlist` |
+| **Ingest plane** | `max_messages_per_second`, `message_burst` (MLLP, raw-TCP, X12 and HTTP inbounds) | **off** (unset = no rate bound) | per message | no | no | no | **in-process** — one bucket per MLLP / raw-TCP / X12 **connection** and one per HTTP **listener**, so it neither coordinates across engine shards nor aggregates per peer | **Ships OFF, and the off default is ruled rather than accidental** — a rate on a clinical interface is only safe at a number taken from a real feed profile. **So a default install has NO message-RATE bound on the ingest plane**, and that is a deliberate posture, not a gap in the control. Both keys are parameters of the `MLLP()`, `Tcp()`, `X12()` and `Http()` factories, so **the code-first surface expresses them on all four**. `connections.toml` desugars through those same factories, so **the TOML surface expresses them on three of the four**: `X12` is absent from that loader's `_TRANSPORTS` map entirely, so **no** X12 setting is expressible in `connections.toml` and the pacing keys are not a special case of that. Closing it means adding the transport, which is a separate decision from this control; the gap is pinned with its own positive control at `tests/test_ingress_message_pacing.py::test_x12_has_no_toml_surface_at_all_which_is_a_separate_gap` (BACKLOG #1249 for MLLP, BACKLOG #1114 for the other three — until #1249 landed the pacer was built and no documented configuration could turn it on, and until #1114 landed the other three intakes had no rate control in **any** configuration, which is a different and worse thing than being off). *What it does when set:* the listener **pauses reading before its next read** so TCP back-pressures the sender; no message is dropped, refused, NAK'd, 429'd or reordered — the count-and-log invariant forbids accept-and-drop, so a discarding limiter was never available. **The HTTP bucket is listener-wide, not per-connection**, because that connector answers one request per connection; a `GET`/`HEAD` probe waits behind an outstanding debt but charges nothing. **Two SIBLING intake bounds on different units, added by BACKLOG #1114 — read them as separate controls, not as this row's keys reaching further.** (1) `max_associations_per_second` / `association_burst` bound the **DICOM C-STORE SCP**, and the unit is an **association**, not a message: `pynetdicom` owns the read loop, so by the time a C-STORE reaches the engine the object has already been read and decoded, and a pace after decode would delay a message the count-and-log invariant has already obliged us to account for. The pacer waits before reading the association request and never refuses one. The engine-wide intake pause is a separate control that does refuse a new association as busy while it holds (BACKLOG #290; the `[inbound].max_staged_depth` row of [CONFIGURATION.md](CONFIGURATION.md) says how). An established association is still **unbounded in the objects it may push** (`max_object_bytes` and `timeout_seconds` bound those instead). It **ships OFF**, for the reason in bold above, so it does not soften the sentence about a default install. (2) `poll_max_files` (the `File`, `Sftp` and `Ftp` sources) and `poll_max_rows` (the `DatabasePoll` source) cap how many items one **poll tick** takes, not how many it lists, and both **ship ON at 500**. That is the opposite default, deliberately, because a poll source has no sender to back-pressure. The excess is **deferred, not refused**: it stays in the drop directory or the table for a later tick. That holds on the Database source only under conditions, and a file source can still spend the cap on a file it leaves in place; [CONNECTIONS.md §*Per-tick poll ceilings*](CONNECTIONS.md#per-tick-poll-ceilings) states both, with what spends the cap on each source, why 500 and when to raise it. A negative or non-numeric value is **refused when the connection is built**, before it starts. **Still not covered even when set:** any **per-message** bound on the DICOM SCP, and any **per-peer MESSAGE-RATE** bound (MLLP, TCP and X12 peers are unauthenticated, so the only key would be source IP, which NAT collapses). **A per-peer CONNECTION bound does now ship on the MLLP, raw-TCP and X12 listeners** — `max_connections_per_host` (32). BACKLOG #1725 added it to MLLP, and vault BACKLOG #2606 to the other two. It is a different unit: it caps concurrent sockets from one address, refusing pre-ingress, and never bounds how fast an admitted peer may send. It keys on source IP, so the NAT objection still applies to it and is recorded at its constant; behind a source-NAT proxy set it to `None`/`0`. The HTTP listener takes the same key but **ships it off**. Behind a reverse proxy every partner arrives from one address, so a cap there would be the listener's whole capacity. The DICOM intake carries no per-host term. **Resource bounds that DO ship on** — at least `max_connections` (256), the MLLP, raw-TCP and X12 listeners' `max_connections_per_host` (32) and `max_frame_seconds` (60.0 s), `receive_timeout` (60.0 s), `max_frame_bytes` (16 MiB), per-connection `max_message_bytes`, `poll_max_files` and `poll_max_rows` (500, on the poll sources), `source_ip_allowlist`. On the MLLP, raw-TCP and X12 listeners `receive_timeout` resets on every byte received, so it bounds only silence; `max_frame_seconds` bounds the frame. On MLLP that deadline runs from a start byte to its end byte. On raw TCP and X12 it starts on any bytes, inside a frame or not, and an X12 frame is one interchange from `ISA` to `IEA`. |
 
 **What these limits defend, and what they do not.** The full inventory of resource-demanding
 functionality — including the surfaces that remain **unbounded** at this release — is
@@ -3941,7 +3986,8 @@ IP is a backlog follow-up).
 
 Every authentication and authorization event is written to the durable `audit_log` with the acting
 user: `auth.login_success` / `auth.login_failed` / `auth.login_locked` / `auth.logout` /
-`auth.login_new_ip` / `auth.login_address_unevaluated` (the first-seen sign-in address, BACKLOG #288) /
+`auth.login_new_ip` / `auth.login_address_unevaluated` (the first-seen sign-in address, BACKLOG #288;
+on a directory sign-in the row's `mech` names the leg, `kerberos` or `oidc`) /
 `auth.permission_denied` / `auth.channel_denied`, the 6.3.5 events `auth.account_locked` /
 `auth.login_after_failures`, the re-proof rows `auth.reauth` / `auth.password_change_failed`, plus `user.created` / `user.roles_changed` /
 `user.channel_scope_changed` / `user.deleted`, `ad_group_map.updated` / `ad_group_scope_map.updated`,

@@ -460,7 +460,7 @@ the bytes.
 | `receive_timeout` | in | `60.0` | close a client idle this many seconds (slowloris). `None`/`0` = no timeout. |
 | `max_frame_bytes` | both | `16 MiB` | reject a single frame larger than this before buffering it whole (OOM guard); applies to inbound frames and any framed reply. `None`/`0` = unlimited. |
 | `max_connections_per_host` | in | `32` | cap on concurrent connections from **one peer address** (vault BACKLOG #2606), as on MLLP. Refused pre-ingress with an `at_capacity` event whose reason reads `max_connections_per_host`. **Set it to `None`/`0` behind a source-NAT proxy**, where every partner shares one address. |
-| `max_frame_seconds` | in | `60.0` | close a client whose frame takes longer than this from its **start byte to its end byte** (vault BACKLOG #2606), as on MLLP: the bound on a peer that trickles bytes and so is never idle. Closes with a `closed` event whose reason reads `frame_deadline`. **Raise it with `max_frame_bytes`.** `None`/`0` = no deadline. |
+| `max_frame_seconds` | in | `60.0` | close a client whose frame takes longer than this to complete (vault BACKLOG #2606): the bound on a peer that trickles bytes and so is never idle. Unlike MLLP, the clock starts on **any** bytes, inside a frame or not, so bytes outside a frame cannot hold a slot either. Closes with a `closed` event whose reason reads `frame_deadline`. **Raise it with `max_frame_bytes`.** `None`/`0` = no deadline. |
 | `max_messages_per_second` | in | **off** | sustained message-rate ceiling per **connection** (ASVS 2.4.1 / 15.2.2, BACKLOG #1114 — the MLLP pacer, ported). Over budget the listener **pauses reading**, so TCP back-pressures the sender — **no message is ever dropped, refused or reordered**. Unset = no bound, which is a deliberate exception to this table's usual secure-default rule: a guessed rate on a clinical interface throttles real traffic, so the number has to come from your own feed profile. |
 | `message_burst` | in | = the rate | tokens the bucket holds, i.e. how large a burst passes unpaced before the sustained rate applies. Only meaningful with `max_messages_per_second` set. Floor of 1 so a connection can always make progress. |
 | `connect_timeout` | out | `10.0` | TCP connect timeout (s) |
@@ -1885,11 +1885,13 @@ wrapping an HL7 payload) — **not** the full envelope. The transport builds the
 - **Populate `[egress].allowed_http`.** A WS-\* mTLS destination carries PHI, so its host must be listed
   — and on a **PHI** instance (every built-in env name by default,
   [ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md)) leaving it
-  empty does **not** mean "unrestricted". With no `[egress]` allowlist at all, `serve` refuses to start;
-  with any other list set, it flips `[security].block_unlisted_outbound` on and an empty `allowed_http`
-  then refuses *every* HTTP destination. Empty-means-unrestricted survives only where an operator
+  empty does **not** mean "unrestricted". `[security].block_unlisted_outbound` is on unless written
+  false, so an empty `allowed_http`
+  refuses *every* HTTP destination. With no `[egress]` allowlist at all, and that switch not written
+  `true`, `serve` also refuses to start.
+  Empty-means-unrestricted survives only where an operator
   writes `[security].block_unlisted_outbound = false` — the explicit, audited opt-out. No instance can
-  declare its way out of the flip any more ([ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)), and the flip does not read `[security].enforcement` either.
+  declare its way out of the deny default ([ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)), and the default does not read `[security].enforcement` either.
   See [CONFIGURATION.md `[egress]`](CONFIGURATION.md#egress) for the full behaviour table.
 - **`ws_timestamp_ttl_seconds` must be ≥ the worst-case retry backoff.** The timestamp is re-stamped on
   each `send()`, but a held FIFO lane plus a short TTL can fail the peer's `Expires` check.
@@ -1984,7 +1986,7 @@ report, plain text); this connector delivers it to `host:port` from `sender` to 
 |---|---|---|---|
 | `host` | str / `env()` | — (required) | SMTP server host. |
 | `sender` | str / `env()` | — (required) | `From:` address, and the envelope sender (`MAIL FROM`) that bounces go to. It must be one plain `local@domain` under the same rule as each recipient, so a display name, a group or an encoded word is refused at load. Its domain is not checked against `[egress].allowed_recipient_domains`. |
-| `recipients` | list[str] / str / `env()` | — (required) | `To:` address(es). An `env()` may be the whole value; one inside the list is refused at load. |
+| `recipients` | list[str] / str / `env()` | — (required) | `To:` address(es). An `env()` may be the whole value; one inside the list is refused at load. An entry with a line break is refused at load too. |
 | `port` | int / `env()` | `587` | `587` = STARTTLS submission; `465` = implicit TLS (`SMTP_SSL`). |
 | `subject` | str / `env()` | `""` | Static subject (a per-message subject is a Phase-2 follow-up). |
 | `username` | str / `env()` / None | `None` | SMTP `AUTH` user — put the secret in `env()`. |
@@ -1996,22 +1998,19 @@ report, plain text); this connector delivers it to `host:port` from `sender` to 
 The egress host is **gated by `[egress].allowed_smtp`** — add the host or the destination is refused at
 config load/reload. On a **PHI** instance (every built-in env name by default,
 [ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md)) an **empty**
-`allowed_smtp` does **not** mean "unrestricted": with no counted `[egress]` allowlist `serve` refuses to
-start, and with one set it flips `[security].block_unlisted_outbound` on, so an empty
+`allowed_smtp` does **not** mean "unrestricted": `[security].block_unlisted_outbound` is on unless
+written false, so an empty
 `allowed_smtp` refuses *every* SMTP destination. Empty-means-unrestricted survives only where an
 operator writes `[security].block_unlisted_outbound = false` — the explicit, audited opt-out. No
-instance can declare its way out of the flip any more ([ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)), and the flip does not read
+instance can declare its way out of the deny default ([ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)), and the default does not read
 `[security].enforcement` either — see [CONFIGURATION.md `[egress]`](CONFIGURATION.md#egress). (The key is
 `[security].block_unlisted_outbound`; `[egress].deny_by_default` moved there under ADR 0118 and is
 **rejected at config load**.)
 
-**CAUTION: `allowed_smtp` is one of the lists that does *not* count as "egress is restricted".** The
-open-egress startup gate reads only `allowed_mllp`/`allowed_tcp`/`allowed_http`/`allowed_db`/
-`allowed_remote`/`allowed_file_dirs`, so a PHI instance whose **only** declared egress is this `Email()`
-relay populates `allowed_smtp`, declares its one destination — and still **exits 2** with *"outbound
-egress is UNRESTRICTED … refusing to start"*. A mail-only deployment must set
-**`[security].block_unlisted_outbound = true`**; that is the arm of the gate it can actually satisfy.
-The same is true of `allowed_direct` for a Direct-only instance.
+**CAUTION: whether `allowed_smtp` counts toward the open-egress startup gate depends on that
+switch.** A mail-only instance that writes it `false` exits 2. "Which lists the startup gate
+counts" in [CONFIGURATION.md `[egress]`](CONFIGURATION.md#egress) is the rule, and it covers
+`allowed_direct` too.
 
 **The recipients are gated too, and that gate is deny-by-default.** `allowed_smtp` gates only the
 relay hop, so every address in `recipients` must also sit in a domain listed in
@@ -2043,8 +2042,8 @@ outbound(
 #   [egress]
 #   allowed_smtp = ["smtp.example.org"]
 #   allowed_recipient_domains = ["example.org"]   # deny-by-default: required for any Email()
-# ...and note allowed_smtp alone does NOT satisfy the open-egress startup gate on a PHI instance —
-# see CONFIGURATION.md §[egress].
+# allowed_smtp alone satisfies the open-egress startup gate only while
+# [security].block_unlisted_outbound is left unset; see CONFIGURATION.md §[egress].
 ```
 
 ### Direct Project — `Direct(...)` (S/MIME over SMTP, outbound send, ADR 0085)
@@ -2065,8 +2064,8 @@ these messages, and the SMTP relay accepts them before anyone tries.
 | Setting | Default | Meaning |
 |---------|---------|---------|
 | `host` | — (required) | the SMTP / HISP relay host (the `[egress].allowed_direct` key; use `env()`) |
-| `sender` | — (required) | the Direct `From:` address |
-| `recipients` | — (required) | the Direct `To:` address(es) — a list or a single string |
+| `sender` | — (required) | the Direct `From:` address, and the envelope sender (`MAIL FROM`) that bounces go to. It must be one plain `local@domain` that reads back unchanged, so a display name, a group or an encoded word is refused at load. Its domain is not gated. |
+| `recipients` | — (required) | the Direct `To:` address(es) — a list or a single string. Each address is held to the sender's rule after any display name or group is dropped, and `To:` and `RCPT TO` carry exactly that checked address. An entry with a line break is refused at load. |
 | `signing_cert` | — (required) | path to the sender's PEM/DER signing **certificate** |
 | `signing_key` | — (required) | path to the sender's PEM/DER signing **private key** |
 | `signing_key_password` | — | passphrase for an encrypted `signing_key` — a **secret**, via `env()`; it must meet the [wrap floor](#encrypted-private-keys-must-meet-the-wrap-floor) |
@@ -2127,8 +2126,8 @@ outbound(
 # In messagefoundry.toml (the SERVICE settings file, or --service-config — not the --config dir):
 #   [egress]
 #   allowed_direct = ["hisp.example.org"]
-# allowed_direct alone does NOT satisfy the open-egress startup gate either: a Direct-only PHI
-# instance also needs [security].block_unlisted_outbound = true — see CONFIGURATION.md §[egress].
+# allowed_direct alone satisfies the open-egress startup gate only while
+# [security].block_unlisted_outbound is left unset; see CONFIGURATION.md §[egress].
 ```
 
 ### FHIR — `FHIR(...)`
@@ -3517,7 +3516,7 @@ reading this page already applies to a file the scan never opened.
 |---|---|---|---|---|
 | MLLP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris) and `max_frame_seconds` 60 s bounds one frame start-byte to end-byte, which is what reaches a peer that trickles bytes and is therefore never idle; the ACK **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. That write bound is not operator-configurable — an ACK is engine-generated and receipt-sized, so there is no partner-sized body to size a budget against. With `tls = true`, a new connection has a fixed 10 s to finish its TLS handshake or the listener aborts it, and a connection the listener closes has a fixed 5 s for the TLS close exchange (on stop, the socket is closed as soon as its close notice is sent, except under uvloop, below). On the stdlib event loop (always on Windows), `source_ip_allowlist`, `max_connections` and `max_connections_per_host` apply **before** the handshake (BACKLOG #1606): the listener accepts plain TCP, refuses or admits the socket exactly as a plaintext listener does, and only then starts TLS. So a socket still in its handshake holds a real slot, and a peer outside the allowlist never gets a handshake. **Under uvloop the loop still runs the handshake, and all three apply only after it**, so there the handshake bound limits how long such a socket lives, not how many a peer can open. The engine runs on uvloop wherever it is installed, which the engine's own `uvloop` dependency does for CPython outside Windows. Neither TLS bound is operator-configurable: both are engine-fixed work with nothing partner-sized in them | the client handler's outer `finally` closes the writer, with a 5 s shutdown grace; stop also closes a socket still in its TLS handshake. Under uvloop, whose server offers no `close_clients()`, stop leaves such a socket to the 10 s bound and refuses it unread if it finishes the handshake after stop began, and stop can also wait up to the 5 s close-exchange bound for a peer that does not answer its close notice | a TLS handshake over its bound, or one that fails, is aborted with a DEBUG line only and no connection event, and gives its slot back; a decode/parse/validate failure NAKs synchronously and records `ERROR` before any ingress row; a frame over its deadline closes with a `frame_deadline` reason, having received nothing to drop; an ACK over its write bound drops the connection as a `peer_reset`; a fault inside the inbound handler, such as a store outage at the ingress commit, is answered with a fixed-text `AE` (`CE` in enhanced mode), then the connection closes and the event is `handler_error`; an inbound that sends no replies keeps the socket and sends nothing. That NAK has no message row, so the ACK capture stream does not hold it; the `handler_error` event is its record (BACKLOG #1619) | n/a — the sender retries |
 | MLLP destination | `connect_timeout` 10 s, `timeout_seconds` 30 s (drain + ACK read) | the socket is closed per delivery, or reused and aged out via `idle_timeout_seconds` / `max_connection_age_seconds` when `persistent` | transient errors re-queue; a `NegativeAckError` (AR) dead-letters immediately | `RetryPolicy` — **default `retry_max_attempts` is 100, finite**; lower it, or set `None` to retry forever |
-| Raw TCP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris) and `max_frame_seconds` 60 s bounds one frame start-byte to end-byte, which is what reaches a peer that trickles bytes (vault BACKLOG #2606); the reply **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. Not operator-configurable — a reply is engine-generated and receipt-sized, so there is no partner-sized body to size a budget against | as MLLP — handler `finally` closes the socket with a shutdown grace | parse failures record `ERROR` on the ingress path; a reply over its write bound drops the connection as a `peer_reset` | n/a |
+| Raw TCP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris) and `max_frame_seconds` 60 s bounds one frame, counted from the first bytes received, inside a frame or not, which is what reaches a peer that trickles bytes (vault BACKLOG #2606); the reply **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. Not operator-configurable — a reply is engine-generated and receipt-sized, so there is no partner-sized body to size a budget against | as MLLP — handler `finally` closes the socket with a shutdown grace | parse failures record `ERROR` on the ingress path; a reply over its write bound drops the connection as a `peer_reset` | n/a |
 | X12 listener (inbound) | `receive_timeout` 60 s; `max_frame_seconds` 60 s bounds one interchange from its ISA to its IEA (vault BACKLOG #2606); `max_interchange_bytes` bounds one ISA/IEA frame; the reply **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. Not operator-configurable, for the same reason as the raw-TCP row | as MLLP — handler `finally` closes the socket with a shutdown grace | parse failures record `ERROR` on the ingress path; an allow-list refusal emits `peer_not_allowlisted` plus a WARNING log, and a capacity refusal emits `at_capacity`; a reply over its write bound drops the connection on a logged warning **and** the `peer_reset` its release path already carries. This listener emits the same seven kinds as the raw-TCP row above (BACKLOG #1665) | n/a |
 | Raw TCP / X12 destination | `connect_timeout` 10 s, `timeout_seconds` 30 s | a fresh connection per delivery, closed in `finally` | transient vs permanent classification as MLLP | `RetryPolicy` |
 | HTTP web-service listener (inbound) | `receive_timeout` 60 s bounds the **whole** request read; over budget returns `408` | handler `finally` closes the connection with a shutdown grace | an over-size body is refused before buffering | n/a |
