@@ -12,9 +12,12 @@ engine's MFA gates on an assertion the engine never receives.
 from __future__ import annotations
 
 import asyncio
+import heapq
 import inspect
 import time
-from typing import Any
+import unicodedata
+from collections.abc import Awaitable
+from typing import Any, TypeVar
 
 import pytest
 from _totp_clock import fresh_totp, pin_totp_clock
@@ -583,17 +586,37 @@ def test_the_credential_lock_key_folds_every_spelling_a_backend_may_match() -> N
     assert _credential_lock_key("alice") != _credential_lock_key("bob")
 
 
-def test_the_credential_lock_key_reads_a_bounded_prefix() -> None:
+def test_the_credential_lock_key_reads_a_bounded_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
     """The key is computed on the event loop before any check, and NFKD expands U+FDFA about
-    eighteenfold, so an unbounded name would stall the loop. Only a bounded prefix is read."""
+    eighteenfold, so an unbounded name would stall the loop. Only a bounded prefix is read.
+
+    The bound is asserted on the INPUT that reaches the normaliser, not on elapsed time. A
+    wall-clock limit here measured the runner: a stalled Windows runner took 2.55 s over work that
+    is bounded by construction (BACKLOG #2556).
+
+    RED when: the name is normalised whole and cut afterwards. That returns the same key, so only
+    the size of what the normaliser was handed can tell the two apart.
+    """
     import messagefoundry.auth.service as svc
 
     cap = svc._CREDENTIAL_KEY_INPUT_MAX
     assert cap >= 256  # the store's column width: no real name is cut
-    huge = "\ufdfa" * 1_000_000
-    started = time.monotonic()
+    real_normalize = unicodedata.normalize
+    normalised_lengths: list[int] = []
+
+    def spy(form: Any, text: str) -> str:
+        normalised_lengths.append(len(text))
+        return real_normalize(form, text)
+
+    # The service calls ``unicodedata.normalize`` through the module, so the module's attribute is
+    # the one seam every caller reads.
+    monkeypatch.setattr(unicodedata, "normalize", spy)
+    huge = "\ufdfa" * (cap * 8)
     key = _credential_lock_key(huge)
-    assert time.monotonic() - started < 1.0
+    assert normalised_lengths, "the key no longer normalises through unicodedata.normalize"
+    assert max(normalised_lengths) <= cap, (
+        f"the normaliser was handed {max(normalised_lengths)} characters, over the {cap} cap"
+    )
     assert key == _credential_lock_key("\ufdfa" * cap)
     # A cut merges names past the cap into one queue, which is coarser and so safe.
     assert _credential_lock_key("a" * cap + "x") == _credential_lock_key("a" * cap + "y")
@@ -1506,25 +1529,35 @@ async def test_AC6_every_refused_combined_outcome_is_padded_into_the_first_slot(
 async def test_AC6_refused_combined_sign_ins_take_the_same_wall_clock_time(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC-6's timing arm, on the real clock and the real budget, three rounds of every refused
-    outcome.
+    """AC-6's timing arm, on the real clock, the real budget and the real sleeps, at least three
+    rounds of every refused outcome.
 
     Two properties, of different strength. **No refused outcome ever answers before the budget.**
     That is the hard one: an early answer is a branch that escaped the pad, told apart by timing
-    alone, and ``_failure_deadline`` rounds up, so load cannot cause it. **Each outcome's MEDIAN
-    answer lies in the first slot**, ``[budget, 2 x budget)``: a branch whose own work is
-    systematically longer would sit in a later slot every round. One round spilling into the next
-    slot on a loaded host is the documented overrun the pad logs, so the median, not every sample,
-    carries that half."""
+    alone, and ``_failure_deadline`` rounds up, so load cannot cause it. Every sample carries it.
+    **Each outcome's FASTEST answer lies in the first slot**, ``[budget, 2 x budget)``: a branch
+    whose own work is longer than the budget sits in a later slot every round, so it has no round
+    there.
+
+    The fastest round carries the second half, not the median (BACKLOG #2556). Every round sends
+    the same inputs, so a branch's own work is the same each time, and a busy host can only add to
+    it. The fastest round is therefore the best reading of the branch itself. The median failed on
+    a loaded runner that stalled two rounds of one outcome, ``[1.001, 1.001, 0.501]``: the third
+    round shows the branch fits. Up to two further rounds are taken, of every outcome, while any
+    outcome still has no round in the first slot. A branch that never fits fails all five.
+
+    RED when: a refused branch returns without the pad, or a refused branch's own work outruns the
+    budget."""
     from messagefoundry.auth import service as service_module
 
     budget = service_module._FAILURE_BUDGET_SECONDS
+    least_rounds, most_rounds = 3, 5
     store = await _store()
     try:
         service = AuthService(store, _lock_settings(500))
         identity, password, steps = await _totp_admin(service, monkeypatch)
         timings: dict[str, list[float]] = {}
-        for _round in range(3):
+        for done in range(1, most_rounds + 1):
             await store.clear_lockout(identity.user_id)
             shapes = await _refused_outcomes(service, store, identity, password, steps)
             for label, username, pw, code, setup in shapes:
@@ -1537,11 +1570,13 @@ async def test_AC6_refused_combined_sign_ins_take_the_same_wall_clock_time(
                 ok = (await service.login(username, pw, totp_code=sent)).ok
                 timings.setdefault(label, []).append(time.monotonic() - started)
                 assert not ok, label
-        rounded = {label: [round(t, 3) for t in ts] for label, ts in timings.items()}
+            rounded = {label: [round(t, 3) for t in ts] for label, ts in timings.items()}
+            if done >= least_rounds and all(min(ts) < 2 * budget for ts in rounded.values()):
+                break
         early = {label: ts for label, ts in rounded.items() if min(ts) < budget}
         assert not early, f"refused outcomes answered BEFORE the pad's deadline: {early}"
-        late = {label: ts for label, ts in rounded.items() if not sorted(ts)[1] < 2 * budget}
-        assert not late, f"refused outcomes whose median left the first padded slot: {late}"
+        late = {label: ts for label, ts in rounded.items() if not min(ts) < 2 * budget}
+        assert not late, f"refused outcomes that never answered in the first padded slot: {late}"
     finally:
         await store.close()
 
@@ -1625,6 +1660,134 @@ async def test_verify_mfa_and_the_sign_in_share_one_queue(
         await store.close()
 
 
+_T = TypeVar("_T")
+
+
+class _VirtualTime:
+    """A clock the failure pad reads and sleeps on, moved only by this class (BACKLOG #2556).
+
+    The slot tests below place a boundary 60 ms from the event they watch. On the real clock that
+    margin is the test host's to spend: one late wake-up moves an answer a whole slot, on either
+    name, and the test reads it as a name-dependent answer. Here a sleep costs no real time and
+    real work costs no virtual time, so an answer's slot depends only on the sleeps the test
+    scripts: the stubbed verify, the stubbed store call, and the pad.
+
+    **Time moves only when no attempt can run.** A sleep parks its caller on a heap. A background
+    driver wakes the earliest sleeper once every attempt in flight is parked, either on that heap
+    or in its account's queue. An attempt waiting on the store's worker thread is neither, so the
+    clock holds still for it however long the host takes. That rule is what keeps the clock honest
+    when several attempts sleep at once, which is exactly what the mutations these tests exist for
+    produce: a clock that jumped on every sleep would be wrong there.
+
+    It replaces the service module's ``time`` (only ``monotonic`` differs) and its two sleep seams,
+    ``_sleep_until`` and ``_sleep_until_write_point``. So these tests no longer exercise the real
+    sleeps; the wall-clock AC-6 arm above still exercises the real pad.
+
+    **Every sign-in a test starts must go through** :meth:`attempt`, and every scripted cost through
+    :meth:`work`. A sign-in the clock does not know about is not waited for, so time would move
+    while it was still running.
+    """
+
+    #: Loop passes the driver must see nothing runnable for before it moves time. A task woken by a
+    #: released lock or a finished sleep runs on the very next pass, so a short streak covers it.
+    _SETTLED_PASSES = 5
+    #: Real seconds without any attempt parking or finishing before the driver gives up.
+    _STUCK_AFTER = 60.0
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, service: AuthService) -> None:
+        import messagefoundry.auth.service as svc
+
+        self._service = service
+        self._now = time.monotonic()
+        self._sleepers: list[tuple[float, int, asyncio.Future[None], bool]] = []
+        self._order = 0
+        self._in_flight = 0
+        monkeypatch.setattr(svc, "time", self)
+        monkeypatch.setattr(svc, "_sleep_until", self._attempt_sleep_until)
+        monkeypatch.setattr(svc, "_sleep_until_write_point", self._attempt_sleep_until)
+        self._driver = asyncio.ensure_future(self._drive())
+
+    def __getattr__(self, name: str) -> Any:
+        # Everything but ``monotonic`` is the real ``time`` module's.
+        return getattr(time, name)
+
+    def monotonic(self) -> float:
+        return self._now
+
+    async def work(self, seconds: float) -> None:
+        """A stub's scripted cost, inside an attempt."""
+        await self._park(self._now + seconds, in_attempt=True)
+
+    async def pause(self, seconds: float) -> None:
+        """A wait by the test itself, between two attempts."""
+        await self._park(self._now + seconds, in_attempt=False)
+
+    def attempt(self, coro: Awaitable[_T]) -> Awaitable[_T]:
+        """Count ``coro`` as an attempt in flight from this call until it returns."""
+        self._in_flight += 1
+
+        async def run() -> _T:
+            try:
+                return await coro
+            finally:
+                self._in_flight -= 1
+
+        return run()
+
+    async def close(self) -> None:
+        """Stop the driver. A sleeper still parked belongs to a test that already failed, and is
+        cancelled so it does not outlive the clock that would have woken it."""
+        self._driver.cancel()
+        await asyncio.gather(self._driver, return_exceptions=True)
+        for sleeper in self._sleepers:
+            sleeper[2].cancel()
+
+    async def _attempt_sleep_until(self, deadline: float) -> None:
+        await self._park(deadline, in_attempt=True)
+
+    async def _park(self, deadline: float, *, in_attempt: bool) -> None:
+        if deadline <= self._now:
+            return
+        woken: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._order += 1
+        heapq.heappush(self._sleepers, (deadline, self._order, woken, in_attempt))
+        await woken
+
+    def _runnable_attempts(self) -> int:
+        """Attempts in flight that are parked neither on the heap nor in an account's queue."""
+        asleep = sum(1 for sleeper in self._sleepers if sleeper[3])
+        queued = sum(
+            entry.users - (1 if entry.lock.locked() else 0)
+            for entry in self._service._credential_locks.values()
+        )
+        return self._in_flight - asleep - queued
+
+    async def _drive(self) -> None:
+        settled, last_moved = 0, time.monotonic()
+        while True:
+            await asyncio.sleep(0)
+            # A sleeper whose task was cancelled is dropped, so it is not counted as parked.
+            self._sleepers = [s for s in self._sleepers if not s[2].done()]
+            heapq.heapify(self._sleepers)
+            if not self._sleepers:
+                settled, last_moved = 0, time.monotonic()
+                continue
+            if self._runnable_attempts() > 0:
+                settled = 0
+                if time.monotonic() - last_moved > self._STUCK_AFTER:
+                    for *_, woken, _in_attempt in self._sleepers:
+                        woken.set_exception(AssertionError("virtual time stuck: an attempt hung"))
+                    return
+                continue
+            settled += 1
+            if settled < self._SETTLED_PASSES:
+                continue
+            deadline, _, woken, _ = heapq.heappop(self._sleepers)
+            self._now = max(self._now, deadline)
+            woken.set_result(None)
+            settled, last_moved = 0, time.monotonic()
+
+
 async def test_a_burst_answers_on_the_same_slots_for_a_real_and_an_unknown_name(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1636,8 +1799,9 @@ async def test_a_burst_answers_on_the_same_slots_for_a_real_and_an_unknown_name(
     later slot than the same burst on an unknown name. Padded inside the queue, every failure
     answers on a whole slot from its own start, whatever its branch.
 
-    The verify is a fixed 40 ms sleep and the real name's failure count gains 60 ms, so the gap is
-    far wider than the host's jitter. The budget is lowered to keep the run short."""
+    The verify costs a fixed 40 ms and the real name's failure count gains 60 ms. Both are scripted
+    on ``_VirtualTime``, so the host's speed is not in the measurement (BACKLOG #2556): on the real
+    clock one late wake-up of more than a quarter slot moved every later answer on that name."""
     import messagefoundry.auth.service as svc
 
     store = await _store()
@@ -1646,31 +1810,35 @@ async def test_a_burst_answers_on_the_same_slots_for_a_real_and_an_unknown_name(
         monkeypatch.setattr(svc, "_FAILURE_BUDGET_SECONDS", budget)
         service = AuthService(store, AuthSettings(lockout_threshold=50, lockout_minutes=15))
         await login_admin(service)
+        clock = _VirtualTime(monkeypatch, service)
 
         async def fixed_wrong(fn: Any, *args: Any) -> Any:
-            await asyncio.sleep(0.04)
+            await clock.work(0.04)
             return False
 
         real_increment = store.increment_login_failure
 
         async def slow_increment(*args: Any, **kwargs: Any) -> Any:
-            await asyncio.sleep(0.06)
+            await clock.work(0.06)
             return await real_increment(*args, **kwargs)
 
         monkeypatch.setattr(service, "_argon2", fixed_wrong)
         monkeypatch.setattr(store, "increment_login_failure", slow_increment)
 
         async def one(name: str) -> int:
-            started = time.monotonic()
+            started = clock.monotonic()
             out = await service.login(name, "wrong")
             assert not out.ok
-            return round((time.monotonic() - started) / budget)
+            return round((clock.monotonic() - started) / budget)
 
         async def slots(name: str) -> list[int]:
-            return sorted(await asyncio.gather(*(one(name) for _ in range(burst))))
+            return sorted(await asyncio.gather(*(clock.attempt(one(name)) for _ in range(burst))))
 
-        real = await slots(ADMIN_USERNAME)
-        unknown = await slots("no-such-operator")
+        try:
+            real = await slots(ADMIN_USERNAME)
+            unknown = await slots("no-such-operator")
+        finally:
+            await clock.close()
         assert real == unknown, f"a burst's answer slots depend on the name: {real} vs {unknown}"
         assert real == list(range(1, burst + 1))
     finally:
@@ -1689,9 +1857,10 @@ async def test_a_second_attempt_answers_on_a_slot_its_own_work_does_not_move(
     later. The pad now holds a queued failure at least half a budget past its turn, so B answers
     on the same slot for either name.
 
-    The verify is a fixed 40 ms sleep and the real name's failure count gains 120 ms, so B's work
-    is about 40 ms on the unknown name and 160 ms on the real one. B starts 120 ms after A, which
-    puts the old slot boundary between the two."""
+    The verify costs a fixed 40 ms and the real name's failure count gains 120 ms, so B's work
+    is 40 ms on the unknown name and 160 ms on the real one. B starts 120 ms after A, which
+    puts the old slot boundary between the two. Every cost is scripted on ``_VirtualTime``, so the
+    host's speed is not in the measurement (BACKLOG #2556)."""
     import messagefoundry.auth.service as svc
 
     store = await _store()
@@ -1700,32 +1869,36 @@ async def test_a_second_attempt_answers_on_a_slot_its_own_work_does_not_move(
         monkeypatch.setattr(svc, "_FAILURE_BUDGET_SECONDS", budget)
         service = AuthService(store, AuthSettings(lockout_threshold=50, lockout_minutes=15))
         await login_admin(service)
+        clock = _VirtualTime(monkeypatch, service)
 
         async def fixed_wrong(fn: Any, *args: Any) -> Any:
-            await asyncio.sleep(0.04)
+            await clock.work(0.04)
             return False
 
         real_increment = store.increment_login_failure
 
         async def slow_increment(*args: Any, **kwargs: Any) -> Any:
-            await asyncio.sleep(0.12)
+            await clock.work(0.12)
             return await real_increment(*args, **kwargs)
 
         monkeypatch.setattr(service, "_argon2", fixed_wrong)
         monkeypatch.setattr(store, "increment_login_failure", slow_increment)
 
         async def second_slot(name: str) -> int:
-            first = asyncio.ensure_future(service.login(name, "wrong"))
-            await asyncio.sleep(offset)
-            started = time.monotonic()
-            out = await service.login(name, "wrong")
-            took = time.monotonic() - started
+            first = asyncio.ensure_future(clock.attempt(service.login(name, "wrong")))
+            await clock.pause(offset)
+            started = clock.monotonic()
+            out = await clock.attempt(service.login(name, "wrong"))
+            took = clock.monotonic() - started
             assert not out.ok and not (await first).ok
             assert took > budget - offset, "the second attempt did not queue; this proves nothing"
             return round(took / budget)
 
-        real = await second_slot(ADMIN_USERNAME)
-        unknown = await second_slot("no-such-operator")
+        try:
+            real = await second_slot(ADMIN_USERNAME)
+            unknown = await second_slot("no-such-operator")
+        finally:
+            await clock.close()
         assert real == unknown, (
             f"the second attempt's slot depends on the name: {real} vs {unknown}"
         )
@@ -1749,9 +1922,11 @@ async def test_a_refusals_answer_slot_does_not_depend_on_its_audit_write_time(
     between the end of one row and the end of two.
 
     Unlike the test above, this slows ``_audit`` and not the failure count: the count runs before
-    the write point, the rows after it. The verify is a fixed 20 ms sleep and each row costs 120 ms.
+    the write point, the rows after it. The verify costs a fixed 20 ms and each row costs 120 ms.
     The queued attempt starts so its next boundary sits 180 ms past its floor, between one row
-    (120 ms) and two (240 ms). The margins are 60 ms each way, wider than this host's jitter."""
+    (120 ms) and two (240 ms). Every cost is scripted on ``_VirtualTime``, so the store's real write
+    time is not in the measurement (BACKLOG #2556): on the real clock a host that took 0.4 s over
+    the rows moved the ``alone`` arm's locked answer a slot, which read as a name-dependent one."""
     import messagefoundry.auth.service as svc
 
     store = await _store()
@@ -1763,15 +1938,16 @@ async def test_a_refusals_answer_slot_does_not_depend_on_its_audit_write_time(
         service = AuthService(store, AuthSettings(lockout_threshold=50, lockout_minutes=15))
         identity, _, _ = await login_admin(service)
         await _set_sign_in_lock(store, identity.user_id)
+        clock = _VirtualTime(monkeypatch, service)
 
         async def fixed_wrong(fn: Any, *args: Any) -> Any:
-            await asyncio.sleep(0.02)
+            await clock.work(0.02)
             return False
 
         real_audit = service._audit
 
         async def slow_audit(*args: Any, **kwargs: Any) -> None:
-            await asyncio.sleep(row)
+            await clock.work(row)
             await real_audit(*args, **kwargs)
 
         monkeypatch.setattr(service, "_argon2", fixed_wrong)
@@ -1780,20 +1956,23 @@ async def test_a_refusals_answer_slot_does_not_depend_on_its_audit_write_time(
         async def slot(name: str, error: str) -> int:
             first = None
             if queued:
-                first = asyncio.ensure_future(service.login(name, "wrong"))
-                await asyncio.sleep(budget / 2 + margin)
+                first = asyncio.ensure_future(clock.attempt(service.login(name, "wrong")))
+                await clock.pause(budget / 2 + margin)
                 # Still inside its padded answer, so it holds the name's queue: the second waits.
                 assert not first.done(), "the first attempt answered early; this proves nothing"
-            started = time.monotonic()
-            out = await service.login(name, "wrong")
-            took = time.monotonic() - started
+            started = clock.monotonic()
+            out = await clock.attempt(service.login(name, "wrong"))
+            took = clock.monotonic() - started
             assert not out.ok and out.error == error, out
             if first is not None:
                 assert not (await first).ok
             return round(took / budget)
 
-        locked = await slot(ADMIN_USERNAME, "account locked")
-        unknown = await slot("no-such-operator", "invalid credentials")
+        try:
+            locked = await slot(ADMIN_USERNAME, "account locked")
+            unknown = await slot("no-such-operator", "invalid credentials")
+        finally:
+            await clock.close()
         assert locked == unknown, f"the answer's slot depends on the name: {locked} vs {unknown}"
     finally:
         await store.close()
