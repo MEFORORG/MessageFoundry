@@ -8,6 +8,7 @@ import * as vscode from "vscode";
 import { getJson, HttpError, postJson } from "./engineClient";
 import { mustChangeProblem } from "./engineStatusModel";
 import { assertBrowsableUrl, assertTargetAllowed } from "./engineTarget";
+import { signInSettled, signInSuperseding } from "./signInSession";
 
 const SECRET_PREFIX = "messagefoundry.token:";
 
@@ -180,27 +181,24 @@ export async function signIn(ctx: vscode.ExtensionContext, url: string): Promise
     if (totpCode !== undefined && totpCode.trim()) {
       body.totp_code = totpCode.trim();
     }
+    // ASVS 7.2.4: the token this sign-in stores REPLACES any token cached for this engine, so the
+    // sign-in names the cached one as `supersedes` and the engine ends that session itself, once it
+    // has accepted the new credential and before its session cap counts. A failed sign-in therefore
+    // signs nobody out, and only that one token ends, never the user's other sessions. No
+    // `/auth/logout` follows. signInSession.ts states why, and what the order costs. `withAuth`
+    // clears the cache before it re-signs in after a 401, so the case this covers is the status
+    // bar's explicit "Sign in" over a token that is still cached and still live.
     let res: LoginResponse;
     try {
-      res = await postJson<LoginResponse>(url, "/auth/login", body);
+      res = await signInSuperseding(ctx.secrets, secretKey(url), body, (named) =>
+        postJson<LoginResponse>(url, "/auth/login", named),
+      );
     } catch (e) {
       if (e instanceof HttpError && e.status === 401) {
         void vscode.window.showWarningMessage("MessageFoundry: invalid credentials — try again.");
         continue;
       }
       throw e;
-    }
-    // ASVS 7.2.4: this store REPLACES any token cached for this engine, so that session is then
-    // ended on the engine, or it would stay valid, unreachable from here, until it idles out. Only
-    // after the new sign-in succeeded, so a failed sign-in signs nobody out, and only that one token,
-    // never the user's other sessions. The new token is stored FIRST and the revoke is not awaited:
-    // postJson has no timeout, and a slow engine must not hold a sign-in that already succeeded.
-    // `withAuth` clears the cache before it re-signs in after a 401, so the case this covers is the
-    // status bar's explicit "Sign in" over a token that is still cached and still live.
-    const prior = await peekToken(ctx, url);
-    await ctx.secrets.store(secretKey(url), res.token);
-    if (prior && prior !== res.token) {
-      void postJson<unknown>(url, "/auth/logout", {}, prior).catch(() => undefined);
     }
     // Both of these produce a token that LOOKS fine and then 403s later, so say so now, at the moment
     // the user can act on it, rather than letting them discover it as an opaque failure mid-promote.
@@ -263,6 +261,10 @@ export async function withAuth<T>(
       if (!(e instanceof HttpError && e.status === 401) || attempt >= 2) {
         throw e;
       }
+      // The engine ends a superseded token INSIDE the sign-in request, before the new one is stored.
+      // A sign-in still in flight would leave this call's dead token in the cache, and the clear
+      // below could then drop the new one. So wait for it before reading the cache.
+      await signInSettled(secretKey(url));
       const cached = await peekToken(ctx, url);
       if (cached !== undefined && cached !== token) {
         token = cached;
