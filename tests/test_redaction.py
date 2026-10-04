@@ -11,6 +11,7 @@ import random
 import re
 import time
 from collections.abc import Callable
+from typing import Any, SupportsIndex
 
 import pytest
 from _phi_log_capture import IDENTIFIER_SHAPED_NAMES, SAFE_NAME_SUFFIXES
@@ -1013,9 +1014,9 @@ def test_one_credential_span_can_cover_a_second_opener_and_both_go() -> None:
 
 
 def test_the_credential_walk_is_bounded_by_the_window_not_by_the_peer() -> None:
-    """THE COST HALF, in the shape ``test_the_token_walk_is_bounded_by_the_window_not_by_the_peer``
-    established: the PEER chooses how many passes the walk takes, so each pass has to stay inside the
-    region it drops.
+    """THE COST HALF, on the argument ``test_the_token_walk_is_bounded_by_the_window_not_by_the_peer``
+    makes: the PEER chooses how many passes the walk takes, so each pass has to stay inside the
+    region it drops. That arm reads a count now (BACKLOG #2896); this one still reads a budget.
 
     It does, on two bounds that are both properties rather than counts. A pass searches one
     ``_USERINFO_SPAN``-wide region behind the cut -- further back than that, a span ends inside the
@@ -1208,6 +1209,24 @@ def _fuzz_text(rand: random.Random) -> str:
     return "".join(parts)
 
 
+def _last_cut_walk(text: str, cut: int, steps: int) -> int:
+    """The name walk spelled the way PR 1319 shipped it, for at most ``steps`` tokens.
+
+    Two controls are cut from this one spelling, so they cannot drift apart. Capped at three steps it
+    is the LEAK ``_three_step_clamp`` reproduces. Left to run until it stops it is the COST
+    ``test_the_last_cut_spelling_of_the_walk_is_quadratic_on_the_same_meter`` reproduces: each step
+    copies ``text[:cut]`` from index 0 and ``_last_cut`` scans back to index 0."""
+    for _ in range(steps):
+        if not cut:
+            break
+        end = len(text[:cut].rstrip(redaction._CUT_CHARS))
+        start = redaction._last_cut(text, end) + 1
+        if not redaction._ends_with_name_token(text[start:end]):
+            break
+        cut = start
+    return cut
+
+
 def _three_step_clamp(text: str, window: int) -> tuple[str, int]:
     """``_clamp`` with the walk PR 1319 shipped: at most three tokens, then stop.
 
@@ -1216,15 +1235,7 @@ def _three_step_clamp(text: str, window: int) -> tuple[str, int]:
     and the honest something is the defect itself."""
     if len(text) <= window:
         return text, 0
-    cut = max(redaction._last_cut(text, window), 0)
-    for _ in range(3):
-        if not cut:
-            break
-        end = len(text[:cut].rstrip(redaction._CUT_CHARS))
-        start = redaction._last_cut(text, end) + 1
-        if not redaction._ends_with_name_token(text[start:end]):
-            break
-        cut = start
+    cut = _last_cut_walk(text, max(redaction._last_cut(text, window), 0), steps=3)
     return text[:cut], len(text) - cut
 
 
@@ -1278,6 +1289,122 @@ def test_no_token_survives_the_clamp_that_the_unbounded_scan_scrubs() -> None:
     assert not shipped, f"{shipped} of 1,500 trials kept a token the unbounded scan scrubs"
 
 
+class _MeteredText(str):
+    """A ``str`` that counts the characters each read of it touches: the clamp's cost with the clock
+    taken out.
+
+    An index is one character, a slice is the characters it copies, and a search is the characters
+    between where it starts and where it stops. Each read hands back a plain ``str``, so the count is
+    of work done on the WHOLE text, which is where a quadratic walk spends it.
+
+    **Why characters and not calls.** The two spellings of the name walk take the same number of
+    steps. What separates them is how far each step reaches, so a step count reads them as equal.
+
+    **WHAT IT CANNOT SEE, which is more than the floor in ``_walk_cost`` covers.** Work done on a
+    plain copy is charged nothing past the copy, and neither is a read made by the regex engine, by an
+    operator (``in``, ``+``) or by an unbound ``str.rfind(text, ...)``. The floor refuses a walk the
+    meter saw NOTHING of. It passes at least these two, both measured: a quadratic walk run on one
+    ``text[:cut]`` copy, and an unseen scan added beside the shipped index reads. So the two walk arms
+    show that the shipped spelling is linear and that the ``_last_cut`` spelling is caught. They do
+    not show that every quadratic spelling is."""
+
+    touched = 0
+
+    def __getattribute__(self, name: str) -> Any:
+        if name in _UNMETERED_READS:
+            raise AssertionError(
+                f"str.{name} read a _MeteredText, and the meter does not charge for it. Override it "
+                f"in _MeteredText with its cost before trusting a count taken through it"
+            )
+        return super().__getattribute__(name)
+
+    def __getitem__(self, key: SupportsIndex | slice, /) -> str:
+        got = super().__getitem__(key)
+        self.touched += len(got)
+        return got
+
+    def find(
+        self, sub: str, start: SupportsIndex | None = None, end: SupportsIndex | None = None, /
+    ) -> int:
+        at = super().find(sub, start, end)
+        low, high, _ = slice(start, end).indices(len(self))
+        self.touched += max((at + len(sub) if at >= 0 else high) - low, 0)
+        return at
+
+    def rfind(
+        self, sub: str, start: SupportsIndex | None = None, end: SupportsIndex | None = None, /
+    ) -> int:
+        at = super().rfind(sub, start, end)
+        low, high, _ = slice(start, end).indices(len(self))
+        self.touched += max(high - (at if at >= 0 else low), 0)
+        return at
+
+
+#: Every public ``str`` method ``_MeteredText`` does not charge for. Reading the text through one of
+#: them is REFUSED rather than passed through, because an uncharged read is how a quadratic walk would
+#: come back with a linear count. **Derived from the class, so charging a method is one edit:**
+#: override it there and it leaves this set.
+_UNMETERED_READS = frozenset(
+    name for name in dir(str) if not name.startswith("_") and name not in vars(_MeteredText)
+)
+
+#: N for the two walk arms; 2N is twice it. **An eighth of the shipped window, on purpose.** The meter
+#: counts characters rather than seconds, so the growth it reads does not depend on the size, and the
+#: quadratic control is still run for real: about 0.1 s here, over a second at the shipped window.
+_WALK_WINDOW = 8_192
+
+#: The one line both walk arms are read against, in the shape ``_SCAN_BUDGET_SECONDS`` argues for: a
+#: shared line, so the control proves this exact number discriminates. A linear walk doubles when the
+#: window doubles and a quadratic one quadruples, so the line sits halfway. **No margin is spent on
+#: noise, because there is none:** the count is the same on every run and every machine.
+_WALK_GROWTH_LINE = 3.0
+
+
+def _name_token_wall(window: int) -> str:
+    """The most steps a ``window`` can buy the name walk: the shortest legal ALLCAPS token plus one
+    space, 21,820 of them at the shipped window, with a non-whitespace run behind so the cut lands at
+    the end of the run and the walk has to travel the whole way back.
+
+    **The run behind grows with the window.** It is the part of the text the PEER sizes, so a step
+    that searched it would cost more as it grew, and a tail of one fixed length would hide that from
+    a growth reading. Behind this one, one unbounded ``rfind`` per step reads a growth of 4.00."""
+    return ("AA " * (window // 3 + 1))[:window] + "Q" * (3 * window)
+
+
+def _walk_cost(window: int) -> int:
+    """Characters the name walk touches inside ``redaction._clamp``, on a ``_name_token_wall``.
+
+    **The walk's own share, not the clamp's total.** ``_clamp`` opens with one ``_last_cut`` over the
+    window, and on this wall that single call is two thirds of everything charged. Left in, it hides
+    a walk the meter cannot see: such a walk reads as free, and the total still doubles with the
+    window. So the opening call is read on its own and taken off.
+
+    Both checks run before anything is divided, because a ratio hides a broken reading: two walks that
+    each stopped early, or two counts that each missed the walk, divide to a clean 2."""
+    wall = _name_token_wall(window)
+    text = _MeteredText(wall)
+    head, _ = redaction._clamp(text, window)
+    assert not head, (
+        f"the walk stopped {len(head)} characters short of the start of a {window}-character run, "
+        f"so this reading is not of a full-window walk"
+    )
+    opening = _MeteredText(wall)
+    cut = redaction._last_cut(opening, window)
+    walked = text.touched - opening.touched
+    assert walked >= cut, (
+        f"the meter charged the walk {walked} characters for dropping {cut}. A walk has to read "
+        f"every character it drops to judge its token, so this one reads the text through something "
+        f"_MeteredText cannot see and the growth would measure nothing"
+    )
+    return walked
+
+
+def _walk_growth() -> float:
+    """``_walk_cost`` at 2N over ``_walk_cost`` at N. Near 2 is a walk linear in the window; near 4 is
+    a quadratic one."""
+    return _walk_cost(2 * _WALK_WINDOW) / _walk_cost(_WALK_WINDOW)
+
+
 def test_the_token_walk_is_bounded_by_the_window_not_by_the_peer() -> None:
     """THE OTHER HALF OF THE LEAK FIX, and the one an absence arm cannot see.
 
@@ -1287,25 +1414,102 @@ def test_the_token_walk_is_bounded_by_the_window_not_by_the_peer() -> None:
     ``_last_cut`` -- each step copies from index 0 and rescans from index 0, and the walk is quadratic
     in the window: the exact cost class BACKLOG #1576 exists to bound, rebuilt inside the fix for it.
 
-    The fixture is the most steps a window can buy: the shortest legal ALLCAPS token plus one space,
-    21,820 of them, with a non-whitespace run behind so the cut lands at the end of the run and the
-    walk has to travel the whole way back. Measured best-of-3 on the author's box, 6.2 ms here against
-    630 ms for the ``_last_cut`` spelling, which is why the budget separates them at all."""
-    window = redaction._REDACT_WINDOW - redaction._CLAMP_MARKER_BUDGET
-    run = ("AA " * (window // 3 + 1))[:window]
-    hostile = run + "Q" * 200_000
+    **This asserts LINEARITY, and it replaced a wall-clock budget that measured the runner (BACKLOG
+    #2896).** The arm used to time one clamp of the shipped window against ``_SCAN_BUDGET_SECONDS``:
+    6.2 ms on the author's box, against 630 ms for the ``_last_cut`` spelling. BACKLOG #2896 records it
+    going red on loaded hosted runners with the walk unchanged. A fixed number of seconds is a claim
+    about the machine as much as about the walk, and the property was never "under 50 ms". It is that
+    doubling the window doubles the work, so that is what is read now: the characters the walk
+    touches at 2N over the characters it touches at N (``_walk_growth``). No clock is involved, so
+    load cannot move the answer.
 
-    best = _best_of(lambda: clamp_untrusted(hostile))
-    assert best < _SCAN_BUDGET_SECONDS, (
-        f"clamping {len(run)} characters of name-shaped tokens cost {best:.4f}s of the event loop "
-        f"against a {_SCAN_BUDGET_SECONDS}s budget -- the walk is no longer linear in the window"
+    Measured on the shipped walk: 19,108 characters at 8,192 and 38,225 at 16,384, a growth of 2.00.
+    The control below reads 4.00 for the ``_last_cut`` spelling on the same meter and the same line.
+
+    **What this gave up, so nobody reads it as more than it is.** The budget bounded the seconds one
+    shipped-window clamp may cost, whatever the spelling. This arm bounds neither: a linear walk with
+    a large constant passes, and so does a quadratic one the meter cannot see (``_MeteredText`` names
+    the cases). A count was chosen over a timed ratio because a count cannot go red on a busy
+    runner, and going red there is the defect being fixed."""
+    growth = _walk_growth()
+    assert growth < _WALK_GROWTH_LINE, (
+        f"doubling the window multiplied the characters the walk touches by {growth:.2f}, over the "
+        f"{_WALK_GROWTH_LINE} line -- the walk is no longer linear in the window"
     )
-    # Non-vacuity: a walk that stopped early would be fast for the wrong reason. Every token here is
-    # name-shaped back to index 0, so a walk that ran to completion keeps nothing but the note.
+    # The same walk at the SHIPPED window, through the public entry. The growth is read at an eighth
+    # of it, and ``_walk_cost`` checks those two walks ran to index 0. This checks the one a peer
+    # reaches does too: every token is name-shaped back to index 0, so nothing is kept but the note.
+    hostile = _name_token_wall(redaction._REDACT_WINDOW - redaction._CLAMP_MARKER_BUDGET)
     assert clamp_untrusted(hostile).strip().startswith("[redaction bound:"), (
-        "the walk stopped before the start of the run, so this fixture is not measuring a full-window "
-        "walk and the budget above proves nothing about one"
+        "the walk stopped before the start of the run at the shipped window, so the growth above is "
+        "of a walk the public entry does not finish"
     )
+
+
+def test_the_last_cut_spelling_of_the_walk_is_quadratic_on_the_same_meter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Live positive control: the SAME fixture, the SAME meter and the SAME line, with the walk swapped
+    for the ``text[:cut].rstrip(...)`` plus ``_last_cut`` spelling inside the shipping ``_clamp``.
+
+    Without it the arm above is unfalsifiable. A meter that saw none of the work, or saw the same work
+    whatever the walk did, would read one growth for both spellings, and one number cannot sit on both
+    sides of a line. This patches the module global ``_clamp`` reads, so the whole shipping path runs
+    with the quadratic walk rather than a copy of the clamp held off to one side.
+
+    The step cap is ``cut``, which is no cap at all: a step drops at least one character."""
+    monkeypatch.setattr(
+        redaction,
+        "_drop_trailing_name_tokens",
+        lambda text, cut: _last_cut_walk(text, cut, steps=cut),
+    )
+    growth = _walk_growth()
+    assert growth > _WALK_GROWTH_LINE, (
+        f"doubling the window multiplied the characters the ``_last_cut`` spelling touches by only "
+        f"{growth:.2f}, under the {_WALK_GROWTH_LINE} line. The meter no longer separates a linear "
+        f"walk from a quadratic one, so the arm above is not measuring anything"
+    )
+
+
+def test_the_meter_charges_each_read_for_the_characters_it_touches() -> None:
+    """The instrument's own control. Both walk arms divide two readings of ``_MeteredText``, and a
+    ratio hides a meter that charges every read the same wrong amount.
+
+    One reading per kind of read ``_clamp`` makes, on a text small enough to count by hand: an index,
+    a slice from 0, a backward search that hits, one that runs out, and a forward search. The forward
+    search is the credential walk's; neither name-walk arm reaches it."""
+    text = _MeteredText("ab cd ef")
+    charged = []
+    for read in (
+        lambda: text[4],  # one character
+        lambda: text[:5],  # the five characters copied
+        lambda: text.rfind(" ", 0, 8),  # hits at 5, having read 7, 6 and 5
+        lambda: text.rfind("\t", 0, 8),  # no hit, so all eight
+        lambda: text.find(" ", 3),  # hits at 5, having read 3, 4 and 5
+    ):
+        before = text.touched
+        read()
+        charged.append(text.touched - before)
+    assert charged == [1, 5, 3, 8, 3]
+    with pytest.raises(AssertionError, match="rsplit"):
+        text.rsplit(None, 1)
+
+
+def test_a_walk_the_meter_cannot_see_is_refused_not_read_as_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The floor's own control. ``_walk_cost`` refuses a walk charged under one touch per character
+    it dropped, and nothing else here shows that refusal can fire.
+
+    The walk is the QUADRATIC spelling run on a plain ``str`` copy, so the meter is charged nothing
+    for it. Without the floor that reads as a walk costing zero at both windows."""
+    monkeypatch.setattr(
+        redaction,
+        "_drop_trailing_name_tokens",
+        lambda text, cut: _last_cut_walk(str(text), cut, steps=cut),
+    )
+    with pytest.raises(AssertionError, match="cannot see"):
+        _walk_cost(_WALK_WINDOW)
 
 
 def test_clamp_untrusted_is_exported() -> None:
