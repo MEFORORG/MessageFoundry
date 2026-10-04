@@ -43,6 +43,10 @@ async def _assert_login_address_contract(store: Any) -> None:
     # key collision.
     await store.remember_login_address("ka-u1", "192.0.2.1", now=2000.0, forget_before=0.0)
     assert await store.list_known_login_addresses("ka-u1", since=1500.0) == ["192.0.2.1"]
+    # ``last_seen`` never moves back: a late write carrying an older clock (another engine shard,
+    # or a delayed write) must not age a still-used address out of the lookback early.
+    await store.remember_login_address("ka-u1", "192.0.2.1", now=1200.0, forget_before=0.0)
+    assert await store.list_known_login_addresses("ka-u1", since=1500.0) == ["192.0.2.1"]
 
     # Keys compare byte for byte on every backend, so case is significant. The service writes only
     # canonical host keys; this pins that the store does not fold them a second way.

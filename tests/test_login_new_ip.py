@@ -747,3 +747,123 @@ async def test_an_address_too_long_to_key_is_never_remembered() -> None:
         assert await store.list_known_login_addresses(uid, since=0.0) == []
     finally:
         await store.close()
+
+
+async def test_a_directory_sign_in_that_owes_nothing_records_even_a_new_address() -> None:
+    """No directory session is seeded, so a NEW verdict there challenges nothing. Holding the
+    write back would only repeat the notice at every sign-in from an address its owner uses."""
+    store = await MessageStore.open(":memory:")
+    try:
+        notifier = _FakeNotifier()
+        settings = AuthSettings(
+            ad_enabled=True,
+            ad_server="ldaps://x",
+            ad_user_search_base="DC=x",
+            ad_bind_dn="CN=svc,DC=x",
+            ad_bind_password="x",
+        )
+        service = AuthService(
+            store,
+            settings,
+            ldap=_FakeLdap(),  # type: ignore[arg-type]
+            security_notifier=notifier,
+        )
+        await service.initialize()
+        await service.set_ad_group_map([("CN=MF-Ops,DC=x", "operator")], actor="admin")
+        for client in ("10.2.2.2", "198.51.100.60", "198.51.100.60"):
+            out = await service._complete_ad_login(_principal("jsmith"), client, mfa_verified=True)
+            assert out.ok and not out.mfa_required
+        assert len(await store.list_audit(actor="jsmith", action="auth.login_new_ip")) == 1
+    finally:
+        await store.close()
+
+
+async def test_a_combined_sign_in_from_a_new_address_records_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A combined sign-in proved its TOTP code in the same request, as ``verify_mfa`` would have,
+    so its address is recorded even when the verdict was NEW."""
+    store = await MessageStore.open(":memory:")
+    try:
+        owed = AuthService(
+            store,
+            AuthSettings(
+                require_mfa=True, mfa_verify_min_elapsed_seconds=0, mfa_recovery_code_count=1
+            ),
+            security_notifier=_FakeNotifier(),
+        )
+        await owed.initialize()
+        uid = await _operator(owed)
+        t0 = 1_000_000.0
+        pin_totp_clock(monkeypatch, t0)
+        first = await owed.login("oper", PW, client="10.1.1.1")
+        assert first.ok and first.identity is not None and first.token is not None
+        secret = await _enrol_totp(owed, first.identity, first.token, client="10.1.1.1", now=t0)
+        t1 = t0 + totp.DEFAULT_PERIOD
+        pin_totp_clock(monkeypatch, t1)
+        combined = await owed.login(
+            "oper", PW, client="203.0.113.21", totp_code=totp.totp(secret, now=t1)
+        )
+        assert combined.ok and not combined.mfa_required
+        assert len(await store.list_audit(actor="oper", action="auth.login_new_ip")) == 1
+        assert sorted(await store.list_known_login_addresses(uid, since=0.0)) == [
+            "10.1.1.1",
+            "203.0.113.21",
+        ]
+    finally:
+        await store.close()
+
+
+async def test_an_enrolment_baseline_outlives_the_lookback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A first sign-in finished through enrolment writes a row but never stamps ``last_login_at``.
+    Once that row ages out of the lookback the account still HAS a baseline, so its next sign-in from
+    another address is judged NEW, not failed open as a first sign-in."""
+    store = await MessageStore.open(":memory:")
+    try:
+        owed = AuthService(
+            store,
+            AuthSettings(require_mfa=True, mfa_recovery_code_count=1),
+            security_notifier=_FakeNotifier(),
+        )
+        await owed.initialize()
+        await _operator(owed)
+        first = await owed.login("oper", PW, client="10.1.1.1")
+        assert first.ok and first.identity is not None and first.token is not None
+        await _enrol_totp(owed, first.identity, first.token, client="10.1.1.1")
+        monkeypatch.setattr(service_module, "_LOGIN_ADDRESS_LOOKBACK_SECONDS", -3600)
+        assert (await owed.login("oper", PW, client="203.0.113.30")).ok
+        assert len(await store.list_audit(actor="oper", action="auth.login_new_ip")) == 1
+    finally:
+        await store.close()
+
+
+async def test_a_failed_read_in_the_step_up_gate_does_not_break_the_step_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The step-up asks whether the session's factor is satisfied before it records the address. A
+    store fault in that read is the record's to swallow: the step-up itself still succeeds."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, _FakeNotifier())
+        uid = await _operator(service)
+        assert (await service.login("oper", PW, client="10.1.1.1")).ok
+        out = await service.login("oper", PW, client="198.51.100.70")
+        assert out.ok and out.identity is not None and out.token is not None
+
+        real = service._mfa_satisfied_hash
+        calls = 0
+
+        async def _flaky(token_hash: str) -> bool:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("synthetic store fault")
+            return await real(token_hash)
+
+        monkeypatch.setattr(service, "_mfa_satisfied_hash", _flaky)
+        stepped = await service.reauth(out.identity, PW, token=out.token, client="198.51.100.70")
+        assert stepped.ok
+        assert calls >= 1
+        assert await store.list_known_login_addresses(uid, since=0.0) == ["10.1.1.1"]
+    finally:
+        await store.close()

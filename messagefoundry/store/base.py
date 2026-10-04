@@ -2004,9 +2004,11 @@ class AuthStore(Protocol):
     # The addresses the account finished a sign-in from with ``last_seen >= since``, in no order.
     async def list_known_login_addresses(self, user_id: str, *, since: float) -> list[str]: ...
 
-    # Upsert one address (``first_seen`` kept, ``last_seen`` set to ``now``), then delete this
-    # account's rows with ``last_seen < forget_before``, in one transaction. The delete is the table's
-    # only retention: a row outside the reader's lookback can never match, so it is not kept.
+    # Upsert one address (``first_seen`` kept, ``last_seen`` moved forward to ``now`` and never back),
+    # then delete this account's rows with ``last_seen < forget_before``. The delete is the table's
+    # only retention: a row outside the reader's lookback can never match, so it is not kept. It may
+    # commit apart from the upsert (SQL Server does, to avoid a deadlock); a lost prune leaves only
+    # rows the reader already ignores. The account's deletion cascades to its rows.
     async def remember_login_address(
         self, user_id: str, address: str, *, now: float, forget_before: float
     ) -> None: ...

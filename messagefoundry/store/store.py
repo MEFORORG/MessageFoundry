@@ -4762,9 +4762,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_webauthn_label ON webauthn_credentials(user
 -- and client host that finished a sign-in owing nothing more. Keyed on the account id, never the
 -- username, so a re-created namesake inherits nothing. The primary key serves the signal's one read
 -- (WHERE user_id), so audit_log, which has no actor index, is never scanned for it. Plaintext like
--- sessions.client: a network address, not PHI (docs/PHI.md section 2).
+-- sessions.client: a network address, not PHI (docs/PHI.md section 2). ON DELETE CASCADE because
+-- the write is best-effort and may race delete_user: a row inserted just before the account's
+-- delete goes with it, and one inserted after fails the key and is dropped by the caller.
 CREATE TABLE IF NOT EXISTS known_login_addresses (
-    user_id    TEXT NOT NULL REFERENCES users(id),
+    user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     address    TEXT NOT NULL,                  -- the host key, as AuthService folds it
     first_seen REAL NOT NULL,
     last_seen  REAL NOT NULL,                  -- the signal reads only rows inside its lookback
@@ -11720,7 +11722,8 @@ class MessageStore:
             await self._db.execute(
                 "INSERT INTO known_login_addresses (user_id, address, first_seen, last_seen)"
                 " VALUES (?, ?, ?, ?)"
-                " ON CONFLICT(user_id, address) DO UPDATE SET last_seen=excluded.last_seen",
+                " ON CONFLICT(user_id, address)"
+                " DO UPDATE SET last_seen=MAX(last_seen, excluded.last_seen)",
                 (user_id, address, now, now),
             )
             await self._db.execute(

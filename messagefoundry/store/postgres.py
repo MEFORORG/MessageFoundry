@@ -773,11 +773,11 @@ _SCHEMA: list[str] = [
     "CREATE INDEX IF NOT EXISTS ix_webauthn_credentials_user ON webauthn_credentials(user_id)",
     "CREATE UNIQUE INDEX IF NOT EXISTS ux_webauthn_label ON webauthn_credentials(user_id, label)",
     # The first-seen sign-in address baseline (BACKLOG #288, vault BACKLOG #2145) -- mirrors the SQLite
-    # `known_login_addresses` table (store/store.py), whose comment gives the reasons. The primary key
-    # serves the signal's one read. Adding this DDL moves _schema_hash() automatically -- the ADR 0064
-    # bump.
+    # `known_login_addresses` table (store/store.py), whose comment gives the reasons, the cascade's
+    # among them. The primary key serves the signal's one read. Adding this DDL moves _schema_hash()
+    # automatically -- the ADR 0064 bump.
     """CREATE TABLE IF NOT EXISTS known_login_addresses (
-        user_id    TEXT NOT NULL REFERENCES users(id),
+        user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         address    TEXT NOT NULL,
         first_seen DOUBLE PRECISION NOT NULL,
         last_seen  DOUBLE PRECISION NOT NULL,
@@ -7775,7 +7775,8 @@ class PostgresStore:
             await conn.execute(
                 "INSERT INTO known_login_addresses (user_id, address, first_seen, last_seen)"
                 " VALUES ($1, $2, $3, $3)"
-                " ON CONFLICT (user_id, address) DO UPDATE SET last_seen=EXCLUDED.last_seen",
+                " ON CONFLICT (user_id, address) DO UPDATE"
+                " SET last_seen=GREATEST(known_login_addresses.last_seen, EXCLUDED.last_seen)",
                 user_id,
                 address,
                 now,
