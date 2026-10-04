@@ -291,11 +291,54 @@ def test_a_rule_recipient_override_is_checked_when_the_notifier_is_built(where: 
         notifier_from_settings(alerts)
 
 
-def test_a_rule_that_never_routes_to_email_is_not_held_to_the_address_rule() -> None:
-    # Its override never reaches a send, so it must not stop startup.
-    rule = AlertRule(
-        event_type="connection_stopped", transports=["webhook"], recipients=[_ENCODED_LOCAL[0]]
-    )
+def _rule_shapes() -> dict[str, tuple[AlertRule, bool]]:
+    """Rules carrying a bad override, mapped to whether that override can reach the email send.
+    Each level resolves as _apply_escalation does: a tier's None keeps the level below."""
+    bad = [_ENCODED_LOCAL[0]]
+
+    def tier(**kw: Any) -> EscalationTier:
+        return EscalationTier(after_count=2, **kw)
+
+    stopped = "connection_stopped"
+    return {
+        "webhook-only": (
+            AlertRule(event_type=stopped, transports=["webhook"], recipients=bad),
+            False,
+        ),
+        "webhook-severity-tier": (
+            AlertRule(
+                event_type=stopped,
+                transports=["webhook"],
+                recipients=bad,
+                escalate=[tier(severity="critical")],
+            ),
+            False,
+        ),
+        "muted": (AlertRule(event_type=stopped, mute=True, recipients=bad), False),
+        "webhook-tier-override": (
+            AlertRule(event_type=stopped, escalate=[tier(transports=["webhook"], recipients=bad)]),
+            False,
+        ),
+        "muted-email-tier": (
+            AlertRule(
+                event_type=stopped, mute=True, recipients=bad, escalate=[tier(transports=["email"])]
+            ),
+            True,
+        ),
+        "base-email-tier-inherits": (
+            AlertRule(event_type=stopped, escalate=[tier(recipients=bad)]),
+            True,
+        ),
+    }
+
+
+_RULE_SHAPES = _rule_shapes()
+
+
+@pytest.mark.parametrize("rule, reaches_email", list(_RULE_SHAPES.values()), ids=list(_RULE_SHAPES))
+def test_a_rule_override_is_checked_only_where_it_reaches_the_email_send(
+    rule: AlertRule, reaches_email: bool
+) -> None:
     alerts = AlertsSettings(
         webhook_url="https://hooks.example/x",
         email_smtp_host="smtp.example",
@@ -303,7 +346,11 @@ def test_a_rule_that_never_routes_to_email_is_not_held_to_the_address_rule() -> 
         email_to=["ops@hospital.example"],
         rules=[rule],
     )
-    assert notifier_from_settings(alerts) is not None
+    if reaches_email:
+        with pytest.raises(ValueError, match="a recipient"):
+            notifier_from_settings(alerts)
+    else:
+        assert notifier_from_settings(alerts) is not None
 
 
 def test_the_security_notifier_refuses_a_sender_that_is_not_one_plain_mailbox() -> None:

@@ -52,7 +52,7 @@ from messagefoundry.pipeline.alert_sinks import (
     _BackgroundDispatcher,
     send_plain_email,
 )
-from messagefoundry.transports.email import envelope_address_problem
+from messagefoundry.transports.email import checked_sender
 
 log = logging.getLogger(__name__)
 
@@ -561,9 +561,7 @@ def security_notifier_from_settings(
     # The sender is MAIL FROM on every notice, and send_plain_email refuses one that fails the address
     # rule. Refuse it here instead, where it stops startup, rather than at each send, where the
     # failure is only a log line (vault BACKLOG #2870).
-    problem = envelope_address_problem(alerts.email_from)
-    if problem is not None:
-        raise ValueError(f"[alerts].email_from {problem}")
+    checked_sender("[alerts].email_from", alerts.email_from)
     smtp_password = resolve_connector_secret(
         secret_provider,
         ref=alerts.email_password_secret,

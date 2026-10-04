@@ -8351,6 +8351,7 @@ def _alert(args: argparse.Namespace) -> int:
         check_rule_recipients,
         configured_alert_transport_names,
     )
+    from messagefoundry.transports.email import checked_sender
 
     path = args.service_config
 
@@ -8417,6 +8418,8 @@ def _alert(args: argparse.Namespace) -> int:
                     and "email" in configured_alert_transport_names(alerts)
                 ):
                     try:
+                        # The sender first, so a bad email_from is named as such, not as the rule.
+                        checked_sender("[alerts].email_from", alerts.email_from)
                         check_rule_recipients(new_rule, alerts.email_from, "alert rule")
                     except ValueError as exc:
                         return _emit_error(

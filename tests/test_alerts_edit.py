@@ -278,6 +278,10 @@ def test_add_refuses_a_recipient_override_the_next_start_would_refuse(
     assert "alert rule: a recipient" in out
     assert bad not in out  # the refusal names the problem, never the address
     assert load_settings(config_path=svc).alerts.rules == []
+    # A rule whose override can never reach email is not held to the rule, so it is written.
+    webhook_only = {"event_type": "connection_stopped", "transports": [], "recipients": [bad]}
+    rc, _ = _add(svc, webhook_only, capsys)
+    assert rc == 0
 
 
 def test_add_allows_a_rule_that_names_no_transport(

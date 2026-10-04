@@ -1457,18 +1457,26 @@ def check_rule_recipients(rule: AlertRule, sender: str, where: str) -> None:
     that fails the address rule :func:`send_plain_email` applies at every send (vault BACKLOG #2870).
 
     Run when the notifier is built and when ``alert add`` writes a rule, so a bad override fails
-    there rather than at the first alert it matches. A rule none of whose levels can route to email
-    is skipped, because its overrides never reach a send. Raises :class:`ValueError` naming
-    ``where``, never the address."""
-    routes = [rule.transports, *(step.transports for step in rule.escalate)]
-    if not any(route is None or "email" in route for route in routes):
-        return
-    overrides = [(where, rule.recipients)]
-    overrides += [
-        (f"{where}.escalate[{j}]", step.recipients) for j, step in enumerate(rule.escalate)
-    ]
-    for label, recipients in overrides:
-        if recipients:
+    there rather than at the first alert it matches. Each level is resolved the way
+    :meth:`NotifierAlertSink._apply_escalation` resolves it: a tier's ``None`` keeps the level
+    below, tiers apply in ``after_count`` order, and a mute sends nothing. Only a level whose
+    effective transports include email has its effective recipients checked, because no other
+    override reaches a send. Raises :class:`ValueError` naming ``where`` and the level that set the
+    recipients, never the address."""
+    transports: tuple[str, ...] | None = (
+        () if rule.mute else (None if rule.transports is None else tuple(rule.transports))
+    )
+    recipients, label = rule.recipients, where
+    levels = [(transports, recipients, label)]
+    tiers = sorted(enumerate(rule.escalate), key=lambda pair: pair[1].after_count)
+    for j, step in tiers:
+        if step.transports is not None:
+            transports = tuple(step.transports)
+        if step.recipients is not None:
+            recipients, label = step.recipients, f"{where}.escalate[{j}]"
+        levels.append((transports, recipients, label))
+    for transports, recipients, label in levels:
+        if recipients and (transports is None or "email" in transports):
             checked_envelope(label, sender, recipients)
 
 

@@ -946,9 +946,10 @@ async def test_a_recipient_that_is_not_one_plain_address_is_refused_before_any_c
 ) -> None:
     # The line-break ids were accepted before vault BACKLOG #2870: the address parser drops a bare
     # CR or LF, so the RCPT line named an address with the break removed. The gate and construction
-    # read the same list, so both refuse.
+    # read the same list, so both refuse, and the gate names the control character.
     dest = _wire_dest(wire.port, [value])
-    with pytest.raises(WiringError, match="allowed_recipient_domains"):
+    gate = "allowed_recipient_domains" if value.isprintable() else "a recipient holds a control"
+    with pytest.raises(WiringError, match=gate):
         check_egress_allowed(dest, _wire_egress(wire.port))
     with pytest.raises(ValueError, match="recipient"):
         EmailDestination(dest)

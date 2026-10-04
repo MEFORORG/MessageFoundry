@@ -82,6 +82,7 @@ __all__ = [
     "CheckedEnvelope",
     "EmailDestination",
     "checked_envelope",
+    "checked_sender",
     "envelope_address_problem",
     "envelope_recipients",
 ]
@@ -89,18 +90,27 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 
+def _recipient_entries(value: Any) -> list[str]:
+    """The ``recipients`` setting as a list of entries (a lone string is one entry); empty for an
+    empty or invalid value."""
+    if isinstance(value, str):
+        return [value] if value else []
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value if str(item)]
+    return []
+
+
 def _as_recipients(value: Any) -> list[str]:
     """Coerce the ``recipients`` setting to a non-empty list of address strings (a lone string is
     treated as a single recipient). Raises :class:`ValueError` for an empty/invalid value."""
-    if isinstance(value, str):
-        recipients = [value] if value else []
-    elif isinstance(value, (list, tuple)):
-        recipients = [str(item) for item in value if str(item)]
-    else:
-        recipients = []
+    recipients = _recipient_entries(value)
     if not recipients:
         raise ValueError("Email destination requires a non-empty 'recipients' setting")
     return recipients
+
+
+#: The refusal for a recipients entry holding a line break or other control character.
+_RECIPIENT_CONTROL_CHAR = "a recipient holds a control character"
 
 
 def envelope_recipients(value: Any) -> list[str]:
@@ -112,13 +122,13 @@ def envelope_recipients(value: Any) -> list[str]:
     this list to ``send_message`` as ``to_addrs`` and builds ``To:`` from it, and the ``[egress]``
     recipient-domain check (vault BACKLOG #2616) checks the same list. An address the parser cannot
     read comes back as ``""``, which :func:`envelope_address_problem` refuses. Raises
-    :class:`ValueError` for an empty setting, as construction does."""
+    :class:`ValueError` for an empty setting, as construction does, and for an entry holding a
+    control character: the parser drops a bare CR or LF, so ``a<LF>b@host`` would come back as
+    ``ab@host``, which is the text checked and sent but not the address written (vault BACKLOG
+    #2870)."""
     entries = _as_recipients(value)
     if any(_holds_control_char(entry) for entry in entries):
-        # The parser drops a bare CR or LF, so "a<LF>b@host" would come back as "ab@host": the same
-        # text checked and sent, but not the address written. Read it as unreadable instead, so the
-        # [egress] check and construction both refuse it (vault BACKLOG #2870).
-        return [""]
+        raise ValueError(_RECIPIENT_CONTROL_CHAR)
     return [addr for _, addr in getaddresses([", ".join(entries)])]
 
 
@@ -236,26 +246,35 @@ def checked_envelope(cell: str, sender: str, recipients: Any) -> CheckedEnvelope
     Raises :class:`ValueError` naming ``cell`` and the problem, never the address. A display name on
     a recipient is dropped, as :func:`envelope_recipients` reads it. The sender gets no such reading:
     it must already be one plain address, because it is ``MAIL FROM``, where bounces go."""
-    try:
-        envelope = envelope_recipients(recipients)
-    except ValueError:
-        envelope = []  # an empty setting; refused below, outside the handler
-    if not envelope:
+    entries = _recipient_entries(recipients)
+    if not entries:
         raise ValueError(f"{cell} requires a non-empty 'recipients' setting")
+    # Checked here as well as in envelope_recipients, so the refusal names the cell.
+    if any(_holds_control_char(entry) for entry in entries):
+        raise ValueError(f"{cell}: {_RECIPIENT_CONTROL_CHAR}")
+    envelope = envelope_recipients(entries)
     for address in envelope:
         problem = envelope_address_problem(address)
         if problem is not None:
             raise ValueError(f"{cell}: a recipient {problem}")
-    # Its domain is not gated: that is a policy question, not an address-shape one.
-    problem = envelope_address_problem(sender)
-    if problem is not None:
-        raise ValueError(f"{cell}: the sender {problem}")
     return CheckedEnvelope(
         sender=sender,
         recipients=tuple(envelope),
-        from_header=tuple(_checked_header(cell, "From", [sender], "sender")),
+        from_header=tuple(checked_sender(cell, sender)),
         to_header=tuple(_checked_header(cell, "To", envelope, "recipients")),
     )
+
+
+def checked_sender(cell: str, sender: str) -> list[Address]:
+    """Check ``sender`` the way :func:`checked_envelope` does and return its ``From:`` addresses.
+
+    For a cell that must refuse a bad sender before it has any recipients, such as the per-user
+    security notifier at startup. Its domain is not gated: that is a policy question, not an
+    address-shape one. Raises :class:`ValueError` naming ``cell``, never the address."""
+    problem = envelope_address_problem(sender)
+    if problem is not None:
+        raise ValueError(f"{cell}: the sender {problem}")
+    return _checked_header(cell, "From", [sender], "sender")
 
 
 class EmailDestination(DestinationConnector):
