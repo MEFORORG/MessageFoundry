@@ -1047,33 +1047,31 @@ engine may **send** PHI, so a fat-fingered or hostile destination can't exfiltra
 transport's list is set, an outbound of that transport not on it is **refused at config load/reload**
 (a `WiringError` → 422 / refused reload), checked against the resolved (`env()`-substituted) destination.
 
-> **Do not record "egress allowlist: opt-in, unrestricted by default."** That is the `EgressSettings`
-> *field* default, and on a **PHI** instance `serve` overrides it before the engine ever runs
-> ([`__main__.py`](../messagefoundry/__main__.py): the open-egress gate, then the deny-by-default flip;
+> **Do not record "egress allowlist: opt-in, unrestricted by default."** The `EgressSettings` model
+> denies by default (vault BACKLOG #2605). So every entry point that builds a connector, not only
+> `serve`, refuses a destination whose transport's list is empty, unless the operator writes
+> `[security].block_unlisted_outbound = false`. On top of that, `serve` runs a startup gate
+> ([`__main__.py`](../messagefoundry/__main__.py), the `egress_open` expression;
 > ASVS 13.2.4/13.2.5). **All three built-in environment names derive PHI**
 > ([ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md)), so this is
 > what `serve --env dev|staging|prod` actually does under `[security].enforcement = enforce` (the default):
 >
 > | `[egress]` / `[security]` as configured | What `serve` does |
 > |---|---|
-> | **none of the six *counted* lists** set (see "Only SIX of the eight lists" below), `block_unlisted_outbound` left unset | **exits 2** — *"outbound egress is UNRESTRICTED … refusing to start"*. A PHI instance with no egress config does **not** start — **and neither does one whose only list is `allowed_smtp` or `allowed_direct`**. |
-> | none of the six set, `block_unlisted_outbound = false` | **exits 2** — same gate; the explicit opt-out does not buy a fully-open PHI instance. |
-> | **≥1 of the six *counted* lists** set (see below), `block_unlisted_outbound` left unset | starts, and **flips deny-by-default ON** (an `info:` line on stderr): every transport whose own list is **empty** now refuses **every** destination of that type. This is the case that bites — a partially-configured instance does not allow-any the transports you didn't list. |
-> | `block_unlisted_outbound = true` | starts, deny-by-default — enumerate every permitted destination. |
-> | **≥1** counted list set, `block_unlisted_outbound = false` | starts **allow-any** for the transports you left empty, with a `warning:` plus a WARNING-level `AUDIT:` line, and reported by `security_loosenings()`. |
+> | **no counted list** set (see "Which lists the startup gate counts" below), `block_unlisted_outbound` left unset | **exits 2** with *"no outbound destination is declared … refusing to start"*. The deny default would refuse every outbound, so `serve` refuses to start rather than run lanes that fail every send. |
+> | none of the six lists that count under the opt-out set, `block_unlisted_outbound = false` | **exits 2** with *"outbound egress is UNRESTRICTED … refusing to start"*; the explicit opt-out does not buy a fully-open PHI instance. |
+> | **at least one counted list** set, `block_unlisted_outbound` left unset | starts deny-by-default (an `info:` line on stderr): every transport whose own list is **empty** refuses **every** destination of that type. This is the case that bites: a partially-configured instance does not allow-any the transports you didn't list. |
+> | `block_unlisted_outbound = true` | starts deny-by-default, with or without a list; enumerate every permitted destination. |
+> | at least one of those six set, `block_unlisted_outbound = false` | starts **allow-any** for the transports you left empty, with a `warning:` plus a WARNING-level `AUDIT:` line, and reported by `security_loosenings()`. |
 >
-> **WARNING: Only SIX of the eight lists satisfy the open-egress gate.** Its predicate
-> ([`__main__.py`](../messagefoundry/__main__.py), the `egress_open` expression) reads
-> `allowed_mllp`, `allowed_tcp`, `allowed_http`, `allowed_db`, `allowed_remote` and
-> `allowed_file_dirs` — and **nothing else**. `allowed_smtp` and `allowed_direct` appear nowhere in
-> that gate. So a PHI instance whose *only* declared egress is an `Email()` relay or a `Direct()`
-> HISP relay is still `egress_open` and still **exits 2** with *"outbound egress is UNRESTRICTED …
-> refusing to start"*, having declared a list. Measured, one list at a time, on `--env prod`: each of
-> the six starts and flips deny-by-default on; `allowed_smtp`-only and `allowed_direct`-only both
-> exit 2. If your deployment is mail-only or Direct-only, set
-> **`[security].block_unlisted_outbound = true`** — that arm of the predicate is what a mail-only
-> instance has to use. (The two lists still *gate* their own transports normally once the instance
-> starts; they just do not count as "egress is restricted" for this gate.)
+> **Which lists the startup gate counts depends on the switch.** With `block_unlisted_outbound` left
+> unset, the gate counts eight lists: `allowed_mllp`, `allowed_tcp`, `allowed_http`, `allowed_db`,
+> `allowed_remote`, `allowed_file_dirs`, `allowed_smtp` and `allowed_direct`. So a mail-only or
+> Direct-only instance passes the gate, and the deny default holds every other transport closed.
+> With the switch written `false`, only the first six count, because the other transports would
+> then stay allow-any. A mail-only instance with that opt-out **exits 2** with *"outbound egress is
+> UNRESTRICTED … refusing to start"*, and the message names the override. `allowed_recipient_domains`
+> and `allowed_proxy` never count. Every list still *gates* its own transport once the instance starts.
 >
 > Under `enforcement = warn` the two refusals become warnings and start. **No instance is exempt**
 > — the synthetic declaration that used to exempt one entirely was retired in [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md).
@@ -1082,22 +1080,22 @@ transport's list is set, an outbound of that transport not on it is **refused at
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `allowed_mllp` | list | `[]` | allowed MLLP destinations; each entry is `host` (any port) or `host:port`. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_MLLP` |
-| `allowed_tcp` | list | `[]` | allowed raw-TCP destinations; each entry is `host` (any port) or `host:port`. **Covers three connectors, not one:** `Tcp(...)`, `X12(...)` and the **DICOM C-STORE SCU** (`DICOM()` outbound) all resolve to this list — they are all raw sockets ([`pipeline/wiring_runner.py`](../messagefoundry/pipeline/wiring_runner.py), the `TCP`/`X12`/`DIMSE` egress arms). Populate it for every one of them, or with deny-by-default flipped on your X12/PACS destinations are refused at load. An inbound `Tcp(...)`/`X12(...)`/`DICOM()` is a local listener and is not connect-gated. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_TCP` |
+| `allowed_tcp` | list | `[]` | allowed raw-TCP destinations; each entry is `host` (any port) or `host:port`. **Covers three connectors, not one:** `Tcp(...)`, `X12(...)` and the **DICOM C-STORE SCU** (`DICOM()` outbound) all resolve to this list — they are all raw sockets ([`transports/egress.py`](../messagefoundry/transports/egress.py), `_allowlist_for`). Populate it for every one of them, or under the deny default your X12/PACS destinations are refused at load. An inbound `Tcp(...)`/`X12(...)`/`DICOM()` is a local listener and is not connect-gated. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_TCP` |
 | `allowed_file_dirs` | list | `[]` | allowed File output directories; a destination's directory must resolve at/under one of these |
 | `allowed_http` | list | `[]` | allowed HTTP destination hosts; each entry is `host` (any port) or `host:port` (ADR 0003). **Covers the whole HTTP family, not just REST/SOAP:** `Rest()`, `Soap()`, `FHIR()`, `DICOMweb()` (STOW-RS), the read-only `fhir_lookup` / `FhirLookup(...)` (ADR 0043), **and** the SMART / OAuth2 **token endpoints** — a token endpoint is a second egress host and is checked against this same list, so list it too. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_HTTP` |
 | `allowed_db` | list | `[]` | allowed DATABASE destination servers; each entry is `host` (any port) or `host:port` (ADR 0003). Via env: comma-separated `MEFOR_EGRESS_ALLOWED_DB` |
 | `allowed_remote` | list | `[]` | allowed RemoteFile (SFTP/FTP/FTPS) hosts — gates the connector in **both** directions (source poll + destination upload); each entry is `host` (any port) or `host:port`. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_REMOTE` |
-| `allowed_smtp` | list | `[]` | allowed **email (SMTP)** destination hosts for the `Email(...)` outbound ([ADR 0029](adr/0029-email-smtp-destination.md)); each entry is `host` (any port) or `host:port`. Distinct from `[alerts].smtp_allowed_hosts`, which gates the **alert notifier's** own SMTP dial. **Does NOT count toward the open-egress startup gate** (see "Only SIX of the eight lists" above the key table) — setting only this on a PHI instance still exits 2. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_SMTP` |
-| `allowed_direct` | list | `[]` | allowed **Direct** (S/MIME-over-SMTP HISP relay) destination hosts ([ADR 0085](adr/0085-direct-hisp-smime-connector.md)); each entry is `host` (any port) or `host:port`. Kept deliberately **separate from `allowed_smtp`** so an operator can permit a Direct HISP relay without opening generic email egress — a distinct trust relationship carrying encrypted PHI. **Does NOT count toward the open-egress startup gate** either — a Direct-only PHI instance needs `[security].block_unlisted_outbound = true` to start. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_DIRECT` |
-| `allowed_recipient_domains` | list | `[]` | allowed **recipient domains** for the `Email(...)` outbound (vault BACKLOG #2616). `allowed_smtp` gates only the relay hop, and a relay forwards to whatever address the connection names, so this list bounds where the mail ends up: **every** address in an `Email()` destination's `recipients` must sit in a listed domain, or the destination is **refused at config load/reload**. Each entry is a bare domain (`hospital.example`), matched exactly and without regard to case; a subdomain needs its own entry. An entry that could never match, such as an address, URL, port, wildcard, IP address or leading-dot suffix, is refused at load. Each address the engine parses out of `recipients` must also be a plain `local@domain` that reads back unchanged, within the SMTP length limits, with a local part of letters, digits, dots and the RFC 5322 mailbox symbols other than `%`, `!`, `|`, `/`, `=` and `?`, not starting with `-`. A display name or comment in the setting is dropped, and the `To:` header carries only the checked addresses. Its domain must be ASCII: write an internationalized domain in its `xn--` form, in the recipient and in the list. **Deny-by-default, unlike the destination lists above:** an empty list refuses every `Email()` destination on every instance, whatever `[security].block_unlisted_outbound` says. It does not gate `Direct()`, which encrypts to one partner certificate, and it does **not** count toward the open-egress startup gate. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_RECIPIENT_DOMAINS` |
+| `allowed_smtp` | list | `[]` | allowed **email (SMTP)** destination hosts for the `Email(...)` outbound ([ADR 0029](adr/0029-email-smtp-destination.md)); each entry is `host` (any port) or `host:port`. Distinct from `[alerts].smtp_allowed_hosts`, which gates the **alert notifier's** own SMTP dial. **Whether it counts toward the open-egress startup gate depends on `[security].block_unlisted_outbound`**; see "Which lists the startup gate counts" above the key table. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_SMTP` |
+| `allowed_direct` | list | `[]` | allowed **Direct** (S/MIME-over-SMTP HISP relay) destination hosts ([ADR 0085](adr/0085-direct-hisp-smime-connector.md)); each entry is `host` (any port) or `host:port`. Kept deliberately **separate from `allowed_smtp`** so an operator can permit a Direct HISP relay without opening generic email egress — a distinct trust relationship carrying encrypted PHI. **Counts toward the open-egress startup gate on the same terms as `allowed_smtp`**. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_DIRECT` |
+| `allowed_recipient_domains` | list | `[]` | allowed **recipient domains** for the `Email(...)` outbound (vault BACKLOG #2616). `allowed_smtp` gates only the relay hop, and a relay forwards to whatever address the connection names, so this list bounds where the mail ends up: **every** address in an `Email()` destination's `recipients` must sit in a listed domain, or the destination is **refused at config load/reload**. Each entry is a bare domain (`hospital.example`), matched exactly and without regard to case; a subdomain needs its own entry. An entry that could never match, such as an address, URL, port, wildcard, IP address or leading-dot suffix, is refused at load. Each address the engine parses out of `recipients` must also be a plain `local@domain` that reads back unchanged, within the SMTP length limits, with a local part of letters, digits, dots and the RFC 5322 mailbox symbols other than `%`, `!`, `|`, `/`, `=` and `?`, not starting with `-`. A display name or comment in the setting is dropped, and the `To:` header carries only the checked addresses. Its domain must be ASCII: write an internationalized domain in its `xn--` form, in the recipient and in the list. **Deny-by-default even under the `block_unlisted_outbound = false` opt-out, unlike the destination lists above:** an empty list refuses every `Email()` destination on every instance, whatever `[security].block_unlisted_outbound` says. It does not gate `Direct()`, which encrypts to one partner certificate, and it does **not** count toward the open-egress startup gate. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_RECIPIENT_DOMAINS` |
 | `proxy_url` | str | _unset_ | site-wide **default forward/egress web proxy** for the HTTP family — REST/SOAP/FHIR/`fhir_lookup`/DICOMweb plus the OAuth2/SMART token endpoints ([ADR 0126](adr/0126-outbound-forward-egress-web-proxy-for-the-stdlib-http-family.md)). A connection that sets no per-connection `proxy` inherits this; a per-connection value overrides it. Unset (default) = no site-wide proxy from this file; only per-connection proxies apply. An off-box hop then still follows `HTTP_PROXY` / `HTTPS_PROXY` and the operating system's own proxy settings, which `urllib` reads on its own. `"default"` selects the OS default web proxy (`getproxies()`); an `http(s)://` address names an explicit one. **A loopback host is never sent through a proxy**, whichever of these named it (see the cleartext note below this table). **Proxy credentials stay per-connection** (secrets via `env()`), never a global TOML value. Via env: `MEFOR_EGRESS_PROXY_URL` |
 | `proxy_no_proxy` | list | `[]` | the site-wide `NO_PROXY`-style **bypass list** inherited by a connection that sets no per-connection `proxy_no_proxy`. Each entry is a host, `.suffix`, `*.suffix` or `*`. Via env: comma-separated `MEFOR_EGRESS_PROXY_NO_PROXY` |
-| `allowed_proxy` | list | `[]` | allowed **forward-proxy** hosts; each entry is `host` (any port) or `host:port`. Gates the proxy an http-family connection dials **through** — per-connection `proxy_url` or the `[egress].proxy_url` default above — on both the outbound and the `fhir_lookup` read arm. **Deny-by-default, unlike the destination lists above:** a configured proxy with an empty `allowed_proxy` is **refused at config load**. Empty refuses nothing until you set a proxy, so the cost is one line for operators who use one; permissive-when-empty would leave the proxy ungated on the default posture, and the proxy receives a `Proxy-Authorization` credential under `proxy_auth_type = basic`. Same shape as `[ai].allowed_endpoints` ([ADR 0135](adr/0135-engine-brokered-ai-assistance-customer-managed-llm-egress-with-per-use-audit.md)). `proxy_url = "default"` is exempt (it names no address at config time and cannot carry engine-minted proxy credentials). **Not a destination list:** it is deliberately separate from `allowed_http`, because [ADR 0126](adr/0126-outbound-forward-egress-web-proxy-for-the-stdlib-http-family.md) puts the proxy out of that gate's scope — one corporate proxy fronts many destinations and would otherwise have to be co-listed with every one — and it does **not** count toward the open-egress startup gate. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_PROXY` |
+| `allowed_proxy` | list | `[]` | allowed **forward-proxy** hosts; each entry is `host` (any port) or `host:port`. Gates the proxy an http-family connection dials **through** — per-connection `proxy_url` or the `[egress].proxy_url` default above — on both the outbound and the `fhir_lookup` read arm. **Deny-by-default even under the `block_unlisted_outbound = false` opt-out, unlike the destination lists above:** a configured proxy with an empty `allowed_proxy` is **refused at config load**. Empty refuses nothing until you set a proxy, so the cost is one line for operators who use one; permissive-when-empty would leave the proxy ungated under that opt-out, and the proxy receives a `Proxy-Authorization` credential under `proxy_auth_type = basic`. Same shape as `[ai].allowed_endpoints` ([ADR 0135](adr/0135-engine-brokered-ai-assistance-customer-managed-llm-egress-with-per-use-audit.md)). `proxy_url = "default"` is exempt (it names no address at config time and cannot carry engine-minted proxy credentials). **Not a destination list:** it is deliberately separate from `allowed_http`, because [ADR 0126](adr/0126-outbound-forward-egress-web-proxy-for-the-stdlib-http-family.md) puts the proxy out of that gate's scope — one corporate proxy fronts many destinations and would otherwise have to be co-listed with every one — and it does **not** count toward the open-egress startup gate. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_PROXY` |
 | `deny_by_default` | | | **→ moved to `[security].block_unlisted_outbound`** (ADR 0118) — set it there; no longer accepted in `[egress]`. |
 
-> **Fully-open egress is a startup REFUSAL, not a warning** (see the table above).
-> With none of the six **counted** allowlists set (`allowed_smtp`/`allowed_direct` do not count —
-> see "Only SIX of the eight lists" above), `serve` **exits 2** on **every** instance — all three built-in env names, not
+> **No counted destination list is a startup REFUSAL, not a warning** (see the table above).
+> With no **counted** allowlist set (see "Which lists the startup gate counts" above), and
+> `block_unlisted_outbound` not written `true`, `serve` **exits 2** on **every** instance — all three built-in env names, not
 > just `prod`/`staging` — under `[security].enforcement = enforce`, the default; it downgrades to a
 > stderr warning only under `enforcement = warn`, which is now the only dial that moves it. Lock it down with
 > the per-transport lists above and/or **`[security].block_unlisted_outbound = true`** — note that key
@@ -1951,7 +1949,7 @@ and a PHI weakening under **strict enforcement** (`enforcement = enforce`, the d
 | `require_mfa_scope` | `"administrators"` \| `"every_local_account"` | `"every_local_account"` | **Which accounts must ENROL a factor** when `require_mfa` is on (ASVS 6.3.3). An account that has already enrolled one must satisfy it while it keeps one, under either value (an OIDC sign-in meets it while `[auth].oidc_require_mfa_claim` is on, the default) — this dial only decides who is required to enrol in the first place. `administrators` restores the pre-6.3.3 posture and is reported as a **loosening** on `GET /security/posture` (advisory, not a refusal: refusing to boot on it would break every existing deployment on upgrade). **The `every_local_account` value is wider than its name** (BACKLOG #1144): directory (AD/Kerberos) identities used to be out of scope under either value, and they are not any more — the directory legs assert no strength the engine can read, so a Kerberos session mints MFA-pending and its holder enrols an engine factor. The value's spelling is stale; renaming a `Literal` reaches the settings model, this table and the tests that pin both, which is its own coherent change rather than a rider on a security fix. **Operator note:** under the default a non-interactive **bearer-token service account** becomes MFA-pending and cannot enrol unattended. Two settings answer it, each with a limit. **Set this to `administrators`**, which frees only a **local** account that does not hold the Administrator role: the Administrator role stays in scope under either value, and a directory session that proved no factor stays MFA-pending under both. Or **set `require_mfa = false`**, which frees any account that has not enrolled a factor, whatever its role; on an exposed instance under `enforcement = enforce`, `serve` then refuses to start unless `allow_single_factor_admin_when_exposed` is set (see that row). An account that has enrolled a factor still owes it either way while it keeps one, with the same OIDC exception. With `require_mfa` off, or for an account `require_mfa_scope` leaves out (under `administrators`, any account without the Administrator role, directory ones included), the holder may remove its last factor. Under `administrators` with `require_mfa` on, a directory account that does so is still not single-factor: its next Kerberos session stays MFA-pending until it enrols again. Making it an AD principal is **no longer** an escape, and mTLS is not one either: a cert-identity is exempt from the MFA gate but is admitted on exactly one route (`GET /service/identity`), so it cannot carry a working service account (see the [`[api]`](#api) `tls_client_cert_identities` row). Env: `MEFOR_SECURITY_REQUIRE_MFA_SCOPE` |
 | `sign_out_after_idle_minutes` | int | `30` | session idle timeout |
 | `max_session_hours` | int | `12` | session absolute lifetime |
-| `block_unlisted_outbound` | bool | `true` | deny-by-default egress — only allow-listed destinations send. **Leaving it unset does not apply `true`** — the internal flag stays `false` and the `[egress]` startup gate decides; see the note under this table |
+| `block_unlisted_outbound` | bool | `true` | deny-by-default egress — only allow-listed destinations send. Leaving it unset applies `true`, because the internal `[egress]` field defaults to deny too (see [`[egress]`](#egress)). `serve` still reads whether you **wrote** it, because its [`[egress]`](#egress) startup gate treats unset and written `true` differently |
 | `delete_message_bodies_after_days` | int | `30` | bounded PHI-body retention; `0` = keep indefinitely (audited). **Leaving it unset does not apply 30 through the desugar** — the internal window stays `0`, and the `[retention]` startup gate then defaults it to 30 days on a PHI instance under **either** enforcement dial. This row used to say the gate refuses under `enforce` and auto-bounds only under `warn`; it does not — only an **explicit** `0` reaches the refusal. See the note under this table |
 | `allow_keeping_phi_indefinitely` | bool | `false` | audited escape: unbounded PHI retention |
 | `allow_keeping_transform_state_indefinitely` | bool | `false` | the acknowledgement for `[retention].state_max_age_days = 0` (BACKLOG #1967). Without it or a window, an enforcing instance refuses to start. With it, the start writes a WARNING-level `AUDIT:` line naming the tier. A **loosening**. See the tier table under [`[retention]`](#retention) |
@@ -1963,24 +1961,26 @@ and a PHI weakening under **strict enforcement** (`enforcement = enforce`, the d
 | `enforcement` | `enforce` \| `warn` | `enforce` | the serve-gate **refuse/warn dial** + the [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) escape-clamp key ([ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md) GIVEN 2). `enforce` (default) **refuses** every PHI serve-gate violation and shuts every blunt escape-clamp — byte-identical to the former production-tier behaviour; `warn` logs + audits + continues and honours the escapes (a loud, audited loosening, named by `security_loosenings()`). **Decoupled from `production_instance`** (env `MEFOR_SECURITY_ENFORCEMENT`) |
 | `production_instance` | bool | *derived* | production-tier posture (was `[ai].production`). Derived from the environment name when unset (`prod` → yes; `dev`/`staging` → no). **Informational since [ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md)** — drives the AI data-scope ceiling, the DEBUG-log refusal, and reporting, **not** the serve-gate refuse/warn dial (that is `enforcement`) |
 
-> **The Default column is the *field* default — for exactly two rows that is not what an
+> **The Default column is the *field* default — for one row that is not what an
 > unconfigured instance runs.** The loader desugars `[security]` **presence-gated**: only a switch you
 > set *explicitly* is written through to its internal field, so an omitted switch leaves the internal
-> default in place and lets the posture gate decide. Measured on a `messagefoundry.toml` with no
-> `[security]` block at all — the other nine pass-throughs agree with their rows; these two do not:
+> default in place and lets the posture gate decide. With no `[security]` block at all, the other
+> pass-throughs agree with their rows; this one does not. `block_unlisted_outbound` was a second
+> such row until vault BACKLOG #2605 made its internal field default to deny:
 >
 > | Row | Reads as | Internal field with `[security]` absent | What an unconfigured PHI instance actually does |
 > |---|---|---|---|
-> | `block_unlisted_outbound` | `true` | `egress.deny_by_default = False` | the [`[egress]`](#egress) gate decides: with none of the six **counted** `allowed_*` lists `serve` **exits 2** (`allowed_smtp`/`allowed_direct` do not count); with ≥1 counted list it **flips deny-by-default on** for the transports you left empty |
 > | `delete_message_bodies_after_days` | `30` | `retention.messages_days = 0` | the [`[retention]`](#retention) gate defaults each *unset* window to 30 days on a PHI instance under **both** enforcement dials; an **explicit** `0` refuses to start (exit 2) under `enforce` and warns under `warn`. There is no synthetic instance left to exempt ([ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md)); the audited keep-forever opt-out is `[security].allow_keeping_phi_indefinitely`. This cell previously had the refuse / auto-bound split backwards |
 >
-> Neither is a silent fail-open — both paths end in a refusal or an audited flip, and `serve`
+> It is not a silent fail-open. Unless `[security].allow_keeping_phi_indefinitely` is set, an unset
+> window is bounded at 30 days, and an explicit `0` is refused under `enforce` and warned under
+> `warn`. With that opt-out set, an enforcing start writes an `AUDIT:` line instead. `serve`
 > back-fills the `[security]` object from the resolved internal values before serving, so
-> `GET /security/posture` reports the **effective** posture rather than these field defaults. But do
+> `GET /security/posture` reports the **effective** posture rather than this field default. But do
 > not read the Default column as "what my unconfigured box is doing": **set the switch you intend to
-> rely on**, and read the [`[egress]`](#egress) and [`[retention]`](#retention) sections for the two
-> above. (An unrecognized `[security]` key is *ignored* with a startup WARNING, not rejected — so a
-> typo leaves the permissive default in force. Check spelling against this table.)
+> rely on**, and read the [`[retention]`](#retention) section for the row above. (An unrecognized
+> `[security]` key is **refused at load**, from the file or the environment, so a typo stops the
+> start. Check spelling against this table.)
 
 **Editing is IDE-only**: the VS Code extension's *Edit Security Settings* command (which shells
 `messagefoundry security show|set`) is the sole authoring surface. The **web console is read-only** — the
@@ -2050,8 +2050,9 @@ twice over. `[retention]` is here for a different reason, given on its own line 
 previously said three blocks and four refusing gates; the retention gate stopped refusing over an
 unset window when the 30-day auto-bound moved to both enforcement dials. The gates a stock PHI
 instance meets, and what satisfies each:
-**keyless PHI** → `MEFOR_STORE_ENCRYPTION_KEY` in the environment; **open egress** → at least one
-*counted* `[egress]` list (see "Only SIX of the eight lists" under [`[egress]`](#egress) — `allowed_smtp` alone does not count);
+**keyless PHI** → `MEFOR_STORE_ENCRYPTION_KEY` in the environment; **no counted egress list** → at least one
+*counted* `[egress]` list, or `[security].block_unlisted_outbound = true` (see "Which lists the
+startup gate counts" under [`[egress]`](#egress));
 **unbounded retention** → nothing you must configure to boot: `serve` defaults each *unset* PHI
 window to 30 days rather than refusing, and only an **explicit** `0` is refused (see
 [`[retention]`](#retention)) — set `[security].delete_message_bodies_after_days` and
@@ -2079,12 +2080,13 @@ delete_message_bodies_after_days = 30   # the PHI-body window (ADR 0118; NOT [re
 [api]
 port = 8765
 
-# REQUIRED on a PHI instance: with none of the six counted allow-lists set, serve exits 2.
+# REQUIRED on a PHI instance: with no counted allow-list set, and
+# [security].block_unlisted_outbound not written true, serve exits 2.
 [egress]
 allowed_mllp = ["epic-adt.hospital.local:6661"]
 allowed_db   = ["sql02.hospital.local"]
-# Any transport left empty here now refuses every destination of its type — deny-by-default is
-# flipped ON for you the moment one counted list is present. Enumerate what you actually send to.
+# Any transport left empty here refuses every destination of its type: deny-by-default is on
+# unless [security].block_unlisted_outbound is written false. Enumerate what you actually send to.
 
 # REQUIRED on every instance: no out-of-band security-notification channel is an
 # exit 2 under the default [security].enforcement = enforce, on dev and staging as much as prod.

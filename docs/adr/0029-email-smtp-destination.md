@@ -79,6 +79,25 @@ this. They are a separate, larger change and were not made here.
 
 ---
 
+## Amendment 2026-10-04: the egress check moved, and the deny default is the model default
+
+This ADR's text describes at least three things the old way. [vault BACKLOG #2605](../BACKLOG.md)
+changed the first two; the third was already wrong when it was written.
+
+- `check_egress_allowed` and `_allowlist_for` now live in
+  [`transports/egress.py`](../../messagefoundry/transports/egress.py), not
+  `pipeline/wiring_runner.py`. The Related list and D4 below name the old module.
+- `EgressSettings.deny_by_default` now defaults to true, so it holds unless an operator writes
+  `[security].block_unlisted_outbound = false`, and not only under `serve`. D4's "Empty list =
+  unrestricted (today's opt-in default)" now holds only under that written opt-out.
+- `allowed_smtp` does count toward the open-egress startup gate while
+  `[security].block_unlisted_outbound` is left unset. The 2026-10-02 amendment's last bullet says the
+  recipient list is not counted "like `allowed_smtp` itself". The recipient list is indeed not
+  counted, but `allowed_smtp` was already counted in that state when the bullet was written. It
+  stops counting only when the switch is written false.
+
+---
+
 ## Amendment 2026-08-02 — the SMTP TLS posture this ADR describes is now VERIFIED on all three cells
 
 D3 below says the connector takes "the same posture `send_plain_email` already takes". That sentence was
