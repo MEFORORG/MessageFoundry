@@ -210,6 +210,13 @@ class FrameDecoder:
         self._buf = bytearray()
         self._in_block = False
         self.max_frame_bytes = max_frame_bytes
+        #: True after a feed whose last byte closed a frame, when the codec has a trailer: the
+        #: trailer may still arrive, alone, in the next read.
+        self._owes_trailer = False
+        #: Whether the most recent :meth:`feed` held nothing but the trailer the frame before it
+        #: still owed. Such a read finishes that frame rather than starting anything, which is how
+        #: a listener's frame deadline tells it from inter-frame noise (vault BACKLOG #2847).
+        self.trailer_only = False
 
     @property
     def in_frame(self) -> bool:
@@ -227,10 +234,12 @@ class FrameDecoder:
         delimiter is reached, and an over-cap frame later in the same read cannot retract one
         already yielded.
         """
-        start, end = self._codec.start, self._codec.end
+        start, end, trailer = self._codec.start, self._codec.end, self._codec.trailer
         cap = self.max_frame_bytes
         view = memoryview(data)
         size = len(data)
+        self.trailer_only = self._owes_trailer and size == 1 and data[0] == trailer
+        self._owes_trailer = False
         pos = 0
         while True:
             if not self._in_block:
@@ -264,6 +273,7 @@ class FrameDecoder:
             # noise, so a missing/extra trailer is tolerated.
             self._in_block = False
             pos = closed + 1
+            self._owes_trailer = pos == size and trailer is not None
             yield payload
 
 

@@ -319,7 +319,7 @@ def test_the_frame_deadline_ships_on_and_refuses_a_negative(kind: str) -> None:
         _build(kind, max_frame_seconds=-1)
 
 
-@pytest.mark.parametrize("kind", ["mllp", "tcp", "x12"])
+@pytest.mark.parametrize("kind", ["tcp", "x12"])
 async def test_a_pipelined_sender_is_not_cut_off_by_the_frame_deadline(kind: str) -> None:
     """The clock restarts for each frame, so a feed that runs longer than the deadline in total,
     one complete frame at a time, is never dropped."""
@@ -381,6 +381,61 @@ async def test_whole_frames_with_quiet_gaps_longer_than_the_deadline_are_not_cut
 
     await _run(source, body, handler)
     assert "frame_deadline" not in events.reasons("closed")
+
+
+@pytest.mark.parametrize("kind", ["mllp", "tcp"])
+async def test_a_trailer_arriving_alone_does_not_start_the_frame_deadline(kind: str) -> None:
+    """MLLP's CR trailer belongs to the frame its FS ended. When it reaches the listener in a read of
+    its own (a TCP segment or a 4096-byte read boundary between FS and CR), it must start nothing,
+    or a healthy peer that then goes quiet is cut as `frame_deadline`. The raw-TCP case runs the
+    same codec through `framing="mllp"`. CONTROL: the outside-any-frame test above, where any other
+    byte does start the clock."""
+    events = _Events()
+    received: list[bytes] = []
+
+    async def handler(raw: bytes) -> str | None:
+        received.append(raw)
+        return None
+
+    framing = {"framing": "mllp"} if kind == "tcp" else {}
+    source = _build(kind, max_frame_seconds=0.3, receive_timeout=5.0, **framing)
+    source.on_connection_event = events
+
+    async def body(port: int) -> None:
+        _reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        whole = _whole_frame("mllp")
+        writer.write(whole[:-1])  # through the FS: the frame completes here
+        await writer.drain()
+        assert await _until(lambda: len(received) == 1)
+        writer.write(whole[-1:])  # the CR, alone
+        await writer.drain()
+        await asyncio.sleep(0.8)  # quiet, for more than twice max_frame_seconds
+        assert events.count("closed") == 0, events.events
+        await _close(writer)
+
+    await _run(source, body, handler)
+    assert "frame_deadline" not in events.reasons("closed")
+
+
+def test_the_mllp_decoder_marks_only_an_owed_trailer_as_trailer_only() -> None:
+    decoder = MLLP_CODEC.decoder()
+    whole = MLLP_CODEC.frame("PAYLOAD")
+    assert list(decoder.feed(whole[:-1])) == [b"PAYLOAD"]
+    assert not decoder.trailer_only
+    assert list(decoder.feed(b"\r")) == []
+    assert decoder.trailer_only, "the CR the frame owed"
+    # CONTROL: a second CR is owed by nothing, so it is noise like any other byte.
+    assert list(decoder.feed(b"\r")) == []
+    assert not decoder.trailer_only
+    # CONTROL: a whole frame in one read owes nothing, so a later CR is noise too.
+    assert list(decoder.feed(whole)) == [b"PAYLOAD"]
+    assert list(decoder.feed(b"\r")) == []
+    assert not decoder.trailer_only
+    # STX/ETX has no trailer, so nothing it reads is ever trailer-only.
+    plain = STX_ETX_CODEC.decoder()
+    assert list(plain.feed(STX_ETX_CODEC.frame("P"))) == [b"P"]
+    assert list(plain.feed(b"\r")) == []
+    assert not plain.trailer_only
 
 
 def test_the_x12_reader_reports_an_open_interchange() -> None:
@@ -531,9 +586,10 @@ async def test_a_stop_cut_short_in_its_wait_still_clears_the_per_host_count(
     source = _build(kind)
     await source.start(handler)
     gate = source._admission  # type: ignore[attr-defined]
-    port = source.sockport  # type: ignore[attr-defined]
-    _reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    client_tasks = source._client_tasks  # type: ignore[attr-defined]
+    writer: asyncio.StreamWriter | None = None
     try:
+        _reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)  # type: ignore[attr-defined]
         writer.write(_whole_frame(kind, HL7))
         await writer.drain()
         await asyncio.wait_for(entered.wait(), 3.0)
@@ -547,9 +603,15 @@ async def test_a_stop_cut_short_in_its_wait_still_clears_the_per_host_count(
             with pytest.raises(asyncio.CancelledError):
                 await stopping
         else:
+            real_wait = asyncio.wait
 
-            async def failing_wait(*_args: object, **_kwargs: object) -> None:
-                raise RuntimeError("synthetic failure in stop()'s client-task wait")
+            async def failing_wait(fs: Any, *args: Any, **kwargs: Any) -> Any:
+                # Fail only the listener's own client-task wait; any other task on the shared loop
+                # that calls asyncio.wait meanwhile gets the real one.
+                fs = list(fs)
+                if any(task in client_tasks for task in fs):
+                    raise RuntimeError("synthetic failure in stop()'s client-task wait")
+                return await real_wait(fs, *args, **kwargs)
 
             with monkeypatch.context() as patch:
                 patch.setattr(asyncio, "wait", failing_wait)
@@ -558,7 +620,8 @@ async def test_a_stop_cut_short_in_its_wait_still_clears_the_per_host_count(
         assert gate.per_host == {}, "a stop() cut short left a stale per-host count behind"
     finally:
         release.set()
-        await _close(writer)
+        if writer is not None:
+            await _close(writer)
         await asyncio.wait_for(source.stop(), timeout=10.0)
 
 

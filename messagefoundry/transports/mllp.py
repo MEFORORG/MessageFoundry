@@ -87,6 +87,7 @@ from messagefoundry.transports.base import (
     InboundHandler,
     NegativeAckError,
     SourceConnector,
+    intake_open,
     positive_cap,
     probe_tcp_reachable,
     register_destination,
@@ -155,10 +156,11 @@ DEFAULT_RECEIVE_TIMEOUT = 60.0  # seconds — close inbound sockets idle this lo
 #: :class:`~messagefoundry.transports.admission.FrameClock` (vault BACKLOG #2606). A bound on
 #: connected time without a completed message was the other option, and it was not taken.
 #:
-#: One consequence an operator can see: a lone trailer byte that reaches the listener in its own
-#: read, after the end byte of a frame, starts the clock too. A peer that then goes quiet is closed
-#: at ``max_frame_seconds`` with a ``frame_deadline`` reason, even where ``receive_timeout`` is
-#: longer or off.
+#: The CR trailer after the end byte belongs to the frame it ends, so a CR that arrives in a read of
+#: its own starts nothing. Any other byte between frames does start the clock, keep-alive bytes
+#: included: a sender that keeps a quiet socket open with them must send a frame within this many
+#: seconds of the first one, even where ``receive_timeout`` is longer or off. Time the engine
+#: withholds (pacing, an intake pause) is not counted.
 #:
 #: 60 s matches the idle bound, so the shipped posture reads as "a frame gets about as long to arrive
 #: as a quiet socket gets to stay open". ``None``/``0`` disables it, like every cap here.
@@ -2093,15 +2095,17 @@ class MLLPSource(SourceConnector):
         finally:
             # Clear the per-host tables with them, in a `finally` so a stop() cancelled or failing
             # anywhere above still clears them (vault BACKLOG #2847), as the raw-TCP, X12 and HTTP
-            # listeners already did. A client task cancelled
-            # past its grace, or one the runner ABANDONS when a stop() overruns (wiring_runner's
-            # demotion path leaves the drain running and reuses this same instance at the next
-            # promotion), never runs its `finally` — so a stale count would survive into the
-            # restarted listener, and `release`'s own docstring names what that costs: a per-host
-            # count left behind by a missed release locks that peer out. A straggler that does run
-            # later decrements a missing key, which `release` already treats as a no-op. `active`
-            # keeps its existing behaviour: it is read by the global cap that predates this row,
-            # and resetting it here would be a separate change.
+            # listeners already did. A client task the runner ABANDONS when a stop() overruns
+            # (wiring_runner's demotion path leaves the drain running and reuses this same instance
+            # at the next promotion) may not run its `finally` before the restart, so a count it
+            # holds would survive into the restarted listener, and `release`'s own docstring names
+            # what that costs: a per-host count left behind by a missed release locks that peer
+            # out. The limit, stated so it is not over-read: a straggler that releases AFTER the
+            # restart has re-admitted its host decrements the new count, so the per-host cap can
+            # undercount by one per such straggler while that host's newer connections stay open.
+            # Tying a release to the run
+            # that admitted it would close that, and is a separate change. `active` keeps its
+            # existing behaviour: the global cap that predates this row reads it.
             self._admission.reset()
         # Now that no client handlers are in flight, this should complete promptly — but on the Windows
         # ProactorEventLoop a still-pending overlapped accept/read can make wait_closed() never return,
@@ -2319,8 +2323,9 @@ class MLLPSource(SourceConnector):
                     # BACKLOG #290: the engine-wide intake pause, BEFORE the read for the
                     # same reason as the pacer. Every frame already read was handled and ACKed
                     # above, so nothing waits here un-committed; the peer's unread bytes stay its
-                    # own.
-                    if not await wait_for_intake(
+                    # own. The sync `intake_open` check keeps an open gate free of a coroutine and
+                    # a closure on every read of this hot path.
+                    if not intake_open(self.intake_gate) and not await wait_for_intake(
                         self.intake_gate,
                         stopped=lambda: self._stopping or writer.is_closing() or reader.at_eof(),
                     ):
@@ -2394,7 +2399,11 @@ class MLLPSource(SourceConnector):
                     # Reached on the success path alone: every arm above breaks or raises.
                     # `FrameClock.after_read` says why `decoded` makes the clock per frame, and why
                     # bytes outside a frame start it too (vault BACKLOG #2847).
-                    clock.after_read(in_frame=decoder.in_frame, decoded=decoded)
+                    clock.after_read(
+                        in_frame=decoder.in_frame,
+                        decoded=decoded,
+                        trailer_only=decoder.trailer_only,
+                    )
             except OSError as exc:
                 failed = True  # peer reset; nothing to do but drop the connection
                 await self._emit_event("peer_reset", peer_host=peer_host, reason=safe_exc(exc))

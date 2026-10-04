@@ -334,7 +334,7 @@ class FrameClock:
             self.max_frame_seconds,
         )
 
-    def after_read(self, *, in_frame: bool, decoded: int) -> None:
+    def after_read(self, *, in_frame: bool, decoded: int, trailer_only: bool = False) -> None:
         """Restamp after the decoder consumed a non-empty read.
 
         A read that completed a frame restarts the clock: a NEW frame if one is open after it, none
@@ -343,9 +343,14 @@ class FrameClock:
         running, WHETHER OR NOT the decoder counts a frame as open: bytes the decoder discards
         outside a frame reset the idle bound just as frame bytes do, so a deadline that waited for
         ``in_frame`` would never reach a peer trickling them. So any bytes must lead to a completed
-        frame within ``max_frame_seconds``.
+        frame within ``max_frame_seconds`` of read time; the engine's own waits are withheld.
+
+        ``trailer_only`` (:attr:`~messagefoundry.framing.FrameDecoder.trailer_only`) is the one
+        exception: a read holding only the trailer the frame before it owed, such as MLLP's CR
+        arriving after its FS, belongs to that completed frame and starts nothing (vault BACKLOG
+        #2847). Without it a healthy peer that went quiet after such a read would be cut here.
         """
         if decoded:
             self.opened_at = time.monotonic() if in_frame else None
-        elif self.opened_at is None:
+        elif self.opened_at is None and not trailer_only:
             self.opened_at = time.monotonic()

@@ -704,7 +704,11 @@ class TcpSource(SourceConnector):
                         )
                         break
                     # Reached on the success path alone: every arm above breaks or raises.
-                    clock.after_read(in_frame=decoder.in_frame, decoded=decoded)
+                    clock.after_read(
+                        in_frame=decoder.in_frame,
+                        decoded=decoded,
+                        trailer_only=decoder.trailer_only,
+                    )
             except OSError as exc:
                 failed = True  # peer reset; nothing to do but drop the connection
                 await self._emit_event("peer_reset", peer_host=peer_host, reason=safe_exc(exc))
