@@ -15,6 +15,7 @@ import textwrap
 from pathlib import Path
 from typing import Any
 
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import load_config
 from messagefoundry.pipeline.cluster import NullCoordinator
 from messagefoundry.pipeline.engine import Engine
@@ -68,7 +69,12 @@ async def test_clustered_follower_does_not_start_the_graph(tmp_path: Path) -> No
     cfgdir = tmp_path / "cfg"
     _minimal_graph(cfgdir, tmp_path)
     coord = _FlipCoordinator(leader=False)
-    eng = await Engine.create(tmp_path / "follower.db", poll_interval=0.05, coordinator=coord)
+    eng = await Engine.create(
+        tmp_path / "follower.db",
+        poll_interval=0.05,
+        coordinator=coord,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     eng.add_registry(load_config(cfgdir))
     await eng.start()
     try:
@@ -85,7 +91,12 @@ async def test_clustered_leader_starts_the_graph_at_startup(tmp_path: Path) -> N
     cfgdir = tmp_path / "cfg"
     _minimal_graph(cfgdir, tmp_path)
     coord = _FlipCoordinator(leader=True)
-    eng = await Engine.create(tmp_path / "leader.db", poll_interval=0.05, coordinator=coord)
+    eng = await Engine.create(
+        tmp_path / "leader.db",
+        poll_interval=0.05,
+        coordinator=coord,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     eng.add_registry(load_config(cfgdir))
     await eng.start()
     try:
@@ -101,7 +112,12 @@ async def test_reconcile_starts_on_promotion_and_stops_on_demotion(tmp_path: Pat
     cfgdir = tmp_path / "cfg"
     _minimal_graph(cfgdir, tmp_path)
     coord = _FlipCoordinator(leader=False)
-    eng = await Engine.create(tmp_path / "flip.db", poll_interval=0.05, coordinator=coord)
+    eng = await Engine.create(
+        tmp_path / "flip.db",
+        poll_interval=0.05,
+        coordinator=coord,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     eng.add_registry(load_config(cfgdir))
     await eng.start()
     try:
@@ -153,7 +169,12 @@ async def test_engine_pushes_leader_epoch_into_store_on_promotion(tmp_path: Path
     cfgdir = tmp_path / "cfg"
     _minimal_graph(cfgdir, tmp_path)
     coord = _EpochCoordinator(epoch=7, lease_key="public:mefor_cluster_leader")
-    eng = await Engine.create(tmp_path / "epoch.db", poll_interval=0.05, coordinator=coord)
+    eng = await Engine.create(
+        tmp_path / "epoch.db",
+        poll_interval=0.05,
+        coordinator=coord,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     eng.add_registry(load_config(cfgdir))
 
     pushes: list[tuple[int | None, str | None]] = []
@@ -192,7 +213,12 @@ async def test_reconcile_restamps_the_epoch_while_leader_and_running(tmp_path: P
     cfgdir = tmp_path / "cfg"
     _minimal_graph(cfgdir, tmp_path)
     coord = _EpochCoordinator(epoch=7, lease_key="public:mefor_cluster_leader")
-    eng = await Engine.create(tmp_path / "restamp.db", poll_interval=0.05, coordinator=coord)
+    eng = await Engine.create(
+        tmp_path / "restamp.db",
+        poll_interval=0.05,
+        coordinator=coord,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     eng.add_registry(load_config(cfgdir))
 
     pushes: list[tuple[int | None, str | None]] = []
@@ -223,7 +249,12 @@ async def test_reconcile_is_idempotent_while_leader(tmp_path: Path) -> None:
     cfgdir = tmp_path / "cfg"
     _minimal_graph(cfgdir, tmp_path)
     coord = _FlipCoordinator(leader=True)
-    eng = await Engine.create(tmp_path / "idem.db", poll_interval=0.05, coordinator=coord)
+    eng = await Engine.create(
+        tmp_path / "idem.db",
+        poll_interval=0.05,
+        coordinator=coord,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     eng.add_registry(load_config(cfgdir))
     await eng.start()
     try:
@@ -262,7 +293,12 @@ async def test_leadership_lost_during_start_graph_tears_back_down(tmp_path: Path
     cfgdir = tmp_path / "cfg"
     _minimal_graph(cfgdir, tmp_path)
     coord = _LeaderThenLostCoordinator(true_calls=1)
-    eng = await Engine.create(tmp_path / "lost.db", poll_interval=0.05, coordinator=coord)
+    eng = await Engine.create(
+        tmp_path / "lost.db",
+        poll_interval=0.05,
+        coordinator=coord,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     eng.add_registry(load_config(cfgdir))
     # start() runs the immediate reconcile: enter _start_graph (leader), re-check (not leader) → stop.
     await eng.start()
@@ -278,7 +314,11 @@ async def test_single_node_starts_graph_directly_no_supervisor(tmp_path: Path) -
     # (byte-identical) and NO graph supervisor is spawned.
     cfgdir = tmp_path / "cfg"
     _minimal_graph(cfgdir, tmp_path)
-    eng = await Engine.create(tmp_path / "single.db", poll_interval=0.05)
+    eng = await Engine.create(
+        tmp_path / "single.db",
+        poll_interval=0.05,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     eng.add_registry(load_config(cfgdir))
     await eng.start()
     try:
@@ -316,7 +356,12 @@ async def test_active_passive_recovers_inflight_on_promotion(tmp_path: Path) -> 
     cfgdir = tmp_path / "cfg"
     _minimal_graph(cfgdir, tmp_path)
     coord = _ReclaimingFlipCoordinator(leader=False)
-    eng = await Engine.create(tmp_path / "ap.db", poll_interval=0.05, coordinator=coord)
+    eng = await Engine.create(
+        tmp_path / "ap.db",
+        poll_interval=0.05,
+        coordinator=coord,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     eng.add_registry(load_config(cfgdir))
 
     calls: list[int] = []
@@ -350,7 +395,12 @@ async def test_postgres_promotion_uses_recover_on_promotion_not_sweep(tmp_path: 
     cfgdir = tmp_path / "cfg"
     _minimal_graph(cfgdir, tmp_path)
     coord = _ReclaimingFlipCoordinator(leader=False)
-    eng = await Engine.create(tmp_path / "pg_ap.db", poll_interval=0.05, coordinator=coord)
+    eng = await Engine.create(
+        tmp_path / "pg_ap.db",
+        poll_interval=0.05,
+        coordinator=coord,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     eng.add_registry(load_config(cfgdir))
 
     promotion_calls: list[float | None] = []

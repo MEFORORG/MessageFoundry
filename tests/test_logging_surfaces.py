@@ -24,7 +24,7 @@ from messagefoundry.api import create_app
 from messagefoundry.auth import Role
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
-from messagefoundry.config.settings import AuthSettings
+from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.logging_setup import (
     LOG_LEVELS,
     current_log_level,
@@ -92,7 +92,7 @@ def test_set_runtime_level_rejects_unknown_level() -> None:
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
     store = await MessageStore.open(tmp_path / "logsurf.db", cipher=make_cipher(generate_key()))
-    eng = Engine(store)
+    eng = Engine(store, egress_settings=EgressSettings(deny_by_default=False))
     yield eng
     await eng.stop()
 

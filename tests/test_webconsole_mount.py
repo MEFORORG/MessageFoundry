@@ -20,7 +20,7 @@ import pytest
 
 from messagefoundry.api import create_app
 from messagefoundry.auth.service import AuthService
-from messagefoundry.config.settings import AuthSettings
+from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 
 # A few representative routes from across the console's areas — enough to prove mount_ui registered
@@ -41,7 +41,11 @@ _REPRESENTATIVE_ROUTES = (
 
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    eng = await Engine.create(tmp_path / "mount.db", poll_interval=0.05)
+    eng = await Engine.create(
+        tmp_path / "mount.db",
+        poll_interval=0.05,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     yield eng
     await eng.stop()
 

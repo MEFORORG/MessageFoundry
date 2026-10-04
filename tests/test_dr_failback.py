@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Priority
-from messagefoundry.config.settings import BackupSettings, DrSettings, StoreSettings
+from messagefoundry.config.settings import BackupSettings, DrSettings, EgressSettings, StoreSettings
 from messagefoundry.config.wiring import (
     MLLP,
     ConnectionSpec,
@@ -55,6 +55,7 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
         config_dir=None,
         store_settings=StoreSettings(path=str(tmp_path / "fb.db")),
         dr_settings=DrSettings(enabled=True, activate=False),
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     yield eng
     await eng.stop()

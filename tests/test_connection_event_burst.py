@@ -25,6 +25,7 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import Registry
 from messagefoundry.pipeline import wiring_runner
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
@@ -70,7 +71,7 @@ async def store(tmp_path: Path) -> AsyncIterator[MessageStore]:
 
 @pytest.fixture
 async def runner(store: MessageStore) -> AsyncIterator[RegistryRunner]:
-    r = RegistryRunner(Registry(), store)
+    r = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
     r._conn_event_q = asyncio.Queue(maxsize=1000)  # normally created in start()
     yield r
     if r._conn_event_drainer is not None:
@@ -238,7 +239,7 @@ async def test_a_salvage_gives_up_once_the_store_itself_is_refusing(
 
 
 async def test_stop_flushes_a_queued_burst(store: MessageStore) -> None:
-    runner = RegistryRunner(Registry(), store)
+    runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
     await runner.start()
     try:
         assert runner._conn_event_q is not None and runner._conn_event_drainer is not None

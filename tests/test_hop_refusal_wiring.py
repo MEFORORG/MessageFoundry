@@ -211,7 +211,7 @@ def test_build_check_registry_stamps_posture(monkeypatch: pytest.MonkeyPatch) ->
 
     seen: list[HopPosture | None] = []
 
-    def fake_build_destination(dest: Destination) -> object:
+    def fake_build_destination(dest: Destination, *, egress: EgressSettings) -> object:
         # A cell built inside build_check_registry sees the stamped posture here (this is exactly
         # what a real connector's __init__ will read to key its posture-keyed refusal).
         seen.append(current_hop_posture())
@@ -227,7 +227,7 @@ def test_build_check_registry_stamps_posture(monkeypatch: pytest.MonkeyPatch) ->
         reg,
         inbound_bind_host="127.0.0.1",
         env_values={},
-        egress=EgressSettings(),
+        egress=EgressSettings(deny_by_default=False),
         posture=posture,
     )
     assert seen == [posture]
@@ -241,12 +241,18 @@ def test_build_check_registry_none_posture_leaves_unstamped(
     from messagefoundry.pipeline import wiring_runner as wr
 
     seen: list[HopPosture | None] = []
-    monkeypatch.setattr(wr, "build_destination", lambda dest: seen.append(current_hop_posture()))
+    monkeypatch.setattr(
+        wr, "build_destination", lambda dest, *, egress: seen.append(current_hop_posture())
+    )
 
     reg = Registry()
     reg.add_outbound(build_outbound_connection("OB", File(directory=".")))
     wr.build_check_registry(
-        reg, inbound_bind_host="127.0.0.1", env_values={}, egress=EgressSettings(), posture=None
+        reg,
+        inbound_bind_host="127.0.0.1",
+        env_values={},
+        egress=EgressSettings(deny_by_default=False),
+        posture=None,
     )
     # Unstamped -> None; the cell fail-closes on its own (treats the hop as prod-PHI).
     assert seen == [None]
@@ -316,7 +322,7 @@ def test_connections_toml_desugars_to_the_same_declaration(tmp_path) -> None:
     )
     # ...and both reach the typed Destination the connectors decide on.
     for oc in (from_toml, from_code):
-        dest = _dest_config(oc, {})
+        dest = _dest_config(oc, {}, None, EgressSettings(deny_by_default=False))
         assert dest.cleartext_accepted is True
         assert dest.cleartext_reason == "vendor firmware predates TLS"
 
@@ -395,7 +401,7 @@ def test_dest_config_mirrors_the_declaration_into_the_resolved_settings() -> Non
         cleartext_accepted=True,
         cleartext_reason="vendor firmware predates TLS",
     )
-    settings = _dest_config(declared, {}).settings
+    settings = _dest_config(declared, {}, None, EgressSettings(deny_by_default=False)).settings
     assert settings["cleartext_accepted"] is True
     assert settings["cleartext_reason"] == "vendor firmware predates TLS"
     # The NAME rides with it, so the acceptance audit record those seams emit can name the declaration.
@@ -410,7 +416,7 @@ def test_dest_config_writes_no_mirror_keys_when_nothing_is_declared() -> None:
     from messagefoundry.pipeline.wiring_runner import _dest_config
 
     plain = build_outbound_connection("OB_PLAIN", Tcp(host="10.0.0.5", port=5000))
-    settings = _dest_config(plain, {}).settings
+    settings = _dest_config(plain, {}, None, EgressSettings(deny_by_default=False)).settings
     assert "cleartext_accepted" not in settings
     assert "cleartext_reason" not in settings
     assert settings["connection_name"] == "OB_PLAIN"

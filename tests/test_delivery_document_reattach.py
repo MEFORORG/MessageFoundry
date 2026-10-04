@@ -33,6 +33,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.config.models import BatchConfig, ConnectorType, ContentType, RetryPolicy
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -199,7 +200,7 @@ async def test_reattach_multiple_documents() -> None:
 
 
 async def test_hydrate_no_handle_byte_identical(store: MessageStore) -> None:
-    runner = RegistryRunner(Registry(), store)
+    runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
     plain = _hl7_with_value(_big_b64(20))
     assert await runner._hydrate_payload(plain) == plain  # single substring check, no store read
 
@@ -207,7 +208,7 @@ async def test_hydrate_no_handle_byte_identical(store: MessageStore) -> None:
 async def test_hydrate_splices_verbatim(store: MessageStore) -> None:
     b64 = _big_b64(2000)
     ref = await _store_doc(store, b64)
-    runner = RegistryRunner(Registry(), store)
+    runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
     hydrated = await runner._hydrate_payload(_hl7_with_value(make_doc_ref(ref, "application/pdf")))
     assert _obx5_5(hydrated) == b64
 
@@ -216,7 +217,7 @@ async def test_hydrate_missing_attachment_raises_delivery_error(store: MessageSt
     # A handle whose attachment was never stored / has been GC'd → DeliveryError (retryable), never a
     # payload carrying the raw handle. Fail-loud: the connector must NEVER see mfdoc:v1:ref:.
     missing = make_doc_ref(hashlib.sha256(b"gone").hexdigest(), "application/pdf")
-    runner = RegistryRunner(Registry(), store)
+    runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
     with pytest.raises(DeliveryError):
         await runner._hydrate_payload(_hl7_with_value(missing))
 
@@ -226,7 +227,7 @@ async def test_hydrate_retry_reads_identically_without_decref(store: MessageStor
     # and delivery is a PURE READ — the refcount is untouched (released only at retention/purge).
     b64 = _big_b64(1500)
     ref = await _store_doc(store, b64)
-    runner = RegistryRunner(Registry(), store)
+    runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
     payload = _hl7_with_value(make_doc_ref(ref, "application/pdf"))
     first = await runner._hydrate_payload(payload)
     second = await runner._hydrate_payload(payload)
@@ -238,7 +239,7 @@ async def test_hydrate_unsupported_backend_raises_delivery_error(store: MessageS
     b64 = _big_b64(1000)
     ref = await _store_doc(store, b64)
     store.supports_streaming_attachments = False  # simulate a non-SQLite backend at read time
-    runner = RegistryRunner(Registry(), store)
+    runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
     with pytest.raises(DeliveryError):
         await runner._hydrate_payload(_hl7_with_value(make_doc_ref(ref, "application/pdf")))
 
@@ -262,7 +263,7 @@ async def test_fan_out_both_deliver_verbatim_refcount_stable(store: MessageStore
     await store.attachment_incref(ref)
     assert await _refcount(store, ref) == 2
 
-    runner = RegistryRunner(Registry(), store)
+    runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
     col1, col2 = _Collector(), _Collector()
     runner._destinations[DEST] = col1
     runner._destinations[DEST2] = col2
@@ -286,7 +287,7 @@ async def test_delivery_item_retry_rehydrates_identically(store: MessageStore) -
     await store.enqueue_message(
         channel_id="c1", raw=skeleton, deliveries=[(DEST, skeleton)], now=100.0
     )
-    runner = RegistryRunner(Registry(), store)
+    runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
     col = _Collector(fail_times=1)
     runner._destinations[DEST] = col
     runner._retry[DEST] = RetryPolicy(backoff_seconds=0.0, backoff_multiplier=1.0)
@@ -316,7 +317,7 @@ async def test_batch_hydrates_every_member(store: MessageStore) -> None:
     await store.enqueue_message(channel_id="c1", raw=sk_a, deliveries=[(DEST, sk_a)], now=100.0)
     await store.enqueue_message(channel_id="c1", raw=sk_b, deliveries=[(DEST, sk_b)], now=101.0)
 
-    runner = RegistryRunner(Registry(), store)
+    runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
     col = _Collector()
     runner._destinations[DEST] = col
     runner._batch[DEST] = BatchConfig(max_count=5, max_wait_ms=1)
@@ -369,7 +370,11 @@ async def test_shape_a_end_to_end_verbatim_roundtrip(store: MessageStore, tmp_pa
     b64 = _big_b64(4000)  # ~5334 base64 chars, well over the 500-byte threshold
     raw = _hl7_with_value(b64)
     runner = RegistryRunner(
-        _reg_shape_a(inbox, outdir), store, claim_mode="pooled", pooled_sweep_interval=0.05
+        _reg_shape_a(inbox, outdir),
+        store,
+        claim_mode="pooled",
+        pooled_sweep_interval=0.05,
+        egress=EgressSettings(deny_by_default=False),
     )
     await runner.start()
     col = _Collector()
@@ -443,7 +448,11 @@ async def test_shape_b_end_to_end_pdf_to_mdm(store: MessageStore, tmp_path: Path
     inbox.mkdir()
     (inbox / "out").mkdir()
     runner = RegistryRunner(
-        _reg_shape_b(inbox), store, claim_mode="pooled", pooled_sweep_interval=0.05
+        _reg_shape_b(inbox),
+        store,
+        claim_mode="pooled",
+        pooled_sweep_interval=0.05,
+        egress=EgressSettings(deny_by_default=False),
     )
     await runner.start()
     col = _Collector()

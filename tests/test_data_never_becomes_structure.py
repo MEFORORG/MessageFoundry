@@ -32,6 +32,7 @@ from messagefoundry.config.models import (
     Source,
     Validation,
 )
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -509,7 +510,7 @@ async def _rows(store: MessageStore) -> list[dict[str, Any]]:
 
 async def test_P6_the_mllp_listener_naks_and_records_error(store: MessageStore) -> None:
     reg = _registry(_mllp_ic())
-    runner = wiring_runner.RegistryRunner(reg, store)
+    runner = wiring_runner.RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
     ack = await runner._handle_inbound(reg.inbound["in"], P6_BODY.encode("utf-8"))
     assert ack is not None and "MSA|AR|" in ack and "more than one MSH in body" in ack
     assert await _rows(store) == [
@@ -529,7 +530,7 @@ async def test_P6_the_http_listener_records_error_and_commits_nothing(store: Mes
         validation=Validation(strict=False, hl7_version="2.5"),
     )
     reg = _registry(ic)
-    runner = wiring_runner.RegistryRunner(reg, store)
+    runner = wiring_runner.RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
     assert await runner._handle_inbound_http(ic, P6_BODY.encode("utf-8")) is None
     assert [r["status"] for r in await _rows(store)] == [MessageStatus.ERROR.value]
 
@@ -636,7 +637,9 @@ async def test_every_message_of_a_noise_led_remote_file_gets_a_disposition(
     client = _FakeClient(files={"/in/batch.hl7": body})
     src = _remote_src(monkeypatch, client)
     ic = _remote_ic()
-    runner = wiring_runner.RegistryRunner(_registry(ic), store)
+    runner = wiring_runner.RegistryRunner(
+        _registry(ic), store, egress=EgressSettings(deny_by_default=False)
+    )
     src._handler = runner._make_handler(ic)
     await _settle(src)
     await src._poll_once()
@@ -1323,7 +1326,9 @@ async def test_a_bom_led_remote_file_gets_the_same_disposition_per_message(
     client = _FakeClient(files={"/in/batch.hl7": body})
     src = _remote_src(monkeypatch, client)
     ic = _remote_ic()
-    runner = wiring_runner.RegistryRunner(_registry(ic), store)
+    runner = wiring_runner.RegistryRunner(
+        _registry(ic), store, egress=EgressSettings(deny_by_default=False)
+    )
     src._handler = runner._make_handler(ic)
     await _settle(src)
     await src._poll_once()
@@ -1376,7 +1381,9 @@ async def test_one_enveloped_remote_message_is_recorded(
     client = _FakeClient(files={"/in/one.hl7": ENVELOPED_ONE.encode("utf-8")})
     src = _remote_src(monkeypatch, client)
     ic = _remote_ic()
-    runner = wiring_runner.RegistryRunner(_registry(ic), store)
+    runner = wiring_runner.RegistryRunner(
+        _registry(ic), store, egress=EgressSettings(deny_by_default=False)
+    )
     src._handler = runner._make_handler(ic)
     await _settle(src)
     await src._poll_once()

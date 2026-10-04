@@ -48,7 +48,7 @@ from messagefoundry.auth.ldap import LdapAuthenticator
 from messagefoundry.auth.oidc_http import build_idp_opener
 from messagefoundry.auth.trust_anchors import AnchorSpec, TrustAnchorError, anchor_cadata
 from messagefoundry.config.models import ConnectorType, Source
-from messagefoundry.config.settings import ApiSettings, ServiceSettings
+from messagefoundry.config.settings import ApiSettings, EgressSettings, ServiceSettings
 from messagefoundry.config.tls_policy import HopPosture, active_hop_posture, urllib_handler_context
 from messagefoundry.store.base import Row
 from messagefoundry.transports.dicom import _server_ssl_context
@@ -837,7 +837,9 @@ async def _post_test(
     )
     reg.add_router("r", lambda m: [])
     engine = await Engine.create(
-        tmp_path / f"route-{enforcing}.db", hop_posture=HopPosture(enforcing=enforcing)
+        tmp_path / f"route-{enforcing}.db",
+        hop_posture=HopPosture(enforcing=enforcing),
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     try:
         engine.add_registry(reg)

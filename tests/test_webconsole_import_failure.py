@@ -32,7 +32,7 @@ from messagefoundry.api._webconsole_import import (
     console_is_absent,
 )
 from messagefoundry.auth.service import AuthService
-from messagefoundry.config.settings import AuthSettings
+from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 
 SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
@@ -111,7 +111,11 @@ def test_a_missing_third_party_dependency_is_named_rather_than_blamed_on_skew() 
 
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    eng = await Engine.create(tmp_path / "broken.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "broken.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     yield eng
     await eng.stop()
 

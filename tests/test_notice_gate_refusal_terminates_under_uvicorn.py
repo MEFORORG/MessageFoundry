@@ -79,6 +79,7 @@ from messagefoundry.api import create_managed_app
 from messagefoundry.config.settings import (
     AlertsSettings,
     AuthSettings,
+    EgressSettings,
     SecurityEnforcement,
     SecuritySettings,
     StoreSettings,
@@ -102,6 +103,7 @@ app = create_managed_app(
     # itself enforce whenever security_settings is passed, as serve always passes it.
     store_settings=StoreSettings(path=str(Path(_TMP) / "phi.db"), allow_unencrypted_phi=True),
     poll_interval=0.05,
+    egress_settings=EgressSettings(),
     auth_settings=AuthSettings(enabled=True, notify_security_events=True),
     alerts_settings=AlertsSettings(
         security_notifications_required=True,

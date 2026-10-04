@@ -47,7 +47,7 @@ from messagefoundry.auth import Role
 from messagefoundry.auth.identity import AuthProvider
 from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.service import AuthService, LoginOutcome
-from messagefoundry.config.settings import AuthSettings
+from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from tests._admin_account import create_local_user_chosen
 
@@ -56,7 +56,11 @@ PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms — satisfies the A
 
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    eng = await Engine.create(tmp_path / "login_deadline.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "login_deadline.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     yield eng
     await eng.stop()
 

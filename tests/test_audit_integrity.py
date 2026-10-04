@@ -20,6 +20,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.__main__ import main
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.engine import Engine
 from messagefoundry.store import MessageStore
@@ -1405,6 +1406,7 @@ async def _verify_on_start(
         alert_sink=sink,
         audit_verify_on_start=True,
         audit_anchor_file=str(anchor_file) if anchor_file is not None else None,
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     cap = _EngineLogCapture()
     try:
@@ -1631,7 +1633,12 @@ async def test_anchor_file_without_verify_on_start_is_reported(tmp_path: Path) -
     anchor_file.write_text(await _aread_anchor(db), encoding="utf-8")
 
     store = await MessageStore.open(db)
-    eng = Engine(store, audit_verify_on_start=False, audit_anchor_file=str(anchor_file))
+    eng = Engine(
+        store,
+        audit_verify_on_start=False,
+        audit_anchor_file=str(anchor_file),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     cap = _EngineLogCapture()
     try:
         with cap:

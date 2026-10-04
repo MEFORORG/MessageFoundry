@@ -365,12 +365,11 @@ def test_egress_allowlist_loads_from_file_and_env(tmp_path: Path) -> None:
 
 def test_retention_secure_by_default_knob(tmp_path: Path) -> None:
     # #186a: allow_unbounded_phi defaults to the SECURE posture (False = the serve gate bounds PHI
-    # retention). The [egress].deny_by_default MODEL default is left UNCHANGED (False) — the fail-closed
-    # flip is a serve-side effective mutation, not a model default change, so loopback stays byte-
-    # identical. Both parse from the file.
+    # retention). The [egress].deny_by_default MODEL default is true since vault BACKLOG #2605: it
+    # used to be false with a serve-side flip, which left every other entry point allow-all.
     s = ServiceSettings()
     assert s.retention.allow_unbounded_phi is False
-    assert s.egress.deny_by_default is False  # unchanged model default (byte-identical constructor)
+    assert s.egress.deny_by_default is True
     # allow_unbounded_phi moved to [security].allow_keeping_phi_indefinitely (ADR 0118).
     cfg = _write(
         tmp_path / "messagefoundry.toml", "security.allow_keeping_phi_indefinitely = true\n"

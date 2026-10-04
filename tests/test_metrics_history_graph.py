@@ -18,6 +18,7 @@ import pytest
 from messagefoundry.api import create_app
 from messagefoundry.api.metrics import MetricsHistory
 from messagefoundry.config.models import ConnectorType
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -30,7 +31,11 @@ from messagefoundry.pipeline import Engine
 
 @pytest.fixture
 async def engine(tmp_path: Path):
-    eng = await Engine.create(tmp_path / "mh.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "mh.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     yield eng
     await eng.stop()
 

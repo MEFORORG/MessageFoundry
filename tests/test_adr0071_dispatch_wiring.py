@@ -31,6 +31,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.models import ConnectorType, InternalErrorPolicy
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -74,7 +75,9 @@ def _runner(store: MessageStore, *, router: Any = None, handler: Any = None) -> 
     )
     reg.add_router("r", router or (lambda m: ["h"]))
     reg.add_handler("h", handler or (lambda m: Send("OB1", "OUTBODY")))
-    return RegistryRunner(reg, store, claim_mode="pooled")
+    return RegistryRunner(
+        reg, store, claim_mode="pooled", egress=EgressSettings(deny_by_default=False)
+    )
 
 
 def _ingress_item(iid: str = "ing-1", mid: str = "m-1") -> OutboxItem:

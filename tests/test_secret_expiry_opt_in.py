@@ -37,6 +37,7 @@ from messagefoundry.config.settings import (
     CONNECTOR_SECRET_EXPIRY_CLASS,
     ENFORCEABLE_SECRET_EXPIRY_CLASSES,
     STORE_DEK_SECRET_CLASS,
+    EgressSettings,
     SecretRotationSettings,
 )
 from messagefoundry.pipeline import secret_rotation as sr
@@ -310,6 +311,7 @@ async def _start_with_old_ad_stamp(
         store,
         secret_rotation_settings=settings,
         security_enforcement=SecurityEnforcement.ENFORCE,
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     try:
         await engine.start()
@@ -383,6 +385,7 @@ async def test_a_keyless_engine_with_an_opt_in_starts(
         store,
         secret_rotation_settings=SecretRotationSettings(enforce_secret_expiry_classes=[_AD]),
         security_enforcement=SecurityEnforcement.ENFORCE,
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     with caplog.at_level("WARNING", logger="messagefoundry.pipeline.engine"):
         await engine.start()

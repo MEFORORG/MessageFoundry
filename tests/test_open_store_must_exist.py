@@ -28,7 +28,7 @@ from fastapi.testclient import TestClient
 
 from messagefoundry.__main__ import main
 from messagefoundry.api.app import create_managed_app
-from messagefoundry.config.settings import ServiceSettings, StoreSettings
+from messagefoundry.config.settings import EgressSettings, ServiceSettings, StoreSettings
 from messagefoundry.store import base as store_base
 from messagefoundry.store.base import open_store, sqlite_settings
 from messagefoundry.store.crypto import generate_key
@@ -149,7 +149,9 @@ def test_backup_cli_refuses_an_absent_store(
 def test_serve_first_run_still_creates_the_store(tmp_path: Path) -> None:
     """``serve``'s lifespan is the ordinary first run, so it opens with ``create=True``."""
     target = tmp_path / "first-run.db"
-    app = create_managed_app(db_path=target, poll_interval=0.05)
+    app = create_managed_app(
+        db_path=target, poll_interval=0.05, egress_settings=EgressSettings(deny_by_default=False)
+    )
 
     with TestClient(app):
         assert target.is_file()

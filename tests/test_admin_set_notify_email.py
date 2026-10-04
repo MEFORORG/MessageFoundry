@@ -34,6 +34,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import (
     AlertsSettings,
     AuthSettings,
+    EgressSettings,
     SecurityEnforcement,
     SecuritySettings,
     StoreSettings,
@@ -144,6 +145,7 @@ def _shipped_posture_app(db: Path, key: str) -> object:
             email_from="alerts@example.invalid",
         ),
         security_settings=SecuritySettings(enforcement=SecurityEnforcement.ENFORCE),
+        egress_settings=EgressSettings(deny_by_default=False),
     )
 
 

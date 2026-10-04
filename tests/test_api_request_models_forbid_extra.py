@@ -46,6 +46,7 @@ from messagefoundry.api import models as models_mod
 from messagefoundry.api.auth_models import ChannelScope, UserCreateRequest
 from messagefoundry.api.models import StatsResponse
 from messagefoundry.api.request_model import RequestModel
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.pipeline import Engine
 
 #: The five shapes the API parses from a request body AND returns in a response. They carry the
@@ -163,7 +164,11 @@ def test_the_channel_scope_typo_no_longer_widens_the_grant() -> None:
 
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    eng = await Engine.create(tmp_path / "extra.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "extra.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     yield eng
     await eng.stop()
 

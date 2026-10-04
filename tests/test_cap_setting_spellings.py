@@ -24,6 +24,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination, Source
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import Sftp
 from messagefoundry.transports import build_source, mllp
 from messagefoundry.transports.base import cap_setting, positive_cap, resolve_poll_ceiling
@@ -52,7 +53,10 @@ def _file(over: dict[str, Any]) -> FileSource:
 
 def _remote(over: dict[str, Any]) -> RemoteFileSource:
     settings = {**Sftp(host="sftp.example.com", remote_dir="/in").settings, **over}
-    src = build_source(Source(type=ConnectorType.REMOTEFILE, settings=settings))
+    src = build_source(
+        Source(type=ConnectorType.REMOTEFILE, settings=settings),
+        egress=EgressSettings(deny_by_default=False),
+    )
     assert isinstance(src, RemoteFileSource)
     return src
 

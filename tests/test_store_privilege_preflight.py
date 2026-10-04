@@ -50,6 +50,7 @@ from messagefoundry.config.settings import (
     AlertsSettings,
     ApiSettings,
     AuthSettings,
+    EgressSettings,
     SchemaManagement,
     SecretRotationSettings,
     SecuritySettings,
@@ -1085,7 +1086,11 @@ def test_the_refusal_switch_is_a_hardening_and_is_not_itself_a_loosening() -> No
 
 @pytest.fixture
 async def engine(tmp_path: Path):
-    eng = await Engine.create(tmp_path / "priv.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "priv.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     yield eng
     await eng.stop()
 
@@ -1160,7 +1165,9 @@ def test_serve_lifespan_runs_the_preflight_and_stashes_a_real_observation(tmp_pa
     from messagefoundry.api.app import create_managed_app
 
     app = create_managed_app(
-        store_settings=sqlite_settings(tmp_path / "managed.db"), allow_no_auth=True
+        store_settings=sqlite_settings(tmp_path / "managed.db"),
+        allow_no_auth=True,
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     with TestClient(app) as tc:
         resp = tc.get("/security/posture")
@@ -1213,6 +1220,7 @@ def test_serve_lifespan_threads_the_dial_and_the_opt_out(
             allow_over_granted_store_principal=accepted,
         ),
         security_enforcement=dial,
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     with TestClient(app):
         pass
@@ -1244,6 +1252,7 @@ def test_serve_lifespan_reads_the_dial_from_security_settings_when_none_is_passe
         security_settings=SecuritySettings(
             enforcement=SecurityEnforcement.WARN, allow_unencrypted_phi=True
         ),
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     with TestClient(app):
         pass
@@ -1287,7 +1296,9 @@ def test_the_preflight_reads_the_PASSED_store_settings_not_the_ambient_environme
     for key, value in hostile.items():
         monkeypatch.setenv(key, value)
     app = create_managed_app(
-        store_settings=sqlite_settings(tmp_path / "pinned.db"), allow_no_auth=True
+        store_settings=sqlite_settings(tmp_path / "pinned.db"),
+        allow_no_auth=True,
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     with TestClient(app) as tc:
         resp = tc.get("/security/posture")

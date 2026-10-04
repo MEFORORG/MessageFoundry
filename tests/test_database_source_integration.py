@@ -48,6 +48,7 @@ from typing import Any, TypeVar
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Source
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import DatabasePoll
 from messagefoundry.transports import build_source
 from messagefoundry.transports.database import (
@@ -156,7 +157,8 @@ async def test_source_polls_and_marks_rows(pool: Any) -> None:
                 mark_statement=f"UPDATE {table} SET status='DONE' WHERE id=:id",
                 body_column="payload",
             ).settings,
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert isinstance(src, DatabaseSource)
     handler = _RecordingHandler()

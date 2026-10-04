@@ -60,6 +60,7 @@ from pydantic import BaseModel
 from messagefoundry.api import create_app
 from messagefoundry.api.app import _NO_STORE_PREFIXES, _NO_STORE_ROUTE_PATHS
 from messagefoundry.api.models import ConnectionEventInfo
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.pipeline import Engine
 
 # Which section of docs/PHI.md the at-rest inventory is, what a row of it looks like, and which cell
@@ -350,7 +351,9 @@ _PREVIOUSLY_UNCOVERED = ("/search/layered", "/logs/tail", "/uploads/f1/messages"
 @pytest.fixture(scope="module")
 async def engine(tmp_path_factory: pytest.TempPathFactory) -> AsyncIterator[Engine]:
     db = tmp_path_factory.mktemp("no_store") / "no_store.db"
-    eng = await Engine.create(db, poll_interval=0.02)
+    eng = await Engine.create(
+        db, poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
     yield eng
     await eng.stop()
 

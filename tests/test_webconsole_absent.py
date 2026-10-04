@@ -35,7 +35,7 @@ import messagefoundry.api.auth_routes as auth_routes_module
 from messagefoundry.__main__ import main
 from messagefoundry.api import create_app
 from messagefoundry.auth.service import AuthService
-from messagefoundry.config.settings import AuthSettings
+from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 
 SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
@@ -46,7 +46,11 @@ _CLEAR_ERROR = "serve_ui requires the web console"
 
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    eng = await Engine.create(tmp_path / "absent.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "absent.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     yield eng
     await eng.stop()
 

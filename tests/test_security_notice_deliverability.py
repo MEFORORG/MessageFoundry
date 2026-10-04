@@ -29,6 +29,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import (
     AlertsSettings,
     AuthSettings,
+    EgressSettings,
     SecurityEnforcement,
     SecuritySettings,
     StoreSettings,
@@ -234,6 +235,7 @@ def _phi_app(tmp_path: Path, *, security: SecuritySettings) -> FastAPI:
         security_settings=security.model_copy(
             update={"allow_unencrypted_phi_under_strict_enforcement": True}
         ),
+        egress_settings=EgressSettings(deny_by_default=False),
     )
 
 

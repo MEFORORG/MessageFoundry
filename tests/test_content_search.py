@@ -26,7 +26,7 @@ from messagefoundry.auth import Role
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
-from messagefoundry.config.settings import AuthSettings
+from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.content_search import (
     ContentSearchError,
@@ -353,7 +353,7 @@ async def test_no_decrypt_leak_in_logs(tmp_path: Path, caplog: pytest.LogCapture
 @pytest.fixture
 async def enc_engine(tmp_path: Path) -> AsyncIterator[Engine]:
     store = await MessageStore.open(tmp_path / "api-enc.db", cipher=make_cipher(generate_key()))
-    eng = Engine(store)
+    eng = Engine(store, egress_settings=EgressSettings(deny_by_default=False))
     yield eng
     await eng.stop()
 

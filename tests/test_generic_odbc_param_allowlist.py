@@ -349,13 +349,18 @@ _DOCUMENTED_DSN = (
 
 
 def test_the_documented_generic_example_builds_as_a_destination() -> None:
-    connector = build_destination(_documented_destination(dict(_DOCUMENTED_PARAMS)))
+    connector = build_destination(
+        _documented_destination(dict(_DOCUMENTED_PARAMS)),
+        egress=EgressSettings(deny_by_default=False),
+    )
     assert isinstance(connector, DatabaseDestination)
     assert connector._dsn == _DOCUMENTED_DSN
 
 
 def test_the_documented_generic_example_builds_as_a_poll_source() -> None:
-    connector = build_source(_documented_source(dict(_DOCUMENTED_PARAMS)))
+    connector = build_source(
+        _documented_source(dict(_DOCUMENTED_PARAMS)), egress=EgressSettings(deny_by_default=False)
+    )
     assert isinstance(connector, DatabaseSource)
     assert connector._dsn == _DOCUMENTED_DSN
 
@@ -363,7 +368,7 @@ def test_the_documented_generic_example_builds_as_a_poll_source() -> None:
 def test_the_destination_seam_refuses_a_keyword_off_the_list() -> None:
     config = _documented_destination(_DOCUMENTED_PARAMS | {"Servername": _VALUE})
     with pytest.raises(ValueError, match="must not set 'servername'") as refused:
-        build_destination(config)
+        build_destination(config, egress=EgressSettings(deny_by_default=False))
     assert "DB-OUT_ACME_PG" in str(refused.value)
     assert _VALUE not in str(refused.value)
 
@@ -371,7 +376,7 @@ def test_the_destination_seam_refuses_a_keyword_off_the_list() -> None:
 def test_the_poll_source_seam_refuses_a_keyword_off_the_list() -> None:
     config = _documented_source(_DOCUMENTED_PARAMS | {"Servername": _VALUE})
     with pytest.raises(ValueError, match="must not set 'servername'") as refused:
-        build_source(config)
+        build_source(config, egress=EgressSettings(deny_by_default=False))
     assert "DB-IN_ACME_PG" in str(refused.value)
     assert _VALUE not in str(refused.value)
 
@@ -396,7 +401,10 @@ def _check_build(params: dict[str, Any]) -> None:
         )
     )
     build_check_registry(
-        registry, inbound_bind_host="127.0.0.1", env_values={}, egress=EgressSettings()
+        registry,
+        inbound_bind_host="127.0.0.1",
+        env_values={},
+        egress=EgressSettings(deny_by_default=False),
     )
 
 
@@ -423,7 +431,8 @@ def test_the_sql_server_preset_never_reads_odbc_params() -> None:
         statement=_INSERT,
     ).settings
     connector = build_destination(
-        Destination(name="DB-OUT_ACME_SQL", type=ConnectorType.DATABASE, settings=settings)
+        Destination(name="DB-OUT_ACME_SQL", type=ConnectorType.DATABASE, settings=settings),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert isinstance(connector, DatabaseDestination)
     assert _VALUE not in connector._dsn

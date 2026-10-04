@@ -20,9 +20,9 @@ from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 from messagefoundry.config.wiring import Soap, WiringError
-from messagefoundry.pipeline.wiring_runner import check_egress_allowed
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
+from messagefoundry.transports.egress import check_egress_allowed
 from messagefoundry.transports.soap import SoapDestination, _classify_soap, _fault_code
 from tests._malformed_reply import MALFORMED_REPLIES, RefusedAndMalformed
 
@@ -34,7 +34,10 @@ _SENDER_12 = "<soap:Fault><soap:Code><soap:Value>soap:Sender</soap:Value></soap:
 
 def _dest(**over: object) -> SoapDestination:
     settings = Soap(url=URL, **over).settings  # type: ignore[arg-type]
-    d = build_destination(Destination(name="OB_SOAP", type=ConnectorType.SOAP, settings=settings))
+    d = build_destination(
+        Destination(name="OB_SOAP", type=ConnectorType.SOAP, settings=settings),
+        egress=EgressSettings(deny_by_default=False),
+    )
     assert isinstance(d, SoapDestination)
     return d
 
@@ -250,7 +253,8 @@ async def test_a_soap_reply_refusal_that_is_also_an_httpexception_passes_through
 def test_rejects_non_http_scheme() -> None:
     with pytest.raises(ValueError):
         build_destination(
-            Destination(name="x", type=ConnectorType.SOAP, settings=Soap(url="ftp://x/y").settings)
+            Destination(name="x", type=ConnectorType.SOAP, settings=Soap(url="ftp://x/y").settings),
+            egress=EgressSettings(deny_by_default=False),
         )
 
 
@@ -274,7 +278,8 @@ def test_soap_credentials_over_cleartext_http_refused(monkeypatch: pytest.Monkey
                 name="OB",
                 type=ConnectorType.SOAP,
                 settings=Soap(url="http://api.example.com/svc", bearer_token="tok").settings,
-            )
+            ),
+            egress=EgressSettings(deny_by_default=False),
         )
 
 
@@ -290,7 +295,8 @@ def test_soap_cleartext_http_nonloopback_refused_without_escape(
                 name="OB",
                 type=ConnectorType.SOAP,
                 settings=Soap(url="http://api.example.com/svc").settings,
-            )
+            ),
+            egress=EgressSettings(deny_by_default=False),
         )
 
 
@@ -301,7 +307,8 @@ def test_soap_cleartext_http_loopback_allowed() -> None:
             name="OB",
             type=ConnectorType.SOAP,
             settings=Soap(url="http://127.0.0.1:8080/svc").settings,
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert isinstance(dest, SoapDestination)
 
@@ -321,7 +328,8 @@ def test_soap_cleartext_http_nonloopback_allowed_when_accepted(
                 settings=Soap(url="http://api.example.com/svc").settings,
                 cleartext_accepted=True,
                 cleartext_reason="legacy partner endpoint has no TLS",
-            )
+            ),
+            egress=EgressSettings(deny_by_default=False),
         )
     assert isinstance(dest, SoapDestination)  # built (warns loudly + audits), not refused
 

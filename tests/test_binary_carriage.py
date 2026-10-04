@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.models import ConnectorType, ContentType
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -215,7 +216,7 @@ async def test_handle_inbound_base64_carries_binary() -> None:
     )
     reg.add_inbound(ic)
     store = _RecordingStore()
-    runner = RegistryRunner(reg, store=store)  # type: ignore[arg-type]
+    runner = RegistryRunner(reg, store=store, egress=EgressSettings(deny_by_default=False))  # type: ignore[arg-type]
 
     ack = await runner._handle_inbound(ic, DICOM_LIKE)
 
@@ -239,7 +240,7 @@ async def test_handle_inbound_does_not_carry_non_binary() -> None:
     )
     reg.add_inbound(ic)
     store = _RecordingStore()
-    runner = RegistryRunner(reg, store=store)  # type: ignore[arg-type]
+    runner = RegistryRunner(reg, store=store, egress=EgressSettings(deny_by_default=False))  # type: ignore[arg-type]
 
     await runner._handle_inbound(ic, b'{"a": 1}')
 

@@ -47,9 +47,9 @@ from cryptography.x509.oid import NameOID
 from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV, EgressSettings
 from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
-from messagefoundry.pipeline.wiring_runner import check_egress_allowed
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.direct import DirectDestination
+from messagefoundry.transports.egress import check_egress_allowed
 from tests.test_email_destination import (
     _ALL_ATEXT_SENDER,
     _NORMALISED_RECIPIENTS,
@@ -730,7 +730,9 @@ def _egress_dest(host: str, port: int = 587) -> Destination:
 
 def test_egress_allow_and_deny() -> None:
     # empty list = unrestricted (opt-in), like every other egress type
-    check_egress_allowed(_egress_dest("any.hisp.example"), EgressSettings())  # no raise
+    check_egress_allowed(
+        _egress_dest("any.hisp.example"), EgressSettings(deny_by_default=False)
+    )  # no raise
 
     e = EgressSettings(allowed_direct=["hisp.partner.example:587", "10.0.0.9"])
     check_egress_allowed(_egress_dest("hisp.partner.example", 587), e)  # exact host:port
@@ -760,7 +762,7 @@ def test_egress_separate_from_smtp() -> None:
 def test_registered_in_destination_registry(pki: dict[str, Any]) -> None:
     from messagefoundry.transports.base import build_destination
 
-    conn = build_destination(_dest(pki))
+    conn = build_destination(_dest(pki), egress=EgressSettings(deny_by_default=False))
     assert isinstance(conn, DirectDestination)
 
 

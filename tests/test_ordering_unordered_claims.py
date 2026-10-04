@@ -50,6 +50,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.models import ConnectorType, OrderingMode
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -243,8 +244,21 @@ def _runner(reg: Registry, store: MessageStore, *, claim_mode: str | None) -> Re
     # exist within a few milliseconds. Without it the rows trickle out one transform at a time and the
     # positive control could read a low peak for a reason that has nothing to do with ordering.
     if claim_mode is None:
-        return RegistryRunner(reg, store, poll_interval=0.02, fifo_claim_batch=8)
-    return RegistryRunner(reg, store, poll_interval=0.02, fifo_claim_batch=8, claim_mode=claim_mode)
+        return RegistryRunner(
+            reg,
+            store,
+            poll_interval=0.02,
+            fifo_claim_batch=8,
+            egress=EgressSettings(deny_by_default=False),
+        )
+    return RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        fifo_claim_batch=8,
+        claim_mode=claim_mode,
+        egress=EgressSettings(deny_by_default=False),
+    )
 
 
 @dataclass(frozen=True)

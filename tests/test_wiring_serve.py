@@ -8,6 +8,7 @@ import asyncio
 import textwrap
 from pathlib import Path
 
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import Send, load_config
 from messagefoundry.parsing.message import Message
 from messagefoundry.pipeline import Engine
@@ -102,7 +103,9 @@ async def test_engine_runs_loaded_registry(tmp_path: Path) -> None:
     )
     (inbox / "a.hl7").write_bytes(ADT.encode("utf-8"))
 
-    engine = await Engine.create(tmp_path / "e.db", poll_interval=0.02)
+    engine = await Engine.create(
+        tmp_path / "e.db", poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
     engine.add_registry(load_config(cfgdir))
     await engine.start()
     try:

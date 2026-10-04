@@ -18,6 +18,7 @@ from typing import Any
 
 import pytest
 
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore
 from tests.test_adr0157_inc2_reload_recovery import RAW, _registry, _seed_pending_routed
@@ -52,7 +53,11 @@ async def _parked_runner(store: MessageStore, tmp_path: Path) -> RegistryRunner:
     seeded row's due time far out (:func:`_not_due`), so no worker can claim one whatever the timing.
     The rows stay PENDING, which is the state a dropped inbound's backlog is in."""
     runner = RegistryRunner(
-        _registry(tmp_path / "in"), store, claim_mode="per_lane", poll_interval=30.0
+        _registry(tmp_path / "in"),
+        store,
+        claim_mode="per_lane",
+        poll_interval=30.0,
+        egress=EgressSettings(deny_by_default=False),
     )
     await runner.start()
     return runner
@@ -150,7 +155,9 @@ async def test_the_drop_is_keyed_on_the_whole_deployment(
     old_slice.all_inbound = whole
     new_slice = _registry(tmp_path / "in", names=("IB_LIVE",))
     new_slice.all_inbound = whole
-    runner = RegistryRunner(new_slice, store, claim_mode="per_lane")
+    runner = RegistryRunner(
+        new_slice, store, claim_mode="per_lane", egress=EgressSettings(deny_by_default=False)
+    )
 
     # IB moved to a sibling shard: still in the deployment, so not dropped.
     assert await runner._warn_stranded_by_dropped_inbounds(old_slice, new_slice) == {}
@@ -169,7 +176,9 @@ async def test_an_inbound_a_later_reload_re_added_is_skipped(
     is live again, and warning about it would be a false alert."""
     await store.enqueue_ingress(channel_id="IB", raw=RAW)
     full = _registry(tmp_path / "in")
-    runner = RegistryRunner(full, store, claim_mode="per_lane")  # the live registry still has IB
+    runner = RegistryRunner(
+        full, store, claim_mode="per_lane", egress=EgressSettings(deny_by_default=False)
+    )  # the live registry still has IB
 
     dropped = _registry(tmp_path / "in", names=("IB_LIVE",))
     assert await runner._warn_stranded_by_dropped_inbounds(full, dropped) == {}

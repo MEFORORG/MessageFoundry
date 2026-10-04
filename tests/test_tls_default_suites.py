@@ -50,7 +50,7 @@ from messagefoundry.api.tls import build_api_ssl_context
 from messagefoundry.apiclient import client as apiclient
 from messagefoundry.auth.oidc_http import build_idp_opener
 from messagefoundry.config import tls_policy
-from messagefoundry.config.settings import ApiSettings, StoreBackend, StoreSettings
+from messagefoundry.config.settings import ApiSettings, EgressSettings, StoreBackend, StoreSettings
 from messagefoundry.config.tls_policy import (
     APPROVED_TLS12_SUITES,
     APPROVED_TLS13_SUITES,
@@ -359,7 +359,9 @@ def _http_listener(p: _Pki) -> ssl.SSLContext:
         Http(port=0, tls=True, tls_cert_file=p.cert, tls_key_file=p.key),
         router="r",
     )
-    source = build_source(_source_config(ic, "127.0.0.1", {}))
+    source = build_source(
+        _source_config(ic, "127.0.0.1", {}), egress=EgressSettings(deny_by_default=False)
+    )
     assert isinstance(source, HttpSource)
     return _built(source._ssl)
 

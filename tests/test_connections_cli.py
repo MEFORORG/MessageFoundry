@@ -35,6 +35,11 @@ def cfg(tmp_path: Path) -> Path:
     return tmp_path
 
 
+#: The edit's build check runs under the settings model's deny default (vault BACKLOG #2605), so
+#: a test whose outbound dials the partner host lists it.
+_EPIC_EGRESS = '[egress]\nallowed_mllp = ["epic.example"]\n'
+
+
 def _svc(cfg: Path, body: str = "") -> Path:
     path = cfg / "svc.toml"
     path.write_text(body, encoding="utf-8")
@@ -204,7 +209,7 @@ def test_hand_comment_survives_gui_upsert(cfg: Path, capsys: pytest.CaptureFixtu
         "cleartext_accepted": True,
         "cleartext_reason": "legacy partner has no MLLP-over-TLS listener",
     }
-    assert _upsert(cfg, obj, capsys, svc=_svc(cfg))[0] == 0
+    assert _upsert(cfg, obj, capsys, svc=_svc(cfg, _EPIC_EGRESS))[0] == 0
     text = (cfg / "connections.toml").read_text(encoding="utf-8")
     assert "# hand-written — keep this header comment" in text  # untouched table's comments survive
     assert "# important inline note" in text
@@ -338,7 +343,7 @@ def test_cli_end_to_end_maximal_with_commented_sibling(
         ),
         encoding="utf-8",
     )
-    svc = _svc(cfg)
+    svc = _svc(cfg, _EPIC_EGRESS)
     before_reg = load_config(cfg)
     rc = main(["connection", "list", "--config", str(cfg), "--json"])
     entries = json.loads(capsys.readouterr().out)
@@ -474,3 +479,68 @@ def test_cli_upsert_does_not_report_a_downstream_recursion_error_as_bad_input(
     assert rc == 1
     assert error.startswith("RecursionError: raised by upsert_connection"), error
     assert "nested too deeply" not in error, "a downstream fault was blamed on the operator's input"
+
+
+_PARTNER_OUTBOUND = {
+    "direction": "outbound",
+    "name": "OB",
+    "transport": "mllp",
+    "settings": {"host": "epic.example", "port": 2700},
+    "cleartext_accepted": True,
+    "cleartext_reason": "legacy partner has no MLLP-over-TLS listener",
+}
+
+
+@pytest.fixture
+def _no_egress_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A shell exporting an [egress] or [security] override would change what these tests see."""
+    import os
+
+    for key in list(os.environ):
+        if key.upper().startswith(("MEFOR_EGRESS_", "MEFOR_SECURITY_")):
+            monkeypatch.delenv(key)
+
+
+@pytest.mark.usefixtures("_no_egress_env")
+def test_an_unlisted_outbound_edit_without_a_service_config_names_where_the_list_goes(
+    cfg: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The IDE runs `connection upsert` with no --service-config. Under the deny default (vault
+    # BACKLOG #2605) an unlisted outbound is refused, and the refusal must say which flag and which
+    # [egress] list fix it, rather than leave the analyst guessing which file was read.
+    monkeypatch.chdir(cfg)  # no messagefoundry.toml here, so no settings file is found
+    rc, out = _upsert(cfg, _PARTNER_OUTBOUND, capsys)
+    error = json.loads(out)["error"]
+    assert rc != 0
+    assert "block_unlisted_outbound" in error
+    assert "--service-config" in error and "[egress] allowed_*" in error
+    assert "with no instance settings file" in error
+    assert not (cfg / "connections.toml").exists()  # rolled back, nothing persisted
+
+
+@pytest.mark.usefixtures("_no_egress_env")
+def test_the_hint_names_the_working_directory_file_it_read(
+    cfg: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # load_settings falls back to ./messagefoundry.toml. When that file exists the hint must name
+    # it, not claim that no settings file was read.
+    monkeypatch.chdir(cfg)
+    (cfg / "messagefoundry.toml").write_text("", encoding="utf-8")
+    rc, out = _upsert(cfg, _PARTNER_OUTBOUND, capsys)
+    error = json.loads(out)["error"]
+    assert rc != 0
+    assert "--service-config" in error
+    assert "the settings file in the working directory" in error
+    assert "with no instance settings file" not in error
+
+
+@pytest.mark.usefixtures("_no_egress_env")
+def test_the_service_config_hint_is_absent_when_one_was_given(
+    cfg: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Control: the same refusal with a service file named says nothing about passing one.
+    rc, out = _upsert(cfg, _PARTNER_OUTBOUND, capsys, svc=_svc(cfg))
+    error = json.loads(out)["error"]
+    assert rc != 0
+    assert "block_unlisted_outbound" in error
+    assert "--service-config" not in error

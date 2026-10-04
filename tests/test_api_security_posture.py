@@ -20,6 +20,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import (
     AiSettings,
     AuthSettings,
+    EgressSettings,
     SecuritySettings,
     StoreSettings,
 )
@@ -31,7 +32,11 @@ PW = "a-strong-test-passphrase"  # ≥15, no app/vendor terms — satisfies the 
 
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    eng = await Engine.create(tmp_path / "posture_api.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "posture_api.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     yield eng
     await eng.stop()
 

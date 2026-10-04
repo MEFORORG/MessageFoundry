@@ -32,6 +32,7 @@ import pytest
 
 import messagefoundry.pipeline.wiring_runner as wiring_runner
 from messagefoundry.config.models import ConnectorType, ContentType, Source
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
 from messagefoundry.parsing.message import Message
 from messagefoundry.parsing.peek import Peek, normalize
@@ -78,7 +79,9 @@ def runner(store: MessageStore) -> tuple[RegistryRunner, InboundConnection]:
         )
     )
     reg.add_router("r", lambda m: [])  # no worker runs; routing is never reached
-    return RegistryRunner(reg, store), reg.inbound[_INBOUND]
+    return RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False)), reg.inbound[
+        _INBOUND
+    ]
 
 
 async def _rows(store: MessageStore) -> list[dict[str, object]]:
@@ -177,7 +180,7 @@ async def test_a_streaming_inbound_detaches_a_document_from_a_message_with_a_bla
         )
     )
     reg.add_router("r", lambda m: [])
-    rr = RegistryRunner(reg, store)
+    rr = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
     ack = await rr._handle_inbound(reg.inbound["IB_STREAM"], body.encode())
 
     assert ack is not None and "MSA|AA|CTRL1594" in ack

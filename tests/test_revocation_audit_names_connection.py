@@ -99,13 +99,15 @@ def test_two_outbounds_to_one_host_the_audit_line_names_the_attested_one(
     url = f"https://{_HOST}/ingest"
     with active_hop_posture(_ENFORCING), caplog.at_level(logging.WARNING):
         build_destination(
-            _dest("OB_LAB_A", ConnectorType.REST, Rest(url=url).settings, attested=True)
+            _dest("OB_LAB_A", ConnectorType.REST, Rest(url=url).settings, attested=True),
+            egress=EgressSettings(deny_by_default=False),
         )
         # CONTROL: the unattested sibling to the SAME host is refused, so it cannot be the
         # connection the audit line names, and the line above is the attestation firing.
         with pytest.raises(InsecureHopRefused, match="revocation"):
             build_destination(
-                _dest("OB_LAB_B", ConnectorType.REST, Rest(url=url).settings, attested=False)
+                _dest("OB_LAB_B", ConnectorType.REST, Rest(url=url).settings, attested=False),
+                egress=EgressSettings(deny_by_default=False),
             )
     audit = _audit(caplog)
     assert "connection 'OB_LAB_A';" in audit
@@ -122,7 +124,8 @@ def test_two_attested_outbounds_to_one_host_each_line_names_its_own(
     with active_hop_posture(_ENFORCING), caplog.at_level(logging.WARNING):
         for name in ("OB_LAB_A", "OB_LAB_B"):
             build_destination(
-                _dest(name, ConnectorType.REST, Rest(url=url).settings, attested=True)
+                _dest(name, ConnectorType.REST, Rest(url=url).settings, attested=True),
+                egress=EgressSettings(deny_by_default=False),
             )
     lines = [r.getMessage() for r in caplog.records if "operator attestation" in r.getMessage()]
     assert len(lines) == 2
@@ -148,7 +151,10 @@ def test_the_http_family_audit_line_names_the_connection(
 ) -> None:
     ctype, factory, url = _HTTP[cell]
     with active_hop_posture(_ENFORCING), caplog.at_level(logging.WARNING):
-        build_destination(_dest(f"OB_{cell}", ctype, factory(url=url).settings, attested=True))
+        build_destination(
+            _dest(f"OB_{cell}", ctype, factory(url=url).settings, attested=True),
+            egress=EgressSettings(deny_by_default=False),
+        )
     assert f"connection 'OB_{cell}';" in _audit(caplog)
 
 
@@ -203,7 +209,12 @@ def test_the_smart_token_hop_of_an_outbound_names_the_connection(
 ) -> None:
     toml_attest = f'tls_revocation_attested = true\ntls_revocation_attested_reason = "{_REASON}"\n'
     # `_dest_config` is the mirror a running engine uses; the provider sees only its settings.
-    dest = _dest_config(_toml(tmp_path, ob_extra=toml_attest).outbound["OB"], {})
+    dest = _dest_config(
+        _toml(tmp_path, ob_extra=toml_attest).outbound["OB"],
+        {},
+        None,
+        EgressSettings(deny_by_default=False),
+    )
     with active_hop_posture(_ENFORCING), caplog.at_level(logging.WARNING):
         token_provider_from_settings({**dest.settings, **_smart(smart_key)})
     assert "connection 'OB';" in _audit(caplog)
@@ -220,7 +231,7 @@ def test_the_smart_token_hop_of_a_fhir_lookup_names_the_lookup(
     )
     spec = load_config(tmp_path, allow_empty=True).fhir_lookups["epic"]
     # The settings the runner hands the lookup executor, which is where the SMART provider is built.
-    settings = _fhir_lookup_settings(spec, {}, None)
+    settings = _fhir_lookup_settings(spec, {}, EgressSettings(deny_by_default=False))
     with active_hop_posture(_ENFORCING), caplog.at_level(logging.WARNING):
         token_provider_from_settings({**settings, **_smart(smart_key)})
     assert "connection 'fhir_lookup:epic';" in _audit(caplog)
@@ -269,7 +280,10 @@ def test_the_name_and_cell_survive_the_log_filters(
     # can end in one, so the record must survive both or it is not findable.
     url = f"https://{_HOST}/ingest"
     with active_hop_posture(_ENFORCING), caplog.at_level(logging.WARNING):
-        build_destination(_dest(name, ConnectorType.REST, Rest(url=url).settings, attested=True))
+        build_destination(
+            _dest(name, ConnectorType.REST, Rest(url=url).settings, attested=True),
+            egress=EgressSettings(deny_by_default=False),
+        )
     shipped = _shipped(_audit(caplog))
     assert f"connection '{name}';" in shipped
     assert "REST destination (verified TLS" in shipped
@@ -322,7 +336,9 @@ outbound(
         encoding="utf-8",
     )
     reg = load_config(tmp_path, allow_empty=True)
-    raw = _dest_config(reg.outbound["OB_RAW"], {}).settings
+    raw = _dest_config(
+        reg.outbound["OB_RAW"], {}, None, EgressSettings(deny_by_default=False)
+    ).settings
     assert not any(
         k in raw
         for k in (
@@ -336,7 +352,9 @@ outbound(
     # The spoofed outbound's SMART token hop is refused, as an undeclared one is.
     with active_hop_posture(_ENFORCING), pytest.raises(InsecureHopRefused, match="revocation"):
         token_provider_from_settings({**raw, **_smart(smart_key)})
-    declared = _dest_config(reg.outbound["OB_DECLARED"], {}).settings
+    declared = _dest_config(
+        reg.outbound["OB_DECLARED"], {}, None, EgressSettings(deny_by_default=False)
+    ).settings
     assert declared["connection_name"] == "OB_DECLARED"
     assert declared["tls_revocation_attested_reason"] == "declared"
     assert "cleartext_accepted" not in declared  # its raw key went; nothing declared it
@@ -370,7 +388,7 @@ def _build_check(reg: Registry) -> None:
         reg,
         inbound_bind_host="127.0.0.1",
         env_values={},
-        egress=EgressSettings(),
+        egress=EgressSettings(deny_by_default=False),
         posture=_ENFORCING,
     )
 
@@ -381,7 +399,7 @@ def _build_live(reg: Registry) -> None:
     runner = SimpleNamespace(
         registry=reg,
         _env_values={},
-        _egress=EgressSettings(),
+        _egress=EgressSettings(deny_by_default=False),
         _hop_posture=_ENFORCING,
         _trust_anchor_policy=None,
     )

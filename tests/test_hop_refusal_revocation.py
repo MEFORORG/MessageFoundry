@@ -40,7 +40,13 @@ from messagefoundry.api import create_managed_app
 from messagefoundry.auth.oidc_http import build_idp_opener
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.models import ConnectorType, Destination, SignatureAlgorithm
-from messagefoundry.config.settings import AiSettings, AuthSettings, StoreBackend, StoreSettings
+from messagefoundry.config.settings import (
+    AiSettings,
+    AuthSettings,
+    EgressSettings,
+    StoreBackend,
+    StoreSettings,
+)
 from messagefoundry.config.tls_policy import (
     TLS_REVOCATION_ATTESTED_ENV,
     HopDisposition,
@@ -406,7 +412,8 @@ def _build_https(spec: tuple[object, object, str], *, revocation_attested: bool 
             tls_revocation_attested_reason="revocation-checking PKI at the partner edge"
             if revocation_attested
             else None,
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
 
 
@@ -1543,6 +1550,7 @@ def _oidc_managed_app(tmp_path: Path, *, host: str) -> FastAPI:
         auth_settings=settings,
         ai_settings=AiSettings(),
         public_origin="https://ops.example",
+        egress_settings=EgressSettings(deny_by_default=False),
     )
 
 

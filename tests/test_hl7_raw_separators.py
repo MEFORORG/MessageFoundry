@@ -18,6 +18,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination, Source
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import MLLP
 from messagefoundry.parsing._builtin_hl7 import (
     encode_raw_separators,
@@ -187,12 +188,17 @@ def test_dest_config_surfaces_raw_separators_from_settings() -> None:
     oc = build_outbound_connection(
         "OB_TEST", MLLP(host="h", port=1, hl7_raw_separators=True), source_file="t", source_line=1
     )
-    assert _dest_config(oc, {}).hl7_raw_separators is True
+    assert (
+        _dest_config(oc, {}, None, EgressSettings(deny_by_default=False)).hl7_raw_separators is True
+    )
 
     oc_off = build_outbound_connection(
         "OB_TEST2", MLLP(host="h", port=1), source_file="t", source_line=1
     )
-    assert _dest_config(oc_off, {}).hl7_raw_separators is False
+    assert (
+        _dest_config(oc_off, {}, None, EgressSettings(deny_by_default=False)).hl7_raw_separators
+        is False
+    )
 
 
 # --- connector __init__ ------------------------------------------------------

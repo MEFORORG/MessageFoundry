@@ -57,6 +57,7 @@ from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
     AuthSettings,
+    EgressSettings,
     StoreBackend,
     StoreSettings,
 )
@@ -320,7 +321,10 @@ def test_digest_rebuilt_opener_context_is_the_one_that_was_asserted(
 ) -> None:
     """A digest-authenticated destination's rebuilt opener carries an asserted context too."""
     settings = with_http_digest(_spec_for(connector_type), user="u", password="p").settings
-    dest = build_destination(Destination(name=name, type=connector_type, settings=settings))
+    dest = build_destination(
+        Destination(name=name, type=connector_type, settings=settings),
+        egress=EgressSettings(deny_by_default=False),
+    )
     opener = dest._opener  # type: ignore[attr-defined]
     assert any(isinstance(h, urllib.request.HTTPDigestAuthHandler) for h in opener.handlers), (
         "this destination did not take the digest rebuild branch, so the test proves nothing"

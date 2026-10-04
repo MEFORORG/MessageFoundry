@@ -28,7 +28,7 @@ from messagefoundry.api import create_app
 from messagefoundry.auth import Role
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
-from messagefoundry.config.settings import AlertsSettings, AuthSettings
+from messagefoundry.config.settings import AlertsSettings, AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from tests._admin_account import create_local_user_chosen
 
@@ -55,7 +55,11 @@ def _email_alerts(**overrides: object) -> AlertsSettings:
 
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    eng = await Engine.create(tmp_path / "alerts.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "alerts.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     eng.started_at = 1.0
     yield eng
     await eng.stop()

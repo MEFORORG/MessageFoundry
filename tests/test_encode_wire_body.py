@@ -22,6 +22,7 @@ import traceback
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.redaction import safe_exc
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import NegativeAckError, encode_wire_body
@@ -181,7 +182,10 @@ async def test_destination_send_fails_content_free(
 
     Before the fix each of these raised a bare ``UnicodeEncodeError`` naming the offending character,
     which the delivery worker then wrote into ``queue.last_error`` and ``message_events.detail``."""
-    dest = build_destination(Destination(name="OB", type=conn_type, settings=settings))
+    dest = build_destination(
+        Destination(name="OB", type=conn_type, settings=settings),
+        egress=EgressSettings(deny_by_default=False),
+    )
     with pytest.raises(NegativeAckError) as ei:
         await dest.send(PAYLOAD)
     _assert_content_free(ei.value, encoding="ascii")
@@ -197,7 +201,8 @@ async def test_fhir_send_fails_content_free() -> None:
             name="OB",
             type=ConnectorType.FHIR,
             settings={"url": "http://127.0.0.1:9/fhir", "encoding": "ascii"},
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     with pytest.raises(NegativeAckError) as ei:
         await dest.send(body)
@@ -218,7 +223,8 @@ async def test_x12_send_fails_content_free() -> None:
                 name="OB",
                 type=ConnectorType.X12,
                 settings={"host": "127.0.0.1", "port": port, "encoding": "ascii"},
-            )
+            ),
+            egress=EgressSettings(deny_by_default=False),
         )
         with pytest.raises(NegativeAckError) as ei:
             await dest.send(PAYLOAD)
@@ -237,7 +243,8 @@ async def test_file_destination_send_fails_content_free_and_writes_nothing(tmp_p
             name="OB",
             type=ConnectorType.FILE,
             settings={"directory": str(tmp_path), "encoding": "ascii"},
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     with pytest.raises(NegativeAckError) as ei:
         await dest.send(PAYLOAD)
@@ -254,7 +261,8 @@ async def test_encodable_payload_still_reaches_the_wire() -> None:
             name="OB",
             type=ConnectorType.REST,
             settings={"url": "http://127.0.0.1:9/x", "encoding": "utf-8", "timeout_seconds": 1.0},
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     with pytest.raises(Exception) as ei:  # noqa: B017 - the point is what it is NOT
         await dest.send(PAYLOAD)  # utf-8 encodes it fine

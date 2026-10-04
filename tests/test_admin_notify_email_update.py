@@ -34,7 +34,7 @@ from messagefoundry.auth.notifications import (
     SecurityEvent,
 )
 from messagefoundry.auth.service import AuthService, InvalidNotifyEmail
-from messagefoundry.config.settings import AuthSettings
+from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.base import AuditStore
 from messagefoundry.store.store import MessageStore
@@ -409,7 +409,11 @@ async def test_a_blank_or_malformed_address_is_refused_before_anything_is_writte
 
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    eng = await Engine.create(tmp_path / "b1139.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "b1139.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     yield eng
     await eng.stop()
 

@@ -22,6 +22,7 @@ from messagefoundry.config.models import (
     OrderingMode,
     RetryPolicy,
 )
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -126,6 +127,7 @@ async def _halt_ib_under_stop(
         poll_interval=0.02,
         internal_error_default=InternalErrorPolicy.STOP,
         delivery_defaults=RetryPolicy(max_attempts=None, backoff_seconds=0.01),
+        egress=EgressSettings(deny_by_default=False),
     )
     await runner.start()
     assert await _wait_until(lambda: _done(runner._router_workers.get("IB"))), (
@@ -216,6 +218,7 @@ async def test_a_worker_whose_inbound_was_removed_releases_its_tail(
         # Long, so the idle worker cannot poll between the enqueues below and claim them one at a
         # time; it wakes once, on the explicit set, and takes all three in one batch.
         poll_interval=30.0,
+        egress=EgressSettings(deny_by_default=False),
     )
     await runner.start()
     try:
@@ -273,6 +276,7 @@ async def test_a_stopping_transform_worker_releases_its_tail(
         claim_mode="per_lane",
         fifo_claim_batch=4,
         internal_error_default=InternalErrorPolicy.STOP,
+        egress=EgressSettings(deny_by_default=False),
     )
     ids = await _seed_pending_routed(store, "IB", "h", 3)
     await asyncio.wait_for(runner._transform_worker("IB"), 5.0)
@@ -312,7 +316,9 @@ async def test_only_a_worker_that_returned_has_its_lane_recovered(
         await asyncio.gather(tasks["RAISE"], tasks["CANCEL"], return_exceptions=True)
         return {"RET": await _returned_task(), **tasks}
 
-    runner = RegistryRunner(Registry(), store, claim_mode="per_lane")
+    runner = RegistryRunner(
+        Registry(), store, claim_mode="per_lane", egress=EgressSettings(deny_by_default=False)
+    )
     router, delivery = await _tasks(), await _tasks()
     runner._router_workers.update({f"IB_{k}": t for k, t in router.items()})
     runner._workers.update({f"OB_{k}": t for k, t in delivery.items()})
@@ -350,7 +356,9 @@ async def test_a_lane_the_outbound_dispatcher_holds_is_not_touched(
         def phase(self, name: str) -> str | None:
             return "processing" if name == "OB_HELD" else None
 
-    runner = RegistryRunner(Registry(), store, claim_mode="per_lane")
+    runner = RegistryRunner(
+        Registry(), store, claim_mode="per_lane", egress=EgressSettings(deny_by_default=False)
+    )
     runner._workers.update({"OB_HELD": await _returned_task(), "OB_FREE": await _returned_task()})
     monkeypatch.setitem(runner._dispatchers, Stage.OUTBOUND, _HoldingDispatcher())
     held_row = await _seed_inflight_outbound(store, "IB_ANY", "OB_HELD")
@@ -374,7 +382,11 @@ async def test_a_failed_backstop_does_not_fail_the_reload(
         raise RuntimeError("store down")
 
     runner = RegistryRunner(
-        _registry(tmp_path / "in", names=("IB",)), store, claim_mode="per_lane", poll_interval=30.0
+        _registry(tmp_path / "in", names=("IB",)),
+        store,
+        claim_mode="per_lane",
+        poll_interval=30.0,
+        egress=EgressSettings(deny_by_default=False),
     )
     await runner.start()
     try:
@@ -420,7 +432,11 @@ async def test_a_stopping_delivery_worker_releases_its_unordered_tail(
     delivery claim with a multi-row tail. The head is failed by the body; the two rows behind it
     must come back PENDING with the claim's ``attempts`` increment undone."""
     runner = RegistryRunner(
-        Registry(), store, claim_mode="per_lane", ordering_default=OrderingMode.UNORDERED
+        Registry(),
+        store,
+        claim_mode="per_lane",
+        ordering_default=OrderingMode.UNORDERED,
+        egress=EgressSettings(deny_by_default=False),
     )
     await _seed_pending_outbound(store, "OB", 3)
     monkeypatch.setattr(runner, "_process_delivery_item", _stop_on_first_item(store))
@@ -447,6 +463,7 @@ async def test_a_node_that_is_not_leader_releases_and_resets_nothing(
         claim_mode="per_lane",
         ordering_default=OrderingMode.UNORDERED,
         coordinator=_Follower(),
+        egress=EgressSettings(deny_by_default=False),
     )
     await _seed_pending_outbound(store, "OB", 3)
     monkeypatch.setattr(runner, "_process_delivery_item", _stop_on_first_item(store))

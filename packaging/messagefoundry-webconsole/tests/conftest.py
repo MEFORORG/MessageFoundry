@@ -31,6 +31,7 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.pipeline import Engine
 
 
@@ -38,7 +39,11 @@ from messagefoundry.pipeline import Engine
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
     """A throwaway engine on a per-test store — the workhorse behind every ASGI /ui test and the
     golden-surface app builder (moved from ``test_webui.py`` so it is shared across the suite)."""
-    eng = await Engine.create(tmp_path / "webui.db", poll_interval=0.02)
+    eng = await Engine.create(
+        tmp_path / "webui.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     yield eng
     await eng.stop()
 

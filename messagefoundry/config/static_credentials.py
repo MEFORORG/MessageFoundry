@@ -133,7 +133,7 @@ class StaticCredentialHop:
 # --- the graph half ---------------------------------------------------------------------------------
 
 #: The HTTP-family connector types. Each may dial through a forward proxy (ADR 0126). The same four
-#: types as ``pipeline.wiring_runner._HTTP_FAMILY_DEST_TYPES``, which ``config`` cannot import; a test
+#: types as ``transports.egress._HTTP_FAMILY_DEST_TYPES``, which ``config`` cannot import; a test
 #: pins the two equal.
 _HTTP_FAMILY = frozenset(
     {ConnectorType.REST, ConnectorType.FHIR, ConnectorType.SOAP, ConnectorType.DICOMWEB}

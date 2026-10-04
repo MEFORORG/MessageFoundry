@@ -28,6 +28,7 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.pipeline.alerts import (
     STORE_CIPHER_SUBJECT,
     UPLOAD_CIPHER_SUBJECT,
@@ -342,6 +343,7 @@ def test_serve_logs_the_startup_count(
             path=str(tmp_path / "serve.db"), encryption_key=generate_key(), uploads_dir=str(root)
         ),
         poll_interval=0.05,
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"), TestClient(app):
         pass

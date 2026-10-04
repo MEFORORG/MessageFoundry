@@ -19,6 +19,7 @@ from messagefoundry.config.settings import (
     AlertsSettings,
     ApiSettings,
     AuthSettings,
+    EgressSettings,
     SecretRotationSettings,
     SecuritySettings,
     StoreSettings,
@@ -94,7 +95,12 @@ def test_either_raw_key_alone_is_refused_on_both_directions(key: str) -> None:
     out_spec = Tcp(host="10.0.0.5", port=5000)
     out_spec.settings[key] = True if key == "tls_hop_attested" else REASON
     with pytest.raises(WiringError, match=key):
-        _dest_config(build_outbound_connection("OB", out_spec), {})
+        _dest_config(
+            build_outbound_connection("OB", out_spec),
+            {},
+            None,
+            EgressSettings(deny_by_default=False),
+        )
 
 
 def test_a_raw_key_written_after_the_declaration_is_still_refused() -> None:
@@ -155,12 +161,19 @@ def test_the_declared_pair_is_mirrored_for_the_settings_driven_seams() -> None:
             tls_hop_attested_reason=REASON,
         ),
         {},
+        None,
+        EgressSettings(deny_by_default=False),
     )
     assert (dest.tls_hop_attested, dest.tls_hop_attested_reason) == (True, REASON)
     assert dest.settings["tls_hop_attested"] is True
     assert dest.settings["tls_hop_attested_reason"] == REASON
 
-    plain = _dest_config(build_outbound_connection("OB", Tcp(host="10.0.0.5", port=5000)), {})
+    plain = _dest_config(
+        build_outbound_connection("OB", Tcp(host="10.0.0.5", port=5000)),
+        {},
+        None,
+        EgressSettings(deny_by_default=False),
+    )
     assert "tls_hop_attested" not in plain.settings
     assert "tls_hop_attested_reason" not in plain.settings
 
@@ -207,7 +220,12 @@ def test_connections_toml_takes_the_pair_top_level_on_both_directions(tmp_path: 
     registry = load_config(tmp_path)
     source = _source_config(registry.inbound["IB"], "127.0.0.1", {})
     check_mllp_tls_exposure(source, "IB", allow_insecure_bind=False, posture=ENFORCING)
-    assert _dest_config(registry.outbound["OB"], {}).tls_hop_attested is True
+    assert (
+        _dest_config(
+            registry.outbound["OB"], {}, None, EgressSettings(deny_by_default=False)
+        ).tls_hop_attested
+        is True
+    )
     assert attested_secure_hops(registry) == [("OB", REASON), ("inbound:IB", REASON)]
 
 
@@ -267,7 +285,10 @@ def test_a_fhir_lookup_flag_written_without_its_reason_is_refused_by_the_executo
     from messagefoundry.transports.fhir import FhirLookupExecutor
 
     with pytest.raises(ValueError, match="requires tls_hop_attested_reason"):
-        FhirLookupExecutor({"fl": {"url": "https://fhir.example/fhir", "tls_hop_attested": True}})
+        FhirLookupExecutor(
+            {"fl": {"url": "https://fhir.example/fhir", "tls_hop_attested": True}},
+            egress=EgressSettings(deny_by_default=False),
+        )
 
 
 def test_the_check_line_lists_every_attested_hop(tmp_path: Path) -> None:

@@ -27,7 +27,7 @@ from messagefoundry.api import create_app
 from messagefoundry.api.models import ClusterNode, ClusterNodeList, ClusterStatus
 from messagefoundry.auth import Role
 from messagefoundry.auth.service import AuthService
-from messagefoundry.config.settings import AuthSettings, ClusterSettings
+from messagefoundry.config.settings import AuthSettings, ClusterSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.cluster import (
     ClusterMember,
@@ -531,7 +531,12 @@ async def _console(
     settings: AuthSettings | None = None,
 ) -> AsyncIterator[tuple[Engine, httpx.AsyncClient]]:
     """A started engine holding ``coordinator`` and a browser tab signed in as ``role``."""
-    engine = await Engine.create(tmp_path / "ha.db", poll_interval=0.02, coordinator=coordinator)
+    engine = await Engine.create(
+        tmp_path / "ha.db",
+        poll_interval=0.02,
+        coordinator=coordinator,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     await engine.start()
     try:
         service = AuthService(

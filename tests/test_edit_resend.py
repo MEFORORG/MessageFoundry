@@ -20,6 +20,7 @@ import httpx
 import pytest
 
 from messagefoundry.config.models import ConnectorType
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -361,7 +362,11 @@ async def test_edit_resend_reroute_endpoint_resubmits_and_audits(tmp_path: Path)
     pytest.importorskip("psutil")
     from messagefoundry.api import create_app
 
-    engine = await Engine.create(tmp_path / "api.db", poll_interval=0.02)
+    engine = await Engine.create(
+        tmp_path / "api.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     engine.add_registry(_registry(tmp_path))
     await engine.start()
     try:
@@ -404,7 +409,11 @@ async def test_edit_resend_direct_endpoint_delivers_edited_body(tmp_path: Path) 
     pytest.importorskip("psutil")
     from messagefoundry.api import create_app
 
-    engine = await Engine.create(tmp_path / "api.db", poll_interval=0.02)
+    engine = await Engine.create(
+        tmp_path / "api.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     engine.add_registry(_registry(tmp_path))
     await engine.start()
     try:
@@ -449,7 +458,11 @@ async def test_edit_resend_malformed_body_422_does_not_echo_the_body(tmp_path: P
     pytest.importorskip("psutil")
     from messagefoundry.api import create_app
 
-    engine = await Engine.create(tmp_path / "api.db", poll_interval=0.02)
+    engine = await Engine.create(
+        tmp_path / "api.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     engine.add_registry(_registry(tmp_path))
     await engine.start()
     marker = "MRN9999SECRET"

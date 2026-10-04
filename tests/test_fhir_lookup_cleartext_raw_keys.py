@@ -76,7 +76,7 @@ def _build_check(reg: Registry) -> None:
         reg,
         inbound_bind_host="127.0.0.1",
         env_values={},
-        egress=EgressSettings(),
+        egress=EgressSettings(deny_by_default=False),
         posture=_ENFORCING,
     )
 
@@ -87,7 +87,7 @@ def _build_live(reg: Registry) -> None:
     runner = SimpleNamespace(
         registry=reg,
         _env_values={},
-        _egress=EgressSettings(),
+        _egress=EgressSettings(deny_by_default=False),
         _hop_posture=_ENFORCING,
         _trust_anchor_policy=None,
     )
@@ -125,7 +125,7 @@ def test_a_declared_lookup_crosses_and_its_audit_line_ignores_the_raw_keys(
 
 def test_fhir_lookup_settings_strips_every_raw_declaration_key() -> None:
     spec = FhirLookupSpec("epic", {"url": _CLEARTEXT_URL, **_RAW, **_RAW_REVOCATION})
-    settings = _fhir_lookup_settings(spec, {}, None)
+    settings = _fhir_lookup_settings(spec, {}, EgressSettings(deny_by_default=False))
     assert not any(k.startswith(("cleartext_", "tls_revocation_attested")) for k in settings)
     assert settings["connection_name"] == "fhir_lookup:epic"  # its own name, not the raw one
     assert settings["url"] == _CLEARTEXT_URL  # control: only the declaration keys went
@@ -138,7 +138,7 @@ def test_fhir_lookup_settings_mirrors_only_the_typed_declaration() -> None:
         cleartext_accepted=True,
         cleartext_reason=_REASON,
     )
-    settings = _fhir_lookup_settings(spec, {}, None)
+    settings = _fhir_lookup_settings(spec, {}, EgressSettings(deny_by_default=False))
     assert settings["cleartext_accepted"] is True
     assert settings["cleartext_reason"] == _REASON
     assert settings["connection_name"] == "fhir_lookup:epic"
@@ -213,4 +213,4 @@ def test_a_raw_hop_attestation_cannot_pair_with_the_typed_acceptance() -> None:
         {"tls_hop_attested": True, "tls_hop_attested_reason": "sidecar terminates TLS"}
     )
     with pytest.raises(WiringError, match="opposite claims"):
-        _fhir_lookup_settings(spec, {}, None)
+        _fhir_lookup_settings(spec, {}, EgressSettings(deny_by_default=False))

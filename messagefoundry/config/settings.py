@@ -4014,15 +4014,14 @@ class EgressSettings(_Section):
     """``[egress]`` — fail-closed outbound destination allowlist (WP-11c; ASVS 13.2.4/13.2.5/14.2.3).
 
     Bounds where the engine may **send** PHI, so a fat-fingered or hostile outbound destination can't
-    exfiltrate it. With ``deny_by_default`` off, each destination list is **opt-in**: empty =
-    unrestricted; once a transport's list is set, a destination of that transport not on it is
-    **refused at config load/reload** (fail-closed), checked against the resolved
-    (``env()``-substituted) destination. The webhook/SMTP *alert* sinks carry no PHI bodies and keep
+    exfiltrate it. ``deny_by_default`` is ON unless an operator turns it off, so a transport whose list
+    is empty refuses every destination of that type; once a transport's list is set, a destination of
+    that transport not on it is **refused at config load/reload** (fail-closed), checked against the
+    resolved (``env()``-substituted) destination. With ``deny_by_default`` off, each list is opt-in and
+    an empty one is unrestricted. The webhook/SMTP *alert* sinks carry no PHI bodies and keep
     their own ``[alerts]`` host allowlists.
 
-    ``deny_by_default`` flips the destination lists fail-closed, so an empty one refuses everything.
-    The comment on the field says what else it covers, how operators set it, and when ``serve`` turns
-    it on.
+    The comment on ``deny_by_default`` says what else it covers and how operators set it.
     """
 
     # Allowed MLLP outbound destinations: each entry is "host" (any port) or "host:port".
@@ -4092,12 +4091,13 @@ class EgressSettings(_Section):
     # db_lookup/fhir_lookup reads that dial through the same lists. Operators set it as
     # [security].block_unlisted_outbound (ADR 0118), which reaches this field only when written.
     #
-    # This field's model default is false (the per-list opt-in above), and a caller that loads settings
-    # without `serve` sees false. `serve` sets it True whenever it is left unset, with no further
-    # condition in the code: since BACKLOG #1279 every instance counts as a PHI instance, so this is
-    # any PHI instance. On stock defaults the open-egress gate just before the flip refuses to start
-    # first. The code at the flip, in `_serve` in messagefoundry/__main__.py, is the authority.
-    deny_by_default: bool = False
+    # The MODEL default is true (vault BACKLOG #2605). It used to be false, with `serve` flipping it on
+    # in place, so every other entry point -- an embedder, `check`, the `connection` CLI -- ran with
+    # allow-all egress. Now every caller that builds settings gets deny unless the operator writes the
+    # audited opt-out `block_unlisted_outbound = false`. `serve` still refuses to start when no
+    # destination list is set and the switch was not written true; that gate tests the explicit
+    # value itself, in `_serve` in messagefoundry/__main__.py, because this default alone would satisfy it.
+    deny_by_default: bool = True
 
     @field_validator(
         "allowed_mllp",
@@ -4158,14 +4158,14 @@ class EgressSettings(_Section):
 #: How an operator-facing refusal says ``EgressSettings.deny_by_default`` is on (BACKLOG #1361).
 #:
 #: BOTH ARMS ARE REACHABLE, AND SAYING ONLY "is set" ASSERTS SOMETHING FALSE ON THE COMMON PATH. The
-#: operator can write ``[security].block_unlisted_outbound`` -- but ``__main__`` also FLIPS the field on
-#: for any PHI instance that left it unset, announcing that as "defaulted ON". An instance that
-#: configured nothing is the usual way this refusal fires, so a message reading "is set" tells that
-#: operator they set something they did not.
+#: operator can write ``[security].block_unlisted_outbound`` -- but the field is also ON by default
+#: (vault BACKLOG #2605; every instance is a PHI instance). An instance that configured nothing is
+#: the usual way this refusal fires, so a message reading "is set" tells that operator they set
+#: something they did not.
 #:
-#: Defined once, beside the field, because the six refusal sites live in two other modules
-#: (``pipeline/reference_sync.py``, ``pipeline/wiring_runner.py``) and a second copy of this sentence
-#: is how five of them stay right while the sixth goes stale.
+#: Defined once, beside the field, because the refusal sites live in another module
+#: (``transports/egress.py``, and ``__main__`` matches on it) and a second copy of this sentence
+#: is how most of them stay right while one goes stale.
 #:
 #: Names the ``[security]`` spelling, not ``[egress].deny_by_default``: ADR 0118 relocated the key and
 #: the loader REFUSES the old one as file or env input, so naming it hands out a remediation that dies
@@ -7024,7 +7024,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
     # py/clear-text-logging-sensitive-data reads an attribute named mfa_* as a password source, and
     # these entries reach the serve WARNING and `security show` stdout, so quoting the number raised
     # two alerts on PR 1842. The value only picks a literal verdict (_floor_verdict), which carries
-    # no data from it. The operator loses nothing they did not set themselves.
+    # no data from it. The operator loses nothing they did not set themselves. ADR 0034's 2026-10-03
+    # amendment states the wider rule once, for this note and the two below that cite it.
     step_field = "mfa_verify_min_elapsed_seconds"
     step_verdict = _floor_verdict(step_field, auth.mfa_verify_min_elapsed_seconds)
     if step_verdict == "off":
@@ -7101,9 +7102,10 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
 #: The one sign-in that proves a second factor without an enrolled one, worded once for the MFA
 #: advisories here and the exposure texts in ``__main__._serve``. ``_check_mfa_gate`` checks the
 #: amr/acr claim, and the OIDC mint stamps the session verified, only while this setting is on.
-#: Neither this name nor the helper's below may hold ``mfa`` as a separate word. CodeQL reads such a
-#: name as a password source (the ``mfa_verify_min_elapsed_seconds`` note above, same cause), so
-#: every log line carrying this fixed sentence would raise ``py/clear-text-logging-sensitive-data``.
+#: Neither this name nor the helper's below may hold ``mfa`` as a separate word: CodeQL would read it
+#: as a password and raise ``py/clear-text-logging-sensitive-data`` on every log line carrying this
+#: fixed sentence. See ADR 0034's
+#: 2026-10-03 amendment; ``test_no_logged_settings_text_is_named_like_a_password`` guards it.
 OIDC_SECOND_FACTOR_CLAIM_EXCEPTION = (
     "an OIDC sign-in carries an amr/acr claim checked while [auth].oidc_require_mfa_claim is on"
 )
@@ -7271,7 +7273,7 @@ def security_loosenings(
             (
                 "enforcement",
                 "the security REFUSE/WARN dial is at 'warn' — posture weakenings (cleartext/verify-off "
-                "hops, keyless PHI, open egress, single-factor admin at exposure) are WARNED + audited "
+                "hops, keyless PHI, open egress, single-factor sign-in at exposure) are WARNED + audited "
                 "and permitted to continue rather than refused, and MEFOR_ALLOW_INSECURE_TLS / "
                 "--allow-insecure-bind escapes are honored",
             )
@@ -7355,7 +7357,8 @@ def security_loosenings(
                 "an account with no second factor enrolled is single-factor, so a Kerberos session "
                 "enters on a ticket that asserts no strength. An enrolled account owes its factor "
                 "only while it keeps one, and its holder may remove the last. Where "
-                f"{OIDC_SECOND_FACTOR_CLAIM_EXCEPTION}, that claim stands in for the enrolled factor",
+                f"{OIDC_SECOND_FACTOR_CLAIM_EXCEPTION}, that claim counts as the second factor, whether or "
+                "not one is enrolled",
             )
         )
     elif sec.require_mfa_scope != "every_local_account":
@@ -7535,7 +7538,8 @@ def security_loosenings(
     # source address poisons the audit trail either way.
     # CodeQL's name heuristic reads `trusted_proxies` as a secret (main's alert 209 is that source on
     # an INFO line). The entries reach the serve WARNING and stdout below; no flow is reported today,
-    # but a refactor of the helper may raise one. Fix it at the source, as the MFA floor above does.
+    # but a refactor of the helper may raise one. The ranges are quoted on purpose: they are the
+    # finding. ADR 0034's 2026-10-03 amendment, rule 3, says how to triage such an alert.
     trust_all = _trust_every_peer_entries(api.trusted_proxies)
     if trust_all:
         out.append(

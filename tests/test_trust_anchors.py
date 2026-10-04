@@ -33,7 +33,7 @@ from messagefoundry.auth.trust_anchors import (
     owner_only_from_icacls,
     run_anchor_preflight,
 )
-from messagefoundry.config.settings import ApiSettings, AuthSettings
+from messagefoundry.config.settings import ApiSettings, AuthSettings, EgressSettings
 from messagefoundry.store import MessageStore
 
 _posix_only = pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits (icacls is the nt path)")
@@ -1234,14 +1234,20 @@ async def test_start_and_reload_refuse_an_unjudged_inbound_ca_alike(
     cfg = tmp_path / "cfg"
     _one_listener_graph(cfg, ca)
 
-    app = create_managed_app(db_path=tmp_path / "m.db", config_dir=cfg)
+    app = create_managed_app(
+        db_path=tmp_path / "m.db",
+        config_dir=cfg,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     with pytest.raises(WiringError) as at_start:
         async with app.router.lifespan_context(app):
             pass
 
     store = await MessageStore.open(tmp_path / "e.db")
     preflight = ta.make_registry_anchor_preflight(store, enforcing=True)
-    engine = Engine(store, registry_preflight=preflight)
+    engine = Engine(
+        store, registry_preflight=preflight, egress_settings=EgressSettings(deny_by_default=False)
+    )
     try:
         with pytest.raises(WiringError) as at_reload:
             await engine.reload_detail(cfg)
@@ -1386,7 +1392,9 @@ async def test_the_reload_route_audits_an_inbound_anchor_refusal_as_trust_anchor
 
     store = await MessageStore.open(tmp_path / "e.db")
     engine = Engine(
-        store, registry_preflight=ta.make_registry_anchor_preflight(store, enforcing=True)
+        store,
+        registry_preflight=ta.make_registry_anchor_preflight(store, enforcing=True),
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     try:
         transport = httpx.ASGITransport(app=create_app(engine, allow_no_auth=True))
@@ -1448,6 +1456,7 @@ async def _anchored_engine(
         store,
         config_dir=cfg if with_config_dir else None,
         settings_preflight=ta.make_settings_anchor_preflight([spec], store, enforcing=True),
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     return engine, cfg
 
@@ -1608,7 +1617,11 @@ async def test_the_reload_route_still_refuses_a_swapped_settings_anchor_the_same
     cfg = tmp_path / "cfg"
     _file_graph(cfg)
     app = create_managed_app(
-        db_path=tmp_path / "m.db", config_dir=cfg, trust_anchor_specs=[spec], allow_no_auth=True
+        db_path=tmp_path / "m.db",
+        config_dir=cfg,
+        trust_anchor_specs=[spec],
+        allow_no_auth=True,
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     async with app.router.lifespan_context(app):
         engine = app.state.engine

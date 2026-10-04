@@ -32,6 +32,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.config.models import AckMode, ConnectorType, ContentType, Validation
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     MLLP,
     ConnectionSpec,
@@ -159,7 +160,7 @@ async def test_over_threshold_detaches_verbatim(store: MessageStore) -> None:
     raw = _hl7_with_doc(b64)
     ic = _streaming_ic(threshold=500)
     reg = _registry(ic)
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
     ack = await runner._handle_inbound(ic, raw.encode("utf-8"))
 
@@ -195,7 +196,7 @@ async def test_below_threshold_byte_identical(store: MessageStore) -> None:
     assert len(raw) < 5000
     ic = _streaming_ic(threshold=5000)
     reg = _registry(ic)
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
     ack = await runner._handle_inbound(ic, raw.encode("utf-8"))
 
@@ -212,7 +213,7 @@ async def test_no_threshold_byte_identical(store: MessageStore) -> None:
     raw = _hl7_with_doc(b64)
     ic = _streaming_ic(threshold=None)
     reg = _registry(ic)
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
     ack = await runner._handle_inbound(ic, raw.encode("utf-8"))
 
@@ -232,7 +233,7 @@ async def test_detach_downgrades_mislabelled_mime_to_octet_stream(store: Message
     b64 = base64.b64encode(b"%PDF-1.7 " + b"P" * 2000).decode("ascii")  # PDF magic, not PNG
     raw = _hl7_with_doc(b64, obx_type="image/png")
     ic = _streaming_ic(threshold=500)
-    runner = RegistryRunner(_registry(ic), store)
+    runner = RegistryRunner(_registry(ic), store, egress=EgressSettings(deny_by_default=False))
 
     ack = await runner._handle_inbound(ic, raw.encode("utf-8"))
     assert _ack_code(ack) == "AA"
@@ -257,7 +258,7 @@ async def test_detach_keeps_matching_mime(store: MessageStore) -> None:
     b64 = base64.b64encode(png).decode("ascii")
     raw = _hl7_with_doc(b64, obx_type="image/png")
     ic = _streaming_ic(threshold=500)
-    runner = RegistryRunner(_registry(ic), store)
+    runner = RegistryRunner(_registry(ic), store, egress=EgressSettings(deny_by_default=False))
 
     await runner._handle_inbound(ic, raw.encode("utf-8"))
     attaches = await _attachments(store)
@@ -273,7 +274,7 @@ async def test_bad_header_naks_synchronously(store: MessageStore) -> None:
     # parse runs first, unchanged, so a malformed header never reaches the detach/ingress.
     ic = _streaming_ic(threshold=10)
     reg = _registry(ic)
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
     ack = await runner._handle_inbound(
         ic, b"NOTHL7 this is not a message at all, definitely over ten bytes"
@@ -294,7 +295,7 @@ async def test_over_max_message_bytes_rejected(store: MessageStore) -> None:
     ic = _streaming_ic(threshold=500, max_message_bytes=1000)
     assert len(raw) > 1000
     reg = _registry(ic)
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
     ack = await runner._handle_inbound(ic, raw.encode("utf-8"))
 
@@ -321,7 +322,7 @@ async def test_strict_downgraded_to_header_only_over_threshold(
     raw = _hl7_with_doc(b64)
     ic = _streaming_ic(threshold=500, strict=True)
     reg = _registry(ic)
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
     ack = await runner._handle_inbound(ic, raw.encode("utf-8"))
 
@@ -348,7 +349,7 @@ async def test_strict_still_runs_below_threshold(store: MessageStore, monkeypatc
     raw = _hl7_with_doc(_big_b64(20))
     ic = _streaming_ic(threshold=100_000, strict=True)  # threshold far above → below-threshold path
     reg = _registry(ic)
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
     await runner._handle_inbound(ic, raw.encode("utf-8"))
     assert len(called) == 1  # whole-body validate DID run
@@ -363,7 +364,7 @@ async def test_ack_fires_after_skeleton_and_incref_commit(store: MessageStore) -
     b64 = _big_b64(1500)
     ic = _streaming_ic(threshold=500)
     reg = _registry(ic)
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
     ack = await runner._handle_inbound(ic, _hl7_with_doc(b64).encode("utf-8"))
     assert _ack_code(ack) == "AA"
@@ -381,7 +382,7 @@ async def test_identical_documents_dedup_no_double_write(store: MessageStore) ->
     b64 = _big_b64(1500)
     ic = _streaming_ic(threshold=500)
     reg = _registry(ic)
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
     await runner._handle_inbound(ic, _hl7_with_doc(b64).encode("utf-8"))
     await runner._handle_inbound(ic, _hl7_with_doc(b64).encode("utf-8"))
@@ -404,7 +405,7 @@ async def test_crash_before_skeleton_commit_orphan_reclaimed_and_rerun_dedups(
     b64 = _big_b64(1500)
     ic = _streaming_ic(threshold=500)
     reg = _registry(ic)
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
     skeleton, refs = await runner._detach_documents(ic, _hl7_with_doc(b64))
     assert len(refs) == 1
@@ -434,7 +435,9 @@ async def test_in_flight_budget_exceeded_naks(store: MessageStore) -> None:
     raw = _hl7_with_doc(b64)
     ic = _streaming_ic(threshold=500)
     reg = _registry(ic)
-    runner = RegistryRunner(reg, store, stream_inflight_budget_bytes=10)  # far below the body size
+    runner = RegistryRunner(
+        reg, store, stream_inflight_budget_bytes=10, egress=EgressSettings(deny_by_default=False)
+    )  # far below the body size
 
     ack = await runner._handle_inbound(ic, raw.encode("utf-8"))
 
@@ -457,7 +460,7 @@ async def test_unsupported_backend_naks(store: MessageStore) -> None:
     b64 = _big_b64(2000)
     ic = _streaming_ic(threshold=500)
     reg = _registry(ic)
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
 
     ack = await runner._handle_inbound(ic, _hl7_with_doc(b64).encode("utf-8"))
 
@@ -474,7 +477,7 @@ async def test_skeleton_composes_with_copy_on_send(store: MessageStore) -> None:
     b64 = _big_b64(1500)
     ic = _streaming_ic(threshold=500)
     reg = _registry(ic)
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
     await runner._handle_inbound(ic, _hl7_with_doc(b64).encode("utf-8"))
 
     skeleton = (await _messages(store))[0]["raw"]
@@ -510,10 +513,20 @@ async def test_zero_budget_admits_a_detach_that_a_positive_budget_refuses(
     raw = _hl7_with_doc(b64).encode("utf-8")
     ic = _streaming_ic(threshold=500)
 
-    refused = RegistryRunner(_registry(ic), store, stream_inflight_budget_bytes=10)
+    refused = RegistryRunner(
+        _registry(ic),
+        store,
+        stream_inflight_budget_bytes=10,
+        egress=EgressSettings(deny_by_default=False),
+    )
     assert _ack_code(await refused._handle_inbound(ic, raw)) == "AE"
 
-    unlimited = RegistryRunner(_registry(ic), store, stream_inflight_budget_bytes=0)
+    unlimited = RegistryRunner(
+        _registry(ic),
+        store,
+        stream_inflight_budget_bytes=0,
+        egress=EgressSettings(deny_by_default=False),
+    )
     assert _ack_code(await unlimited._handle_inbound(ic, raw)) == "AA"
     assert unlimited._stream_inflight_bytes == 0  # released, exactly as on the positive path
     # The detach really happened on the unlimited run (an attachment exists), so "AA" is not an
@@ -583,7 +596,7 @@ async def test_binding_a_streaming_listener_emits_the_warning(store: MessageStor
     reg.add_inbound(build_inbound_connection("IB_PLAIN", MLLP(port=free_port()), router="r"))
     reg.add_router("r", lambda m: [])
     runner = RegistryRunner(
-        reg, store, poll_interval=0.02
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
     )  # stream_inflight_budget_bytes=0 default
 
     with caplog.at_level("WARNING", logger=wiring_runner.__name__):

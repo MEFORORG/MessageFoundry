@@ -41,7 +41,7 @@ from messagefoundry.api.security import (
 )
 from messagefoundry.auth.permissions import Permission
 from messagefoundry.auth.service import AuthService
-from messagefoundry.config.settings import AuthSettings
+from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from scripts.security import route_gates
 
@@ -121,7 +121,9 @@ def test_no_create_app_flag_registers_a_route_the_full_surface_app_lacks(full_ap
 
 @pytest.fixture
 async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    eng = await Engine.create(tmp_path / "deny.db", poll_interval=0.05)
+    eng = await Engine.create(
+        tmp_path / "deny.db", poll_interval=0.05, egress_settings=EgressSettings()
+    )
     yield eng
     await eng.stop()
 
@@ -176,7 +178,11 @@ def test_the_stats_websocket_answers_as_it_did_before(
 
     def streams(name: str) -> bool:
         app = create_managed_app(
-            db_path=tmp_path / name, poll_interval=0.05, allow_no_auth=allow_no_auth, serve_ui=True
+            db_path=tmp_path / name,
+            poll_interval=0.05,
+            allow_no_auth=allow_no_auth,
+            serve_ui=True,
+            egress_settings=EgressSettings(),
         )
         with TestClient(app) as client:
             try:

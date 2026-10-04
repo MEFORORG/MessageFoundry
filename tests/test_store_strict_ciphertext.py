@@ -35,7 +35,12 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.config.settings import ApiSettings, StoreSettings, security_loosenings
+from messagefoundry.config.settings import (
+    ApiSettings,
+    EgressSettings,
+    StoreSettings,
+    security_loosenings,
+)
 from messagefoundry.pipeline.engine import Engine
 from messagefoundry.store import MessageStore
 from messagefoundry.store import crypto as crypto_mod
@@ -113,7 +118,11 @@ async def test_unmarked_value_on_a_sealed_surface_is_refused_and_alerts(
         assert "messages.raw holds 1 unmarked value(s) beside sealed ones" in caplog.text
 
         sink = _Sink()
-        engine = Engine(store, alert_sink=sink)  # type: ignore[arg-type]
+        engine = Engine(
+            store,
+            alert_sink=sink,  # type: ignore[arg-type]
+            egress_settings=EgressSettings(deny_by_default=False),
+        )
         engine._arm_cipher_refusal_alert()
         try:
             assert (await store.get_message(good) or {})["raw"] == _RAW.format(i=0)
@@ -431,6 +440,7 @@ def test_serve_alerts_when_a_planted_state_value_blocks_the_open(
         store_settings=StoreSettings(path=str(db), encryption_key=key),
         alerts_settings=AlertsSettings(),
         poll_interval=0.05,
+        egress_settings=EgressSettings(deny_by_default=False),
     )
     with pytest.raises(CipherError), TestClient(app):
         pass

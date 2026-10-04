@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Priority
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     MLLP,
     ConnectionSpec,
@@ -83,7 +84,13 @@ async def test_startup_filters_below_threshold(store: MessageStore, tmp_path: Pa
         )
     )
     reg.add_router("r", lambda m: [])
-    runner = RegistryRunner(reg, store, poll_interval=0.02, dr_threshold=Priority.CRITICAL)
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        dr_threshold=Priority.CRITICAL,
+        egress=EgressSettings(deny_by_default=False),
+    )
     await runner.start()
     try:
         assert runner.running
@@ -112,7 +119,9 @@ async def test_no_dr_threshold_starts_everything(store: MessageStore, tmp_path: 
         build_inbound_connection("in_low", MLLP(port=low_port), router="r", priority=Priority.LOW)
     )
     reg.add_router("r", lambda m: [])
-    runner = RegistryRunner(reg, store, poll_interval=0.02)  # dr_threshold defaults to None
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )  # dr_threshold defaults to None
     await runner.start()
     try:
         assert runner.inbound_running("in_low")  # a low-priority feed runs normally (no DR profile)
@@ -157,7 +166,13 @@ async def test_filtered_inbound_drains_backlog(store: MessageStore, tmp_path: Pa
         now=1.0,
     )
 
-    runner = RegistryRunner(reg, store, poll_interval=0.02, dr_threshold=Priority.CRITICAL)
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        dr_threshold=Priority.CRITICAL,
+        egress=EgressSettings(deny_by_default=False),
+    )
     await runner.start()
     try:
         # The listener is parked (filtered), but the workers run and drain the pre-seeded backlog to the
@@ -208,7 +223,13 @@ async def test_same_name_inbound_and_outbound_park_independently(
         )
     )
     reg.add_router("r", lambda m: [])
-    runner = RegistryRunner(reg, store, poll_interval=0.02, dr_threshold=Priority.CRITICAL)
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        dr_threshold=Priority.CRITICAL,
+        egress=EgressSettings(deny_by_default=False),
+    )
     await runner.start()
     try:
         # The critical inbound binds; the low outbound is parked, and says so.

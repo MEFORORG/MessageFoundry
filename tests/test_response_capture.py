@@ -20,6 +20,7 @@ from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.response import activated, response_get
 from messagefoundry.config.run_context import ROUTER, TRANSFORM, RunContext, run_contexts
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     MLLP,
     ConnectionSpec,
@@ -252,7 +253,10 @@ def _ack(code: str, msa3: str = "") -> bytes:
 
 def _mllp(capture: bool) -> MLLPDestination:
     settings = MLLP(host="h", port=1, capture_response=capture).settings
-    d = build_destination(Destination(name="OB_M", type=ConnectorType.MLLP, settings=settings))
+    d = build_destination(
+        Destination(name="OB_M", type=ConnectorType.MLLP, settings=settings),
+        egress=EgressSettings(deny_by_default=False),
+    )
     assert isinstance(d, MLLPDestination)
     return d
 
@@ -312,7 +316,10 @@ def _mllp_verify(verify: bool, *, capture: bool = False) -> MLLPDestination:
     settings = MLLP(
         host="h", port=1, capture_response=capture, verify_ack_control_id=verify
     ).settings
-    d = build_destination(Destination(name="OB_M", type=ConnectorType.MLLP, settings=settings))
+    d = build_destination(
+        Destination(name="OB_M", type=ConnectorType.MLLP, settings=settings),
+        egress=EgressSettings(deny_by_default=False),
+    )
     assert isinstance(d, MLLPDestination)
     return d
 
@@ -429,7 +436,10 @@ class _Opener:
 
 def _rest(capture: bool) -> Any:
     s = Rest(url="https://api.example.com/x", capture_response=capture).settings
-    return build_destination(Destination(name="OB_R", type=ConnectorType.REST, settings=s))
+    return build_destination(
+        Destination(name="OB_R", type=ConnectorType.REST, settings=s),
+        egress=EgressSettings(deny_by_default=False),
+    )
 
 
 async def test_rest_capture_2xx_body_and_empty() -> None:
@@ -466,7 +476,10 @@ _SOAP_OK = (
 
 def _soap(capture: bool) -> Any:
     s = Soap(url="https://api.example.com/svc", capture_response=capture).settings
-    return build_destination(Destination(name="OB_S", type=ConnectorType.SOAP, settings=s))
+    return build_destination(
+        Destination(name="OB_S", type=ConnectorType.SOAP, settings=s),
+        egress=EgressSettings(deny_by_default=False),
+    )
 
 
 async def test_soap_capture_clean_and_fault() -> None:
@@ -489,7 +502,10 @@ async def test_soap_noncapture_fault_still_raises() -> None:
 
 def _db(capture: bool, statement: str = "INSERT INTO t VALUES (:x) RETURNING id") -> Any:
     s = Database(server="s", database="d", statement=statement, capture_response=capture).settings
-    return build_destination(Destination(name="OB_D", type=ConnectorType.DATABASE, settings=s))
+    return build_destination(
+        Destination(name="OB_D", type=ConnectorType.DATABASE, settings=s),
+        egress=EgressSettings(deny_by_default=False),
+    )
 
 
 class _Cur:
@@ -585,7 +601,7 @@ async def test_runner_start_isolates_capture_on_unsupporting_backend(
     reg.add_outbound(
         build_outbound_connection("OB_Q", MLLP(host="h", port=1, capture_response=True))
     )
-    runner = RegistryRunner(reg, store)
+    runner = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
     try:
         await runner.start()  # does NOT raise — the capturing lane is isolated, not fatal
         assert runner.running
@@ -609,7 +625,11 @@ async def test_responses_route_rbac_and_audit(tmp_path: Any) -> None:
     from messagefoundry.pipeline import Engine
 
     pw = "a-strong-test-passphrase"
-    engine = await Engine.create(tmp_path / "resp_api.db", poll_interval=0.02)
+    engine = await Engine.create(
+        tmp_path / "resp_api.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         service = AuthService(engine.store, AuthSettings(require_mfa=False))
         await service.initialize()

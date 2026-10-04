@@ -14,6 +14,7 @@ import pytest
 
 from messagefoundry.config.connections_file import load_connections_file
 from messagefoundry.config.models import Priority
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     MLLP,
     Registry,
@@ -55,20 +56,27 @@ async def test_priority_inherits_then_overrides(tmp_path: Path) -> None:
         reg.add_router("r", lambda m: [])
 
         # Global default LOW: the un-tagged connections inherit it; the explicit ones override.
-        runner = RegistryRunner(reg, store, priority_default=Priority.LOW)
+        runner = RegistryRunner(
+            reg, store, priority_default=Priority.LOW, egress=EgressSettings(deny_by_default=False)
+        )
         assert runner.resolved_priority("in_default") is Priority.LOW  # inherits global default
         assert runner.resolved_priority("in_critical") is Priority.CRITICAL  # explicit override
         assert runner.resolved_priority("out_default") is Priority.LOW  # inherits global default
         assert runner.resolved_priority("out_low") is Priority.LOW  # explicit (== default here)
 
         # A different global default proves it is the inherited value, not a hard-coded NORMAL.
-        runner2 = RegistryRunner(reg, store, priority_default=Priority.CRITICAL)
+        runner2 = RegistryRunner(
+            reg,
+            store,
+            priority_default=Priority.CRITICAL,
+            egress=EgressSettings(deny_by_default=False),
+        )
         assert runner2.resolved_priority("in_default") is Priority.CRITICAL
         assert runner2.resolved_priority("out_default") is Priority.CRITICAL
         assert runner2.resolved_priority("out_low") is Priority.LOW  # override still wins
 
         # Built-in default (no priority_default passed) is NORMAL.
-        runner3 = RegistryRunner(reg, store)
+        runner3 = RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
         assert runner3.resolved_priority("in_default") is Priority.NORMAL
     finally:
         await store.close()

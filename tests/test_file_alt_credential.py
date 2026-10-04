@@ -36,6 +36,7 @@ from messagefoundry.config.models import (
     Source,
     WindowsCredential,
 )
+from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import EnvRef, File, WiringError, env, redacted_settings
 from messagefoundry.transports import build_destination, build_source, wincred
 from messagefoundry.transports.base import DeliveryError, SourceStartupError
@@ -107,16 +108,26 @@ def test_credential_on_non_windows_fails_to_build(
     }
     with pytest.raises(wincred.CredentialUnsupportedError):
         if direction == "source":
-            build_source(Source(type=ConnectorType.FILE, settings=settings))
+            build_source(
+                Source(type=ConnectorType.FILE, settings=settings),
+                egress=EgressSettings(deny_by_default=False),
+            )
         else:
-            build_destination(Destination(name="OB", type=ConnectorType.FILE, settings=settings))
+            build_destination(
+                Destination(name="OB", type=ConnectorType.FILE, settings=settings),
+                egress=EgressSettings(deny_by_default=False),
+            )
 
 
 def test_no_credential_is_byte_identical(tmp_path: Path) -> None:
     # No credential_* settings => no context on either connector (the ambient-identity path is untouched).
-    src = build_source(Source(type=ConnectorType.FILE, settings={"directory": str(tmp_path)}))
+    src = build_source(
+        Source(type=ConnectorType.FILE, settings={"directory": str(tmp_path)}),
+        egress=EgressSettings(deny_by_default=False),
+    )
     dst = build_destination(
-        Destination(name="OB", type=ConnectorType.FILE, settings={"directory": str(tmp_path)})
+        Destination(name="OB", type=ConnectorType.FILE, settings={"directory": str(tmp_path)}),
+        egress=EgressSettings(deny_by_default=False),
     )
     assert isinstance(src, FileSource) and src._cred_ctx is None
     assert isinstance(dst, FileDestination) and dst._cred_ctx is None
@@ -128,7 +139,8 @@ async def test_no_credential_destination_still_writes(tmp_path: Path) -> None:
             name="OB",
             type=ConnectorType.FILE,
             settings={"directory": str(tmp_path), "filename": "out.hl7"},
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     await dst.send(ADT)
     assert (tmp_path / "out.hl7").read_bytes() == ADT.encode("utf-8")
@@ -376,7 +388,8 @@ async def test_destination_write_runs_under_credential(
                 "credential_username": "svc",
                 "credential_password": "pw",
             },
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     await dst.send(ADT)
     # The write actually happened (real bytes), AND it was bracketed by impersonate/revert — i.e. the
@@ -399,7 +412,8 @@ async def test_destination_logon_failure_maps_to_delivery_error(
                 "credential_username": "svc",
                 "credential_password": "bad",
             },
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     with pytest.raises(DeliveryError):
         await dst.send(ADT)
@@ -419,7 +433,8 @@ async def test_source_validate_startup_runs_under_credential(
                 "credential_username": "svc",
                 "credential_password": "pw",
             },
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     await src.validate_startup()  # the #114 startup probe, wrapped under the credential
     assert "impersonate" in fake.calls and "revert" in fake.calls
@@ -439,7 +454,8 @@ async def test_source_startup_logon_failure_isolates_connection(
                 "credential_username": "svc",
                 "credential_password": "bad",
             },
-        )
+        ),
+        egress=EgressSettings(deny_by_default=False),
     )
     # A logon failure at startup surfaces as SourceStartupError (ADR 0031 isolates it `failed`),
     # not a crash — because CredentialLogonError is an OSError the probe path already catches.

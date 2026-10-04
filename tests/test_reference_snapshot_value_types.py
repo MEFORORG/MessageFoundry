@@ -39,7 +39,7 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry.config.settings import ReferenceSettings
+from messagefoundry.config.settings import EgressSettings, ReferenceSettings
 from messagefoundry.config.wiring import FileRef, ReferenceSpec
 from messagefoundry.pipeline.reference_sync import ReferenceSyncRunner, _load_file_source
 from messagefoundry.store.metadata import encode_reference_value
@@ -141,6 +141,7 @@ async def test_full_sync_of_a_toml_source_succeeds(tmp_path: Path) -> None:
             store,
             lambda: [ReferenceSpec(name="payers", source=FileRef(path=str(src)))],
             REF,
+            egress=EgressSettings(deny_by_default=False),
         )
         result = await runner.sync_all()
         assert (result.synced, result.failed) == (1, 0)
