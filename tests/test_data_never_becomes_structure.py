@@ -226,6 +226,50 @@ def test_the_lint_does_not_flag_safe_or_unknowable_shapes(tmp_path: Path, line: 
     assert "[leaf-to-whole-field]" not in detail
 
 
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize(
+    "line",
+    [
+        pytest.param('msg.set("PV1-19", msg.field("PID-3.1"))', id="hl7"),
+        pytest.param("msg.set(\"CLM-05\", f\"{msg['CLM-05.1'] or ''}:B:1\")", id="x12-composite"),
+    ],
+)
+def test_the_lint_advice_names_the_x12_case_where_set_data_raises(
+    tmp_path: Path, line: str, strict: bool
+) -> None:
+    # Vault #2862: the lint reads paths, not formats, so it flags the X12 composite too. Its
+    # advice must not send an X12 author to a set_data that refuses the component separator.
+    (tmp_path / "feed.py").write_text(f'@handler("h")\ndef h(msg):\n    {line}\n', "utf-8")
+    result = _check_handler_security(tmp_path, strict=strict)
+    assert "feed.py:3 [leaf-to-whole-field]" in result.detail
+    advice = result.detail.partition(". leaf-to-whole-field: ")[2]
+    assert advice.startswith("on HL7, write a value read from a component or subcomponent with")
+    assert "On X12, set_data refuses the component separator in a whole element" in advice
+    # Keeping set is offered to the X12 case alone; on HL7 it is the unsafe write.
+    assert advice.index("keep set") > advice.index("On X12")
+    assert "write each component on its own path" in advice
+    # Strict mode is unchanged: a finding blocks, and advisory mode never does.
+    assert (result.ok, result.required) == (not strict, strict)
+
+
+def test_an_unscanned_write_gets_the_same_advice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _too_deep(*_args: object) -> bool:
+        raise RecursionError
+
+    monkeypatch.setattr(checks, "_flows", _too_deep)
+    detail = _lint(tmp_path, '@handler("h")\ndef h(msg):\n    msg.set("PV1-19", "x")\n')
+    assert "[leaf-to-whole-field-unscanned]" in detail
+    assert ". leaf-to-whole-field: on HL7, write a value read from a component" in detail
+
+
+def test_the_lint_gives_no_leaf_advice_without_a_leaf_finding(tmp_path: Path) -> None:
+    detail = _lint(tmp_path, '@handler("h")\ndef h(msg):\n    print(msg)\n')
+    assert "[phi-to-log]" in detail
+    assert "set_data" not in detail
+
+
 # --- rule 1 in the lens: the Steps view's Copy Field writes a leaf as data (#2558) ----------------
 
 LENS_SOURCE = """\

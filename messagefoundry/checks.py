@@ -1228,6 +1228,18 @@ def _unvetted_import_hits(
 # cannot tell the decoded value from authored text, so only the call site can be flagged. Paths
 # must be string literals for the AST to know their level; anything else is left alone.
 
+#: What a ``leaf-to-whole-field`` finding advises. The lint reads paths, not formats, so it fires on
+#: an X12 handler too, where ``set_data`` refuses the component separator in a whole element and
+#: would raise on a value whose text holds one (vault #2862). So the advice names that case rather
+#: than send an X12 author to a write that raises. It offers ``set`` to the X12 case only: on HL7
+#: that is the unsafe write the finding is about.
+_LEAF_TO_WHOLE_FIELD_ADVICE = (
+    ". leaf-to-whole-field: on HL7, write a value read from a component or subcomponent with"
+    " set_data, which keeps it data. On X12, set_data refuses the component separator in a whole"
+    " element. Where the text holds one on purpose, keep set there, or write each component on"
+    " its own path (ADR 0206)"
+)
+
 
 def _literal_is_leaf(node: ast.expr | None) -> bool | None:
     """For a string-literal HL7 path, whether it names a component or subcomponent; None for
@@ -1461,8 +1473,10 @@ def _check_handler_security(
     * ``unvetted-import`` — an operator-added third-party import (supply-chain / slopsquat surface).
     * ``leaf-to-whole-field``: a value read decoded from a component or subcomponent and written to a
       whole field with ``set``, where its escaped separators would become structure; the safe write
-      is ``set_data`` (ADR 0206 rule 3). Literal paths only. A write it cannot finish walking is
-      reported as ``leaf-to-whole-field-unscanned`` instead.
+      is ``set_data`` (ADR 0206 rule 3). On X12, ``set_data`` refuses the component separator in a
+      whole element, so the finding's advice names that case too (vault #2862). Literal paths
+      only. A write it cannot finish walking is reported as ``leaf-to-whole-field-unscanned``
+      instead.
 
     Static analysis catches only a fraction of insecure code, so this is a **filter, not a fix**.
     **Advisory by default** (``required=False``, prints, never blocks); ``strict=True`` (the opt-in
@@ -1548,6 +1562,7 @@ def _check_handler_security(
     detail = (
         f"{len(hits)} handler-security {kind} — static compensating control for "
         f"ASVS 15.2.5, a filter not a boundary (ADR 0144): {shown}{more}"
+        + (_LEAF_TO_WHOLE_FIELD_ADVICE if any("[leaf-to-whole-field" in h for h in hits) else "")
     )
     # Advisory by default (ok=True/required=False — never blocks); strict block mode makes a finding a
     # required failure (ok=False/required=True). The finding text is identical either way.
