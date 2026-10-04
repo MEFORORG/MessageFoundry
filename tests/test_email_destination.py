@@ -945,8 +945,11 @@ async def test_a_recipient_that_is_not_one_plain_address_is_refused_before_any_c
     wire: _WireCapture, value: str
 ) -> None:
     # The line-break ids were accepted before vault BACKLOG #2870: the address parser drops a bare
-    # CR or LF, so the RCPT line named an address with the break removed.
+    # CR or LF, so the RCPT line named an address with the break removed. The gate and construction
+    # read the same list, so both refuse.
     dest = _wire_dest(wire.port, [value])
+    with pytest.raises(WiringError, match="allowed_recipient_domains"):
+        check_egress_allowed(dest, _wire_egress(wire.port))
     with pytest.raises(ValueError, match="recipient"):
         EmailDestination(dest)
     assert wire.connections == 0

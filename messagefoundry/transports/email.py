@@ -113,7 +113,13 @@ def envelope_recipients(value: Any) -> list[str]:
     recipient-domain check (vault BACKLOG #2616) checks the same list. An address the parser cannot
     read comes back as ``""``, which :func:`envelope_address_problem` refuses. Raises
     :class:`ValueError` for an empty setting, as construction does."""
-    return [addr for _, addr in getaddresses([", ".join(_as_recipients(value))])]
+    entries = _as_recipients(value)
+    if any(_holds_control_char(entry) for entry in entries):
+        # The parser drops a bare CR or LF, so "a<LF>b@host" would come back as "ab@host": the same
+        # text checked and sent, but not the address written. Read it as unreadable instead, so the
+        # [egress] check and construction both refuse it (vault BACKLOG #2870).
+        return [""]
+    return [addr for _, addr in getaddresses([", ".join(entries)])]
 
 
 #: What a recipient's local part may hold, between dots: RFC 5322 ``atext`` without ``%`` and ``!``,
@@ -205,8 +211,8 @@ class CheckedEnvelope:
     Given no ``from_addr`` or ``to_addrs``, ``smtplib``'s ``send_message`` derives ``MAIL FROM`` and
     ``RCPT TO`` from a parse of the headers, and that parse decodes encoded words and expands groups.
     So the envelope could differ from the text that was checked. :meth:`send` passes both halves
-    explicitly. The Email, Direct and alert-mail cells all send through it (vault BACKLOG #2841,
-    #2870)."""
+    explicitly. At least the Email, Direct and alert-mail cells send through it (vault BACKLOG
+    #2841, #2870)."""
 
     sender: str
     recipients: tuple[str, ...]
@@ -231,14 +237,11 @@ def checked_envelope(cell: str, sender: str, recipients: Any) -> CheckedEnvelope
     a recipient is dropped, as :func:`envelope_recipients` reads it. The sender gets no such reading:
     it must already be one plain address, because it is ``MAIL FROM``, where bounces go."""
     try:
-        entries = _as_recipients(recipients)
+        envelope = envelope_recipients(recipients)
     except ValueError:
-        raise ValueError(f"{cell} requires a non-empty 'recipients' setting") from None
-    # The address parser drops a bare CR or LF, so "a<LF>b@host" would be checked and sent as
-    # "ab@host": consistent, but not the address that was written. Refuse it instead.
-    if any(_holds_control_char(entry) for entry in entries):
-        raise ValueError(f"{cell}: a recipient holds a control character")
-    envelope = envelope_recipients(entries)
+        envelope = []  # an empty setting; refused below, outside the handler
+    if not envelope:
+        raise ValueError(f"{cell} requires a non-empty 'recipients' setting")
     for address in envelope:
         problem = envelope_address_problem(address)
         if problem is not None:

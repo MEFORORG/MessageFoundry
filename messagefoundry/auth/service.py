@@ -123,6 +123,7 @@ from messagefoundry.store.store import (
     require_notify_email,
     seed_notify_email,
 )
+from messagefoundry.transports.email import envelope_address_problem
 from messagefoundry.transports.rest import opener_tls_context
 
 _log = logging.getLogger(__name__)
@@ -852,6 +853,9 @@ def _is_single_mailbox(address: str) -> bool:
         and not domain.endswith(".")
         and all(ch.isprintable() and not ch.isspace() for ch in address)
         and not any(ch in _ADDRESS_FORBIDDEN_CHARS for ch in address)
+        # The rule send_plain_email applies to every notice's RCPT TO (vault BACKLOG #2870). Without
+        # it, an address accepted here could never be sent to, and every later notice would fail.
+        and envelope_address_problem(address) is None
     )
 
 

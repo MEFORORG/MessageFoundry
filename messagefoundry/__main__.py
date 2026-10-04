@@ -8347,7 +8347,10 @@ def _alert(args: argparse.Namespace) -> int:
 
     from messagefoundry.config import alerts_edit
     from messagefoundry.config.settings import AlertRule, load_settings
-    from messagefoundry.pipeline.alert_sinks import configured_alert_transport_names
+    from messagefoundry.pipeline.alert_sinks import (
+        check_rule_recipients,
+        configured_alert_transport_names,
+    )
 
     path = args.service_config
 
@@ -8401,6 +8404,24 @@ def _alert(args: argparse.Namespace) -> int:
                         "otherwise the engine refuses to start.",
                         as_json=args.json,
                     )
+            # The same reason for a recipient override: notifier_from_settings checks it against the
+            # email address rule at the next start (vault BACKLOG #2870).
+            if new_rule.recipients or any(step.recipients for step in new_rule.escalate):
+                try:
+                    alerts = load_settings(config_path=path).alerts
+                except (OSError, ValueError):
+                    alerts = None  # no settings yet → no email transport to send to the override
+                if (
+                    alerts is not None
+                    and alerts.email_from
+                    and "email" in configured_alert_transport_names(alerts)
+                ):
+                    try:
+                        check_rule_recipients(new_rule, alerts.email_from, "alert rule")
+                    except ValueError as exc:
+                        return _emit_error(
+                            f"{exc}; otherwise the engine refuses to start.", as_json=args.json
+                        )
             result = alerts_edit.add_rule(path, obj, validate=validate)
         else:  # remove
             if args.index is None:

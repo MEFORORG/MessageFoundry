@@ -496,6 +496,9 @@ async def test_direct_envelope_does_not_follow_the_headers(
     monkeypatch.setattr(DirectDestination, "_build_smime", changed_headers)
     d = _wire_direct(monkeypatch, pki, wire.port)
     await d.send(_SYNTHETIC_HL7)
+    # The change reached the wire, so the test is not passing because nothing changed.
+    headers = [line.rstrip(b"\r\n") for line in wire.data if line.startswith((b"From: ", b"To: "))]
+    assert headers == [b"From: another@partner.example", b"To: another@partner.example"]
     assert wire.mail_lines == [b"mail from:<sender@hisp.example>"]
     assert wire.rcpt_lines == [b"rcpt to:<recipient@hisp.example>"]
 

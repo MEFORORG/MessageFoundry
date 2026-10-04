@@ -257,6 +257,29 @@ def test_add_refuses_a_rule_routing_to_an_unconfigured_transport(
     assert load_settings(config_path=svc).alerts.rules == []
 
 
+def test_add_refuses_a_recipient_override_the_next_start_would_refuse(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # notifier_from_settings holds a rule's recipients to the email address rule at startup (vault
+    # BACKLOG #2870), so the editor refuses the same override now rather than writing it.
+    svc = _svc(tmp_path)
+    svc.write_text(
+        textwrap.dedent("""\
+            [alerts]
+            email_smtp_host = "smtp.example.org"
+            email_from = "alerts@example.org"
+            email_to = ["oncall@example.org"]
+            """),
+        encoding="utf-8",
+    )
+    bad = "first" + "/" + "last@example.org"
+    rc, out = _add(svc, {"event_type": "connection_stopped", "recipients": [bad]}, capsys)
+    assert rc == 1
+    assert "alert rule: a recipient" in out
+    assert bad not in out  # the refusal names the problem, never the address
+    assert load_settings(config_path=svc).alerts.rules == []
+
+
 def test_add_allows_a_rule_that_names_no_transport(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

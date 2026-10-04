@@ -27,12 +27,14 @@ from messagefoundry.pipeline.alert_sinks import (
     notifier_from_settings,
     send_plain_email,
 )
+from messagefoundry.pipeline.security_notify import security_notifier_from_settings
 from tests.test_email_destination import (
     _ALL_ATEXT_SENDER,
     _ENCODED_LOCAL,
     _NORMALISED_RECIPIENTS,
     _REFUSED_ADDRESS_IDS,
     _REFUSED_ADDRESSES,
+    _SENDER_SHAPES,
     _WireCapture,
 )
 
@@ -222,8 +224,28 @@ def test_alert_envelope_does_not_follow_the_headers(
 
     monkeypatch.setattr("messagefoundry.pipeline.alert_sinks.EmailMessage", _SwappedHeaders)
     _send_to(wire.port, "engine@hospital.example", ["ops@hospital.example"])
+    # The swap reached the wire, so the test is not passing because nothing changed.
+    headers = [line.rstrip(b"\r\n") for line in wire.data if line.startswith((b"From: ", b"To: "))]
+    assert headers == [b"From: another@partner.example", b"To: another@partner.example"]
     assert wire.mail_lines == [b"mail from:<engine@hospital.example>"]
     assert wire.rcpt_lines == [b"rcpt to:<ops@hospital.example>"]
+
+
+def test_a_rule_override_reaches_rcpt_to_through_the_email_transport(wire: _WireCapture) -> None:
+    # #146's override, end to end: RCPT TO names each override address, never the default email_to.
+    t = EmailTransport(
+        host="127.0.0.1",
+        port=wire.port,
+        sender="engine@hospital.example",
+        recipients=["default@hospital.example"],
+        use_tls=False,
+        timeout=5.0,
+    )
+    event = {"type": "connection_stopped", "connection": "OB_X", "detail": "x"}
+    t._send(event, ["Ops <a@hospital.example>", "b@hospital.example"])
+    assert wire.rcpt_lines == [b"rcpt to:<a@hospital.example>", b"rcpt to:<b@hospital.example>"]
+    [to_line] = [line for line in wire.data if line.lower().startswith(b"to:")]
+    assert to_line.rstrip(b"\r\n") == b"To: a@hospital.example, b@hospital.example"
 
 
 @pytest.mark.parametrize("field, value", _REFUSED_ADDRESSES, ids=_REFUSED_ADDRESS_IDS)
@@ -267,6 +289,28 @@ def test_a_rule_recipient_override_is_checked_when_the_notifier_is_built(where: 
     expected = r"\[alerts\]\.rules\[0\]" + (r"\.escalate\[0\]" if where == "tier" else "")
     with pytest.raises(ValueError, match=expected + ": a recipient"):
         notifier_from_settings(alerts)
+
+
+def test_a_rule_that_never_routes_to_email_is_not_held_to_the_address_rule() -> None:
+    # Its override never reaches a send, so it must not stop startup.
+    rule = AlertRule(
+        event_type="connection_stopped", transports=["webhook"], recipients=[_ENCODED_LOCAL[0]]
+    )
+    alerts = AlertsSettings(
+        webhook_url="https://hooks.example/x",
+        email_smtp_host="smtp.example",
+        email_from="engine@hospital.example",
+        email_to=["ops@hospital.example"],
+        rules=[rule],
+    )
+    assert notifier_from_settings(alerts) is not None
+
+
+def test_the_security_notifier_refuses_a_sender_that_is_not_one_plain_mailbox() -> None:
+    # Per-user notices need no email_to, so EmailTransport is never built to refuse it at startup.
+    alerts = AlertsSettings(email_smtp_host="smtp.example", email_from=_SENDER_SHAPES["shape-i"])
+    with pytest.raises(ValueError, match=r"\[alerts\]\.email_from"):
+        security_notifier_from_settings(alerts)
 
 
 # --- model validation --------------------------------------------------------
