@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import os
 import sys
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Mapping, Sequence
 from pathlib import Path
 from typing import Final
 
@@ -200,7 +200,17 @@ def outside_engine_namespace(name: str) -> bool:
     )
 
 
-def python_child_argv(module: str, *, executable: str | None = None) -> list[str]:
+def _flags(extra_flags: Sequence[str]) -> list[str]:
+    """``extra_flags`` ahead of :data:`CHILD_INTERPRETER_FLAGS`."""
+    if isinstance(extra_flags, str):
+        # A bare string is a sequence of its characters, so "-E" would arrive as "-" and "E".
+        raise TypeError("extra_flags takes a sequence of options, not one string")
+    return [*extra_flags, *CHILD_INTERPRETER_FLAGS]
+
+
+def python_child_argv(
+    module: str, *, executable: str | None = None, extra_flags: Sequence[str] = ()
+) -> list[str]:
     """The command line that runs ``module`` in a child interpreter, as ``python -m`` would.
 
     Two differences from ``python -m``. The child starts with :data:`CHILD_INTERPRETER_FLAGS`.
@@ -209,20 +219,27 @@ def python_child_argv(module: str, *, executable: str | None = None) -> list[str
     source checkout that is not installed. Pass the result of :func:`worker_environment` or
     :func:`engine_environment` as its ``env``: they keep a ``PYTHONPATH`` entry from putting the
     working directory on the child's import path.
+
+    ``extra_flags`` go ahead of the shared flags, for one caller's own options. The tray's login
+    command passes ``-E`` this way (vault BACKLOG #2852).
     """
-    return [executable or sys.executable, *CHILD_INTERPRETER_FLAGS, _BOOTSTRAP, module]
+    return [executable or sys.executable, *_flags(extra_flags), _BOOTSTRAP, module]
 
 
-def python_module_argv(module: str, *, executable: str | None = None) -> list[str]:
+def python_module_argv(
+    module: str, *, executable: str | None = None, extra_flags: Sequence[str] = ()
+) -> list[str]:
     """``python -m module`` with :data:`CHILD_INTERPRETER_FLAGS`, and no bootstrap.
 
     Shorter than :func:`python_child_argv`, and only for a package the interpreter can import on
     its own, from site-packages or a ``.pth`` entry. ``-P`` drops the working directory from a
     ``-m`` start, so a source checkout that is not installed cannot be found this way. Nothing
-    pins this build either: the first ``messagefoundry`` on the import path answers, so an absolute
-    ``PYTHONPATH`` entry naming another copy wins. The tray's login command is the one user.
+    pins this build either: the first ``messagefoundry`` on the import path answers. The tray's
+    login command is the one user. It passes ``-E`` in ``extra_flags``, so an absolute
+    ``PYTHONPATH`` entry naming another copy does not answer that start (vault BACKLOG #2852). The
+    tray it relaunches still reads the user's ``PYTHONPATH``, less any empty or relative entry.
     """
-    return [executable or sys.executable, *CHILD_INTERPRETER_FLAGS, "-m", module]
+    return [executable or sys.executable, *_flags(extra_flags), "-m", module]
 
 
 def _without_working_directory_entries(env: dict[str, str]) -> dict[str, str]:

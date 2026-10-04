@@ -404,6 +404,18 @@ def test_a_python_child_starts_with_the_interpreters_remote_debugging_disabled()
     assert childenv.python_child_argv("a.module")[1 : 1 + len(flags)] == list(flags)
 
 
+@pytest.mark.parametrize("build", [childenv.python_child_argv, childenv.python_module_argv])
+def test_a_callers_own_flags_go_ahead_of_the_shared_ones(build: Any) -> None:
+    """Vault BACKLOG #2852: the tray's login command adds ``-E`` this way. A bare string is refused,
+    because it would arrive one character at a time."""
+    argv = build("a.module", executable="py", extra_flags=("-E",))
+    flags = list(childenv.CHILD_INTERPRETER_FLAGS)
+    assert argv[: 2 + len(flags)] == ["py", "-E", *flags]
+    assert build("a.module", executable="py")[: 1 + len(flags)] == ["py", *flags]
+    with pytest.raises(TypeError):
+        build("a.module", extra_flags="-E")
+
+
 def test_the_bootstrap_runs_a_module_with_its_arguments_and_without_the_working_directory(
     tmp_path: Path,
 ) -> None:

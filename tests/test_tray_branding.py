@@ -15,7 +15,7 @@ from typing import Any
 import pytest
 
 import messagefoundry
-from messagefoundry import _child_bootstrap
+from messagefoundry import _child_bootstrap, childenv
 from messagefoundry.tray import autostart, branding
 from tests.test_isolated_launch import _decoy
 
@@ -149,6 +149,14 @@ with open(sys.argv[1], "w", encoding="utf-8") as out:
 #: reach the child. ``_run`` in ``tests/test_isolated_launch.py`` drops these two among others.
 _FLAG_STAND_INS = ("PYTHONSAFEPATH", "PYTHON_DISABLE_REMOTE_DEBUG")
 
+#: The option the login command adds so the interpreter ignores ``PYTHON*`` variables. Typed out
+#: rather than read from ``autostart``, so a test does not check the module against itself.
+_LOGIN_FLAG = "-E"
+
+#: Each stops a pythonw start that has no stderr with exit 1, before any code runs (vault BACKLOG
+#: #2852; measured on 3.14).
+_NEEDS_A_STDERR = ("PYTHONFAULTHANDLER", "PYTHONDEVMODE")
+
 
 def _probe_layout(tmp_path: Path) -> tuple[Path, Path, Path]:
     """The probe's folder, a working directory with a decoy package in it, and the report path."""
@@ -186,6 +194,43 @@ def _without_flag_stand_ins(probe_dir: Path) -> dict[str, str]:
     return env
 
 
+def _skip_unless_installed(cwd: Path, env: dict[str, str] | None, *flags: str) -> None:
+    """The short form needs the package on the interpreter's own path, as an install puts it."""
+    control = subprocess.run(  # noqa: S603 - this interpreter, a fixed command line
+        [
+            sys.executable,
+            *flags,
+            "-P",
+            "-c",
+            "import messagefoundry; print(messagefoundry.__file__)",
+        ],
+        cwd=cwd,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=50,
+        check=False,
+    )
+    found = control.stdout.strip()
+    if control.returncode or Path(found).resolve() != Path(messagefoundry.__file__).resolve():
+        pytest.skip("this build is not installed into this interpreter, so -m cannot find it")
+
+
+def _login_command_without_the_login_flags(executable: str, installed: bool | None) -> str:
+    """The login command as it was before vault BACKLOG #2852 added ``-E``: the child builders
+    with no options of the login command's own."""
+    if installed is None:
+        installed = autostart.installed_in_site_packages()
+    build = childenv.python_module_argv if installed else childenv.python_child_argv
+    return subprocess.list2cmdline(build("messagefoundry.tray", executable=executable))
+
+
+def _running(command: str, *module_and_args: str) -> str:
+    """``command`` with ``module_and_args`` in place of the tray module it ends with."""
+    assert command.endswith(" messagefoundry.tray"), command
+    return command.removesuffix("messagefoundry.tray") + subprocess.list2cmdline(module_and_args)
+
+
 @_WINDOWS_ONLY
 @pytest.mark.parametrize(
     "installed", [False, True, None], ids=["checkout", "installed", "as-classified"]
@@ -193,30 +238,20 @@ def _without_flag_stand_ins(probe_dir: Path) -> dict[str, str]:
 def test_the_login_command_starts_a_real_first_process_with_the_flags(
     tmp_path: Path, installed: bool | None
 ) -> None:
-    """The Run-key string itself, parsed by Windows, from a working directory holding a decoy. Red
-    before vault BACKLOG #2822: a plain ``-m`` put the working directory first and the decoy
+    """The Run-key string, less ``-E``, parsed by Windows, from a working directory holding a decoy.
+    Red before vault BACKLOG #2822: a plain ``-m`` put the working directory first and the decoy
     answered. ``None`` takes the form ``installed_in_site_packages`` picks for this interpreter, so
-    a short form chosen where ``-P -m`` cannot import the package fails here (vault BACKLOG #2837)."""
+    a short form chosen where ``-P -m`` cannot import the package fails here (vault BACKLOG #2837).
+    The probe is found through ``PYTHONPATH``, which ``-E`` ignores. The next test runs the string
+    as written, ``-E`` included, from the same kind of folder (vault BACKLOG #2852)."""
     probe_dir, cwd, report = _probe_layout(tmp_path)
     env = _without_flag_stand_ins(probe_dir)
     if installed is True:
-        # The short form needs the package on the interpreter's own path, as an install puts it.
-        control = subprocess.run(  # noqa: S603 - this interpreter, a fixed command line
-            [sys.executable, "-P", "-c", "import messagefoundry; print(messagefoundry.__file__)"],
-            cwd=tmp_path,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=50,
-            check=False,
-        )
-        found = control.stdout.strip()
-        if control.returncode or Path(found).resolve() != Path(messagefoundry.__file__).resolve():
-            pytest.skip("this build is not installed into this interpreter, so -m cannot find it")
-    command = autostart.launcher_command(sys.executable, installed=installed)
-    assert command.endswith(" messagefoundry.tray"), command
-    command = command.removesuffix("messagefoundry.tray") + subprocess.list2cmdline(
-        [_PROBE_MODULE, str(report)]
+        _skip_unless_installed(tmp_path, env)
+    command = _running(
+        _login_command_without_the_login_flags(sys.executable, installed),
+        _PROBE_MODULE,
+        str(report),
     )
     done = subprocess.run(  # noqa: S603 - this interpreter, our own command line
         command, cwd=cwd, env=env, capture_output=True, text=True, timeout=50, check=False
@@ -229,6 +264,48 @@ def test_the_login_command_starts_a_real_first_process_with_the_flags(
         assert seen["orig_argv"][-3:-2] == ["-m"], seen["orig_argv"]
     else:
         _assert_started_through_the_bootstrap(report)
+
+
+def _exit_code_with_no_std_handles(command: str, cwd: Path, env: dict[str, str]) -> int:
+    """Run ``command`` with no stdin, stdout or stderr argument. A GUI-subsystem child such as
+    ``pythonw.exe`` then gets no standard handles at all, as it does from a Run value."""
+    done = subprocess.run(  # noqa: S603 - this interpreter, our own command line
+        command, cwd=cwd, env=env, timeout=60, check=False
+    )
+    return done.returncode
+
+
+@_WINDOWS_ONLY
+@pytest.mark.parametrize("variable", _NEEDS_A_STDERR)
+@pytest.mark.parametrize(
+    "installed", [False, True, None], ids=["checkout", "installed", "as-classified"]
+)
+def test_the_login_command_starts_pythonw_with_no_stderr_under_the_users_python_variables(
+    tmp_path: Path, installed: bool | None, variable: str
+) -> None:
+    """Vault BACKLOG #2852: a Run value cannot hand ``pythonw.exe`` a stderr, and with either
+    variable set the interpreter exits 1 before any code runs. The login command, as written, starts
+    ``messagefoundry.tray.autostart`` in place of the tray: it imports the tray package and stops.
+    It starts in a folder holding a decoy package, which exits nonzero if it is imported. The same
+    command without ``-E`` must fail on this host, or a pass here would prove nothing."""
+    pythonw = autostart.pythonw_executable(sys.executable)
+    if Path(pythonw).name.lower() != "pythonw.exe":
+        pytest.skip("no pythonw.exe beside this interpreter")
+    cwd = _decoy(tmp_path)
+    # No other interpreter variable, so the start without -E can fail only on this one.
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith("PYTHON")}
+    env[variable] = "1"
+    if installed is True:
+        _skip_unless_installed(tmp_path, None, _LOGIN_FLAG)
+    module = "messagefoundry.tray.autostart"
+    command = _running(autostart.launcher_command(pythonw, installed=installed), module)
+    code = _exit_code_with_no_std_handles(command, cwd, env)
+    assert code == 0, f"the login command exited {code} with {variable}=1: {command}"
+    # A pass only counts where the same start without the flag fails.
+    without = _running(_login_command_without_the_login_flags(pythonw, installed), module)
+    assert without != command
+    if _exit_code_with_no_std_handles(without, cwd, env) == 0:
+        pytest.skip(f"pythonw without {_LOGIN_FLAG} starts here under {variable}; nothing to tell")
 
 
 @_WINDOWS_ONLY
