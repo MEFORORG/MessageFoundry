@@ -9,12 +9,13 @@ was installed into. The working directory is a risk as well, not only the interp
 working directory of a Run-key start (vault BACKLOG #2822).
 
 So the command carries :data:`~messagefoundry.childenv.CHILD_INTERPRETER_FLAGS`, which include
-``-P``, and takes one of two forms:
+``-P``, after :data:`LOGIN_INTERPRETER_FLAGS`, and takes one of two forms:
 
 * Where the package sits directly in a site-packages folder, the short form from
   :func:`~messagefoundry.childenv.python_module_argv`: ``-m messagefoundry.tray``. On a ``-m``
   start, ``-P`` drops the working directory.
-* Anywhere else, editable installs included, the child bootstrap script by its absolute path, from
+* Anywhere else, editable installs included, and wherever the user set ``PYTHONNOUSERSITE``, the
+  child bootstrap script by its absolute path, from
   :func:`~messagefoundry.childenv.python_child_argv`. It loads this build by its location, which a
   ``-m`` start cannot promise for a checkout.
 
@@ -36,6 +37,7 @@ import site
 import subprocess
 import sys
 from pathlib import Path
+from typing import Final
 
 from messagefoundry.childenv import python_child_argv, python_module_argv
 from messagefoundry.tray import ENTRY_MODULE
@@ -48,6 +50,28 @@ _VALUE_NAME = "MessageFoundryTray"
 #: The longest command line Microsoft documents for a Run or RunOnce value ("Run and RunOnce
 #: Registry Keys", learn.microsoft.com: "no longer than 260 characters").
 RUN_VALUE_LIMIT = 260
+
+#: Options the login command adds ahead of the child flags (vault BACKLOG #2852).
+#:
+#: A Run value starts ``pythonw.exe`` with no stderr. With ``PYTHONFAULTHANDLER=1`` or
+#: ``PYTHONDEVMODE=1`` set, that interpreter then exits 1 before any code runs; measured on 3.14.
+#: The branded relaunch hands its child a null stderr. A Run value is a bare command line, so it
+#: cannot. ``-E`` makes the interpreter ignore its ``PYTHON*`` variables, those two among them.
+#:
+#: What else ``-E`` does at login. ``PYTHONPATH`` is ignored, so an entry naming another copy no
+#: longer answers a short-form start. ``PYTHONDONTWRITEBYTECODE``, ``PYTHONPYCACHEPREFIX`` and
+#: ``PYTHONHOME`` are ignored as well. An interpreter that needs ``PYTHONHOME`` to find its
+#: standard library would not start. ``PYTHONNOUSERSITE`` is ignored too, which
+#: :func:`_login_turns_user_site_back_on` answers. ``PYTHONUSERBASE`` still counts, because
+#: ``site`` reads it from the environment itself.
+#:
+#: Not ``-I``. It implies ``-s``, which drops the user site-packages. A ``pip install --user``
+#: tray counts as installed, so its short-form login would stop importing.
+#:
+#: Only the login command takes ``-E``. The options every child shares stay in
+#: ``CHILD_INTERPRETER_FLAGS``. The first process's own environment is unchanged, so the relaunch
+#: builds its child's environment from the same variables as before.
+LOGIN_INTERPRETER_FLAGS: Final = ("-E",)
 
 
 def pythonw_executable(executable: str | None = None) -> str:
@@ -84,12 +108,24 @@ def launcher_command(pythonw: str | None = None, *, installed: bool | None = Non
     """The HKCU Run command string, quoted by ``subprocess.list2cmdline`` the way the Windows
     command-line parser reads it back. ``installed`` defaults to :func:`installed_in_site_packages`
     for the RUNNING interpreter, so pass ``pythonw`` only for that interpreter or with
-    ``installed``. The module docstring describes both forms."""
+    ``installed``. The default is False where :func:`_login_turns_user_site_back_on`. The module
+    docstring describes both forms."""
     exe = pythonw or pythonw_executable()
     if installed is None:
-        installed = installed_in_site_packages()
+        installed = installed_in_site_packages() and not _login_turns_user_site_back_on()
     build = python_module_argv if installed else python_child_argv
-    return subprocess.list2cmdline(build(ENTRY_MODULE, executable=exe))
+    return subprocess.list2cmdline(
+        build(ENTRY_MODULE, executable=exe, extra_flags=LOGIN_INTERPRETER_FLAGS)
+    )
+
+
+def _login_turns_user_site_back_on() -> bool:
+    """Whether ``-E`` would put back a user site-packages folder the user turned off.
+
+    ``PYTHONNOUSERSITE`` turns that folder off, and ``-E`` ignores the variable. The folder is
+    searched ahead of site-packages, so a copy of the package there would answer a short-form
+    start. The bootstrap form loads this build by its location, so the login command takes it."""
+    return bool(os.environ.get("PYTHONNOUSERSITE"))
 
 
 def _windows_length(command: str) -> int:

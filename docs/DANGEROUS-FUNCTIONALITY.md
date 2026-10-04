@@ -182,23 +182,30 @@ script skips step 1.
 
 **Autostart starts the tray with the interpreter options; a tray started by hand does not.**
 `tray/autostart.py` writes the login command in one of two forms (vault BACKLOG #2822, #2837). Both
-carry `childenv.CHILD_INTERPRETER_FLAGS`, which include `-P` and turn remote debugging off.
+carry `childenv.CHILD_INTERPRETER_FLAGS`, which include `-P` and turn remote debugging off. Both
+start with `-E`, so the interpreter ignores the user's `PYTHON*` variables (vault BACKLOG #2852).
+A Run value gives `pythonw.exe` no stderr. Without `-E`, `PYTHONFAULTHANDLER=1` or
+`PYTHONDEVMODE=1` then made it exit 1 before any code ran. Measured 2026-10-04 on Windows, Python
+3.14.6, in both forms, from a start with no standard handles. That is the start a Run value gives;
+a real login was not measured. `-E` also drops `PYTHONHOME`, `PYTHONDONTWRITEBYTECODE` and
+`PYTHONPYCACHEPREFIX` at login. It drops `PYTHONNOUSERSITE` too, so where the user set that, the
+login command takes the script form.
 
 - An installed engine gets `-m messagefoundry.tray`. Installed means the package sits directly in
   a site-packages folder. On a `-m` start, `-P` keeps the working directory off the import path.
   Measured 2026-10-02 on Windows, Python 3.14.6, from a folder holding a decoy `messagefoundry`
   package. With a copy of the package in a venv's site-packages, `-P -X disable-remote-debug -m`
   loaded the installed copy. The same start without `-P` loaded the decoy. This form does not pin
-  the build the way the script does. An absolute `PYTHONPATH` entry in the user's settings is
-  searched ahead of site-packages. A copy of the package there would answer instead.
+  the build the way the script does. `-E` keeps the user's `PYTHONPATH` off the import path.
+  Another copy found ahead of this one on that path would still answer.
 - A checkout gets the script by its absolute path, editable installs included. The script loads the
   build by its location. An editable install's `.pth` file can be pointed at another checkout before
   the next login, so a `-m` start there could load a different build, or none.
 
 Microsoft documents a Run value as a command line of at most 260 characters. The code counts UTF-16
-code units, as Windows stores the value. The installed form fits a venv folder of up to 188
+code units, as Windows stores the value. The installed form fits a venv folder of up to 185
 characters. The script form names the checkout folder twice. With the venv inside the checkout, it
-passes 260 once that folder reaches about 74 characters. When the command is
+passes 260 once that folder reaches about 73 characters. When the command is
 longer than 260, enabling does not write it. It logs a warning naming the length and the limit to
 `tray.log`, removes any value already there, and leaves Start at Login off. It never falls back to a
 command without the options. What Windows does at login with a longer value was not measured.
@@ -277,10 +284,10 @@ branded relaunch. The module's docstring says what each one gets, and why that i
 boundary by itself. The tray's relaunch also takes its command line from that module, so it
 starts with `-P` like the engine's Python children. Its environment is the user's whole
 environment, less any empty or relative `PYTHONPATH` entry. Autostart starts the first tray
-process with the same interpreter options, under the plain `pythonw.exe`. It goes through the
-script only from a checkout. Windows hands that process the user's environment unfiltered. So an
-empty or relative `PYTHONPATH` entry in the user's own settings would put the working directory back
-on its import path. A tray started by hand gets none of the options either. Section 3, under
+process with the same interpreter options plus `-E`, under the plain `pythonw.exe`. It goes through
+the script only from a checkout. Windows hands that process the user's environment unfiltered.
+`-E` makes the interpreter ignore its `PYTHON*` variables, so no `PYTHONPATH` entry reaches that
+process's import path (vault BACKLOG #2852). A tray started by hand gets none of the options. Section 3, under
 *Autostart starts the tray with the interpreter options; a tray started by hand does not*, says what that means for its import path. The other
 starts in the table hand over the whole environment. `tests/test_child_process_environment.py`
 lists each of those with its reason, and fails a new start whose environment does not come from
