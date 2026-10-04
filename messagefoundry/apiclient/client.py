@@ -838,9 +838,10 @@ class EngineClient:
         reference, not a lock. That is a plain retry (one background read 401s and the next succeeds),
         not the permanent breakage a stale copy would cause.
 
-        A read racing a SIGN-IN is the same plain retry. :meth:`login` has the engine end the token
-        it replaces inside the sign-in request, so a read sent on that token before the reply
-        arrives is refused once, and the next read carries the new token.
+        A read racing a SIGN-IN fails the same way. :meth:`login` has the engine end the token it
+        replaces inside the sign-in request, so every request a clone sends on that token before
+        the reply arrives raises :class:`ApiError` with status 401. Nothing here retries it; a read
+        sent after the reply carries the new token.
         """
         # The absolute paths fixed at construction, when there are any: a relative path resolved
         # now could name a different file than this client pins, after a change of directory.
@@ -1595,15 +1596,18 @@ class EngineClient:
         **The cost is the order on this side.** The old token now dies inside the request, before
         the new one is in the shared cell. Two things follow.
 
-        * A :meth:`for_polling` clone that sends a request on the old token in that span is
-          refused once, the same plain retry a rotation race causes (see :meth:`for_polling`).
+        * A :meth:`for_polling` clone that sends a request on the old token in that span gets a
+          401, as in a rotation race (see :meth:`for_polling`).
         * **A lost reply leaves this client signed out.** If the engine mints the new session and
-          ends the old one, and the reply then fails to arrive or to decode, this client still
-          holds the old token, which is dead, and never learns the new one. ``login`` raises
-          :class:`ApiError` and every later call on the held token is refused with a 401 until the
-          caller signs in again. Before, the old token stayed live in that case. The new session
-          nobody holds stays valid until it idles out or expires, as it did before. This is the
-          accepted price of ending the old session ahead of the cap. It is not harmless.
+          ends the old one, and the reply then fails to arrive, times out or will not decode, this
+          client still holds the old token, which is dead, and never learns the new one.
+          ``login`` raises :class:`ApiError` and every later call on the held token is refused
+          with a 401 until the caller signs in again. A timeout is the likely way in: the client
+          timeout (5 s per phase by default) also bounds this request, and a sign-in waiting in the
+          engine's per-account queue can take longer, while the engine goes on to finish it.
+          Before, the old token stayed live in that case. The new session nobody holds stays valid
+          until it idles out or expires, as it did before. This is the accepted price of ending the
+          old session ahead of the cap. It is not harmless.
 
         No second request follows the sign-in, so ``login`` returns when the reply does."""
         self._refuse_credential_on_cleartext("a password")

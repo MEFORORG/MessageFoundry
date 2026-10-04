@@ -106,6 +106,15 @@ suite("sign-in names the cached token as superseded (BACKLOG #2281)", () => {
 });
 
 suite("a caller can wait out a sign-in in flight (BACKLOG #2281)", () => {
+  // Each test gets its own cache key. The in-flight map is module state, so a test that fails
+  // while a sign-in is held open would otherwise make every later test wait out the bound.
+  let key = "";
+  let n = 0;
+  setup(() => {
+    n += 1;
+    key = `messagefoundry.token:http://engine-${n}.wait.test`;
+  });
+
   // The engine ends the superseded token inside the sign-in request. Until the reply is stored the
   // cache still holds that dead token, so a caller refused with a 401 must be able to wait.
 
@@ -137,21 +146,21 @@ suite("a caller can wait out a sign-in in flight (BACKLOG #2281)", () => {
 
   test("signInSettled resolves only after the new token is stored", async () => {
     const cache = new MapCache();
-    cache.values.set(KEY, "tok-old");
+    cache.values.set(key, "tok-old");
     const held = heldPost();
-    const signingIn = signInSuperseding(cache, KEY, CREDENTIALS, held.post);
+    const signingIn = signInSuperseding(cache, key, CREDENTIALS, held.post);
     await held.sent; // the request has left: the engine has ended tok-old by now
 
     let settled = false;
-    const waiting = signInSettled(KEY).then(() => {
+    const waiting = signInSettled(key).then(() => {
       settled = true;
-      return cache.values.get(KEY);
+      return cache.values.get(key);
     });
     await new Promise<void>((resolve) => setImmediate(resolve));
     // RED when: the wait resolves while the dead token is still the cached one. `withAuth` would
     // then clear the cache and prompt for a sign-in the user already made.
     assert.strictEqual(settled, false, "the wait ended while the sign-in was still in flight");
-    assert.strictEqual(cache.values.get(KEY), "tok-old");
+    assert.strictEqual(cache.values.get(key), "tok-old");
 
     held.answer("tok-new");
     assert.strictEqual(await waiting, "tok-new", "the waiter read the cache before the store");
@@ -160,31 +169,31 @@ suite("a caller can wait out a sign-in in flight (BACKLOG #2281)", () => {
 
   test("a failed sign-in ends the wait without rejecting it", async () => {
     const cache = new MapCache();
-    cache.values.set(KEY, "tok-old");
+    cache.values.set(key, "tok-old");
     const held = heldPost();
-    const signingIn = signInSuperseding(cache, KEY, CREDENTIALS, held.post);
+    const signingIn = signInSuperseding(cache, key, CREDENTIALS, held.post);
     await held.sent;
-    const waiting = signInSettled(KEY);
+    const waiting = signInSettled(key);
     held.fail(new Error("engine went away"));
     await assert.rejects(signingIn, /engine went away/);
     await waiting; // must resolve: the waiter is some other call, and this failure is not its own
-    assert.strictEqual(cache.values.get(KEY), "tok-old");
+    assert.strictEqual(cache.values.get(key), "tok-old");
   });
 
   test("with no sign-in in flight the wait resolves at once, and a finished one is forgotten", async () => {
-    await signInSettled("messagefoundry.token:http://never-signed-in.test");
+    await signInSettled(`${key}-never-signed-in`);
     const cache = new MapCache();
     const held = heldPost();
-    const signingIn = signInSuperseding(cache, KEY, CREDENTIALS, held.post);
+    const signingIn = signInSuperseding(cache, key, CREDENTIALS, held.post);
     held.answer("tok-1");
     await signingIn;
-    await signInSettled(KEY);
+    await signInSettled(key);
     // A second, later sign-in is tracked afresh rather than read as already settled.
     const again = heldPost();
-    const second = signInSuperseding(cache, KEY, CREDENTIALS, again.post);
+    const second = signInSuperseding(cache, key, CREDENTIALS, again.post);
     await again.sent;
     let settled = false;
-    const waiting = signInSettled(KEY).then(() => (settled = true));
+    const waiting = signInSettled(key).then(() => (settled = true));
     await new Promise<void>((resolve) => setImmediate(resolve));
     assert.strictEqual(settled, false);
     again.answer("tok-2");
@@ -194,15 +203,15 @@ suite("a caller can wait out a sign-in in flight (BACKLOG #2281)", () => {
 
   test("a second sign-in waits for the first and names the token the first one stored", async () => {
     const cache = new MapCache();
-    cache.values.set(KEY, "tok-old");
+    cache.values.set(key, "tok-old");
     const named: Array<string | undefined> = [];
     const first = heldPost();
-    const signingInFirst = signInSuperseding(cache, KEY, CREDENTIALS, (body) => {
+    const signingInFirst = signInSuperseding(cache, key, CREDENTIALS, (body) => {
       named.push(body.supersedes);
       return first.post(body);
     });
     await first.sent;
-    const signingInSecond = signInSuperseding(cache, KEY, CREDENTIALS, async (body) => {
+    const signingInSecond = signInSuperseding(cache, key, CREDENTIALS, async (body) => {
       named.push(body.supersedes);
       return { token: "tok-second" };
     });
@@ -214,20 +223,20 @@ suite("a caller can wait out a sign-in in flight (BACKLOG #2281)", () => {
     await signingInFirst;
     await signingInSecond;
     assert.deepStrictEqual(named, ["tok-old", "tok-first"]);
-    assert.strictEqual(cache.values.get(KEY), "tok-second");
+    assert.strictEqual(cache.values.get(key), "tok-second");
   });
 
   test("a sign-in that never answers is waited for only as long as the bound", async () => {
     const cache = new MapCache();
-    cache.values.set(KEY, "tok-old");
+    cache.values.set(key, "tok-old");
     const hung = heldPost();
-    void signInSuperseding(cache, KEY, CREDENTIALS, hung.post, 20).catch(() => undefined);
+    void signInSuperseding(cache, key, CREDENTIALS, hung.post, 20).catch(() => undefined);
     await hung.sent;
     // RED when: the wait has no bound. postJson has no timeout, so a reader would hang with it.
-    await signInSettled(KEY, 20);
-    assert.strictEqual(cache.values.get(KEY), "tok-old");
+    await signInSettled(key, 20);
+    assert.strictEqual(cache.values.get(key), "tok-old");
     hung.fail(new Error("cleanup")); // release it, so the next test starts with nothing in flight
-    await signInSettled(KEY, 1000);
+    await signInSettled(key, 1000);
   });
 });
 
@@ -251,6 +260,11 @@ suite("auth.ts routes sign-in through the superseding path (BACKLOG #2281)", () 
   test("signIn posts through signInSuperseding and no longer revokes afterwards", () => {
     const text = fs.readFileSync(AUTH_TS, "utf8");
     assert.ok(text.includes("signInSuperseding(ctx.secrets, secretKey(url), body"), "signIn's call moved");
+    // postJson has no timeout unless given one, and every wait in signInSession.ts assumes this one.
+    assert.ok(
+      text.includes('postJson<LoginResponse>(url, "/auth/login", named, undefined, SIGN_IN_TIMEOUT_MS)'),
+      "the sign-in request lost its timeout",
+    );
     const sites = logoutSites(text);
     assert.strictEqual(sites.length, 1, `only signOut may post /auth/logout; found ${sites.length}`);
     assert.ok(/postJson<unknown>\(url, "\/auth\/logout", \{\}, token\)/.test(sites[0]), sites[0]);

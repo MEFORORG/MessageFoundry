@@ -22,17 +22,21 @@
 //      first has stored its token, so it names THAT token and the first one's session ends too. Run
 //      side by side, both would name the same old token, and the first new session would be left live
 //      and unreachable.
-//   3. A wait is bounded by SIGN_IN_WAIT_MS, because `postJson` has no timeout of its own. A sign-in
-//      that hangs past it is no longer waited for: a reader then sees the old token, and a second
-//      sign-in names it again, which is the order this file had before the bound.
+//   3. Nothing may wait forever. auth.ts sends the sign-in with SIGN_IN_TIMEOUT_MS, so every attempt
+//      settles, and each wait here is bounded by the longer SIGN_IN_WAIT_MS as well. Only an engine
+//      that trickles bytes slower than the timeout could outlast a wait. A reader would then see the
+//      old token, and a later sign-in would name it again and could be overwritten by the late reply.
 //   4. The tracking lives in one extension host, which is one VS Code window, while SecretStorage is
 //      shared by every window. A sign-in in one window is NOT waited for in another. A call there on
-//      the old token can get a 401 and prompt for a sign-in the user already made. The bounded cost is
-//      that extra prompt, and nothing here can wait across windows.
-// A lost reply also leaves the cache holding a dead token: if the engine minted the new session and
-// ended the old one and the reply never arrived, the next authenticated call gets a 401 and `withAuth`
-// signs in again. Before, the old token stayed live in that case. That is the accepted price of ending
-// the old session ahead of the cap; it is not harmless.
+//      the old token can get a 401 and prompt for a sign-in the user already made. Its `withAuth`
+//      clears the cache before that prompt, and if the first window stored its new token in between,
+//      the clear drops it, leaving that session live and unheld until it idles out. Nothing here can
+//      wait across windows.
+// The order also costs when the reply is lost. If the engine minted the new session and ended the old
+// one, and the reply never arrived (a timeout included) or the new token could not be stored, the cache
+// still holds a dead token. The next authenticated call gets a 401 and `withAuth` signs in again, and
+// the new session stays live, unheld, until it idles out. Before, the old token stayed live in those
+// cases. That is the accepted price of ending the old session ahead of the cap; it is not harmless.
 
 /** The slice of `vscode.SecretStorage` a sign-in needs. */
 export interface TokenCache {
@@ -40,8 +44,12 @@ export interface TokenCache {
   store(key: string, value: string): PromiseLike<void>;
 }
 
-/** The longest any wait here lasts, in ms. `postJson` has no timeout, so an unbounded wait could hang. */
-export const SIGN_IN_WAIT_MS = 30_000;
+/** How long the sign-in request may go silent, in ms. It runs the engine's password hash and its
+ *  per-account queue, so it gets far more than a status read. */
+export const SIGN_IN_TIMEOUT_MS = 30_000;
+
+/** The longest any wait here lasts, in ms: past the request timeout, so a waiter outlasts the attempt. */
+export const SIGN_IN_WAIT_MS = SIGN_IN_TIMEOUT_MS + 5_000;
 
 /** Sign-ins between "request about to leave" and "new token stored", by cache key. Never rejects. */
 const inFlight = new Map<string, Promise<void>>();
@@ -84,9 +92,12 @@ export function signInSuperseding<R extends { token: string }>(
     await cache.store(key, reply.token);
     return reply;
   })();
-  // Chained onto the earlier sign-in, so one await covers them all, but only as long as this attempt
-  // waited for it. Set in the same tick the attempt starts, which is before its request can leave.
-  const settled = Promise.allSettled([bounded(earlier, waitMs), attempt]).then(() => undefined);
+  // The attempt waits for the earlier sign-in first, so one await covers them all. Set in the same
+  // tick the attempt starts, which is before its request can leave.
+  const settled = attempt.then(
+    () => undefined,
+    () => undefined,
+  );
   inFlight.set(key, settled);
   void settled.then(() => {
     if (inFlight.get(key) === settled) {

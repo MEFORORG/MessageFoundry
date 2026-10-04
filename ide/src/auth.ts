@@ -8,7 +8,7 @@ import * as vscode from "vscode";
 import { getJson, HttpError, postJson } from "./engineClient";
 import { mustChangeProblem } from "./engineStatusModel";
 import { assertBrowsableUrl, assertTargetAllowed } from "./engineTarget";
-import { signInSettled, signInSuperseding } from "./signInSession";
+import { SIGN_IN_TIMEOUT_MS, signInSettled, signInSuperseding } from "./signInSession";
 
 const SECRET_PREFIX = "messagefoundry.token:";
 
@@ -196,7 +196,7 @@ export async function signIn(ctx: vscode.ExtensionContext, url: string): Promise
     let res: LoginResponse;
     try {
       res = await signInSuperseding(ctx.secrets, secretKey(url), body, (named) =>
-        postJson<LoginResponse>(url, "/auth/login", named),
+        postJson<LoginResponse>(url, "/auth/login", named, undefined, SIGN_IN_TIMEOUT_MS),
       );
     } catch (e) {
       if (e instanceof HttpError && e.status === 401) {
@@ -266,9 +266,9 @@ export async function withAuth<T>(
       if (!(e instanceof HttpError && e.status === 401) || attempt >= 2) {
         throw e;
       }
-      // peekToken waits for a sign-in in flight first. Without that, a sign-in that ended this call's
-      // token would leave it cached until its reply is stored, and the clear below could drop the
-      // new token.
+      // peekToken waits for a sign-in in flight first. Without that, it would read this call's dead
+      // token while that sign-in's reply is still on its way, and the clear and prompt below would
+      // ask for a sign-in the user already made, which would then end the session it just created.
       const cached = await peekToken(ctx, url);
       if (cached !== undefined && cached !== token) {
         token = cached;

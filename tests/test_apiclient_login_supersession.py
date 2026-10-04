@@ -340,6 +340,7 @@ def test_a_failed_sign_in_ends_nothing_and_keeps_the_held_token() -> None:
         client.close()
     assert excinfo.value.status == 401
     assert _logouts(sent) == []
+    assert _superseded(sent) == [None, held]
     assert client.token == held
 
 
