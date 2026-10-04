@@ -4249,6 +4249,10 @@ _ALERT_EVENT_TYPES = frozenset(
         # [inbound].max_staged_depth or the SQLite volume fell below [retention].min_free_disk_mb.
         # Keyed `intake:<reason>`, which no connection can be named.
         "intake_paused",
+        # vault BACKLOG #2597: a start loaded a config whose fingerprint differs from the store's last
+        # recorded one. Keyed `config:<12 hex>`, which no connection can be named, so it is not in
+        # _ALERT_CONTROL_EVENT_TYPES below.
+        "config_changed",
         # NOTE: the INVERSE events (leadership_lost / dr_released / intake_resumed) are
         # auto-resolve-only (alert_sinks _AUTO_RESOLVE), NOT rule-targetable alert types -- a
         # step-down, a fail-back or a resumed intake needs no page.

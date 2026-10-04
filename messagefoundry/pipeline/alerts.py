@@ -27,6 +27,7 @@ __all__ = [
     "INTAKE_DISK_REASON",
     "AlertSink",
     "LoggingAlertSink",
+    "config_changed_detail",
     "intake_pause_detail",
 ]
 
@@ -50,6 +51,26 @@ def intake_pause_detail(*, reason: str, value: int, limit: int, store_kind: str)
             f"({store_kind} store)"
         )
     return f"intake paused: the staged backlog went over {limit} messages ({store_kind} store)"
+
+
+def config_changed_detail(
+    *,
+    fingerprint: str,
+    previous_fingerprint: str,
+    baseline_action: str,
+    baseline_node: str | None,
+    baseline_at: str,
+) -> str:
+    """The one-line description of a ``config_changed`` alert both sinks show (vault BACKLOG #2597).
+
+    It must hold for a config that changed on purpose and for one node that diverged from the rest,
+    so it states the two digests and where the older one came from and judges neither. Digests are
+    cut to 12 hex characters here; the event carries them whole. No path and no git commit."""
+    return (
+        f"this process started with config {fingerprint[:12]}; the store last recorded config "
+        f"{previous_fingerprint[:12]} (node {baseline_node or 'unknown'}, action "
+        f"{baseline_action}, time {baseline_at or 'unknown'})"
+    )
 
 
 class AlertSink(Protocol):
@@ -412,6 +433,36 @@ class AlertSink(Protocol):
         warning for the same subject, so a fixed grant clears the dashboard."""
         ...
 
+    def config_changed(
+        self,
+        name: str,
+        *,
+        fingerprint: str,
+        previous_fingerprint: str,
+        node: str | None,
+        shard: str | None,
+        baseline_action: str,
+        baseline_actor: str | None,
+        baseline_at: str,
+        baseline_node: str | None,
+    ) -> None:
+        """This process started with a config whose ADR 0041 D1 fingerprint differs from the one the
+        store last recorded (vault BACKLOG #2597). The baseline is the newest ``config_loaded``,
+        ``config_reload`` or ``connection_flag_set`` audit row from any node or engine shard, since
+        every one of them shares one config directory. So an edit applied first by ``POST
+        /config/reload`` and then restarted does not fire it, and an edit that only a restart picked
+        up does, by design: nothing else separates that deploy from an unrecorded edit.
+
+        ``name`` is ``config:<first 12 hex of fingerprint>``, so each distinct config is its own
+        instance to acknowledge, and nothing resolves it. ``fingerprint`` and
+        ``previous_fingerprint`` are the two whole digests; ``node`` and ``shard`` are this
+        process's; ``baseline_action``, ``baseline_actor``, ``baseline_at`` (ISO-8601 UTC) and
+        ``baseline_node`` describe the row the older digest came from. Never a path, a git commit
+        or message content (no PHI). It is not a connection-scoped event, so no rule's
+        ``control_action`` fires on it (BACKLOG #1898). Raised once per start at most, never on a
+        fresh store, a baseline without a digest, or one taken under another fingerprint scheme."""
+        ...
+
     def leadership_acquired(self, node: str, *, role: str, epoch: int | None = None) -> None:
         """A node went **non-leader → leader** (BACKLOG #145) — an active-passive HA failover / the
         initial election. The page-worthy edge the failover blind spot hid: an operator sees leadership
@@ -749,6 +800,37 @@ class LoggingAlertSink:
     def store_privilege_clean(self, name: str) -> None:
         # The inverse (auto-resolve) event; no page, so DEBUG: the preflight already logged at INFO.
         log.debug("ALERT store_privilege_clean: %r store principal observed clean", name)
+
+    def config_changed(
+        self,
+        name: str,
+        *,
+        fingerprint: str,
+        previous_fingerprint: str,
+        node: str | None,
+        shard: str | None,
+        baseline_action: str,
+        baseline_actor: str | None,
+        baseline_at: str,
+        baseline_node: str | None,
+    ) -> None:
+        log.warning(
+            "ALERT config_changed: %r %s (this node %s, engine shard %s; baseline actor %s; "
+            "fingerprint %s, previous %s)",
+            name,
+            config_changed_detail(
+                fingerprint=fingerprint,
+                previous_fingerprint=previous_fingerprint,
+                baseline_action=baseline_action,
+                baseline_node=baseline_node,
+                baseline_at=baseline_at,
+            ),
+            node,
+            shard,
+            baseline_actor,
+            fingerprint,
+            previous_fingerprint,
+        )
 
     def leadership_acquired(self, node: str, *, role: str, epoch: int | None = None) -> None:
         log.warning(
