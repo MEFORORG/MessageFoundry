@@ -10,13 +10,18 @@ a history of significant vulnerabilities". ``docs/RISKY-COMPONENTS.md`` designat
 exposure. This script supplies the other reading: each component measured on those examples, from
 public metadata only.
 
-THE POPULATION is every name in ``security/runtime-closure-sqlserver.txt``: the core runtime closure
-plus the two names the ``sqlserver`` extra adds. It is not only the designated set, because a
-component can be risky by maintenance or history even where the exposure criterion did not designate
-it. It is NOT everything the page assesses: the names ``security/runtime-closure-harness.txt`` adds
-are outside it, and the page's ``harness`` section reads them by hand and names what it did not
-read. ``tests/test_risky_component_designation.py`` goes red when a reading of one of them appears,
-so the page's account of that gap is rewritten in the same change.
+THE POPULATION is every distribution the page assesses: each name in the core runtime closure,
+``security/runtime-closure-core.txt``, plus each name an assessed extra's closure adds to it. ``EXTRAS``
+names those extras and their closure files (BACKLOG #2414 brought ``harness`` in). It is not only
+the designated set, because a component can be risky by maintenance or history even where the
+exposure criterion did not designate it. Each reading records which extras add its name, and
+``tests/test_risky_component_designation.py`` holds the population to the closure files, so a
+closure the page assesses and this script does not read turns that test red.
+
+OSV MATCHES AN ADVISORY BY PYPI NAME. A flaw in code a wheel carries inside it, such as a compiled
+library, is counted only where an advisory names the PyPI package. So no reading here can show
+that a wheel's contents are free of known flaws. The rendered section says so, and the page's
+``harness`` section says what it means for the Qt inside that extra's wheels.
 
 THE SOURCES, and nothing else:
 
@@ -41,7 +46,7 @@ A full run needs the network and runs by hand, never in CI. Standard library onl
 
 The snapshot date is always today, UTC: the APIs answer only with today's classifiers, statuses and
 yanks, so no earlier date can be read honestly. The readings are dated to that day and to the pins
-the closure file held on it; a later lock bump does not change them until the next run.
+the closure files held on it; a later lock bump does not change them until the next run.
 ``--render-only`` re-renders the page section from the tracked snapshot with no network, for when
 the tiers change and the readings do not.
 """
@@ -72,8 +77,13 @@ if str(_ROOT) not in sys.path:
 from scripts.security import runtime_closure  # noqa: E402
 
 ROOT = runtime_closure.ROOT
-POPULATION = runtime_closure.SQLSERVER_CLOSURE
 CORE = runtime_closure.CLOSURE
+#: Each extra the page assesses and its closure file, in the page's order. The population is the
+#: core closure plus what each of these adds to it (``population``).
+EXTRAS: dict[str, Path] = {
+    "sqlserver": runtime_closure.SQLSERVER_CLOSURE,
+    "harness": runtime_closure.HARNESS_CLOSURE,
+}
 SNAPSHOT = ROOT / "security" / "risky-component-readings.json"
 PAGE = ROOT / "docs" / "RISKY-COMPONENTS.md"
 
@@ -130,6 +140,9 @@ _PAGE_WIDTH = 100
 _BLOCK_START = re.compile(r"^(\d+[.)]|[-*+>#|])(\s|$)")
 #: The heading that ends the page's tier tables. The designation labels are read above it.
 READINGS_HEADING = "## Risky by ASVS's own examples, read from public data"
+#: The rendered subsection that lists what was read for the names the assessed extras add. An
+#: extra's own section on the page points a reader at it by this name.
+EXTRAS_HEADING = "### The names the assessed extras add"
 
 
 class Advisory(TypedDict):
@@ -157,11 +170,13 @@ class Reading(TypedDict):
 
     ``newest_upload``, ``development_status``, ``project_status``, ``pinned_yanked`` and
     ``advisories`` decide the verdicts in ``risky``. The rest is context for a reader.
+    ``added_by`` names the assessed extras whose closure adds this name to the core one, in
+    ``EXTRAS`` order; it is empty for a name in the core closure.
     """
 
     name: str
     pinned: str
-    in_core: bool
+    added_by: list[str]
     latest_version: str
     newest_upload: str | None
     releases_in_maintenance_window: int
@@ -452,7 +467,7 @@ def criteria() -> dict[str, Any]:
 
 
 def read_component(
-    name: str, pinned: str, *, in_core: bool, as_of: dt.date, fetch: Fetch = fetch_json
+    name: str, pinned: str, *, added_by: list[str], as_of: dt.date, fetch: Fetch = fetch_json
 ) -> Reading:
     """One component's readings from PyPI and OSV, as of ``as_of``."""
     quoted = urllib.parse.quote(name, safe="")
@@ -481,7 +496,7 @@ def read_component(
     reading: Reading = {
         "name": name,
         "pinned": pinned,
-        "in_core": in_core,
+        "added_by": list(added_by),
         "latest_version": str(info["version"]),
         "newest_upload": max(past).isoformat() if past else None,
         "releases_in_maintenance_window": sum(window_floor <= d for d in past),
@@ -501,16 +516,37 @@ def read_component(
     return reading
 
 
+def population() -> dict[str, tuple[str, list[str]]]:
+    """Name to its pin and the extras that add it: the core closure plus every extra's additions.
+
+    A core name's list is empty. A name two closures pin at different versions raises: a reading
+    records one pin per name, so it could not say which version was read.
+    """
+    core = runtime_closure.closure_pins(CORE)
+    members: dict[str, tuple[str, list[str]]] = {name: (pin, []) for name, pin in core.items()}
+    for extra, path in EXTRAS.items():
+        for name, pin in runtime_closure.closure_pins(path).items():
+            recorded, added_by = members.setdefault(name, (pin, []))
+            if recorded != pin:
+                raise ValueError(
+                    f"{path.name} pins {name} at {pin}; another closure pins it at {recorded}"
+                )
+            if name not in core:
+                added_by.append(extra)
+    return members
+
+
 def snapshot(as_of: dt.date, fetch: Fetch = fetch_json) -> dict[str, Any]:
     """The whole dated snapshot: provenance, criteria, and one reading per population member."""
-    members = runtime_closure.closure_pins(POPULATION)
-    core = runtime_closure.closure_pins(CORE)
     return {
         "subject": "Public-metadata readings of each runtime component on ASVS 5.0.0 V15.1's "
         "risky-component examples (BACKLOG #1189, ASVS 15.1.4)",
         "snapshot_date": as_of.isoformat(),
         "reread_by": (as_of + dt.timedelta(days=REREAD_INTERVAL_DAYS)).isoformat(),
-        "population": POPULATION.relative_to(ROOT).as_posix(),
+        "population": {
+            "core": CORE.relative_to(ROOT).as_posix(),
+            "extras": {extra: path.relative_to(ROOT).as_posix() for extra, path in EXTRAS.items()},
+        },
         "sources": {
             "pypi_json": PYPI_JSON,
             "pypi_simple": PYPI_SIMPLE + " (Accept: application/vnd.pypi.simple.v1+json)",
@@ -519,8 +555,8 @@ def snapshot(as_of: dt.date, fetch: Fetch = fetch_json) -> dict[str, Any]:
         "criteria": criteria(),
         "generator": "python scripts/security/component_readings.py",
         "readings": [
-            read_component(n, v, in_core=n in core, as_of=as_of, fetch=fetch)
-            for n, v in sorted(members.items())
+            read_component(name, pin, added_by=added_by, as_of=as_of, fetch=fetch)
+            for name, (pin, added_by) in sorted(population().items())
         ],
     }
 
@@ -565,10 +601,14 @@ def _count(n: int, one: str, many: str) -> str:
     return f"{n} {one if n == 1 else many}"
 
 
+def _series(items: list[str], joiner: str) -> str:
+    """Items as "a, b <joiner> c"."""
+    return f" {joiner} ".join([", ".join(items[:-1]), items[-1]] if len(items) > 1 else items)
+
+
 def _either(words: Iterable[str]) -> str:
     """Backticked words as "`a`, `b` or `c`"."""
-    quoted = [f"`{w}`" for w in words]
-    return " or ".join([", ".join(quoted[:-1]), quoted[-1]] if len(quoted) > 1 else quoted)
+    return _series([f"`{w}`" for w in words], "or")
 
 
 def render_section(data: Mapping[str, Any], labels: Mapping[str, str]) -> str:
@@ -577,7 +617,11 @@ def render_section(data: Mapping[str, Any], labels: Mapping[str, str]) -> str:
     as_of = dt.date.fromisoformat(data["snapshot_date"])
     readings = data["readings"]
     size = len(readings)
-    core = sum(r["in_core"] for r in readings)
+    added = [r for r in readings if r["added_by"]]
+    additions = {
+        extra: [f"`{r['name']}`" for r in readings if extra in r["added_by"]]
+        for extra in data["population"]["extras"]
+    }
     flagged = {axis: [r for r in readings if r["risky"][axis]] for axis in AXES}
     clean = [r for r in readings if not any(r["risky"].values())]
 
@@ -598,11 +642,15 @@ def render_section(data: Mapping[str, Any], labels: Mapping[str, str]) -> str:
         "",
         "### What is read, and the test for each example",
         "",
-        f"All {size} distributions in the `sqlserver` closure are read: the {core} in the core "
-        f"closure and the {size - core} the extra adds. That is not only the designated part. A "
-        "library can be risky on these examples even where the tiers did not designate it. The "
-        "names the `harness` extra adds are not in this snapshot. The `harness` section above "
-        "reads them itself, and says what it could not read.",
+        f"All {size} distributions this page assesses are read: the {size - len(added)} in the "
+        f"core closure and the {len(added)} that the assessed extras add to it. "
+        + " ".join(
+            f"The `{extra}` extra adds {len(names)}"
+            + (f": {_series(names, 'and')}." if names else ".")
+            for extra, names in additions.items()
+        )
+        + " That is not only the designated part. A library can be risky on these examples even "
+        "where the tiers did not designate it.",
         "",
         "| Example | A component is risky on it when | Source |",
         "|---|---|---|",
@@ -627,6 +675,11 @@ def render_section(data: Mapping[str, Any], labels: Mapping[str, str]) -> str:
         "scores the record's CVSS 3 vector and rates it on that system's scale. CVSS is the Common "
         "Vulnerability Scoring System. An advisory with neither does not count. The ones in the "
         "window are named below so a reader can judge them.",
+        "",
+        "OSV matches an advisory to a component by its PyPI name. A flaw in code a wheel carries "
+        "inside it, such as a compiled library, shows up here only when an advisory names the "
+        "PyPI package. So nothing below shows that the code inside a wheel is free of known "
+        "flaws.",
         "",
         "These tests are mechanical. A small library that is finished can trip the first one "
         "without being neglected. The reading says where to look; it does not say the library is "
@@ -739,6 +792,12 @@ def render_section(data: Mapping[str, Any], labels: Mapping[str, str]) -> str:
         names = [r["name"] for r in clean if (r["name"] in labels) == yes]
         if names:
             out.append(f"| {', '.join(f'`{n}`' for n in names)} | {'yes' if yes else 'no'} |")
+    out += [
+        "",
+        "Not risky here means that none of the three tests fired. It is not a clean result "
+        "beyond them: the vulnerability-history test reads advisories by PyPI name only, as "
+        "stated with the tests above.",
+    ]
     risky = [r for r in readings if any(r["risky"].values())]
     both = [r for r in risky if r["name"] in labels]
     only = [r for r in risky if r["name"] not in labels]
@@ -777,6 +836,27 @@ def render_section(data: Mapping[str, Any], labels: Mapping[str, str]) -> str:
         )
     else:
         out.append("Every component risky on an ASVS example is also designated above.")
+    if added:
+        out += [
+            "",
+            EXTRAS_HEADING,
+            "",
+            "The same readings again, for the names an assessed extra adds to the core closure. "
+            "The advisory column is how many advisories this reading counted under that PyPI "
+            "name, of any severity and any date, after the merging and the leaving out described "
+            "with the tests above. Read it under the limit stated there: a 0 is about the name, "
+            "not about the code inside the wheel.",
+            "",
+            "| Component | Added by | Pinned | Newest release | Advisories counted under the name "
+            "| Risky on |",
+            "|---|---|---|---|---|---|",
+        ]
+        out += [
+            f"| `{r['name']}` | {_series([f'`{e}`' for e in r['added_by']], 'and')} | "
+            f"{r['pinned']} | {r['newest_upload'] or 'none'} | {len(r['advisories'])} | "
+            f"{axes(r) or 'none'} |"
+            for r in added
+        ]
     return "\n".join(_wrap(line) for line in out)
 
 
