@@ -4375,9 +4375,56 @@ jobs:
           & python $probe check-inside --report $report --service-sid $serviceSid --privilege $privilege
           Assert-Native "the check on what the service token can do"
 
+      # BACKLOG #2747: THE STOP'S EXIT CODE IS NOT THIS STEP'S RESULT. This step used to be the stop
+      # command alone, so that command's exit code decided it. In job 111525536301 (windows-2022,
+      # 2026-10-04) it printed "Unexpected status SERVICE_RUNNING in response to STOP control" and
+      # exited 1 about 0.3 seconds after the step began. The stop had arrived all the same: the
+      # service's error log, printed by the next step, shows the probe interrupted at its hold, and
+      # the uninstall's own confirmed stop raised no warning one second later. This job is one of
+      # ci-gate's needs, so that red failed the merge group over a service that stopped. Why this
+      # copy read RUNNING back is NOT established, and nothing below depends on the answer.
+      #
+      # So the Service Control Manager is asked, with the same bounded wait the token step uses for
+      # its stop, and a service that is not Stopped after it still fails the step. The stop is sent
+      # ONCE. That job shows a stop that arrived, so nothing shows a second one is needed, and what
+      # a second one does to a service that is already stopping has not been measured. A stop that
+      # is lost goes red here with the state the Service Control Manager reports, and that reading
+      # is what would justify a resend.
+      #
+      # `if: always()`, so this also runs after a failed install, when there is no service. That is
+      # said in one line and the step passes: the red is the earlier step's, and an error from a
+      # stop sent to nothing would read as a second fault. A service that IS registered never takes
+      # that branch. The control is a service Windows always has, so a read that can see no service
+      # at all is not taken for "not installed" over an engine that is still running.
+      #
+      # The exit code is printed, and so is what the service read as the command returned. Those
+      # two readings are what the open question above is short of.
       - name: Stop the service (graceful)
         if: always()
-        run: '& "$env:SMOKE_NSSM_DIR\nssm.exe" stop MessageFoundry'
+        run: |
+          # The runner ends this script with the last native exit code, and may make a non-zero
+          # one an error first. Neither may decide this step, on any runner default.
+          $PSNativeCommandUseErrorActionPreference = $false
+          if (-not (Get-Service -Name EventLog -ErrorAction SilentlyContinue)) {
+            throw "CONTROL FAILED: this read cannot see the EventLog service, so it cannot say MessageFoundry is not installed"
+          }
+          if (-not (Get-Service -Name MessageFoundry -ErrorAction SilentlyContinue)) {
+            "no MessageFoundry service is registered, so there is nothing to stop"
+          } else {
+            & "$env:SMOKE_NSSM_DIR\nssm.exe" stop MessageFoundry
+            $stopExit = $LASTEXITCODE
+            $global:LASTEXITCODE = 0
+            $asReturned = (Get-Service -Name MessageFoundry).Status
+            foreach ($i in 1..60) {
+              if ((Get-Service -Name MessageFoundry).Status -eq "Stopped") { break }
+              Start-Sleep -Milliseconds 500
+            }
+            $status = (Get-Service -Name MessageFoundry).Status
+            "the stop command exited $stopExit; the service read $asReturned as it returned and $status after the wait"
+            if ($status -ne "Stopped") {
+              throw "the service did not stop within 30 seconds; the Service Control Manager reports $status"
+            }
+          }
 
       - name: Show service logs
         if: always()
