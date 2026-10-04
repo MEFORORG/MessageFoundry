@@ -1526,25 +1526,35 @@ async def test_AC6_every_refused_combined_outcome_is_padded_into_the_first_slot(
 async def test_AC6_refused_combined_sign_ins_take_the_same_wall_clock_time(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC-6's timing arm, on the real clock and the real budget, three rounds of every refused
-    outcome.
+    """AC-6's timing arm, on the real clock, the real budget and the real sleeps, at least three
+    rounds of every refused outcome.
 
     Two properties, of different strength. **No refused outcome ever answers before the budget.**
     That is the hard one: an early answer is a branch that escaped the pad, told apart by timing
-    alone, and ``_failure_deadline`` rounds up, so load cannot cause it. **Each outcome's MEDIAN
-    answer lies in the first slot**, ``[budget, 2 x budget)``: a branch whose own work is
-    systematically longer would sit in a later slot every round. One round spilling into the next
-    slot on a loaded host is the documented overrun the pad logs, so the median, not every sample,
-    carries that half."""
+    alone, and ``_failure_deadline`` rounds up, so load cannot cause it. Every sample carries it.
+    **Each outcome's FASTEST answer lies in the first slot**, ``[budget, 2 x budget)``: a branch
+    whose own work is longer than the budget sits in a later slot every round, so it has no round
+    there.
+
+    The fastest round carries the second half, not the median (BACKLOG #2556). Every round sends
+    the same inputs, so a branch's own work is the same each time, and a busy host can only add to
+    it. The fastest round is therefore the best reading of the branch itself. The median failed on
+    a loaded runner that stalled two rounds of one outcome, ``[1.001, 1.001, 0.501]``: the third
+    round shows the branch fits. Up to two further rounds are taken, of every outcome, while any
+    outcome still has no round in the first slot. A branch that never fits fails all five.
+
+    RED when: a refused branch returns without the pad, or a refused branch's own work outruns the
+    budget."""
     from messagefoundry.auth import service as service_module
 
     budget = service_module._FAILURE_BUDGET_SECONDS
+    least_rounds, most_rounds = 3, 5
     store = await _store()
     try:
         service = AuthService(store, _lock_settings(500))
         identity, password, steps = await _totp_admin(service, monkeypatch)
         timings: dict[str, list[float]] = {}
-        for _round in range(3):
+        for done in range(1, most_rounds + 1):
             await store.clear_lockout(identity.user_id)
             shapes = await _refused_outcomes(service, store, identity, password, steps)
             for label, username, pw, code, setup in shapes:
@@ -1557,11 +1567,13 @@ async def test_AC6_refused_combined_sign_ins_take_the_same_wall_clock_time(
                 ok = (await service.login(username, pw, totp_code=sent)).ok
                 timings.setdefault(label, []).append(time.monotonic() - started)
                 assert not ok, label
+            if done >= least_rounds and all(min(ts) < 2 * budget for ts in timings.values()):
+                break
         rounded = {label: [round(t, 3) for t in ts] for label, ts in timings.items()}
         early = {label: ts for label, ts in rounded.items() if min(ts) < budget}
         assert not early, f"refused outcomes answered BEFORE the pad's deadline: {early}"
-        late = {label: ts for label, ts in rounded.items() if not sorted(ts)[1] < 2 * budget}
-        assert not late, f"refused outcomes whose median left the first padded slot: {late}"
+        late = {label: ts for label, ts in rounded.items() if not min(ts) < 2 * budget}
+        assert not late, f"refused outcomes that never answered in the first padded slot: {late}"
     finally:
         await store.close()
 
