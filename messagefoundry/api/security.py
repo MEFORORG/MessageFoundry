@@ -329,6 +329,18 @@ def bearer_token(request: Request) -> str | None:
     return None
 
 
+async def bearer_token_dependency(request: Request) -> str | None:
+    """:func:`bearer_token` for use in ``Depends``, so FastAPI calls it on the event loop.
+
+    FastAPI runs a plain ``def`` dependency on an AnyIO worker thread, and that pool is what ASVS
+    15.4.4 asks us not to spend on work that never blocks (BACKLOG #2448, a #1195 follow-up).
+    :func:`bearer_token` stays sync because engine code calls it directly in many places. Put this
+    wrapper in ``Depends``, never the sync function: ``tests/test_thread_pool_fairness_baseline.py``
+    fails when a route declares a sync dependency. The wrapper is safe only because the header read
+    never blocks. A helper that does block needs a thread, and that test's allow-list says where."""
+    return bearer_token(request)
+
+
 def client_ip(conn: Request | WebSocket) -> str | None:
     """The caller's client address, matching how login records it on the session (``_client`` in
     ``auth_routes``). Used by the WP-L3-13 new-client-IP risk signal so the comparison is
