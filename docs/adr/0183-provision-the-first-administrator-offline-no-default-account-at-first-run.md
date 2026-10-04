@@ -12,6 +12,8 @@
 - **Amended 2026-10-03:** open item (b), whether `scripts/` is inside cell 6.3.2's corpus, is
   answered by owner ruling R3 of 2026-10-02; see the notes under *To resolve on acceptance* and
   under item (b) of Amendment A.
+- **Amended 2026-10-04:** Amendment C below. A repair of a row that already holds a notification
+  address is refused unless `--email` is given (BACKLOG #2288).
 - **Date:** 2026-09-05
 - **Related:** BACKLOG #1136 (ASVS 6.3.2) · [ADR 0171](0171-offline-administrator-unlock-a-host-gated-cli-recovery-path-for-a-sole-administrator-lockout.md)
   (the same host gate, argued there) · [ADR 0164](0164-record-bootstrap-claimed-ness-never-infer-a-monotonic-lifecycle-fact-from-mutable-credential-state.md)
@@ -116,9 +118,15 @@ holds. See Amendment A.*
   repaired rather than created.
   → `tests/test_provision_first_administrator.py::test_an_interrupted_provision_is_completed_by_re_running`
   (parametrized over both points)
+  *(Amended 2026-10-04 by Amendment C: a re-run of a run given `--email` completes the row only
+  when it is given `--email` too, which the same command already carries.
+  → `tests/test_provision_first_administrator.py::test_the_address_refusal_does_not_strand_a_run_that_stopped_after_the_create`)*
 - **AC-5** — IF the named account holds roles, is disabled, or is directory-owned, THEN THE SYSTEM
   SHALL refuse rather than take it over.
   → `tests/test_provision_first_administrator.py::test_it_refuses_to_take_over_an_account_somebody_is_using`
+  *(Amended 2026-10-04 by Amendment C: it also refuses an account that holds a notification
+  address when no `--email` is given.
+  → `tests/test_provision_first_administrator.py::test_a_repair_of_a_row_that_holds_an_address_is_refused_without_an_email`)*
 - **AC-6** — IF no terminal is attached, THEN THE SYSTEM SHALL refuse, and THE SYSTEM SHALL expose no
   flag that supplies the password from argv or a file.
   → `tests/test_provision_first_administrator.py::test_cli_refuses_without_a_terminal`,
@@ -159,6 +167,7 @@ without that parameter the plant passes.
 5. **Require `--email` unconditionally.** Rejected. An operator with no mail relay would type a fake
    address to get past it, which is worse than an empty column, and the PHI start gate is already the
    single authority on deliverability. The command warns and names the flag instead.
+   *Amended 2026-10-04: Amendment C adds one narrower case and does not reopen this option.*
 
 ## Consequences
 
@@ -629,3 +638,31 @@ replaced there.
 in a terminal it holds open, and a held-open terminal keeps its scrollback. The key is shown before any write, so a
 failed run can show it too; the flow now clears the scrollback and closes the terminal after every
 run, once the operator presses Enter, and the command tells the operator to clear their own. That mitigates the exposure; it does not close it.
+
+## Amendment C (2026-10-04) -- a repair of a row that holds an address needs `--email`
+
+Made by BACKLOG #2288. Amendment B closed that item's first two steps: the repair branch clears the
+row's factors and sessions. This amendment closes the third, and changes one thing here.
+
+**A repair of a row that already holds a notification address is refused unless `--email` is
+given.** Before this change the repair kept that address, and the command printed a WARNING. Kept,
+the address receives every security notice for the sole Administrator, and it may be the earlier
+holder's. It also satisfies the ADR 0167 start gate, so nothing later asks the operator to change
+it. The refusal comes from `AuthService._existing_row_refusal`, so `provision_refusal` gives the same
+answer before the password prompt and the service gives it again at the write. Nothing is written,
+and nobody is told of a takeover, because none happened. The refusal text does not print the
+stored address.
+
+**Option 5 under *Options considered* stays rejected.** That option made `--email` required on
+every run. There the cost of no address is an empty column, which the start gate already reports.
+Here the alternative is an address nobody chose, so the narrower rule does not reopen it. A fresh
+create and a repair of a row with no address still succeed without `--email`, and still warn.
+
+**It does not strand a half-written provision.** A first run given `--email` that stopped
+after the create leaves its own address on the row. The same command, run again, carries the same `--email`,
+so it completes the row. The operator may also give the address the row already holds; it is then
+a stated choice rather than an inherited one. A blank `--email` counts as none, and so does a
+blank stored address.
+
+The `docs/SECURITY.md` bullet under *Provisioning the first administrator* that said the account
+keeps the earlier holder's address with a warning is replaced there.

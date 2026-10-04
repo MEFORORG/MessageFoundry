@@ -284,7 +284,7 @@ def test_email_transport_sends_via_smtp(monkeypatch: pytest.MonkeyPatch) -> None
         def auth_login(self, challenge: bytes | None = None) -> str:
             return ""
 
-        def send_message(self, msg: Any) -> None:
+        def send_message(self, msg: Any, **envelope: Any) -> None:
             sent["subject"] = msg["Subject"]
             sent["to"] = msg["To"]
             sent["body"] = msg.get_content()

@@ -546,8 +546,9 @@ def test_the_lens_set_field_template_line_runs_on_an_x12_message() -> None:
 
 
 @pytest.mark.parametrize("comp", [":", ">"])
-def test_a_lens_template_whose_text_holds_the_component_separator_runs_on_x12(comp: str) -> None:
-    # The author typed the separator, so it is structure: the lens keeps set, which writes it.
+def test_a_lens_template_whose_text_holds_the_component_separator_raises_on_x12(comp: str) -> None:
+    # Vault #2861: the lens holds no X12 separator, so it writes set_data, and on X12 that refuses
+    # the component separator in a whole element. It raises rather than split the value.
     expr = f"f\"{{msg['CLM-05.1'] or ''}}{comp}B{comp}1\""
     inserted = _lens_insert_set_field("NM1-03", expr)
     edited = _lens_edit(
@@ -555,24 +556,35 @@ def test_a_lens_template_whose_text_holds_the_component_separator_runs_on_x12(co
         {"value": {"parts": [{"path": "CLM-05.1"}, {"text": f"{comp}B{comp}1"}]}},
     )
     for out in (inserted, edited):
-        assert "set_data" not in out
+        assert 'msg.set_data("NM1-03"' in out
         assert _lens_row(out)["action"] == "set_field"
         msg = _claim(comp)
-        _run_last_line(out, msg)
-        assert msg["NM1-03"] == f"11{comp}B{comp}1"
-        assert msg["NM1-03.2"] == "B"
+        with pytest.raises(ValueError, match="delimiter"):
+            _run_last_line(out, msg)
+        assert msg["NM1-03"] == "DOE"
+    # Structure is still the author's to write by hand: a hand-written set keeps the separator.
+    msg = _claim(comp)
+    msg.set("NM1-03", f"{msg['CLM-05.1'] or ''}{comp}B{comp}1")
+    assert msg["NM1-03"] == f"11{comp}B{comp}1"
+    assert msg["NM1-03.2"] == "B"
 
 
-def test_a_path_edit_keeps_set_for_a_template_holding_the_component_separator() -> None:
-    # The hand-written line from the review: its path edited to a whole element in the Steps view.
-    source = _LENS_HANDLER.replace(
-        'set_field(msg, "NM1-03", "X")', "msg.set(\"NM1-03\", f\"{msg['CLM-05.1'] or ''}:B:1\")"
-    )
+def test_a_path_edit_writes_set_data_for_a_template_holding_the_component_separator() -> None:
+    # The hand-written line from the review, its path edited to a whole element in the Steps view.
+    # Vault #2861: the edit re-picks set_data, which raises on X12 rather than split the value.
+    line = "msg.set(\"NM1-03\", f\"{msg['CLM-05.1'] or ''}:C:2\")"
+    source = _LENS_HANDLER.replace('set_field(msg, "NM1-03", "X")', line)
     out = _lens_edit(source, {"path": "CLM-05"})
-    assert out.splitlines()[-1] == "    msg.set(\"CLM-05\", f\"{msg['CLM-05.1'] or ''}:B:1\")"
+    assert out.splitlines()[-1] == "    msg.set_data(\"CLM-05\", f\"{msg['CLM-05.1'] or ''}:C:2\")"
     msg = _claim()
-    _run_last_line(out, msg)
-    assert msg["CLM-05"] == "11:B:1"
+    with pytest.raises(ValueError, match="delimiter"):
+        _run_last_line(out, msg)
+    assert msg.encode() == _claim().encode()  # nothing written: CLM-05 is still 11:B:1
+    # The hand-written line, left unedited, still writes its separators as structure.
+    msg = _claim()
+    _run_last_line(source, msg)
+    assert msg["NM1-03"] == "11:C:2"
+    assert msg["NM1-03.2"] == "C"
 
 
 def test_message_refuses_envelope_segment_edits() -> None:

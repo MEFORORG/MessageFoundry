@@ -52,6 +52,7 @@ from messagefoundry.pipeline.alert_sinks import (
     _BackgroundDispatcher,
     send_plain_email,
 )
+from messagefoundry.transports.email import checked_sender
 
 log = logging.getLogger(__name__)
 
@@ -367,6 +368,14 @@ def _build_body(event: SecurityEvent) -> str:
         roles = event.detail.get("roles")
         if isinstance(roles, list) and roles:
             lines.append("Roles: " + ", ".join(str(r) for r in roles))
+    if event.event_type == ADMIN_NEW_IP and event.detail.get("cap_reached"):
+        # vault BACKLOG #2159: past this notice the session reports no further new addresses until
+        # it re-verifies, so silence after it must not read as "no more new locations".
+        lines.append(
+            "This session has now been used from many new addresses. Further new addresses for "
+            "this session are not reported until it re-verifies. If this was not you, contact "
+            "your MessageFoundry administrator."
+        )
     if event.event_type == RECOVERY_CODE_USED:
         remaining = event.detail.get("remaining")
         if isinstance(remaining, int):
@@ -559,6 +568,10 @@ def security_notifier_from_settings(
     ``email_password``, byte-identical to before."""
     if not (alerts.email_smtp_host and alerts.email_from):
         return None
+    # The sender is MAIL FROM on every notice, and send_plain_email refuses one that fails the address
+    # rule. Refuse it here instead, where it stops startup, rather than at each send, where the
+    # failure is only a log line (vault BACKLOG #2870).
+    checked_sender("[alerts].email_from", alerts.email_from)
     smtp_password = resolve_connector_secret(
         secret_provider,
         ref=alerts.email_password_secret,

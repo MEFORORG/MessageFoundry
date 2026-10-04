@@ -103,7 +103,7 @@ def _capture_smtp(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         def starttls(self, context: ssl.SSLContext | None = None) -> None:
             pass
 
-        def send_message(self, msg: Any) -> None:
+        def send_message(self, msg: Any, **envelope: Any) -> None:
             captured["subject"] = msg["Subject"]
             plain = html = None
             for part in msg.walk():

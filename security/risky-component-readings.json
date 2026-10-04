@@ -1,8 +1,14 @@
 {
   "subject": "Public-metadata readings of each runtime component on ASVS 5.0.0 V15.1's risky-component examples (BACKLOG #1189, ASVS 15.1.4)",
-  "snapshot_date": "2026-09-29",
-  "reread_by": "2026-12-28",
-  "population": "security/runtime-closure-sqlserver.txt",
+  "snapshot_date": "2026-10-04",
+  "reread_by": "2027-01-02",
+  "population": {
+    "core": "security/runtime-closure-core.txt",
+    "extras": {
+      "sqlserver": "security/runtime-closure-sqlserver.txt",
+      "harness": "security/runtime-closure-harness.txt"
+    }
+  },
   "sources": {
     "pypi_json": "https://pypi.org/pypi/{name}/json",
     "pypi_simple": "https://pypi.org/simple/{name}/ (Accept: application/vnd.pypi.simple.v1+json)",
@@ -27,7 +33,9 @@
     {
       "name": "aioodbc",
       "pinned": "0.5.0",
-      "in_core": false,
+      "added_by": [
+        "sqlserver"
+      ],
       "latest_version": "0.5.0",
       "newest_upload": "2023-10-28",
       "releases_in_maintenance_window": 0,
@@ -50,7 +58,7 @@
     {
       "name": "aiosqlite",
       "pinned": "0.22.1",
-      "in_core": true,
+      "added_by": [],
       "latest_version": "0.22.1",
       "newest_upload": "2025-12-23",
       "releases_in_maintenance_window": 3,
@@ -72,8 +80,8 @@
     },
     {
       "name": "annotated-doc",
-      "pinned": "0.0.4",
-      "in_core": true,
+      "pinned": "0.0.5",
+      "added_by": [],
       "latest_version": "0.0.5",
       "newest_upload": "2026-07-28",
       "releases_in_maintenance_window": 4,
@@ -95,8 +103,8 @@
     },
     {
       "name": "annotated-types",
-      "pinned": "0.7.0",
-      "in_core": true,
+      "pinned": "0.8.0",
+      "added_by": [],
       "latest_version": "0.8.0",
       "newest_upload": "2026-07-23",
       "releases_in_maintenance_window": 1,
@@ -118,8 +126,8 @@
     },
     {
       "name": "anyio",
-      "pinned": "4.14.2",
-      "in_core": true,
+      "pinned": "4.15.1",
+      "added_by": [],
       "latest_version": "4.15.1",
       "newest_upload": "2026-09-05",
       "releases_in_maintenance_window": 17,
@@ -161,7 +169,7 @@
     {
       "name": "argon2-cffi",
       "pinned": "25.1.0",
-      "in_core": true,
+      "added_by": [],
       "latest_version": "25.1.0",
       "newest_upload": "2025-06-03",
       "releases_in_maintenance_window": 1,
@@ -183,8 +191,8 @@
     },
     {
       "name": "argon2-cffi-bindings",
-      "pinned": "25.1.0",
-      "in_core": true,
+      "pinned": "26.1.0",
+      "added_by": [],
       "latest_version": "26.1.0",
       "newest_upload": "2026-08-20",
       "releases_in_maintenance_window": 2,
@@ -206,8 +214,8 @@
     },
     {
       "name": "certifi",
-      "pinned": "2026.6.17",
-      "in_core": true,
+      "pinned": "2026.7.22",
+      "added_by": [],
       "latest_version": "2026.7.22",
       "newest_upload": "2026-07-22",
       "releases_in_maintenance_window": 15,
@@ -248,8 +256,8 @@
     },
     {
       "name": "cffi",
-      "pinned": "2.0.0",
-      "in_core": true,
+      "pinned": "2.1.1",
+      "added_by": [],
       "latest_version": "2.1.1",
       "newest_upload": "2026-08-03",
       "releases_in_maintenance_window": 4,
@@ -270,7 +278,7 @@
     {
       "name": "click",
       "pinned": "8.5.0",
-      "in_core": true,
+      "added_by": [],
       "latest_version": "8.5.0",
       "newest_upload": "2026-08-26",
       "releases_in_maintenance_window": 11,
@@ -305,10 +313,10 @@
     {
       "name": "cryptography",
       "pinned": "50.0.1",
-      "in_core": true,
-      "latest_version": "50.0.1",
-      "newest_upload": "2026-08-25",
-      "releases_in_maintenance_window": 26,
+      "added_by": [],
+      "latest_version": "50.0.2",
+      "newest_upload": "2026-09-30",
+      "releases_in_maintenance_window": 27,
       "development_status": [
         "Development Status :: 5 - Production/Stable"
       ],
@@ -473,10 +481,10 @@
     {
       "name": "fastapi",
       "pinned": "0.141.1",
-      "in_core": true,
-      "latest_version": "0.141.1",
-      "newest_upload": "2026-07-29",
-      "releases_in_maintenance_window": 108,
+      "added_by": [],
+      "latest_version": "0.142.2",
+      "newest_upload": "2026-09-30",
+      "releases_in_maintenance_window": 111,
       "development_status": [
         "Development Status :: 4 - Beta"
       ],
@@ -508,7 +516,7 @@
     {
       "name": "h11",
       "pinned": "0.16.0",
-      "in_core": true,
+      "added_by": [],
       "latest_version": "0.16.0",
       "newest_upload": "2025-04-24",
       "releases_in_maintenance_window": 2,
@@ -538,7 +546,7 @@
     {
       "name": "hl7apy",
       "pinned": "1.3.5",
-      "in_core": true,
+      "added_by": [],
       "latest_version": "1.3.5",
       "newest_upload": "2024-03-13",
       "releases_in_maintenance_window": 0,
@@ -559,10 +567,10 @@
     {
       "name": "httpcore",
       "pinned": "1.0.9",
-      "in_core": true,
+      "added_by": [],
       "latest_version": "1.0.9",
       "newest_upload": "2025-04-24",
-      "releases_in_maintenance_window": 4,
+      "releases_in_maintenance_window": 3,
       "development_status": [
         "Development Status :: 3 - Alpha"
       ],
@@ -582,7 +590,7 @@
     {
       "name": "httptools",
       "pinned": "0.8.0",
-      "in_core": true,
+      "added_by": [],
       "latest_version": "0.8.0",
       "newest_upload": "2026-05-25",
       "releases_in_maintenance_window": 5,
@@ -605,7 +613,7 @@
     {
       "name": "httpx",
       "pinned": "0.28.1",
-      "in_core": true,
+      "added_by": [],
       "latest_version": "0.28.1",
       "newest_upload": "2026-08-31",
       "releases_in_maintenance_window": 8,
@@ -634,8 +642,8 @@
     },
     {
       "name": "idna",
-      "pinned": "3.18",
-      "in_core": true,
+      "pinned": "3.20",
+      "added_by": [],
       "latest_version": "3.20",
       "newest_upload": "2026-09-17",
       "releases_in_maintenance_window": 10,
@@ -671,7 +679,7 @@
     {
       "name": "ldap3",
       "pinned": "2.9.1",
-      "in_core": true,
+      "added_by": [],
       "latest_version": "2.9.1",
       "newest_upload": "2026-04-18",
       "releases_in_maintenance_window": 3,
@@ -694,7 +702,7 @@
     {
       "name": "psutil",
       "pinned": "7.2.2",
-      "in_core": true,
+      "added_by": [],
       "latest_version": "7.2.2",
       "newest_upload": "2026-01-28",
       "releases_in_maintenance_window": 10,
@@ -724,7 +732,7 @@
     {
       "name": "pyasn1",
       "pinned": "0.6.4",
-      "in_core": true,
+      "added_by": [],
       "latest_version": "0.6.4",
       "newest_upload": "2026-07-09",
       "releases_in_maintenance_window": 3,
@@ -778,7 +786,7 @@
     {
       "name": "pycparser",
       "pinned": "3.0",
-      "in_core": true,
+      "added_by": [],
       "latest_version": "3.0",
       "newest_upload": "2026-01-21",
       "releases_in_maintenance_window": 2,
@@ -801,7 +809,7 @@
     {
       "name": "pydantic",
       "pinned": "2.13.5",
-      "in_core": true,
+      "added_by": [],
       "latest_version": "2.13.5",
       "newest_upload": "2026-09-09",
       "releases_in_maintenance_window": 51,
@@ -837,7 +845,7 @@
     {
       "name": "pydantic-core",
       "pinned": "2.46.5",
-      "in_core": true,
+      "added_by": [],
       "latest_version": "2.49.0",
       "newest_upload": "2026-09-09",
       "releases_in_maintenance_window": 46,
@@ -860,7 +868,9 @@
     {
       "name": "pyodbc",
       "pinned": "5.3.0",
-      "in_core": false,
+      "added_by": [
+        "sqlserver"
+      ],
       "latest_version": "5.3.0",
       "newest_upload": "2025-10-17",
       "releases_in_maintenance_window": 2,
@@ -881,12 +891,87 @@
       }
     },
     {
+      "name": "pyside6",
+      "pinned": "6.11.2",
+      "added_by": [
+        "harness"
+      ],
+      "latest_version": "6.11.2",
+      "newest_upload": "2026-08-18",
+      "releases_in_maintenance_window": 19,
+      "development_status": [
+        "Development Status :: 5 - Production/Stable"
+      ],
+      "project_status": "active",
+      "pinned_yanked": false,
+      "requires_python_latest": "<3.15,>=3.10",
+      "advisories": [],
+      "advisories_dropped": [],
+      "advisories_unresolved": [],
+      "advisories_affecting_pin": [],
+      "risky": {
+        "maintenance": false,
+        "support": false,
+        "advisory_history": false
+      }
+    },
+    {
+      "name": "pyside6-addons",
+      "pinned": "6.11.2",
+      "added_by": [
+        "harness"
+      ],
+      "latest_version": "6.11.2",
+      "newest_upload": "2026-08-18",
+      "releases_in_maintenance_window": 19,
+      "development_status": [
+        "Development Status :: 5 - Production/Stable"
+      ],
+      "project_status": "active",
+      "pinned_yanked": false,
+      "requires_python_latest": "<3.15,>=3.10",
+      "advisories": [],
+      "advisories_dropped": [],
+      "advisories_unresolved": [],
+      "advisories_affecting_pin": [],
+      "risky": {
+        "maintenance": false,
+        "support": false,
+        "advisory_history": false
+      }
+    },
+    {
+      "name": "pyside6-essentials",
+      "pinned": "6.11.2",
+      "added_by": [
+        "harness"
+      ],
+      "latest_version": "6.11.2",
+      "newest_upload": "2026-08-18",
+      "releases_in_maintenance_window": 19,
+      "development_status": [
+        "Development Status :: 5 - Production/Stable"
+      ],
+      "project_status": "active",
+      "pinned_yanked": false,
+      "requires_python_latest": "<3.15,>=3.10",
+      "advisories": [],
+      "advisories_dropped": [],
+      "advisories_unresolved": [],
+      "advisories_affecting_pin": [],
+      "risky": {
+        "maintenance": false,
+        "support": false,
+        "advisory_history": false
+      }
+    },
+    {
       "name": "pyspnego",
       "pinned": "0.12.2",
-      "in_core": true,
-      "latest_version": "0.12.2",
-      "newest_upload": "2026-08-26",
-      "releases_in_maintenance_window": 4,
+      "added_by": [],
+      "latest_version": "0.12.3",
+      "newest_upload": "2026-09-29",
+      "releases_in_maintenance_window": 5,
       "development_status": [
         "Development Status :: 4 - Beta"
       ],
@@ -904,12 +989,37 @@
       }
     },
     {
+      "name": "shiboken6",
+      "pinned": "6.11.2",
+      "added_by": [
+        "harness"
+      ],
+      "latest_version": "6.11.2",
+      "newest_upload": "2026-08-18",
+      "releases_in_maintenance_window": 19,
+      "development_status": [
+        "Development Status :: 5 - Production/Stable"
+      ],
+      "project_status": "active",
+      "pinned_yanked": false,
+      "requires_python_latest": "<3.15,>=3.10",
+      "advisories": [],
+      "advisories_dropped": [],
+      "advisories_unresolved": [],
+      "advisories_affecting_pin": [],
+      "risky": {
+        "maintenance": false,
+        "support": false,
+        "advisory_history": false
+      }
+    },
+    {
       "name": "sspilib",
-      "pinned": "0.5.0",
-      "in_core": true,
+      "pinned": "0.6.0",
+      "added_by": [],
       "latest_version": "0.6.0",
       "newest_upload": "2026-08-24",
-      "releases_in_maintenance_window": 6,
+      "releases_in_maintenance_window": 5,
       "development_status": [
         "Development Status :: 4 - Beta"
       ],
@@ -929,10 +1039,10 @@
     {
       "name": "starlette",
       "pinned": "1.7.0",
-      "in_core": true,
+      "added_by": [],
       "latest_version": "1.7.0",
       "newest_upload": "2026-09-23",
-      "releases_in_maintenance_window": 42,
+      "releases_in_maintenance_window": 41,
       "development_status": [
         "Development Status :: 3 - Alpha"
       ],
@@ -1013,7 +1123,7 @@
     {
       "name": "tomlkit",
       "pinned": "0.15.1",
-      "in_core": true,
+      "added_by": [],
       "latest_version": "0.15.1",
       "newest_upload": "2026-07-17",
       "releases_in_maintenance_window": 4,
@@ -1034,7 +1144,7 @@
     {
       "name": "truststore",
       "pinned": "0.10.4",
-      "in_core": true,
+      "added_by": [],
       "latest_version": "0.10.4",
       "newest_upload": "2025-08-12",
       "releases_in_maintenance_window": 4,
@@ -1056,8 +1166,8 @@
     },
     {
       "name": "typing-extensions",
-      "pinned": "4.15.0",
-      "in_core": true,
+      "pinned": "4.16.0",
+      "added_by": [],
       "latest_version": "4.16.0",
       "newest_upload": "2026-07-02",
       "releases_in_maintenance_window": 12,
@@ -1079,8 +1189,8 @@
     },
     {
       "name": "typing-inspection",
-      "pinned": "0.4.2",
-      "in_core": true,
+      "pinned": "0.4.4",
+      "added_by": [],
       "latest_version": "0.4.4",
       "newest_upload": "2026-08-12",
       "releases_in_maintenance_window": 10,
@@ -1103,10 +1213,10 @@
     {
       "name": "tzdata",
       "pinned": "2026.4",
-      "in_core": true,
-      "latest_version": "2026.4",
-      "newest_upload": "2026-09-12",
-      "releases_in_maintenance_window": 7,
+      "added_by": [],
+      "latest_version": "2026.5",
+      "newest_upload": "2026-10-03",
+      "releases_in_maintenance_window": 8,
       "development_status": [
         "Development Status :: 5 - Production/Stable"
       ],
@@ -1126,7 +1236,7 @@
     {
       "name": "uvicorn",
       "pinned": "0.49.0",
-      "in_core": true,
+      "added_by": [],
       "latest_version": "0.54.0",
       "newest_upload": "2026-09-25",
       "releases_in_maintenance_window": 35,
@@ -1162,10 +1272,10 @@
     {
       "name": "uvloop",
       "pinned": "0.22.1",
-      "in_core": true,
-      "latest_version": "0.22.1",
-      "newest_upload": "2025-10-16",
-      "releases_in_maintenance_window": 2,
+      "added_by": [],
+      "latest_version": "0.23.0",
+      "newest_upload": "2026-10-01",
+      "releases_in_maintenance_window": 3,
       "development_status": [
         "Development Status :: 5 - Production/Stable"
       ],
@@ -1184,11 +1294,11 @@
     },
     {
       "name": "websockets",
-      "pinned": "16.0",
-      "in_core": true,
-      "latest_version": "17.1",
-      "newest_upload": "2026-08-26",
-      "releases_in_maintenance_window": 11,
+      "pinned": "17.1",
+      "added_by": [],
+      "latest_version": "17.2",
+      "newest_upload": "2026-10-03",
+      "releases_in_maintenance_window": 12,
       "development_status": [
         "Development Status :: 5 - Production/Stable"
       ],

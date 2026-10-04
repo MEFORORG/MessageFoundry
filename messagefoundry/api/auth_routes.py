@@ -73,6 +73,7 @@ from messagefoundry.api.security import (
     alert_sink_for,
     answers_before_body,
     bearer_token,
+    bearer_token_dependency,
     client_ip,
     get_auth,
     pending_credential_deadline,
@@ -499,7 +500,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         request: Request,
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require()),
-        session: str | None = Depends(bearer_token),
+        session: str | None = Depends(bearer_token_dependency),
     ) -> SimpleMessage:
         """``session`` is the caller's session token, which a wrong current password is charged to
         (BACKLOG #1138). The JSON plane resolves it from the bearer header; the web console, which

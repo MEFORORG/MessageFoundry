@@ -202,14 +202,19 @@ function networkError(err: NodeJS.ErrnoException, baseUrl: string): NetworkError
  * A route dual control can hold answers 202 instead of running the action, so call such a route
  * through {@link postApprovable}. Here a 202 rejects with a {@link HeldError} rather than decoding as
  * `T`: a caller that does not handle a hold must not read one as success (BACKLOG #1981).
+ *
+ * `timeoutMs`, when given, fails a request that goes silent for that long, as {@link getJson} does,
+ * with a {@link NetworkError} carrying {@link TIMEOUT_CODE}. Omitted, there is no cap. Sign-in passes
+ * one (BACKLOG #2281); no other caller does.
  */
 export function postJson<T>(
   baseUrl: string,
   route: string,
   body: unknown,
   token?: string,
+  timeoutMs?: number,
 ): Promise<T> {
-  return postReply(baseUrl, route, body, token).then((reply) => {
+  return postReply(baseUrl, route, body, token, timeoutMs).then((reply) => {
     const outcome = classifyApprovable<T>(reply.status, reply.body);
     if (outcome.kind === "held") {
       throw new HeldError(outcome.hold.approvalId);
@@ -311,6 +316,7 @@ function postReply(
   route: string,
   body: unknown,
   token?: string,
+  timeoutMs?: number,
 ): Promise<PostReply> {
   return new Promise<PostReply>((resolve, reject) => {
     let url: URL;
@@ -349,7 +355,14 @@ function postReply(
         reject(new HttpError(status, httpErrorMessage(status, text)));
       });
     });
-    req.on("error", (err: NodeJS.ErrnoException) => reject(networkError(err, baseUrl)));
+    if (timeoutMs !== undefined) {
+      req.setTimeout(timeoutMs, () =>
+        req.destroy(new NetworkError(`engine request timed out after ${timeoutMs}ms`, TIMEOUT_CODE)),
+      );
+    }
+    req.on("error", (err: NodeJS.ErrnoException) =>
+      reject(err instanceof NetworkError ? err : networkError(err, baseUrl)),
+    );
     req.write(payload);
     req.end();
   });

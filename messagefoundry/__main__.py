@@ -844,7 +844,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "--email",
         default=None,
         help="notification address for out-of-band security notices; a PHI instance under "
-        "[security].enforcement=enforce refuses to serve without one on some enabled Administrator",
+        "[security].enforcement=enforce refuses to serve without one on some enabled Administrator. "
+        "Required to complete an existing roleless account that already holds an address",
     )
     provision_admin.add_argument(
         "--service-config",
@@ -869,15 +870,17 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         description="Set the engine-owned notification address (users.notify_email) on an enabled "
         "Administrator that has none, so a PHI instance under [security].enforcement=enforce can "
         "start. Runs against the store directly, on the same host gate as admin-unlock; run it with "
-        "the engine stopped. It refuses a blank address, a non-Administrator, a disabled account, "
-        "and an account that already has an address: change an existing address from the web "
-        "console, which notifies the old one.",
+        "the engine stopped. It refuses at least a blank address, an address that is not one plain "
+        "mailbox, a non-Administrator, a disabled account, and an account that already has an "
+        "address: change an existing address from the web console, which notifies the old one.",
     )
     admin_set_notify_email.add_argument(
         "--username", required=True, help="the enabled Administrator to address"
     )
     admin_set_notify_email.add_argument(
-        "--email", required=True, help="the notification address to set (must not be blank)"
+        "--email",
+        required=True,
+        help="the notification address to set: one plain mailbox, such as name@example.org",
     )
     admin_set_notify_email.add_argument(
         "--service-config",
@@ -6501,7 +6504,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
         HOLDER_NOTICE_NO_CHANNEL,
         HOLDER_NOTICE_NO_PRIOR_ADDRESS,
         FirstAdministratorRefused,
+        InvalidNotifyEmail,
         ProvisionedAdministrator,
+        _require_single_mailbox,
     )
     from messagefoundry.config.settings import (
         KEYLESS_REFUSED_BY_UNREAD_KEY,
@@ -6522,7 +6527,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
     # AC-15: the argument checks, before the prompt and before any open. The limits are the web
     # console's (`UserCreateRequest`), so this offline surface admits nothing the console refuses,
     # and the address limit is the one `admin-set-notify-email` applies. A blank address is still no
-    # address rather than a refusal (AC-9), so only its length is checked here.
+    # address rather than a refusal (AC-9). A non-blank one also gets the one-mailbox check below.
     username = args.username.strip()
     if not username:
         return _emit_error("a username is required and must not be blank", as_json=args.json)
@@ -6532,6 +6537,13 @@ def _provision_admin(args: argparse.Namespace) -> int:
         return _emit_error(
             f"the notification address is longer than {_NAME_MAX} characters", as_json=args.json
         )
+    if args.email is not None and args.email.strip():
+        # The one-mailbox rule admin-set-notify-email and the API apply (vault BACKLOG #2870). It
+        # refuses an address the alert sender could never put on the RCPT TO line.
+        try:
+            _require_single_mailbox(args.email)
+        except InvalidNotifyEmail as exc:
+            return _emit_error(f"the notification address was refused: {exc}", as_json=args.json)
     if args.display_name is not None and len(args.display_name) > _NAME_MAX:
         return _emit_error(
             f"the display name is longer than {_NAME_MAX} characters", as_json=args.json
@@ -6614,7 +6626,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
         try:
             # ADR 0197 Amendment A: every refusal the store can answer, before the password prompt
             # and before an authenticator key is shown for an account that would then be refused.
-            return False, await service.provision_refusal(username)
+            # BACKLOG #2288: with --email, because a row that holds an address needs one.
+            return False, await service.provision_refusal(username, notify_email=args.email)
         finally:
             store_slot.current = None
             await store.close()
@@ -6851,11 +6864,6 @@ def _provision_admin(args: argparse.Namespace) -> int:
     _safe_print(
         f"Sign in as {outcome.username!r} once the engine is running; it creates no account itself."
     )
-    email_given = bool(args.email and args.email.strip())
-    kept_prior_address = outcome.holder_notice in (
-        HOLDER_NOTICE_DISPATCHED,
-        HOLDER_NOTICE_NO_CHANNEL,
-    )
     if outcome.holder_notice == HOLDER_NOTICE_DISPATCHED:
         _safe_print(
             "Queued a takeover notice to the account's earlier notification address. Delivery is "
@@ -6870,14 +6878,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
         )
     elif outcome.holder_notice == HOLDER_NOTICE_NO_PRIOR_ADDRESS:
         _safe_print("The account had no notification address, so there was nobody to tell.")
-    if kept_prior_address and not email_given:
-        # A WARNING, not a note: that address now receives every notice for the sole Administrator.
-        _safe_print(
-            "WARNING: the account keeps its earlier notification address, so every security notice "
-            "for this Administrator still goes there. If it is not yours, change it from the web "
-            "console; this command refuses to run again now that an Administrator exists."
-        )
-    if not email_given and not kept_prior_address:
+    # No --email means the account has no address at all: a repair of a row that held one is
+    # refused without --email (BACKLOG #2288), so no earlier address can be kept silently.
+    if not (args.email and args.email.strip()):
         # Not `!r` (BACKLOG #1985): cmd.exe does not read single quotes as quoting.
         user_arg = _paste_safe_option("--username", outcome.username)
         hint = (
@@ -6932,6 +6935,7 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
 
     from messagefoundry.api.auth_models import _NAME_MAX
     from messagefoundry.auth.permissions import Role
+    from messagefoundry.auth.service import InvalidNotifyEmail, _require_single_mailbox
     from messagefoundry.config.settings import keyless_opt_out_refusal
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import (
@@ -6941,24 +6945,22 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
         store_driver_errors,
     )
     from messagefoundry.store.crypto import StoreKeylessError
-    from messagefoundry.store.store import require_notify_email
 
     settings = _host_gated_store_settings(args)
     if isinstance(settings, int):
         return settings
-    try:
-        # Validated before the store opens, so a refusal touches nothing. The same helper every
-        # write of the column uses, plus the web console's length bound. It does NOT apply the
-        # one-mailbox shape check the console's user form and POST /me/notify-email apply (BACKLOG
-        # #1139), so it accepts a host-only address such as ops@localhost that those refuse. The
-        # console's user form does not re-check a stored value it is handed back unchanged.
-        address = require_notify_email(args.email)
-    except ValueError as exc:
-        return _emit_error(str(exc), as_json=args.json)
+    # Validated before the store opens, so a refusal touches nothing. The web console's length
+    # bound comes first. Then comes the one-mailbox check the console and POST /me/notify-email
+    # apply (BACKLOG #1139). Since vault BACKLOG #2870 that check includes the rule the alert sender
+    # applies to RCPT TO. It checks the address's shape only, not that a relay will take it.
     if len(args.email) > _NAME_MAX:
         return _emit_error(
             f"the notification address is longer than {_NAME_MAX} characters", as_json=args.json
         )
+    try:
+        address = _require_single_mailbox(args.email)
+    except InvalidNotifyEmail as exc:
+        return _emit_error(f"the notification address was refused: {exc}", as_json=args.json)
     # Stripped as `provision_first_administrator` strips it, so the argv that created the account
     # also finds it.
     wanted = args.username.strip()
@@ -8391,7 +8393,11 @@ def _alert(args: argparse.Namespace) -> int:
 
     from messagefoundry.config import alerts_edit
     from messagefoundry.config.settings import AlertRule, load_settings
-    from messagefoundry.pipeline.alert_sinks import configured_alert_transport_names
+    from messagefoundry.pipeline.alert_sinks import (
+        check_rule_recipients,
+        configured_alert_transport_names,
+    )
+    from messagefoundry.transports.email import checked_sender
 
     path = args.service_config
 
@@ -8445,6 +8451,26 @@ def _alert(args: argparse.Namespace) -> int:
                         "otherwise the engine refuses to start.",
                         as_json=args.json,
                     )
+            # The same reason for a recipient override: notifier_from_settings checks it against the
+            # email address rule at the next start (vault BACKLOG #2870).
+            if new_rule.recipients or any(step.recipients for step in new_rule.escalate):
+                try:
+                    alerts = load_settings(config_path=path).alerts
+                except (OSError, ValueError):
+                    alerts = None  # no settings yet, so no email transport sends the override
+                if (
+                    alerts is not None
+                    and alerts.email_from
+                    and "email" in configured_alert_transport_names(alerts)
+                ):
+                    try:
+                        # The sender first, so a bad email_from is named as such, not as the rule.
+                        checked_sender("[alerts].email_from", alerts.email_from)
+                        check_rule_recipients(new_rule, alerts.email_from, "alert rule")
+                    except ValueError as exc:
+                        return _emit_error(
+                            f"{exc}; otherwise the engine refuses to start.", as_json=args.json
+                        )
             result = alerts_edit.add_rule(path, obj, validate=validate)
         else:  # remove
             if args.index is None:
