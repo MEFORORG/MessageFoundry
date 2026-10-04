@@ -2323,7 +2323,9 @@ class AuthService:
         permission to inherit, and this branch is reachable only when the store has no enabled
         administrator at all, which is already the state an operator needs recovering from. Safe is
         not silent, though: a roleless account can still be somebody's, so a repair tells the
-        address it held before (BACKLOG #2019).
+        address it held before (BACKLOG #2019). And a row that holds an address is completed only
+        when ``notify_email`` is given (BACKLOG #2288), so the sole Administrator's notices never
+        go to an address nobody chose.
 
         Not reused from :meth:`create_local_user`, which does the same four writes: that method
         creates WITH a hash and forces a rotation, and the ordering above is a durability property
@@ -2376,7 +2378,9 @@ class AuthService:
         # "" and the notifier drops it, so "dispatched" would be a false record.
         prior_notify_email = ((existing.notify_email if existing else None) or "").strip() or None
         if existing is not None:
-            refusal = await self._existing_row_refusal(existing, username)
+            refusal = await self._existing_row_refusal(
+                existing, username, notify_email=notify_email
+            )
             if refusal is not None:
                 raise FirstAdministratorRefused(refusal)
             user_id = existing.id
@@ -2446,10 +2450,13 @@ class AuthService:
             # here ends it before it can act as an Administrator.
             await self._store.revoke_user_sessions(user_id)
         # BACKLOG #2019: a repair can take over an account somebody else holds -- one an administrator
-        # created with no roles, say -- so its earlier holder is told, at the address they held. Told
-        # rather than refused, because an address is no sign of a second holder: a run given --email
-        # that crashed after `create_user` leaves its own address on the roleless row, and refusing
-        # it would strand exactly the half-written provision this branch exists to complete.
+        # created with no roles, say -- so its earlier holder is told, at the address they held.
+        # The repair is not refused outright, because an address is no sign of a second holder: a
+        # run given --email that crashed after `create_user` leaves its own address on the roleless
+        # row, and a flat refusal would strand exactly the half-written provision this branch
+        # exists to complete. BACKLOG #2288 asks for the address instead: `_existing_row_refusal`
+        # declines such a row until --email is given, and the crashed run's own command already
+        # carries it, so the same command run again completes the row.
         #
         # The notice goes out BEFORE the audit row, so the row records its real outcome rather than a
         # forecast: `_notify_security` swallows a notifier failure, and a row written first would then
@@ -2498,14 +2505,23 @@ class AuthService:
             recovery_codes=plain_codes,
         )
 
-    async def _existing_row_refusal(self, existing: UserRecord, username: str) -> str | None:
+    async def _existing_row_refusal(
+        self, existing: UserRecord, username: str, *, notify_email: str | None
+    ) -> str | None:
         """Why ``provision_first_administrator`` would refuse to complete ``existing``, or ``None``.
 
         A directory identity draws its authority from the directory, so it is never promoted here
         whatever its role state -- provision a separate local account instead. A disabled account is
         refused rather than re-enabled: an operator who disabled it did so on purpose, and silently
         reviving it under a new credential is not a recovery. An account holding roles is somebody's
-        in use."""
+        in use.
+
+        BACKLOG #2288: a row that already holds a notification address is completed only when
+        ``notify_email`` (``--email``) is given. Kept silently, that address would receive every
+        security notice for the sole Administrator, and it may be an earlier holder's. Giving the
+        same address again is allowed: it is then the operator's stated choice. A blank
+        ``notify_email`` counts as none, and so does a blank stored address. The text never prints
+        the stored address, which may be somebody else's."""
         if existing.auth_provider != AuthProvider.LOCAL.value:
             return (
                 f"{username!r} is a {existing.auth_provider} account -- provision a separate "
@@ -2521,14 +2537,21 @@ class AuthService:
                 f"an account named {username!r} already exists and holds roles -- choose "
                 "another username"
             )
+        if (existing.notify_email or "").strip() and not (notify_email or "").strip():
+            return (
+                f"the account named {username!r} already holds a notification address, and "
+                "this Administrator's security notices would go there -- run the command again "
+                "with --email <address> to say where they go"
+            )
         return None
 
-    async def provision_refusal(self, username: str) -> str | None:
+    async def provision_refusal(self, username: str, *, notify_email: str | None) -> str | None:
         """What ``provision_first_administrator`` would refuse ``username`` for, asked BEFORE any
         prompt (ADR 0197 Amendment A): an enabled Administrator exists, or the named row is one this
         command will not complete. ``provision-admin`` asks it first, so an operator is never shown
         an authenticator key for an account the store then refuses. The service still refuses on its
-        own; this is the courtesy, that is the control."""
+        own; this is the courtesy, that is the control. ``notify_email`` is the ``--email`` value,
+        required here so the pre-check cannot disagree with the write about BACKLOG #2288."""
         name = username.strip()
         if await self.has_enabled_administrator():
             return (
@@ -2537,7 +2560,9 @@ class AuthService:
                 "administrator is locked out"
             )
         existing = await self._store.get_user_by_username(name)
-        return None if existing is None else await self._existing_row_refusal(existing, name)
+        if existing is None:
+            return None
+        return await self._existing_row_refusal(existing, name, notify_email=notify_email)
 
     def initial_credential_deadline(self, password_changed_at: float | None) -> float | None:
         """The instant an admin-issued must-change credential stops working, or ``None`` when

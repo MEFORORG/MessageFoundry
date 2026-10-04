@@ -308,9 +308,11 @@ notification address the account held **before** the repair (BACKLOG #2019).
   `dispatched` means the notifier took it. It does not mean the mail was delivered. The row also
   gains `notify_email_moved`. The `notified` field keeps its old meaning: an address was given with
   `--email`.
-- Without `--email`, the account keeps the earlier holder's address, so every later notice for the
-  new Administrator goes there. The command warns. Change it from the web console if it is not
-  yours.
+- **An account that already holds a notification address needs `--email`** (BACKLOG #2288).
+  Without it the command refuses before the password prompt and writes nothing. Kept silently,
+  that address would receive every later notice for the new Administrator. A first run given
+  `--email` that stopped after creating the account left that address there, so run the same
+  command again, with `--email`. You may give the address the account already holds.
 
 The repair first ends every session on the account and removes its TOTP key, its recovery codes
 and its passkeys, then enrols the new Administrator's own, and ends the sessions again once the role
