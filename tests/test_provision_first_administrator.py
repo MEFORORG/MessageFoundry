@@ -1233,16 +1233,46 @@ async def test_a_repair_of_a_row_that_holds_an_address_is_refused_without_an_ema
 ) -> None:
     """Kept silently, the stored address would receive the sole Administrator's notices.
 
-    The refusal writes nothing: the row keeps its address, gains no role and no credential, a
-    session on it survives, and nobody is told of a takeover that did not happen. The text does
-    not print the stored address, which may be somebody else's.
+    The refusal writes nothing. The row keeps its address, password, factors and session, gains no
+    role, and nobody is told of a takeover that did not happen. The row holds all of those on
+    purpose: a refusal that ran after the factor and session clear would still pass on a bare row.
+    The text does not print the stored address, which may be somebody else's.
     """
     store = await MessageStore.open(":memory:")
     try:
+        holder = AuthService(store, AuthSettings(require_mfa=False))
+        await holder.initialize()
+        await _roleless_account(store, email="holder@example.invalid")
+        await store.set_password(
+            "roleless",
+            password_hash=await asyncio.to_thread(hash_password, "the-earlier-holders-passphrase"),
+            must_change_password=False,
+            password_generated=False,
+        )
+        await store.set_totp_secret("roleless", secret="JBSWY3DPEHPK3PXP")
+        await store.enable_totp("roleless", recovery_code_hashes=["h1", "h2"])
+        await store.add_webauthn_credential(
+            WebAuthnCredential(
+                credential_id_hash="holder-passkey-hash",
+                credential_id="holder-passkey-id",
+                user_id="roleless",
+                rp_id="t",
+                public_key="cose-public-key-b64url",
+                sign_count=0,
+                transports=None,
+                device_type="multi_device",
+                backed_up=True,
+                label="theirs",
+                aaguid=None,
+                created_at=1.0,
+            )
+        )
+        kept = await holder.login("site-admin", "the-earlier-holders-passphrase")
+        assert kept.ok and kept.token is not None
+        before = await store.get_user("roleless")
+
         notifier = _Recorder()
         service = AuthService(store, AuthSettings(), security_notifier=notifier)
-        await _roleless_account(store, email="holder@example.invalid")
-        before = await store.get_user("roleless")
 
         with pytest.raises(FirstAdministratorRefused, match="--email") as refused:
             await service.provision_first_administrator(
@@ -1261,6 +1291,11 @@ async def test_a_repair_of_a_row_that_holds_an_address_is_refused_without_an_ema
         after = await store.get_user("roleless")
         assert after == before
         assert await store.get_user_role_ids("roleless") == []
+        assert await store.get_totp_secret("roleless") == "JBSWY3DPEHPK3PXP"
+        assert sorted(await store.get_recovery_code_hashes("roleless")) == ["h1", "h2"]
+        passkeys = await store.list_webauthn_credentials("roleless")
+        assert [c.credential_id for c in passkeys] == ["holder-passkey-id"]
+        assert await service.identity_for_token(kept.token, activity=False) is not None
         assert notifier.events == []
         actions = [dict(r)["action"] for r in await store.list_audit(limit=50)]
         assert "auth.first_administrator_provisioned" not in actions
@@ -1536,10 +1571,7 @@ def test_cli_refuses_a_row_that_holds_an_address_before_any_prompt(
         "messagefoundry.__main__._offline_security_notifier", lambda _settings: recorder
     )
 
-    def no_prompt(*_a: object, **_k: object) -> str:
-        raise AssertionError("the command prompted before it refused")
-
-    monkeypatch.setattr("getpass.getpass", no_prompt)
+    _no_prompt(monkeypatch)
     assert main(["provision-admin", "--username", "site-admin", "--db", str(db)]) != 0
     captured = capsys.readouterr()
     assert "--email" in captured.out + captured.err

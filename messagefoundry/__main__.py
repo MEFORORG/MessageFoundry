@@ -844,7 +844,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "--email",
         default=None,
         help="notification address for out-of-band security notices; a PHI instance under "
-        "[security].enforcement=enforce refuses to serve without one on some enabled Administrator",
+        "[security].enforcement=enforce refuses to serve without one on some enabled Administrator. "
+        "Required to complete an existing roleless account that already holds an address",
     )
     provision_admin.add_argument(
         "--service-config",

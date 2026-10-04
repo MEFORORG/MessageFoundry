@@ -652,8 +652,8 @@ every run. There the cost of no address is an empty column, which the start gate
 Here the alternative is an address nobody chose, so the narrower rule does not reopen it. A fresh
 create and a repair of a row with no address still succeed without `--email`, and still warn.
 
-**It does not strand a half-written provision.** A run given `--email` that stopped after the
-create leaves its own address on the row. The same command, run again, carries the same `--email`,
+**It does not strand a half-written provision.** A first run given `--email` that stopped
+after the create leaves its own address on the row. The same command, run again, carries the same `--email`,
 so it completes the row. The operator may also give the address the row already holds; it is then
 a stated choice rather than an inherited one. A blank `--email` counts as none, and so does a
 blank stored address.

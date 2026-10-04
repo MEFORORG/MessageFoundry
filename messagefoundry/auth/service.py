@@ -2539,9 +2539,9 @@ class AuthService:
             )
         if (existing.notify_email or "").strip() and not (notify_email or "").strip():
             return (
-                f"the account named {username!r} already holds a notification address, which "
-                "would keep receiving this Administrator's security notices -- run the command "
-                "again with --email <address> to say where they go"
+                f"the account named {username!r} already holds a notification address, and "
+                "this Administrator's security notices would go there -- run the command again "
+                "with --email <address> to say where they go"
             )
         return None
 
