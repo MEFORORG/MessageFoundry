@@ -846,7 +846,10 @@ class X12Source(SourceConnector):
                         )
                         break
                     # Reached on the success path alone: every arm above breaks or raises.
-                    clock.after_read(in_frame=decoder.in_frame, decoded=decoded)
+                    # X12FrameReader reports no end-of-frame bytes yet, so a newline after the IEA
+                    # segment terminator that arrives in a read of its own starts the clock. That
+                    # gap is open, not intended (vault BACKLOG #2847 review).
+                    clock.after_read(in_frame=decoder.in_frame, decoded=decoded, trailer_only=False)
             except OSError as exc:
                 failed = True  # peer reset; nothing to do but drop the connection
                 await self._emit_event("peer_reset", peer_host=peer_host, reason=safe_exc(exc))

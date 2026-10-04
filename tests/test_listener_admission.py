@@ -12,8 +12,8 @@ Each refusal test carries its own control: the same drive with the bound switche
 listener admitting a peer that is within its budget. A refusal that a broken harness produced would
 read as a working cap without one.
 
-Vault BACKLOG #2847 moved the MLLP listener onto the same frame clock, so its frame-deadline tests run
-on all three socket listeners, and it put the MLLP stop()'s per-host reset in a ``finally``.
+Vault BACKLOG #2847 moved the MLLP listener onto the same frame clock, so MLLP joins most of the
+frame-deadline tests here, and it put the MLLP stop()'s per-host reset in a ``finally``.
 """
 
 from __future__ import annotations
@@ -383,13 +383,27 @@ async def test_whole_frames_with_quiet_gaps_longer_than_the_deadline_are_not_cut
     assert "frame_deadline" not in events.reasons("closed")
 
 
-@pytest.mark.parametrize("kind", ["mllp", "tcp"])
-async def test_a_trailer_arriving_alone_does_not_start_the_frame_deadline(kind: str) -> None:
-    """MLLP's CR trailer belongs to the frame its FS ended. When it reaches the listener in a read of
-    its own (a TCP segment or a 4096-byte read boundary between FS and CR), it must start nothing,
-    or a healthy peer that then goes quiet is cut as `frame_deadline`. The raw-TCP case runs the
-    same codec through `framing="mllp"`. CONTROL: the outside-any-frame test above, where any other
-    byte does start the clock."""
+@pytest.mark.parametrize(
+    ("kind", "after", "cut"),
+    [
+        ("mllp", b"\r", False),
+        (
+            "mllp",
+            b"\n",
+            False,
+        ),  # after a trailer that arrived with the FS: CR LF split as FS CR | LF
+        ("tcp", b"\r", False),
+        ("mllp", b"Z", True),  # CONTROL: any other byte after a completed frame starts the clock
+        ("mllp", b"\r\n\r", True),  # CONTROL: line ends past the two-byte allowance are noise
+    ],
+)
+async def test_line_end_bytes_ending_a_frame_do_not_start_the_frame_deadline(
+    kind: str, after: bytes, cut: bool
+) -> None:
+    """Up to two line-end bytes after a frame's end byte belong to that frame. When they reach the
+    listener in a read of their own (a TCP segment or a 4096-byte read boundary after the FS), they
+    must start nothing, or a healthy peer that then goes quiet is cut as `frame_deadline` (vault
+    BACKLOG #2847 review). The raw-TCP case runs the MLLP codec through `framing="mllp"`."""
     events = _Events()
     received: list[bytes] = []
 
@@ -400,42 +414,61 @@ async def test_a_trailer_arriving_alone_does_not_start_the_frame_deadline(kind: 
     framing = {"framing": "mllp"} if kind == "tcp" else {}
     source = _build(kind, max_frame_seconds=0.3, receive_timeout=5.0, **framing)
     source.on_connection_event = events
+    whole = _whole_frame("mllp")
+    # The `\n` row sends the CR with the frame, so the LF is the second line-end byte.
+    first = whole if after == b"\n" else whole[:-1]
 
     async def body(port: int) -> None:
-        _reader, writer = await asyncio.open_connection("127.0.0.1", port)
-        whole = _whole_frame("mllp")
-        writer.write(whole[:-1])  # through the FS: the frame completes here
-        await writer.drain()
-        assert await _until(lambda: len(received) == 1)
-        writer.write(whole[-1:])  # the CR, alone
-        await writer.drain()
-        await asyncio.sleep(0.8)  # quiet, for more than twice max_frame_seconds
-        assert events.count("closed") == 0, events.events
-        await _close(writer)
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        closed = asyncio.ensure_future(reader.read())
+        try:
+            writer.write(first)
+            await writer.drain()
+            assert await _until(lambda: len(received) == 1)
+            writer.write(after)
+            await writer.drain()
+            await asyncio.wait({closed}, timeout=0.9)  # quiet, for three times max_frame_seconds
+        finally:
+            closed.cancel()
+            with contextlib.suppress(BaseException):
+                await closed
+            await _close(writer)
 
     await _run(source, body, handler)
-    assert "frame_deadline" not in events.reasons("closed")
+    assert ("frame_deadline" in events.reasons("closed")) is cut, events.events
 
 
-def test_the_mllp_decoder_marks_only_an_owed_trailer_as_trailer_only() -> None:
+def test_the_decoder_marks_only_a_frames_own_line_ends_as_trailer_only() -> None:
     decoder = MLLP_CODEC.decoder()
     whole = MLLP_CODEC.frame("PAYLOAD")
     assert list(decoder.feed(whole[:-1])) == [b"PAYLOAD"]
     assert not decoder.trailer_only
     assert list(decoder.feed(b"\r")) == []
-    assert decoder.trailer_only, "the CR the frame owed"
-    # CONTROL: a second CR is owed by nothing, so it is noise like any other byte.
+    assert decoder.trailer_only, "the CR ending the frame"
+    assert list(decoder.feed(b"\n")) == []
+    assert decoder.trailer_only, "the LF of a CR LF ending"
+    # CONTROL: a third line-end byte is past the allowance, so it is noise like any other byte.
     assert list(decoder.feed(b"\r")) == []
     assert not decoder.trailer_only
-    # CONTROL: a whole frame in one read owes nothing, so a later CR is noise too.
+    # CONTROL: a byte that is not a line end ends the allowance for what follows it too.
+    assert list(decoder.feed(whole[:-1])) == [b"PAYLOAD"]
+    assert list(decoder.feed(b"Z")) == []
+    assert not decoder.trailer_only
+    assert list(decoder.feed(b"\r")) == []
+    assert not decoder.trailer_only
+    # A whole frame with its CR leaves one byte of allowance, for an LF.
     assert list(decoder.feed(whole)) == [b"PAYLOAD"]
-    assert list(decoder.feed(b"\r")) == []
+    assert list(decoder.feed(b"\n")) == []
+    assert decoder.trailer_only
+    # Decided when feed() is called, before its generator runs, so it never describes a past read.
+    assert list(decoder.feed(whole)) == [b"PAYLOAD"]
+    decoder.feed(b"Z")  # not iterated
     assert not decoder.trailer_only
-    # STX/ETX has no trailer, so nothing it reads is ever trailer-only.
+    # STX/ETX framing takes the same line-end allowance.
     plain = STX_ETX_CODEC.decoder()
     assert list(plain.feed(STX_ETX_CODEC.frame("P"))) == [b"P"]
-    assert list(plain.feed(b"\r")) == []
-    assert not plain.trailer_only
+    assert list(plain.feed(b"\r\n")) == []
+    assert plain.trailer_only
 
 
 def test_the_x12_reader_reports_an_open_interchange() -> None:

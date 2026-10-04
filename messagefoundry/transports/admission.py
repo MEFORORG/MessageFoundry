@@ -288,6 +288,9 @@ class FrameClock:
         self.receive_timeout = receive_timeout
         #: Monotonic stamp of the read that carried the current frame's first byte, or None.
         self.opened_at: float | None = None
+        #: True while the running clock was started by bytes outside any frame and no frame has
+        #: opened since, so the drop line can say that rather than "a frame did not complete".
+        self._noise_only = False
 
     def withhold(self, since: float) -> None:
         """Push the open frame's start forward by the time the engine declined to read since
@@ -326,6 +329,15 @@ class FrameClock:
         Socket metadata only, never frame bytes. One line per dropped connection, like
         `frame_oversize`: reaching it costs the peer a connection held for `max_frame_seconds`, so
         the connection caps bound its rate."""
+        if self._noise_only:
+            logger.warning(
+                "%s peer %s sent bytes outside any frame and completed no frame within "
+                "max_frame_seconds (%.1fs); dropping the connection",
+                self.transport,
+                writer.get_extra_info("peername"),
+                self.max_frame_seconds,
+            )
+            return
         logger.warning(
             "%s frame from %s did not complete within max_frame_seconds (%.1fs); "
             "dropping the connection",
@@ -334,7 +346,7 @@ class FrameClock:
             self.max_frame_seconds,
         )
 
-    def after_read(self, *, in_frame: bool, decoded: int, trailer_only: bool = False) -> None:
+    def after_read(self, *, in_frame: bool, decoded: int, trailer_only: bool) -> None:
         """Restamp after the decoder consumed a non-empty read.
 
         A read that completed a frame restarts the clock: a NEW frame if one is open after it, none
@@ -346,11 +358,15 @@ class FrameClock:
         frame within ``max_frame_seconds`` of read time; the engine's own waits are withheld.
 
         ``trailer_only`` (:attr:`~messagefoundry.framing.FrameDecoder.trailer_only`) is the one
-        exception: a read holding only the trailer the frame before it owed, such as MLLP's CR
-        arriving after its FS, belongs to that completed frame and starts nothing (vault BACKLOG
-        #2847). Without it a healthy peer that went quiet after such a read would be cut here.
+        exception: a read holding only the line-end bytes that end the frame before it, such as
+        MLLP's CR arriving after its FS, belongs to that completed frame and starts nothing (vault
+        BACKLOG #2847). Without it a healthy peer that went quiet after such a read would be cut
+        here. It is required, so a new caller cannot leave it out by accident.
         """
         if decoded:
             self.opened_at = time.monotonic() if in_frame else None
         elif self.opened_at is None and not trailer_only:
             self.opened_at = time.monotonic()
+            self._noise_only = True
+        if in_frame:
+            self._noise_only = False

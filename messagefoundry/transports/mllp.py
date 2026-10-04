@@ -156,9 +156,9 @@ DEFAULT_RECEIVE_TIMEOUT = 60.0  # seconds — close inbound sockets idle this lo
 #: :class:`~messagefoundry.transports.admission.FrameClock` (vault BACKLOG #2606). A bound on
 #: connected time without a completed message was the other option, and it was not taken.
 #:
-#: The CR trailer after the end byte belongs to the frame it ends, so a CR that arrives in a read of
-#: its own starts nothing. Any other byte between frames does start the clock, keep-alive bytes
-#: included: a sender that keeps a quiet socket open with them must send a frame within this many
+#: Up to two line-end bytes after the end byte (the CR trailer, or CR LF) belong to the frame they
+#: end, so they start nothing even in a read of their own. Any other byte between frames does start
+#: the clock, keep-alive bytes included: a sender that keeps a quiet socket open with them must send a frame within this many
 #: seconds of the first one, even where ``receive_timeout`` is longer or off. Time the engine
 #: withholds (pacing, an intake pause) is not counted.
 #:
