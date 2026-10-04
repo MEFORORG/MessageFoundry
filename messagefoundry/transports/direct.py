@@ -249,8 +249,9 @@ class DirectDestination(DestinationConnector):
         self.password: str | None = str(password) if password else None
         self.use_tls = bool(s.get("use_tls", True))
         # #323: server-certificate verification on the TLS hop, kept byte-identical to
-        # EmailDestination's spelling (this connector's SMTP core is a deliberate copy, not an import —
-        # the one-way dependency rule — so the two must not drift).
+        # EmailDestination's spelling. This connector's TLS and AUTH handling is a copy of that
+        # connector's, so the two must not drift; its envelope check is imported from
+        # transports/email.py (checked_envelope, vault BACKLOG #2870).
         self.tls_verify = bool(s.get("tls_verify", True))
         tls_ca_file = s.get("tls_ca_file")
         self.tls_ca_file: str | None = str(tls_ca_file) if tls_ca_file else None

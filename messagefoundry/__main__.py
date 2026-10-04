@@ -6480,7 +6480,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
         HOLDER_NOTICE_NO_CHANNEL,
         HOLDER_NOTICE_NO_PRIOR_ADDRESS,
         FirstAdministratorRefused,
+        InvalidNotifyEmail,
         ProvisionedAdministrator,
+        _require_single_mailbox,
     )
     from messagefoundry.config.settings import (
         KEYLESS_REFUSED_BY_UNREAD_KEY,
@@ -6511,6 +6513,13 @@ def _provision_admin(args: argparse.Namespace) -> int:
         return _emit_error(
             f"the notification address is longer than {_NAME_MAX} characters", as_json=args.json
         )
+    if args.email is not None and args.email.strip():
+        # The one-mailbox rule admin-set-notify-email and the API apply, so the Administrator is
+        # not given an address every security notice would fail to reach (vault BACKLOG #2870).
+        try:
+            _require_single_mailbox(args.email)
+        except InvalidNotifyEmail as exc:
+            return _emit_error(f"the notification address was refused: {exc}", as_json=args.json)
     if args.display_name is not None and len(args.display_name) > _NAME_MAX:
         return _emit_error(
             f"the display name is longer than {_NAME_MAX} characters", as_json=args.json
@@ -6911,6 +6920,7 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
 
     from messagefoundry.api.auth_models import _NAME_MAX
     from messagefoundry.auth.permissions import Role
+    from messagefoundry.auth.service import InvalidNotifyEmail, _require_single_mailbox
     from messagefoundry.config.settings import keyless_opt_out_refusal
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import (
@@ -6920,24 +6930,23 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
         store_driver_errors,
     )
     from messagefoundry.store.crypto import StoreKeylessError
-    from messagefoundry.store.store import require_notify_email
 
     settings = _host_gated_store_settings(args)
     if isinstance(settings, int):
         return settings
-    try:
-        # Validated before the store opens, so a refusal touches nothing. The same helper every
-        # write of the column uses, plus the web console's length bound. It does NOT apply the
-        # one-mailbox shape check the console's user form and POST /me/notify-email apply (BACKLOG
-        # #1139), so it accepts a host-only address such as ops@localhost that those refuse. The
-        # console's user form does not re-check a stored value it is handed back unchanged.
-        address = require_notify_email(args.email)
-    except ValueError as exc:
-        return _emit_error(str(exc), as_json=args.json)
+    # Validated before the store opens, so a refusal touches nothing. The web console's length
+    # bound first, so an over-long value is named as that. Then the one-mailbox check the console's
+    # user form and POST /me/notify-email apply (BACKLOG #1139), which since vault BACKLOG #2870 also
+    # holds the address to the rule the alert sender applies to RCPT TO, so no notice to it would
+    # fail at send.
     if len(args.email) > _NAME_MAX:
         return _emit_error(
             f"the notification address is longer than {_NAME_MAX} characters", as_json=args.json
         )
+    try:
+        address = _require_single_mailbox(args.email)
+    except InvalidNotifyEmail as exc:
+        return _emit_error(f"the notification address was refused: {exc}", as_json=args.json)
     # Stripped as `provision_first_administrator` strips it, so the argv that created the account
     # also finds it.
     wanted = args.username.strip()

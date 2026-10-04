@@ -638,6 +638,51 @@ def test_an_argument_it_will_refuse_is_refused_before_the_prompt_and_the_open(
     assert not db.exists(), "a refused provision left a store behind"
 
 
+#: Notification addresses the API and self-service paths refuse, because the alert sender could
+#: never put them on the RCPT TO line (vault BACKLOG #2870). Built from parts; the ids are neutral.
+_UNSENDABLE_ADDRESSES = {
+    "non-ascii-local": "é" + "ops@example.invalid",
+    "slash-local": "ops" + "/" + "team@example.invalid",
+    "percent-local": "ops" + "%" + "relay@example.invalid",
+}
+
+
+@pytest.mark.parametrize(
+    "address", list(_UNSENDABLE_ADDRESSES.values()), ids=list(_UNSENDABLE_ADDRESSES)
+)
+def test_an_address_notices_could_not_be_sent_to_is_refused_before_the_prompt_and_the_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    address: str,
+) -> None:
+    """The same one-mailbox rule the API and self-service paths apply, so the Administrator this
+    provisions is not given an address every security notice would fail to reach."""
+    monkeypatch.chdir(tmp_path)
+    _key_in_this_shell(monkeypatch)
+    _no_prompt(monkeypatch)
+    db = tmp_path / "never.db"
+    argv = ["provision-admin", "--username", "site-admin", "--email", address]
+    assert main([*argv, "--db", str(db), "--json"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert "one email address" in error
+    assert address not in error  # the refusal names the problem, never the address
+    assert not db.exists(), "a refused provision left a store behind"
+
+
+def test_a_plain_address_still_provisions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The control for the refusals above: the rule is not refusing every address.
+    monkeypatch.chdir(tmp_path)
+    _key_in_this_shell(monkeypatch)
+    _tty(monkeypatch, _PASSWORD, _PASSWORD)
+    db = tmp_path / "plain.db"
+    argv = ["provision-admin", "--username", "site-admin", "--email", "ops.team@example.invalid"]
+    assert main([*argv, "--db", str(db)]) == 0
+    assert "WARNING" not in capsys.readouterr().out
+
+
 def test_a_password_the_policy_refuses_leaves_no_store(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

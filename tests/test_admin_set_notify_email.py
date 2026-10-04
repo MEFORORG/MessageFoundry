@@ -223,6 +223,50 @@ def test_a_blank_address_is_refused_and_writes_nothing(
     assert _audit_rows(db) == []
 
 
+#: Addresses the API and self-service paths refuse, because the alert sender could never put them on
+#: the RCPT TO line (vault BACKLOG #2870). Built from parts; the ids are neutral.
+_UNSENDABLE_ADDRESSES = {
+    "non-ascii-local": "é" + "ops@example.invalid",
+    "slash-local": "ops" + "/" + "team@example.invalid",
+    "percent-local": "ops" + "%" + "relay@example.invalid",
+}
+
+
+@pytest.mark.parametrize(
+    "address", list(_UNSENDABLE_ADDRESSES.values()), ids=list(_UNSENDABLE_ADDRESSES)
+)
+def test_an_address_notices_could_not_be_sent_to_is_refused_and_writes_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    address: str,
+) -> None:
+    # The one-mailbox rule the API and self-service paths apply, so this exit cannot store an
+    # address every later security notice would fail to reach.
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "unsendable.db"
+    _seed(db)
+    assert main([_CMD, "--username", _ADMIN, "--email", address, "--db", str(db), "--json"]) == 1
+    error = _error(capsys)
+    assert "one email address" in error
+    assert address not in error  # the refusal names the problem, never the address
+    assert _notify_email(db, _ADMIN) is None
+    assert _audit_rows(db) == []
+
+
+def test_a_plain_address_is_still_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The control for the refusals above: the rule is not refusing every address.
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "plain.db"
+    _seed(db)
+    plain = "ops.team@example.invalid"
+    assert main([_CMD, "--username", _ADMIN, "--email", plain, "--db", str(db), "--json"]) == 0
+    capsys.readouterr()
+    assert _notify_email(db, _ADMIN) == plain
+
+
 def test_the_address_flag_is_required(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """No --email is a parser refusal, so there is no spelling that means "set it to nothing"."""
     monkeypatch.chdir(tmp_path)
