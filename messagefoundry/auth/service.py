@@ -257,12 +257,6 @@ class _LoginAddress(Enum):
 _LOGIN_VERDICTS_THAT_SEED_THE_BASELINE = frozenset(
     {_LoginAddress.KNOWN, _LoginAddress.UNEVALUATED_NO_BASELINE}
 )
-#: The same set for a DIRECTORY sign-in that owes nothing more. ``NEW`` is in it because no directory
-#: session is ever seeded, so withholding the write there would challenge nothing and would only
-#: repeat the notice at every sign-in from an address its owner keeps using.
-_DIRECTORY_VERDICTS_THAT_SEED_THE_BASELINE = _LOGIN_VERDICTS_THAT_SEED_THE_BASELINE | {
-    _LoginAddress.NEW
-}
 
 
 def _host_key(address: str) -> str:
@@ -4009,8 +4003,6 @@ class AuthService:
         # The password leg's three ORDER-CRITICAL steps (see :meth:`reauth`), against the hash.
         # (1) Every stamp against the OLD hash, re-anchoring the session to this client address.
         await self._store.mark_session_reauthed(token_hash, client=client)
-        # vault BACKLOG #2145, as in reauth: the IdP step-up passes a first-seen address's challenge.
-        await self._mark_login_address_known(user.id, client, if_satisfied=token_hash)
         grant_refused = purpose is not None and await self._factor_binding_is_blocked_hash(
             token_hash, purpose
         )
@@ -4018,6 +4010,9 @@ class AuthService:
         elevation = await self._elevated_hash(
             token_hash, ceremony="reauth_oidc", actor=user.username, client=client
         )
+        if elevation.ok:
+            # vault BACKLOG #2145, as in reauth.
+            await self._mark_login_address_known(user.id, client, step_up=True)
         if purpose is not None and not grant_refused and elevation.token is not None:
             # (3) The purpose-bound grant, against the NEW hash.
             self._grant_action_step_up(hash_token(elevation.token), purpose)
@@ -4426,7 +4421,10 @@ class AuthService:
             # vault BACKLOG #2145, closing the #2156 review's R1-1: only a directory sign-in that owes
             # nothing more marks its address known. The audit baseline this replaced counted a
             # directory row that still owed a factor, because that row carries no marker of it.
-            if address in _DIRECTORY_VERDICTS_THAT_SEED_THE_BASELINE:
+            # NEW is written too: no directory session is ever seeded, so withholding the write
+            # would challenge nothing and would only repeat the notice at every sign-in from an
+            # address its owner keeps using. A failed read is no evidence, so it writes nothing.
+            if address is not _LoginAddress.UNEVALUATED_READ_FAILED:
                 await self._mark_login_address_known(user.id, client)
         return LoginOutcome(
             ok=True,
@@ -6547,11 +6545,6 @@ class AuthService:
             # Re-anchor the session to the address it re-verified from, so a forced step-up triggered
             # by a roamed/new client IP (WP-L3-13) clears once the caller re-proves from there.
             await self._store.mark_session_reauthed(hash_token(token), client=client)
-            # vault BACKLOG #2145: a step-up on a session that owes no factor is how a first-seen
-            # address passes its challenge, so it becomes known. Asked against the OLD hash.
-            await self._mark_login_address_known(
-                identity.user_id, client, if_satisfied=hash_token(token)
-            )
             # `_factor_binding_is_blocked` resolves the session BY THE OLD TOKEN and fails closed when
             # it cannot find it, so it is decided here, BEFORE the rotation retires that token --
             # asking after would refuse every such grant on a session that is perfectly fine. It
@@ -6563,6 +6556,10 @@ class AuthService:
             elevation = await self._elevated(
                 token, ceremony="reauth", actor=identity.username, client=client
             )
+            if elevation.ok:
+                # vault BACKLOG #2145: a step-up on an account that owes no factor is how a
+                # first-seen address passes its challenge, so it becomes known.
+                await self._mark_login_address_known(identity.user_id, client, step_up=True)
             if purpose is not None and not grant_refused and elevation.token is not None:
                 # (3) Purpose-bound grants are minted AFTER, against the NEW hash -- minted against the
                 # old one they would be stranded on a hash nothing resolves any more.
@@ -6945,7 +6942,12 @@ class AuthService:
         return _LoginAddress.NEW
 
     async def _mark_login_address_known(
-        self, user_id: str, client: str | None, *, if_satisfied: str | None = None
+        self,
+        user_id: str,
+        client: str | None,
+        *,
+        step_up: bool = False,
+        enrolment: UserRecord | None = None,
     ) -> None:
         """Add ``client`` to the account's known-address record, the baseline
         :meth:`_classify_login_address` reads (vault BACKLOG #2145).
@@ -6959,36 +6961,61 @@ class AuthService:
           address is not written there: that sign-in's challenge is the step-up it has not done yet;
         * a directory sign-in that owes nothing more, NEW included, because no directory session is
           seeded whatever the verdict, so there is no challenge to bypass;
-        * a second factor proved at the MFA gate (``verify_mfa``, ``finish_webauthn_assertion``);
+        * a second factor proved at the MFA gate (``verify_mfa``, ``finish_webauthn_assertion``),
+          once the session has rotated;
         * a first factor enrolment confirmed (``confirm_mfa_enrollment``,
           ``finish_webauthn_registration``), which is how a first sign-in under ``require_mfa``
-          finishes;
-        * a step-up re-proof (``reauth``, ``complete_oidc_step_up``) on a session whose second factor
-          is satisfied. That is how a first-seen address on a no-factor sign-in passes its
-          challenge. Those two callers pass the session's hash as ``if_satisfied``, and the check
-          runs here, inside the guard, so a failed read cannot break the step-up's ordered steps.
+          finishes. Those callers pass the account as ``enrolment``, and an address that classifies
+          NEW is not written: ADR 0197 Amendment A lets a holder of the password alone enrol an
+          authenticator they control, so the enrolment proves nothing about the address;
+        * a step-up re-proof (``reauth``, ``complete_oidc_step_up``), once the session has rotated,
+          with ``step_up`` set. It writes only for an account that owes no second factor. That is
+          how a first-seen address on a no-factor sign-in passes its challenge. An account that owes
+          a factor passes it at the factor legs instead, so a password-only step-up from a roamed
+          session cannot plant its address.
 
         Best-effort and never refusing: a failed read or write is logged, and the sign-in it records
-        has already succeeded. The cost of a lost write is one extra challenge and notice later. A
-        host key longer than ``_LOGIN_ADDRESS_KEY_MAX`` UTF-16 code units is not written. The write
-        also prunes the account's rows older than the lookback, which is the record's only
-        retention."""
+        has already succeeded. A lost write costs a challenge and notice at the next sign-in from
+        that address, and on the local no-factor leg at every one until a step-up records it. A host
+        key longer than ``_LOGIN_ADDRESS_KEY_MAX`` UTF-16 code units is not written. Each write is
+        followed by a prune of the account's rows older than the lookback, the record's only
+        retention, in its own call, so a failed prune never reads as a lost write.
+
+        The catches are broad for the reason :meth:`_classify_login_address` states, except that a
+        programming error (``AttributeError``, ``TypeError``) is re-raised rather than logged."""
         if not client:
             return
-        key = _host_key(client)
-        if len(key.encode("utf-16-le")) // 2 > _LOGIN_ADDRESS_KEY_MAX:
-            return
-        now = time.time()
         try:
-            if if_satisfied is not None and not await self._mfa_satisfied_hash(if_satisfied):
+            key = _host_key(client)
+            if len(key.encode("utf-16-le")) // 2 > _LOGIN_ADDRESS_KEY_MAX:
                 return
-            await self._store.remember_login_address(
-                user_id, key, now=now, forget_before=now - _LOGIN_ADDRESS_LOOKBACK_SECONDS
-            )
+            if step_up:
+                user = await self._store.get_user(user_id)
+                if user is None or await self._unverified_session_owes_factor(user):
+                    return
+            if enrolment is not None and (
+                await self._classify_login_address(enrolment, client)
+                not in _LOGIN_VERDICTS_THAT_SEED_THE_BASELINE
+            ):
+                return
+            now = time.time()
+            await self._store.remember_login_address(user_id, key, now=now)
+        except (AttributeError, TypeError):
+            raise
         except Exception:
-            # Broad for the reason _classify_login_address states: each backend raises its own
-            # driver's classes, and auth/ may import none of them.
             _log.exception("could not record a known sign-in address; the sign-in stands")
+            return
+        try:
+            await self._store.forget_login_addresses(
+                user_id, before=now - _LOGIN_ADDRESS_LOOKBACK_SECONDS
+            )
+        except (AttributeError, TypeError):
+            raise
+        except Exception:
+            _log.warning(
+                "could not prune old known sign-in addresses; the address itself was recorded",
+                exc_info=True,
+            )
 
     def _login_new_ip_notice_due(self, user_id: str, client: str | None) -> bool:
         """At most one ``login_new_ip`` notice per (account, address) per
@@ -7479,8 +7506,9 @@ class AuthService:
             return elevation
         await self._store.enable_totp(identity.user_id, recovery_code_hashes=hashes)
         # vault BACKLOG #2145: a first sign-in under require_mfa finishes HERE, so without this it
-        # left no baseline and the account's next sign-in failed open again.
-        await self._mark_login_address_known(identity.user_id, client)
+        # left no baseline and the account's next sign-in failed open again. Not for a NEW
+        # address: see _mark_login_address_known.
+        await self._mark_login_address_known(identity.user_id, client, enrolment=user)
         await self._audit("auth.mfa_enrolled", actor=identity.username, client=client)
         # ADR 0197 Amendment A: enrolment now comes BEFORE the first rotation, so whoever intercepts
         # an issued credential can enrol their own authenticator without rotating. The notice to a
@@ -7589,11 +7617,14 @@ class AuthService:
                 # step-up.
                 await self._store.mark_session_reauthed(hash_token(token), client=client)
                 await self._store.record_login_success(user.id, now=now)
-                await self._mark_login_address_known(user.id, client)
                 await self._audit("auth.mfa_verified", actor=user.username, client=client)
-                return await self._elevated(
+                elevation = await self._elevated(
                     token, ceremony="mfa_verify", actor=user.username, client=client
                 )
+                if elevation.ok:
+                    # vault BACKLOG #2145: the factor is proved from this address.
+                    await self._mark_login_address_known(user.id, client)
+                return elevation
             # Wrong code: register the failure through the SAME machinery the password path uses, so
             # the per-account lockout + ACCOUNT_LOCKED notification fire on sustained MFA guessing.
             # On the SECOND-STEP counter: the caller holds a session, so it has proved the first step.
@@ -8101,7 +8132,7 @@ class AuthService:
         )
         if elevation.ok:
             # vault BACKLOG #2145, as in confirm_mfa_enrollment.
-            await self._mark_login_address_known(identity.user_id, client)
+            await self._mark_login_address_known(identity.user_id, client, enrolment=user)
         await self._audit(
             "auth.webauthn_enrolled",
             actor=identity.username,
@@ -8279,11 +8310,14 @@ class AuthService:
         # ``verify_mfa`` is -- though this write targets the USER row, not the session, so it is
         # ordering by parity rather than by necessity.
         await self._store.record_login_success(user.id, now=now)
-        await self._mark_login_address_known(user.id, client)
         await self._audit("auth.webauthn_verified", actor=user.username, client=client)
-        return await self._elevated(
+        elevation = await self._elevated(
             token, ceremony="webauthn_assert", actor=user.username, client=client
         )
+        if elevation.ok:
+            # vault BACKLOG #2145, as in verify_mfa.
+            await self._mark_login_address_known(user.id, client)
+        return elevation
 
     async def delete_webauthn_credential(
         self, identity: Identity, credential_id_hash: str, *, client: str | None = None

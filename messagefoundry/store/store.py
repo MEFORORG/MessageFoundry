@@ -11714,11 +11714,9 @@ class MessageStore:
             rows = await cur.fetchall()
         return [str(r["address"]) for r in rows]
 
-    async def remember_login_address(
-        self, user_id: str, address: str, *, now: float, forget_before: float
-    ) -> None:
+    async def remember_login_address(self, user_id: str, address: str, *, now: float) -> None:
         """See :meth:`messagefoundry.store.base.AuthStore.remember_login_address`."""
-        async with _writer_txn(self._db, self._lock):
+        async with _writer_guard(self._db, self._lock):
             await self._db.execute(
                 "INSERT INTO known_login_addresses (user_id, address, first_seen, last_seen)"
                 " VALUES (?, ?, ?, ?)"
@@ -11726,9 +11724,14 @@ class MessageStore:
                 " DO UPDATE SET last_seen=MAX(last_seen, excluded.last_seen)",
                 (user_id, address, now, now),
             )
+            await self._commit()
+
+    async def forget_login_addresses(self, user_id: str, *, before: float) -> None:
+        """See :meth:`messagefoundry.store.base.AuthStore.forget_login_addresses`."""
+        async with _writer_guard(self._db, self._lock):
             await self._db.execute(
                 "DELETE FROM known_login_addresses WHERE user_id=? AND last_seen<?",
-                (user_id, forget_before),
+                (user_id, before),
             )
             await self._commit()
 

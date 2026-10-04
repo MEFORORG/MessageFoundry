@@ -7767,11 +7767,9 @@ class PostgresStore:
         )
         return [str(r["address"]) for r in rows]
 
-    async def remember_login_address(
-        self, user_id: str, address: str, *, now: float, forget_before: float
-    ) -> None:
+    async def remember_login_address(self, user_id: str, address: str, *, now: float) -> None:
         """See :meth:`messagefoundry.store.base.AuthStore.remember_login_address`."""
-        async with self._timed_acquire() as conn, conn.transaction():
+        async with self._timed_acquire() as conn:
             await conn.execute(
                 "INSERT INTO known_login_addresses (user_id, address, first_seen, last_seen)"
                 " VALUES ($1, $2, $3, $3)"
@@ -7781,11 +7779,14 @@ class PostgresStore:
                 address,
                 now,
             )
-            await conn.execute(
-                "DELETE FROM known_login_addresses WHERE user_id=$1 AND last_seen<$2",
-                user_id,
-                forget_before,
-            )
+
+    async def forget_login_addresses(self, user_id: str, *, before: float) -> None:
+        """See :meth:`messagefoundry.store.base.AuthStore.forget_login_addresses`."""
+        await self._execute(
+            "DELETE FROM known_login_addresses WHERE user_id=$1 AND last_seen<$2",
+            user_id,
+            before,
+        )
 
     async def delete_user(self, user_id: str) -> None:
         async with self._timed_acquire() as conn, conn.transaction():

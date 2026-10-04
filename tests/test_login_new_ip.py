@@ -541,12 +541,13 @@ async def test_a_password_step_row_that_still_owed_a_factor_is_not_a_baseline() 
         assert len(await store.list_audit(actor="oper", action="auth.login_new_ip")) == 2
         # The audit row is written every time; the notice is debounced per account.
         assert len(_new_ip_notices(notifier)) == 1
-        # vault BACKLOG #2145: a first factor enrolment confirmed from that address finishes the
-        # sign-in, and is what makes it known. The audit baseline left no trace of it.
+        # vault BACKLOG #2145: nor does enrolling a factor from it. ADR 0197 Amendment A lets a
+        # holder of the password alone enrol an authenticator they control, so an enrolment from a
+        # NEW address proves nothing about the address and writes nothing.
         assert second.identity is not None and second.token is not None
         await _enrol_totp(owed, second.identity, second.token, client="203.0.113.5")
         assert (await owed.login("oper", PW, client="203.0.113.5")).ok
-        assert len(await store.list_audit(actor="oper", action="auth.login_new_ip")) == 2
+        assert len(await store.list_audit(actor="oper", action="auth.login_new_ip")) == 3
     finally:
         await store.close()
 
@@ -584,7 +585,7 @@ async def test_a_second_new_address_inside_the_debounce_window_is_still_notified
         await owed.initialize()
         uid = await _operator(owed)
         # A known address that is neither of the two below, so both read as NEW.
-        await store.remember_login_address(uid, "10.1.1.1", now=time.time(), forget_before=0.0)
+        await store.remember_login_address(uid, "10.1.1.1", now=time.time())
         assert (await owed.login("oper", PW, client="203.0.113.5")).ok
         assert (await owed.login("oper", PW, client="203.0.113.6")).ok
         assert [e.client_ip for e in _new_ip_notices(notifier)] == ["203.0.113.5", "203.0.113.6"]
@@ -840,8 +841,8 @@ async def test_an_enrolment_baseline_outlives_the_lookback(monkeypatch: pytest.M
 async def test_a_failed_read_in_the_step_up_gate_does_not_break_the_step_up(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The step-up asks whether the session's factor is satisfied before it records the address. A
-    store fault in that read is the record's to swallow: the step-up itself still succeeds."""
+    """The step-up asks whether the account owes a factor before it records the address. A store
+    fault in that read is the record's to swallow: the step-up itself still succeeds."""
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store, _FakeNotifier())
@@ -850,20 +851,54 @@ async def test_a_failed_read_in_the_step_up_gate_does_not_break_the_step_up(
         out = await service.login("oper", PW, client="198.51.100.70")
         assert out.ok and out.identity is not None and out.token is not None
 
-        real = service._mfa_satisfied_hash
         calls = 0
 
-        async def _flaky(token_hash: str) -> bool:
+        async def _broken(user: object) -> bool:
             nonlocal calls
             calls += 1
-            if calls == 1:
-                raise RuntimeError("synthetic store fault")
-            return await real(token_hash)
+            raise RuntimeError("synthetic store fault")
 
-        monkeypatch.setattr(service, "_mfa_satisfied_hash", _flaky)
+        monkeypatch.setattr(service, "_unverified_session_owes_factor", _broken)
         stepped = await service.reauth(out.identity, PW, token=out.token, client="198.51.100.70")
         assert stepped.ok
-        assert calls >= 1
+        assert calls == 1
+        assert await store.list_known_login_addresses(uid, since=0.0) == ["10.1.1.1"]
+    finally:
+        await store.close()
+
+
+async def test_a_password_step_up_on_an_account_that_owes_a_factor_records_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session whose factor was proved at one address, then used from another, steps up there with
+    the password alone. That proves no factor from the new address, so it must not plant it: the
+    account owes a factor, and only a factor leg records its addresses."""
+    store = await MessageStore.open(":memory:")
+    try:
+        owed = AuthService(
+            store,
+            AuthSettings(
+                require_mfa=True, mfa_verify_min_elapsed_seconds=0, mfa_recovery_code_count=1
+            ),
+            security_notifier=_FakeNotifier(),
+        )
+        await owed.initialize()
+        uid = await _operator(owed)
+        t0 = 1_000_000.0
+        pin_totp_clock(monkeypatch, t0)
+        first = await owed.login("oper", PW, client="10.1.1.1")
+        assert first.ok and first.identity is not None and first.token is not None
+        secret = await _enrol_totp(owed, first.identity, first.token, client="10.1.1.1", now=t0)
+        signed = await owed.login("oper", PW, client="10.1.1.1")
+        assert signed.ok and signed.token is not None and signed.identity is not None
+        t1 = t0 + totp.DEFAULT_PERIOD
+        pin_totp_clock(monkeypatch, t1)
+        verified = await owed.verify_mfa(signed.token, totp.totp(secret, now=t1), client="10.1.1.1")
+        assert verified.ok and verified.token is not None
+        stepped = await owed.reauth(
+            signed.identity, PW, token=verified.token, client="203.0.113.40"
+        )
+        assert stepped.ok
         assert await store.list_known_login_addresses(uid, since=0.0) == ["10.1.1.1"]
     finally:
         await store.close()

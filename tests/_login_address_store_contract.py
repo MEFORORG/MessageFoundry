@@ -31,8 +31,8 @@ async def _assert_login_address_contract(store: Any) -> None:
 
     assert await store.list_known_login_addresses("ka-u1", since=0.0) == []
 
-    await store.remember_login_address("ka-u1", "192.0.2.1", now=1000.0, forget_before=0.0)
-    await store.remember_login_address("ka-u2", "192.0.2.1", now=1000.0, forget_before=0.0)
+    await store.remember_login_address("ka-u1", "192.0.2.1", now=1000.0)
+    await store.remember_login_address("ka-u2", "192.0.2.1", now=1000.0)
     assert await store.list_known_login_addresses("ka-u1", since=0.0) == ["192.0.2.1"]
 
     # The read honours the lookback: a row last seen before ``since`` is not returned.
@@ -41,31 +41,33 @@ async def _assert_login_address_contract(store: Any) -> None:
 
     # A second write of the same key is an upsert that moves ``last_seen``, never a second row or a
     # key collision.
-    await store.remember_login_address("ka-u1", "192.0.2.1", now=2000.0, forget_before=0.0)
+    await store.remember_login_address("ka-u1", "192.0.2.1", now=2000.0)
     assert await store.list_known_login_addresses("ka-u1", since=1500.0) == ["192.0.2.1"]
     # ``last_seen`` never moves back: a late write carrying an older clock (another engine shard,
     # or a delayed write) must not age a still-used address out of the lookback early.
-    await store.remember_login_address("ka-u1", "192.0.2.1", now=1200.0, forget_before=0.0)
+    await store.remember_login_address("ka-u1", "192.0.2.1", now=1200.0)
     assert await store.list_known_login_addresses("ka-u1", since=1500.0) == ["192.0.2.1"]
 
     # Keys compare byte for byte on every backend, so case is significant. The service writes only
     # canonical host keys; this pins that the store does not fold them a second way.
-    await store.remember_login_address("ka-u1", "Host-A", now=2000.0, forget_before=0.0)
-    await store.remember_login_address("ka-u1", "host-a", now=2000.0, forget_before=0.0)
+    await store.remember_login_address("ka-u1", "Host-A", now=2000.0)
+    await store.remember_login_address("ka-u1", "host-a", now=2000.0)
     assert sorted(await store.list_known_login_addresses("ka-u1", since=0.0)) == [
         "192.0.2.1",
         "Host-A",
         "host-a",
     ]
 
-    # The prune deletes only THIS account's rows older than ``forget_before``.
-    await store.remember_login_address("ka-u1", "198.51.100.9", now=5000.0, forget_before=3000.0)
+    # The prune deletes only THIS account's rows older than ``before``.
+    await store.remember_login_address("ka-u1", "198.51.100.9", now=5000.0)
+    await store.forget_login_addresses("ka-u1", before=3000.0)
     assert await store.list_known_login_addresses("ka-u1", since=0.0) == ["198.51.100.9"]
     assert await store.list_known_login_addresses("ka-u2", since=0.0) == ["192.0.2.1"]
 
-    # A write whose own ``now`` is older than ``forget_before`` keeps nothing for that account.
-    await store.remember_login_address("ka-u2", "203.0.113.4", now=6000.0, forget_before=7000.0)
+    # A prune past every row empties the account, and one on an empty account is a no-op.
+    await store.forget_login_addresses("ka-u2", before=7000.0)
     assert await store.list_known_login_addresses("ka-u2", since=0.0) == []
+    await store.forget_login_addresses("ka-u2", before=7000.0)
 
     # Deleting the account deletes its rows; a re-created namesake under a new id inherits none.
     await store.delete_user("ka-u1")

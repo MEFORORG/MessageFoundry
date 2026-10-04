@@ -11560,17 +11560,10 @@ class SqlServerStore:
         )
         return [str(d["address"]) for d in rows]
 
-    async def remember_login_address(
-        self, user_id: str, address: str, *, now: float, forget_before: float
-    ) -> None:
+    async def remember_login_address(self, user_id: str, address: str, *, now: float) -> None:
         """See :meth:`messagefoundry.store.base.AuthStore.remember_login_address`. ``HOLDLOCK``
         makes the MERGE's match-then-insert one decision, so two concurrent sign-ins from one host
-        cannot both take the insert branch and collide on the key.
-
-        The prune commits SEPARATELY from the upsert, on this backend only. In one transaction, two
-        writes for one account from different hosts each held a range lock from its MERGE while
-        its DELETE scanned into the other's key, which is a deadlock cycle. Apart, a lost prune
-        only leaves rows the reader already ignores, until the next write."""
+        cannot both take the insert branch and collide on the key."""
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
@@ -11585,14 +11578,16 @@ class SqlServerStore:
                     (user_id, address, now),
                 )
                 await self._commit(conn)
-                await cur.execute(
-                    "DELETE FROM known_login_addresses WHERE user_id=? AND last_seen<?",
-                    (user_id, forget_before),
-                )
-                await self._commit(conn)
             except Exception:
                 await conn.rollback()
                 raise
+
+    async def forget_login_addresses(self, user_id: str, *, before: float) -> None:
+        """See :meth:`messagefoundry.store.base.AuthStore.forget_login_addresses`."""
+        await self._execute(
+            "DELETE FROM known_login_addresses WHERE user_id=? AND last_seen<?",
+            (user_id, before),
+        )
 
     async def delete_user(self, user_id: str) -> None:
         async with self._acquire() as conn, self._cursor(conn) as cur:

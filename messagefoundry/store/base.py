@@ -2004,14 +2004,15 @@ class AuthStore(Protocol):
     # The addresses the account finished a sign-in from with ``last_seen >= since``, in no order.
     async def list_known_login_addresses(self, user_id: str, *, since: float) -> list[str]: ...
 
-    # Upsert one address (``first_seen`` kept, ``last_seen`` moved forward to ``now`` and never back),
-    # then delete this account's rows with ``last_seen < forget_before``. The delete is the table's
-    # only retention: a row outside the reader's lookback can never match, so it is not kept. It may
-    # commit apart from the upsert (SQL Server does, to avoid a deadlock); a lost prune leaves only
-    # rows the reader already ignores. The account's deletion cascades to its rows.
-    async def remember_login_address(
-        self, user_id: str, address: str, *, now: float, forget_before: float
-    ) -> None: ...
+    # Upsert one address: ``first_seen`` kept, ``last_seen`` moved forward to ``now`` and never back.
+    # The account's deletion cascades to its rows.
+    async def remember_login_address(self, user_id: str, address: str, *, now: float) -> None: ...
+
+    # Delete this account's rows with ``last_seen < before``: the table's only retention, since a
+    # row outside the reader's lookback can never match. A separate call and transaction from the
+    # upsert, because in one transaction two writes for one account from different hosts could each
+    # lock its own row and then wait on the other's in the prune, a deadlock on both server backends.
+    async def forget_login_addresses(self, user_id: str, *, before: float) -> None: ...
 
     # --- MFA: native TOTP second factor (local accounts, WP-14) --------------
     async def set_totp_secret(
