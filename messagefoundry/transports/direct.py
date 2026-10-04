@@ -115,20 +115,6 @@ _BUILD_ERRORS: tuple[type[Exception], ...] = (
 )
 
 
-def _as_recipients(value: Any) -> list[str]:
-    """Coerce the ``recipients`` setting to a non-empty list of Direct address strings (a lone string
-    is one recipient). Mirrors :func:`messagefoundry.transports.email._as_recipients`."""
-    if isinstance(value, str):
-        recipients = [value] if value else []
-    elif isinstance(value, (list, tuple)):
-        recipients = [str(item) for item in value if str(item)]
-    else:
-        recipients = []
-    if not recipients:
-        raise ValueError("Direct destination requires a non-empty 'recipients' setting")
-    return recipients
-
-
 def _read_file(setting: str, value: Any) -> bytes:
     """Read a PEM/DER material file named by a required setting. PHI/secret-safe errors: the setting
     name and the OS error class only, never the file *contents* (a private key)."""
@@ -250,12 +236,12 @@ class DirectDestination(DestinationConnector):
         self.host = host
         self.port = int(s.get("port", 587))
         self.sender = sender
-        self.recipients = _as_recipients(s.get("recipients"))
         # The Email destination's address rule, for the sender and each recipient, with the headers
         # built from the checked text. MAIL FROM and RCPT TO are then passed explicitly at send, so a
         # header parse that decodes an encoded word or expands a group cannot move the envelope
         # (vault BACKLOG #2870). Checked before the crypto material, so _probe_build uses it too.
-        self._envelope = checked_envelope("Direct destination", self.sender, self.recipients)
+        self._envelope = checked_envelope("Direct destination", sender, s.get("recipients"))
+        self.recipients = list(self._envelope.recipients)
         self.subject = str(s.get("subject", ""))
         username = s.get("username")
         password = s.get("password")

@@ -53,8 +53,8 @@ from messagefoundry.transports.direct import DirectDestination
 from tests.test_email_destination import (
     _ALL_ATEXT_SENDER,
     _NORMALISED_RECIPIENTS,
-    _RECIPIENT_SHAPES,
-    _SENDER_SHAPES,
+    _REFUSED_ADDRESS_IDS,
+    _REFUSED_ADDRESSES,
     _WireCapture,
 )
 
@@ -502,9 +502,8 @@ async def test_direct_envelope_does_not_follow_the_headers(
 
 @pytest.mark.parametrize(
     "field, value",
-    [("sender", v) for v in _SENDER_SHAPES.values()]
-    + [("recipients", v) for v in _RECIPIENT_SHAPES.values()],
-    ids=[f"sender-{k}" for k in _SENDER_SHAPES] + [f"recipient-{k}" for k in _RECIPIENT_SHAPES],
+    _REFUSED_ADDRESSES,
+    ids=_REFUSED_ADDRESS_IDS,
 )
 def test_direct_refuses_an_address_that_is_not_one_plain_mailbox_before_any_connection(
     monkeypatch: pytest.MonkeyPatch,

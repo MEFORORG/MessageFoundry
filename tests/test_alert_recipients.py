@@ -31,8 +31,8 @@ from tests.test_email_destination import (
     _ALL_ATEXT_SENDER,
     _ENCODED_LOCAL,
     _NORMALISED_RECIPIENTS,
-    _RECIPIENT_SHAPES,
-    _SENDER_SHAPES,
+    _REFUSED_ADDRESS_IDS,
+    _REFUSED_ADDRESSES,
     _WireCapture,
 )
 
@@ -226,15 +226,7 @@ def test_alert_envelope_does_not_follow_the_headers(
     assert wire.rcpt_lines == [b"rcpt to:<ops@hospital.example>"]
 
 
-_REFUSED = [("sender", v) for v in _SENDER_SHAPES.values()] + [
-    ("recipients", v) for v in _RECIPIENT_SHAPES.values()
-]
-_REFUSED_IDS = [f"sender-{k}" for k in _SENDER_SHAPES] + [
-    f"recipient-{k}" for k in _RECIPIENT_SHAPES
-]
-
-
-@pytest.mark.parametrize("field, value", _REFUSED, ids=_REFUSED_IDS)
+@pytest.mark.parametrize("field, value", _REFUSED_ADDRESSES, ids=_REFUSED_ADDRESS_IDS)
 def test_alert_send_refuses_an_address_that_is_not_one_plain_mailbox_before_any_connection(
     wire: _WireCapture, field: str, value: str
 ) -> None:
@@ -247,7 +239,7 @@ def test_alert_send_refuses_an_address_that_is_not_one_plain_mailbox_before_any_
     assert wire.mail_lines == []
 
 
-@pytest.mark.parametrize("field, value", _REFUSED, ids=_REFUSED_IDS)
+@pytest.mark.parametrize("field, value", _REFUSED_ADDRESSES, ids=_REFUSED_ADDRESS_IDS)
 def test_email_transport_refuses_the_same_addresses_at_construction(field: str, value: str) -> None:
     sender = value if field == "sender" else "engine@hospital.example"
     recipients = [value] if field == "recipients" else ["ops@hospital.example"]

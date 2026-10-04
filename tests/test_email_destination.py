@@ -829,7 +829,7 @@ async def test_the_mail_from_line_and_from_header_name_exactly_the_checked_sende
     wire: _WireCapture,
 ) -> None:
     # Every character the allowlist admits, so a decoding or quoting step would show here.
-    sender = "a#b$c&d'e*f+g-h^i_j`k{l}m~n.o@Hospital.example"
+    sender = _ALL_ATEXT_SENDER
     dest = _wire_dest(wire.port, ["a@hospital.example"], sender=sender)
     check_egress_allowed(dest, _wire_egress(wire.port))
     await EmailDestination(dest).send("PID|1|synthetic")
@@ -912,6 +912,14 @@ def _recipient_shapes() -> dict[str, str]:
 
 
 _RECIPIENT_SHAPES = _recipient_shapes()
+
+#: Both tables as (setting, value) pairs, for a test that refuses either half of the envelope.
+_REFUSED_ADDRESSES = [("sender", v) for v in _SENDER_SHAPES.values()] + [
+    ("recipients", v) for v in _RECIPIENT_SHAPES.values()
+]
+_REFUSED_ADDRESS_IDS = [f"sender-{k}" for k in _SENDER_SHAPES] + [
+    f"recipient-{k}" for k in _RECIPIENT_SHAPES
+]
 
 #: Every character the local-part allowlist admits, so a decoding or quoting step would show.
 _ALL_ATEXT_SENDER = "a#b$c&d'e*f+g-h^i_j`k{l}m~n.o@Hospital.example"

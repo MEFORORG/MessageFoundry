@@ -1526,6 +1526,9 @@ def notifier_from_settings(
     # refuses at startup and names the keys to add. A rule that names NO transport is unaffected and
     # still starts, which is what keeps the ordinary "rules but no [alerts] block yet" path working.
     configured = {t.name for t in transports}
+    # A rule's or a tier's recipient override goes to the same send, so it gets the same address
+    # check here rather than at the first alert it matches (vault BACKLOG #2870).
+    email_sender = alerts.email_from if "email" in configured else None
     for i, rule in enumerate(alerts.rules):
         unknown = [t for t in (rule.transports or []) if t not in configured]
         if unknown:
@@ -1533,17 +1536,8 @@ def notifier_from_settings(
                 f"[alerts].rules[{i}] routes to unconfigured transport(s) {unknown}; "
                 f"configured: {sorted(configured)}"
             )
-        if alerts.email_from and "email" in configured:
-            # A rule's or a tier's recipient override goes to the same send, so it gets the same
-            # address check now rather than at the first alert it matches (vault BACKLOG #2870).
-            overrides = [(f"[alerts].rules[{i}]", rule.recipients)]
-            overrides += [
-                (f"[alerts].rules[{i}].escalate[{j}]", step.recipients)
-                for j, step in enumerate(rule.escalate)
-            ]
-            for where, recipients in overrides:
-                if recipients:
-                    checked_envelope(where, alerts.email_from, recipients)
+        if email_sender and rule.recipients:
+            checked_envelope(f"[alerts].rules[{i}]", email_sender, rule.recipients)
         # #81 (ADR 0133): an escalation tier's transport override must also name only configured transports.
         for j, step in enumerate(rule.escalate):
             unknown_tier = [t for t in (step.transports or []) if t not in configured]
@@ -1552,6 +1546,9 @@ def notifier_from_settings(
                     f"[alerts].rules[{i}].escalate[{j}] routes to unconfigured transport(s) "
                     f"{unknown_tier}; configured: {sorted(configured)}"
                 )
+            if email_sender and step.recipients:
+                where = f"[alerts].rules[{i}].escalate[{j}]"
+                checked_envelope(where, email_sender, step.recipients)
     if not transports:
         if alerts.rules:
             # Every rule here names no transport (one that did would have raised above), so this is not
