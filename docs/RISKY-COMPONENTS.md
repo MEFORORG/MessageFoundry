@@ -249,9 +249,8 @@ harness's process, not a Python exception.
 ### What the ASVS reading shows for these names, and what it cannot show
 
 The generated reading further down reads these names with every other component on this page, on
-all three of ASVS's examples. Its last table is *The names the assessed extras add*. For each name
-it gives the pinned version, the newest release, the count of advisories read under the name, and
-the examples it is risky on.
+all three of ASVS's examples. Its last table is *The names the assessed extras add*, and it has a
+row for each of these names.
 
 The results are stated there and not copied here, so a later re-read cannot leave this section
 behind.
@@ -267,6 +266,10 @@ they carry. A name in that reading's *Not risky on any of the three* table is un
 
 That is a limit of the instrument, and this page does not close it. A reader who needs the Qt side
 has to check Qt's own security notices against the Qt version the pinned wheels carry.
+
+The pins to check are the ones in
+[`security/runtime-closure-harness.txt`](../security/runtime-closure-harness.txt). The table's
+pinned column is the pin on the snapshot date, and a later lock bump does not move it.
 
 ## Risky by ASVS's own examples, read from public data
 
@@ -310,9 +313,8 @@ System. An advisory with neither does not count. The ones in the window are name
 can judge them.
 
 OSV matches an advisory to a component by its PyPI name. A flaw in code a wheel carries inside it,
-such as a compiled library, shows up here only when an advisory names the PyPI package. So where a
-component has no advisory below, OSV lists none under that name. That does not show the code inside
-its wheel is free of known flaws.
+such as a compiled library, shows up here only when an advisory names the PyPI package. So nothing
+below shows that the code inside a wheel is free of known flaws.
 
 These tests are mechanical. A small library that is finished can trip the first one without being
 neglected. The reading says where to look; it does not say the library is broken.

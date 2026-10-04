@@ -19,10 +19,9 @@ exposure criterion did not designate it. Each reading records which extras add i
 closure the page assesses and this script does not read turns that test red.
 
 OSV MATCHES AN ADVISORY BY PYPI NAME. A flaw in code a wheel carries inside it, such as a compiled
-library, is counted only where an advisory names the PyPI package. So a reading with no advisory
-means OSV lists none under that name, never that the wheel's contents have no known flaw. The
-rendered section says so, and the page's ``harness`` section says what it means for the Qt inside
-that extra's wheels.
+library, is counted only where an advisory names the PyPI package. So no reading here can show
+that a wheel's contents are free of known flaws. The rendered section says so, and the page's
+``harness`` section says what it means for the Qt inside that extra's wheels.
 
 THE SOURCES, and nothing else:
 
@@ -618,7 +617,7 @@ def render_section(data: Mapping[str, Any], labels: Mapping[str, str]) -> str:
     as_of = dt.date.fromisoformat(data["snapshot_date"])
     readings = data["readings"]
     size = len(readings)
-    core = sum(not r["added_by"] for r in readings)
+    added = [r for r in readings if r["added_by"]]
     additions = {
         extra: [f"`{r['name']}`" for r in readings if extra in r["added_by"]]
         for extra in data["population"]["extras"]
@@ -643,8 +642,8 @@ def render_section(data: Mapping[str, Any], labels: Mapping[str, str]) -> str:
         "",
         "### What is read, and the test for each example",
         "",
-        f"All {size} distributions this page assesses are read: the {core} in the core closure "
-        f"and the {size - core} that the assessed extras add to it. "
+        f"All {size} distributions this page assesses are read: the {size - len(added)} in the "
+        f"core closure and the {len(added)} that the assessed extras add to it. "
         + " ".join(
             f"The `{extra}` extra adds {len(names)}"
             + (f": {_series(names, 'and')}." if names else ".")
@@ -679,8 +678,8 @@ def render_section(data: Mapping[str, Any], labels: Mapping[str, str]) -> str:
         "",
         "OSV matches an advisory to a component by its PyPI name. A flaw in code a wheel carries "
         "inside it, such as a compiled library, shows up here only when an advisory names the "
-        "PyPI package. So where a component has no advisory below, OSV lists none under that "
-        "name. That does not show the code inside its wheel is free of known flaws.",
+        "PyPI package. So nothing below shows that the code inside a wheel is free of known "
+        "flaws.",
         "",
         "These tests are mechanical. A small library that is finished can trip the first one "
         "without being neglected. The reading says where to look; it does not say the library is "
@@ -837,7 +836,6 @@ def render_section(data: Mapping[str, Any], labels: Mapping[str, str]) -> str:
         )
     else:
         out.append("Every component risky on an ASVS example is also designated above.")
-    added = [r for r in readings if r["added_by"]]
     if added:
         out += [
             "",

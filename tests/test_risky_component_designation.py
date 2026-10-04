@@ -432,8 +432,9 @@ def test_the_harness_section_rests_on_the_generated_reading() -> None:
     assert f"*{_EXTRA_NAMES.removeprefix('### ')}*" in section, (
         "the harness section no longer names the rendered table that carries its readings"
     )
-    *head, last = (f"`{name}`" for name in sorted(_additions(_HARNESS_CLOSURE)))
-    names = f"{', '.join(head)} or {last}"
+    additions = sorted(_additions(_HARNESS_CLOSURE))
+    assert additions, f"{_HARNESS_CLOSURE.name} adds nothing to the core closure"
+    names = _listed(additions, "or")
     assert f"it counted no advisory naming the {names} PyPI packages" in section, (
         f"the harness section's statement of what a 0 means does not name {names}"
     )
@@ -715,6 +716,23 @@ _AXIS_WORDS = {
     "support": "support",
     "advisory_history": "vulnerability history",
 }
+#: The columns of the table under ``_EXTRA_NAMES``, in order. Its header row is held to these.
+_EXTRA_COLUMNS = (
+    "Component",
+    "Added by",
+    "Pinned",
+    "Newest release",
+    "Advisories counted under the name",
+    "Risky on",
+)
+
+
+def _listed(names: list[str], joiner: str) -> str:
+    """Backticked names as "`a`, `b` <joiner> `c`". This module's own, not the generator's."""
+    *head, last = (f"`{name}`" for name in names)
+    return f"{', '.join(head)} {joiner} {last}" if head else last
+
+
 #: Each ASVS example's subsection in the rendered section, and the subsection after it.
 _AXIS_SECTIONS = (
     ("maintenance", "### Poorly maintained", "### Unsupported or end of life"),
@@ -794,34 +812,48 @@ def _stated_facts_drift(page: str, data: dict[str, Any]) -> list[str]:
     if stated not in flat:
         problems.append(f"the page does not state {stated!r}")
     for extra in data["population"]["extras"]:
-        adds = sum(extra in r["added_by"] for r in added.values())
-        if f"The `{extra}` extra adds {adds}" not in flat:
-            problems.append(f"the page does not state that the {extra} extra adds {adds}")
+        names = sorted(n for n, r in added.items() if extra in r["added_by"])
+        sentence = f"The `{extra}` extra adds {len(names)}" + (
+            f": {_listed(names, 'and')}." if names else "."
+        )
+        if sentence not in flat:
+            problems.append(f"the page does not state {sentence!r}")
+    # The last table, read here cell by cell and not through the renderer. An extra's own section
+    # rests on it, so a wrong column printed consistently must not pass.
     table = _region(_EXTRA_NAMES, _END, page)
-    named = _table_names(table)
-    if named != added.keys():
-        problems.append(f"extras' names: page names {sorted(named)}, snapshot {sorted(added)}")
-    # Each row's cells, read here and not through the renderer. An extra's own section rests on
-    # this table, so a wrong column printed consistently must not pass.
-    rows = {
-        cells[1].strip(" `"): [c.strip() for c in cells[2:-1]]
-        for cells in (ln.split("|") for ln in table.splitlines() if ln.startswith("| `"))
-    }
-    for name in sorted(named & added.keys()):
+    if f"| {' | '.join(_EXTRA_COLUMNS)} |" not in table.splitlines():
+        problems.append(f"extras' table: the header row is not {_EXTRA_COLUMNS}")
+    rows = [
+        [cell.strip() for cell in line.split("|")[1:-1]]
+        for line in table.splitlines()
+        if line.startswith("| `")
+    ]
+    # Lists, not sets, so a name with two rows is drift too.
+    named_rows = sorted(row[0].strip("`") for row in rows)
+    if named_rows != sorted(added):
+        problems.append(f"extras' names: page names {named_rows}, snapshot {sorted(added)}")
+    for row in rows:
+        name = row[0].strip("`")
+        if name not in added:
+            continue
+        if len(row) != len(_EXTRA_COLUMNS):
+            problems.append(f"extras' row for {name}: {len(row)} cells, not {len(_EXTRA_COLUMNS)}")
+            continue
         reading = added[name]
         risky_on = [_AXIS_WORDS[axis] for axis, _, _ in _AXIS_SECTIONS if reading["risky"][axis]]
-        by, *figures, on = rows[name]
-        expected = [
+        want = [
+            sorted(reading["added_by"]),
             reading["pinned"],
             reading["newest_upload"] or "none",
             str(len(reading["advisories"])),
+            " and ".join(risky_on) or "none",
         ]
-        if (
-            sorted(re.findall(r"`([^`]+)`", by)) != sorted(reading["added_by"])
-            or figures != expected
-            or on != (" and ".join(risky_on) or "none")
-        ):
-            problems.append(f"extras' row for {name} is {rows[name]}, not what the snapshot reads")
+        got = [sorted(re.findall(r"`([^`]+)`", row[1])), *row[2:]]
+        problems += [
+            f"extras' row for {name}: {column} is {g!r}, the snapshot reads {w!r}"
+            for column, g, w in zip(_EXTRA_COLUMNS[1:], got, want, strict=True)
+            if g != w
+        ]
     return problems
 
 
@@ -1093,14 +1125,22 @@ def test_the_section_checks_can_fail() -> None:
     row = next(ln for ln in extras_table.splitlines() if ln.startswith("| `"))
     drift = _stated_facts_drift(page.replace(row + "\n", ""), data)
     assert any(line.startswith("extras' names") for line in drift), drift
-    # One more advisory for a name an extra adds: only that row's count moves, and the per-extra
-    # count when the name stops being an addition.
+    # A stale second row for a name the table already has.
+    drift = _stated_facts_drift(page.replace(row + "\n", row + "\n" + row + "\n"), data)
+    assert any(line.startswith("extras' names") for line in drift), drift
+    # One change per cell of a row, each seen as that cell. The last one stops the name being an
+    # addition at all, which moves the sentences above the table.
     added = next(r for r in data["readings"] if r["added_by"])
-    extra = {"id": "GHSA-test", "severity": "LOW", "rated_by": "github", "published": "2000-01-01"}
+    advisory = {"id": "GHSA-t", "severity": "LOW", "rated_by": "github", "published": "2000-01-01"}
+    flipped_axes = {**added["risky"], "support": not added["risky"]["support"]}
+    in_row = f"extras' row for {added['name']}: "
     for change, problem in (
-        ({"advisories": [*added["advisories"], extra]}, "extras' row for"),
-        ({"pinned": "0.0.0-not-the-pin"}, "extras' row for"),
-        ({"added_by": []}, "the page does not state that the"),
+        ({"added_by": [*added["added_by"], "another"]}, in_row + "Added by"),
+        ({"pinned": "0.0.0-not-the-pin"}, in_row + "Pinned"),
+        ({"newest_upload": "1999-01-01"}, in_row + "Newest release"),
+        ({"advisories": [*added["advisories"], advisory]}, in_row + "Advisories counted"),
+        ({"risky": flipped_axes}, in_row + "Risky on"),
+        ({"added_by": []}, "the page does not state 'The `"),
     ):
         changed = {
             **data,
