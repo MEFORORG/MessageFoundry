@@ -130,6 +130,7 @@ destruction) are documented in [§3](#3-encryption-at-rest) under the matching h
 | `state.namespace` / `state.key` | all three | **Possibly** — a Handler that keys correlation state on a raw MRN stores that identifier here in the clear | **No** — plaintext by construction: the pair is the composite primary key **and** the AAD input for `state.value`, so it cannot be ciphered without losing the lookup | **PL-4** | Authors must key state on a **surrogate, never a raw identifier**. Covered only by the whole-DB / volume layer. Rides `[retention].state_max_age_days` with its value | ``rides `[retention].state_max_age_days` `` |
 | `reference.name` / `reference.version` / `reference.key` | all three | **Possibly** — §2's `reference.value` row notes a snapshot row may be patient-keyed; the key column is where that identifier would sit | **No** — plaintext by construction, same reason as `state` | **PL-4** | Same rule: key reference sets on a surrogate. The key columns ride the same delete: `purge_reference_snapshots` removes whole rows of an **undeclared** set, so these go with the `value` they key. A **declared** set is never touched — same orphan-only limit as `reference.value` above | ``orphan-only `[retention].reference_snapshot_days` `` |
 | `sessions.token_hash` / `client`, `resend_log`, `processed_files`, `pending_approvals.params`, `webauthn_credentials.public_key` | all three | **No** | No (deliberately not ciphered) | **PL-4** | Session tokens are stored as SHA-256 only; `processed_files` holds a hashed derived file key, never a path; approval params carry connection names / channel ids / a config dir by construction; COSE public keys (ADR 0068) are **verification material, not secrets** and are explicitly excluded from the cipher and from rekey | `n/a — not PHI` |
+| `known_login_addresses` (`user_id` / `address` / `first_seen` / `last_seen`, vault BACKLOG #2145) | all three | **No** — a network address tied to an account; identifies a *host*, not a patient | No (metadata, deliberately not ciphered) | **PL-4** | The first-seen sign-in address baseline (BACKLOG #288): one row per host an account finished a sign-in from, keyed on the account id. **Personal data, not PHI** — the same class and the same decision as `sessions.client` and `audit_log.client`. Read only by the sign-in signal; **no API surface**. Rows past the signal's 90-day lookback are deleted at that account's next recorded sign-in, so a dormant account keeps its last rows until it signs in again; `delete_user` removes every row with the account | `n/a — not PHI` |
 | `secret_rotation_meta` (`secret_key` / `fingerprint` / `tracked_since` / `last_rotated`) | **All three backends** (#1186 — SQLite `MessageStore`, `SqlServerStore` and `PostgresStore` each create the table at open and implement the `SecretRotationMetaStore` protocol) | **No** — non-secret rotation state: a **keyed MAC** (DEK-derived, one-way — never the secret value) + ISO dates only | No (deliberately not ciphered — it is neither PHI nor a secret; the MAC is one-way and un-guessable without the DEK) | **PL-4** | ASVS 13.3.4 rotation watcher (BACKLOG #282). `fingerprint` is a keyed MAC so obtaining the rows leaks no secret. Written on a keyed store; absent on a keyless one | `n/a — not PHI` |
 | SQLite DB file + `-wal` / `-shm` / temp files, and every index | SQLite | **Yes** (mirror the above) | **No** — the app cipher cannot reach them | **PL-5** | WAL/shm hold recently-written PHI outside any app-level encryption. Cover: SQLCipher (whole-DB) and/or FDE on the engine host's data volume | `n/a — not PHI` |
 | SQL Server `.ldf` **transaction log** + the **tempdb version store**, and every index | SQL Server | **Yes** (row images of `messages`/`queue`, ciphertext columns **plus** the always-plaintext `control_id`/`message_type`) | **No** — outside the app-level AEAD entirely | **PL-5** | The engine itself makes this load-bearing: it **force-enables `READ_COMMITTED_SNAPSHOT` and `ALLOW_SNAPSHOT_ISOLATION`** on the store database at open, so tempdb's version store holds row images for the lifetime of every open snapshot. The `.ldf` holds every row image for the same reason. Additional tempdb objects: the `#eligible` temp table used by `purge_message_bodies` and the FIFO-claim table variables (ids only, non-PHI). Cover: **SQL Server TDE at the database + FDE on the *SQL Server host's* volumes** — **not** BitLocker on the engine host | `n/a — not PHI` |
@@ -801,7 +802,7 @@ is no plaintext to protect.
 **Applies to:** `audit_log.detail` · `audit_log.client` · `sessions.token_hash` / `client` · `processed_files` ·
 `pending_approvals.params` · `delivered_keys` · `resend_log` · `queue.handler_name` / `destination_name` /
 `channel_id` · `messages.control_id` / `message_type` · `webauthn_credentials.public_key` · `state.namespace` /
-`state.key` · `reference.name` / `version` / `key` · `connection_event.peer_host` · the `attachment`
+`state.key` · `reference.name` / `version` / `key` · `connection_event.peer_host` · `known_login_addresses` · the `attachment`
 header row (`content_type`, `total_bytes`, `refcount`, `created_at`) + the `message_attachment`
 linkage · `secret_rotation_meta` (all three backends) · `.mfbak` on the server backends · and,
 from the [harness table](#the-test-harnesss-own-at-rest-data-harness), the `MEFOR_COORD_DIR` coord
@@ -827,7 +828,7 @@ address is folded *inside* it), not from a cipher. Its strength is **key-custody
   `MessageDetail.attachments` under the detail route's `messages:view_raw` + channel scope; the
   linkage row is what scopes the audited byte download to a message the caller may already read.
 - `pending_approvals.params` — only through the approvals routes, under their own permission.
-- `delivered_keys`, `resend_log`, `processed_files`, `webauthn_credentials.public_key`,
+- `delivered_keys`, `resend_log`, `processed_files`, `webauthn_credentials.public_key`, `known_login_addresses`,
   `state.namespace`/`key`, `reference.name`/`version`/`key`, `connection_event.peer_host`'s siblings —
   **no API surface** (`connection_event.peer_host` itself is returned by `GET /events` under
   `monitoring:read`).
@@ -846,6 +847,9 @@ on the store-file ACL plus the volume/whole-DB layer for the rest.
 - `reference.*` — **no purge path**; replaced only by the next sync's build-new-then-flip.
 - `queue` metadata columns — removed with their row; `messages.control_id` / `message_type` are kept for
   the life of the metadata row.
+- `known_login_addresses` — each recorded sign-in deletes that account's rows older than the
+  sign-in signal's 90-day lookback, and `delete_user` deletes them all; a dormant account's
+  rows stay until it signs in again or is deleted.
 - `connection_event.peer_host` — removed with its row on
   `[retention].connection_event_retention_hours`.
 - `attachment` header + `message_attachment` linkage — the join rows are `DELETE`d and the header's
