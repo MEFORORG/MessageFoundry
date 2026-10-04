@@ -15,6 +15,7 @@ import asyncio
 import heapq
 import inspect
 import time
+import unicodedata
 from collections.abc import Awaitable
 from typing import Any, TypeVar
 
@@ -600,14 +601,16 @@ def test_the_credential_lock_key_reads_a_bounded_prefix(monkeypatch: pytest.Monk
 
     cap = svc._CREDENTIAL_KEY_INPUT_MAX
     assert cap >= 256  # the store's column width: no real name is cut
-    real_normalize = svc.unicodedata.normalize
+    real_normalize = unicodedata.normalize
     normalised_lengths: list[int] = []
 
-    def spy(form: str, text: str) -> str:
+    def spy(form: Any, text: str) -> str:
         normalised_lengths.append(len(text))
         return real_normalize(form, text)
 
-    monkeypatch.setattr(svc.unicodedata, "normalize", spy)
+    # The service calls ``unicodedata.normalize`` through the module, so the module's attribute is
+    # the one seam every caller reads.
+    monkeypatch.setattr(unicodedata, "normalize", spy)
     huge = "\ufdfa" * (cap * 8)
     key = _credential_lock_key(huge)
     assert normalised_lengths, "the key no longer normalises through unicodedata.normalize"
@@ -1567,9 +1570,9 @@ async def test_AC6_refused_combined_sign_ins_take_the_same_wall_clock_time(
                 ok = (await service.login(username, pw, totp_code=sent)).ok
                 timings.setdefault(label, []).append(time.monotonic() - started)
                 assert not ok, label
-            if done >= least_rounds and all(min(ts) < 2 * budget for ts in timings.values()):
+            rounded = {label: [round(t, 3) for t in ts] for label, ts in timings.items()}
+            if done >= least_rounds and all(min(ts) < 2 * budget for ts in rounded.values()):
                 break
-        rounded = {label: [round(t, 3) for t in ts] for label, ts in timings.items()}
         early = {label: ts for label, ts in rounded.items() if min(ts) < budget}
         assert not early, f"refused outcomes answered BEFORE the pad's deadline: {early}"
         late = {label: ts for label, ts in rounded.items() if not min(ts) < 2 * budget}
@@ -1678,7 +1681,11 @@ class _VirtualTime:
 
     It replaces the service module's ``time`` (only ``monotonic`` differs) and its two sleep seams,
     ``_sleep_until`` and ``_sleep_until_write_point``. So these tests no longer exercise the real
-    sleeps; the wall-clock AC-6 arm above still does.
+    sleeps; the wall-clock AC-6 arm above still exercises the real pad.
+
+    **Every sign-in a test starts must go through** :meth:`attempt`, and every scripted cost through
+    :meth:`work`. A sign-in the clock does not know about is not waited for, so time would move
+    while it was still running.
     """
 
     #: Loop passes the driver must see nothing runnable for before it moves time. A task woken by a
@@ -1728,8 +1735,12 @@ class _VirtualTime:
         return run()
 
     async def close(self) -> None:
+        """Stop the driver. A sleeper still parked belongs to a test that already failed, and is
+        cancelled so it does not outlive the clock that would have woken it."""
         self._driver.cancel()
         await asyncio.gather(self._driver, return_exceptions=True)
+        for sleeper in self._sleepers:
+            sleeper[2].cancel()
 
     async def _attempt_sleep_until(self, deadline: float) -> None:
         await self._park(deadline, in_attempt=True)
