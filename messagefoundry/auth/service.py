@@ -123,6 +123,7 @@ from messagefoundry.store.store import (
     require_notify_email,
     seed_notify_email,
 )
+from messagefoundry.transports.email import envelope_address_problem
 from messagefoundry.transports.rest import opener_tls_context
 
 _log = logging.getLogger(__name__)
@@ -852,6 +853,9 @@ def _is_single_mailbox(address: str) -> bool:
         and not domain.endswith(".")
         and all(ch.isprintable() and not ch.isspace() for ch in address)
         and not any(ch in _ADDRESS_FORBIDDEN_CHARS for ch in address)
+        # The rule send_plain_email applies to every notice's RCPT TO (vault BACKLOG #2870). Without
+        # it, an address accepted here could never be sent to, and every later notice would fail.
+        and envelope_address_problem(address) is None
     )
 
 
@@ -891,15 +895,21 @@ class InvalidNotifyEmail(ValueError):
 def _require_single_mailbox(value: str) -> str:
     """``value`` stripped, when it may become a notification address; else :class:`InvalidNotifyEmail`.
 
-    The check both engine surfaces that take a typed address apply: the holder's own fill and an
-    administrator's explicit change. Not blank (:func:`require_notify_email`), and one plain
-    mailbox (:func:`_is_single_mailbox`)."""
+    The check that surfaces taking a typed address apply. They include at least the holder's own
+    fill, an administrator's change, and the host commands ``admin-set-notify-email`` and
+    ``provision-admin --email`` (vault BACKLOG #2870). Not blank (:func:`require_notify_email`),
+    and one plain mailbox (:func:`_is_single_mailbox`). When the send rule is what refuses it, the
+    message carries that rule's reason, which never quotes the address."""
     try:
         address = require_notify_email(value)
     except ValueError as exc:
         raise InvalidNotifyEmail(str(exc)) from exc
     if not _is_single_mailbox(address):
-        raise InvalidNotifyEmail("enter one email address, such as name@example.org")
+        message = "enter one email address, such as name@example.org"
+        problem = envelope_address_problem(address)
+        if problem is not None:
+            message += f"; this one {problem}"
+        raise InvalidNotifyEmail(message)
     return address
 
 

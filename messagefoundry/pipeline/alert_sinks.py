@@ -56,9 +56,10 @@ from messagefoundry.config.tls_policy import (
 from messagefoundry.pipeline.alerts import intake_pause_detail
 
 # Not lazy, unlike the two transports imports below: the shared webhook opener is built at import.
-# Importing this module already loads the transports package through pipeline/__init__.py, so this
-# adds no import cost.
+# Importing this module already loads the transports package through pipeline/__init__.py, so these
+# add no import cost.
 from messagefoundry.transports.bounded_read import build_strict_opener
+from messagefoundry.transports.email import checked_envelope
 
 __all__ = [
     "AlertTransport",
@@ -508,6 +509,10 @@ def send_plain_email(
             "credentials require STARTTLS. Set [alerts].email_use_tls=true, or drop "
             "[alerts].email_username/email_password to send unauthenticated."
         )
+    # The Email destination's address rule, here at the chokepoint every caller passes, so a rule's
+    # recipient override and a per-user notice address are held to it too. MAIL FROM and RCPT TO are
+    # passed explicitly below rather than derived from a parse of the headers (vault BACKLOG #2870).
+    envelope = checked_envelope(ALERTS_SMTP_CELL, sender, recipients)
     # Built AFTER the allowlist check, deliberately: tests/test_alerts_test_email.py runs the REAL
     # function and depends on a disallowed host raising before ANY other work happens.
     tls_context = (
@@ -523,8 +528,7 @@ def send_plain_email(
     )
     msg = EmailMessage()
     msg["Subject"] = subject
-    msg["From"] = sender
-    msg["To"] = ", ".join(recipients)
+    envelope.address(msg)
     msg.set_content(body)  # plain-text part is always kept (never HTML-only)
     if html_body is not None:
         msg.add_alternative(html_body, subtype="html")
@@ -545,7 +549,7 @@ def send_plain_email(
                 channel_encrypted=use_tls,
                 cell=ALERTS_SMTP_CELL,
             )
-        smtp.send_message(msg)
+        envelope.send(smtp, msg)
 
 
 class EmailTransport:
@@ -572,6 +576,9 @@ class EmailTransport:
         tls_ca_file: str | None = None,
         trust_anchor_policy: TrustAnchorPolicy | None = None,
     ) -> None:
+        # send_plain_email checks the addresses at every send. Checking here too means a bad
+        # [alerts].email_from or email_to refuses at startup, not at the first alert (#2870).
+        checked_envelope(ALERTS_SMTP_CELL, sender, recipients)
         self.host = host
         self.port = port
         self.sender = sender
@@ -1445,6 +1452,34 @@ def configured_alert_transport_names(alerts: AlertsSettings) -> set[str]:
     return names
 
 
+def check_rule_recipients(rule: AlertRule, sender: str, where: str) -> None:
+    """Refuse a rule's or a tier's recipient override that the email transport would send to and
+    that fails the address rule :func:`send_plain_email` applies at every send (vault BACKLOG #2870).
+
+    Run when the notifier is built and when ``alert add`` writes a rule, so a bad override fails
+    there rather than at the first alert it matches. Each level is resolved the way
+    :meth:`NotifierAlertSink._apply_escalation` resolves it: a tier's ``None`` keeps the level
+    below, tiers apply in ``after_count`` order, and a mute sends nothing. Only a level whose
+    effective transports include email has its effective recipients checked, because no other
+    override reaches a send. Raises :class:`ValueError` naming ``where`` and the level that set the
+    recipients, never the address."""
+    transports: tuple[str, ...] | None = (
+        () if rule.mute else (None if rule.transports is None else tuple(rule.transports))
+    )
+    recipients, label = rule.recipients, where
+    levels = [(transports, recipients, label)]
+    tiers = sorted(enumerate(rule.escalate), key=lambda pair: pair[1].after_count)
+    for j, step in tiers:
+        if step.transports is not None:
+            transports = tuple(step.transports)
+        if step.recipients is not None:
+            recipients, label = step.recipients, f"{where}.escalate[{j}]"
+        levels.append((transports, recipients, label))
+    for transports, recipients, label in levels:
+        if recipients and (transports is None or "email" in transports):
+            checked_envelope(label, sender, recipients)
+
+
 def notifier_from_settings(
     alerts: AlertsSettings,
     *,
@@ -1519,6 +1554,7 @@ def notifier_from_settings(
     # refuses at startup and names the keys to add. A rule that names NO transport is unaffected and
     # still starts, which is what keeps the ordinary "rules but no [alerts] block yet" path working.
     configured = {t.name for t in transports}
+    email_sender = alerts.email_from if "email" in configured else None
     for i, rule in enumerate(alerts.rules):
         unknown = [t for t in (rule.transports or []) if t not in configured]
         if unknown:
@@ -1534,6 +1570,8 @@ def notifier_from_settings(
                     f"[alerts].rules[{i}].escalate[{j}] routes to unconfigured transport(s) "
                     f"{unknown_tier}; configured: {sorted(configured)}"
                 )
+        if email_sender:
+            check_rule_recipients(rule, email_sender, f"[alerts].rules[{i}]")
     if not transports:
         if alerts.rules:
             # Every rule here names no transport (one that did would have raised above), so this is not

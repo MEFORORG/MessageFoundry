@@ -81,7 +81,7 @@ class _RecordingSMTP:
     def auth_login(self, challenge: bytes | None = None) -> str:
         return ""
 
-    def send_message(self, msg: Any) -> None:
+    def send_message(self, msg: Any, **envelope: Any) -> None:
         _RecordingSMTP.captured["subject"] = msg["Subject"]
 
 

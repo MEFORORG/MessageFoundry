@@ -1225,8 +1225,8 @@ another node on the same store may still be paused there.
 | `webhook_allowed_hosts` | list | `[]` | egress allowlist for the webhook host (`[]` = any); SSRF defense (ASVS 15.3.2/1.3.6) |
 | `email_smtp_host` | str | _unset_ | SMTP server; with `email_from` + `email_to` set, enables the **email** transport |
 | `email_smtp_port` | int | 587 | SMTP port |
-| `email_from` | str | _unset_ | sender address (required for email) |
-| `email_to` | list | _unset_ | recipient(s) (required for email). Via env: comma-separated `MEFOR_ALERTS_EMAIL_TO` |
+| `email_from` | str | _unset_ | sender address (required for email), and the envelope sender (`MAIL FROM`). It must be one plain `local@domain`; a display name, a group or an encoded word is refused at startup |
+| `email_to` | list | _unset_ | recipient(s) (required for email). Via env: comma-separated `MEFOR_ALERTS_EMAIL_TO`. Each address, and each rule's `recipients` override, is held to the `email_from` rule after any display name is dropped; `RCPT TO` carries exactly that address |
 | `email_use_tls` | bool | `true` | issue STARTTLS before sending. Selects TLS vs **cleartext** — it does not by itself decide whether the relay is authenticated; that is `email_tls_verify` |
 | `email_tls_verify` | bool | `true` | verify the relay's certificate on that STARTTLS hop — chain + hostname + strict RFC 5280, TLS 1.2 floor ([#323](BACKLOG.md)). `false` keeps the session encrypted but accepts **any** certificate (MITM-able). Both `false` values are **loosenings**: `security_loosenings()` names them, `messagefoundry check`'s `alert-smtp-tls` advisory reports them, and on an enforcing PHI instance `serve` **refuses to start** unless `[security].allow_unverified_alert_smtp_tls` is also set |
 | `email_tls_ca_file` | str | *(unset)* | PEM bundle of trust anchors for that hop. Unset = `[tls].internal_ca_file` if configured, else the OS trust store. A path, not a secret |

@@ -308,9 +308,11 @@ async def test_a_move_is_audited_and_announced_even_when_a_later_step_fails(
 
 
 async def test_a_stored_address_that_fails_the_shape_check_does_not_block_a_save() -> None:
-    """Round-one QA finding. Other writers store addresses the one-mailbox check refuses, such as
-    ``admin-set-notify-email --email ops@localhost``. The console posted the stored value back on a
-    save, and re-checking it refused every save of that account, a disable included."""
+    """Round-one QA finding. Other writers can store addresses the one-mailbox check refuses, such
+    as ``ops@localhost``. The schema migration's copy of the profile email is one, and so is a
+    direct service or store call. (``admin-set-notify-email`` was one until vault BACKLOG #2870.)
+    The console posted the stored value back on a save, and re-checking it refused every save of
+    that account, a disable included."""
     store = await MessageStore.open(":memory:")
     try:
         notifier = _FakeNotifier()
