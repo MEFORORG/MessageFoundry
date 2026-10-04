@@ -216,8 +216,9 @@ def test_a_retried_post_is_delivered_exactly_once(engine: _RenewableEngine) -> N
 def test_the_revoke_of_a_replaced_session_follows_a_renewal_with_the_replaced_token(
     engine: _RenewableEngine, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The login revoke (BACKLOG #1901) keeps the renewal follow (BACKLOG #1276), and its retry
-    still presents the REPLACED token.
+    """The revoke of a replaced session keeps the renewal follow (BACKLOG #1276), and its retry
+    still presents the REPLACED token. ``set_token`` sends it; ``login`` sent one too until it
+    began naming the old token as ``supersedes`` (BACKLOG #1901, #2281).
 
     Red when: the certificate retry drops ``_bearer`` and falls back to the held token. That retry
     would end the NEW session, which the client has just adopted, and leave the old one live.

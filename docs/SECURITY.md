@@ -3219,8 +3219,9 @@ and stays valid until it expires. The two bearer sign-in routes, `POST /auth/log
 return a token and replace none, so ending a client's old token is the client's own act. On
 `POST /auth/login` the client can do it in the same request: a `supersedes` field in the body names
 the token being replaced, and the engine ends it as the console legs do, before the cap counts.
-`POST /auth/negotiate` has no body and revokes nothing. The VS Code extension still ends its old
-token with `POST /auth/logout` after it signs in again.
+`POST /auth/negotiate` has no body and revokes nothing. The VS Code extension and the Python
+engine client (`EngineClient.login`) both name the token they replace in `supersedes`. The Python
+client names only a token the engine issued to it, never one adopted with `set_token`.
 
 A session's `id` is its token hash, and that hash changes whenever the session completes MFA or a
 step-up. So an id shown on a sessions page can go stale. The console's revoke says "Nothing was
