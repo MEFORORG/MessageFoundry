@@ -1233,7 +1233,9 @@ list folds them into one instance.
 - A fresh store, a baseline row with no fingerprint, or one taken under another fingerprint scheme
   raises nothing. The engine logs that at INFO.
 - The check is alert-only. A baseline read that fails or takes over five seconds is logged at
-  WARNING, and the start goes on.
+  WARNING, and the start goes on. Its row records `comparison = "read_failed"`, and later starts
+  pass over that row, so they still compare against the last checked baseline. They also pass
+  over a row that is not JSON. Every row records its `comparison` outcome.
 
 Its `connection` is `config:` plus the first 12 hex characters of the new fingerprint, so each
 distinct config is its own alert. Nothing resolves it; an operator does. A rule cannot attach a

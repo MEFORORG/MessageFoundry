@@ -119,8 +119,10 @@ otherwise it carries the loaded digest, so a toggle never vouches for an edit no
 the `fingerprint` key is compared. The detail now records a
 `scheme` tag, and a baseline under another scheme, or with none, is not comparable, so a change to
 what is hashed does not read as a changed config. A change raises the `config_changed` alert, and the
-start row records `previous_fingerprint` and `changed`. The check is alert-only: a failed or slow
-baseline read never blocks the start.
+start row records `comparison`, `previous_fingerprint` and `changed`. The check is alert-only: a
+failed or slow baseline read never blocks the start. That start's row is marked `read_failed`, and
+later starts pass over it to the last checked baseline, so the change it could not see is still
+reported.
 
 ### D2 — Dual-control `config:deploy`  *(BUILT — BACKLOG #53, shipped in 0.2.9; drafted as "planned")*
 

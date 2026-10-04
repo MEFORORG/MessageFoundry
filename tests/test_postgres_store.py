@@ -836,21 +836,24 @@ async def test_audit_chain_verifies(store) -> None:
     assert [r["action"] for r in rows] == ["export", "message_view"]  # newest first
 
 
-async def test_latest_audit_of_reads_the_newest_matching_row(store) -> None:
+async def test_recent_audit_of_reads_the_newest_matching_row(store) -> None:
     # vault BACKLOG #2597: the start's config baseline read, on the real backend.
-    assert await store.latest_audit_of(["config_loaded", "config_reload"]) is None
+    actions = ["config_loaded", "config_reload"]
+    assert await store.recent_audit_of(actions, limit=5) == []
     await store.record_audit("config_loaded", actor="system", detail='{"fingerprint": "a"}')
     await store.record_audit("config_reload", actor="alice", detail='{"fingerprint": "b"}')
     await store.record_audit("export", actor="bob", detail="not a baseline")
-    row = await store.latest_audit_of(["config_loaded", "config_reload"])
-    assert row is not None
-    assert (row["action"], row["actor"], row["detail"]) == (
-        "config_reload",
-        "alice",
-        '{"fingerprint": "b"}',
-    )
-    assert isinstance(row["ts"], float) and row["id"] > 0
-    assert await store.latest_audit_of([]) is None
+    await store.record_audit("config_loaded", actor="system", detail='{"fingerprint": "c"}')
+    rows = await store.recent_audit_of(actions, limit=2)
+    # Newest first, matching actions only, cut at the limit.
+    assert [(r["action"], r["detail"]) for r in rows] == [
+        ("config_loaded", '{"fingerprint": "c"}'),
+        ("config_reload", '{"fingerprint": "b"}'),
+    ]
+    assert rows[1]["actor"] == "alice"
+    assert isinstance(rows[0]["ts"], float) and rows[0]["id"] > rows[1]["id"]
+    assert len(await store.recent_audit_of(actions, limit=10)) == 3
+    assert await store.recent_audit_of([], limit=5) == []
 
 
 async def test_record_audit_tees_off_box_redacted(store) -> None:

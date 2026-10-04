@@ -1661,13 +1661,15 @@ class AuditStore(Protocol):
         :func:`~messagefoundry.store.store.audit_row_hash`."""
         ...
 
-    async def latest_audit_of(self, actions: Sequence[str]) -> dict[str, Any] | None:
-        """The newest audit row whose ``action`` is one of ``actions``, as a dict of ``id``, ``ts``,
-        ``actor``, ``action`` and ``detail``; ``None`` when no row matches or ``actions`` is empty.
+    async def recent_audit_of(self, actions: Sequence[str], *, limit: int) -> list[dict[str, Any]]:
+        """Up to ``limit`` newest audit rows whose ``action`` is one of ``actions``, newest first, each
+        a dict of ``id``, ``ts``, ``actor``, ``action`` and ``detail``; empty when none match or
+        ``actions`` is empty.
 
-        The start reads its config baseline through this (vault BACKLOG #2597): one newest-row seek
-        per action on the ``(action, id)`` index, then the newest of those, so it stays cheap on a
-        long chain. Every action is a bound parameter."""
+        The start reads its config baseline through this (vault BACKLOG #2597): one seek per action
+        on the ``(action, id)`` index, so it stays cheap on a long chain, and enough rows that a row
+        the start cannot use can be passed over for an older one. Every value is a bound
+        parameter."""
         ...
 
     async def list_audit(

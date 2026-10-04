@@ -106,23 +106,24 @@ def _edit(cfg: Path) -> None:
 # --- the store read ------------------------------------------------------------------------------
 
 
-async def test_latest_audit_of_reads_the_newest_matching_row(tmp_path: Path) -> None:
+async def test_recent_audit_of_reads_the_newest_matching_rows(tmp_path: Path) -> None:
     store = await MessageStore.open(tmp_path / "s.db")
     try:
-        assert await store.latest_audit_of(_ACTIONS) is None, "a fresh store has no baseline"
+        assert await store.recent_audit_of(_ACTIONS, limit=5) == [], "a fresh store: no baseline"
         await store.record_audit("config_loaded", actor="system", detail='{"fingerprint": "a"}')
         await store.record_audit("config_reload", actor="alice", detail='{"fingerprint": "b"}')
         await store.record_audit("export", actor="bob", detail="not a baseline")
-        row = await store.latest_audit_of(_ACTIONS)
-        assert row is not None
-        # The newest MATCHING row: the later "export" row is skipped, the reload row wins.
-        assert (row["action"], row["actor"], row["detail"]) == (
-            "config_reload",
-            "alice",
-            '{"fingerprint": "b"}',
-        )
-        assert isinstance(row["ts"], float) and row["id"] > 0
-        assert await store.latest_audit_of([]) is None
+        await store.record_audit("config_loaded", actor="system", detail='{"fingerprint": "c"}')
+        rows = await store.recent_audit_of(_ACTIONS, limit=2)
+        # Newest first, matching actions only (the "export" row is not one), cut at the limit.
+        assert [(r["action"], r["detail"]) for r in rows] == [
+            ("config_loaded", '{"fingerprint": "c"}'),
+            ("config_reload", '{"fingerprint": "b"}'),
+        ]
+        assert rows[1]["actor"] == "alice"
+        assert isinstance(rows[0]["ts"], float) and rows[0]["id"] > rows[1]["id"]
+        assert len(await store.recent_audit_of(_ACTIONS, limit=10)) == 3
+        assert await store.recent_audit_of([], limit=5) == []
     finally:
         await store.close()
 
@@ -225,6 +226,8 @@ async def test_a_degraded_baseline_raises_no_alert(
     rows = await _start(tmp_path, cfg)
     assert alerts == []
     assert rows[-1]["changed"] is None and rows[-1]["previous_fingerprint"] is None
+    # A usable row for the next start, not one it passes over: see the scheme test below.
+    assert rows[-1]["comparison"] == "degraded_baseline"
 
 
 @pytest.mark.parametrize("scheme", ["mefor-cfg-fp:v0", None], ids=["other-scheme", "no-scheme"])
@@ -254,39 +257,104 @@ async def test_a_baseline_under_another_scheme_raises_no_alert(
     assert rows[-1]["scheme"] == FINGERPRINT_SCHEME
     assert alerts == []
     assert rows[-1]["changed"] is None
+    assert rows[-1]["comparison"] == "scheme_mismatch"
+    # The mismatched start begins a new baseline. Had it been passed over, every later start
+    # would meet the old-scheme row again and never compare anything.
+    _edit(cfg)
+    await _start(tmp_path, cfg)
+    assert len(alerts) == 1, "the next change after the scheme move is reported"
 
 
 def _failing_read(kind: str) -> Any:
-    async def _raise(self: MessageStore, actions: Any) -> Any:
+    async def _raise(self: MessageStore, actions: Any, *, limit: int) -> Any:
         raise RuntimeError("store unavailable")
 
-    async def _hang(self: MessageStore, actions: Any) -> Any:
+    async def _hang(self: MessageStore, actions: Any, *, limit: int) -> Any:
         await asyncio.sleep(30)
 
-    async def _undecodable(self: MessageStore, actions: Any) -> Any:
-        return {"id": 1, "ts": 0.0, "actor": "system", "action": "config_loaded", "detail": "{no"}
+    async def _undecodable(self: MessageStore, actions: Any, *, limit: int) -> Any:
+        return [{"id": 1, "ts": 0.0, "actor": "system", "action": "config_loaded", "detail": "{no"}]
 
     return {"raises": _raise, "times-out": _hang, "undecodable": _undecodable}[kind]
 
 
-@pytest.mark.parametrize("kind", ["raises", "times-out", "undecodable"])
+@pytest.mark.parametrize(
+    ("kind", "outcome"),
+    [("raises", "read_failed"), ("times-out", "read_failed"), ("undecodable", "no_baseline")],
+)
 async def test_a_failed_baseline_read_never_blocks_the_start(
     tmp_path: Path,
     cfg: Path,
     monkeypatch: pytest.MonkeyPatch,
     alerts: list[dict[str, Any]],
     kind: str,
+    outcome: str,
 ) -> None:
     await _start(tmp_path, cfg)
     _edit(cfg)
     monkeypatch.setattr(app_module, "_CONFIG_BASELINE_TIMEOUT_SECONDS", 0.2)
-    monkeypatch.setattr(MessageStore, "latest_audit_of", _failing_read(kind))
+    monkeypatch.setattr(MessageStore, "recent_audit_of", _failing_read(kind))
     loop = asyncio.get_running_loop()
     began = loop.time()
     rows = await _start(tmp_path, cfg)  # asserts the graph is serving
     assert loop.time() - began < 15, "the start was held past the bound"
     assert alerts == []
     assert rows[-1]["changed"] is None
+    assert rows[-1]["comparison"] == outcome
+
+
+@pytest.mark.parametrize("kind", ["raises", "times-out"])
+async def test_a_restart_after_a_failed_read_still_alerts_against_the_older_baseline(
+    tmp_path: Path,
+    cfg: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    alerts: list[dict[str, Any]],
+    kind: str,
+) -> None:
+    """Review finding 2: a start whose baseline read failed records the new digest unchecked. If
+    the next start took that row as its baseline, the change would never be reported. It passes
+    over the row and compares against the last checked one."""
+    before = config_fingerprint(cfg)
+    await _start(tmp_path, cfg)
+    _edit(cfg)
+    with monkeypatch.context() as m:
+        m.setattr(app_module, "_CONFIG_BASELINE_TIMEOUT_SECONDS", 0.2)
+        m.setattr(MessageStore, "recent_audit_of", _failing_read(kind))
+        failed = await _start(tmp_path, cfg)
+    assert failed[-1]["comparison"] == "read_failed"
+    assert alerts == [], "control: the failed read raised nothing"
+    rows = await _start(tmp_path, cfg)  # the SAME changed bytes, with a working read
+    assert len(alerts) == 1
+    assert alerts[0]["previous_fingerprint"] == before
+    assert alerts[0]["fingerprint"] == config_fingerprint(cfg)
+    assert rows[-1]["comparison"] == "compared" and rows[-1]["changed"] is True
+
+
+async def test_an_undecodable_newest_row_is_passed_over_for_an_older_one(
+    tmp_path: Path, cfg: Path, alerts: list[dict[str, Any]]
+) -> None:
+    before = config_fingerprint(cfg)
+    await _start(tmp_path, cfg)
+    store = await MessageStore.open(tmp_path / "start.db")
+    try:
+        await store.record_audit("config_reload", actor="mallory", detail="{not json")
+    finally:
+        await store.close()
+    _edit(cfg)
+    rows = await _start(tmp_path, cfg)
+    assert len(alerts) == 1
+    assert alerts[0]["previous_fingerprint"] == before
+    assert alerts[0]["baseline_action"] == "config_loaded"
+    assert rows[-1]["comparison"] == "compared"
+
+
+async def test_a_start_row_records_its_comparison_outcome(
+    tmp_path: Path, cfg: Path, alerts: list[dict[str, Any]]
+) -> None:
+    first = await _start(tmp_path, cfg)
+    assert first[-1]["comparison"] == "no_baseline"
+    rows = await _start(tmp_path, cfg)
+    assert rows[-1]["comparison"] == "compared" and rows[-1]["changed"] is False
 
 
 async def test_a_reload_after_capture_does_not_change_the_comparison(
