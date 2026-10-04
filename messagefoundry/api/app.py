@@ -40,9 +40,10 @@ import os
 import re
 import shutil
 import time
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 from typing import Annotated, Any, Literal, NoReturn, TypeVar
@@ -1090,8 +1091,153 @@ async def _record_reload_audit(
     return list(failed_steps)
 
 
+#: The audit actions that record which config bytes a process ran from: a start, an applied reload,
+#: and a flag toggle that rewrote ``connections.toml`` (vault BACKLOG #2597). A dry run's
+#: ``config_reload_check`` is not one: it applied nothing.
+_CONFIG_BASELINE_ACTIONS: tuple[str, ...] = (
+    "config_loaded",
+    "config_reload",
+    "connection_flag_set",
+)
+
+#: How long the start waits for its baseline read. A slow store costs the comparison, never the start.
+_CONFIG_BASELINE_TIMEOUT_SECONDS = 5.0
+
+
+@dataclass(frozen=True, slots=True)
+class _StartConfigComparison:
+    """This start's config digest set against the newest one the store recorded (vault BACKLOG
+    #2597). Built only when both digests exist under one fingerprint scheme."""
+
+    fingerprint: str
+    previous_fingerprint: str
+    changed: bool
+    baseline_action: str
+    baseline_actor: str | None
+    baseline_at: str
+    baseline_node: str | None
+
+
+def _iso_utc(ts: Any) -> str:
+    """An audit row's epoch ``ts`` as ISO-8601 UTC to the second, or ``""`` when unreadable."""
+    try:
+        return datetime.fromtimestamp(float(ts), tz=UTC).isoformat(timespec="seconds")
+    except (TypeError, ValueError, OSError, OverflowError):
+        return ""
+
+
+async def _bounded[T](coro: Coroutine[Any, Any, T]) -> T:
+    """Await ``coro`` for at most :data:`_CONFIG_BASELINE_TIMEOUT_SECONDS`, then raise TimeoutError.
+
+    Not ``asyncio.wait_for``: that waits for the cancelled read to unwind, and a store driver can
+    take its time over that (returning a pooled connection to a server that stopped answering).
+    Here the read runs as its own task, which is cancelled and left behind on a timeout, so the
+    caller is never held past the bound. The left-behind task's outcome is retrieved, never raised."""
+    task = asyncio.ensure_future(coro)
+    try:
+        done, _pending = await asyncio.wait({task}, timeout=_CONFIG_BASELINE_TIMEOUT_SECONDS)
+    except BaseException:
+        task.cancel()
+        raise
+    if not done:
+        task.cancel()
+        task.add_done_callback(lambda t: None if t.cancelled() else t.exception())
+        raise TimeoutError(f"no answer within {_CONFIG_BASELINE_TIMEOUT_SECONDS}s")
+    return task.result()
+
+
+async def _compare_start_config(
+    engine: Engine, snapshot: Mapping[str, object] | None
+) -> _StartConfigComparison | None:
+    """Compare the start's config ``snapshot`` with the newest baseline row in the store (vault
+    BACKLOG #2597). Keyed on the store, not on a node: every engine shard and cluster node shares
+    one config directory by contract, and a node id changes on every restart.
+
+    The caller passes the digest :meth:`Engine.capture_start_provenance` took, not a later read of
+    :attr:`Engine.loaded_config_fingerprint`, so a reload that lands before the row is written
+    cannot change what this start is said to have loaded. Only the ``fingerprint`` key is compared,
+    since ``git_head``, ``dir`` and ``node`` differ between nodes running the same bytes.
+
+    Returns ``None``, and logs at INFO, when there is nothing to compare: no digest for this start,
+    a fresh store, a baseline row without a digest, or one taken under another fingerprint scheme.
+    It never raises, except on cancellation: the read is bounded by
+    :data:`_CONFIG_BASELINE_TIMEOUT_SECONDS`, and any failure, a timeout or an undecodable row
+    included, is logged at WARNING and costs only the comparison."""
+    current = snapshot.get("fingerprint") if snapshot is not None else None
+    if snapshot is None or not isinstance(current, str) or not current:
+        _log.info("config change check skipped: this start has no config fingerprint")
+        return None
+    scheme = snapshot.get("scheme")
+    try:
+        row = await _bounded(engine.store.latest_audit_of(_CONFIG_BASELINE_ACTIONS))
+        if row is None:
+            _log.info("config change check: no earlier config row; this start is the baseline")
+            return None
+        detail = json.loads(row["detail"] or "null")
+        previous = detail.get("fingerprint") if isinstance(detail, dict) else None
+        if not isinstance(previous, str) or not previous:
+            _log.info(
+                "config change check skipped: the store's newest %s row has no fingerprint",
+                row["action"],
+            )
+            return None
+        if scheme is None or detail.get("scheme") != scheme:
+            _log.info(
+                "config change check skipped: the store's newest %s row used fingerprint scheme "
+                "%r and this start uses %r, so the two digests are not comparable",
+                row["action"],
+                detail.get("scheme"),
+                scheme,
+            )
+            return None
+        node = detail.get("node")
+        actor = row["actor"]
+        return _StartConfigComparison(
+            fingerprint=current,
+            previous_fingerprint=previous,
+            changed=not fingerprint_matches(current, previous),
+            baseline_action=str(row["action"]),
+            baseline_actor=actor if isinstance(actor, str) else None,
+            baseline_at=_iso_utc(row["ts"]),
+            baseline_node=node if isinstance(node, str) else None,
+        )
+    except Exception as exc:  # noqa: BLE001 - alert-only (step 5): no failure here may stop a start
+        _log.warning(
+            "config change check skipped: the store's config baseline could not be read: %s",
+            safe_exc(exc),
+        )
+        return None
+
+
+def _raise_config_changed(
+    sink: AlertSink, engine: Engine, comparison: _StartConfigComparison
+) -> None:
+    """Raise ``config_changed`` for a start whose config differs from the store's baseline (vault
+    BACKLOG #2597). Never raises: the start is already serving."""
+    try:
+        rr = engine.registry_runner
+        sink.config_changed(
+            f"config:{comparison.fingerprint[:12]}",
+            fingerprint=comparison.fingerprint,
+            previous_fingerprint=comparison.previous_fingerprint,
+            node=engine.coordinator.node_id,
+            shard=rr.registry.shard_id if rr else None,
+            baseline_action=comparison.baseline_action,
+            baseline_actor=comparison.baseline_actor,
+            baseline_at=comparison.baseline_at,
+            baseline_node=comparison.baseline_node,
+        )
+    except Exception as exc:  # noqa: BLE001 - an alert failure must not change the start
+        _log.warning("the config_changed alert could not be raised: %s", safe_exc(exc))
+
+
 async def _record_start_audit(
-    app: FastAPI, engine: Engine, *, fingerprint_failed: bool = False
+    app: FastAPI,
+    engine: Engine,
+    *,
+    fingerprint_failed: bool = False,
+    comparison: _StartConfigComparison | None = None,
+    alert_sink: AlertSink | None = None,
 ) -> None:
     """Write the start's ``config_loaded`` row through :func:`_record_reload_audit` (vault BACKLOG
     #2597), so a restart records which code and which posture the engine started with.
@@ -1100,7 +1246,12 @@ async def _record_start_audit(
     raises: the engine is already taking traffic, and a lost row is logged at ERROR rather than
     refusing a start. A loosenings list that cannot be read is recorded as ``None``, which says
     unknown, never as an empty list, which would say none are active. A start whose fingerprint
-    could not be taken is marked degraded with the ``config_fingerprint`` step, as a reload is."""
+    could not be taken is marked degraded with the ``config_fingerprint`` step, as a reload is.
+
+    ``comparison`` is :func:`_compare_start_config`'s result. The row records its
+    ``previous_fingerprint`` and ``changed``, both ``None`` when no comparison was made, and a
+    change raises ``config_changed`` on ``alert_sink`` (the logging sink when there is no
+    notifier), whether or not the row itself was written."""
     switches: list[str] | None
     try:
         pairs, _scope = _posture_loosenings(
@@ -1119,8 +1270,14 @@ async def _record_start_audit(
         actor="system",
         action="config_loaded",
         failed_steps=["config_fingerprint"] if fingerprint_failed else [],
-        extra={"loosenings": switches},
+        extra={
+            "loosenings": switches,
+            "previous_fingerprint": comparison.previous_fingerprint if comparison else None,
+            "changed": comparison.changed if comparison else None,
+        },
     )
+    if comparison is not None and comparison.changed:
+        _raise_config_changed(alert_sink or LoggingAlertSink(), engine, comparison)
 
 
 def _summary(row: Row) -> MessageSummary:
@@ -8179,6 +8336,11 @@ def create_managed_app(
                 # route has a baseline from the start on (vault BACKLOG #2597). Never raises on an
                 # unreadable bundle: it leaves the baseline empty and the start goes on.
                 start_fingerprint_failure = await engine.capture_start_provenance()
+                # Before engine.start(), so no reload can have moved the baseline yet, and against
+                # this snapshot, so a later one cannot change what this start is said to have
+                # loaded. Bounded and never raises: it costs only the comparison (vault BACKLOG
+                # #2597, step 5).
+                start_config = await _compare_start_config(engine, engine.loaded_config_fingerprint)
             except BaseException:
                 if notifier is not None:
                     await notifier.aclose()
@@ -8340,7 +8502,11 @@ def create_managed_app(
             # serving, so a later startup step that aborts must not leave the start unrecorded.
             if config_dir is not None:
                 await _record_start_audit(
-                    app, engine, fingerprint_failed=start_fingerprint_failure is not None
+                    app,
+                    engine,
+                    fingerprint_failed=start_fingerprint_failure is not None,
+                    comparison=start_config,
+                    alert_sink=notifier,
                 )
             # The auth_settings test adds nothing at runtime; it narrows the type for the reads below.
             if auth is not None and auth_settings is not None:
