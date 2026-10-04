@@ -105,6 +105,7 @@ async def store() -> AsyncIterator[object]:
                 "messages",
                 "sessions",
                 "webauthn_credentials",  # ADR 0068: FK to users(id) — must clear before users
+                "known_login_addresses",  # vault BACKLOG #2145: per-account, cleared before users
                 "user_roles",
                 "ad_group_role_map",
                 "users",
@@ -806,6 +807,14 @@ async def test_lockout_store_contract(store) -> None:
     from tests._lockout_store_contract import _assert_lockout_contract
 
     await _assert_lockout_contract(store)
+
+
+async def test_login_address_store_contract(store) -> None:
+    """vault BACKLOG #2145: the known sign-in address record on the real SQL Server backend. This leg
+    is the only thing that executes this backend's upsert and prune bodies. Extra-free import."""
+    from tests._login_address_store_contract import _assert_login_address_contract
+
+    await _assert_login_address_contract(store)
 
 
 async def test_pending_approval_store_contract(store) -> None:

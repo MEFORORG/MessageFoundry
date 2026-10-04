@@ -772,6 +772,17 @@ _SCHEMA: list[str] = [
     )""",
     "CREATE INDEX IF NOT EXISTS ix_webauthn_credentials_user ON webauthn_credentials(user_id)",
     "CREATE UNIQUE INDEX IF NOT EXISTS ux_webauthn_label ON webauthn_credentials(user_id, label)",
+    # The first-seen sign-in address baseline (BACKLOG #288, vault BACKLOG #2145) -- mirrors the SQLite
+    # `known_login_addresses` table (store/store.py), whose comment gives the reasons, the cascade's
+    # among them. The primary key serves the signal's one read. Adding this DDL moves _schema_hash()
+    # automatically -- the ADR 0064 bump.
+    """CREATE TABLE IF NOT EXISTS known_login_addresses (
+        user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        address    TEXT NOT NULL,
+        first_seen DOUBLE PRECISION NOT NULL,
+        last_seen  DOUBLE PRECISION NOT NULL,
+        PRIMARY KEY (user_id, address)
+    )""",
     # Saved-search presets (ADR 0136, BACKLOG #151): per-user; the `criteria` JSON is PHI-shaped and
     # AES-256-GCM-encrypted at rest (id-keyed cell-AAD, in _CIPHER_COLUMNS). Adding this DDL moves
     # _schema_hash() automatically — the ADR 0064 bump.
@@ -7747,11 +7758,43 @@ class PostgresStore:
             )
             return True
 
+    async def list_known_login_addresses(self, user_id: str, *, since: float) -> list[str]:
+        """See :meth:`messagefoundry.store.base.AuthStore.list_known_login_addresses`."""
+        rows = await self._fetchall(
+            "SELECT address FROM known_login_addresses WHERE user_id=$1 AND last_seen>=$2",
+            user_id,
+            since,
+        )
+        return [str(r["address"]) for r in rows]
+
+    async def remember_login_address(self, user_id: str, address: str, *, now: float) -> None:
+        """See :meth:`messagefoundry.store.base.AuthStore.remember_login_address`."""
+        async with self._timed_acquire() as conn:
+            await conn.execute(
+                "INSERT INTO known_login_addresses (user_id, address, first_seen, last_seen)"
+                " VALUES ($1, $2, $3, $3)"
+                " ON CONFLICT (user_id, address) DO UPDATE"
+                " SET last_seen=GREATEST(known_login_addresses.last_seen, EXCLUDED.last_seen)",
+                user_id,
+                address,
+                now,
+            )
+
+    async def forget_login_addresses(self, user_id: str, *, before: float) -> None:
+        """See :meth:`messagefoundry.store.base.AuthStore.forget_login_addresses`."""
+        await self._execute(
+            "DELETE FROM known_login_addresses WHERE user_id=$1 AND last_seen<$2",
+            user_id,
+            before,
+        )
+
     async def delete_user(self, user_id: str) -> None:
         async with self._timed_acquire() as conn, conn.transaction():
             await conn.execute("DELETE FROM user_roles WHERE user_id=$1", user_id)
             await conn.execute("DELETE FROM sessions WHERE user_id=$1", user_id)
             await conn.execute("DELETE FROM webauthn_credentials WHERE user_id=$1", user_id)
+            # vault BACKLOG #2145: the account's known sign-in addresses go with it.
+            await conn.execute("DELETE FROM known_login_addresses WHERE user_id=$1", user_id)
             # BACKLOG #1233, verbatim with the SQLite and SQL Server bodies: presets are owner-scoped
             # by Identity.user_id (#1225) with no FK cascade, so without this the rows outlive the
             # account carrying PHI-shaped `criteria` (ADR 0136) that no owner can reach or purge.

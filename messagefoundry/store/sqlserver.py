@@ -2020,6 +2020,19 @@ _SCHEMA: list[str] = [
         CREATE INDEX ix_webauthn_credentials_user ON webauthn_credentials(user_id)""",
     """IF INDEXPROPERTY(OBJECT_ID('webauthn_credentials'),'ux_webauthn_label','IndexID') IS NULL
         CREATE UNIQUE INDEX ux_webauthn_label ON webauthn_credentials(user_id, label)""",
+    # The first-seen sign-in address baseline (BACKLOG #288, vault BACKLOG #2145) -- mirrors the SQLite
+    # `known_login_addresses` table (store/store.py), whose comment gives the reasons, the cascade's
+    # among them. The primary key serves the signal's one read. `address` is BIN2 so key equality is
+    # a byte comparison, as on
+    # SQLite and Postgres, and capped at 256 so the key stays bounded; the service never writes a
+    # longer one. Adding this DDL moves _schema_hash() -- the ADR 0064 bump.
+    """IF OBJECT_ID('known_login_addresses','U') IS NULL CREATE TABLE known_login_addresses (
+        user_id NVARCHAR(64) NOT NULL,
+        address NVARCHAR(256) COLLATE Latin1_General_100_BIN2 NOT NULL,
+        first_seen FLOAT NOT NULL, last_seen FLOAT NOT NULL,
+        CONSTRAINT pk_known_login_addresses PRIMARY KEY (user_id, address),
+        CONSTRAINT fk_known_login_addresses_user FOREIGN KEY (user_id)
+            REFERENCES users(id) ON DELETE CASCADE)""",
     # Captured request/response replies (ADR 0013) — an IMMUTABLE ARTIFACT table (composite PK), NOT a
     # queue stage, so it is invisible to _maybe_finalize's `FROM queue` scan. response_seq is replay-
     # stable (1+MAX per (message_id,destination_name)). body + detail are BOTH ciphertext at rest for
@@ -11539,12 +11552,51 @@ class SqlServerStore:
             "UPDATE users SET notify_email=?, updated_at=? WHERE id=?", (cleaned, now, user_id)
         )
 
+    async def list_known_login_addresses(self, user_id: str, *, since: float) -> list[str]:
+        """See :meth:`messagefoundry.store.base.AuthStore.list_known_login_addresses`."""
+        rows = await self._fetchall(
+            "SELECT address FROM known_login_addresses WHERE user_id=? AND last_seen>=?",
+            (user_id, since),
+        )
+        return [str(d["address"]) for d in rows]
+
+    async def remember_login_address(self, user_id: str, address: str, *, now: float) -> None:
+        """See :meth:`messagefoundry.store.base.AuthStore.remember_login_address`. ``HOLDLOCK``
+        makes the MERGE's match-then-insert one decision, so two concurrent sign-ins from one host
+        cannot both take the insert branch and collide on the key."""
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await cur.execute(
+                    "MERGE known_login_addresses WITH (HOLDLOCK) AS t"
+                    " USING (SELECT ? AS user_id, ? AS address, ? AS seen) AS s"
+                    " ON t.user_id = s.user_id AND t.address = s.address"
+                    " WHEN MATCHED THEN UPDATE SET t.last_seen ="
+                    " CASE WHEN t.last_seen > s.seen THEN t.last_seen ELSE s.seen END"
+                    " WHEN NOT MATCHED THEN"
+                    " INSERT (user_id, address, first_seen, last_seen)"
+                    " VALUES (s.user_id, s.address, s.seen, s.seen);",
+                    (user_id, address, now),
+                )
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+
+    async def forget_login_addresses(self, user_id: str, *, before: float) -> None:
+        """See :meth:`messagefoundry.store.base.AuthStore.forget_login_addresses`."""
+        await self._execute(
+            "DELETE FROM known_login_addresses WHERE user_id=? AND last_seen<?",
+            (user_id, before),
+        )
+
     async def delete_user(self, user_id: str) -> None:
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
                 await cur.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
                 await cur.execute("DELETE FROM webauthn_credentials WHERE user_id=?", (user_id,))
+                # vault BACKLOG #2145: the account's known sign-in addresses go with it.
+                await cur.execute("DELETE FROM known_login_addresses WHERE user_id=?", (user_id,))
                 # BACKLOG #1233, verbatim with the SQLite and Postgres bodies: presets are
                 # owner-scoped by Identity.user_id (#1225) with no FK cascade, so without this the
                 # rows outlive the account carrying PHI-shaped `criteria` (ADR 0136) that no owner can

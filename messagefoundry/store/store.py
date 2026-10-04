@@ -4758,6 +4758,22 @@ CREATE TABLE IF NOT EXISTS webauthn_credentials (
 CREATE INDEX IF NOT EXISTS ix_webauthn_credentials_user ON webauthn_credentials(user_id);
 CREATE UNIQUE INDEX IF NOT EXISTS ux_webauthn_label ON webauthn_credentials(user_id, label);
 
+-- The first-seen sign-in address baseline (BACKLOG #288, vault BACKLOG #2145). One row per account
+-- and client host where a sign-in finished owing nothing more, or a step-up or enrolment passed
+-- (AuthService._mark_login_address_known says when). Keyed on the account id, never the
+-- username, so a re-created namesake inherits nothing. The primary key serves the signal's one read
+-- (WHERE user_id), so audit_log, which has no actor index, is never scanned for it. Plaintext like
+-- sessions.client: a network address, not PHI (docs/PHI.md section 2). ON DELETE CASCADE because
+-- the write is best-effort and may race delete_user: a row inserted just before the account's
+-- delete goes with it, and one inserted after fails the key and is dropped by the caller.
+CREATE TABLE IF NOT EXISTS known_login_addresses (
+    user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    address    TEXT NOT NULL,                  -- the host key, as AuthService folds it
+    first_seen REAL NOT NULL,
+    last_seen  REAL NOT NULL,                  -- the signal reads only rows inside its lookback
+    PRIMARY KEY (user_id, address)
+);
+
 CREATE TABLE IF NOT EXISTS search_presets (
     id         TEXT PRIMARY KEY,                 -- uuid4 hex; the cell-AAD pk for the encrypted criteria
     owner_user_id TEXT NOT NULL,                 -- the owning Identity.user_id (BACKLOG #1225: NOT the
@@ -11689,11 +11705,44 @@ class MessageStore:
             await self._commit()
             return cur.rowcount > 0
 
+    async def list_known_login_addresses(self, user_id: str, *, since: float) -> list[str]:
+        """See :meth:`messagefoundry.store.base.AuthStore.list_known_login_addresses`."""
+        async with self._read() as db:
+            cur = await db.execute(
+                "SELECT address FROM known_login_addresses WHERE user_id=? AND last_seen>=?",
+                (user_id, since),
+            )
+            rows = await cur.fetchall()
+        return [str(r["address"]) for r in rows]
+
+    async def remember_login_address(self, user_id: str, address: str, *, now: float) -> None:
+        """See :meth:`messagefoundry.store.base.AuthStore.remember_login_address`."""
+        async with _writer_guard(self._db, self._lock):
+            await self._db.execute(
+                "INSERT INTO known_login_addresses (user_id, address, first_seen, last_seen)"
+                " VALUES (?, ?, ?, ?)"
+                " ON CONFLICT(user_id, address)"
+                " DO UPDATE SET last_seen=MAX(last_seen, excluded.last_seen)",
+                (user_id, address, now, now),
+            )
+            await self._commit()
+
+    async def forget_login_addresses(self, user_id: str, *, before: float) -> None:
+        """See :meth:`messagefoundry.store.base.AuthStore.forget_login_addresses`."""
+        async with _writer_guard(self._db, self._lock):
+            await self._db.execute(
+                "DELETE FROM known_login_addresses WHERE user_id=? AND last_seen<?",
+                (user_id, before),
+            )
+            await self._commit()
+
     async def delete_user(self, user_id: str) -> None:
         async with _writer_txn(self._db, self._lock):
             await self._db.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
             await self._db.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
             await self._db.execute("DELETE FROM webauthn_credentials WHERE user_id=?", (user_id,))
+            # vault BACKLOG #2145: the account's known sign-in addresses go with it.
+            await self._db.execute("DELETE FROM known_login_addresses WHERE user_id=?", (user_id,))
             # BACKLOG #1233: presets are owner-scoped by Identity.user_id (#1225) and there is no
             # FK cascade on this table, so without this DELETE the rows outlive the account —
             # PHI-shaped `criteria` (ADR 0136) persisting with no owner able to reach or purge it,
