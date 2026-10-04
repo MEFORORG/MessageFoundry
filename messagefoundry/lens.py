@@ -4682,13 +4682,18 @@ def _copy_write_method(src: Any) -> str:
 #: repetition, subcomponent and escape characters ``^ ~ & \``. Text holding one keeps ``set``.
 #:
 #: The lens is static. It cannot tell an HL7 handler from an X12 one, and it cannot read a
-#: message's own separators. So it protects HL7, the default format, and holds no X12 separator
-#: (vault #2861, ADR 0206 amendment 2026-10-04). Each character here costs HL7 something: a
-#: template that keeps ``set`` lets a decoded leaf's separators become structure. ``MRN: `` around
-#: a leaf decoding to ``12^34`` wrote a second component while ``:`` was here. An X12 template
-#: gives up nothing it needs. Its ``set_data`` refuses the component separator in a whole element,
-#: so a template whose text holds one raises at once rather than split data such as ``12:30``
-#: into two components, as ``set`` would. Both writes already refuse the element separator.
+#: message's own separators. So it protects HL7, the default format, and adds no X12-only
+#: separator (vault #2861, ADR 0206 amendment 2026-10-04). ``^`` and ``~`` are also common X12
+#: separators, for a repetition and a segment end, and both X12 writes refuse those. Each
+#: character here costs HL7 something: a template that keeps ``set`` lets a decoded leaf's
+#: separators become structure. ``MRN: `` around a leaf decoding to ``12^34`` wrote a second
+#: component while ``:`` was here.
+#:
+#: X12 pays for this instead. An X12 leaf read cannot hold the component separator, so on X12 one
+#: in a template is always text the author typed. ``set_data`` refuses it in a whole element, so
+#: the line raises, whether the author meant a composite such as ``11:B:1`` or data such as
+#: ``12:30``. ``set`` would write the first and split the second without a word. An X12 author who
+#: means a composite writes ``set`` by hand or writes each component.
 #:
 #: The HL7 field separator is not here either: a whole-field ``set`` refuses one anyway, so text
 #: holding it can only mean data.

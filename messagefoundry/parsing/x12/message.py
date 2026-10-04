@@ -138,9 +138,9 @@ class X12Message:
         ``msg.set_data``, and it cannot tell an X12 handler from an HL7 one. Without this name
         that line raised ``AttributeError`` on every X12 message. The value reaches this method
         already built, so it cannot tell a separator the author typed from one a read returned.
-        A template whose own text holds the component separator therefore raises here: the Steps
-        view keeps ``set`` only for the HL7 separators, so the X12 one fails loud rather than
-        splitting data. A bad path fails first, as it does under :meth:`set`."""
+        The Steps view keeps ``set`` only for the HL7 separators (ADR 0206 amendment 2026-10-04),
+        so a template whose own text holds the component separator raises here, whether the
+        author meant a composite or data. A bad path fails first, as it does under :meth:`set`."""
         _parse_path(path)
         self._reject_delimiters(value, whole_element=False)
         self.set(path, value, occurrence=occurrence)
