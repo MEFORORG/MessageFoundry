@@ -6982,17 +6982,15 @@ class AuthService:
         back."""
         self._new_ip_seen.pop(token_hash, None)
 
-    async def _classify_login_address(
-        self, user: UserRecord, client: str | None, *, enrolment: bool = False
-    ) -> _LoginAddress:
+    async def _classify_login_address(self, user: UserRecord, client: str | None) -> _LoginAddress:
         """The first-seen login-address signal's verdict for one sign-in (BACKLOG #288, ASVS 8.2.4).
 
         Call it BEFORE the mint and before :meth:`_mark_login_address_known` can run for this sign-in,
         or the login could find itself.
 
         **THE BASELINE IS THE ACCOUNT'S KNOWN-ADDRESS RECORD** (vault BACKLOG #2145): the host keys
-        of sign-ins that finished every factor they owed, read through the record's primary key on
-        the account id. It replaced a baseline read from ``audit_log``, which has no actor index and
+        where a sign-in finished every factor it owed, or a step-up or factor enrolment passed, read
+        through the record's primary key on the account id. It replaced a baseline read from ``audit_log``, which has no actor index and
         could not tell a finished sign-in from one that stopped at the password on the directory leg.
         Which events write the record is :meth:`_mark_login_address_known`'s to say. Keyed on the
         account id, so a re-created namesake inherits nothing, and the account's deletion removes it.
@@ -7024,14 +7022,12 @@ class AuthService:
             ):
                 return _LoginAddress.UNEVALUATED_NO_BASELINE
         except Exception:
-            # Two callers, two consequences: a sign-in goes on unchallenged, and an enrolment
-            # (``_mark_login_address_known``) leaves its address unrecorded. Say which.
+            # Worded for both callers: a sign-in goes on unchallenged, and an enrolment
+            # (``_mark_login_address_known``) records nothing.
             _log.exception(
-                "first-seen login-address read failed for %s; %s",
+                "first-seen login-address read failed for %s; the address is left unevaluated, "
+                "so it is neither challenged nor recorded",
                 user.username,
-                "the enrolment does not record its address"
-                if enrolment
-                else "the sign-in proceeds unchallenged",
             )
             return _LoginAddress.UNEVALUATED_READ_FAILED
         return _LoginAddress.NEW
@@ -7073,7 +7069,10 @@ class AuthService:
           with ``step_up`` set. It writes only for an account that owes no second factor. That is
           how a first-seen address on a no-factor sign-in passes its challenge. An account that owes
           a factor passes it at the factor legs instead, so a password-only step-up from a roamed
-          session cannot plant its address.
+          session cannot plant its address. "Owes" is asked of the ACCOUNT, as an unverified
+          session of it would be, never of this session's own stamp. So under ``require_mfa`` no
+          directory step-up writes, even an IdP step-up that re-proved the MFA claim. A later sign-in
+          from that host records it once that sign-in finishes, at the cost of one more notice.
 
         Best-effort and never refusing: a failed read or write is logged, and the sign-in it records
         has already succeeded. A lost write costs a challenge and notice at the next sign-in from
@@ -7095,7 +7094,7 @@ class AuthService:
                 if user is None or await self._unverified_session_owes_factor(user):
                     return
             if enrolment is not None and (
-                await self._classify_login_address(enrolment, client, enrolment=True)
+                await self._classify_login_address(enrolment, client)
                 not in _LOGIN_VERDICTS_THAT_SEED_THE_BASELINE
             ):
                 return
@@ -7765,29 +7764,22 @@ class AuthService:
                 elevation = await self._elevated(
                     token, ceremony="mfa_verify", actor=user.username, client=client
                 )
-            else:
-                # Wrong code: register the failure through the SAME machinery the password path
-                # uses, so the per-account lockout + ACCOUNT_LOCKED notification fire on sustained
-                # MFA guessing. On the SECOND-STEP counter: the caller holds a session, so it has
-                # proved the first step.
-                failure = await self._register_failure(user, now, counter="second_step")
-                await self._audit("auth.mfa_failed", actor=user.username, client=client)
-                await self._record_lock(
-                    user,
-                    "second_step",
-                    failure,
-                    client=client,
-                    audit_detail=None,
-                    factor="first_step",
-                )
-                return Elevation()
-        if elevation.ok:
-            # vault BACKLOG #2145: the factor is proved from this address. Recorded AFTER the
-            # account's queue is released: the record's write and prune are two store commits that
-            # no check inside the queue reads, so holding the queue for them would only stall the
-            # next attempt on this account.
-            await self._mark_login_address_known(user.id, client)
-        return elevation
+                if elevation.ok:
+                    # vault BACKLOG #2145: the factor is proved from this address. Recorded INSIDE
+                    # the account's queue, two commits and all: ``login`` classifies a sign-in's
+                    # address under the same queue, so a sign-in queued behind this one must find
+                    # the address already written, or it reads NEW and is challenged for nothing.
+                    await self._mark_login_address_known(user.id, client)
+                return elevation
+            # Wrong code: register the failure through the SAME machinery the password path uses, so
+            # the per-account lockout + ACCOUNT_LOCKED notification fire on sustained MFA guessing.
+            # On the SECOND-STEP counter: the caller holds a session, so it has proved the first step.
+            failure = await self._register_failure(user, now, counter="second_step")
+            await self._audit("auth.mfa_failed", actor=user.username, client=client)
+            await self._record_lock(
+                user, "second_step", failure, client=client, audit_detail=None, factor="first_step"
+            )
+            return Elevation()
 
     async def _second_factor_too_early(
         self,

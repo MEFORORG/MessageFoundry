@@ -416,9 +416,10 @@ async def test_kerberos_under_the_default_require_mfa_builds_its_baseline_at_the
 ) -> None:
     """The default path, which the test above steps around. Under the shipped ``require_mfa`` every
     Kerberos session owes a factor, so no Kerberos SIGN-IN writes the record. The factor legs do:
-    the first sign-in finishes at enrolment, and each later one at ``verify_mfa``. So only the
-    account's first-ever sign-in is unjudged; the second is KNOWN and a third, from another host,
-    is NEW. Each later sign-in is classified before its own ``verify_mfa`` runs."""
+    the first sign-in finishes at enrolment, and each later one at ``verify_mfa``. Every sign-in
+    is unjudged until one finishes: a sign-in abandoned at the factor prompt leaves no baseline.
+    After the first one finishes, a sign-in from the same host is KNOWN and one from another host
+    is NEW. Each is classified before its own ``verify_mfa`` runs."""
     monkeypatch.setattr(service_module, "kerberos_principal", lambda token, settings: "jsmith")
     store = await MessageStore.open(":memory:")
     try:
@@ -460,6 +461,10 @@ async def test_kerberos_under_the_default_require_mfa_builds_its_baseline_at_the
         assert await store.list_known_login_addresses(uid, since=0.0) == []
         [unevaluated] = await _reasons()
         assert json.loads(str(unevaluated["detail"]))["reason"] == "no_baseline"
+        # A second sign-in, abandoned at the factor prompt, is unjudged too: nothing finished yet.
+        abandoned = await service.authenticate_kerberos(b"ticket", client="203.0.113.61")
+        assert abandoned.ok and abandoned.mfa_required
+        assert len(await _reasons()) == 2
         secret = await _enrol_totp(service, first.identity, first.token, client="10.2.2.2", now=t0)
         assert await store.list_known_login_addresses(uid, since=0.0) == ["10.2.2.2"]
 
@@ -470,8 +475,8 @@ async def test_kerberos_under_the_default_require_mfa_builds_its_baseline_at_the
             pin_totp_clock(monkeypatch, t)
             assert (await service.verify_mfa(out.token, totp.totp(secret, now=t), client=client)).ok
 
-        # The second sign-in was KNOWN and the third NEW; no further sign-in failed open.
-        assert len(await _reasons()) == 1
+        # The first after enrolment was KNOWN and the next NEW; neither failed open.
+        assert len(await _reasons()) == 2
         assert await _new_ip_rows() == ["198.51.100.48"]
         assert [e.client_ip for e in _new_ip_notices(notifier)] == ["198.51.100.48"]
         assert sorted(await store.list_known_login_addresses(uid, since=0.0)) == [

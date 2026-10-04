@@ -13,6 +13,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import time
 from typing import Any
 
 import pytest
@@ -1043,5 +1044,44 @@ async def test_a_first_passkey_registration_finishes_the_first_sign_in_and_recor
         )
         assert len(unevaluated) == 1, "the second sign-in failed open as a first one"
         assert await store.list_audit(actor="aduser", action="auth.login_new_ip") == []
+    finally:
+        await store.close()
+
+
+async def test_a_passkey_registered_from_a_first_seen_address_records_nothing() -> None:
+    """The negative of the test above. ADR 0197 Amendment A lets a holder of the password alone
+    enrol an authenticator, so a registration from a first-seen address proves nothing about that
+    address and must not make it known. The test above is the positive control: the same
+    registration from an account with no baseline yet does write."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, _token, password = await login_admin(service)
+        uid = identity.user_id
+        # The first sign-in had no client address, so the account's baseline is seeded directly.
+        await store.remember_login_address(uid, "10.7.7.7", now=time.time())
+        known = await service.login(ADMIN_USERNAME, password, client="10.7.7.7")
+        assert known.ok and known.identity is not None and known.token is not None
+        assert await store.list_known_login_addresses(uid, since=0.0) == ["10.7.7.7"]
+
+        opts = json.loads(
+            await service.begin_webauthn_registration(
+                known.identity, token=known.token, rp_id=RP, rp_name="MessageFoundry"
+            )
+        )
+        auth = SoftAuthenticator(rp_id=RP, origin=ORIGIN)
+        elevation = await service.finish_webauthn_registration(
+            known.identity,
+            auth.create_response(base64url_to_bytes(opts["challenge"]), transports=["usb"]),
+            label="roamed-key",
+            token=known.token,
+            client="198.51.100.90",
+            rp_id=RP,
+            origin=ORIGIN,
+        )
+
+        assert elevation.ok
+        assert await store.has_webauthn_credentials(uid)
+        assert await store.list_known_login_addresses(uid, since=0.0) == ["10.7.7.7"]
     finally:
         await store.close()

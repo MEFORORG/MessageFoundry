@@ -537,8 +537,10 @@ async def test_the_idp_step_up_records_its_address_only_for_an_account_that_owes
 ) -> None:
     """A step-up is how a first-seen address passes its challenge, so the IdP leg writes the
     callback's address to the account's known-address record. It writes only for an account that
-    owes no second factor. Under the shipped ``require_mfa`` every directory account owes one (the
-    directory floor), so there the step-up writes nothing and the factor legs write instead.
+    owes no second factor, asked of the account and not of this session's own MFA stamp. Under the
+    shipped ``require_mfa`` every directory account owes one (the directory floor), so there the
+    step-up writes nothing, even though the IdP re-proved the MFA claim. A later sign-in from the
+    host records it once that sign-in finishes.
 
     The sign-in passes no client address, so it writes nothing itself; the row the first case finds
     can only have come from the step-up."""
