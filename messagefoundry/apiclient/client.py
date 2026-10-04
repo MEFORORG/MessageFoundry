@@ -545,15 +545,24 @@ class _TokenCell:
 
     ``issued_here`` records where ``value`` came from. It is True only when the engine handed the
     token to THIS client, by a sign-in or a rotation, and False for a token adopted from outside
-    (:meth:`EngineClient.set_token`). :meth:`EngineClient.login` revokes the token it replaces only
-    when it is True, because a token from outside may be in use by another process.
+    (:meth:`EngineClient.set_token`). :meth:`EngineClient.login` names the token it replaces to the
+    engine as superseded only when it is True, because a token from outside may be in use by
+    another process.
+
+    ``replacing`` is held by :meth:`EngineClient.login` from before its request leaves until the new
+    token is in the cell. The engine ends the superseded token inside that request, so for that
+    span the cell holds a token the engine already refuses. A read on a clone that is refused with
+    a 401 waits on this lock and then looks at the cell again: see
+    :meth:`EngineClient._replaced_since`. It is re-entrant, so a read made on the signing-in thread
+    itself never waits on its own sign-in.
     """
 
-    __slots__ = ("issued_here", "value")
+    __slots__ = ("issued_here", "replacing", "value")
 
     def __init__(self, value: str | None = None) -> None:
         self.value = value
         self.issued_here = False
+        self.replacing = threading.RLock()
 
 
 class EngineClient:
@@ -836,6 +845,11 @@ class EngineClient:
         A read racing a rotation can still see either the old or the new token — the cell is a shared
         reference, not a lock. That is a plain retry (one background read 401s and the next succeeds),
         not the permanent breakage a stale copy would cause.
+
+        A read racing a SIGN-IN is retried here instead of failing. :meth:`login` has the engine end
+        the token it replaces inside the sign-in request, so a ``GET`` sent on that token can be
+        refused before the new one is in the cell. Such a ``GET`` waits for the sign-in to finish
+        and is sent once more on the new token (:meth:`_replaced_since`).
         """
         # The absolute paths fixed at construction, when there are any: a relative path resolved
         # now could name a different file than this client pins, after a change of directory.
@@ -891,11 +905,12 @@ class EngineClient:
         _allow_step_up: bool = True,
         _allow_mfa: bool = True,
         _follow_pin: bool = True,
+        _follow_replaced: bool = True,
         _bearer: str | None = None,
         **kw: object,
     ) -> httpx.Response:
         # ``_bearer`` sends a token OTHER than the held one, for the one call that must: ending the
-        # session a sign-in or set_token replaced (:meth:`_end_replaced_session`). It rides through
+        # session a set_token replaced (:meth:`_end_replaced_session`). It rides through
         # here rather than a side request so it keeps every bound below, the cleartext refusal, and
         # the renewed-certificate follow. It disarms the MFA and step-up retries: their handlers elevate
         # the HELD session, not the one sent here. The certificate retry stays armed and carries
@@ -984,6 +999,7 @@ class EngineClient:
                 _allow_step_up=_allow_step_up,
                 _allow_mfa=_allow_mfa,
                 _follow_pin=False,
+                _follow_replaced=_follow_replaced,
                 _bearer=_bearer,
                 **kw,
             )
@@ -1005,6 +1021,7 @@ class EngineClient:
                 _allow_step_up=_allow_step_up,
                 _allow_mfa=False,
                 _follow_pin=True,
+                _follow_replaced=_follow_replaced,
                 # Always None here, since a ``_bearer`` call disarms this retry. Keep it: strict
                 # mypy refuses to let ``**kw: object`` fill the typed ``_bearer`` parameter.
                 _bearer=_bearer,
@@ -1031,12 +1048,65 @@ class EngineClient:
                     _allow_step_up=False,
                     _allow_mfa=_allow_mfa,
                     _follow_pin=True,
+                    _follow_replaced=_follow_replaced,
                     _bearer=_bearer,  # always None here; kept for mypy, as in the MFA retry above
                     **kw,
                 )
+        # A sign-in on the shared cell ended the token this read carried (BACKLOG #2281): send it
+        # once more, on the token that sign-in was issued. Only a GET, and only once; see
+        # _replaced_since for why both limits are there.
+        if (
+            _follow_replaced
+            and response.status_code == 401
+            and method == "GET"
+            and _bearer is None
+            and bearer is not None
+            and self._replaced_since(bearer)
+        ):
+            return self._request(
+                method,
+                path,
+                _allow_step_up=_allow_step_up,
+                _allow_mfa=_allow_mfa,
+                _follow_pin=True,
+                _follow_replaced=False,
+                _bearer=None,  # this branch runs only when it is None; kept for mypy, as above
+                **kw,
+            )
         if response.status_code >= 400:
             raise ApiError(_error_detail(response), status=response.status_code)
         return response
+
+    def _replaced_since(self, sent: str) -> bool:
+        """After a 401 on ``sent``: True when the shared cell now holds a different token.
+
+        :meth:`login` names the token it replaces as ``supersedes``, and the engine ends that token
+        inside the sign-in request. The new token reaches the cell only when the reply does. A
+        :meth:`for_polling` clone that sends a read in between presents a token the engine has
+        already ended, and is refused. That refusal says nothing about the user's session, which
+        is about to continue on the new token, so it must not reach the caller as a sign-out.
+
+        So this waits for a sign-in in flight on the cell, then compares. True means the caller
+        sends the request again, on the token now in the cell. False means the 401 stands: the
+        cell still holds ``sent`` (no sign-in replaced it, or the sign-in failed), or it was
+        cleared. The wait is bounded by the client timeout, and a wait that runs out reads as False.
+
+        Three limits keep the second send safe:
+
+        * **Only a GET.** The clones exist for reads. A 401 on a write could also be the route's own
+          answer, such as a wrong code on ``/auth/mfa-verify``, and sending that twice counts twice.
+        * **Only once.** The second attempt is sent with this follow disarmed.
+        * **Only the held token.** A request sent on another token (``_bearer``) is never followed.
+
+        A rotation (:meth:`_adopt_rotated`) takes no lock, so a read refused before the rotated
+        token is adopted still fails once. One refused after it is retried here.
+        """
+        cell = self._token_cell
+        if not cell.replacing.acquire(timeout=self._timeout):
+            return False
+        cell.replacing.release()
+        current = cell.value
+        return current is not None and current != sent
 
     def _adopt_rotated(self, response: httpx.Response) -> None:
         """Adopt the re-keyed session token an elevation route hands back (ASVS 7.2.4).
@@ -1512,17 +1582,21 @@ class EngineClient:
         The adopted token counts as NOT issued to this client, so a later :meth:`login` leaves it
         live (see :class:`_TokenCell`).
 
-        The token it replaces is ended when the engine issued that one to this client, by the rule
-        :meth:`login` follows (BACKLOG #2091). This client is dropping it, and nothing else can
+        The token it replaces is ended when the engine issued that one to this client, the same
+        test :meth:`login` applies (BACKLOG #2091). This client is dropping it, and nothing else can
         reach it, so leaving it live would only strand it. A token adopted from outside is dropped
         and left live, because another process may be using it. Adopting the token already held
         changes nothing, including where it came from.
 
+        Nothing is signed in here, so there is no sign-in request to carry ``supersedes``. The
+        replaced token is ended with its own ``POST /auth/logout`` (:meth:`_end_replaced_session`).
+
         The revoke runs after ``/auth/me`` answers, whether or not it succeeds: the held token
         was replaced before that call, so a refused new token strands the old one just the same.
 
-        The revoke blocks the calling thread, as in :meth:`login`. No caller in this repository
-        reaches it today, because each one adopts a token on a fresh client that holds none."""
+        The revoke blocks the calling thread, bounded by the client timeout, which httpx applies
+        per phase rather than in total. No caller in this repository reaches it today, because
+        each one adopts a token on a fresh client that holds none."""
         self._refuse_credential_on_cleartext("a bearer token")
         prior = self._token
         issued = self._token_cell.issued_here
@@ -1558,69 +1632,75 @@ class EngineClient:
         local account with TOTP enrolled it signs in past a sign-in lock someone else set, and
         answers with ``mfa_required`` False.
 
-        ``POST /auth/login`` only RETURNS a token; it revokes nothing, because a bearer is not
-        ambient and the engine cannot know this client is about to drop one. So the client ends the
-        token it held, as the IDE's ``signIn`` does. Without that, the replaced session would stay
-        valid on first deployment, unreachable from here, until it idled out or expired.
+        ``POST /auth/login`` returns a token and, left alone, revokes nothing: a bearer is not
+        ambient, so the engine cannot know this client is about to drop one. The client therefore
+        NAMES the token it is replacing, in the body's ``supersedes`` field, and the engine ends
+        that one session as part of the sign-in (BACKLOG #2096, #2281). Without that, the replaced
+        session would stay valid on first deployment, unreachable from here, until it idled out or
+        expired.
 
-        It ends that token only when the engine issued it to this client, by an earlier ``login`` or
-        a rotation. A token adopted with :meth:`set_token` came from outside, such as a keyring or a
-        ``--token`` flag, and another process may be using it. Revoking it would sign that process
-        out, so it is dropped here and left live. This is where the client parts from the IDE,
-        which also ends a cached token. The rule protects only the adopting side: a token this
+        It names that token only when the engine issued it to this client, by an earlier ``login``
+        or a rotation. A token adopted with :meth:`set_token` came from outside, such as a keyring
+        or a ``--token`` flag, and another process may be using it. Naming it would sign that
+        process out, so it is dropped here and left live. This is where the client parts from the
+        IDE, which names any cached token. The rule protects only the adopting side: a token this
         client issued and then handed to another client is still ended on its next ``login``.
 
-        The order matters. The prior token is ended only AFTER the engine accepted the new
-        credential, so a refused sign-in signs nobody out. The new token is adopted FIRST, so the
-        poll clients sharing the cell move to it before the old one dies. That holds when the answer
-        is ``mfa_required`` or ``must_change_password`` too: this client has already dropped the old
-        token for the new one, so leaving the old one live would only strand it.
+        The engine ends the named token only once it has accepted the new credential, so a refused
+        sign-in signs nobody out. It ends it when the answer is ``mfa_required`` or
+        ``must_change_password`` too: this client drops the old token for the new one either way,
+        so leaving the old one live would only strand it. A token the engine no longer knows, or
+        has already revoked, ends nothing and the sign-in still succeeds.
 
-        Unlike the IDE, the revoke is not fire-and-forget. This client is blocking, so ``login``
-        returns after it, bounded by the client timeout, which httpx applies per phase rather than
-        in total. A revoke that fails never fails the sign-in: see :meth:`_end_replaced_session`.
+        **The engine ends it BEFORE its per-user session cap counts, and that is why it rides in
+        the sign-in.** This method used to sign in first and then end the old token with its own
+        ``POST /auth/logout``. For a user already at the cap, the sign-in then pushed out their
+        oldest OTHER session to make room for a session that was about to be replaced anyway.
 
-        So a GUI caller that signs in on its main thread waits for the revoke there too. That is
-        LATENT, not reachable, today (BACKLOG #2091): the harness ``LoginDialog`` signs in on the
-        Qt main thread, but only ever on a fresh client that holds no token, so no revoke runs.
-        A caller that re-signs-in on a client already holding an issued token would wait out one
-        more round trip; moving the sign-in off that thread is the fix, if one ever does.
+        **The cost is the order on this side.** The old token now dies inside the request, before
+        the new one is in the shared cell. Two things follow.
 
-        The engine runs its per-user session cap inside ``/auth/login``, before this revoke. A user
-        already at the cap therefore loses their oldest other session to make room, as with the
-        IDE. Ending the old session inside the mint needs an engine-side change."""
+        * A :meth:`for_polling` clone can send a read on the old token in that span and be refused.
+          ``login`` holds the cell's ``replacing`` lock from before the request until the new token
+          is held, and a refused ``GET`` on a clone waits for it and is sent once more on the new
+          token. See :meth:`_replaced_since`. A write sent on a clone in that span is not retried.
+        * **A lost reply leaves this client signed out.** If the engine mints the new session and
+          ends the old one, and the reply then fails to arrive or to decode, this client still
+          holds the old token, which is dead, and never learns the new one. ``login`` raises
+          :class:`ApiError` and every later call on the held token is refused with a 401 until the
+          caller signs in again. Before, the old token stayed live in that case. The new session
+          nobody holds stays valid until it idles out or expires, as it did before. This is the
+          accepted price of ending the old session ahead of the cap. It is not harmless.
+
+        No second request follows the sign-in, so ``login`` returns when the reply does."""
         self._refuse_credential_on_cleartext("a password")
         body = {"username": username, "password": password, "provider": provider}
         if totp_code and totp_code.strip():
             body["totp_code"] = totp_code.strip()
-        prior = self._token
-        prior_issued_here = self._token_cell.issued_here
-        result = _decode(
-            self._request(
-                "POST",
-                "/auth/login",
-                json=body,
-            ),
-            LoginResponse,
-        )
-        self._hold_issued(result.token)
+        cell = self._token_cell
+        # Held across the request AND the adoption: see _replaced_since for who waits on it.
+        with cell.replacing:
+            prior = cell.value
+            if prior and cell.issued_here:
+                body["supersedes"] = prior
+            result = _decode(self._request("POST", "/auth/login", json=body), LoginResponse)
+            self._hold_issued(result.token)
         self._user = result.user
         # A step-up purpose stashed for the old session must not bind the new one's next reauth().
         self._pending_step_up_action = None
-        if prior and prior_issued_here and prior != result.token:
-            self._end_replaced_session(prior)
         return result
 
     def _end_replaced_session(self, prior: str) -> None:
         """Revoke ``prior`` with ``POST /auth/logout``, presenting it as the bearer.
 
         Only that one token is ended, never the user's other sessions: a bearer caller may run
-        several at once, one per tool. :meth:`login` and :meth:`set_token` call this only for a
-        token the engine issued to this client, so a token shared with another process through
-        :meth:`set_token` is never ended here. The call installs no MFA or step-up retry, so it
+        several at once, one per tool. Only :meth:`set_token` calls this, and only for a token
+        the engine issued to this client, so a token shared with another process through
+        :meth:`set_token` is never ended here. (:meth:`login` ends the token it replaces inside
+        the sign-in request instead.) The call installs no MFA or step-up retry, so it
         can never prompt the user; ``/auth/logout`` is exempt from both gates anyway.
 
-        A failure is logged and swallowed, because the sign-in or adoption it follows has already
+        A failure is logged and swallowed, because the adoption it follows has already
         replaced the token. A 401 is the common case (usually the old token had already expired or
         been revoked), so it logs at INFO. The engine refuses with 401 for other reasons too, so the line says the
         engine refused rather than that the session had ended. Anything else may leave a live
@@ -1635,7 +1715,7 @@ class EngineClient:
         The catch is wider than :class:`ApiError` on purpose. ``_request`` maps transport failures
         to it, but a stream error, a client closed on another thread, or a header that will not
         encode arrive as ``RuntimeError`` or ``ValueError``. By then the new token is adopted, so
-        letting one escape would report a failed sign-in for a client that is signed in."""
+        letting one escape would report a failed adoption for a client that holds the token."""
         try:
             self._request("POST", "/auth/logout", _bearer=prior)
         except (RuntimeError, ValueError, httpx.HTTPError) as exc:
