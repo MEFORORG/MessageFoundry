@@ -41,6 +41,7 @@ from messagefoundry.config.tls_policy import (
     InsecureHopRefused,
     TrustAnchorPolicy,
     active_hop_posture,
+    build_smtp_tls_context,
     context_checks_revocation,
 )
 from messagefoundry.config.wiring import WiringError, load_config
@@ -48,11 +49,14 @@ from messagefoundry.pipeline.wiring_runner import build_check_registry
 from messagefoundry.redaction import redact
 from messagefoundry.secretscrub import scrub_credentials
 from messagefoundry.transports import dicom as dicom_module
+from messagefoundry.transports import direct as direct_module
 from messagefoundry.transports import remotefile as remotefile_module
 from messagefoundry.transports.dicom import DicomScuDestination
+from messagefoundry.transports.direct import DirectDestination
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.remotefile import RemoteFileDestination, _FtpClient
 from messagefoundry.transports.rest import _NO_REDIRECT_OPENER, opener_tls_context
+from tests.test_direct_transport import _mint_ca, _mint_leaf, _write_key, _write_pem
 
 ENFORCING = HopPosture(enforcing=True)
 NOT_ENFORCING = HopPosture(enforcing=False)
@@ -453,4 +457,143 @@ def test_an_anonymous_plain_ftp_upload_is_the_cleartext_refusal_not_this_one() -
     with active_hop_posture(ENFORCING), pytest.raises(InsecureHopRefused) as exc:
         RemoteFileDestination(_ftps(REMOTE, protocol="ftp"))
     assert "cleartext anonymous FTP" in str(exc.value)
+    assert "revocation" not in str(exc.value)
+
+
+# --- DIRECT: the SMTP authentication leg (transports/direct.py) ------------------------------------
+#
+# DIRECT's body is S/MIME-protected, and the shipped decision is that a DIRECT hop with NO SMTP
+# credential takes no revocation guard. That decision is kept, and it has its own arm below. A hop
+# that also sends a username and password is a credential hop like any other, and is guarded.
+
+
+@pytest.fixture(scope="module")
+def direct_material(tmp_path_factory: pytest.TempPathFactory) -> dict[str, str]:
+    """The S/MIME files DirectDestination loads before it reaches its TLS arms. Synthetic."""
+    directory = tmp_path_factory.mktemp("direct2193")
+    ca_key, ca_cert = _mint_ca()
+    signer_key, signer_cert = _mint_leaf("Sender Direct", ca_key, ca_cert)
+    _recipient_key, recipient_cert = _mint_leaf("recipient@hisp.example", ca_key, ca_cert)
+    _write_pem(directory / "signer.crt", signer_cert)
+    _write_key(directory / "signer.key", signer_key)
+    _write_pem(directory / "recipient.crt", recipient_cert)
+    _write_pem(directory / "ca.crt", ca_cert)
+    return {
+        "signing_cert": str(directory / "signer.crt"),
+        "signing_key": str(directory / "signer.key"),
+        "recipient_cert": str(directory / "recipient.crt"),
+        "trust_anchor": str(directory / "ca.crt"),
+    }
+
+
+def _direct(
+    material: dict[str, str],
+    host: str,
+    *,
+    credential: bool = True,
+    attested: bool = False,
+    policy: TrustAnchorPolicy | None = None,
+    **extra: object,
+) -> Destination:
+    settings: dict[str, object] = {
+        "host": host,
+        "sender": "sender@hisp.example",
+        "recipients": ["recipient@hisp.example"],
+        **material,
+        **extra,
+    }
+    if credential:
+        settings.update({"username": "svc", "password": "synthetic-not-a-secret"})
+    return _dest("OB_DIRECT", ConnectorType.DIRECT, settings, attested=attested, policy=policy)
+
+
+def test_a_credentialed_direct_hop_is_refused_when_it_checks_no_revocation(
+    direct_material: dict[str, str],
+) -> None:
+    # THE CONTROL. Before #2193 this constructed: DIRECT took no revocation guard at all.
+    with (
+        active_hop_posture(ENFORCING),
+        pytest.raises(InsecureHopRefused, match="revocation") as exc,
+    ):
+        DirectDestination(_direct(direct_material, REMOTE))
+    assert "connection 'OB_DIRECT';" in str(exc.value)
+
+
+def test_a_credentialed_direct_hop_is_admitted_when_a_crl_reaches_its_own_context(
+    direct_material: dict[str, str], bare_crl: str
+) -> None:
+    with active_hop_posture(ENFORCING):
+        dest = DirectDestination(_direct(direct_material, REMOTE, policy=_crl_policy(bare_crl)))
+    # The context this destination hands to smtplib.
+    assert context_checks_revocation(dest._tls_context) is True
+
+
+def test_a_configured_crl_does_not_admit_a_direct_hop_whose_context_lacks_it(
+    direct_material: dict[str, str], bare_crl: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guard reads the context, never the setting. The policy carries a CRL and the context the
+    destination ends up holding does not, so the hop must stay refused."""
+
+    def without_the_policy(**kw: object) -> ssl.SSLContext:
+        kw.pop("trust_anchor_policy", None)
+        return build_smtp_tls_context(**kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(direct_module, "build_smtp_tls_context", without_the_policy)
+    with active_hop_posture(ENFORCING), pytest.raises(InsecureHopRefused, match="revocation"):
+        DirectDestination(_direct(direct_material, REMOTE, policy=_crl_policy(bare_crl)))
+
+
+def test_a_credentialed_direct_hop_crosses_on_its_attestation_and_is_audited(
+    direct_material: dict[str, str], caplog: pytest.LogCaptureFixture
+) -> None:
+    with active_hop_posture(ENFORCING), caplog.at_level(logging.WARNING):
+        DirectDestination(_direct(direct_material, REMOTE, attested=True))
+    shipped = _shipped(_audit(caplog))
+    assert "connection 'OB_DIRECT';" in shipped and REASON in shipped
+    # The cell label survives the log filters, which scrub two adjacent all-capital tokens.
+    assert "Direct destination (SMTP authentication over verified TLS)" in shipped
+
+
+def test_a_direct_hop_with_no_credential_still_takes_no_revocation_guard(
+    direct_material: dict[str, str], caplog: pytest.LogCaptureFixture
+) -> None:
+    """The shipped S/MIME decision, kept for the case it argues. With no username the hop sends no
+    credential, so it constructs under an enforcing posture with no CRL and no attestation. Under a
+    non-enforcing posture every guarded hop WARNs, and no such line appears here, so the guard is
+    not taken at all."""
+    with active_hop_posture(ENFORCING):
+        DirectDestination(_direct(direct_material, REMOTE, credential=False))
+    with active_hop_posture(NOT_ENFORCING), caplog.at_level(logging.WARNING):
+        DirectDestination(_direct(direct_material, REMOTE, credential=False))
+    assert not any("revocation" in r.getMessage() for r in caplog.records)
+
+
+def test_a_credentialed_direct_hop_on_loopback_still_crosses(
+    direct_material: dict[str, str],
+) -> None:
+    with active_hop_posture(ENFORCING):
+        DirectDestination(_direct(direct_material, LOOPBACK))
+
+
+def test_a_credentialed_direct_hop_warns_but_builds_when_not_enforcing(
+    direct_material: dict[str, str], caplog: pytest.LogCaptureFixture
+) -> None:
+    with active_hop_posture(NOT_ENFORCING), caplog.at_level(logging.WARNING):
+        DirectDestination(_direct(direct_material, REMOTE))
+    assert any("revocation" in r.getMessage() for r in caplog.records)
+
+
+def test_a_credentialed_direct_hop_built_outside_the_gate_is_unchanged(
+    direct_material: dict[str, str],
+) -> None:
+    DirectDestination(_direct(direct_material, REMOTE))
+
+
+def test_a_credentialed_direct_hop_that_verifies_nothing_keeps_its_own_refusal(
+    direct_material: dict[str, str],
+) -> None:
+    """Disjoint gates. A credential over ``tls_verify=false`` is refused absolutely by the arm that
+    owns it, before any context exists, so the revocation guard never decides that hop."""
+    with active_hop_posture(ENFORCING), pytest.raises(ValueError, match="tls_verify=false") as exc:
+        DirectDestination(_direct(direct_material, REMOTE, tls_verify=False))
     assert "revocation" not in str(exc.value)
