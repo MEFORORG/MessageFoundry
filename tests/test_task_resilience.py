@@ -169,7 +169,9 @@ async def test_session_reaper_survives_purge_error(monkeypatch: pytest.MonkeyPat
     calls = {"n": 0}
 
     class _Store:
-        async def purge_expired_sessions(self, *, idle_seconds: float | None = None) -> None:
+        async def purge_expired_sessions(
+            self, *, now: float | None = None, idle_seconds: float | None = None
+        ) -> None:
             calls["n"] += 1
             if calls["n"] == 1:
                 raise RuntimeError("db blip")

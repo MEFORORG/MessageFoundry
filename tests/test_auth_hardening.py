@@ -788,6 +788,54 @@ async def test_session_reaper_purges_expired_sessions(engine: Engine) -> None:
     assert await engine.store.get_session("live-hash") is not None
 
 
+async def test_session_reaper_skips_a_pass_after_a_forward_clock_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #2283: a forward wall-clock step makes every session look idle, and a purge cannot
+    be undone. The pass that sees the wall clock outrun the monotonic clock deletes nothing. The
+    next pass compares against that one, so a step that holds is purged by then. A drift inside the
+    tolerance is the control: that pass purges as usual."""
+    from messagefoundry.api import app as api_app
+
+    monkeypatch.setattr(api_app, "_SESSION_REAP_INTERVAL", 0)
+    hour = 3600.0
+    tolerance = api_app._SESSION_REAP_STEP_TOLERANCE
+    # (wall, monotonic) per pass. Pass 2 drifts inside the tolerance; pass 3 steps forward by a day.
+    readings = [
+        (1_000.0, 50.0),
+        (1_000.0 + hour + tolerance, 50.0 + hour),
+        (1_000.0 + 2 * hour + tolerance + 86_400, 50.0 + 2 * hour),
+        (1_000.0 + 3 * hour + tolerance + 86_400, 50.0 + 3 * hour),
+    ]
+    wall = iter(r[0] for r in readings)
+    mono = iter(r[1] for r in readings)
+    purged: list[float | None] = []
+    done = asyncio.Event()
+
+    class _Store:
+        async def purge_expired_sessions(
+            self, *, now: float | None = None, idle_seconds: float | None = None
+        ) -> None:
+            purged.append(now)
+
+    def _wall() -> float:
+        try:
+            return next(wall)
+        except StopIteration:
+            done.set()
+            raise asyncio.CancelledError from None
+
+    task = asyncio.create_task(
+        _session_reaper(_Store(), idle_seconds=600, wall=_wall, mono=lambda: next(mono))  # type: ignore[arg-type]
+    )
+    await asyncio.wait_for(done.wait(), timeout=5)
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    assert purged == [readings[0][0], readings[1][0], readings[3][0]], (
+        "the pass after a forward clock step purged; each purge must also use the pass's own reading"
+    )
+
+
 # --- F1: /dead-letters gates the PHI summary the same way as /messages -------
 
 

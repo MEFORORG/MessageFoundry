@@ -2519,7 +2519,13 @@ class AuthStore(Protocol):
     ) -> int:
         """Delete session rows past their absolute expiry, revoked or not, and return the count.
         With ``idle_seconds`` given, rows idle for longer are deleted too (BACKLOG #2096): the
-        validator refuses them on presentation, so keeping them only grows the table."""
+        validator refuses them on presentation, so keeping them only grows the table.
+
+        The idle variant scans the table, because its ``OR`` reaches past the expiry index, and that
+        stands on purpose (BACKLOG #2283). The scan runs once per reaper pass over a table the
+        purge itself keeps small. The alternative is an index on ``last_used_at``, and every
+        authenticated request writes that column, so the index would cost a write on each request
+        to save a scan once an hour."""
         ...
 
 

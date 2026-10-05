@@ -7770,23 +7770,53 @@ async def _assert_security_notice_is_deliverable(
 
 
 _SESSION_REAP_INTERVAL = 3600.0  # purge expired/idle sessions hourly to bound the sessions table
+# How far the wall clock may run ahead of the monotonic clock between two reaper passes before the
+# later pass is skipped as a clock step. Clock discipline slews by far less than this in an hour.
+_SESSION_REAP_STEP_TOLERANCE = 60.0
 
 
-async def _session_reaper(store: Store, *, idle_seconds: float | None = None) -> None:
+async def _session_reaper(
+    store: Store,
+    *,
+    idle_seconds: float | None = None,
+    wall: Callable[[], float] = time.time,
+    mono: Callable[[], float] = time.monotonic,
+) -> None:
     """Drop expired session rows (immediately, then on an interval) until the task is cancelled.
     With ``idle_seconds`` given, idle-expired rows go too (BACKLOG #2096); the lifespan passes the
     idle timeout the validator uses.
 
+    **A pass that sees the wall clock jump forward is skipped (BACKLOG #2283).** The purge judges
+    expiry and idleness by the wall clock, and its deletes cannot be undone. Run just after a
+    forward step, it would delete every session as idle, though setting the clock right would have
+    made them valid again. So each pass compares how far the wall clock moved since the previous
+    pass with how far the monotonic clock moved. When the wall clock ran ahead by more than
+    ``_SESSION_REAP_STEP_TOLERANCE``, the pass deletes nothing and logs a warning. The next pass
+    compares against this one, so a step that persists for a whole interval is then trusted and
+    purged by. A host that slept can also trip it, which costs one skipped pass. The first pass at
+    start-up has nothing to compare against, so it always runs.
+
     A transient store error must not kill the reaper for the process lifetime (it would let the
     sessions table grow unbounded, and its stored exception could later abort lifespan shutdown) —
     log and retry next interval (review M-33)."""
+    previous: tuple[float, float] | None = None
     while True:
-        try:
-            await store.purge_expired_sessions(idle_seconds=idle_seconds)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            _log.exception("session reaper: purge failed; will retry next interval")
+        now, ticks = wall(), mono()
+        ahead = 0.0 if previous is None else (now - previous[0]) - (ticks - previous[1])
+        previous = (now, ticks)
+        if ahead > _SESSION_REAP_STEP_TOLERANCE:
+            _log.warning(
+                "session reaper: the wall clock ran %.0fs ahead of the monotonic clock since the "
+                "last pass, so this pass deleted nothing; the next pass purges if the clock holds",
+                ahead,
+            )
+        else:
+            try:
+                await store.purge_expired_sessions(now=now, idle_seconds=idle_seconds)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _log.exception("session reaper: purge failed; will retry next interval")
         await asyncio.sleep(_SESSION_REAP_INTERVAL)
 
 
