@@ -925,6 +925,91 @@ hops fall outside the reads and are ungraded. BACKLOG #2194 tracks grading the h
 are named here by subject only. Check the backlog ledger before filing one.")* **Do not read
 this table as a count of verifying hops.** Per SDS-3.6, it is "at least these".
 
+**Note 2026-10-04: the hops outside the reads, graded by name (BACKLOG #2194).** Read at engine
+`76355472a`. This note grades the hops the list above left ungraded. It builds no guard, documents
+no driver control and records no accept. Each fact carries its source: *code* was read in the
+engine at that commit, *measured* was run there, *documentation* was read on the vendor's page on
+2026-10-04, and *not established* means none of those settles it.
+
+**Three statements above need a correction, and this note does not edit them.**
+
+- "At least six hops" becomes eight rows when graded by name. DATABASE has two dialects that verify
+  differently, and `db_lookup` is a dial of its own.
+- "Some hops build no Python TLS context at all" no longer holds for the three Vault hops. Since
+  BACKLOG #300 the engine builds the context each Vault handshake runs on (*code*). The five ODBC
+  hops still build none (*code*).
+- "The two `requests`-based Vault clients" are two construction points that build three `hvac`
+  clients (*code*).
+
+**The instrument.** `git grep -c "RevocationHopGuard\|refuse_unrevoked"` returned no hit in each of
+eight files: `store/sqlserver.py`, `transports/database.py`, `config/db_lookup.py`,
+`pipeline/reference_sync.py`, `store/keyprovider_vault.py`, `store/crypto_transit.py`,
+`config/secretprovider_vault.py` and `transports/strict_requests.py`. Control: the same pattern
+returns 3 for `store/postgres.py` and 6 for `transports/rest.py`. So no hop in this note calls a
+revocation guard.
+
+**The interim grades.** These rows use two grades that are not among the eight above, because
+BACKLOG #2194 leaves the outcome of each hop to a decision this note does not make. Each row moves
+to one of the eight when its open question closes.
+
+| Hop (file, symbol) | What crosses | How it verifies the peer | Revocation check | Interim grade |
+|---|---|---|---|---|
+| SQL Server store: `store/sqlserver.py`, `connection_string` | the whole PHI store on that backend, and the SQL login under SQL authentication | ODBC Driver 18, named in the string. `Encrypt=yes` and `TrustServerCertificate=no` by default, emitted last (*code*). Microsoft's table says the driver checks the server certificate for that pair (*documentation*). With `ssl_root_cert` set, the string also carries `ServerCertificate=` (*code*); see the finding below. The weakened arm, `trust_server_certificate=true` or `encrypt=false`, is verify-off and is refused on an enforcing instance (*code*) | None in the engine (*code*). The driver's own: *not established* | **No revocation check in the engine, driver behaviour not established, DECISION PENDING** |
+| DATABASE connector, SQL Server preset: `transports/database.py`, `_build_dsn`, reached through `_build_connection` by `DatabaseDestination` and `DatabaseSource` | rows built from messages, rows polled into messages, the SQL login | The same two keywords, emitted last (*code*). The driver is the `odbc_driver` setting, which defaults to ODBC Driver 18 (*code*). This builder emits no `ServerCertificate=` (*code*). The weakened arm is verify-off: it is refused on an enforcing instance unless the connection declares `tls_hop_attested` (*code*) | None in the engine (*code*). The driver's own: *not established* | **No revocation check in the engine, driver behaviour not established, DECISION PENDING** |
+| DATABASE connector, generic dialect: `transports/database.py`, `_build_odbc_dsn`, the other arm of `_build_connection` | the same | The operator's driver and its own keywords, passed through `odbc_params` (*code*). The engine cannot tell whether a keyword's value verifies the peer, and the builder's docstring says so (*code*). `generic_cleartext_hop_guard` refuses only a connection whose keywords say TLS is not required (*code*). The psqlODBC and MySQL ODBC documentation was not read | None in the engine (*code*). Each driver's own: *not established* | **No revocation check in the engine, driver behaviour not established, DECISION PENDING.** The list above does not name this arm |
+| `db_lookup` reads: `transports/database.py`, `DatabaseLookupExecutor.__init__` | lookup parameters taken from a message, the rows that come back, the SQL login | `_build_dsn(read_only=True)`, so the SQL Server preset row applies. The generic dialect cannot be reached from here (*code*) | None in the engine (*code*). The driver's own: *not established* | **No revocation check in the engine, driver behaviour not established, DECISION PENDING** |
+| DATABASE reference-sync source: `pipeline/reference_sync.py`, `database_source_dsn` and `_load_database_source` | reference rows, the SQL login | `_build_dsn` and a pool of its own, so the SQL Server preset row applies. A reference source takes no dialect (*code*) | None in the engine (*code*). The driver's own: *not established* | **No revocation check in the engine, driver behaviour not established, DECISION PENDING** |
+| Vault key provider: `store/keyprovider_vault.py`, `_build_client` | the Vault token out, the store's data-encryption key back | `hvac` over `requests`. Each handshake runs on a fresh context from the factory `assert_hvac_tls_suites` returns, set per connection by `_narrowed_pool_classes` in `transports/strict_requests.py` (*code*). The context requires a verified peer and checks the host name (*measured*). It trusts the file `MEFOR_STORE_VAULT_CA_FILE` names, or the certifi bundle when that is unset (*code*). `verify=False` is refused, and so is a connection that would verify no peer (*code*) | None. The factory never calls `harden_crl_check` (*code*). A context it built had `VERIFY_CRL_CHECK_LEAF` clear and no CRL loaded, and the same read returned true for a control context with the flag set (*measured*, with hvac 2.4.0, requests 2.34.2 and urllib3 2.8.0). A search of those installed `requests` and `urllib3` packages found no CRL or OCSP handling (*code*) | **No revocation check, a guard is possible** |
+| Vault Transit cipher: `store/crypto_transit.py`, which calls the key provider's `_build_client` | the Vault token, and message bodies sent to Vault to encrypt and decrypt | The key provider's row applies: it is the same client build (*code*) | None, as the key provider's row | **No revocation check, a guard is possible** |
+| Vault secret provider: `config/secretprovider_vault.py`, its own `_build_client` | the Vault token out, connector credentials back | The same shape as the key provider, with `MEFOR_SECRETS_VAULT_CA_FILE` as its anchor (*code*) | None, as the key provider's row | **No revocation check, a guard is possible** |
+
+**What is open on the five ODBC hops.** BACKLOG #2194 names three outcomes for a hop: a guard, a
+documented driver control, or an accepted gap. This note chooses none. Per the grades list above,
+only an owner ruling makes a row an accept. What the reading found:
+
+- **No driver control was found to document.** Three Microsoft Learn pages for the ODBC Driver for
+  SQL Server were fetched on 2026-10-04: "DSN and Connection String Keywords", "Connecting from
+  Linux or macOS" and the Windows release notes. None contains the words revocation, CRL or OCSP,
+  and none lists a keyword that turns a revocation check on (*documentation*). The first two were
+  read in full. The third was read through a summarising fetch. Other Microsoft pages were not
+  read. **So whether the driver checks revocation is not established either way.** Three pages
+  that are silent are not evidence that it does not.
+- **Where the driver's TLS runs.** On Linux and macOS it uses the OpenSSL library and the
+  platform's certificate store (*documentation*). The three pages do not say what it uses on
+  Windows (*not established*).
+- **A guard would have no context to read.** `RevocationHopGuard.capture` learns that a hop checks
+  a CRL by reading `VERIFY_CRL_CHECK_LEAF` off that hop's own `SSLContext` (*code*). These hops
+  have none, so that arm could never fire for them. A guard here would decide on the posture, the
+  loopback carve-out and a per-connection attestation alone.
+
+**What is open on the three Vault hops.** The context exists, so a guard could read it, as
+`_refuse_store_revocation` does for the PostgreSQL store. Two things are missing first (*code*):
+
+1. **The providers hold no hop posture.** They are built from the environment.
+   `_refuse_a_cleartext_vault_hop` in `transports/strict_requests.py` says so, and fails closed as
+   if the instance were enforcing.
+2. **No CRL can reach the context.** `vault_client_verify_kwargs` builds a default
+   `TrustAnchorPolicy`, which carries none, and `requests_verify_from_anchor` refuses an anchor
+   that carries a `crl_file`. Until a CRL can load onto the factory's context, a guard on these
+   hops would have nothing to relax it.
+
+No backlog item tracks that build yet. BACKLOG #2193's checklist names none of these three.
+
+**One finding on the store's pin, recorded here and not fixed.** `connection_string` emits
+`ServerCertificate=` beside `Encrypt=yes` (*code*). Microsoft's Linux and macOS page says of that
+keyword: "This option is only available when using strict encryption." The engine never emits
+`Encrypt=strict` (*code*). So what the driver does with the pin on this posture is *not
+established*, and it may not apply it. If the driver does apply it, Microsoft's keyword page says
+the exact match replaces the standard checks, the trust chain among them (*documentation*). That
+branch would then have no chain for a revocation check to walk. `docs/ASVS-L2-PHASE0-CHANGES.md`
+already records that the pin has not been measured on this posture.
+
+**The counts, after this note.** "At least six hops fall outside the reads and are ungraded", in
+the paragraph above, is superseded. Those hops are graded here by name, as eight rows. Five wait on
+an owner decision. Three could take a guard, and nothing tracks that build. The ODBC drivers' own
+revocation behaviour is still not established. **Read the eight as "at least these", per SDS-3.6.**
+This note re-read the hops the list named. It did not search for other hops of the same shape.
+
 ## 8. Sources that are stale, and must not be cited as current
 
 Recorded so the next reader does not re-derive a refuted premise, and so nobody edits these files as
