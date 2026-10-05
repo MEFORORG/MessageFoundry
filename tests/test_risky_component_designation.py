@@ -1568,11 +1568,20 @@ def test_the_survey_checks_can_fail() -> None:
     assert early == [f"{name}: the source and data answers are dated before the first"], early
     assert one({"surveyed": "2026-10-05", "forms_surveyed": "2026-10-05"}) == []
     # A malformed entry is reported, and neither the check nor the renderer raises on it.
-    for malformed in ({"projects": ["a bare string"]}, {"data": {**yes, "projects": ["x"]}}):
-        changed = [{**w, **malformed} if w is plain else w for w in wheels]
+    # The first is on a wheel whose compiled answer is "yes", so its entry is read and rendered.
+    carrier = next(w for w in wheels if w["carries"] == "yes")
+    for target, malformed in (
+        (carrier, {"projects": ["a bare string"]}),
+        (plain, {"data": {**yes, "projects": ["x"]}}),
+        (plain, {"word_hits": [{**yes, "kind": ["a list"]}]}),
+    ):
+        changed = [{**w, **malformed} if w is target else w for w in wheels]
         found = component_readings.survey_problems({**survey, "wheels": changed}, data, labels)
-        assert any("does not match the projects" in line for line in found), (malformed, found)
+        assert any(line.startswith(f"{target['name']}: ") for line in found), (malformed, found)
         component_readings.render_page(page, data, {**survey, "wheels": changed})
+    # A read route whose ``read`` is loose text is reported the same way.
+    found = problems(swap(routed, route="read", read="see the notices"))
+    assert any(line.startswith(f"{name}: a read route must record") for line in found), found
     # The word-search hits and the adapted modules. Built on ``plain``, which was fetched.
     word = stated["words"][0]
     hit = {"files": ["a/module.py"], "words": [word], "kind": "adapted module", "says": "a note"}

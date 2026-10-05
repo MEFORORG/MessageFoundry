@@ -814,7 +814,7 @@ def survey_problems(
         elif route not in ROUTES or not _said(wheel.get("route_reason")):
             problems.append(f"{name}: not designated and not shown to carry no code, with no route")
         elif route == "read" and not all(
-            _said((wheel.get("read") or {}).get(field)) for field in READ_FIELDS
+            _said(_entries([wheel.get("read")])[0].get(field)) for field in READ_FIELDS
         ):
             problems.append(f"{name}: a read route must record {READ_FIELDS}")
     return problems
@@ -953,15 +953,14 @@ def hit_counts(wheels: Iterable[Mapping[str, Any]]) -> dict[str, int]:
     counts = dict.fromkeys(HIT_KINDS, 0)
     for wheel in wheels:
         for hit in _entries(wheel.get("word_hits")):
-            files = hit.get("files")
-            if hit.get("kind") in counts and isinstance(files, list):
-                counts[str(hit["kind"])] += len(files)
+            files, kind = hit.get("files"), hit.get("kind")
+            # A kind that is not text cannot be a key, and is reported by ``_hit_problems``.
+            if isinstance(kind, str) and kind in counts and isinstance(files, list):
+                counts[kind] += len(files)
     return counts
 
 
-def _render_adapted(
-    wheels: list[Mapping[str, Any]], labels: Mapping[str, str], search: Mapping[str, Any]
-) -> list[str]:
+def _render_adapted(wheels: list[Mapping[str, Any]], labels: Mapping[str, str]) -> list[str]:
     """What the word search hit: its counts, the adapted modules, and a wheel's own second line."""
     counts = hit_counts(wheels)
     searched = sum(
@@ -972,10 +971,10 @@ def _render_adapted(
         "",
         f"The word search ran over the {searched} wheels that were fetched. It hit "
         + _count(sum(counts.values()), "file", "files")
-        + f". By kind: {counts[ADAPTED]} a single module adapted from another project, "
-        f"{counts[COPIED_LINES]} lines copied into a wheel's own module, and {counts[PROSE]} "
-        "prose that marks no copy, such as a project's own licence header. The record lists "
-        "each hit under its wheel.",
+        + f". Counted in files: {counts[ADAPTED]} hold a single module adapted from another "
+        f"project, {counts[COPIED_LINES]} hold lines copied into a wheel's own module, and "
+        f"{counts[PROSE]} hold prose that marks no copy, such as a project's own licence "
+        "header. The record lists each hit under its wheel.",
     ]
     rows = [
         f"| `{w['name']}` | `{m.get('file')}` | {m.get('project')} | "
@@ -1006,7 +1005,8 @@ def _render_adapted(
                 f"`{line.get('path')}`, {line.get('files')} files, version {line.get('version')}. "
                 "That is the same project, so it is not counted as another project's source. An "
                 f"advisory against that line would name `{wheel['name']}`, at that line's own "
-                "version numbers.",
+                "version numbers. The reading above asks about the pinned version only, so no "
+                "advisory was read at that line's version.",
             ]
     return out
 
@@ -1089,7 +1089,7 @@ def _render_survey(survey: Mapping[str, Any], labels: Mapping[str, str]) -> list
         + " no row in the table: the search found no package, library tree or data set of "
         "another project in them, in any form.",
     ]
-    out += _render_adapted(wheels, labels, search)
+    out += _render_adapted(wheels, labels)
     data_only = [
         w for w in wheels if not carries_code(w) and form_answer(w, "data").get("carries") == "yes"
     ]
@@ -1204,7 +1204,7 @@ def _render_survey(survey: Mapping[str, Any], labels: Mapping[str, str]) -> list
         ]
         out += [
             f"| `{w['name']}` | {_carried(w, CODE_FORMS)} | "
-            + " | ".join(str((w.get("read") or {}).get(field)) for field in READ_FIELDS)
+            + " | ".join(str(_entries([w.get("read")])[0].get(field)) for field in READ_FIELDS)
             + " |"
             for w in read
         ]

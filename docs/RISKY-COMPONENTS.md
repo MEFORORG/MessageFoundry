@@ -478,9 +478,10 @@ tree: `psutil`, `pyodbc`, `sspilib`, `websockets`.
 26 wheels have no row in the table: the search found no package, library tree or data set of another
 project in them, in any form.
 
-The word search ran over the 38 wheels that were fetched. It hit 90 files. By kind: 7 a single
-module adapted from another project, 24 lines copied into a wheel's own module, and 59 prose that
-marks no copy, such as a project's own licence header. The record lists each hit under its wheel.
+The word search ran over the 38 wheels that were fetched. It hit 90 files. Counted in files: 7 hold
+a single module adapted from another project, 24 hold lines copied into a wheel's own module, and 59
+hold prose that marks no copy, such as a project's own licence header. The record lists each hit
+under its wheel.
 
 **Single modules adapted from another project, as found:**
 
@@ -501,7 +502,8 @@ another project that does not say so in one of the listed words is not in it.
 
 `pydantic` also holds a second release line of its own project: `pydantic/v1`, 27 files, version
 1.10.26. That is the same project, so it is not counted as another project's source. An advisory
-against that line would name `pydantic`, at that line's own version numbers.
+against that line would name `pydantic`, at that line's own version numbers. The reading above asks
+about the pinned version only, so no advisory was read at that line's version.
 
 5 wheels carry another project's data and none of its code: `certifi`, `hl7apy`, `idna`, `ldap3`,
 `tzdata`. Not designated among them: `tzdata`. Under the criterion above, that owes no route. No
@@ -625,9 +627,10 @@ recorded route. A wheel that carries only data must have none. The record must s
 name a control the search fired on. And the page's survey tables, its counts and its list of adapted
 modules must say what the record says.
 
-The unit and the criterion are not in the record. The script that renders the section states them,
-and the test holds the page to its own copy of each sentence. It holds a few hand-written sentences
-about the survey the same way, and not every one.
+The page's unit and criterion are written in the script that renders the section. The test holds the
+page to its own copy of the unit's sentences, and of some of the criterion's. It holds a few
+hand-written sentences about the survey the same way, and not every one. The record's `method`
+states the unit in its own words, and no test holds those words to the page.
 
 The survey is made by hand, and no script repeats it. It is dated to the pins the snapshot reads, so
 a version bump alone does not turn the test red. A re-read that moves a pin does: the script then
