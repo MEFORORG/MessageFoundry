@@ -1916,12 +1916,18 @@ def _through_the_log_filter_chain(text: str) -> str:
 
 
 def _every_log_path(text: str) -> dict[str, str]:
-    """``text`` to the log by each route the engine uses: straight to the handler, and redacted
-    first by ``safe_text`` or ``safe_exc`` as an error log call does."""
+    """``text`` by routes the engine uses, at least these: straight to the handler, redacted
+    first by ``safe_text`` or ``safe_exc`` as an error log call does, the store's two calls, and
+    two handlers on one record."""
     return {
         "once": _through_the_log_filter_chain(text),
         "safe_text": _through_the_log_filter_chain(safe_text(text, limit=100_000)),
         "safe_exc": _through_the_log_filter_chain(safe_exc(ValueError(text), limit=100_000)),
+        # The store's own two calls, with no handler after them.
+        "store": safe_text(safe_exc(ValueError(text), limit=100_000), limit=100_000),
+        # One record through two handlers. Each runs the whole chain, control-character
+        # filter included, so the second sees what the first wrote.
+        "two handlers": _through_the_log_filter_chain(_through_the_log_filter_chain(text)),
     }
 
 
@@ -1931,8 +1937,9 @@ def _kept_that_the_stages_alone_scrub(
     """Each ``path: value`` this head keeps and the redactor without the encoded run scrubs.
 
     The baseline is this module with the run switched off, on the same three log paths. It stands in
-    for ``origin/main`` inside the suite; the differential against main's own file is on the pull
-    request."""
+    for the redactor before BACKLOG #2171 inside the suite. It is not that redactor exactly: the
+    BACKLOG #2312 change to the backstop is in both arms. The differential against the earlier
+    file itself is on the pull request."""
     head = _every_log_path(text)
     with monkeypatch.context() as patched:
         patched.setattr(redaction, "_HL7_ENCODED_FIELD_RUN", _NO_ENCODED_RUN)
@@ -2126,11 +2133,15 @@ def test_a_url_password_spelled_like_a_label_word_is_scrubbed(
     """A password with NO label, in a URL's userinfo, beside an encoded run in the query (PR 2011
     review finding N1). At 6c018c5e16 the run kept bare label words, so the word came out between
     two placeholders, whole or as the dot- or dash-bounded part of a longer password. THE CONTROL:
-    the credential stage alone scrubs it, as ``origin/main`` did."""
+    the credential stage alone scrubs it."""
     text = f"GET https://svc:{password}@db.internal/fhir/Patient?identifier=x%7Cy%7Cz failed"
     assert f":{password}@" not in secretscrub.scrub_credentials(text), "the control does not hold"
     for path, out in _every_log_path(text).items():
-        assert word not in out, f"{path}: {out!r}"
+        if path != "store":  # no credential filter runs on the store's own path, then or now
+            assert word not in out, f"{path}: {out!r}"
+    # The URL password is what switches the run off here. Without that, the run takes the
+    # token whole and the arm above still passes, so it would not hold the rule.
+    assert redact(text) == redaction._redact_stages(text)
 
 
 #: The grammar the second reviewer named as the instrument for this change: a label-anchored PHI
@@ -2228,7 +2239,9 @@ def test_no_log_path_keeps_what_the_stages_alone_scrub_over_the_grammar(
 def test_redact_is_a_fixed_point_over_the_grammar() -> None:
     """A second ``redact`` changes nothing, with a credential in the text or without one. At
     a7cbd25488 it did on 748 of the 4,968 texts of this grammar."""
-    moved = [text for text in _grammar_texts() if redact(redact(text)) != redact(text)]
+    texts = _grammar_texts()
+    assert len(texts) >= 4_000
+    moved = [text for text in texts if redact(redact(text)) != redact(text)]
     assert not moved, f"{len(moved)} texts, first {moved[0]!r}"
 
 
@@ -2240,6 +2253,7 @@ def test_what_the_credential_filters_write_still_switches_the_run_off() -> None:
         text = f"id {_ENCODED_TOKEN} {credential}"
         once = _through_the_log_filter_chain(text)
         assert _CREDENTIAL_VALUE not in once, once
+        assert "x%7Cy" in once, f"the run was not left alone on the first pass: {once!r}"
         assert redaction._CREDENTIAL_AHEAD.search(once) is not None, once
         assert _through_the_log_filter_chain(once) == once
 
@@ -2357,8 +2371,38 @@ def test_a_text_with_no_credential_shape_still_loses_its_encoded_run(
 @pytest.mark.parametrize(
     ("text", "planted"),
     [
-        ('&%7e\t-\n&ok%7E"name": 7788990 ', "7788990"),
-        ('Qorvel Digest\nZqxdoe%7E%5E"name":  <ok.Qorvel&\n', "Qorvel"),
+        # A URL password split by a line break: one line once the first handler has escaped it.
+        (
+            f"connect postgres://user:pa%7Cx%7C\n{_CREDENTIAL_VALUE}@host failed",
+            _CREDENTIAL_VALUE,
+        ),
+        # An escaped control character becomes text that completes a readable label.
+        (f"x%7Cy%7C\x01_password: {_CREDENTIAL_VALUE}", _CREDENTIAL_VALUE),
+        # A key glued to the run, its value after the break.
+        ('Doe Janepw:%7E"mrn":PWD|44556674455667\n#Zqxdoe%7e', "Zqxdoe"),
+    ],
+    ids=["url-password-over-a-line-break", "escaped-control-character", "key-before-a-line-break"],
+)
+def test_a_text_with_an_unprintable_character_keeps_its_run_for_the_second_handler(
+    text: str, planted: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One record through two handlers. The first handler's control-character filter writes a line
+    break as visible text, so the second reads one line where the first read two, and scrubs a
+    value that needed both halves. A run replaced on the first pass cannot be put back, so the run
+    stays off such a text. THE CONTROL: with the run off, the second handler does scrub the value;
+    with the unprintable-character rule removed from ``redact``, each arm goes red."""
+    with monkeypatch.context() as patched:
+        patched.setattr(redaction, "_HL7_ENCODED_FIELD_RUN", _NO_ENCODED_RUN)
+        assert planted not in _every_log_path(text)["two handlers"], "the control does not hold"
+    assert not _kept_that_the_stages_alone_scrub(monkeypatch, text, (planted,))
+    assert redact(text) == redaction._redact_stages(text)
+
+
+@pytest.mark.parametrize(
+    ("text", "planted"),
+    [
+        ('&%7e - &ok%7E"name": 7788990 ', "7788990"),
+        ('Qorvel Digest Zqxdoe%7E%5E"name":  <ok.Qorvel& ', "Qorvel"),
     ],
     ids=["bare-value-ends-the-text", "value-ends-the-text-after-a-strip"],
 )
@@ -2381,23 +2425,38 @@ def test_the_stages_run_again_over_what_the_encoded_run_changed() -> None:
     the run's output directly left every other test green. The shape came from a search over fuzzed
     inputs. THE CONTROL is the middle assertion: the name survives the stages and the run, so the
     second pass of the stages is what removes it."""
-    text = "|%7C7788990~\tPatientName=<name> PatientName=;1980-05-05%7e%7e1980-05-05 Zqxdoe"
+    text = "PatientName=patient   key=%7c,%7C%7e%26 zq9hunter2zQorvel:  Zqxdoe"
     staged = redaction._redact_stages(text)
+    assert text.isprintable() and redact(text) != staged, "the run must apply to this text"
     assert redaction._CREDENTIAL_AHEAD.search(staged) is None, "the run must apply to this text"
     after_run = redaction._HL7_ENCODED_FIELD_RUN.sub(redaction._REDACTED, staged)
     assert "Zqxdoe" in after_run, "the control no longer holds"
     assert "Zqxdoe" not in redact(text)
 
 
-def test_the_second_run_of_the_stages_skips_the_backstop() -> None:
-    """The first run applied the backstop to the text a peer sent. Applied again to a line the
-    encoded run has shortened, it reaches an ``@`` that was past its bound, so a clamped and an
-    unclamped scan of one text stop agreeing. THE CONTROL: on the shortened line the backstop does
-    reach it."""
-    text = f"nonnumeric port: 'x a%7Cb%7C{'c' * 300} zqtail@host"
-    out = redact(text)
-    assert out == "nonnumeric port: 'x [redacted] zqtail@host"
-    assert "zqtail" not in redaction._redact_stages(out)
+@pytest.mark.parametrize(
+    "text",
+    [
+        # The run would take the token that holds the opener's quote.
+        f"nonnumeric port: 'a%7Cb%7Cc d|e|{'f' * 300} {_CREDENTIAL_VALUE}@host",
+        # The run would take the token that holds the closing `@`.
+        f"nonnumeric port: '{_CREDENTIAL_VALUE} d|e|{'f' * 300} x%7Cy%7Cz@host",
+        # The run would shorten the line and bring the `@` within the backstop's bound.
+        f"nonnumeric port: 'x a%7Cb%7C{'c' * 300} {_CREDENTIAL_VALUE}@host",
+    ],
+    ids=["run-holds-the-opener-quote", "run-holds-the-closing-at", "run-shortens-the-line"],
+)
+def test_the_backstop_opener_switches_the_encoded_run_off(
+    text: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The credential backstop reads an opener, a tail and an ``@`` on one line, and a second call
+    can reach an ``@`` the first could not, once the literal run has shortened the line. The encoded
+    run must not take either end of that span first. THE CONTROL: on the first two, the store's two
+    calls do scrub the value when the run is off."""
+    assert redact(text) == redaction._redact_stages(text)
+    assert not _kept_that_the_stages_alone_scrub(monkeypatch, text, (_CREDENTIAL_VALUE,))
+    if "d|e|" in text:
+        assert _CREDENTIAL_VALUE not in _every_log_path(text)["store"]
 
 
 # --- BACKLOG #2312: the credential backstop leaves its own output alone ------------------------------
