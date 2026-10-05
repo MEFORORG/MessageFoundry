@@ -25,7 +25,9 @@ from _ui_clients import create_local_user_chosen
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
 from messagefoundry.auth.service import AuthService
+from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.settings import AuthSettings
+from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
 from messagefoundry.pipeline import Engine
 
 PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms -- satisfies the ASVS policy (WP-3)
@@ -219,9 +221,16 @@ async def test_a_permitted_bulk_target_is_not_denied(engine: Engine) -> None:
     """RED when: the scope fixture stops discriminating -- a guard that denied EVERYTHING would make
     the tests above pass while proving nothing about per-channel RBAC.
 
-    ``_ALLOWED`` is in scope, so it reaches the 404 for a name no runner serves rather than the 403,
-    and writes no denial row at all.
+    ``_ALLOWED`` is in scope and is a real inbound, so the stop is applied rather than refused, and
+    no denial row is written at all. It has to exist: since BACKLOG #2640 a scoped caller gets the
+    out-of-scope 403 for a name no runner serves, even one its own scope lists.
     """
+    reg = Registry()
+    reg.add_inbound(
+        InboundConnection(_ALLOWED, ConnectionSpec(ConnectorType.MLLP, {"port": 2579}), router="r")
+    )
+    reg.add_router("r", lambda m: [])
+    engine.add_registry(reg)
     service = await _service(engine)
     await _scoped_operator(service)
 
@@ -233,7 +242,10 @@ async def test_a_permitted_bulk_target_is_not_denied(engine: Engine) -> None:
             [("action", "stop"), ("sel", _row_key("source", _ALLOWED))],
         )
         assert r.status_code == 200
-        assert "404" in r.text, f"an in-scope name should reach the 404, not the 403: {r.text!r}"
+        # "applied (running=" is the success label alone; "not applied" is the failure one.
+        assert "applied (running=" in r.text, (
+            f"an in-scope inbound should be stopped, not refused: {r.text!r}"
+        )
 
     assert await _denials(engine) == [], (
         "an in-scope target must write no channel-denied row; if it does, the guard is denying "
