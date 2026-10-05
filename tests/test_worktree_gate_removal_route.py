@@ -292,6 +292,9 @@ def test_every_command_rule_3d_prints_passes_this_same_gate(
                 for line in _command_lines(_deny(repo, family, standing_in, verb)):
                     scanned.append(f"[{family}/{standing_in}/{verb}] {line}")
                     where.setdefault(line, scanned[-1])
+    # The walk below must have something to walk, or "nothing was refused" is true of nothing. Three
+    # is the floor: a -Path line, the prune-merged.ps1 line and the `worktree list` line.
+    assert len(where) >= 3, "the deny texts printed too few command lines:\n" + "\n".join(scanned)
     # Each DISTINCT line once: the same `worktree list` line is printed by six of the texts.
     # From the PRIMARY: the route must run from outside the tree it removes.
     refused = [
