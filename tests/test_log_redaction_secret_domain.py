@@ -67,6 +67,7 @@ import inspect
 import logging
 import math
 import pathlib
+import random
 import re
 import re._constants as sre_constants
 import re._parser as sre_parser
@@ -247,6 +248,23 @@ QUOTED_VALUES: tuple[QuotedValue, ...] = (
         "key_material_braced_space",
         "store opened encryption_key={ek-Kb_A-49 ek-Kb_B-50} active",
         ("ek-Kb_A-49", "ek-Kb_B-50"),
+        ("store opened", "active"),
+        "_KEY_MATERIAL",
+    ),
+    # THE BRACE GUARD'S FAILURE PATH. A closer that does not END the value must not be taken as the
+    # end: the plain class used to cover the text after it. Without the guard these print their
+    # second fragment, which no other row here exercises -- every row above has a space after "}".
+    QuotedValue(
+        "mefor_braced_glued",
+        "startup MEFOR_VALUE_PW={pw-Mg_A-51}pw-Mg_B-52 loaded",
+        ("pw-Mg_A-51", "pw-Mg_B-52"),
+        ("startup", "loaded"),
+        "_MEFOR_SECRET",
+    ),
+    QuotedValue(
+        "key_material_braced_glued",
+        "store opened encryption_key={ek-Kg_A-53}ek-Kg_B-54 active",
+        ("ek-Kg_A-53", "ek-Kg_B-54"),
         ("store opened", "active"),
         "_KEY_MATERIAL",
     ),
@@ -2100,15 +2118,52 @@ _SWALLOW_SECOND_LABELS = (
 _SWALLOW_VALUES = ("fv-Fst_V-01", "sv-Snd_A-02", "sv-Snd_B-03")
 
 
-def _swallow_family() -> list[str]:
+def _swallow_family_cases() -> list[tuple[str, str, str, str]]:
+    """``(first label, separator, second label, line)`` for every member of the family."""
     first_value, second_head, second_tail = _SWALLOW_VALUES
     return [
-        f"connect failed {first}={first_value}{sep}{second}={q}{second_head} {second_tail}{q} for svc"
+        (
+            first,
+            sep,
+            second,
+            f"connect failed {first}={first_value}{sep}{second}={q}{second_head} {second_tail}{q}"
+            " for svc",
+        )
         for first in _SWALLOW_FIRST_LABELS
         for sep in _SWALLOW_SEPARATORS
         for second in _SWALLOW_SECOND_LABELS
         for q in ("'", '"')
     ]
+
+
+def _swallow_family() -> list[str]:
+    return [line for _first, _sep, _second, line in _swallow_family_cases()]
+
+
+#: The pattern that reads each family label.
+_LABEL_FAMILY = {
+    **dict.fromkeys(
+        ("password", "pwd", "client_secret", "ad_bind_password", "secret"), "_CREDENTIAL_KV"
+    ),
+    **dict.fromkeys(
+        ("api_token", "session", "authorization", "token", "api_key", "bearer_token"), "_BEARER"
+    ),
+    **dict.fromkeys(
+        ("private_key", "encryption_keys_retired", "intake_api_key_next"), "_KEY_MATERIAL"
+    ),
+    **dict.fromkeys(("MEFOR_STORE_PW", "MEFOR_VALUE_PW"), "_MEFOR_SECRET"),
+}
+
+
+def _is_known_residual(first: str, sep: str, second: str) -> bool:
+    """The one family shape the stop leaves open, stated in ``secretscrub``'s RESIDUALS: a second
+    label of the SAME family whose keyword carries an underscored prefix, after a "." that is not a
+    hard separator. The stop lands on the keyword, and the pass cannot resume after "_"."""
+    return (
+        sep == "."
+        and second in ("ad_bind_password", "bearer_token")
+        and _LABEL_FAMILY[first] == _LABEL_FAMILY[second]
+    )
 
 
 #: Every surface the stop protects: the write-time pass, the handler filter that calls it, and the
@@ -2139,16 +2194,28 @@ def test_a_plain_value_does_not_swallow_a_later_quoted_label(
 
 
 def test_no_two_label_line_prints_either_value() -> None:
-    """The generated family, every line on every surface: neither value may print."""
-    lines = _swallow_family()
-    assert len(lines) == 9 * 7 * 9 * 2
-    failures = [
-        f"{surface}: {line!r} -> {out!r}"
-        for line in lines
-        for surface, apply in _SWALLOW_SURFACES
-        if any(value in (out := apply(line)) for value in _SWALLOW_VALUES)
-    ]
-    assert not failures, f"{len(failures)} lines printed a value, first: {failures[:5]}"
+    """The generated family, every line on every surface: neither value may print, except on the one
+    residual shape, and that one must still print. TWO-SIDED, so the residual can neither grow nor be
+    closed without this test being edited to say so."""
+    cases = _swallow_family_cases()
+    assert len(cases) == 9 * 7 * 9 * 2
+    residual = {
+        line for first, sep, second, line in cases if _is_known_residual(first, sep, second)
+    }
+    assert residual, "the residual predicate matched nothing, so its half of this test is vacuous"
+    for surface, apply in _SWALLOW_SURFACES:
+        printed = {
+            line
+            for _first, _sep, _second, line in cases
+            if any(value in apply(line) for value in _SWALLOW_VALUES)
+        }
+        unexpected = sorted(printed - residual)
+        assert not unexpected, f"{surface}: {len(unexpected)} lines printed, first {unexpected[:3]}"
+        closed = sorted(residual - printed)
+        assert not closed, (
+            f"{surface}: the residual no longer prints on {closed[:3]}. Good news -- update "
+            "_is_known_residual and secretscrub's RESIDUALS comment to say it is closed."
+        )
 
 
 def _without_the_stop(module: ModuleType) -> dict[str, re.Pattern[str]]:
@@ -2194,44 +2261,186 @@ def test_the_swallow_tests_fail_without_the_stop(monkeypatch: pytest.MonkeyPatch
     assert len(leaked) >= 500, f"only {len(leaked)} family lines leaked without the stop"
 
 
-#: A token carrying both a hyphen and an underscore: every value sentinel in this file has that shape,
-#: and no label does, so it tells a printed VALUE from printed label text.
-_SENTINEL = re.compile(r"[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)+")
+# --- the change must not print anything the patterns before it hid ---------------------------------
+#
+# A DIFFERENTIAL AGAINST THE PATTERNS AS THEY STOOD BEFORE, at 50a4a3dccb, and not against the new
+# patterns minus one part. The first version of this check cut only the stop out, so it kept the new
+# quoted alternates on both sides and could not see them print a later label's value, which a review
+# found they did. Values here are ATOMS, ``vq`` plus digits, so a value printed in part is caught too:
+# a check on whole tokens missed ``01`` printing out of ``fv-A_1-01_password``.
 
 
-def _sentinels(text: str) -> set[str]:
-    return {t for t in _SENTINEL.findall(text) if "-" in t and "_" in t}
+def _pre_change_patterns() -> dict[str, re.Pattern[str]]:
+    """The five value patterns as they stood before the stop and the guarded forms, built from the
+    vocabulary both copies still share. Written in ``secretscrub``'s spelling, with a global fold;
+    on the ASCII corpus below that equals the bundle copy's scoped fold."""
+    s = scrub_mod
+    prefix = s._LABEL_PREFIX
+    return {
+        "_BEARER": re.compile(
+            r"(?i)\b(" + prefix + r"(?:" + s._alternation(s._TOKEN_WORDS) + r"))\b"
+            r"\s*[:=]\s*(?:(?:bearer|basic|digest)\s+)?['\"]?[^\s'\"]+"
+        ),
+        "_AUTH_SCHEME": re.compile(r"(?i)\b(bearer)\s+['\"]?[^\s'\",;]{4,}"),
+        "_MEFOR_SECRET": re.compile(
+            r"\b("
+            + re.escape(s._ENV_PREFIX)
+            + r"[A-Z0-9_]+)\b['\"]?\s*[:=]\s*['\"]?[^\s'\"]+['\"]?"
+        ),
+        "_CREDENTIAL_KV": re.compile(
+            r"(?i)\b(" + prefix + r"(?:" + s._alternation(s._CREDENTIAL_WORDS) + r"))\b"
+            r"['\"]?\s*[:=]\s*(?:"
+            + s._ODBC_BRACED
+            + "|"
+            + s._QUOTED_VALUE
+            + "|"
+            + s._ODBC_BRACED_OVERRUN
+            + r"|['\"]?[^\s'\";,&]+)"
+        ),
+        "_KEY_MATERIAL": re.compile(
+            r"(?i)\b(" + prefix + r"(?:" + s._alternation(s._KEY_MATERIAL_WORDS) + r"))\b"
+            r"['\"]?\s*[:=]\s*['\"]?[^\s'\";&]+"
+        ),
+    }
 
 
-def test_the_stop_never_prints_a_value_the_stop_free_patterns_hide(
+#: Shapes a review of this change found printing a value the old patterns hid, each written with
+#: ``vq`` atoms. Every one is level with the old output or redacts more now; kept so none comes back.
+_REVIEW_SHAPES = (
+    "token='vq1 (truncated), password='vq2 vq3'",
+    "MEFOR_VALUE_PW='vq1 (truncated) password='vq2 vq3'",
+    'session="vq1-vq2_vq3 password="vq4 vq5"',
+    "private_key='vq1 encryption_key='vq2 vq3'",
+    "password='vq1 vq2 api_key=\"vq3' vq4\"",
+    'token=eyJ-aB.eyJ-cD.vq1-vq2_vq3_password="vq4 vq5"',
+    'token=-vq1_password="vq2"',
+    'token=+vq1_vq2-vq3_password="vq4"',
+    'token=vq1;password=vq2-vq3_session="vq4 vq5"',
+    'token=vq1-vq2_password="vq3',
+    'token=vq1;password="private_key: vq2',
+    'Authorization: Bearer vq1_password="private_key: vq2',
+    "MEFOR_X_PW={vq1}vq2",
+    "private_key={vq1}vq2",
+    "MEFOR_X={vq1 password='vq2} vq3'",
+    'token=vq1-vq2_vq3-vq4_password="vq5"',
+)
+
+#: The alphabet the seeded fuzz builds lines from: labels of every family, separators, both quotes,
+#: braces and an auth scheme, with ``vq`` atoms mixed in as values.
+_FUZZ_PIECES = (
+    *("password", "pwd", "secret", "client_secret", "token", "api_key", "session"),
+    *("authorization", "private_key", "encryption_keys_retired", "MEFOR_A", "MEFOR_B_PW"),
+    *("Bearer ", "bearer_", "x_", "a.b.", "=", "=", ":", ": ", ";", "&", ",", "|", ".", "-"),
+    *("_", " ", "'", "'", '"', '"', "{", "}", "}}", "@", "/", "://"),
+)
+
+
+def _fuzz_lines(count: int) -> list[str]:
+    """``count`` lines from :data:`_FUZZ_PIECES`, seeded so every run reads the same corpus."""
+    rng = random.Random(20261004)
+    lines = []
+    for _ in range(count):
+        parts = [
+            f"vq{j}" if rng.random() < 0.3 else rng.choice(_FUZZ_PIECES)
+            for j in range(rng.randint(3, 14))
+        ]
+        lines.append("".join(parts))
+    return lines
+
+
+_ATOM = re.compile(r"vq\d+(?!\d)")
+
+
+def _secret_passes_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Take the PHI pass and the long-base64 sweep out of ``redact_log_line``, on both sides.
+
+    The PHI pass judges whole lines by their shape, so a change to what the secret passes hand it can
+    flip its verdict on a line either way, for reasons outside these patterns. Measured: one fuzz line
+    in 150,000 that the PHI pass redacted whole under the old secret passes and not under the new."""
+    monkeypatch.setattr(redact_mod, "_redact_phi", lambda text: text)
+    monkeypatch.setattr(redact_mod, "_LONG_B64", NEVER_MATCHES)
+
+
+def _newly_printed_atoms(
+    monkeypatch: pytest.MonkeyPatch, shipped_patterns: dict[ModuleType, dict[str, re.Pattern[str]]]
+) -> tuple[list[str], int]:
+    """``(atoms the shipped patterns print and the pre-change ones hid, count the reverse way)``.
+
+    ``shipped_patterns`` lets a control swap a mutated pattern set in for the real one."""
+    _secret_passes_only(monkeypatch)
+    corpus = [*_REVIEW_SHAPES, *_fuzz_lines(4000)]
+    surfaces = (("scrub_credentials", scrub_credentials), ("redact_log_line", redact_log_line))
+
+    def outputs(patterns: dict[ModuleType, dict[str, re.Pattern[str]]]) -> dict[str, list[str]]:
+        for module, by_name in patterns.items():
+            for name, pattern in by_name.items():
+                monkeypatch.setattr(module, name, pattern)
+        return {surface: [apply(line) for line in corpus] for surface, apply in surfaces}
+
+    new = outputs(shipped_patterns)
+    old = outputs({scrub_mod: _pre_change_patterns(), redact_mod: _pre_change_patterns()})
+    newly: list[str] = []
+    hidden_now = 0
+    for surface, _apply in surfaces:
+        for line, before, after in zip(corpus, old[surface], new[surface], strict=True):
+            for atom in set(_ATOM.findall(line)):
+                printed_before = re.search(re.escape(atom) + r"(?!\d)", before) is not None
+                printed_after = re.search(re.escape(atom) + r"(?!\d)", after) is not None
+                if printed_after and not printed_before:
+                    newly.append(f"{surface}: {atom} in {line!r} -> {after!r}")
+                hidden_now += printed_before and not printed_after
+    return newly, hidden_now
+
+
+def _shipped() -> dict[ModuleType, dict[str, re.Pattern[str]]]:
+    return {
+        module: {name: getattr(module, name) for name in _STOPPED_PATTERNS}
+        for module in (scrub_mod, redact_mod)
+    }
+
+
+def test_the_change_prints_no_value_the_pre_change_patterns_hid(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A DIFFERENTIAL, because the stop's whole safety claim is relative: it may print label text, and
-    never a value the patterns without it would have hidden. Run over this file's fixtures and the
-    generated family, on every surface, against the same patterns with the stop cut out."""
-    corpus = [
-        *_swallow_family(),
-        *(line for line, _values, _labels in SWALLOW_EXAMPLES),
-        *(fam.line for fam in FAMILIES),
-        *ORDINARY_DIAGNOSTICS,
-    ]
-    shipped = {surface: [apply(line) for line in corpus] for surface, apply in _SWALLOW_SURFACES}
-    _patched_without_the_stop(monkeypatch)
-    newly_printed: list[str] = []
-    fixed = 0
-    for surface, apply in _SWALLOW_SURFACES:
-        for line, out in zip(corpus, shipped[surface], strict=True):
-            stop_free = apply(line)
-            for token in _sentinels(line):
-                if token in out and token not in stop_free:
-                    newly_printed.append(f"{surface}: {token} in {line!r}")
-                if token in stop_free and token not in out:
-                    fixed += 1
-    assert not newly_printed, f"the stop printed values: {newly_printed[:5]}"
-    # The differential compared outputs that DIFFER, or it compared nothing.
-    assert fixed > 0, (
-        "the stop changed no output in the corpus, so this differential proves nothing"
-    )
+    """Over the review shapes and 4,000 seeded fuzz lines, on both surfaces: no value atom the old
+    patterns hid may print now. The reverse count must be above zero, or the two sides never
+    differed and the comparison proved nothing."""
+    newly, hidden_now = _newly_printed_atoms(monkeypatch, _shipped())
+    assert not newly, f"{len(newly)} value atoms newly printed, first: {newly[:3]}"
+    assert hidden_now > 0, "the new patterns hid nothing the old printed, so nothing was compared"
+
+
+def _mutated(old: str, new: str) -> dict[ModuleType, dict[str, re.Pattern[str]]]:
+    """The shipped stopped patterns with ``old`` replaced by ``new`` in every source that holds it."""
+    mutated: dict[ModuleType, dict[str, re.Pattern[str]]] = {}
+    for module in (scrub_mod, redact_mod):
+        by_name = {}
+        for name in _STOPPED_PATTERNS:
+            pattern: re.Pattern[str] = getattr(module, name)
+            by_name[name] = re.compile(
+                pattern.pattern.replace(getattr(module, old), getattr(module, new) if new else ""),
+                pattern.flags,
+            )
+        mutated[module] = by_name
+    return mutated
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    (("_GUARDED_QUOTED_VALUE", "_QUOTED_VALUE"), ("_HARD_SEPARATOR_BEHIND", "")),
+    ids=("unguarded-quote", "prefix-after-any-separator"),
+)
+def test_the_differential_sees_each_guard_removed(
+    old: str, new: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE POSITIVE CONTROLS. Each guard the review asked for, taken back out, must make the
+    differential above find a newly printed value: the quoted form that ignores whose closer it is,
+    and the underscored-prefix stop that fires after "." and "-" too."""
+    for module in (scrub_mod, redact_mod):
+        source = module._BEARER.pattern
+        assert getattr(module, old) in source, f"{module.__name__}._BEARER does not hold {old}"
+    newly, _hidden_now = _newly_printed_atoms(monkeypatch, _mutated(old, new))
+    assert newly, f"with {old} removed the differential found nothing, so it cannot see that guard"
 
 
 def test_both_copies_of_each_stopped_pattern_agree() -> None:
@@ -2258,13 +2467,14 @@ def test_both_copies_of_each_stopped_pattern_agree() -> None:
 def test_every_keyword_passes_the_stops_first_letter_gate() -> None:
     """The stop gates its keyword alternation on the keyword's first letter. A keyword whose first
     letter the gate lacks would never stop a value, silently. Driven by the vocabulary tuples, so a
-    word added to them reaches this check in both copies."""
+    word added to them reaches this check in both copies. The value is a closed quote, because the
+    stop only fires before one."""
     words = scrub_mod._CREDENTIAL_WORDS + scrub_mod._KEY_MATERIAL_WORDS + scrub_mod._TOKEN_WORDS
     for module in (scrub_mod, redact_mod):
         label = re.compile(module._QUOTED_LABEL)
         for word in words:
             for spelling in (word, word.upper()):
-                assert label.match(f'{spelling}="'), (
+                assert label.match(f'{spelling}="v w"'), (
                     f"{module.__name__}: {spelling} misses the gate"
                 )
 
