@@ -9,7 +9,7 @@ plain-text SMTP message to a configured server and maps the outcome onto the eng
   capture, exactly like File).
 - **connect/EHLO/STARTTLS/AUTH/send failure** (``smtplib.SMTPException`` / ``OSError`` /
   ``TimeoutError``) → :class:`DeliveryError` (transient — the staged queue retries with backoff).
-- **a body the configured ``encoding`` cannot encode** → the permanent, content-free
+- **a body the configured ``encoding`` cannot encode** maps to the permanent, content-free
   :class:`~messagefoundry.transports.base.NegativeAckError` that
   :func:`~messagefoundry.transports.base.encode_wire_body` raises (dead-lettered, never retried).
 
@@ -48,6 +48,7 @@ There is **no email source yet** — an inbound IMAP/POP read + M365/Google XOAU
 from __future__ import annotations
 
 import asyncio
+import email.charset
 import email.policy
 import logging
 import smtplib
@@ -512,15 +513,19 @@ class EmailDestination(DestinationConnector):
     def _build_message(self, payload: str) -> EmailMessage:
         # set_content() below encodes with a bare str.encode(charset), whose UnicodeEncodeError names
         # a character of the message and holds the whole payload on `.object`. The shared helper fails
-        # permanent and content-free instead (see its docstring). set_content() repeats the same call,
-        # so it cannot fail after this one.
-        encode_wire_body(payload, self.encoding, transport=f"Email {self.host}:{self.port}")
+        # permanent and content-free instead (see its docstring). set_content() repeats the same
+        # encode, so it cannot fail after this one, PROVIDED both use one codec. Python 3.15's
+        # set_content() encodes with the email package's OUTPUT charset (euc-jp and shift_jis become
+        # iso-2022-jp), where 3.14 uses the name it is given. Passing that output charset to both
+        # calls makes them agree on either version; it maps to itself, so 3.15 does not remap it.
+        charset = email.charset.Charset(self.encoding).output_charset or self.encoding
+        encode_wire_body(payload, charset, transport=f"Email {self.host}:{self.port}")
         msg = EmailMessage()
         msg["Subject"] = self.subject
         self._envelope.address(msg)
         # The Handler-produced payload IS the body (content-agnostic — an HL7 string, a JSON/XML report,
         # plain text); rendering it human-readable is the Handler's job, not the transport's.
-        msg.set_content(payload, charset=self.encoding)
+        msg.set_content(payload, charset=charset)
         return msg
 
     def _connect(self) -> smtplib.SMTP:
