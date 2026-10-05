@@ -164,9 +164,12 @@ def envelope_address_problem(address: str) -> str | None:
 
     Hostname-shaped means labels of letters, digits and hyphens, 1 to 63 characters each, none
     starting or ending with a hyphen. So an empty label, and a leading or trailing dot, are refused.
-    The last label may not be all digits. RFC 5321 section 4.1.3 writes an IP address only as a
+    The last label must start with a letter. RFC 5321 section 4.1.3 writes an IP address only as a
     bracketed address literal, which the character test already refuses, so a bare dotted quad
-    names no mail domain (vault BACKLOG #2911, a Manager decision under the owner's driver rule)."""
+    names no mail domain (vault BACKLOG #2911, a Manager decision under the owner's driver rule).
+    An all-digits test would not be enough: ``inet_aton`` reads ``10.0.0.0x1`` and ``0x7f000001``
+    as IPv4 addresses too. No top-level domain starts with a digit, so the letter test refuses
+    every such form and no real domain."""
     if parseaddr(address)[1] != address:
         return "does not read back as the same address"
     local, at, domain = address.rpartition("@")
@@ -190,8 +193,8 @@ def envelope_address_problem(address: str) -> str | None:
         return f"has a domain label longer than {_MAX_LABEL} characters"
     if any(label[0] == "-" or label[-1] == "-" for label in labels):
         return "has a domain label that starts or ends with a hyphen"
-    if labels[-1].isdigit():
-        return "has a domain whose last label is all digits, as a bare IP address is"
+    if labels[-1][0] not in string.ascii_letters:
+        return "has a domain whose last label does not start with a letter, as in an IP address"
     return None
 
 

@@ -901,8 +901,11 @@ _DOMAIN_SHAPES = {
     "domain-leading-hyphen": ("a@-mx.example.org", "hyphen"),
     "domain-trailing-hyphen": ("a@mx-.example.org", "hyphen"),
     "domain-long-label": ("a@" + "x" * 64 + ".example.org", "longer than 63"),
-    "domain-dotted-quad": ("a@10.0.0.1", "all digits"),
-    "domain-numeric-last-label": ("a@example.123", "all digits"),
+    "domain-dotted-quad": ("a@10.0.0.1", "start with a letter"),
+    "domain-numeric-last-label": ("a@example.123", "start with a letter"),
+    # inet_aton reads both as IPv4 addresses, so an all-digits test alone would pass them.
+    "domain-hex-last-part": ("a@10.0.0.0x1", "start with a letter"),
+    "domain-hex-whole": ("a@0x7f000001", "start with a letter"),
 }
 
 #: Plain addresses the domain rule must still pass: a hyphen inside a label, digits in a label that
@@ -918,9 +921,11 @@ _DOMAIN_CONTROLS = [
 
 #: The domain shapes the shared tables carry, so every cell that reads them (Email, Direct, alert
 #: mail) is shown to refuse one before any connection. Every cell calls the same rule, so two
-#: shapes show the call; the unit test proves each shape. The dotted quad is the decided one.
+#: shapes show the call; the unit test proves each shape. The dotted quad is the decided one, and the
+#: hex form is the one an all-digits test would have missed.
 _DOMAIN_ON_THE_WIRE = {
-    k: _DOMAIN_SHAPES[k][0] for k in ("domain-trailing-dot", "domain-dotted-quad")
+    k: _DOMAIN_SHAPES[k][0]
+    for k in ("domain-trailing-dot", "domain-dotted-quad", "domain-hex-last-part")
 }
 
 _SENDER_SHAPES = _sender_shapes() | _DOMAIN_ON_THE_WIRE

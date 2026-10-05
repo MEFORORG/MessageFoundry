@@ -383,6 +383,7 @@ async def test_naming_the_stored_address_again_writes_and_sends_nothing() -> Non
         "a@example..org",
         "a@-mx.example.org",
         "a@10.0.0.1",
+        "a@10.0.0.0x1",
     ],
 )
 async def test_a_blank_or_malformed_address_is_refused_before_anything_is_written(
