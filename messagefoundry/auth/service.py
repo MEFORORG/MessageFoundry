@@ -5743,10 +5743,10 @@ class AuthService:
             await self._store.mark_session_mfa_verified(token_hash)
         if supersedes_hash is not None:
             await self._supersede_session_hash(supersedes_hash, client=client)
-        await self._enforce_session_cap(user_id)
+        await self._enforce_session_cap(user_id, client=client)
         return token
 
-    async def _enforce_session_cap(self, user_id: str) -> None:
+    async def _enforce_session_cap(self, user_id: str, *, client: str | None = None) -> None:
         """Apply ``[auth].max_sessions_per_user`` to one user (AUTH-SESS-CAP).
 
         Runs after a sign-in mints a row, and again after a ceremony in ``_FACTOR_CEREMONIES``
@@ -5775,8 +5775,9 @@ class AuthService:
         rows count as full ones until the next cap run, which then keeps the newest ``cap``.
 
         **A run that revoked anything is audited (BACKLOG #2283):** one ``auth.session_revoked`` row
-        with scope ``cap`` and the count, under the owner's name, as the supersession row is, so it
-        lands in that user's own security-event feed. A count, not hashes, as the other
+        with scope ``cap`` and the count, under the owner's name and with the address of the
+        sign-in or ceremony that ran the cap, as the supersession row is. So it lands in that
+        user's own security-event feed. A count, not hashes, as the other
         multi-session revocations record it. The count includes lapsed rows the cap ended, which
         the validator already refused; the store returns one count for both.
         """
@@ -5798,6 +5799,7 @@ class AuthService:
                 "auth.session_revoked",
                 actor=user.username if user is not None else None,
                 detail=_json({"scope": "cap", "count": revoked, "cap": cap}),
+                client=client,
             )
 
     @property
@@ -5944,10 +5946,12 @@ class AuthService:
             # The session just joined the full ones, so the cap runs again (BACKLOG #2076). With
             # `cap` full sessions already live, the oldest of those goes, never the one just
             # completed: its fresh stamp ranks it newest.
-            await self._enforce_session_cap_after_elevation(rotated)
+            await self._enforce_session_cap_after_elevation(rotated, client=client)
         return Elevation(token=rotated, recovery_codes=recovery_codes)
 
-    async def _enforce_session_cap_after_elevation(self, token: str) -> None:
+    async def _enforce_session_cap_after_elevation(
+        self, token: str, *, client: str | None = None
+    ) -> None:
         """Run the cap for the owner of a session that has ALREADY been rotated.
 
         A failure here is logged, never raised. The old token is gone by now, and the ceremony has
@@ -5963,9 +5967,14 @@ class AuthService:
         try:
             session = await self._store.get_session(hash_token(token))
             if session is not None:
-                await self._enforce_session_cap(session.user_id)
+                await self._enforce_session_cap(session.user_id, client=client)
         except Exception:  # noqa: BLE001 -- driver errors vary by backend; see the docstring
-            _log.exception("session cap after a completed second factor failed; skipped this run")
+            # The run may have revoked sessions before its audit write failed, so the log does not
+            # claim the run was skipped (BACKLOG #2283).
+            _log.exception(
+                "session cap after a completed second factor failed; it may not have run, or its"
+                " audit row may be missing"
+            )
 
     async def identity_for_token(
         self, token: str | None, *, activity: bool = True

@@ -7778,31 +7778,11 @@ _SESSION_REAP_INTERVAL = 3600.0  # purge expired/idle sessions hourly to bound t
 # How long the reaper waits after start before its first pass, so time sync has run and an engine
 # that restarts often still purges.
 _SESSION_REAP_FIRST_DELAY = 300.0
-# The CEILING on how far the wall clock may run ahead of the monotonic clock between two readings
-# before the reaper skips the pass as a clock step. Above what clock discipline slews in an hour
-# (chrony's default ceiling is about 300 s), below the default 30-minute idle window. A shorter idle
-# window lowers the tolerance below it; see `_session_reap_step_tolerance`.
+# How far the wall clock may run ahead of the monotonic clock between two readings before the
+# reaper skips the pass as a clock step. Above what clock discipline slews in an hour (chrony's
+# maximum slew rate is about 300 s an hour). Each pass that runs also purges as of this much before
+# its own reading, so a step under it cannot delete a row the validator would still accept.
 _SESSION_REAP_STEP_TOLERANCE = 600.0
-
-
-def _session_reap_step_tolerance(idle_seconds: float | None) -> float:
-    """How far the wall clock may run ahead of the monotonic clock before a reaper pass is skipped:
-    half the idle window, and never more than ``_SESSION_REAP_STEP_TOLERANCE`` (BACKLOG #2283).
-
-    A forward step of ``x`` seconds makes the idle purge delete every row unused for more than
-    ``idle_seconds - x`` real seconds. A fixed 600 s tolerance therefore let through a step as long
-    as the whole window whenever the idle timeout was 10 minutes or less, and that pass deleted
-    every session nobody used during the step. Half the window bounds what a step the guard lets
-    through can cost: no session used within the last half of its window is deleted. The setting
-    counts whole minutes, so the shortest positive window is one minute and the smallest tolerance
-    30 s, still far above what clock discipline slews between two passes.
-
-    With no idle purge (``None``) only absolute expiry is judged, so the fixed ceiling stands. An
-    idle window of zero or less makes the validator refuse every row already, so a step cannot cost
-    a session it would accept, and the ceiling stands there too."""
-    if idle_seconds is None or idle_seconds <= 0:
-        return _SESSION_REAP_STEP_TOLERANCE
-    return min(_SESSION_REAP_STEP_TOLERANCE, idle_seconds / 2)
 
 
 async def _session_reaper(
@@ -7822,12 +7802,20 @@ async def _session_reaper(
     a forward step, it would delete every session as idle, though setting the clock right would
     have made them valid again. So each pass compares how far the wall clock moved since the
     previous reading with how far the monotonic clock moved. When the wall clock ran ahead by more
-    than :func:`_session_reap_step_tolerance` allows for this idle window, the pass deletes nothing
-    and logs a warning. The next
+    than ``_SESSION_REAP_STEP_TOLERANCE``, the pass deletes nothing and logs a warning. The next
     pass compares against this one, so a step that persists for a whole interval is then trusted
     and purged by. A host that slept can also trip it, which costs one skipped pass. A host whose
     clock steps forward by more than the tolerance every interval never purges, and the warning
     each pass is what says so.
+
+    **A pass that runs purges as of ``_SESSION_REAP_STEP_TOLERANCE`` before its own reading.** A
+    forward step of ``x`` seconds that the guard lets through would make a purge at the reading
+    delete every row unused for more than ``idle_seconds - x`` real seconds, and every row with
+    less than ``x`` seconds of absolute life left. With an idle window of 10 minutes or less, a step
+    under the tolerance would then delete every session nobody used during it (BACKLOG #2283).
+    Purging as of the earlier instant cancels any step the guard lets through, at any idle setting:
+    a row goes only once the validator would refuse it at the true time. The cost is that a lapsed
+    row waits up to that much longer for a pass to delete it, and the validator refuses it meanwhile.
 
     **The first reading is a baseline, not a pass.** A wrong clock is likeliest at start-up, before
     time sync has run, and a first pass would have nothing to compare it with. So the reaper reads
@@ -7847,7 +7835,6 @@ async def _session_reaper(
     def _clocks() -> tuple[float, float]:
         return (wall or time.time)(), (mono or time.monotonic)()
 
-    tolerance = _session_reap_step_tolerance(idle_seconds)
     previous = _clocks()
     delay = _SESSION_REAP_FIRST_DELAY
     while True:
@@ -7856,7 +7843,7 @@ async def _session_reaper(
         now, ticks = _clocks()
         ahead = (now - previous[0]) - (ticks - previous[1])
         previous = (now, ticks)
-        if ahead > tolerance:
+        if ahead > _SESSION_REAP_STEP_TOLERANCE:
             _log.warning(
                 "session reaper: the wall clock ran %.0fs ahead of the monotonic clock since the "
                 "last reading, so this pass deleted nothing; the next pass purges if the clock holds",
@@ -7864,7 +7851,9 @@ async def _session_reaper(
             )
             continue
         try:
-            await store.purge_expired_sessions(now=now, idle_seconds=idle_seconds)
+            await store.purge_expired_sessions(
+                now=now - _SESSION_REAP_STEP_TOLERANCE, idle_seconds=idle_seconds
+            )
         except asyncio.CancelledError:
             raise
         except Exception:

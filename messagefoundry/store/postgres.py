@@ -2260,12 +2260,18 @@ class PostgresStore:
         unrotated. Waiting for a connection instead finishes the write once the pool frees, which is
         what both did before BACKLOG #2283 moved them onto the bounded ``_execute``.
 
+        Not every caller has committed first. At least "sign out everywhere else", an
+        administrator's force sign-out and the directory reconciler when it writes no roles have no
+        earlier write, and they wait the same way, as they did before. A per-caller choice would need a store parameter on
+        all three backends. The wait has a known price, also as before: it holds whatever lock its
+        caller holds, such as a ceremony's per-account lock, until the pool frees.
+
         A bounded retry that fell back to this wait would end the same way, later, since each retry
         rejoins the back of asyncpg's queue. Moving each write into its caller's transaction would
         close the gap entirely, but every caller commits through a different store method on three
         backends. ``self._pool.execute`` borrows inside asyncpg with no timeout and returns the
         status tag the count is read from. ``tests/test_store_pool_acquire_timeout.py`` counts this
-        site among the pinned unbounded borrows."""
+        site among the pinned unbounded borrows, and pins which methods call it."""
         return _rowcount(await self._pool.execute(sql, *params))
 
     async def _count(self, table: str) -> int:
@@ -8362,8 +8368,8 @@ class PostgresStore:
     ) -> int:
         """Revoke a user's active sessions (all, or all but ``except_token_hash``). Returns the count."""
         now = time.time() if now is None else now
-        # Unbounded, after the caller's own committed write, as `_execute_after_commit` explains
-        # (BACKLOG #2283).
+        # Unbounded, because most callers have already committed their own write, as
+        # `_execute_after_commit` explains (BACKLOG #2283).
         return await self._execute_after_commit(
             "UPDATE sessions SET revoked_at=$1 WHERE user_id=$2 AND revoked_at IS NULL"
             " AND ($3::text IS NULL OR token_hash != $3)",

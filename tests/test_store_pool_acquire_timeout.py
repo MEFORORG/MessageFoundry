@@ -477,6 +477,26 @@ def test_postgres_borrows_outside_the_bounded_helper_are_pinned() -> None:
     )
 
 
+def test_postgres_unbounded_post_commit_helper_has_exactly_its_two_callers() -> None:
+    """``_execute_after_commit`` is ONE pinned site in the census above, however many methods call
+    it, and the offline placeholder tests stub it out. So a third session write moved onto it would
+    pass both. This pins its callers by name (BACKLOG #2283)."""
+    import ast
+
+    tree = ast.parse((_REPO / "messagefoundry/store/postgres.py").read_text(encoding="utf-8"))
+    callers = sorted(
+        fn.name
+        for fn in ast.walk(tree)
+        if isinstance(fn, ast.AsyncFunctionDef | ast.FunctionDef)
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Attribute) and node.attr == "_execute_after_commit"
+    )
+    assert callers == ["revoke_user_sessions", "rotate_session"], (
+        "a new caller reached the unbounded post-commit borrow; give it the bounded `_execute`"
+        " unless it too follows a committed write nothing retries, then update this pin"
+    )
+
+
 # --- the setting -------------------------------------------------------------
 
 

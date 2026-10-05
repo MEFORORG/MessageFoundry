@@ -3328,11 +3328,13 @@ Facts that are easy to get wrong, stated plainly first:
   not a statement about every code path that can touch a pool.
 
   **Two Postgres session writes wait without the bound, on purpose (BACKLOG #2283).**
-  `rotate_session` and `revoke_user_sessions` run after their caller's own change has committed: a
-  password reset, a disable, a role change, a completed second factor. Nothing retries them, so they
-  wait for a free connection rather than fail after that change. On SQL Server both stay bounded,
-  because `_acquire` is that backend's sole borrow site. There, at the limit, the request fails
-  after the change has committed, and the account's other sessions are left unrevoked.
+  `rotate_session` and `revoke_user_sessions` mostly run after their caller's own change has
+  committed: a password reset, a disable, a role change, a completed second factor. Nothing retries
+  them, so they wait for a free connection rather than fail after that change. Callers with no
+  earlier write, such as "sign out everywhere else", wait the same way. On SQL Server both stay
+  bounded, because `_acquire` is that backend's sole borrow site. There, at the limit, the request
+  fails after the change has committed. A revoke then leaves the account's other sessions
+  unrevoked. A rotation leaves the session on its old token, now carrying the factor it just proved.
 
   **Behaviour at the store-pool acquire limit.** The borrow raises `StoreAcquireTimeout` with a
   numeric, PHI-free message naming the backend and the knob. It is an ordinary `Exception`, so it

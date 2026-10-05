@@ -185,7 +185,7 @@ async def _cap_rows(store: MessageStore) -> list[dict[str, object]]:
         if row["action"] == "auth.session_revoked" and row["detail"]:
             detail = json.loads(str(row["detail"]))
             if detail.get("scope") == "cap":
-                out.append({**detail, "actor": row["actor"]})
+                out.append({**detail, "actor": row["actor"], "client": row["client"]})
     return out
 
 
@@ -203,8 +203,10 @@ async def test_a_cap_revocation_is_audited_under_the_owners_name() -> None:
             assert (await service.login("dana", PW)).token is not None
         assert await _cap_rows(store) == [], "a cap run that revoked nothing wrote an audit row"
 
-        assert (await service.login("dana", PW)).token is not None
-        assert await _cap_rows(store) == [{"scope": "cap", "count": 1, "cap": 2, "actor": "dana"}]
+        assert (await service.login("dana", PW, client="10.0.0.5")).token is not None
+        assert await _cap_rows(store) == [
+            {"scope": "cap", "count": 1, "cap": 2, "actor": "dana", "client": "10.0.0.5"}
+        ]
     finally:
         await store.close()
 
@@ -291,7 +293,8 @@ async def test_completing_mfa_evicts_the_oldest_full_sibling_not_itself(
         sibling_b = await _full_sign_in(service, password, codes[1])
         assert await _is_full(service, sibling_a) and await _is_full(service, sibling_b)
 
-        done = await service.verify_mfa(waiting, codes[2])
+        before = len(await _cap_rows(store))
+        done = await service.verify_mfa(waiting, codes[2], client="10.0.0.7")
         assert done.ok and done.token is not None
 
         assert await _is_full(service, done.token), (
@@ -301,6 +304,12 @@ async def test_completing_mfa_evicts_the_oldest_full_sibling_not_itself(
         assert await service.identity_for_token(sibling_a) is None, (
             "the cap must hold full sessions to `keep`: the oldest-completed sibling goes"
         )
+        # BACKLOG #2283, row item 9: the cap run after a completed second factor is audited too.
+        rows = await _cap_rows(store)
+        assert len(rows) == before + 1, "the cap run after a completed second factor wrote no row"
+        assert [r for r in rows if r["client"] == "10.0.0.7"] == [
+            {"scope": "cap", "count": 1, "cap": 2, "actor": ADMIN_USERNAME, "client": "10.0.0.7"}
+        ]
     finally:
         await store.close()
 
