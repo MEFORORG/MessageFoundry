@@ -590,16 +590,22 @@ foreach ($raw in $Path) {
         # The handle test and the delete share one act: rename first, then delete the renamed tree.
         $tomb = "$($res.Full).removing-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
         $renamed = $false
-        if (Test-Path -LiteralPath $tomb) { $receipt['in-use'] = "REFUSED '$tomb' already exists" }
+        if ([IO.Directory]::Exists($tomb) -or [IO.File]::Exists($tomb)) { $receipt['in-use'] = "REFUSED '$tomb' already exists" }
         else {
             try { [IO.Directory]::Move($res.Full, $tomb); $renamed = $true }
             catch { $receipt['in-use'] = "REFUSED the folder could not be renamed, so something holds a handle inside it or it cannot be changed: $($_.Exception.Message)" }
         }
         if ($renamed) {
             $receipt['in-use'] = "PASS renamed to '$tomb' with no handle open inside"
-            Remove-TreeNoFollow $tomb $failures
-            if (Test-Path -LiteralPath $tomb) {
-                $remains = @(Get-Remains $tomb)
+            # Past the rename a throw must still end in a verdict that says where the tree went.
+            $gone = $false
+            try {
+                Remove-TreeNoFollow $tomb $failures
+                $gone = -not [IO.Directory]::Exists($tomb)
+                if (-not $gone) { $remains = @(Get-Remains $tomb) }
+            }
+            catch { $failures.Add("the delete threw: $($_.Exception.Message)") }
+            if (-not $gone) {
                 $verdict = "PARTIAL $($res.Full): the delete stopped part-way. The tree was renamed to '$tomb' and $($remains.Count) entr$(if ($remains.Count -eq 1) { 'y remains' } else { 'ies remain' }) under it."
                 $counts.partial++
             }
@@ -619,7 +625,7 @@ foreach ($raw in $Path) {
         if ($receipt.Contains($c)) { Write-Host "  ${c}: $($receipt[$c])" }
     }
     foreach ($c in $checkNames) {
-        $v = if ($receipt.Contains($c)) { $receipt[$c] } else { 'not run (an earlier check refused)' }
+        $v = if ($receipt.Contains($c)) { $receipt[$c] } else { 'not run (an earlier check refused or threw)' }
         Write-Host "  ${c}: $v"
     }
     if (-not $verdict) {
