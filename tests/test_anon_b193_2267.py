@@ -23,7 +23,6 @@ from pathlib import Path
 
 import pytest
 
-import tee.anon
 import tee.anon.rules
 from tee.__main__ import main as tee_main
 from tee.store import RelayStore
@@ -67,11 +66,12 @@ def db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
     return path
 
 
-def _overlay(tmp_path: Path, body: str | bytes) -> str:
+def _overlay(tmp_path: Path, body: str | bytes | None) -> str:
+    """Write ``body`` as an overlay and return its path. ``None`` writes nothing: a missing file."""
     path = tmp_path / "anon.toml"
     if isinstance(body, bytes):
         path.write_bytes(body)
-    else:
+    elif body is not None:
         path.write_text(body, encoding="utf-8")
     return str(path)
 
@@ -87,11 +87,12 @@ def _run(db: str, out: Path, *extra: str) -> int:
         (b'[hl7]\nkeep = ["EVN-1"]\n# \xff\xfe\n', "UTF-8"),
         ('[hl7]\nkeep = ["PID-5.1"]\n', "PID-5.1"),
         ("[fhir]\n", "fhir"),
+        (None, "cannot read anon overlay"),
     ],
-    ids=["malformed", "not-utf8", "component-path", "unknown-table"],
+    ids=["malformed", "not-utf8", "component-path", "unknown-table", "missing"],
 )
 def test_a_bad_overlay_refuses_the_run_once(
-    body: str | bytes,
+    body: str | bytes | None,
     reason: str,
     db: str,
     tmp_path: Path,
@@ -110,21 +111,6 @@ def test_a_bad_overlay_refuses_the_run_once(
     assert _FAILED not in err
     assert not out.exists()
     assert "DOE" not in err
-
-
-def test_a_missing_overlay_refuses_the_run_once(
-    db: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    out = tmp_path / "ds.jsonl"
-    overlay = str(tmp_path / "no-such-anon.toml")
-
-    assert _run(db, out, "--overlay", overlay) == 1
-
-    err = capsys.readouterr().err
-    (error,) = [line for line in err.splitlines() if line.startswith("error:")]
-    assert overlay in error
-    assert _FAILED not in err
-    assert not out.exists()
 
 
 def _counting(

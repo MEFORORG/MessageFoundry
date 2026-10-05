@@ -547,9 +547,8 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    # LOAD THE RULES ONCE, HERE, FOR THE SAME REASON. Handing the overlay path to the loop made
-    # every row re-read anon.toml inside the catch-all, so a malformed overlay came out as N
-    # failed messages and the one line naming the file was discarded (BACKLOG #2267).
+    # LOAD THE RULES ONCE, HERE, FOR THE SAME REASON: the overlay is a property of the run, and a
+    # bad one read inside the loop comes out as N failed messages (BACKLOG #2267).
     try:
         rules = load_rules(overlay)
     except RuleError as exc:
