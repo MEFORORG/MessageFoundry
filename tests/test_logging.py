@@ -2025,10 +2025,10 @@ def test_a_hostile_request_target_costs_the_access_log_chain_linear_time(
         for name in dir(re.Pattern)
         if not name.startswith("_") and callable(getattr(re.Pattern, name, None))
     ]
-    # A walk that found fewer public callables than the set names did not see re.Pattern's surface,
-    # and "nothing uncovered" over it would say nothing.
-    assert len(public) >= 9, f"re.Pattern showed only {sorted(public)} as public callables"
-    assert len(public) >= len(_APPLYING_METHODS)
+    # An empty or near-empty walk proves nothing, and "nothing uncovered" over it would pass. The
+    # floor sits well under the real count on purpose: it catches a blind walk, and it must not
+    # red on a stdlib method being added or removed.
+    assert len(public) >= 5, f"re.Pattern showed only {sorted(public)} as public callables"
     uncovered = {name for name in public if name not in _APPLYING_METHODS}
     assert not uncovered, f"_APPLYING_METHODS does not cover re.Pattern's {sorted(uncovered)}"
     longest = _ACCESS_GROWTH_LENGTHS[1]
