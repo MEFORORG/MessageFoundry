@@ -2096,7 +2096,7 @@ def test_the_bound_does_not_keep_the_head_of_an_identifier_it_splits() -> None:
     identifier that also looked redacted. A token the bound would split now goes whole."""
     out = safe_exc(ValueError(_identifier_straddling(redaction._DEFAULT_LIMIT)))
     assert out.startswith("ValueError: ")
-    assert "(900" not in out and "900" not in out, out
+    assert "900" not in out, out
     # The space before the identifier goes too, so the count is the tail plus one.
     assert out.endswith(f"value is…(+{len(_STRADDLING_TAIL) + 1} chars)"), out
 
@@ -2113,11 +2113,13 @@ def test_control_the_straddling_identifier_survives_redact_and_a_wider_bound() -
     assert f"({_BARE_IDENTIFIER})" in safe_text(text, limit=len(text))
 
 
+@pytest.mark.parametrize("separator", [" ", "\t", "\n"], ids=["space", "tab", "newline"])
 @pytest.mark.parametrize("limit", range(150, 230))
-def test_the_count_covers_every_character_the_bound_drops(limit: int) -> None:
+def test_the_count_covers_every_character_the_bound_drops(limit: int, separator: str) -> None:
     """``(+N chars)`` plus what is kept accounts for the whole redacted text, wherever the bound falls:
-    inside a token, on whitespace, or on a whitespace run. And no kept token is a fragment."""
-    text = _identifier_straddling(200) + "  trailing words here"
+    inside a token, on whitespace, or on a whitespace run. And no kept token is a fragment. Run over
+    each kind of boundary, since the cut searches for every whitespace character separately."""
+    text = (_identifier_straddling(200) + "  trailing words here").replace(" ", separator)
     full = redact(text).strip()
     out = safe_text(text, limit=limit)
     head, marker, rest = out.partition("…(+")
@@ -2125,9 +2127,8 @@ def test_the_count_covers_every_character_the_bound_drops(limit: int) -> None:
     count = int(rest.removesuffix(" chars)"))
     assert len(head) + count == len(full)
     assert len(head) <= limit
-    assert full.startswith(head)
-    assert head == full[: len(head)].rstrip()
-    assert len(head) == len(full) or full[len(head)] in redaction._CUT_CHARS
+    assert full.startswith(head) and head == head.rstrip()
+    assert full[len(head)] in redaction._CUT_CHARS  # the head ends where a token does
 
 
 def test_a_single_token_longer_than_the_bound_is_dropped_whole() -> None:
@@ -2166,17 +2167,24 @@ def test_control_unclamped_redact_scrubs_the_fragment_by_the_tail_msh() -> None:
 
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason=(
         "BACKLOG #1848, accepted residual: the clamp drops the MSH that declares the delimiters, so "
         "the sniff has nothing to read. A whole-text sniff would close it and undo the #1576 bound."
     ),
 )
-def test_a_custom_delimiter_fragment_whose_msh_the_clamp_drops_is_scrubbed() -> None:
+@pytest.mark.parametrize(
+    "bounded",
+    [redact_untrusted, lambda text: safe_text(text, limit=100_000)],
+    ids=["redact_untrusted", "safe_text"],
+)
+def test_a_custom_delimiter_fragment_whose_msh_the_clamp_drops_is_scrubbed(
+    bounded: Callable[[str], str],
+) -> None:
     """ASSERTS THE BEHAVIOUR WE DO NOT HAVE, so it fails today and is marked a strict xfail.
 
-    The day a change closes the gap, this passes, strict mode turns the pass into a failure, and the
-    person who closed it removes the mark and updates the residual in the module docstring. The day a
-    change makes the shape worse, nothing here moves -- that is the cost of accepting it."""
-    text = _fragment_then_msh_past_the_window()
-    for out in (redact_untrusted(text), safe_text(text, limit=100_000)):
-        assert _FRAGMENT_IDENTIFIER not in out
+    One case per bounded path, so closing the gap on either one alone passes that case, and strict
+    mode turns the pass into a failure. Whoever closed it removes the mark and updates the residual in
+    the module docstring. ``raises`` keeps an unrelated error from passing as the expected failure.
+    The day a change makes the shape worse, nothing here moves -- that is the cost of accepting it."""
+    assert _FRAGMENT_IDENTIFIER not in bounded(_fragment_then_msh_past_the_window())
