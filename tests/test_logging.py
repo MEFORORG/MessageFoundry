@@ -4,6 +4,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import importlib.util
+import io
 import json
 import logging
 import logging.handlers
@@ -14,12 +17,14 @@ import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
 from functools import lru_cache
+from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
+from uvicorn.protocols.utils import get_path_with_query_string
 
-from messagefoundry import __main__
+from messagefoundry import __main__, secretscrub
 from messagefoundry.logging_setup import (
     _CREDENTIAL_QUERY_KEYS,
     ControlCharScrubFilter,
@@ -37,6 +42,7 @@ from messagefoundry.logging_setup import (
     configure_stderr_logging,
 )
 from messagefoundry.redaction import clamp_untrusted, redact
+from messagefoundry.secretscrub import CREDENTIAL_PLACEHOLDER
 from tests._phi_gate_provisions import make_syslog_ca_and_crl
 
 #: Synthetic HL7 (never real PHI) embedded in a log record so a redaction assertion has something to
@@ -1817,6 +1823,302 @@ def test_the_installed_chain_scrubs_a_custom_delimiter_body() -> None:
     for identifier in ("Z9998887", "DOE", "JANE"):
         assert identifier not in out, f"{identifier!r} reached the sink through the installed chain"
     assert "ValueError" in out and "cannot transform" in out  # type + non-PHI context kept
+
+
+# --- BACKLOG #1547: a request target through the installed access-log chain -----------------------
+#
+# The scheme scan in ``secretscrub._DSN_PASSWORD`` was quadratic on a delimiter-free run, and an
+# unauthenticated request target reached it through ``uvicorn.access``. The pattern is fixed and timed
+# directly in ``tests/test_log_redaction_secret_domain.py``; the arm below is the acceptance test the
+# item names, which drives the same input through the chain production installs.
+#
+# The next three constants MIRROR ``_GROWTH_LENGTHS``, ``_MAX_GROWTH`` and ``_SHIPPED_BEFORE_DSN`` in
+# that file. They are copied rather than imported so this arm does not move when that file is
+# rewired. The reasoning behind each value is recorded there and not repeated here; if that file
+# retunes one, retune its mirror in the same change.
+_ACCESS_GROWTH_LENGTHS = (2048, 16384)
+_ACCESS_MAX_GROWTH = 24.0
+_PRE_1547_DSN_PASSWORD = r"(?i)\b([a-z][a-z0-9+.\-]*://[^\s:/@]+):[^\s/@]+@"
+
+#: uvicorn's access-log format, as ``h11_impl`` and ``httptools_impl`` pass it to
+#: ``access_logger.info``. With ``log_config=None`` no ``AccessFormatter`` is installed, so the root
+#: handler renders it through the engine's own formatter.
+#: ``test_the_access_format_this_file_copies_is_uvicorns`` pins the copy to uvicorn's source.
+_UVICORN_ACCESS_FORMAT = '%s - "%s %s HTTP/%s" %d'
+
+#: At least the ``re.Pattern`` methods that apply the pattern to text. A recorder that watched ``sub``
+#: alone would stay quiet if ``_run`` moved to ``subn`` or ``finditer``. The growth test checks this
+#: set covers every public callable of ``re.Pattern``.
+_APPLYING_METHODS = frozenset(
+    {"findall", "finditer", "fullmatch", "match", "scanner", "search", "split", "sub", "subn"}
+)
+
+
+#: The query that carries ``://``, the marker that opens the DSN gate, as the item measured it.
+_MARKED_QUERY = "x=://"
+
+
+def _hostile_run(length: int) -> str:
+    """An alternating letter-and-hyphen run of ``length`` characters."""
+    return ("a-" * (length // 2 + 1))[:length]
+
+
+def _request_target(length: int, query: str = _MARKED_QUERY) -> str:
+    """The item's own shape: ``/`` + an alternating letter-and-hyphen run + ``?`` + ``query``."""
+    return f"/{_hostile_run(length)}?{query}"
+
+
+def _emit_access(target: str) -> None:
+    """One access record, emitted the way uvicorn emits it for a 401 on ``target``."""
+    logging.getLogger("uvicorn.access").info(
+        _UVICORN_ACCESS_FORMAT, "127.0.0.1:50123", "GET", target, "1.1", 401
+    )
+
+
+def _timed_emit(target: str) -> float:
+    """Seconds one access record on ``target`` took to pass every installed handler."""
+    start = time.perf_counter()
+    _emit_access(target)
+    return time.perf_counter() - start
+
+
+def _access_growth(rounds: int) -> float:
+    """Emit time at the long target over emit time at the short one, both with the DSN marker.
+
+    The emits run inside a coroutine on a running event loop, the way uvicorn's own emit does. A
+    ``logging`` emit is synchronous, so every handler filter runs on the loop thread and nothing else
+    on that loop runs until it returns: its duration IS the stall a waiting coroutine sees. That is
+    why this times the emit rather than a sleeping ticker, whose scheduler jitter on Windows swamps
+    the short length.
+
+    Each endpoint keeps its MINIMUM, the statistic load inflates least, and the short and long emits
+    alternate so load that comes and goes lands on both endpoints rather than on one block."""
+    short_target = _request_target(_ACCESS_GROWTH_LENGTHS[0])
+    long_target = _request_target(_ACCESS_GROWTH_LENGTHS[1])
+
+    async def measure() -> tuple[float, float]:
+        short = long_ = float("inf")
+        for _ in range(rounds):
+            short = min(short, _timed_emit(short_target))
+            long_ = min(long_, _timed_emit(long_target))
+        return short, long_
+
+    short, long_ = asyncio.run(measure())
+    return long_ / short
+
+
+class _CountingPattern:
+    """A compiled pattern that counts each time it is applied to text holding ``needle``, and is
+    otherwise the real one.
+
+    The swap is process-wide, so a record another thread logs during the window would be counted too
+    if every application were. Counting only text that holds this test's own run keeps such a record
+    out of the reading."""
+
+    def __init__(self, pattern: re.Pattern[str], needle: str, seen: list[str]) -> None:
+        self._pattern = pattern
+        self._needle = needle
+        self._seen = seen
+
+    def __getattr__(self, attr: str) -> Any:
+        # An instance built without __init__ (copy, pickle) would otherwise recurse on _pattern.
+        if "_pattern" not in self.__dict__:
+            raise AttributeError(attr)
+        target = getattr(self._pattern, attr)
+        if attr not in _APPLYING_METHODS:
+            return target
+
+        def counted(*args: Any, **kwargs: Any) -> Any:
+            texts = (a for a in (*args, *kwargs.values()) if isinstance(a, str))
+            if any(self._needle in text for text in texts):
+                self._seen.append(attr)
+            return target(*args, **kwargs)
+
+        return counted
+
+
+def _dsn_passes_during(monkeypatch: pytest.MonkeyPatch, target: str) -> int:
+    """How many times ``secretscrub._DSN_PASSWORD`` was applied to one access record on ``target``.
+
+    ``secretscrub._run`` reads the pattern from the module global on every call, so swapping the
+    global reaches the object the installed filter applies. The needle is the target's first 64
+    characters, all inside the hostile run, which no filter rewrites."""
+    seen: list[str] = []
+    recorder = _CountingPattern(secretscrub._DSN_PASSWORD, target[:64], seen)
+    with monkeypatch.context() as m:
+        m.setattr(secretscrub, "_DSN_PASSWORD", recorder)
+        _emit_access(target)
+    return len(seen)
+
+
+@pytest.fixture
+def _uvicorn_loggers_restored() -> Iterator[None]:
+    """``configure_logging`` sets level, propagation and handlers on uvicorn's named loggers, which
+    neither root-logger restore puts back. Put them back, so these arms leave no order dependence."""
+    names = ("uvicorn", "uvicorn.error", "uvicorn.access")
+    saved = {
+        name: (lg.level, lg.propagate, lg.handlers[:])
+        for name in names
+        for lg in (logging.getLogger(name),)
+    }
+    try:
+        yield
+    finally:
+        for name, (level, propagate, handlers) in saved.items():
+            lg = logging.getLogger(name)
+            lg.setLevel(level)  # setLevel, not assignment: it clears the isEnabledFor cache
+            lg.propagate = propagate
+            lg.handlers[:] = handlers
+
+
+@pytest.mark.usefixtures("_uvicorn_loggers_restored")
+def test_a_hostile_request_target_costs_the_access_log_chain_linear_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #1547's acceptance arm: the row's request target, through the chain production installs.
+
+    ``configure_logging`` builds the root handler and routes ``uvicorn.access`` into it, as ``serve``
+    does with ``log_config=None``. This arm installs the default stdout sink only, with no log file
+    and no forwarder. The record is emitted on ``uvicorn.access`` with uvicorn's own format and
+    argument tuple, so every filter on every installed handler runs on it. Each further filtered sink
+    repeats the pass, which the count below asserts as one pass per filtered handler.
+
+    One measurement covers both halves of the item. The emit runs on a running event loop and is
+    synchronous there, so its growth across lengths is the growth of the loop stall a client could
+    cause without authenticating, on first deployment. The arm bounds that GROWTH and not the stall's
+    size: an absolute budget is a reading about the runner as much as the code, and a cost-share arm
+    built that way went red on a hosted Windows runner and was deleted.
+
+    THE POSITIVE CONTROL runs in the same test: the pre-#1547 pattern is swapped into the module the
+    filter reads, and the same harness must then break the growth bound. Without it, a fast box would
+    pass whatever the pattern did.
+
+    THE NEGATIVE ARM IS A COUNT, NOT A CLOCK. The unmarked target still costs every other filter its
+    time, so a timing ratio between the two would measure the other filters. Instead the DSN pass is
+    counted: once per filtered handler on the marked line, never on an unmarked one. Two unmarked
+    queries are counted. The item's own ``x=nothing`` names no credential word, so the entry gate
+    turns it away. ``token=nothing`` passes the entry gate, which leaves the DSN gate as the only
+    thing between it and the scan. The marked count also proves the growth readings are about a
+    chain in which the DSN pass actually ran.
+
+    NOT COVERED HERE, ON PURPOSE: ``messagefoundry/support/redact.py`` carries a twin of this pattern.
+    No logging handler applies it; ``redact_log_line`` does, at READ time, over log text already
+    stored, such as a log tail or a support bundle. A stored access line DOES reach it that way, so the
+    same hostile target is scanned by the twin when the log is read back, off this emit path. Its
+    growth is covered by the growth arm in ``tests/test_log_redaction_secret_domain.py``, and the same
+    file pins the two copies as identical.
+    """
+    monkeypatch.setattr(sys, "stdout", io.StringIO())
+    configure_logging("INFO")
+    filtered = [
+        handler
+        for handler in logging.getLogger().handlers
+        if any(isinstance(f, CredentialScrubFilter) for f in handler.filters)
+    ]
+    assert filtered, "configure_logging installed no handler carrying the credential scrub"
+
+    # The structural arms first: they say what the timings below are about. The recorder can only
+    # count a method it wraps, so a public re.Pattern callable missing from the set would read as a
+    # quiet zero.
+    uncovered = {
+        name
+        for name in dir(re.Pattern)
+        if not name.startswith("_")
+        and callable(getattr(re.Pattern, name, None))
+        and name not in _APPLYING_METHODS
+    }
+    assert not uncovered, f"_APPLYING_METHODS does not cover re.Pattern's {sorted(uncovered)}"
+    longest = _ACCESS_GROWTH_LENGTHS[1]
+    marked_passes = _dsn_passes_during(monkeypatch, _request_target(longest))
+    assert marked_passes == len(filtered), (
+        f"the marked target applied the DSN pattern {marked_passes} times across {len(filtered)} "
+        "filtered handler(s). Zero means the record never reached the pass, so the timings below would "
+        "be about other filters; more than one per handler means the pass now runs repeatedly."
+    )
+    # ``token=nothing`` is only a test of the DSN gate if the entry gate lets it through.
+    assert secretscrub._admits(
+        _request_target(longest, "token=nothing").casefold(), secretscrub._ANY_HINT
+    )
+    for query in ("x=nothing", "token=nothing"):
+        unmarked_passes = _dsn_passes_during(monkeypatch, _request_target(longest, query))
+        assert unmarked_passes == 0, (
+            f"the target with ?{query}, which carries no '://', applied the DSN pattern "
+            f"{unmarked_passes} times. The gates in front of it no longer key on the marker, so "
+            "access lines without one now pay for the scan."
+        )
+
+    with monkeypatch.context() as m:
+        m.setattr(secretscrub, "_DSN_PASSWORD", re.compile(_PRE_1547_DSN_PASSWORD))
+        before_growth = _access_growth(rounds=3)
+    assert before_growth > _ACCESS_MAX_GROWTH, (
+        f"with the pre-#1547 pattern swapped in, the access chain grew only {before_growth:.1f}x "
+        f"across {_ACCESS_GROWTH_LENGTHS}, under the {_ACCESS_MAX_GROWTH}x bound. This harness is not "
+        "exercising the scan, so the assertion below cannot fail. Fix the harness, not the bound."
+    )
+
+    growth = _access_growth(rounds=5)
+    assert growth <= _ACCESS_MAX_GROWTH, (
+        f"one access record grew {growth:.1f}x for 8x the request-target length, over the "
+        f"{_ACCESS_MAX_GROWTH}x bound; the pre-#1547 pattern measured {before_growth:.0f}x in this "
+        "run. Something in the installed chain scans this target in more than linear time, and the "
+        "emit holds the event loop for all of it."
+    )
+
+
+@pytest.mark.usefixtures("_uvicorn_loggers_restored")
+@pytest.mark.parametrize(
+    "lead",
+    ("", "9-", "x" * 200),
+    ids=("bare-scheme", "digit-led-run", "glued-200-char-run"),
+)
+def test_a_dsn_in_a_request_target_is_redacted_by_the_installed_chain(
+    monkeypatch: pytest.MonkeyPatch, lead: str
+) -> None:
+    """The fix kept the redaction: a synthetic DSN password in an access line never reaches the sink.
+
+    Same chain and same emit as the growth arm above. The leading runs are the two shapes #1547's
+    earlier fixes lost on the way to linear time: a run opening on a non-letter, which a letter-only
+    scheme head refused, and a scheme glued to a long word run, which a bounded scheme class could
+    not reach. A pattern made linear by matching less fails one of these.
+
+    The password names no credential word, so ``://`` is the only thing admitting the line to the
+    credential pass, which is the case a real DSN password usually is. The precondition below checks
+    that rather than assuming it."""
+    sink = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", sink)
+    configure_logging("INFO")
+    secret = "not-a-real-pw-1547"
+    target = f"/x?next={lead}postgres://svc:{secret}@db.invalid:5432/mefor"
+    assert not secretscrub._admits(target.replace("://", "-").casefold(), secretscrub._ANY_HINT), (
+        "the target names a credential word besides '://', so this arm no longer tests the marker"
+    )
+    _emit_access(target)
+    out = sink.getvalue()
+    assert "GET /x?next=" in out, f"the access line did not reach the sink: {out!r}"
+    assert secret not in out
+    assert f"postgres://svc:{CREDENTIAL_PLACEHOLDER}@db.invalid" in out
+
+
+@pytest.mark.parametrize("module", ("h11_impl", "httptools_impl"))
+def test_the_access_format_this_file_copies_is_uvicorns(module: str) -> None:
+    """The growth arm emits a hand-copied access record. Pin the copy to the installed uvicorn's own
+    source, so an upgrade that changes the format reds here rather than leaving the arm measuring a
+    record uvicorn no longer writes. Read as text, because importing ``httptools_impl`` needs the
+    optional ``httptools`` package."""
+    spec = importlib.util.find_spec(f"uvicorn.protocols.http.{module}")
+    assert spec is not None and spec.origin is not None, f"uvicorn has no {module}"
+    source = Path(spec.origin).read_text(encoding="utf-8")
+    # The target argument is uvicorn's rendering of path and query. The arms put '://' in the raw
+    # query, so a uvicorn that started quoting the query would make them model a line it never writes.
+    assert "get_path_with_query_string(self.scope)" in source
+    rendered = get_path_with_query_string(
+        cast(Any, {"path": "/a-a-a", "query_string": _MARKED_QUERY.encode("ascii")})
+    )
+    assert rendered == f"/a-a-a?{_MARKED_QUERY}", f"uvicorn now renders the target as {rendered!r}"
+    assert "access_logger.info(" in source and f"'{_UVICORN_ACCESS_FORMAT}'" in source, (
+        f"uvicorn's {module} no longer calls access_logger.info with {_UVICORN_ACCESS_FORMAT!r}. "
+        "Update the copy and the argument tuple _emit_access passes."
+    )
 
 
 # BACKLOG #1967: this file's serve fixtures test other gates, so they bound the two warn-only
