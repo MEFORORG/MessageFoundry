@@ -46,6 +46,12 @@ whose entire stated purpose is that an ungated route must red a run rather than 
 under the synthetic method :data:`MOUNT_METHOD`), so a route class this walk does not understand lands
 in :func:`ungated_http_rows` and must be reviewed into a consumer's allow-list to pass.
 
+EACH ROW SAYS WHAT THE REFUSAL MAKES OF IT (vault BACKLOG #2846). "No gate" covered two routes that
+mean opposite things: one public by design, and one the engine refuses to every caller. A row's
+``kind`` now separates them (``KIND_GATED``, ``KIND_PUBLIC``, ``KIND_IN_BODY``, ``KIND_REFUSED`` or
+``KIND_OUTSIDE``), decided by the engine's own ``route_is_declared``, and ``declaration`` carries the
+reason a ``public_route`` or ``authorizes_in_body`` mark gives.
+
 This is a LIBRARY: no argparse, no ``main()``. It imports cleanly with only the engine installed.
 """
 
@@ -67,7 +73,12 @@ from fastapi.routing import APIRoute, APIWebSocketRoute
 from starlette.routing import BaseRoute, Mount
 
 from messagefoundry.api.app import create_app
-from messagefoundry.api.security import is_route_gate
+from messagefoundry.api.security import (
+    is_route_gate,
+    refuse_undeclared_route,
+    route_declaration_of,
+    route_is_declared,
+)
 from messagefoundry.auth.permissions import Permission
 
 #: Substituted for every ``{path_param}`` when a template must become a concrete request target. It is
@@ -86,6 +97,21 @@ WS_METHOD = "WS"
 #: real HTTP-reachable surface, so it is emitted as an UNGATED row rather than dropped.
 MOUNT_METHOD = "MOUNT"
 
+# What the engine's request-time refusal (``refuse_undeclared_route``) makes of a row, so a reader of
+# the walk can tell a route public by design from one refused to every caller (vault BACKLOG #2846).
+#: A top-level dependency carries the gate mark.
+KIND_GATED = "gated"
+#: No gate; the endpoint is marked ``public_route``, and the row's ``declaration`` is its reason.
+KIND_PUBLIC = "public"
+#: A WebSocket with no gate dependency whose endpoint is marked ``authorizes_in_body``.
+KIND_IN_BODY = "in-body"
+#: Neither: the engine refuses this route to every caller.
+KIND_REFUSED = "refused"
+#: The refusal does not run on this route: a mount, a plain Starlette route, or a route of an app
+#: that does not install the refusal, such as a mounted application. ``declaration`` is still
+#: reported when the endpoint carries one, but nothing enforces it there.
+KIND_OUTSIDE = "outside"
+
 
 @dataclass(frozen=True)
 class RouteRow:
@@ -99,12 +125,18 @@ class RouteRow:
     only on a WebSocket route that tries more than one gate: ``/ws/stats`` on an app with the web
     console mounted reads ``("authorize_ui_ws", "authorize_ws")``, the cookie gate then the header
     fallback.
+
+    ``kind`` is one of the ``KIND_*`` values: what the engine's refusal makes of the route, read with
+    the engine's own ``route_is_declared``. ``declaration`` is the reason the endpoint's
+    ``public_route`` or ``authorizes_in_body`` mark gives, or ``None`` when it carries neither.
     """
 
     method: str
     path: str
     permissions: tuple[str, ...]
     gates: tuple[str, ...]
+    kind: str
+    declaration: str | None = None
 
     @property
     def gate(self) -> str | None:
@@ -410,10 +442,30 @@ def _effective_routes(routes: Sequence[BaseRoute]) -> Iterator[tuple[BaseRoute, 
             yield original, getattr(context, "starlette_route", None) or original
 
 
+def _kind(declared_on: Any, effective: Any, *, websocket: bool) -> tuple[str, str | None]:
+    """``(kind, declaration reason)`` for one API route, as the engine's refusal sees it.
+
+    ``declared_on`` is the route object the refusal reads, and ``effective`` is the one FastAPI
+    serves, whose dependencies say whether the refusal runs at all. The decision is the engine's own
+    ``route_is_declared``, so the walk and the refusal cannot disagree about a route."""
+    declaration = route_declaration_of(getattr(declared_on, "endpoint", None))
+    reason = declaration.reason if declaration is not None else None
+    served = getattr(getattr(effective, "dependant", None), "dependencies", None) or ()
+    if not any(d.call is refuse_undeclared_route for d in served):
+        return KIND_OUTSIDE, reason
+    if not route_is_declared(declared_on, websocket=websocket):
+        return KIND_REFUSED, reason
+    if any(is_route_gate(d.call) for d in declared_on.dependant.dependencies):
+        return KIND_GATED, reason
+    assert declaration is not None  # route_is_declared found no gate, so a declaration passed it
+    return (KIND_PUBLIC if declaration.public else KIND_IN_BODY), reason
+
+
 def _walk(routes: Sequence[BaseRoute], prefix: str, app: FastAPI) -> Iterator[RouteRow]:
     for route, effective in _effective_routes(routes):
         path = prefix + (getattr(effective, "path", None) or "")
         if isinstance(route, APIRoute):
+            kind, declaration = _kind(route, effective, websocket=False)
             methods = sorted(m for m in (effective.methods or set()) if m not in _SYNTHETIC_METHODS)
             gate: tuple[str, tuple[str, ...], str | None] | None = None
             # The route's OWN dependencies, never the include's: the engine's request-time refusal
@@ -430,13 +482,23 @@ def _walk(routes: Sequence[BaseRoute], prefix: str, app: FastAPI) -> Iterator[Ro
                     path=path,
                     permissions=gate[1] if gate else (),
                     gates=(gate[0],) if gate else (),
+                    kind=kind,
+                    declaration=declaration,
                 )
         elif isinstance(effective, APIWebSocketRoute):
             # A WebSocket reached through an include is served by a rebuilt route that carries the
             # include's dependencies, and that rebuilt route is what the engine's refusal reads, so
             # the walk reads it too.
             names, perms = websocket_gates(effective, app)
-            yield RouteRow(method=WS_METHOD, path=path, permissions=perms, gates=names)
+            kind, declaration = _kind(effective, effective, websocket=True)
+            yield RouteRow(
+                method=WS_METHOD,
+                path=path,
+                permissions=perms,
+                gates=names,
+                kind=kind,
+                declaration=declaration,
+            )
         elif isinstance(effective, Mount) and effective.routes:
             # A mounted application with routes of its own. Its routes are walked under the mount's
             # path, so one the engine's refusal cannot reach still shows up here as ungated.
@@ -453,7 +515,9 @@ def _walk(routes: Sequence[BaseRoute], prefix: str, app: FastAPI) -> Iterator[Ro
                 if m not in _SYNTHETIC_METHODS
             )
             for method in declared or [MOUNT_METHOD]:
-                yield RouteRow(method=method, path=path, permissions=(), gates=())
+                yield RouteRow(
+                    method=method, path=path, permissions=(), gates=(), kind=KIND_OUTSIDE
+                )
 
 
 def route_rows(app: FastAPI | None = None) -> list[RouteRow]:

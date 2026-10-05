@@ -22,7 +22,13 @@ import pytest
 from fastapi import APIRouter, Depends, FastAPI, Request, WebSocket
 
 from messagefoundry.api.app import create_app
-from messagefoundry.api.security import authorize_ws, mark_route_gate, require
+from messagefoundry.api.security import (
+    authorize_ws,
+    authorizes_in_body,
+    mark_route_gate,
+    public_route,
+    require,
+)
 from messagefoundry.auth.permissions import Permission
 from scripts.security import route_gates
 
@@ -378,6 +384,88 @@ def test_the_walk_descends_into_a_mounted_application_with_routes() -> None:
 def test_a_mount_with_no_routes_stays_one_ungated_row(ui_app: FastAPI) -> None:
     rows = _rows_by_key(ui_app)
     assert rows[(route_gates.MOUNT_METHOD, "/ui/static")].gate is None
+
+
+# --- vault BACKLOG #2846: what the refusal makes of each row --------------------------------------------
+# Before #2846 a row carried no kind and no declaration, so a route public by design and one the engine
+# refuses to every caller both read as "no gate". Each test below fails on that walk.
+
+
+def test_each_row_says_whether_the_route_is_gated_public_in_body_refused_or_outside() -> None:
+    app = create_app()
+
+    @app.get("/zz/public")
+    @public_route("a synthetic public route")
+    async def zz_public() -> dict[str, str]:
+        return {"ok": "reached"}
+
+    @app.get("/zz/undeclared")
+    async def zz_undeclared() -> dict[str, str]:
+        return {"ok": "reached"}
+
+    @app.get("/zz/in-body-on-http")
+    @authorizes_in_body("only a WebSocket may say this")
+    async def zz_in_body_on_http() -> dict[str, str]:
+        return {"ok": "reached"}
+
+    app.add_api_websocket_route("/zz/ws-undeclared", _hooked)
+    sub = APIRouter()
+    sub.add_api_route("/zz/included", _ok)
+    app.include_router(sub)
+    inner = FastAPI(openapi_url=None)
+    inner.add_api_route("/inner", _ok)
+    app.mount("/zz/mounted", inner)
+
+    rows = _rows_by_key(app)
+    assert rows[("GET", "/zz/public")].kind == route_gates.KIND_PUBLIC
+    assert rows[("GET", "/zz/public")].declaration == "a synthetic public route"
+    assert rows[("GET", "/zz/undeclared")].kind == route_gates.KIND_REFUSED
+    assert rows[("GET", "/zz/undeclared")].declaration is None
+    # An HTTP route may not authorize in its body, so the engine refuses it; the reason still shows.
+    in_body = rows[("GET", "/zz/in-body-on-http")]
+    assert (in_body.kind, in_body.declaration) == (
+        route_gates.KIND_REFUSED,
+        "only a WebSocket may say this",
+    )
+    # Gates read from a socket's body do not declare it, so the engine refuses this one too.
+    socket = rows[(route_gates.WS_METHOD, "/zz/ws-undeclared")]
+    assert socket.gates and socket.kind == route_gates.KIND_REFUSED, socket
+    assert rows[("GET", "/zz/included")].kind == route_gates.KIND_REFUSED
+    # The outer app's refusal never runs inside a mount, so that row is outside it.
+    assert rows[("GET", "/zz/mounted/inner")].kind == route_gates.KIND_OUTSIDE
+    assert rows[("GET", "/messages")].kind == route_gates.KIND_GATED
+    assert rows[(route_gates.WS_METHOD, "/ws/stats")].kind == route_gates.KIND_IN_BODY
+    assert rows[(route_gates.WS_METHOD, "/ws/stats")].declaration
+
+
+def test_a_bare_app_with_no_refusal_reads_as_outside_it() -> None:
+    """The kind is what the refusal does, so an app that does not install it has no refused row."""
+    app = FastAPI()
+    app.add_api_route("/planted", _ok)
+    assert _rows_by_key(app)[("GET", "/planted")].kind == route_gates.KIND_OUTSIDE
+
+
+def test_the_shipped_surface_refuses_nothing_and_every_ungated_row_is_declared_public() -> None:
+    """On the app with every route-registering flag on, a row with no gate is public by design with
+    a reason, or sits outside the refusal (the docs and the static mount). None is refused."""
+    rows = route_gates.route_rows(route_gates.full_surface_app())
+    by_kind: dict[str, list[route_gates.RouteRow]] = {}
+    for row in rows:
+        by_kind.setdefault(row.kind, []).append(row)
+    assert not by_kind.get(route_gates.KIND_REFUSED), by_kind.get(route_gates.KIND_REFUSED)
+    assert len(by_kind[route_gates.KIND_GATED]) > 150, "the walk classified too few rows as gated"
+    public = by_kind[route_gates.KIND_PUBLIC]
+    assert ("POST", "/auth/login") in {(r.method, r.path) for r in public}
+    assert all(r.declaration and r.declaration.strip() for r in public), public
+    assert all(r.gate is None for r in public), public
+    outside = {(r.method, r.path) for r in by_kind[route_gates.KIND_OUTSIDE]}
+    assert outside == {
+        (route_gates.MOUNT_METHOD, "/ui/static"),
+        ("GET", "/docs"),
+        ("GET", "/docs/oauth2-redirect"),
+        ("GET", "/openapi.json"),
+        ("GET", "/redoc"),
+    }, outside
 
 
 def test_the_full_surface_app_walks_the_flag_registered_routes(ui_app: FastAPI) -> None:

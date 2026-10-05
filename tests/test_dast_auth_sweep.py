@@ -206,6 +206,13 @@ def test_ungated_routes_are_exactly_the_documented_anonymous_set(
         f"{sorted(documented - observed)}. A route with no require*() gate is reachable by anyone."
     )
     assert len(observed) == receipt["ungated_http_rows"]
+    # Vault BACKLOG #2846: the allow-list names routes public BY DESIGN. A route the engine refuses to
+    # every caller also has no gate, so each listed route must also read as declared public, with a
+    # reason, or the set above could not tell the two apart.
+    undeclared = [
+        r for r in receipt["ungated_routes"] if r["kind"] != "public" or not r["declaration"]
+    ]
+    assert not undeclared, f"ungated routes not declared public with a reason: {undeclared}"
 
     # The WebSocket route cannot be probed with an HTTP request, so the sweep excludes it. Its gate is
     # read from the endpoint body (BACKLOG #2057, tests/test_route_gates.py), and the row is REPORTED as

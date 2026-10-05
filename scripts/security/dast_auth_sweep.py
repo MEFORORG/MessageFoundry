@@ -438,7 +438,12 @@ async def run_sweep(policy: dict[str, Any], *, canary: str | None = None) -> dic
             "route_rows_examined": len(rows),
             "gated_http_rows": len(gated),
             "ungated_http_rows": len(ungated),
-            "ungated_routes": [{"method": r.method, "path": r.path} for r in ungated],
+            # ``kind`` and ``declaration`` tell a route public by design from one the engine refuses
+            # to every caller, which the method and path alone cannot (vault BACKLOG #2846).
+            "ungated_routes": [
+                {"method": r.method, "path": r.path, "kind": r.kind, "declaration": r.declaration}
+                for r in ungated
+            ],
             "websocket_rows": [{"method": r.method, "path": r.path} for r in websocket_rows],
             "negative_probes": negative_probes,
             "negative_non_401": negative_non_401,
