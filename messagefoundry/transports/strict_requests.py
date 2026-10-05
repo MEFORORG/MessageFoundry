@@ -62,14 +62,12 @@ A pool whose connections would read the head with the stock class is refused bef
 sent. The one such pool ``requests`` can build is a SOCKS proxy's, and that needs the PySocks
 package, which the engine does not install. Without it ``requests`` refuses a SOCKS proxy itself.
 
-**An HTTP proxy's own CONNECT reply is read strictly too (vault BACKLOG #2170).** For an ``https``
-target through an HTTP proxy, ``http.client`` reads the proxy's reply to ``CONNECT`` with
-``_read_status`` and ``_read_headers`` and never calls ``begin``. ``StrictHTTPResponse`` carries its
-guard from construction, so a bare CR there is refused before anything enters the tunnel, and
-:meth:`StrictReplyAdapter.send` names it like any other head refusal. This rests on ``urllib3``
-calling ``http.client``'s own ``_tunnel``, which urllib3 2.8.0 does on the Python this engine
-requires; ``tests/test_proxy_connect_reply_head.py`` measures it on the wire, for this hop and for
-#2052's urllib openers.
+**An HTTP proxy's own CONNECT reply is read strictly too (vault BACKLOG #2170).**
+``StrictHTTPResponse`` says how. A bare CR there is refused before anything enters the tunnel, and
+:meth:`StrictReplyAdapter.send` names it like any other head refusal. On this hop that rests on
+``urllib3`` calling ``http.client``'s own ``_tunnel``, as it does on the Python this engine requires.
+``tests/test_proxy_connect_reply_head.py`` measures it on the wire, so a ``urllib3`` that brought its
+own would turn that test red.
 """
 
 from __future__ import annotations

@@ -213,6 +213,9 @@ class _ConnectProxy:
         return self
 
     def __exit__(self, *exc: object) -> None:
+        # shutdown wakes a blocked accept() on Linux, where close() alone does not.
+        with contextlib.suppress(OSError):
+            self._listener.shutdown(socket.SHUT_RDWR)
         self._listener.close()
         self._thread.join(timeout=10)
 
