@@ -674,6 +674,46 @@ write a number a reader treats as coverage. *(Stale since the #1498 build: the s
 now withdraws the count reason and declines on the S/MIME argument alone. §7.1 grades DIRECT as an
 owner question.)*
 
+**Note, 2026-10-04 -- with an ECH sidecar, the HTTP-family guard is handed no opener (BACKLOG #2169
+and #2188).** Correction 1 above says a CRL on the token hop lives in that hop's opener. That holds
+only while the engine dials the token host itself. With `ech_sidecar` set, `_post_token` re-addresses
+the POST to the loopback sidecar, and the sidecar makes its own TLS connection to the token host
+(ADR 0139). The provider's opener then only ever meets the sidecar. A `[tls].crl_file` covering the
+token host still lands on that opener, and the guard read it, so the refusal was lifted with no
+revocation check behind it.
+
+BACKLOG #2169 offered two ways to close this: pass no opener on the ECH arm, or require the
+attestation there. **The first was chosen.** `_open_token_hop` passes
+`opener=None if ech_sidecar is not None else self._opener`, one expression serving the SMART and the
+OAuth2 token hop. Two reasons:
+
+- It holds by construction. The guard cannot read a context it was never given, so no later change
+  to how that opener is built can relax the ECH arm.
+- It delivers the second option's outcome without a second rule. With no context `crl_checked` is
+  false, and `refuse_unrevoked_verified_hop` has no `proxy_proven` parameter. So on an enforcing
+  instance only a loopback token host or the per-connection `tls_revocation_attested` crosses.
+
+**The refusal text was not changed, and on the ECH arm it over-offers.** It still names
+`[tls].crl_file` and an egress proxy as ways across. Neither can cross an ECH hop: only the
+attestation can.
+
+The REST destination's ECH arm takes the same value, under BACKLOG #2188. That item moved the guard
+in the REST, SOAP, FHIR and DICOMweb destinations below the last statement that builds or replaces
+the opener, and passed that opener, so a CRL that reaches one of those hops now relaxes its refusal.
+REST with a sidecar passes none, for the reason above: the sidecar verifies the destination, not the
+engine.
+
+The engine cannot see whether a sidecar checks revocation. On the ECH arm the attestation is the
+operator's statement that it does, or that the PKI behind the hop does.
+
+The 2026-10-02 notes in the Status and in §7.1 that call #2188 and #2169 open defects predate this
+build.
+
+Pinned by `tests/test_token_hop_revocation_guard_with_ech_sidecar.py` for the token hop, and by
+`tests/test_http_destination_revocation_guard_reads_its_opener.py` for the four destinations. Each
+refusal arm there is paired with a control in which the same CRL relaxes the same hop without a
+sidecar.
+
 ## 5. Consequences
 
 **Positive**

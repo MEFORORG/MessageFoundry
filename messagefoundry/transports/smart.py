@@ -370,13 +370,19 @@ class _TokenEndpointProvider(abc.ABC):
         # InsecureHopRefused propagates rather than being re-wrapped as the provider's error: the
         # guard's own message names this hop and its ways across, which a re-wrap would discard, and
         # both are ValueError subclasses so the loader surfaces either identically.
+        #
+        # WITH AN ECH SIDECAR THE GUARD GETS NO OPENER (vault BACKLOG #2169). `_post_token`
+        # re-addresses the POST to the loopback sidecar, and the sidecar makes its own TLS connection
+        # to the token host. So this opener's context only ever meets the sidecar. A `[tls].crl_file`
+        # covering the token host still lands on it, and reading it here lifted the refusal with no
+        # check behind it. Only the per-connection attestation crosses that arm.
         refuse_unrevoked_verified_hop(
             scheme,
             token_url,
             connector=f"{self._LABEL} token endpoint",
             revocation_attested=revocation_attested,
             revocation_attested_reason=revocation_attested_reason,
-            opener=self._opener,
+            opener=None if ech_sidecar is not None else self._opener,
             connection=revocation_connection,
         )
         self._proxy_auth: dict[str, str] = (

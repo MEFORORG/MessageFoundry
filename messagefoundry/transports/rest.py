@@ -930,10 +930,11 @@ def refuse_unrevoked_verified_hop(
     the opener**, and after every later statement that replaces it or adds a handler to it.
 
     Pass ``None`` in two cases. One is a caller whose hop rides the shared import-time opener, which
-    can carry no CRL. The other is a hop re-addressed to an ECH sidecar (ADR 0139): the engine dials
-    the loopback sidecar and the sidecar verifies the real peer, so no context the engine holds
-    checks that peer's certificate. A CRL on the engine's opener must not relax that hop
-    (vault BACKLOG #2188, the REST destination).
+    can carry no CRL; passing that opener gives the same answer. The other is a hop re-addressed to
+    an ECH sidecar (ADR 0139), and there ``None`` is required: the engine dials the loopback sidecar
+    and the sidecar verifies the real peer, so no context the engine holds checks that peer's
+    certificate. A CRL on the engine's opener must not relax that hop (vault BACKLOG #2188 for the
+    REST destination, #2169 for the SMART and OAuth2 token hop).
 
     ``connection`` is the declaring connection's name, recorded in the audit line logged when an
     attestation crosses the refusal, so the record leads back to the declaration (ADR 0173).
