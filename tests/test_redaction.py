@@ -7,6 +7,8 @@ safe_name() derives a safe label for a partner-chosen file name, which redact() 
 
 from __future__ import annotations
 
+import http.client
+import logging
 import random
 import re
 import time
@@ -16,7 +18,7 @@ from typing import Any, SupportsIndex
 import pytest
 from _phi_log_capture import IDENTIFIER_SHAPED_NAMES, SAFE_NAME_SUFFIXES
 
-from messagefoundry import redaction
+from messagefoundry import logging_setup, redaction, secretscrub
 from messagefoundry.redaction import (
     clamp_untrusted,
     redact,
@@ -1738,6 +1740,904 @@ _MRN_HOSTILE = {
 def test_the_mrn_pass_stays_linear_and_affordable(unit: str) -> None:
     """8x the input must cost well under 64x the time, and a whole window stays well under a second
     on the event loop. The ratio ceiling is the one the structured passes use."""
+
+    def sized(chars: int) -> str:
+        return (unit * (chars // len(unit) + 1))[:chars]
+
+    small, large = sized(8 * 1024), sized(64 * 1024)
+    t_small = max(_best_of(lambda: redact(small)), 1e-4)
+    t_large = _best_of(lambda: redact(large))
+    assert t_large / t_small < 24, f"{t_large / t_small:.1f}x for 8x the input on {unit!r}"
+    window = sized(redaction._REDACT_WINDOW)
+    assert _best_of(lambda: redact(window)) < 0.5
+
+
+# --- BACKLOG #2171: a percent-encoded separator counts like the literal one -------------------------
+
+#: The FHIR search shape the row names: one literal separator and two encoded ones. Synthetic values.
+_FHIR_SEARCH = "GET /fhir/Patient?identifier=MRN%7C4455667&name=ZQXDOE%5EVANJA"
+#: What must not survive it, through any entry point.
+_FHIR_PLANTED = ("4455667", "ZQXDOE", "VANJA")
+
+
+def _every_entry_point(text: str) -> dict[str, str]:
+    """``text`` through each way the engine reaches the redactor, named for the failure message."""
+    once = redact(text)
+    return {
+        "redact": once,
+        "redact twice": redact(once),
+        "safe_text(safe_exc())": safe_text(safe_exc(ValueError(text))),
+        "redact_untrusted": redact_untrusted(text),
+    }
+
+
+@pytest.mark.parametrize("encoded", ["%7C", "%7c", "%5E", "%5e", "%7E", "%7e", "%26"])
+def test_an_encoded_separator_counts_like_the_literal_one(encoded: str) -> None:
+    """Each of the four default separators, in either case, makes a field run on its own."""
+    for name, out in _every_entry_point(f"id MRN{encoded}4455667{encoded}H here").items():
+        assert "4455667" not in out, f"{name}: {out!r}"
+        assert out.endswith("here"), f"{name} took the text after the run: {out!r}"
+
+
+def test_literal_and_encoded_separators_count_together() -> None:
+    """One of each is two, which is the threshold the literal pattern uses. The literal pattern alone
+    sees one separator here and passes it."""
+    assert redaction._HL7_FIELD_RUN.search("x ZQXDOE|VANJA%5E4455667 y") is None
+    for name, out in _every_entry_point("x ZQXDOE|VANJA%5E4455667 y").items():
+        for planted in ("ZQXDOE", "VANJA", "4455667"):
+            assert planted not in out, f"{name}: {out!r}"
+
+
+def test_the_fhir_search_shape_is_scrubbed_through_every_entry_point() -> None:
+    """The shape the row names. Before this, the literal pattern counted only the ``&`` and the whole
+    query walked through."""
+    assert redaction._HL7_FIELD_RUN.search(_FHIR_SEARCH) is None, "the control no longer holds"
+    for name, out in _every_entry_point(_FHIR_SEARCH).items():
+        for planted in _FHIR_PLANTED:
+            assert planted not in out, f"{name}: {out!r}"
+        assert "GET" in out, f"{name} took the verb with the query: {out!r}"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # A search URL glued to the XML element after it: whole-token, the run took `<name><family`.
+        '<Patient><meta><source value="Patient?identifier=urn%7C1%5EMR"/></meta>'
+        '<name><family value="ZQXDOE"/></name></Patient>',
+        # The same in compact JSON: whole-token, the run took the `"name":` key.
+        '{"id":"a%7Cb%7Cc","name": "Zqxdoe"}',
+        # Before the name run, the encoded run took JANE and left ZQXDOE under the two-token threshold.
+        "patient ZQXDOE JANE%7Cx%7Cy",
+        # A DICOM keyword glued to the run by punctuation, with its value in the next token.
+        "lookup failed: url=/q?a=x%7Cy%7Cz;PatientID= ZQXDOE",
+        # The same for a labelled MRN, which only the widened stage reads.
+        "lookup failed: x%7Cy%7Cz;mrn: 4455667",
+    ],
+    ids=["xml-label", "json-key", "name-run", "dicom-keyword", "mrn-label"],
+)
+def test_the_encoded_run_takes_no_label_or_name_another_pass_needed(text: str) -> None:
+    """THE NO-REGRESSION ARM. Each value here was scrubbed before this pattern existed, by a pass that
+    needed a label or a second token the encoded run could swallow. It must still go, which is why
+    the run comes after both stages of ``redact``."""
+    for name, out in _every_entry_point(text).items():
+        for planted in ("ZQXDOE", "Zqxdoe", "4455667"):
+            assert planted not in out, f"{name}: {out!r}"
+
+
+def test_a_fhir_or_list_is_one_run() -> None:
+    """FHIR joins alternatives with a comma, which must not split the run into one-separator parts."""
+    text = "GET /fhir/Patient?identifier=urn%7C4455667,urn%7C7788990"
+    for name, out in _every_entry_point(text).items():
+        assert "4455667" not in out and "7788990" not in out, f"{name}: {out!r}"
+
+
+def test_the_screen_spells_the_separators_the_pattern_counts() -> None:
+    """THE DRIFT GATE for the screen. ``redact`` skips the encoded run when ``_ENCODED_SEPARATOR``
+    finds nothing, so a separator the pattern counts and the screen does not would pass unscrubbed.
+    Every ``%`` in the pattern must be inside a copy of the screen's own spelling."""
+    pattern = redaction._HL7_ENCODED_FIELD_RUN.pattern
+    screen = redaction._ENCODED_SEPARATOR.pattern
+    assert screen in pattern
+    assert "%" not in pattern.replace(screen, "")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "GET /files/a%20b%20c%20d.txt",  # a run of %20 is ordinary text, however long
+        # One encoded separator is under the threshold, as one literal one is. A stated residual on
+        # the pattern, not an endorsement: FHIR's `identifier=system%7Cvalue` keeps its value.
+        "path a%7Cb kept",
+        "rate 50%25 of %7 cap",  # an escape that is not a separator, and a truncated one
+        "id x%2Fy%2Fz",  # an encoded slash is not an HL7 separator
+    ],
+)
+def test_an_ordinary_escape_is_not_a_field_run(text: str) -> None:
+    """THE CONTROL. Every arm above asserts an absence, and scrubbing every ``%`` would satisfy them
+    all."""
+    assert redact(text) == text
+
+
+def test_the_placeholder_never_matches_the_encoded_run() -> None:
+    """The fixed point ``safe_text`` relies on. ``[redacted]`` holds no separator of either kind."""
+    assert redaction._HL7_ENCODED_FIELD_RUN.search(redaction._REDACTED) is None
+    once = redact(_FHIR_SEARCH)
+    assert redact(once) == once
+
+
+@pytest.mark.parametrize(
+    ("tail", "head_holds_run"),
+    [
+        # The cut falls before the run: the run goes with the dropped tail.
+        (" id=mrn%7c4455667%5e9", False),
+        # The cut falls after the run: the whole run stays in the head and is scrubbed there.
+        (" id=mrn%7c4455667%5e9 ", True),
+    ],
+)
+def test_a_cut_cannot_split_an_encoded_run(tail: str, head_holds_run: bool) -> None:
+    """The register on ``_CUT_CHARS`` asks each pattern whether a cut at a space can leave a fragment
+    it no longer matches. The encoded run holds no whitespace, so a cut never falls inside it, and the
+    run is kept or dropped whole. Both placements are checked. The run is lower case and ends on a
+    digit so the name walk leaves it alone and this arm measures the encoded pass, not the walk."""
+    text = _over_window(tail)
+    assert ("4455667" in clamp_untrusted(text)) is head_holds_run, "the cut did not land as named"
+    for out in (redact_untrusted(text), safe_text(text, limit=100_000)):
+        assert "4455667" not in out, out[-200:]
+
+
+# --- PR 2011 review finding 1: a credential filter runs after this module -----------------------------
+#
+# The log handler chain runs ``RedactionFilter`` first and the credential filters after it. A run that
+# takes a whole token, or the second run of the stages after it, can take a mark those filters read.
+# So ``redact`` leaves the encoded run off a text that holds any credential shape. Every arm here goes
+# through the real chain in its installed order, ONCE and TWICE: the engine's usual error log calls
+# ``safe_exc`` or ``safe_text`` first, and the handler's filter redacts the result again.
+
+#: A synthetic credential: lowercase-led with digits, so no name or date pass is what removes it.
+_CREDENTIAL_VALUE = "zq9hunter2z"
+#: A token the encoded run takes: two encoded separators and no literal one.
+_ENCODED_TOKEN = "x%7Cy%7Cz"
+#: Characters that glue a credential label to the run with no whitespace between. At least these;
+#: each one kept the value at 6563110bab, which is the reading the fix was measured against.
+_LABEL_GLUE = "\"',})(;{[]/.-_|:?#>!*=@+$\\"
+#: A pattern that matches nothing. With it in place of the encoded run, ``redact`` is the two stages
+#: alone, which is what it was before BACKLOG #2171.
+_NO_ENCODED_RUN = re.compile(r"(?!)")
+
+
+def _through_the_log_filter_chain(text: str) -> str:
+    """``text`` as a log message through the filters ``_install_phi_filters`` puts on every handler,
+    in their installed order."""
+    handler = logging.Handler()
+    logging_setup._install_phi_filters(handler)
+    record = logging.LogRecord("test", logging.ERROR, __file__, 1, "%s", (text,), None)
+    assert handler.filter(record)
+    return record.getMessage()
+
+
+def _every_log_path(text: str) -> dict[str, str]:
+    """``text`` by routes the engine uses, at least these: straight to the handler, redacted
+    first by ``safe_text`` or ``safe_exc`` as an error log call does, the store's two calls, and
+    two handlers on one record."""
+    return {
+        "once": _through_the_log_filter_chain(text),
+        "safe_text": _through_the_log_filter_chain(safe_text(text, limit=100_000)),
+        "safe_exc": _through_the_log_filter_chain(safe_exc(ValueError(text), limit=100_000)),
+        # The store's own two calls, with no handler after them.
+        "store": safe_text(safe_exc(ValueError(text), limit=100_000), limit=100_000),
+        # One record through two handlers. Each runs the whole chain, control-character
+        # filter included, so the second sees what the first wrote.
+        "two handlers": _through_the_log_filter_chain(_through_the_log_filter_chain(text)),
+    }
+
+
+def _kept_that_the_stages_alone_scrub(
+    monkeypatch: pytest.MonkeyPatch, text: str, values: tuple[str, ...]
+) -> list[str]:
+    """Each ``path: value`` this head keeps and the redactor without the encoded run scrubs.
+
+    The baseline is this module with the run switched off, on the same three log paths. It stands in
+    for the redactor before BACKLOG #2171 inside the suite. It is not that redactor exactly: the
+    BACKLOG #2312 change to the backstop is in both arms. The differential against the earlier
+    file itself is on the pull request."""
+    head = _every_log_path(text)
+    with monkeypatch.context() as patched:
+        patched.setattr(redaction, "_HL7_ENCODED_FIELD_RUN", _NO_ENCODED_RUN)
+        base = _every_log_path(text)
+    return [
+        f"{path}: {value}"
+        for path in head
+        for value in values
+        if value in text and value in head[path] and value not in base[path]
+    ]
+
+
+def _assert_the_chain_drops_the_credential(monkeypatch: pytest.MonkeyPatch, text: str) -> None:
+    """The value is gone from the chain's output, and no log path keeps it where the stages alone
+    would scrub it. THE CONTROL comes first: the credential stage alone must scrub this shape, or the
+    arm would pass on a shape nothing reads."""
+    assert _CREDENTIAL_VALUE in text
+    assert _CREDENTIAL_VALUE not in secretscrub.scrub_credentials(text), "the control does not hold"
+    out = _through_the_log_filter_chain(text)
+    assert _CREDENTIAL_VALUE not in out, out
+    assert not _kept_that_the_stages_alone_scrub(monkeypatch, text, (_CREDENTIAL_VALUE,))
+
+
+@pytest.mark.parametrize("glue", list(_LABEL_GLUE))
+def test_a_credential_label_glued_to_an_encoded_run_still_loses_its_value(
+    glue: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The label sits in the run's token and its value in the next one."""
+    _assert_the_chain_drops_the_credential(
+        monkeypatch, f"{_ENCODED_TOKEN}{glue}password: {_CREDENTIAL_VALUE}"
+    )
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        *secretscrub._CREDENTIAL_WORDS,
+        *secretscrub._TOKEN_WORDS,
+        *secretscrub._KEY_MATERIAL_WORDS,
+        f"{secretscrub._ENV_PREFIX}VALUE_PW",
+        "db_password",
+        "a_b_c_d_e_f_password",
+        "PWD",
+    ],
+)
+def test_every_credential_label_word_is_still_read_after_an_encoded_run(
+    label: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Read from ``secretscrub``'s own tuples, so a word added there and not to
+    ``redaction._CREDENTIAL_AHEAD`` goes red here by behaviour as well as in the gate below. The
+    six-segment label holds the prefix bound to the credential stage's."""
+    _assert_the_chain_drops_the_credential(
+        monkeypatch, f"{_ENCODED_TOKEN},{label}: {_CREDENTIAL_VALUE}"
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '{"q":"' + _ENCODED_TOKEN + '","password": "' + _CREDENTIAL_VALUE + '"}',
+        f"({_ENCODED_TOKEN})secret: {_CREDENTIAL_VALUE}",
+        f"{_ENCODED_TOKEN},password = {_CREDENTIAL_VALUE}",
+        f'{_ENCODED_TOKEN},"password" : "{_CREDENTIAL_VALUE}"',
+        f"{_ENCODED_TOKEN},Authorization: Basic {_CREDENTIAL_VALUE}",
+        f"{_ENCODED_TOKEN},Authorization:Digest {_CREDENTIAL_VALUE}",
+        f"{_ENCODED_TOKEN},Bearer {_CREDENTIAL_VALUE}",
+        f"{_ENCODED_TOKEN},password:\n  {_CREDENTIAL_VALUE}",
+        f"{_ENCODED_TOKEN}%7Cdb_password: {_CREDENTIAL_VALUE}",
+        # The label is outside the run's token, and the run takes one end of a quoted value.
+        f'password: "{_ENCODED_TOKEN} {_CREDENTIAL_VALUE} tail"',
+        f'password: "aa {_CREDENTIAL_VALUE} {_ENCODED_TOKEN}"',
+        f'password: "aa {_CREDENTIAL_VALUE} {_ENCODED_TOKEN}"tail',
+        f'password :"{_ENCODED_TOKEN} {_CREDENTIAL_VALUE} tail"',
+        f'password:\n "aa {_CREDENTIAL_VALUE} {_ENCODED_TOKEN}"',
+        # The value opens inside the run's token and closes outside it.
+        f'{_ENCODED_TOKEN},password="aa {_CREDENTIAL_VALUE} tail"',
+        f"{_ENCODED_TOKEN};PWD={{aa {_CREDENTIAL_VALUE}}}",
+        f"PWD={{{_ENCODED_TOKEN} {_CREDENTIAL_VALUE}}}",
+        f"PWD={{aa\n{_CREDENTIAL_VALUE} {_ENCODED_TOKEN}}}",
+        f"PWD={{aa\nsecret: b\n{_CREDENTIAL_VALUE} {_ENCODED_TOKEN}}}",
+        f"PWD={{aa token: q}} bb\n{_CREDENTIAL_VALUE} {_ENCODED_TOKEN}}}",
+    ],
+    ids=[
+        "compact-json",
+        "parenthesis",
+        "spaced-equals",
+        "quoted-key-spaced-colon",
+        "basic-scheme",
+        "glued-digest-scheme",
+        "bare-bearer",
+        "value-on-next-line",
+        "prefixed-label-after-separator",
+        "quoted-value-run-first",
+        "quoted-value-run-last",
+        "quoted-value-closed-inside-token",
+        "separator-leads-the-token",
+        "quoted-value-on-next-line",
+        "quoted-value-opens-in-token",
+        "braced-value-opens-in-token",
+        "braced-value-run-first",
+        "brace-closes-in-the-run-token",
+        "brace-with-a-label-inside",
+        "brace-with-an-early-closer-inside",
+    ],
+)
+def test_a_credential_span_that_crosses_an_encoded_run_is_still_scrubbed(
+    text: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ways a credential match can reach across the run's token, at least these: the label, the
+    separator, an auth scheme, or one end of a quoted or braced value inside it, and the rest
+    outside."""
+    _assert_the_chain_drops_the_credential(monkeypatch, text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Found against the cuts of this fix that kept a label inside the replaced token.
+        f"secret: abc;x%7Cy%7C_password: {_CREDENTIAL_VALUE}",
+        f"db_password: &url%26x%7Cy%7Cdb_password: {_CREDENTIAL_VALUE}",
+        f"x%7Cy|_password: secret: {_CREDENTIAL_VALUE}",
+        f"mode=a%7Cb%7Coauth_bearer password: {_CREDENTIAL_VALUE}",
+        f"lookup x%7Cy%7Cz;vault_token=Basic {_CREDENTIAL_VALUE}",
+        f"x%7Cy%7Cuser_Session Token: {_CREDENTIAL_VALUE}",
+        f"x%7Cy%7CDB_PWD SECRET={_CREDENTIAL_VALUE}",
+        f"x%7Cy%7CDB_PWD| password:\n {_CREDENTIAL_VALUE}",
+        '{"name": "x%7Cy%7C.password": "' + _CREDENTIAL_VALUE + '"}',
+        f"nonnumeric port: 'x a%7Cb%7C{'c' * 300} secret: abc@{_CREDENTIAL_VALUE}",
+        # Found against the cut that skipped only the tokens a credential match could reach: the
+        # run's token ended a label-anchored PHI value, and the stages, run again, read on past the
+        # placeholder and took the credential label.
+        "PatientID=123 url=http://h/fhir?identifier=a%7Cb%7Cc "
+        f"Authorization: Basic {_CREDENTIAL_VALUE}==",
+        f"PatientName=x key=a%7Cb%7Cc password:\n{_CREDENTIAL_VALUE}",
+        f"(0010,0010) PN Doe (0008,0018)x%7Cy%7Cz secret:\n{_CREDENTIAL_VALUE}",
+        f"a&Doe Jane&password: {_CREDENTIAL_VALUE}\nGET /q?id=x%7Cy%7Cz",
+        f'password: "aa {_CREDENTIAL_VALUE} token: Basic\nabc x%7Cy%7Cz"',
+        f'password: "aa {_CREDENTIAL_VALUE} Authorization: Digest\nabc x%7Cy%7Cz"',
+        # A credential with no label: the stages, run again, cut it at the `;`.
+        f"PatientID=123 q=a%7Cb%7Cc connect postgres://admin:zq9;{_CREDENTIAL_VALUE}@db/x",
+        f"PatientID=123 q=a%7Cb%7Cc GET /cb?code=zq9;{_CREDENTIAL_VALUE}",
+        f"connect failed postgres://admin:{_CREDENTIAL_VALUE}@db.internal/x?a=1%7C2%7C3",
+    ],
+    ids=[
+        "value-ends-at-semicolon",
+        "ampersand-leads-the-token",
+        "not-a-label-to-the-stage",
+        "underscore-prefixed-bearer",
+        "underscore-prefixed-token",
+        "title-case-label-words",
+        "upper-case-label-words",
+        "label-word-before-a-pipe",
+        "json-name-string",
+        "backstop-on-a-shortened-line",
+        "run-ended-a-dicom-value",
+        "run-ended-a-dicom-value-next-line",
+        "run-ended-a-dicom-tag-value",
+        "second-run-finishes-a-literal-run",
+        "basic-scheme-then-line-break",
+        "digest-scheme-then-line-break",
+        "url-password-cut-at-a-semicolon",
+        "query-code-cut-at-a-semicolon",
+        "url-password-in-the-run-token",
+    ],
+)
+def test_the_shapes_three_code_reviews_found_keep_no_credential(
+    text: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each kept its value at some head of this pull request, on one call or on the second:
+    e68fbc2896, 6c018c5e16, 229e63cf82 or a7cbd25488."""
+    assert _CREDENTIAL_VALUE in text
+    assert not _kept_that_the_stages_alone_scrub(monkeypatch, text, (_CREDENTIAL_VALUE,))
+    assert _CREDENTIAL_VALUE not in _through_the_log_filter_chain(text)
+
+
+@pytest.mark.parametrize(
+    ("password", "word"),
+    [
+        ("password", "password"),
+        ("secret", "secret"),
+        ("Token", "Token"),
+        ("my.secret", "secret"),
+        ("prod-pass", "pass"),
+        ("db.basic-9", "basic"),
+        ("MEFOR_PROD_2024", "MEFOR_PROD_2024"),
+    ],
+)
+def test_a_url_password_spelled_like_a_label_word_is_scrubbed(
+    password: str, word: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A password with NO label, in a URL's userinfo, beside an encoded run in the query (PR 2011
+    review finding N1). At 6c018c5e16 the run kept bare label words, so the word came out between
+    two placeholders, whole or as the dot- or dash-bounded part of a longer password. THE CONTROL:
+    the credential stage alone scrubs it."""
+    text = f"GET https://svc:{password}@db.internal/fhir/Patient?identifier=x%7Cy%7Cz failed"
+    assert f":{password}@" not in secretscrub.scrub_credentials(text), "the control does not hold"
+    for path, out in _every_log_path(text).items():
+        if path != "store":  # no credential filter runs on the store's own path, then or now
+            assert word not in out, f"{path}: {out!r}"
+    # The URL password is what switches the run off here. Without that, the run takes the
+    # token whole and the arm above still passes, so it would not hold the rule.
+    assert redact(text) == redaction._redact_stages(text)
+
+
+#: The grammar the second reviewer named as the instrument for this change: a label-anchored PHI
+#: value, then an encoded run, then a credential form or none. Synthetic values throughout.
+_GRAMMAR_PHI = ("Zqxdoe", "ZQXDOE", "VANJA", "12345", "4455667", "1980-05-05")
+_GRAMMAR_HEADS = (
+    "PatientID=12345",
+    "PatientName=Zqxdoe",
+    "(0010,0010) PN Zqxdoe",
+    "(0010,0020) LO 4455667",
+    "PatientBirthDate=1980-05-05",
+    "OtherPatientIDs=4455667",
+    '"family": "Zqxdoe",',
+    "mrn: 4455667",
+    '<family value="Zqxdoe"/>',
+    "patient ZQXDOE VANJA",
+    "MRN 4455667",
+    "dob 1980-05-05",
+)
+_GRAMMAR_RUNS = (
+    "url=https://h/fhir?identifier=a%7Cb%7Cc",
+    "key=a%7Cb%7Cc",
+    "(0008,0018)x%7Cy%7Cz",
+    "q=a%7Cb&c",
+    "'x%5Ey%5Ez'",
+    "id=u%7Cv%7Cw,",
+)
+_GRAMMAR_CREDENTIALS = (
+    f"Authorization: Basic {_CREDENTIAL_VALUE}==",
+    f"Authorization: Bearer {_CREDENTIAL_VALUE}",
+    f"password: {_CREDENTIAL_VALUE}",
+    f"password:\n{_CREDENTIAL_VALUE}",
+    f"password={_CREDENTIAL_VALUE}",
+    f'secret: "aa {_CREDENTIAL_VALUE} bb"',
+    f"PWD={{aa {_CREDENTIAL_VALUE}}}",
+    f"Bearer {_CREDENTIAL_VALUE}",
+    f"token={_CREDENTIAL_VALUE}",
+    f"api_key: {_CREDENTIAL_VALUE}=",
+    f"MEFOR_X={_CREDENTIAL_VALUE}",
+    f"private_key={_CREDENTIAL_VALUE}=",
+    f'password = "{_CREDENTIAL_VALUE}"',
+    f"postgres://admin:{_CREDENTIAL_VALUE}@db/x",
+    f"postgres://admin:zq9;{_CREDENTIAL_VALUE}@db/x",
+    f"GET /cb?code={_CREDENTIAL_VALUE}",
+    f"GET /cb?code=zq9;{_CREDENTIAL_VALUE}",
+    f"session: {_CREDENTIAL_VALUE}",
+    f"db_password:\n {_CREDENTIAL_VALUE}",
+    f"Authorization: Digest\n{_CREDENTIAL_VALUE}",
+    f"secret:\t{_CREDENTIAL_VALUE}==",
+    # No credential: the texts the encoded run applies to.
+    "",
+    "status 404 not found",
+)
+
+
+def _grammar_texts() -> list[str]:
+    return [
+        f"{head} {run}{glue}{credential}"
+        for head in _GRAMMAR_HEADS
+        for run in _GRAMMAR_RUNS
+        for glue in (" ", "\n", ",")
+        for credential in _GRAMMAR_CREDENTIALS
+    ]
+
+
+def test_no_log_path_keeps_what_the_stages_alone_scrub_over_the_grammar(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """NEVER WORSE THAN BEFORE THE ENCODED RUN, once through and twice through. Every text of the
+    grammar goes to the log three ways, and nothing planted may survive where the redactor without
+    the run scrubs it: not the credential, not a PHI value.
+
+    Measured with this test at earlier heads of the pull request, texts of 4,968 with at least one
+    such value on some path: 6563110bab 744, 229e63cf82 186, a7cbd25488 186. THE CONTROLS: the baseline does scrub the credential on most texts, and the run does
+    apply on the texts that hold none."""
+    values = (_CREDENTIAL_VALUE, *_GRAMMAR_PHI)
+    worse = 0
+    first = ""
+    scrubbed_by_the_chain = 0
+    for text in _grammar_texts():
+        kept = _kept_that_the_stages_alone_scrub(monkeypatch, text, values)
+        if kept:
+            worse += 1
+            first = first or f"{text!r}: {kept}"
+        if _CREDENTIAL_VALUE in text:
+            scrubbed_by_the_chain += _CREDENTIAL_VALUE not in _through_the_log_filter_chain(text)
+    assert not worse, f"{worse} texts keep a value the stages alone scrub, first {first}"
+    assert scrubbed_by_the_chain > 3_500, "the grammar no longer holds credentials the chain reads"
+    plain = [text for text in _grammar_texts() if text.endswith("status 404 not found")]
+    assert sum("%" not in redact(text) for text in plain) > len(plain) // 2, (
+        "the encoded run no longer applies to the texts that hold no credential"
+    )
+
+
+def test_redact_is_a_fixed_point_over_the_grammar() -> None:
+    """A second ``redact`` changes nothing, with a credential in the text or without one. At
+    a7cbd25488 it did on 748 of the 4,968 texts of this grammar."""
+    texts = _grammar_texts()
+    assert len(texts) >= 4_000
+    moved = [text for text in texts if redact(redact(text)) != redact(text)]
+    assert not moved, f"{len(moved)} texts, first {moved[0]!r}"
+
+
+def test_what_the_credential_filters_write_still_switches_the_run_off() -> None:
+    """The rule must answer the same on a second call over the first call's output, when a second
+    handler filters a record the first has already scrubbed. The filters keep the label, the scheme
+    word, the URL user and the query key, and each of those still matches."""
+    for credential in _GRAMMAR_CREDENTIALS[:-2]:
+        text = f"id {_ENCODED_TOKEN} {credential}"
+        once = _through_the_log_filter_chain(text)
+        assert _CREDENTIAL_VALUE not in once, once
+        assert "x%7Cy" in once, f"the run was not left alone on the first pass: {once!r}"
+        assert redaction._CREDENTIAL_AHEAD.search(once) is not None, once
+        assert _through_the_log_filter_chain(once) == once
+
+
+def test_the_credential_pattern_is_held_to_its_sources() -> None:
+    """THE DRIFT GATE, by spelling. ``redaction`` is stdlib-only and cannot import ``secretscrub``
+    or ``logging_setup``, so each arm of ``_CREDENTIAL_AHEAD`` is a copy. The arm below it checks
+    the same thing by behaviour."""
+    pattern = redaction._CREDENTIAL_AHEAD.pattern
+    assert secretscrub._LABEL_PREFIX in pattern
+    assert secretscrub._ENV_PREFIX in pattern
+    words = pattern.split(secretscrub._LABEL_PREFIX + "(?:")[1].split(")")[0].split("|")
+    assert set(words) == {
+        *secretscrub._CREDENTIAL_WORDS,
+        *secretscrub._TOKEN_WORDS,
+        *secretscrub._KEY_MATERIAL_WORDS,
+    }
+    assert "|".join(logging_setup._CREDENTIAL_QUERY_KEYS) in pattern
+    url_arm = r"://[^\s:/@]+:[^\s/@]+@"
+    assert url_arm in pattern
+    assert secretscrub._DSN_PASSWORD.pattern.replace(")", "").endswith(url_arm)
+
+
+def test_the_credential_pattern_matches_every_text_a_credential_filter_changes() -> None:
+    """THE DRIFT GATE, by behaviour. If either credential filter would change a text, the pattern
+    must match that text, or the encoded run could apply beside a credential. Seeded, over fragments
+    that build each filter's shapes and near misses. THE CONTROL: the filters do change a large
+    share of the corpus, and the pattern does not simply match everything."""
+    fragments = (
+        *secretscrub._CREDENTIAL_WORDS,
+        *secretscrub._TOKEN_WORDS,
+        *secretscrub._KEY_MATERIAL_WORDS,
+        *logging_setup._CREDENTIAL_QUERY_KEYS,
+        "MEFOR_X", "Basic", "Digest", "db_", "a.b-", "://", "postgres", "user", "host", "abc123",
+        ":", "=", " ", " ", "\n", "\t", '"', "'", "{", "}", "@", "/", "?", "&", ";", ",", "x", "9",
+        "_", ".", "-", "%7C",
+    )  # fmt: skip
+    rand = random.Random(2011)
+    changed = unmatched = 0
+    for _ in range(20_000):
+        text = "".join(rand.choice(fragments) for _ in range(rand.randint(2, 9)))
+        if (
+            secretscrub.scrub_credentials(text) != text
+            or logging_setup._scrub_credential_query(text) != text
+        ):
+            changed += 1
+            assert redaction._CREDENTIAL_AHEAD.search(text) is not None, repr(text)
+        elif redaction._CREDENTIAL_AHEAD.search(text) is None:
+            unmatched += 1
+    assert changed > 500 and unmatched > 2_000, (changed, unmatched)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"{_ENCODED_TOKEN},password: {_CREDENTIAL_VALUE}",
+        f'password: "aa {_ENCODED_TOKEN}" tail',
+        f"note Bearer {_ENCODED_TOKEN}",
+        f"{_ENCODED_TOKEN} password: {_CREDENTIAL_VALUE}",
+        f"password: {_CREDENTIAL_VALUE}\nid {_ENCODED_TOKEN} here",
+        f"connect postgres://admin:{_CREDENTIAL_VALUE}@db/x id {_ENCODED_TOKEN}",
+        f"GET /cb?code={_CREDENTIAL_VALUE} id {_ENCODED_TOKEN}",
+        f"state=RUNNING id {_ENCODED_TOKEN}",
+    ],
+    ids=[
+        "label-in-token",
+        "token-in-quoted-value",
+        "token-after-bearer",
+        "run-before-label",
+        "run-on-the-next-line",
+        "url-password",
+        "query-code",
+        "ordinary-state-key",
+    ],
+)
+def test_a_text_with_a_credential_shape_is_left_as_the_stages_left_it(text: str) -> None:
+    """THE STATED PRICE, pinned so it cannot change unseen. A text that holds a credential shape
+    anywhere gets exactly the two stages, as it did before the encoded run existed, and the run in
+    it keeps its text. The last arm is the cost at its plainest: an ordinary ``state=`` is a query
+    key the credential filter reads, so it switches the run off too."""
+    assert redact(text) == redaction._redact_stages(text)
+    assert "x%7Cy" in redact(text)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("id zqxdoe%7C4455667%7Cvanja here", "id [redacted] here"),
+        # A word that only CONTAINS a label word, or runs on past one, is not a label.
+        ("name=zqxdoe%5E4455667%5Ecompass: 404 here", "[redacted] 404 here"),
+        ("bypass=zqxdoe%5E4455667%5Eq here", "[redacted] here"),
+        ("passwords: 3 id zqxdoe%7C4455667%7Cvanja here", "passwords: 3 id [redacted] here"),
+        # A label word with no separator after it, and a URL with no password in it.
+        ("the session ended id zqxdoe%7C4455667%7Cvanja", "the session ended id [redacted]"),
+        ("GET https://h/q?id=zqxdoe%7C4455667%7Cvanja failed", "GET [redacted] failed"),
+    ],
+    ids=[
+        "no-label",
+        "word-inside-a-word",
+        "label-word-runs-on",
+        "plural-label-word",
+        "label-word-without-separator",
+        "url-without-userinfo",
+    ],
+)
+def test_a_text_with_no_credential_shape_still_loses_its_encoded_run(
+    text: str, expected: str
+) -> None:
+    """THE CONTROL for the arm above, and the PHI arm: switching the run off everywhere would
+    satisfy it."""
+    assert redaction._CREDENTIAL_AHEAD.search(text) is None
+    assert redact(text) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "planted"),
+    [
+        # A URL password split by a line break: one line once the first handler has escaped it.
+        (
+            f"connect postgres://user:pa%7Cx%7C\n{_CREDENTIAL_VALUE}@host failed",
+            _CREDENTIAL_VALUE,
+        ),
+        # An escaped control character becomes text that completes a readable label.
+        (f"x%7Cy%7C\x01_password: {_CREDENTIAL_VALUE}", _CREDENTIAL_VALUE),
+        # A key glued to the run, its value after the break.
+        ('Doe Janepw:%7E"mrn":PWD|44556674455667\n#Zqxdoe%7e', "Zqxdoe"),
+    ],
+    ids=["url-password-over-a-line-break", "escaped-control-character", "key-before-a-line-break"],
+)
+def test_a_text_with_an_unprintable_character_keeps_its_run_for_the_second_handler(
+    text: str, planted: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One record through two handlers. The first handler's control-character filter writes a line
+    break as visible text, so the second reads one line where the first read two, and scrubs a
+    value that needed both halves. A run replaced on the first pass cannot be put back, so the run
+    stays off such a text. THE CONTROL: with the run off, the second handler does scrub the value;
+    with the unprintable-character rule removed from ``redact``, each arm goes red."""
+    with monkeypatch.context() as patched:
+        patched.setattr(redaction, "_HL7_ENCODED_FIELD_RUN", _NO_ENCODED_RUN)
+        assert planted not in _every_log_path(text)["two handlers"], "the control does not hold"
+    assert not _kept_that_the_stages_alone_scrub(monkeypatch, text, (planted,))
+    assert redact(text) == redaction._redact_stages(text)
+
+
+@pytest.mark.parametrize(
+    ("text", "planted"),
+    [
+        ('&%7e - &ok%7E"name": 7788990 ', "7788990"),
+        ('Qorvel Digest Zqxdoe%7E%5E"name":  <ok.Qorvel& ', "Qorvel"),
+    ],
+    ids=["bare-value-ends-the-text", "value-ends-the-text-after-a-strip"],
+)
+def test_a_key_the_widened_stage_reads_is_not_taken_by_the_run(
+    text: str, planted: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second call can scrub a value the first kept, but only while its key is still there. Both
+    shapes came from a fuzz, where the run took a ``"name":`` key glued to its token and the value
+    then survived ``safe_text`` followed by the chain. THE CONTROL: without the encoded run, that
+    path does scrub the value."""
+    with monkeypatch.context() as patched:
+        patched.setattr(redaction, "_HL7_ENCODED_FIELD_RUN", _NO_ENCODED_RUN)
+        assert planted not in _every_log_path(text)["safe_text"], "the control does not hold"
+    assert not _kept_that_the_stages_alone_scrub(monkeypatch, text, (planted,))
+    assert redact(text) == redaction._redact_stages(text)
+
+
+def test_the_stages_run_again_over_what_the_encoded_run_changed() -> None:
+    """Pins the second ``_redact_stages`` call in ``redact`` (PR 2011 review finding 5): returning
+    the run's output directly left every other test green. The shape came from a search over fuzzed
+    inputs. THE CONTROL is the middle assertion: the name survives the stages and the run, so the
+    second pass of the stages is what removes it."""
+    text = "PatientName=patient   key=%7c,%7C%7e%26 zq9hunter2zQorvel:  Zqxdoe"
+    staged = redaction._redact_stages(text)
+    assert text.isprintable() and redact(text) != staged, "the run must apply to this text"
+    assert redaction._CREDENTIAL_AHEAD.search(staged) is None, "the run must apply to this text"
+    after_run = redaction._HL7_ENCODED_FIELD_RUN.sub(redaction._REDACTED, staged)
+    assert "Zqxdoe" in after_run, "the control no longer holds"
+    assert "Zqxdoe" not in redact(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # The run would take the token that holds the opener's quote.
+        f"nonnumeric port: 'a%7Cb%7Cc d|e|{'f' * 300} {_CREDENTIAL_VALUE}@host",
+        # The run would take the token that holds the closing `@`.
+        f"nonnumeric port: '{_CREDENTIAL_VALUE} d|e|{'f' * 300} x%7Cy%7Cz@host",
+        # The run would shorten the line and bring the `@` within the backstop's bound.
+        f"nonnumeric port: 'x a%7Cb%7C{'c' * 300} {_CREDENTIAL_VALUE}@host",
+    ],
+    ids=["run-holds-the-opener-quote", "run-holds-the-closing-at", "run-shortens-the-line"],
+)
+def test_the_backstop_opener_switches_the_encoded_run_off(
+    text: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The credential backstop reads an opener, a tail and an ``@`` on one line, and a second call
+    can reach an ``@`` the first could not, once the literal run has shortened the line. The encoded
+    run must not take either end of that span first. THE CONTROL: on the first two, the store's two
+    calls do scrub the value when the run is off."""
+    assert redact(text) == redaction._redact_stages(text)
+    assert not _kept_that_the_stages_alone_scrub(monkeypatch, text, (_CREDENTIAL_VALUE,))
+    if "d|e|" in text:
+        assert _CREDENTIAL_VALUE not in _every_log_path(text)["store"]
+
+
+# --- BACKLOG #2312: the credential backstop leaves its own output alone ------------------------------
+
+#: The backstop as it shipped before #2312, for the positive control below and for nothing else.
+_PRE_2312_BACKSTOP = re.compile(r"(nonnumeric port: ')[^\r\n]{1,256}@")
+
+#: Synthetic passwords, lowercase-led and digit-bearing so no name or date pass is what removes them.
+_PW_ONE = "ab0c" * 25
+_PW_TWO = "zy9x" * 25
+_PW_REAL = "realpw7q"
+
+
+def _two_credential_spans() -> str:
+    """Two ``http.client`` credential messages on one line, placed so the second ``@`` is past the
+    bound from the first opener on the first pass and inside it once both passwords are scrubbed.
+
+    That geometry is the whole defect: each scrub shortens the line, so a span the first pass could not
+    reach comes within reach of the next. The ``keep`` words between are the operator text a second
+    pass used to swallow."""
+    return (
+        f"first nonnumeric port: '{_PW_ONE}@h1.example'"
+        + " keep" * 20
+        + f" nonnumeric port: '{_PW_TWO}@h2.example' end"
+    )
+
+
+def _pre_2312_scrub(text: str) -> str:
+    return _PRE_2312_BACKSTOP.sub(lambda m: f"{m.group(1)}[redacted]@", text)
+
+
+def test_the_two_span_fixture_really_reaches_across_on_the_old_backstop() -> None:
+    """THE POSITIVE CONTROL. An idempotence arm passes vacuously on a line no second pass could
+    change, so show the pre-fix backstop really does swallow this gap on its second run."""
+    once = _pre_2312_scrub(_two_credential_spans())
+    assert "keep" in once, "the first pass already spans the gap, so the fixture is mis-sized"
+    assert "keep" not in _pre_2312_scrub(once), (
+        "the old backstop no longer swallows this gap on a second pass"
+    )
+
+
+def test_the_credential_backstop_is_a_fixed_point_on_two_spans_it_scrubbed() -> None:
+    """BACKLOG #2312: a second pass over two scrubbed spans changes nothing, through ``redact`` and
+    through the stored-error pairing ``safe_exc`` then ``safe_text``."""
+    text = _two_credential_spans()
+    once = redact(text)
+    assert once == (
+        "first nonnumeric port: '[redacted]@h1.example'"
+        + " keep" * 20
+        + " nonnumeric port: '[redacted]@h2.example' end"
+    )
+    assert redact(once) == once
+
+    stored = safe_exc(ValueError(text), limit=100_000)
+    restored = safe_text(stored, limit=100_000)
+    assert restored == stored
+    for out in (once, stored, restored, redact_untrusted(text)):
+        assert _PW_ONE not in out and _PW_TWO not in out
+        assert "keep" in out and "h1.example" in out and "h2.example" in out
+
+
+def test_a_placeholder_inside_a_password_does_not_shield_what_follows_it() -> None:
+    """Text can carry ``[redacted]@`` itself, and the tail stays greedy to the LAST ``@``. So a bare
+    placeholder in the tail stops nothing, and the real password after it still goes. Only the
+    opener and placeholder together mark a span as already scrubbed."""
+    text = f"nonnumeric port: 'u:[redacted]@x:{_PW_REAL}@host.example'"
+    out = redact(text)
+    assert out == "nonnumeric port: '[redacted]@host.example'"
+    assert redact(out) == out
+    assert _PW_REAL not in redact_untrusted(text)
+    assert _PW_REAL not in safe_text(safe_exc(ValueError(text)))
+
+
+def test_the_real_producer_never_quotes_a_placeholder() -> None:
+    """Why the stated residual on ``_INVALID_URL_USERINFO`` cannot reach the shape the backstop exists
+    for. ``http.client`` quotes what follows the LAST ``:``, and only when no ``]`` comes after it, so
+    the "port" it writes holds neither. Handed the hostile netloc above, it quotes only the real
+    password and the host."""
+    with pytest.raises(http.client.InvalidURL) as caught:
+        http.client.HTTPConnection(f"u:[redacted]@x:{_PW_REAL}@host.example")
+    message = str(caught.value)
+    assert message == f"nonnumeric port: '{_PW_REAL}@host.example'"
+    assert _PW_REAL not in redact(message)
+
+
+def test_a_match_may_start_on_the_scrubbed_form_and_still_take_what_follows() -> None:
+    """The start is not guarded, so text that opens with the scrubbed form is no shield. Only the
+    tail's crossing of a LATER scrubbed span is refused."""
+    text = f"nonnumeric port: '[redacted]@x {_PW_REAL}@host.example'"
+    assert redact(text) == "nonnumeric port: '[redacted]@host.example'"
+
+
+def test_a_later_pass_finishes_a_password_whose_last_at_was_past_the_bound() -> None:
+    """Why the start is not guarded. A password with an inner ``@`` and its last ``@`` past the bound
+    is scrubbed only to the inner one. A later pass sees a shorter line and reaches the last one. The
+    stored error runs ``safe_exc`` then ``safe_text``, so that is the path that must finish it. A
+    start guard kept the hundred characters after the inner ``@``."""
+    text = "nonnumeric port: '" + "a" * 200 + "@" + "q7" * 50 + "@host.example'"
+    once = redact(text)
+    assert "q7" * 50 in once, "one pass already reaches the last @, so the fixture is mis-sized"
+    assert "q7" not in redact(once)
+    assert "q7" not in safe_text(safe_exc(ValueError(text)), limit=100_000)
+
+
+def _opener_then_scrubbed_span() -> str:
+    """An opener with no ``@`` of its own, then a credential message. The first pass cannot reach the
+    second ``@`` from the first opener (it is past the bound) and scrubs only the second span. That
+    shortens the line enough for the next pass to reach it. Only the tail guard stops that pass."""
+    return "nonnumeric port: 'abc'" + " keep" * 44 + f" nonnumeric port: '{_PW_TWO}@h2.example' end"
+
+
+def test_the_tail_guard_fixture_reaches_across_without_it() -> None:
+    """THE POSITIVE CONTROL for the arm below. Its first opener is NOT scrubbed on the first pass, so
+    only the tail guard, never a start guard, can be what holds the fixed point."""
+    once = _pre_2312_scrub(_opener_then_scrubbed_span())
+    assert "nonnumeric port: 'abc'" in once, "the first pass reached the second @ after all"
+    assert "keep" not in _pre_2312_scrub(once), "the old backstop no longer swallows this gap"
+
+
+def test_the_tail_never_crosses_a_later_scrubbed_span() -> None:
+    """BACKLOG #2312, the arm that fails if the tail guard is removed."""
+    once = redact(_opener_then_scrubbed_span())
+    assert _PW_TWO not in once
+    assert redact(once) == once
+    assert "keep" in redact(once)
+
+
+def test_the_tail_guard_spells_the_form_the_scrub_writes() -> None:
+    """THE DRIFT GATE for the copy inside the tail guard. The pattern spells the opener and the
+    placeholder again there, as literals for the static regex gate. If either drifts from the form
+    the scrub writes, the guard stops recognising it and the fixed point breaks silently."""
+    form = redaction._USERINFO_OPENER + re.escape(redaction._REDACTED) + "@"
+    assert f"n(?!{form[1:]})" in redaction._INVALID_URL_USERINFO.pattern
+    written = redaction._INVALID_URL_USERINFO.sub(
+        lambda m: f"{m.group(1)}{redaction._REDACTED}@", f"x {redaction._USERINFO_OPENER}pw0@h"
+    )
+    assert written == f"x {redaction._USERINFO_OPENER}{redaction._REDACTED}@h"
+
+
+#: Inputs shaped to make the backstop work hardest: openers with no ``@``, scrubbed forms with the
+#: ``@`` missing so each lookahead reads nearly the whole form, and scrubbed spans packed tight.
+_BACKSTOP_HOSTILE = {
+    "openers-without-at": "nonnumeric port: '",
+    "near-scrubbed-forms": "nonnumeric port: '[redacted]",
+    "scrubbed-spans": "nonnumeric port: '[redacted]@h ",
+    "opener-then-at": "nonnumeric port: 'x@",
+}
+
+
+#: Inputs shaped to make the encoded-run pass work hardest: a match every few characters, escapes
+#: that are not separators, a separator prefix that never completes, and one-separator tokens. Every
+#: unit but the first holds one encoded separator per token, so the screen lets it through and the
+#: pattern's body lookahead runs at every ``%`` without a match to end the attempt early.
+_ENCODED_HOSTILE = {
+    "many-matches": "a%7Cb%5Ec ",
+    "non-separator-escapes": "a%20%20%20%20%7Cb ",
+    "unfinished-escapes": "%7%7%7%7%7Cb ",
+    "bare-percents": "%%%%%7Cb ",
+    # A literal separator per token, so the literal pass leaves it and the pattern restarts after it.
+    "restart-after-literal": "a|b c%7Cd ",
+    # One long token with one separator: a single attempt walks all of it.
+    "one-long-token": "%20" * 1000 + "%7C ",
+    # The credential scan runs once a qualifying run is found. With no credential shape in the
+    # text it reads all of it, and a dotted and hyphenated run offers a label start at every
+    # segment. The second unit holds label words with no separator after them.
+    "label-prefix-run": "a-b.c-" * 40 + " x%7Cx%7Cy ",
+    "label-words-no-separator": "pass-token.secret-" * 12 + "%7Cx%7Cy ",
+}
+
+
+@pytest.mark.parametrize(
+    "unit",
+    [*_BACKSTOP_HOSTILE.values(), *_ENCODED_HOSTILE.values()],
+    ids=[
+        *(f"backstop-{k}" for k in _BACKSTOP_HOSTILE),
+        *(f"encoded-{k}" for k in _ENCODED_HOSTILE),
+    ],
+)
+def test_the_backstop_and_the_encoded_run_stay_linear_and_affordable(unit: str) -> None:
+    """8x the input must cost well under 64x the time, and a whole window stays well under a second
+    on the event loop. The same ceilings as the MRN pass above."""
 
     def sized(chars: int) -> str:
         return (unit * (chars // len(unit) + 1))[:chars]
