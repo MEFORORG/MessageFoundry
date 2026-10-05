@@ -2240,9 +2240,12 @@ class PostgresStore:
         async with self._timed_acquire(record=False) as conn:
             return await conn.fetchrow(sql, *params)
 
-    async def _execute(self, sql: str, *params: Any) -> None:
+    async def _execute(self, sql: str, *params: Any) -> int:
+        """Run one write on a bounded borrow and return its row count, read from asyncpg's status
+        tag. Most callers ignore it; the session writes that report what they changed read it
+        (BACKLOG #2283), so none of them borrows around this helper to reach the tag."""
         async with self._timed_acquire(record=False) as conn:
-            await conn.execute(sql, *params)
+            return _rowcount(await conn.execute(sql, *params))
 
     async def _count(self, table: str) -> int:
         row = await self._pool.fetchrow(f"SELECT COUNT(*) AS n FROM {table}")  # table is a constant
@@ -8305,16 +8308,15 @@ class PostgresStore:
     async def rotate_session(self, token_hash: str, *, new_token_hash: str) -> bool:
         """Re-key a live session in place (ASVS 7.2.4). See :meth:`AuthStore.rotate_session`.
 
-        Borrows through ``_timed_acquire`` rather than calling ``self._execute``, which discards
-        asyncpg's status tag, and this op's contract is its rowcount. Not ``self._pool.execute``
-        either: that acquires with no timeout (BACKLOG #1052, #2283)."""
-        async with self._timed_acquire(record=False) as conn:
-            result = await conn.execute(
-                "UPDATE sessions SET token_hash=$1 WHERE token_hash=$2 AND revoked_at IS NULL",
-                new_token_hash,
-                token_hash,
-            )
-        return _rowcount(result) > 0
+        Through ``self._execute``, which borrows under the acquire timeout and returns the
+        rowcount this op's contract is. It used ``self._pool.execute``, which acquires with no
+        timeout (BACKLOG #1052, #2283)."""
+        changed = await self._execute(
+            "UPDATE sessions SET token_hash=$1 WHERE token_hash=$2 AND revoked_at IS NULL",
+            new_token_hash,
+            token_hash,
+        )
+        return changed > 0
 
     async def revoke_session(self, token_hash: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
@@ -8339,16 +8341,14 @@ class PostgresStore:
     ) -> int:
         """Revoke a user's active sessions (all, or all but ``except_token_hash``). Returns the count."""
         now = time.time() if now is None else now
-        # The bounded borrow, as `rotate_session` explains (BACKLOG #2283).
-        async with self._timed_acquire(record=False) as conn:
-            result = await conn.execute(
-                "UPDATE sessions SET revoked_at=$1 WHERE user_id=$2 AND revoked_at IS NULL"
-                " AND ($3::text IS NULL OR token_hash != $3)",
-                now,
-                user_id,
-                except_token_hash,
-            )
-        return _rowcount(result)
+        # Through `_execute`, the bounded borrow, as `rotate_session` explains (BACKLOG #2283).
+        return await self._execute(
+            "UPDATE sessions SET revoked_at=$1 WHERE user_id=$2 AND revoked_at IS NULL"
+            " AND ($3::text IS NULL OR token_hash != $3)",
+            now,
+            user_id,
+            except_token_hash,
+        )
 
     async def enforce_session_cap(
         self,
@@ -8384,19 +8384,16 @@ class PostgresStore:
         self, *, now: float | None = None, idle_seconds: float | None = None
     ) -> int:
         now = time.time() if now is None else now
-        # Borrowed through the bounded helper rather than `self._pool.execute`, which acquires with
-        # no timeout (BACKLOG #1052); `record=False` keeps this hourly sweep out of the worker
-        # acquire-wait curve, as the `_fetchall` family does.
-        async with self._timed_acquire(record=False) as conn:
-            if idle_seconds is None:
-                result = await conn.execute("DELETE FROM sessions WHERE expires_at < $1", now)
-            else:
-                result = await conn.execute(
-                    "DELETE FROM sessions WHERE expires_at < $1 OR $1 - last_used_at > $2",
-                    now,
-                    float(idle_seconds),
-                )
-        return _rowcount(result)
+        # Through `_execute`, the bounded borrow, rather than `self._pool.execute`, which acquires
+        # with no timeout (BACKLOG #1052). `_execute` borrows with `record=False`, which keeps this
+        # hourly sweep out of the worker acquire-wait curve, and returns the count (BACKLOG #2283).
+        if idle_seconds is None:
+            return await self._execute("DELETE FROM sessions WHERE expires_at < $1", now)
+        return await self._execute(
+            "DELETE FROM sessions WHERE expires_at < $1 OR $1 - last_used_at > $2",
+            now,
+            float(idle_seconds),
+        )
 
     # --- retention / purge + maintenance (PHI.md §8) -------------------------
 

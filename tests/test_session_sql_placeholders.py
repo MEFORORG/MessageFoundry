@@ -100,7 +100,7 @@ class _MssqlConn:
 def _mssql_store(seen: list[tuple[str, tuple[Any, ...]]]) -> Any:
     from messagefoundry.store.sqlserver import SqlServerStore
 
-    store = SqlServerStore.__new__(SqlServerStore)
+    store: Any = SqlServerStore.__new__(SqlServerStore)
     store._settings = StoreSettings(command_timeout=0)
     store._acquire_wait = AcquireWaitHistogram()
     store.committed_txns = 0
@@ -124,15 +124,9 @@ async def test_sqlserver_session_statements_bind_every_placeholder(name: str) ->
         )
 
 
-@pytest.mark.parametrize("output_rows", [[], [(_OTHER,)]])
-async def test_sqlserver_rotate_reads_its_output_rowset_not_the_row_count(
-    output_rows: list[Any],
-) -> None:
-    """BACKLOG #2283: a session-wide ``SET NOCOUNT ON`` can report ``-1`` for a zero-match UPDATE,
-    and ``bool(-1)`` is True. Read from the count, a rotation of a revoked session would report
-    success and hand the caller a token for nothing. The rowset decides instead, whatever the
-    count says."""
-    seen: list[tuple[str, tuple[Any, ...]]] = []
+def _nocount_store(seen: list[tuple[str, tuple[Any, ...]]], output_rows: list[Any]) -> Any:
+    """A SQL Server store whose driver reports ``-1`` for every row count, as a session-wide
+    ``SET NOCOUNT ON`` can, and whose ``OUTPUT`` rowset is ``output_rows``."""
     store = _mssql_store(seen)
 
     class _NoCountCursor(_MssqlCursor):
@@ -150,7 +144,30 @@ async def test_sqlserver_rotate_reads_its_output_rowset_not_the_row_count(
         yield _NoCountConn(seen)
 
     store._acquire = _acquire
+    return store
+
+
+@pytest.mark.parametrize("output_rows", [[], [(_OTHER,)]])
+async def test_sqlserver_rotate_reads_its_output_rowset_not_the_row_count(
+    output_rows: list[Any],
+) -> None:
+    """BACKLOG #2283: a session-wide ``SET NOCOUNT ON`` can report ``-1`` for a zero-match UPDATE,
+    and ``bool(-1)`` is True. Read from the count, a rotation of a revoked session would report
+    success and hand the caller a token for nothing. The rowset decides instead, whatever the
+    count says."""
+    seen: list[tuple[str, tuple[Any, ...]]] = []
+    store = _nocount_store(seen, output_rows)
     assert await store.rotate_session(_HASH, new_token_hash=_OTHER) is bool(output_rows)
+    assert "OUTPUT inserted.token_hash" in seen[0][0]
+
+
+@pytest.mark.parametrize("revoked", [0, 3])
+async def test_sqlserver_revoke_user_sessions_counts_its_output_rowset(revoked: int) -> None:
+    """The same hazard, on a count that is audited and returned to the API caller: read from the
+    driver it would be ``-1`` whether three sessions were revoked or none."""
+    seen: list[tuple[str, tuple[Any, ...]]] = []
+    store = _nocount_store(seen, [(f"{n:064x}",) for n in range(revoked)])
+    assert await store.revoke_user_sessions("u", except_token_hash=_HASH, now=_NOW) == revoked
     assert "OUTPUT inserted.token_hash" in seen[0][0]
 
 
@@ -186,7 +203,7 @@ class _PgConn:
 def _pg_store(seen: list[tuple[str, tuple[Any, ...]]]) -> Any:
     from messagefoundry.store.postgres import PostgresStore
 
-    store = PostgresStore.__new__(PostgresStore)
+    store: Any = PostgresStore.__new__(PostgresStore)
     store._settings = StoreSettings()
     store._acquire_wait = AcquireWaitHistogram()
 
@@ -221,8 +238,9 @@ async def test_the_checks_catch_a_miscount(monkeypatch: pytest.MonkeyPatch) -> N
     backend's session-cap clause, the shared piece a miscount would most likely come from, and the
     recorded statement must then fail the same comparison the tests make."""
     from messagefoundry.store import postgres, sqlserver
+    from messagefoundry.store.store import _SESSION_LIVE_SQL
 
-    monkeypatch.setattr(sqlserver, "_SESSION_LIVE_SQL", sqlserver._SESSION_LIVE_SQL + " AND 1=?")
+    monkeypatch.setattr(sqlserver, "_SESSION_LIVE_SQL", _SESSION_LIVE_SQL + " AND 1=?")
     seen: list[tuple[str, tuple[Any, ...]]] = []
     await _CALLS["enforce_session_cap"](_mssql_store(seen))
     assert any(sql.count("?") != len(params) for sql, params in seen)

@@ -4512,6 +4512,26 @@ class SqlServerStore:
                 raise
         return rows
 
+    async def _execute_output(self, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
+        """Run one write that carries an ``OUTPUT`` clause, commit it as a durable write, and return
+        the rows it output (BACKLOG #2283).
+
+        For a write whose caller needs to know what it changed. The rowset holds whatever
+        ``cursor.rowcount`` would, and a session-wide ``SET NOCOUNT ON`` cannot hide it, while the
+        count can come back ``-1`` for a zero-match UPDATE. ``_fetchall`` would not do: it commits
+        as a READ. The rows are drained before the commit, and ``_cursor`` frees the statement
+        handle the ``OUTPUT`` clause leaves open."""
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await cur.execute(sql, params)
+                columns = [c[0] for c in cur.description]
+                rows = await cur.fetchall()
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        return [dict(zip(columns, row)) for row in rows]  # noqa: B905
+
     def _event_stmt(
         self,
         message_id: str,
@@ -12199,22 +12219,14 @@ class SqlServerStore:
         This op's whole contract is whether a row was re-keyed, so it reads an ``OUTPUT`` rowset and
         never ``cursor.rowcount`` (BACKLOG #2283). A session-wide ``SET NOCOUNT ON`` can leave the
         count at ``-1`` for a zero-match UPDATE, and ``bool(-1)`` would report a revoked session
-        as re-keyed; ``_exec_terminal`` reads its fence the same way for the same reason. Hand-rolled
-        because ``_fetchall`` commits as a READ, and this is a durable write. ``token_hash`` is
-        ``NVARCHAR(64)`` and a hex digest is exactly 64 chars, so the clustered-PK row move is
-        width-safe."""
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                await cur.execute(
-                    "UPDATE sessions SET token_hash=? OUTPUT inserted.token_hash"
-                    " WHERE token_hash=? AND revoked_at IS NULL",
-                    (new_token_hash, token_hash),
-                )
-                rows = await cur.fetchall()
-                await self._commit(conn)
-            except Exception:
-                await conn.rollback()
-                raise
+        as re-keyed; ``_exec_terminal`` reads its fence the same way for the same reason.
+        ``token_hash`` is ``NVARCHAR(64)`` and a hex digest is exactly 64 chars, so the
+        clustered-PK row move is width-safe."""
+        rows = await self._execute_output(
+            "UPDATE sessions SET token_hash=? OUTPUT inserted.token_hash"
+            " WHERE token_hash=? AND revoked_at IS NULL",
+            (new_token_hash, token_hash),
+        )
         return bool(rows)
 
     async def revoke_session(self, token_hash: str, *, now: float | None = None) -> None:
@@ -12248,14 +12260,21 @@ class SqlServerStore:
     async def revoke_user_sessions(
         self, user_id: str, *, except_token_hash: str | None = None, now: float | None = None
     ) -> int:
-        """Revoke a user's active sessions (all, or all but ``except_token_hash``). Returns the count."""
+        """Revoke a user's active sessions (all, or all but ``except_token_hash``). Returns the count.
+
+        Counted from an ``OUTPUT`` rowset, as ``rotate_session`` is (BACKLOG #2283). The count is
+        audited and returned to the API caller, and ``cursor.rowcount`` under a session-wide
+        ``SET NOCOUNT ON`` would report ``-1``. The rowset is one row per session of one user."""
         now = time.time() if now is None else now
-        sql = "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL"
+        sql = (
+            "UPDATE sessions SET revoked_at=? OUTPUT inserted.token_hash"
+            " WHERE user_id=? AND revoked_at IS NULL"
+        )
         params: list[Any] = [now, user_id]
         if except_token_hash is not None:
             sql += " AND token_hash != ?"
             params.append(except_token_hash)
-        return await self._execute(sql, tuple(params))
+        return len(await self._execute_output(sql, tuple(params)))
 
     async def enforce_session_cap(
         self,
@@ -12293,7 +12312,10 @@ class SqlServerStore:
             sql = "DELETE FROM sessions WHERE expires_at < ? OR ? - last_used_at > ?"
             params = (now, now, float(idle_seconds))
         # Through `_execute`, which owns the borrow, commit and rollback and returns the driver's
-        # count, rather than a hand-rolled copy of it (BACKLOG #2283).
+        # count, rather than a hand-rolled copy of it (BACKLOG #2283). Unlike `rotate_session` and
+        # `revoke_user_sessions` this keeps the driver's count, which a session-wide SET NOCOUNT ON
+        # can turn to -1: the reaper ignores it and decides nothing on it, and an OUTPUT rowset
+        # would carry every purged row back each pass for a number nobody acts on.
         return await self._execute(sql, params)
 
     async def stats(self) -> dict[str, int]:

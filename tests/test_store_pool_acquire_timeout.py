@@ -416,9 +416,9 @@ def test_postgres_borrows_outside_the_bounded_helper_are_pinned() -> None:
     # cluster._call_within's `pool.acquire(timeout=...)`, and the start-up DDL through its own bounded
     # acquire (BACKLOG #2523). The store's count is the positive control: the scan still finds borrows.
     # Store 36 -> 34 on 2026-10-05: `rotate_session` and `revoke_user_sessions` moved inside the
-    # helper (BACKLOG #2283). Each needs asyncpg's status tag for its rowcount, which `_execute`
-    # discards, so each borrows through `_timed_acquire(record=False)` and reads `conn.execute`. The
-    # CONNECTIONS.md note still says "at least", so this drop also leaves it true as written.
+    # helper (BACKLOG #2283). Each needs its rowcount, which is why it called `self._pool.execute`:
+    # `_execute` discarded asyncpg's status tag. `_execute` now returns the count, and both call it.
+    # The CONNECTIONS.md note still says "at least", so this drop also leaves it true as written.
     assert (len(store_sites), len(cluster_sites)) == (34, 0), (
         "the measured population of pool borrows OUTSIDE the bounded helper moved from 34 (store)"
         " + 0 (cluster), measured 2026-10-05. Re-read the CONNECTIONS.md scope note before changing"
