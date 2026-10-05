@@ -6599,7 +6599,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
     from messagefoundry.config.tls_policy import InsecureHopRefused
     from messagefoundry.secrets_dpapi import DpapiError, DpapiUnavailable
     from messagefoundry.store.base import StoreNotFoundError, build_store_cipher
-    from messagefoundry.store.crypto import StoreKeylessError
+    from messagefoundry.store.crypto import CipherError, StoreKeylessError
     from messagefoundry.store.keyprovider import KeyProviderError
 
     store_slot = _ProvisionStore()
@@ -6651,7 +6651,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
             # resolves it again, which costs a second Vault round trip. Nothing is created. A
             # server backend resolved it inside the open, before it found no store.
             build_store_cipher(settings.store)
-    except StoreKeylessError as exc:
+    except (StoreKeylessError, CipherError) as exc:
+        # CipherError: a keyed open met a row it cannot read, or one that decrypted to something
+        # that is not JSON (BACKLOG #2308). Its text names the table or key id, never the value.
         return _emit_error(f"{exc}. Nothing was written", as_json=args.json)
     except KeylessAuditChainRefused as exc:  # #1916: could not start, as the write below exits
         _emit_error(str(exc), as_json=args.json)
@@ -6947,7 +6949,7 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
         open_store,
         store_driver_errors,
     )
-    from messagefoundry.store.crypto import StoreKeylessError
+    from messagefoundry.store.crypto import CipherError, StoreKeylessError
 
     settings = _host_gated_store_settings(args)
     if isinstance(settings, int):
@@ -6982,9 +6984,10 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
                 settings.store,
                 keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
             )
-        except StoreKeylessError as exc:
+        except (StoreKeylessError, CipherError) as exc:
             # A keyed store with encrypted rows, opened from a shell without its key, refuses at
-            # open. Nothing has been read or written.
+            # open. So does a keyed open that meets a row it cannot read or that is not JSON once
+            # decrypted (BACKLOG #2308). Nothing has been read or written.
             return ("open-refused", wanted, str(exc))
         try:
             user = await store.get_user_by_username(wanted)

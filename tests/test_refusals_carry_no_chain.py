@@ -38,6 +38,7 @@ import httpx
 import pytest
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from fastapi import HTTPException
 from pydantic import ValidationError
 from starlette.requests import Request
@@ -76,7 +77,13 @@ from messagefoundry.pipeline.ingress_guards import (
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore
 from messagefoundry.store.backup_codec import MAGIC, BackupCodecError, read_header
-from messagefoundry.store.crypto import CipherError, StoreKeylessError, decrypt_json_cell
+from messagefoundry.store.crypto import (
+    CipherError,
+    StoreKeylessError,
+    decrypt_json_cell,
+    generate_key,
+    make_cipher,
+)
 from messagefoundry.store.crypto_transit import build_transit_cipher
 from messagefoundry.transports.ai_broker import AiBrokerError, ai_broker_from_settings
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
@@ -442,10 +449,12 @@ def test_malformed_transit_plaintext_stays_off_the_chain(monkeypatch: pytest.Mon
 
 
 class _StubCipher:
-    """Decrypts every cell to the planted text, which is not JSON; ``encrypted`` sets the marker test."""
+    """Decrypts every cell to the planted text, which is not JSON. ``encrypted`` sets the marker test
+    and ``encrypts`` says whether a key is configured."""
 
-    def __init__(self, *, encrypted: bool) -> None:
+    def __init__(self, *, encrypted: bool, encrypts: bool = False) -> None:
         self.encrypted = encrypted
+        self.encrypts = encrypts
 
     def decrypt(self, stored: str, *, aad: bytes | None) -> str:
         return "{" + _PLANTED
@@ -462,11 +471,58 @@ def test_a_keyless_json_cell_keeps_the_cell_off_the_chain() -> None:
     _assert_bare(caught.value)
 
 
-def test_a_malformed_plaintext_cell_still_surfaces_its_decode_error() -> None:
-    """Control: the documented contract, a legacy plaintext row's JSONDecodeError, is unchanged."""
+def test_a_malformed_legacy_cell_keeps_the_cell_off_the_chain() -> None:
+    """BACKLOG #2308. A legacy plaintext row that is not JSON still raises ``JSONDecodeError``, the
+    documented type, and is not reported as a missing key. json's own error kept the whole cell on
+    ``.doc``; the refusal keeps none of it and names the table instead."""
     cipher: Any = _StubCipher(encrypted=False)
-    with pytest.raises(json.JSONDecodeError):
-        decrypt_json_cell(cipher, "{", aad=None, table="state")
+    with pytest.raises(json.JSONDecodeError) as caught:
+        decrypt_json_cell(cipher, "{" + _PLANTED, aad=None, table="state")
+    assert str(caught.value) == (
+        "store table 'state' holds a value that is not JSON (JSONDecodeError at line 1, column 2)"
+    )
+    assert caught.value.doc == ""
+    _assert_bare(caught.value)
+
+
+def test_a_keyed_cell_that_decrypts_to_non_json_is_a_corrupt_row() -> None:
+    """BACKLOG #2308. With a key configured, a row that decrypts but is not JSON is corrupt. It was
+    told no key is configured, which sends the operator to fix the wrong thing."""
+    cipher: Any = _StubCipher(encrypted=True, encrypts=True)
+    with pytest.raises(CipherError) as caught:
+        decrypt_json_cell(cipher, "mfenc:v4:x", aad=None, table="reference")
+    message = str(caught.value)
+    assert message.startswith("store table 'reference' holds an encrypted value that decrypted")
+    assert "the row is corrupt" in message and "no store encryption key" not in message
+    _assert_bare(caught.value)
+
+
+def _seal_v1(plaintext: bytes) -> tuple[Any, str]:
+    """A real cipher, and an ``mfenc:v1`` value sealed by hand under its key, so the plaintext can be
+    bytes that are not UTF-8. ``encrypt`` takes a str, so it can never write such a value."""
+    key_b64 = generate_key()
+    cipher = make_cipher(key_b64)
+    key_id = cipher.encrypt("x").split(":")[2]  # v1 is "mfenc:v1:<key_id>:<base64>"
+    nonce = bytes(12)
+    sealed = AESGCM(base64.b64decode(key_b64)).encrypt(nonce, plaintext, None)
+    return cipher, f"mfenc:v1:{key_id}:{base64.b64encode(nonce + sealed).decode('ascii')}"
+
+
+def test_a_hand_sealed_value_opens_under_the_cipher() -> None:
+    """Control: the hand-built value is under the cipher's key, so the refusal below is the decode
+    failing and not the tag."""
+    cipher, stored = _seal_v1(_PLANTED.encode())
+    assert cipher.decrypt(stored) == _PLANTED
+
+
+def test_non_utf8_aes_plaintext_stays_off_the_chain() -> None:
+    """BACKLOG #2308. ``pt.decode`` raised a ``UnicodeDecodeError`` whose ``.object`` is the decrypted
+    plaintext, the PHI the cipher protects. The tag verified, so it is a corrupt row, not a key miss."""
+    cipher, stored = _seal_v1(_PLANTED.encode() + b"\xff")
+    with pytest.raises(CipherError) as caught:
+        cipher.decrypt(stored)
+    assert str(caught.value).startswith("decrypted value is not valid UTF-8 (key_id=")
+    _assert_bare(caught.value)
 
 
 @pytest.mark.parametrize(
