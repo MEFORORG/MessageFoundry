@@ -8,6 +8,7 @@ safe_name() derives a safe label for a partner-chosen file name, which redact() 
 from __future__ import annotations
 
 import http.client
+import logging
 import random
 import re
 import time
@@ -17,7 +18,7 @@ from typing import Any, SupportsIndex
 import pytest
 from _phi_log_capture import IDENTIFIER_SHAPED_NAMES, SAFE_NAME_SUFFIXES
 
-from messagefoundry import redaction
+from messagefoundry import logging_setup, redaction, secretscrub
 from messagefoundry.redaction import (
     clamp_untrusted,
     redact,
@@ -1882,6 +1883,154 @@ def test_a_cut_cannot_split_an_encoded_run(tail: str, head_holds_run: bool) -> N
     assert ("4455667" in clamp_untrusted(text)) is head_holds_run, "the cut did not land as named"
     for out in (redact_untrusted(text), safe_text(text, limit=100_000)):
         assert "4455667" not in out, out[-200:]
+
+
+# --- PR 2011 review finding 1: the credential stage still reads its label after an encoded run -------
+#
+# The log handler chain runs ``RedactionFilter`` first and ``CredentialScrubFilter`` after it. A run
+# that takes a whole token takes any credential label, quote or brace in that token too, and the later
+# filter then has nothing to read. Every arm here goes through the real chain in its installed order.
+
+#: A synthetic credential: lowercase-led with digits, so no name or date pass is what removes it.
+_CREDENTIAL_VALUE = "zq9hunter2z"
+#: A token the encoded run takes: two encoded separators and no literal one.
+_ENCODED_TOKEN = "x%7Cy%7Cz"
+#: Characters that glue a credential label to the run with no whitespace between. At least these;
+#: each one kept the value at 6563110bab, which is the reading the fix was measured against.
+_LABEL_GLUE = "\"',})(;{[]/.-_|:?#>!*=@+$\\"
+
+
+def _through_the_log_filter_chain(text: str) -> str:
+    """``text`` as a log message through the filters ``_install_phi_filters`` puts on every handler,
+    in their installed order."""
+    handler = logging.Handler()
+    logging_setup._install_phi_filters(handler)
+    record = logging.LogRecord("test", logging.ERROR, __file__, 1, "%s", (text,), None)
+    assert handler.filter(record)
+    return record.getMessage()
+
+
+def _assert_the_chain_drops_the_credential(text: str) -> None:
+    """The value is gone from the chain's output. THE CONTROL comes first: the credential stage alone
+    must scrub this shape, or the arm would pass on a shape nothing reads."""
+    assert _CREDENTIAL_VALUE in text
+    assert _CREDENTIAL_VALUE not in secretscrub.scrub_credentials(text), "the control does not hold"
+    out = _through_the_log_filter_chain(text)
+    assert _CREDENTIAL_VALUE not in out, out
+    assert "x%7Cy" not in out, f"the encoded run survived: {out!r}"
+
+
+@pytest.mark.parametrize("glue", list(_LABEL_GLUE))
+def test_a_credential_label_glued_to_an_encoded_run_still_loses_its_value(glue: str) -> None:
+    """The label sits in the run's token and its value in the next one."""
+    _assert_the_chain_drops_the_credential(f"{_ENCODED_TOKEN}{glue}password: {_CREDENTIAL_VALUE}")
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        *secretscrub._CREDENTIAL_WORDS,
+        *secretscrub._TOKEN_WORDS,
+        *secretscrub._KEY_MATERIAL_WORDS,
+        f"{secretscrub._ENV_PREFIX}VALUE_PW",
+        "db_password",
+        "PWD",
+    ],
+)
+def test_every_credential_label_word_survives_the_encoded_run(label: str) -> None:
+    """Read from ``secretscrub``'s own tuples, so a word added there and not to
+    ``redaction._CREDENTIAL_LABEL_WORDS`` goes red here by behaviour as well as in the gate below."""
+    _assert_the_chain_drops_the_credential(f"{_ENCODED_TOKEN},{label}: {_CREDENTIAL_VALUE}")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '{"q":"' + _ENCODED_TOKEN + '","password": "' + _CREDENTIAL_VALUE + '"}',
+        f"({_ENCODED_TOKEN})secret: {_CREDENTIAL_VALUE}",
+        f"{_ENCODED_TOKEN},password = {_CREDENTIAL_VALUE}",
+        f'{_ENCODED_TOKEN},"password" : "{_CREDENTIAL_VALUE}"',
+        f"{_ENCODED_TOKEN},Authorization: Basic {_CREDENTIAL_VALUE}",
+        f"{_ENCODED_TOKEN},Authorization:Digest {_CREDENTIAL_VALUE}",
+        f"{_ENCODED_TOKEN},Bearer {_CREDENTIAL_VALUE}",
+        f"{_ENCODED_TOKEN},password:\n  {_CREDENTIAL_VALUE}",
+        f"{_ENCODED_TOKEN}%7Cdb_password: {_CREDENTIAL_VALUE}",
+        # The label is outside the run's token, and the run takes one end of a quoted value.
+        f'password: "{_ENCODED_TOKEN} {_CREDENTIAL_VALUE} tail"',
+        f'password: "aa {_CREDENTIAL_VALUE} {_ENCODED_TOKEN}"',
+        f'password: "aa {_CREDENTIAL_VALUE} {_ENCODED_TOKEN}"tail',
+        f'password :"{_ENCODED_TOKEN} {_CREDENTIAL_VALUE} tail"',
+        # The value opens inside the run's token and closes outside it.
+        f'{_ENCODED_TOKEN},password="aa {_CREDENTIAL_VALUE} tail"',
+        f"{_ENCODED_TOKEN};PWD={{aa {_CREDENTIAL_VALUE}}}",
+        f"PWD={{{_ENCODED_TOKEN} {_CREDENTIAL_VALUE}}}",
+    ],
+    ids=[
+        "compact-json",
+        "parenthesis",
+        "spaced-equals",
+        "quoted-key-spaced-colon",
+        "basic-scheme",
+        "glued-digest-scheme",
+        "bare-bearer",
+        "value-on-next-line",
+        "prefixed-label-after-separator",
+        "quoted-value-run-first",
+        "quoted-value-run-last",
+        "quoted-value-closed-inside-token",
+        "separator-leads-the-token",
+        "quoted-value-opens-in-token",
+        "braced-value-opens-in-token",
+        "braced-value-run-first",
+    ],
+)
+def test_a_credential_span_that_crosses_an_encoded_run_is_still_scrubbed(text: str) -> None:
+    """Every way a credential match can reach across the run's token: the label, the separator, an
+    auth scheme, or one end of a quoted or braced value inside it, and the rest outside."""
+    _assert_the_chain_drops_the_credential(text)
+
+
+def test_the_label_words_the_encoded_run_keeps_cover_the_credential_vocabulary() -> None:
+    """THE DRIFT GATE. ``redaction`` is stdlib-only and cannot import ``secretscrub``, so the words
+    are duplicated literals. This holds the copy to a superset of the source."""
+    kept = set(redaction._CREDENTIAL_LABEL_WORDS)
+    for source in (
+        secretscrub._CREDENTIAL_WORDS,
+        secretscrub._TOKEN_WORDS,
+        secretscrub._KEY_MATERIAL_WORDS,
+    ):
+        assert set(source) <= kept
+    for scheme in ("bearer", "basic", "digest"):
+        assert scheme in kept and scheme in secretscrub._BEARER.pattern
+    assert secretscrub._ENV_PREFIX in redaction._ENCODED_RUN_KEPT.pattern
+
+
+@pytest.mark.parametrize(
+    ("text", "planted"),
+    [
+        # A label word inside a longer word is not a label, so nothing of the word is kept.
+        (f"name=ZQXDOE%5ECOMPASS%5EQ: {_CREDENTIAL_VALUE}", ("ZQXDOE", "PASS")),
+        # Text beside a kept label still goes, quotes or not.
+        ('{"family":"ZQXDOE%5EVANJA%5EQ","password":', ("ZQXDOE", "VANJA")),
+        ("ZQXDOE%7C4455667%7CVANJA,token=", ("ZQXDOE", "4455667", "VANJA")),
+        ("'ZQXDOE%7C4455667%7CVANJA'", ("ZQXDOE", "4455667", "VANJA")),
+    ],
+    ids=["word-inside-a-word", "json-beside-a-label", "run-before-a-label", "quoted-run"],
+)
+def test_the_encoded_run_keeps_only_marks_and_label_words(
+    text: str, planted: tuple[str, ...]
+) -> None:
+    """THE PHI ARM. What the run leaves in place is quotes, braces, punctuation and fixed label
+    words. Nothing a partner chose survives beside them."""
+    for name, out in _every_entry_point(text).items():
+        for value in planted:
+            assert value not in out, f"{name}: {out!r}"
+
+
+def test_an_encoded_run_with_no_mark_or_label_is_one_placeholder() -> None:
+    """THE CONTROL for the arm above: the ordinary run is still replaced whole."""
+    assert redact("id zqxdoe%7C4455667%7Cvanja here") == "id [redacted] here"
+    assert redact("'zqxdoe%7C4455667%7Cvanja',") == "'[redacted]',"
 
 
 # --- BACKLOG #2312: the credential backstop leaves its own output alone ------------------------------

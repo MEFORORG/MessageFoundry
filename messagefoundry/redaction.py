@@ -144,12 +144,12 @@ _HL7_FIELD_RUN = re.compile(r"(?<![^\s|^~&])[^\s|^~&]*+[|^~&][^\s|^~&]*+(?:[|^~&
 #: The body's lookahead fails on its first character everywhere but a ``%``. ``[redacted]`` holds no
 #: separator of either kind, so it never matches.
 #:
-#: Like the literal pattern it takes the whole token, so a URL holding one ``&`` and one ``%26`` loses
-#: its host too. Residuals, at least these: a single encoded separator, as with a single literal one
-#: (so FHIR's ``identifier=system%7Cvalue`` keeps its value); a label a LATER filter reads, such as the
-#: credential scrub in :mod:`messagefoundry.logging_setup`, glued to a run (``x%7Cy%7Cz;password:``),
-#: which the literal pattern shares; a double-encoded separator (``%257C``); and an encoded CUSTOM
-#: delimiter that MSH declares (:func:`_sniff_delimiters` reads only the literal header).
+#: Like the literal pattern it MATCHES the whole token, so a URL holding one ``&`` and one ``%26``
+#: loses its host too. What it writes back is :func:`_encoded_run_replacement`, which keeps the marks
+#: a later credential filter reads. Residuals, at least these: a single encoded separator, as with a
+#: single literal one (so FHIR's ``identifier=system%7Cvalue`` keeps its value); a double-encoded
+#: separator (``%257C``); and an encoded CUSTOM delimiter that MSH declares (:func:`_sniff_delimiters`
+#: reads only the literal header).
 _HL7_ENCODED_FIELD_RUN = re.compile(
     r"(?<![^\s|^~&])(?:(?!%(?:7[CcEe]|5[Ee]|26))[^\s|^~&])*+"
     r"(?:[|^~&]|%(?:7[CcEe]|5[Ee]|26))(?:(?!%(?:7[CcEe]|5[Ee]|26))[^\s|^~&])*+"
@@ -157,6 +157,93 @@ _HL7_ENCODED_FIELD_RUN = re.compile(
 )
 #: An encoded separator anywhere: the screen that keeps text without one off the pass above.
 _ENCODED_SEPARATOR = re.compile(r"%(?:7[CcEe]|5[Ee]|26)")
+
+#: The label words the credential stage reads, plus the three auth scheme words its header pattern
+#: allows between a label and its value. :mod:`messagefoundry.secretscrub` owns the vocabulary. This
+#: module is stdlib-only and cannot import it, so the words are duplicated literals, and
+#: ``tests/test_redaction.py`` holds this copy to a superset of the source.
+_CREDENTIAL_LABEL_WORDS = (
+    "encryption_keys_retired",
+    "intake_api_key_next",
+    "encryption_key",
+    "authorization",
+    "private_key",
+    "passphrase",
+    "credential",
+    "password",
+    "session",
+    "api_key",
+    "api-key",
+    "apikey",
+    "bearer",
+    "passwd",
+    "secret",
+    "digest",
+    "basic",
+    "token",
+    "pass",
+    "pwd",
+)
+
+#: What :func:`_encoded_run_replacement` leaves in place inside a token the encoded run takes.
+#:
+#: **Why anything is kept (PR 2011, review finding 1).** The log handler chain runs the credential
+#: filters AFTER this module (``logging_setup._install_phi_filters``). A token replaced whole loses
+#: every mark those filters read, and the credential beside it then passes them. Measured at
+#: 6563110bab through that chain: ``x%7Cy%7Cz,password: <value>`` kept its value under each of 26
+#: glue characters, and so did a quoted value whose first or last word was a run.
+#:
+#: **What is kept, and nothing else:**
+#:
+#: * a quote or a brace, wherever it sits, so a quoted or braced credential value that reaches across
+#:   the token still pairs as it did in the original text;
+#: * a ``:`` or ``=`` that LEADS the token, where the label is the token before it;
+#: * a credential label word (:data:`_CREDENTIAL_LABEL_WORDS`, or a ``MEFOR_`` variable name), with
+#:   the quote and separator directly after it.
+#:
+#: The label must not follow a letter or a digit, and must not run on into a word character. That is
+#: at least as wide as the credential stage's own ``\b`` and label prefix, and it keeps a word that
+#: merely CONTAINS one whole: ``COMPASS:`` is replaced, not kept as ``PASS:``. Every kept piece is a
+#: mark or a fixed word, so no text a partner chose survives beside the placeholder. One stated
+#: exception: text that IS one of these words (a value spelled ``secret``) stays as that word.
+#:
+#: **The literal run does not do this.** :data:`_HL7_FIELD_RUN` still writes one placeholder over the
+#: whole token, so a credential label glued to a pipe run loses its value's label the same way. That
+#: defect is older than this pattern and is not fixed here.
+_ENCODED_RUN_KEPT = re.compile(
+    r"""["'{}]|^[:=]"""
+    r"""|(?<![A-Za-z0-9])(?:MEFOR_[A-Z0-9_]+|(?i:"""
+    + "|".join(re.escape(word) for word in sorted(_CREDENTIAL_LABEL_WORDS, key=len, reverse=True))
+    + r"""))(?!\w)(?:["']?[:=])?"""
+)
+_WORD_CHAR = re.compile(r"\w")
+
+
+def _encoded_run_replacement(match: re.Match[str]) -> str:
+    """What replaces one :data:`_HL7_ENCODED_FIELD_RUN` match: the placeholder, around whatever
+    :data:`_ENCODED_RUN_KEPT` keeps.
+
+    A token holding none of those marks is one placeholder, as before. Otherwise each stretch between
+    two kept marks becomes a placeholder, unless it holds no word character at all: punctuation
+    carries no value, and keeping it leaves ``"[redacted]",`` readable. An encoded separator holds a
+    hex digit, so it always goes."""
+    token = match.group()
+    if _ENCODED_RUN_KEPT.search(token) is None:
+        return _REDACTED
+    parts: list[str] = []
+    pos = 0
+    for kept in _ENCODED_RUN_KEPT.finditer(token):
+        parts.append(_scrub_gap(token[pos : kept.start()]))
+        parts.append(kept.group())
+        pos = kept.end()
+    parts.append(_scrub_gap(token[pos:]))
+    return "".join(parts)
+
+
+def _scrub_gap(gap: str) -> str:
+    """The text between two kept marks: itself when it is only punctuation, else the placeholder."""
+    return gap if _WORD_CHAR.search(gap) is None else _REDACTED
+
 
 #: A **date / birthdate run** in free text: an ISO ``YYYY-MM-DD`` / US ``MM-DD-YYYY`` (``-`` or ``/``
 #: separator) or a bare HL7 8-digit ``YYYYMMDD``. A DOB is a direct identifier, and a free-text leak like
@@ -1538,7 +1625,7 @@ def redact(text: str) -> str:
     out = _redact_stages(text)
     if "%" not in out or _ENCODED_SEPARATOR.search(out) is None:
         return out
-    encoded = _HL7_ENCODED_FIELD_RUN.sub(_REDACTED, out)
+    encoded = _HL7_ENCODED_FIELD_RUN.sub(_encoded_run_replacement, out)
     return out if encoded == out else _redact_stages(encoded)
 
 
