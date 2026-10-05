@@ -311,6 +311,26 @@ def _validate_path_token(value: str, pattern: re.Pattern[str], field: str) -> st
     return value
 
 
+def _is_dot_only(segment: str) -> bool:
+    """Whether a path segment that already passed ``_FHIR_ID_RE`` is dots alone (``.``, ``..``, ``...``).
+
+    The id grammar admits all three, and percent-encoding leaves ``.`` as it is, so each would reach
+    the request path. Both id sites refuse one, each with its own exception type: a write in
+    ``FhirDestination._require_id`` and a ``fhir_lookup`` read in ``_resolve_read_url``.
+
+    ``.`` and ``..`` are RFC 3986 dot segments (section 5.2.4). The engine does not remove them: it
+    sends the path as built, and the ``[egress].allowed_http`` check compares the base URL's host
+    and port when the connection is built, so it never sees a per-call path. A proxy or server that
+    removes dot segments after the engine would read ``Patient/..`` as the base and ``Patient/.``
+    as the type, on the same allow-listed host (vault BACKLOG #1589).
+    ``tests/test_fhir_read_dot_only_id.py`` pins the engine half of that. What a given proxy or
+    server does was not measured. ``...`` is no dot segment; it is refused only because an id of
+    dots alone is never a real resource id.
+
+    True for an empty string too, so a caller checks for a missing id first."""
+    return not segment.strip(".")
+
+
 class _FhirRequest(NamedTuple):
     """What :meth:`FhirDestination._resolve_request` derives from one outgoing body.
 
@@ -804,7 +824,7 @@ class FhirDestination(DestinationConnector):
         _reject_control_chars(peek.id, "resource id")
         # Grammar-gate the message-derived id so '../$reindex'-style traversal can't redirect the write.
         _validate_path_token(peek.id, _FHIR_ID_RE, "resource id")
-        if not peek.id.strip("."):
+        if _is_dot_only(peek.id):
             # The id grammar admits '.' and '..', which a path resolver reads as this level or the
             # parent: 'Patient/..' would aim the write at the base.
             raise NegativeAckError(
@@ -1150,7 +1170,9 @@ def _resolve_read_url(
     path = type_seg
     if len(segments) == 2:
         resource_id = segments[1]
-        if not _FHIR_ID_RE.match(resource_id):
+        # The id grammar admits '.' and '..', and quote() below leaves them alone, so each would be
+        # sent as the last path segment. `_is_dot_only` says what a later hop could make of that.
+        if not _FHIR_ID_RE.match(resource_id) or _is_dot_only(resource_id):
             raise ValueError("FHIR read id is not a valid FHIR id")
         path = f"{type_seg}/{urllib.parse.quote(resource_id, safe='')}"
     url = f"{base.rstrip('/')}/{path}"
