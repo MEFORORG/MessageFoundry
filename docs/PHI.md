@@ -46,9 +46,12 @@ levels:
   `[security].enforcement = enforce`, without an effective peer control. **CORRECTED 2026-10-03:** this
   said the listener was not built.
 
-The security controls that only become material off-loopback (MFA, mTLS, certificate revocation,
-off-box logs) are **delegated to the org's environment** (IdP/AD, PKI, SIEM, network controls) and
+The security controls that only become material off-loopback (mTLS, certificate revocation,
+off-box logs) are **delegated to the org's environment** (PKI, SIEM, network controls) and
 documented per deployment — see [DEPLOYMENT.md](DEPLOYMENT.md) and [§11](#11-hardening-roadmap).
+MFA is not among them. The engine enforces its own second factor (`[security].require_mfa`, on by
+default) on any bind. Which accounts it covers, directory and OIDC sign-ins included, is stated in
+[SECURITY.md](SECURITY.md#multi-factor-authentication-totp-wp-14).
 
 | Actor / vector | In scope? | Mitigation |
 |---|---|---|

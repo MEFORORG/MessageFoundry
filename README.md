@@ -50,8 +50,9 @@ renders on GitHub and in the VS Code preview). The prose source of truth is
   The database holds runtime state and messages only, never configuration.
 - **PHI is first-class.** Authentication, RBAC, a user-attributed audit log of message
   views/replays, **encryption-at-rest** for message bodies (AES-256-GCM), **global PHI log redaction**,
-  and **transport TLS** (HTTPS/WSS for the API plus MLLP-over-TLS) are **built**; MFA and off-box log
-  shipping remain on the roadmap. See [docs/PHI.md](https://github.com/MEFORORG/MessageFoundry/blob/main/docs/PHI.md) for the full data-protection map.
+  **transport TLS** (HTTPS/WSS for the API plus MLLP-over-TLS) and a **native second factor** (TOTP
+  and passkeys, required by default through `[security].require_mfa`) are **built**; off-box log
+  shipping remains on the roadmap. See [docs/PHI.md](https://github.com/MEFORORG/MessageFoundry/blob/main/docs/PHI.md) for the full data-protection map.
 
 ## Features
 

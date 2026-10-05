@@ -58,8 +58,9 @@ operate it over a localhost HTTP API. See [ARCHITECTURE.md](ARCHITECTURE.md) for
 and who are comfortable validating a pre-1.0 tool against their own traffic before trusting it. A single
 engine node on a trusted network is the simplest pilot; **native TLS** (API + MLLP) and an opt-in
 **active-passive failover** cluster on a shared server-DB store (PostgreSQL or SQL Server) are both built when you need them (see
-§2/§6/§14). What is genuinely *not* there yet is MFA, off-box log shipping, and a de-identification
-framework — track those items (§2) and pilot the parts that are ready. (Horizontal *active-active*
+§2/§6/§14). Native MFA (TOTP and passkeys) is built and required by default (§2). What is genuinely
+*not* there yet is off-box log shipping and a de-identification framework — track those items (§2)
+and pilot the parts that are ready. (Horizontal *active-active*
 scale-out was dropped and is not a planned milestone; active-passive HA is the supported HA model.)
 
 ---
@@ -102,7 +103,7 @@ use the table below alongside them when planning.
 
 **The early-adopter bargain, stated plainly:** you get a durable engine with native TLS, real auth,
 opt-in active-passive failover, and a real validation toolchain, in exchange for validating capacity on
-your own hardware and supplying the operational pieces that aren't built yet (MFA, off-box logs,
+your own hardware and supplying the operational pieces that aren't built yet (off-box logs,
 de-identification). If that trade is acceptable, the rest of this guide is your playbook.
 
 ---
@@ -413,8 +414,8 @@ Guidance for a clean first flow:
 
 Full references: **[SECURITY.md](SECURITY.md)**, **[PHI.md](PHI.md)**, and **[DEPLOYMENT.md](DEPLOYMENT.md)**
 (network exposure). MEFOR ships real auth, RBAC, audit, opt-in at-rest encryption, and **native TLS**
-(API + MLLP, with a fail-closed off-loopback bind guard); the remaining transport gaps are **MFA** and
-**off-box log shipping**. Complete this checklist **before any real PHI flows**:
+(API + MLLP, with a fail-closed off-loopback bind guard). Its native second factor is on by default.
+The remaining transport gap is **off-box log shipping**. Complete this checklist **before any real PHI flows**:
 
 - [ ] **API off-loopback requires native TLS.** The API binds `127.0.0.1` by default. To reach it from
       another host, configure **in-process TLS** (`[api].tls_cert_file` + `[api].tls_key_file`,

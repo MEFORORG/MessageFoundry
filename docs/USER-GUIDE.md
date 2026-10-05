@@ -518,7 +518,7 @@ https://127.0.0.1:8765/ui
 
 When the engine requires authentication (the default), a **Sign in** form appears first:
 
-1. Enter your **username** and **password**, and pick a **Provider** — *Local* always; *Active Directory* appears only if the engine advertises AD.
+1. Enter your **username** and **password**. The optional **Authenticator code** box lets you give your TOTP code in the same step instead of in step 2. The form signs in local accounts only. An Active Directory account has no password sign-in here: use **Sign in with Windows (SSO)** or **Sign in with your organization** instead. Each link shows only when the engine has that route available, and the second works once an administrator has linked your account.
 2. If your account uses **two-factor (TOTP)**, you are prompted for the 6-digit code from your authenticator app (or a single-use recovery code) before you land on a page. An account with a **passkey** enrolled gets a *Use passkey* button here instead ([ADR 0068](adr/0068-browser-webauthn-passkeys-offloopback.md); it needs the `[webauthn]` extra and a configured `public_origin`, and says so plainly when either is missing).
 3. On a forced password change, the console chains a change-password step (local accounts only — AD passwords are changed in Active Directory).
 

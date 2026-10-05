@@ -123,8 +123,11 @@ reported here: `MEFOR_ALLOW_INSECURE_TLS` (the `enforcement = warn` entry names 
 > enumerated deviations above, except `update_url_form` (its entry says which records it has). It is
 > **not yet** an exhaustive register of every security-relevant
 > switch in every section: `[store].encrypt` / `trust_server_certificate` and
-> `[auth].enabled` / `require_mfa` / `ad_tls_verify` /
-> `oidc_require_mfa_claim` are gated by their own serve-time refusals and are **not** reported here.
+> `[auth].enabled` / `ad_tls_verify` are gated by their own serve-time refusals and are **not**
+> reported here. `[auth].oidc_require_mfa_claim` is not reported either, and it has no serve-time
+> refusal of its own. Turned off, it mints every OIDC session with no factor met. While
+> `[security].require_mfa` is on, that session then owes an engine factor at the access gate.
+> `require_mfa` itself is reported: see its entry below.
 > That gap is enumerated in the floor test's exemption set, so it is a written decision rather than an
 > accident, and a *new* switch in either section cannot join it silently. Closing it is owed work.
 
