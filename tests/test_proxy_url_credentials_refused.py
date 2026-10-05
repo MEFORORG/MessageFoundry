@@ -159,6 +159,9 @@ class _WireProxy:
         return self
 
     def __exit__(self, *exc: object) -> None:
+        # shutdown wakes a blocked accept() on Linux, where close() alone does not.
+        with contextlib.suppress(OSError):
+            self._listener.shutdown(socket.SHUT_RDWR)
         self._listener.close()
         self._thread.join(timeout=10)
 
@@ -367,6 +370,9 @@ def test_a_system_proxy_with_credentials_is_refused(
         pytest.param(f"http://{_USER}:pa55%2Fw0rd@{_PROXY_HOST}", id="percent-encoded-password"),
         pytest.param(f"http://{_USER}:pa55/w0rd@{_PROXY_HOST}", id="slash-in-the-password"),
         pytest.param(f"socks5://{_CRED}@{_PROXY_HOST}", id="another-scheme"),
+        # urllib takes the LAST "@" as the end of the userinfo, so this dials the marker host and
+        # sends it a header. A reader that split at the first "/" would see 127.0.0.1 and none.
+        pytest.param(f"http://127.0.0.1:3128/x@{_PROXY_HOST}", id="at-sign-after-a-path"),
         # urllib cannot parse these two, and its own error quotes the value.
         pytest.param(f"http:/{_CRED}@{_PROXY_HOST}", id="unreadable-one-slash"),
         pytest.param(f"https:/{_CRED}@{_PROXY_HOST}", id="unreadable-written-https"),
@@ -393,6 +399,21 @@ def test_control_a_proxy_value_that_sends_no_credential_is_used(recorded: None, 
         dialled = _dial(opener, target)
         assert dialled.host == _PROXY_HOST
         assert dialled.proxy_header is None
+
+
+def test_control_without_the_check_an_at_sign_after_a_path_moves_the_proxy_host(
+    recorded: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mutation control for the ``at-sign-after-a-path`` shape above: with the reading undone,
+    urllib dials the host after the ``@`` and sends it a credential header. The check reads the
+    value with urllib's own parser, so it judges the proxy urllib would dial."""
+    monkeypatch.setattr(
+        bounded_read, "_sends_cleartext_proxy_credentials", lambda req, proxy: False
+    )
+    value = f"http://127.0.0.1:3128/x@{_PROXY_HOST}"
+    dialled = _dial(build_strict_opener(urllib.request.ProxyHandler({"http": value})), _HTTP_TARGET)
+    assert dialled.host == _PROXY_HOST
+    assert dialled.proxy_header is not None
 
 
 def test_control_an_unreadable_proxy_value_with_no_credentials_is_left_to_urllib(
@@ -482,7 +503,8 @@ def _assert_send_is_refused(dest: RestDestination) -> None:
 
 
 def test_a_rest_send_through_an_explicit_credentialed_proxy_url_is_refused(recorded: None) -> None:
-    """No ``proxy_user`` is set, so the posture-keyed ``proxy_user`` guard never ran."""
+    """No ``proxy_user`` is set, so the posture-keyed ``proxy_user`` guard never ran. The
+    connection builds, and each send is refused."""
     _assert_send_is_refused(_rest(proxy_url=_CREDENTIALED))
 
 

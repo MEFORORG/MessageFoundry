@@ -728,13 +728,11 @@ class LoopbackDirectProxyHandler(urllib.request.ProxyHandler):
     :func:`build_strict_opener` puts this on every opener it builds, in place of the stock class.
 
     **It also refuses a proxy whose URL carries credentials and is not written** ``https://``
-    (vault BACKLOG #2572). urllib turns a user and password in the proxy URL into a
-    ``Proxy-Authorization: Basic`` header, and to such a proxy that header crosses the network in
-    cleartext. :class:`ProxyCredentialsRefusedError` says what is refused and when. The check is
-    made here, per request, because this method sees the proxy from every source: the environment,
-    the system settings, and a ``proxy_url`` an operator configured. It is not made when the
-    handler is built. Shared openers are built at import, and a refusal there would stop the engine
-    starting over a proxy that many of its hops never use.
+    (vault BACKLOG #2572). :class:`ProxyCredentialsRefusedError` says what is refused and what is
+    not. The check is made here, per request, because this method sees the proxy from every source:
+    the environment, the system settings, and a ``proxy_url`` an operator configured. It is not
+    made when the handler is built. Shared openers are built at import, and a refusal there would
+    stop the engine starting over a proxy that many of its hops never use.
     """
 
     def proxy_open(self, req: urllib.request.Request, proxy: str, type: str) -> Any:  # noqa: A002
@@ -750,8 +748,8 @@ class LoopbackDirectProxyHandler(urllib.request.ProxyHandler):
 
 
 #: The fixed text of the proxy-credential refusal. It names no part of the proxy URL, because the
-#: part it is about is a password. It does not suggest an ``https://`` proxy either: that spelling
-#: is not refused, but urllib opens no TLS session to a proxy before it sends ``CONNECT``.
+#: part it is about is a password. It does not suggest an ``https://`` proxy either, for the reason
+#: :class:`ProxyCredentialsRefusedError` gives.
 _CLEARTEXT_PROXY_CREDENTIALS = (
     "the web proxy for this request carries credentials in its URL and is not an https:// proxy, "
     "or its URL cannot be read. Those credentials would cross to the proxy in cleartext. Take the "
@@ -762,12 +760,16 @@ _CLEARTEXT_PROXY_CREDENTIALS = (
 class ProxyCredentialsRefusedError(urllib.error.URLError):
     """A request would send credentials from its proxy's URL to that proxy in cleartext.
 
-    Refused by :class:`LoopbackDirectProxyHandler`, on every opener :func:`build_strict_opener`
-    makes, under every ``[security].enforcement`` setting. The proxy may come from ``HTTP_PROXY``
-    or ``HTTPS_PROXY``, from the system proxy settings, or from a connection's ``proxy_url``. The
-    opener holds no posture and no connection, and a proxy from the environment has no acceptance
-    field, so there is nothing to key an exception on. The Vault hop's twin is
-    ``strict_requests._refuse_cleartext_proxy_credentials`` (BACKLOG #2547).
+    urllib turns a user and a password in a proxy URL into a ``Proxy-Authorization: Basic``
+    header. Refused by :class:`LoopbackDirectProxyHandler`, on every opener
+    :func:`build_strict_opener` makes, under every ``[security].enforcement`` setting. The proxy
+    may come from ``HTTP_PROXY`` or ``HTTPS_PROXY``, from the system proxy settings, or from a
+    connection's ``proxy_url``. The opener holds no posture and no connection, and a proxy from
+    the environment has no acceptance field. So this refusal has no acceptance and no exception
+    for a proxy on a loopback address, like the Vault hop's twin,
+    ``strict_requests._refuse_cleartext_proxy_credentials`` (BACKLOG #2547). Nothing refuses a
+    connection's own ``proxy_url`` when the connection is built: such a connection builds, and
+    each send is refused.
 
     **Refused:** a proxy URL holding a user and a password, unless it is written ``https://``. A
     value with no scheme counts as not ``https://``. So does a value urllib cannot parse, when it
@@ -782,11 +784,13 @@ class ProxyCredentialsRefusedError(urllib.error.URLError):
     ``https`` target it opens plain TCP and sends ``CONNECT`` with the credential header before
     any TLS. ``tests/test_proxy_url_credentials_refused.py`` measures both on the wire.
 
-    A :class:`urllib.error.URLError`, on purpose. Every urllib hop the engine has already maps
-    that class to its own error for a request that could not be sent: a retryable
-    :class:`~messagefoundry.transports.base.DeliveryError` on a delivery, and the hop's own error
-    elsewhere. So the refusal needs no new ``except`` arm, and a message waits in the queue while
-    an operator corrects the proxy setting. ``reason`` is fixed text and never echoes the URL.
+    A :class:`urllib.error.URLError`, on purpose. It is the class urllib raises for a request it
+    could not send, so each hop treats this refusal as it treats that. At least the REST, SOAP,
+    FHIR and DICOMweb sends, ``fhir_lookup``, the token endpoints and the AI broker map it to
+    their own error; on a delivery that is a retryable
+    :class:`~messagefoundry.transports.base.DeliveryError`, so the message is retried under the
+    connection's policy and dead-lettered when that runs out. At least the alert webhook and the
+    OIDC key fetch let it through as it is. ``reason`` is fixed text and never echoes the URL.
     """
 
 
