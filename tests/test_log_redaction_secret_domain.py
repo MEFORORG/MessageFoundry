@@ -2087,6 +2087,14 @@ SWALLOW_EXAMPLES: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
         ("pw-Sw_G-67", "pw-Sw_H-68", "pw-Sw_I-69"),
         ("pwd=", "password="),
     ),
+    (
+        # _AUTH_SCHEME's value class carries the stop too. The bearer token is TWO characters on
+        # purpose: asked of the stopped run "q7:" instead of the lookahead, the four-character floor
+        # would fail, the scheme would not match, and "q7" would print.
+        'retrying with Bearer q7:password="pw-Au_B-72 pw-Au_C-73" now',
+        ("q7", "pw-Au_B-72", "pw-Au_C-73"),
+        ("password=",),
+    ),
 )
 
 #: The generated family: a first label from every family, each separator the finding named, then a
@@ -2103,7 +2111,8 @@ _SWALLOW_FIRST_LABELS = (
     "encryption_keys_retired",
     "MEFOR_STORE_PW",
 )
-_SWALLOW_SEPARATORS = (";", "&", ",", ":", "=", "|", ".")
+#: The separators the finding named, plus "-" and "_", the two that pin the residual's other forms.
+_SWALLOW_SEPARATORS = (";", "&", ",", ":", "=", "|", ".", "-", "_")
 _SWALLOW_SECOND_LABELS = (
     "password",
     "ad_bind_password",
@@ -2156,14 +2165,16 @@ _LABEL_FAMILY = {
 
 
 def _is_known_residual(first: str, sep: str, second: str) -> bool:
-    """The one family shape the stop leaves open, stated in ``secretscrub``'s RESIDUALS: a second
-    label of the SAME family whose keyword carries an underscored prefix, after a "." that is not a
-    hard separator. The stop lands on the keyword, and the pass cannot resume after "_"."""
-    return (
-        sep == "."
-        and second in ("ad_bind_password", "bearer_token")
-        and _LABEL_FAMILY[first] == _LABEL_FAMILY[second]
-    )
+    """The family shapes the stop leaves open, stated in ``secretscrub``'s RESIDUALS.
+
+    * A second label of the SAME family glued on by "_", or whose keyword carries an underscored
+      prefix after "." or "-". The stop lands on the keyword, and the pass cannot resume after "_".
+    * A ``MEFOR_`` name glued on by "_", of any family. ``_MEFOR_SECRET`` needs a ``\\b`` there, so
+      no pattern reads it as a label at all, then or now."""
+    same = _LABEL_FAMILY[first] == _LABEL_FAMILY[second]
+    if sep == "_":
+        return same or second.startswith("MEFOR_")
+    return sep in ".-" and same and second in ("ad_bind_password", "bearer_token")
 
 
 #: Every surface the stop protects: the write-time pass, the handler filter that calls it, and the
@@ -2178,7 +2189,7 @@ _SWALLOW_SURFACES: tuple[tuple[str, Callable[[str], str]], ...] = (
 @pytest.mark.parametrize(
     "example",
     SWALLOW_EXAMPLES,
-    ids=("token-then-password", "session-then-key", "pwd-then-password"),
+    ids=("token-then-password", "session-then-key", "pwd-then-password", "bearer-then-password"),
 )
 def test_a_plain_value_does_not_swallow_a_later_quoted_label(
     example: tuple[str, tuple[str, ...], tuple[str, ...]],
@@ -2198,7 +2209,7 @@ def test_no_two_label_line_prints_either_value() -> None:
     residual shape, and that one must still print. TWO-SIDED, so the residual can neither grow nor be
     closed without this test being edited to say so."""
     cases = _swallow_family_cases()
-    assert len(cases) == 9 * 7 * 9 * 2
+    assert len(cases) == 9 * 9 * 9 * 2
     residual = {
         line for first, sep, second, line in cases if _is_known_residual(first, sep, second)
     }
@@ -2323,6 +2334,19 @@ _REVIEW_SHAPES = (
     "private_key={vq1}vq2",
     "MEFOR_X={vq1 password='vq2} vq3'",
     'token=vq1-vq2_vq3-vq4_password="vq5"',
+    # Round two: an auth scheme between ":" or "=" and the later quote.
+    "token='vq1 (truncated) authorization: Bearer 'vq2 vq3'",
+    "MEFOR_VALUE_PW='vq1 Authorization: Basic 'vq2 vq3'",
+    "session='vq1 api_key=Bearer 'vq2 vq3'",
+    "token='vq1 Bearer 'vq20000 vq3'",
+    # Round two: a consumed closer that a later pass needed as its own closer or as a terminator.
+    "password='vq1 vq2 token='vq3'",
+    "password='vq1, token='vq2', client_secret='vq3'",
+    'secret="vq1 vq2 session="vq3 vq4"',
+    "password='vq1 vq2 MEFOR_X='vq3 vq4'",
+    'pwd=vq1|token="vq2"|secret={vq3 vq4}',
+    "pwd=vq1/session='vq2'/private_key={vq3 vq4}",
+    "Bearer vq1/token='vq2'/secret=vq3 vq4",
 )
 
 #: The alphabet the seeded fuzz builds lines from: labels of every family, separators, both quotes,
@@ -2348,7 +2372,58 @@ def _fuzz_lines(count: int) -> list[str]:
     return lines
 
 
+#: The units the structured corpus joins: a label, an assignment, a value. A random-piece corpus
+#: almost never assembles a whole ``label=value`` unit, so a review found it blind to every leak it
+#: was asked to look for; this one is built from units.
+_UNIT_LABELS = (
+    *("password", "pwd", "secret", "client_secret", "ad_bind_password", "token", "api_key"),
+    *("session", "authorization", "bearer_token", "private_key", "encryption_key"),
+    *("encryption_keys_retired", "MEFOR_A", "MEFOR_B_PW", "x_password", "Bearer"),
+)
+_UNIT_ASSIGNMENTS = ("=", ": ", " = ", "'=", "=Bearer ", ": Bearer ", "=Basic ")
+_UNIT_SEPARATORS = (";", "&", ",", "|", "/", " ", ".", "=", ":", "-", "_", ", ", "; ")
+
+
+def _structured_lines(count: int) -> list[str]:
+    """``count`` lines of one to four ``label``, assignment, value units, seeded."""
+    rng = random.Random(9)
+    lines = []
+    for _ in range(count):
+        parts = []
+        for n in range(0, 2 * rng.randint(1, 4), 2):
+            a, b = f"vq{n}", f"vq{n + 1}"
+            value = rng.choice(
+                (a, f"{a}-{b}_x", f"'{a} {b}'", f'"{a} {b}"', "{" + f"{a} {b}" + "}")
+                + (f"'{a} {b}", f'"{a}', f"{a},{b}", f"'{a}'", f"{a}={b}", "{" + a + "}" + b)
+                + (f"{a}_{b}",)
+            )
+            label = rng.choice(_UNIT_LABELS)
+            assign = " " if label == "Bearer" else rng.choice(_UNIT_ASSIGNMENTS)
+            parts.append(f"{label}{assign}{value}")
+            parts.append(rng.choice(_UNIT_SEPARATORS))
+        lines.append("".join(parts[:-1]))
+    return lines
+
+
 _ATOM = re.compile(r"vq\d+(?!\d)")
+
+#: Every keyword a label can end in, in either copy's spelling.
+_ANY_KEYWORD = (
+    r"(?i:passphrase|password|passwd|pass|pwd|secret|credential|authorization|bearer|token"
+    r"|session|api[_-]?key|encryption_keys_retired|encryption_key|private_key|intake_api_key_next)"
+)
+
+
+def _printed_as_label_prefix(atom: str, line: str, out: str) -> bool:
+    """Whether ``atom`` prints only as the underscored prefix of a later label, after a hard
+    separator: the one deliberate trade ``secretscrub``'s RESIDUALS names. Both halves are checked,
+    the hard separator in the input and the label shape in the output, so an atom printed after "."
+    or "-" is not excused."""
+    run = re.escape(atom) + r"(?:_[A-Za-z0-9]+)*_" + _ANY_KEYWORD + r"\b['\"]?\s*[:=]"
+    return (
+        re.search(r"(?<![A-Za-z0-9._\-])" + run, line) is not None
+        and re.search(run, out) is not None
+    )
 
 
 def _secret_passes_only(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2368,7 +2443,7 @@ def _newly_printed_atoms(
 
     ``shipped_patterns`` lets a control swap a mutated pattern set in for the real one."""
     _secret_passes_only(monkeypatch)
-    corpus = [*_REVIEW_SHAPES, *_fuzz_lines(4000)]
+    corpus = [*_REVIEW_SHAPES, *_fuzz_lines(4000), *_structured_lines(4000)]
     surfaces = (("scrub_credentials", scrub_credentials), ("redact_log_line", redact_log_line))
 
     def outputs(patterns: dict[ModuleType, dict[str, re.Pattern[str]]]) -> dict[str, list[str]]:
@@ -2386,7 +2461,11 @@ def _newly_printed_atoms(
             for atom in set(_ATOM.findall(line)):
                 printed_before = re.search(re.escape(atom) + r"(?!\d)", before) is not None
                 printed_after = re.search(re.escape(atom) + r"(?!\d)", after) is not None
-                if printed_after and not printed_before:
+                if (
+                    printed_after
+                    and not printed_before
+                    and not _printed_as_label_prefix(atom, line, after)
+                ):
                     newly.append(f"{surface}: {atom} in {line!r} -> {after!r}")
                 hidden_now += printed_before and not printed_after
     return newly, hidden_now
@@ -2402,9 +2481,16 @@ def _shipped() -> dict[ModuleType, dict[str, re.Pattern[str]]]:
 def test_the_change_prints_no_value_the_pre_change_patterns_hid(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Over the review shapes and 4,000 seeded fuzz lines, on both surfaces: no value atom the old
-    patterns hid may print now. The reverse count must be above zero, or the two sides never
-    differed and the comparison proved nothing."""
+    """Over the review shapes, 4,000 random-piece lines and 4,000 structured lines, on both surfaces:
+    no value atom the old patterns hid may print now, except as the underscored label prefix the
+    RESIDUALS comment names. The reverse count must be above zero, or the two sides never differed
+    and the comparison proved nothing.
+
+    NOT A PROOF OVER ALL TEXT, and the gap is measured rather than assumed. Over 120,000 structured
+    lines on three other seeds, three lines printed an atom the old patterns hid for another reason:
+    a cascade in which a stray quote, or another label's value, used to cut a later pass short. Each
+    of the three also hides a value the old output printed. Six passes over rewritten text cannot
+    rule that class out; one scan that ends each value at the next label could."""
     newly, hidden_now = _newly_printed_atoms(monkeypatch, _shipped())
     assert not newly, f"{len(newly)} value atoms newly printed, first: {newly[:3]}"
     assert hidden_now > 0, "the new patterns hid nothing the old printed, so nothing was compared"
