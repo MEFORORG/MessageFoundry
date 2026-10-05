@@ -8829,7 +8829,7 @@ class MessageStore:
             )
             enc_detail = (
                 self._enc(
-                    safe_text(detail)[:200],
+                    safe_text(detail, limit=200),  # whole: a slice cuts its note (#1797)
                     aad=cell_aad("response", "detail", message_id, dest, seq),
                 )
                 if detail
@@ -10395,7 +10395,7 @@ class MessageStore:
         # autoincrement, unknown here, so cell_aad can't use it (ASVS 11.3.3).
         reason_enc = (
             self._enc(
-                safe_text(reason)[:200],
+                safe_text(reason, limit=200),  # whole: a slice cuts its note (#1797)
                 aad=cell_aad("connection_event", "reason", connection, now, kind),
             )
             if reason
@@ -10495,7 +10495,7 @@ class MessageStore:
         # both the INSERT and the re-fire UPDATE that never sees the autoincrement id (ASVS 11.3.3).
         reason_enc = (
             self._enc(
-                safe_text(reason)[:200],
+                safe_text(reason, limit=200),  # whole: a slice cuts its note (#1797)
                 aad=cell_aad("alert_instance", "reason", event_type, connection),
             )
             if reason
