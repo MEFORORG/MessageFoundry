@@ -2705,6 +2705,11 @@ def test_the_twelfth_sweep_probes_mfa_and_the_first_factor_order(
         and any(_is_the_claim(a) for a in ast.walk(n.test))
         and any(isinstance(r, ast.Raise) for s in n.body for r in ast.walk(s))
     ]
+    # The off-value scan below walks these, so it must have something to walk.
+    assert len(refusing) >= 1, (
+        f"no `if` in {sorted(trees)} tests {claim} and raises, so the scan for a refusal of the "
+        "off value reads nothing; re-derive it."
+    )
     assert any(name.endswith("config/settings.py") for name, _ in refusing), (
         f"the settings check that refuses {claim} = true with nothing to match is gone"
     )
@@ -2773,11 +2778,17 @@ def test_the_twelfth_sweep_user_guide_offers_no_provider_choice() -> None:
     guide = _doc("docs/USER-GUIDE.md")
     start = guide.index("### Opening and signing in to the console")
     signing_in = guide[start : guide.index("\n### ", start + 1)]
+    # The section must still hold steps to read, or the scan below clears a heading and no more.
+    steps = _clauses(signing_in)
+    assert len(steps) >= 8, (
+        f"docs/USER-GUIDE.md's sign-in section cut into {len(steps)} clause(s), floor 8: the "
+        "provider-choice scan reads too little to clear it."
+    )
     # A choice on the form, worded with or without the word "provider": a choosing word, or the
     # old "appears", beside a provider or one of the two provider names.
     chooser = [
         c
-        for c in _clauses(signing_in)
+        for c in steps
         if re.search(r"(?i:\bproviders?\b)|\bActive Directory\b|\bAD\b|\bLocal\b", c)
         and re.search(r"\b(pick|choose|select|selector|dropdown|appears)\b", c, re.IGNORECASE)
     ]
@@ -2819,11 +2830,12 @@ def test_the_twelfth_sweep_remote_console_sends_a_covered_account_to_totp_first(
 
 def test_the_twelfth_sweep_phi_does_not_delegate_mfa() -> None:
     """docs/PHI.md listed MFA among controls "delegated to the org's environment (IdP/AD, ...)"."""
-    delegated = [
-        c
-        for c in _clauses(_doc("docs/PHI.md"))
-        if re.search(r"\bMFA\b", c) and re.search(r"\bdelegated\b", c)
-    ]
+    clauses = _clauses(_doc("docs/PHI.md"))
+    assert len(clauses) >= 1000, (
+        f"docs/PHI.md cut into {len(clauses)} clause(s), floor 1000: the MFA scan reads too little "
+        "to clear it."
+    )
+    delegated = [c for c in clauses if re.search(r"\bMFA\b", c) and re.search(r"\bdelegated\b", c)]
     assert not delegated, (
         f"docs/PHI.md delegates MFA to the org's environment again: {delegated}. The engine's own "
         "factor gates local and directory accounts while require_mfa is on (BACKLOG #1133)."
@@ -2857,6 +2869,10 @@ def test_the_twelfth_sweep_loosening_note_gives_the_claim_gate_no_refusal() -> N
     refusal, and listed `require_mfa` among the switches the registry does not report. No serve gate
     reads the first, and the registry reports the second (the probe above)."""
     clauses = _clauses(_doc("docs/SECURITY-LOOSENING.md"))
+    assert len(clauses) >= 500, (
+        f"docs/SECURITY-LOOSENING.md cut into {len(clauses)} clause(s), floor 500: the require_mfa "
+        "scan reads too little to clear it."
+    )
     unreported = [c for c in clauses if "not reported" in c and "`require_mfa`" in c]
     assert not unreported, (
         f"docs/SECURITY-LOOSENING.md says require_mfa is not reported again: {unreported}. "
@@ -2920,13 +2936,22 @@ def test_the_twelfth_sweep_second_round_probes_what_is_built() -> None:
         )
         == settings_module.KEYLESS_REFUSED_BY_NO_OPT_OUT
     ), "a keyless store opens by default now; the guide says encryption is required by default."
-    # 4. Raw TCP and X12 take no TLS setting, so they are the remaining transport gap.
-    for factory in (Tcp, X12):
-        tls = [p for p in inspect.signature(factory).parameters if "tls" in p.lower()]
-        assert not tls, (
-            f"{factory.__name__}() takes {tls} now; the guide names raw TCP and X12 as the "
-            "remaining transport gap."
-        )
+    # 4. Raw TCP and X12 take no TLS setting, so they are the remaining transport gap. Both
+    #    signatures are read into one list, floored above what either holds alone today, so a
+    #    factory cut down to ``**settings`` cannot pass by showing no names to scan.
+    parameters = [
+        (factory.__name__, name)
+        for factory in (Tcp, X12)
+        for name in inspect.signature(factory).parameters
+    ]
+    assert len(parameters) >= 30, (
+        f"Tcp() and X12() show {len(parameters)} parameter(s) between them, floor 30: the TLS scan "
+        "reads too little to clear them."
+    )
+    tls = [f"{factory}({name})" for factory, name in parameters if "tls" in name.lower()]
+    assert not tls, (
+        f"{tls} are TLS settings now; the guide names raw TCP and X12 as the remaining transport gap."
+    )
     # 5. `[auth].enabled`, and the `[security].require_sign_in` it had moved to, are removed keys,
     #    refused at load: no config turns sign-in off.
     for key in (("auth", "enabled"), ("security", "require_sign_in")):
@@ -2942,6 +2967,10 @@ def test_the_twelfth_sweep_guide_names_the_real_transport_gap_and_encryption_def
     `require_encryption` to get the keyless refusal (a keyless store is refused by default), and
     said auth can be disabled (`serve` always requires sign-in)."""
     clauses = _clauses(_doc("docs/EARLY-ADOPTER-GUIDE.md"))
+    assert len(clauses) >= 300, (
+        f"docs/EARLY-ADOPTER-GUIDE.md cut into {len(clauses)} clause(s), floor 300: the opt-in and "
+        "auth-disabled scans read too little to clear it."
+    )
     gap = [c for c in clauses if re.search(r"\bremaining transport gaps?\b", c, re.IGNORECASE)]
     assert gap and all("raw TCP and X12" in c for c in gap), (
         f"the guide's remaining-transport-gap sentence must name raw TCP and X12: {gap}"
@@ -2968,9 +2997,14 @@ def test_the_twelfth_sweep_phi_does_not_delegate_built_controls() -> None:
     """docs/PHI.md said mTLS, certificate revocation and off-box logs are "delegated to the org's
     environment", and its threat table said to delegate off-box log shipping to the SIEM. The engine
     builds each; the org supplies the PKI and the SIEM."""
+    clauses = _clauses(_doc("docs/PHI.md"))
+    assert len(clauses) >= 1000, (
+        f"docs/PHI.md cut into {len(clauses)} clause(s), floor 1000: the built-controls scan reads "
+        "too little to clear it."
+    )
     delegated = [
         c
-        for c in _clauses(_doc("docs/PHI.md"))
+        for c in clauses
         if re.search(r"\bdelegat", c, re.IGNORECASE) and re.search(r"mTLS|off-box log", c)
     ]
     assert not delegated, f"docs/PHI.md delegates built controls again: {delegated}"
@@ -2979,9 +3013,10 @@ def test_the_twelfth_sweep_phi_does_not_delegate_built_controls() -> None:
 def test_the_twelfth_sweep_loosening_note_does_not_gate_a_removed_key() -> None:
     """docs/SECURITY-LOOSENING.md listed `[auth].enabled` among switches gated by their own
     serve-time refusals. The key is gone: it is refused at load (the probe above)."""
-    gated = [
-        c
-        for c in _clauses(_doc("docs/SECURITY-LOOSENING.md"))
-        if "`[auth].enabled`" in c and "serve-time refusal" in c
-    ]
+    clauses = _clauses(_doc("docs/SECURITY-LOOSENING.md"))
+    assert len(clauses) >= 500, (
+        f"docs/SECURITY-LOOSENING.md cut into {len(clauses)} clause(s), floor 500: the removed-key "
+        "scan reads too little to clear it."
+    )
+    gated = [c for c in clauses if "`[auth].enabled`" in c and "serve-time refusal" in c]
     assert not gated, f"docs/SECURITY-LOOSENING.md gates the removed [auth].enabled again: {gated}"
