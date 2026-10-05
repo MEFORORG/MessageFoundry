@@ -1173,8 +1173,10 @@ jobs:
       # HAND THE PYPI FILES TO THE PUBLISH-ONLY JOB (vault BACKLOG #2631, limb 1; the header says
       # why the publish has its own job). Their SHA-256 digests leave as a job output, so the
       # publish job can prove what it downloaded is byte for byte what this job gated.
-      # Unconditional, so a dispatch dry-run exercises the hand-over too. Kept 30 days, so an
-      # approval on the `pypi` environment, or a late re-run, still finds the files. An artifact
+      # Unconditional, so a dispatch dry-run exercises the upload half of the hand-over; no dispatch
+      # runs a publish job, so the download and the check first run on a real tag. Kept 30 days on
+      # a tag, so an approval on the `pypi` environment, or a late re-run, still finds the files, and
+      # 1 day on a dispatch, where nothing downloads them. An artifact
       # of ONE directory is rooted at that directory, so its publish job downloads it back into it.
       - name: Record the digests of the files PyPI will receive
         id: pypi-digests
@@ -1193,7 +1195,7 @@ jobs:
             dist-pub/
             toolkit-dist/
           if-no-files-found: error
-          retention-days: 30
+          retention-days: ${{ github.event_name == 'push' && 30 || 1 }}
 
   # PUBLISH THE ENGINE AND THE TOOLKIT TO PYPI, FROM A JOB THAT ONLY PUBLISHES (vault BACKLOG #2631,
   # limb 1). The header says why the publish is split from the build.
@@ -1312,8 +1314,8 @@ jobs:
 
       - name: Build the console wheel (wheel-only — the package tree is force-included from the repo root)
         run: |
-          # Hash-pinned like every other build job on this path: this workflow's jobs hold contents/id-token
-          # write and publish the release artifacts, so an unpinned resolve takes whatever PyPI serves at
+          # Hash-pinned like every other build job on this path: this workflow's jobs hold write scopes
+          # and build what is published, so an unpinned resolve takes whatever PyPI serves at
           # tag time (Scorecard PinnedDependenciesID, ADR 0034 §3). `build` and its transitives come from
           # ci/locks/release-tools.lock -- see the engine build step above for why there is no pip
           # bootstrap. Guarded by tests/test_ci_venv_pinning.py.
@@ -1589,8 +1591,13 @@ jobs:
       # CREATE-OR-UPDATE, and it must CREATE — unlike release-harness, this job has no `needs: release`,
       # so on a `webconsole-v*` tag NO engine job has run and NO GitHub release exists. A bare
       # `gh release upload` (what the harness can safely use, because `needs: release` guarantees the
-      # release) would fail with "release not found" on every console tag, killing the job BEFORE the
-      # publish step below — i.e. the one job whose purpose is to claim the PyPI name could never claim it.
+      # release) would fail with "release not found" on every console tag, killing the job, and with it
+      # publish-pypi-webconsole, which needs it — i.e. the PyPI name could never be claimed.
+      #
+      # UNLIKE THE ENGINE, THIS RELEASE IS PUBLIC BEFORE THE `pypi` APPROVAL IS ASKED FOR. The publish
+      # runs in publish-pypi-webconsole after this job ends, so a refused approval leaves a published
+      # console release with no PyPI upload. It is the same order the console had before the split
+      # (vault BACKLOG #2631, limb 1); a re-run of the publish job, once approved, finishes it.
       #
       # The re-run arm is equally load-bearing: v0.3.1 showed a bare `gh release create` turns a single
       # PyPI failure into a permanent retry deadlock (every re-run dies here and SKIPS the publish, so a
@@ -1614,7 +1621,7 @@ jobs:
           pre_create=""; case "$ver" in *-*) pre_create="--prerelease" ;; esac
           # ONE CALL CREATES THE RELEASE WITH ITS ONE ASSET (vault BACKLOG #2631, limb 6). So a
           # re-run leaves a published release alone: the call that created it attached the wheel,
-          # and a re-upload to a published release would be refused before the PyPI publish below.
+          # and a re-upload to a published release would be refused, so the publish job never ran.
           # `gh release create` makes a draft, uploads, then publishes, so an interrupted create can
           # leave a DRAFT. A re-run finishes that one: attach, then publish.
           err=$(mktemp)
@@ -1645,8 +1652,10 @@ jobs:
       # HAND THE PYPI FILES TO THE PUBLISH-ONLY JOB (vault BACKLOG #2631, limb 1; the header says
       # why the publish has its own job). Their SHA-256 digests leave as a job output, so the
       # publish job can prove what it downloaded is byte for byte what this job gated.
-      # Unconditional, so a dispatch dry-run exercises the hand-over too. Kept 30 days, so an
-      # approval on the `pypi` environment, or a late re-run, still finds the files. An artifact
+      # Unconditional, so a dispatch dry-run exercises the upload half of the hand-over; no dispatch
+      # runs a publish job, so the download and the check first run on a real tag. Kept 30 days on
+      # a tag, so an approval on the `pypi` environment, or a late re-run, still finds the files, and
+      # 1 day on a dispatch, where nothing downloads them. An artifact
       # of ONE directory is rooted at that directory, so its publish job downloads it back into it.
       - name: Record the digests of the files PyPI will receive
         id: pypi-digests
@@ -1664,7 +1673,7 @@ jobs:
           path: |
             webconsole-dist/
           if-no-files-found: error
-          retention-days: 30
+          retention-days: ${{ github.event_name == 'push' && 30 || 1 }}
 
   # PUBLISH THE CONSOLE TO PYPI, FROM A JOB THAT ONLY PUBLISHES (vault BACKLOG #2631, limb 1). The
   # variable gate sits on the job as well as the step, so the environment is never asked for while
@@ -1794,15 +1803,15 @@ jobs:
           # comes from the wheel's own METADATA, which hatchling has already normalised. On tag
           # v0.3.0-rc1 the metadata says 0.3.0rc1 while want=0.3.0-rc1, so a string compare could NEVER
           # match — this job failed on every pre-release tag by construction, whatever __version__ said.
-          # With PUBLISH_HARNESS=true it also runs after the engine has already uploaded, so the failure
-          # would land half-published.
+          # With PUBLISH_HARNESS=true the engine's publish-pypi runs beside this job, so the engine may
+          # already be on PyPI when this fails, and the failure would land half-published.
           #
           # Pin DERIVED from constraints.lock + installed outside the tag guard — see the engine job's
           # wheel smoke above for the full rationale — and into a THROWAWAY VENV, not this job's
           # interpreter, which is the other half of ADR 0034's recommendation. This job holds
           # contents: write and the steps AFTER this one attach the wheel to the release and hand it
           # to the PyPI publish, so an install resolved into the main interpreter here sits
-          # inside the publishing identity.
+          # beside the files that publish-pypi-harness uploads.
           PKG_PIN="$(sed -n 's/^packaging==\([^ ;]*\).*/\1/p' constraints.lock | head -1)"
           if [ -z "$PKG_PIN" ]; then
             echo "::error::no packaging== pin in constraints.lock — refusing an unpinned install on the release path"; exit 1
@@ -2063,8 +2072,10 @@ jobs:
       # HAND THE PYPI FILES TO THE PUBLISH-ONLY JOB (vault BACKLOG #2631, limb 1; the header says
       # why the publish has its own job). Their SHA-256 digests leave as a job output, so the
       # publish job can prove what it downloaded is byte for byte what this job gated.
-      # Unconditional, so a dispatch dry-run exercises the hand-over too. Kept 30 days, so an
-      # approval on the `pypi` environment, or a late re-run, still finds the files. An artifact
+      # Unconditional, so a dispatch dry-run exercises the upload half of the hand-over; no dispatch
+      # runs a publish job, so the download and the check first run on a real tag. Kept 30 days on
+      # a tag, so an approval on the `pypi` environment, or a late re-run, still finds the files, and
+      # 1 day on a dispatch, where nothing downloads them. An artifact
       # of ONE directory is rooted at that directory, so its publish job downloads it back into it.
       - name: Record the digests of the files PyPI will receive
         id: pypi-digests
@@ -2082,7 +2093,7 @@ jobs:
           path: |
             harness-dist/
           if-no-files-found: error
-          retention-days: 30
+          retention-days: ${{ github.event_name == 'push' && 30 || 1 }}
 
   # PUBLISH THE HARNESS TO PYPI, FROM A JOB THAT ONLY PUBLISHES (vault BACKLOG #2631, limb 1). It
   # needs publish-pypi so the engine the harness pins is on PyPI first, as it was when this step
@@ -2138,9 +2149,11 @@ jobs:
   # the header says why). Its `needs:` is every job that attaches an asset to the engine release. A
   # job added later that attaches one must join it; tests/test_release_pipeline.py fails until it does.
   # It also needs `publish-pypi`, so the engine is on PyPI before the release goes public, as it was
-  # when that publish sat inside `release` (limb 1). A refused `pypi` approval leaves a draft.
-  # It does NOT need `publish-pypi-harness`: that job is skipped while PUBLISH_HARNESS is unset, and
-  # a skipped need would skip this job too, so the release would never be published.
+  # when that publish sat inside `release` (limb 1). A refused `pypi` approval on an engine tag
+  # leaves a draft. It does NOT need `publish-pypi-harness`: that job is skipped while
+  # PUBLISH_HARNESS is unset, and a skipped need would skip this job too, so the release would never
+  # be published. So with PUBLISH_HARNESS set, the release can go public before the harness is on
+  # PyPI. Its wheel is already on the draft, so no asset changes later; a re-run finishes PyPI.
   #
   # If `release-harness` or `publish-pypi` fails, this job is skipped and the release stays a draft.
   # Re-running the failed jobs finishes the release. A draft is never published with an asset missing.

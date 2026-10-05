@@ -887,18 +887,28 @@ def test_the_console_publish_uses_trusted_publishing_and_is_tag_gated() -> None:
     creates the PyPI project and CLAIMS the name (ASVS 15.2.4): a registered *pending* publisher grants
     permission to publish but reserves nothing.
     """
-    body = RELEASE_YML.read_text(encoding="utf-8")
-    console = body[body.index("release-webconsole:") : body.index("release-harness:")]
-    assert "pypa/gh-action-pypi-publish@" in console, (
-        "the console must publish via the pinned action"
+    # Read per JOB: the publish moved to its own job (vault BACKLOG #2631, limb 1), and a text slice
+    # spanning both would let either job satisfy an assertion meant for the other.
+    jobs = _jobs()
+    publish = jobs["publish-pypi-webconsole"]
+    assert needs_of(publish) == ["release-webconsole"], needs_of(publish)
+    assert any(
+        str(s.get("uses") or "").startswith("pypa/gh-action-pypi-publish@")
+        for s in publish["steps"]
+    ), "the console must publish via the pinned action"
+    assert publish.get("permissions") == {"id-token": "write"}, (
+        "Trusted Publishing needs the OIDC identity, and the publish job needs nothing else"
     )
-    assert "id-token: write" in console, "Trusted Publishing needs the OIDC identity"
-    assert not re.search(r"password:|PYPI_.*TOKEN|api-token", console), (
+    assert "id-token" not in (jobs["release-webconsole"].get("permissions") or {}), (
+        "the console build job holds the OIDC identity again; only its publish job may"
+    )
+    assert not re.search(r"password|PYPI_.*TOKEN|api-token", str(publish)), (
         "the console publish must not use an API token — Trusted Publishing only"
     )
-    assert (
-        "startsWith(github.ref, 'refs/tags/')" in console and "vars.PUBLISH_WEBCONSOLE" in console
-    ), "the console publish must be tag-gated AND variable-gated"
+    guard = str(publish.get("if") or "")
+    assert "startsWith(github.ref, 'refs/tags/')" in guard and "vars.PUBLISH_WEBCONSOLE" in guard, (
+        "the console publish must be tag-gated AND variable-gated"
+    )
 
 
 def test_a_job_without_needs_release_must_create_its_own_github_release() -> None:
@@ -3654,6 +3664,7 @@ def test_the_publish_step_publishes_a_draft_and_leaves_a_published_release_alone
 _ENVIRONMENT = "pypi"
 _PUBLISH_ACTION = "pypa/gh-action-pypi-publish@"
 _VERIFY_PREFIX = "The downloaded files are the ones the build job gated"
+_PUBLISH_JOB_ACTIONS = ("actions/download-artifact@", _PUBLISH_ACTION)
 
 
 def _environment(job: dict) -> str | None:
@@ -3681,12 +3692,45 @@ def test_every_pypi_publish_runs_in_a_publish_only_job_that_names_the_environmen
             problems.append(f"{key} publishes to PyPI without `environment: {_ENVIRONMENT}`")
         if job.get("permissions") != {"id-token": "write"}:
             problems.append(f"{key} holds {job.get('permissions')}, not only id-token: write")
+        for extra in ("container", "services"):
+            if extra in job:
+                problems.append(f"{key} runs a `{extra}:` beside the PyPI identity")
         for step in job["steps"]:
             uses = str(step.get("uses") or "")
-            if uses.startswith("actions/checkout@"):
-                problems.append(f"{key} checks out the repository")
+            # An allowlist, not a checkout ban: any other action is code running with the identity.
+            if uses and not uses.startswith(_PUBLISH_JOB_ACTIONS):
+                problems.append(
+                    f"{key} calls {uses}; a publish job may call only {_PUBLISH_JOB_ACTIONS}"
+                )
             if "run" in step and not str(step.get("name", "")).startswith(_VERIFY_PREFIX):
                 problems.append(f"{key} runs a command: {step.get('name')!r}")
+    assert not problems, "\n".join(problems)
+
+
+#: Shell routes to PyPI. The action route is `_PUBLISH_ACTION`.
+_PYPI_UPLOAD_COMMANDS = re.compile(
+    r"\b(?:twine\s+upload|uv\s+publish|hatch\s+publish|flit\s+publish|pdm\s+publish|poetry\s+publish)\b"
+)
+
+
+def test_only_the_publish_jobs_can_reach_pypi() -> None:
+    """Outside the jobs that name the environment, no step uploads to PyPI by action or by shell,
+    and only `release` holds the OIDC identity, which it needs for Sigstore and SLSA. A publisher
+    bound to `pypi` refuses that job's token; this keeps a second minting job from appearing.
+
+    Mutation: give `release-harness` `id-token: write`, or add `uv publish` to `release`. Red here.
+    """
+    problems = []
+    for key, job in _jobs().items():
+        if _environment(job):
+            continue
+        if "id-token" in (job.get("permissions") or {}) and key != "release":
+            problems.append(f"{key} holds id-token without naming `{_ENVIRONMENT}`")
+        for step in job["steps"]:
+            if str(step.get("uses") or "").startswith(_PUBLISH_ACTION):
+                problems.append(f"{key} publishes with {_PUBLISH_ACTION} outside the environment")
+            if _PYPI_UPLOAD_COMMANDS.search(_executed_shell(str(step.get("run") or ""))):
+                problems.append(f"{key} uploads to PyPI from a shell: {step.get('name')!r}")
     assert not problems, "\n".join(problems)
 
 
@@ -3761,6 +3805,16 @@ def test_each_publish_job_checks_the_digests_its_producer_recorded() -> None:
             if str(s.get("uses") or "").startswith("actions/upload-artifact@")
             and str((s.get("with") or {}).get("name", "")).startswith("pypi-")
         )
+        # The files leave only after every gate and smoke check has passed, or a refused archive
+        # would already sit in a 30-day artifact when the job fails (the BACKLOG #1838 class).
+        order = prod["steps"]
+        gates = [
+            i
+            for i, s in enumerate(order)
+            if re.search(r"\bgate\b|^Smoke-check", str(s.get("name", "")), re.IGNORECASE)
+        ]
+        assert gates and order.index(digest) > max(gates), (producer, "hands over before a gate")
+        assert order.index(handover) > order.index(digest), (producer, "uploads before digesting")
         handed = set(str(handover["with"]["path"]).split())
         digested = set(re.findall(r"([\w-]+/)\*", digest["run"]))
         assert handed == digested, (producer, handed, digested)
