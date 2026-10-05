@@ -486,11 +486,23 @@ _ATTESTING_ACTIONS = (
 _MUTATING_ACTIONS = _PUBLISHING_ACTIONS + _ATTESTING_ACTIONS
 
 #: …and the same sinks reached from a shell line. `gh release view` is deliberately absent: it reads.
+#: Shell routes to PyPI, at least these. One list, read here and by section (14).
+_PYPI_UPLOAD_COMMANDS = re.compile(
+    r"\b(?:twine\s+upload|uv\s+publish|hatch\s+publish|flit\s+publish|pdm\s+publish"
+    r"|poetry\s+publish)\b|upload\.pypi\.org"
+)
+
 _PUBLISHING_COMMANDS = re.compile(
     r"\bgh release (?:create|edit|upload)\b"
-    r"|\b(?:python\s+-m\s+)?twine\s+upload\b"
+    rf"|{_PYPI_UPLOAD_COMMANDS.pattern}"
     r"|\bgh api\b[^\n]*\breleases\b"
 )
+
+
+def _is_publish_action(uses: str) -> bool:
+    """The PyPI publish action by any spelling GitHub resolves: owner names are case-insensitive,
+    and a `docker://` image of it runs the same code."""
+    return "gh-action-pypi-publish" in uses.lower()
 
 
 def _mutating_steps(job: dict) -> list[tuple[str, str]]:
@@ -1511,19 +1523,19 @@ def test_each_wheel_smoke_installs_the_built_wheel_into_a_throwaway_venv() -> No
     no package tree is named exactly like a good one.
 
     The venv must be a throwaway rather than the job's own interpreter (ADR 0034): both jobs hold
-    ``contents: write`` + ``id-token: write``, and the steps after the smoke attach the wheel to a
-    GitHub release and publish it to PyPI.
+    ``contents: write``, and the steps after the smoke attach the wheel to a GitHub release and hand
+    it to a PyPI publish job (vault BACKLOG #2631, limb 1).
     """
     for job, step in _wheel_smoke_steps().items():
         shell = _executed_shell(str(step["run"]))
         assert "python -m venv /tmp/" in shell, (
             f"{job}'s smoke does not create a throwaway venv — an install here lands in the "
-            f"interpreter that then publishes the artifact"
+            f"interpreter that then hands the artifact over for publishing"
         )
         assert re.search(r"/tmp/\S+/bin/pip install --quiet --no-deps \S+\.whl", shell), (
             f"{job}'s smoke does not install its own built wheel into that venv with --no-deps. "
             f"--no-deps is load-bearing, not an optimisation: both distributions depend on the "
-            f"engine, so a full install resolves it FROM PYPI inside a job holding id-token: write"
+            f"engine, so a full install resolves it FROM PYPI inside a job holding contents: write"
         )
 
 
@@ -3676,7 +3688,7 @@ def _publish_jobs() -> dict[str, dict]:
     jobs = {
         key: job
         for key, job in _jobs().items()
-        if any(str(s.get("uses") or "").startswith(_PUBLISH_ACTION) for s in job["steps"])
+        if any(_is_publish_action(str(s.get("uses") or "")) for s in job["steps"])
     }
     # Liveness: the engine-and-toolkit, console and harness publishes.
     assert len(jobs) >= 3, sorted(jobs)
@@ -3704,32 +3716,51 @@ def test_every_pypi_publish_runs_in_a_publish_only_job_that_names_the_environmen
                 )
             if "run" in step and not str(step.get("name", "")).startswith(_VERIFY_PREFIX):
                 problems.append(f"{key} runs a command: {step.get('name')!r}")
+            # A failed digest check must stop the publish, and a failed toolkit upload the engine's.
+            if step.get("continue-on-error"):
+                problems.append(f"{key}: {step.get('name')!r} carries continue-on-error")
+            if any(f in str(step.get("if") or "") for f in _STATUS_FUNCTIONS):
+                problems.append(f"{key}: {step.get('name')!r} runs after a failed step")
+            if _is_publish_action(uses) and set(step.get("with") or {}) - _PUBLISH_INPUTS:
+                problems.append(f"{key}: {step.get('name')!r} sets inputs beyond {_PUBLISH_INPUTS}")
+        for key_word in ("env", "defaults", "continue-on-error"):
+            if key_word in job:
+                problems.append(f"{key} sets job-level `{key_word}:`")
     assert not problems, "\n".join(problems)
 
 
-#: Shell routes to PyPI. The action route is `_PUBLISH_ACTION`.
-_PYPI_UPLOAD_COMMANDS = re.compile(
-    r"\b(?:twine\s+upload|uv\s+publish|hatch\s+publish|flit\s+publish|pdm\s+publish|poetry\s+publish)\b"
-)
+#: Inputs a publish step may set. `repository-url` above all is out: it sends the OIDC token there.
+_PUBLISH_INPUTS = {"packages-dir", "skip-existing", "attestations"}
+_STATUS_FUNCTIONS = ("always()", "cancelled()", "failure()")
+
+
+def _permits_id_token(job: dict) -> bool:
+    perms = job.get("permissions")
+    if isinstance(perms, str):  # `write-all` or `read-all`
+        return perms == "write-all"
+    return "id-token" in (perms or {})
 
 
 def test_only_the_publish_jobs_can_reach_pypi() -> None:
-    """Outside the jobs that name the environment, no step uploads to PyPI by action or by shell,
-    and only `release` holds the OIDC identity, which it needs for Sigstore and SLSA. A publisher
-    bound to `pypi` refuses that job's token; this keeps a second minting job from appearing.
+    """Outside the jobs that name the environment, no step uploads to PyPI by at least the routes
+    `_is_publish_action` and `_PYPI_UPLOAD_COMMANDS` know, and only `release` holds the OIDC
+    identity, which it needs for Sigstore and SLSA. A publisher bound to `pypi` refuses that job's
+    token; this keeps a second minting job from appearing. A route neither knows is not caught.
 
-    Mutation: give `release-harness` `id-token: write`, or add `uv publish` to `release`. Red here.
+    Mutation: give `release-harness` `id-token: write` or `write-all`, or add `uv publish` to
+    `release`. Red here.
     """
     problems = []
     for key, job in _jobs().items():
         if _environment(job):
             continue
-        if "id-token" in (job.get("permissions") or {}) and key != "release":
+        if _permits_id_token(job) and key != "release":
             problems.append(f"{key} holds id-token without naming `{_ENVIRONMENT}`")
         for step in job["steps"]:
-            if str(step.get("uses") or "").startswith(_PUBLISH_ACTION):
-                problems.append(f"{key} publishes with {_PUBLISH_ACTION} outside the environment")
-            if _PYPI_UPLOAD_COMMANDS.search(_executed_shell(str(step.get("run") or ""))):
+            if _is_publish_action(str(step.get("uses") or "")):
+                problems.append(f"{key} publishes with {step.get('uses')} outside the environment")
+            shell = _executed_shell(str(step.get("run") or "")).replace("\\\n", " ")
+            if _PYPI_UPLOAD_COMMANDS.search(shell):
                 problems.append(f"{key} uploads to PyPI from a shell: {step.get('name')!r}")
     assert not problems, "\n".join(problems)
 
@@ -3756,9 +3787,14 @@ def test_a_dispatch_never_schedules_a_job_that_names_the_environment() -> None:
     problems = []
     for key, job in named.items():
         guard = _despace(str(job.get("if") or ""))
-        if not any(_despace(c) in guard for c in _GUARD_CONJUNCTIONS) or "||" in guard:
+        # `!(` would let a negated pair through: it admits every dispatch and skips the tag push.
+        if (
+            not any(_despace(c) in guard for c in _GUARD_CONJUNCTIONS)
+            or "||" in guard
+            or "!(" in guard
+        ):
             problems.append(f"{key}: `if:` {job.get('if')!r} lacks the event-and-ref pair")
-        widened = [f for f in ("always()", "cancelled()", "failure()") if f in guard]
+        widened = [f for f in _STATUS_FUNCTIONS if f in guard]
         if widened:
             problems.append(f"{key}: `if:` widens the guard with {widened}")
     assert not problems, "\n".join(problems)
@@ -3815,6 +3851,9 @@ def test_each_publish_job_checks_the_digests_its_producer_recorded() -> None:
         ]
         assert gates and order.index(digest) > max(gates), (producer, "hands over before a gate")
         assert order.index(handover) > order.index(digest), (producer, "uploads before digesting")
+        # No `if:` on either: the implicit success() is what keeps a refused file from leaving.
+        assert "if" not in digest and "if" not in handover, (producer, "the hand-over is guarded")
+        assert not handover.get("continue-on-error") and not digest.get("continue-on-error")
         handed = set(str(handover["with"]["path"]).split())
         digested = set(re.findall(r"([\w-]+/)\*", digest["run"]))
         assert handed == digested, (producer, handed, digested)

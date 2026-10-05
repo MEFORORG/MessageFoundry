@@ -60,6 +60,17 @@
 # a blank environment accepts a token from any job in this workflow.
 # A job naming an environment that does not exist creates it with no rules, which would publish
 # exactly as before while reading as a control that is not there. Keep the name `pypi`.
+# Keep PUBLISH_HARNESS and PUBLISH_WEBCONSOLE off the environment, as repository variables only. A
+# job's `if:` is read before its environment applies, and a step's inside it after, so a copy on
+# the environment would let the two gates read different values.
+#
+# THE HAND-OVER. Each build job's last two steps record the digests and upload the files, with no
+# `if:`, so any earlier failure skips both. An artifact of ONE directory is rooted at that
+# directory, so its publish job downloads it back into it. A dispatch uploads the files too, which
+# exercises the upload half; no dispatch runs a publish job, so the download and the check first run
+# on a real tag. A tag keeps the files 30 days from the end of the build job, a dispatch 1 day. The
+# harness publish waits on the engine's approval and then its own, so both must land inside the 30
+# days, or a re-run of every job rebuilds them.
 #
 # PyPI publish uses Trusted Publishing (OIDC) — no API token. OWNER PREREQ (one-time, before the first
 # tag): claim the `messagefoundry` PyPI project + configure a Trusted Publisher (a PENDING publisher works
@@ -68,8 +79,8 @@
 # only AFTER the py.typed marker (WS-3) is on main — the wheel smoke step enforces this on a tag.
 #
 # SECOND distribution — `messagefoundry-harness` (the synthetic test/load/failover harness,
-# packaging/messagefoundry-harness/) — is built + published in lockstep by the `release-harness` job
-# below (same version, same tag). Its PyPI publish is GATED on the `PUBLISH_HARNESS` repo variable so it
+# packaging/messagefoundry-harness/) — is built by the `release-harness` job and published by the
+# `publish-pypi-harness` job below, in lockstep (same version, same tag). Its PyPI publish is GATED on the `PUBLISH_HARNESS` repo variable so it
 # stays a no-op until the OWNER (one-time): (1) configures a `messagefoundry-harness` PyPI Trusted
 # Publisher — a PENDING publisher for repo MEFORORG/MessageFoundry + workflow `release.yml` (environment
 # `pypi`, as every publisher here should be) — then (2) sets repo variable PUBLISH_HARNESS=true. Until
@@ -77,8 +88,8 @@
 # GitHub release.
 #
 # THIRD distribution — `messagefoundry-toolkit` (the authoring and development commands, ADR 0201,
-# packaging/messagefoundry-toolkit/) — is built, gated, smoked and published INSIDE the `release` job,
-# in lockstep, and uploaded BEFORE the engine; the steps there say why. OWNER PREREQ (one-time, before
+# packaging/messagefoundry-toolkit/) — is built, gated and smoked INSIDE the `release` job, in
+# lockstep, and published by `publish-pypi` BEFORE the engine; the steps there say why. OWNER PREREQ (one-time, before
 # the first tag carrying those steps): a PENDING Trusted Publisher for `messagefoundry-toolkit`, repo
 # MEFORORG/MessageFoundry, workflow `release.yml`, environment `pypi`. It is NOT gated on a variable.
 #
@@ -881,7 +892,7 @@ jobs:
           # PINNED IN-REPO, not against the asset's own checksums.txt (BACKLOG #1698). The security.yml
           # twin still verifies same-origin and that is adequate THERE. It is not adequate here, and the
           # difference is the job, not the tool: this step runs inside `id-token: write` — the identity
-          # that Sigstore-signs the artifacts and publishes to PyPI a few steps below — and it runs
+          # that Sigstore-signs the artifacts and digests the files publish-pypi uploads — and it runs
           # BEFORE the signing step, so anything that executes here executes next to the credential that
           # vouches for the release. A backdoored sbomqs at this point is in position before every
           # control standing after it.
@@ -1170,14 +1181,8 @@ jobs:
             messagefoundry-vex.openvex.json.sigstore*
           if-no-files-found: ignore
 
-      # HAND THE PYPI FILES TO THE PUBLISH-ONLY JOB (vault BACKLOG #2631, limb 1; the header says
-      # why the publish has its own job). Their SHA-256 digests leave as a job output, so the
-      # publish job can prove what it downloaded is byte for byte what this job gated.
-      # Unconditional, so a dispatch dry-run exercises the upload half of the hand-over; no dispatch
-      # runs a publish job, so the download and the check first run on a real tag. Kept 30 days on
-      # a tag, so an approval on the `pypi` environment, or a late re-run, still finds the files, and
-      # 1 day on a dispatch, where nothing downloads them. An artifact
-      # of ONE directory is rooted at that directory, so its publish job downloads it back into it.
+      # HAND THE PYPI FILES TO THE PUBLISH-ONLY JOB (vault BACKLOG #2631, limb 1). The digests leave
+      # as a job output; the header's THE HAND-OVER paragraph says the rest. No `if:`, on purpose.
       - name: Record the digests of the files PyPI will receive
         id: pypi-digests
         run: |
@@ -1621,7 +1626,7 @@ jobs:
           pre_create=""; case "$ver" in *-*) pre_create="--prerelease" ;; esac
           # ONE CALL CREATES THE RELEASE WITH ITS ONE ASSET (vault BACKLOG #2631, limb 6). So a
           # re-run leaves a published release alone: the call that created it attached the wheel,
-          # and a re-upload to a published release would be refused, so the publish job never ran.
+          # and a re-upload to it would be refused, failing this job and skipping the publish job.
           # `gh release create` makes a draft, uploads, then publishes, so an interrupted create can
           # leave a DRAFT. A re-run finishes that one: attach, then publish.
           err=$(mktemp)
@@ -1649,14 +1654,8 @@ jobs:
           path: webconsole-dist/
           if-no-files-found: ignore
 
-      # HAND THE PYPI FILES TO THE PUBLISH-ONLY JOB (vault BACKLOG #2631, limb 1; the header says
-      # why the publish has its own job). Their SHA-256 digests leave as a job output, so the
-      # publish job can prove what it downloaded is byte for byte what this job gated.
-      # Unconditional, so a dispatch dry-run exercises the upload half of the hand-over; no dispatch
-      # runs a publish job, so the download and the check first run on a real tag. Kept 30 days on
-      # a tag, so an approval on the `pypi` environment, or a late re-run, still finds the files, and
-      # 1 day on a dispatch, where nothing downloads them. An artifact
-      # of ONE directory is rooted at that directory, so its publish job downloads it back into it.
+      # HAND THE PYPI FILES TO THE PUBLISH-ONLY JOB (vault BACKLOG #2631, limb 1). The digests leave
+      # as a job output; the header's THE HAND-OVER paragraph says the rest. No `if:`, on purpose.
       - name: Record the digests of the files PyPI will receive
         id: pypi-digests
         run: |
@@ -2069,14 +2068,8 @@ jobs:
           path: harness-dist/
           if-no-files-found: ignore
 
-      # HAND THE PYPI FILES TO THE PUBLISH-ONLY JOB (vault BACKLOG #2631, limb 1; the header says
-      # why the publish has its own job). Their SHA-256 digests leave as a job output, so the
-      # publish job can prove what it downloaded is byte for byte what this job gated.
-      # Unconditional, so a dispatch dry-run exercises the upload half of the hand-over; no dispatch
-      # runs a publish job, so the download and the check first run on a real tag. Kept 30 days on
-      # a tag, so an approval on the `pypi` environment, or a late re-run, still finds the files, and
-      # 1 day on a dispatch, where nothing downloads them. An artifact
-      # of ONE directory is rooted at that directory, so its publish job downloads it back into it.
+      # HAND THE PYPI FILES TO THE PUBLISH-ONLY JOB (vault BACKLOG #2631, limb 1). The digests leave
+      # as a job output; the header's THE HAND-OVER paragraph says the rest. No `if:`, on purpose.
       - name: Record the digests of the files PyPI will receive
         id: pypi-digests
         run: |

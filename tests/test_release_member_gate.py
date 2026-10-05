@@ -772,7 +772,7 @@ def test_each_job_gates_the_artifacts_it_actually_builds() -> None:
     reason, not about the leak.
     """
     expected = {
-        # The toolkit wheel is built and published inside the engine job (ADR 0201).
+        # The toolkit wheel is built and gated inside the engine job (ADR 0201); publish-pypi uploads it.
         "release": ("dist/", "toolkit-dist/"),
         "release-webconsole": ("webconsole-dist/",),
         "release-harness": ("harness-dist/",),
