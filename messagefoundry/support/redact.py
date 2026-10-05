@@ -91,8 +91,8 @@ _MFB64 = re.compile(r"mfb64:v1:[A-Za-z0-9+/=]+")
 _LABEL_PREFIX = r"(?:[A-Za-z0-9]+[._-]){0,6}"
 
 # The quoted and braced value fragments (BACKLOG #1685). ``_ODBC_BRACED``, ``_QUOTED_VALUE`` and the
-# overrun are ``_CREDENTIAL_KV``'s only. ``_MEFOR_SECRET``, ``_BEARER`` and ``_KEY_MATERIAL`` take the
-# GUARDED forms, which refuse any value whose closer may belong to a later label and fall back to the
+# overrun are ``_CREDENTIAL_KV``'s only, and it takes the quoted one through ``_KV_QUOTED_VALUE``.
+# ``_MEFOR_SECRET``, ``_BEARER`` and ``_KEY_MATERIAL`` take the GUARDED forms, which refuse any value whose closer may belong to a later label and fall back to the
 # plain class: ``token='abc, password='p w'`` would otherwise print "p w". The guarded quoted form
 # leaves its closer in the text, as the plain classes always did, because a later pass needs it there.
 # Every guard, why the closer stays, and why ``_BEARER`` takes no brace form, are stated once, on the
@@ -110,22 +110,22 @@ _GUARDED_BRACED_VALUE = r"\{(?:[^}'\"\r\n]|\}\})*+\}(?!\})"
 # quote. Without it a plain value ran on across a separator into a LATER label and ended at that
 # label's opening quote, so the later pattern never saw its label and the quoted value went into the
 # support archive and ``GET /logs/tail``: ``api_token=x;password="v w"`` came out as
-# ``api_token=[REDACTED]"v w"``. Why it stops only there (so it can newly print label text and never a
-# value), where in the label it stops (at the keyword, or at an underscored prefix right after a hard
-# separator), why the MEFOR_ branch keeps ``\b``, why it stays linear, and the residuals, are stated
+# ``api_token=[REDACTED]"v w"``. Why it stops only there (so one pass can newly print label text and
+# never a value, though a later pass over the changed text can), where in the label it stops (at the
+# keyword, or at an underscored prefix right after a hard separator), why the MEFOR_ branch keeps ``\b``, why it stays linear, and the residuals, are stated
 # once, on the same fragments in ``messagefoundry/secretscrub.py``. This copy spells the keywords the
 # way this module's own patterns do, and folds case on them alone, for the reason given at ``_BEARER``.
-_QUOTED_LABEL = (
+_LABEL_HEAD = (
     r"(?=(?i:[abceipst]))"
     r"(?:(?i:pass(?:word|wd|phrase)?|pwd|secret|credential|encryption_key(?:s_retired)?|private_key"
     r"|intake_api_key_next)\b['\"]?\s*+[:=]\s*+"
     r"|(?i:bearer|authorization|token|session|api[_-]?key)\b\s*+[:=]\s*+"
     r"(?:(?i:bearer|basic|digest)\s++)?"
-    r")(?:" + _GUARDED_QUOTED_VALUE + r")"
+    r")"
 )
-_MEFOR_QUOTED_LABEL = (
-    r"\b(?-i:MEFOR_[A-Z0-9_]++)\b['\"]?\s*+[:=]\s*+(?:" + _GUARDED_QUOTED_VALUE + r")"
-)
+_MEFOR_LABEL_HEAD = r"\b(?-i:MEFOR_[A-Z0-9_]++)\b['\"]?\s*+[:=]\s*+"
+_QUOTED_LABEL = _LABEL_HEAD + r"(?:" + _GUARDED_QUOTED_VALUE + r")"
+_MEFOR_QUOTED_LABEL = _MEFOR_LABEL_HEAD + r"(?:" + _GUARDED_QUOTED_VALUE + r")"
 _NOT_AT_QUOTED_LABEL = r"(?!" + _QUOTED_LABEL + r"|" + _MEFOR_QUOTED_LABEL + r")"
 _HARD_SEPARATOR_BEHIND = r"(?<![A-Za-z0-9._\-])"
 _NOT_BEFORE_QUOTED_LABEL = (
@@ -136,6 +136,33 @@ _NOT_BEFORE_QUOTED_LABEL = (
     + r"|"
     + _MEFOR_QUOTED_LABEL
     + r")"
+)
+
+
+# ``_CREDENTIAL_KV``'s quoted value: ``_QUOTED_VALUE``, except where the quote that would close it opens
+# a later label's value. There it takes that label and its value too, through the value's own closer,
+# so ``password='abc, private_key='p w q'`` no longer prints "p w q'". When it runs on and when it falls
+# back to ``_QUOTED_VALUE``'s span, what that was measured to cost, and why it stays linear, are stated
+# once, on the same fragment in ``messagefoundry/secretscrub.py``. Written as plain concatenation, not
+# built by a helper, so ``tests/test_security_static.py`` can resolve this copy and scan it.
+_RUN_ON_LABEL = r"(?:" + _LABEL_HEAD + r"|" + _MEFOR_LABEL_HEAD + r")"
+_SQ_RUN_ON_WALK = r"(?:[^'\r\nA-Za-z0-9]|(?!" + _RUN_ON_LABEL + r"')[A-Za-z0-9]++)*+"
+_DQ_RUN_ON_WALK = r"(?:[^\"\r\nA-Za-z0-9]|(?!" + _RUN_ON_LABEL + r"\")[A-Za-z0-9]++)*+"
+_KV_QUOTED_VALUE = (
+    r"'"
+    + _SQ_RUN_ON_WALK
+    + r"(?:"
+    + _RUN_ON_LABEL
+    + r"(?=')(?:'"
+    + _SQ_RUN_ON_WALK
+    + r"(?='(?!\s*+[:=])))?+)?+'"
+    + r"|\""
+    + _DQ_RUN_ON_WALK
+    + r"(?:"
+    + _RUN_ON_LABEL
+    + r"(?=\")(?:\""
+    + _DQ_RUN_ON_WALK
+    + r"(?=\"(?!\s*+[:=])))?+)?+\""
 )
 
 # The plain value classes. Each takes its whole natural run when ``_NO_QUOTED_LABEL_AFTER`` shows no
@@ -312,7 +339,7 @@ _CREDENTIAL_KV = re.compile(
     r"(?:"
     + _ODBC_BRACED
     + r"|"
-    + _QUOTED_VALUE
+    + _KV_QUOTED_VALUE
     + r"|"
     + _ODBC_BRACED_OVERRUN
     + r"|"
