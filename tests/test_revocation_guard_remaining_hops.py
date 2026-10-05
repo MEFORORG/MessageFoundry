@@ -45,18 +45,16 @@ from messagefoundry.config.tls_policy import (
     context_checks_revocation,
 )
 from messagefoundry.config.wiring import WiringError, load_config
-from messagefoundry.pipeline.wiring_runner import build_check_registry
-from messagefoundry.redaction import redact
-from messagefoundry.secretscrub import scrub_credentials
 from messagefoundry.transports import dicom as dicom_module
 from messagefoundry.transports import direct as direct_module
 from messagefoundry.transports import remotefile as remotefile_module
 from messagefoundry.transports.dicom import DicomScuDestination
 from messagefoundry.transports.direct import DirectDestination
 from messagefoundry.transports.fhir import FhirLookupExecutor
-from messagefoundry.transports.remotefile import RemoteFileDestination, _FtpClient
+from messagefoundry.transports.remotefile import RemoteFileDestination
 from messagefoundry.transports.rest import _NO_REDIRECT_OPENER, opener_tls_context
 from tests.test_direct_transport import _mint_ca, _mint_leaf, _write_key, _write_pem
+from tests.test_revocation_audit_names_connection import _audit, _build_check, _shipped
 
 ENFORCING = HopPosture(enforcing=True)
 NOT_ENFORCING = HopPosture(enforcing=False)
@@ -100,17 +98,6 @@ def _crl_policy(crl: str) -> TrustAnchorPolicy:
     return TrustAnchorPolicy(crl_file=crl)
 
 
-def _audit(caplog: pytest.LogCaptureFixture) -> str:
-    return " ".join(
-        r.getMessage() for r in caplog.records if "operator attestation" in r.getMessage()
-    )
-
-
-def _shipped(text: str) -> str:
-    """The two text filters a shipped log line passes through. Either can eat a cell label."""
-    return scrub_credentials(redact(text))
-
-
 def _dest(
     name: str,
     ctype: ConnectorType,
@@ -133,9 +120,9 @@ def _dest(
 
 
 def _lookup(
-    settings: dict[str, object], *, policy: TrustAnchorPolicy | None = None, name: str = "epic"
+    settings: dict[str, object], *, policy: TrustAnchorPolicy | None = None
 ) -> FhirLookupExecutor:
-    return FhirLookupExecutor({name: settings}, egress=_OPEN_EGRESS, trust_anchor_policy=policy)
+    return FhirLookupExecutor({"epic": settings}, egress=_OPEN_EGRESS, trust_anchor_policy=policy)
 
 
 def test_a_fhir_lookup_read_hop_is_refused_when_it_checks_no_revocation() -> None:
@@ -250,24 +237,12 @@ def test_the_check_gate_refuses_an_undeclared_fhir_lookup_and_admits_a_declared_
     undeclared.mkdir()
     registry = load_config(_lookup_config(undeclared, declared=False), allow_empty=True)
     with pytest.raises(WiringError, match="FhirLookup 'epic'.*revocation"):
-        build_check_registry(
-            registry,
-            inbound_bind_host=LOOPBACK,
-            env_values={},
-            egress=_OPEN_EGRESS,
-            posture=ENFORCING,
-        )
+        _build_check(registry)
     declared = tmp_path / "declared"
     declared.mkdir()
     registry = load_config(_lookup_config(declared, declared=True), allow_empty=True)
     with caplog.at_level(logging.WARNING):
-        build_check_registry(
-            registry,
-            inbound_bind_host=LOOPBACK,
-            env_values={},
-            egress=_OPEN_EGRESS,
-            posture=ENFORCING,
-        )
+        _build_check(registry)
     audit = _audit(caplog)
     assert "connection 'fhir_lookup:epic';" in audit and REASON in audit
 
@@ -275,11 +250,17 @@ def test_the_check_gate_refuses_an_undeclared_fhir_lookup_and_admits_a_declared_
 # --- DICOM C-STORE SCU over TLS (transports/dicom.py) ----------------------------------------------
 
 
-def _scu(host: str, *, tls: bool = True, **kw: object) -> Destination:
+def _scu(
+    host: str,
+    *,
+    tls: bool = True,
+    attested: bool = False,
+    policy: TrustAnchorPolicy | None = None,
+) -> Destination:
     settings: dict[str, object] = {"ae_title": "MF_SCU", "host": host, "port": 11112}
     if tls:
         settings["tls"] = True
-    return _dest("OB_PACS", ConnectorType.DIMSE, settings, **kw)  # type: ignore[arg-type]
+    return _dest("OB_PACS", ConnectorType.DIMSE, settings, attested=attested, policy=policy)
 
 
 def test_a_dicom_tls_association_is_refused_when_it_checks_no_revocation() -> None:
@@ -357,23 +338,18 @@ def test_a_plaintext_dicom_association_is_the_cleartext_refusal_not_this_one() -
 # --- FTPS upload, the destination (transports/remotefile.py) ---------------------------------------
 
 
-def _ftps(host: str, *, protocol: str = "ftps", **kw: object) -> Destination:
-    extra = kw.pop("settings", {})
-    assert isinstance(extra, dict)
-    settings: dict[str, object] = {
-        "host": host,
-        "remote_dir": "/in",
-        "protocol": protocol,
-        **extra,
-    }
-    return _dest("OB_FTPS", ConnectorType.REMOTEFILE, settings, **kw)  # type: ignore[arg-type]
-
-
-def _ftps_context(dest: RemoteFileDestination) -> ssl.SSLContext | None:
-    """The context the destination's own client will hand to ``ftplib.FTP_TLS``."""
-    client = dest._client
-    assert isinstance(client, _FtpClient)
-    return client._context
+def _ftps(
+    host: str,
+    *,
+    protocol: str = "ftps",
+    tls_verify: bool = True,
+    attested: bool = False,
+    policy: TrustAnchorPolicy | None = None,
+) -> Destination:
+    settings: dict[str, object] = {"host": host, "remote_dir": "/in", "protocol": protocol}
+    if not tls_verify:
+        settings["tls_verify"] = False
+    return _dest("OB_FTPS", ConnectorType.REMOTEFILE, settings, attested=attested, policy=policy)
 
 
 def test_an_ftps_upload_is_refused_when_it_checks_no_revocation() -> None:
@@ -389,7 +365,7 @@ def test_an_ftps_upload_is_refused_when_it_checks_no_revocation() -> None:
 def test_an_ftps_upload_is_admitted_when_a_crl_reaches_its_own_context(bare_crl: str) -> None:
     with active_hop_posture(ENFORCING):
         dest = RemoteFileDestination(_ftps(REMOTE, policy=_crl_policy(bare_crl)))
-    assert context_checks_revocation(_ftps_context(dest)) is True
+    assert context_checks_revocation(dest._client.tls_context) is True
 
 
 def test_a_configured_crl_does_not_admit_an_ftps_upload_whose_context_lacks_it(
@@ -420,7 +396,7 @@ def test_an_ftps_upload_crosses_on_its_attestation_and_is_audited(
 def test_an_ftps_upload_on_loopback_still_crosses(bare_crl: str) -> None:
     with active_hop_posture(ENFORCING):
         dest = RemoteFileDestination(_ftps(LOOPBACK, policy=_crl_policy(bare_crl)))
-    assert context_checks_revocation(_ftps_context(dest)) is False
+    assert context_checks_revocation(dest._client.tls_context) is False
 
 
 def test_an_ftps_upload_warns_but_builds_when_not_enforcing(
@@ -442,13 +418,12 @@ def test_an_ftps_upload_that_verifies_nothing_takes_no_revocation_guard(
     matter, so its own refusal owns it under an enforcing posture. Where the escape permits the hop,
     the guard is not taken at all: a non-enforcing posture WARNs on every guarded hop, and no such
     line appears here."""
-    off = {"tls_verify": False}
     with active_hop_posture(ENFORCING), pytest.raises(ValueError, match="tls_verify=false") as exc:
-        RemoteFileDestination(_ftps(REMOTE, settings=off))
+        RemoteFileDestination(_ftps(REMOTE, tls_verify=False))
     assert "revocation" not in str(exc.value)
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
     with active_hop_posture(NOT_ENFORCING), caplog.at_level(logging.WARNING):
-        RemoteFileDestination(_ftps(REMOTE, settings=off))
+        RemoteFileDestination(_ftps(REMOTE, tls_verify=False))
     assert any("verification is DISABLED" in r.getMessage() for r in caplog.records)
     assert not any("revocation" in r.getMessage() for r in caplog.records)
 

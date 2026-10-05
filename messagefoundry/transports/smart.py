@@ -628,7 +628,8 @@ def revocation_attestation_from_settings(
     reason and the connection's name (:data:`MIRRORED_CONNECTION_SETTING`, written for every
     connection, so a REFUSAL names it too) into the resolved settings. This is the one reader of those
     keys for both bearer providers (BACKLOG #2112, #2115), as ``cleartext_acceptance_from_settings``
-    is for the cleartext twin."""
+    is for the cleartext twin. The ``fhir_lookup`` read hop reads them through it too
+    (BACKLOG #2193): a lookup has no ``Destination``, so the mirror is where its declaration is."""
     reason = s.get("tls_revocation_attested_reason")
     connection = s.get(MIRRORED_CONNECTION_SETTING)
     return (

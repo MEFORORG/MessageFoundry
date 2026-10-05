@@ -412,6 +412,13 @@ class _RemoteClient(abc.ABC):
     the connector calls them via :func:`asyncio.to_thread`. Each method opens its own connection, does
     the operation, and closes — nothing is held across calls."""
 
+    @property
+    def tls_context(self) -> ssl.SSLContext | None:
+        """The TLS context this client dials with, or ``None`` for a client that uses none (SFTP,
+        plain FTP). The destination's revocation guard reads it (BACKLOG #2193), so a client that
+        gains TLS must return its context here to be guarded."""
+        return None
+
     @abc.abstractmethod
     def list_dir(self, remote_dir: str) -> list[tuple[str, int]]:
         """``(name, size)`` for each regular file directly in ``remote_dir`` (no recursion)."""
@@ -779,6 +786,10 @@ class _FtpClient(_RemoteClient):
             if tls
             else None
         )
+
+    @property
+    def tls_context(self) -> ssl.SSLContext | None:
+        return self._context
 
     def _connect(self) -> ftplib.FTP:
         """Connect, secure the control channel (FTPS), log in and secure the data channel (FTPS), or
@@ -1873,7 +1884,7 @@ class RemoteFileDestination(DestinationConnector):
         # relaxes the refusal and a hop it never reached keeps it. Keyed on the context, as MLLP's
         # is: sftp and plain ftp build none, and a tls_verify=false context verifies nothing, so
         # the refusals that own those hops stay the only gate on them.
-        ftps_context = self._client._context if isinstance(self._client, _FtpClient) else None
+        ftps_context = self._client.tls_context
         if ftps_context is not None and ftps_context.verify_mode is not ssl.CERT_NONE:
             RevocationHopGuard.capture(
                 host=str(s["host"]),
