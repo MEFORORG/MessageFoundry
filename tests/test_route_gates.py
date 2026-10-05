@@ -447,7 +447,8 @@ def test_a_plain_route_outside_the_refusal_still_reports_its_declaration() -> No
 
 
 def test_a_socket_in_a_mounted_app_runs_the_mounted_apps_hook_at_request_time() -> None:
-    """The premise of the test above, measured on a live handshake rather than assumed."""
+    """The premise of ``test_a_mounted_apps_socket_hooks_are_read_from_that_app``, measured on a
+    live handshake rather than assumed."""
     ran: list[str] = []
 
     def recorder(name: str) -> Callable[..., Awaitable[tuple[None, None]]]:

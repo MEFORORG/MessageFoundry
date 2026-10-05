@@ -469,6 +469,22 @@ async def run_sweep(policy: dict[str, Any], *, canary: str | None = None) -> dic
         }
 
 
+def ungated_not_declared_public(receipt: dict[str, Any]) -> list[str]:
+    """Each ungated route in ``receipt`` that does not read as declared public with a reason.
+
+    The allow-list names routes public BY DESIGN, and a route the engine refuses to every caller has
+    no gate either, so the (method, path) set alone cannot tell them apart (vault BACKLOG #2846). A
+    row with no kind is listed too, so an older receipt cannot pass by omission."""
+    found: list[str] = []
+    for row in receipt.get("ungated_routes", []):
+        kind = row.get("kind") or "no kind"
+        if kind == route_gates.KIND_PUBLIC and row.get("declaration"):
+            continue
+        state = "public, no reason" if kind == route_gates.KIND_PUBLIC else kind
+        found.append(f"{str(row['method']).upper()} {row['path']} ({state})")
+    return sorted(found)
+
+
 def evaluate(receipt: dict[str, Any], policy: dict[str, Any]) -> tuple[int, list[str]]:
     """``(exit code, error lines)`` for a receipt. Pure — the tests drive it with no target running.
 
@@ -527,14 +543,7 @@ def evaluate(receipt: dict[str, Any], policy: dict[str, Any]) -> tuple[int, list
             f"Newly anonymous: {added or 'none'}; documented but absent: {removed or 'none'}. "
             "A route with no require*() gate is reachable by anyone."
         )
-    # The allow-list names routes public BY DESIGN, and a route the engine refuses to every caller has
-    # no gate either, so each ungated route must also read as declared public with a reason (vault
-    # BACKLOG #2846). A row with no kind fails too, so an older receipt cannot pass by omission.
-    undeclared = sorted(
-        f"{str(r['method']).upper()} {r['path']} ({r.get('kind') or 'no kind'})"
-        for r in receipt.get("ungated_routes", [])
-        if r.get("kind") != route_gates.KIND_PUBLIC or not r.get("declaration")
-    )
+    undeclared = ungated_not_declared_public(receipt)
     if undeclared:
         errors.append(
             f"ungated route(s) not declared public with a reason: {undeclared}. The allow-list "
@@ -652,6 +661,8 @@ def receipt_lines(receipt: dict[str, Any], policy: dict[str, Any], verdict: str)
     anonymous_ok = len(receipt.get("ungated_routes", [])) and {
         (str(r["method"]).upper(), str(r["path"])) for r in receipt["ungated_routes"]
     } == {_key(e) for e in policy.get("anonymous_allowlist", [])}
+    ungated_rows = receipt.get("ungated_routes", [])
+    not_public = ungated_not_declared_public(receipt)
     return [
         INDEPENDENCE_NOTICE,
         f"target {receipt.get('target_base_url')} (uvicorn, loopback, one process, one event loop)",
@@ -664,6 +675,9 @@ def receipt_lines(receipt: dict[str, Any], policy: dict[str, Any], verdict: str)
         f"ungated set {'matches' if anonymous_ok else 'DOES NOT MATCH'} the documented anonymous "
         f"allowlist ({receipt.get('ungated_http_rows')}/"
         f"{len(policy.get('anonymous_allowlist', []))})",
+        f"declared public with a reason -- "
+        f"{len(ungated_rows) - len(not_public)}/{len(ungated_rows)} ungated routes"
+        + (f"; NOT: {not_public}" if not_public else ""),
         f"negative probes -- {receipt.get('negative_probes')} requests "
         f"({receipt.get('gated_http_rows')} operations x "
         "{no-credential, invalid-credential}); "

@@ -103,17 +103,17 @@ MOUNT_METHOD = "MOUNT"
 # the walk can tell a route public by design from one refused to every caller (vault BACKLOG #2846).
 RouteKind = Literal["gated", "public", "in-body", "refused", "outside"]
 #: A top-level dependency carries the gate mark.
-KIND_GATED: Final = "gated"
+KIND_GATED: Final[RouteKind] = "gated"
 #: No gate; the endpoint is marked ``public_route``, and the row's ``declaration`` is its reason.
-KIND_PUBLIC: Final = "public"
+KIND_PUBLIC: Final[RouteKind] = "public"
 #: A WebSocket with no gate dependency whose endpoint is marked ``authorizes_in_body``.
-KIND_IN_BODY: Final = "in-body"
+KIND_IN_BODY: Final[RouteKind] = "in-body"
 #: Neither: the engine refuses this route to every caller.
-KIND_REFUSED: Final = "refused"
+KIND_REFUSED: Final[RouteKind] = "refused"
 #: The refusal is not among the route's dependencies: a mount, a plain Starlette route, or a route of
 #: an app that does not install the refusal, such as a mounted application. ``declaration`` is still
 #: reported when the endpoint carries one, but nothing enforces it there.
-KIND_OUTSIDE: Final = "outside"
+KIND_OUTSIDE: Final[RouteKind] = "outside"
 
 
 @dataclass(frozen=True)
@@ -453,9 +453,11 @@ def _kind(declared_on: Any, effective: Any, *, websocket: bool) -> tuple[RouteKi
 
     ``declared_on`` is the route object the refusal reads, and ``effective`` is the one FastAPI
     serves, whose dependencies say whether the refusal runs at all. The decision is the engine's own
-    ``route_is_declared``, read through the same helpers the refusal uses. The walk reads no
-    ``dependency_overrides``, at least, so an app that overrides the refusal itself still reads as
-    refused here while it serves the route."""
+    ``route_is_declared``, read through the same helpers the refusal uses.
+
+    The walk reads no ``dependency_overrides``. That cuts both ways, at least: an app that overrides
+    the refusal reads as refused here while it serves the route, and one that overrides a gate
+    reads as gated here while it serves the route to anyone."""
     declaration = route_declaration_of(getattr(declared_on, "endpoint", None))
     reason = declaration.reason if declaration is not None else None
     if not refusal_runs_on(effective):

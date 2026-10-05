@@ -39,6 +39,7 @@ from scripts.security.dast_auth_sweep import (
     is_refused,
     load_policy,
     main,
+    ungated_not_declared_public,
     write_probe_outcome,
 )
 from scripts.security.dast_target import (
@@ -216,12 +217,9 @@ def test_ungated_routes_are_exactly_the_documented_anonymous_set(
     assert len(observed) == receipt["ungated_http_rows"]
     # Vault BACKLOG #2846: the allow-list names routes public BY DESIGN. A route the engine refuses to
     # every caller also has no gate, so each listed route must also read as declared public, with a
-    # reason, or the set above could not tell the two apart.
-    undeclared = [
-        r
-        for r in receipt["ungated_routes"]
-        if r["kind"] != route_gates.KIND_PUBLIC or not r["declaration"]
-    ]
+    # reason, or the set above could not tell the two apart. The rule is the shipped one evaluate()
+    # applies, so this test does not keep a copy of it.
+    undeclared = ungated_not_declared_public(receipt)
     assert not undeclared, f"ungated routes not declared public with a reason: {undeclared}"
 
     # The WebSocket route cannot be probed with an HTTP request, so the sweep excludes it. Its gate is
@@ -839,7 +837,17 @@ def test_a_newly_ungated_route_reds_the_run() -> None:
         "write_reached": 47,
         "write_bfla_probes": 43,
         "unreached_unexplained": 0,
-        "ungated_routes": [*_declared_public(policy), {"method": "GET", "path": "/messages"}],
+        # Declared public with a reason, so only the set check can catch it: the route is public
+        # but missing from the reviewed allow-list.
+        "ungated_routes": [
+            *_declared_public(policy),
+            {
+                "method": "GET",
+                "path": "/messages",
+                "kind": route_gates.KIND_PUBLIC,
+                "declaration": "synthetic reason",
+            },
+        ],
         "findings": [],
     }
     code, errors = evaluate(receipt, policy)
@@ -860,8 +868,7 @@ def test_an_allow_listed_route_that_is_not_declared_public_reds_the_run(
     Each case passed ``evaluate()`` before #2846."""
     policy = _policy()
     rows = _declared_public(policy)
-    rows[0] = {**rows[0], **row_change}
-    receipt = {
+    clean: dict[str, Any] = {
         "gated_http_rows": 99,
         "route_rows_examined": 105,
         "negative_probes": 198,
@@ -873,9 +880,13 @@ def test_an_allow_listed_route_that_is_not_declared_public_reds_the_run(
         "ungated_routes": rows,
         "findings": [],
     }
-    code, errors = evaluate(receipt, policy)
+    # The control: the same receipt with every row declared public passes, so the red below comes
+    # from the one changed row and not from the helper or the receipt.
+    assert evaluate(clean, policy) == (0, [])
+    changed = {**rows[0], **row_change}
+    code, errors = evaluate({**clean, "ungated_routes": [changed, *rows[1:]]}, policy)
     assert code == 1, errors
-    assert any("not declared public" in line and rows[0]["path"] in line for line in errors), errors
+    assert any("not declared public" in line and changed["path"] in line for line in errors), errors
 
 
 # =====================================================================================================

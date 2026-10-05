@@ -558,8 +558,9 @@ _REFUSALS_ATTR = "_mefor_route_refusals"
 #: The shortest gap between two ERROR lines for one refused route (vault BACKLOG #2846). The first
 #: refusal is always logged, and a burst costs one line a minute. Each line carries how many
 #: refusals came since the previous one. Refusals after a burst's last line are held only in the
-#: in-process tally (:func:`undeclared_route_refusals`) until the route is refused again; no timer
-#: flushes them to the log.
+#: in-process tally (:func:`undeclared_route_refusals`). They reach the log only with the first
+#: refusal of that route that comes at least this long after the last line; no timer flushes them,
+#: and a restart loses them.
 REFUSAL_LOG_INTERVAL_SECONDS = 60.0
 
 
