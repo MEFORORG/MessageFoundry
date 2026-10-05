@@ -12,19 +12,23 @@ Every value here is synthetic. The dashed number is the made-up shape the detect
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
 from messagefoundry.anon import DEFAULT_RULES, AnonError, FieldRule, SurrogateKind
 from messagefoundry.anon import anonymize as engine_anonymize
 from messagefoundry.anon import anonymize_checked as engine_anonymize_checked
+from messagefoundry.anon import hl7 as engine_hl7
 from tee.anon import DEFAULT_RULES as TEE_DEFAULT_RULES
 from tee.anon import AnonError as TeeAnonError
 from tee.anon import FieldRule as TeeFieldRule
 from tee.anon import anonymize as tee_anonymize
 from tee.anon import anonymize_checked as tee_anonymize_checked
+from tee.anon import hl7 as tee_hl7
 
 _LEAK_SCANNER = Path(__file__).resolve().parents[1] / "scripts" / "security" / "scan_forbidden.py"
 _NO_SCANNER = pytest.mark.skipif(
@@ -147,9 +151,28 @@ def test_an_msh_rule_reads_the_messages_own_separators(anonymize: Callable[..., 
     assert out.split("\r")[-1].split("!")[6:9] == ["20260101120000", "", "ADT*A01"]
 
 
-@pytest.mark.parametrize(
-    "path", ["MSH-0", "MSH-00", "MSH-1", "MSH-01", "MSH-2", "MSH-02", "MSH-002"]
-)
+#: Spellings ``load_rules`` accepts (the last one too: its pattern ends in ``$``, which matches
+#: before a final newline), then spellings only a rule built in code can carry. ``int()`` reads a
+#: number below 3 from every one of them, and ``int()`` is how the adapters read a path.
+_UNWRITABLE_MSH_PATHS = [
+    "MSH-0",
+    "MSH-00",
+    "MSH-1",
+    "MSH-01",
+    "MSH-2",
+    "MSH-02",
+    "MSH-002",
+    "MSH-2\n",
+    "MSH- 2",
+    "MSH-2 ",
+    "MSH-+2",
+    "MSH-0_2",
+    "MSH--1",
+    "msh-2",
+]
+
+
+@pytest.mark.parametrize("path", _UNWRITABLE_MSH_PATHS, ids=repr)
 @pytest.mark.parametrize("kind", _REWRITING_KINDS, ids=lambda kind: kind.value)
 @_PLAIN
 def test_a_rule_that_would_rewrite_the_delimiters_is_refused(
@@ -159,21 +182,47 @@ def test_a_rule_that_would_rewrite_the_delimiters_is_refused(
     readable delimiters for some kinds, and the tee ignored the rule. Both now refuse, and the
     refusal carries no message text.
 
-    The field NUMBER decides, not the path text: ``MSH-02`` is field 2 to ``int()``, so a text
-    comparison with ``MSH-2`` would let it through and blank the encoding characters. ``MSH-0``
-    would be split index -1 on the tee, the LAST field of the line."""
-    number = int(path.split("-")[1])
-    with pytest.raises(ValueError, match=f"a rule names MSH-{number},") as exc:
+    The field NUMBER decides, read the way the adapters read it: ``MSH-02`` is field 2 to
+    ``int()``, so a text comparison with ``MSH-2`` would let it through and blank the encoding
+    characters. A digits-only test such as ``str.isdecimal`` lets ``"MSH-2\\n"`` through the same
+    way. ``MSH-0`` would be split index -1 on the tee, the LAST field of the line."""
+    segment, _, number = path.partition("-")
+    named = re.escape(f"{segment}-{int(number)}")
+    with pytest.raises(ValueError, match=f"a rule names {named},") as exc:
         anonymize(_MSG, salt=_SALT, rules=_with(path, kind))
     assert isinstance(exc.value, (AnonError, TeeAnonError))
     assert _SSN not in str(exc.value) and "APP2" not in str(exc.value)
 
 
 @_PLAIN
-def test_the_refusal_names_both_delimiter_fields(anonymize: Callable[..., str]) -> None:
+def test_the_refusal_names_every_unwritable_field(anonymize: Callable[..., str]) -> None:
     rules = (*_with("MSH-2", SurrogateKind.DROP), FieldRule("MSH-1", SurrogateKind.DROP))
-    with pytest.raises(ValueError, match="a rule names MSH-1 and MSH-2"):
+    with pytest.raises(ValueError, match="a rule names MSH-1, MSH-2,"):
         anonymize(_MSG, salt=_SALT, rules=rules)
+
+
+@_PLAIN
+def test_a_rule_for_field_zero_of_any_segment_is_refused(anonymize: Callable[..., str]) -> None:
+    """Field 0 is the segment id. Before, the tee blanked the id (split index 0) and the engine
+    refused the message as malformed; both now give the same named refusal. ``PID-1`` is the
+    control: the lowest field a rule may rewrite outside MSH."""
+    with pytest.raises(ValueError, match="a rule names PID-0,"):
+        anonymize(_MSG, salt=_SALT, rules=_with("PID-0", SurrogateKind.DROP))
+    out = anonymize(_MSG, salt=_SALT, rules=_with("PID-1", SurrogateKind.DROP))
+    assert out.split("\r")[1].startswith("PID||")
+
+
+@pytest.mark.parametrize("module", (engine_hl7, tee_hl7), ids=("engine", "tee"))
+def test_the_refusal_lets_a_keep_and_a_non_field_path_through(module: ModuleType) -> None:
+    """``anonymize`` strips KEEP rules before the adapter, so the exemption is pinned here, at the
+    check itself. A path whose number ``int()`` cannot read is not this check's to refuse. The
+    last line is the control: the same paths with a rewriting kind are refused."""
+    refuse = module._refuse_unwritable_rules
+    keeps = tuple(module.FieldRule(p, "keep") for p in ("MSH-0", "MSH-1", "MSH-2", "PID-0"))
+    refuse(keeps)
+    refuse((module.FieldRule("MSH-9.1", "drop"), module.FieldRule("MSH", "drop")))
+    with pytest.raises(ValueError, match="a rule names MSH-0, MSH-1, MSH-2, PID-0,"):
+        refuse(tuple(module.FieldRule(rule.path, "drop") for rule in keeps))
 
 
 @_NO_SCANNER
@@ -236,30 +285,39 @@ def test_an_overlay_drop_reaches_a_second_msh_line_through_the_tee(tmp_path: Pat
 def test_full_coverage_reports_the_scrubbed_msh_field_as_decided(
     checked: Callable[..., str],
 ) -> None:
-    """With the coverage switch on, the second line's MSH-8 counts as decided, and that is now
-    true: the output the report describes no longer holds the number. Before the fix the tee
-    reported it decided with the number still in the output (RED on the tee)."""
-    rules = (
-        *_with("MSH-8", SurrogateKind.DROP),
-        *(FieldRule(f"MSH-{n}", SurrogateKind.KEEP) for n in (2, 3, 4, 5, 6, 7, 9, 10, 11, 12)),
-        FieldRule("PID-5", SurrogateKind.NAME),
+    """With the coverage switch on, a second line's MSH-8 counts as decided because a rule names
+    it, and the rule was applied: the field holds the redaction, not its old value. Before the
+    fix the tee counted it decided and left the value in place (RED on the tee).
+
+    The kind is FREETEXT so the field is still PRESENT in the output; a DROP would empty it, and
+    the check skips an empty field before it looks at any rule. The control is the same call
+    without the MSH-8 rule, which is refused for that one field."""
+    msg = _MSG.replace(_SSN, "OLDVALUE")
+    keeps = tuple(
+        FieldRule(f"MSH-{n}", SurrogateKind.KEEP) for n in (2, 3, 4, 5, 6, 7, 9, 10, 11, 12)
     )
     reports: list[object] = []
     out = checked(
-        _MSG, salt=_SALT, rules=rules, require_full_coverage=True, on_report=reports.append
+        msg,
+        salt=_SALT,
+        rules=(*_with("MSH-8", SurrogateKind.FREETEXT), *keeps),
+        require_full_coverage=True,
+        on_report=reports.append,
     )
     (report,) = reports
     assert report.undecided_fields == ()  # type: ignore[attr-defined]
-    assert _SSN not in out
+    assert "OLDVALUE" not in out
+    assert _msh_lines(out)[1][7] == "[REDACTED]"
+    with pytest.raises(Exception, match=r"1 field\(s\) with no rule and no keep: MSH-8"):
+        checked(msg, salt=_SALT, rules=(*DEFAULT_RULES, *keeps), require_full_coverage=True)
 
 
 def test_the_lowest_rewritable_msh_field_is_three() -> None:
-    """The control for the refusal above: MSH-3, also spelled MSH-03, is rewritten, not refused."""
-    for path in ("MSH-3", "MSH-03"):
-        engine = engine_anonymize(_MSG, salt=_SALT, rules=_with(path, SurrogateKind.DROP))
-        tee = tee_anonymize(_MSG, salt=_SALT, rules=_tee_with(path, SurrogateKind.DROP))
-        assert engine == tee
-        assert [line[2] for line in _msh_lines(tee)] == ["", ""]
+    """The control for the refusal above: MSH-3 is rewritten, not refused."""
+    engine = engine_anonymize(_MSG, salt=_SALT, rules=_with("MSH-3", SurrogateKind.DROP))
+    tee = tee_anonymize(_MSG, salt=_SALT, rules=_tee_with("MSH-3", SurrogateKind.DROP))
+    assert engine == tee
+    assert [line[2] for line in _msh_lines(tee)] == ["", ""]
 
 
 def test_the_tee_applies_an_msh_rule_to_a_header_not_in_capitals() -> None:
@@ -270,3 +328,48 @@ def test_the_tee_applies_an_msh_rule_to_a_header_not_in_capitals() -> None:
     assert out.split("\r")[0].split("|")[3] == "[REDACTED]"
     with pytest.raises(ValueError):
         engine_anonymize(msg, salt=_SALT, rules=_with("MSH-4", SurrogateKind.FREETEXT))
+
+
+def test_a_later_line_not_in_capitals_is_not_an_msh_line_to_either_side() -> None:
+    """Only the HEADER is matched in any case. A later ``Msh`` line is not an MSH line to the
+    engine or to the leak-check, so the tee must leave it alone too: same bytes from both, and
+    the leak-check then refuses the line as one no rule can reach."""
+    later = _SECOND.replace("MSH", "Msh", 1)
+    msg = "\r".join((_HEADER, _PID, later))
+    engine = engine_anonymize(msg, salt=_SALT, rules=_with("MSH-8", SurrogateKind.DROP))
+    tee = tee_anonymize(msg, salt=_SALT, rules=_tee_with("MSH-8", SurrogateKind.DROP))
+    assert engine == tee
+    assert tee.split("\r")[-1] == later
+
+
+#: Messages with a later MSH line in shapes the one fixture above does not have.
+_PARITY_MESSAGES = {
+    "fixture": _MSG,
+    "two-later-lines": "\r".join((_MSG, rf"MSH|^~\&|APP3|FAC3|RCV|RFAC|2026|{_SSN}|ADT^A01|M3")),
+    "repetitions-and-escapes": "\r".join(
+        (_HEADER, _PID, rf"MSH|^~\&|A~B^C&D|F\T\G|RCV|RFAC|2026|{_SSN}~{_SSN}|ADT^A01|M2")
+    ),
+    "three-fields": "\r".join((_HEADER, _PID, r"MSH|^~\&|APP2")),
+    "msh-between-segments": "\r".join((_HEADER, _SECOND, _PID, "NK1|1|Z^Q")),
+    "own-separators": "\r".join(
+        (
+            r"MSH!*~\&!APP!FAC!RCV!RFAC!20260101120000!!ADT*A01!M1!P!2.5.1",
+            "PID!1!!1***H*MR!!X*Y",
+            rf"MSH!*~\&!APP2!FAC2!RCV!RFAC!20260101120000!{_SSN}!ADT*A01!M2!P!2.5.1",
+        )
+    ),
+}
+
+
+@pytest.mark.parametrize("message", _PARITY_MESSAGES.values(), ids=_PARITY_MESSAGES.keys())
+@pytest.mark.parametrize("path", ["MSH-3", "MSH-4", "MSH-8", "MSH-9", "MSH-12", "MSH-30"])
+@pytest.mark.parametrize("kind", _REWRITING_KINDS, ids=lambda kind: kind.value)
+def test_an_msh_rule_gives_the_same_bytes_on_both_sides(
+    message: str, path: str, kind: SurrogateKind
+) -> None:
+    """Engine and tee output are equal byte for byte under an MSH rule, for each message shape,
+    field and kind. The parity file's own inputs run with the default rules, which name no MSH
+    field, so they cannot show this."""
+    engine = engine_anonymize(message, salt=_SALT, rules=_with(path, kind))
+    tee = tee_anonymize(message, salt=_SALT, rules=_tee_with(path, kind))
+    assert engine == tee
