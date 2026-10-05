@@ -2240,6 +2240,21 @@ For a server like these, a connection can opt back into the plain form:
 outbound("OB_EPIC_OBS", FHIR(url=env("epic_fhir_base"), conditional="if-match", update_url_form="path"))
 ```
 
+**A plain `interaction="update"` sends no `If-Match` header.** Only `conditional="if-match"` adds one. So
+a server that requires `If-Match` on update would refuse a plain update, and the message would
+dead-letter. There are three ways to send the header:
+
+- Set `conditional="if-match"`, as the example does. Each resource then needs a `meta.versionId`.
+- Put a static `If-Match` in `headers`. It is the same on every message, so it only helps where the
+  server accepts one fixed value.
+- Set `dynamic_headers=True` and have a Handler stamp `If-Match` per message.
+
+`messagefoundry check` prints an advisory `fhir-update-if-match` line. It names each path-form update
+with no `conditional="if-match"` and no static `If-Match`. It **never blocks**: it cannot tell which
+server a connection points at, and it cannot see a header a Handler stamps. The sourcing for which
+Oracle Health resources require the header stops at "most" in the bullet above. Check the vendor's page
+for the resource you write. This is vault BACKLOG #2570.
+
 With `update_url_form="path"`, an `update` or `if-match` is sent as `PUT {base}/{ResourceType}/{id}`:
 
 - The id must match the FHIR id grammar, `[A-Za-z0-9\-\.]{1,64}`, and must not be only dots. Any other id

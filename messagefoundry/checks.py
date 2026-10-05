@@ -277,6 +277,9 @@ def run_checks(
         # vault BACKLOG #2550: every FHIR connection that puts the update id back in the URL, a
         # listed loosening of owner ruling R3. Advisory, as tls_allow_expired is -- see the check.
         _check_fhir_update_path_form(config_dir),
+        # vault BACKLOG #2570: every path-form update that declares no If-Match, which a server
+        # requiring one on update would refuse. Advisory -- see the check.
+        _check_fhir_update_if_match(config_dir),
         # #1159 / ASVS 10.2.3: name every SMART connection asking for more FHIR authority than its
         # declared interaction can spend. Advisory, and a refusal was ruled out — see the check.
         _check_smart_scope(config_dir),
@@ -2443,6 +2446,57 @@ def _check_fhir_update_path_form(config_dir: str | Path) -> CheckResult:
             f"{len(path_form)} FHIR connection(s) send updates in the path form, so each message's "
             f"resource id is in the request URL — {', '.join(path_form)} (a listed loosening of "
             "owner ruling R3, ASVS 14.2.1)"
+        ),
+    )
+
+
+def _check_fhir_update_if_match(config_dir: str | Path) -> CheckResult:
+    """Name every path-form ``FHIR()`` update that declares no ``If-Match`` (vault BACKLOG #2570).
+
+    A plain ``interaction="update"`` sends its ``PUT`` with no ``If-Match`` header, and a server that
+    requires one on update would refuse it, so the message would dead-letter. The set and what it
+    cannot see are in :func:`~messagefoundry.config.wiring.path_form_fhir_updates_without_if_match`.
+
+    **Advisory (``required=False``), for two reasons, each enough.** Nothing in a connection names
+    the server's vendor, so this cannot know whether the server requires the header. And a Handler
+    can stamp ``If-Match`` through ``dynamic_headers``, which no load-time check can see. So the line
+    reports, says both limits, and never refuses.
+
+    SKIPs when the graph will not load, the same convention as its siblings."""
+    from messagefoundry.config.wiring import (
+        WiringError,
+        load_config,
+        path_form_fhir_updates_without_if_match,
+    )
+
+    name = "fhir-update-if-match"
+    try:
+        registry = load_config(config_dir)
+    except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
+        return CheckResult(
+            name, ok=True, required=False, skipped=True, detail=f"config did not load: {exc}"
+        )
+    plain = path_form_fhir_updates_without_if_match(registry)
+    if not plain:
+        return CheckResult(
+            name,
+            ok=True,
+            required=False,
+            detail="no path-form FHIR update is declared without an If-Match",
+        )
+    listed = "; ".join(f"{conn} ({note})" for conn, note in plain)
+    return CheckResult(
+        name,
+        ok=True,
+        required=False,
+        detail=(
+            f"{len(plain)} path-form FHIR update(s) declare no If-Match header: {listed}. A server "
+            "that requires If-Match on update refuses such a request, and the message would "
+            "dead-letter. Oracle Health documents that requirement on most of the resources it "
+            "lets a client update (docs/CONNECTIONS.md, 'Vendor compatibility and the path-form "
+            "opt-in'). Set conditional='if-match', which needs meta.versionId on the resource, or "
+            "a static If-Match in headers. Advisory: check cannot tell which server a connection "
+            "points at, or see a header a Handler stamps"
         ),
     )
 

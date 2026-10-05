@@ -158,6 +158,7 @@ __all__ = [
     "expiry_relaxed_hops",
     "hostname_unchecked_hops",
     "path_form_fhir_updates",
+    "path_form_fhir_updates_without_if_match",
     "query_credential_hops",
     "revocation_attested_hops",
     "unverified_generic_db_hops",
@@ -5273,6 +5274,55 @@ def path_form_fhir_updates(registry: Registry) -> list[str]:
         for oc in registry.outbound.values()
         if oc.spec.type == ConnectorType.FHIR and oc.spec.settings.get("update_url_form") == "path"
     )
+
+
+def path_form_fhir_updates_without_if_match(registry: Registry) -> list[tuple[str, str]]:
+    """Every path-form ``FHIR()`` update that declares no ``If-Match``, as ``(name, note)`` (vault
+    BACKLOG #2570).
+
+    The single reader of that set, on the contract of :func:`path_form_fhir_updates`, whose list it
+    narrows. Sorted by name.
+
+    A plain ``interaction="update"`` sends ``PUT {base}/{ResourceType}/{id}`` with no ``If-Match``
+    header. Only ``conditional="if-match"`` adds one, from the resource's ``meta.versionId``. A server
+    that requires ``If-Match`` on update would refuse the plain request, and the message would
+    dead-letter. ``docs/CONNECTIONS.md``, "Vendor compatibility and the path-form opt-in", records one
+    vendor that documents the requirement, and is where the sourcing for it stops.
+
+    A connection is named when all three hold: it takes the path form, its ``conditional`` is not
+    ``if-match``, and its static ``headers`` carry no ``If-Match`` key in any letter case.
+
+    **The note says what this reader cannot see.** A Handler can stamp ``If-Match`` per message when
+    ``dynamic_headers`` is on, and no load-time reader can know whether it does. A ``headers`` table
+    written as one ``env()`` reference is unresolved here. Both cases are still named, with the reason
+    in the note, so the set is "declares none", never "sends none".
+
+    There is no vendor setting to read, so this cannot tell which server a connection points at. It is
+    an inventory for review, not a verdict.
+
+    Pure: it reads the loaded graph and touches nothing else."""
+    out: list[tuple[str, str]] = []
+    for oc in registry.outbound.values():
+        settings = oc.spec.settings
+        if oc.spec.type != ConnectorType.FHIR or settings.get("update_url_form") != "path":
+            continue
+        if settings.get("conditional") == "if-match":
+            continue
+        headers = settings.get("headers")
+        unread = ""
+        if _is_nested_envref(headers):
+            unread = "its headers are an env() reference, which check does not resolve; "
+        elif isinstance(headers, Mapping) and any(
+            str(key).lower() == "if-match" for key in headers
+        ):
+            continue
+        stamped = (
+            "dynamic_headers is on, so a Handler may stamp If-Match per message"
+            if settings.get("dynamic_headers")
+            else "dynamic_headers is off, so no Handler can add one"
+        )
+        out.append((oc.name, unread + stamped))
+    return sorted(out)
 
 
 def revocation_attested_hops(registry: Registry) -> list[tuple[str, str]]:
