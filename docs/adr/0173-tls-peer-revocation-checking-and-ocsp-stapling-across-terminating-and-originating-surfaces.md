@@ -694,8 +694,8 @@ OAuth2 token hop. Two reasons:
   instance only a loopback token host or the per-connection `tls_revocation_attested` crosses.
 
 **The refusal text was not changed, and on the ECH arm it over-offers.** It still names
-`[tls].crl_file` and an egress proxy as ways across. Neither can cross an ECH hop: only the
-attestation can.
+`[tls].crl_file` and an egress proxy as ways across. Neither can cross an ECH hop. On an enforcing
+instance a non-loopback ECH hop crosses on the attestation alone.
 
 The REST destination's ECH arm takes the same value, under BACKLOG #2188. That item moved the guard
 in the REST, SOAP, FHIR and DICOMweb destinations below the last statement that builds or replaces

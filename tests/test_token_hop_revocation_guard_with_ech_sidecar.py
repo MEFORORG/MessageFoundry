@@ -162,7 +162,7 @@ def test_an_ech_sidecar_and_a_crl_still_refuse_the_token_hop(
 
 
 @pytest.mark.parametrize("name", _PROVIDERS)
-def test_the_ech_arm_refuses_with_or_without_a_crl(
+def test_the_ech_arm_also_refuses_with_no_crl(
     name: str, settings_for: dict[str, dict[str, object]]
 ) -> None:
     """The CRL changes nothing on the ECH arm: the hop was refused with none, and it still is."""

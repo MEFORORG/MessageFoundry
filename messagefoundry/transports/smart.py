@@ -375,7 +375,8 @@ class _TokenEndpointProvider(abc.ABC):
         # re-addresses the POST to the loopback sidecar, and the sidecar makes its own TLS connection
         # to the token host. So this opener's context only ever meets the sidecar. A `[tls].crl_file`
         # covering the token host still lands on it, and reading it here lifted the refusal with no
-        # check behind it. Only the per-connection attestation crosses that arm.
+        # check behind it. On an enforcing instance a non-loopback token host then crosses on the
+        # per-connection attestation alone.
         refuse_unrevoked_verified_hop(
             scheme,
             token_url,
