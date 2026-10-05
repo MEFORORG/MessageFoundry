@@ -47,8 +47,10 @@ levels:
   said the listener was not built.
 
 The security controls that only become material off-loopback (mTLS, certificate revocation,
-off-box logs) are **delegated to the org's environment** (PKI, SIEM, network controls) and
-documented per deployment — see [DEPLOYMENT.md](DEPLOYMENT.md) and [§11](#11-hardening-roadmap).
+off-box logs) are **built into the engine and opt-in**, and each leans on the org's environment.
+Its PKI issues the certificates and the CRL files the engine checks, its SIEM receives the forwarded
+logs, and its network controls stay its own. Each is documented per deployment — see
+[DEPLOYMENT.md](DEPLOYMENT.md) and [§11](#11-hardening-roadmap).
 MFA is not among them. The engine enforces its own second factor (`[security].require_mfa`, on by
 default) on any bind. Which accounts it covers, directory and OIDC sign-ins included, is stated in
 [SECURITY.md](SECURITY.md#multi-factor-authentication-totp-wp-14).
