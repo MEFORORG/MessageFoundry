@@ -2496,8 +2496,11 @@ def _check_fhir_update_if_match(config_dir: str | Path) -> CheckResult:
             f"{len(plain)} path-form FHIR update(s) have no If-Match that check can read: "
             f"{listed}. A server "
             "that requires If-Match on update refuses such a request, and the message would "
-            "dead-letter. Oracle Health documents that requirement on most of the resources it "
-            "lets a client update (docs/CONNECTIONS.md, 'Vendor compatibility and the path-form "
+            # Worded so the PHI name heuristic does not scrub it: two adjacent Title-case words
+            # would reach the log as [redacted] (tests/test_engine_text_survives_the_name_run.py).
+            "dead-letter. Oracle documents that requirement on most of the resources its Health "
+            "platform (Millennium) lets a client update (docs/CONNECTIONS.md, 'Vendor "
+            "compatibility and the path-form "
             "opt-in'). Set conditional='if-match', which needs meta.versionId on the resource, or "
             "a static If-Match in headers. Advisory: check cannot tell which server a connection "
             "points at, or see a header a Handler stamps"
@@ -2716,7 +2719,9 @@ def _check_oauth_request(config_dir: str | Path) -> CheckResult:
     if read.not_compared:
         skipped = "; ".join(f"{conn} ({reason})" for conn, reason in read.not_compared)
         detail += (
-            f". NOT COMPARED: {len(read.not_compared)} setting(s), each for the reason beside "
+            # "Not compared", never two ALL-CAPS words: the PHI name heuristic scrubs that run,
+            # and this string is built through a local, where the engine-text scan cannot see it.
+            f". Not compared: {len(read.not_compared)} setting(s), each for the reason beside "
             f"it; check reads literal values and does not resolve env(): {skipped}"
         )
     return CheckResult(name, ok=True, required=False, detail=detail)

@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry import redaction
 from messagefoundry.checks import CheckResult, run_checks
 from messagefoundry.config.wiring import load_config, path_form_fhir_updates_without_if_match
 
@@ -145,6 +146,10 @@ def test_check_names_the_connection_and_says_both_limits(tmp_path: Path) -> None
     # The two limits that keep it advisory, in the line itself.
     assert "cannot tell which server a connection points at" in r.detail
     assert "or see a header a Handler stamps" in r.detail
+    # The vendor is still named, in words the PHI name heuristic does not scrub.
+    assert "Oracle documents that requirement" in r.detail
+    assert "its Health platform (Millennium)" in r.detail
+    assert redaction._NAME_RUN.findall(r.detail) == []
 
 
 def test_check_says_none_out_loud(tmp_path: Path) -> None:
