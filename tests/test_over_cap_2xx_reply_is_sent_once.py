@@ -45,6 +45,7 @@ from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import Registry
 from messagefoundry.parsing import RawMessage
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome
+from messagefoundry.redaction import safe_exc, safe_text
 from messagefoundry.store.store import MessageStatus, MessageStore, OutboxStatus, Stage
 from messagefoundry.transports.base import NegativeAckError
 from messagefoundry.transports.bounded_read import (
@@ -88,7 +89,7 @@ def test_an_unused_over_cap_body_reads_as_empty_and_warns(
     (record,) = caplog.records
     assert record.levelno == logging.WARNING
     message = record.getMessage()
-    assert message.startswith("REST connection 'OB_X' accepted the request (status 201)")
+    assert message.startswith("REST connection 'OB_X' answered with status 201 and")
     assert "64-byte bound" in message
     assert "recorded as delivered" in message
     assert _REPLY_FILL.decode() * 4 not in message
@@ -107,8 +108,10 @@ def test_a_used_over_cap_body_is_a_permanent_refusal() -> None:
     assert err.code == REPLY_TOO_LARGE_CODE == "reply-too-large"
     # Not a credential or configuration fault: those stop the lane, and this is one reply.
     assert (err.permanent, err.credential_fault, err.config_fault) == (True, False, False)
-    assert str(err).startswith("SOAP connection 'OB_X' accepted the request with a 2xx status")
-    assert "64-byte bound" in str(err)
+    assert str(err) == (
+        "SOAP connection 'OB_X': reply-too-large, not sent again. A 2xx reply body is over the "
+        "64-byte bound and is needed here. Check the partner before a replay"
+    )
     assert _REPLY_FILL.decode() * 4 not in str(err)
     # Neither chain reaches the frame that holds the bytes read so far.
     assert err.__context__ is None
@@ -150,6 +153,46 @@ def test_a_truncated_body_is_still_raised_as_it_was(body_is_needed: bool) -> Non
             encoding="utf-8",
             body_is_needed=body_is_needed,
         )
+
+
+@pytest.mark.parametrize("body_is_needed", [False, True])
+@pytest.mark.parametrize("status", [199, 300, 404, 500])
+def test_an_over_cap_body_on_another_status_is_left_to_the_caller(
+    status: int, body_is_needed: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The helper is for a 2xx. Handed a reply with any other status it changes nothing, so a
+    wrong call cannot record a refused request as delivered, or claim a 2xx that never came."""
+    with caplog.at_level(logging.WARNING), pytest.raises(ResponseTooLargeError) as ei:
+        read_accepted_reply_text(
+            _ExactResp(_REPLY_FILL * 65, status=status),
+            limit=64,
+            connector="c",
+            encoding="utf-8",
+            body_is_needed=body_is_needed,
+        )
+    assert not isinstance(ei.value, NegativeAckError)
+    assert caplog.records == []
+
+
+def test_the_stored_refusal_keeps_its_code_under_a_long_connection_name() -> None:
+    """A dead-lettered row keeps the error text, cut at 200 characters, and not the code. So the
+    code and "not sent again" come first, where a long connection name cannot push them out."""
+    name = "OB_" + "LONGPARTNER_" * 5 + "ADT"
+    assert len(name) > 60
+    with pytest.raises(NegativeAckError) as ei:
+        read_accepted_reply_text(
+            _ExactResp(_REPLY_FILL * 65),
+            limit=64,
+            connector=f"DICOMweb connection {name!r}",
+            encoding="utf-8",
+            body_is_needed=True,
+        )
+    # What the worker does with it: safe_exc, then the store's own safe_text.
+    stored = safe_text(safe_exc(ei.value))
+    # The control: the text really was cut, and what the cut took is the advice at the end.
+    assert "Check the partner before a replay" in str(ei.value)
+    assert "Check the partner before a replay" not in stored
+    assert f"{name!r}: {REPLY_TOO_LARGE_CODE}, not sent again" in stored
 
 
 # --- each destination's _post, against a body that never ends -------------------------------------
@@ -209,7 +252,8 @@ async def test_send_follows_the_ruling_and_keeps_the_byte_bound(
             assert ei.value.code == REPLY_TOO_LARGE_CODE
             assert ei.value.permanent is True
             refusal = str(ei.value)
-            assert refusal.startswith(f"{_LABEL[ctype]} connection {CONNECTION!r} accepted")
+            identity = f"{_LABEL[ctype]} connection {CONNECTION!r}"
+            assert refusal.startswith(f"{identity}: {REPLY_TOO_LARGE_CODE}, not sent again")
             assert _URL_MARKER not in str(ei.value)
             assert "partner.example.com" not in str(ei.value)
     # The bound is still enforced on the read: one byte past it, and never the whole body.
@@ -218,7 +262,7 @@ async def test_send_follows_the_ruling_and_keeps_the_byte_bound(
     warnings = [r.getMessage() for r in caplog.records if "over the" in r.getMessage()]
     if side == _DELIVERED:
         (warning,) = warnings
-        assert warning.startswith(f"{_LABEL[ctype]} connection {CONNECTION!r} accepted")
+        assert warning.startswith(f"{_LABEL[ctype]} connection {CONNECTION!r} answered")
         for leaked in (_URL_MARKER, "partner.example.com", _PAYLOAD_MARKER, "\x00\x00"):
             assert leaked not in warning
     else:
@@ -382,7 +426,10 @@ async def test_an_over_cap_2xx_is_sent_once_and_recorded_as_ruled(
         # The stored error is the fixed text: the connection, the bound, and nothing of the URL,
         # the payload or the reply.
         identity = f"{_LABEL[ctype]} connection {CONNECTION!r}"
-        assert f"{identity} accepted the request" in got.last_error
+        # The code is in the text, because the row keeps the text and not the code. The advice
+        # is the last thing in it, so seeing it shows the 200-character cut took nothing.
+        assert f"{identity}: {REPLY_TOO_LARGE_CODE}, not sent again" in got.last_error
+        assert got.last_error.endswith("Check the partner before a replay")
         for leaked in (_URL_MARKER, "127.0.0.1", _PAYLOAD_MARKER, "ZZZZ"):
             assert leaked not in got.last_error
     for record in caplog.records:
@@ -437,7 +484,7 @@ async def test_an_over_cap_body_on_a_500_is_retried_as_before(
     assert got.outcomes == [_ItemOutcome.PROCESSED] * _OFFERS
     assert got.row_status == OutboxStatus.PENDING.value
     assert "HTTP 500" in got.last_error
-    assert "accepted the request" not in got.last_error
+    assert REPLY_TOO_LARGE_CODE not in got.last_error
     assert got.captured == []
 
 
@@ -456,8 +503,11 @@ async def test_fhir_with_capture_on_is_not_changed_by_this_item(
     dest = _build(ConnectorType.FHIR, "https://partner.example.com/fhir", capture_response=True)
     resp = _UnboundedResp()
     dest._opener = _FakeOpener(resp)
-    with pytest.raises(ResponseTooLargeError):
+    with pytest.raises(ResponseTooLargeError) as ei:
         await dest.send(_payload(ConnectorType.FHIR))
+    # Still the reader's own text: the connection, and no part of the URL.
+    assert str(ei.value).startswith(f"FHIR connection {CONNECTION!r} returned")
+    assert "partner.example.com" not in str(ei.value)
     assert resp.requested == [DEFAULT_MAX_RESPONSE_BYTES + 1]
     with _Partner(200, over_cap_body) as partner:
         wired = _build(ConnectorType.FHIR, f"{partner.url}/fhir", capture_response=True)

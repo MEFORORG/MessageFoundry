@@ -1377,23 +1377,25 @@ raise `DeliveryError`, so the lane **retries** with backoff. **Other 4xx** (and 
 redirect**) raise a permanent `NegativeAckError`, so the message **dead-letters immediately** rather
 than blocking the FIFO lane on a request the endpoint will never accept.
 
-**A 2xx reply over the byte bound (vault BACKLOG #2180).** The engine reads at most 16 MiB of a reply
-body. After a 2xx the partner has already accepted the request, so an over-size body never causes a
-re-send. What happens instead depends on who reads the body (owner ruling 2026-10-05). This table
-covers the four HTTP destinations, and their own sections point here.
+**A 2xx reply over the byte bound (vault BACKLOG #2180).** The engine keeps at most 16 MiB of a reply
+body. A retry after a 2xx would send again a request the partner has already answered, so in every
+row below but the last an over-size body does not cause a re-send. What happens instead depends on
+whether the engine needs the body (owner ruling 2026-10-05). This table is the one place that lists
+the four HTTP destinations, and their own sections point here.
 
 | Destination | `capture_response` | An over-size body after a 2xx |
 |---|---|---|
-| REST | off | **delivered**: nothing reads the body, so it is dropped and a WARNING names the connection |
+| REST | off | **delivered**: nothing looks at the body, so it is dropped and a WARNING names the connection |
 | REST | on | **permanent refusal**, code `reply-too-large`: the reply would be stored and may be passed on, so the message dead-letters once |
 | SOAP | off or on | **permanent refusal**: a `Fault` can sit inside a 2xx body, so the engine cannot tell the outcome |
 | DICOMweb | off or on | **permanent refusal**: a `FailedSOPSequence` can sit inside a 2xx body |
-| FHIR | off | **delivered**, with the same WARNING |
+| FHIR | off | **delivered**, with the same WARNING. For an update sent as a transaction, see the FHIR section |
 | FHIR | on | not covered by the ruling. It is still a `DeliveryError`, so the lane retries and the request is sent again |
 
-A message that dead-letters this way was accepted by the partner. Check the partner's own record
-before you replay it. A reply that is cut short or misframed after a 2xx is a separate case, and the
-lane still retries it.
+A message that dead-letters this way got a 2xx, but the engine could not read the reply. The partner
+may have applied it, and on SOAP or DICOMweb the unread body may have held a rejection. Its stored
+error carries the code `reply-too-large`. Check the partner's own record before you replay it. A
+reply that is cut short or misframed after a 2xx is a separate case, and the lane still retries it.
 
 **Security.** Redirects are **refused** (a 3xx can't divert PHI to another host — ASVS 15.3.2), the URL
 scheme is constrained to `http`/`https`, and the outbound host is gated by the fail-closed
@@ -2243,8 +2245,10 @@ What a site needs to know:
 - If a server answers 2xx while the entry's own `response.status` failed, the message is classified on
   that entry status, like any other HTTP status. An entry status that does not read as an HTTP code is
   logged as a warning, and the 2xx reply counts as delivered.
-- A reply body over the byte bound is not read at all, so its entry status is not seen. With
-  `capture_response` off the 2xx counts as delivered. See *A 2xx reply over the byte bound* under REST.
+- A reply body over the byte bound is dropped before the engine looks inside it, so its entry status
+  is not seen. With `capture_response` off the 2xx counts as delivered, as it does for any reply the
+  engine cannot read. An entry that failed inside such a reply is therefore recorded as delivered. See
+  *A 2xx reply over the byte bound* under REST.
 - `capture_response_headers` still captures `ETag`, `Location` and `Last-Modified`. They come from the
   entry, which describes the updated resource, and an entry field hides a reply header of the same
   name. They keep the entry's formats: `Last-Modified` is a FHIR instant, not an HTTP-date, and
