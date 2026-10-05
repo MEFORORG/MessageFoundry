@@ -483,7 +483,11 @@ class CipherError(Exception):
     with no matching key, a failed AEAD tag (corrupt blob, or a key/old key that wasn't supplied), a
     malformed value, **or an unknown marker version / algorithm id** (M9 — fail-closed, never a silent
     pass-through). Call sites **contain** this (dead-letter the row) rather than letting a raw
-    ``cryptography`` exception escape into a worker."""
+    ``cryptography`` exception escape into a worker.
+
+    It also covers a **corrupt row** that no key fixes (BACKLOG #2308): a value whose tag verified
+    but whose plaintext is not UTF-8, or, at an eager read seam (:func:`decrypt_json_cell`), is not
+    JSON. The message says which, so an operator is not sent looking for a missing key."""
 
 
 class StoreKeylessError(RuntimeError):

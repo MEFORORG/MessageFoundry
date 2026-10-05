@@ -7538,6 +7538,8 @@ def _rotate_key(args: argparse.Namespace) -> int:
         # the uploaded-file store), so a failure in the second leaves the FIRST already committed
         # and the ASVS 13.3.4 rotation stamp unwritten. That is safe precisely because both passes
         # skip what is already under the active key — it is a resumable rotation, not a rollback.
+        # One case no key finishes: a row whose tag verified but which is not UTF-8, or not JSON at
+        # the open's cache warm-up, is corrupt, and its message says so (BACKLOG #2308).
         print(f"error: rotation aborted — {exc}", file=sys.stderr)
         return 1
     except (NotImplementedError, StoreNotFoundError) as exc:  # #1780: no store there
