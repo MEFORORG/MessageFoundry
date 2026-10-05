@@ -9552,7 +9552,9 @@ class AuthService:
         return False
 
     async def _revoke_ad_sessions(self) -> int:
-        """Revoke every live session held by a directory account. Returns the number revoked.
+        """Revoke every unrevoked session held by an enabled directory account, lapsed ones
+        included. Returns the number revoked, which is the ``sessions_revoked`` the two map audit
+        rows record; it counts rows, not live sessions.
 
         BACKLOG #1154 (ASVS 8.3.2). The two AD map setters below are authorization-value mutators:
         the group maps resolve to role sets and to channel scope, which is exactly what an

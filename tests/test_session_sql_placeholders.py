@@ -171,6 +171,46 @@ async def test_sqlserver_revoke_user_sessions_counts_its_output_rowset(revoked: 
     assert "OUTPUT inserted.token_hash" in seen[0][0]
 
 
+async def test_sqlserver_supersede_returns_the_output_row_by_column_name() -> None:
+    """``supersede_session`` reads its ``OUTPUT inserted.*`` row through ``_execute_output``
+    (BACKLOG #2283), which pairs each value with its column name. Read by position instead, a
+    reordered column list would fill the record from the wrong columns."""
+    columns = ("user_id", "token_hash", "revoked_at", "expires_at", "created_at", "last_used_at")
+    row = ("u", _HASH, _NOW, _NOW + 60, _NOW - 60, _NOW - 30)
+    seen: list[tuple[str, tuple[Any, ...]]] = []
+    store = _mssql_store(seen)
+
+    class _ColumnsCursor(_MssqlCursor):
+        def __init__(self, seen: list[tuple[str, tuple[Any, ...]]]) -> None:
+            super().__init__(seen)
+            self.description = [(c,) for c in (*columns, "client")]
+
+        async def fetchall(self) -> list[Any]:
+            return [(*row, None)]
+
+    class _ColumnsConn(_MssqlConn):
+        async def cursor(self) -> _MssqlCursor:
+            return _ColumnsCursor(self._seen)
+
+    @asynccontextmanager
+    async def _acquire() -> AsyncIterator[_MssqlConn]:
+        yield _ColumnsConn(seen)
+
+    store._acquire = _acquire
+    ended = await store.supersede_session(_HASH, now=_NOW)
+    assert ended is not None
+    assert (ended.user_id, ended.token_hash, ended.revoked_at) == ("u", _HASH, _NOW)
+    assert (ended.created_at, ended.last_used_at, ended.expires_at) == (
+        _NOW - 60,
+        _NOW - 30,
+        _NOW + 60,
+    )
+    assert "OUTPUT inserted.*" in seen[0][0]
+
+    empty = _nocount_store([], [])
+    assert await empty.supersede_session(_HASH, now=_NOW) is None
+
+
 @pytest.mark.parametrize("split", [False, True])
 @pytest.mark.parametrize("revoked", [0, 2])
 async def test_sqlserver_session_cap_counts_its_output_rowset(revoked: int, split: bool) -> None:

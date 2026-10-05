@@ -12239,23 +12239,14 @@ class SqlServerStore:
     async def supersede_session(self, token_hash: str, *, now: float) -> SessionRecord | None:
         """Revoke and return in one statement (BACKLOG #2146). See :meth:`AuthStore.supersede_session`.
 
-        Hand-rolled because ``_fetchone`` commits as a READ, and this is a durable write. The rows
-        are drained before the commit, and ``_cursor`` frees the statement handle the ``OUTPUT``
-        clause leaves open."""
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                await cur.execute(
-                    "UPDATE sessions SET revoked_at=? OUTPUT inserted.*"
-                    " WHERE token_hash=? AND revoked_at IS NULL",
-                    (now, token_hash),
-                )
-                columns = [c[0] for c in cur.description]
-                rows = await cur.fetchall()
-                await self._commit(conn)
-            except Exception:
-                await conn.rollback()
-                raise
-        return SessionRecord.from_mapping(dict(zip(columns, rows[0]))) if rows else None  # noqa: B905
+        Through ``_execute_output`` rather than ``_fetchone``, which commits as a READ, while this is
+        a durable write (BACKLOG #2283)."""
+        rows = await self._execute_output(
+            "UPDATE sessions SET revoked_at=? OUTPUT inserted.*"
+            " WHERE token_hash=? AND revoked_at IS NULL",
+            (now, token_hash),
+        )
+        return SessionRecord.from_mapping(rows[0]) if rows else None
 
     async def revoke_user_sessions(
         self, user_id: str, *, except_token_hash: str | None = None, now: float | None = None
