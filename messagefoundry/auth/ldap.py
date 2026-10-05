@@ -25,8 +25,9 @@ import logging
 import math
 import re
 import ssl
+import struct
 import uuid
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -514,8 +515,48 @@ def _refuse_referral(conn: Any, operation: str) -> None:
 def _search(conn: Any, operation: str, **kwargs: Any) -> None:
     """``conn.search(**kwargs)``, refusing a referral result. Every search in this module goes
     through here, so none can read one as "no entries"; a test pins that."""
-    conn.search(**kwargs)
+    with _socket_faults_as_ldap_error():
+        conn.search(**kwargs)
     _refuse_referral(conn, operation)
+
+
+#: What an ldap3 call can raise that is not an ldap3 error (BACKLOG #2566). ldap3 wraps most socket
+#: faults in its own ``LDAPException`` subclasses, but not all. ``socket.settimeout`` raises
+#: ``OverflowError`` or ``TypeError`` on a bad value, and ldap3's POSIX ``setsockopt`` raised
+#: ``struct.error`` on a float (BACKLOG #2546). ``OSError`` covers ``ssl.SSLError`` and a raw socket
+#: error. At least these; a type not named here still escapes unmapped.
+_SOCKET_FAULTS: tuple[type[Exception], ...] = (OSError, OverflowError, TypeError, struct.error)
+
+
+@contextlib.contextmanager
+def _socket_faults_as_ldap_error() -> Iterator[None]:
+    """Turn a :data:`_SOCKET_FAULTS` error from the ldap3 call inside into :class:`LdapError`.
+
+    Every caller maps ``LdapError`` to a directory failure, and the sign-in callers write
+    ``auth.login_error``, so an unmapped fault would skip both and surface as an unhandled error.
+
+    **It wraps the ldap3 call alone, never the code that reads the answer.** A ``TypeError`` from
+    the engine's own parsing is a defect. Mapped, it would read as a directory outage, which the
+    session reconciler holds on and logs at debug level, so the defect would hide. An ``LDAPException``
+    passes through untouched, even one that is also an ``OSError`` or ``TypeError``, so its own
+    handler keeps its own text. The new text is fixed: the fault's message can carry directory data.
+    """
+    import ldap3
+
+    try:
+        yield
+    except ldap3.core.exceptions.LDAPException:
+        raise
+    except _SOCKET_FAULTS as exc:
+        kind = type(exc)
+        # The type alone, never str(exc). struct.error's own name is just "error", so a type from
+        # outside builtins carries its module.
+        name = (
+            kind.__qualname__
+            if kind.__module__ == "builtins"
+            else f"{kind.__module__}.{kind.__qualname__}"
+        )
+        raise LdapError(f"AD directory call failed: {name}") from exc
 
 
 class LdapAuthenticator:
@@ -656,15 +697,17 @@ class LdapAuthenticator:
         # ASVS 13.1.3: receive_timeout bounds every LDAP RESPONSE read on this connection (the bind and
         # each search). ldap3's default is None — an unresponsive DC would otherwise pin the thread-pool
         # worker AuthService dispatches this call on, since that dispatch has no asyncio.wait_for.
-        return ldap3.Connection(
-            self._server(),
-            user=self._s.ad_bind_dn,
-            password=self._bind_password,  # resolved once in __init__ (env or [secrets].provider)
-            authentication=ldap3.SIMPLE,
-            auto_bind=True,
-            receive_timeout=_ldap3_receive_timeout(self._s.ad_receive_timeout),
-            auto_referrals=False,  # BACKLOG #2530: see _refuse_referral
-        )
+        # auto_bind opens the socket here, so a socket fault surfaces here (BACKLOG #2566).
+        with _socket_faults_as_ldap_error():
+            return ldap3.Connection(
+                self._server(),
+                user=self._s.ad_bind_dn,
+                password=self._bind_password,  # resolved once in __init__ (env or a provider)
+                authentication=ldap3.SIMPLE,
+                auto_bind=True,
+                receive_timeout=_ldap3_receive_timeout(self._s.ad_receive_timeout),
+                auto_referrals=False,  # BACKLOG #2530: see _refuse_referral
+            )
 
     def _equalizing_bind(self, password: str) -> None:
         """Do the password-verifying bind's work for a principal that does not exist, and discard it.
@@ -679,6 +722,12 @@ class LdapAuthenticator:
         against a deliberately-bogus DN raise would turn a plain failed login into a *connectivity
         error* — a louder oracle than the timing one this exists to close, and a behaviour change on
         the ordinary wrong-username path.
+
+        **A socket fault that is not an ldap3 error is NOT swallowed (BACKLOG #2566).** It propagates,
+        and ``authenticate`` maps it to :class:`LdapError` exactly as it maps the real bind's. Both
+        branches open a socket to the same directory, so a fault there fails them alike; swallowing
+        it here alone would answer "wrong password" for an absent account and "directory error" for
+        a present one.
 
         **What this does NOT claim:** that wall-clock is now provably equal. It equalizes the code
         PATH, which is what the item measured; a directory may still answer ``invalidCredentials``
@@ -892,7 +941,12 @@ class LdapAuthenticator:
                     # _find_user. It has TWO callers — this one binds, the Kerberos/SSO one below
                     # does not — so relocating it into the bind path alone would let a DISABLED
                     # ACCOUNT AUTHENTICATE OVER SSO. Equalize the CALLER, never move the check.
-                    self._equalizing_bind(password)
+                    #
+                    # A socket fault in the decoy bind is mapped HERE, the same way the real bind's
+                    # is below, so an absent and a present account fail alike (BACKLOG #2566).
+                    # Swallowing it inside _equalizing_bind would tell the two apart.
+                    with _socket_faults_as_ldap_error():
+                        self._equalizing_bind(password)
                     return None
                 user_dn = str(info["dn"])
                 # The password-verifying bind — a SECOND connection (and a second Server, built by
@@ -909,15 +963,19 @@ class LdapAuthenticator:
                 )
                 # Released on BOTH paths. A rejected password is the common adversarial case, so
                 # returning early without unbinding would leave the connection to GC under exactly
-                # the load that matters (ASVS 13.1.3 — resource release).
+                # the load that matters (ASVS 13.1.3 — resource release). The bind opens the
+                # socket; the construction above does not (BACKLOG #2566).
                 try:
-                    if not user_conn.bind():
+                    with _socket_faults_as_ldap_error():
+                        bound = user_conn.bind()
+                    if not bound:
                         _refuse_referral(user_conn, "user bind")
                         return None
                 finally:
-                    user_conn.unbind()
+                    with _socket_faults_as_ldap_error():
+                        user_conn.unbind()
                 groups = self._resolve_groups(svc, user_dn, info["memberOf"])
-        except ldap3.core.exceptions.LDAPException as exc:  # pragma: no cover - needs real AD
+        except ldap3.core.exceptions.LDAPException as exc:
             raise LdapError(str(exc)) from exc
         return _principal_from(info, user_dn, groups)
 
@@ -972,7 +1030,7 @@ class LdapAuthenticator:
                     return DirectoryProbe(found.answer)
                 user_dn = str(info["dn"])
                 groups = self._resolve_groups(svc, user_dn, info["memberOf"])
-        except ldap3.core.exceptions.LDAPException as exc:  # pragma: no cover - needs real AD
+        except ldap3.core.exceptions.LDAPException as exc:
             raise LdapError(str(exc)) from exc
         return DirectoryProbe(DirectoryAnswer.FOUND, _principal_from(info, user_dn, groups))
 
@@ -1000,11 +1058,15 @@ class LdapAuthenticator:
             # failure, and the group read still runs.
             whoami_error: str | None = None
             try:
-                who = _authzid_text(svc.extend.standard.who_am_i())
-            except ldap3.core.exceptions.LDAPException as exc:
+                with _socket_faults_as_ldap_error():
+                    answer = svc.extend.standard.who_am_i()
+                who = _authzid_text(answer)
+            except (ldap3.core.exceptions.LDAPException, LdapError) as exc:
                 # The type name only, as the group read below does: ldap3's text for an
-                # extended-operation error carries the directory's own diagnostic message.
-                who, whoami_error = None, f"Who am I failed: {type(exc).__name__}"
+                # extended-operation error carries the directory's own diagnostic message. An
+                # LdapError is a mapped socket fault, whose fixed text names only its type.
+                why = str(exc) if isinstance(exc, LdapError) else type(exc).__name__
+                who, whoami_error = None, f"Who am I failed: {why}"
             try:
                 _search(
                     svc,
@@ -1025,7 +1087,9 @@ class LdapAuthenticator:
         except ldap3.core.exceptions.LDAPException as exc:
             raise LdapError(str(exc)) from exc
         finally:
-            with contextlib.suppress(ldap3.core.exceptions.LDAPException):
+            # The release only: a fault here would replace the reading or the error already in hand.
+            # Suppressing TypeError is safe only because the one ldap3 call is all this covers.
+            with contextlib.suppress(ldap3.core.exceptions.LDAPException, *_SOCKET_FAULTS):
                 svc.unbind()
         if entry is None:
             # ldap3 does not raise on a failed search here, so the result code is the only record of
@@ -1083,8 +1147,6 @@ def kerberos_principal(token: bytes, settings: AuthSettings) -> str | None:
     have a usable keytab/credential for ``kerberos_spn`` in its environment; the realm suffix
     (``user@REALM``) is stripped to yield the account name.
     """
-    import struct
-
     import spnego
 
     try:

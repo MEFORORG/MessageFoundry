@@ -3379,8 +3379,9 @@ class AuthSettings(_Section):
                 "negative value would fail every LDAP read or connect)"
             )
         # A huge finite value overflows socket.settimeout / setsockopt (measured from about 3e6 s on
-        # Windows) with OverflowError or TypeError. Those are not ldap3 errors, so they would skip
-        # the LdapError mapping and the auth.login_error audit. The cap sits far below that point.
+        # Windows) with OverflowError or TypeError. auth/ldap.py now maps those to LdapError, so a
+        # sign-in would fail as a directory error and be audited (BACKLOG #2566), but it would fail
+        # every time. The cap refuses the value at load instead, far below that point.
         if value > _AD_TIMEOUT_MAX_SECONDS:
             raise ValueError(
                 f"ad_connect_timeout / ad_receive_timeout must be at most {_AD_TIMEOUT_MAX_SECONDS:g} "
