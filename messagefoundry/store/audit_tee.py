@@ -122,15 +122,16 @@ def emit_audit_tee(
     **The record survives the scrub, and the scrub is what makes it so.** A failed sign-in sets
     ``actor`` to the typed name, so a client chooses its characters. ``ControlCharScrubFilter``
     runs last on every configured handler, and since vault BACKLOG #3012 every escape it writes is
-    valid inside a JSON string (``controlchars._log_escape``). So this serializes with plain
-    ``json.dumps`` and leaves every character raw for the filters. Escaping here instead, BEFORE the
-    redaction and credential filters, hid a name or a password from them: an escape such as
-    ``\\u007f`` ends in a word character, so ``\\b``-anchored patterns no longer matched the next
-    word. ``ensure_ascii=True`` is the same mistake, for every non-ASCII character.
+    valid inside a JSON string (:mod:`messagefoundry.controlchars` says why). So this serializes
+    with plain ``json.dumps`` and leaves every character raw for the filters. Escaping here
+    instead, BEFORE the redaction and credential filters, hid a name or a password from them: an
+    escape such as ``\\u007f`` ends in a word character, so ``\\b``-anchored patterns no longer
+    matched the next word. ``ensure_ascii=True`` is the same mistake, for every non-ASCII character.
 
     **At least one residual is separate from this.** The redaction and credential filters rewrite
-    spans of this document, and a span can take a closing quote with it. An ASCII ``actor`` of
-    ``a%7Cb%7Cc`` breaks the JSON.
+    spans of this document as text, and a span can take a closing quote with it. An ASCII
+    ``actor`` of ``a%7Cb%7Cc`` breaks the JSON. Serializing after the filters, from structured
+    fields on the record, would close it; that is a larger change than this one.
 
     Best-effort: a logging failure must never fail the audit write (already committed), so it is
     caught and logged, not raised. Callers invoke this **after commit** and **outside any write

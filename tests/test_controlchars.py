@@ -356,11 +356,6 @@ def test_the_detector_does_not_fire_on_a_different_set(source: str) -> None:
     assert _rederivations(source) == []
 
 
-#: Any ``\uD800``-``\uDFFF`` escape in JSON text, with the run of backslashes before it. An odd run
-#: makes it a real escape; an even run makes it literal text that only looks like one.
-_SURROGATE_ESCAPE = re.compile(r"(\\+)u[dD][89a-fA-F][0-9a-fA-F]{2}")
-
-
 def _strict_json(document: str) -> object:
     """``json.loads``, refusing what a strict decoder such as jiter, or I-JSON (RFC 7493), refuses
     and Python accepts: an unpaired surrogate escape. Checked on the decoded value, because Python
@@ -370,27 +365,20 @@ def _strict_json(document: str) -> object:
     return value
 
 
-def _real_surrogate_escapes(document: str) -> list[str]:
-    return [m.group() for m in _SURROGATE_ESCAPE.finditer(document) if len(m.group(1)) % 2]
-
-
-#: Every BMP code point but the surrogates, then astral samples: a tag character (``Cf``), a
-#: private-use one (``Co``), the last code point, and two printable ones that must stay raw.
-_EVERY_NON_SURROGATE = "".join(
-    chr(c) for c in range(0x10000) if not has_lone_surrogate(chr(c))
-) + "".join(chr(c) for c in (0xE0001, 0xF0000, 0x10FFFF, 0x1F600, 0x20000))
-
-
 def test_a_json_document_survives_the_scrub_and_decodes_unchanged() -> None:
     """Vault BACKLOG #3012. Every escape the scrub writes is valid inside a JSON string, so a
     document from plain ``json.dumps(..., ensure_ascii=False)`` still parses after it, for a strict
     decoder too, and decodes to the text that went in."""
-    document = json.dumps({"actor": _EVERY_NON_SURROGATE}, ensure_ascii=False)
+    # Every BMP code point but the surrogates, then astral samples: a tag character (Cf), a
+    # private-use one (Co), the last code point, and two printable ones that must stay raw.
+    text = "".join(map(chr, (*range(0xD800), *range(0xE000, 0x10000))))
+    text += "".join(map(chr, (0xE0001, 0xF0000, 0x10FFFF, 0x1F600, 0x20000)))
+    document = json.dumps({"actor": text}, ensure_ascii=False)
     scrubbed = scrub_control_chars(document)
     # CONTROL: the scrub really rewrote characters inside the string, so the parse is not vacuous.
     assert chr(0x7F) in document and chr(0x7F) not in scrubbed
     assert chr(0xE0001) in document and chr(0xE0001) not in scrubbed
-    assert _strict_json(scrubbed) == {"actor": _EVERY_NON_SURROGATE}
+    assert _strict_json(scrubbed) == {"actor": text}
 
 
 def test_the_old_spelling_was_not_json() -> None:
@@ -407,10 +395,10 @@ def test_a_lone_surrogate_is_spelled_as_visible_text_a_strict_decoder_accepts(co
     backslash: six visible characters every decoder reads as text, naming the code point."""
     document = scrub_control_chars(json.dumps(f"a{chr(code)}b", ensure_ascii=False))
     assert document == f'"a\\\\u{code:04x}b"'
-    assert _real_surrogate_escapes(document) == []
     assert _strict_json(document) == f"a\\u{code:04x}b"
-    # CONTROL: the pattern finds a real escape, so its empty answer above means something.
-    assert _real_surrogate_escapes(f'"\\u{code:04x}"') == [f"\\u{code:04x}"]
+    # CONTROL: JSON's own spelling fails the strict check, so the check above can fail.
+    with pytest.raises(AssertionError):
+        _strict_json(f'"a\\u{code:04x}b"')
 
 
 def test_an_adjacent_lone_high_and_low_surrogate_do_not_decode_as_one_character() -> None:
@@ -418,12 +406,12 @@ def test_an_adjacent_lone_high_and_low_surrogate_do_not_decode_as_one_character(
     decode as U+1F600, a character the text never held. As text, each stays its own."""
     document = scrub_control_chars(json.dumps(chr(0xD83D) + chr(0xDE00), ensure_ascii=False))
     assert _strict_json(document) == "\\ud83d\\ude00"
-    assert _strict_json(document) != chr(0x1F600)
 
 
 def test_an_astral_code_point_is_a_surrogate_pair_that_decodes_as_itself() -> None:
-    assert scrub_control_chars(chr(0xE0001)) == "\\udb40\\udc01"
-    assert _strict_json(f'"{scrub_control_chars(chr(0xE0001))}"') == chr(0xE0001)
+    escaped = scrub_control_chars(chr(0xE0001))
+    assert escaped == "\\udb40\\udc01"
+    assert _strict_json(f'"{escaped}"') == chr(0xE0001)
 
 
 def test_plain_non_ascii_is_left_raw() -> None:

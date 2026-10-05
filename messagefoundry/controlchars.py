@@ -40,8 +40,9 @@ refusals, that makes three actions built on one predicate:
   * ESCAPE -- every log line, :func:`scrub_control_chars`. Neither refuses nor deletes: it renders
     the code point as a readable backslash escape, so one record cannot become two. Its alphabet is
     WIDER than the other two arms' (vault BACKLOG #2815); :func:`_escapes_in_a_log_line` states it.
-    Every escape it writes is also valid inside a JSON string (:func:`_log_escape`), so a JSON
-    document logged as a message still parses after it (vault BACKLOG #3012).
+    Every escape it writes is also valid inside a JSON string (:func:`_log_escape`), so a
+    single-line JSON document logged as a message still parses after it (vault BACKLOG #3012). An
+    indented one does not: its line breaks sit between tokens, where ``\\n`` is not JSON.
 
 WHY ESCAPE LIVES HERE, WHICH IS THE ONE FACT WORTH STATING ONCE (BACKLOG #1591). It was defined in
 ``logging_setup`` until ``logging_guard`` needed it, and ``logging_setup`` imports

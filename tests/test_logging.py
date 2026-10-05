@@ -25,6 +25,7 @@ import pytest
 from uvicorn.protocols.utils import get_path_with_query_string
 
 from messagefoundry import __main__, secretscrub
+from messagefoundry.controlchars import has_lone_surrogate
 from messagefoundry.logging_setup import (
     _CREDENTIAL_QUERY_KEYS,
     ControlCharScrubFilter,
@@ -1967,7 +1968,7 @@ def test_a_logged_json_document_still_parses_on_every_sink(
         inner = message.split("message said ", 1)[1]
         decoded = json.loads(inner)
         # Strict: Python's json keeps an unpaired surrogate escape as a surrogate; jiter refuses it.
-        assert not any(0xD800 <= ord(ch) <= 0xDFFF for ch in decoded["k"]), f"{fmt} {sink}"
+        assert not has_lone_surrogate(decoded["k"]), f"{fmt} {sink}"
         assert decoded == {"k": expected}, f"{fmt} {sink}: {inner!r}"
 
 

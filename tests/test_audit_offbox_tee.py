@@ -32,6 +32,7 @@ from messagefoundry.logging_setup import build_stderr_handler, configure_logging
 from messagefoundry.store import MessageStore, audit_tee
 from messagefoundry.store.audit_tee import emit_audit_tee
 from tests._phi_gate_provisions import AT_REST_OPT_OUT_TOML
+from tests.test_logging import _decoded_from_the_log
 
 # A stand-in chain head for the direct-call cases. Shape only: a real one comes from `audit_row_hash`.
 _HASH = "a" * 64
@@ -292,9 +293,9 @@ def test_emit_audit_tee_redacts_bare_delimiter_run_without_segment(audit_capture
 
 # --- the record must still be JSON after the configured handlers' filters run ---------------------
 #
-# Spelled with chr() so this file carries no raw control character of its own. Most overlap
-# `tests/test_logging.py`'s `_LOG_ESCAPED_CLASSES` and `_ASTRAL_SAMPLE`, which lack DEL and the
-# soft hyphen; written out so the samples this defect needs are visible beside it.
+# Spelled with chr() so this file carries no raw control character of its own. One sample per
+# class, named, beside the tee; `tests/test_logging.py`'s `_LOG_ESCAPED_CLASSES` covers more code
+# points per class through the generic logger.
 _LOG_ALPHABET_SAMPLES = {
     "del": chr(0x7F),
     "c1_nel": chr(0x85),
@@ -306,16 +307,11 @@ _LOG_ALPHABET_SAMPLES = {
     "astral_private_use": chr(0xF0000),
 }
 
-#: The characters whose old spelling a collector could not parse: until vault BACKLOG #3012 the
-#: scrub wrote ``\x..`` or ``\U........``, which JSON does not define.
-_BROKE_THE_OLD_ENCODING = ("del", "c1_nel", "soft_hyphen", "astral_tag", "astral_private_use")
-
 
 def _as_read_back(text: str) -> str:
     """``text`` as a collector decodes it from the tee: each character as itself, except a lone
-    surrogate, which the log spells as the visible six characters ``\\udcff`` (see
-    ``controlchars._log_escape``)."""
-    return "".join(f"\\u{ord(ch):04x}" if 0xD800 <= ord(ch) <= 0xDFFF else ch for ch in text)
+    surrogate, which reads back as the visible six characters ``\\udcff``."""
+    return "".join(_decoded_from_the_log(ord(ch)) for ch in text)
 
 
 def _teed_through_configured_stdout(
@@ -371,15 +367,6 @@ def test_the_tee_parses_as_json_after_the_log_scrub(fmt: str, kind: str, capsys)
     # Strict: Python's json decodes an unpaired surrogate escape to a surrogate; jiter refuses it.
     assert not has_lone_surrogate(record["actor"] + record["detail"])
     assert all(0x20 <= ord(ch) < 0x7F for ch in line), ascii(line)
-
-
-@pytest.mark.parametrize("kind", _BROKE_THE_OLD_ENCODING)
-def test_the_old_spelling_of_these_samples_was_not_json(kind: str) -> None:
-    """The control for the test above: these samples discriminate. Python's ``ascii`` spelling,
-    which the scrub used until #3012, is not a JSON string escape for any of them."""
-    old = ascii(_LOG_ALPHABET_SAMPLES[kind])[1:-1]
-    with pytest.raises(json.JSONDecodeError):
-        json.loads(f'"{old}"')
 
 
 @pytest.mark.parametrize("fmt", ["text", "json"])
