@@ -1863,6 +1863,11 @@ keep = ["EVN-1", "OBX-2"]
 A kept field is still scanned for the shapes in the table above, so a dashed SSN in it still
 refuses.
 
+**A keep on a field the default rules scrub turns that scrub off.** Keeping `PID-5` to clear a
+refusal leaves the patient name in the output as captured. `load_rules` logs a WARNING for each
+such field. The line names the field and the kind of scrub it lost, never a value. A keep on a
+field with no default rule logs nothing.
+
 **Expect it to refuse conformant traffic until the rule map is finished.** The measured corpus
 came from `messagefoundry generate --count 2 --seed 1710`, run for every type: 186 messages. With
 the switch on, all 186 refused. Mapping the dates and locations above did not change that count.

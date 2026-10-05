@@ -24,6 +24,7 @@ Pure stdlib — byte-identical with ``tee/anon/rules.py`` (parity test); no ``me
 
 from __future__ import annotations
 
+import logging
 import re
 import tomllib
 from dataclasses import dataclass
@@ -177,6 +178,9 @@ class AnonError(ValueError):
     so existing fail-closed call-site catches treat it as a drop-and-count."""
 
 
+_LOG = logging.getLogger(__name__)
+
+
 def _validate_path(path: str) -> str:
     if not _FIELD_PATH_RE.match(path):
         raise RuleError(
@@ -205,6 +209,9 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
     A ``keep`` comes back as a :attr:`SurrogateKind.KEEP` rule. The anonymizer rewrites nothing for
     it; the leak-check counts the field as DECIDED for ``require_full_coverage`` and still scans
     it for PHI shapes (BACKLOG #1710).
+
+    A keep on a :data:`DEFAULT_RULES` path turns that default scrub off. Each one is logged at
+    WARNING, by field address and kind only; :func:`kept_defaults` lists them (BACKLOG #2268).
     """
     effective: dict[str, SurrogateKind] = {r.path: r.kind for r in DEFAULT_RULES}
     if overlay is None:
@@ -242,7 +249,28 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
         effective[_validate_path(path)] = SurrogateKind.DROP
 
     # A KEEP rule is returned, not dropped: it is the record that someone decided the field.
-    return tuple(FieldRule(path, kind) for path, kind in effective.items())
+    rules = tuple(FieldRule(path, kind) for path, kind in effective.items())
+    for cancelled in kept_defaults(rules):
+        _LOG.warning(
+            "anon overlay %s keeps %s, which turns off its default %s scrub: the field is left "
+            "as captured",
+            overlay,
+            cancelled.path,
+            cancelled.kind.value,
+        )
+    return rules
+
+
+def kept_defaults(rules: tuple[FieldRule, ...]) -> tuple[FieldRule, ...]:
+    """The :data:`DEFAULT_RULES` entries that ``rules`` keeps, so their scrub no longer runs.
+
+    A keep does two jobs. It records a field as reviewed for ``require_full_coverage``, and it
+    cancels any default scrub on that path. So keeping ``PID-5`` to clear a coverage refusal also
+    turns the name scrub off. :func:`load_rules` logs each one, and a caller with a console of
+    its own can repeat them there. Each entry is the default rule, so it names the lost kind.
+    """
+    kept = {r.path for r in rules if r.kind == SurrogateKind.KEEP}
+    return tuple(r for r in DEFAULT_RULES if r.path in kept)
 
 
 def _as_path_list(hl7: dict[str, object], key: str) -> list[str]:
