@@ -1036,10 +1036,10 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         )
 
     def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:
-        # ADR 0079 mechanism 2: the mass-revoke breaker tripped, or a probe was referred (BACKLOG
-        # #2538; `reason` tells which), and the pass applied nothing. The fixed
-        # source label keys the throttle, so a standing misconfiguration that trips every pass pages
-        # once per cooldown rather than once per pass. `detail` is the latched operator explanation,
+        # ADR 0079 mechanism 2: the mass-revoke breaker tripped and the pass applied nothing, or one
+        # or more probes were referred and left unjudged (BACKLOG #2538; `reason` tells which). The
+        # fixed source label keys the throttle, so a standing misconfiguration that trips every pass
+        # pages once per cooldown rather than once per pass. `detail` is the latched operator explanation,
         # and it is what the instance's reason column shows (detail wins over reason there).
         self._emit(
             {

@@ -30,8 +30,10 @@ Four safety properties are built in, in order of importance:
    planned in full before anything is written: an abort must leave the store byte-identical,
    including the role re-diff.
 
-A referral is not an outage (BACKLOG #2538). One :attr:`ProbeOutcome.REFERRED` probe aborts the pass
-as ``directory_referral``, which judges nothing and, unlike an outage, alerts.
+A referral is not an outage, and not a reason to stop the pass either (BACKLOG #2538). A
+:attr:`ProbeOutcome.REFERRED` account is left unjudged, like an unreachable one, and every other
+probe in the pass is judged as usual. Unlike an outage, a referral alerts. A pass whose only answers are
+referrals and failures aborts as ``directory_referral``, which judges nothing and alerts.
 
 The pass also re-diffs channel scope (ADR 0198, BACKLOG #1957). It revokes when the directory would
 withdraw or narrow a principal's scope, and it never writes the scope: the next login does, through
@@ -75,13 +77,16 @@ class ProbeOutcome(Enum):
     #: (BACKLOG #2027): an entry an id-keyed search found that does not read back that id is this
     #: outcome whatever its account state, because it is not this account's entry.
     ABSENT = "absent"
-    #: The directory could not be consulted (``LdapError`` — connectivity/bind/config). Contributes
+    #: The directory could not be consulted (``LdapError`` — connectivity/bind/config — other than a
+    #: referral), or the probe raised something else (BACKLOG #2241). Contributes
     #: nothing: no strike, no revocation, no strike reset.
     UNAVAILABLE = "unavailable"
     #: The directory answered with a referral, which the engine never follows (``LdapReferralError``,
-    #: BACKLOG #2538). Contributes nothing, like :attr:`UNAVAILABLE`. Unlike it, one referral aborts
-    #: the whole pass with an alert, because it is a configuration error that recurs on every pass:
-    #: read as unavailable, it would stop every revocation without a sound.
+    #: BACKLOG #2538). Contributes nothing for this account, like :attr:`UNAVAILABLE`: no strike,
+    #: no revocation, no strike reset, no recorded outcome. Unlike it, a referral alerts, because it
+    #: is a configuration error that recurs on every pass: read as unavailable, it would stop
+    #: revocation for the referred accounts without a sound. It never stops the other accounts
+    #: being judged.
     REFERRED = "referred"
 
 
@@ -100,6 +105,9 @@ class Probe:
     outcome: ProbeOutcome
     groups: frozenset[str] = frozenset()
     directory_username: str | None = None
+    #: For :attr:`ProbeOutcome.REFERRED` only: the refusal's text, which names the referred search
+    #: and the referred hosts and nothing else (BACKLOG #2530). The pass logs the first one.
+    detail: str | None = None
 
 
 @dataclass(frozen=True)
@@ -135,8 +143,12 @@ _READABLE = frozenset({ProbeOutcome.PRESENT, ProbeOutcome.DISABLED})
 #: The closed-set slug the held audit row and alert carry (ADR 0195 rule item 9).
 HOLD_REASON = "user_account_control_undetermined"
 
-#: The ``aborted`` slug of a pass in which the directory answered a probe with a referral (#2538).
+#: The ``aborted`` slug of a pass whose only answers were referrals and failures (BACKLOG #2538).
+#: Also the reason slug of the referral's own audit row and alert, on any pass with a referral.
 REFERRAL_ABORT = "directory_referral"
+
+#: The outcomes that judge nothing about the account: no strike, no recorded outcome (rule item 4).
+_UNJUDGED = frozenset({ProbeOutcome.UNAVAILABLE, ProbeOutcome.REFERRED})
 
 
 @dataclass(frozen=True)
@@ -170,20 +182,21 @@ class ReconcilePlan:
     renames: tuple[UsernameRefresh, ...] = ()
     #: Strikes to record: ``user_id -> consecutive ABSENT, DISABLED or UNDETERMINED count``. A PRESENT
     #: probe maps to 0 (reset), and so does a HELD one (ADR 0195 rule item 7; ``held`` tells the two
-    #: apart). An UNAVAILABLE probe is absent from this mapping entirely, leaving whatever strike the
-    #: user already carried untouched. Populated even on a breaker abort — see :func:`plan_pass`.
+    #: apart). An UNAVAILABLE or REFERRED probe is absent from this mapping, leaving whatever strike
+    #: the user already carried untouched. Populated even on a breaker abort — see :func:`plan_pass`.
     strikes: Mapping[str, int] = field(default_factory=dict)
     probed: int = 0  # principals actually probed this pass (excludes the per-pass budget remainder)
     unavailable: int = 0
-    #: Probes the directory answered with a referral (BACKLOG #2538). Any one aborts the pass.
-    referred: int = 0
-    #: Non-None when the pass ABORTED and must apply nothing: the breaker tripped, a probe was
-    #: referred, or every probe in the pass failed (a whole-directory outage). The value is a
-    #: closed-set operator-facing slug.
+    #: ``user_id`` of every probe the directory answered with a referral (BACKLOG #2538). Any one
+    #: alerts, and none of them stops the rest of the pass being judged.
+    referred: tuple[str, ...] = ()
+    #: Non-None when the pass ABORTED and must apply nothing: the breaker tripped, every probe in
+    #: the pass failed (a whole-directory outage), or every probe failed or was referred, at least
+    #: one of them referred. The value is a closed-set operator-facing slug.
     aborted: str | None = None
     #: Outcomes to record in the caller's per-candidate record (ADR 0195 rule item 4): every probe of
-    #: this pass except an UNAVAILABLE one, which leaves the prior entry in place. Populated on a
-    #: breaker abort too, like ``strikes``.
+    #: this pass except an UNAVAILABLE or REFERRED one, which leaves the prior entry in place.
+    #: Populated on a breaker abort too, like ``strikes``.
     outcomes: Mapping[str, ProbeOutcome] = field(default_factory=dict)
     #: Whether this pass held its UNDETERMINED probes (:func:`hold_engaged`).
     hold: bool = False
@@ -198,11 +211,13 @@ class ReconcilePlan:
     #: ``r``: probes in THIS pass that read the attribute (PRESENT or DISABLED).
     readable: int = 0
     #: Set by the auth service after the pass, never by :func:`plan_pass` (BACKLOG #2136): whether
-    #: this pass is EVIDENCE that the breaker is not tripped, or that no hold stands. Not merely
-    #: "not aborted" or "not held". The caller resolves the matching durable alert on it, so a pass
-    #: that could not have tripped or held must leave these False.
+    #: this pass is EVIDENCE that the breaker is not tripped, that no hold stands, or that no
+    #: referral stands (BACKLOG #2538). Not merely "not aborted", "not held" or "not referred". The
+    #: caller resolves the matching durable alert on it, so a pass that could not tell must leave
+    #: these False.
     breaker_clear: bool = False
     hold_clear: bool = False
+    referral_clear: bool = False
 
     @property
     def directory_outage(self) -> bool:
@@ -213,23 +228,30 @@ class ReconcilePlan:
 
     @property
     def directory_referral(self) -> bool:
-        """True when the pass aborted because the directory answered a probe with a referral
-        (BACKLOG #2538). Audited as ``auth.ad_reconcile_aborted`` and alerted, unlike an outage: a
-        referral usually means ``ad_user_search_base`` lies in another domain of the forest, which
-        no later pass fixes on its own."""
+        """True when the pass aborted because every probe was referred or failed, at least one of
+        them referred (BACKLOG #2538). It judged nothing, like an outage, but it alerts: a referral
+        usually means ``ad_user_search_base`` lies in another domain of the forest, which no later
+        pass fixes on its own. A pass with a referral beside other answers is NOT this. It judged
+        those answers, and only ``referred`` says it saw a referral."""
         return self.aborted == REFERRAL_ABORT
 
     @property
     def judged_nothing(self) -> bool:
-        """True when the pass aborted before judging any account: an outage or a referral. Such a
-        pass leaves the hold's state, its message and every clear alone, because it learned nothing
-        about the accounts."""
+        """True when the pass aborted before judging any account: an outage, or a pass of referrals
+        and failures only. Such a pass leaves the hold's state, its message and every clear alone,
+        because it learned nothing about the accounts."""
         return self.directory_outage or self.directory_referral
 
     @property
     def judged(self) -> int:
         """The probes the mass-revoke breaker judged: every probe except the held ones (ADR 0195
-        rule item 7). The breaker's decision and the ceiling an operator is told both use this."""
+        rule item 7). The breaker's decision and the ceiling an operator is told both use this.
+
+        A referred probe stays in (BACKLOG #2538), as an unavailable one always has. Left out, a
+        referring group search base, which refers every enabled account, would leave only the
+        accounts that can strike, so more than ``max_absolute`` genuine disables at once would trip
+        the breaker on every pass and offboarding would stop. Kept in, the cost is that referrals dilute the
+        fraction a wave of false absences must exceed, as outages already do."""
         return self.probed - len(self.held)
 
 
@@ -339,17 +361,15 @@ def plan_pass(
     unavailable = [p for p in probes if p.outcome is ProbeOutcome.UNAVAILABLE]
     referred = [p for p in probes if p.outcome is ProbeOutcome.REFERRED]
 
-    if referred:
-        # BACKLOG #2538. Checked before the outage, so a pass mixing referrals and failures is not
-        # read as a plain outage, which pages nobody. A referral is the directory saying where to
-        # look, not a judgment of the account, so the pass judges nothing: no strike, no outcome
-        # recorded, and the hold's state carries over, exactly as on an outage. Aborting rather
-        # than judging the other probes keeps one rule for a search base that refers only some
-        # accounts: none of this pass's answers is trusted while the configuration is wrong.
+    if referred and len(unavailable) + len(referred) == len(probes):
+        # BACKLOG #2538. Nothing in the pass was answered, as on an outage, so it judges nothing and
+        # the hold's state carries over. Checked before the outage, so a pass of referrals and
+        # failures is not read as a plain outage, which pages nobody. A user search base in another
+        # domain of the forest refers every probe, and this is the shape it takes.
         return ReconcilePlan(
             probed=len(probes),
             unavailable=len(unavailable),
-            referred=len(referred),
+            referred=tuple(p.user_id for p in referred),
             aborted=REFERRAL_ABORT,
             latched=latched,
         )
@@ -367,8 +387,11 @@ def plan_pass(
         )
 
     # ADR 0195 rule items 4 to 6. An UNAVAILABLE probe leaves the prior entry in place, so a
-    # directory blip on one held account does not make another look single.
-    outcomes = {p.user_id: p.outcome for p in probes if p.outcome is not ProbeOutcome.UNAVAILABLE}
+    # directory blip on one held account does not make another look single. A REFERRED probe does
+    # too (BACKLOG #2538): a referral says where to look, not what the account is. Every other probe
+    # is judged below as on any pass. A referring group search base refers only the accounts the
+    # user search FOUND enabled, so a disabled or absent account's answer still strikes and revokes.
+    outcomes = {p.user_id: p.outcome for p in probes if p.outcome not in _UNJUDGED}
     record = {**(prior_outcomes or {}), **outcomes}
     undetermined = sum(1 for o in record.values() if o is ProbeOutcome.UNDETERMINED)
     readable = sum(1 for p in probes if p.outcome in _READABLE)
@@ -448,6 +471,7 @@ def plan_pass(
         strikes=strikes,
         probed=len(probes),
         unavailable=len(unavailable),
+        referred=tuple(p.user_id for p in referred),
         outcomes=outcomes,
         hold=hold,
         latched=hold_latches(undetermined=undetermined, latched=latched),
@@ -456,7 +480,7 @@ def plan_pass(
         readable=readable,
     )
     # Held probes are left out of the breaker's denominator (rule item 7): it judges only what the
-    # pass could still revoke.
+    # pass could still revoke. Referred ones stay in; ReconcilePlan.judged says why.
     if breaker_tripped(
         revoke_count=len(revocations),
         probed=plan.judged,

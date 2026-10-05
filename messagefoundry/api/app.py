@@ -250,7 +250,7 @@ from messagefoundry.api.validation import (
 # app.state.ui_ws_authorize, app.state.ui_connections_render (read by the always-on middleware/routes).
 from messagefoundry.auth import Identity, Permission, Role
 from messagefoundry.auth.audit_visibility import reads_audit_copies_in_the_log
-from messagefoundry.auth.reconcile import HOLD_REASON, ReconcilePlan
+from messagefoundry.auth.reconcile import HOLD_REASON, REFERRAL_ABORT, ReconcilePlan
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.trust_anchors import (
     AnchorSpec,
@@ -7816,6 +7816,12 @@ async def _directory_reconciler(auth: AuthService, interval: float, sink: AlertS
             _log.exception("directory reconcile: pass failed; will retry next interval")
 
 
+#: The source label of the referral's own ``ad_reconcile_aborted`` instance (BACKLOG #2538). Apart
+#: from the breaker's ``directory-reconciler``, so each has its own instance, throttle and detail,
+#: and an alert rule can match one source without the other.
+_REFERRAL_ALERT_SOURCE = "directory-reconciler-referral"
+
+
 def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSink) -> None:
     """Raise the alert that matches each audit row the pass wrote (ASVS 8.3.2).
 
@@ -7824,39 +7830,51 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     ``ad_reconcile_held`` alert, on every pass while it holds, including one the breaker also aborts
     (ADR 0195). Each applied revocation is ``auth.ad_session_revoked`` and becomes one ``ad_session_revoked``
     alert. A whole-directory outage aborts too, but it is audited as ``auth.ad_reconcile_skipped``
-    and pages nothing: the accounts are fine, the directory is not, and the pass is fail-open. A
-    referral abort (BACKLOG #2538) is NOT an outage: it recurs until ``ad_user_search_base`` is
-    fixed, so it is audited as ``auth.ad_reconcile_aborted`` and pages on ``ad_reconcile_aborted``
-    with reason ``directory_referral``, its detail naming the setting.
+    and pages nothing: the accounts are fine, the directory is not, and the pass is fail-open.
+
+    A referral (BACKLOG #2538) is NOT an outage: it recurs until a search base is fixed. Any pass
+    with a referred probe is ``auth.ad_reconcile_referred`` and becomes one ``ad_reconcile_aborted``
+    alert with reason ``directory_referral``, under its own source label
+    (:data:`_REFERRAL_ALERT_SOURCE`), beside whatever else the pass raised. The type is reused, not
+    new. Its own source keeps it apart from the breaker's instance: acknowledging or muting a
+    standing referral must not silence a later breaker trip, and each keeps its own detail.
 
     Reads the RETURNED plan, so it sees only a pass that finished. A failed write of the pass's own
-    held, aborted, skipped or unkeyed-binding row no longer ends the pass (BACKLOG #2137): the
-    service logs it at ERROR and returns the plan, so these alerts still fire. A pass that raised
+    held, aborted, skipped, referred or unkeyed-binding row no longer ends the pass (BACKLOG #2137):
+    the service logs it at ERROR and returns the plan, so these alerts still fire. A pass that raised
     part-way for another reason, such as inside one revocation, has already audited the revocations
     it applied before that point; those rows stand, and no alert is raised for them.
 
     Each standing alert also gets its inverse, which pages nobody and resolves the open instance
-    (BACKLOG #2136): ``ad_reconcile_breaker_cleared`` and ``ad_reconcile_hold_released``. The auth
-    service decides when a pass is evidence of a clear (``plan.breaker_clear``, ``plan.hold_clear``;
-    see ``AuthService._mark_reconcile_clears``), so the alert and the service read one predicate.
-    An outage or a pass with no signed-in account sets neither. The inverse is raised on EVERY pass
-    that sets its flag, not once per clear: resolving is an idempotent update, a resolve the
-    notifier failed to write is retried that way, and a fresh process resolves an instance its last
-    run left open with no state of its own."""
+    (BACKLOG #2136): ``ad_reconcile_breaker_cleared`` and ``ad_reconcile_hold_released``, and
+    ``ad_reconcile_breaker_cleared`` under the referral's source for the referral's instance. The
+    auth service decides when a pass is evidence of a clear (``plan.breaker_clear``,
+    ``plan.hold_clear``, ``plan.referral_clear``; see ``AuthService._mark_reconcile_clears``), so
+    the alert and the service read one predicate. An outage or a pass with no signed-in account
+    sets none. The inverse is raised on EVERY pass that sets its flag, not once per clear:
+    resolving is an idempotent update, a resolve the notifier failed to write is retried that way,
+    and a fresh process resolves an instance its last run left open with no state of its own."""
     if plan.directory_outage:
         return
-    if plan.aborted is not None:
-        # Every other abort is audited as auth.ad_reconcile_aborted (ReconcilePlan.directory_outage
-        # is the one predicate both sides read), so every such abort alerts.
+    if plan.aborted is not None and not plan.directory_referral:
+        # A breaker trip. A pass of referrals only is not one: its one alert is the referral's below.
         sink.ad_reconcile_aborted(
             "directory-reconciler",
             reason=plan.aborted,
             probed=plan.probed,
             detail=auth.directory_reconcile_alert or plan.aborted,
         )
-    else:
+    elif plan.aborted is None:
         for revocation in plan.revocations:
             sink.ad_session_revoked(revocation.username, reason=revocation.reason)
+    if plan.referred:
+        # BACKLOG #2538. After the breaker and the revocations, matching the service's order.
+        sink.ad_reconcile_aborted(
+            _REFERRAL_ALERT_SOURCE,
+            reason=REFERRAL_ABORT,
+            probed=plan.probed,
+            detail=auth.directory_reconcile_referral or REFERRAL_ABORT,
+        )
     if plan.hold:
         # After the breaker and the revocations, matching the auth service's order: a sink that
         # raises here cannot suppress the breaker's or a revocation's alert for the same pass.
@@ -7871,6 +7889,8 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
         sink.ad_reconcile_breaker_cleared("directory-reconciler")
     if plan.hold_clear:
         sink.ad_reconcile_hold_released("directory-reconciler")
+    if plan.referral_clear:
+        sink.ad_reconcile_breaker_cleared(_REFERRAL_ALERT_SOURCE)
 
 
 _INITIAL_CREDENTIAL_MAX_LEAD = 24 * 3600.0  # warn at most this long before the deadline

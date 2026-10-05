@@ -3208,13 +3208,26 @@ immediate, and one LDAP bind per signed-in directory user per pass is the cost â
 `ad_session_recheck_max_users` (200) caps it, and it is zero when nobody is signed in. An off-loopback
 PHI deployment serving AD accounts gets `ad_session_recheck_seconds = 300` by default; setting it to `0` is a declared loosening, not a neutral choice.
 
-A referral is not an outage (BACKLOG #2538). A pass in which a probe is answered with an LDAP
-referral aborts with reason `directory_referral`. It judges and revokes nothing, audits
-`auth.ad_reconcile_aborted`, and raises the `ad_reconcile_aborted` alert, whose text names
-`ad_user_search_base` and `ad_group_search_base`. A base in another domain of the forest refers on
-every pass, so read as an outage it would stop every revocation on a first deployment without a page.
-A referring group base also stops the revocation of accounts whose user search answered cleanly,
-because the whole pass aborts.
+A referral is not an outage (BACKLOG #2538). A probe answered with an LDAP referral leaves that one
+account unjudged: no strike, no revocation, and no answer on record. Every other probe in the pass
+is judged as usual, so a disabled or absent account whose user search answered cleanly is still
+revoked. A pass with any referral audits `auth.ad_reconcile_referred` and raises the
+`ad_reconcile_aborted` alert with reason `directory_referral`, under its own source
+`directory-reconciler-referral`. So it is its own instance, apart from the breaker's, and muting
+one does not silence the other. The alert's text names `ad_user_search_base` and
+`ad_group_search_base`. It resolves only once every signed-in account it referred has been read
+present and enabled, which runs every search a referral can come from. Referred accounts stay in
+the mass-revoke breaker's count, as unreachable ones do. Left out, a referring group base would
+trip the breaker on any handful of genuine disables. A base in another domain of the forest
+refers on every pass. Read as an outage, it would stop revocation on a first deployment without a
+page.
+
+The two bases fail differently. A referring user search base refers every probe that searches,
+so the pass judges nothing and revokes nothing, like an outage, but it still pages. A referring
+group search base
+refers only the accounts the user search found enabled. Disables and deletions still revoke, but a
+role or channel-scope change in the directory does not reach those accounts' sessions while it
+lasts.
 
 A probe that raises something other than an LDAP error, such as a malformed entry the engine cannot
 read, fails open for that one account (BACKLOG #2241). It is logged at WARNING by name on every

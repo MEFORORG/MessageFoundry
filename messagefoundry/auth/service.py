@@ -2072,6 +2072,13 @@ class AuthService:
         self._reconcile_last_probed: dict[str, float] = {}
         #: Latched mass-revoke circuit-breaker trip, cleared by the next clean pass.
         self._reconcile_alert: str | None = None
+        #: Latched LDAP referral (BACKLOG #2538). Its own latch, like the hold's, because a pass with
+        #: a referral beside other answers is not aborted and so clears `_reconcile_alert`. Set on a
+        #: pass with a referral, cleared on the next pass that reaches the directory without one.
+        self._reconcile_referral_alert: str | None = None
+        #: user_ids referred since a probe last read them without a referral (BACKLOG #2538).
+        #: `_mark_reconcile_clears` reports no referral clear while one is signed in.
+        self._reconcile_referred: set[str] = set()
         #: user_ids a breaker trip has not yet seen re-read on a pass that was not aborted
         #: (BACKLOG #2136). `_mark_reconcile_clears` reports no breaker clear while one is signed in.
         self._reconcile_unconfirmed: set[str] = set()
@@ -4995,10 +5002,15 @@ class AuthService:
 
     @property
     def directory_reconcile_alert(self) -> str | None:
-        """The last alerting abort's message, such as a mass-revoke circuit-breaker trip or a
-        referral (BACKLOG #2538), or ``None``. Latches until a pass completes without aborting, so
-        an operator who missed the log line still sees the standing condition."""
+        """The last mass-revoke circuit-breaker trip, or ``None``. Latches until a pass completes
+        without tripping, so an operator who missed the log line still sees the standing condition."""
         return self._reconcile_alert
+
+    @property
+    def directory_reconcile_referral(self) -> str | None:
+        """The standing LDAP referral's operator message, or ``None`` (BACKLOG #2538). Latches until
+        a pass reaches the directory and no probe is referred."""
+        return self._reconcile_referral_alert
 
     @property
     def directory_reconcile_hold(self) -> str | None:
@@ -5051,14 +5063,17 @@ class AuthService:
         except LdapReferralError as exc:
             # BACKLOG #2538. Ahead of LdapError, which it subclasses. A referral is not an outage:
             # it recurs on every pass until the search base is fixed, so read as UNAVAILABLE it
-            # would stop every revocation without a page. REFERRED never strikes or revokes, it
-            # aborts the pass with an alert, and verify_mfa refuses on it like any other non-PRESENT
-            # answer. WARNING, because the pass stops at its first referral, so this is one line
-            # per pass, and ldap.py's own warning is once per process: this is the line that says,
-            # after a log rotation, whether the user search or the group search was referred. The
-            # text names the operation and the referred hosts only (BACKLOG #2530).
-            _log.warning("directory probe of %s was referred: %s", user.username, exc)
-            return reconcile.Probe(user.id, user.username, reconcile.ProbeOutcome.REFERRED)
+            # would stop revocation for the referred accounts without a page. REFERRED never
+            # strikes or revokes this account, the rest of the pass is still judged, the pass
+            # alerts, and verify_mfa refuses on it like any other non-PRESENT answer. DEBUG here: a
+            # referring base refers every account on every pass, so the reconciler logs one ERROR
+            # per pass carrying the first referral's text instead, and verify_mfa audits its own
+            # refusal. ldap.py warns once per process too. The text names the operation and the
+            # referred hosts only (BACKLOG #2530), which is what makes it safe to carry and log.
+            _log.debug("directory probe of %s was referred: %s", user.username, exc)
+            return reconcile.Probe(
+                user.id, user.username, reconcile.ProbeOutcome.REFERRED, detail=str(exc)
+            )
         except LdapError as exc:
             # FAIL OPEN, for the reconciler. verify_mfa reads the same UNAVAILABLE as a refusal and
             # fails closed, because it grants rather than revokes (BACKLOG #2023). It writes an audit
@@ -5128,6 +5143,8 @@ class AuthService:
         within one interval instead of at the 12-hour absolute cap. Safe by construction:
 
         * a probe that could not reach the directory contributes nothing (fail-open);
+        * a probe the directory referred contributes nothing either, and the pass alerts, while
+          every other account is still judged (BACKLOG #2538);
         * a principal must come back absent, disabled or undetermined ``ad_session_recheck_strikes``
           passes running;
         * a PRESENT principal whose directory groups would change its roles, or withdraw or narrow
@@ -5189,23 +5206,18 @@ class AuthService:
         )
         now = time.monotonic()
         probes: list[reconcile.Probe] = []
+        # No early stop on a referral (BACKLOG #2538): a referral leaves only its own account
+        # unjudged, so every other account in the sample is still probed and judged.
         for user_id, _username in selected:
-            probe = await self._probe_principal(users[user_id])
-            probes.append(probe)
+            probes.append(await self._probe_principal(users[user_id]))
             self._reconcile_last_probed[user_id] = now
-            if probe.outcome is reconcile.ProbeOutcome.REFERRED:
-                # BACKLOG #2538. One referral aborts the pass, so the rest of the sample would only
-                # cost a bind each and be thrown away. Unprobed, they sort first on the next pass.
-                break
 
         # Resolve the role sets for the role re-diff, and the scope inputs for the scope re-diff (ADR
         # 0198). Store reads only — no extra directory traffic.
         current_roles: dict[str, frozenset[str]] = {}
         target_roles: dict[str, frozenset[str]] = {}
         scopes: dict[str, channel_scope.ScopeInput] = {}
-        # A referred pass is aborted unjudged (BACKLOG #2538), so its re-diff reads are skipped.
-        referred = bool(probes) and probes[-1].outcome is reconcile.ProbeOutcome.REFERRED
-        for probe in [] if referred else probes:
+        for probe in probes:
             if probe.outcome is not reconcile.ProbeOutcome.PRESENT:
                 continue
             current_roles[probe.user_id] = frozenset(
@@ -5257,18 +5269,32 @@ class AuthService:
         self._reconcile_hold_latched = plan.latched
         # BACKLOG #2136. A trip makes every candidate unconfirmed until a pass that is not aborted
         # reads it again, so a probe sample that missed the accounts behind the trip is no clear.
-        # A referral abort pages on the same alert, so it unconfirms every candidate too (#2538).
         self._reconcile_unconfirmed.intersection_update(users)
         if plan.aborted is None:
             self._reconcile_unconfirmed.difference_update(plan.outcomes)
-        elif not plan.directory_outage:
+        elif not plan.judged_nothing:
             self._reconcile_unconfirmed = set(users)
+        # BACKLOG #2538. The same for a referral, on its own record: a referred account counts as
+        # unconfirmed until a probe reads it PRESENT. Only that answer ran every search a referral
+        # can come from; a DISABLED or ABSENT one returns before the group search, so it says
+        # nothing about a referring group base. A revoked account leaves with the candidate set.
+        present = reconcile.ProbeOutcome.PRESENT
+        self._reconcile_referred.intersection_update(users)
+        self._reconcile_referred.difference_update(
+            uid for uid, outcome in plan.outcomes.items() if outcome is present
+        )
+        self._reconcile_referred.update(plan.referred)
+        referral = next((p for p in probes if p.outcome is reconcile.ProbeOutcome.REFERRED), None)
         if plan.aborted is not None:
-            await self._abort_reconcile_pass(plan)
+            if not plan.directory_referral:
+                await self._abort_reconcile_pass(plan)
+            if not plan.directory_outage:
+                # A pass of referrals only is recorded as a referral and nothing else (#2538).
+                await self._record_reconcile_referral(plan, first=referral)
             if not plan.judged_nothing:
                 # A held pass writes its own row even when the breaker also aborts it (ADR 0195 rule
-                # item 9). An outage or a referral judged nothing, so it leaves the hold's message
-                # alone and marks no clear (BACKLOG #2538).
+                # item 9). An outage or a pass of referrals only judged nothing, so it leaves the
+                # hold's message alone and marks no clear (BACKLOG #2538).
                 await self._record_reconcile_hold(plan)
                 plan = self._mark_reconcile_clears(plan, users)
             await self._report_unkeyed_bindings(unkeyed, still_unkeyed=still_unkeyed)
@@ -5303,6 +5329,9 @@ class AuthService:
                 new_username=refresh.new_username,
                 held=await self._store.get_user_by_username(refresh.new_username),
             )
+        # BACKLOG #2538. After the revocations, like the hold below: the referred accounts were left
+        # unjudged, and every other account's revocation above has already been applied.
+        await self._record_reconcile_referral(plan, first=referral)
         # ADR 0195. After the revocations, so a held-row audit write that fails cannot stop a
         # genuine disable or demotion in the same pass from being applied. And that failure is
         # logged rather than raised (BACKLOG #2137), so the pass still returns its plan and the
@@ -5322,13 +5351,19 @@ class AuthService:
         """Say on the plan whether this pass is EVIDENCE that each standing condition has cleared.
 
         BACKLOG #2136. The lifespan task resolves the durable ``ad_reconcile_aborted`` and
-        ``ad_reconcile_held`` alert instances on these, on every pass that sets them. Those
+        ``ad_reconcile_held`` alert instances on these, on every pass that sets them, and the
+        referral's own ``ad_reconcile_aborted`` instance (BACKLOG #2538). Those
         instances outlive the process, and the strike and outcome records here do not. So "not
         aborted" or "not held" is not enough: after a restart, or before the probe budget has
         reached every account, a pass can read clear while the condition still stands.
 
         * Both need an answer on record, from this process, for every signed-in account the pass
           did not just revoke. A probe that could not reach the directory leaves none.
+        * A pass in which any probe was referred marks neither of those two (BACKLOG #2538). A referred account
+          has no answer from this pass, and an older one on record may predate the referral.
+        * The referral's own instance (BACKLOG #2538) is clear when, on top of the first test, the
+          pass saw no referral and every account referred earlier in this process has been read
+          without one since. A pass of referrals only, or an outage, is never evidence.
         * The hold is clear when, on top of that, the pass did not hold and none of those answers
           is undetermined. The second test does not rest on this node's hysteresis latch, which
           another node on the store may not share.
@@ -5351,7 +5386,9 @@ class AuthService:
         revoked = {r.user_id for r in plan.revocations}
         ids = [uid for uid in users if uid not in revoked]
         outcomes = [self._reconcile_outcomes.get(uid) for uid in ids]
-        covered = bool(ids) and None not in outcomes
+        covered = bool(ids) and None not in outcomes and not plan.referred
+        # Called only on a pass that judged something, so a pass of referrals only never gets here.
+        referral_clear = covered and self._reconcile_referred.isdisjoint(ids)
         hold_clear = covered and not plan.hold and undetermined not in outcomes
         breaker_clear = (
             covered
@@ -5360,7 +5397,12 @@ class AuthService:
             and all(self._reconcile_strikes.get(uid, 0) == 0 for uid in ids)
             and self._reconcile_unconfirmed.isdisjoint(ids)
         )
-        return replace(plan, breaker_clear=breaker_clear, hold_clear=hold_clear)
+        return replace(
+            plan,
+            breaker_clear=breaker_clear,
+            hold_clear=hold_clear,
+            referral_clear=referral_clear,
+        )
 
     async def _refresh_cached_username(
         self,
@@ -5688,29 +5730,9 @@ class AuthService:
                 detail=_json({"reason": plan.aborted, "probed": plan.probed}),
             )
             return
-        if plan.directory_referral:
-            # BACKLOG #2538. Its own branch, not the breaker's: nothing was judged, so there is no
-            # ceiling to quote. Latched and paged on the breaker's alert type, because a referral
-            # recurs on every pass until an operator fixes the search base. The message is the
-            # alert's detail, so it names the settings to change, and names them FIRST: the store
-            # keeps only the first 200 characters of an alert instance's reason. No count: the
-            # pass stops at its first referral, so "1 of N" would only say where it stopped.
-            self._reconcile_alert = (
-                "LDAP referral: check [auth].ad_user_search_base and, for nested groups, "
-                "[auth].ad_group_search_base; one names a base in another domain of the forest. "
-                "The reconcile pass revoked nothing. No directory disable reaches a signed-in "
-                "session while this lasts, because the engine does not follow referrals. Use a "
-                "base in the bound domain controller's own domain, or a global catalog. The "
-                "WARNING 'directory probe of ... was referred' names the search and the hosts."
-            )
-            _log.error("directory reconcile: %s", self._reconcile_alert)
-            await self._audit_reconciler_row(
-                "auth.ad_reconcile_aborted",
-                detail=_json({"reason": plan.aborted, "probed": plan.probed}),
-            )
-            return
         # Held probes were left out of the breaker's denominator (ADR 0195 rule item 7), so the
-        # ceiling it quotes is taken over the same count. `probed` keeps its meaning in the row.
+        # ceiling it quotes is taken over the same count. `probed` keeps its meaning in the row. A
+        # pass of referrals only never reaches here: it is not a trip (BACKLOG #2538).
         ceiling = reconcile.breaker_ceiling(
             probed=plan.judged,
             max_absolute=self._settings.ad_session_revoke_max,
@@ -5738,16 +5760,88 @@ class AuthService:
             ),
         )
 
+    async def _record_reconcile_referral(
+        self, plan: reconcile.ReconcilePlan, *, first: reconcile.Probe | None
+    ) -> None:
+        """Latch, log and audit a pass in which the directory referred probes, or release the latch.
+
+        BACKLOG #2538. Called on every pass that reached the directory. On one with a referral,
+        whatever else the pass did, it latches the message, logs it at ERROR with the first
+        referral's search and hosts, and writes an ``auth.ad_reconcile_referred`` row. Its own audit
+        action, because a pass with a referral beside other answers is not an aborted one, and an
+        ``auth.ad_reconcile_aborted`` row is read as "nothing was revoked". The row's ``aborted``
+        field says what else the pass did. On a pass with no referral it releases a latched
+        message. An outage is not called here, so it leaves the message as it is.
+
+        **Its own latch and its own alert instance**, apart from the breaker's: the lifespan task
+        raises it as ``ad_reconcile_aborted`` under its own source label. A shared instance would
+        let an operator who acknowledges or mutes a standing referral also silence a later breaker
+        trip, and would let one detail hide the other.
+
+        The message is the alert's detail, so it names the settings to change FIRST: the store
+        keeps only the first 200 characters of an alert instance's reason. It carries counts and
+        no username. It is latched before the row is written, so a failed write leaves it set.
+        """
+        if not plan.referred:
+            # Released on the same evidence as the referral's clear: no signed-in account is still
+            # waiting to be read PRESENT. A sample that missed the referred accounts is not that.
+            if self._reconcile_referral_alert is not None and not self._reconcile_referred:
+                self._reconcile_referral_alert = None
+                _log.warning(
+                    "directory reconcile: every referred account has since been read; the LDAP "
+                    "referral cleared"
+                )
+            return
+        others = (
+            "The pass revoked nothing."
+            if plan.aborted is not None
+            else "Accounts that answered without a referral were judged as usual."
+        )
+        if plan.unavailable:
+            # A pass of referrals and failures is recorded here and not as an outage, so the
+            # failures are counted here, or a near-total outage would read as a search-base fault.
+            others = f"{plan.unavailable} could not reach the directory. {others}"
+        self._reconcile_referral_alert = (
+            "LDAP referral: check [auth].ad_user_search_base and, for nested groups, "
+            "[auth].ad_group_search_base; one names a base in another domain of the forest. "
+            f"{len(plan.referred)} of {plan.probed} signed-in directory account(s) probed were "
+            f"referred and left unjudged. {others} A referred account is never revoked while it "
+            "is referred, because the engine does not follow referrals. Use a base in the bound "
+            "domain controller's own domain, or a global catalog. The ERROR log line for each such "
+            "pass names the first referred search and its hosts."
+        )
+        # The username and the refusal's text go to the log only: the refusal names the search
+        # and the referred hosts and nothing else (BACKLOG #2530). One line per pass, not one per
+        # referred account, because a referring base refers every account on every pass.
+        _log.error(
+            "directory reconcile: %s First referral: %s: %s",
+            self._reconcile_referral_alert,
+            first.username if first is not None else "?",
+            first.detail if first is not None else "?",
+        )
+        await self._audit_reconciler_row(
+            "auth.ad_reconcile_referred",
+            detail=_json(
+                {
+                    "reason": reconcile.REFERRAL_ABORT,
+                    "referred": len(plan.referred),
+                    "unavailable": plan.unavailable,
+                    "probed": plan.probed,
+                    "aborted": plan.aborted,
+                }
+            ),
+        )
+
     async def _audit_reconciler_row(self, action: str, *, detail: str) -> bool:
         """Write one of the reconcile pass's own rows, and say whether it was written.
 
         BACKLOG #2137. These rows are the held row, the breaker's aborted row, the outage's skipped
-        row and the unkeyed-binding report. Each is written after the pass's revocations, or on a
-        pass that applies none. **A failed write here does not end the pass.** If
-        it raised, the pass would return no plan, and the lifespan task would raise no alert for
-        the revocations already applied, nor for the hold or the breaker. So a store refusal is
-        logged at ERROR, naming the action, and the pass goes on. The log line is then the only
-        record of that row. A per-revocation audit write is not routed through here: that one
+        row, the referral's row (BACKLOG #2538) and the unkeyed-binding report. Each is written
+        after the pass's revocations, or on a pass that applies none. **A failed write here does
+        not end the pass.** If it raised, the pass would return no plan, and the lifespan task
+        would raise no alert for the revocations already applied, nor for the hold, the breaker or
+        the referral. So a store refusal is logged at ERROR, naming the action, and the pass goes
+        on. The log line is then the only record of that row. A per-revocation audit write is not routed through here: that one
         still raises.
         """
         try:
@@ -8022,8 +8116,8 @@ class AuthService:
 
         **FAILS CLOSED, UNLIKE THE RECONCILER.** The reconciler REVOKES, so it fails open on an
         unreachable directory and wants two strikes for an ambiguous answer. This GRANTS, so any
-        answer short of a present, enabled account refuses: absent, disabled, undetermined and
-        unavailable alike. The directory step-up legs already refuse this way: ``_reauth_ad`` on a
+        answer short of a present, enabled account refuses: absent, disabled, undetermined,
+        unavailable and referred (BACKLOG #2538) alike. The directory step-up legs already refuse this way: ``_reauth_ad`` on a
         failed bind, and the federated step-up on ``directory_unavailable``. A refusal revokes
         nothing, so the next attempt asks again. An AD row on an engine with no directory
         configured is refused as ``not_configured``, because nothing can confirm it.

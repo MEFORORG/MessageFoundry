@@ -325,12 +325,16 @@ class AlertSink(Protocol):
         ...
 
     def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:
-        """A directory reconciliation pass aborted and revoked NOTHING (ADR 0079 mechanism 2), for
-        example because the mass-revoke circuit breaker tripped (``reason``
-        ``mass_revoke_breaker``) or the directory answered a probe with a referral
-        (``directory_referral``, BACKLOG #2538). Read ``reason`` before naming the cause. The same event as the ``auth.ad_reconcile_aborted`` audit
-        row. ``name`` labels the source (``"directory-reconciler"``); ``reason`` is the pass's
-        closed-set abort slug; ``probed`` is how many principals the pass probed; ``detail`` is the
+        """A directory reconciliation pass revoked nothing for some or all signed-in accounts and
+        needs an operator (ADR 0079 mechanism 2). Either the mass-revoke circuit breaker tripped
+        (``reason`` ``mass_revoke_breaker``), so the pass applied NOTHING, the same event as the
+        ``auth.ad_reconcile_aborted`` audit row; or the directory answered one or more probes with a
+        referral (``directory_referral``, BACKLOG #2538, the ``auth.ad_reconcile_referred`` row),
+        which leaves the referred accounts unjudged and may sit beside revocations the pass applied.
+        The type's name predates the second case. Read ``reason`` before naming the cause. ``name``
+        labels the source: ``"directory-reconciler"`` for the breaker, and
+        ``"directory-reconciler-referral"`` for a referral, so each is its own instance and
+        throttle; ``reason`` is one of those two closed-set slugs; ``probed`` is how many principals the pass probed; ``detail`` is the
         operator-facing explanation the auth service latches. No PHI. Emitted by the API-lifespan
         reconciler task, never from ``auth/``. A whole-directory outage is NOT this event: it is
         audited as ``auth.ad_reconcile_skipped`` and pages nothing, because the accounts are fine."""
@@ -350,7 +354,8 @@ class AlertSink(Protocol):
 
     def ad_reconcile_breaker_cleared(self, name: str) -> None:
         """The INVERSE of :meth:`ad_reconcile_aborted` (BACKLOG #2136): a pass that is evidence the
-        mass-revoke breaker is not tripped, as the auth service judges it
+        mass-revoke breaker is not tripped, or, under the referral's source label, that no referral
+        stands (BACKLOG #2538), as the auth service judges it
         (``AuthService._mark_reconcile_clears`` states the test). Emits **no** notification; when
         alert-state is wired (ADR 0044) it auto-resolves the open ``ad_reconcile_aborted`` instance
         for the same ``name`` (``"directory-reconciler"``). Raised on every such pass, so a resolve
@@ -749,7 +754,8 @@ class LoggingAlertSink:
 
     def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:
         log.warning(
-            "ALERT ad_reconcile_aborted: %r aborted a pass of %d principal(s) (%s): %s",
+            "ALERT ad_reconcile_aborted: %r left accounts unrevoked in a pass of %d principal(s) "
+            "(%s): %s",
             name,
             probed,
             reason,

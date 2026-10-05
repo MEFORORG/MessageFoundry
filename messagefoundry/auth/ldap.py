@@ -496,7 +496,7 @@ def _refuse_referral(conn: Any, operation: str) -> None:
     entries, which the session reconciler would count toward revoking the account. A referred bind
     reads as a rejected password, which the step-up re-bind would count toward the engine lockout.
     An :class:`LdapError` is audited as ``auth.login_error`` at sign-in. The reconciler reads this
-    subclass as referred, which never revokes and aborts the pass with an alert (BACKLOG #2538). A
+    subclass as referred, which never revokes that account and alerts (BACKLOG #2538). A
     referral usually means a search base in another domain of the forest.
 
     **Only a referral RESULT (resultCode 10).** A search continuation reference (``searchResRef``)

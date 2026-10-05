@@ -441,32 +441,84 @@ def test_an_outage_carries_the_hold_state_and_judges_nothing() -> None:
 R = reconcile.ProbeOutcome.REFERRED
 
 
-def test_one_referred_probe_aborts_the_pass_and_judges_nothing() -> None:
-    """BACKLOG #2538. One referral beside answers that would revoke: the pass applies nothing,
-    strikes nobody, records no outcome, and carries the hold's latch. RED when: a referral is read
-    as UNAVAILABLE, so the absent account below is revoked on this pass and the referral is lost."""
+def test_a_referred_probe_is_left_unjudged_and_the_rest_of_the_pass_is_judged() -> None:
+    """BACKLOG #2538. One referral beside answers that revoke: the referred account is neither
+    struck, reset nor recorded, exactly as an unreachable one, and the absent and disabled accounts
+    beside it are revoked on this pass. RED when: any referral aborts the whole pass, so a referring
+    group search base, which refers only the accounts the user search found, stops offboarding."""
     probes = [
         reconcile.Probe("r", "referred", R),
         reconcile.Probe("g", "gone", reconcile.ProbeOutcome.ABSENT),
+        reconcile.Probe("x", "disabled", reconcile.ProbeOutcome.DISABLED),
         reconcile.Probe("d", "down", reconcile.ProbeOutcome.UNAVAILABLE),
-        reconcile.Probe("u", "unread", U),
+        reconcile.Probe("ok", "fine", P),
     ]
+    plan = _plan(probes, prior_strikes={"g": 1, "x": 1, "r": 1})
+    assert plan.aborted is None and not plan.directory_referral and not plan.judged_nothing
+    assert sorted((r.user_id, r.reason) for r in plan.revocations) == [
+        ("g", "directory_absent"),
+        ("x", "directory_disabled"),
+    ]
+    # The referred account's prior strike is left where it was: absent from the plan, not reset.
+    assert plan.strikes == {"g": 2, "x": 2, "ok": 0}
+    assert set(plan.outcomes) == {"g", "x", "ok"}
+    assert (plan.probed, len(plan.referred), plan.unavailable) == (5, 1, 1)
+
+
+def test_a_referred_probe_leaves_the_prior_outcome_in_place() -> None:
+    """Rule item 4, as for an unavailable probe: a referral on one held account must not make the
+    other look single, so the hold still counts two."""
+    probes = [
+        reconcile.Probe("u1", "a", U),
+        reconcile.Probe("u2", "b", R),
+        reconcile.Probe("ok", "c", P),
+    ]
+    plan = _plan(probes, prior_outcomes={"u1": U, "u2": U})
+    assert plan.aborted is None and plan.hold and plan.undetermined == 2
+    assert plan.held == ("u1",) and "u2" not in plan.outcomes and "u2" not in plan.strikes
+
+
+def test_referred_probes_stay_in_the_breakers_count() -> None:
+    """Like unavailable ones. A referring group search base refers every enabled account, so six
+    genuine disables beside 294 referrals are the whole of what the pass can judge. Counted over
+    those six alone, the breaker would trip on every pass and offboarding would stop; counted over
+    all 300, they revoke. The control: the same six with nothing beside them do trip."""
+    off = [reconcile.Probe(f"x{i}", f"x{i}", reconcile.ProbeOutcome.DISABLED) for i in range(6)]
+    referred = [reconcile.Probe(f"r{i}", f"r{i}", R) for i in range(294)]
+    strikes = {p.user_id: 1 for p in off}
+    plan = _plan(referred + off, prior_strikes=strikes)
+    assert plan.aborted is None and plan.judged == 300 and len(plan.revocations) == 6
+    assert _plan(off, prior_strikes=strikes).aborted == "mass_revoke_breaker"
+
+
+def test_a_pass_of_referrals_only_judges_nothing() -> None:
+    """A user search base in another domain refers every probe. Nothing was answered, so the pass
+    judges nothing, as on an outage, and carries the hold's latch; unlike an outage it is a
+    referral, which pages."""
+    probes = [reconcile.Probe(f"r{i}", f"r{i}", R) for i in range(3)]
     for latched in (True, False):
-        plan = _plan(probes, prior_strikes={"g": 1}, latched=latched)
+        plan = _plan(probes, prior_strikes={"r0": 1}, latched=latched)
         assert plan.aborted == reconcile.REFERRAL_ABORT == "directory_referral"
         assert plan.directory_referral and plan.judged_nothing and not plan.directory_outage
         assert plan.revocations == () and plan.renames == ()
         assert plan.strikes == {} and plan.outcomes == {}
         assert not plan.hold and plan.latched is latched
-        assert (plan.probed, plan.referred, plan.unavailable) == (4, 1, 1)
+        assert (plan.probed, len(plan.referred), plan.unavailable) == (3, 3, 0)
 
 
 def test_a_pass_of_referrals_and_failures_is_a_referral_not_an_outage() -> None:
     """An outage pages nobody, so a pass whose only answers are referrals and failures must not be
-    read as one. Every probe failing is still an outage, the control."""
+    read as one. Every probe failing is still an outage, the control. One answer beside them makes
+    it an ordinary pass that judges that answer."""
     down = reconcile.Probe("d", "down", reconcile.ProbeOutcome.UNAVAILABLE)
-    mixed = _plan([down, reconcile.Probe("r", "referred", R)])
-    assert mixed.directory_referral and not mixed.directory_outage
+    referred = reconcile.Probe("r", "referred", R)
+    mixed = _plan([down, referred])
+    assert mixed.directory_referral and mixed.judged_nothing and not mixed.directory_outage
+    assert (len(mixed.referred), mixed.unavailable) == (1, 1)
+    gone = reconcile.Probe("g", "gone", reconcile.ProbeOutcome.ABSENT)
+    answered = _plan([down, referred, gone], prior_strikes={"g": 1})
+    assert answered.aborted is None and answered.referred == ("r",)
+    assert [r.user_id for r in answered.revocations] == ["g"]
     outage = _plan([down])
     assert outage.directory_outage and outage.judged_nothing and not outage.directory_referral
     tripped = _plan(
@@ -686,11 +738,18 @@ async def test_the_breaker_alert_clears_on_a_clean_pass() -> None:
         await store.close()
 
 
-async def test_a_referred_search_base_aborts_every_pass_loudly_and_revokes_nothing() -> None:
-    """BACKLOG #2538. A search base in another domain of the forest refers every probe. Read as an
-    outage, every pass would skip, page nobody and revoke nothing, for as long as it lasted. It
-    must abort as a referral instead: an aborted row naming the reason, a latched message naming
-    the setting, and no skipped row. Once the base is fixed, a clean pass clears the message.
+def _referred_rows(audit: list[Any]) -> list[dict[str, Any]]:
+    return [json.loads(a["detail"]) for a in audit if a["action"] == "auth.ad_reconcile_referred"]
+
+
+async def test_a_referring_user_search_base_judges_nothing_and_pages_every_pass(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #2538. A user search base in another domain of the forest refers every probe. Read
+    as an outage, every pass would skip, page nobody and revoke nothing, for as long as it lasted.
+    It must be recorded as a referral instead: a referred row naming the reason, a latched message
+    naming the settings, and no skipped row. Every account is still probed. Once the base is fixed,
+    a clean pass clears the message.
 
     RED when: the referral is caught as a plain LdapError and the pass reads as an outage."""
     store = await MessageStore.open(":memory:")
@@ -703,31 +762,165 @@ async def test_a_referred_search_base_aborts_every_pass_loudly_and_revokes_nothi
         ldap.referring = {"jdoe", "asmith"}
         for _ in range(3):
             ldap.probes.clear()
-            plan = await service.reconcile_directory_sessions()
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+                plan = await service.reconcile_directory_sessions()
             assert plan.aborted == "directory_referral" and not plan.directory_outage
-            assert plan.referred == 1 and plan.revocations == ()
-            assert not plan.breaker_clear and not plan.hold_clear
-            # The first referral ends the sample: the rest would cost a bind each, for nothing.
-            assert len(ldap.probes) == 1
+            assert len(plan.referred) == 2 and plan.revocations == ()
+            assert not plan.breaker_clear and not plan.hold_clear and not plan.referral_clear
+            assert sorted(ldap.probes) == ["asmith", "jdoe"]  # no early stop on a referral
+            # One line per pass, not one per referred account, carrying the first referral's
+            # text: the search and the hosts, which say which base to fix after a log rotation.
+            lines = [r for r in caplog.records if "referr" in r.getMessage()]
+            assert [r.levelno for r in lines] == [logging.ERROR]
+            assert "First referral:" in lines[0].getMessage()
+            assert "answered the user search with a referral" in lines[0].getMessage()
 
         for token in tokens:
             assert token is not None and await service.identity_for_token(token) is not None
-        alert = service.directory_reconcile_alert
+        alert = service.directory_reconcile_referral
         assert alert is not None and "referral" in alert
         # Both settings inside the first 200 characters: the store keeps only that much of an
         # alert instance's reason, and the setting is what the page exists to name.
         assert "ad_user_search_base" in alert[:200] and "ad_group_search_base" in alert[:200]
-        assert "circuit breaker" not in alert  # its own branch, not the breaker's text
+        assert "revoked nothing" in alert and "circuit breaker" not in alert
         audit = await store.list_audit()
-        aborted = [
-            json.loads(a["detail"]) for a in audit if a["action"] == "auth.ad_reconcile_aborted"
-        ]
-        assert aborted and all(d == {"reason": "directory_referral", "probed": 1} for d in aborted)
+        referred = _referred_rows(audit)
+        expected = {
+            "reason": "directory_referral",
+            "referred": 2,
+            "unavailable": 0,
+            "probed": 2,
+            "aborted": "directory_referral",
+        }
+        assert len(referred) == 3 and all(d == expected for d in referred)
         assert not any(a["action"] == "auth.ad_reconcile_skipped" for a in audit)
+        assert not any(a["action"] == "auth.ad_reconcile_aborted" for a in audit)
 
         ldap.referring.clear()  # the operator moved the search base into this domain
         plan = await service.reconcile_directory_sessions()
-        assert plan.aborted is None and service.directory_reconcile_alert is None
+        assert plan.aborted is None and plan.referred == ()
+        assert service.directory_reconcile_referral is None
+    finally:
+        await store.close()
+
+
+async def test_a_referral_beside_other_answers_still_revokes_them_and_pages() -> None:
+    """BACKLOG #2538, the defect the first fix introduced. A referral on one account must not stop
+    the pass: the account that left the directory is struck and revoked as usual, the referred one
+    keeps its session, and every pass still alerts and writes a referred row. No clear is marked
+    while the referral stands.
+
+    RED when: any referral aborts the whole pass, so the departed account keeps its session."""
+    store = await MessageStore.open(":memory:")
+    try:
+        names = ("jdoe", "asmith", "bwong")
+        ldap = _FakeLdap({n: _principal(n) for n in names})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        tokens = {n: await _signed_in_ad_user(service, store, n) for n in names}
+
+        ldap.referring = {"jdoe"}
+        del ldap.present["asmith"]  # offboarded
+        first = await service.reconcile_directory_sessions()
+        second = await service.reconcile_directory_sessions()
+        for plan in (first, second):
+            assert plan.aborted is None and len(plan.referred) == 1
+            assert not plan.breaker_clear and not plan.hold_clear
+        assert [(r.username, r.reason) for r in second.revocations] == [
+            ("asmith", "directory_absent")
+        ]
+        alive = {n for n, t in tokens.items() if await service.identity_for_token(t or "")}
+        assert alive == {"jdoe", "bwong"}
+
+        alert = service.directory_reconcile_referral
+        assert alert is not None
+        assert "ad_user_search_base" in alert[:200] and "ad_group_search_base" in alert[:200]
+        assert "1 of 3" in alert and "without a referral were judged as usual" in alert
+        assert service.directory_reconcile_alert is None  # the breaker's own latch is untouched
+        referred = _referred_rows(await store.list_audit())
+        assert len(referred) == 2
+        assert all(d["aborted"] is None and d["referred"] == 1 for d in referred)
+
+        ldap.referring.clear()
+        clean = await service.reconcile_directory_sessions()
+        assert clean.referred == () and service.directory_reconcile_referral is None
+        # jdoe has now been read without a referral, so the referral's instance may resolve.
+        assert clean.referral_clear and clean.breaker_clear and clean.hold_clear
+    finally:
+        await store.close()
+
+
+async def test_a_referral_beside_an_outage_judges_what_answered_and_pages() -> None:
+    """Referral, outage and answer in one pass. The answer is judged; the referral pages; the
+    outage leaves its account's strike alone. With the answer removed, referral plus outage alone
+    judges nothing. It is a referral, not an outage, so it still pages and writes no skipped
+    row."""
+    store = await MessageStore.open(":memory:")
+    try:
+        names = ("jdoe", "asmith", "bwong")
+        ldap = _FakeLdap({n: _principal(n) for n in names})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        tokens = {n: await _signed_in_ad_user(service, store, n) for n in names}
+
+        ldap.referring = {"jdoe"}
+        ldap.unreachable = {"bwong"}
+        del ldap.present["asmith"]
+        await service.reconcile_directory_sessions()
+        plan = await service.reconcile_directory_sessions()
+        assert plan.aborted is None and (len(plan.referred), plan.unavailable) == (1, 1)
+        assert [r.username for r in plan.revocations] == ["asmith"]
+        assert service.directory_reconcile_referral is not None
+
+        # asmith is revoked, so it is no longer a candidate: the referral and the outage remain.
+        both = await service.reconcile_directory_sessions()
+        assert both.directory_referral and not both.directory_outage and both.revocations == ()
+        # The failures are counted beside the referral, or the outage would read as a base fault.
+        message = service.directory_reconcile_referral
+        assert message is not None and "1 could not reach the directory" in message
+        audit = await store.list_audit()
+        assert not any(a["action"] == "auth.ad_reconcile_skipped" for a in audit)
+        # list_audit is newest first: the referral-and-outage pass, then the two judged passes.
+        rows = _referred_rows(audit)
+        assert [d["aborted"] for d in rows] == ["directory_referral", None, None]
+        assert [d["unavailable"] for d in rows] == [1, 1, 1]
+        for name in ("jdoe", "bwong"):
+            assert await service.identity_for_token(tokens[name] or "") is not None
+    finally:
+        await store.close()
+
+
+async def test_a_breaker_trip_beside_a_referral_keeps_both_conditions_apart() -> None:
+    """A pass that trips the breaker and also sees a referral revokes nothing. Each condition keeps
+    its own latched message and its own row, so neither hides the other."""
+    store = await MessageStore.open(":memory:")
+    try:
+        names = [f"user{i:02d}" for i in range(12)]
+        ldap = _FakeLdap({n: _principal(n) for n in names})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        for name in names:
+            await _signed_in_ad_user(service, store, name)
+
+        ldap.referring = {"user00"}
+        for name in names[1:]:
+            del ldap.present[name]
+        await service.reconcile_directory_sessions()  # strike 1
+        plan = await service.reconcile_directory_sessions()
+        assert plan.aborted == "mass_revoke_breaker" and len(plan.referred) == 1
+        assert plan.revocations == ()
+        assert not plan.referral_clear
+        breaker = service.directory_reconcile_alert
+        assert breaker is not None and breaker.startswith("mass-revoke circuit breaker TRIPPED")
+        assert "LDAP referral" not in breaker
+        referral = service.directory_reconcile_referral
+        assert referral is not None and referral.startswith("LDAP referral")
+        assert "ad_group_search_base" in referral[:200] and "The pass revoked nothing" in referral
+        audit = await store.list_audit()
+        assert any(a["action"] == "auth.ad_reconcile_aborted" for a in audit)
+        # Newest first: the tripped pass, then the first pass, which only struck.
+        assert [d["aborted"] for d in _referred_rows(audit)] == ["mass_revoke_breaker", None]
     finally:
         await store.close()
 
