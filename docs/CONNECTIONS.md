@@ -2329,6 +2329,14 @@ is reusable at every endpoint it is registered with, while the assertion's `aud`
 pinned token endpoint and the key never leaves the engine (BACKLOG #1158). Pass `algorithm="RS256"` for
 a generic partner — the `RS384` default below is SMART's own requirement, not this engine's.
 
+**If you stay on `with_oauth2_client_credentials(...)`**, its `auth_style` defaults to `"basic"`. The
+client id and secret then ride an `Authorization: Basic` header on every token request.
+`auth_style="post"` puts them in the form body. Both styles send the secret itself. `basic` stays the
+default for two reasons (vault BACKLOG #2206, decided 2026-10-04). RFC 6749 section 2.3.1 says an
+authorization server MUST support HTTP Basic for a client with a password, and that the form-body style
+is NOT RECOMMENDED. And a public-key style cannot be a default, because it needs a key only you can
+supply. So the stronger option above is a choice you make per connection.
+
 | `with_smart_backend(...)` arg | Default | Notes |
 |---|---|---|
 | `token_url` | — (required) | the authorization server's token endpoint (`https`; `env()`). **Also gated by `[egress].allowed_http`** — it is a second egress host. |

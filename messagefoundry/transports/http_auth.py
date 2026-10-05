@@ -125,7 +125,9 @@ class OAuth2ClientCredentialsProvider(_TokenEndpointProvider):
     token until it nears expiry, else POSTs the grant to the token endpoint. :meth:`invalidate` drops the
     cache so the next call re-mints (the connector calls it on a ``401`` — a token that expired between
     mint and use). ``auth_style`` selects RFC 6749 §2.3.1 ``client_secret_basic`` (the credential rides an
-    HTTP ``Basic`` header, the default) or ``client_secret_post`` (in the form body).
+    HTTP ``Basic`` header, the default) or ``client_secret_post`` (in the form body). Why ``basic`` is
+    the default, and what that does not claim about the header, is recorded on
+    :func:`with_oauth2_client_credentials` (vault BACKLOG #2206).
 
     The token hop and the cache are the SMART provider's own, through the shared base (BACKLOG #2115):
     the cleartext refusal, the #2112 revocation guard, the proxy, ECH and trust-anchor routing, and the
@@ -442,7 +444,20 @@ def with_oauth2_client_credentials(
     A symmetric ``client_secret_jwt`` (RFC 7523 with an HMAC) is **deliberately not offered**: the
     authorization server must hold the same secret to verify such an assertion, so it can mint one for
     any other audience. It would stop transmitting the secret without restoring the property above.
-    ``tests/test_oauth2_destination_binding.py`` holds both halves of this paragraph."""
+    ``tests/test_oauth2_destination_binding.py`` holds both halves of this paragraph.
+
+    **Why ``auth_style`` defaults to ``"basic"``** (vault BACKLOG #2206, decided 2026-10-04: the default
+    stays, and no behaviour changed). Two reasons. Of the two symmetric styles, RFC 6749 section 2.3.1
+    says an authorization server MUST support HTTP Basic for a client issued a client password, and
+    that sending the credentials in the request body is NOT RECOMMENDED. So ``basic`` is the style a
+    server is required to accept. And a public-key style cannot be a default: it needs key material,
+    which ``with_smart_backend`` requires as ``private_key`` and which no default can supply. The
+    stronger option is therefore a choice you make, named in the paragraph above.
+
+    That is a statement about WHICH style is the default. It is not a claim that the header this
+    provider builds follows that section's encoding rule. ``_fetch_token`` base64-encodes the client
+    id and secret as written. The section also asks for each to be form-encoded first, and that step
+    is not applied. The two forms are the same for an id and secret with no reserved character."""
     _require_http_spec(spec, "OAuth2 client-credentials")
     spec.settings.update(
         {
