@@ -50,6 +50,11 @@
   is recorded by address in the coverage report. The site-code pass (§5) and its leak-check twin
   skip a field the `DATE` kind filled. The output is still NOT Safe Harbor de-identified, for the
   reasons the bullet above gives. [PHI.md](../PHI.md) §9 is the long form.
+- **AMENDED 2026-10-05 (BACKLOG #2645): nine more default rules, from the batch_18 overlay.** The
+  default map adds `GT1-16`, `GT1-17`, `GT1-18`, `IN1-5`, `IN1-6`, `IN1-7`, `IN1-11`, `IN1-44` and
+  `OBR-35`. **This adds to the §3 field list and changes none of its ratified choices:** `IN1-4`
+  stays `KEEP`. That field and the non-standard `DST` segment are in a committed overlay fixture,
+  `tests/fixtures/anon/batch_18.anon.toml`, which says why neither is a default.
 - **Decision in one line:** ship a **pure-stdlib, dependency-free `anon` package** that turns real,
   messy HL7 v2 into structurally-faithful **PHI-free** datasets via a **two-layer rule model — a
   declarative field-*selection* map (data) over a code registry of pure surrogate *functions* (logic)** —

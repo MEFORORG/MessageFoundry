@@ -156,11 +156,20 @@ DEFAULT_RULES: tuple[FieldRule, ...] = (
     FieldRule("GT1-7", SurrogateKind.PHONE),
     FieldRule("GT1-8", SurrogateKind.DOB),  # guarantor's date of birth
     FieldRule("GT1-12", SurrogateKind.SSN),
-    # IN1/IN2 — insurance (plan/company codes IN1-2/3/4 are KEPT by omission)
+    FieldRule("GT1-16", SurrogateKind.NAME),  # guarantor's employer, an XPN
+    FieldRule("GT1-17", SurrogateKind.ADDRESS),  # guarantor's employer address
+    FieldRule("GT1-18", SurrogateKind.PHONE),  # guarantor's employer phone
+    # IN1/IN2 — insurance (plan/company codes IN1-2/3/4 are KEPT by omission). The company's
+    # address, contact and phone, and the insured's employer, are mapped (BACKLOG #2645).
+    FieldRule("IN1-5", SurrogateKind.ADDRESS),  # insurance company address
+    FieldRule("IN1-6", SurrogateKind.NAME),  # insurance company contact person
+    FieldRule("IN1-7", SurrogateKind.PHONE),  # insurance company phone
+    FieldRule("IN1-11", SurrogateKind.NAME),  # insured's group employer name
     FieldRule("IN1-16", SurrogateKind.NAME),
     FieldRule("IN1-18", SurrogateKind.DOB),  # insured's date of birth
     FieldRule("IN1-19", SurrogateKind.ADDRESS),
     FieldRule("IN1-36", SurrogateKind.ID),
+    FieldRule("IN1-44", SurrogateKind.ADDRESS),  # insured's employer address
     FieldRule("IN1-49", SurrogateKind.ID),
     FieldRule("IN2-2", SurrogateKind.SSN),
     FieldRule("IN2-3", SurrogateKind.FREETEXT),
@@ -183,6 +192,7 @@ DEFAULT_RULES: tuple[FieldRule, ...] = (
     FieldRule("OBR-7", SurrogateKind.DATE),  # observation date/time
     FieldRule("OBR-16", SurrogateKind.PROVIDER),
     FieldRule("OBR-32", SurrogateKind.PROVIDER),
+    FieldRule("OBR-35", SurrogateKind.PROVIDER),  # transcriptionist
     FieldRule("OBX-5", SurrogateKind.FREETEXT),
     FieldRule("OBX-14", SurrogateKind.DATE),  # observation date/time
     FieldRule("OBX-16", SurrogateKind.PROVIDER),
