@@ -793,6 +793,7 @@ async def test_a_stop_before_the_first_message_hands_nothing_over_and_still_prun
     src._handler = handler
     original = split_mod.split_batch_bytes
     loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
     stop_ran = threading.Event()
 
     def _set_stop() -> None:
@@ -800,14 +801,19 @@ async def test_a_stop_before_the_first_message_hands_nothing_over_and_still_prun
         stop_ran.set()
 
     def _stop_on_the_batch(raw: bytes, encoding: str) -> list[bytes]:
-        # The split runs in a worker thread, so the stop is set on the loop, where the Event lives.
-        # The worker then waits until the loop has run it. Queueing it is not enough: when the
-        # worker finishes before the loop has registered the future's done-callback, asyncio
-        # completes the awaited future without yielding, and the poller reads the flag while the
-        # stop is still queued. The wait is a bound, never a delay: it returns as the stop runs.
         if raw.count(b"MSH") > 1:
-            loop.call_soon_threadsafe(_set_stop)
-            stop_ran.wait(30)
+            if threading.get_ident() == loop_thread:
+                # A split run inline is already on the loop, where the Event lives. Waiting here
+                # would block the one thread that can run the stop.
+                _set_stop()
+            else:
+                # The split runs in a worker thread, so the stop is queued to the loop. The worker
+                # then waits until the loop has run it, because queueing alone does not order it.
+                # A worker can finish before the loop registers the future's done-callback. asyncio
+                # then completes the awaited future without yielding. The poller would read the
+                # flag while the stop is still queued.
+                loop.call_soon_threadsafe(_set_stop)
+                stop_ran.wait(30)
         return original(raw, encoding)
 
     monkeypatch.setattr(
@@ -815,9 +821,9 @@ async def test_a_stop_before_the_first_message_hands_nothing_over_and_still_prun
     )
     await _settle(src)
     await src._poll_once()
-    # The stop ran while b.hl7 was being split. Without this, a split that never reached the stop
-    # would leave the assertions below passing for the wrong reason.
-    assert stop_ran.is_set()
+    # The poll split b.hl7 and the stop ran. A poll that never reached b.hl7 (not settled, filtered
+    # out, or past the tick ceiling) would pass the two assertions below without this one.
+    assert stop_ran.is_set(), "the stop never ran: the poll did not split b.hl7"
     # a.hl7 was handed over and recorded; b.hl7 met the stop before its first message.
     assert [b.decode("utf-8").split("|")[9] for b in handler.bodies] == ["CTRL1"]
     assert len(ledger.keys) == 1 and ledger.pruned == 1
