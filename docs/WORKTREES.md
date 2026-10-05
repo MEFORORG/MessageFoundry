@@ -1607,6 +1607,9 @@ It cannot see at least these. Say them wherever you recommend the script.
 2. It deletes the renamed tree bottom-up, one entry at a time, and never through a reparse point.
 3. If a delete fails part-way, it lists exactly what remains under the renamed folder.
 
+One case that ends part-done is a file whose name ends in a dot. Windows drops that dot from the
+path, so the delete finds nothing and the file stays.
+
 | Exit code | Meaning |
 |---|---|
 | 0 | Every target passed. |

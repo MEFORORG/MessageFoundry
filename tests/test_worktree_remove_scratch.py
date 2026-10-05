@@ -42,6 +42,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -66,7 +67,6 @@ CALLER = "11111111-1111-4111-8111-111111111111"
 OTHER = "22222222-2222-4222-8222-222222222222"
 THIRD = "33333333-3333-4333-8333-333333333333"
 GONE = "44444444-4444-4444-8444-444444444444"
-EVERYONE = "*S-1-1-0"
 
 _FILETIME_EPOCH = 116444736000000000  # 1601-01-01 to 1970-01-01, in 100 ns ticks
 
@@ -108,7 +108,7 @@ def _stamp(path: Path, when: float, created: float | None = None) -> None:
     k32 = _kernel32()
     # FILE_WRITE_ATTRIBUTES; share everything; OPEN_EXISTING; BACKUP_SEMANTICS so a directory opens,
     # OPEN_REPARSE_POINT so a junction is stamped itself and its target is left alone.
-    handle = k32.CreateFileW(str(path), 0x0100, 0x7, None, 3, 0x02000000 | 0x00200000, None)
+    handle = k32.CreateFileW(_literal(path), 0x0100, 0x7, None, 3, 0x02000000 | 0x00200000, None)
     if handle is None or handle == ctypes.c_void_p(-1).value:
         raise ctypes.WinError(ctypes.get_last_error())
     try:
@@ -169,12 +169,22 @@ def _junction(link: Path, target: Path) -> None:
     )
 
 
+def _literal(path: Path) -> str:
+    r"""``path`` under the ``\\?\`` prefix, which turns Win32 name normalisation off.
+
+    Without it Windows drops a trailing dot from a name, so a file called ``stuck.`` cannot be
+    opened, stamped or removed by its own name.
+    """
+    return "\\\\?\\" + str(path)
+
+
 def _snapshot(tree: Path) -> list[str]:
     """Relative names of everything under ``tree``, with file sizes, for an exact survival check."""
     out = []
     for entry in _entries(tree):
         rel = str(entry.relative_to(tree))
-        out.append(rel if entry.is_dir() else f"{rel} [{entry.stat().st_size}]")
+        info = os.stat(_literal(entry))
+        out.append(rel if stat.S_ISDIR(info.st_mode) else f"{rel} [{info.st_size}]")
     return sorted(out)
 
 
@@ -960,31 +970,40 @@ def test_an_open_file_inside_the_tree_refuses_the_delete_and_changes_nothing(rig
 def test_a_delete_that_stops_part_way_lists_exactly_what_remains(rig: Rig) -> None:
     rig.caller()
     victim = rig.tree(rig.root / "victim")
-    stuck = victim / "sub" / "b.bin"
-
-    def icacls(*args: str, check: bool = True) -> None:
-        subprocess.run(["icacls", *args], check=check, capture_output=True, text=True)
-
-    # Deny deleting the file, and deny its folder the right to delete children. The top folder can
-    # still be renamed, so the delete starts and then cannot finish.
-    icacls(str(stuck), "/deny", f"{EVERYONE}:(DE)")
-    icacls(str(stuck.parent), "/deny", f"{EVERYONE}:(DC)")
+    # A file whose name ends in a dot. Windows drops a trailing dot from a path it is handed, so the
+    # script's delete of `sub\stuck.` asks for `sub\stuck`, finds nothing and raises nothing. The
+    # file stays, its folder cannot be removed, and the delete stops part-way.
+    #
+    # NOT a deny entry in the file's access list, which is what this rig used first. On the hosted
+    # Windows runner that entry did not stop the delete (run 37258094252: all nine checks PASS, then
+    # DELETED). A name needs no permission to be in the way, so it holds for an administrator too.
+    stuck = victim / "sub" / "stuck."
+    with open(_literal(stuck), "wb") as handle:
+        handle.write(b"12345")
+    _age(victim, 600)
+    assert _snapshot(victim) == ["a.txt [5]", "sub", "sub\\b.bin [7]", "sub\\stuck. [5]"]
     try:
         r = rig.run(victim)
 
         assert r.code == 3, r.out
         b = r.block(victim)
         assert b.verdict.startswith(f"PARTIAL {victim}: the delete stopped part-way"), r.out
+        assert "2 entries remain" in b.verdict, r.out
         assert "partial=1" in r.summary and "deleted=0" in r.summary, r.out
         left = list(rig.root.iterdir())
         assert len(left) == 1 and re.fullmatch(r"victim\.removing-[0-9a-f]{8}", left[0].name), left
         tomb = left[0]
-        assert _snapshot(tomb) == ["sub", "sub\\b.bin [7]"]
+        # Everything that could go has gone, and exactly the stuck file and its folder are left.
+        assert _snapshot(tomb) == ["sub", "sub\\stuck. [5]"]
         remains = sorted(
             line[len("remains: ") :] for line in b.extra if line.startswith("remains: ")
         )
-        assert remains == [str(tomb / "sub"), str(tomb / "sub" / "b.bin")], r.out
-        assert any(line.startswith(f"failed: {tomb / 'sub' / 'b.bin'}") for line in b.extra), r.out
+        assert remains == [str(tomb / "sub"), str(tomb / "sub" / "stuck.")], r.out
+        failed = [line for line in b.extra if line.startswith("failed: ")]
+        assert any(line.startswith(f"failed: {tomb / 'sub'} (") for line in failed), r.out
+        assert any(line.startswith(f"failed: {tomb} (") for line in failed), r.out
     finally:
-        # check=False: a failed restore must not replace the assertion that explains the test.
-        icacls(str(rig.root), "/remove:d", EVERYONE, "/T", "/C", check=False)
+        # pytest cannot remove this name either, so take it away by its literal path.
+        for entry in _entries(rig.root):
+            if entry.name == "stuck.":
+                os.unlink(_literal(entry))
