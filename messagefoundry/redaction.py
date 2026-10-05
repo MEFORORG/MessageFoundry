@@ -134,8 +134,9 @@ _HL7_FIELD_RUN = re.compile(r"(?<![^\s|^~&])[^\s|^~&]*+[|^~&][^\s|^~&]*+(?:[|^~&
 #: can swallow a label another pass reads, and leave that label's value behind: an XML element or JSON
 #: key glued to the run, an ``mrn:`` or ``PatientID=`` after it, or the second token of a name run.
 #: Run first, it kept values those passes had scrubbed before it existed. Run last, every such value
-#: is already gone, so it can only add redaction. :func:`redact` then runs both stages once more over
-#: what it changed.
+#: is already gone, so inside this module it only adds redaction. :func:`redact` then runs both
+#: stages once more over what it changed. A filter that runs AFTER this module is a different case,
+#: and :data:`_ENCODED_RUN_KEPT` is the answer to it.
 #:
 #: Linear for the same reason as :data:`_HL7_FIELD_RUN`. The lookbehind admits a start only after
 #: whitespace, a literal separator or the start of the text. A match from a token's start takes the
@@ -1593,12 +1594,12 @@ def redact(text: str) -> str:
     Order matters: HL7-shaped content (:data:`_HL7_SEGMENT`, then :data:`_HL7_FIELD_RUN`, then the
     separator-aware pass for a message that declares delimiters outside the defaults) is handled first,
     so the free-text passes (:data:`_MRN_LABELLED`, :data:`_DATE_RUN`, then :data:`_NAME_RUN`) only
-    see delimiter-free text. The percent-encoded run (:data:`_HL7_ENCODED_FIELD_RUN`) comes after
-    everything, as the last paragraph here says. The structured-shape passes (:func:`_redact_structured`: JSON keys, DICOM tags and labels,
-    XML elements) run LAST, so they can only add redaction to what the others left (the section
+    see delimiter-free text. The structured-shape passes (:func:`_redact_structured`: JSON keys, DICOM tags and labels,
+    XML elements) run after those within each round, so they can only add redaction to what the others left (the section
     comment above them says what running them first cost). The free-text heuristic narrows the prior
     residual to adversarial *single-token* identifiers (a lone name with no second token, no date) — for which the "never put PHI in an exception message"
-    convention remains the control. Meant to be idempotent, since the literal ``[redacted]`` substituted
+    convention remains the control. The percent-encoded run (:data:`_HL7_ENCODED_FIELD_RUN`) comes
+    after all of them, as the last paragraph here says. Meant to be idempotent, since the literal ``[redacted]`` substituted
     in is built never to re-match a pattern; it is not quite, and :func:`safe_text` names the known
     exceptions.
 
@@ -1632,8 +1633,15 @@ def redact(text: str) -> str:
 
     **The percent-encoded run runs after both stages (BACKLOG #2171).** Its pattern says why: run
     among them, it took labels and name tokens the other passes needed. When it changes the text, both
-    stages run once more over its output, so a pass that reads what it left still sees it. The screen
-    is a C-speed search, so text without an encoded separator pays nothing more."""
+    stages run once more over its output, so a pass that reads what it left still sees it. That second
+    run includes the credential backstop, on a line the run may have shortened. So text holding a
+    qualifying run pays both stages twice, and ``redact`` of a clamped text can differ from the same
+    cut of the unclamped result. The screen is a C-speed search, so text without an encoded separator
+    pays nothing more.
+
+    **Inside this module the run only adds redaction. Across the log filter chain it could remove a
+    label a later filter reads**, which is why it writes back :func:`_encoded_run_replacement` and
+    not one placeholder (:data:`_ENCODED_RUN_KEPT`)."""
     out = _redact_stages(text)
     if "%" not in out or _ENCODED_SEPARATOR.search(out) is None:
         return out
@@ -1700,7 +1708,8 @@ def _redact_rounds(text: str, *, widened: bool) -> str:
     return _redact_flat(text, widened=widened, credentials=not widened)
 
 
-#: The most rounds one stage of :func:`redact` takes, so a call takes at most twice this. Measured over 200,000 fuzzed inputs from the alphabet of
+#: The most rounds one stage of :func:`redact` takes. A call runs two stages, and runs both again when
+#: the encoded run changed the text, so it takes at most four times this. Measured over 200,000 fuzzed inputs from the alphabet of
 #: ``test_redact_is_a_fixed_point_over_random_structure``: none needed more than 3, the last of them
 #: the round that confirms nothing changed. The cap is set well above that so a peer has to build
 #: many nested layers of uncovering to reach it; an input that does gets one last flat round, and
@@ -1714,7 +1723,8 @@ def _redact_flat(text: str, *, widened: bool, credentials: bool) -> str:
     :func:`_redact_structured`, repeated to a fixed point.
 
     ``credentials=False`` skips the backstop, which the widened stage of :func:`redact` does. The
-    first stage has already run it. The skip was written when the backstop's greedy tail swallowed
+    first stage has already run it, and runs it once more when the encoded run changed the text
+    (:func:`redact` runs both stages again). The skip was written when the backstop's greedy tail swallowed
     everything between two spans it had scrubbed, on any further run, and a clamp dropping the later
     span kept what the unclamped scan removed (the clamp fuzz in ``tests/test_redaction.py`` measured
     it). BACKLOG #2312 stopped the tail crossing a scrubbed span (:data:`_INVALID_URL_USERINFO`), so a

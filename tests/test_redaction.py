@@ -2050,6 +2050,18 @@ def test_the_encoded_run_keeps_only_marks_and_label_words(
             assert value not in out, f"{name}: {out!r}"
 
 
+def test_the_stages_run_again_over_what_the_encoded_run_changed() -> None:
+    """Pins the second ``_redact_stages`` call in ``redact`` (PR 2011 review finding 5): returning
+    the run's output directly left every other test green. Found by a search over fuzzed inputs.
+    THE CONTROL is the middle assertion: the value survives the stages and the run, so only the
+    second pass of the stages is what removes it."""
+    text = '<family value="%7c%5Ekk7wtsecr3tb1q<name>%5e%7c\t%5epassword=Basic4455667secret:;'
+    staged = redaction._redact_stages(text)
+    after_run = redaction._HL7_ENCODED_FIELD_RUN.sub(redaction._encoded_run_replacement, staged)
+    assert "4455667" in after_run, "the control no longer holds"
+    assert "4455667" not in redact(text)
+
+
 def test_an_encoded_run_with_no_mark_or_label_is_one_placeholder() -> None:
     """THE CONTROL for the arm above: the ordinary run is still replaced whole."""
     assert redact("id zqxdoe%7C4455667%7Cvanja here") == "id [redacted] here"
@@ -2216,6 +2228,10 @@ _ENCODED_HOSTILE = {
     "restart-after-literal": "a|b c%7Cd ",
     # One long token with one separator: a single attempt walks all of it.
     "one-long-token": "%20" * 1000 + "%7C ",
+    # Tokens the run takes, built to make the kept-label scan work hardest: a dotted and hyphenated
+    # run offers a label start at every segment, and quotes split the token into many stretches.
+    "label-prefix-run": "a-b.c-" * 40 + "pass%7Cx%7Cy ",
+    "many-kept-marks": "'a\"b;c,d&" * 20 + "%7Cx%7Cy ",
 }
 
 
