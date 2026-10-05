@@ -435,7 +435,7 @@ class _Sinks:
             "INFO",
             log_file=LogFile(path=str(self.log)),
             forward=SyslogForward(host="127.0.0.1", port=self.collector.getsockname()[1]),
-            # Nothing here is an engine, and the control arm fails every sink on purpose.
+            # Nothing here is an engine, and the control arm fails the stdout sink on purpose.
             stop_on_write_failure=False,
         )
 
@@ -498,28 +498,23 @@ def test_the_refusal_line_reaches_every_sink_whatever_the_file_name(
     assert sinks.states() == {"stdout": "healthy", "file": "healthy"}
 
 
-def test_without_the_escape_a_lone_surrogate_keeps_the_line_out_of_every_sink(
+def test_without_the_escape_a_name_outside_cp1252_keeps_the_line_off_stdout(
     build_sinks: Callable[[], _Sinks], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """CONTROL for the test above: the same sinks and the same name, with the name passed as it
-    came. The line reaches none of them and the log file is rolled aside, so every assertion
-    above could have failed.
+    """CONTROL for the test above: the same sinks, with the name passed as it came. A printable
+    character the strict cp1252 stdout cannot encode is not in the log escape's alphabet, so only
+    ``_ascii`` keeps that line on stdout, and every stdout assertion above could have failed. The
+    UTF-8 file takes the line either way.
 
-    This arm depends on the sinks themselves failing on a lone surrogate, which they do for any
-    logger's line. If a later change makes the sinks take any string, this arm goes red: delete
-    it then, and the escape is no longer what protects the line."""
+    Until vault BACKLOG #2815 this control used a lone surrogate, which failed every sink. The
+    handlers' log escape now covers category ``Cs``, so that arm no longer fails anything;
+    ``tests/test_logging.py`` pins the surrogate through the sinks instead."""
     sinks = build_sinks()
     monkeypatch.setattr(remotedebug, "_ascii", lambda name: name)
-    remotedebug._report("pay\udcffload.py")
-    assert REMOTE_SCRIPT_EVENT not in sinks.in_file()
+    remotedebug._report(f"pay{chr(0x4E2D)}load.py")
     assert REMOTE_SCRIPT_EVENT not in sinks.on_stdout()
-    assert len(sinks.rolled_aside()) == 1
-    assert sinks.states() == {"stdout": "unwritable", "file": "unwritable"}
-    # The forwarder sends in order. A later line that arrives with no refusal line ahead of it
-    # shows the refusal line was not sent, without waiting out a timeout to prove an absence.
-    logging.getLogger("tests.remote_debug_guard").warning("a later line")
-    forwarded = sinks.forwarded("a later line")
-    assert "a later line" in forwarded and REMOTE_SCRIPT_EVENT not in forwarded
+    assert REMOTE_SCRIPT_EVENT in sinks.in_file()
+    assert sinks.states()["stdout"] == "unwritable"
 
 
 # --- installing --------------------------------------------------------------------------------
