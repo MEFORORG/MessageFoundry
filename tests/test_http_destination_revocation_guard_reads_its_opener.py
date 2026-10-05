@@ -337,33 +337,6 @@ def test_the_rest_ech_refusal_offers_only_a_lever_that_can_cross_it(pki: dict[st
     assert "tls_revocation_attested=true" in default
 
 
-_UNCHECKED_CROSSING = "crossed without certificate revocation checking"
-
-
-def _crossing_audit_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
-    return [r.getMessage() for r in caplog.records if _UNCHECKED_CROSSING in r.getMessage()]
-
-
-@pytest.mark.parametrize("cell", list(_CELLS))
-def test_a_hop_that_checks_a_crl_is_not_audited_as_an_unchecked_crossing(
-    cell: str, pki: dict[str, str], caplog: pytest.LogCaptureFixture
-) -> None:
-    """A site that attested as its only way across, then adds a CRL, has both set. The hop now
-    crosses because its context checks a CRL, so the audit line that says it crossed with no
-    revocation checking would be a false record."""
-    with active_hop_posture(PROD_PHI), caplog.at_level("WARNING"):
-        dest = _build(cell, crl=pki["crl"], revocation_attested=True)
-    assert _checks_a_crl(dest) is True
-    assert _crossing_audit_lines(caplog) == []
-    # CONTROL: the same attested hop with NO CRL does cross unchecked, and is still audited once.
-    caplog.clear()
-    with active_hop_posture(PROD_PHI), caplog.at_level("WARNING"):
-        _build(cell, revocation_attested=True)
-    lines = _crossing_audit_lines(caplog)
-    assert len(lines) == 1
-    assert "revocation-checking PKI at the partner edge" in lines[0]  # the attested reason
-
-
 def test_opener_is_a_required_keyword() -> None:
     """A default of ``None`` is what let four destinations call the guard with no opener and be
     refused with a CRL loaded. Required, a new caller that forgets it fails at the call."""

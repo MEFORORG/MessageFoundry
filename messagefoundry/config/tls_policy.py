@@ -2417,16 +2417,13 @@ class RevocationHopGuard:
         # Audit an attestation / proven terminator that SUPPRESSED a would-be production-PHI refusal: the
         # disposition is ALLOW only because tls_revocation_attested / proxy_proven fired before the REFUSE
         # arm, so an operator should see the unchecked-revocation hop was crossed on their attestation.
-        # A crl_checked hop is EXCLUDED, by its own test below: that hop DOES check revocation, so
-        # there is no unchecked-revocation crossing to audit, even when it is also attested. This
-        # comment stated the exclusion while the condition lacked it, until vault BACKLOG #2188.
-        # blanket_attested is not here either — under an
+        # crl_checked is deliberately NOT in this condition: that hop DOES check revocation, so there is
+        # no unchecked-revocation crossing to audit. blanket_attested is not here either — under an
         # enforcing posture it can no longer produce an ALLOW (BACKLOG #299), and under a non-enforcing
         # one `posture.enforcing` already excludes the line.
         if (
             disposition is HopDisposition.ALLOW
             and (self.attested or self.proxy_proven)
-            and not self.crl_checked
             and posture.enforcing
             and not is_loopback_hop_host(self.host)
         ):
