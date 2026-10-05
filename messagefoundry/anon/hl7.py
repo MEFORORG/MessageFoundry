@@ -59,9 +59,11 @@ def _refuse_unwritable_rules(rules: tuple[FieldRule, ...]) -> None:
 
     The field number is read with ``int()``, the way the adapters read it, so ``MSH-02`` and a
     path with a stray space or newline are refused like ``MSH-2``. A path whose number ``int()``
-    cannot read is not a whole-field address; ``load_rules`` refuses those, and one built in code
-    is left to the adapter as before. A ``KEEP`` rewrites nothing, so it is allowed. The same
-    check runs in both adapters (BACKLOG #2265)."""
+    cannot read is not a whole-field address, and it is not this check's to refuse.
+    ``FieldRule`` refuses every path that is not a whole-field address when the rule is built,
+    field 0 and ``MSH-02`` included (BACKLOG #2330). So for those spellings this check is a
+    second line, and for ``MSH-1`` and ``MSH-2`` it is the only one. A ``KEEP`` rewrites
+    nothing, so it is allowed. The same check runs in both adapters (BACKLOG #2265)."""
     named: set[str] = set()
     for rule in rules:
         if rule.kind == SurrogateKind.KEEP:

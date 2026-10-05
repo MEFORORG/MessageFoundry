@@ -1808,9 +1808,11 @@ counted its field as scrubbed. No default rule names an MSH field, so the header
 an overlay maps one.
 
 A rule that would rewrite `MSH-1` or `MSH-2` is refused, because those two fields hold the
-message's delimiters. So is a rule for field 0 of any segment, which is the segment id. A `keep`
-is allowed, because it rewrites nothing. A later MSH line that carries data where `MSH-2` belongs
-cannot be scrubbed by a rule. Repair or remove that line.
+message's delimiters. A `keep` on either is allowed, because it rewrites nothing. A rule for
+field 0 of any segment, which is the segment id, is refused whatever its kind: `PID-0` is not a
+whole-field address, so the rule is refused when it is built or loaded (BACKLOG #2330). A later
+MSH line that carries data where `MSH-2` belongs cannot be scrubbed by a rule. Repair or remove
+that line.
 
 **The two anonymizers still differ on some inputs, at least these:**
 
@@ -1898,7 +1900,9 @@ What the `date` kind does to a value:
   `dob` field is not skipped, so a fabricated `YYYYMM` date of birth is still rewritten into a
   number that is not a date. A site code that is itself a year followed by `01` leaves whole.
   The skip needs the rules: `leak_check` called with no rules, and the publish gate's own scan
-  of a committed file, still flag a kept `YYYYMM` date under such a prefix.
+  of a committed file, still flag a kept `YYYYMM` date under such a prefix. The skip never
+  reaches an MSH line. A `date` rule on an MSH field is applied, and a `YYYYMM` it leaves there
+  is still treated as a site code.
 
 Do not shift the dates to fix the `MSH-7` gap. The kept `MSH-7` minus a shifted `EVN-2` gives back
 the shift.

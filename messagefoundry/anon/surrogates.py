@@ -484,7 +484,9 @@ def _date_output_test(rules: tuple[FieldRule, ...], seps: Seps) -> Callable[[lis
     The OBX-5 case reads OBX-2 from the text it is given. A rule that rewrites OBX-2 hides the date
     type, and that OBX-5 is then scrubbed as before the exemption existed.
 
-    An MSH line is never skipped: the tee applies no rule there. What this lets through: a site
+    An MSH line is never skipped. Both adapters apply an ``MSH-N`` rule (BACKLOG #2265), but this
+    test does not number MSH fields the MSH way, so a ``DATE`` rule there earns no exemption: its
+    output is checked and scrubbed like any other MSH field. What this lets through: a site
     code that reads as a year and a month, sitting in a date field, leaves as its first four digits
     and ``01``.
     """
