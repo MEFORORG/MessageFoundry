@@ -1274,8 +1274,9 @@ def test_no_token_survives_the_clamp_that_the_unbounded_scan_scrubs() -> None:
     tokens. It cannot reach a leak that turns on text the window never sees: a clamp that drops the
     ``MSH`` declaring custom delimiters leaves ``_sniff_delimiters`` nothing to read, and no token
     list produces that, because the dependency is on the whole text rather than on a span. That one
-    is a known open gap recorded on the pull request, and both controls share the blind spot, so a
-    zero here is evidence about the two walks and about nothing else."""
+    is an accepted residual (BACKLOG #1848), pinned by the strict xfail
+    ``test_a_custom_delimiter_fragment_whose_msh_the_clamp_drops_is_scrubbed``. Both controls share
+    the blind spot, so a zero here is evidence about the two walks and about nothing else."""
     shipped = _clamp_leaks(redaction._clamp, 1_500)
     name_control = _clamp_leaks(_three_step_clamp, 1_500)
     credential_control = _clamp_leaks(_clamp_without_the_credential_walk, 1_500)
@@ -2134,3 +2135,48 @@ def test_a_single_token_longer_than_the_bound_is_dropped_whole() -> None:
     window with no boundary in it. The count is the whole token."""
     assert safe_text("A1" * 300, limit=40) == "…(+600 chars)"
     assert safe_exc(RuntimeError("x" * 5000), limit=50) == "RuntimeError: …(+5000 chars)"
+
+
+# --- BACKLOG #1848: a whole-text dependency the clamp cannot hold ------------------------------------
+
+#: A headerless fragment in the fully-custom delimiters, then filler past the window, then the MSH
+#: that declares those delimiters. Unclamped, the sniff reads the tail's MSH and the fragment in the
+#: head is scrubbed. Clamped, the MSH is gone and the fragment survives.
+_FRAGMENT_IDENTIFIER = "MRN123"
+
+
+def _fragment_then_msh_past_the_window() -> str:
+    return (
+        f"id {_FRAGMENT_IDENTIFIER}$$$H$MR here "
+        + _filler(redaction._REDACT_WINDOW)
+        + " "
+        + ADT_FULLY_CUSTOM
+    )
+
+
+def test_control_unclamped_redact_scrubs_the_fragment_by_the_tail_msh() -> None:
+    """Non-vacuity for the xfail below. The unbounded scan scrubs the fragment, and only because of
+    the MSH past the window: the same fragment alone is the headerless residual and survives."""
+    text = _fragment_then_msh_past_the_window()
+    assert len(text) > redaction._REDACT_WINDOW
+    assert _FRAGMENT_IDENTIFIER not in redact(text).split("MSH", 1)[0]
+    assert _FRAGMENT_IDENTIFIER in redact(f"id {_FRAGMENT_IDENTIFIER}$$$H$MR here")
+    assert "MSH" not in clamp_untrusted(text), "the clamp kept the header, so nothing is measured"
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "BACKLOG #1848, accepted residual: the clamp drops the MSH that declares the delimiters, so "
+        "the sniff has nothing to read. A whole-text sniff would close it and undo the #1576 bound."
+    ),
+)
+def test_a_custom_delimiter_fragment_whose_msh_the_clamp_drops_is_scrubbed() -> None:
+    """ASSERTS THE BEHAVIOUR WE DO NOT HAVE, so it fails today and is marked a strict xfail.
+
+    The day a change closes the gap, this passes, strict mode turns the pass into a failure, and the
+    person who closed it removes the mark and updates the residual in the module docstring. The day a
+    change makes the shape worse, nothing here moves -- that is the cost of accepting it."""
+    text = _fragment_then_msh_past_the_window()
+    for out in (redact_untrusted(text), safe_text(text, limit=100_000)):
+        assert _FRAGMENT_IDENTIFIER not in out

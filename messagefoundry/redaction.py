@@ -24,9 +24,11 @@ labels, and XML elements with the same vocabulary (:func:`_redact_structured`, B
 
 Residuals, at least these, and this module claims no completeness: an adversarially-crafted
 *single-token* or non-name-shaped identifier, a **headerless** custom-delimiter fragment (no MSH, so
-nothing declares its delimiters), and the structured shapes the section comment above
-:func:`_redact_structured` lists. For all of them, the "never put PHI in an exception message"
-convention remains the control.
+nothing declares its delimiters), a custom-delimiter fragment whose declaring MSH sits past
+:data:`_REDACT_WINDOW` (the clamp drops the header the sniff needs, so the fragment in the kept head
+survives; BACKLOG #1848, accepted below under :data:`_CUT_CHARS`), and the structured shapes the
+section comment above :func:`_redact_structured` lists. For all of them, the "never put PHI in an
+exception message" convention remains the control.
 
 A **file name is exactly the first of those residuals**, which is why :func:`safe_name` exists beside
 the heuristic rather than inside it: a partner names a drop ``MRN123456789_ADT.hl7`` or
@@ -534,8 +536,15 @@ _REDACT_WINDOW = 64 * 1024
 #: work.** :func:`_sniff_delimiters` reads the WHOLE text, so a clamp that drops the ``MSH`` declaring
 #: a feed's real delimiters leaves the separator-aware pass nothing to read, and a run inside the head
 #: that :func:`redact` scrubs unclamped survives. The dependency is not on a span, so no amount of
-#: looking back from the cut finds it. It is a known open gap, recorded here and on the corpus arm in
-#: ``tests/test_redaction.py`` that also cannot reach it -- not a pattern this register covers.
+#: looking back from the cut finds it.
+#:
+#: **It is ACCEPTED as a residual, not fixed (BACKLOG #1848).** Sniffing the whole text before the
+#: clamp would close it and would undo #1576: the sniff then reads everything a peer sends. Measured
+#: here on 16 MB, the sniff alone cost 0.67 s on a header every eleven characters and 0.16 s on
+#: near-miss headers, against the 50 ms budget the #1437 arms hold. Keeping the first segment whatever
+#: the cut would special-case a register that has none. A strict xfail in ``tests/test_redaction.py``
+#: asserts the fragment IS scrubbed, so it fails loudly the day someone closes the gap; the corpus arm
+#: there cannot reach the shape at all.
 #:
 #: **The structured passes (BACKLOG #1711) mostly answer "yes", and need no walk.** Each is
 #: label-anchored and treats a region that never closes as running to the end of the text, so a cut
