@@ -4,6 +4,11 @@
 
 One section per defect, numbered as the row numbers them. Defect 5 is the ``second-msh`` case in
 ``tests/test_anon_core.py``. Synthetic text only.
+
+Measured red, each with one fix reverted in the engine copy (the CLI for defect 3): the old no-separator rule failed
+7 tests (defect 1); "live" from token_tables_live alone failed 2 (defect 2); no plain print
+failed 2, one of them the real subprocess run (defect 3); no blank-line drop failed 4 and the
+byte-identity test (defect 6). A test with a tee arm kept that arm green, which is the control.
 """
 
 from __future__ import annotations

@@ -8,6 +8,9 @@ shared ``normalized_message``, which both entry points and both copies (engine a
 
 A legal empty segment, such as a bare ``PV2``, is not such a line (vault BACKLOG #2247), so each
 refusal here is paired with a line that must still pass. Synthetic text only.
+
+Measured red: with the refusal taken out of the engine copy of normalized_message, 30 tests
+across the five anonymizer test files failed. The tee arms stayed green, which is the control.
 """
 
 from __future__ import annotations
