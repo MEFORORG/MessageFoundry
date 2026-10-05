@@ -22,7 +22,9 @@ from typing import Any
 import pytest
 from fastapi import APIRouter, Depends, FastAPI, Request, WebSocket
 from fastapi.routing import APIWebSocketRoute
-from starlette.routing import Mount
+from starlette.middleware import Middleware
+from starlette.responses import PlainTextResponse
+from starlette.routing import Mount, Route
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
@@ -406,6 +408,42 @@ def test_a_mounted_apps_socket_hooks_are_read_from_that_app(hook_on: str) -> Non
     assert row.path == "/mounted/ws"
     expected = ("authorize_ws",) if hook_on == "outer" else ("authorize_probe", "authorize_ws")
     assert row.gates == expected, row
+
+
+class _PassThrough:
+    """An ASGI middleware that changes nothing, so a mount wraps its app in one layer."""
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        await self.app(scope, receive, send)
+
+
+def test_a_mounted_app_beneath_mount_middleware_is_still_the_state_owner() -> None:
+    """``_state_owner`` reads Starlette's private ``Mount._base_app``. This pins that it still
+    exists and is what the walk reads, so a Starlette rename reds a run here."""
+    inner = FastAPI(openapi_url=None)
+    inner.add_api_websocket_route("/ws", _hooked)
+    inner.state.probe_hook = authorize_probe
+    outer = FastAPI()
+    outer.routes.append(Mount("/mw", app=inner, middleware=[Middleware(_PassThrough)]))
+    (mount,) = [r for r in outer.routes if isinstance(r, Mount)]
+    assert getattr(mount, "_base_app", None) is inner
+    (row,) = _ws_rows(outer)
+    assert row.gates == ("authorize_probe", "authorize_ws"), row
+
+
+def test_a_plain_route_outside_the_refusal_still_reports_its_declaration() -> None:
+    app = FastAPI()
+
+    @public_route("a synthetic plain route")
+    async def plain(request: Request) -> PlainTextResponse:
+        return PlainTextResponse("ok")
+
+    app.routes.append(Route("/plain", plain))
+    row = _rows_by_key(app)[("GET", "/plain")]
+    assert (row.kind, row.declaration) == (route_gates.KIND_OUTSIDE, "a synthetic plain route")
 
 
 def test_a_socket_in_a_mounted_app_runs_the_mounted_apps_hook_at_request_time() -> None:

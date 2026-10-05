@@ -556,8 +556,10 @@ _DECLARED_CACHE_ATTR = "_mefor_route_declared"
 _REFUSALS_ATTR = "_mefor_route_refusals"
 
 #: The shortest gap between two ERROR lines for one refused route (vault BACKLOG #2846). The first
-#: refusal is always logged. Each later line carries how many refusals it stands for, so a burst
-#: costs one line a minute and still loses no count.
+#: refusal is always logged, and a burst costs one line a minute. Each line carries how many
+#: refusals came since the previous one. Refusals after a burst's last line are held only in the
+#: in-process tally (:func:`undeclared_route_refusals`) until the route is refused again; no timer
+#: flushes them to the log.
 REFUSAL_LOG_INTERVAL_SECONDS = 60.0
 
 
@@ -611,8 +613,8 @@ async def refuse_undeclared_route(connection: HTTPConnection) -> None:
 
     An HTTP caller gets 403 with :data:`UNDECLARED_ROUTE_DETAIL`. A WebSocket is closed with policy
     violation (1008) before it is accepted. Either way the route is a defect in the code that
-    registered it, so every refusal is counted and logged at ERROR, at most once per
-    :data:`REFUSAL_LOG_INTERVAL_SECONDS` for each route."""
+    registered it, so every refusal is counted, and an ERROR line is written at most once per
+    :data:`REFUSAL_LOG_INTERVAL_SECONDS` for each route. That constant says what the log misses."""
     websocket = connection.scope.get("type") == "websocket"
     route = connection.scope.get("route")
     declared = getattr(route, _DECLARED_CACHE_ATTR, None)

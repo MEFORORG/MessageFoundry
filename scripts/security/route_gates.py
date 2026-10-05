@@ -65,7 +65,7 @@ import re
 import types
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Final, Literal
 
 from fastapi import FastAPI
 from fastapi import routing as fastapi_routing
@@ -101,18 +101,19 @@ MOUNT_METHOD = "MOUNT"
 
 # What the engine's request-time refusal (``refuse_undeclared_route``) makes of a row, so a reader of
 # the walk can tell a route public by design from one refused to every caller (vault BACKLOG #2846).
+RouteKind = Literal["gated", "public", "in-body", "refused", "outside"]
 #: A top-level dependency carries the gate mark.
-KIND_GATED = "gated"
+KIND_GATED: Final = "gated"
 #: No gate; the endpoint is marked ``public_route``, and the row's ``declaration`` is its reason.
-KIND_PUBLIC = "public"
+KIND_PUBLIC: Final = "public"
 #: A WebSocket with no gate dependency whose endpoint is marked ``authorizes_in_body``.
-KIND_IN_BODY = "in-body"
+KIND_IN_BODY: Final = "in-body"
 #: Neither: the engine refuses this route to every caller.
-KIND_REFUSED = "refused"
-#: The refusal does not run on this route: a mount, a plain Starlette route, or a route of an app
-#: that does not install the refusal, such as a mounted application. ``declaration`` is still
+KIND_REFUSED: Final = "refused"
+#: The refusal is not among the route's dependencies: a mount, a plain Starlette route, or a route of
+#: an app that does not install the refusal, such as a mounted application. ``declaration`` is still
 #: reported when the endpoint carries one, but nothing enforces it there.
-KIND_OUTSIDE = "outside"
+KIND_OUTSIDE: Final = "outside"
 
 
 @dataclass(frozen=True)
@@ -137,7 +138,7 @@ class RouteRow:
     path: str
     permissions: tuple[str, ...]
     gates: tuple[str, ...]
-    kind: str
+    kind: RouteKind
     declaration: str | None = None
 
     @property
@@ -447,12 +448,14 @@ def _effective_routes(routes: Sequence[BaseRoute]) -> Iterator[tuple[BaseRoute, 
             yield original, getattr(context, "starlette_route", None) or original
 
 
-def _kind(declared_on: Any, effective: Any, *, websocket: bool) -> tuple[str, str | None]:
+def _kind(declared_on: Any, effective: Any, *, websocket: bool) -> tuple[RouteKind, str | None]:
     """``(kind, declaration reason)`` for one API route, as the engine's refusal sees it.
 
     ``declared_on`` is the route object the refusal reads, and ``effective`` is the one FastAPI
     serves, whose dependencies say whether the refusal runs at all. The decision is the engine's own
-    ``route_is_declared``, so the walk and the refusal cannot disagree about a route."""
+    ``route_is_declared``, read through the same helpers the refusal uses. The walk reads no
+    ``dependency_overrides``, at least, so an app that overrides the refusal itself still reads as
+    refused here while it serves the route."""
     declaration = route_declaration_of(getattr(declared_on, "endpoint", None))
     reason = declaration.reason if declaration is not None else None
     if not refusal_runs_on(effective):
@@ -472,6 +475,8 @@ def _state_owner(mount: Mount, outer: Starlette) -> Starlette:
     mounted application sees that application, not the outer one (vault BACKLOG #2846). A mount of
     bare routes has no app of its own, so its sockets still see ``outer``. The app is read from the
     same object ``Mount.routes`` reads, beneath any middleware the mount wraps around it."""
+    # ``_base_app`` is private to Starlette; a test pins it, so a rename reds a run rather than
+    # quietly reading a middleware-wrapped mount against ``outer`` again.
     base = getattr(mount, "_base_app", mount.app)
     return base if isinstance(base, Starlette) else outer
 
@@ -530,9 +535,15 @@ def _walk(routes: Sequence[BaseRoute], prefix: str, app: Starlette) -> Iterator[
                 for m in (getattr(effective, "methods", None) or set())
                 if m not in _SYNTHETIC_METHODS
             )
+            marked = route_declaration_of(getattr(effective, "endpoint", None))
             for method in declared or [MOUNT_METHOD]:
                 yield RouteRow(
-                    method=method, path=path, permissions=(), gates=(), kind=KIND_OUTSIDE
+                    method=method,
+                    path=path,
+                    permissions=(),
+                    gates=(),
+                    kind=KIND_OUTSIDE,
+                    declaration=marked.reason if marked is not None else None,
                 )
 
 

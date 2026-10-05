@@ -527,6 +527,19 @@ def evaluate(receipt: dict[str, Any], policy: dict[str, Any]) -> tuple[int, list
             f"Newly anonymous: {added or 'none'}; documented but absent: {removed or 'none'}. "
             "A route with no require*() gate is reachable by anyone."
         )
+    # The allow-list names routes public BY DESIGN, and a route the engine refuses to every caller has
+    # no gate either, so each ungated route must also read as declared public with a reason (vault
+    # BACKLOG #2846). A row with no kind fails too, so an older receipt cannot pass by omission.
+    undeclared = sorted(
+        f"{str(r['method']).upper()} {r['path']} ({r.get('kind') or 'no kind'})"
+        for r in receipt.get("ungated_routes", [])
+        if r.get("kind") != route_gates.KIND_PUBLIC or not r.get("declaration")
+    )
+    if undeclared:
+        errors.append(
+            f"ungated route(s) not declared public with a reason: {undeclared}. The allow-list "
+            "cannot tell such a route from one public by design."
+        )
 
     # A run whose session kept being destroyed measured a target moving underneath it. The cap is
     # enforced inside the pass too (it stops there rather than grinding out a login per row); this is
