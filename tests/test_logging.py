@@ -1872,6 +1872,8 @@ def test_every_configured_sink_escapes_the_wider_log_alphabet(
     scrub escaped C0 and DEL only, and ``json.dumps(ensure_ascii=False)`` escapes C0 only. The
     expected spelling comes from the ``unicode_escape`` codec, not from the module under test."""
     codes = _LOG_ESCAPED_CLASSES[kind]
+    # A class with no code points would log "startend" and pass every assertion below.
+    assert len(codes) >= 1, f"{kind} names no code points"
     text = "start" + "".join(chr(c) for c in codes) + "end"
     shown = "start" + "".join(chr(c).encode("unicode_escape").decode() for c in codes) + "end"
     outputs = _write_one_record_through_every_sink(fmt, text, tmp_path, capsys)
