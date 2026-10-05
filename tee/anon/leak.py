@@ -396,7 +396,8 @@ def leak_report(text: str, *, rules: tuple[FieldRule, ...] | None = None) -> Lea
     when ``rules`` is supplied**; a bare-string call is the legacy token-only behaviour.
     """
     token_hits = scan_text(text, include_estate=True)
-    if message_has_site_code(text):
+    # The rules scope this check too: a field the DATE kind filled is not a site code (#2330).
+    if message_has_site_code(text, rules or ()):
         token_hits.append("site-code pattern")
     undecided: tuple[str, ...] = ()
     if rules is None:

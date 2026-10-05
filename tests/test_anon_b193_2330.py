@@ -9,7 +9,7 @@ adapters, the engine's and the tee's, because the two reach a field by different
 from __future__ import annotations
 
 import functools
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -17,10 +17,14 @@ import pytest
 
 from messagefoundry.anon import DEFAULT_RULES, SurrogateKind
 from messagefoundry.anon import anonymize as engine_anonymize
+from messagefoundry.anon import anonymize_checked as engine_anonymize_checked
+from messagefoundry.anon import keying as engine_keying
+from messagefoundry.anon import leak as engine_leak
 from messagefoundry.anon import rules as engine_rules
 from messagefoundry.anon import surrogates as engine_surrogates
 from tee.anon import DEFAULT_RULES as TEE_DEFAULT_RULES
 from tee.anon import anonymize as tee_anonymize
+from tee.anon import anonymize_checked as tee_anonymize_checked
 from tee.anon import rules as tee_rules
 from tee.anon import surrogates as tee_surrogates
 
@@ -216,3 +220,123 @@ def test_an_overlay_keep_still_leaves_a_date_typed_obx5_alone() -> None:
     message = _msg(_ORU_HEADER, "OBX|1|DT|8665-2^LMP^LN||20260315|")
     rules = (engine_rules.FieldRule("OBX-5", SurrogateKind.KEEP),)
     assert _field_of(engine_anonymize(message, salt=_SALT, rules=rules), "OBX-5") == "20260315"
+
+
+# --- item 4: the site-code pass leaves DATE output alone ------------------------------------------
+
+# A year-and-month date. Its first two digits are the century, and an estate whose site-code prefix
+# is that same pair turns every such date into the shape of a site code. The prefix is derived from
+# the date so that no literal prefix sits in this scanned file.
+_YEAR_MONTH = "202603"
+_FILLED = "202601"
+_SITE_CODE = _YEAR_MONTH[:2] + "5588"  # the prefix and four digits that are not a month and a day
+_CHECKED = (engine_anonymize_checked, tee_anonymize_checked)
+_SURROGATES = pytest.mark.parametrize(
+    "module", (engine_surrogates, tee_surrogates), ids=("engine", "tee")
+)
+
+
+@pytest.fixture
+def century_site_prefix(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
+    """Configure a synthetic site-code prefix equal to the century, in BOTH copies of the module.
+    The engine's scanner is loaded first, so it never reads the patched token source."""
+    engine_leak._scanner()
+    prefix = _YEAR_MONTH[:2]
+    monkeypatch.setenv("MEFOR_FORBIDDEN_TOKENS", f"[site_prefix]\n{prefix}\n")
+    engine_surrogates.reload_site_prefixes()
+    tee_surrogates.reload_site_prefixes()
+    yield prefix
+    monkeypatch.undo()  # restore the real source BEFORE recomputing, as tests/test_anon_core.py does
+    engine_surrogates.reload_site_prefixes()
+    tee_surrogates.reload_site_prefixes()
+
+
+def _site_message(*segments: str) -> str:
+    return _msg(_HEADER, "PID|1||12345^^^HOSP^MR||DOE^JOHN", *segments)
+
+
+@_SURROGATES
+def test_the_control_values_have_the_shape_of_a_site_code(
+    module: Any, century_site_prefix: str
+) -> None:
+    """Without this the cases below pass with no prefix configured at all."""
+    for value in (_YEAR_MONTH, _FILLED, _SITE_CODE):
+        assert module.SITE_CODE_RE.fullmatch(value), value
+
+
+@pytest.mark.parametrize("checked", _CHECKED, ids=("engine", "tee"))
+def test_a_year_and_month_date_survives_the_site_code_pass(
+    checked: Callable[..., str], century_site_prefix: str
+) -> None:
+    """Before, the pass replaced the filled date with a salted number, which is not a date."""
+    out = checked(_site_message("EVN|A01|" + _YEAR_MONTH), salt=_SALT)
+    assert _field_of(out, "EVN-2") == _FILLED
+
+
+@pytest.mark.parametrize("checked", _CHECKED, ids=("engine", "tee"))
+def test_a_date_typed_obx5_survives_the_site_code_pass(
+    checked: Callable[..., str], century_site_prefix: str
+) -> None:
+    out = checked(_site_message("OBX|1|DT|8665-2^LMP^LN||" + _YEAR_MONTH), salt=_SALT)
+    assert _field_of(out, "OBX-5") == _FILLED
+
+
+@_EACH_ADAPTER
+def test_a_site_code_outside_a_date_field_is_still_scrubbed(
+    adapter: Callable[..., str], century_site_prefix: str
+) -> None:
+    """The exemption is per field. An unmapped field and a numeric OBX-5 keep the old behaviour."""
+    out = adapter(
+        _site_message("ZPD|" + _SITE_CODE, "OBX|1|NM|8480-6^Count^LN||" + _SITE_CODE), salt=_SALT
+    )
+    for address in ("ZPD-1", "OBX-5"):
+        value = _field_of(out, address)
+        assert value != _SITE_CODE and len(value) == len(_SITE_CODE), address
+
+
+@_EACH_ADAPTER
+def test_a_date_of_birth_field_is_not_exempt(
+    adapter: Callable[..., str], century_site_prefix: str
+) -> None:
+    """Only the DATE kind is exempt. The DOB kind can keep text after the eighth character, so its
+    output is not known to be free of a site code."""
+    rules = (engine_rules.FieldRule("ZPD-1", SurrogateKind.DOB),)
+    out = adapter(_site_message("ZPD|19800101^" + _SITE_CODE), salt=_SALT, rules=rules)
+    assert _SITE_CODE not in out
+
+
+@_SURROGATES
+def test_the_leak_check_skips_only_a_value_the_date_kind_wrote(
+    module: Any, century_site_prefix: str
+) -> None:
+    rules = (engine_rules.FieldRule("EVN-2", SurrogateKind.DATE),)
+
+    def flagged(value: str, with_rules: bool = True) -> bool:
+        text = _site_message("EVN|A01|" + value)
+        return bool(module.message_has_site_code(text, rules if with_rules else ()))
+
+    assert not flagged(_FILLED)
+    assert flagged(_FILLED, with_rules=False)  # no rules, no exemption: the old behaviour
+    assert flagged(_YEAR_MONTH)  # a date field that never went through the DATE kind
+    assert flagged(_SITE_CODE)  # a site code that is not a date at all
+    assert flagged(_FILLED + "~" + _SITE_CODE)  # one bad repetition spoils the field
+
+
+@_SURROGATES
+def test_the_exemption_never_reaches_an_msh_line(module: Any, century_site_prefix: str) -> None:
+    """The tee applies no rule to an MSH field, so a DATE rule there proves nothing about it."""
+    rules = tuple(engine_rules.FieldRule(f"MSH-{n}", SurrogateKind.DATE) for n in (12, 13, 14))
+    text = _HEADER + "|" + _FILLED  # one field after the version, whichever way MSH is numbered
+    assert module.message_has_site_code(text, rules)
+    assert _FILLED not in module.scrub_message_site_codes(text, engine_keying.Keyer(_SALT), rules)
+
+
+@_SURROGATES
+def test_a_path_with_a_second_non_date_rule_is_not_exempt(
+    module: Any, century_site_prefix: str
+) -> None:
+    rules = (
+        engine_rules.FieldRule("EVN-2", SurrogateKind.DATE),
+        engine_rules.FieldRule("EVN-2", SurrogateKind.ID),
+    )
+    assert module.message_has_site_code(_site_message("EVN|A01|" + _FILLED), rules)

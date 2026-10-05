@@ -61,7 +61,7 @@ def anonymize_message(raw: str, keyer: Keyer, rules: tuple[FieldRule, ...]) -> s
             if fnum < len(fields):
                 fields[fnum] = surrogate_field(_kind_for(rule, fields), fields[fnum], keyer, seps)
     encoded = "\r".join(field_sep.join(fields) for fields in segments)
-    return scrub_message_site_codes(encoded, keyer)
+    return scrub_message_site_codes(encoded, keyer, rules)
 
 
 def _skip_obx5(rule: FieldRule, fields: list[str], seps: Seps) -> bool:

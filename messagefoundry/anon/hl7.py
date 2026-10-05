@@ -75,7 +75,7 @@ def anonymize_message(raw: str, keyer: Keyer, rules: tuple[FieldRule, ...]) -> s
         # let a traceback carry the message. ValueError includes HL7PeekError, which Message.parse
         # raises for a body with no leading MSH and for a parser fault.
         raise AnonError("could not anonymize HL7 message (malformed structure)") from exc
-    return scrub_message_site_codes(encoded, keyer)
+    return scrub_message_site_codes(encoded, keyer, rules)
 
 
 def _skip_obx5(rule: FieldRule, msg: Message, occurrence: int, value: str, seps: Seps) -> bool:

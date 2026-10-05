@@ -30,7 +30,7 @@ from pathlib import Path
 
 from . import _pools
 from .keying import Keyer
-from .rules import AnonError, SurrogateKind
+from .rules import AnonError, FieldRule, SurrogateKind
 
 #: A never-matching pattern — the site-code detector when no prefix is configured (a token-less
 #: public build). ``re`` has no built-in "match nothing", so encode one explicitly.
@@ -276,6 +276,11 @@ def surrogate_date(rep: str, keyer: Keyer, seps: Seps) -> str:
     empty**, never passed through: no faithful surrogate exists for it. The HL7 explicit null
     ``""`` carries nothing and is kept.
     """
+    return _filled_date(rep, seps)
+
+
+def _filled_date(rep: str, seps: Seps) -> str:
+    """What :func:`surrogate_date` returns. It takes no keyer, so the site-code pass can call it."""
     if rep == '""':
         return rep
     ts1, sep, ts2 = rep.partition(seps.component)
@@ -391,19 +396,66 @@ def read_message_seps(text: str) -> tuple[Seps, str] | None:
     return None
 
 
-def message_has_site_code(text: str) -> bool:
+def _date_output_test(rules: tuple[FieldRule, ...], seps: Seps) -> Callable[[list[str], int], bool]:
+    """A test for "field ``index`` of this segment holds ``DATE``-kind output", for the site-code pass
+    and its leak-check twin to skip (BACKLOG #2330).
+
+    A ``YYYYMM`` date such as ``202601`` has the shape of a site code whenever the estate's prefix is
+    ``19`` or ``20``. Scrubbing it replaced a date with a salted number that was no longer a date and
+    no longer matched across datasets. A field passes this test only when BOTH hold:
+
+    * the rules put the ``DATE`` kind there: every rule for its path is ``DATE``, or it is the OBX-5
+      of a date-typed OBX under the OBX-5 free-text rule (:func:`obx5_kind`); and
+    * its value is already what the ``DATE`` kind writes, repetition by repetition. So text that
+      never went through the kind, or a real site code that is not a filled date, is not skipped.
+
+    An MSH line is never skipped: the tee applies no rule there. What this lets through: a site
+    code that reads as a year and a month, sitting in a date field, leaves as its first four digits
+    and ``01``.
+    """
+    kinds: dict[str, set[str]] = {}
+    for rule in rules:
+        if rule.kind != SurrogateKind.KEEP:  # a KEEP rewrites nothing, so it decides no output
+            kinds.setdefault(rule.path, set()).add(str(rule.kind))
+    date_paths = {path for path, found in kinds.items() if found == {SurrogateKind.DATE.value}}
+    obx5_dates = kinds.get("OBX-5") == {SurrogateKind.FREETEXT.value}
+
+    def is_date_output(fields: list[str], index: int) -> bool:
+        seg_id = fields[0]
+        if index == 0 or seg_id.upper() == "MSH":
+            return False
+        if f"{seg_id}-{index}" not in date_paths and not (
+            obx5_dates
+            and seg_id == "OBX"
+            and index == 5
+            and obx5_kind(fields[2]) == SurrogateKind.DATE
+        ):
+            return False
+        return all(_filled_date(rep, seps) == rep for rep in fields[index].split(seps.repetition))
+
+    return is_date_output
+
+
+def message_has_site_code(text: str, rules: tuple[FieldRule, ...] = ()) -> bool:
     """True if any whole field/component/subcomponent **is exactly** a site code — the field-anchored
     leak-check that matches the scrub (ADR 0030 §5). Using ``fullmatch`` per component (not a broad
     substring search) means a value that merely *contains* a site-code run — a timestamp, a fabricated
     date, a long order number — is not falsely flagged, while a genuine scrub *miss* still is. Falls
     back to a broad search only for unstructured (no-MSH) text. Always False when no site-code prefix
-    is configured."""
+    is configured.
+
+    ``rules`` are the rules the text was anonymized with. A field they filled with the ``DATE`` kind
+    is not checked, for the reason :func:`_date_output_test` gives."""
     parsed = read_message_seps(text)
     if parsed is None:
         return SITE_CODE_RE.search(text) is not None
     seps, field_sep = parsed
+    is_date_output = _date_output_test(rules, seps)
     for seg in text.replace("\r\n", "\r").replace("\n", "\r").split("\r"):
-        for field in seg.split(field_sep):
+        fields = seg.split(field_sep)
+        for index, field in enumerate(fields):
+            if is_date_output(fields, index):
+                continue
             for rep in field.split(seps.repetition):
                 for comp in rep.split(seps.component):
                     if any(SITE_CODE_RE.fullmatch(sub) for sub in comp.split(seps.subcomponent)):
@@ -411,7 +463,7 @@ def message_has_site_code(text: str) -> bool:
     return False
 
 
-def scrub_message_site_codes(text: str, keyer: Keyer) -> str:
+def scrub_message_site_codes(text: str, keyer: Keyer, rules: tuple[FieldRule, ...] = ()) -> str:
     """Field-anchored site-code safety pass over a whole ``\\r``-delimited message (ADR 0030 §5).
 
     Splits on the message's own separators and replaces any whole **component** that is exactly a
@@ -419,11 +471,15 @@ def scrub_message_site_codes(text: str, keyer: Keyer) -> str:
     unexpected field. MSH-1 (field separator) and MSH-2 (encoding characters) are left untouched so
     the header stays parseable. The broad, unanchored catch-all stays in the publish leak-gate as
     defense-in-depth; here we never over-redact a coincidental site-code run inside a longer value.
+
+    ``rules`` are the rules the adapter just applied. A field they filled with the ``DATE`` kind is
+    left as it is; :func:`_date_output_test` says why, and what that lets through.
     """
     parsed = read_message_seps(text)
     if parsed is None:
         return text
     seps, field_sep = parsed
+    is_date_output = _date_output_test(rules, seps)
     out_segments: list[str] = []
     for seg in text.replace("\r\n", "\r").replace("\n", "\r").split("\r"):
         if not seg:
@@ -437,7 +493,10 @@ def scrub_message_site_codes(text: str, keyer: Keyer) -> str:
             out_segments.append(field_sep.join(head + tail))
         else:
             head = fields[:1]
-            tail = [scrub_site_codes(f, keyer, seps) for f in fields[1:]]
+            tail = [
+                f if is_date_output(fields, i) else scrub_site_codes(f, keyer, seps)
+                for i, f in enumerate(fields[1:], start=1)
+            ]
             out_segments.append(field_sep.join(head + tail))
     # Drop trailing empty segments so the engine's re-encode (which appends a trailing
     # segment separator) and the tee's pure splitter converge to the same bytes — golden-corpus

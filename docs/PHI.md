@@ -1838,9 +1838,12 @@ What the `date` kind does to a value:
   `date` kind too: the year stays, and a value that is not a valid timestamp is scrubbed to
   empty. A date under any other type gets that type's treatment. So a date sent as `NM` is still
   kept whole, and one sent as `DTM` or `ST` is redacted whole.
-- When a site-code prefix of `19` or `20` is configured, the site-code pass rewrites a six-digit
-  `YYYYMM` output with a salted code. That value then differs between datasets and is no longer a
-  valid date.
+- When a site-code prefix of `19` or `20` is configured, a six-digit `YYYYMM` has the shape of a
+  site code. The site-code pass and the leak-check's site-code test skip a field that the `date`
+  kind filled, so the filled date stays a date. Two things follow. A site code that reads as a
+  year and a month, sitting in a date field, leaves as its first four digits and `01`. And a
+  `dob` field is not skipped, so a fabricated `YYYYMM` date of birth is still rewritten into a
+  number that is not a date.
 
 Do not shift the dates to fix the `MSH-7` gap. The kept `MSH-7` minus a shifted `EVN-2` gives back
 the shift.
