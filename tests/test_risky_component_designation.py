@@ -1163,8 +1163,10 @@ def test_the_section_checks_can_fail() -> None:
 # OSV matches an advisory by PyPI name, so a flaw in code a wheel packs from another project does
 # not show in the reading above. ``security/bundled-code-survey.json`` answers, for every assessed
 # wheel, whether it carries a bundled copy of another project, and in what form: compiled code,
-# source code or data. It records the route the page takes for a not-designated wheel that carries
-# code in either form. The tests below hold the survey to the population and the page to the survey.
+# source code or data. A bundled copy is a package, a library tree or a data set. A single module
+# adapted from another project is recorded where the survey's search found one, and moves no
+# answer. The record names the route the page takes for a not-designated wheel that carries code
+# in either form. The tests below hold the survey to the population and the page to the survey.
 
 _SURVEY_HEADING = "### What each wheel carries inside it"
 _HIGHLIGHTED = "**Highlighted as risky on what it carries:**"
@@ -1182,6 +1184,32 @@ _CRITERION = (
     "A wheel that carries only another project's data is listed below with what it carries.",
     "It is owed no route, because data holds another project's tables and none of its logic.",
     "A wheel whose answer is not established, for any form, is treated as carrying code.",
+)
+#: The page's unit, held the same way: what counts as a bundled copy, and what does not.
+_UNIT = (
+    "A bundled copy counts when it is a package, a library tree or a data set of another "
+    "project, in any form.",
+    "The forms are compiled code, source code and data.",
+    "A single module adapted from another project is not that unit.",
+    "It is recorded where the search found one, and is owed no route.",
+    "Lines copied into a wheel's own module are not counted.",
+)
+#: The limit that must sit with the counts, so a "not found" is never read as "does not carry".
+_COUNT_LIMIT = (
+    "Each count is what the search described below found, and not a statement of what a wheel "
+    "holds.",
+    "It can miss a copy that has no marker, so a wheel counted as not found can still carry one.",
+)
+_ADAPTED_MODULES = "**Single modules adapted from another project, as found:**"
+#: Sentences written by hand, outside the rendered section, that state the survey's rule. Each
+#: must stand once on the page, in these words: the forms, and the route rule in its two places.
+_HAND_RULES = (
+    "It answers for three forms: compiled code, source code and data.",
+    "A wheel that is not designated, and that the survey did not show to carry no code from "
+    "another project, takes one of the two routes stated there.",
+    "A wheel that is not designated, and not shown to carry no code from another project, must "
+    "have a recorded route.",
+    "A wheel that carries only data must have none.",
 )
 
 
@@ -1219,6 +1247,10 @@ def _survey_page_drift(page: str, survey: dict[str, Any]) -> list[str]:
     # that route. Split from the end, so a missing middle table does not swallow the last one.
     head, _, read = section.partition(f"\n{_READ}\n")
     found, _, highlighted = head.partition(f"\n{_HIGHLIGHTED}\n")
+    # The adapted modules have a table of their own, after the first. It is there only when the
+    # record names one, and its rows are not rows of what a wheel carries.
+    found, _, adapted = found.partition(f"\n{_ADAPTED_MODULES}\n")
+    adapted = adapted.partition("\n\nEach row is what the file says of itself.")[0]
     wheels = survey["wheels"]
     size = len(wheels)
     flat = " ".join(section.split())
@@ -1228,7 +1260,7 @@ def _survey_page_drift(page: str, survey: dict[str, Any]) -> list[str]:
         yes, no = said.count("yes"), said.count("no")
         unknown = size - yes - no
         sentence = (
-            f"**Carries another project's {words}: {yes} of {size}. Does not: {no}. "
+            f"**Another project's {words}: found in {yes} of {size}. Not found in {no}. "
             f"Not established: {unknown}. {yes} plus {no} plus {unknown} is {size}.**"
         )
         if sentence not in flat:
@@ -1236,6 +1268,26 @@ def _survey_page_drift(page: str, survey: dict[str, Any]) -> list[str]:
     for sentence in _CRITERION:
         if flat.count(sentence) != 1:
             problems.append(f"criterion: the page does not state once {sentence!r}")
+    for sentence in _UNIT:
+        if flat.count(sentence) != 1:
+            problems.append(f"unit: the page does not state once {sentence!r}")
+    # The limit stands with the counts: after the last count, and before the first table.
+    counts_end = flat.rfind(f"is {size}.**")
+    table_start = flat.find("| Component |")
+    for sentence in _COUNT_LIMIT:
+        if not 0 <= counts_end < flat.find(sentence) < table_start:
+            problems.append(f"limit: the page does not state with its counts {sentence!r}")
+    modules = {(w["name"], m.get("file")) for w in wheels for m in w.get("adapted_modules") or []}
+    on_page = {
+        (cells[1].strip(" `"), cells[2].strip(" `"))
+        for cells in (row.split("|") for row in adapted.splitlines() if row.startswith("| `"))
+    }
+    if on_page != modules:
+        problems.append(f"adapted: the page and the survey differ on {sorted(on_page ^ modules)}")
+    whole = " ".join(page.split())
+    for sentence in _HAND_RULES:
+        if whole.count(sentence) != 1:
+            problems.append(f"hand: the page does not state once {sentence!r}")
     carrying = {w["name"] for w in wheels if any(_said(w, f) != "no" for f in _FORMS)}
     if _table_names(found) != carrying:
         problems.append(
@@ -1302,7 +1354,9 @@ def test_every_assessed_wheel_has_a_survey_answer_and_every_owed_route_is_record
 def test_the_page_states_what_the_survey_found_and_the_route_each_wheel_took() -> None:
     """RED when: the page's survey tables or counts disagree with the record, for any of the
     three forms; a wheel and form that is not a plain "no" has no row; the wheels that carry only
-    data are not listed; or the page does not state its criterion once.
+    data are not listed; the adapted modules the page lists are not the record's; the page does
+    not state its unit or its criterion once; the limit of the search does not stand with the
+    counts; or a hand-written sentence in ``_HAND_RULES`` is gone or changed.
 
     Independent of the renderer: see ``_survey_page_drift``. The exact text is held by
     ``test_the_rendered_section_is_the_tracked_one``.
@@ -1314,8 +1368,11 @@ def test_the_page_states_what_the_survey_found_and_the_route_each_wheel_took() -
 def test_the_survey_checks_can_fail() -> None:
     """RED when: a survey check stops seeing a missing answer, a missing route, a guessed "no" or
     a stale page. That covers each form: a wheel with no source or data answer, another project's
-    source with no route, a route on a wheel that carries only data, a search with no control, and
-    a page that drops a form's row or its criterion.
+    source with no route, a route on a wheel that carries only data, a search that is not stated
+    or has no control for one of its rules, a control that is a surveyed wheel, source and data
+    answers dated before the compiled one, a malformed entry, a word-search hit or an adapted
+    module that is half recorded, and a page that drops a form's row, an adapted module, its
+    unit, its criterion, the limit beside its counts or a hand-written rule sentence.
 
     THE POSITIVE CONTROL FOR THE TWO TESTS ABOVE. Every mutation starts from two wheels picked by
     what they are, not by where they sit: a not-designated wheel shown to carry nothing, and a
@@ -1344,6 +1401,8 @@ def test_the_survey_checks_can_fail() -> None:
         "files_read": [],
         "source": unknown,
         "data": unknown,
+        "word_hits": [],
+        "adapted_modules": [],
         "route": "highlight",
         "route_reason": "a reason",
     }
@@ -1355,6 +1414,8 @@ def test_the_survey_checks_can_fail() -> None:
         "files_read": [],
         "source": unknown,
         "data": unknown,
+        "word_hits": [],
+        "adapted_modules": [],
         "route": None,
     }
     base = [routed if w is plain else designated if w is ranked else w for w in wheels]
@@ -1471,11 +1532,76 @@ def test_the_survey_checks_can_fail() -> None:
     assert any(
         line.startswith(f"{name}: a source answer of 'no' names no wheel") for line in guessed
     )
-    # A search with no control that fired: missing, and with a field blank.
-    for control in ({}, {"control": {**survey["control"], "fired_on": " "}}):
-        without = {k: v for k, v in survey.items() if k != "control"} | control
-        found = one({}, without)
-        assert found == ["the survey names no control that its source and data search fired on"]
+    # A search with no control that fired: missing, ``fired_on`` as loose text, a rule with no
+    # path, a rule whose path is blank, a rule left out, and a control with no hash.
+    tracked = survey["control"]
+    fired = tracked["fired_on"]
+    no_control = "the survey names no control with a path that each rule of its search fired on"
+    for control in (
+        None,
+        {**tracked, "fired_on": "pip/_vendor"},
+        {**tracked, "fired_on": {**fired, "data": []}},
+        {**tracked, "fired_on": {**fired, "words": [" "]}},
+        {**tracked, "fired_on": {k: v for k, v in fired.items() if k != "licence file"}},
+        {**tracked, "sha256": "not a hash"},
+    ):
+        without = {k: v for k, v in survey.items() if k != "control"}
+        found = one({}, without if control is None else {**without, "control": control})
+        assert any(line.startswith(no_control) for line in found), (control, found)
+    # A control that is one of the surveyed wheels, and a control word the search does not list.
+    own = next(f["file"] for f in plain["files_read"] if f["file"].endswith(".whl"))
+    found = one({}, {**survey, "control": {**tracked, "file": own}})
+    assert found == ["the control is one of the surveyed wheels, so it controls nothing"], found
+    found = one({}, {**survey, "control": {**tracked, "word": "not a listed word"}})
+    assert found == ["the control names no listed word that the word search hit"], found
+    # A search that is not stated: missing, a list emptied, and a rule left blank.
+    stated = survey["search"]
+    for search in (None, {**stated, "directories": []}, {**stated, "size_rule": " "}):
+        without = {k: v for k, v in survey.items() if k != "search"}
+        found = one({}, without if search is None else {**without, "search": search})
+        assert any(line.startswith("the survey does not state its search") for line in found), (
+            search,
+            found,
+        )
+    # Source and data answers dated before the compiled one.
+    early = one({"surveyed": "2026-10-05", "forms_surveyed": "2026-10-04"})
+    assert early == [f"{name}: the source and data answers are dated before the first"], early
+    assert one({"surveyed": "2026-10-05", "forms_surveyed": "2026-10-05"}) == []
+    # A malformed entry is reported, and neither the check nor the renderer raises on it.
+    for malformed in ({"projects": ["a bare string"]}, {"data": {**yes, "projects": ["x"]}}):
+        changed = [{**w, **malformed} if w is plain else w for w in wheels]
+        found = component_readings.survey_problems({**survey, "wheels": changed}, data, labels)
+        assert any("does not match the projects" in line for line in found), (malformed, found)
+        component_readings.render_page(page, data, {**survey, "wheels": changed})
+    # The word-search hits and the adapted modules. Built on ``plain``, which was fetched.
+    word = stated["words"][0]
+    hit = {"files": ["a/module.py"], "words": [word], "kind": "adapted module", "says": "a note"}
+    module = {"file": "a/module.py", "project": "another project", "words": "copied from it"}
+    assert one({"word_hits": [hit], "adapted_modules": [module]}) == []
+    loose = {**hit, "kind": "copied lines"}
+    assert one({"word_hits": [loose], "adapted_modules": []}) == []
+    for hits_change, problem in (
+        ({"word_hits": None}, "the word-search hits and the adapted modules are not both"),
+        ({"adapted_modules": None}, "the word-search hits and the adapted modules are not both"),
+        # A module recorded with no hit of that kind, and a hit of that kind with no module.
+        ({"word_hits": [], "adapted_modules": [module]}, "the adapted modules and the hits"),
+        ({"word_hits": [hit], "adapted_modules": []}, "the adapted modules and the hits"),
+        ({"word_hits": [loose], "adapted_modules": [module]}, "the adapted modules and the hits"),
+        ({"word_hits": [{**loose, "kind": "hearsay"}], "adapted_modules": []}, "a word-search hit"),
+        ({"word_hits": [{**loose, "words": ["unlisted"]}], "adapted_modules": []}, "a word-search"),
+        ({"word_hits": [{**loose, "files": []}], "adapted_modules": []}, "a word-search hit"),
+        ({"word_hits": [{**loose, "says": " "}], "adapted_modules": []}, "a word-search hit"),
+        ({"word_hits": ["a bare string"], "adapted_modules": []}, "a word-search hit"),
+        (
+            {"word_hits": [hit], "adapted_modules": [{**module, "project": None}]},
+            "an adapted module lacks",
+        ),
+    ):
+        found = one(hits_change)
+        assert any(line.startswith(f"{name}: {problem}") for line in found), (problem, found)
+    # A wheel nobody fetched cannot record a hit.
+    found = problems(swap(routed, word_hits=[loose]))
+    assert any(line.startswith(f"{name}: a wheel that was not fetched records") for line in found)
     # This module's own rule follows the forms too: source code is owed a route, data is not.
     assert name in _owed_a_route({**survey, "wheels": [{**plain, "source": yes}]})
     assert name in _owed_a_route({**survey, "wheels": [{**plain, "data": unknown}]})
@@ -1522,6 +1648,47 @@ def test_the_survey_checks_can_fail() -> None:
     assert len(kept) == len(rendered.splitlines()) - 1, row
     drift = _survey_page_drift("\n".join(kept), mutated)
     assert [line.partition(":")[0] for line in drift] == ["row"], drift
+    # An adapted module the page does not list. It moves no form's count and no row of the first
+    # table, so only the adapted check and the rendered text can see it.
+    mutated = {
+        **survey,
+        "wheels": [
+            {**w, "word_hits": [hit], "adapted_modules": [module]} if w is plain else w
+            for w in wheels
+        ],
+    }
+    rendered = component_readings.render_page(page, data, mutated)
+    assert _survey_page_drift(rendered, mutated) == []
+    drift = _survey_page_drift(page, mutated)
+    assert [line.partition(":")[0] for line in drift] == ["adapted"], drift
+    assert component_readings.section_of(rendered) != component_readings.section_of(page)
+    # The unit, the limit beside the counts, and the hand-written rule sentences: each reversed
+    # on a copy of the page, and each seen by its own check and by no other.
+    for label, before, after in (
+        ("unit", "is not that unit.", "is that unit too."),
+        ("unit", "and is owed no route.", "and is owed a route."),
+        ("unit", "library tree or a data set", "library tree or a module"),
+        ("limit", "and not a statement of", "and is a statement of"),
+        ("limit", "can still carry one.", "carries none."),
+        ("hand", "It answers for three forms:", "It answers for two forms:"),
+        ("hand", "takes one of the two routes stated there.", "takes no route."),
+        ("hand", "must have a recorded route.", "need not have a recorded route."),
+        ("hand", "A wheel that carries only data must have none.", "It must have one."),
+    ):
+        flat_before = re.compile(r"\s+".join(re.escape(part) for part in before.split()))
+        edited = flat_before.sub(after, page, count=1)
+        assert edited != page, f"{before!r} was not found on the page"
+        drift = _survey_page_drift(edited, survey)
+        assert drift and {line.partition(":")[0] for line in drift} == {label}, (before, drift)
+    # The limit moved away from the counts, to the end of the subsection, is seen too.
+    limit = re.compile(r"Each\s+count\s+is\s+what.*?can\s+still\s+carry\s+one\.\n\n", re.DOTALL)
+    stated_limit = limit.search(page)
+    assert stated_limit is not None, "the limit beside the counts was not found on the page"
+    moved = limit.sub("", page, count=1).replace(
+        f"\n{_EXTRA_NAMES}\n", f"\n{stated_limit[0]}{_EXTRA_NAMES}\n", 1
+    )
+    drift = _survey_page_drift(moved, survey)
+    assert drift and {line.partition(":")[0] for line in drift} == {"limit"}, drift
     # The criterion, stated once: dropped, and reversed.
     assert _CRITERION[2] in " ".join(section.split())
     # The page wraps its lines, so the sentence is matched across any white space.

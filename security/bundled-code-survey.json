@@ -10,14 +10,20 @@
     "The `pyside6` and `shiboken6` wheels were fetched on 2026-10-05, hash-checked against the harness lock, and their contents listed. PyPI offers no source distribution for either, so those two answers rest on the wheel file lists alone.",
     "Where an answer could not be established, it is recorded as not established and the wheel is treated as carrying.",
     "Each answer carries the date it was made. A wheel surveyed again later carries its own date.",
-    "The unit is a bundled copy of a separately distributed project. Lines copied into a wheel's own module do not count.",
+    "The unit is a package, a library tree or a data set of another project, bundled in the wheel in any form. Each `carries` answer is about that unit.",
+    "A single module adapted from another project is not that unit. Where the search found one, the wheel's `adapted_modules` records the file, the project the file names and the words in the file that say so. It changes no answer and is owed no route.",
+    "Lines copied into a wheel's own module are not counted. Where the word search hit such lines, the hit is recorded as copied lines.",
+    "A second release line of the wheel's own project is not another project. `own_release_lines` records it where one was found.",
     "Each wheel's top-level `carries` and `projects` answer for compiled code. Its `source` and `data` entries answer for the other two forms, and `forms_surveyed` dates them.",
     "For source code and data, every wheel named under `files_read` was fetched again on 2026-10-05, its sha256 checked against the recorded hash and the lock, and its file list read. Nothing was installed or run.",
-    "What was looked for: a directory named `_vendor`, `vendor`, `vendored`, `_vendored`, `third_party`, `thirdparty`, `3rdparty`, `extern`, `external`, `_bundled`, `bundled`, `contrib`, `packages`, `ext` or `deps`; a top-level name beyond the project's own, from the file list and `top_level.txt`; a licence or notice file named for another project; a non-Python file over 20 KB; and the largest Python modules, opened where a name or a size suggested a generated table.",
-    "The text files of each wheel were also searched for words such as `vendored`, `copied from`, `taken from` and `backported from`. Each hit was read. A hit inside a project's own module is lines copied, which the unit does not count.",
+    "What was looked for is given under `search`: the directory names, the top-level rule, the licence rule, the size rule and the word list.",
+    "The word search under `search` was run on 2026-10-05 over every wheel named under `files_read`. Every file it hit is recorded under the wheel's `word_hits` as an adapted module, copied lines or prose.",
+    "Each hit line was read with the lines around it. The head of each file recorded as an adapted module was opened. Where two platform wheels of one name were read, their hits were the same and are recorded once.",
+    "Prose means the words mark no copy: a sentence that uses them in another sense, or the project's own licence header.",
+    "Each `project` under `adapted_modules` is what the file says of itself. No file was compared with the project it names.",
     "Data means another project's or body's published tables, held in the wheel as files or as generated modules: a time zone database, a list of root certificates, Unicode tables, a standard's definitions, a server's schema.",
-    "This search reads names, sizes and marked text. It can miss a copy kept under an ordinary name inside a wheel's own package, with no marker.",
-    "A search that finds nothing proves nothing unless it can fire. The `control` entry names a wheel known to vendor source. The same search was run over it and fired.",
+    "This search reads names, sizes and marked text. What it cannot see is listed under `search`, as `cannot_see`.",
+    "A search that finds nothing proves nothing unless it can fire. The `control` entry names a wheel known to vendor source, which is not one of the surveyed wheels. The same search was run over it, and `fired_on` names a path for each rule that fired.",
     "The `pyside6-addons` and `pyside6-essentials` wheels were not fetched for this either. Their source and data answers are recorded as not established."
   ],
   "sources": {
@@ -27,11 +33,87 @@
       "security/locks/requirements-harness.lock"
     ]
   },
+  "search": {
+    "run": "2026-10-05",
+    "directories": [
+      "_vendor",
+      "vendor",
+      "vendored",
+      "_vendored",
+      "third_party",
+      "thirdparty",
+      "3rdparty",
+      "extern",
+      "external",
+      "_bundled",
+      "bundled",
+      "contrib",
+      "packages",
+      "ext",
+      "deps"
+    ],
+    "directory_rule": "A directory at any depth in the wheel whose name, in lower case, is one of `directories`.",
+    "top_level_rule": "A top-level name in the wheel's file list beyond the project's own package, module or compiled file.",
+    "licence_rule": "A file whose path holds `licen`, `notice`, `copying`, `authors`, `credits` or `third`, in any case, and that is named for another project. The names were read by hand.",
+    "size_rule": "A file outside `.dist-info` whose name does not end in `.py` or `.pyi`, and whose size is over 20,000 bytes.",
+    "module_rule": "A `.py` module was opened where its name or its size suggested a generated table. This rule was applied by hand and is not exact.",
+    "words": [
+      "vendored",
+      "vendoring",
+      "copied from",
+      "taken from",
+      "stolen from",
+      "backported from",
+      "backport of",
+      "integrated from",
+      "adapted from",
+      "started out as",
+      "redistribution and use in source and binary forms",
+      "permission is hereby granted"
+    ],
+    "suffixes": [
+      ".py",
+      ".pyi",
+      ".pyx",
+      ".pxd",
+      ".pxi",
+      ".c",
+      ".h",
+      ".txt",
+      ".md",
+      ".rst"
+    ],
+    "word_rule": "Each file outside `.dist-info` whose name ends in one of `suffixes` was decoded as UTF-8 and put in lower case. Each line was searched for each of `words` as a substring.",
+    "wheels_searched": 38,
+    "wheel_files_searched": 48,
+    "cannot_see": [
+      "A copy that carries none of `words`, sits under no directory in `directories`, and has no licence file named for another project.",
+      "A module adapted from another project that says so in other words, or does not say so. So `adapted_modules` lists what was found and is not a full list.",
+      "Whether a file matches the project it names. No file was compared with its source.",
+      "Text in a file whose name ends in none of `suffixes`, and anything inside a compiled file.",
+      "A wheel that was not fetched, or a wheel for another platform."
+    ]
+  },
   "control": {
     "file": "pip-26.2.1-py3-none-any.whl",
     "sha256": "71138adf1f4ca900cdb7d289c21b7494329f2332b6d85f0e1c42108c0384ed3e",
-    "fired_on": "pip/_vendor",
-    "note": "pip vendors its dependencies in source form. The directory search fired on `pip/_vendor`, and on the licence files filed under `licenses/src/pip/_vendor`. The sha256 is the one PyPI states for the file: pip is in no lock here."
+    "fired_on": {
+      "directory": [
+        "pip/_vendor",
+        "pip/_vendor/urllib3/contrib"
+      ],
+      "licence file": [
+        "pip-26.2.1.dist-info/licenses/src/pip/_vendor/cachecontrol/LICENSE.txt"
+      ],
+      "data": [
+        "pip/_vendor/certifi/cacert.pem"
+      ],
+      "words": [
+        "pip/_vendor/__init__.py"
+      ]
+    },
+    "note": "pip vendors its dependencies in source form. The directory rule fired on `pip/_vendor`. The licence rule fired on the files under `licenses/src/pip/_vendor`, each named for a vendored project. The size rule fired on `pip/_vendor/certifi/cacert.pem`, 234,354 bytes. The word `vendored` hit `pip/_vendor/__init__.py`, first at line 26, and the word search hit 35 files of the wheel in all. The top-level rule did not fire, because pip's one top-level name is its own. So that rule has no control here. The sha256 is the one PyPI states for the file: pip is in no lock here.",
+    "word": "vendored"
   },
   "wheels": [
     {
@@ -50,7 +132,7 @@
       "source": {
         "carries": "no",
         "projects": [],
-        "evidence": "The wheel's 12 files were listed again. The top-level name is `aioodbc`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+        "evidence": "The wheel's 12 files were listed again. The top-level name is `aioodbc`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The word search hit 1 file: 1 recorded as an adapted module, 0 as copied lines and 0 as prose. `word_hits` lists each."
       },
       "data": {
         "carries": "no",
@@ -60,7 +142,29 @@
       "route": null,
       "route_reason": null,
       "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05"
+      "forms_surveyed": "2026-10-05",
+      "word_hits": [
+        {
+          "files": [
+            "aioodbc/pool.py"
+          ],
+          "lines": [
+            1
+          ],
+          "words": [
+            "copied from"
+          ],
+          "kind": "adapted module",
+          "says": "Line 1 reads `# copied from aiopg`, and line 2 gives the address of aiopg's `pool.py`."
+        }
+      ],
+      "adapted_modules": [
+        {
+          "file": "aioodbc/pool.py",
+          "project": "aiopg",
+          "words": "# copied from aiopg"
+        }
+      ]
     },
     {
       "name": "aiosqlite",
@@ -78,7 +182,7 @@
       "source": {
         "carries": "no",
         "projects": [],
-        "evidence": "The wheel's 15 files were listed again. The top-level name is `aiosqlite`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+        "evidence": "The wheel's 15 files were listed again. The top-level name is `aiosqlite`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The word search hit no file."
       },
       "data": {
         "carries": "no",
@@ -88,7 +192,9 @@
       "route": null,
       "route_reason": null,
       "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05"
+      "forms_surveyed": "2026-10-05",
+      "word_hits": [],
+      "adapted_modules": []
     },
     {
       "name": "annotated-doc",
@@ -106,7 +212,7 @@
       "source": {
         "carries": "no",
         "projects": [],
-        "evidence": "The wheel's 8 files were listed again. The top-level name is `annotated_doc`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+        "evidence": "The wheel's 8 files were listed again. The top-level name is `annotated_doc`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The word search hit no file."
       },
       "data": {
         "carries": "no",
@@ -116,7 +222,9 @@
       "route": null,
       "route_reason": null,
       "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05"
+      "forms_surveyed": "2026-10-05",
+      "word_hits": [],
+      "adapted_modules": []
     },
     {
       "name": "annotated-types",
@@ -134,7 +242,7 @@
       "source": {
         "carries": "no",
         "projects": [],
-        "evidence": "The wheel's 7 files were listed again. The top-level name is `annotated_types`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+        "evidence": "The wheel's 7 files were listed again. The top-level name is `annotated_types`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The word search hit no file."
       },
       "data": {
         "carries": "no",
@@ -144,7 +252,9 @@
       "route": null,
       "route_reason": null,
       "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05"
+      "forms_surveyed": "2026-10-05",
+      "word_hits": [],
+      "adapted_modules": []
     },
     {
       "name": "anyio",
@@ -162,7 +272,7 @@
       "source": {
         "carries": "no",
         "projects": [],
-        "evidence": "The wheel's 53 files were listed again. The top-level name is `anyio`, the project's own. No directory has a vendoring name, and no licence file is named for another project. A few functions are marked as copied from CPython, as lines in the project's own modules."
+        "evidence": "The wheel's 53 files were listed again. The top-level name is `anyio`, the project's own. No directory has a vendoring name, and no licence file is named for another project. A few functions are marked as copied from CPython, as lines in the project's own modules. The word search hit 3 files: 0 recorded as an adapted module, 3 as copied lines and 0 as prose. `word_hits` lists each."
       },
       "data": {
         "carries": "no",
@@ -172,7 +282,49 @@
       "route": null,
       "route_reason": null,
       "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05"
+      "forms_surveyed": "2026-10-05",
+      "word_hits": [
+        {
+          "files": [
+            "anyio/_backends/_asyncio.py"
+          ],
+          "lines": [
+            131
+          ],
+          "words": [
+            "copied from"
+          ],
+          "kind": "copied lines",
+          "says": "One class is marked as copied from CPython 3.11."
+        },
+        {
+          "files": [
+            "anyio/_core/_exceptions.py"
+          ],
+          "lines": [
+            33
+          ],
+          "words": [
+            "adapted from"
+          ],
+          "kind": "copied lines",
+          "says": "One method is marked as adapted from the standard library's `concurrent.futures.interpreter`."
+        },
+        {
+          "files": [
+            "anyio/_core/_sockets.py"
+          ],
+          "lines": [
+            878
+          ],
+          "words": [
+            "copied from"
+          ],
+          "kind": "copied lines",
+          "says": "A few lines are marked as copied from `pathlib`."
+        }
+      ],
+      "adapted_modules": []
     },
     {
       "name": "argon2-cffi",
@@ -190,7 +342,7 @@
       "source": {
         "carries": "no",
         "projects": [],
-        "evidence": "The wheel's 13 files were listed again. The top-level name is `argon2`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+        "evidence": "The wheel's 13 files were listed again. The top-level name is `argon2`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The word search hit no file."
       },
       "data": {
         "carries": "no",
@@ -200,7 +352,9 @@
       "route": null,
       "route_reason": null,
       "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05"
+      "forms_surveyed": "2026-10-05",
+      "word_hits": [],
+      "adapted_modules": []
     },
     {
       "name": "argon2-cffi-bindings",
@@ -231,7 +385,7 @@
       "source": {
         "carries": "no",
         "projects": [],
-        "evidence": "Both wheels read were listed again, 6 files. The top-level name is `_argon2_cffi_bindings`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+        "evidence": "Both wheels read were listed again, 6 files. The top-level name is `_argon2_cffi_bindings`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The word search hit no file."
       },
       "data": {
         "carries": "no",
@@ -241,7 +395,9 @@
       "route": null,
       "route_reason": null,
       "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05"
+      "forms_surveyed": "2026-10-05",
+      "word_hits": [],
+      "adapted_modules": []
     },
     {
       "name": "certifi",
@@ -259,7 +415,7 @@
       "source": {
         "carries": "no",
         "projects": [],
-        "evidence": "The wheel's 12 files were listed again. The top-level name is `certifi`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+        "evidence": "The wheel's 12 files were listed again. The top-level name is `certifi`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The word search hit no file."
       },
       "data": {
         "carries": "yes",
@@ -274,7 +430,9 @@
       "route": null,
       "route_reason": null,
       "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05"
+      "forms_surveyed": "2026-10-05",
+      "word_hits": [],
+      "adapted_modules": []
     },
     {
       "name": "cffi",
@@ -305,7 +463,7 @@
       "source": {
         "carries": "no",
         "projects": [],
-        "evidence": "Both wheels read were listed again, 31 files. The top-level names are `_cffi_backend` and `cffi`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The four `.h` files are the project's own headers."
+        "evidence": "Both wheels read were listed again, 31 files. The top-level names are `_cffi_backend` and `cffi`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The four `.h` files are the project's own headers. The word search hit 4 files: 2 recorded as an adapted module, 0 as copied lines and 2 as prose. `word_hits` lists each."
       },
       "data": {
         "carries": "no",
@@ -315,7 +473,75 @@
       "route": null,
       "route_reason": null,
       "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05"
+      "forms_surveyed": "2026-10-05",
+      "word_hits": [
+        {
+          "files": [
+            "cffi/_cffi_gen_src.py"
+          ],
+          "lines": [
+            1,
+            9
+          ],
+          "words": [
+            "integrated from",
+            "permission is hereby granted"
+          ],
+          "kind": "adapted module",
+          "says": "The file opens by saying it was integrated from the cffi-buildtool project, and gives that project's MIT licence text."
+        },
+        {
+          "files": [
+            "cffi/_embedding.h"
+          ],
+          "lines": [
+            24
+          ],
+          "words": [
+            "copied from"
+          ],
+          "kind": "prose",
+          "says": "A comment about a function pointer. It marks no copy."
+        },
+        {
+          "files": [
+            "cffi/_imp_emulation.py"
+          ],
+          "lines": [
+            9
+          ],
+          "words": [
+            "copied from"
+          ],
+          "kind": "adapted module",
+          "says": "The file's fallback branch, most of its 83 lines, is marked as copied from the source code of Python 3.11."
+        },
+        {
+          "files": [
+            "cffi/_shimmed_dist_utils.py"
+          ],
+          "lines": [
+            3
+          ],
+          "words": [
+            "vendored"
+          ],
+          "kind": "prose",
+          "says": "A docstring that mentions setuptools' own vendored distutils. It marks no copy."
+        }
+      ],
+      "adapted_modules": [
+        {
+          "file": "cffi/_cffi_gen_src.py",
+          "project": "cffi-buildtool",
+          "words": "# Integrated from the cffi-buildtool project by Rose Davidson"
+        },
+        {
+          "file": "cffi/_imp_emulation.py",
+          "project": "CPython 3.11, the standard library's `imp` module",
+          "words": "# This is copied from the source code of Python 3.11."
+        }
+      ]
     },
     {
       "name": "click",
@@ -333,7 +559,7 @@
       "source": {
         "carries": "no",
         "projects": [],
-        "evidence": "The wheel's 22 files were listed again. The top-level name is `click`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+        "evidence": "The wheel's 22 files were listed again. The top-level name is `click`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The word search hit 2 files: 1 recorded as an adapted module, 0 as copied lines and 1 as prose. `word_hits` lists each."
       },
       "data": {
         "carries": "no",
@@ -343,7 +569,42 @@
       "route": null,
       "route_reason": null,
       "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05"
+      "forms_surveyed": "2026-10-05",
+      "word_hits": [
+        {
+          "files": [
+            "click/core.py"
+          ],
+          "lines": [
+            947
+          ],
+          "words": [
+            "taken from"
+          ],
+          "kind": "prose",
+          "says": "A docstring about where a parameter's value was taken from. It marks no copy."
+        },
+        {
+          "files": [
+            "click/parser.py"
+          ],
+          "lines": [
+            2
+          ],
+          "words": [
+            "started out as"
+          ],
+          "kind": "adapted module",
+          "says": "The module's docstring says it started out as largely a copy of the standard library's `optparse`, and carries two copyright lines for it."
+        }
+      ],
+      "adapted_modules": [
+        {
+          "file": "click/parser.py",
+          "project": "CPython, the standard library's `optparse` module",
+          "words": "This module started out as largely a copy paste from the stdlib's optparse module"
+        }
+      ]
     },
     {
       "name": "cryptography",
@@ -378,7 +639,7 @@
       "source": {
         "carries": "no",
         "projects": [],
-        "evidence": "Both wheels read were listed again, 120 files. The top-level name is `cryptography`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+        "evidence": "Both wheels read were listed again, 120 files. The top-level name is `cryptography`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The word search hit 1 file: 0 recorded as an adapted module, 1 as copied lines and 0 as prose. `word_hits` lists each."
       },
       "data": {
         "carries": "no",
@@ -388,7 +649,23 @@
       "route": null,
       "route_reason": null,
       "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05"
+      "forms_surveyed": "2026-10-05",
+      "word_hits": [
+        {
+          "files": [
+            "cryptography/hazmat/primitives/asymmetric/rsa.py"
+          ],
+          "lines": [
+            253
+          ],
+          "words": [
+            "adapted from"
+          ],
+          "kind": "copied lines",
+          "says": "One function is marked as adapted from code in PyCrypto."
+        }
+      ],
+      "adapted_modules": []
     },
     {
       "name": "fastapi",
@@ -406,7 +683,7 @@
       "source": {
         "carries": "no",
         "projects": [],
-        "evidence": "The wheel's 61 files were listed again. The top-level name is `fastapi`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The seven `.md` files under `fastapi/.agents` are the project's own notes."
+        "evidence": "The wheel's 61 files were listed again. The top-level name is `fastapi`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The seven `.md` files under `fastapi/.agents` are the project's own notes. The word search hit 3 files: 0 recorded as an adapted module, 3 as copied lines and 0 as prose. `word_hits` lists each."
       },
       "data": {
         "carries": "no",
@@ -416,7 +693,54 @@
       "route": null,
       "route_reason": null,
       "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05"
+      "forms_surveyed": "2026-10-05",
+      "word_hits": [
+        {
+          "files": [
+            "fastapi/encoders.py"
+          ],
+          "lines": [
+            52,
+            57
+          ],
+          "words": [
+            "taken from",
+            "adapted from"
+          ],
+          "kind": "copied lines",
+          "says": "Two functions are marked as taken or adapted from Pydantic v1."
+        },
+        {
+          "files": [
+            "fastapi/openapi/docs.py"
+          ],
+          "lines": [
+            307
+          ],
+          "words": [
+            "copied from"
+          ],
+          "kind": "copied lines",
+          "says": "One HTML page, held as a string, is marked as copied from swagger-ui 4.14.0."
+        },
+        {
+          "files": [
+            "fastapi/routing.py"
+          ],
+          "lines": [
+            192,
+            197,
+            215,
+            222
+          ],
+          "words": [
+            "vendored"
+          ],
+          "kind": "copied lines",
+          "says": "One class and one function are marked as vendored from `starlette.routing`."
+        }
+      ],
+      "adapted_modules": []
     },
     {
       "name": "h11",
@@ -434,7 +758,7 @@
       "source": {
         "carries": "no",
         "projects": [],
-        "evidence": "The wheel's 17 files were listed again. The top-level name is `h11`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+        "evidence": "The wheel's 17 files were listed again. The top-level name is `h11`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The word search hit no file."
       },
       "data": {
         "carries": "no",
@@ -444,7 +768,9 @@
       "route": null,
       "route_reason": null,
       "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05"
+      "forms_surveyed": "2026-10-05",
+      "word_hits": [],
+      "adapted_modules": []
     },
     {
       "name": "hl7apy",
@@ -462,14 +788,15 @@
       "source": {
         "carries": "no",
         "projects": [],
-        "evidence": "The wheel's 100 files were listed again. The top-level name is `hl7apy`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+        "evidence": "The wheel's 100 files were listed again. The top-level name is `hl7apy`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The word search hit 54 files: 0 recorded as an adapted module, 0 as copied lines and 54 as prose. `word_hits` lists each."
       },
       "data": {
         "carries": "yes",
         "projects": [
           {
-            "name": "HL7 v2 definitions of messages, segments, fields and data types, versions",
-            "version": "2.1 to 2.8.2, twelve versions"
+            "name": "HL7 v2 definitions of messages, segments, fields and data types",
+            "version": "2.1 to 2.8.2",
+            "display": "HL7 v2 definitions of messages, segments, fields and data types, the twelve versions from 2.1 to 2.8.2"
           }
         ],
         "evidence": "The wheel's 100 files were listed again. Twelve directories, `hl7apy/v2_1` to `hl7apy/v2_8_2`, hold the definitions of each HL7 v2 version as Python modules. The largest, `v2_8_2/groups.py`, is about 302 KB. They are tables from the HL7 standard, held as Python modules."
@@ -477,7 +804,73 @@
       "route": null,
       "route_reason": null,
       "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05"
+      "forms_surveyed": "2026-10-05",
+      "word_hits": [
+        {
+          "files": [
+            "hl7apy/__init__.py",
+            "hl7apy/base_datatypes.py",
+            "hl7apy/consts.py",
+            "hl7apy/core.py",
+            "hl7apy/exceptions.py",
+            "hl7apy/factories.py",
+            "hl7apy/mllp.py",
+            "hl7apy/parser.py",
+            "hl7apy/utils.py",
+            "hl7apy/v2_1/__init__.py",
+            "hl7apy/v2_1/base_datatypes.py",
+            "hl7apy/v2_1/datatypes.py",
+            "hl7apy/v2_2/__init__.py",
+            "hl7apy/v2_2/datatypes.py",
+            "hl7apy/v2_3/__init__.py",
+            "hl7apy/v2_3_1/__init__.py",
+            "hl7apy/v2_3_1/tables.py",
+            "hl7apy/v2_4/__init__.py",
+            "hl7apy/v2_4/tables.py",
+            "hl7apy/v2_5/__init__.py",
+            "hl7apy/v2_5_1/__init__.py",
+            "hl7apy/v2_5_1/tables.py",
+            "hl7apy/v2_6/__init__.py",
+            "hl7apy/v2_6/base_datatypes.py",
+            "hl7apy/v2_6/tables.py",
+            "hl7apy/v2_7/__init__.py",
+            "hl7apy/v2_7/base_datatypes.py",
+            "hl7apy/v2_7/datatypes.py",
+            "hl7apy/v2_7/fields.py",
+            "hl7apy/v2_7/groups.py",
+            "hl7apy/v2_7/messages.py",
+            "hl7apy/v2_7/segments.py",
+            "hl7apy/v2_7/tables.py",
+            "hl7apy/v2_8/__init__.py",
+            "hl7apy/v2_8/datatypes.py",
+            "hl7apy/v2_8/groups.py",
+            "hl7apy/v2_8/messages.py",
+            "hl7apy/v2_8/segments.py",
+            "hl7apy/v2_8/tables.py",
+            "hl7apy/v2_8_1/__init__.py",
+            "hl7apy/v2_8_1/datatypes.py",
+            "hl7apy/v2_8_1/fields.py",
+            "hl7apy/v2_8_1/groups.py",
+            "hl7apy/v2_8_1/messages.py",
+            "hl7apy/v2_8_1/segments.py",
+            "hl7apy/v2_8_1/tables.py",
+            "hl7apy/v2_8_2/__init__.py",
+            "hl7apy/v2_8_2/datatypes.py",
+            "hl7apy/v2_8_2/fields.py",
+            "hl7apy/v2_8_2/groups.py",
+            "hl7apy/v2_8_2/messages.py",
+            "hl7apy/v2_8_2/segments.py",
+            "hl7apy/v2_8_2/tables.py",
+            "hl7apy/validation.py"
+          ],
+          "words": [
+            "permission is hereby granted"
+          ],
+          "kind": "prose",
+          "says": "The project's own licence header, under the copyright line `Copyright (c) 2012-2018, CRS4`, at the top of 54 of the wheel's 94 Python modules. It marks no copy."
+        }
+      ],
+      "adapted_modules": []
     },
     {
       "name": "httpcore",
@@ -495,7 +888,7 @@
       "source": {
         "carries": "no",
         "projects": [],
-        "evidence": "The wheel's 36 files were listed again. The top-level name is `httpcore`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+        "evidence": "The wheel's 36 files were listed again. The top-level name is `httpcore`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The word search hit 3 files: 0 recorded as an adapted module, 3 as copied lines and 0 as prose. `word_hits` lists each."
       },
       "data": {
         "carries": "no",
@@ -505,7 +898,49 @@
       "route": null,
       "route_reason": null,
       "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05"
+      "forms_surveyed": "2026-10-05",
+      "word_hits": [
+        {
+          "files": [
+            "httpcore/_utils.py"
+          ],
+          "lines": [
+            24
+          ],
+          "words": [
+            "stolen from"
+          ],
+          "kind": "copied lines",
+          "says": "One function body is marked as taken from trio's `_socket.py`."
+        },
+        {
+          "files": [
+            "httpcore/_async/http2.py"
+          ],
+          "lines": [
+            203
+          ],
+          "words": [
+            "taken from"
+          ],
+          "kind": "copied lines",
+          "says": "Two setting values are marked as taken from h2."
+        },
+        {
+          "files": [
+            "httpcore/_sync/http2.py"
+          ],
+          "lines": [
+            203
+          ],
+          "words": [
+            "taken from"
+          ],
+          "kind": "copied lines",
+          "says": "Two setting values are marked as taken from h2."
+        }
+      ],
+      "adapted_modules": []
     },
     {
       "name": "httptools",
@@ -540,7 +975,7 @@
       "source": {
         "carries": "no",
         "projects": [],
-        "evidence": "Both wheels read were listed again, 22 files. The top-level name is `httptools`, the project's own. The `.pyx` and `.pxd` files are the project's own Cython sources. The licence files under `licenses/vendor` are for llhttp and http-parser, which are compiled in, as the compiled answer records. Their source is not in the wheel."
+        "evidence": "Both wheels read were listed again, 22 files. The top-level name is `httptools`, the project's own. The `.pyx` and `.pxd` files are the project's own Cython sources. The licence files under `licenses/vendor` are for llhttp and http-parser, which are compiled in, as the compiled answer records. Their source is not in the wheel. The word search hit no file."
       },
       "data": {
         "carries": "no",
@@ -550,7 +985,9 @@
       "route": null,
       "route_reason": null,
       "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05"
+      "forms_surveyed": "2026-10-05",
+      "word_hits": [],
+      "adapted_modules": []
     },
     {
       "name": "httpx",
@@ -568,7 +1005,7 @@
       "source": {
         "carries": "no",
         "projects": [],
-        "evidence": "The wheel's 29 files were listed again. The top-level name is `httpx`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+        "evidence": "The wheel's 29 files were listed again. The top-level name is `httpx`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The word search hit no file."
       },
       "data": {
         "carries": "no",
@@ -578,7 +1015,9 @@
       "route": null,
       "route_reason": null,
       "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05"
+      "forms_surveyed": "2026-10-05",
+      "word_hits": [],
+      "adapted_modules": []
     },
     {
       "name": "idna",
@@ -596,14 +1035,15 @@
       "source": {
         "carries": "no",
         "projects": [],
-        "evidence": "The wheel's 16 files were listed again. The top-level name is `idna`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+        "evidence": "The wheel's 16 files were listed again. The top-level name is `idna`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The word search hit no file."
       },
       "data": {
         "carries": "yes",
         "projects": [
           {
-            "name": "IDNA and UTS 46 mapping tables, Unicode",
-            "version": "18.0.0"
+            "name": "IDNA and UTS 46 mapping tables",
+            "version": "Unicode 18.0.0",
+            "display": "IDNA and UTS 46 mapping tables, Unicode 18.0.0"
           }
         ],
         "evidence": "The wheel's 16 files were listed again. `idna/uts46data.py`, about 237 KB, and `idna/idnadata.py`, about 46 KB, each say they are generated by the project's `tools/idna-data`, and each gives `__version__` as 18.0.0, the Unicode version. They are tables, held as Python modules."
@@ -611,7 +1051,9 @@
       "route": null,
       "route_reason": null,
       "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05"
+      "forms_surveyed": "2026-10-05",
+      "word_hits": [],
+      "adapted_modules": []
     },
     {
       "name": "ldap3",
@@ -629,14 +1071,15 @@
       "source": {
         "carries": "no",
         "projects": [],
-        "evidence": "The wheel's 118 files were listed again. The top-level name is `ldap3`, the project's own. No directory has a vendoring name, and no licence file is named for another project. `ldap3/utils/tls_backport.py` holds two functions backported from the Python standard library, as lines in the project's own module."
+        "evidence": "The wheel's 118 files were listed again. The top-level name is `ldap3`, the project's own. No directory has a vendoring name, and no licence file is named for another project. `ldap3/utils/tls_backport.py` holds two functions backported from the Python standard library, as lines in the project's own module. The word search hit 2 files: 1 recorded as an adapted module, 1 as copied lines and 0 as prose. `word_hits` lists each."
       },
       "data": {
         "carries": "yes",
         "projects": [
           {
-            "name": "Directory server schemas (Active Directory 2012 R2, 389 Directory Server, eDirectory 8.8.8 and 9.1.4, OpenLDAP slapd 2.4),",
-            "version": "versions as the file names give them"
+            "name": "Directory server schemas: Active Directory 2012 R2, 389 Directory Server, eDirectory 8.8.8 and 9.1.4, OpenLDAP slapd 2.4",
+            "version": "as the file names give them",
+            "display": "Directory server schemas: Active Directory 2012 R2, 389 Directory Server, eDirectory 8.8.8 and 9.1.4, OpenLDAP slapd 2.4, versions as the file names give them"
           }
         ],
         "evidence": "The wheel's 118 files were listed again. `ldap3/protocol/schemas` holds five modules, each a recorded schema of one directory server: `ad2012R2.py` (about 334 KB), `ds389.py`, `edir888.py`, `edir914.py` and `slapd24.py`. The versions are read from the file names. They are data from those servers, held as Python modules."
@@ -644,7 +1087,43 @@
       "route": null,
       "route_reason": null,
       "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05"
+      "forms_surveyed": "2026-10-05",
+      "word_hits": [
+        {
+          "files": [
+            "ldap3/utils/ordDict.py"
+          ],
+          "lines": [
+            3
+          ],
+          "words": [
+            "permission is hereby granted"
+          ],
+          "kind": "adapted module",
+          "says": "The file opens with a copyright line for Raymond Hettinger and an MIT permission text. It is the one file in the wheel that the permission text hit."
+        },
+        {
+          "files": [
+            "ldap3/utils/tls_backport.py"
+          ],
+          "lines": [
+            36,
+            91
+          ],
+          "words": [
+            "backported from"
+          ],
+          "kind": "copied lines",
+          "says": "Two functions are marked as backported from the Python 3.4.3 standard library."
+        }
+      ],
+      "adapted_modules": [
+        {
+          "file": "ldap3/utils/ordDict.py",
+          "project": "none named; the copyright line names a person, Raymond Hettinger",
+          "words": "# Copyright (c) 2009 Raymond Hettinger"
+        }
+      ]
     },
     {
       "name": "psutil",
@@ -670,7 +1149,7 @@
       "source": {
         "carries": "no",
         "projects": [],
-        "evidence": "Both wheels read were listed again, 16 files. The top-level name is `psutil`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+        "evidence": "Both wheels read were listed again, 16 files. The top-level name is `psutil`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The word search hit 1 file: 0 recorded as an adapted module, 1 as copied lines and 0 as prose. `word_hits` lists each."
       },
       "data": {
         "carries": "no",
@@ -680,7 +1159,23 @@
       "route": null,
       "route_reason": null,
       "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05"
+      "forms_surveyed": "2026-10-05",
+      "word_hits": [
+        {
+          "files": [
+            "psutil/_pslinux.py"
+          ],
+          "lines": [
+            188
+          ],
+          "words": [
+            "adapted from"
+          ],
+          "kind": "copied lines",
+          "says": "A few lines are marked as adapted from the iostat source code."
+        }
+      ],
+      "adapted_modules": []
     },
     {
       "name": "pyasn1",
@@ -698,7 +1193,7 @@
       "source": {
         "carries": "no",
         "projects": [],
-        "evidence": "The wheel's 38 files were listed again. The top-level name is `pyasn1`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+        "evidence": "The wheel's 38 files were listed again. The top-level name is `pyasn1`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The word search hit no file."
       },
       "data": {
         "carries": "no",
@@ -708,7 +1203,9 @@
       "route": null,
       "route_reason": null,
       "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05"
+      "forms_surveyed": "2026-10-05",
+      "word_hits": [],
+      "adapted_modules": []
     },
     {
       "name": "pycparser",
@@ -726,7 +1223,7 @@
       "source": {
         "carries": "no",
         "projects": [],
-        "evidence": "The wheel's 13 files were listed again. The top-level name is `pycparser`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The 13 files hold no `ply` directory and no parser generator from another project."
+        "evidence": "The wheel's 13 files were listed again. The top-level name is `pycparser`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The 13 files hold no `ply` directory and no parser generator from another project. The word search hit no file."
       },
       "data": {
         "carries": "no",
@@ -736,7 +1233,9 @@
       "route": null,
       "route_reason": null,
       "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05"
+      "forms_surveyed": "2026-10-05",
+      "word_hits": [],
+      "adapted_modules": []
     },
     {
       "name": "pydantic",
@@ -752,14 +1251,9 @@
         }
       ],
       "source": {
-        "carries": "yes",
-        "projects": [
-          {
-            "name": "pydantic 1.x, a separately released line of the same project,",
-            "version": "1.10.26"
-          }
-        ],
-        "evidence": "The wheel's 111 files were listed again. The directory `pydantic/v1` holds 27 files, a copy of the project's own 1.x line, and its `version.py` gives 1.10.26. That line is released separately on PyPI under the same name. An advisory against that line names `pydantic`, at version numbers below 2. It is counted here because it is a second, separately released copy inside the wheel. One file in that copy, `datetime_parse.py`, says it was taken from Django. The one top-level name is `pydantic`, no other directory has a vendoring name, and no licence file is named for another project."
+        "carries": "no",
+        "projects": [],
+        "evidence": "The wheel's 111 files were listed again. The one top-level name is `pydantic`, no directory has a vendoring name, and no licence file is named for another project. The directory `pydantic/v1` holds 27 files, a copy of the project's own 1.x line. That is the same project, so it is not another project's source. `own_release_lines` records it. One file in that copy, `datetime_parse.py`, says it was taken from Django. That is one module, recorded under `adapted_modules`. The word search hit 7 files: 1 recorded as an adapted module, 4 as copied lines and 2 as prose. `word_hits` lists each."
       },
       "data": {
         "carries": "no",
@@ -769,7 +1263,115 @@
       "route": null,
       "route_reason": null,
       "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05"
+      "forms_surveyed": "2026-10-05",
+      "word_hits": [
+        {
+          "files": [
+            "pydantic/dataclasses.py"
+          ],
+          "lines": [
+            280
+          ],
+          "words": [
+            "taken from"
+          ],
+          "kind": "copied lines",
+          "says": "Two small functions are marked as taken from the standard library's `dataclasses`."
+        },
+        {
+          "files": [
+            "pydantic/main.py"
+          ],
+          "lines": [
+            1766
+          ],
+          "words": [
+            "taken from"
+          ],
+          "kind": "prose",
+          "says": "A docstring about where a value is taken from. It marks no copy."
+        },
+        {
+          "files": [
+            "pydantic/_internal/_generics.py"
+          ],
+          "lines": [
+            70
+          ],
+          "words": [
+            "taken from"
+          ],
+          "kind": "copied lines",
+          "says": "One class is marked as taken from the Python documentation's `ChainMap` recipe."
+        },
+        {
+          "files": [
+            "pydantic/_internal/_typing_extra.py"
+          ],
+          "lines": [
+            282
+          ],
+          "words": [
+            "backport of"
+          ],
+          "kind": "copied lines",
+          "says": "One function is marked as a backport of the standard library's `typing._type_convert`."
+        },
+        {
+          "files": [
+            "pydantic/v1/_hypothesis_plugin.py"
+          ],
+          "lines": [
+            79
+          ],
+          "words": [
+            "taken from"
+          ],
+          "kind": "prose",
+          "says": "A comment about names taken from the `math` module. It marks no copy."
+        },
+        {
+          "files": [
+            "pydantic/v1/datetime_parse.py"
+          ],
+          "lines": [
+            9
+          ],
+          "words": [
+            "stolen from"
+          ],
+          "kind": "adapted module",
+          "says": "The module's docstring says it was taken from Django's `django/utils/dateparse.py` at a named commit, and lists what was changed."
+        },
+        {
+          "files": [
+            "pydantic/v1/typing.py"
+          ],
+          "lines": [
+            399
+          ],
+          "words": [
+            "taken from"
+          ],
+          "kind": "copied lines",
+          "says": "One function is marked as partially taken from `typing.get_type_hints`."
+        }
+      ],
+      "adapted_modules": [
+        {
+          "file": "pydantic/v1/datetime_parse.py",
+          "project": "Django",
+          "words": "Stolen from https://raw.githubusercontent.com/django/django/main/django/utils/dateparse.py"
+        }
+      ],
+      "own_release_lines": [
+        {
+          "path": "pydantic/v1",
+          "files": 27,
+          "version": "1.10.26",
+          "note": "The project's own 1.x line, released separately on PyPI under the same name. Its `version.py` gives 1.10.26. An advisory against that line names `pydantic`, at version numbers below 2."
+        }
+      ]
     },
     {
       "name": "pydantic-core",
@@ -800,7 +1402,7 @@
       "source": {
         "carries": "no",
         "projects": [],
-        "evidence": "Both wheels read were listed again, 10 files. The top-level name is `pydantic_core`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+        "evidence": "Both wheels read were listed again, 10 files. The top-level name is `pydantic_core`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The word search hit no file."
       },
       "data": {
         "carries": "no",
@@ -810,7 +1412,9 @@
       "route": null,
       "route_reason": null,
       "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05"
+      "forms_surveyed": "2026-10-05",
+      "word_hits": [],
+      "adapted_modules": []
     },
     {
       "name": "pyodbc",
@@ -836,7 +1440,7 @@
       "source": {
         "carries": "no",
         "projects": [],
-        "evidence": "Both wheels read were listed again, 7 files. The top-level name is `pyodbc`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+        "evidence": "Both wheels read were listed again, 7 files. The top-level name is `pyodbc`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The word search hit no file."
       },
       "data": {
         "carries": "no",
@@ -846,7 +1450,9 @@
       "route": null,
       "route_reason": null,
       "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05"
+      "forms_surveyed": "2026-10-05",
+      "word_hits": [],
+      "adapted_modules": []
     },
     {
       "name": "pyside6",
@@ -868,7 +1474,7 @@
       "source": {
         "carries": "no",
         "projects": [],
-        "evidence": "Both wheels read were listed again, 67 and 69 files. The top-level name is `PySide6`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The wheel holds typing stubs and three small modules, all the project's own."
+        "evidence": "Both wheels read were listed again, 67 and 69 files. The top-level name is `PySide6`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The wheel holds typing stubs and three small modules, all the project's own. The word search hit no file."
       },
       "data": {
         "carries": "no",
@@ -878,7 +1484,9 @@
       "route": null,
       "route_reason": null,
       "surveyed": "2026-10-05",
-      "forms_surveyed": "2026-10-05"
+      "forms_surveyed": "2026-10-05",
+      "word_hits": [],
+      "adapted_modules": []
     },
     {
       "name": "pyside6-addons",
@@ -906,7 +1514,9 @@
       "route": "highlight",
       "route_reason": "It holds compiled Qt modules, among them the web engine, multimedia and PDF modules. The harness imports none of them, but an install puts them on disk. A flaw filed against Qt names Qt, not `pyside6-addons`, so the vulnerability-history reading would not show it.",
       "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05"
+      "forms_surveyed": "2026-10-05",
+      "adapted_modules": [],
+      "word_hits": []
     },
     {
       "name": "pyside6-essentials",
@@ -934,7 +1544,9 @@
       "route": null,
       "route_reason": null,
       "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05"
+      "forms_surveyed": "2026-10-05",
+      "adapted_modules": [],
+      "word_hits": []
     },
     {
       "name": "pyspnego",
@@ -952,7 +1564,7 @@
       "source": {
         "carries": "no",
         "projects": [],
-        "evidence": "The wheel's 38 files were listed again. The top-level name is `spnego`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+        "evidence": "The wheel's 38 files were listed again. The top-level name is `spnego`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The word search hit no file."
       },
       "data": {
         "carries": "no",
@@ -962,7 +1574,9 @@
       "route": null,
       "route_reason": null,
       "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05"
+      "forms_surveyed": "2026-10-05",
+      "word_hits": [],
+      "adapted_modules": []
     },
     {
       "name": "shiboken6",
@@ -989,7 +1603,7 @@
       "source": {
         "carries": "no",
         "projects": [],
-        "evidence": "Both wheels read were listed again, 58 and 70 files. The top-level name is `shiboken6`, the project's own. The 41 `.h` files and six `.cmake` files are the project's own. No directory has a vendoring name. The Windows wheel's one licence file is Qt's own commercial licence text."
+        "evidence": "Both wheels read were listed again, 58 and 70 files. The top-level name is `shiboken6`, the project's own. The 41 `.h` files and six `.cmake` files are the project's own. No directory has a vendoring name. The Windows wheel's one licence file is Qt's own commercial licence text. The word search hit no file."
       },
       "data": {
         "carries": "no",
@@ -999,7 +1613,9 @@
       "route": null,
       "route_reason": null,
       "surveyed": "2026-10-05",
-      "forms_surveyed": "2026-10-05"
+      "forms_surveyed": "2026-10-05",
+      "word_hits": [],
+      "adapted_modules": []
     },
     {
       "name": "sspilib",
@@ -1021,7 +1637,7 @@
       "source": {
         "carries": "no",
         "projects": [],
-        "evidence": "The wheel's 29 files were listed again. The top-level name is `sspilib`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+        "evidence": "The wheel's 29 files were listed again. The top-level name is `sspilib`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The word search hit no file."
       },
       "data": {
         "carries": "no",
@@ -1031,7 +1647,9 @@
       "route": null,
       "route_reason": null,
       "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05"
+      "forms_surveyed": "2026-10-05",
+      "word_hits": [],
+      "adapted_modules": []
     },
     {
       "name": "starlette",
@@ -1049,7 +1667,7 @@
       "source": {
         "carries": "no",
         "projects": [],
-        "evidence": "The wheel's 41 files were listed again. The top-level name is `starlette`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+        "evidence": "The wheel's 41 files were listed again. The top-level name is `starlette`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The word search hit 1 file: 0 recorded as an adapted module, 1 as copied lines and 0 as prose. `word_hits` lists each."
       },
       "data": {
         "carries": "no",
@@ -1059,7 +1677,23 @@
       "route": null,
       "route_reason": null,
       "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05"
+      "forms_surveyed": "2026-10-05",
+      "word_hits": [
+        {
+          "files": [
+            "starlette/requests.py"
+          ],
+          "lines": [
+            54
+          ],
+          "words": [
+            "adapted from"
+          ],
+          "kind": "copied lines",
+          "says": "One function is marked as adapted from Django 3.1.0."
+        }
+      ],
+      "adapted_modules": []
     },
     {
       "name": "tomlkit",
@@ -1077,7 +1711,7 @@
       "source": {
         "carries": "no",
         "projects": [],
-        "evidence": "The wheel's 17 files were listed again. The top-level name is `tomlkit`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+        "evidence": "The wheel's 17 files were listed again. The top-level name is `tomlkit`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The word search hit no file."
       },
       "data": {
         "carries": "no",
@@ -1087,7 +1721,9 @@
       "route": null,
       "route_reason": null,
       "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05"
+      "forms_surveyed": "2026-10-05",
+      "word_hits": [],
+      "adapted_modules": []
     },
     {
       "name": "truststore",
@@ -1105,7 +1741,7 @@
       "source": {
         "carries": "no",
         "projects": [],
-        "evidence": "The wheel's 11 files were listed again. The top-level name is `truststore`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+        "evidence": "The wheel's 11 files were listed again. The top-level name is `truststore`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The word search hit no file."
       },
       "data": {
         "carries": "no",
@@ -1115,7 +1751,9 @@
       "route": null,
       "route_reason": null,
       "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05"
+      "forms_surveyed": "2026-10-05",
+      "word_hits": [],
+      "adapted_modules": []
     },
     {
       "name": "typing-extensions",
@@ -1133,7 +1771,7 @@
       "source": {
         "carries": "no",
         "projects": [],
-        "evidence": "The wheel's 5 files were listed again. The top-level name is `typing_extensions`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The wheel is one module. Parts of it follow CPython's `typing`, as lines in the project's own module."
+        "evidence": "The wheel's 5 files were listed again. The top-level name is `typing_extensions`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The wheel is one module. Parts of it follow CPython's `typing`, as lines in the project's own module. The word search hit 1 file: 0 recorded as an adapted module, 1 as copied lines and 0 as prose. `word_hits` lists each."
       },
       "data": {
         "carries": "no",
@@ -1143,7 +1781,29 @@
       "route": null,
       "route_reason": null,
       "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05"
+      "forms_surveyed": "2026-10-05",
+      "word_hits": [
+        {
+          "files": [
+            "typing_extensions.py"
+          ],
+          "lines": [
+            269,
+            334,
+            3620,
+            3777,
+            4058
+          ],
+          "words": [
+            "vendored",
+            "taken from",
+            "backport of"
+          ],
+          "kind": "copied lines",
+          "says": "The wheel is this one module. One class is marked as vendored from CPython's `typing`, and three parts as backports of standard library functions. The hit at line 269 is a comment that marks no copy."
+        }
+      ],
+      "adapted_modules": []
     },
     {
       "name": "typing-inspection",
@@ -1161,7 +1821,7 @@
       "source": {
         "carries": "no",
         "projects": [],
-        "evidence": "The wheel's 9 files were listed again. The top-level name is `typing_inspection`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+        "evidence": "The wheel's 9 files were listed again. The top-level name is `typing_inspection`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The word search hit no file."
       },
       "data": {
         "carries": "no",
@@ -1171,7 +1831,9 @@
       "route": null,
       "route_reason": null,
       "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05"
+      "forms_surveyed": "2026-10-05",
+      "word_hits": [],
+      "adapted_modules": []
     },
     {
       "name": "tzdata",
@@ -1189,7 +1851,7 @@
       "source": {
         "carries": "no",
         "projects": [],
-        "evidence": "The wheel's 633 files were listed again. The top-level name is `tzdata`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+        "evidence": "The wheel's 633 files were listed again. The top-level name is `tzdata`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The word search hit no file."
       },
       "data": {
         "carries": "yes",
@@ -1204,7 +1866,9 @@
       "route": null,
       "route_reason": null,
       "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05"
+      "forms_surveyed": "2026-10-05",
+      "word_hits": [],
+      "adapted_modules": []
     },
     {
       "name": "uvicorn",
@@ -1222,7 +1886,7 @@
       "source": {
         "carries": "no",
         "projects": [],
-        "evidence": "The wheel's 46 files were listed again. The top-level name is `uvicorn`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+        "evidence": "The wheel's 46 files were listed again. The top-level name is `uvicorn`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The word search hit 1 file: 1 recorded as an adapted module, 0 as copied lines and 0 as prose. `word_hits` lists each."
       },
       "data": {
         "carries": "no",
@@ -1232,7 +1896,29 @@
       "route": null,
       "route_reason": null,
       "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05"
+      "forms_surveyed": "2026-10-05",
+      "word_hits": [
+        {
+          "files": [
+            "uvicorn/_types.py"
+          ],
+          "lines": [
+            5
+          ],
+          "words": [
+            "redistribution and use in source and binary forms"
+          ],
+          "kind": "adapted module",
+          "says": "The file opens with a BSD licence text whose copyright line names the Django Software Foundation. It is the one file in the wheel that the licence text hit."
+        }
+      ],
+      "adapted_modules": [
+        {
+          "file": "uvicorn/_types.py",
+          "project": "none named; the copyright line names the Django Software Foundation",
+          "words": "Copyright (c) Django Software Foundation and individual contributors."
+        }
+      ]
     },
     {
       "name": "uvloop",
@@ -1259,7 +1945,7 @@
       "source": {
         "carries": "no",
         "projects": [],
-        "evidence": "The wheel's 63 files were listed again. The top-level name is `uvloop`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The `.pyx`, `.pxd` and `.pxi` files are the project's own Cython sources. libuv's source is not in the wheel: it is compiled in, as the compiled answer records."
+        "evidence": "The wheel's 63 files were listed again. The top-level name is `uvloop`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The `.pyx`, `.pxd` and `.pxi` files are the project's own Cython sources. libuv's source is not in the wheel: it is compiled in, as the compiled answer records. The word search hit 3 files: 0 recorded as an adapted module, 3 as copied lines and 0 as prose. `word_hits` lists each."
       },
       "data": {
         "carries": "no",
@@ -1269,7 +1955,50 @@
       "route": "highlight",
       "route_reason": "libuv is the event loop's I/O layer, so the socket reads and writes of an engine that runs on `uvloop` go through it. An advisory against libuv names libuv, not `uvloop`, so the vulnerability-history reading would not show it.",
       "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05"
+      "forms_surveyed": "2026-10-05",
+      "word_hits": [
+        {
+          "files": [
+            "uvloop/__init__.py"
+          ],
+          "lines": [
+            53,
+            105
+          ],
+          "words": [
+            "copied from"
+          ],
+          "kind": "copied lines",
+          "says": "Two functions are marked as copied from CPython."
+        },
+        {
+          "files": [
+            "uvloop/loop.pyx"
+          ],
+          "lines": [
+            1445
+          ],
+          "words": [
+            "copied from"
+          ],
+          "kind": "copied lines",
+          "says": "A few lines are marked as copied from `asyncio.tasks`."
+        },
+        {
+          "files": [
+            "uvloop/handles/stream.pyx"
+          ],
+          "lines": [
+            377
+          ],
+          "words": [
+            "copied from"
+          ],
+          "kind": "copied lines",
+          "says": "An error check is marked as copied from libuv."
+        }
+      ],
+      "adapted_modules": []
     },
     {
       "name": "websockets",
@@ -1295,7 +2024,7 @@
       "source": {
         "carries": "no",
         "projects": [],
-        "evidence": "Both wheels read were listed again, 62 files. The top-level name is `websockets`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The one `.c` file, `speedups.c`, is the project's own."
+        "evidence": "Both wheels read were listed again, 62 files. The top-level name is `websockets`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The one `.c` file, `speedups.c`, is the project's own. The word search hit 3 files: 0 recorded as an adapted module, 3 as copied lines and 0 as prose. `word_hits` lists each."
       },
       "data": {
         "carries": "no",
@@ -1305,7 +2034,59 @@
       "route": null,
       "route_reason": null,
       "surveyed": "2026-10-04",
-      "forms_surveyed": "2026-10-05"
+      "forms_surveyed": "2026-10-05",
+      "word_hits": [
+        {
+          "files": [
+            "websockets/asyncio/connection.py"
+          ],
+          "lines": [
+            126,
+            1037,
+            1050,
+            1055,
+            1066,
+            1071
+          ],
+          "words": [
+            "adapted from"
+          ],
+          "kind": "copied lines",
+          "says": "Six places are marked as adapted from `asyncio`."
+        },
+        {
+          "files": [
+            "websockets/legacy/protocol.py"
+          ],
+          "lines": [
+            231,
+            303,
+            315,
+            1466,
+            1486,
+            1493
+          ],
+          "words": [
+            "copied from"
+          ],
+          "kind": "copied lines",
+          "says": "Six places are marked as copied from `asyncio`."
+        },
+        {
+          "files": [
+            "websockets/sync/client.py"
+          ],
+          "lines": [
+            1105
+          ],
+          "words": [
+            "adapted from"
+          ],
+          "kind": "copied lines",
+          "says": "One method is marked as adapted from the standard library's `ssl`."
+        }
+      ],
+      "adapted_modules": []
     }
   ]
 }
