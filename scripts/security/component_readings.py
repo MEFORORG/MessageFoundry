@@ -39,6 +39,13 @@ the criteria and their windows, and a re-read date. The page section between the
 from the page's own tiers. ``tests/test_risky_component_designation.py`` re-derives every verdict
 and re-renders the section, WITHOUT the network, and fails if either differs from what is tracked.
 
+WHAT A WHEEL CARRIES is answered by a third file, ``security/bundled-code-survey.json`` (BACKLOG
+#2935): a survey, made by hand, of whether each pinned wheel carries another project's compiled
+code. This script never writes it. It renders it into the same page section, and
+``survey_problems`` holds it to the snapshot: one answer per reading at the reading's pin, and a
+route for each not-designated wheel that was not shown to carry nothing. A run that leaves the
+survey behind says so and exits 1, after writing the snapshot and the page.
+
 A full run needs the network and runs by hand, never in CI. Standard library only, like
 ``runtime_closure.py`` beside it, so it runs under any Python 3.11 or later with nothing installed:
 
@@ -85,6 +92,9 @@ EXTRAS: dict[str, Path] = {
     "harness": runtime_closure.HARNESS_CLOSURE,
 }
 SNAPSHOT = ROOT / "security" / "risky-component-readings.json"
+#: The hand-made survey of what each pinned wheel carries inside it (BACKLOG #2935). A run of this
+#: script never writes it. ``survey_problems`` holds it to the snapshot and to the page's tiers.
+SURVEY = ROOT / "security" / "bundled-code-survey.json"
 PAGE = ROOT / "docs" / "RISKY-COMPONENTS.md"
 
 PYPI_JSON = "https://pypi.org/pypi/{name}/json"
@@ -143,6 +153,26 @@ READINGS_HEADING = "## Risky by ASVS's own examples, read from public data"
 #: The rendered subsection that lists what was read for the names the assessed extras add. An
 #: extra's own section on the page points a reader at it by this name.
 EXTRAS_HEADING = "### The names the assessed extras add"
+#: The rendered subsection that says what each wheel carries inside it, from ``SURVEY``.
+SURVEY_HEADING = "### What each wheel carries inside it"
+
+#: A survey answer to "does the pinned wheel carry another project's compiled code". The last one
+#: counts as carrying wherever a route is decided: a guessed "no" is what the survey exists to stop.
+CARRIES = ("yes", "no", "not established")
+#: What an answer may rest on. A ``none-any`` wheel whose files were listed can only support "no".
+#: A source-tree answer names the source distribution it read. A file-list answer names wheels
+#: only: no source distribution was read, so it cannot show what is linked into a compiled file,
+#: and the guard cannot check its "no" beyond the files named. Project metadata lists no file, so
+#: it can never support "no".
+TAG_AND_LIST = "wheel tag and file list"
+SOURCE_TREE = "wheel file list and source tree"
+FILE_LIST = "wheel file list"
+METADATA_ONLY = "project metadata"
+EVIDENCE_KINDS = (TAG_AND_LIST, SOURCE_TREE, FILE_LIST, METADATA_ONLY)
+#: What the page does about a not-designated wheel that carries: highlight it as risky on what it
+#: carries, or read the carried project's own advisories. A ``read`` route records these fields.
+ROUTES = ("highlight", "read")
+READ_FIELDS = ("source", "date", "version", "result")
 
 
 class Advisory(TypedDict):
@@ -561,6 +591,255 @@ def snapshot(as_of: dt.date, fetch: Fetch = fetch_json) -> dict[str, Any]:
     }
 
 
+# --- The survey of what each wheel carries (BACKLOG #2935) ---------------------------------------
+
+
+def _needs_route(wheel: Mapping[str, Any], labels: Mapping[str, str]) -> bool:
+    """Whether the page owes this wheel a route: it is not designated, and "no" was not shown."""
+    return wheel["name"] not in labels and wheel.get("carries") != "no"
+
+
+def _said(value: object) -> bool:
+    """Whether a recorded field says anything: a JSON null, or blank text, does not."""
+    return bool(str(value or "").strip())
+
+
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+
+
+def _file_pin(file: str) -> tuple[str, str]:
+    """The distribution name, canonical, and the exact version a wheel or sdist file name states.
+
+    A wheel's name is ``dist-version-tags.whl`` and its dist part holds no hyphen. A source
+    distribution's is ``dist-version.tar.gz``. The version is compared whole, never as a prefix.
+    """
+    if file.endswith(".whl"):
+        dist, _, rest = file.partition("-")
+        return runtime_closure.canonical_name(dist), rest.partition("-")[0]
+    dist, _, version = file.removesuffix(".zip").removesuffix(".tar.gz").rpartition("-")
+    return runtime_closure.canonical_name(dist), version
+
+
+def survey_problems(
+    survey: Mapping[str, Any], data: Mapping[str, Any], labels: Mapping[str, str]
+) -> list[str]:
+    """Where the survey fails to answer for the snapshot's population, or to route what it found.
+
+    One answer per reading, at the reading's pin, so a re-read that moves a pin leaves the survey
+    behind visibly. Each answer names the files it was read from, and each file name must carry
+    the surveyed pin, so moving the pin alone does not pass. A not-designated wheel that carries,
+    or whose answer is not established, must have a route; a designated wheel, or one shown to
+    carry nothing, must have none. Each file named must carry a sha256, a source-tree answer
+    must name a wheel and a source distribution, a file-list answer wheels only, and a metadata
+    answer no file. A missing field of a wheel is reported, never raised, except its ``name``.
+    """
+    problems: list[str] = []
+    pins = {r["name"]: r["pinned"] for r in data["readings"]}
+    answers: dict[str, Mapping[str, Any]] = {}
+    for wheel in survey["wheels"]:
+        if wheel["name"] in answers:
+            problems.append(f"the survey answers for {wheel['name']} twice")
+        answers[wheel["name"]] = wheel
+    missing = sorted(pins.keys() - answers.keys())
+    if missing:
+        problems.append(f"no survey answer for {missing}")
+    stray = sorted(answers.keys() - pins.keys())
+    if stray:
+        problems.append(f"the survey answers for {stray}, which the snapshot does not read")
+    for name, wheel in sorted(answers.items()):
+        pinned = str(wheel.get("pinned"))
+        if name in pins and pinned != pins[name]:
+            problems.append(f"{name}: surveyed at {pinned}, the snapshot reads {pins[name]}")
+        try:
+            dt.date.fromisoformat(str(wheel.get("surveyed")))
+        except ValueError:
+            problems.append(f"{name}: no date is recorded for the answer")
+        carries, kind = wheel.get("carries"), wheel.get("evidence_kind")
+        projects = wheel.get("projects") or []
+        read = wheel.get("files_read") or []
+        files = [str(f.get("file", "")) for f in read]
+        wheels_named = sum(f.endswith(".whl") for f in files)
+        if carries not in CARRIES:
+            problems.append(f"{name}: the answer {carries!r} is not one of {CARRIES}")
+        if kind not in EVIDENCE_KINDS or not _said(wheel.get("evidence")):
+            problems.append(f"{name}: no evidence of a known kind is recorded")
+        if (carries == "yes") != bool(projects) or not all(
+            _said(p.get("name")) and _said(p.get("version")) for p in projects
+        ):
+            problems.append(f"{name}: the answer {carries!r} does not match the projects named")
+        # Project metadata lists no file, so it cannot show that a wheel carries nothing.
+        if kind == METADATA_ONLY:
+            if carries == "no":
+                problems.append(f"{name}: project metadata cannot show a wheel carries nothing")
+            if files:
+                problems.append(f"{name}: a project-metadata answer names files it did not read")
+        elif not files or not all(_file_pin(f) == (name, pinned) for f in files):
+            problems.append(f"{name}: the files read are not named, or not at the surveyed pin")
+        elif kind == TAG_AND_LIST and (
+            carries != "no" or not all(f.endswith("-none-any.whl") for f in files)
+        ):
+            problems.append(f"{name}: a none-any answer needs a none-any wheel that carries none")
+        elif (kind == SOURCE_TREE and not 0 < wheels_named < len(files)) or (
+            kind == FILE_LIST and wheels_named != len(files)
+        ):
+            problems.append(f"{name}: the files read do not match the evidence kind {kind!r}")
+        if not all(_SHA256.fullmatch(str(f.get("sha256", ""))) for f in read):
+            problems.append(f"{name}: a file read has no sha256 recorded")
+        route = wheel.get("route")
+        if not _needs_route(wheel, labels):
+            if route is not None:
+                problems.append(f"{name}: a route is recorded where the page owes none")
+        elif route not in ROUTES or not _said(wheel.get("route_reason")):
+            problems.append(f"{name}: not designated and not shown to carry nothing, with no route")
+        elif route == "read" and not all(
+            _said((wheel.get("read") or {}).get(field)) for field in READ_FIELDS
+        ):
+            problems.append(f"{name}: a read route must record {READ_FIELDS}")
+    return problems
+
+
+def _carried(wheel: Mapping[str, Any]) -> str:
+    """What the wheel carries, for a table cell: each project, and its version or the lack of one."""
+    words = {"not established": ", version not established", "as locked": ""}
+    return (
+        "; ".join(
+            str(p.get("name")) + words.get(str(p.get("version")), f" {p.get('version')}")
+            for p in wheel.get("projects") or []
+        )
+        or "not established"
+    )
+
+
+def _surveyed_on(wheels: list[Mapping[str, Any]]) -> str:
+    """The day the answers were made, or the span of days where some were made again later."""
+    days = sorted({str(w.get("surveyed")) for w in wheels})
+    return f"on {days[0]}" if len(days) == 1 else f"between {days[0]} and {days[-1]}"
+
+
+def _render_survey(survey: Mapping[str, Any], labels: Mapping[str, str]) -> list[str]:
+    """The survey subsection: what was found, on what evidence, and the route each wheel took."""
+    wheels = sorted(survey["wheels"], key=lambda w: str(w["name"]))
+    size = len(wheels)
+    counts = {answer: sum(w.get("carries") == answer for w in wheels) for answer in CARRIES}
+    routed = [w for w in wheels if _needs_route(w, labels)]
+
+    def route(wheel: Mapping[str, Any]) -> str:
+        if wheel["name"] in labels:
+            return f"designated, {labels[wheel['name']]}"
+        words = {"highlight": "highlighted below", "read": "read below"}
+        return words.get(str(wheel.get("route")), "none")
+
+    out = [
+        SURVEY_HEADING,
+        "",
+        "The vulnerability-history test reads advisories by PyPI name. This survey asks what "
+        f"that test cannot: whether each of the {size} pinned wheels carries compiled code from "
+        f"another project. It was made by hand {_surveyed_on(wheels)}, against the pins the "
+        "snapshot reads. Its evidence, the files read and their hashes are recorded in "
+        "[`security/bundled-code-survey.json`](../security/bundled-code-survey.json). A run of "
+        "the script does not repeat it.",
+        "",
+        f"**Carries another project's compiled code: {counts['yes']} of {size}. Does not: "
+        f"{counts['no']}. Not established: {counts['not established']}. {counts['yes']} plus "
+        f"{counts['no']} plus {counts['not established']} is {size}.**",
+        "",
+        "A wheel whose answer is not established is treated as carrying.",
+        "",
+        "| Component | Pinned | Carries | Evidence | Route |",
+        "|---|---|---|---|---|",
+    ]
+    out += [
+        f"| `{w['name']}` | {w.get('pinned')} | {_carried(w)} | {w.get('evidence_kind')} "
+        f"| {route(w)} |"
+        for w in wheels
+        if w.get("carries") != "no"
+    ]
+    for kind in EVIDENCE_KINDS:
+        names = [
+            f"`{w['name']}`"
+            for w in wheels
+            if w.get("carries") == "no" and w.get("evidence_kind") == kind
+        ]
+        if names:
+            out += [
+                "",
+                _count(len(names), "wheel was", "wheels were")
+                + f" found to carry none, on the evidence of the {kind}: "
+                + ", ".join(names)
+                + ".",
+            ]
+    out += [
+        "",
+        "Each answer rests on the evidence the record names. A wheel tagged `none-any` had its "
+        "file list read as well as its tag. For any other wheel that was fetched, one Linux "
+        "x86_64 wheel and the Windows amd64 wheel were read, where the lock carries them. A "
+        "file list shows a bundled library and cannot show code linked into an extension, so "
+        "the pinned source distribution was read too. A wheel the record does not name was not "
+        "read, and can carry something else. That holds for another platform, and for a second "
+        "Linux x86_64 wheel where the lock carries more than one.",
+    ]
+    # The two kinds of evidence that fall short of the paragraph above, each naming its wheels.
+    for kind, lead, rests_on in (
+        (
+            FILE_LIST,
+            "No source distribution was read for {}.",
+            "wheel file lists alone, which cannot show what is linked into a compiled file.",
+        ),
+        (
+            METADATA_ONLY,
+            "No wheel was fetched for {}.",
+            "PyPI project metadata, which lists no file. What the table names for such a wheel "
+            "is the least it carries: nothing else was looked for.",
+        ),
+    ):
+        names = [f"`{w['name']}`" for w in wheels if w.get("evidence_kind") == kind]
+        if names:
+            whose = "Its answer rests on" if len(names) == 1 else "Their answers rest on"
+            out += ["", f"{lead.format(_series(names, 'or'))} {whose} {rests_on}"]
+    out += [
+        "",
+        "A designated wheel is already highlighted, by its tier. No carried project's advisories "
+        "were read for a designated wheel. "
+        + _count(len(routed), "wheel is", "wheels are")
+        + " not designated and not shown to carry nothing. Each takes one of two routes: this "
+        "page highlights it as risky on what it carries, or reads the carried project's own "
+        "advisories.",
+    ]
+    highlighted = [w for w in routed if w.get("route") == "highlight"]
+    if highlighted:
+        out += [
+            "",
+            "**Highlighted as risky on what it carries:**",
+            "",
+            "| Component | Carries | Why |",
+            "|---|---|---|",
+        ]
+        out += [f"| `{w['name']}` | {_carried(w)} | {w.get('route_reason')} |" for w in highlighted]
+        out += [
+            "",
+            "No advisory for a carried project was read for these. A reader who needs that has "
+            "to check the carried project's own security notices against the version the pinned "
+            "wheel carries. Where the table gives no version, the survey did not establish one. "
+            "Highlighting here does not move a wheel into a tier.",
+        ]
+    read = [w for w in routed if w.get("route") == "read"]
+    if read:
+        out += [
+            "",
+            "**Read from the carried project's own advisories:**",
+            "",
+            "| Component | Carries | Source | Date read | Version read | Result |",
+            "|---|---|---|---|---|---|",
+        ]
+        out += [
+            f"| `{w['name']}` | {_carried(w)} | "
+            + " | ".join(str((w.get("read") or {}).get(field)) for field in READ_FIELDS)
+            + " |"
+            for w in read
+        ]
+    return out
+
+
 # --- The page ------------------------------------------------------------------------------------
 
 _TIER_HEADING = re.compile(r"^## Tier (\d+)\b")
@@ -611,8 +890,10 @@ def _either(words: Iterable[str]) -> str:
     return _series([f"`{w}`" for w in words], "or")
 
 
-def render_section(data: Mapping[str, Any], labels: Mapping[str, str]) -> str:
-    """The page section between the markers, from the snapshot and the page's tier labels."""
+def render_section(
+    data: Mapping[str, Any], labels: Mapping[str, str], survey: Mapping[str, Any]
+) -> str:
+    """The page section between the markers: the snapshot, the page's tier labels and the survey."""
     rules = data["criteria"]
     as_of = dt.date.fromisoformat(data["snapshot_date"])
     readings = data["readings"]
@@ -679,7 +960,8 @@ def render_section(data: Mapping[str, Any], labels: Mapping[str, str]) -> str:
         "OSV matches an advisory to a component by its PyPI name. A flaw in code a wheel carries "
         "inside it, such as a compiled library, shows up here only when an advisory names the "
         "PyPI package. So nothing below shows that the code inside a wheel is free of known "
-        "flaws.",
+        f"flaws. *{SURVEY_HEADING.removeprefix('### ')}*, further down, says which wheels carry "
+        "such code and what this page does about each.",
         "",
         "These tests are mechanical. A small library that is finished can trip the first one "
         "without being neglected. The reading says where to look; it does not say the library is "
@@ -836,6 +1118,7 @@ def render_section(data: Mapping[str, Any], labels: Mapping[str, str]) -> str:
         )
     else:
         out.append("Every component risky on an ASVS example is also designated above.")
+    out += ["", *_render_survey(survey, labels)]
     if added:
         out += [
             "",
@@ -902,10 +1185,10 @@ def section_of(page: str) -> str:
     return page[start + len(BEGIN) + 2 : stop].strip("\n")
 
 
-def render_page(page: str, data: Mapping[str, Any]) -> str:
-    """``page`` with the section between the markers re-rendered from ``data``."""
+def render_page(page: str, data: Mapping[str, Any], survey: Mapping[str, Any]) -> str:
+    """``page`` with the section between the markers re-rendered from ``data`` and ``survey``."""
     start, stop = _marker_bounds(page)
-    body = render_section(data, designation_labels(page))
+    body = render_section(data, designation_labels(page), survey)
     return f"{page[:start]}\n{BEGIN}\n\n{body}\n\n{END}\n{page[stop + len(END) + 2 :]}"
 
 
@@ -923,6 +1206,9 @@ def main(argv: list[str] | None = None) -> int:
         help="re-render the page section from the tracked snapshot; no network",
     )
     args = parser.parse_args(argv)
+    # Read before the network run, so a broken hand-made survey stops it before the long read.
+    text = PAGE.read_text(encoding="utf-8")
+    survey = json.loads(SURVEY.read_text(encoding="utf-8"))
     if args.render_only:
         data = json.loads(SNAPSHOT.read_text(encoding="utf-8"))
     else:
@@ -934,13 +1220,18 @@ def main(argv: list[str] | None = None) -> int:
             # Nothing is written on a failed read, so a half-fetched snapshot never lands.
             print(f"component readings failed, nothing written: {exc}", file=sys.stderr)
             return 1
-    page = render_page(PAGE.read_text(encoding="utf-8"), data)
+    page = render_page(text, data, survey)
     if not args.render_only:
         _write_text(SNAPSHOT, json.dumps(data, indent=2) + "\n")
     _write_text(PAGE, page)
     counts = {axis: sum(r["risky"][axis] for r in data["readings"]) for axis in AXES}
     print(f"{len(data['readings'])} readings as of {data['snapshot_date']}: {counts}")
-    return 0
+    # The survey is made by hand, so a re-read that moved a pin or a name leaves it behind. Say so
+    # here; tests/test_risky_component_designation.py fails on the same list.
+    behind = survey_problems(survey, data, designation_labels(text))
+    for problem in behind:
+        print(f"{SURVEY.name} needs a new survey: {problem}", file=sys.stderr)
+    return 1 if behind else 0
 
 
 if __name__ == "__main__":

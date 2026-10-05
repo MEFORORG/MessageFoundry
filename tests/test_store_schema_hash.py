@@ -167,3 +167,38 @@ def test_pending_approvals_requester_user_id_present_on_all_backends() -> None:
         "ALTER TABLE pending_approvals ADD COLUMN IF NOT EXISTS requester_user_id TEXT"
         in postgres._SCHEMA
     )
+
+
+def test_known_login_addresses_table_present_on_all_backends() -> None:
+    # vault BACKLOG #2145: the first-seen sign-in address record must exist in ALL THREE backend
+    # schemas, keyed (user_id, address) so the signal's one read is a primary-key lookup. On the
+    # server backends the DDL lives in _SCHEMA, which is what moves _schema_hash.
+    from messagefoundry.store import store as sqlite_store
+
+    assert "CREATE TABLE IF NOT EXISTS known_login_addresses" in sqlite_store._SCHEMA
+    assert "PRIMARY KEY (user_id, address)" in sqlite_store._SCHEMA
+    # The best-effort write may race delete_user; the cascade removes what it left behind.
+    assert (
+        "user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE," in sqlite_store._SCHEMA
+    )
+
+    sqlserver = pytest.importorskip(
+        "messagefoundry.store.sqlserver", reason="requires the sqlserver extra (aioodbc)"
+    )
+    assert any(
+        "CREATE TABLE known_login_addresses" in s
+        and "PRIMARY KEY (user_id, address)" in s
+        and "Latin1_General_100_BIN2" in s
+        and "REFERENCES users(id) ON DELETE CASCADE" in s
+        for s in sqlserver._SCHEMA
+    )
+
+    postgres = pytest.importorskip(
+        "messagefoundry.store.postgres", reason="requires the postgres extra (asyncpg)"
+    )
+    assert any(
+        "CREATE TABLE IF NOT EXISTS known_login_addresses" in s
+        and "PRIMARY KEY (user_id, address)" in s
+        and "REFERENCES users(id) ON DELETE CASCADE" in s
+        for s in postgres._SCHEMA
+    )

@@ -52,6 +52,7 @@ from messagefoundry.transports.direct import DirectDestination
 from messagefoundry.transports.egress import check_egress_allowed
 from tests.test_email_destination import (
     _ALL_ATEXT_SENDER,
+    _DOMAIN_ON_THE_WIRE,
     _NORMALISED_RECIPIENTS,
     _REFUSED_ADDRESS_IDS,
     _REFUSED_ADDRESSES,
@@ -520,6 +521,18 @@ def test_direct_refuses_an_address_that_is_not_one_plain_mailbox_before_any_conn
         _wire_direct(monkeypatch, pki, wire.port, **{field: setting})
     assert wire.connections == 0
     assert wire.mail_lines == []
+
+
+def test_direct_refuses_a_bare_ip_domain_by_the_domain_rule(
+    monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any], wire: _WireCapture
+) -> None:
+    # The reason pins the domain rule as what refused, not some later recipient check
+    # (vault BACKLOG #2911).
+    with pytest.raises(ValueError, match="start with a letter"):
+        _wire_direct(
+            monkeypatch, pki, wire.port, recipients=[_DOMAIN_ON_THE_WIRE["domain-hex-last-part"]]
+        )
+    assert wire.connections == 0
 
 
 async def test_direct_send_passes_both_halves_of_the_envelope(
