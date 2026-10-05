@@ -159,14 +159,15 @@ SURVEY_HEADING = "### What each wheel carries inside it"
 #: A survey answer to "does the pinned wheel carry another project's compiled code". The last one
 #: counts as carrying wherever a route is decided: a guessed "no" is what the survey exists to stop.
 CARRIES = ("yes", "no", "not established")
-#: What an answer may rest on. A ``none-any`` wheel tag can only ever support "no".
-EVIDENCE_KINDS = ("wheel tag", "wheel file list and source tree", "project metadata")
+#: What an answer may rest on. A ``none-any`` wheel whose files were listed can only support "no".
+#: Project metadata lists no file, so it can never support "no".
+TAG_AND_LIST = "wheel tag and file list"
+METADATA_ONLY = "project metadata"
+EVIDENCE_KINDS = (TAG_AND_LIST, "wheel file list and source tree", METADATA_ONLY)
 #: What the page does about a not-designated wheel that carries: highlight it as risky on what it
 #: carries, or read the carried project's own advisories. A ``read`` route records these fields.
 ROUTES = ("highlight", "read")
 READ_FIELDS = ("source", "date", "version", "result")
-#: A project version the survey records in words. A table cell names the project without it.
-_NO_VERSION = ("not established", "as locked")
 
 
 class Advisory(TypedDict):
@@ -590,7 +591,17 @@ def snapshot(as_of: dt.date, fetch: Fetch = fetch_json) -> dict[str, Any]:
 
 def _needs_route(wheel: Mapping[str, Any], labels: Mapping[str, str]) -> bool:
     """Whether the page owes this wheel a route: it is not designated, and "no" was not shown."""
-    return wheel["name"] not in labels and wheel["carries"] != "no"
+    return wheel["name"] not in labels and wheel.get("carries") != "no"
+
+
+def _said(value: object) -> bool:
+    """Whether a recorded field says anything: a JSON null, or blank text, does not."""
+    return bool(str(value or "").strip())
+
+
+def _file_key(text: str) -> str:
+    """A distribution file name, or a ``name-version`` pair, in one comparable spelling."""
+    return re.sub(r"[-_.]+", "-", text).lower()
 
 
 def survey_problems(
@@ -599,8 +610,10 @@ def survey_problems(
     """Where the survey fails to answer for the snapshot's population, or to route what it found.
 
     One answer per reading, at the reading's pin, so a re-read that moves a pin leaves the survey
-    behind visibly. A not-designated wheel that carries, or whose answer is not established, must
-    have a route; a designated wheel, or one shown to carry nothing, must have none.
+    behind visibly. Each answer names the files it was read from, and each file name must carry
+    the surveyed pin, so moving the pin alone does not pass. A not-designated wheel that carries,
+    or whose answer is not established, must have a route; a designated wheel, or one shown to
+    carry nothing, must have none. A missing field is reported, never raised.
     """
     problems: list[str] = []
     pins = {r["name"]: r["pinned"] for r in data["readings"]}
@@ -616,60 +629,86 @@ def survey_problems(
     if stray:
         problems.append(f"the survey answers for {stray}, which the snapshot does not read")
     for name, wheel in sorted(answers.items()):
-        if name in pins and wheel["pinned"] != pins[name]:
-            problems.append(
-                f"{name}: surveyed at {wheel['pinned']}, the snapshot reads {pins[name]}"
-            )
-        carries, kind = wheel["carries"], wheel["evidence_kind"]
+        pinned = str(wheel.get("pinned"))
+        if name in pins and pinned != pins[name]:
+            problems.append(f"{name}: surveyed at {pinned}, the snapshot reads {pins[name]}")
+        try:
+            dt.date.fromisoformat(str(wheel.get("surveyed")))
+        except ValueError:
+            problems.append(f"{name}: no date is recorded for the answer")
+        carries, kind = wheel.get("carries"), wheel.get("evidence_kind")
+        projects = wheel.get("projects") or []
+        files = [str(f.get("file", "")) for f in wheel.get("files_read") or []]
         if carries not in CARRIES:
             problems.append(f"{name}: the answer {carries!r} is not one of {CARRIES}")
-        if kind not in EVIDENCE_KINDS or not str(wheel["evidence"]).strip():
+        if kind not in EVIDENCE_KINDS or not _said(wheel.get("evidence")):
             problems.append(f"{name}: no evidence of a known kind is recorded")
-        if kind == "wheel tag" and carries != "no":
-            problems.append(f"{name}: a wheel tag cannot show that a wheel carries compiled code")
-        if (carries == "yes") != bool(wheel["projects"]):
+        if (carries == "yes") != bool(projects) or not all(
+            _said(p.get("name")) and _said(p.get("version")) for p in projects
+        ):
             problems.append(f"{name}: the answer {carries!r} does not match the projects named")
-        route = wheel["route"]
+        # Project metadata lists no file, so it cannot show that a wheel carries nothing.
+        if kind == METADATA_ONLY:
+            if carries == "no":
+                problems.append(f"{name}: project metadata cannot show a wheel carries nothing")
+        elif not files or not all(
+            _file_key(f).startswith(_file_key(f"{name}-{pinned}") + "-") for f in files
+        ):
+            problems.append(f"{name}: the files read are not named, or not at the surveyed pin")
+        elif kind == TAG_AND_LIST and (
+            carries != "no" or not all(f.endswith("-none-any.whl") for f in files)
+        ):
+            problems.append(f"{name}: a none-any answer needs a none-any wheel that carries none")
+        route = wheel.get("route")
         if not _needs_route(wheel, labels):
             if route is not None:
                 problems.append(f"{name}: a route is recorded where the page owes none")
-        elif route not in ROUTES or not str(wheel["route_reason"] or "").strip():
+        elif route not in ROUTES or not _said(wheel.get("route_reason")):
             problems.append(f"{name}: not designated and not shown to carry nothing, with no route")
         elif route == "read" and not all(
-            str((wheel.get("read") or {}).get(field, "")).strip() for field in READ_FIELDS
+            _said((wheel.get("read") or {}).get(field)) for field in READ_FIELDS
         ):
             problems.append(f"{name}: a read route must record {READ_FIELDS}")
     return problems
 
 
 def _carried(wheel: Mapping[str, Any]) -> str:
-    """What the wheel carries, for a table cell: each project, with its version where one is read."""
-    if not wheel["projects"]:
-        return "not established"
-    return "; ".join(
-        p["name"] + ("" if p["version"] in _NO_VERSION else f" {p['version']}")
-        for p in wheel["projects"]
+    """What the wheel carries, for a table cell: each project, and its version or the lack of one."""
+    words = {"not established": ", version not established", "as locked": ""}
+    return (
+        "; ".join(
+            str(p.get("name")) + words.get(str(p.get("version")), f" {p.get('version')}")
+            for p in wheel.get("projects") or []
+        )
+        or "not established"
     )
+
+
+def _surveyed_on(wheels: list[Mapping[str, Any]]) -> str:
+    """The day the answers were made, or the span of days where some were made again later."""
+    days = sorted({str(w.get("surveyed")) for w in wheels})
+    return f"on {days[0]}" if len(days) == 1 else f"between {days[0]} and {days[-1]}"
 
 
 def _render_survey(survey: Mapping[str, Any], labels: Mapping[str, str]) -> list[str]:
     """The survey subsection: what was found, on what evidence, and the route each wheel took."""
     wheels = sorted(survey["wheels"], key=lambda w: str(w["name"]))
     size = len(wheels)
-    counts = {answer: sum(w["carries"] == answer for w in wheels) for answer in CARRIES}
+    counts = {answer: sum(w.get("carries") == answer for w in wheels) for answer in CARRIES}
     routed = [w for w in wheels if _needs_route(w, labels)]
 
     def route(wheel: Mapping[str, Any]) -> str:
         if wheel["name"] in labels:
             return f"designated, {labels[wheel['name']]}"
-        return {"highlight": "highlighted below", "read": "read below"}.get(wheel["route"], "none")
+        words = {"highlight": "highlighted below", "read": "read below"}
+        return words.get(str(wheel.get("route")), "none")
 
     out = [
         SURVEY_HEADING,
         "",
         "The vulnerability-history test reads advisories by PyPI name. This survey asks what "
         f"that test cannot: whether each of the {size} pinned wheels carries compiled code from "
-        f"another project. It was made by hand on {survey['survey_date']}, against the pins the "
+        f"another project. It was made by hand {_surveyed_on(wheels)}, against the pins the "
         "snapshot reads. Its evidence, the files read and their hashes are recorded in "
         "[`security/bundled-code-survey.json`](../security/bundled-code-survey.json). A run of "
         "the script does not repeat it.",
@@ -684,13 +723,16 @@ def _render_survey(survey: Mapping[str, Any], labels: Mapping[str, str]) -> list
         "|---|---|---|---|---|",
     ]
     out += [
-        f"| `{w['name']}` | {w['pinned']} | {_carried(w)} | {w['evidence_kind']} | {route(w)} |"
+        f"| `{w['name']}` | {w.get('pinned')} | {_carried(w)} | {w.get('evidence_kind')} "
+        f"| {route(w)} |"
         for w in wheels
-        if w["carries"] != "no"
+        if w.get("carries") != "no"
     ]
     for kind in EVIDENCE_KINDS:
         names = [
-            f"`{w['name']}`" for w in wheels if w["carries"] == "no" and w["evidence_kind"] == kind
+            f"`{w['name']}`"
+            for w in wheels
+            if w.get("carries") == "no" and w.get("evidence_kind") == kind
         ]
         if names:
             out += [
@@ -702,9 +744,11 @@ def _render_survey(survey: Mapping[str, Any], labels: Mapping[str, str]) -> list
             ]
     out += [
         "",
-        "A wheel tagged `none-any` holds no compiled code at all. For a compiled wheel, a file "
-        "list shows a bundled library and cannot show code linked into an extension, so the "
-        "pinned source distribution was read too.",
+        "Each answer rests on the files the record names. A wheel tagged `none-any` had its file "
+        "list read as well as its tag. For a compiled wheel, the Linux x86_64 and Windows amd64 "
+        "wheels were read, where the lock carries them. A file list shows a bundled library and "
+        "cannot show code linked into an extension, so the pinned source distribution was read "
+        "too. A wheel for another platform was not read, and can carry something else.",
         "",
         "A designated wheel is already highlighted, by its tier. "
         + _count(len(routed), "wheel is", "wheels are")
@@ -712,7 +756,7 @@ def _render_survey(survey: Mapping[str, Any], labels: Mapping[str, str]) -> list
         "page highlights it as risky on what it carries, or reads the carried project's own "
         "advisories.",
     ]
-    highlighted = [w for w in routed if w["route"] == "highlight"]
+    highlighted = [w for w in routed if w.get("route") == "highlight"]
     if highlighted:
         out += [
             "",
@@ -721,14 +765,15 @@ def _render_survey(survey: Mapping[str, Any], labels: Mapping[str, str]) -> list
             "| Component | Carries | Why |",
             "|---|---|---|",
         ]
-        out += [f"| `{w['name']}` | {_carried(w)} | {w['route_reason']} |" for w in highlighted]
+        out += [f"| `{w['name']}` | {_carried(w)} | {w.get('route_reason')} |" for w in highlighted]
         out += [
             "",
             "No advisory for a carried project was read for these. A reader who needs that has "
-            "to check the carried project's own security notices against the version named. "
+            "to check the carried project's own security notices against the version the pinned "
+            "wheel carries. Where the table gives no version, the survey did not establish one. "
             "Highlighting here does not move a wheel into a tier.",
         ]
-    read = [w for w in routed if w["route"] == "read"]
+    read = [w for w in routed if w.get("route") == "read"]
     if read:
         out += [
             "",
@@ -739,7 +784,7 @@ def _render_survey(survey: Mapping[str, Any], labels: Mapping[str, str]) -> list
         ]
         out += [
             f"| `{w['name']}` | {_carried(w)} | "
-            + " | ".join(str(w["read"][field]) for field in READ_FIELDS)
+            + " | ".join(str((w.get("read") or {}).get(field)) for field in READ_FIELDS)
             + " |"
             for w in read
         ]

@@ -151,7 +151,7 @@ rather than trusting that it is.
 
 Not designated is a statement about the tiers only. A wheel in this table can still carry another
 project's compiled code. *What each wheel carries inside it*, in the ASVS reading further down,
-says which wheels do and highlights the ones that are not designated.
+says which wheels do, and the route this page takes for each one that is not designated.
 
 ## The `sqlserver` extra
 
@@ -223,7 +223,7 @@ On the reading of 2026-10-03, the harness imports four Qt modules: `QtCore`, `Qt
 
 | Component | Why not |
 |---|---|
-| `pyside6` | a metadistribution: the `PySide6` package initialiser, typing stubs and tool launchers. It ships no compiled module and parses no input. It exists to pull in the other three |
+| `pyside6` | a metadistribution: the `PySide6` package initialiser, typing stubs and tool launchers. It parses no input, and it exists to pull in the other three. This row took it to ship no compiled module. The survey further down did not list the wheel's files, so it records that as not established |
 | `pyside6-addons` | compiled, but it holds only Qt modules the harness never imports, among them the web engine, multimedia, PDF, serial port and HTTP server modules. None of them runs, so none sees input. A harness change that imports one needs this row read again |
 
 So 2 plus 2 is 4, and 34 plus 4 is 38.
@@ -268,14 +268,16 @@ A flaw filed against Qt itself, and not against one of those PyPI names, does no
 reading. So the vulnerability-history example is read for the names of the wheels and not for the Qt
 they carry. A name in that reading's *Not risky on any of the three* table is under the same limit.
 
-That is a limit of the instrument. The same generated reading answers it under *What each wheel
-carries inside it*. That survey says, for every wheel this page assesses, whether the pinned wheel
-carries another project's compiled code, and on what evidence. The designated wheels here are
-already highlighted by the table above. A wheel that is not designated, and that the survey did not
-show to carry nothing, is highlighted there as risky on what it carries.
+That is a limit of the instrument. The same generated reading narrows it, under *What each wheel
+carries inside it*, and does not by itself close it. That survey says, for every wheel this page
+assesses, whether the pinned wheel carries another project's compiled code, and on what evidence.
+The designated wheels here are already highlighted by the table above. A wheel that is not
+designated, and that the survey did not show to carry nothing, takes one of the two routes stated
+there.
 
-The survey did not fetch the PySide6 wheels and read no Qt advisory. A reader who needs the Qt side
-still has to check Qt's own security notices against the Qt version the pinned wheels carry.
+That subsection says whether any advisory for Qt was read, and what the survey could not establish.
+Where it read none, a reader who needs the Qt side still has to check Qt's own security notices
+against the Qt version the pinned wheels carry.
 
 The pins to check are the ones in
 [`security/runtime-closure-harness.txt`](../security/runtime-closure-harness.txt). The table's
@@ -415,28 +417,31 @@ A wheel whose answer is not established is treated as carrying.
 
 | Component | Pinned | Carries | Evidence | Route |
 |---|---|---|---|---|
-| `argon2-cffi-bindings` | 26.1.0 | Argon2 reference implementation (phc-winner-argon2) | wheel file list and source tree | designated, tier 2 |
-| `cffi` | 2.1.1 | libffi | wheel file list and source tree | designated, tier 2 |
+| `argon2-cffi-bindings` | 26.1.0 | Argon2 reference implementation (phc-winner-argon2), version not established | wheel file list and source tree | designated, tier 2 |
+| `cffi` | 2.1.1 | libffi, version not established | wheel file list and source tree | designated, tier 2 |
 | `cryptography` | 50.0.1 | OpenSSL 4.0.2; Rust crates, the 40 entries of the source distribution's `Cargo.lock` | wheel file list and source tree | designated, tier 2 |
 | `httptools` | 0.8.0 | llhttp 9.4.1; http-parser 2.9.4 | wheel file list and source tree | designated, tier 3 |
 | `pydantic-core` | 2.46.5 | Rust crates, the 104 entries of the source distribution's `Cargo.lock` | wheel file list and source tree | designated, tier 1 |
 | `pyside6` | 6.11.2 | not established | project metadata | highlighted below |
-| `pyside6-addons` | 6.11.2 | Qt | project metadata | highlighted below |
-| `pyside6-essentials` | 6.11.2 | Qt | project metadata | designated, the `harness` extra |
+| `pyside6-addons` | 6.11.2 | Qt, version not established | project metadata | highlighted below |
+| `pyside6-essentials` | 6.11.2 | Qt, version not established | project metadata | designated, the `harness` extra |
 | `shiboken6` | 6.11.2 | not established | project metadata | designated, the `harness` extra |
 | `uvloop` | 0.22.1 | libuv 1.48.0 | wheel file list and source tree | highlighted below |
 
-26 wheels were found to carry none, on the evidence of the wheel tag: `aioodbc`, `aiosqlite`,
-`annotated-doc`, `annotated-types`, `anyio`, `argon2-cffi`, `certifi`, `click`, `fastapi`, `h11`,
-`hl7apy`, `httpcore`, `httpx`, `idna`, `ldap3`, `pyasn1`, `pycparser`, `pydantic`, `pyspnego`,
-`starlette`, `tomlkit`, `truststore`, `typing-extensions`, `typing-inspection`, `tzdata`, `uvicorn`.
+26 wheels were found to carry none, on the evidence of the wheel tag and file list: `aioodbc`,
+`aiosqlite`, `annotated-doc`, `annotated-types`, `anyio`, `argon2-cffi`, `certifi`, `click`,
+`fastapi`, `h11`, `hl7apy`, `httpcore`, `httpx`, `idna`, `ldap3`, `pyasn1`, `pycparser`, `pydantic`,
+`pyspnego`, `starlette`, `tomlkit`, `truststore`, `typing-extensions`, `typing-inspection`,
+`tzdata`, `uvicorn`.
 
 4 wheels were found to carry none, on the evidence of the wheel file list and source tree: `psutil`,
 `pyodbc`, `sspilib`, `websockets`.
 
-A wheel tagged `none-any` holds no compiled code at all. For a compiled wheel, a file list shows a
-bundled library and cannot show code linked into an extension, so the pinned source distribution was
-read too.
+Each answer rests on the files the record names. A wheel tagged `none-any` had its file list read as
+well as its tag. For a compiled wheel, the Linux x86_64 and Windows amd64 wheels were read, where
+the lock carries them. A file list shows a bundled library and cannot show code linked into an
+extension, so the pinned source distribution was read too. A wheel for another platform was not
+read, and can carry something else.
 
 A designated wheel is already highlighted, by its tier. 3 wheels are not designated and not shown to
 carry nothing. Each takes one of two routes: this page highlights it as risky on what it carries, or
@@ -447,12 +452,13 @@ reads the carried project's own advisories.
 | Component | Carries | Why |
 |---|---|---|
 | `pyside6` | not established | The answer is not established, so the wheel is treated as carrying. A file listing of the pinned wheel would settle it. |
-| `pyside6-addons` | Qt | It holds compiled Qt modules, among them the web engine, multimedia and PDF modules. The harness imports none of them, but an install puts them on disk. A flaw filed against Qt names Qt, not `pyside6-addons`, so the vulnerability-history reading would not show it. |
+| `pyside6-addons` | Qt, version not established | It holds compiled Qt modules, among them the web engine, multimedia and PDF modules. The harness imports none of them, but an install puts them on disk. A flaw filed against Qt names Qt, not `pyside6-addons`, so the vulnerability-history reading would not show it. |
 | `uvloop` | libuv 1.48.0 | libuv is the event loop's I/O layer, so the socket reads and writes of an engine that runs on `uvloop` go through it. An advisory against libuv names libuv, not `uvloop`, so the vulnerability-history reading would not show it. |
 
 No advisory for a carried project was read for these. A reader who needs that has to check the
-carried project's own security notices against the version named. Highlighting here does not move a
-wheel into a tier.
+carried project's own security notices against the version the pinned wheel carries. Where the table
+gives no version, the survey did not establish one. Highlighting here does not move a wheel into a
+tier.
 
 ### The names the assessed extras add
 

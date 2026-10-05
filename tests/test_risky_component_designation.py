@@ -1181,9 +1181,10 @@ def _owed_a_route(survey: dict[str, Any]) -> set[str]:
 def _survey_page_drift(page: str, survey: dict[str, Any]) -> list[str]:
     """Where the page's survey subsection disagrees with the record. Not through the renderer."""
     section = _region(_SURVEY_HEADING, _EXTRA_NAMES, page)
-    found, _, highlighted = section.partition(f"\n{_HIGHLIGHTED}\n")
-    # A read route renders its own table after the highlighted one; its names are not highlights.
-    highlighted = highlighted.partition(f"\n{_READ}\n")[0]
+    # Three tables, in this order; the second and third are each there only when a wheel took
+    # that route. Split from the end, so a missing middle table does not swallow the last one.
+    head, _, read = section.partition(f"\n{_READ}\n")
+    found, _, highlighted = head.partition(f"\n{_HIGHLIGHTED}\n")
     wheels = survey["wheels"]
     counts = {a: sum(w["carries"] == a for w in wheels) for a in component_readings.CARRIES}
     size = len(wheels)
@@ -1197,12 +1198,15 @@ def _survey_page_drift(page: str, survey: dict[str, Any]) -> list[str]:
         problems.append(f"the page does not state {sentence!r}")
     carrying = {w["name"] for w in wheels if w["carries"] != "no"}
     if _table_names(found) != carrying:
-        problems.append(f"found: page names {sorted(_table_names(found))}, the survey {carrying}")
-    want = {w["name"] for w in wheels if w["route"] == "highlight"}
-    if _table_names(highlighted) != want:
         problems.append(
-            f"highlighted: page names {sorted(_table_names(highlighted))}, the survey {want}"
+            f"found: page names {sorted(_table_names(found))}, the survey {sorted(carrying)}"
         )
+    for label, table, route in (("highlighted", highlighted, "highlight"), ("read", read, "read")):
+        want = {w["name"] for w in wheels if w["route"] == route}
+        if _table_names(table) != want:
+            problems.append(
+                f"{label}: page names {sorted(_table_names(table))}, the survey {sorted(want)}"
+            )
     return problems
 
 
@@ -1245,64 +1249,105 @@ def test_the_page_states_what_the_survey_found_and_the_route_each_wheel_took() -
 
 
 def test_the_survey_checks_can_fail() -> None:
-    """RED when: a survey check stops seeing a missing answer, a missing route or a stale page.
+    """RED when: a survey check stops seeing a missing answer, a missing route, a guessed "no" or
+    a stale page.
 
-    THE POSITIVE CONTROL FOR THE TWO TESTS ABOVE. Each mutation is built from the record, so it
-    survives the next survey.
+    THE POSITIVE CONTROL FOR THE TWO TESTS ABOVE. Every mutation starts from two wheels picked by
+    what they are, not by where they sit: a not-designated wheel shown to carry nothing, and a
+    designated one. Each is first rewritten into a known shape, so this holds whatever routes a
+    later survey records.
     """
     page = _DOC.read_text(encoding="utf-8")
     data, survey = _snapshot(), _survey()
     labels = component_readings.designation_labels(page)
     wheels = survey["wheels"]
+    carried = [{"name": "another project", "version": "1.0"}]
+    plain = next(w for w in wheels if w["name"] not in labels and w["carries"] == "no")
+    ranked = next(w for w in wheels if w["name"] in labels)
+    # The same two wheels in a known shape: one routed and highlighted, one designated and carrying.
+    routed = {
+        **plain,
+        "carries": "yes",
+        "projects": carried,
+        "evidence_kind": component_readings.METADATA_ONLY,
+        "route": "highlight",
+        "route_reason": "a reason",
+    }
+    designated = {
+        **ranked,
+        "carries": "yes",
+        "projects": carried,
+        "evidence_kind": component_readings.METADATA_ONLY,
+        "route": None,
+    }
+    base = [routed if w is plain else designated if w is ranked else w for w in wheels]
 
     def problems(changed: list[dict[str, Any]]) -> list[str]:
         return component_readings.survey_problems({**survey, "wheels": changed}, data, labels)
 
     def swap(target: dict[str, Any], **change: Any) -> list[dict[str, Any]]:
-        return [{**w, **change} if w is target else w for w in wheels]
+        return [{**w, **change} if w is target else w for w in base]
 
-    routed = next(w for w in wheels if w["route"] is not None)
-    designated = next(w for w in wheels if w["name"] in labels and w["carries"] == "yes")
-    tagged = next(w for w in wheels if w["evidence_kind"] == "wheel tag")
+    assert problems(base) == []
+    read = {"source": "a source", "date": "2026-01-01", "version": "1.0", "result": "a result"}
+    assert problems(swap(routed, route="read", read=read)) == []
+    name, rank = routed["name"], designated["name"]
     for changed, problem in (
-        (wheels[1:], f"no survey answer for ['{wheels[0]['name']}']"),
-        (
-            [*wheels, {**wheels[0], "name": "not-a-member"}],
-            "the survey answers for ['not-a-member']",
-        ),
-        ([*wheels, wheels[0]], f"the survey answers for {wheels[0]['name']} twice"),
-        (swap(routed, pinned="0.0.0-not-the-pin"), f"{routed['name']}: surveyed at"),
-        (swap(routed, route=None), f"{routed['name']}: not designated"),
-        (swap(routed, route_reason=" "), f"{routed['name']}: not designated"),
-        (swap(routed, route="read"), f"{routed['name']}: a read route must record"),
-        (swap(designated, route="highlight"), f"{designated['name']}: a route is recorded"),
-        (swap(designated, carries="maybe"), f"{designated['name']}: the answer 'maybe'"),
-        (swap(designated, projects=[]), f"{designated['name']}: the answer 'yes' does not match"),
-        (swap(designated, evidence=""), f"{designated['name']}: no evidence"),
-        (swap(tagged, carries="not established"), f"{tagged['name']}: a wheel tag cannot"),
+        (base[1:], f"no survey answer for ['{base[0]['name']}']"),
+        ([*base, {**base[0], "name": "not-a-member"}], "the survey answers for ['not-a-member']"),
+        ([*base, base[0]], f"the survey answers for {base[0]['name']} twice"),
+        (swap(routed, pinned="0.0.0-not-the-pin"), f"{name}: surveyed at"),
+        (swap(routed, surveyed="not a date"), f"{name}: no date"),
+        (swap(routed, route=None), f"{name}: not designated"),
+        (swap(routed, route_reason=None), f"{name}: not designated"),
+        (swap(routed, route_reason=" "), f"{name}: not designated"),
+        (swap(routed, route="read"), f"{name}: a read route must record"),
+        (swap(routed, route="read", read={**read, "result": None}), f"{name}: a read route"),
+        (swap(designated, route="highlight"), f"{rank}: a route is recorded"),
+        (swap(designated, carries="maybe"), f"{rank}: the answer 'maybe'"),
+        (swap(designated, projects=[]), f"{rank}: the answer 'yes' does not match"),
+        (swap(designated, projects=[{"name": "x"}]), f"{rank}: the answer 'yes' does not match"),
+        (swap(designated, evidence=None), f"{rank}: no evidence"),
+        (swap(designated, evidence_kind="hearsay"), f"{rank}: no evidence"),
+        # A guessed "no", resting on metadata that lists no file.
+        (swap(designated, carries="no", projects=[]), f"{rank}: project metadata cannot"),
     ):
         found = problems(changed)
         assert any(line.startswith(problem) for line in found), (problem, found)
-    # A wheel shown to carry nothing that loses that answer is owed a route it does not have.
-    clean = next(w for w in wheels if w["name"] not in labels and w["carries"] == "no")
-    unsure = swap(clean, carries="not established", evidence_kind="project metadata")
-    assert any(line.startswith(f"{clean['name']}: not designated") for line in problems(unsure))
-    assert clean["name"] in _owed_a_route({**survey, "wheels": unsure})
-    # The page side: a changed answer, a changed route and a dropped row each show.
+    # The files behind an answer, on the tracked record: none named, another version's file, and
+    # a none-any answer that says a wheel carries or that names a file with another tag.
+    tagged = next(w for w in wheels if w["evidence_kind"] == component_readings.TAG_AND_LIST)
+    stem = tagged["name"]
+    unnamed, none_any = f"{stem}: the files read are not named", f"{stem}: a none-any answer"
+    for change, problem in (
+        ({"files_read": []}, unnamed),
+        ({"files_read": [{"file": f"{stem}-0.0.0-py3-none-any.whl"}]}, unnamed),
+        ({"carries": "yes", "projects": carried}, none_any),
+        ({"files_read": [{"file": f"{stem}-{tagged['pinned']}.tar.gz"}]}, none_any),
+    ):
+        found = problems([{**w, **change} if w is tagged else w for w in wheels])
+        assert any(line.startswith(problem) for line in found), (problem, found)
+    # The names owed a route, by this module's own rule, follow the answer.
+    assert name in _owed_a_route({**survey, "wheels": base})
+    assert name not in _owed_a_route(survey)
+
+    # The page side. Each mutated survey is rendered into a copy of the page, which then agrees
+    # with that survey and disagrees with every other one.
     assert _survey_page_drift(page, survey) == []
-    for changed in (unsure, swap(routed, route="read"), swap(designated, carries="no")):
-        assert _survey_page_drift(page, {**survey, "wheels": changed}), changed
-    row = next(
-        ln
-        for ln in _region(_SURVEY_HEADING, _EXTRA_NAMES, page)
-        .partition(_HIGHLIGHTED)[2]
-        .splitlines()
-        if ln.startswith("| `")
-    )
-    drift = _survey_page_drift(page.replace(row + "\n", ""), survey)
-    assert any(line.startswith("highlighted:") for line in drift), drift
-    tracked = component_readings.section_of(page)
-    assert component_readings.render_section(data, labels, {**survey, "wheels": unsure}) != tracked
+    as_read = swap(routed, route="read", read=read)
+    for changed, table in ((base, "highlighted:"), (as_read, "read:")):
+        mutated = {**survey, "wheels": changed}
+        rendered = component_readings.render_page(page, data, mutated)
+        assert _survey_page_drift(rendered, mutated) == []
+        assert f"| `{name}` |" in _region(_SURVEY_HEADING, _EXTRA_NAMES, rendered)
+        drift = _survey_page_drift(page, mutated)
+        assert any(line.startswith(table) for line in drift), (table, drift)
+        assert component_readings.section_of(rendered) != component_readings.section_of(page)
+    # A row dropped from the first table moves no count, so only the names check can see it.
+    section = _region(_SURVEY_HEADING, _EXTRA_NAMES, page)
+    row = next(ln for ln in section.splitlines() if ln.startswith("| `"))
+    drift = _survey_page_drift(page.replace(row + "\n", "", 1), survey)
+    assert [line.partition(":")[0] for line in drift] == ["found"], drift
 
 
 def test_the_generator_reads_a_component_from_fake_replies() -> None:

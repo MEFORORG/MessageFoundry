@@ -1,14 +1,14 @@
 {
   "subject": "Survey of which pinned wheels carry another project's compiled code (BACKLOG #2935, ASVS 15.1.4)",
-  "survey_date": "2026-10-04",
   "readings": "security/risky-component-readings.json",
   "method": [
     "The population and the pins are those of the readings snapshot named above.",
-    "A wheel tagged none-any holds no compiled code; the tag is the evidence.",
-    "For any other wheel, the pinned Linux x86_64 wheel for CPython 3.14 or abi3, and the Windows amd64 one, were downloaded from PyPI, their sha256 checked against the lock, and their contents listed. Nothing was installed or run. Extension modules were searched as bytes for needed-library names and version strings.",
+    "A wheel tagged none-any was downloaded, its sha256 checked against the lock, and its file list read for compiled files. Nothing was installed or run.",
+    "For any other wheel, the pinned Linux x86_64 wheel for CPython 3.14 or abi3, and the Windows amd64 one, were downloaded and hash-checked the same way, and their contents listed. Extension modules were searched as bytes for needed-library names and version strings. A wheel for another platform was not read.",
     "A file list cannot show code linked into an extension, so the pinned source distribution was read as well, hash-checked the same way.",
     "The four PySide6 wheels were not fetched. Their answers rest on PyPI project metadata.",
-    "Where an answer could not be established, it is recorded as not established and the wheel is treated as carrying."
+    "Where an answer could not be established, it is recorded as not established and the wheel is treated as carrying.",
+    "Each answer carries the date it was made. A wheel surveyed again later carries its own date."
   ],
   "sources": {
     "pypi_release": "https://pypi.org/pypi/<name>/<version>/json",
@@ -23,8 +23,8 @@
       "pinned": "0.5.0",
       "carries": "no",
       "projects": [],
-      "evidence_kind": "wheel tag",
-      "evidence": "PyPI lists one wheel for the pinned version, `aioodbc-0.5.0-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "evidence_kind": "wheel tag and file list",
+      "evidence": "PyPI lists one wheel for the pinned version, `aioodbc-0.5.0-py3-none-any.whl`, tagged `none-any`. Its 12 files were listed, and none is a compiled file.",
       "files_read": [
         {
           "file": "aioodbc-0.5.0-py3-none-any.whl",
@@ -32,15 +32,16 @@
         }
       ],
       "route": null,
-      "route_reason": null
+      "route_reason": null,
+      "surveyed": "2026-10-04"
     },
     {
       "name": "aiosqlite",
       "pinned": "0.22.1",
       "carries": "no",
       "projects": [],
-      "evidence_kind": "wheel tag",
-      "evidence": "PyPI lists one wheel for the pinned version, `aiosqlite-0.22.1-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "evidence_kind": "wheel tag and file list",
+      "evidence": "PyPI lists one wheel for the pinned version, `aiosqlite-0.22.1-py3-none-any.whl`, tagged `none-any`. Its 15 files were listed, and none is a compiled file.",
       "files_read": [
         {
           "file": "aiosqlite-0.22.1-py3-none-any.whl",
@@ -48,15 +49,16 @@
         }
       ],
       "route": null,
-      "route_reason": null
+      "route_reason": null,
+      "surveyed": "2026-10-04"
     },
     {
       "name": "annotated-doc",
       "pinned": "0.0.5",
       "carries": "no",
       "projects": [],
-      "evidence_kind": "wheel tag",
-      "evidence": "PyPI lists one wheel for the pinned version, `annotated_doc-0.0.5-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "evidence_kind": "wheel tag and file list",
+      "evidence": "PyPI lists one wheel for the pinned version, `annotated_doc-0.0.5-py3-none-any.whl`, tagged `none-any`. Its 8 files were listed, and none is a compiled file.",
       "files_read": [
         {
           "file": "annotated_doc-0.0.5-py3-none-any.whl",
@@ -64,15 +66,16 @@
         }
       ],
       "route": null,
-      "route_reason": null
+      "route_reason": null,
+      "surveyed": "2026-10-04"
     },
     {
       "name": "annotated-types",
       "pinned": "0.8.0",
       "carries": "no",
       "projects": [],
-      "evidence_kind": "wheel tag",
-      "evidence": "PyPI lists one wheel for the pinned version, `annotated_types-0.8.0-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "evidence_kind": "wheel tag and file list",
+      "evidence": "PyPI lists one wheel for the pinned version, `annotated_types-0.8.0-py3-none-any.whl`, tagged `none-any`. Its 7 files were listed, and none is a compiled file.",
       "files_read": [
         {
           "file": "annotated_types-0.8.0-py3-none-any.whl",
@@ -80,15 +83,16 @@
         }
       ],
       "route": null,
-      "route_reason": null
+      "route_reason": null,
+      "surveyed": "2026-10-04"
     },
     {
       "name": "anyio",
       "pinned": "4.15.1",
       "carries": "no",
       "projects": [],
-      "evidence_kind": "wheel tag",
-      "evidence": "PyPI lists one wheel for the pinned version, `anyio-4.15.1-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "evidence_kind": "wheel tag and file list",
+      "evidence": "PyPI lists one wheel for the pinned version, `anyio-4.15.1-py3-none-any.whl`, tagged `none-any`. Its 53 files were listed, and none is a compiled file.",
       "files_read": [
         {
           "file": "anyio-4.15.1-py3-none-any.whl",
@@ -96,15 +100,16 @@
         }
       ],
       "route": null,
-      "route_reason": null
+      "route_reason": null,
+      "surveyed": "2026-10-04"
     },
     {
       "name": "argon2-cffi",
       "pinned": "25.1.0",
       "carries": "no",
       "projects": [],
-      "evidence_kind": "wheel tag",
-      "evidence": "PyPI lists one wheel for the pinned version, `argon2_cffi-25.1.0-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "evidence_kind": "wheel tag and file list",
+      "evidence": "PyPI lists one wheel for the pinned version, `argon2_cffi-25.1.0-py3-none-any.whl`, tagged `none-any`. Its 13 files were listed, and none is a compiled file.",
       "files_read": [
         {
           "file": "argon2_cffi-25.1.0-py3-none-any.whl",
@@ -112,7 +117,8 @@
         }
       ],
       "route": null,
-      "route_reason": null
+      "route_reason": null,
+      "surveyed": "2026-10-04"
     },
     {
       "name": "argon2-cffi-bindings",
@@ -141,15 +147,16 @@
         }
       ],
       "route": null,
-      "route_reason": null
+      "route_reason": null,
+      "surveyed": "2026-10-04"
     },
     {
       "name": "certifi",
       "pinned": "2026.7.22",
       "carries": "no",
       "projects": [],
-      "evidence_kind": "wheel tag",
-      "evidence": "PyPI lists one wheel for the pinned version, `certifi-2026.7.22-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "evidence_kind": "wheel tag and file list",
+      "evidence": "PyPI lists one wheel for the pinned version, `certifi-2026.7.22-py3-none-any.whl`, tagged `none-any`. Its 12 files were listed, and none is a compiled file.",
       "files_read": [
         {
           "file": "certifi-2026.7.22-py3-none-any.whl",
@@ -157,7 +164,8 @@
         }
       ],
       "route": null,
-      "route_reason": null
+      "route_reason": null,
+      "surveyed": "2026-10-04"
     },
     {
       "name": "cffi",
@@ -186,15 +194,16 @@
         }
       ],
       "route": null,
-      "route_reason": null
+      "route_reason": null,
+      "surveyed": "2026-10-04"
     },
     {
       "name": "click",
       "pinned": "8.5.0",
       "carries": "no",
       "projects": [],
-      "evidence_kind": "wheel tag",
-      "evidence": "PyPI lists one wheel for the pinned version, `click-8.5.0-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "evidence_kind": "wheel tag and file list",
+      "evidence": "PyPI lists one wheel for the pinned version, `click-8.5.0-py3-none-any.whl`, tagged `none-any`. Its 22 files were listed, and none is a compiled file.",
       "files_read": [
         {
           "file": "click-8.5.0-py3-none-any.whl",
@@ -202,7 +211,8 @@
         }
       ],
       "route": null,
-      "route_reason": null
+      "route_reason": null,
+      "surveyed": "2026-10-04"
     },
     {
       "name": "cryptography",
@@ -235,15 +245,16 @@
         }
       ],
       "route": null,
-      "route_reason": null
+      "route_reason": null,
+      "surveyed": "2026-10-04"
     },
     {
       "name": "fastapi",
       "pinned": "0.141.1",
       "carries": "no",
       "projects": [],
-      "evidence_kind": "wheel tag",
-      "evidence": "PyPI lists one wheel for the pinned version, `fastapi-0.141.1-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "evidence_kind": "wheel tag and file list",
+      "evidence": "PyPI lists one wheel for the pinned version, `fastapi-0.141.1-py3-none-any.whl`, tagged `none-any`. Its 61 files were listed, and none is a compiled file.",
       "files_read": [
         {
           "file": "fastapi-0.141.1-py3-none-any.whl",
@@ -251,15 +262,16 @@
         }
       ],
       "route": null,
-      "route_reason": null
+      "route_reason": null,
+      "surveyed": "2026-10-04"
     },
     {
       "name": "h11",
       "pinned": "0.16.0",
       "carries": "no",
       "projects": [],
-      "evidence_kind": "wheel tag",
-      "evidence": "PyPI lists one wheel for the pinned version, `h11-0.16.0-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "evidence_kind": "wheel tag and file list",
+      "evidence": "PyPI lists one wheel for the pinned version, `h11-0.16.0-py3-none-any.whl`, tagged `none-any`. Its 17 files were listed, and none is a compiled file.",
       "files_read": [
         {
           "file": "h11-0.16.0-py3-none-any.whl",
@@ -267,15 +279,16 @@
         }
       ],
       "route": null,
-      "route_reason": null
+      "route_reason": null,
+      "surveyed": "2026-10-04"
     },
     {
       "name": "hl7apy",
       "pinned": "1.3.5",
       "carries": "no",
       "projects": [],
-      "evidence_kind": "wheel tag",
-      "evidence": "PyPI lists one wheel for the pinned version, `hl7apy-1.3.5-py2.py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "evidence_kind": "wheel tag and file list",
+      "evidence": "PyPI lists one wheel for the pinned version, `hl7apy-1.3.5-py2.py3-none-any.whl`, tagged `none-any`. Its 100 files were listed, and none is a compiled file.",
       "files_read": [
         {
           "file": "hl7apy-1.3.5-py2.py3-none-any.whl",
@@ -283,15 +296,16 @@
         }
       ],
       "route": null,
-      "route_reason": null
+      "route_reason": null,
+      "surveyed": "2026-10-04"
     },
     {
       "name": "httpcore",
       "pinned": "1.0.9",
       "carries": "no",
       "projects": [],
-      "evidence_kind": "wheel tag",
-      "evidence": "PyPI lists one wheel for the pinned version, `httpcore-1.0.9-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "evidence_kind": "wheel tag and file list",
+      "evidence": "PyPI lists one wheel for the pinned version, `httpcore-1.0.9-py3-none-any.whl`, tagged `none-any`. Its 36 files were listed, and none is a compiled file.",
       "files_read": [
         {
           "file": "httpcore-1.0.9-py3-none-any.whl",
@@ -299,7 +313,8 @@
         }
       ],
       "route": null,
-      "route_reason": null
+      "route_reason": null,
+      "surveyed": "2026-10-04"
     },
     {
       "name": "httptools",
@@ -332,15 +347,16 @@
         }
       ],
       "route": null,
-      "route_reason": null
+      "route_reason": null,
+      "surveyed": "2026-10-04"
     },
     {
       "name": "httpx",
       "pinned": "0.28.1",
       "carries": "no",
       "projects": [],
-      "evidence_kind": "wheel tag",
-      "evidence": "PyPI lists one wheel for the pinned version, `httpx-0.28.1-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "evidence_kind": "wheel tag and file list",
+      "evidence": "PyPI lists one wheel for the pinned version, `httpx-0.28.1-py3-none-any.whl`, tagged `none-any`. Its 29 files were listed, and none is a compiled file.",
       "files_read": [
         {
           "file": "httpx-0.28.1-py3-none-any.whl",
@@ -348,15 +364,16 @@
         }
       ],
       "route": null,
-      "route_reason": null
+      "route_reason": null,
+      "surveyed": "2026-10-04"
     },
     {
       "name": "idna",
       "pinned": "3.20",
       "carries": "no",
       "projects": [],
-      "evidence_kind": "wheel tag",
-      "evidence": "PyPI lists one wheel for the pinned version, `idna-3.20-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "evidence_kind": "wheel tag and file list",
+      "evidence": "PyPI lists one wheel for the pinned version, `idna-3.20-py3-none-any.whl`, tagged `none-any`. Its 16 files were listed, and none is a compiled file.",
       "files_read": [
         {
           "file": "idna-3.20-py3-none-any.whl",
@@ -364,15 +381,16 @@
         }
       ],
       "route": null,
-      "route_reason": null
+      "route_reason": null,
+      "surveyed": "2026-10-04"
     },
     {
       "name": "ldap3",
       "pinned": "2.9.1",
       "carries": "no",
       "projects": [],
-      "evidence_kind": "wheel tag",
-      "evidence": "PyPI lists one wheel for the pinned version, `ldap3-2.9.1-py2.py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "evidence_kind": "wheel tag and file list",
+      "evidence": "PyPI lists one wheel for the pinned version, `ldap3-2.9.1-py2.py3-none-any.whl`, tagged `none-any`. Its 118 files were listed, and none is a compiled file.",
       "files_read": [
         {
           "file": "ldap3-2.9.1-py2.py3-none-any.whl",
@@ -380,7 +398,8 @@
         }
       ],
       "route": null,
-      "route_reason": null
+      "route_reason": null,
+      "surveyed": "2026-10-04"
     },
     {
       "name": "psutil",
@@ -404,15 +423,16 @@
         }
       ],
       "route": null,
-      "route_reason": null
+      "route_reason": null,
+      "surveyed": "2026-10-04"
     },
     {
       "name": "pyasn1",
       "pinned": "0.6.4",
       "carries": "no",
       "projects": [],
-      "evidence_kind": "wheel tag",
-      "evidence": "PyPI lists one wheel for the pinned version, `pyasn1-0.6.4-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "evidence_kind": "wheel tag and file list",
+      "evidence": "PyPI lists one wheel for the pinned version, `pyasn1-0.6.4-py3-none-any.whl`, tagged `none-any`. Its 38 files were listed, and none is a compiled file.",
       "files_read": [
         {
           "file": "pyasn1-0.6.4-py3-none-any.whl",
@@ -420,15 +440,16 @@
         }
       ],
       "route": null,
-      "route_reason": null
+      "route_reason": null,
+      "surveyed": "2026-10-04"
     },
     {
       "name": "pycparser",
       "pinned": "3.0",
       "carries": "no",
       "projects": [],
-      "evidence_kind": "wheel tag",
-      "evidence": "PyPI lists one wheel for the pinned version, `pycparser-3.0-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "evidence_kind": "wheel tag and file list",
+      "evidence": "PyPI lists one wheel for the pinned version, `pycparser-3.0-py3-none-any.whl`, tagged `none-any`. Its 13 files were listed, and none is a compiled file.",
       "files_read": [
         {
           "file": "pycparser-3.0-py3-none-any.whl",
@@ -436,15 +457,16 @@
         }
       ],
       "route": null,
-      "route_reason": null
+      "route_reason": null,
+      "surveyed": "2026-10-04"
     },
     {
       "name": "pydantic",
       "pinned": "2.13.5",
       "carries": "no",
       "projects": [],
-      "evidence_kind": "wheel tag",
-      "evidence": "PyPI lists one wheel for the pinned version, `pydantic-2.13.5-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "evidence_kind": "wheel tag and file list",
+      "evidence": "PyPI lists one wheel for the pinned version, `pydantic-2.13.5-py3-none-any.whl`, tagged `none-any`. Its 111 files were listed, and none is a compiled file.",
       "files_read": [
         {
           "file": "pydantic-2.13.5-py3-none-any.whl",
@@ -452,7 +474,8 @@
         }
       ],
       "route": null,
-      "route_reason": null
+      "route_reason": null,
+      "surveyed": "2026-10-04"
     },
     {
       "name": "pydantic-core",
@@ -481,7 +504,8 @@
         }
       ],
       "route": null,
-      "route_reason": null
+      "route_reason": null,
+      "surveyed": "2026-10-04"
     },
     {
       "name": "pyodbc",
@@ -505,7 +529,8 @@
         }
       ],
       "route": null,
-      "route_reason": null
+      "route_reason": null,
+      "surveyed": "2026-10-04"
     },
     {
       "name": "pyside6",
@@ -516,7 +541,8 @@
       "evidence": "The wheel was not fetched or listed. PyPI gives it a platform tag and a size of about 0.6 MB, and its metadata requires `shiboken6`, `PySide6_Essentials` and `PySide6_Addons` at the same version. That does not show whether it holds a compiled file.",
       "files_read": [],
       "route": "highlight",
-      "route_reason": "The answer is not established, so the wheel is treated as carrying. A file listing of the pinned wheel would settle it."
+      "route_reason": "The answer is not established, so the wheel is treated as carrying. A file listing of the pinned wheel would settle it.",
+      "surveyed": "2026-10-04"
     },
     {
       "name": "pyside6-addons",
@@ -532,7 +558,8 @@
       "evidence": "The wheel was not fetched or listed. Its PyPI description says it includes Qt modules, and PyPI lists the Linux wheel at about 175 MB. The Qt version inside was not read.",
       "files_read": [],
       "route": "highlight",
-      "route_reason": "It holds compiled Qt modules, among them the web engine, multimedia and PDF modules. The harness imports none of them, but an install puts them on disk. A flaw filed against Qt names Qt, not `pyside6-addons`, so the vulnerability-history reading would not show it."
+      "route_reason": "It holds compiled Qt modules, among them the web engine, multimedia and PDF modules. The harness imports none of them, but an install puts them on disk. A flaw filed against Qt names Qt, not `pyside6-addons`, so the vulnerability-history reading would not show it.",
+      "surveyed": "2026-10-04"
     },
     {
       "name": "pyside6-essentials",
@@ -548,15 +575,16 @@
       "evidence": "The wheel was not fetched or listed. Its PyPI description says it includes the essential Qt modules, and PyPI lists the Linux wheel at about 80 MB. The Qt version inside was not read.",
       "files_read": [],
       "route": null,
-      "route_reason": null
+      "route_reason": null,
+      "surveyed": "2026-10-04"
     },
     {
       "name": "pyspnego",
       "pinned": "0.12.2",
       "carries": "no",
       "projects": [],
-      "evidence_kind": "wheel tag",
-      "evidence": "PyPI lists one wheel for the pinned version, `pyspnego-0.12.2-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "evidence_kind": "wheel tag and file list",
+      "evidence": "PyPI lists one wheel for the pinned version, `pyspnego-0.12.2-py3-none-any.whl`, tagged `none-any`. Its 38 files were listed, and none is a compiled file.",
       "files_read": [
         {
           "file": "pyspnego-0.12.2-py3-none-any.whl",
@@ -564,7 +592,8 @@
         }
       ],
       "route": null,
-      "route_reason": null
+      "route_reason": null,
+      "surveyed": "2026-10-04"
     },
     {
       "name": "shiboken6",
@@ -575,7 +604,8 @@
       "evidence": "The wheel was not fetched or listed. PyPI gives it a platform tag and a size between about 0.3 MB and 1.8 MB by platform. That does not show what compiled files it holds beyond the binding runtime.",
       "files_read": [],
       "route": null,
-      "route_reason": null
+      "route_reason": null,
+      "surveyed": "2026-10-04"
     },
     {
       "name": "sspilib",
@@ -595,15 +625,16 @@
         }
       ],
       "route": null,
-      "route_reason": null
+      "route_reason": null,
+      "surveyed": "2026-10-04"
     },
     {
       "name": "starlette",
       "pinned": "1.7.0",
       "carries": "no",
       "projects": [],
-      "evidence_kind": "wheel tag",
-      "evidence": "PyPI lists one wheel for the pinned version, `starlette-1.7.0-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "evidence_kind": "wheel tag and file list",
+      "evidence": "PyPI lists one wheel for the pinned version, `starlette-1.7.0-py3-none-any.whl`, tagged `none-any`. Its 41 files were listed, and none is a compiled file.",
       "files_read": [
         {
           "file": "starlette-1.7.0-py3-none-any.whl",
@@ -611,15 +642,16 @@
         }
       ],
       "route": null,
-      "route_reason": null
+      "route_reason": null,
+      "surveyed": "2026-10-04"
     },
     {
       "name": "tomlkit",
       "pinned": "0.15.1",
       "carries": "no",
       "projects": [],
-      "evidence_kind": "wheel tag",
-      "evidence": "PyPI lists one wheel for the pinned version, `tomlkit-0.15.1-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "evidence_kind": "wheel tag and file list",
+      "evidence": "PyPI lists one wheel for the pinned version, `tomlkit-0.15.1-py3-none-any.whl`, tagged `none-any`. Its 17 files were listed, and none is a compiled file.",
       "files_read": [
         {
           "file": "tomlkit-0.15.1-py3-none-any.whl",
@@ -627,15 +659,16 @@
         }
       ],
       "route": null,
-      "route_reason": null
+      "route_reason": null,
+      "surveyed": "2026-10-04"
     },
     {
       "name": "truststore",
       "pinned": "0.10.4",
       "carries": "no",
       "projects": [],
-      "evidence_kind": "wheel tag",
-      "evidence": "PyPI lists one wheel for the pinned version, `truststore-0.10.4-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "evidence_kind": "wheel tag and file list",
+      "evidence": "PyPI lists one wheel for the pinned version, `truststore-0.10.4-py3-none-any.whl`, tagged `none-any`. Its 11 files were listed, and none is a compiled file.",
       "files_read": [
         {
           "file": "truststore-0.10.4-py3-none-any.whl",
@@ -643,15 +676,16 @@
         }
       ],
       "route": null,
-      "route_reason": null
+      "route_reason": null,
+      "surveyed": "2026-10-04"
     },
     {
       "name": "typing-extensions",
       "pinned": "4.16.0",
       "carries": "no",
       "projects": [],
-      "evidence_kind": "wheel tag",
-      "evidence": "PyPI lists one wheel for the pinned version, `typing_extensions-4.16.0-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "evidence_kind": "wheel tag and file list",
+      "evidence": "PyPI lists one wheel for the pinned version, `typing_extensions-4.16.0-py3-none-any.whl`, tagged `none-any`. Its 5 files were listed, and none is a compiled file.",
       "files_read": [
         {
           "file": "typing_extensions-4.16.0-py3-none-any.whl",
@@ -659,15 +693,16 @@
         }
       ],
       "route": null,
-      "route_reason": null
+      "route_reason": null,
+      "surveyed": "2026-10-04"
     },
     {
       "name": "typing-inspection",
       "pinned": "0.4.4",
       "carries": "no",
       "projects": [],
-      "evidence_kind": "wheel tag",
-      "evidence": "PyPI lists one wheel for the pinned version, `typing_inspection-0.4.4-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "evidence_kind": "wheel tag and file list",
+      "evidence": "PyPI lists one wheel for the pinned version, `typing_inspection-0.4.4-py3-none-any.whl`, tagged `none-any`. Its 9 files were listed, and none is a compiled file.",
       "files_read": [
         {
           "file": "typing_inspection-0.4.4-py3-none-any.whl",
@@ -675,15 +710,16 @@
         }
       ],
       "route": null,
-      "route_reason": null
+      "route_reason": null,
+      "surveyed": "2026-10-04"
     },
     {
       "name": "tzdata",
       "pinned": "2026.4",
       "carries": "no",
       "projects": [],
-      "evidence_kind": "wheel tag",
-      "evidence": "PyPI lists one wheel for the pinned version, `tzdata-2026.4-py2.py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "evidence_kind": "wheel tag and file list",
+      "evidence": "PyPI lists one wheel for the pinned version, `tzdata-2026.4-py2.py3-none-any.whl`, tagged `none-any`. Its 633 files were listed, and none is a compiled file.",
       "files_read": [
         {
           "file": "tzdata-2026.4-py2.py3-none-any.whl",
@@ -691,15 +727,16 @@
         }
       ],
       "route": null,
-      "route_reason": null
+      "route_reason": null,
+      "surveyed": "2026-10-04"
     },
     {
       "name": "uvicorn",
       "pinned": "0.49.0",
       "carries": "no",
       "projects": [],
-      "evidence_kind": "wheel tag",
-      "evidence": "PyPI lists one wheel for the pinned version, `uvicorn-0.49.0-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "evidence_kind": "wheel tag and file list",
+      "evidence": "PyPI lists one wheel for the pinned version, `uvicorn-0.49.0-py3-none-any.whl`, tagged `none-any`. Its 46 files were listed, and none is a compiled file.",
       "files_read": [
         {
           "file": "uvicorn-0.49.0-py3-none-any.whl",
@@ -707,7 +744,8 @@
         }
       ],
       "route": null,
-      "route_reason": null
+      "route_reason": null,
+      "surveyed": "2026-10-04"
     },
     {
       "name": "uvloop",
@@ -732,7 +770,8 @@
         }
       ],
       "route": "highlight",
-      "route_reason": "libuv is the event loop's I/O layer, so the socket reads and writes of an engine that runs on `uvloop` go through it. An advisory against libuv names libuv, not `uvloop`, so the vulnerability-history reading would not show it."
+      "route_reason": "libuv is the event loop's I/O layer, so the socket reads and writes of an engine that runs on `uvloop` go through it. An advisory against libuv names libuv, not `uvloop`, so the vulnerability-history reading would not show it.",
+      "surveyed": "2026-10-04"
     },
     {
       "name": "websockets",
@@ -756,7 +795,8 @@
         }
       ],
       "route": null,
-      "route_reason": null
+      "route_reason": null,
+      "surveyed": "2026-10-04"
     }
   ]
 }
