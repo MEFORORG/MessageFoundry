@@ -929,12 +929,20 @@ def refuse_unrevoked_verified_hop(
     advice to configure the CRL it already has. **Callers that pass it must call this AFTER building
     the opener**, and after every later statement that replaces it or adds a handler to it.
 
-    Pass ``None`` in two cases. One is a caller whose hop rides the shared import-time opener, which
-    can carry no CRL; passing that opener gives the same answer. The other is a hop re-addressed to
-    an ECH sidecar (ADR 0139), and there ``None`` is required: the engine dials the loopback sidecar
-    and the sidecar verifies the real peer, so no context the engine holds checks that peer's
-    certificate. A CRL on the engine's opener must not relax that hop (vault BACKLOG #2188 for the
-    REST destination, #2169 for the SMART and OAuth2 token hop).
+    Pass ``None`` in at least these cases:
+
+    - A caller whose hop rides the shared import-time opener, which can carry no CRL. Passing that
+      opener gives the same answer.
+    - A hop re-addressed to an ECH sidecar (ADR 0139). ``None`` is required there: the engine dials
+      the loopback sidecar and the sidecar verifies the real peer, so no context the engine holds
+      checks that peer's certificate (vault BACKLOG #2188 for the REST destination, #2169 for the
+      SMART and OAuth2 token hop).
+    - An opener built with ``tls_allow_expired`` (ADR 0094). ``None`` is required there too.
+      :func:`~messagefoundry.config.tls_policy.relax_verify_expiry` sets
+      ``X509_V_FLAG_NO_CHECK_TIME`` on its context, and OpenSSL applies that flag to a CRL's
+      validity window as well as the certificate's: a CRL past ``nextUpdate`` is then accepted at
+      the handshake. A CRL on that context is not a check that may relax this refusal, so the hop
+      stays refused unless attested (vault BACKLOG #2188).
 
     ``connection`` is the declaring connection's name, recorded in the audit line logged when an
     attestation crosses the refusal, so the record leads back to the declaration (ADR 0173).
@@ -1924,13 +1932,18 @@ class RestDestination(DestinationConnector):
             #
             # With an ECH sidecar it gets NO opener. The engine dials the loopback sidecar, which
             # verifies the destination itself, so no context the engine holds checks that peer.
+            # With tls_allow_expired it gets none either: that opener skips validity-period checks,
+            # a CRL's own included, so its CRL is not evidence this guard accepts.
+            no_crl_evidence = self._ech_sidecar is not None or bool(
+                s.get("tls_allow_expired", False)
+            )
             refuse_unrevoked_verified_hop(
                 scheme,
                 self.url,
                 connector="REST destination",
                 revocation_attested=config.tls_revocation_attested,
                 revocation_attested_reason=config.tls_revocation_attested_reason,
-                opener=None if self._ech_sidecar is not None else self._opener,
+                opener=None if no_crl_evidence else self._opener,
                 connection=config.name,
             )
 

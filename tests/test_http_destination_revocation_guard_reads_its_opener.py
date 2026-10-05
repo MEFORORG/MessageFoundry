@@ -19,6 +19,7 @@ and for no other reason.
 from __future__ import annotations
 
 import datetime
+import ssl
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
@@ -38,11 +39,17 @@ from messagefoundry.config.tls_policy import (
     TrustAnchorPolicy,
     active_hop_posture,
     context_checks_revocation,
+    relax_verify_expiry,
 )
 from messagefoundry.config.wiring import FHIR, ConnectionSpec, DICOMweb, Rest, Soap
 from messagefoundry.transports import build_destination, dicomweb, fhir, rest, soap
 from messagefoundry.transports.http_auth import HttpAuthError
 from messagefoundry.transports.rest import opener_tls_context
+from tests.test_hop_refusal_revocation import (
+    _crl_coverage_ca,
+    _crl_coverage_server,
+    _handshake,
+)
 
 PROD_PHI = HopPosture(enforcing=True)
 
@@ -69,6 +76,7 @@ _DIGEST_CELLS = ["REST", "SOAP", "FHIR"]
 
 _Settings = Mapping[str, object]
 _NONE: _Settings = {}
+_EXPIRED: _Settings = {"tls_allow_expired": True}
 _DIGEST: _Settings = {
     "http_auth": "digest",
     "http_auth_user": "u",
@@ -194,14 +202,66 @@ def test_a_crl_that_reaches_the_hop_relaxes_the_refusal(cell: str, pki: dict[str
 
 
 @pytest.mark.parametrize("cell", _EXPIRY_CELLS)
-def test_the_expiry_relaxed_opener_carries_the_crl_to_the_guard(
-    cell: str, pki: dict[str, str]
-) -> None:
-    """``tls_allow_expired`` builds its own opener. That opener loads the CRL too, so it crosses."""
+def test_the_expiry_relaxed_arm_is_still_refused_with_a_crl(cell: str, pki: dict[str, str]) -> None:
+    """``tls_allow_expired`` builds an opener that skips validity-period checks, a CRL's own
+    included (measured below). Its CRL is not evidence the guard accepts, so the arm stays refused,
+    as it was before #2188."""
+    assert _LABEL[cell] in _refused(cell, crl=pki["crl"], extra=_EXPIRED)
+    # CONTROL 1: the plain verifying arm with the same CRL builds, so the refusal above is the
+    # expiry-relaxed arm and not a CRL that failed to load.
     with active_hop_posture(PROD_PHI):
-        dest = _build(cell, crl=pki["crl"], extra={"tls_allow_expired": True})
+        assert _checks_a_crl(_build(cell, crl=pki["crl"])) is True
+    # CONTROL 2: the same arm builds on the per-connection attestation, and its opener did load the
+    # CRL. So the guard was handed no opener; it did not read one and find it empty.
+    with active_hop_posture(PROD_PHI):
+        dest = _build(cell, crl=pki["crl"], revocation_attested=True, extra=_EXPIRED)
     assert _checks_a_crl(dest) is True
-    _refused(cell, extra={"tls_allow_expired": True})
+
+
+def test_soap_mutual_tls_with_expiry_relaxed_is_still_refused_with_a_crl(
+    pki: dict[str, str],
+) -> None:
+    """SOAP's client-certificate opener takes the same relaxation, so it takes the same refusal."""
+    mtls: _Settings = {
+        "client_cert_file": pki["client_cert"],
+        "client_key_file": pki["client_key"],
+        **_EXPIRED,
+    }
+    _refused("SOAP", crl=pki["crl"], extra=mtls)
+    with active_hop_posture(PROD_PHI):
+        dest = _build("SOAP", crl=pki["crl"], revocation_attested=True, extra=mtls)
+    assert _checks_a_crl(dest) is True
+
+
+def test_a_lapsed_crl_passes_a_context_that_skips_validity_checks(tmp_path: Path) -> None:
+    """THE REASON for the refusal above, as a measurement. A CRL past ``nextUpdate`` refuses the
+    handshake on a CRL-checking context. Add ``X509_V_FLAG_NO_CHECK_TIME``, which is all
+    ``tls_allow_expired`` adds, and the same handshake is accepted."""
+    host = "expired-crl.test"
+    ca_key, ca = _crl_coverage_ca("mefor-2188-lapsed-crl-ca")
+    server = _crl_coverage_server(ca_key, ca, host, tmp_path)
+    now = datetime.datetime.now(datetime.UTC)
+    lapsed = (
+        x509.CertificateRevocationListBuilder()
+        .issuer_name(ca.subject)
+        .last_update(now - datetime.timedelta(days=30))
+        .next_update(now - datetime.timedelta(days=1))
+        .sign(ca_key, hashes.SHA256())
+    )
+    pem = serialization.Encoding.PEM
+    bundle = tmp_path / "ca_and_lapsed_crl.pem"
+    bundle.write_bytes(ca.public_bytes(pem) + lapsed.public_bytes(pem))
+
+    def client(*, relaxed: bool) -> ssl.SSLContext:
+        ctx = ssl.create_default_context(cafile=str(bundle))
+        assert ctx.cert_store_stats()["crl"] == 1  # the lapsed CRL is in the store
+        ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
+        if relaxed:
+            relax_verify_expiry(ctx, host=host)
+        return ctx
+
+    assert _handshake(client(relaxed=False), server, host) == "CRL has expired"
+    assert _handshake(client(relaxed=True), server, host) == "accepted"
 
 
 def test_soap_mutual_tls_carries_the_crl_to_the_guard(pki: dict[str, str]) -> None:
@@ -270,13 +330,10 @@ _MODULE = {"REST": rest, "SOAP": soap, "FHIR": fhir, "DICOMWEB": dicomweb}
 _OPENER_ARMS = [
     ("REST", _NONE),
     ("REST", _DIGEST),
-    ("REST", {"tls_allow_expired": True}),
     ("SOAP", _NONE),
     ("SOAP", _DIGEST),
-    ("SOAP", {"tls_allow_expired": True}),
     ("FHIR", _NONE),
     ("FHIR", _DIGEST),
-    ("FHIR", {"tls_allow_expired": True}),
     ("DICOMWEB", _NONE),
 ]
 
@@ -307,6 +364,16 @@ def test_the_guard_is_handed_the_opener_the_destination_keeps(
     dest = _build(cell, crl=pki["crl"] if with_crl else None, extra=extra)
     assert len(seen) == 1
     assert seen[0] is dest._opener  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("cell", _EXPIRY_CELLS)
+@pytest.mark.parametrize("with_crl", [True, False])
+def test_the_expiry_relaxed_arm_hands_the_guard_no_opener(
+    cell: str, with_crl: bool, pki: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen = _record_guard_openers(cell, monkeypatch)
+    _build(cell, crl=pki["crl"] if with_crl else None, extra=_EXPIRED)
+    assert seen == [None]
 
 
 def test_the_rest_ech_arm_hands_the_guard_no_opener(

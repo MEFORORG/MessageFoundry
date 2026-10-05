@@ -707,7 +707,8 @@ class FhirDestination(DestinationConnector):
                 connector="FHIR destination",
                 revocation_attested=config.tls_revocation_attested,
                 revocation_attested_reason=config.tls_revocation_attested_reason,
-                opener=self._opener,
+                # None with tls_allow_expired: see refuse_unrevoked_verified_hop.
+                opener=None if bool(s.get("tls_allow_expired", False)) else self._opener,
                 connection=config.name,
             )
 
