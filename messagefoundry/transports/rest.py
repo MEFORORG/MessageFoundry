@@ -613,6 +613,25 @@ class InsecureHopGuard:
             )
 
 
+def assert_probe_hop(guard: InsecureHopGuard | None, url: str, *, connector: str) -> None:
+    """Run a destination's send-time hop re-check for its test-connection probe (BACKLOG #2196).
+
+    The probe crosses the same hop as ``_post``, and the REST and FHIR probes mint a bearer for it.
+    So each ``_probe`` calls this first, before a token is minted or a byte crosses. A ``None``
+    guard (a secure or loopback hop) does nothing.
+
+    A refusal is a :class:`DeliveryError`, as a probe's other failures are. The raw
+    :class:`InsecureHopRefused` is a ``ValueError``, which would reach the test-connection route's
+    catch-all as an unclassified failure. The refusal text names the connection, the cell, the
+    host and the redacted URL, and no message content."""
+    if guard is None:
+        return
+    try:
+        guard.assert_send(urllib.parse.urlsplit(url).hostname or "", _redact_url(url))
+    except InsecureHopRefused as exc:
+        raise DeliveryError(f"{connector} probe refused: {exc}") from exc
+
+
 def _enforce_shipped_hop(
     host: str,
     *,
@@ -1972,6 +1991,8 @@ class RestDestination(DestinationConnector):
         # the host answered, so a 405 (HEAD not allowed on a POST endpoint) is still a pass — but a 401/
         # 403 means the configured credentials would be rejected, which a real delivery dead-letters, so
         # surface it as a failure. Connection/DNS/TLS/timeout is always a fail.
+        # BACKLOG #2196: the hop re-check _post runs, before the bearer is minted below.
+        assert_probe_hop(self._hop_guard, self.url, connector="REST")
         headers = self._headers
         if self._token_provider is not None:
             # Acquire a real SMART token so reachability reflects the actual credentials (a token-

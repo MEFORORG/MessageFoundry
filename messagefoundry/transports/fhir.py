@@ -92,6 +92,7 @@ from messagefoundry.transports.rest import (
     _insecure_opener,
     _no_redirect_opener,
     _redact_url,
+    assert_probe_hop,
     capture_response_headers,
     cleartext_acceptance_from_settings,
     egress_route_from_settings,
@@ -873,6 +874,8 @@ class FhirDestination(DestinationConnector):
         # Reachability only: a GET of the FHIR base metadata (CapabilityStatement) reaches the server
         # without POSTing a resource. Any HTTP response means the host answered; 401/403 means the
         # configured credentials would be rejected. Connection/DNS/TLS/timeout always fails.
+        # BACKLOG #2196: the hop re-check _post runs, before the bearer is minted below.
+        assert_probe_hop(self._hop_guard, self.base_url, connector="FHIR")
         url = f"{self.base_url.rstrip('/')}/metadata"
         headers = self._headers
         if self._token_provider is not None:

@@ -99,6 +99,7 @@ from messagefoundry.transports.rest import (
     _no_redirect_opener,
     _NoRedirectHandler,
     _redact_url,
+    assert_probe_hop,
     capture_response_headers,
     egress_route_from_settings,
     enforce_outbound_length_limits,
@@ -809,6 +810,8 @@ class SoapDestination(DestinationConnector):
         # this one does not mint a bearer -- it ships ``self.url`` and ``self._headers`` verbatim, and
         # both were bounded at construction. A gate here could not fire on any input, and a guard that
         # cannot fail reads as coverage without being it.
+        # BACKLOG #2196: the hop re-check _post runs, before a byte crosses.
+        assert_probe_hop(self._hop_guard, self.url, connector="SOAP")
         req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s) in __init__
             self.url, headers=self._headers, method="HEAD"
         )
