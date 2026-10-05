@@ -21,6 +21,7 @@ from __future__ import annotations
 import datetime
 from collections.abc import Callable, Mapping
 from pathlib import Path
+from typing import Any
 
 import pytest
 from cryptography import x509
@@ -39,7 +40,7 @@ from messagefoundry.config.tls_policy import (
     context_checks_revocation,
 )
 from messagefoundry.config.wiring import FHIR, ConnectionSpec, DICOMweb, Rest, Soap
-from messagefoundry.transports import build_destination
+from messagefoundry.transports import build_destination, dicomweb, fhir, rest, soap
 from messagefoundry.transports.http_auth import HttpAuthError
 from messagefoundry.transports.rest import opener_tls_context
 
@@ -256,6 +257,64 @@ def test_rest_with_an_ech_sidecar_and_a_crl_is_still_refused(pki: dict[str, str]
     with active_hop_posture(PROD_PHI):
         dest = _build("REST", crl=pki["crl"], revocation_attested=True, extra=_ECH)
     assert _checks_a_crl(dest) is False  # the sidecar hop's opener carries no CRL
+
+
+# --- which opener the guard is handed, by identity ------------------------------------------------
+#
+# The arms above read the OUTCOME. These read the ARGUMENT, which is what the outcome cannot show in
+# two places. Handing the ECH arm its swapped plain opener refuses today exactly as handing it none
+# does, so only the argument tells the two apart. And a statement that replaced the opener below the
+# guard would leave every outcome arm green while the guard judged an opener the hop never uses.
+
+_MODULE = {"REST": rest, "SOAP": soap, "FHIR": fhir, "DICOMWEB": dicomweb}
+_OPENER_ARMS = [
+    ("REST", _NONE),
+    ("REST", _DIGEST),
+    ("REST", {"tls_allow_expired": True}),
+    ("SOAP", _NONE),
+    ("SOAP", _DIGEST),
+    ("SOAP", {"tls_allow_expired": True}),
+    ("FHIR", _NONE),
+    ("FHIR", _DIGEST),
+    ("FHIR", {"tls_allow_expired": True}),
+    ("DICOMWEB", _NONE),
+]
+
+
+def _record_guard_openers(cell: str, monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    """Record the ``opener`` each guard call in this destination's module is handed."""
+    seen: list[object] = []
+    real = rest.refuse_unrevoked_verified_hop
+
+    def spy(*args: Any, **kwargs: Any) -> None:
+        seen.append(kwargs.get("opener"))
+        real(*args, **kwargs)
+
+    monkeypatch.setattr(_MODULE[cell], "refuse_unrevoked_verified_hop", spy)
+    return seen
+
+
+@pytest.mark.parametrize(("cell", "extra"), _OPENER_ARMS)
+@pytest.mark.parametrize("with_crl", [True, False])
+def test_the_guard_is_handed_the_opener_the_destination_keeps(
+    cell: str,
+    extra: _Settings,
+    with_crl: bool,
+    pki: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen = _record_guard_openers(cell, monkeypatch)
+    dest = _build(cell, crl=pki["crl"] if with_crl else None, extra=extra)
+    assert len(seen) == 1
+    assert seen[0] is dest._opener  # type: ignore[attr-defined]
+
+
+def test_the_rest_ech_arm_hands_the_guard_no_opener(
+    pki: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen = _record_guard_openers("REST", monkeypatch)
+    _build("REST", crl=pki["crl"], extra=_ECH)
+    assert seen == [None]
 
 
 # --- the new error order: the revocation refusal comes last ----------------------------------------
