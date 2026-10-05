@@ -565,7 +565,7 @@
         }
       ],
       "evidence_kind": "project metadata",
-      "evidence": "The wheel was not fetched or listed. Its PyPI description says it includes Qt modules, and PyPI lists the Linux wheel at about 175 MB. The Qt version inside was not read.",
+      "evidence": "The wheel was not fetched or listed. Its PyPI description says it includes Qt modules, and PyPI lists the Linux wheel at about 175 MB. The Qt version inside was not read, and nothing else the wheel bundles was looked for. A lead, not evidence: a copy of this version installed in a Windows development environment, not hash-checked here, lists FFmpeg libraries (`avcodec`, `avformat`, `avutil`, `swresample`, `swscale`), `QtWebEngineProcess.exe` and a V8 snapshot. A listing of the pinned wheel would settle what it carries beyond Qt.",
       "files_read": [],
       "route": "highlight",
       "route_reason": "It holds compiled Qt modules, among them the web engine, multimedia and PDF modules. The harness imports none of them, but an install puts them on disk. A flaw filed against Qt names Qt, not `pyside6-addons`, so the vulnerability-history reading would not show it.",
@@ -582,7 +582,7 @@
         }
       ],
       "evidence_kind": "project metadata",
-      "evidence": "The wheel was not fetched or listed. Its PyPI description says it includes the essential Qt modules, and PyPI lists the Linux wheel at about 80 MB. The Qt version inside was not read.",
+      "evidence": "The wheel was not fetched or listed. Its PyPI description says it includes the essential Qt modules, and PyPI lists the Linux wheel at about 80 MB. The Qt version inside was not read, and nothing else the wheel bundles was looked for. A lead, not evidence: a copy of this version installed in a Windows development environment, not hash-checked here, lists `opengl32sw.dll` and Microsoft Visual C++ runtime libraries. A listing of the pinned wheel would settle what it carries beyond Qt.",
       "files_read": [],
       "route": null,
       "route_reason": null,

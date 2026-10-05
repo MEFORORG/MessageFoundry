@@ -125,7 +125,7 @@ What the dependency audit and the SBOM can and cannot see of it is stated once, 
 | `uvicorn` | the HTTP server that binds the socket | no |
 | `h11` | HTTP/1.1 message parsing | no |
 | `httptools` | compiled HTTP parsing | **yes** |
-| `websockets` | the WebSocket protocol for the console. The pinned wheel ships a compiled extension, `speedups` | **yes** |
+| `websockets` | the WebSocket protocol for the console, with a compiled extension | **yes** |
 | `httpx` | outbound HTTP for every egress connector | no |
 | `httpcore` | connection and TLS handling beneath it | no |
 | `idna` | decodes domain names from untrusted sources | no |
@@ -223,7 +223,7 @@ On the reading of 2026-10-03, the harness imports four Qt modules: `QtCore`, `Qt
 
 | Component | Why not |
 |---|---|
-| `pyside6` | a metadistribution: the `PySide6` package initialiser, two small version and configuration modules, and typing stubs. It parses no input, and it exists to pull in the other three. It ships no compiled file: the survey further down listed the files of the pinned Linux x86_64 and Windows amd64 wheels and found none in either |
+| `pyside6` | a metadistribution: the `PySide6` package initialiser, two small version and configuration modules, and typing stubs. It parses no input, and it exists to pull in the other three. It ships no compiled file. The survey further down listed the pinned Linux x86_64 and Windows amd64 wheels and found none in either |
 | `pyside6-addons` | compiled, but it holds only Qt modules the harness never imports, among them the web engine, multimedia, PDF, serial port and HTTP server modules. None of them runs, so none sees input. A harness change that imports one needs this row read again |
 
 So 2 plus 2 is 4, and 34 plus 4 is 38.
@@ -440,16 +440,18 @@ A wheel whose answer is not established is treated as carrying.
 1 wheel was found to carry none, on the evidence of the wheel file list: `pyside6`.
 
 Each answer rests on the evidence the record names. A wheel tagged `none-any` had its file list read
-as well as its tag. For any other wheel that was fetched, the Linux x86_64 and Windows amd64 wheels
-were read, where the lock carries them. A file list shows a bundled library and cannot show code
-linked into an extension, so the pinned source distribution was read too. A wheel for another
-platform was not read, and can carry something else.
+as well as its tag. For any other wheel that was fetched, one Linux x86_64 wheel and the Windows
+amd64 wheel were read, where the lock carries them. A file list shows a bundled library and cannot
+show code linked into an extension, so the pinned source distribution was read too. A wheel the
+record does not name was not read, and can carry something else. That holds for another platform,
+and for a second Linux x86_64 wheel where the lock carries more than one.
 
-No source distribution was read for `pyside6` or `shiboken6`. Their answers rest on the wheel file
-lists alone, which cannot show what is linked into a compiled file.
+No source distribution was read for `pyside6` or `shiboken6`. Their answers rest on wheel file lists
+alone, which cannot show what is linked into a compiled file.
 
 No wheel was fetched for `pyside6-addons` or `pyside6-essentials`. Their answers rest on PyPI
-project metadata, which lists no file.
+project metadata, which lists no file. What the table names for such a wheel is the least it
+carries: nothing else was looked for.
 
 A designated wheel is already highlighted, by its tier. No carried project's advisories were read
 for a designated wheel. 2 wheels are not designated and not shown to carry nothing. Each takes one

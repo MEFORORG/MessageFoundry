@@ -1202,7 +1202,7 @@ def _survey_page_drift(page: str, survey: dict[str, Any]) -> list[str]:
             f"found: page names {sorted(_table_names(found))}, the survey {sorted(carrying)}"
         )
     for label, table, route in (("highlighted", highlighted, "highlight"), ("read", read, "read")):
-        want = {w["name"] for w in wheels if w["route"] == route}
+        want = {w["name"] for w in wheels if w.get("route") == route}
         if _table_names(table) != want:
             problems.append(
                 f"{label}: page names {sorted(_table_names(table))}, the survey {sorted(want)}"
@@ -1232,7 +1232,7 @@ def test_every_assessed_wheel_has_a_survey_answer_and_every_owed_route_is_record
         survey, _snapshot(), component_readings.designation_labels(page)
     )
     assert problems == [], f"{_SURVEY.name} is incomplete:\n  " + "\n  ".join(problems)
-    routed = {w["name"] for w in survey["wheels"] if w["route"] in component_readings.ROUTES}
+    routed = {w["name"] for w in survey["wheels"] if w.get("route") in component_readings.ROUTES}
     assert _owed_a_route(survey) == routed, (
         f"owed a route: {sorted(_owed_a_route(survey))}; routed: {sorted(routed)}"
     )
@@ -1270,6 +1270,7 @@ def test_the_survey_checks_can_fail() -> None:
         "carries": "yes",
         "projects": carried,
         "evidence_kind": component_readings.METADATA_ONLY,
+        "files_read": [],
         "route": "highlight",
         "route_reason": "a reason",
     }
@@ -1278,6 +1279,7 @@ def test_the_survey_checks_can_fail() -> None:
         "carries": "yes",
         "projects": carried,
         "evidence_kind": component_readings.METADATA_ONLY,
+        "files_read": [],
         "route": None,
     }
     base = [routed if w is plain else designated if w is ranked else w for w in wheels]
@@ -1341,6 +1343,22 @@ def test_the_survey_checks_can_fail() -> None:
     # Both changes together are a true file-list answer, which passes.
     both = {**no_source, **as_file_list}
     assert problems([{**w, **both} if w is sourced else w for w in wheels]) == []
+    # A source-tree answer that names no wheel, a file with no hash, a file whose version only
+    # starts with the pin, and a metadata answer that names a file it did not read.
+    stem, pin = sourced["name"], sourced["pinned"]
+    first = sourced["files_read"][0]
+    longer = {**first, "file": first["file"].replace(f"-{pin}-", f"-{pin}.1-", 1)}
+    assert longer != first, f"{first['file']} does not carry the pin {pin} as written"
+    sdists = [f for f in sourced["files_read"] if f not in only_wheels]
+    for files_change, problem in (
+        (sdists, f"{stem}: the files read do not match the evidence kind"),
+        ([{"file": first["file"]}, *sourced["files_read"][1:]], f"{stem}: a file read has no sha"),
+        ([longer, *sourced["files_read"][1:]], f"{stem}: the files read are not named, or not at"),
+    ):
+        found = problems([{**w, "files_read": files_change} if w is sourced else w for w in wheels])
+        assert any(line.startswith(problem) for line in found), (problem, found)
+    found = problems(swap(designated, files_read=only_wheels))
+    assert any(line.startswith(f"{rank}: a project-metadata answer names") for line in found)
     # The names owed a route, by this module's own rule, follow the answer.
     assert name in _owed_a_route({**survey, "wheels": base})
     assert name not in _owed_a_route(survey)

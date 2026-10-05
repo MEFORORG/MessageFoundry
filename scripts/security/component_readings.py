@@ -604,9 +604,20 @@ def _said(value: object) -> bool:
     return bool(str(value or "").strip())
 
 
-def _file_key(text: str) -> str:
-    """A distribution file name, or a ``name-version`` pair, in one comparable spelling."""
-    return re.sub(r"[-_.]+", "-", text).lower()
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+
+
+def _file_pin(file: str) -> tuple[str, str]:
+    """The distribution name, canonical, and the exact version a wheel or sdist file name states.
+
+    A wheel's name is ``dist-version-tags.whl`` and its dist part holds no hyphen. A source
+    distribution's is ``dist-version.tar.gz``. The version is compared whole, never as a prefix.
+    """
+    if file.endswith(".whl"):
+        dist, _, rest = file.partition("-")
+        return runtime_closure.canonical_name(dist), rest.partition("-")[0]
+    dist, _, version = file.removesuffix(".zip").removesuffix(".tar.gz").rpartition("-")
+    return runtime_closure.canonical_name(dist), version
 
 
 def survey_problems(
@@ -618,7 +629,9 @@ def survey_problems(
     behind visibly. Each answer names the files it was read from, and each file name must carry
     the surveyed pin, so moving the pin alone does not pass. A not-designated wheel that carries,
     or whose answer is not established, must have a route; a designated wheel, or one shown to
-    carry nothing, must have none. A missing field is reported, never raised.
+    carry nothing, must have none. Each file named must carry a sha256, a source-tree answer
+    must name a wheel and a source distribution, a file-list answer wheels only, and a metadata
+    answer no file. A missing field of a wheel is reported, never raised, except its ``name``.
     """
     problems: list[str] = []
     pins = {r["name"]: r["pinned"] for r in data["readings"]}
@@ -643,7 +656,9 @@ def survey_problems(
             problems.append(f"{name}: no date is recorded for the answer")
         carries, kind = wheel.get("carries"), wheel.get("evidence_kind")
         projects = wheel.get("projects") or []
-        files = [str(f.get("file", "")) for f in wheel.get("files_read") or []]
+        read = wheel.get("files_read") or []
+        files = [str(f.get("file", "")) for f in read]
+        wheels_named = sum(f.endswith(".whl") for f in files)
         if carries not in CARRIES:
             problems.append(f"{name}: the answer {carries!r} is not one of {CARRIES}")
         if kind not in EVIDENCE_KINDS or not _said(wheel.get("evidence")):
@@ -656,18 +671,20 @@ def survey_problems(
         if kind == METADATA_ONLY:
             if carries == "no":
                 problems.append(f"{name}: project metadata cannot show a wheel carries nothing")
-        elif not files or not all(
-            _file_key(f).startswith(_file_key(f"{name}-{pinned}") + "-") for f in files
-        ):
+            if files:
+                problems.append(f"{name}: a project-metadata answer names files it did not read")
+        elif not files or not all(_file_pin(f) == (name, pinned) for f in files):
             problems.append(f"{name}: the files read are not named, or not at the surveyed pin")
         elif kind == TAG_AND_LIST and (
             carries != "no" or not all(f.endswith("-none-any.whl") for f in files)
         ):
             problems.append(f"{name}: a none-any answer needs a none-any wheel that carries none")
-        elif kind in (SOURCE_TREE, FILE_LIST) and (kind == SOURCE_TREE) == all(
-            f.endswith(".whl") for f in files
+        elif (kind == SOURCE_TREE and not 0 < wheels_named < len(files)) or (
+            kind == FILE_LIST and wheels_named != len(files)
         ):
             problems.append(f"{name}: the files read do not match the evidence kind {kind!r}")
+        if not all(_SHA256.fullmatch(str(f.get("sha256", ""))) for f in read):
+            problems.append(f"{name}: a file read has no sha256 recorded")
         route = wheel.get("route")
         if not _needs_route(wheel, labels):
             if route is not None:
@@ -754,31 +771,31 @@ def _render_survey(survey: Mapping[str, Any], labels: Mapping[str, str]) -> list
     out += [
         "",
         "Each answer rests on the evidence the record names. A wheel tagged `none-any` had its "
-        "file list read as well as its tag. For any other wheel that was fetched, the Linux "
-        "x86_64 and Windows amd64 wheels were read, where the lock carries them. A file list "
-        "shows a bundled library and cannot show code linked into an extension, so the pinned "
-        "source distribution was read too. A wheel for another platform was not read, and can "
-        "carry something else.",
+        "file list read as well as its tag. For any other wheel that was fetched, one Linux "
+        "x86_64 wheel and the Windows amd64 wheel were read, where the lock carries them. A "
+        "file list shows a bundled library and cannot show code linked into an extension, so "
+        "the pinned source distribution was read too. A wheel the record does not name was not "
+        "read, and can carry something else. That holds for another platform, and for a second "
+        "Linux x86_64 wheel where the lock carries more than one.",
     ]
     # The two kinds of evidence that fall short of the paragraph above, each naming its wheels.
-    for kind, joiner, lead, rests_on in (
+    for kind, lead, rests_on in (
         (
             FILE_LIST,
-            "or",
             "No source distribution was read for {}.",
-            "the wheel file lists alone, which cannot show what is linked into a compiled file.",
+            "wheel file lists alone, which cannot show what is linked into a compiled file.",
         ),
         (
             METADATA_ONLY,
-            "or",
             "No wheel was fetched for {}.",
-            "PyPI project metadata, which lists no file.",
+            "PyPI project metadata, which lists no file. What the table names for such a wheel "
+            "is the least it carries: nothing else was looked for.",
         ),
     ):
         names = [f"`{w['name']}`" for w in wheels if w.get("evidence_kind") == kind]
         if names:
             whose = "Its answer rests on" if len(names) == 1 else "Their answers rest on"
-            out += ["", f"{lead.format(_series(names, joiner))} {whose} {rests_on}"]
+            out += ["", f"{lead.format(_series(names, 'or'))} {whose} {rests_on}"]
     out += [
         "",
         "A designated wheel is already highlighted, by its tier. No carried project's advisories "
@@ -1189,6 +1206,9 @@ def main(argv: list[str] | None = None) -> int:
         help="re-render the page section from the tracked snapshot; no network",
     )
     args = parser.parse_args(argv)
+    # Read before the network run, so a broken hand-made survey stops it before the long read.
+    text = PAGE.read_text(encoding="utf-8")
+    survey = json.loads(SURVEY.read_text(encoding="utf-8"))
     if args.render_only:
         data = json.loads(SNAPSHOT.read_text(encoding="utf-8"))
     else:
@@ -1200,8 +1220,6 @@ def main(argv: list[str] | None = None) -> int:
             # Nothing is written on a failed read, so a half-fetched snapshot never lands.
             print(f"component readings failed, nothing written: {exc}", file=sys.stderr)
             return 1
-    text = PAGE.read_text(encoding="utf-8")
-    survey = json.loads(SURVEY.read_text(encoding="utf-8"))
     page = render_page(text, data, survey)
     if not args.render_only:
         _write_text(SNAPSHOT, json.dumps(data, indent=2) + "\n")
