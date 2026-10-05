@@ -197,6 +197,47 @@ async def test_a_lapsed_prior_is_revoked_by_supersession_itself(
     assert await _superseded(store) == [], "a lapsed session was recorded as superseded"
 
 
+async def test_a_rotation_racing_the_supersession_cannot_keep_the_session_live(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #2146. A step-up on the same session re-keys it. The supersession used to read the row
+    # by hash and then revoke by hash, two store calls with an await between them, so a rotation
+    # landing in that gap moved the row to a new hash and the revoke matched nothing. The session
+    # lived on under the rotated token. This drives the rotation in right after the supersession's
+    # FIRST store call that names the presented hash, whichever call that is, so it measures the
+    # gap rather than one implementation's method name. Either order is acceptable as an outcome
+    # only if the session ends: the rotation fails closed, or its new token does not validate.
+    service = await _service(store)
+    prior = await _token(service)
+    prior_hash = hash_token(prior)
+    rotations: list[str | None] = []
+
+    def _inject(name: str) -> None:
+        real = getattr(store, name)
+
+        async def _then_rotate(*args: object, **kwargs: object) -> object:
+            result = await real(*args, **kwargs)
+            if args and args[0] == prior_hash and not rotations:
+                rotations.append(None)  # claim the one injection before the rotation re-enters
+                rotations[0] = await service._rotate_session_token(prior)
+            return result
+
+        monkeypatch.setattr(store, name, _then_rotate)
+
+    for name in ("get_session", "supersede_session"):
+        if hasattr(store, name):
+            _inject(name)
+    new = await _token(service, supersedes=prior)
+
+    assert rotations, "the injection never fired, so this measured nothing"
+    rotated = rotations[0]
+    assert rotated is None or not await _live(service, rotated), (
+        "a rotation between the supersession's read and its revoke kept the session live"
+    )
+    assert not await _live(service, prior)
+    assert await _live(service, new)
+
+
 async def test_a_failed_sign_in_ends_nothing(store: MessageStore) -> None:
     service = await _service(store)
     prior = await _token(service)

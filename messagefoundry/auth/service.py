@@ -6012,23 +6012,31 @@ class AuthService:
         presented token is the whole point, whatever its state. (The per-user cap no longer relies on
         this. Since BACKLOG #1900 it counts only live rows and revokes lapsed ones itself.) Only a
         session that was still LIVE gets an audit row, so the trail does
-        not record the ending of something that had already ended. ``revoke_session`` reports no
-        rowcount, so the row is read back: a rotation that re-keyed it between the read and the
-        revoke leaves the old hash absent, and then no row claims a revoke that never happened.
+        not record the ending of something that had already ended.
+
+        **The read and the revoke are ONE store statement (BACKLOG #2146).** They used to be two,
+        with an await between, and a step-up that rotated the same session in that gap re-keyed the
+        row, so the revoke by the old hash matched nothing and the session lived on under its new
+        token. :meth:`AuthStore.supersede_session` lets the store order the two writes on the row,
+        across engine processes too, since engine shards serve the API from one shared store. Either
+        this revoke lands first and the rotation fails closed, or the rotation committed first, the
+        presented hash names no session, and this ends nothing.
+
+        **That last case is a stated limit, not a race this closes.** A rotation that commits while
+        the sign-in is still in flight, before this statement, leaves the session live under its new
+        token. Following it would need a link from a retired hash to its successor, which the
+        sessions table does not hold.
         Returns True when it audited.
         """
-        prior = await self._store.get_session(prior_hash)
-        if prior is None or prior.revoked_at is not None:
-            return False
         now = time.time()
+        prior = await self._store.supersede_session(prior_hash, now=now)
+        if prior is None:
+            return False
         # The validator's own test, clock-step checks included (BACKLOG #2096): a row stamped ahead
         # of `now` is one the validator would refuse, so ending it is not the end of a live session.
-        was_live = prior.is_live(now=now, idle_seconds=self.session_idle_seconds)
-        await self._store.revoke_session(prior_hash, now=now)
-        if not was_live:
-            return False
-        after = await self._store.get_session(prior_hash)
-        if after is None or after.revoked_at is None:
+        # The returned row's other columns are as the revoke found them, so this judges the session
+        # as it stood the instant it ended.
+        if not prior.is_live(now=now, idle_seconds=self.session_idle_seconds):
             return False
         owner = await self._store.get_user(prior.user_id)
         await self._audit(
