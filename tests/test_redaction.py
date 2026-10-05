@@ -1917,7 +1917,6 @@ def _assert_the_chain_drops_the_credential(text: str) -> None:
     assert _CREDENTIAL_VALUE not in secretscrub.scrub_credentials(text), "the control does not hold"
     out = _through_the_log_filter_chain(text)
     assert _CREDENTIAL_VALUE not in out, out
-    assert "x%7Cy" not in out, f"the encoded run survived: {out!r}"
 
 
 @pytest.mark.parametrize("glue", list(_LABEL_GLUE))
@@ -1934,12 +1933,14 @@ def test_a_credential_label_glued_to_an_encoded_run_still_loses_its_value(glue: 
         *secretscrub._KEY_MATERIAL_WORDS,
         f"{secretscrub._ENV_PREFIX}VALUE_PW",
         "db_password",
+        "a_b_c_d_e_f_password",
         "PWD",
     ],
 )
-def test_every_credential_label_word_survives_the_encoded_run(label: str) -> None:
+def test_every_credential_label_word_is_still_read_after_an_encoded_run(label: str) -> None:
     """Read from ``secretscrub``'s own tuples, so a word added there and not to
-    ``redaction._CREDENTIAL_LABEL_WORDS`` goes red here by behaviour as well as in the gate below."""
+    ``redaction._CREDENTIAL_LABEL_AHEAD`` goes red here by behaviour as well as in the gate below.
+    The six-segment label holds the prefix bound to the credential stage's."""
     _assert_the_chain_drops_the_credential(f"{_ENCODED_TOKEN},{label}: {_CREDENTIAL_VALUE}")
 
 
@@ -1960,10 +1961,12 @@ def test_every_credential_label_word_survives_the_encoded_run(label: str) -> Non
         f'password: "aa {_CREDENTIAL_VALUE} {_ENCODED_TOKEN}"',
         f'password: "aa {_CREDENTIAL_VALUE} {_ENCODED_TOKEN}"tail',
         f'password :"{_ENCODED_TOKEN} {_CREDENTIAL_VALUE} tail"',
+        f'password:\n "aa {_CREDENTIAL_VALUE} {_ENCODED_TOKEN}"',
         # The value opens inside the run's token and closes outside it.
         f'{_ENCODED_TOKEN},password="aa {_CREDENTIAL_VALUE} tail"',
         f"{_ENCODED_TOKEN};PWD={{aa {_CREDENTIAL_VALUE}}}",
         f"PWD={{{_ENCODED_TOKEN} {_CREDENTIAL_VALUE}}}",
+        f"PWD={{aa\n{_ENCODED_TOKEN} {_CREDENTIAL_VALUE}}}",
     ],
     ids=[
         "compact-json",
@@ -1979,9 +1982,11 @@ def test_every_credential_label_word_survives_the_encoded_run(label: str) -> Non
         "quoted-value-run-last",
         "quoted-value-closed-inside-token",
         "separator-leads-the-token",
+        "quoted-value-on-next-line",
         "quoted-value-opens-in-token",
         "braced-value-opens-in-token",
         "braced-value-run-first",
+        "braced-value-over-two-lines",
     ],
 )
 def test_a_credential_span_that_crosses_an_encoded_run_is_still_scrubbed(text: str) -> None:
@@ -1993,79 +1998,119 @@ def test_a_credential_span_that_crosses_an_encoded_run_is_still_scrubbed(text: s
 @pytest.mark.parametrize(
     "text",
     [
-        # A `;` ends the first label's bare value. Without it the kept label became that value.
+        # A label before the run's token must not gain a value it never had.
         f"secret: abc;x%7Cy%7C_password: {_CREDENTIAL_VALUE}",
-        # A leading `&` cannot start a bare value, so the first label has none.
         f"db_password: &url%26x%7Cy%7Cdb_password: {_CREDENTIAL_VALUE}",
-        # `_password` after a pipe is not a label to the credential stage, so it must not be kept:
-        # kept, it took `secret:` as its value and left the real one.
         f"x%7Cy|_password: secret: {_CREDENTIAL_VALUE}",
+        # A label word after an underscore prefix must not gain a word boundary.
+        f"mode=a%7Cb%7Coauth_bearer password: {_CREDENTIAL_VALUE}",
+        f"lookup x%7Cy%7Cz;vault_token=Basic {_CREDENTIAL_VALUE}",
+        # A label word must not be left where a later pass reads it as a name or a segment.
+        f"x%7Cy%7Cuser_Session Token: {_CREDENTIAL_VALUE}",
+        f"x%7Cy%7CDB_PWD SECRET={_CREDENTIAL_VALUE}",
+        f"x%7Cy%7CDB_PWD| password:\n {_CREDENTIAL_VALUE}",
+        '{"name": "x%7Cy%7C.password": "' + _CREDENTIAL_VALUE + '"}',
+        # A password in a DSN goes with its token, whatever it spells.
+        f"connect failed postgres://admin:{_CREDENTIAL_VALUE}@db.internal/x?a=1%7C2%7C3",
+        # The second stage run must not apply the backstop to a line the run has shortened.
+        f"nonnumeric port: 'x a%7Cb%7C{'c' * 300} secret: abc@{_CREDENTIAL_VALUE}",
     ],
-    ids=["value-ends-at-semicolon", "ampersand-leads-the-token", "not-a-label-to-the-stage"],
+    ids=[
+        "value-ends-at-semicolon",
+        "ampersand-leads-the-token",
+        "not-a-label-to-the-stage",
+        "underscore-prefixed-bearer",
+        "underscore-prefixed-token",
+        "title-case-label-words",
+        "upper-case-label-words",
+        "label-word-before-a-pipe",
+        "json-name-string",
+        "dsn-password",
+        "backstop-on-a-shortened-line",
+    ],
 )
-def test_a_kept_label_never_changes_which_label_owns_a_value(text: str) -> None:
-    """A kept label is only safe if the credential stage pairs labels and values as it did on the
-    original text. Each shape here kept its value at e68fbc2896, the first cut of this fix."""
+def test_the_encoded_run_never_changes_which_label_owns_a_value(text: str) -> None:
+    """The shapes code review found against the first cuts of this fix, which kept the label and
+    replaced the rest of the token. Each kept its value at e68fbc2896 or at 6c018c5e16."""
     _assert_the_chain_drops_the_credential(text)
 
 
-def test_the_label_words_the_encoded_run_keeps_cover_the_credential_vocabulary() -> None:
-    """THE DRIFT GATE. ``redaction`` is stdlib-only and cannot import ``secretscrub``, so the words
-    are duplicated literals. This holds the copy to a superset of the source."""
-    kept = set(redaction._CREDENTIAL_LABEL_WORDS)
-    for source in (
-        secretscrub._CREDENTIAL_WORDS,
-        secretscrub._TOKEN_WORDS,
-        secretscrub._KEY_MATERIAL_WORDS,
-    ):
-        assert set(source) <= kept
-    for scheme in ("bearer", "basic", "digest"):
-        assert scheme in kept and scheme in secretscrub._BEARER.pattern
-    pattern = redaction._ENCODED_RUN_KEPT.pattern
+def test_the_label_pattern_is_the_credential_stages_own() -> None:
+    """THE DRIFT GATE. ``redaction`` is stdlib-only and cannot import ``secretscrub``, so the label
+    grammar is a copy: the prefix, the words and the environment prefix. This holds each to its
+    source."""
+    pattern = redaction._CREDENTIAL_LABEL_AHEAD.pattern
+    assert secretscrub._LABEL_PREFIX in pattern
     assert secretscrub._ENV_PREFIX in pattern
-    # The pattern is a plain literal for the static regex gate, so its words are a second copy.
-    spelled = pattern.split("(?P<word>")[1].split(")")[0].split("|")
-    assert spelled == list(redaction._CREDENTIAL_LABEL_WORDS)
+    spelled = pattern.split(secretscrub._LABEL_PREFIX + "(?:")[1].split(")")[0].split("|")
+    assert set(spelled) == {
+        *secretscrub._CREDENTIAL_WORDS,
+        *secretscrub._TOKEN_WORDS,
+        *secretscrub._KEY_MATERIAL_WORDS,
+    }
+    # Longest first, as the source builds it, so a short word cannot shadow a longer one.
+    assert spelled == sorted(spelled, key=len, reverse=True)
 
 
 @pytest.mark.parametrize(
-    ("text", "planted"),
+    "text",
     [
-        # A label word inside a longer word is not a label, so nothing of the word is kept.
-        (f"name=ZQXDOE%5ECOMPASS%5EQ: {_CREDENTIAL_VALUE}", ("ZQXDOE", "PASS")),
-        # Text beside a kept label still goes, quotes or not.
-        ('{"family":"ZQXDOE%5EVANJA%5EQ","password":', ("ZQXDOE", "VANJA")),
-        ("ZQXDOE%7C4455667%7CVANJA,token=", ("ZQXDOE", "4455667", "VANJA")),
-        ("'ZQXDOE%7C4455667%7CVANJA'", ("ZQXDOE", "4455667", "VANJA")),
+        f"{_ENCODED_TOKEN},password: {_CREDENTIAL_VALUE}",
+        f'password: "aa {_ENCODED_TOKEN}" tail',
+        f"note Bearer {_ENCODED_TOKEN}",
     ],
-    ids=["word-inside-a-word", "json-beside-a-label", "run-before-a-label", "quoted-run"],
+    ids=["label-in-token", "token-in-quoted-value", "token-after-bearer"],
 )
-def test_the_encoded_run_keeps_only_marks_and_label_words(
-    text: str, planted: tuple[str, ...]
+def test_a_run_a_credential_span_reaches_is_left_as_the_stages_left_it(text: str) -> None:
+    """THE STATED PRICE, pinned so it cannot change unseen. Inside a credential span ``redact`` is
+    exactly the two stages, as it was before the encoded run existed. The credential filter then
+    sees the text it saw then."""
+    assert redact(text) == redaction._redact_stages(text)
+    assert "x%7Cy" in redact(text)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # No credential label anywhere.
+        ("id zqxdoe%7C4455667%7Cvanja here", "id [redacted] here"),
+        # A word that only CONTAINS a label word is not a label.
+        ("name=zqxdoe%5Ecompass%5Eq: 404 here", "[redacted] 404 here"),
+        ("bypass=zqxdoe%5E4455667%5Eq here", "[redacted] here"),
+        # The run is in a token BEFORE the label, so no credential match can reach it.
+        (f"zqxdoe%7C4455667%7Cvanja password: {_CREDENTIAL_VALUE}", None),
+        # The run is on a later line than the value.
+        (f"password: {_CREDENTIAL_VALUE}\nid zqxdoe%7C4455667%7Cvanja here", None),
+    ],
+    ids=[
+        "no-label",
+        "word-inside-a-word",
+        "label-word-runs-on",
+        "run-before-label",
+        "run-next-line",
+    ],
+)
+def test_a_run_no_credential_span_reaches_is_still_scrubbed(
+    text: str, expected: str | None
 ) -> None:
-    """THE PHI ARM. What the run leaves in place is quotes, braces, punctuation and fixed label
-    words. Nothing a partner chose survives beside them."""
-    for name, out in _every_entry_point(text).items():
-        for value in planted:
-            assert value not in out, f"{name}: {out!r}"
+    """THE CONTROL for the arm above, and the PHI arm: skipping every run would satisfy it."""
+    out = redact(text)
+    if expected is not None:
+        assert out == expected
+    for planted in ("zqxdoe", "4455667", "vanja"):
+        assert planted not in out, out
+    assert _CREDENTIAL_VALUE not in _through_the_log_filter_chain(text)
 
 
 def test_the_stages_run_again_over_what_the_encoded_run_changed() -> None:
     """Pins the second ``_redact_stages`` call in ``redact`` (PR 2011 review finding 5): returning
-    the run's output directly left every other test green. Found by a search over fuzzed inputs.
-    THE CONTROL is the middle assertion: the value survives the stages and the run, so only the
+    the run's output directly left every other test green. The shape came from a search over fuzzed
+    inputs. THE CONTROL is the middle assertion: the name survives the stages and the run, so the
     second pass of the stages is what removes it."""
-    text = '<family value="%7c%5Ekk7wtsecr3tb1q<name>%5e%7c\t%5epassword=Basic4455667secret:;'
-    staged = redaction._redact_stages(text)
-    after_run = redaction._HL7_ENCODED_FIELD_RUN.sub(redaction._encoded_run_replacement, staged)
-    assert "4455667" in after_run, "the control no longer holds"
-    assert "4455667" not in redact(text)
-
-
-def test_an_encoded_run_with_no_mark_or_label_is_one_placeholder() -> None:
-    """THE CONTROL for the arm above: the ordinary run is still replaced whole."""
-    assert redact("id zqxdoe%7C4455667%7Cvanja here") == "id [redacted] here"
-    assert redact("'zqxdoe%7C4455667%7Cvanja',") == "'[redacted]',"
+    text = "|%7C7788990~\tPatientName=<name> PatientName=;1980-05-05%7e%7e1980-05-05 Zqxdoe"
+    after_run = redaction._scrub_encoded_runs(redaction._redact_stages(text))
+    assert "Zqxdoe" in after_run, "the control no longer holds"
+    assert "Zqxdoe" not in redact(text)
 
 
 # --- BACKLOG #2312: the credential backstop leaves its own output alone ------------------------------
@@ -2228,10 +2273,10 @@ _ENCODED_HOSTILE = {
     "restart-after-literal": "a|b c%7Cd ",
     # One long token with one separator: a single attempt walks all of it.
     "one-long-token": "%20" * 1000 + "%7C ",
-    # Tokens the run takes, built to make the kept-label scan work hardest: a dotted and hyphenated
-    # run offers a label start at every segment, and quotes split the token into many stretches.
-    "label-prefix-run": "a-b.c-" * 40 + "pass%7Cx%7Cy ",
-    "many-kept-marks": "'a\"b;c,d&" * 20 + "%7Cx%7Cy ",
+    # A credential label scan runs once the screen passes. A dotted and hyphenated run offers a
+    # label start at every segment, and each token here ends in a label the scan must find.
+    "label-prefix-run": "a-b.c-" * 40 + "pass=x%7Cx%7Cy ",
+    "label-words-no-separator": "pass-token.secret-" * 12 + "%7Cx%7Cy ",
 }
 
 
