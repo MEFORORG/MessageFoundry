@@ -5773,6 +5773,12 @@ class AuthService:
         The price is a bound of twice the cap. If the user later stops owing a factor (MFA turned
         off, the last factor removed, a role change under the administrators scope), the pending
         rows count as full ones until the next cap run, which then keeps the newest ``cap``.
+
+        **A run that revoked anything is audited (BACKLOG #2283):** one ``auth.session_revoked`` row
+        with scope ``cap`` and the count, under the owner's name, as the supersession row is, so it
+        lands in that user's own security-event feed. A count, not hashes, as the other
+        multi-session revocations record it. The count includes lapsed rows the cap ended, which
+        the validator already refused; the store returns one count for both.
         """
         cap = self._settings.max_sessions_per_user
         if not cap or cap <= 0:
@@ -5781,12 +5787,18 @@ class AuthService:
         # A user row that has gone owes nothing more; splitting is then the closed choice, since it
         # can only protect full sessions.
         split = True if user is None else await self._unverified_session_owes_factor(user)
-        await self._store.enforce_session_cap(
+        revoked = await self._store.enforce_session_cap(
             user_id,
             keep=cap,
             idle_seconds=self.session_idle_seconds,
             split_mfa_pending=split,
         )
+        if revoked > 0:
+            await self._audit(
+                "auth.session_revoked",
+                actor=user.username if user is not None else None,
+                detail=_json({"scope": "cap", "count": revoked, "cap": cap}),
+            )
 
     @property
     def session_idle_seconds(self) -> float:

@@ -171,6 +171,21 @@ async def test_sqlserver_revoke_user_sessions_counts_its_output_rowset(revoked: 
     assert "OUTPUT inserted.token_hash" in seen[0][0]
 
 
+@pytest.mark.parametrize("split", [False, True])
+@pytest.mark.parametrize("revoked", [0, 2])
+async def test_sqlserver_session_cap_counts_its_output_rowset(revoked: int, split: bool) -> None:
+    """The cap's count is audited too (BACKLOG #2283, row item 9), so it is read the same way."""
+    seen: list[tuple[str, tuple[Any, ...]]] = []
+    store = _nocount_store(seen, [(f"{n:064x}",) for n in range(revoked)])
+    assert (
+        await store.enforce_session_cap(
+            "u", keep=2, idle_seconds=1800, split_mfa_pending=split, now=_NOW
+        )
+        == revoked
+    )
+    assert "OUTPUT inserted.token_hash" in seen[0][0]
+
+
 # --- Postgres ----------------------------------------------------------------
 
 

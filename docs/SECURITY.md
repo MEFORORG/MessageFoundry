@@ -3269,7 +3269,10 @@ promoted to Administrator under the `administrators` scope. A directory
 account is not refused here: `POST /me/password` answers it with the usual 400 and changes nothing.
 The owner ruled on 2026-09-24 to keep this behaviour as built.
 
-Every targeted revoke is audited (`auth.session_revoked`, with scope + actor). The **web console** surfaces
+Every targeted revoke is audited (`auth.session_revoked`, with scope + actor). So is each run of the
+per-user session cap that revokes anything: scope `cap`, with the number of sessions it ended and the
+cap it applied, under the name of the user who owned them. The count includes sessions already past
+their idle or absolute limit, which the cap also ends. The **web console** surfaces
 this: an **Active sessions…** view in the account menu lists your sessions and offers per-session
 revoke + "sign out everywhere else". The console renders **no Revoke button on the current session**,
 so the list cannot leave the operator mid-request; *Sign out* is the console's way to end it. That is

@@ -12284,22 +12284,28 @@ class SqlServerStore:
         idle_seconds: float,
         split_mfa_pending: bool,
         now: float | None = None,
-    ) -> None:
+    ) -> int:
         """Keep a user's ``keep`` newest LIVE sessions (per group) and revoke the other unrevoked
         ones that are not stamped ahead of ``now`` (AUTH-SESS-CAP). See
         :meth:`AuthStore.enforce_session_cap`. ``TOP (?)`` binds before the subquery's WHERE, so
-        each group's parameters lead with ``keep``."""
+        each group's parameters lead with ``keep``.
+
+        Returns the count revoked, read from an ``OUTPUT`` rowset as ``revoke_user_sessions``
+        reads its own: the count is audited, and ``cursor.rowcount`` under a session-wide
+        ``SET NOCOUNT ON`` would report ``-1`` (BACKLOG #2283)."""
         if keep <= 0:
-            return
+            return 0
         now = time.time() if now is None else now
         per_group = (keep, user_id, *_session_live_params(now, idle_seconds), now)
         groups = len(_session_cap_groups(split_mfa_pending))
-        await self._execute(
-            "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL"
+        rows = await self._execute_output(
+            "UPDATE sessions SET revoked_at=? OUTPUT inserted.token_hash"
+            " WHERE user_id=? AND revoked_at IS NULL"
             f" AND {_SESSION_NOT_AHEAD_SQL} AND {_SESSION_CAP_RANK_NOT_AHEAD_SQL}"
             f"{_mssql_session_cap_keep_sql(split_mfa_pending)}",
             (now, user_id, now, now, now, *(per_group * groups)),
         )
+        return len(rows)
 
     async def purge_expired_sessions(
         self, *, now: float | None = None, idle_seconds: float | None = None

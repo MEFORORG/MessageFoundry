@@ -6,6 +6,7 @@ reject audit (AUTH-K-AUDIT), and WS token extraction (API-3)."""
 
 from __future__ import annotations
 
+import json
 import time
 
 import pytest
@@ -173,6 +174,37 @@ async def test_login_enforces_per_user_session_cap() -> None:
         tokens = [(await service.login("bob", PW)).token for _ in range(3)]
         active = [t for t in tokens if t and await service.identity_for_token(t) is not None]
         assert len(active) == 2  # only the two newest sessions survive the cap
+    finally:
+        await store.close()
+
+
+async def _cap_rows(store: MessageStore) -> list[dict[str, object]]:
+    """Each ``auth.session_revoked`` row with scope ``cap``, as its detail plus the row's actor."""
+    out: list[dict[str, object]] = []
+    for row in await store.list_audit():
+        if row["action"] == "auth.session_revoked" and row["detail"]:
+            detail = json.loads(str(row["detail"]))
+            if detail.get("scope") == "cap":
+                out.append({**detail, "actor": row["actor"]})
+    return out
+
+
+async def test_a_cap_revocation_is_audited_under_the_owners_name() -> None:
+    """BACKLOG #2283, row item 9: a sign-in that pushes the user over the cap revokes their oldest
+    session, and that revocation is audited. One row per cap run that revoked anything, with the
+    count, under the name of the user whose session ended, so it reaches their own feed. The first
+    two sign-ins are the control: under the cap they revoke nothing and write no row."""
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings(max_sessions_per_user=2))
+        await service.initialize()
+        await _local_user(service, "dana")
+        for _ in range(2):
+            assert (await service.login("dana", PW)).token is not None
+        assert await _cap_rows(store) == [], "a cap run that revoked nothing wrote an audit row"
+
+        assert (await service.login("dana", PW)).token is not None
+        assert await _cap_rows(store) == [{"scope": "cap", "count": 1, "cap": 2, "actor": "dana"}]
     finally:
         await store.close()
 

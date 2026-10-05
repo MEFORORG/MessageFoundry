@@ -12428,12 +12428,12 @@ class MessageStore:
         idle_seconds: float,
         split_mfa_pending: bool,
         now: float | None = None,
-    ) -> None:
+    ) -> int:
         """Keep a user's ``keep`` newest LIVE sessions (per group) and revoke the other unrevoked
-        ones that are not stamped ahead of ``now`` (AUTH-SESS-CAP). See
+        ones that are not stamped ahead of ``now`` (AUTH-SESS-CAP). Returns the count revoked. See
         :meth:`AuthStore.enforce_session_cap`."""
         if keep <= 0:
-            return
+            return 0
         now = time.time() if now is None else now
         per_group = (user_id, *_session_live_params(now, idle_seconds), now, keep)
         groups = len(_session_cap_groups(split_mfa_pending))
@@ -12441,13 +12441,14 @@ class MessageStore:
             # The statement is spelled at the call, not built in a local, because
             # `tests/test_writer_txn_is_the_only_begin.py` cannot read a local and pins how many it
             # cannot read.
-            await self._db.execute(
+            cur = await self._db.execute(
                 "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL"
                 f" AND {_SESSION_NOT_AHEAD_SQL} AND {_SESSION_CAP_RANK_NOT_AHEAD_SQL}"
                 f"{_sqlite_session_cap_keep_sql(split_mfa_pending)}",
                 (now, user_id, now, now, now, *(per_group * groups)),
             )
             await self._commit()
+            return int(cur.rowcount)
 
     async def purge_expired_sessions(
         self, *, now: float | None = None, idle_seconds: float | None = None

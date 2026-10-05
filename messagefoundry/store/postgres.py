@@ -2242,7 +2242,8 @@ class PostgresStore:
 
     async def _execute(self, sql: str, *params: Any) -> int:
         """Run one write on a bounded borrow and return its row count, read from asyncpg's status
-        tag. Most callers ignore it; the session purge reads it (BACKLOG #2283). Two session writes that need the count borrow without the bound instead, for the
+        tag. Most callers ignore it; the session purge and the session cap read it (BACKLOG
+        #2283). Two session writes that need the count borrow without the bound instead, for the
         reason :meth:`_execute_after_commit` gives."""
         async with self._timed_acquire(record=False) as conn:
             return _rowcount(await conn.execute(sql, *params))
@@ -8379,18 +8380,18 @@ class PostgresStore:
         idle_seconds: float,
         split_mfa_pending: bool,
         now: float | None = None,
-    ) -> None:
+    ) -> int:
         """Keep a user's ``keep`` newest LIVE sessions (per group) and revoke the other unrevoked
-        ones that are not stamped ahead of ``now`` (AUTH-SESS-CAP). See
+        ones that are not stamped ahead of ``now`` (AUTH-SESS-CAP). Returns the count revoked. See
         :meth:`AuthStore.enforce_session_cap`.
 
         The clauses are store.py's ``_SESSION_NOT_AHEAD_SQL``, ``_SESSION_LIVE_SQL`` and
         ``_SESSION_CAP_RANK_NOT_AHEAD_SQL``, respelled for ``$n``. Every group reuses ``$1`` to
         ``$4``, so a split adds no parameters."""
         if keep <= 0:
-            return
+            return 0
         now = time.time() if now is None else now
-        await self._execute(
+        return await self._execute(
             "UPDATE sessions SET revoked_at=$1 WHERE user_id=$2 AND revoked_at IS NULL"
             " AND created_at <= $1 AND last_used_at <= $1"
             " AND COALESCE(mfa_verified_at, created_at) <= $1"

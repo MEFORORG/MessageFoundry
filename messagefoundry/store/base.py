@@ -2470,9 +2470,14 @@ class AuthStore(Protocol):
         idle_seconds: float,
         split_mfa_pending: bool,
         now: float | None = None,
-    ) -> None:
+    ) -> int:
         """Keep a user's ``keep`` newest LIVE sessions and revoke the rest, lapsed ones included
         (AUTH-SESS-CAP, BACKLOG #1900).
+
+        Returns how many sessions it revoked, so the caller can audit the revocation (BACKLOG
+        #2283). A ``keep`` of zero or less revokes nothing and returns 0. On SQL Server the count
+        comes from an ``OUTPUT`` rowset, as ``revoke_user_sessions`` counts, so a session-wide
+        ``SET NOCOUNT ON`` cannot turn it into ``-1``.
 
         "Newest" ranks a row from when it completed its second factor (``mfa_verified_at``), or
         from its creation when it has no stamp (BACKLOG #2076). Completing MFA keeps
