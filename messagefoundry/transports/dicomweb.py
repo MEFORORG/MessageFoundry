@@ -58,7 +58,7 @@ from messagefoundry.transports.bounded_read import (
     EgressReplyError,
     drain_bounded,
     hop_identity,
-    read_bounded_text,
+    read_accepted_reply_text,
 )
 from messagefoundry.transports.dicom import recover_dicom_object_bytes
 
@@ -475,10 +475,14 @@ class DicomWebDestination(DestinationConnector):
             with self._opener.open(req, timeout=self.timeout) as resp:
                 # ASVS 15.2.2: bounded on the socket read. A STOW-RS reply is a small result
                 # document, so the 16 MiB ceiling refuses only a peer that is broken or hostile.
-                body = read_bounded_text(
+                # vault BACKLOG #2180: the status here is 2xx, so an over-cap body must not
+                # re-send. A FailedSOPSequence can sit inside a 2xx, so send() reads this body in
+                # both capture modes, and the refusal is permanent.
+                body = read_accepted_reply_text(
                     resp,
                     connector=self._hop,
                     encoding=self.encoding,
+                    body_is_used=True,
                 )
                 status = int(getattr(resp, "status", 200))
                 return body, status

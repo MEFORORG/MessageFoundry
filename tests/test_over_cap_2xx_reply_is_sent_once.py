@@ -1,0 +1,544 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
+"""An over-cap reply body after a 2xx is not sent again (vault BACKLOG #2180).
+
+Before this, a 2xx whose body was over the byte bound raised ``ResponseTooLargeError``, a retryable
+``DeliveryError``. The partner had already accepted the request, so on a first deployment each retry
+would have sent it again, and the message would then have dead-lettered although it was delivered.
+
+The owner ruling of 2026-10-05 judges such a reply by who reads the body:
+
+* nothing reads it (REST with capture off, FHIR): the message is delivered, the body is dropped,
+  and a WARNING is logged;
+* the engine reads it to know the outcome, or passes it on (SOAP, DICOMweb, REST with capture on):
+  a permanent refusal, and no re-send.
+
+Three layers:
+
+* **The helper**, with a small bound, including the two arms it must leave alone.
+* **Each destination's ``_post``**, against a peer whose body never ends.
+* **The delivery worker, on the wire.** A loopback partner counts the requests it receives while
+  the worker is given the row again and again. This is the layer the item is about: one send, and
+  the recorded status the ruling names. The same harness shows a 500 IS sent again, so a count of
+  one is not something it reports for every reply.
+
+Synthetic data only.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import email.message
+import functools
+import http.server
+import json
+import logging
+import threading
+import time
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.settings import EgressSettings
+from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
+from messagefoundry.config.wiring import FHIR, DICOMweb, Registry, Rest, Soap
+from messagefoundry.parsing import RawMessage
+from messagefoundry.pipeline.alerts import LoggingAlertSink
+from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome
+from messagefoundry.store.store import MessageStatus, MessageStore, OutboxStatus, Stage
+from messagefoundry.transports import build_destination
+from messagefoundry.transports.base import DeliveryError, NegativeAckError
+from messagefoundry.transports.bounded_read import (
+    DEFAULT_MAX_RESPONSE_BYTES,
+    REPLY_TOO_LARGE_CODE,
+    ResponseTooLargeError,
+    TruncatedResponseError,
+    read_accepted_reply_text,
+)
+from tests._egress_policy import permitting
+
+_WARN_DIAL = HopPosture(enforcing=False)
+CHANNEL = "IB_TEST"
+DEST = "OB_PARTNER"
+RAW = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\r"
+#: In the URL so a test can see that no part of the URL reaches a log line or a stored error.
+_URL_MARKER = "SITE-QUERY-MARKER"
+#: In every outgoing payload, for the same reason.
+_PAYLOAD_MARKER = "PAYLOAD-MARKER-7f3a"
+#: The byte an over-cap reply is made of. A run of it must never reach a log line.
+_REPLY_FILL = b"Z"
+
+
+# --- the helper -----------------------------------------------------------------------------------
+
+
+class _Resp:
+    """A reply holding ``body``, with a 2xx status and no declared length."""
+
+    status = 201
+
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+        self.headers = email.message.Message()
+
+    def read(self, amt: int = -1) -> bytes:
+        return self._body if amt < 0 else self._body[:amt]
+
+
+def test_an_unused_over_cap_body_reads_as_empty_and_warns(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.WARNING):
+        text = read_accepted_reply_text(
+            _Resp(_REPLY_FILL * 65),
+            limit=64,
+            connector="REST connection 'OB_X'",
+            encoding="utf-8",
+            body_is_used=False,
+        )
+    assert text == ""
+    (record,) = caplog.records
+    assert record.levelno == logging.WARNING
+    message = record.getMessage()
+    assert message.startswith("REST connection 'OB_X' accepted the request (status 201)")
+    assert "64-byte bound" in message
+    assert "recorded as delivered" in message
+    assert _REPLY_FILL.decode() * 4 not in message
+
+
+def test_a_used_over_cap_body_is_a_permanent_refusal() -> None:
+    with pytest.raises(NegativeAckError) as ei:
+        read_accepted_reply_text(
+            _Resp(_REPLY_FILL * 65),
+            limit=64,
+            connector="SOAP connection 'OB_X'",
+            encoding="utf-8",
+            body_is_used=True,
+        )
+    err = ei.value
+    assert err.code == REPLY_TOO_LARGE_CODE == "reply-too-large"
+    # Not a credential or configuration fault: those stop the lane, and this is one reply.
+    assert (err.permanent, err.credential_fault, err.config_fault) == (True, False, False)
+    assert str(err).startswith("SOAP connection 'OB_X' accepted the request with a 2xx status")
+    assert "64-byte bound" in str(err)
+    assert _REPLY_FILL.decode() * 4 not in str(err)
+    # Neither chain reaches the frame that holds the bytes read so far.
+    assert err.__context__ is None
+    assert err.__cause__ is None
+
+
+@pytest.mark.parametrize("body_is_used", [False, True])
+def test_a_body_at_the_bound_comes_back_whole(
+    body_is_used: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """THE CONTROL: the helper changes nothing at or under the bound."""
+    with caplog.at_level(logging.WARNING):
+        text = read_accepted_reply_text(
+            _Resp(b"y" * 64), limit=64, connector="c", encoding="utf-8", body_is_used=body_is_used
+        )
+    assert text == "y" * 64
+    assert caplog.records == []
+
+
+class _ShortResp(_Resp):
+    """A reply that stopped 9 bytes short of the length it declared."""
+
+    length = 9
+
+
+@pytest.mark.parametrize("body_is_used", [False, True])
+def test_a_truncated_body_is_still_raised_as_it_was(body_is_used: bool) -> None:
+    """Only the byte bound is handled. A truncated reply after a 2xx is still a retryable
+    ``TruncatedResponseError``, in both modes: that is a different question, left alone."""
+    with pytest.raises(TruncatedResponseError) as ei:
+        read_accepted_reply_text(
+            _ShortResp(b"y" * 5),
+            limit=64,
+            connector="c",
+            encoding="utf-8",
+            body_is_used=body_is_used,
+        )
+    assert not isinstance(ei.value, NegativeAckError)
+
+
+# --- each destination's _post, against a body that never ends -------------------------------------
+
+
+class _UnboundedResp:
+    """A 2xx whose body never ends: ``read(amt)`` returns exactly ``amt`` bytes."""
+
+    status = 200
+    headers: email.message.Message = email.message.Message()
+
+    def __init__(self) -> None:
+        self.requested: list[int] = []
+
+    def read(self, amt: int = -1) -> bytes:
+        self.requested.append(amt)
+        if amt < 0:
+            raise AssertionError("unbounded read: the call site asked for the whole body")
+        return _REPLY_FILL * amt
+
+    def __enter__(self) -> _UnboundedResp:
+        return self
+
+    def __exit__(self, *a: object) -> None:
+        return None
+
+
+class _CountingOpener:
+    def __init__(self, resp: object) -> None:
+        self.resp = resp
+        self.opened = 0
+
+    def open(self, req: object, timeout: float | None = None) -> object:
+        self.opened += 1
+        return self.resp
+
+
+_FACTORY: dict[ConnectorType, Any] = {
+    ConnectorType.REST: Rest,
+    ConnectorType.SOAP: Soap,
+    ConnectorType.FHIR: FHIR,
+    ConnectorType.DICOMWEB: DICOMweb,
+}
+_KIND = {
+    ConnectorType.REST: "REST",
+    ConnectorType.SOAP: "SOAP",
+    ConnectorType.FHIR: "FHIR",
+    ConnectorType.DICOMWEB: "DICOMweb",
+}
+
+
+def _build(ctype: ConnectorType, url: str, **over: object) -> Any:
+    spec = _FACTORY[ctype](url=url, **over)
+    cleartext = url.startswith("http://")
+    with active_hop_posture(_WARN_DIAL):
+        return build_destination(
+            Destination(
+                name=DEST,
+                type=ctype,
+                settings=spec.settings,
+                cleartext_accepted=cleartext,
+                cleartext_reason="test peer has no TLS" if cleartext else None,
+                tls_revocation_attested=True,
+                tls_revocation_attested_reason="revocation-checking PKI at the partner edge",
+            ),
+            egress=permitting(spec.settings),
+        )
+
+
+def _payload(ctype: ConnectorType) -> str:
+    if ctype is ConnectorType.FHIR:
+        return json.dumps({"resourceType": "Patient", "id": "p1", "note": _PAYLOAD_MARKER})
+    if ctype is ConnectorType.DICOMWEB:
+        return RawMessage.from_bytes(
+            b"\x00" * 128 + b"DICM" + _PAYLOAD_MARKER.encode(), "dicom"
+        ).encode()
+    if ctype is ConnectorType.SOAP:
+        return f"<x>{_PAYLOAD_MARKER}</x>"
+    return json.dumps({"note": _PAYLOAD_MARKER})
+
+
+#: What the ruling names, as (connector, extra settings) -> the delivered side or the refused side.
+#: FHIR with capture on is absent on purpose: see the last test in this file.
+_DELIVERED = "delivered"
+_REFUSED = "refused"
+_RULED: list[tuple[ConnectorType, dict[str, object], str]] = [
+    (ConnectorType.REST, {"capture_response": False}, _DELIVERED),
+    (ConnectorType.REST, {"capture_response": True}, _REFUSED),
+    (ConnectorType.SOAP, {"capture_response": False}, _REFUSED),
+    (ConnectorType.SOAP, {"capture_response": True}, _REFUSED),
+    (ConnectorType.DICOMWEB, {"capture_response": False}, _REFUSED),
+    (ConnectorType.DICOMWEB, {"capture_response": True}, _REFUSED),
+    (ConnectorType.FHIR, {"capture_response": False}, _DELIVERED),
+    # An update goes out wrapped in a transaction, and its reply is parsed for the entry status.
+    (ConnectorType.FHIR, {"capture_response": False, "interaction": "update"}, _DELIVERED),
+]
+
+
+def _case_id(case: tuple[ConnectorType, dict[str, object], str]) -> str:
+    ctype, over, _ = case
+    capture = "capture-on" if over.get("capture_response") else "capture-off"
+    interaction = f"-{over['interaction']}" if "interaction" in over else ""
+    return f"{ctype.value}-{capture}{interaction}"
+
+
+@pytest.mark.parametrize("case", _RULED, ids=_case_id)
+async def test_send_follows_the_ruling_and_keeps_the_byte_bound(
+    case: tuple[ConnectorType, dict[str, object], str], caplog: pytest.LogCaptureFixture
+) -> None:
+    ctype, over, side = case
+    dest = _build(ctype, f"https://partner.example.com/x?site={_URL_MARKER}", **over)
+    resp = _UnboundedResp()
+    opener = _CountingOpener(resp)
+    dest._opener = opener
+    with caplog.at_level(logging.WARNING):
+        if side == _DELIVERED:
+            assert await dest.send(_payload(ctype)) is None
+        else:
+            with pytest.raises(NegativeAckError) as ei:
+                await dest.send(_payload(ctype))
+            assert ei.value.code == REPLY_TOO_LARGE_CODE
+            assert ei.value.permanent is True
+            assert str(ei.value).startswith(f"{_KIND[ctype]} connection {DEST!r} accepted")
+            assert _URL_MARKER not in str(ei.value)
+            assert "partner.example.com" not in str(ei.value)
+    # The bound is still enforced on the read: one byte past it, and never the whole body.
+    assert resp.requested == [DEFAULT_MAX_RESPONSE_BYTES + 1]
+    assert opener.opened == 1
+    warnings = [r.getMessage() for r in caplog.records if "over the" in r.getMessage()]
+    if side == _DELIVERED:
+        (warning,) = warnings
+        assert warning.startswith(f"{_KIND[ctype]} connection {DEST!r} accepted the request")
+        for leaked in (_URL_MARKER, "partner.example.com", _PAYLOAD_MARKER, "ZZZZ"):
+            assert leaked not in warning
+    else:
+        assert warnings == []
+
+
+# --- the delivery worker, on the wire -------------------------------------------------------------
+
+
+@functools.cache
+def _over_cap_body() -> bytes:
+    """One byte past the bound. Built on first use, so collecting this module allocates nothing."""
+    return _REPLY_FILL * (DEFAULT_MAX_RESPONSE_BYTES + 1)
+
+
+class _Partner:
+    """A loopback partner that answers every request with ``status`` and ``body``, and counts them."""
+
+    def __init__(self, status: int, body: bytes) -> None:
+        self.requests: list[str] = []
+        outer = self
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def _serve(self) -> None:
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                outer.requests.append(self.command)
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                # A destination that classifies a non-2xx on the status alone closes without
+                # reading the body, so the rest of the write has nowhere to go.
+                with contextlib.suppress(OSError):
+                    self.wfile.write(body)
+
+            do_POST = do_PUT = _serve
+
+            def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+                return
+
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self.url = f"http://127.0.0.1:{self._server.server_address[1]}"
+        self._thread = threading.Thread(
+            target=self._server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+        )
+
+    def __enter__(self) -> _Partner:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=5)
+
+
+class _Stops(LoggingAlertSink):
+    def __init__(self) -> None:
+        self.stopped: list[str] = []
+
+    def connection_stopped(self, name: str, *, detail: str) -> None:
+        self.stopped.append(name)
+
+
+class _Delivery:
+    """What the store holds after the worker was offered one row ``offers`` times."""
+
+    def __init__(self) -> None:
+        self.outcomes: list[_ItemOutcome] = []
+        self.row_status = ""
+        self.last_error = ""
+        self.message_status = ""
+        self.captured: list[tuple[str, str | None]] = []
+        self.stopped: list[str] = []
+
+
+#: How often the worker is offered the row. Each offer is past any backoff, so a row that is still
+#: pending is claimed and sent again. Three is enough to tell one send from a send per offer.
+_OFFERS = 3
+
+
+async def _deliver(tmp_path: Path, dest: Any, payload: str) -> _Delivery:
+    """Queue one outbound row for ``dest`` and offer it to the delivery worker ``_OFFERS`` times."""
+    result = _Delivery()
+    store = await MessageStore.open(tmp_path / "overcap.db")
+    try:
+        mid = await store.enqueue_ingress(channel_id=CHANNEL, raw=RAW, now=0.0)
+        ing = await store.claim_next_fifo(CHANNEL, stage=Stage.INGRESS.value, now=0.0)
+        assert ing is not None
+        await store.route_handoff(
+            ingress_id=ing.id,
+            message_id=mid,
+            channel_id=CHANNEL,
+            handlers=[("h1", RAW)],
+            disposition=MessageStatus.ROUTED,
+            now=0.0,
+        )
+        routed = await store.claim_next_fifo(CHANNEL, stage=Stage.ROUTED.value, now=0.0)
+        assert routed is not None
+        await store.transform_handoff(
+            routed_id=routed.id,
+            message_id=mid,
+            channel_id=CHANNEL,
+            deliveries=[(DEST, payload)],
+            now=0.0,
+        )
+        sink = _Stops()
+        runner = RegistryRunner(
+            Registry(),
+            store,
+            poll_interval=0.02,
+            alert_sink=sink,
+            egress=EgressSettings(deny_by_default=False),
+        )
+        runner._destinations[DEST] = dest
+        for offer in range(1, _OFFERS + 1):
+            # A day further on each time: past any backoff the last attempt set.
+            item = await store.claim_next_fifo(DEST, now=time.time() + offer * 86400.0)
+            if item is None:
+                break
+            outcome, _ = await runner._process_delivery_item(DEST, item)
+            result.outcomes.append(outcome)
+        cur = await store._db.execute(
+            "SELECT status, last_error FROM queue WHERE message_id=? AND stage=?",
+            (mid, Stage.OUTBOUND.value),
+        )
+        row = await cur.fetchone()
+        assert row is not None
+        result.row_status = str(row["status"])
+        # Plaintext here: the test store has the default identity cipher.
+        result.last_error = "" if row["last_error"] is None else str(row["last_error"])
+        message = await store.get_message(mid)
+        assert message is not None
+        result.message_status = str(message["status"])
+        result.captured = [(c.outcome, c.body) for c in await store.correlate_response(mid)]
+        result.stopped = sink.stopped
+        return result
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("case", _RULED, ids=_case_id)
+async def test_an_over_cap_2xx_is_sent_once_and_recorded_as_ruled(
+    case: tuple[ConnectorType, dict[str, object], str],
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    ctype, over, side = case
+    with _Partner(200, _over_cap_body()) as partner:
+        dest = _build(ctype, f"{partner.url}/x?site={_URL_MARKER}", **over)
+        with caplog.at_level(logging.WARNING):
+            got = await _deliver(tmp_path, dest, _payload(ctype))
+    # THE ITEM: the partner accepted the request, so it must never see it twice.
+    assert len(partner.requests) == 1, partner.requests
+    assert got.outcomes == [_ItemOutcome.PROCESSED]
+    assert got.stopped == [], "one over-cap reply must not stop the lane"
+    assert got.captured == []
+    if side == _DELIVERED:
+        assert got.row_status == OutboxStatus.DONE.value
+        assert got.message_status == MessageStatus.PROCESSED.value
+        assert got.last_error == ""
+        assert any("recorded as delivered" in r.getMessage() for r in caplog.records)
+    else:
+        assert got.row_status == OutboxStatus.DEAD.value
+        assert got.message_status == MessageStatus.ERROR.value
+        # The stored error is the fixed text: the connection, the bound, and nothing of the URL,
+        # the payload or the reply.
+        assert f"{_KIND[ctype]} connection {DEST!r} accepted the request" in got.last_error
+        for leaked in (_URL_MARKER, "127.0.0.1", _PAYLOAD_MARKER, "ZZZZ"):
+            assert leaked not in got.last_error
+    for record in caplog.records:
+        for leaked in (_URL_MARKER, _PAYLOAD_MARKER, "ZZZZ"):
+            assert leaked not in record.getMessage()
+
+
+#: A reply each destination takes as a plain success.
+_IN_CAP_BODY = {
+    ConnectorType.REST: b'{"ok": true}',
+    ConnectorType.SOAP: (
+        b'<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope">'
+        b"<soap:Body><ok/></soap:Body></soap:Envelope>"
+    ),
+    ConnectorType.FHIR: b'{"resourceType": "Patient", "id": "p1"}',
+    ConnectorType.DICOMWEB: b'{"00081199": {"vr": "SQ", "Value": [{}]}}',
+}
+
+
+@pytest.mark.parametrize("ctype", list(_FACTORY), ids=lambda c: c.value)
+@pytest.mark.parametrize("capture", [False, True], ids=["capture-off", "capture-on"])
+async def test_an_in_cap_2xx_is_delivered_as_before(
+    ctype: ConnectorType, capture: bool, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """THE CONTROL: a reply under the bound is delivered once, in every mode, and with capture on
+    its body is stored whole. No new WARNING is logged for it."""
+    body = _IN_CAP_BODY[ctype]
+    with _Partner(200, body) as partner:
+        dest = _build(ctype, f"{partner.url}/x", capture_response=capture)
+        with caplog.at_level(logging.WARNING):
+            got = await _deliver(tmp_path, dest, _payload(ctype))
+    assert len(partner.requests) == 1
+    assert got.outcomes == [_ItemOutcome.PROCESSED]
+    assert got.row_status == OutboxStatus.DONE.value
+    assert got.message_status == MessageStatus.PROCESSED.value
+    assert got.captured == ([("accepted", body.decode())] if capture else [])
+    assert not any("over the" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("ctype", list(_FACTORY), ids=lambda c: c.value)
+@pytest.mark.parametrize("capture", [False, True], ids=["capture-off", "capture-on"])
+async def test_an_over_cap_body_on_a_500_is_retried_as_before(
+    ctype: ConnectorType, capture: bool, tmp_path: Path
+) -> None:
+    """THE CONTROL, and the proof the harness can see a re-send. A 500 says the partner did not
+    take the request, so it is sent again on every offer, whatever the size of its body. A harness
+    that reported one request for every reply would fail here."""
+    with _Partner(500, _over_cap_body()) as partner:
+        dest = _build(ctype, f"{partner.url}/x", capture_response=capture)
+        got = await _deliver(tmp_path, dest, _payload(ctype))
+    assert len(partner.requests) == _OFFERS
+    assert got.outcomes == [_ItemOutcome.PROCESSED] * _OFFERS
+    assert got.row_status == OutboxStatus.PENDING.value
+    assert "HTTP 500" in got.last_error
+    assert "accepted the request" not in got.last_error
+    assert got.captured == []
+
+
+# --- the case the ruling does not name ------------------------------------------------------------
+
+
+async def test_fhir_with_capture_on_is_not_changed_by_this_item(tmp_path: Path) -> None:
+    """**Not a decision.** The ruling names FHIR on the delivered side, because nothing reads its
+    reply. With ``capture_response`` on, the reply is stored and can be passed on through
+    ``reingress_to`` or ``reply_from``, as a REST reply is, and the ruling names no side for that.
+    So this item leaves the arm alone, and an over-cap 2xx there is still retried and sent again.
+
+    This test records what the code does today, so that a change to it is made on purpose."""
+    dest = _build(ConnectorType.FHIR, "https://partner.example.com/fhir", capture_response=True)
+    resp = _UnboundedResp()
+    dest._opener = _CountingOpener(resp)
+    with pytest.raises(ResponseTooLargeError) as ei:
+        await dest.send(_payload(ConnectorType.FHIR))
+    assert isinstance(ei.value, DeliveryError)
+    assert not isinstance(ei.value, NegativeAckError)
+    assert resp.requested == [DEFAULT_MAX_RESPONSE_BYTES + 1]
+    with _Partner(200, _over_cap_body()) as partner:
+        wired = _build(ConnectorType.FHIR, f"{partner.url}/fhir", capture_response=True)
+        got = await _deliver(tmp_path, wired, _payload(ConnectorType.FHIR))
+    assert len(partner.requests) == _OFFERS
+    assert got.row_status == OutboxStatus.PENDING.value

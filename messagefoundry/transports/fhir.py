@@ -77,6 +77,7 @@ from messagefoundry.transports.bounded_read import (
     EgressReplyError,
     drain_bounded,
     hop_identity,
+    read_accepted_reply_text,
     read_bounded_text,
 )
 
@@ -1013,11 +1014,26 @@ class FhirDestination(DestinationConnector):
             with self._opener.open(req, timeout=self.timeout) as resp:
                 # ASVS 15.2.2: bounded on the socket read. A FHIR write returns the created resource
                 # or an OperationOutcome, both orders of magnitude under the 16 MiB ceiling.
-                body = read_bounded_text(
-                    resp,
-                    connector=self._hop,
-                    encoding=self.encoding,
-                )
+                if self.capture_response:
+                    # vault BACKLOG #2180 does not reach this arm. With capture on the reply is
+                    # stored and may be passed on, and the owner ruling of 2026-10-05 names no
+                    # side for that. So an over-cap body here is still retried, as before.
+                    body = read_bounded_text(
+                        resp,
+                        connector=self._hop,
+                        encoding=self.encoding,
+                    )
+                else:
+                    # vault BACKLOG #2180: the status here is 2xx, so an over-cap body must not
+                    # re-send. With capture off the message is delivered and the body dropped. A
+                    # wrapped update then meets an empty body, which _unwrap_transaction_reply
+                    # takes as delivered, as it takes any reply it cannot read.
+                    body = read_accepted_reply_text(
+                        resp,
+                        connector=self._hop,
+                        encoding=self.encoding,
+                        body_is_used=False,
+                    )
                 status = int(getattr(resp, "status", 200))
                 # #154: capture only the allow-listed response headers (empty allow-list → {}).
                 headers_out = capture_response_headers(

@@ -56,10 +56,11 @@ from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 from messagefoundry.pipeline.alert_sinks import WebhookTransport
 from messagefoundry.transports import bounded_read, build_destination
 from messagefoundry.transports.ai_broker import AiBroker, AiBrokerError
-from messagefoundry.transports.base import DeliveryError
+from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.bounded_read import (
     DEFAULT_MAX_RESPONSE_BYTES,
     MAX_TOKEN_RESPONSE_BYTES,
+    REPLY_TOO_LARGE_CODE,
     EgressReplyError,
     ResponseTooLargeError,
     TruncatedResponseError,
@@ -171,11 +172,10 @@ def test_the_bound_is_enforced_on_the_read_not_after_it() -> None:
 
 
 def test_the_refusal_is_a_delivery_error_not_a_permanent_nak() -> None:
-    """A peer-side fault stays transient. Promoting it to NegativeAckError would add a new
-    dead-letter cause, which #1191 rules out."""
+    """A peer-side fault stays transient: the class itself is a plain ``DeliveryError``. A delivery
+    that already holds a 2xx does not let it travel, and ``read_accepted_reply_text`` decides
+    there (vault BACKLOG #2180). ``tests/test_over_cap_2xx_reply_is_sent_once.py`` covers that."""
     assert issubclass(ResponseTooLargeError, DeliveryError)
-    from messagefoundry.transports.base import NegativeAckError
-
     assert not issubclass(ResponseTooLargeError, NegativeAckError)
 
 
@@ -295,12 +295,13 @@ def _dicomweb() -> DicomWebDestination:
     return d
 
 
-def test_rest_post_refuses_an_unbounded_reply() -> None:
+def test_rest_post_reads_no_more_than_the_bound_of_an_unbounded_reply() -> None:
+    """The read still stops one byte past the bound. What an over-cap body then means after a 2xx
+    is vault BACKLOG #2180: with capture off nothing reads it, so it comes back empty."""
     dest = _rest()
     resp = _UnboundedResp()
     dest._opener = _FakeOpener(resp)  # type: ignore[assignment]
-    with pytest.raises(ResponseTooLargeError):
-        dest._post("<payload/>")
+    assert dest._post("<payload/>") == ("", 200, {})
     assert resp.requested == [DEFAULT_MAX_RESPONSE_BYTES + 1]
 
 
@@ -314,10 +315,14 @@ def test_rest_probe_refuses_an_unbounded_drain() -> None:
 
 
 def test_soap_post_refuses_an_unbounded_reply() -> None:
+    """Refused for good after a 2xx, not retried (vault BACKLOG #2180): a Fault can sit in the body."""
     dest = _soap()
-    dest._opener = _FakeOpener(_UnboundedResp())  # type: ignore[assignment]
-    with pytest.raises(ResponseTooLargeError):
+    resp = _UnboundedResp()
+    dest._opener = _FakeOpener(resp)  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as err:
         dest._post("<env:Envelope/>")
+    assert (err.value.code, err.value.permanent) == (REPLY_TOO_LARGE_CODE, True)
+    assert resp.requested == [DEFAULT_MAX_RESPONSE_BYTES + 1]
 
 
 def test_soap_probe_refuses_an_unbounded_drain() -> None:
@@ -365,11 +370,14 @@ def test_soap_fault_body_is_bounded_and_the_status_still_classifies(
     assert any("could not read whole" in r.getMessage() for r in caplog.records)
 
 
-def test_fhir_post_refuses_an_unbounded_reply() -> None:
+def test_fhir_post_reads_no_more_than_the_bound_of_an_unbounded_reply() -> None:
+    """As for REST with capture off: the body comes back empty (vault BACKLOG #2180)."""
     dest = _fhir()
-    dest._opener = _FakeOpener(_UnboundedResp())  # type: ignore[assignment]
-    with pytest.raises(ResponseTooLargeError):
-        dest._post(json.dumps({"resourceType": "Patient"}), "POST", f"{FHIR_BASE}/Patient", {})
+    resp = _UnboundedResp()
+    dest._opener = _FakeOpener(resp)  # type: ignore[assignment]
+    body = json.dumps({"resourceType": "Patient"})
+    assert dest._post(body, "POST", f"{FHIR_BASE}/Patient", {}) == ("", 200, {})
+    assert resp.requested == [DEFAULT_MAX_RESPONSE_BYTES + 1]
 
 
 def test_fhir_probe_refuses_an_unbounded_drain() -> None:
@@ -393,10 +401,15 @@ def test_fhir_error_body_is_bounded_and_the_status_still_classifies(
 
 
 def test_dicomweb_post_refuses_an_unbounded_reply() -> None:
+    """Refused for good after a 2xx, not retried (vault BACKLOG #2180): a FailedSOPSequence can sit
+    in the body."""
     dest = _dicomweb()
-    dest._opener = _FakeOpener(_UnboundedResp())  # type: ignore[assignment]
-    with pytest.raises(ResponseTooLargeError):
+    resp = _UnboundedResp()
+    dest._opener = _FakeOpener(resp)  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as err:
         dest._post(b"\x00" * 128 + b"DICM")
+    assert (err.value.code, err.value.permanent) == (REPLY_TOO_LARGE_CODE, True)
+    assert resp.requested == [DEFAULT_MAX_RESPONSE_BYTES + 1]
 
 
 def test_dicomweb_probe_refuses_an_unbounded_drain() -> None:
@@ -884,6 +897,7 @@ def test_a_truncated_reply_never_carries_the_partial_body_on_the_exception_chain
 #: The readers, plus the helpers that pass a ``connector`` label on to one unchanged.
 _READERS = frozenset(
     {
+        "read_accepted_reply_text",
         "read_bounded",
         "read_bounded_text",
         "drain_bounded",
@@ -946,34 +960,56 @@ def test_the_url_scan_can_still_find_one() -> None:
     assert not _url_bearing_connectors('drain_bounded(resp, connector=f"{self._hop} probe")')
 
 
-def test_each_destination_names_its_connection_and_not_its_host() -> None:
+def test_each_destination_names_its_connection_and_not_its_host(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     rest, soap, fhir, dicomweb = _rest(), _soap(), _fhir(), _dicomweb()
-    cases: list[tuple[object, Callable[[], object], str, str]] = [
-        (rest, lambda: rest._post("<payload/>"), "REST connection 'OB_REST'", "api.example.com"),
+    probes: list[tuple[object, Callable[[], object], str, str]] = [
         (rest, rest._probe, "REST connection 'OB_REST' probe", "api.example.com"),
-        (soap, lambda: soap._post("<env:Envelope/>"), "SOAP connection 'OB_SOAP'", "api.example"),
         (soap, soap._probe, "SOAP connection 'OB_SOAP' probe", "api.example"),
-        (
-            fhir,
-            lambda: fhir._post("{}", "POST", f"{FHIR_BASE}/Patient", {}),
-            "FHIR connection 'OB_FHIR'",
-            "fhir.example.org",
-        ),
         (fhir, fhir._probe, "FHIR connection 'OB_FHIR' probe", "fhir.example.org"),
+        (dicomweb, dicomweb._probe, "DICOMweb connection 'OB_DCMWEB' probe", "pacs.example.org"),
+    ]
+    for dest, call, identity, host in probes:
+        dest._opener = _FakeOpener(_UnboundedResp())  # type: ignore[attr-defined]
+        with pytest.raises(ResponseTooLargeError) as err:
+            call()
+        assert str(err.value).startswith(identity + " returned")
+        assert host not in str(err.value)
+    # After a 2xx an over-cap body is refused for good where the body is read (vault BACKLOG #2180).
+    refused: list[tuple[object, Callable[[], object], str, str]] = [
+        (soap, lambda: soap._post("<env:Envelope/>"), "SOAP connection 'OB_SOAP'", "api.example"),
         (
             dicomweb,
             lambda: dicomweb._post(b"\x00" * 128 + b"DICM"),
             "DICOMweb connection 'OB_DCMWEB'",
             "pacs.example.org",
         ),
-        (dicomweb, dicomweb._probe, "DICOMweb connection 'OB_DCMWEB' probe", "pacs.example.org"),
     ]
-    for dest, call, identity, host in cases:
+    for dest, call, identity, host in refused:
         dest._opener = _FakeOpener(_UnboundedResp())  # type: ignore[attr-defined]
-        with pytest.raises(ResponseTooLargeError) as err:
+        with pytest.raises(NegativeAckError) as refusal:
             call()
-        assert str(err.value).startswith(identity + " returned")
-        assert host not in str(err.value)
+        assert str(refusal.value).startswith(identity + " accepted the request")
+        assert host not in str(refusal.value)
+    # Where nothing reads it, the body is dropped and a WARNING names the connection instead.
+    delivered: list[tuple[object, Callable[[], object], str, str]] = [
+        (rest, lambda: rest._post("<payload/>"), "REST connection 'OB_REST'", "api.example.com"),
+        (
+            fhir,
+            lambda: fhir._post("{}", "POST", f"{FHIR_BASE}/Patient", {}),
+            "FHIR connection 'OB_FHIR'",
+            "fhir.example.org",
+        ),
+    ]
+    for dest, call, identity, host in delivered:
+        dest._opener = _FakeOpener(_UnboundedResp())  # type: ignore[attr-defined]
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            call()
+        (warning,) = [r.getMessage() for r in caplog.records]
+        assert warning.startswith(identity + " accepted the request")
+        assert host not in warning
 
 
 def test_the_lookup_the_token_endpoint_and_the_ai_broker_name_no_host(ec_pem: str) -> None:

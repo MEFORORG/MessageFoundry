@@ -86,6 +86,7 @@ from messagefoundry.transports.bounded_read import (
     build_strict_opener,
     drain_bounded,
     hop_identity,
+    read_accepted_reply_text,
     read_bounded_text,
 )
 
@@ -901,7 +902,12 @@ class SoapDestination(DestinationConnector):
             with self._opener.open(req, timeout=self.timeout) as resp:
                 # ASVS 15.2.2: bounded on the socket read. One SOAP response envelope sits far under
                 # the 16 MiB ceiling, so this refuses only a peer that is broken or hostile.
-                body = read_bounded_text(resp, connector=self._hop, encoding=self.encoding)
+                # vault BACKLOG #2180: the status here is 2xx, so an over-cap body must not
+                # re-send. A Fault can sit inside a 2xx, so send() reads this body in both capture
+                # modes, and the refusal is permanent.
+                body = read_accepted_reply_text(
+                    resp, connector=self._hop, encoding=self.encoding, body_is_used=True
+                )
                 status = int(getattr(resp, "status", 200))
                 # #154: capture only the allow-listed response headers (empty allow-list → {}).
                 headers = capture_response_headers(
