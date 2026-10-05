@@ -2436,6 +2436,23 @@ class AuthStore(Protocol):
 
     async def revoke_session(self, token_hash: str, *, now: float | None = None) -> None: ...
 
+    async def supersede_session(self, token_hash: str, *, now: float) -> SessionRecord | None:
+        """Revoke the unrevoked session ``token_hash`` names, and return its row as revoked.
+
+        Returns ``None`` when no unrevoked row has that hash, so nothing was written. A row that is
+        expired or idle is still revoked and returned. Its other columns are as the revoke found
+        them, so the caller can judge whether the session was live, and ``revoked_at`` is ``now``.
+
+        **ONE statement, so it cannot interleave with :meth:`rotate_session` (BACKLOG #2146).** The
+        login supersession used to read the row and then revoke it by hash, and a rotation that
+        re-keyed the row between the two left the revoke matching nothing, so the session lived on
+        under its new hash. Here the store orders the two writes on the row. If this one runs first,
+        the row is revoked and the rotation's ``revoked_at IS NULL`` guard refuses it, so the
+        rotation fails closed. If the rotation committed first, the hash names no row and this
+        returns ``None``.
+        """
+        ...
+
     async def revoke_user_sessions(
         self, user_id: str, *, except_token_hash: str | None = None, now: float | None = None
     ) -> int: ...

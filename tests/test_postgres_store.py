@@ -4892,6 +4892,14 @@ async def test_session_rotation_contract(store) -> None:
     await assert_session_rotation_contract(store)
 
 
+async def test_session_supersession_contract(store) -> None:
+    """BACKLOG #2146: supersede_session revokes and returns in one statement, so a rotation after it
+    fails closed. Extra-free shared contract, run here as on SQLite."""
+    from tests._session_rotation_contract import assert_session_supersession_contract
+
+    await assert_session_supersession_contract(store)
+
+
 async def test_session_cap_contract(store) -> None:
     """BACKLOG #1900: the per-user cap counts only LIVE sessions. What this leg executes that no
     other does: the liveness clauses respelled for ``$n``, with ``$1`` reused in the UPDATE and in

@@ -8322,6 +8322,16 @@ class PostgresStore:
             token_hash,
         )
 
+    async def supersede_session(self, token_hash: str, *, now: float) -> SessionRecord | None:
+        """Revoke and return in one statement (BACKLOG #2146). See :meth:`AuthStore.supersede_session`."""
+        d = await self._fetchone(
+            "UPDATE sessions SET revoked_at=$1 WHERE token_hash=$2 AND revoked_at IS NULL"
+            " RETURNING *",
+            now,
+            token_hash,
+        )
+        return SessionRecord.from_mapping(dict(d)) if d else None
+
     async def revoke_user_sessions(
         self, user_id: str, *, except_token_hash: str | None = None, now: float | None = None
     ) -> int:
