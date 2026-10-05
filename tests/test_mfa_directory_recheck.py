@@ -28,7 +28,13 @@ from _totp_clock import fresh_totp, pin_totp_clock
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import reconcile, totp
-from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryProbe, LdapError
+from messagefoundry.auth.ldap import (
+    AdPrincipal,
+    DirectoryAnswer,
+    DirectoryProbe,
+    LdapError,
+    LdapReferralError,
+)
 from messagefoundry.auth.service import DIRECTORY_UNCONFIRMED, AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
@@ -57,12 +63,16 @@ class _Directory:
         self.principal = principal
         self.answer = DirectoryAnswer.FOUND
         self.unreachable = False
+        #: Raised by the lookup when set: a referral (BACKLOG #2538) or a non-LDAP fault (#2241).
+        self.raises: Exception | None = None
         self.probes: list[tuple[str, str | None]] = []
 
     def probe_principal(self, username: str, *, object_id: str | None = None) -> DirectoryProbe:
         self.probes.append((username, object_id))
         if self.unreachable:
             raise LdapError("synthetic: LDAP socket closed")
+        if self.raises is not None:
+            raise self.raises
         if self.answer is DirectoryAnswer.FOUND:
             return DirectoryProbe(DirectoryAnswer.FOUND, self.principal)
         return DirectoryProbe(self.answer)
@@ -179,6 +189,46 @@ async def test_a_directory_the_account_is_not_confirmed_in_refuses_the_renewal(
     # directory confirms the account.
     e.directory.answer = DirectoryAnswer.FOUND
     e.directory.unreachable = False
+    assert (await e.service.verify_mfa(e.token, code)).ok is True
+
+
+@pytest.mark.parametrize(
+    ("raised", "outcome"),
+    [
+        (LdapReferralError("synthetic: AD answered the user search with a referral"), "referred"),
+        (KeyError("userAccountControl"), "unavailable"),
+        (ValueError("synthetic: malformed objectGUID"), "unavailable"),
+    ],
+    ids=["referral", "key-error", "value-error"],
+)
+async def test_a_lookup_that_raises_refuses_the_renewal_rather_than_failing(
+    store: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    raised: Exception,
+    outcome: str,
+) -> None:
+    """BACKLOG #2241 and #2538. A referral, or a fault that is not an LdapError, still refuses as
+    an audited directory_unconfirmed, spending no code and charging no lockout.
+
+    RED when: the non-LdapError escapes verify_mfa (a 500 at the route), or the referral is read
+    as anything that lets the renewal through."""
+    e = await _enrolled_directory_session(store, monkeypatch)
+    e.directory.raises = raised
+    code = totp.totp(e.secret, now=_T1)
+
+    refused = await e.service.verify_mfa(e.token, code)
+
+    assert refused.ok is False and refused.directory_unconfirmed is True
+    session = await store.get_session(hash_token(e.token))
+    assert session is not None and session.revoked_at is None and session.reauth_at is None
+    user = await store.get_user(e.user_id)
+    assert user is not None and user.failed_attempts == 0
+    assert user.second_step_failed_attempts == 0
+    assert {"reason": DIRECTORY_UNCONFIRMED, "outcome": outcome} in await _audited_mfa_failures(
+        store
+    )
+
+    e.directory.raises = None
     assert (await e.service.verify_mfa(e.token, code)).ok is True
 
 
@@ -482,6 +532,34 @@ async def test_the_route_says_the_directory_could_not_confirm_the_account(
     try:
         e = await _enrolled_directory_session(engine.store, monkeypatch)
         e.directory.answer = DirectoryAnswer.DISABLED
+        transport = httpx.ASGITransport(
+            app=create_app(engine, auth=e.service), client=("127.0.0.1", 123)
+        )
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            r = await c.post(
+                "/auth/mfa-verify",
+                json={"code": totp.totp(e.secret, now=_T1)},
+                headers={"Authorization": f"Bearer {e.token}"},
+            )
+        assert r.status_code == 403
+        assert "directory could not confirm this account" in r.json()["detail"]
+    finally:
+        await engine.stop()
+
+
+async def test_the_route_refuses_and_does_not_500_when_the_lookup_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2241, where the operator meets it: a lookup fault that is not an LdapError used to
+    reach the route as a 500. It is the same 403 refusal as any other unconfirmed account."""
+    engine = await Engine.create(
+        tmp_path / "mfa_directory_raises.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        e = await _enrolled_directory_session(engine.store, monkeypatch)
+        e.directory.raises = KeyError("userAccountControl")
         transport = httpx.ASGITransport(
             app=create_app(engine, auth=e.service), client=("127.0.0.1", 123)
         )

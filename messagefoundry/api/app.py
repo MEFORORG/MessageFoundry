@@ -7824,7 +7824,10 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     ``ad_reconcile_held`` alert, on every pass while it holds, including one the breaker also aborts
     (ADR 0195). Each applied revocation is ``auth.ad_session_revoked`` and becomes one ``ad_session_revoked``
     alert. A whole-directory outage aborts too, but it is audited as ``auth.ad_reconcile_skipped``
-    and pages nothing: the accounts are fine, the directory is not, and the pass is fail-open.
+    and pages nothing: the accounts are fine, the directory is not, and the pass is fail-open. A
+    referral abort (BACKLOG #2538) is NOT an outage: it recurs until ``ad_user_search_base`` is
+    fixed, so it is audited as ``auth.ad_reconcile_aborted`` and pages on ``ad_reconcile_aborted``
+    with reason ``directory_referral``, its detail naming the setting.
 
     Reads the RETURNED plan, so it sees only a pass that finished. A failed write of the pass's own
     held, aborted, skipped or unkeyed-binding row no longer ends the pass (BACKLOG #2137): the

@@ -46,6 +46,7 @@ from messagefoundry.auth.ldap import (
     DirectoryAnswer,
     LdapAuthenticator,
     LdapError,
+    LdapReferralError,
     kerberos_principal,
     normalise_object_guid,
 )
@@ -4994,8 +4995,9 @@ class AuthService:
 
     @property
     def directory_reconcile_alert(self) -> str | None:
-        """The last mass-revoke circuit-breaker trip, or ``None``. Latches until a pass completes
-        without tripping, so an operator who missed the log line still sees the standing condition."""
+        """The last alerting abort's message, such as a mass-revoke circuit-breaker trip or a
+        referral (BACKLOG #2538), or ``None``. Latches until a pass completes without aborting, so
+        an operator who missed the log line still sees the standing condition."""
         return self._reconcile_alert
 
     @property
@@ -5046,6 +5048,17 @@ class AuthService:
             probe = await asyncio.to_thread(
                 self._ldap.probe_principal, user.username, object_id=user.directory_object_id
             )
+        except LdapReferralError as exc:
+            # BACKLOG #2538. Ahead of LdapError, which it subclasses. A referral is not an outage:
+            # it recurs on every pass until the search base is fixed, so read as UNAVAILABLE it
+            # would stop every revocation without a page. REFERRED never strikes or revokes, it
+            # aborts the pass with an alert, and verify_mfa refuses on it like any other non-PRESENT
+            # answer. WARNING, because the pass stops at its first referral, so this is one line
+            # per pass, and ldap.py's own warning is once per process: this is the line that says,
+            # after a log rotation, whether the user search or the group search was referred. The
+            # text names the operation and the referred hosts only (BACKLOG #2530).
+            _log.warning("directory probe of %s was referred: %s", user.username, exc)
+            return reconcile.Probe(user.id, user.username, reconcile.ProbeOutcome.REFERRED)
         except LdapError as exc:
             # FAIL OPEN, for the reconciler. verify_mfa reads the same UNAVAILABLE as a refusal and
             # fails closed, because it grants rather than revokes (BACKLOG #2023). It writes an audit
@@ -5055,6 +5068,30 @@ class AuthService:
             # need the console. Debug-level — a flapping DC must not flood the log at one line per
             # user per pass; the pass-level summary below reports the count at WARNING.
             _log.debug("directory probe failed for %s: %s", user.username, exc)
+            return reconcile.Probe(user.id, user.username, reconcile.ProbeOutcome.UNAVAILABLE)
+        except Exception as exc:
+            # BACKLOG #2241. Anything else the directory layer raised: a KeyError or ValueError on a
+            # malformed entry, an OSError, a fault in a test double. Uncaught, it was a 500 from
+            # verify_mfa instead of an audited refusal, and it ended the WHOLE reconcile pass, so one
+            # account that always raised stopped revocation for every account. Read as UNAVAILABLE:
+            # verify_mfa refuses on it (fail closed), and the reconciler skips this one account.
+            #
+            # NOT LIKE #1639, AND THE COST IS NAMED. An unreadable userAccountControl is an answer
+            # the directory gave, so it strikes as UNDETERMINED. This is the engine failing to read
+            # whatever came back, which says nothing about the account, so it must not strike; and
+            # UNDETERMINED would move the ADR 0195 hold. The price is that an account whose entry
+            # raises every time is never revoked by the reconciler while that lasts. So this logs
+            # at WARNING on every probe, unlike the debug-level outage above: a repeat here is a
+            # standing gap for one named account, not a blip. CancelledError is not an Exception.
+            # The WARNING names the type only: the message can quote a directory value, which
+            # ldap.py never logs. The traceback, with the message, goes to DEBUG for diagnosis.
+            _log.warning(
+                "directory probe of %s raised %s; read as unavailable, so this account's "
+                "sessions are not revoked and its step-up is refused while this repeats",
+                user.username,
+                type(exc).__name__,
+            )
+            _log.debug("directory probe of %s raised", user.username, exc_info=True)
             return reconcile.Probe(user.id, user.username, reconcile.ProbeOutcome.UNAVAILABLE)
         principal = probe.principal
         if principal is None:
@@ -5153,15 +5190,22 @@ class AuthService:
         now = time.monotonic()
         probes: list[reconcile.Probe] = []
         for user_id, _username in selected:
-            probes.append(await self._probe_principal(users[user_id]))
+            probe = await self._probe_principal(users[user_id])
+            probes.append(probe)
             self._reconcile_last_probed[user_id] = now
+            if probe.outcome is reconcile.ProbeOutcome.REFERRED:
+                # BACKLOG #2538. One referral aborts the pass, so the rest of the sample would only
+                # cost a bind each and be thrown away. Unprobed, they sort first on the next pass.
+                break
 
         # Resolve the role sets for the role re-diff, and the scope inputs for the scope re-diff (ADR
         # 0198). Store reads only — no extra directory traffic.
         current_roles: dict[str, frozenset[str]] = {}
         target_roles: dict[str, frozenset[str]] = {}
         scopes: dict[str, channel_scope.ScopeInput] = {}
-        for probe in probes:
+        # A referred pass is aborted unjudged (BACKLOG #2538), so its re-diff reads are skipped.
+        referred = bool(probes) and probes[-1].outcome is reconcile.ProbeOutcome.REFERRED
+        for probe in [] if referred else probes:
             if probe.outcome is not reconcile.ProbeOutcome.PRESENT:
                 continue
             current_roles[probe.user_id] = frozenset(
@@ -5213,6 +5257,7 @@ class AuthService:
         self._reconcile_hold_latched = plan.latched
         # BACKLOG #2136. A trip makes every candidate unconfirmed until a pass that is not aborted
         # reads it again, so a probe sample that missed the accounts behind the trip is no clear.
+        # A referral abort pages on the same alert, so it unconfirms every candidate too (#2538).
         self._reconcile_unconfirmed.intersection_update(users)
         if plan.aborted is None:
             self._reconcile_unconfirmed.difference_update(plan.outcomes)
@@ -5220,9 +5265,10 @@ class AuthService:
             self._reconcile_unconfirmed = set(users)
         if plan.aborted is not None:
             await self._abort_reconcile_pass(plan)
-            if not plan.directory_outage:
+            if not plan.judged_nothing:
                 # A held pass writes its own row even when the breaker also aborts it (ADR 0195 rule
-                # item 9). An outage judged nothing, so it leaves the hold's message alone.
+                # item 9). An outage or a referral judged nothing, so it leaves the hold's message
+                # alone and marks no clear (BACKLOG #2538).
                 await self._record_reconcile_hold(plan)
                 plan = self._mark_reconcile_clears(plan, users)
             await self._report_unkeyed_bindings(unkeyed, still_unkeyed=still_unkeyed)
@@ -5232,7 +5278,8 @@ class AuthService:
         if plan.unavailable:
             _log.warning(
                 "directory reconcile: %d of %d principals could not be resolved (directory "
-                "unreachable) — those sessions were left alone (fail-open)",
+                "unreachable, or a probe raised, which is warned per account) — those sessions "
+                "were left alone (fail-open)",
                 plan.unavailable,
                 plan.probed,
             )
@@ -5638,6 +5685,27 @@ class AuthService:
             )
             await self._audit_reconciler_row(
                 "auth.ad_reconcile_skipped",
+                detail=_json({"reason": plan.aborted, "probed": plan.probed}),
+            )
+            return
+        if plan.directory_referral:
+            # BACKLOG #2538. Its own branch, not the breaker's: nothing was judged, so there is no
+            # ceiling to quote. Latched and paged on the breaker's alert type, because a referral
+            # recurs on every pass until an operator fixes the search base. The message is the
+            # alert's detail, so it names the settings to change, and names them FIRST: the store
+            # keeps only the first 200 characters of an alert instance's reason. No count: the
+            # pass stops at its first referral, so "1 of N" would only say where it stopped.
+            self._reconcile_alert = (
+                "LDAP referral: check [auth].ad_user_search_base and, for nested groups, "
+                "[auth].ad_group_search_base; one names a base in another domain of the forest. "
+                "The reconcile pass revoked nothing. No directory disable reaches a signed-in "
+                "session while this lasts, because the engine does not follow referrals. Use a "
+                "base in the bound domain controller's own domain, or a global catalog. The "
+                "WARNING 'directory probe of ... was referred' names the search and the hosts."
+            )
+            _log.error("directory reconcile: %s", self._reconcile_alert)
+            await self._audit_reconciler_row(
+                "auth.ad_reconcile_aborted",
                 detail=_json({"reason": plan.aborted, "probed": plan.probed}),
             )
             return

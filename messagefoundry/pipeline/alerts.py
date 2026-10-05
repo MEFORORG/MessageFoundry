@@ -325,8 +325,10 @@ class AlertSink(Protocol):
         ...
 
     def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:
-        """A directory reconciliation pass tripped the mass-revoke circuit breaker and revoked
-        NOTHING (ADR 0079 mechanism 2). The same event as the ``auth.ad_reconcile_aborted`` audit
+        """A directory reconciliation pass aborted and revoked NOTHING (ADR 0079 mechanism 2), for
+        example because the mass-revoke circuit breaker tripped (``reason``
+        ``mass_revoke_breaker``) or the directory answered a probe with a referral
+        (``directory_referral``, BACKLOG #2538). Read ``reason`` before naming the cause. The same event as the ``auth.ad_reconcile_aborted`` audit
         row. ``name`` labels the source (``"directory-reconciler"``); ``reason`` is the pass's
         closed-set abort slug; ``probed`` is how many principals the pass probed; ``detail`` is the
         operator-facing explanation the auth service latches. No PHI. Emitted by the API-lifespan

@@ -4242,7 +4242,8 @@ _ALERT_EVENT_TYPES = frozenset(
         "approval_approver_provenance",
         "administrator_granted",
         # ADR 0079 mechanism 2: the directory reconciler's two audited outcomes, each routable apart:
-        # the mass-revoke breaker tripped (nothing revoked), and one principal's sessions were revoked.
+        # a pass aborted (nothing revoked: the breaker tripped, or a probe was referred, BACKLOG
+        # #2538), and one principal's sessions were revoked.
         "ad_reconcile_aborted",
         "ad_session_revoked",
         # ADR 0195: the reconciler held accounts whose userAccountControl it could not read.

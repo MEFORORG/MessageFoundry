@@ -3208,6 +3208,20 @@ immediate, and one LDAP bind per signed-in directory user per pass is the cost â
 `ad_session_recheck_max_users` (200) caps it, and it is zero when nobody is signed in. An off-loopback
 PHI deployment serving AD accounts gets `ad_session_recheck_seconds = 300` by default; setting it to `0` is a declared loosening, not a neutral choice.
 
+A referral is not an outage (BACKLOG #2538). A pass in which a probe is answered with an LDAP
+referral aborts with reason `directory_referral`. It judges and revokes nothing, audits
+`auth.ad_reconcile_aborted`, and raises the `ad_reconcile_aborted` alert, whose text names
+`ad_user_search_base` and `ad_group_search_base`. A base in another domain of the forest refers on
+every pass, so read as an outage it would stop every revocation on a first deployment without a page.
+A referring group base also stops the revocation of accounts whose user search answered cleanly,
+because the whole pass aborts.
+
+A probe that raises something other than an LDAP error, such as a malformed entry the engine cannot
+read, fails open for that one account (BACKLOG #2241). It is logged at WARNING by name on every
+pass, and the rest of the estate is still reconciled. **The cost:** while it repeats, that account's
+sessions are never revoked by the reconciler, and no alert is raised. If it hits every probe, the
+pass reads as a directory outage.
+
 ### Session inventory & targeted revocation (WP-10)
 
 Users and admins can see and revoke individual sessions (ASVS 7.5.2 / 7.4.5):

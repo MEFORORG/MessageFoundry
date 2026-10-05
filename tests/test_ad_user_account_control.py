@@ -158,6 +158,9 @@ class _Directory:
         self.uac: dict[str, Any] = dict.fromkeys(names, ENABLED)
         #: Every search raises, as an unreachable domain controller does.
         self.down = False
+        #: Every search is answered with a referral (resultCode 10), as a search base in another
+        #: domain of the forest is (BACKLOG #2538).
+        self.refer = False
 
     def delete(self, name: str) -> None:
         """The account leaves the directory: both the name-keyed and the id-keyed search miss."""
@@ -203,7 +206,12 @@ def _install_directory(monkeypatch: pytest.MonkeyPatch, directory: _Directory) -
         def search(self, **kwargs: Any) -> bool:
             if directory.down:
                 raise ldap3.core.exceptions.LDAPSocketOpenError("synthetic: DC unreachable")
+            if directory.refer:
+                self.entries = []
+                self.result = {"result": 10, "referrals": ["ldap://dc1.other.test.invalid/"]}
+                return False
             self.entries = directory.lookup(str(kwargs["search_filter"]))
+            self.result = {"result": 0}
             return True
 
         def bind(self) -> bool:
@@ -1060,3 +1068,69 @@ async def test_a_fresh_process_does_not_release_a_hold_its_budget_has_not_reache
         second = await _alerted_pass(service, sink)
         assert second.hold and not second.hold_clear
         assert HELD in await _open_alerts(store)
+
+
+# --- BACKLOG #2538: a referral pages, through the real authenticator and the real notifier ------
+
+
+async def test_a_referring_search_base_pages_and_resolves_once_the_base_is_fixed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End to end: resultCode 10 on the user search, through the REAL ``LdapAuthenticator``, the
+    real service, the real notifier and the real alert-instance table. The referral opens the
+    ``ad_reconcile_aborted`` instance with reason ``directory_referral``; an ordinary outage, the
+    control, opens nothing; and a pass that reads every account clean after the fix resolves it.
+
+    RED when: the referral reaches the reconciler as a plain LdapError, so the pass reads as an
+    outage, is audited as skipped and pages nobody."""
+    async with _signed_in_estate(monkeypatch, ["jdoe", "asmith"]) as estate:
+        directory, service, store, tokens = estate
+        sink = NotifierAlertSink([], store=store)
+
+        directory.down = True  # the control: an outage pages nothing
+        assert (await _alerted_pass(service, sink)).directory_outage
+        assert await _open_alerts(store) == set()
+        directory.down = False
+
+        directory.refer = True
+        for _ in range(2):
+            plan = await _alerted_pass(service, sink)
+            assert plan.directory_referral and plan.referred == 1 and plan.revocations == ()
+            assert not plan.breaker_clear and not plan.hold_clear
+        assert await _open_alerts(store) == {ABORTED}
+        rows = [
+            json.loads(r["detail"])
+            for r in await store.list_audit(action="auth.ad_reconcile_aborted")
+        ]
+        assert rows and all(row["reason"] == "directory_referral" for row in rows)
+        alert = service.directory_reconcile_alert
+        assert alert is not None and "ad_user_search_base" in alert
+        for token in tokens.values():
+            assert await service.identity_for_token(token) is not None
+
+        directory.refer = False  # the base now lies in the bound controller's own domain
+        plan = await _alerted_pass(service, sink)
+        assert plan.aborted is None and plan.breaker_clear
+        assert await _open_alerts(store) == set()
+
+
+async def test_a_referral_pass_neither_releases_a_hold_nor_resolves_what_is_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A referral judged nothing, so like an outage it leaves the hold's message and the open held
+    instance alone, and marks no clear, even though the accounts it would have read are fine now.
+    It raises only its own aborted alert."""
+    async with _signed_in_estate(monkeypatch, ["u1", "u2", "ok1", "ok2"]) as estate:
+        directory, service, store, _tokens = estate
+        sink = NotifierAlertSink([], store=store)
+        directory.uac.update({"u1": ABSENT, "u2": ABSENT})
+        assert (await _alerted_pass(service, sink)).hold
+        held_message = service.directory_reconcile_hold
+        assert held_message is not None
+        directory.uac.update({"u1": ENABLED, "u2": ENABLED})  # would release, if it were read
+        directory.refer = True
+        plan = await _alerted_pass(service, sink)
+        assert plan.directory_referral and not plan.hold
+        assert not plan.hold_clear and not plan.breaker_clear
+        assert service.directory_reconcile_hold == held_message
+        assert await _open_alerts(store) == {ABORTED, HELD}

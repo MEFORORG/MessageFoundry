@@ -29,7 +29,13 @@ from pydantic import ValidationError
 
 from messagefoundry.auth import channel_scope, reconcile
 from messagefoundry.auth.identity import SessionMechanism
-from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryProbe, LdapError
+from messagefoundry.auth.ldap import (
+    AdPrincipal,
+    DirectoryAnswer,
+    DirectoryProbe,
+    LdapError,
+    LdapReferralError,
+)
 from messagefoundry.auth.notifications import USERNAME_CHANGED
 from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.service import AuthService, DirectoryObjectIdMissing
@@ -102,6 +108,10 @@ class _FakeLdap:
     ) -> None:
         self.present = present or {}
         self.unreachable = unreachable or set()
+        #: Usernames whose lookup the directory answers with a referral (BACKLOG #2538).
+        self.referring: set[str] = set()
+        #: Usernames whose lookup raises something that is not an LdapError (BACKLOG #2241).
+        self.broken: dict[str, Exception] = {}
         self.probes: list[str] = []
         self.probe_keys: list[tuple[str, str]] = []
 
@@ -117,6 +127,10 @@ class _FakeLdap:
         self.probe_keys.append(("object_id", object_id) if object_id else ("username", username))
         if username in self.unreachable:
             raise LdapError("synthetic: LDAP socket closed")
+        if username in self.referring:
+            raise LdapReferralError("synthetic: AD answered the user search with a referral")
+        if username in self.broken:
+            raise self.broken[username]
         if object_id is None:
             return self.present.get(username)
         return next((p for p in self.present.values() if p.directory_object_id == object_id), None)
@@ -424,6 +438,44 @@ def test_an_outage_carries_the_hold_state_and_judges_nothing() -> None:
         assert plan.directory_outage and not plan.hold and plan.latched is latched
 
 
+R = reconcile.ProbeOutcome.REFERRED
+
+
+def test_one_referred_probe_aborts_the_pass_and_judges_nothing() -> None:
+    """BACKLOG #2538. One referral beside answers that would revoke: the pass applies nothing,
+    strikes nobody, records no outcome, and carries the hold's latch. RED when: a referral is read
+    as UNAVAILABLE, so the absent account below is revoked on this pass and the referral is lost."""
+    probes = [
+        reconcile.Probe("r", "referred", R),
+        reconcile.Probe("g", "gone", reconcile.ProbeOutcome.ABSENT),
+        reconcile.Probe("d", "down", reconcile.ProbeOutcome.UNAVAILABLE),
+        reconcile.Probe("u", "unread", U),
+    ]
+    for latched in (True, False):
+        plan = _plan(probes, prior_strikes={"g": 1}, latched=latched)
+        assert plan.aborted == reconcile.REFERRAL_ABORT == "directory_referral"
+        assert plan.directory_referral and plan.judged_nothing and not plan.directory_outage
+        assert plan.revocations == () and plan.renames == ()
+        assert plan.strikes == {} and plan.outcomes == {}
+        assert not plan.hold and plan.latched is latched
+        assert (plan.probed, plan.referred, plan.unavailable) == (4, 1, 1)
+
+
+def test_a_pass_of_referrals_and_failures_is_a_referral_not_an_outage() -> None:
+    """An outage pages nobody, so a pass whose only answers are referrals and failures must not be
+    read as one. Every probe failing is still an outage, the control."""
+    down = reconcile.Probe("d", "down", reconcile.ProbeOutcome.UNAVAILABLE)
+    mixed = _plan([down, reconcile.Probe("r", "referred", R)])
+    assert mixed.directory_referral and not mixed.directory_outage
+    outage = _plan([down])
+    assert outage.directory_outage and outage.judged_nothing and not outage.directory_referral
+    tripped = _plan(
+        [reconcile.Probe(f"g{i}", f"g{i}", reconcile.ProbeOutcome.ABSENT) for i in range(20)],
+        prior_strikes={f"g{i}": 1 for i in range(20)},
+    )
+    assert tripped.aborted == "mass_revoke_breaker" and not tripped.judged_nothing
+
+
 def test_the_outcome_record_caps_undetermined_entries_last() -> None:
     assert reconcile.outcome_rank(U) > reconcile.outcome_rank(P)
     ledger = {"u1": U, "u2": P}
@@ -630,6 +682,84 @@ async def test_the_breaker_alert_clears_on_a_clean_pass() -> None:
             await _signed_in_ad_user(service, store, name)
         await service.reconcile_directory_sessions()
         assert service.directory_reconcile_alert is None
+    finally:
+        await store.close()
+
+
+async def test_a_referred_search_base_aborts_every_pass_loudly_and_revokes_nothing() -> None:
+    """BACKLOG #2538. A search base in another domain of the forest refers every probe. Read as an
+    outage, every pass would skip, page nobody and revoke nothing, for as long as it lasted. It
+    must abort as a referral instead: an aborted row naming the reason, a latched message naming
+    the setting, and no skipped row. Once the base is fixed, a clean pass clears the message.
+
+    RED when: the referral is caught as a plain LdapError and the pass reads as an outage."""
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap({"jdoe": _principal("jdoe"), "asmith": _principal("asmith")})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        tokens = [await _signed_in_ad_user(service, store, u) for u in ("jdoe", "asmith")]
+
+        ldap.referring = {"jdoe", "asmith"}
+        for _ in range(3):
+            ldap.probes.clear()
+            plan = await service.reconcile_directory_sessions()
+            assert plan.aborted == "directory_referral" and not plan.directory_outage
+            assert plan.referred == 1 and plan.revocations == ()
+            assert not plan.breaker_clear and not plan.hold_clear
+            # The first referral ends the sample: the rest would cost a bind each, for nothing.
+            assert len(ldap.probes) == 1
+
+        for token in tokens:
+            assert token is not None and await service.identity_for_token(token) is not None
+        alert = service.directory_reconcile_alert
+        assert alert is not None and "referral" in alert
+        # Both settings inside the first 200 characters: the store keeps only that much of an
+        # alert instance's reason, and the setting is what the page exists to name.
+        assert "ad_user_search_base" in alert[:200] and "ad_group_search_base" in alert[:200]
+        assert "circuit breaker" not in alert  # its own branch, not the breaker's text
+        audit = await store.list_audit()
+        aborted = [
+            json.loads(a["detail"]) for a in audit if a["action"] == "auth.ad_reconcile_aborted"
+        ]
+        assert aborted and all(d == {"reason": "directory_referral", "probed": 1} for d in aborted)
+        assert not any(a["action"] == "auth.ad_reconcile_skipped" for a in audit)
+
+        ldap.referring.clear()  # the operator moved the search base into this domain
+        plan = await service.reconcile_directory_sessions()
+        assert plan.aborted is None and service.directory_reconcile_alert is None
+    finally:
+        await store.close()
+
+
+async def test_one_principal_that_raises_no_longer_ends_the_pass(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #2241. A lookup that raises something other than LdapError used to escape the probe
+    and end the WHOLE pass, so one such account stopped revocation for every account. It is read as
+    unavailable for that account alone, logged at WARNING by name, and the rest is reconciled.
+
+    RED when: the KeyError escapes reconcile_directory_sessions."""
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap({"jdoe": _principal("jdoe"), "asmith": _principal("asmith")})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        tokens = {u: await _signed_in_ad_user(service, store, u) for u in ("jdoe", "asmith")}
+
+        ldap.broken["jdoe"] = KeyError("userAccountControl")  # a malformed entry, every pass
+        del ldap.present["asmith"]  # genuinely gone from the directory
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            first = await service.reconcile_directory_sessions()
+            second = await service.reconcile_directory_sessions()
+
+        assert first.aborted is None and first.unavailable == 1
+        assert [r.username for r in second.revocations] == ["asmith"]
+        assert await service.identity_for_token(tokens["asmith"] or "") is None
+        # Fail open for the account that raised: never struck, never revoked.
+        assert await service.identity_for_token(tokens["jdoe"] or "") is not None
+        warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert sum("jdoe" in m and "KeyError" in m for m in warned) == 2  # every pass, by name
     finally:
         await store.close()
 
