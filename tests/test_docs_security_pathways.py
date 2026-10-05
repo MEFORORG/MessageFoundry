@@ -2528,13 +2528,19 @@ def test_the_eleventh_sweep_says_no_doc_delegates_directory_mfa() -> None:
 #: emphasis stripped, so "*not* there yet" and "**MFA**" read as plain words.
 _ABSENT = re.compile(
     r"\broadmap\b|\bnot there yet\b|n't built\b|\bnot (?:yet )?built\b|\bremaining\b[^.]*\bgaps?\b"
-    r"|\bplanned\b",
+    r"|\bplanned\b|\bdeferred\b",
     re.IGNORECASE,
 )
 
 #: The engine's second factor under any name a doc gives it.
 _SECOND_FACTOR = re.compile(
     r"\bMFA\b|\bTOTP\b|\bpasskeys?\b|second factor|two-factor|multi-factor", re.IGNORECASE
+)
+
+#: Off-box logs and the de-identification framework, under the names the docs give them.
+_BUILT_ELSEWHERE = re.compile(
+    r"off-box log|log shipping|log forwarding|de-identification framework|\bde-identification\)",
+    re.IGNORECASE,
 )
 
 
@@ -2726,18 +2732,37 @@ def test_the_twelfth_sweep_probes_mfa_and_the_first_factor_order(
 # can be told apart from its correction, so a reworded return of it still reds.
 
 
-@pytest.mark.parametrize("name", ["README.md", "docs/EARLY-ADOPTER-GUIDE.md"])
-def test_the_twelfth_sweep_no_doc_says_mfa_is_missing(name: str) -> None:
-    """README.md said MFA "remain[s] on the roadmap", and the early-adopter guide said three times
-    that MFA is not there yet, not built, or a remaining gap. No clause may pair the second factor,
-    under any of its names, with absence. The subject must occur, or the scan examined nothing."""
-    clauses = _clauses(_doc(name))
-    subject = [c for c in clauses if _SECOND_FACTOR.search(c)]
-    assert subject, f"{name} no longer names the second factor at all, so this check reads nothing"
-    stale = [c for c in subject if _ABSENT.search(c)]
+@pytest.mark.parametrize(
+    ("name", "subject"),
+    [
+        (doc, subject)
+        for doc in ("README.md", "docs/EARLY-ADOPTER-GUIDE.md")
+        for subject in ("second factor", "off-box logs or de-identification")
+    ],
+)
+def test_the_twelfth_sweep_no_doc_says_a_built_control_is_missing(name: str, subject: str) -> None:
+    """README.md said MFA and off-box log shipping "remain on the roadmap". The early-adopter guide
+    said MFA, off-box logs and the de-identification framework are not there yet, not built, a
+    remaining gap, or deferred. All three are built (the probes above).
+
+    Two units are read. A clause may not pair the control, under any of its names, with absence.
+    A table row may not name the control in its label cell and absence in a later cell, which a
+    clause cut at the cell bars cannot see. The subject must occur, or the scan examined nothing."""
+    pattern = {
+        "second factor": _SECOND_FACTOR,
+        "off-box logs or de-identification": _BUILT_ELSEWHERE,
+    }[subject]
+    text = _doc(name)
+    clauses = [c for c in _clauses(text) if pattern.search(c)]
+    assert clauses, f"{name} no longer names the {subject} at all, so this check reads nothing"
+    stale = [c for c in clauses if _ABSENT.search(c)]
+    for line in text.splitlines():
+        cells = [c.strip().replace("*", "") for c in line.strip().strip("|").split("|")]
+        if line.lstrip().startswith("|") and len(cells) > 1 and pattern.search(cells[0]):
+            stale += [line.strip() for c in cells[1:] if _ABSENT.search(c)][:1]
     assert not stale, (
-        f"{name} says MFA is missing or still to come: {stale}. `[security].require_mfa` is on by "
-        "default and TOTP and passkeys are built (BACKLOG #1133)."
+        f"{name} says the {subject} is missing or still to come: {stale}. It is built "
+        "(BACKLOG #1133)."
     )
 
 
@@ -2902,38 +2927,22 @@ def test_the_twelfth_sweep_second_round_probes_what_is_built() -> None:
             f"{factory.__name__}() takes {tls} now; the guide names raw TCP and X12 as the "
             "remaining transport gap."
         )
-    # 5. `[auth].enabled` is a removed key, refused at load.
-    assert ("auth", "enabled") in settings_module._REMOVED_KEYS, (
-        "[auth].enabled is no longer refused as removed; restate docs/SECURITY-LOOSENING.md."
-    )
-
-
-#: Off-box logs and the de-identification framework, under the names the docs give them.
-_BUILT_ELSEWHERE = re.compile(
-    r"off-box log|log shipping|log forwarding|de-identification framework|\bde-identification\)",
-    re.IGNORECASE,
-)
-
-
-@pytest.mark.parametrize("name", ["README.md", "docs/EARLY-ADOPTER-GUIDE.md"])
-def test_the_twelfth_sweep_no_doc_says_offbox_logs_or_deid_are_missing(name: str) -> None:
-    """README said off-box log shipping "remains on the roadmap", and the early-adopter guide said
-    off-box logs and the de-identification framework are not there yet, not built, or the remaining
-    transport gap. Both are built (the probe above)."""
-    clauses = _clauses(_doc(name))
-    subject = [c for c in clauses if _BUILT_ELSEWHERE.search(c)]
-    assert subject, (
-        f"{name} no longer names off-box logs or de-identification, so this reads nothing"
-    )
-    stale = [c for c in subject if _ABSENT.search(c)]
-    assert not stale, f"{name} says a built control is missing again: {stale} (BACKLOG #1133)."
+    # 5. `[auth].enabled`, and the `[security].require_sign_in` it had moved to, are removed keys,
+    #    refused at load: no config turns sign-in off.
+    for key in (("auth", "enabled"), ("security", "require_sign_in")):
+        assert key in settings_module._REMOVED_KEYS, (
+            f"{key} is no longer refused as removed; restate docs/SECURITY-LOOSENING.md and the "
+            "guide's API checklist item."
+        )
 
 
 def test_the_twelfth_sweep_guide_names_the_real_transport_gap_and_encryption_default() -> None:
-    """The guide named off-box log shipping as the remaining transport gap (raw TCP and X12 are),
-    and twice called at-rest encryption opt-in (a keyless store is refused by default)."""
+    """The guide named off-box log shipping as the remaining transport gap (raw TCP and X12 are at
+    least two), called at-rest encryption opt-in twice and told the reader to set
+    `require_encryption` to get the keyless refusal (a keyless store is refused by default), and
+    said auth can be disabled (`serve` always requires sign-in)."""
     clauses = _clauses(_doc("docs/EARLY-ADOPTER-GUIDE.md"))
-    gap = [c for c in clauses if re.search(r"\bremaining transport gap\b", c, re.IGNORECASE)]
+    gap = [c for c in clauses if re.search(r"\bremaining transport gaps?\b", c, re.IGNORECASE)]
     assert gap and all("raw TCP and X12" in c for c in gap), (
         f"the guide's remaining-transport-gap sentence must name raw TCP and X12: {gap}"
     )
@@ -2944,15 +2953,25 @@ def test_the_twelfth_sweep_guide_names_the_real_transport_gap_and_encryption_def
         and re.search(r"\bopt-in\b", c, re.IGNORECASE)
     ]
     assert not opt_in, f"the guide calls at-rest encryption opt-in again: {opt_in}"
+    # The require_encryption step must not be the thing that creates the keyless refusal.
+    require = [c for c in clauses if "require_encryption" in c]
+    assert require and not any(
+        "so the engine refuses to start unencrypted" in c for c in require
+    ), f"the guide says require_encryption creates the keyless refusal again: {require}"
+    disabled = [
+        c for c in clauses if re.search(r"\bauth(?:entication)? (?:is )?disabled\b", c, re.I)
+    ]
+    assert not disabled, f"the guide says auth can be disabled again: {disabled}"
 
 
 def test_the_twelfth_sweep_phi_does_not_delegate_built_controls() -> None:
     """docs/PHI.md said mTLS, certificate revocation and off-box logs are "delegated to the org's
-    environment". The engine builds each; the org supplies the PKI and the SIEM."""
+    environment", and its threat table said to delegate off-box log shipping to the SIEM. The engine
+    builds each; the org supplies the PKI and the SIEM."""
     delegated = [
         c
         for c in _clauses(_doc("docs/PHI.md"))
-        if re.search(r"delegated to the org", c) and re.search(r"mTLS|off-box log", c)
+        if re.search(r"\bdelegat", c, re.IGNORECASE) and re.search(r"mTLS|off-box log", c)
     ]
     assert not delegated, f"docs/PHI.md delegates built controls again: {delegated}"
 
