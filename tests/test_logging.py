@@ -1793,9 +1793,10 @@ def test_tab_is_the_only_control_character_left_intact() -> None:
     assert 0x09 not in _CTRL_TRANSLATION, "tab must survive a log line unescaped"
     assert _CTRL_TRANSLATION[0x0A] == "\\n", "LF is the injection vector and must be escaped"
     assert _CTRL_TRANSLATION[0x0D] == "\\r", "CR is the injection vector and must be escaped"
-    assert _CTRL_TRANSLATION[0x00] == "\\x00"
-    assert _CTRL_TRANSLATION[0x7F] == "\\x7f", "DEL is in the alphabet and must still be escaped"
-    assert _CTRL_TRANSLATION[0x85] == "\\x85", "NEL ends a line for str.splitlines (#2815)"
+    # JSON's spelling since vault BACKLOG #3012, so a logged JSON document still parses.
+    assert _CTRL_TRANSLATION[0x00] == "\\u0000"
+    assert _CTRL_TRANSLATION[0x7F] == "\\u007f", "DEL is in the alphabet and must still be escaped"
+    assert _CTRL_TRANSLATION[0x85] == "\\u0085", "NEL ends a line for str.splitlines (#2815)"
 
 
 def test_a_tab_survives_the_real_scrub_and_a_newline_does_not() -> None:
@@ -1821,7 +1822,28 @@ _LOG_ESCAPED_CLASSES = {
     "separator": (0x2028, 0x2029),
     # A lone surrogate made every UTF-8 or cp1252 sink fail the write before #2815.
     "surrogate": (0xDCFF,),
+    # Not #2815's classes, but the ones whose old ``\x``/``\U`` spelling was not JSON (#3012).
+    "c0_and_del": (0x01, 0x08, 0x1B, 0x7F),
+    "soft_hyphen": (0xAD,),
+    "astral": (0xE0001, 0xF0000),
 }
+
+
+def _expected_log_escape(code: int) -> str:
+    """The log's spelling of one escaped code point, CR and LF aside, written out here rather than
+    taken from the module under test: a JSON ``\\uXXXX`` per UTF-16 unit, so a surrogate pair past
+    U+FFFF, and for a lone surrogate the same with its backslash doubled (vault BACKLOG #3012)."""
+    if 0xD800 <= code <= 0xDFFF:
+        return f"\\\\u{code:04x}"
+    units = chr(code).encode("utf-16-be")
+    return "".join(f"\\u{units[i]:02x}{units[i + 1]:02x}" for i in range(0, len(units), 2))
+
+
+def _decoded_from_the_log(code: int) -> str:
+    """What a JSON decoder reads back from :func:`_expected_log_escape` inside a JSON string: the
+    character itself, or for a lone surrogate the six characters of text that name it."""
+    return f"\\u{code:04x}" if 0xD800 <= code <= 0xDFFF else chr(code)
+
 
 #: Ordinary non-ASCII text that must reach the log unchanged: Latin-1 and Latin Extended letters,
 #: Greek, and CJK. The control for every escape assertion below.
@@ -1876,12 +1898,12 @@ def test_every_configured_sink_escapes_the_wider_log_alphabet(
 ) -> None:
     """Before #2815 every one of these reached stdout and the log file raw, in both formats: the
     scrub escaped C0 and DEL only, and ``json.dumps(ensure_ascii=False)`` escapes C0 only. The
-    expected spelling comes from the ``unicode_escape`` codec, not from the module under test."""
+    expected spelling is :func:`_expected_log_escape`'s, not the module under test's."""
     codes = _LOG_ESCAPED_CLASSES[kind]
     # A class with no code points would log "startend" and pass every assertion below.
     assert len(codes) >= 1, f"{kind} names no code points"
     text = "start" + "".join(chr(c) for c in codes) + "end"
-    shown = "start" + "".join(chr(c).encode("unicode_escape").decode() for c in codes) + "end"
+    shown = "start" + "".join(_expected_log_escape(c) for c in codes) + "end"
     outputs = _write_one_record_through_every_sink(fmt, text, tmp_path, capsys)
     for sink, out in zip(("stdout", "file"), outputs, strict=True):
         raw = [hex(c) for c in codes if chr(c) in out]
@@ -1898,9 +1920,11 @@ def test_ordinary_non_ascii_text_reaches_every_sink_unchanged(
         _assert_logged(fmt, out, _PLAIN_NON_ASCII)
 
 
-def test_the_c0_escape_is_unchanged_by_the_wider_alphabet() -> None:
-    """C0 and DEL are escaped exactly as before #2815, written out independently of the table:
-    CR and LF readable, tab kept, every other one ``\\xNN``, and printable ASCII untouched."""
+def test_the_c0_escape_is_spelled_as_json() -> None:
+    """C0 and DEL, written out independently of the table: CR and LF readable as before, tab kept,
+    printable ASCII untouched, and every other one ``\\u00NN``. Until vault BACKLOG #3012 that last
+    was ``\\xNN``, which JSON does not define, so a JSON document logged as a message stopped
+    parsing. Each spelling here is also a JSON string escape."""
     from messagefoundry.controlchars import scrub_control_chars
 
     for code in range(0x80):
@@ -1912,8 +1936,65 @@ def test_the_c0_escape_is_unchanged_by_the_wider_alphabet() -> None:
         elif char == "\t" or 0x20 <= code < 0x7F:
             expected = char
         else:
-            expected = f"\\x{code:02x}"
+            expected = f"\\u{code:04x}"
         assert scrub_control_chars(char) == expected, hex(code)
+        if expected != char:
+            assert json.loads(f'"{expected}"') == char, hex(code)
+
+
+@pytest.mark.parametrize("fmt", ["text", "json"])
+@pytest.mark.parametrize("kind", sorted(_LOG_ESCAPED_CLASSES))
+def test_a_logged_json_document_still_parses_on_every_sink(
+    fmt: str, kind: str, tmp_path: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Vault BACKLOG #3012: a JSON document logged as a message, such as the off-box audit record,
+    parses after every configured handler's filters, for a strict decoder too. A lone surrogate
+    reads back as the visible text ``\\udcff``; every other character as itself."""
+    codes = _LOG_ESCAPED_CLASSES[kind]
+    value = "v" + "".join(chr(c) for c in codes) + "w"
+    expected = "v" + "".join(_decoded_from_the_log(c) for c in codes) + "w"
+    document = json.dumps({"k": value}, ensure_ascii=False)
+    for sink, out in zip(
+        ("stdout", "file"),
+        _write_one_record_through_every_sink(fmt, document, tmp_path, capsys),
+        strict=True,
+    ):
+        if fmt == "json":
+            (record,) = (json.loads(line) for line in out.splitlines() if line)
+            message = record["message"]
+        else:
+            (message,) = (line for line in out.splitlines() if "message said " in line)
+        inner = message.split("message said ", 1)[1]
+        decoded = json.loads(inner)
+        # Strict: Python's json keeps an unpaired surrogate escape as a surrogate; jiter refuses it.
+        assert not any(0xD800 <= ord(ch) <= 0xDFFF for ch in decoded["k"]), f"{fmt} {sink}"
+        assert decoded == {"k": expected}, f"{fmt} {sink}: {inner!r}"
+
+
+@pytest.mark.parametrize("fmt", ["text", "json"])
+@pytest.mark.parametrize("before", ["", chr(0x7F), chr(0x85), chr(0xAD)])
+@pytest.mark.parametrize(
+    ("planted", "secret"), [("DOE JANE", "JANE"), ("password=hunter2", "hunter2")]
+)
+def test_redaction_still_fires_across_an_escaped_character(
+    fmt: str,
+    before: str,
+    planted: str,
+    secret: str,
+    tmp_path: Any,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Vault BACKLOG #3012. The redaction and credential filters run before the scrub, so they see
+    the raw character, which is not a word character, and their ``\\b`` anchors still match the
+    next word. An escape written before them ends in a hex digit, so they would not. ``before`` of
+    ``""`` is the control: the same text redacts with nothing in front of it. Synthetic values."""
+    for sink, out in zip(
+        ("stdout", "file"),
+        _write_one_record_through_every_sink(fmt, before + planted, tmp_path, capsys),
+        strict=True,
+    ):
+        assert "said" in out, f"{fmt} {sink}: nothing logged"
+        assert secret not in out, f"{fmt} {sink}: {out!r}"
 
 
 def test_the_self_filling_table_is_bounded_and_decides_past_its_bound() -> None:
@@ -1936,7 +2017,7 @@ def test_the_self_filling_table_is_bounded_and_decides_past_its_bound() -> None:
     assert sum(1 for code in table if code > 0xFFFF) == _ASTRAL_MEMO_LIMIT
     over = astral[-1]
     assert over not in table
-    assert chr(0xE0001).translate(table) == "\\U000e0001"  # a tag character, past the bound
+    assert chr(0xE0001).translate(table) == "\\udb40\\udc01"  # a tag character, past the bound
     assert chr(over).translate(table) == chr(over)
 
 

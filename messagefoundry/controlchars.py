@@ -2,7 +2,8 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The control-character alphabets, each written once: the C0/DEL test (BACKLOG #1253) and the
 wider log alphabet built on it (vault BACKLOG #2815). Beside them sits :func:`has_lone_surrogate`,
-the other test a mail header value needs, which is not a control character (vault BACKLOG #2842).
+the other test a mail header value needs, which the C0/DEL test does not cover. The log alphabet
+does cover it, through category ``Cs`` (vault BACKLOG #2842).
 
 WHAT THIS REPLACES. ``ord(ch) < 0x20 or ord(ch) == 0x7F`` was written out seven times across six
 files -- two in ``transports/fhir.py`` and one each in ``config/codeset_edit.py``,
@@ -39,8 +40,8 @@ refusals, that makes three actions built on one predicate:
   * ESCAPE -- every log line, :func:`scrub_control_chars`. Neither refuses nor deletes: it renders
     the code point as a readable backslash escape, so one record cannot become two. Its alphabet is
     WIDER than the other two arms' (vault BACKLOG #2815); :func:`_escapes_in_a_log_line` states it.
-    Its ``\\xNN`` and ``\\UXXXXXXXX`` spellings are not JSON, so a JSON document logged as a
-    message is serialized with :func:`json_dumps_for_log`, which spells those characters as JSON.
+    Every escape it writes is also valid inside a JSON string (:func:`_log_escape`), so a JSON
+    document logged as a message still parses after it (vault BACKLOG #3012).
 
 WHY ESCAPE LIVES HERE, WHICH IS THE ONE FACT WORTH STATING ONCE (BACKLOG #1591). It was defined in
 ``logging_setup`` until ``logging_guard`` needed it, and ``logging_setup`` imports
@@ -69,7 +70,6 @@ THE POINT IS THE COPYING PRACTICE, not the seven known lines. If you need this t
 
 from __future__ import annotations
 
-import json
 import unicodedata
 
 #: The Unicode general categories a reader of TEXT may act on rather than show: the C0 and C1
@@ -120,14 +120,20 @@ def has_control_char(text: str) -> bool:
     return any(_is_control_char(ch) for ch in text)
 
 
+def _is_surrogate(code: int) -> bool:
+    """True for a surrogate code point, U+D800 to U+DFFF: the one statement of that range here."""
+    return 0xD800 <= code <= 0xDFFF
+
+
 def has_lone_surrogate(text: str) -> bool:
     """True if ``text`` holds a surrogate code point (U+D800 to U+DFFF), which strict UTF-8 cannot
     write. That includes each half of an adjacent pair, which ``str`` holds as two code points only
-    after a ``surrogatepass`` decode or an escape. TOML refuses one, but at least Python config and an environment value can carry one: a
-    ``surrogateescape`` decode makes U+DC80 to U+DCFF. :func:`has_control_char` passes it, so a mail
-    header needs both tests (vault BACKLOG #2842). In a header most surrogates raise
-    ``UnicodeEncodeError`` at build; U+DC80 to U+DCFF go out as a garbled ``unknown-8bit`` word."""
-    return any("\ud800" <= ch <= "\udfff" for ch in text)
+    after a ``surrogatepass`` decode or an escape. TOML refuses one, but at least Python config and
+    an environment value can carry one: a ``surrogateescape`` decode makes U+DC80 to U+DCFF.
+    :func:`has_control_char` passes it, so a mail header needs both tests (vault BACKLOG #2842). In
+    a header most surrogates raise ``UnicodeEncodeError`` at build; U+DC80 to U+DCFF go out as a
+    garbled ``unknown-8bit`` word."""
+    return any(_is_surrogate(ord(ch)) for ch in text)
 
 
 def strip_control_chars(text: str) -> str:
@@ -162,20 +168,50 @@ def _escapes_in_a_log_line(ch: str) -> bool:
     return ch != "\t" and (_is_control_char(ch) or unicodedata.category(ch) in CONTROL_CATEGORIES)
 
 
+def json_unicode_escape(code: int) -> str:
+    """JSON's own escape for one code point inside a string: ``\\u2028``, or past U+FFFF a
+    surrogate pair, ``\\udb40\\udc01`` for U+E0001. A caller that may hold a lone surrogate decides
+    its spelling itself, because ``\\udc80`` alone is not valid for a strict JSON decoder."""
+    if code <= 0xFFFF:
+        return f"\\u{code:04x}"
+    code -= 0x10000
+    return f"\\u{0xD800 + (code >> 10):04x}\\u{0xDC00 + (code & 0x3FF):04x}"
+
+
 def _log_escape(code: int) -> str:
-    """Python's own escape for one code point (``\\x85``, ``\\u2028``, ``\\U000e0001``).
-    ``ascii`` spells it, not this module. A backslash in the text is not doubled, as it never was
-    for C0, so peer text that spells an escape reads the same as an escaped character."""
-    return ascii(chr(code))[1:-1]
+    """The log's escape for one code point, written so it is also valid inside a JSON string.
+
+    CR and LF are ``\\r`` and ``\\n``. A lone surrogate is ``\\\\udc80``, a doubled backslash and
+    the hex (see below). Every other code point is :func:`json_unicode_escape`: ``\\u007f``,
+    ``\\u0085``, ``\\u2028``, and a surrogate pair past U+FFFF. So a JSON document logged as a
+    message, such as the off-box audit record, still parses after the scrub, and the redaction
+    filters before the scrub see the raw characters (vault BACKLOG #3012). Python's ``ascii``
+    spelling, used until then, wrote ``\\x7f`` and ``\\U000e0001``, which JSON does not define.
+
+    A LONE SURROGATE IS SPELLED AS TEXT, NOT AS A CHARACTER. ``\\udc80`` alone is accepted by
+    Python's ``json`` and refused by a strict decoder, and I-JSON (RFC 7493) forbids it. Worse, a
+    lone high surrogate next to a lone low one would decode as ONE astral character that the text
+    never held. Doubling the backslash makes it six visible characters that every JSON decoder
+    reads as text, so the code point is still shown and nothing is invented.
+
+    A backslash in the text is not doubled, as it never was, so peer text that spells an escape
+    reads the same as an escaped character."""
+    if code == 0x0A:
+        return "\\n"
+    if code == 0x0D:
+        return "\\r"
+    if _is_surrogate(code):
+        return f"\\\\u{code:04x}"
+    return json_unicode_escape(code)
 
 
 # The log alphabet up to U+00FF, as a ``str.translate`` table: the whole table for ASCII text, and
-# the seed of :class:`_LogTranslation` for the rest. ``ascii`` spells CR and LF as the readable
-# ``\r`` and ``\n``; tab is absent because the predicate leaves it out. RANGE 0x100 SO THE C1 BLOCK
-# IS SEEDED, and a widening of ``_is_control_char`` anywhere in it reaches the table by construction
-# (BACKLOG #1273, limb 3). A comprehension rather than a ``for`` loop so the index does not survive
-# as a module global: this is a leaf every other module imports, and it should export nothing it did
-# not mean to.
+# the seed of :class:`_LogTranslation` for the rest. :func:`_log_escape` spells CR and LF as the
+# readable ``\r`` and ``\n``; tab is absent because the predicate leaves it out. RANGE 0x100 SO THE
+# C1 BLOCK IS SEEDED, and a widening of ``_is_control_char`` anywhere in it reaches the table by
+# construction (BACKLOG #1273, limb 3). A comprehension rather than a ``for`` loop so the index does
+# not survive as a module global: this is a leaf every other module imports, and it should export
+# nothing it did not mean to.
 _CTRL_TRANSLATION: dict[int, str] = {
     cp: _log_escape(cp) for cp in range(0x100) if _escapes_in_a_log_line(chr(cp))
 }
@@ -234,39 +270,6 @@ def scrub_control_chars(text: str) -> str:
     if text.isascii():
         return text.translate(_CTRL_TRANSLATION)
     return text.translate(_LOG_TRANSLATION)
-
-
-#: The log alphabet up to U+00FF, spelled as JSON escapes. :func:`scrub_control_chars` spells these
-#: ``\xNN``, which JSON does not define. Above U+00FF the scrub's ``\uXXXX`` is already JSON, except
-#: past U+FFFF, which :func:`json_dumps_for_log` handles itself.
-_JSON_SPELLING: dict[int, str] = {cp: json.dumps(chr(cp))[1:-1] for cp in _CTRL_TRANSLATION}
-
-
-def json_dumps_for_log(obj: object) -> str:
-    """``json.dumps(obj, ensure_ascii=False)`` that stays valid JSON after
-    :func:`scrub_control_chars`, for a JSON document logged as a message (the off-box audit tee).
-
-    The scrub spells the log alphabet the way ``ascii()`` does. Up to U+00FF that is ``\\xNN`` and
-    past U+FFFF it is ``\\UXXXXXXXX``, and JSON defines neither, so a raw DEL, C1, soft hyphen or
-    astral format code point left the document unparseable. This spells exactly those characters
-    as JSON escapes (an astral one as a surrogate pair) before any filter runs. ``json.dumps``
-    already escapes C0 inside a string, and the alphabet can occur nowhere else in its output.
-
-    EVERY OTHER CHARACTER IS LEFT RAW, ON PURPOSE. The scrub still spells the BMP part of the
-    alphabet as ``\\uXXXX``, which is JSON. So a filter that runs before the scrub, such as the
-    redaction filter, sees those characters as it always did. An escape there would join the
-    following word (``\\u200eDOE`` has no word boundary), and redaction would miss the name. The
-    characters this does escape left the record unparseable before, so the redaction filter now
-    sees different text only in a record that could not be read anyway, or where it had removed
-    that character itself. That second case is at least a name joined by U+0085."""
-    document = json.dumps(obj, ensure_ascii=False).translate(_JSON_SPELLING)
-    # `max` is one C-level pass; the per-character walk runs only for text past U+FFFF.
-    if document.isascii() or max(document) <= chr(0xFFFF):
-        return document
-    return "".join(
-        json.dumps(ch)[1:-1] if ord(ch) > 0xFFFF and _escapes_in_a_log_line(ch) else ch
-        for ch in document
-    )
 
 
 def scrub_log_argument(text: str) -> str:

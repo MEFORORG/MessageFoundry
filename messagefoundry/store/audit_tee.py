@@ -23,9 +23,9 @@ host, and the durable off-box forwarder remains unbuilt.
 
 from __future__ import annotations
 
+import json
 import logging
 
-from messagefoundry.controlchars import json_dumps_for_log
 from messagefoundry.logging_setup import ensure_logger_sink
 from messagefoundry.redaction import safe_text
 
@@ -119,22 +119,18 @@ def emit_audit_tee(
     redacting here keeps the off-box guarantee independent of handler config and **identical across
     every backend**.
 
-    **The record survives the scrub.** ``ControlCharScrubFilter`` spells part of the log alphabet as
-    ``\\x7f`` or ``\\U000e0001``, which JSON does not define. So a raw DEL, C1, soft hyphen or astral
-    format code point in ``actor``, which a failed sign-in sets to the typed name, left a collector
-    unable to parse the record. :func:`~messagefoundry.controlchars.json_dumps_for_log` spells those
-    characters as JSON escapes, and leaves the rest of the alphabet for the scrub, whose ``\\uXXXX``
-    is already JSON. The scrub runs on this logger exactly as on every other. Its function docstring
-    says what the redaction filter, which runs first, now sees differently.
+    **The record survives the scrub, and the scrub is what makes it so.** A failed sign-in sets
+    ``actor`` to the typed name, so a client chooses its characters. ``ControlCharScrubFilter``
+    runs last on every configured handler, and since vault BACKLOG #3012 every escape it writes is
+    valid inside a JSON string (``controlchars._log_escape``). So this serializes with plain
+    ``json.dumps`` and leaves every character raw for the filters. Escaping here instead, BEFORE the
+    redaction and credential filters, hid a name or a password from them: an escape such as
+    ``\\u007f`` ends in a word character, so ``\\b``-anchored patterns no longer matched the next
+    word. ``ensure_ascii=True`` is the same mistake, for every non-ASCII character.
 
-    Not ``ensure_ascii=True``, and not an escape of the whole alphabet: both change what the
-    redaction filter matches in records that parsed before. With ``ensure_ascii=True``, ``DOE JANE``
-    joined by a no-break space shipped unredacted, and with either, so did ``DOE JANE`` after a
-    left-to-right mark.
-
-    **At least one residual is separate from this fix.** The redaction and credential filters
-    rewrite spans of this document, and a span can take a closing quote with it. An ASCII ``actor``
-    of ``a%7Cb%7Cc`` breaks the JSON with or without this function.
+    **At least one residual is separate from this.** The redaction and credential filters rewrite
+    spans of this document, and a span can take a closing quote with it. An ASCII ``actor`` of
+    ``a%7Cb%7Cc`` breaks the JSON.
 
     Best-effort: a logging failure must never fail the audit write (already committed), so it is
     caught and logged, not raised. Callers invoke this **after commit** and **outside any write
@@ -158,8 +154,8 @@ def emit_audit_tee(
     try:
         # Inside the guard: a sink that cannot be built must not fail the caller's audit write either.
         ensure_logger_sink(audit_logger)
-        # See "The record survives the scrub" in the docstring.
-        audit_logger.info(json_dumps_for_log(record))
+        # Not ensure_ascii, and no escaping here: see "The record survives the scrub" above.
+        audit_logger.info(json.dumps(record, ensure_ascii=False))
     except Exception:  # noqa: BLE001 — the audit row is durable; the off-box tee is best-effort
         # Once per process, and never naming the row (BACKLOG #1131). A line per failed row named
         # its action, and its COUNT tracked the rows, the hidden lock rows included; ``GET

@@ -24,7 +24,6 @@ from messagefoundry.controlchars import (
     _is_control_char,
     has_control_char,
     has_lone_surrogate,
-    json_dumps_for_log,
     scrub_control_chars,
     scrub_log_argument,
     strip_control_chars,
@@ -357,26 +356,76 @@ def test_the_detector_does_not_fire_on_a_different_set(source: str) -> None:
     assert _rederivations(source) == []
 
 
-def test_json_dumped_for_the_log_still_parses_after_the_scrub_and_decodes_unchanged() -> None:
-    """Every BMP code point plus astral samples, as one JSON string: after the scrub, the
-    :func:`json_dumps_for_log` document still parses and decodes to the same text."""
-    # The surrogate block is left out of the run and one lone surrogate added on its own: a lone
-    # high surrogate escaped next to a lone low one decodes as ONE astral character, which is how
-    # JSON defines that pair, whichever side of the scrub spells it.
-    text = "".join(chr(c) for c in range(0x10000) if not 0xD800 <= c <= 0xDFFF) + "".join(
-        chr(c) for c in (0xDCFF, 0x1F600, 0xE0001, 0xF0000, 0x10FFFF)
-    )
-    # CONTROL: plain json.dumps does not survive the scrub, so the assertion below is not vacuous.
-    with pytest.raises(json.JSONDecodeError):
-        json.loads(scrub_control_chars(json.dumps({"actor": text}, ensure_ascii=False)))
-    assert json.loads(scrub_control_chars(json_dumps_for_log({"actor": text}))) == {"actor": text}
+#: Any ``\uD800``-``\uDFFF`` escape in JSON text, with the run of backslashes before it. An odd run
+#: makes it a real escape; an even run makes it literal text that only looks like one.
+_SURROGATE_ESCAPE = re.compile(r"(\\+)u[dD][89a-fA-F][0-9a-fA-F]{2}")
 
 
-def test_json_dumped_for_the_log_escapes_only_what_the_scrub_would_spell_as_non_json() -> None:
-    """Everything else stays raw, so a filter that runs before the scrub sees what it saw before:
-    ordinary non-ASCII, a no-break space, and the part of the log alphabet the scrub already spells
-    as ``\\uXXXX`` (a left-to-right mark, a line separator, a lone surrogate)."""
-    kept = "".join(chr(c) for c in (0xE9, 0x5F20, 0xA0, 0x1F600, 0x200E, 0x2028, 0xDCFF))
-    assert json_dumps_for_log(kept) == json.dumps(kept, ensure_ascii=False)
-    escaped = "".join(chr(c) for c in (0x7F, 0x85, 0xAD, 0xE0001))
-    assert json_dumps_for_log(escaped) == '"\\u007f\\u0085\\u00ad\\udb40\\udc01"'
+def _strict_json(document: str) -> object:
+    """``json.loads``, refusing what a strict decoder such as jiter, or I-JSON (RFC 7493), refuses
+    and Python accepts: an unpaired surrogate escape. Checked on the decoded value, because Python
+    pairs a valid high and low escape into one character and leaves an unpaired one as a surrogate."""
+    value = json.loads(document)
+    assert not has_lone_surrogate(json.dumps(value, ensure_ascii=False)), document
+    return value
+
+
+def _real_surrogate_escapes(document: str) -> list[str]:
+    return [m.group() for m in _SURROGATE_ESCAPE.finditer(document) if len(m.group(1)) % 2]
+
+
+#: Every BMP code point but the surrogates, then astral samples: a tag character (``Cf``), a
+#: private-use one (``Co``), the last code point, and two printable ones that must stay raw.
+_EVERY_NON_SURROGATE = "".join(
+    chr(c) for c in range(0x10000) if not has_lone_surrogate(chr(c))
+) + "".join(chr(c) for c in (0xE0001, 0xF0000, 0x10FFFF, 0x1F600, 0x20000))
+
+
+def test_a_json_document_survives_the_scrub_and_decodes_unchanged() -> None:
+    """Vault BACKLOG #3012. Every escape the scrub writes is valid inside a JSON string, so a
+    document from plain ``json.dumps(..., ensure_ascii=False)`` still parses after it, for a strict
+    decoder too, and decodes to the text that went in."""
+    document = json.dumps({"actor": _EVERY_NON_SURROGATE}, ensure_ascii=False)
+    scrubbed = scrub_control_chars(document)
+    # CONTROL: the scrub really rewrote characters inside the string, so the parse is not vacuous.
+    assert chr(0x7F) in document and chr(0x7F) not in scrubbed
+    assert chr(0xE0001) in document and chr(0xE0001) not in scrubbed
+    assert _strict_json(scrubbed) == {"actor": _EVERY_NON_SURROGATE}
+
+
+def test_the_old_spelling_was_not_json() -> None:
+    """The control for the test above: Python's ``ascii`` spelling, used before #3012, is not JSON
+    for DEL, C1, the soft hyphen and an astral code point, so those samples discriminate."""
+    for code in (0x7F, 0x85, 0xAD, 0xE0001):
+        with pytest.raises(json.JSONDecodeError):
+            json.loads('"' + ascii(chr(code))[1:-1] + '"')
+
+
+@pytest.mark.parametrize("code", [0xD800, 0xDBFF, 0xDC00, 0xDCFF, 0xDFFF])
+def test_a_lone_surrogate_is_spelled_as_visible_text_a_strict_decoder_accepts(code: int) -> None:
+    """JSON's own ``\\udcff`` alone is refused by a strict decoder, so the log doubles the
+    backslash: six visible characters every decoder reads as text, naming the code point."""
+    document = scrub_control_chars(json.dumps(f"a{chr(code)}b", ensure_ascii=False))
+    assert document == f'"a\\\\u{code:04x}b"'
+    assert _real_surrogate_escapes(document) == []
+    assert _strict_json(document) == f"a\\u{code:04x}b"
+    # CONTROL: the pattern finds a real escape, so its empty answer above means something.
+    assert _real_surrogate_escapes(f'"\\u{code:04x}"') == [f"\\u{code:04x}"]
+
+
+def test_an_adjacent_lone_high_and_low_surrogate_do_not_decode_as_one_character() -> None:
+    """``str`` can hold U+D83D then U+DE00 as two code points. Spelled as JSON escapes they would
+    decode as U+1F600, a character the text never held. As text, each stays its own."""
+    document = scrub_control_chars(json.dumps(chr(0xD83D) + chr(0xDE00), ensure_ascii=False))
+    assert _strict_json(document) == "\\ud83d\\ude00"
+    assert _strict_json(document) != chr(0x1F600)
+
+
+def test_an_astral_code_point_is_a_surrogate_pair_that_decodes_as_itself() -> None:
+    assert scrub_control_chars(chr(0xE0001)) == "\\udb40\\udc01"
+    assert _strict_json(f'"{scrub_control_chars(chr(0xE0001))}"') == chr(0xE0001)
+
+
+def test_plain_non_ascii_is_left_raw() -> None:
+    plain = "".join(chr(c) for c in (0xE9, 0xA0, 0x5F20, 0x1F600, 0x20000))
+    assert scrub_control_chars(plain) == plain
