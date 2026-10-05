@@ -561,7 +561,7 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
         print(
             "warning: the overlay keeps "
             + ", ".join(f"{rule.path} ({rule.kind.value})" for rule in kept)
-            + ", which turns off the default scrub of each: those fields are written as captured",
+            + ", which turns off the default scrub of each: those fields are not rewritten",
             file=sys.stderr,
         )
 

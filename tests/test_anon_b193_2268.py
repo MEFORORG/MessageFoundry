@@ -72,7 +72,7 @@ def test_keeping_a_default_scrubbed_field_warns(rules: ModuleType, tmp_path: Pat
     (line,) = lines
     # The field and the kind it lost, so the reader knows which scrub is now off.
     assert "PID-5" in line
-    assert "name" in line
+    assert "default name scrub" in line
     assert [(r.path, r.kind) for r in rules.kept_defaults(loaded)] == [
         ("PID-5", rules.SurrogateKind.NAME)
     ]
@@ -96,8 +96,8 @@ def test_each_overridden_default_gets_its_own_line(rules: ModuleType, tmp_path: 
         rules.load_rules(overlay)
 
     assert len(lines) == 2
-    assert any("PID-5" in line and "name" in line for line in lines)
-    assert any("PID-13" in line and "phone" in line for line in lines)
+    assert any("PID-5" in line and "default name scrub" in line for line in lines)
+    assert any("PID-13" in line and "default phone scrub" in line for line in lines)
     assert not any("EVN-1" in line for line in lines)
 
 

@@ -123,6 +123,7 @@ def test_an_overlay_nested_past_the_parser_is_a_rule_error(
         rules.load_rules(overlay)
 
     _assert_bare(caught.value)
+    assert "nests too deeply" in str(caught.value)
 
 
 @_BOTH
