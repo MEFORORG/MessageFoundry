@@ -60,6 +60,7 @@ from messagefoundry.config.tls_policy import (
     enforce_insecure_hop,
     harden_cipher_suites,
     hop_name_prefix,
+    hop_url_host,
     insecure_hop_disposition,
     is_loopback_hop_host,
     narrow_to_approved_suites,
@@ -342,11 +343,15 @@ def http_family_trust_anchor(
 
     Total by construction — a policy-less build (a direct test construction) resolves to
     :data:`~messagefoundry.config.tls_policy.SYSTEM_TRUST_ANCHOR`, which is the same value the shipped
-    default resolves to, so callers have ONE "nothing configured" value to handle rather than two."""
+    default resolves to, so callers have ONE "nothing configured" value to handle rather than two.
+
+    A ``url`` that names no host raises ``ValueError`` (:func:`hop_url_host`, BACKLOG #2207). Read as
+    ``""`` it took the loopback arm, which drops the instance CA and the CRL from a hop nobody can
+    place."""
     ca = settings.get("tls_ca_file")
     return resolve_trust_anchor(
         connection_ca_file=str(ca) if ca else None,
-        host=urllib.parse.urlsplit(url).hostname or "",
+        host=hop_url_host(url, cell="HTTP-family trust anchor"),
         policy=trust_anchor_policy if trust_anchor_policy is not None else TrustAnchorPolicy(),
     )
 
@@ -596,7 +601,15 @@ class InsecureHopGuard:
     connection: str | None = None
 
     def assert_send(self, host: str, redacted_url: str) -> None:
-        """Re-assert (zero I/O) that ``host`` is still a permitted hop under the captured posture."""
+        """Re-assert (zero I/O) that ``host`` is still a permitted hop under the captured posture.
+
+        An empty ``host`` is refused whatever the posture (BACKLOG #2207): the authority below reads
+        ``""`` as loopback and would ALLOW it. The text is fixed and names no part of the URL."""
+        if not host:
+            raise InsecureHopRefused(
+                f"{hop_name_prefix(self.connection)}{self.cell}: send-time refusal: the URL names "
+                "no host, so the hop cannot be judged on-box or off-box"
+            )
         if (
             _shipped_strict_disposition(
                 self.posture,
@@ -612,6 +625,20 @@ class InsecureHopGuard:
                 "is not permitted under the instance posture"
             )
 
+    def assert_send_url(self, url: str) -> None:
+        """:meth:`assert_send` for the hop ``url`` names. The call every send-time site makes.
+
+        The host is read by :func:`hop_url_host`, the one check the construction guards use, so no
+        site falls through to ``""`` (BACKLOG #2207). Its ``ValueError`` becomes the
+        :class:`InsecureHopRefused` that :meth:`assert_send` raises for an empty host, so each
+        caller reports a missing host as it reports any refused hop."""
+        try:
+            host = hop_url_host(url, cell=self.cell)
+        except ValueError:
+            host = ""
+        # _redact_url splits the URL again, so it is skipped for a URL that would not split.
+        self.assert_send(host, _redact_url(url) if host else "")
+
 
 def assert_probe_hop(guard: InsecureHopGuard | None, url: str, *, connector: str) -> None:
     """Run a destination's send-time hop re-check for its test-connection probe (BACKLOG #2196).
@@ -623,11 +650,11 @@ def assert_probe_hop(guard: InsecureHopGuard | None, url: str, *, connector: str
     A refusal is a :class:`DeliveryError`, as a probe's other failures are. The raw
     :class:`InsecureHopRefused` is a ``ValueError``, which would reach the test-connection route's
     catch-all as an unclassified failure. The refusal text names the connection, the cell, the
-    host and the redacted URL, and no message content."""
+    host and the redacted URL, and no message content. For a URL with no host it names neither."""
     if guard is None:
         return
     try:
-        guard.assert_send(urllib.parse.urlsplit(url).hostname or "", _redact_url(url))
+        guard.assert_send_url(url)
     except InsecureHopRefused as exc:
         raise DeliveryError(f"{connector} probe refused: {exc}") from exc
 
@@ -720,24 +747,10 @@ def _hop_guard_host(url: str, *, cell: str) -> str:
     """The host the hop guards below decide on. A URL whose authority names none (``https:///x``,
     ``https://:443/x``) raises :class:`ValueError`, whatever the posture (BACKLOG #1924).
 
-    Each guard keys its on-box carve-out on :func:`is_loopback_hop_host`, which reads ``""`` as
-    loopback, and at least one caller elsewhere relies on that. So the old ``hostname or ""`` let
-    the one hop a guard cannot classify cross as on-box. What such a URL dials is not knowable here:
-    an empty host can resolve to this box's own network addresses rather than to loopback. So the
-    remedy is the URL, and no posture, attestation or acceptance crosses this.
-
-    A plain ``ValueError`` and not :class:`InsecureHopRefused`: the token-endpoint and Digest seams
-    re-raise that type with posture advice ("attest the hop", "declare cleartext_accepted") that
-    cannot fix a missing host. The loader surfaces both types the same way. The message names no
-    part of the URL, because a proxy URL's userinfo can spill into what ``urlsplit`` reads as its
-    path."""
-    host = urllib.parse.urlsplit(url).hostname
-    if not host:
-        raise ValueError(
-            f"{cell}: the URL names no host, so the hop cannot be judged on-box or off-box. "
-            "Give the URL a host."
-        )
-    return host
+    The check itself is :func:`~messagefoundry.config.tls_policy.hop_url_host`, which the send-time
+    re-checks and the trust-anchor lookups share (BACKLOG #2207). Its docstring says why the error
+    is a plain ``ValueError`` and why the message names no part of the URL."""
+    return hop_url_host(url, cell=cell)
 
 
 def refuse_cleartext_credential_hop(
@@ -2065,9 +2078,7 @@ class RestDestination(DestinationConnector):
         # a single byte crosses — defense against a reload / per-message target sneaking PHI past the
         # construction-only gate. A None guard (secure/loopback hop) is byte-identical.
         if self._hop_guard is not None:
-            self._hop_guard.assert_send(
-                urllib.parse.urlsplit(self.url).hostname or "", _redact_url(self.url)
-            )
+            self._hop_guard.assert_send_url(self.url)
         data = encode_wire_body(payload, self.encoding, transport="REST")
         headers = self._headers
         if dynamic_headers or self._token_provider is not None or self._signer is not None:

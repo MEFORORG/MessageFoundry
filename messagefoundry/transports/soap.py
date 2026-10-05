@@ -848,9 +848,7 @@ class SoapDestination(DestinationConnector):
         # #200 (ADR 0092 decision 4): zero-I/O send-time re-assertion of a permitted insecure hop before
         # a byte crosses (a None guard — secure/loopback — is byte-identical).
         if self._hop_guard is not None:
-            self._hop_guard.assert_send(
-                urllib.parse.urlsplit(self.url).hostname or "", _redact_url(self.url)
-            )
+            self._hop_guard.assert_send_url(self.url)
         # payload is the FINAL wire body (in WS-* mode send() already wrapped + stamped the envelope),
         # so signing over these bytes covers exactly what the partner receives.
         data = encode_wire_body(payload, self.encoding, transport="SOAP")

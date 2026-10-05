@@ -948,9 +948,7 @@ class FhirDestination(DestinationConnector):
         # a byte crosses. ``url`` is a per-message write path but its host is always the base_url host, so
         # a None guard (secure/loopback base) is byte-identical.
         if self._hop_guard is not None:
-            self._hop_guard.assert_send(
-                urllib.parse.urlsplit(self.base_url).hostname or "", _redact_url(self.base_url)
-            )
+            self._hop_guard.assert_send_url(self.base_url)
         data = encode_wire_body(payload, self.encoding, transport="FHIR")
         headers = {**self._headers, **extra_headers}
         if self._token_provider is not None:
@@ -1424,9 +1422,8 @@ class FhirLookupExecutor:
         guard = self._hop_guard.get(connection)
         if guard is None:
             return
-        base = self._base[connection]
         try:
-            guard.assert_send(urllib.parse.urlsplit(base).hostname or "", _redact_url(base))
+            guard.assert_send_url(self._base[connection])
         except InsecureHopRefused as exc:
             raise FhirLookupError(f"{prefix}: {exc}") from exc
 

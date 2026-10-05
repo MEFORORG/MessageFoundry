@@ -135,6 +135,7 @@ __all__ = [
     "in_process_tls_revocation_refused",
     "insecure_hop_disposition",
     "is_loopback_hop_host",
+    "hop_url_host",
     "phi_read_hop_disposition",
     "proxy_mtls_declared_but_unverified",
     "resolve_trust_anchor",
@@ -1904,6 +1905,38 @@ def is_loopback_hop_host(host: str) -> bool:
         return False
 
 
+def hop_url_host(url: str, *, cell: str) -> str:
+    """The host a hop decision is keyed on. A URL whose authority names none (``https:///x``,
+    ``https://:443/x``) raises :class:`ValueError`, whatever the posture (BACKLOG #1924, #2207).
+
+    The ONE reader of a hop URL's host for a hop guard, a send-time re-check or a trust-anchor
+    lookup. Each of those keys an on-box carve-out on :func:`is_loopback_hop_host`, which reads
+    ``""`` as loopback, and at least one caller elsewhere relies on that. So a site that wrote
+    ``hostname or ""`` let the one hop it cannot classify cross as on-box. What such a URL dials is
+    not knowable here: an empty host can resolve to this box's own network addresses rather than to
+    loopback. So the remedy is the URL, and no posture, attestation or acceptance crosses this.
+
+    A plain ``ValueError`` and not :class:`InsecureHopRefused`: the token-endpoint and Digest seams
+    re-raise that type with posture advice ("attest the hop", "declare cleartext_accepted") that
+    cannot fix a missing host. The loader surfaces both types the same way. The message names no
+    part of the URL, because a proxy URL's userinfo can spill into what ``urlsplit`` reads as its
+    path. A site that must not raise this type catches it and reports the refusal its own way, as
+    ``transports.rest.InsecureHopGuard.assert_send_url`` and :func:`vault_client_verify_kwargs` do.
+
+    A URL ``urlsplit`` will not split (a malformed bracketed host) is refused the same way, with
+    the same text. Its own ``ValueError`` can quote the URL, so it is not raised or chained."""
+    try:
+        host = urllib.parse.urlsplit(url).hostname
+    except ValueError:
+        host = None
+    if not host:
+        raise ValueError(
+            f"{cell}: the URL names no host, so the hop cannot be judged on-box or off-box. "
+            "Give the URL a host."
+        )
+    return host
+
+
 def insecure_hop_disposition(
     *,
     enforcing: bool,
@@ -2733,11 +2766,14 @@ def vault_client_verify_kwargs(
     plumbing change. Routing through :func:`resolve_trust_anchor` anyway means that change moves one
     argument rather than rewriting the hop."""
     try:
-        host = urllib.parse.urlsplit(addr or "").hostname or ""
+        host = hop_url_host(addr or "", cell=cell)
     except ValueError:
-        # A malformed bracketed host. urllib's error text can quote it, so it is not raised here;
-        # the client build refuses the address with fixed text instead (BACKLOG #2317). NOT "":
-        # is_loopback_hop_host("") is True, and an unreadable host must not count as on-box.
+        # A malformed bracketed host, or an address that names no host (BACKLOG #2207). Not
+        # raised here: the client build refuses a given address it cannot read as one URL, with
+        # fixed text and the provider's own error type (BACKLOG #2317). An unset address lands
+        # here too: hvac then picks its own, which this function cannot see. NOT "":
+        # is_loopback_hop_host("") is True, and a host this function cannot read must not count
+        # as on-box.
         host = "(unreadable host)"
     anchor = resolve_trust_anchor(connection_ca_file=ca_file, host=host, policy=TrustAnchorPolicy())
     verify = requests_verify_from_anchor(anchor, cell=cell)
