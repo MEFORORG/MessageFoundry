@@ -26,6 +26,13 @@ from messagefoundry.transports.mllp import DEFAULT_MAX_FRAME_BYTES, MLLPDecoder,
 from tests._mllp_over_cap import send_over_cap, send_valid_then_over_cap
 
 _ANON_SALT = "capture-salt-0123456789abcdef"  # synthetic; long enough for the Keyer's floor
+# The same skip tests/test_anon_core.py carries: the leak-check loads this script by path, and an
+# installed wheel has no scripts/ tree.
+_LEAK_SCANNER = Path(__file__).resolve().parents[1] / "scripts" / "security" / "scan_forbidden.py"
+_NO_SCANNER = pytest.mark.skipif(
+    not _LEAK_SCANNER.exists(),
+    reason="leak-check needs scripts/security/scan_forbidden.py (absent on an installed wheel)",
+)
 
 
 def _message(control_id: str) -> str:
@@ -83,11 +90,12 @@ def test_capture_acks_and_writes_jsonl(tmp_path: Path) -> None:
     assert all(isinstance(r["received_at"], float) for r in records)
 
 
+@_NO_SCANNER
 def test_the_documented_on_report_wiring_hands_the_caller_a_coverage_report(tmp_path: Path) -> None:
-    """The comment on ``CaptureSink._anonymizer`` shows ``anonymize_checked`` wired with
-    ``on_report=tally.add``. The sink takes a str-to-str callable and never sees the report, so that
-    closure is the only route by which the coverage report reaches whoever shares the capture. This
-    runs the example as written; drop ``on_report`` and the tally stays at zero messages."""
+    """The ``CaptureSink`` docstring shows ``anonymize_checked`` wired with ``on_report=tally.add``.
+    The sink takes a str-to-str callable and never sees the report. So that closure is the only
+    route by which the coverage report reaches whoever shares the capture. This runs the example
+    as written. Drop ``on_report`` and the tally stays at zero messages."""
     out = tmp_path / "cap.jsonl"
     tally = CoverageTally()
 
@@ -108,6 +116,8 @@ def test_the_documented_on_report_wiring_hands_the_caller_a_coverage_report(tmp_
     assert sink.captured == 2 and sink.anon_failed == 0
     assert "DOE" not in out.read_text(encoding="utf-8")  # the rule map did run
     assert tally.messages == 2  # one report per message, on the clean path
+    # The report's content arrived too, not only the call: each unmapped address, once per message.
+    assert tally.counts and set(tally.counts.values()) == {2}
     assert tally.summary().startswith("coverage: 2 message(s) reached the leak-check")
 
 
