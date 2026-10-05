@@ -631,10 +631,10 @@ class InsecureHopGuard:
     def assert_send_url(self, url: str) -> None:
         """:meth:`assert_send` for the hop ``url`` names. The HTTP-family send-time sites call it.
 
-        The host is read by :func:`hop_url_host`, the one check the construction guards use, so no
-        site falls through to ``""`` (BACKLOG #2207). Its ``ValueError`` becomes the
-        :class:`InsecureHopRefused` that :meth:`assert_send` raises for an empty host, so each
-        caller reports a missing host as it reports any refused hop."""
+        The host is read by :func:`hop_url_host`, the check the construction guards use, so a
+        caller of this method cannot fall through to ``""`` (BACKLOG #2207). Its ``ValueError``
+        becomes the :class:`InsecureHopRefused` that :meth:`assert_send` raises for an empty host,
+        so each caller reports a missing host as it reports any refused hop."""
         try:
             host = hop_url_host(url, cell=self.cell)
         except ValueError:

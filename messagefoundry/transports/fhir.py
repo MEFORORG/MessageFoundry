@@ -1419,7 +1419,8 @@ class FhirLookupExecutor:
         A refusal is a :class:`FhirLookupError`, like every other failure of this executor. The raw
         ``InsecureHopRefused`` is a ``ValueError``, which the sandbox worker does not catch, so it
         reached the Handler as a crash rather than as a lookup error (BACKLOG #2059). Its text names
-        the redacted base and the host, as the sibling arms here do."""
+        the redacted base and the host, as the sibling arms here do. For a base with no host it
+        names neither (BACKLOG #2207)."""
         from messagefoundry.config.fhir_lookup import FhirLookupError
 
         guard = self._hop_guard.get(connection)

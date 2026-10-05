@@ -406,7 +406,7 @@ class DicomWebDestination(DestinationConnector):
         # Any HTTP response means the host answered; 401/403 means the configured credentials would be
         # rejected (which a real store dead-letters). Connection/DNS/TLS/timeout always fails.
         # BACKLOG #2196: the hop re-check _post runs, before a byte crosses.
-        assert_probe_hop(self._hop_guard, self._target_url, connector="DICOMweb")
+        assert_probe_hop(self._hop_guard, self.base_url, connector="DICOMweb")
         req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s) in __init__
             self._target_url, headers=self._headers, method="OPTIONS"
         )
@@ -448,8 +448,7 @@ class DicomWebDestination(DestinationConnector):
         # #200 (ADR 0092 decision 4): zero-I/O send-time re-assertion of a permitted insecure hop before
         # a byte crosses (a None guard — secure/loopback — is byte-identical).
         if self._hop_guard is not None:
-            # The URL this request dials, which is derived from base_url once, at construction.
-            self._hop_guard.assert_send_url(self._target_url)
+            self._hop_guard.assert_send_url(self.base_url)
         data, boundary = self._multipart_body(dicom_bytes)
         headers = {
             **self._headers,

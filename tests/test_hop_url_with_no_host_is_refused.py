@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""One refusal for a hop URL that names no host, at every site that reads one (BACKLOG #2207).
+"""One refusal for a hop URL that names no host, at the sites BACKLOG #2207 names.
 
 ``tls_policy.is_loopback_hop_host("")`` is True. So a site that wrote ``hostname or ""`` took the
 on-box carve-out for the one hop it could not classify. BACKLOG #1924 closed that in the four
@@ -225,7 +225,7 @@ _CELLS: dict[str, tuple[Any, Any, str, str, tuple[Any, ...]]] = {
         ConnectorType.DICOMWEB,
         DICOMweb,
         "http://pacs.example.org/dicom-web",
-        "_target_url",  # what the STOW-RS request dials, derived from base_url at construction
+        "base_url",
         (b"DICM",),
     ),
 }
@@ -253,7 +253,7 @@ def _destination(cell: str) -> tuple[DestinationConnector, _Opener, str, tuple[A
     opener = _Opener()
     dest._opener = opener  # type: ignore[attr-defined]
     dest._hop_guard = _open_guard()  # type: ignore[attr-defined]
-    assert getattr(dest, attr).startswith(url)
+    assert getattr(dest, attr) == url
     return dest, opener, attr, post_args
 
 
@@ -437,6 +437,10 @@ def test_a_token_endpoint_with_no_host_is_refused_by_name(token_url: str) -> Non
             token_provider_from_settings(
                 {"smart_token_url": token_url, "smart_client_id": "synthetic-client"}
             )
+    # Exactly ValueError: the providers' own error types subclass it, and so does the refusal
+    # that carries posture advice.
+    assert type(oauth.value) is ValueError
+    assert type(smart.value) is ValueError
     assert str(oauth.value).startswith("oauth2_token_url: ")
     assert str(smart.value).startswith("smart_token_url: ")
 
@@ -551,7 +555,8 @@ def test_an_oidc_leg_with_no_host_is_refused_in_any_posture(
     opener = build_idp_opener(None)
     with pytest.raises(InsecureHopRefused, match="names no host") as err:
         idp_revocation_guards(_auth(token_endpoint, jwks_uri), opener, posture)
-    # The type this hop's other refusal raises, which serve, provision-admin and verify report.
+    # The type this hop's other refusal raises. serve and provision-admin report it as they report
+    # that one; verify shows it as an ERROR on its revocation row.
     assert type(err.value) is InsecureHopRefused
     assert str(err.value).startswith(f"[auth] OIDC {leg}: ")
 

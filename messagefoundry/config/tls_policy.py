@@ -1936,7 +1936,7 @@ def hop_url_host(url: str, *, cell: str) -> str:
     if not host:
         raise ValueError(
             f"{cell}: the URL names no host, so the hop cannot be judged on-box or off-box. "
-            "Give the URL a host. A URL written with no scheme reads as one with no host."
+            "Give the URL a host."
         )
     return host
 
