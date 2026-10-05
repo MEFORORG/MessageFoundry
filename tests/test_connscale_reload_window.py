@@ -19,7 +19,8 @@ connection to come back, and keeps traffic flowing after it. These tests pin tha
 
 ORDERING, NOT WALL CLOCK. The hold's late timeouts wait on the window closing, and the time left in
 the hold is set through ``hold_started``, so a stalled event loop on a loaded runner cannot move a
-send across the window's edge.
+send across the window's edge. The real-socket no-ACK steps are the exception, and
+``_no_ack_fault_step`` says which half of them still rests on timers.
 """
 
 from __future__ import annotations
@@ -608,13 +609,14 @@ def _outgoing(seq: int) -> Outgoing:
 
 class _WatchedDriver(ConnScaleDriver):
     """A real driver that keeps what the probe's strand watch saw, so a failure can say where each
-    stranded send stood against the window. The probe opens the watch right after it sets the
-    window, with no await between, so the watch's clock readings are the request's."""
+    send the close left unconfirmed stood against the window. The probe opens the watch right after
+    it sets the window, with no await between. So these readings are a moment later than the
+    probe's own: good for a message, not for the window's edge."""
 
     request_ns = 0  # `perf_counter_ns` at the request, the clock the send times are on
     request_at = 0.0  # the loop clock at the request, the clock the hold is measured on
     slowest_ack_at_request_s = 0.0
-    strand_ns: tuple[int, ...] = ()  # the send time of every send the watch saw stranded
+    strand_ns: tuple[int, ...] = ()  # the send time of every send the close left unconfirmed
 
     def watch_strands(self) -> None:
         self.request_ns = time.perf_counter_ns()
@@ -637,24 +639,22 @@ class _FaultStep:
 
 
 async def _no_ack_fault_step(
-    *, unacked_just_before_reload: bool, sends_late_s: float = 0.0, probe_late_s: float = 0.0
+    *, unacked_just_before_reload: bool, sends_late_s: float = 0.0
 ) -> _FaultStep:
     """One connection, a 1.2 s hold, the probe 0.6 s into it. 2 sends are ACKed, 28 go unACKed
     until the reload closes the socket, then 6 more after it are ACKed: 28 of 36 unconfirmed, 78%.
 
-    BY DEFAULT THE 28 ARE PLACED BY ORDERING, NOT WALL CLOCK (BACKLOG #2936). All 30 sends are
-    written first, and the hold's start is read only after that. So when the request goes out each
-    has waited at least as long as the hold has run, and the lookback is never more than half of
-    that (`_reload_lookback`), whatever the ACKs took. They are outside the window however late a
-    loaded runner writes the sends or fires the probe.
+    BY DEFAULT THE 28 ARE PLACED BY ORDERING, NOT WALL CLOCK (BACKLOG #2936). The hold starts, all
+    30 sends go out, and the probe is entered only once the sender has written them. It is entered
+    late enough that its request falls at more than twice the hold's age at that last write. So
+    every send was written in the first half of the hold so far when the request goes out, and
+    the lookback never reaches past that half (`_reload_lookback`), whatever the ACKs took. They
+    are outside the window however late a loaded runner writes the sends or fires the probe.
+    ``sends_late_s`` injects that late runner: a wait after the hold starts and before any send.
 
-    ``unacked_just_before_reload`` starts the hold first and writes the 28 at 0.55 s into it, 50 ms
-    before the request and inside the window. THAT HALF STILL RESTS ON TWO TIMERS: a runner that
-    lets more than the lookback (0.25 s at least) pass between the sends and the request ages them
-    out of the window.
-
-    ``sends_late_s`` and ``probe_late_s`` inject that late runner: a wait before any send is made,
-    and a wait before the probe is entered.
+    ``unacked_just_before_reload`` writes the 28 at 0.55 s into the hold, 50 ms before the request
+    and inside the window. THAT HALF STILL RESTS ON TWO TIMERS: a runner that lets more than the
+    lookback (0.25 s at least) pass between those sends and the request ages them out of the window.
     """
     engine = _NoAckEngine(ack_first=2)
     server = await asyncio.start_server(engine.on_client, "127.0.0.1", 0)
@@ -672,16 +672,21 @@ async def _no_ack_fault_step(
         await driver.open(connect_batch=1, batch_pause_s=0.0)
         while driver.generations()[0] < 1:
             await asyncio.sleep(0.01)
-        await asyncio.sleep(sends_late_s)
+        started = loop.time()
         if unacked_just_before_reload:
-            started = loop.time()
             emit(range(2))
         else:
+            if sends_late_s:
+                await asyncio.sleep(sends_late_s)
             emit(range(30))
             deadline = loop.time() + 5.0
             while counters.sent < 30 and loop.time() < deadline:
                 await asyncio.sleep(0.005)
-            started = loop.time()  # after the last write, so no send is younger than the hold
+            assert counters.sent == 30, counters  # the ordering below rests on every write
+            # The probe sleeps half the hold before its request. Enter it late enough that the
+            # request falls at more than twice the hold's age now, after the last write.
+            written_s = loop.time() - started
+            await asyncio.sleep(max(0.0, written_s + 0.05 - hold / 2))
 
         async def run_hold() -> None:
             if unacked_just_before_reload:
@@ -705,7 +710,6 @@ async def _no_ack_fault_step(
                 await asyncio.sleep(0.01)
 
         hold_task = asyncio.create_task(run_hold())
-        await asyncio.sleep(probe_late_s)
         account = await runner._reload_mid_hold(
             driver=driver,
             counters=counters,
@@ -719,8 +723,6 @@ async def _no_ack_fault_step(
         await driver.stop(0.5)
         server.close()
         await server.wait_closed()
-    # The control on the fault itself: the shape really is 28 of 36 unconfirmed.
-    assert (counters.sent, counters.acked, counters.timeouts) == (36, 8, 28), counters
     counters.sink_received = engine.read  # every read frame delivered: only the ACKs are missing
     result = runner._reconcile(
         counters,
@@ -734,9 +736,12 @@ async def _no_ack_fault_step(
         f"{account.stranded} send(s) inside the window and {account.aged} before it; "
         f"lookback_s={account.lookback_s:.3f}, from a hold {driver.request_at - started:.3f} s old "
         f"at the request (of {hold} s) and a slowest ACK of {driver.slowest_ack_at_request_s:.3f} s; "
-        f"the {len(ages)} stranded send(s) were {max(ages, default=0.0):.3f} s old at the request "
-        f"at the oldest and {min(ages, default=0.0):.3f} s at the newest; {result.detail}"
+        f"the {len(ages)} send(s) the close left unconfirmed were {max(ages, default=0.0):.3f} s "
+        f"old at the request at the oldest and {min(ages, default=0.0):.3f} s at the newest; "
+        f"{result.detail}"
     )
+    # The control on the fault itself: the shape really is 28 of 36 unconfirmed.
+    assert (counters.sent, counters.acked, counters.timeouts) == (36, 8, 28), (counters, why)
     return _FaultStep(result, why)
 
 
@@ -755,18 +760,18 @@ async def test_a_no_ack_fault_before_the_reload_is_not_excused_as_its_stranding(
     _assert_the_fault_was_judged(await _no_ack_fault_step(unacked_just_before_reload=False))
 
 
-@pytest.mark.parametrize(
-    "late", [{"sends_late_s": 0.45}, {"probe_late_s": 0.5}], ids=["sends late", "probe late"]
-)
-async def test_a_late_runner_cannot_move_that_fault_into_the_window(late: dict[str, float]) -> None:
-    # BACKLOG #2936. The control above failed twice in the merge queue on windows-2025, with all 28
-    # sends excused. It then read the hold's start BEFORE handing the sends to a task, and trusted
-    # the sender to write them at once. Injected into that layout, the first wait here reproduced
-    # the red: written 0.45 s into the hold, the sends were 0.16 s old at the request, inside the
-    # 0.25 s floor. The second did not, at 0.5 s or at 2 s: the lookback stops at half the hold so
-    # far, so a late probe cannot reach a send made when the hold started. What made the sends late
-    # on that runner was not found.
-    _assert_the_fault_was_judged(await _no_ack_fault_step(unacked_just_before_reload=False, **late))
+async def test_sends_written_late_cannot_move_that_fault_into_the_window() -> None:
+    # BACKLOG #2936. The control above failed in merge-group run 37232687208 on windows-2025, with
+    # all 28 sends excused. It then handed the sends to a task and entered the probe at once,
+    # trusting the sender to write them first. Injected into that layout, this wait reproduced the
+    # red: written 0.45 s into the hold, the sends were 0.16 s old at the request, inside the 0.25 s
+    # floor. A wait before the probe did not, at 0.5 s or at 2 s: the lookback stops at half the
+    # hold so far. What made the sends late on that runner was not found.
+    # SCOPE: the harness reads a step's start before its first send too, so a run whose first sends
+    # are written that late has them inside the window. This file does not change that.
+    _assert_the_fault_was_judged(
+        await _no_ack_fault_step(unacked_just_before_reload=False, sends_late_s=0.45)
+    )
 
 
 async def test_the_same_sends_made_just_before_the_reload_are_excused() -> None:
