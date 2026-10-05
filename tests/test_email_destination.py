@@ -29,6 +29,8 @@ from messagefoundry.config.tls_policy import (
     active_hop_posture,
 )
 from messagefoundry.config.wiring import WiringError
+from messagefoundry.redaction import safe_exc
+from messagefoundry.transports import email as email_module
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.egress import check_egress_allowed
 from messagefoundry.transports.email import EmailDestination, envelope_address_problem
@@ -1358,23 +1360,51 @@ def _body_dest(port: int, encoding: str) -> EmailDestination:
     )
 
 
+class _Py315SetContent(EmailMessage):
+    """Python 3.15's set_content() encodes with the email package's OUTPUT charset, so euc-jp is
+    encoded as iso-2022-jp. Modelled here so the required 3.14 suite drives that path: a bare
+    encode whose UnicodeEncodeError holds the whole payload on ``.object``."""
+
+    def set_content(self, *args: Any, **kwargs: Any) -> None:
+        str(args[0]).encode("iso-2022-jp")
+        super().set_content(*args, **kwargs)
+
+
+def _assert_refused_content_free(exc: BaseException, *, codec_named: str) -> None:
+    assert _BODY_MARKER not in str(getattr(exc, "object", "")), "the error carries the payload"
+    _assert_content_free(exc, encoding=codec_named)
+    # One line at a time, minus the File lines: a checkout path may itself hold "e9" or an accent.
+    frames = "".join(traceback.format_exception(exc)).splitlines()
+    surfaces = {
+        "str": str(exc),
+        "repr": repr(exc),
+        "stored error": safe_exc(exc),
+        "traceback": "\n".join(line for line in frames if not line.lstrip().startswith("File ")),
+    }
+    for where, text in surfaces.items():
+        assert _BODY_MARKER not in text, f"message content reached the {where}"
+        for ch in (SECRET_CHAR, CJK_CHAR, _LONE_SURROGATE):
+            for form in _escapes(ch):
+                assert form not in text, f"a message character reached the {where} as {form!r}"
+    # The same bytes never encode on a retry, so the row dead-letters on the first attempt. A bad
+    # MESSAGE, so neither flag may stop the whole lane.
+    assert isinstance(exc, NegativeAckError)
+    assert exc.permanent is True and exc.code == "encoding"
+    assert exc.credential_fault is False and exc.config_fault is False
+
+
 @pytest.mark.parametrize(
-    ("encoding", "payload", "codec_named"),
+    ("encoding", "payload"),
     [
-        ("us-ascii", _NON_ASCII_BODY, "us-ascii"),
-        # The error names the MIME charset the body is written in, which is iso-8859-1 for latin-1.
-        ("latin-1", _NON_ASCII_BODY, "iso-8859-1"),
-        # euc-jp encodes this body, but set_content() writes euc-jp as iso-2022-jp on Python 3.15,
-        # which cannot. A guard that checked the configured name passes it, and 3.15 then raises a
-        # bare UnicodeEncodeError carrying the payload. The guard checks the charset actually used.
-        ("euc-jp", _NON_ASCII_BODY, "iso-2022-jp"),
+        ("us-ascii", _NON_ASCII_BODY),
+        ("latin-1", _NON_ASCII_BODY),
         # The shipped default: utf-8 refuses only a lone surrogate, which a Handler can still build.
-        ("utf-8", _NON_ASCII_BODY + _LONE_SURROGATE, "utf-8"),
+        ("utf-8", _NON_ASCII_BODY + _LONE_SURROGATE),
     ],
-    ids=["us-ascii", "latin-1", "euc-jp", "utf-8-lone-surrogate"],
+    ids=["us-ascii", "latin-1", "utf-8-lone-surrogate"],
 )
 async def test_an_unencodable_body_is_a_permanent_content_free_refusal(
-    wire: _WireCapture, encoding: str, payload: str, codec_named: str
+    wire: _WireCapture, encoding: str, payload: str
 ) -> None:
     """Classified exactly as Direct classifies it. Nothing of the message reaches the text, the
     repr, ``safe_exc`` (what the delivery worker stores in ``queue.last_error`` and
@@ -1383,26 +1413,24 @@ async def test_an_unencodable_body_is_a_permanent_content_free_refusal(
 
     Before the fix ``set_content`` raised a bare UnicodeEncodeError: its text named the offending
     character and its ``.object`` held the whole payload, so the first assertion fails."""
-    d = _body_dest(wire.port, encoding)
     with pytest.raises(Exception) as ei:  # noqa: B017 - before the fix it is not a NegativeAckError
-        await d.send(payload)
-    exc = ei.value
-    assert _BODY_MARKER not in str(getattr(exc, "object", "")), "the error carries the payload"
-    _assert_content_free(exc, encoding=codec_named)
-    # File lines are dropped: a checkout path may itself contain "e9" or an accented letter.
-    frames = "".join(
-        line for line in traceback.format_exception(exc) if not line.lstrip().startswith("File ")
-    )
-    assert _BODY_MARKER not in frames
-    for ch in (SECRET_CHAR, CJK_CHAR, _LONE_SURROGATE):
-        for form in _escapes(ch):
-            assert form not in frames, f"a message character reached the traceback as {form!r}"
-    # The same bytes never encode on a retry, so the row dead-letters on the first attempt. A bad
-    # MESSAGE, so neither flag may stop the whole lane.
-    assert isinstance(exc, NegativeAckError)
-    assert exc.permanent is True and exc.code == "encoding"
-    assert exc.credential_fault is False and exc.config_fault is False
+        await _body_dest(wire.port, encoding).send(payload)
+    _assert_refused_content_free(ei.value, codec_named=encoding)
     assert wire.connections == 0, "nothing is dialled for a message that never built"
+
+
+async def test_a_body_set_content_cannot_encode_is_refused_content_free(
+    wire: _WireCapture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The backstop. euc-jp encodes the e-acute, so the guard passes it, but 3.15's set_content()
+    encodes as iso-2022-jp, which cannot. Without the backstop the bare UnicodeEncodeError reaches
+    the worker carrying the payload."""
+    monkeypatch.setattr(email_module, "EmailMessage", _Py315SetContent)
+    with pytest.raises(Exception) as ei:  # noqa: B017 - before the fix it is not a NegativeAckError
+        await _body_dest(wire.port, "euc-jp").send(_NON_ASCII_BODY)
+    _assert_refused_content_free(ei.value, codec_named="euc-jp")
+    assert "UnicodeEncodeError" in str(ei.value), "the type name is the one safe detail kept"
+    assert wire.connections == 0
 
 
 @pytest.mark.parametrize(
@@ -1411,16 +1439,14 @@ async def test_an_unencodable_body_is_a_permanent_content_free_refusal(
         ("utf-8", _NON_ASCII_BODY, "utf-8"),
         # The email package writes latin-1 under its MIME name.
         ("latin-1", _NON_ASCII_BODY.replace(CJK_CHAR, ""), "iso-8859-1"),
-        # And euc-jp as iso-2022-jp, on 3.14 as on 3.15, so a body that encodes there still sends.
-        ("euc-jp", _NON_ASCII_BODY.replace(SECRET_CHAR, ""), "iso-2022-jp"),
     ],
-    ids=["utf-8", "latin-1", "euc-jp"],
+    ids=["utf-8", "latin-1"],
 )
 async def test_an_encodable_body_still_reaches_the_wire(
     wire: _WireCapture, encoding: str, payload: str, wire_charset: str
 ) -> None:
-    """POSITIVE CONTROL. A guard that refused every non-ASCII body would pass the test above. The
-    guard keys on the codec: each body here encodes in the charset it is written in."""
+    """POSITIVE CONTROL. A guard that refused every non-ASCII body would pass the tests above. The
+    guard keys on the codec: latin-1 carries the e-acute it can encode."""
     await _body_dest(wire.port, encoding).send(payload)
     sent = message_from_bytes(b"".join(wire.data), policy=default_policy)
     assert isinstance(sent, EmailMessage)

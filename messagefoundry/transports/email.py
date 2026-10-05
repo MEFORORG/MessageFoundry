@@ -9,7 +9,7 @@ plain-text SMTP message to a configured server and maps the outcome onto the eng
   capture, exactly like File).
 - **connect/EHLO/STARTTLS/AUTH/send failure** (``smtplib.SMTPException`` / ``OSError`` /
   ``TimeoutError``) → :class:`DeliveryError` (transient — the staged queue retries with backoff).
-- **a body the configured ``encoding`` cannot encode** maps to the permanent, content-free
+- **a body that cannot be encoded for the configured ``encoding``** maps to the permanent, content-free
   :class:`~messagefoundry.transports.base.NegativeAckError` that
   :func:`~messagefoundry.transports.base.encode_wire_body` raises (dead-lettered, never retried).
 
@@ -48,7 +48,6 @@ There is **no email source yet** — an inbound IMAP/POP read + M365/Google XOAU
 from __future__ import annotations
 
 import asyncio
-import email.charset
 import email.policy
 import logging
 import smtplib
@@ -78,6 +77,7 @@ from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
     DestinationConnector,
+    NegativeAckError,
     encode_wire_body,
     register_destination,
 )
@@ -513,19 +513,14 @@ class EmailDestination(DestinationConnector):
     def _build_message(self, payload: str) -> EmailMessage:
         # set_content() below encodes with a bare str.encode(charset), whose UnicodeEncodeError names
         # a character of the message and holds the whole payload on `.object`. The shared helper fails
-        # permanent and content-free instead (see its docstring). set_content() repeats the same
-        # encode, so it cannot fail after this one, PROVIDED both use one codec. Python 3.15's
-        # set_content() encodes with the email package's OUTPUT charset (euc-jp and shift_jis become
-        # iso-2022-jp), where 3.14 uses the name it is given. Passing that output charset to both
-        # calls makes them agree on either version; it maps to itself, so 3.15 does not remap it.
-        charset = email.charset.Charset(self.encoding).output_charset or self.encoding
-        encode_wire_body(payload, charset, transport=f"Email {self.host}:{self.port}")
+        # permanent and content-free instead (see its docstring). _send backs up the second encode.
+        encode_wire_body(payload, self.encoding, transport=f"Email {self.host}:{self.port}")
         msg = EmailMessage()
         msg["Subject"] = self.subject
         self._envelope.address(msg)
         # The Handler-produced payload IS the body (content-agnostic — an HL7 string, a JSON/XML report,
         # plain text); rendering it human-readable is the Handler's job, not the transport's.
-        msg.set_content(payload, charset=charset)
+        msg.set_content(payload, charset=self.encoding)
         return msg
 
     def _connect(self) -> smtplib.SMTP:
@@ -551,7 +546,24 @@ class EmailDestination(DestinationConnector):
             # Zero-I/O send-time backstop at the byte crossing (the tcp/x12/dicom pattern): re-assert the
             # captured cleartext decision so a reload can't route PHI around the construction-only gate.
             self._hop_guard.assert_send()
-        msg = self._build_message(payload)
+        # Backstop for set_content()'s own encode, in Direct's shape (see `encode_wire_body`). Python
+        # 3.15 encodes there with the email package's OUTPUT charset (euc-jp and shift_jis become
+        # iso-2022-jp), not the name the guard checked, so a body can pass the guard and still fail.
+        # Keep only the type name and raise outside the handler, so neither chain link holds the
+        # error whose `.object` is the whole payload.
+        msg: EmailMessage | None = None
+        failure = ""
+        try:
+            msg = self._build_message(payload)
+        except UnicodeError as exc:
+            failure = type(exc).__name__
+        if msg is None:
+            raise NegativeAckError(
+                f"Email {self.host}:{self.port}: the message could not be encoded for "
+                f"{self.encoding!r} ({failure})",
+                code="encoding",
+                permanent=True,
+            )
         try:
             with self._connect() as smtp:
                 if self.username is not None:
