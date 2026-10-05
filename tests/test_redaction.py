@@ -1751,6 +1751,94 @@ def test_the_mrn_pass_stays_linear_and_affordable(unit: str) -> None:
     assert _best_of(lambda: redact(window)) < 0.5
 
 
+# --- BACKLOG #2171: a percent-encoded separator counts like the literal one -------------------------
+
+#: The FHIR search shape the row names: one literal separator and two encoded ones. Synthetic values.
+_FHIR_SEARCH = "GET /fhir/Patient?identifier=MRN%7C4455667&name=ZQXDOE%5EVANJA"
+#: What must not survive it, through any entry point.
+_FHIR_PLANTED = ("4455667", "ZQXDOE", "VANJA")
+
+
+def _every_entry_point(text: str) -> dict[str, str]:
+    """``text`` through each way the engine reaches the redactor, named for the failure message."""
+    once = redact(text)
+    return {
+        "redact": once,
+        "redact twice": redact(once),
+        "safe_text(safe_exc())": safe_text(safe_exc(ValueError(text))),
+        "redact_untrusted": redact_untrusted(text),
+    }
+
+
+@pytest.mark.parametrize("encoded", ["%7C", "%7c", "%5E", "%5e", "%7E", "%7e", "%26"])
+def test_an_encoded_separator_counts_like_the_literal_one(encoded: str) -> None:
+    """Each of the four default separators, in either case, makes a field run on its own."""
+    for name, out in _every_entry_point(f"id MRN{encoded}4455667{encoded}H here").items():
+        assert "4455667" not in out, f"{name}: {out!r}"
+        assert out.endswith("here"), f"{name} took the text after the run: {out!r}"
+
+
+def test_literal_and_encoded_separators_count_together() -> None:
+    """One of each is two, which is the threshold the literal pattern uses. The literal pattern alone
+    sees one separator here and passes it."""
+    assert redaction._HL7_FIELD_RUN.search("x ZQXDOE|VANJA%5E4455667 y") is None
+    for name, out in _every_entry_point("x ZQXDOE|VANJA%5E4455667 y").items():
+        for planted in ("ZQXDOE", "VANJA", "4455667"):
+            assert planted not in out, f"{name}: {out!r}"
+
+
+def test_the_fhir_search_shape_is_scrubbed_through_every_entry_point() -> None:
+    """The shape the row names. Before this, the literal pattern counted only the ``&`` and the whole
+    query walked through."""
+    assert redaction._HL7_FIELD_RUN.search(_FHIR_SEARCH) is None, "the control no longer holds"
+    for name, out in _every_entry_point(_FHIR_SEARCH).items():
+        for planted in _FHIR_PLANTED:
+            assert planted not in out, f"{name}: {out!r}"
+        assert "GET" in out, f"{name} took the verb with the query: {out!r}"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "GET /files/a%20b%20c%20d.txt",  # a run of %20 is ordinary text, however long
+        "path a%7Cb kept",  # one encoded separator is under the threshold, as one literal one is
+        "rate 50%25 of %7 cap",  # an escape that is not a separator, and a truncated one
+        "id x%2Fy%2Fz",  # an encoded slash is not an HL7 separator
+    ],
+)
+def test_an_ordinary_escape_is_not_a_field_run(text: str) -> None:
+    """THE CONTROL. Every arm above asserts an absence, and scrubbing every ``%`` would satisfy them
+    all."""
+    assert redact(text) == text
+
+
+def test_the_placeholder_never_matches_the_encoded_run() -> None:
+    """The fixed point ``safe_text`` relies on. ``[redacted]`` holds no separator of either kind."""
+    assert redaction._HL7_ENCODED_FIELD_RUN.search(redaction._REDACTED) is None
+    once = redact(_FHIR_SEARCH)
+    assert redact(once) == once
+
+
+@pytest.mark.parametrize(
+    ("tail", "head_holds_run"),
+    [
+        # The cut falls before the run: the run goes with the dropped tail.
+        (" id=mrn%7c4455667%5e9", False),
+        # The cut falls after the run: the whole run stays in the head and is scrubbed there.
+        (" id=mrn%7c4455667%5e9 ", True),
+    ],
+)
+def test_a_cut_cannot_split_an_encoded_run(tail: str, head_holds_run: bool) -> None:
+    """The register on ``_CUT_CHARS`` asks each pattern whether a cut at a space can leave a fragment
+    it no longer matches. The encoded run holds no whitespace, so a cut never falls inside it, and the
+    run is kept or dropped whole. Both placements are checked. The run is lower case and ends on a
+    digit so the name walk leaves it alone and this arm measures the encoded pass, not the walk."""
+    text = _over_window(tail)
+    assert ("4455667" in clamp_untrusted(text)) is head_holds_run, "the cut did not land as named"
+    for out in (redact_untrusted(text), safe_text(text, limit=100_000)):
+        assert "4455667" not in out, out[-200:]
+
+
 # --- BACKLOG #2312: the credential backstop leaves its own output alone ------------------------------
 
 #: The backstop as it shipped before #2312, for the positive control below and for nothing else.
@@ -1852,8 +1940,27 @@ _BACKSTOP_HOSTILE = {
 }
 
 
-@pytest.mark.parametrize("unit", list(_BACKSTOP_HOSTILE.values()), ids=list(_BACKSTOP_HOSTILE))
-def test_the_credential_backstop_stays_linear_and_affordable(unit: str) -> None:
+#: Inputs shaped to make the encoded-run pass work hardest: a match every few characters, escapes
+#: that are not separators, a separator prefix that never completes, and one-separator tokens.
+_ENCODED_HOSTILE = {
+    "many-matches": "a%7Cb%5Ec ",
+    "non-separator-escapes": "%20",
+    "unfinished-escapes": "%7",
+    "bare-percents": "%",
+    "one-separator-tokens": "a%7Cb ",
+    "one-of-each-kind": "a|b%7C",
+}
+
+
+@pytest.mark.parametrize(
+    "unit",
+    [*_BACKSTOP_HOSTILE.values(), *_ENCODED_HOSTILE.values()],
+    ids=[
+        *(f"backstop-{k}" for k in _BACKSTOP_HOSTILE),
+        *(f"encoded-{k}" for k in _ENCODED_HOSTILE),
+    ],
+)
+def test_the_backstop_and_the_encoded_run_stay_linear_and_affordable(unit: str) -> None:
     """8x the input must cost well under 64x the time, and a whole window stays well under a second
     on the event loop. The same ceilings as the MRN pass above."""
 

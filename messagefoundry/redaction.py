@@ -14,7 +14,9 @@ separate, centralized framework; see PHI.md §9). It errs toward over-redaction.
 spans it also applies a **conservative free-text heuristic** (date/DOB runs, multi-token name runs and
 a number after an ``MRN`` label; see :func:`redact`), so a delimiter-free leak like ``raise ValueError("patient DOE JANE dob 1980-05-05
 not found")`` is narrowed too. The delimiters are **read from MSH** rather than assumed, so a feed
-declaring ``*`` and ``$`` is covered too (:func:`_sniff_delimiters`, BACKLOG #1572). Three
+declaring ``*`` and ``$`` is covered too (:func:`_sniff_delimiters`, BACKLOG #1572), and a
+percent-encoded default separator in a URL counts like the literal one (:data:`_HL7_ENCODED_FIELD_RUN`,
+BACKLOG #2171). Three
 **structured** shapes get label-anchored passes of their own, because they hand every pattern above
 single tokens by construction: FHIR (or any) JSON keyed ``family``/``given``/``name``/``birthDate``/
 ``identifier``/``telecom``/``address``, DICOM group ``(0010,xxxx)`` tag dumps and ``PatientName=``-style
@@ -116,6 +118,32 @@ _HL7_SEGMENT = re.compile(r"\b([A-Z][A-Z0-9]{2})\|[^\r\n]*")
 #: would still stall the loop. **Linear is what makes a window that generous affordable**, and the
 #: bound is what keeps a linear scan from being charged 16 MiB of a peer's choosing.
 _HL7_FIELD_RUN = re.compile(r"(?<![^\s|^~&])[^\s|^~&]*+[|^~&][^\s|^~&]*+(?:[|^~&][^\s|^~&]*+)+")
+
+#: A field run whose separators are PERCENT-ENCODED, in a URL or a form body: ``%7C``, ``%5E``,
+#: ``%7E`` and ``%26`` for ``| ^ ~ &``, either case (BACKLOG #2171). A FHIR search such as
+#: ``identifier=MRN%7C12345&name=DOE%5EJANE`` carries one literal separator and two encoded ones, so
+#: :data:`_HL7_FIELD_RUN` read it as below its threshold and passed it through. Literal and encoded
+#: separators count together toward the same two, and the run is scrubbed whole, as that pattern does.
+#:
+#: **A pattern of its own, because the guard on :data:`_HL7_FIELD_RUN` cannot hold three characters.**
+#: Python's lookbehind is fixed-width, so ``%7C`` cannot join that pattern's one-character guard class.
+#: The encoded form is matched in place rather than decoded and rescanned, so nothing here allocates a
+#: second copy of a peer's text. A lone ``%20`` (or any other escape) is ordinary body text.
+#:
+#: Linear for the same reason as :data:`_HL7_FIELD_RUN`. The lookbehind admits a start only after
+#: whitespace, a literal separator or the start of the text. A match from a token's start takes the
+#: whole token whenever it holds two separators, since the body stops only at a separator or the
+#: token's end. So a token that survives holds at most one separator, and gets at most two attempts.
+#: The body's lookahead is a fixed three-character test that fails on its first character everywhere
+#: but a ``%``. ``[redacted]`` holds no separator of either kind, so it never matches.
+#:
+#: Residuals, at least these: a double-encoded separator (``%257C``), and an encoded CUSTOM delimiter
+#: that MSH declares (:func:`_sniff_delimiters` reads only the literal header).
+_HL7_ENCODED_FIELD_RUN = re.compile(
+    r"(?<![^\s|^~&])(?:(?!%(?:7[CcEe]|5[Ee]|26))[^\s|^~&])*+"
+    r"(?:[|^~&]|%(?:7[CcEe]|5[Ee]|26))(?:(?!%(?:7[CcEe]|5[Ee]|26))[^\s|^~&])*+"
+    r"(?:(?:[|^~&]|%(?:7[CcEe]|5[Ee]|26))(?:(?!%(?:7[CcEe]|5[Ee]|26))[^\s|^~&])*+)+"
+)
 
 #: A **date / birthdate run** in free text: an ISO ``YYYY-MM-DD`` / US ``MM-DD-YYYY`` (``-`` or ``/``
 #: separator) or a bare HL7 8-digit ``YYYYMMDD``. A DOB is a direct identifier, and a free-text leak like
@@ -449,8 +477,10 @@ _REDACT_WINDOW = 64 * 1024
 
 #: The characters :func:`_clamp` may cut at. Whitespace is the boundary because a pattern survives a
 #: cut when it either cannot contain whitespace at all or still matches with its tail gone:
-#: :data:`_HL7_FIELD_RUN` and :data:`_DATE_RUN` are built from classes that exclude ``\s`` outright,
-#: and :data:`_HL7_SEGMENT` goes on matching from its own header whatever is cut off its tail.
+#: :data:`_HL7_FIELD_RUN`, :data:`_HL7_ENCODED_FIELD_RUN` and :data:`_DATE_RUN` are built from classes
+#: that exclude ``\s`` outright, and :data:`_HL7_SEGMENT` goes on matching from its own header whatever
+#: is cut off its tail. So a cut cannot fall inside an encoded run, which is kept or dropped whole
+#: (BACKLOG #2171, pinned in ``tests/test_redaction.py``).
 #: :data:`_NAME_RUN` has neither property, and the token walk in :func:`_clamp` is there for it.
 #:
 #: **A pattern with a REQUIRED tail past a space has neither property, and this module has one.**
@@ -1444,9 +1474,9 @@ def redact(text: str) -> str:
     redaction); the goal is that a raw HL7 body — or a free-text name/DOB — embedded in an exception
     message can't reach a log or the stored ``last_error``/``detail``. NOT de-identification (PHI.md §9).
 
-    Order matters: HL7-shaped content (:data:`_HL7_SEGMENT`, then :data:`_HL7_FIELD_RUN`, then the
-    separator-aware pass for a message that declares delimiters outside the defaults) is handled first,
-    so the free-text passes (:data:`_MRN_LABELLED`, :data:`_DATE_RUN`, then :data:`_NAME_RUN`) only
+    Order matters: HL7-shaped content (:data:`_HL7_SEGMENT`, then :data:`_HL7_FIELD_RUN` and its
+    percent-encoded twin :data:`_HL7_ENCODED_FIELD_RUN`, then the separator-aware pass for a message
+    that declares delimiters outside the defaults) is handled first, so the free-text passes (:data:`_MRN_LABELLED`, :data:`_DATE_RUN`, then :data:`_NAME_RUN`) only
     see delimiter-free text. The structured-shape passes (:func:`_redact_structured`: JSON keys, DICOM tags and labels,
     XML elements) run LAST, so they can only add redaction to what the others left (the section
     comment above them says what running them first cost). The free-text heuristic narrows the prior
@@ -1569,6 +1599,8 @@ def _redact_flat(text: str, *, widened: bool, credentials: bool) -> str:
         text = _INVALID_URL_USERINFO.sub(lambda m: f"{m.group(1)}{_REDACTED}@", text)
     scrubbed = _HL7_SEGMENT.sub(lambda m: f"{m.group(1)}|{_REDACTED}", text)
     scrubbed = _HL7_FIELD_RUN.sub(_REDACTED, scrubbed)
+    if "%" in scrubbed:  # BACKLOG #2171; every encoded separator holds one, so most text skips it
+        scrubbed = _HL7_ENCODED_FIELD_RUN.sub(_REDACTED, scrubbed)
     # BACKLOG #1572. The passes above assume `| ^ ~ &`; MSH DECLARES the real set per message, so a
     # feed using `*` and `$` kept its identifiers. Sniff, and run a separator-aware pass only when the
     # declared set reaches outside the defaults — widening the hardcoded class instead would have been
