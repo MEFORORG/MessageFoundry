@@ -1377,6 +1377,41 @@ raise `DeliveryError`, so the lane **retries** with backoff. **Other 4xx** (and 
 redirect**) raise a permanent `NegativeAckError`, so the message **dead-letters immediately** rather
 than blocking the FIFO lane on a request the endpoint will never accept.
 
+**A 2xx reply over the byte bound (vault BACKLOG #2180).** The engine keeps at most 16 MiB of a reply
+body. A retry after a 2xx would send again a request the partner has already answered, so on these
+four destinations an over-size body does not cause a re-send. What happens instead depends on
+whether the engine needs the body (owner ruling 2026-10-05). This table is the one place that lists
+the four HTTP destinations, and their own sections point here.
+
+| Destination | Write | `capture_response` | An over-size body after a 2xx |
+|---|---|---|---|
+| REST | any | off | **delivered**: nothing looks inside the body, so it is dropped and a WARNING names the connection |
+| REST | any | on | **permanent refusal**, code `reply-too-large`: the reply would be stored and may be passed on, so the message dead-letters once |
+| SOAP | any | off or on | **permanent refusal**: a `Fault` can sit inside a 2xx body, so the engine cannot tell the outcome |
+| DICOMweb | any | off or on | **permanent refusal**: a `FailedSOPSequence` can sit inside a 2xx body |
+| FHIR | an update the engine sends as a transaction | off or on | **permanent refusal**: the engine reads that reply for the entry's own status, so it cannot tell the outcome |
+| FHIR | any other write | off | **delivered**, with the same WARNING |
+| FHIR | any other write | on | **permanent refusal**: the reply would be stored and may be passed on, as for REST |
+
+**Which rows the ruling itself covers.** The owner ruling of 2026-10-05 names the principle: judge
+an over-size body after a 2xx by who reads it. It does not name the FHIR rows that refuse. Refusing
+them is a reading of that ruling made when this was built (BACKLOG #2180), and the owner may reverse
+that reading. It covers every FHIR write with `capture_response` on, and an update the engine sends
+as a transaction with it off. The ruling's own wording puts FHIR on the delivered side, which is
+what the one remaining FHIR row does: any other write, with `capture_response` off.
+
+"An update the engine sends as a transaction" is `conditional="if-match"`, or `interaction="update"`
+with no `conditional`, each with the default `update_url_form`. Every other FHIR write is in the
+last two rows. That is at least a create, `conditional="conditional-update"` or `"if-none-exist"`
+under `interaction="create"` or `"update"`, an update in the path form, and a `transaction` or
+`batch` `Bundle` a Handler built. The engine does not read the reply to a Handler's own `Bundle` for
+its entry statuses.
+
+A message that dead-letters this way got a 2xx, but the engine could not read the reply. The partner
+may have applied it. On SOAP, on DICOMweb, and on a FHIR update sent as a transaction, the unread
+body may instead have held a rejection. Its stored error carries the code `reply-too-large`. Check the partner's own record before you replay it. A
+reply that is cut short or misframed after a 2xx is a separate case, and the lane still retries it.
+
 **Security.** Redirects are **refused** (a 3xx can't divert PHI to another host — ASVS 15.3.2), the URL
 scheme is constrained to `http`/`https`, and the outbound host is gated by the fail-closed
 `[egress].allowed_http` allowlist (WP-11c). Standard library only (`urllib`) — no new dependency.
@@ -1869,7 +1904,8 @@ request is rejected; a retry won't help). A **Receiver/Server** fault → `Deliv
 unrecognized fault is treated as permanent (so a rejected request can't loop the lane). With no fault, the
 HTTP status decides (2xx delivered, 5xx retry, other 4xx / refused 3xx dead-letter); a connection/timeout
 error retries. Fault bodies are **not** echoed into errors/logs (they may carry PHI) — only the fault role
-+ HTTP status.
++ HTTP status. A 2xx whose body is over the byte bound cannot be inspected, so it is a permanent refusal
+and is not sent again: see *A 2xx reply over the byte bound* under REST.
 
 **Security & idempotency.** Same hardening as REST (redirects refused, scheme constrained, host gated by
 `[egress].allowed_http`, secrets via `env()`). Delivery is **at-least-once**, so a retry **re-sends** —
@@ -2224,6 +2260,9 @@ What a site needs to know:
 - If a server answers 2xx while the entry's own `response.status` failed, the message is classified on
   that entry status, like any other HTTP status. An entry status that does not read as an HTTP code is
   logged as a warning, and the 2xx reply counts as delivered.
+- A reply body over the byte bound is not kept, so the engine cannot see the entry's status. The
+  update is then a permanent refusal, code `reply-too-large`, in either capture mode, and it is not
+  sent again. It is not recorded as delivered. See *A 2xx reply over the byte bound* under REST.
 - `capture_response_headers` still captures `ETag`, `Location` and `Last-Modified`. They come from the
   entry, which describes the updated resource, and an entry field hides a reply header of the same
   name. They keep the entry's formats: `Last-Modified` is a FHIR instant, not an HTTP-date, and
@@ -2300,7 +2339,8 @@ never an error). On an error status the HTTP code decides, refined by the `Opera
 4xx whose `issue.code` is in the FHIR **transient** IssueType group (`lock-error`/`throttled`/`timeout`/
 `incomplete`), or `408`/`429` → retry; any other 4xx / refused 3xx → **dead-letter**. The HTTP status wins
 when in doubt (a 5xx stays transient). `OperationOutcome`/reply bodies are **not** echoed into errors/logs
-(they may carry PHI) — only the HTTP status + a redacted URL.
+(they may carry PHI) — only the HTTP status + a redacted URL. For a 2xx whose body is over the byte bound,
+see *A 2xx reply over the byte bound* under REST.
 
 **Security & idempotency.** Same hardening as REST (redirects refused, scheme constrained, host gated by
 `[egress].allowed_http`, cleartext-credential refusal, optional detached-JWS signing, secrets via `env()`).
@@ -2640,7 +2680,9 @@ handling. It needs **no `[dicom]` extra** (the object is opaque bytes).
 
 **Status classification.** A 2xx whose `dicom+json` body carries a per-instance **FailedSOPSequence**
 (`00081198`) → the instance was rejected → permanent dead-letter; a 409 (all instances failed) / other 4xx /
-a refused 3xx → permanent; 5xx / 408 / 429 / connection-timeout → transient retry. **PHI:** the response can
+a refused 3xx → permanent; 5xx / 408 / 429 / connection-timeout → transient retry. A 2xx whose body is
+over the byte bound cannot be checked for a FailedSOPSequence, so it is a permanent refusal and is not sent
+again: see *A 2xx reply over the byte bound* under REST. **PHI:** the response can
 name patient/study identifiers, so it is never logged — only the HTTP status and a redacted URL are.
 
 ```python
