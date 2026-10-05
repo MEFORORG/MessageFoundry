@@ -698,8 +698,9 @@ OAuth2 token hop. Two reasons:
 **The refusal on the ECH arm names the attestation alone.** The default text offers
 `[tls].crl_file` and an egress proxy, and neither can cross an ECH hop. So
 `refuse_unrevoked_verified_hop` takes `ways_across`, and both ECH callers pass the fixed text
-`ECH_HOP_WAYS_ACROSS`. On an enforcing instance a non-loopback ECH hop crosses on the attestation
-alone.
+`ECH_HOP_WAYS_ACROSS`. Where the guard runs, a non-loopback ECH hop on an enforcing instance
+crosses on the attestation alone. On the REST destination the guard runs only with `verify_tls`
+true, as before; with `verify_tls=false` the hop is the verify-off gate's (#200), ECH or not.
 
 The REST destination's ECH arm takes the same value, under BACKLOG #2188. That item moved the guard
 in the REST, SOAP, FHIR and DICOMweb destinations below the last statement that builds or replaces
@@ -726,9 +727,10 @@ The Status paragraph and the two §7.1 rows that called #2188 and #2169 open def
 correction dated 2026-10-04.
 
 Pinned by `tests/test_token_hop_revocation_guard_with_ech_sidecar.py` for the token hop, and by
-`tests/test_http_destination_revocation_guard_reads_its_opener.py` for the four destinations. Each
-refusal arm there is paired with a control in which the same CRL relaxes the same hop without a
-sidecar.
+`tests/test_http_destination_revocation_guard_reads_its_opener.py` for the four destinations. Two
+cases there carry the ECH claim, `test_an_ech_sidecar_and_a_crl_still_refuse_the_token_hop` and
+`test_rest_with_an_ech_sidecar_and_a_crl_is_still_refused`. Each pairs its refusal with a control in
+which the same CRL relaxes the same hop without a sidecar.
 
 ## 5. Consequences
 
