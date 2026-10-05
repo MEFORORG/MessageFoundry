@@ -1800,8 +1800,30 @@ def test_the_fhir_search_shape_is_scrubbed_through_every_entry_point() -> None:
 @pytest.mark.parametrize(
     "text",
     [
+        # A search URL glued to the XML element after it: whole-token, the run took `<name><family`.
+        '<Patient><meta><source value="Patient?identifier=urn%7C1%5EMR"/></meta>'
+        '<name><family value="ZQXDOE"/></name></Patient>',
+        # The same in compact JSON: whole-token, the run took the `"name":` key.
+        '{"id":"a%7Cb%7Cc","name": "Zqxdoe"}',
+        # Before the name run, the encoded run took JANE and left ZQXDOE under the two-token threshold.
+        "patient ZQXDOE JANE%7Cx%7Cy",
+    ],
+    ids=["xml-label", "json-key", "name-run"],
+)
+def test_the_encoded_run_takes_no_label_or_name_another_pass_needed(text: str) -> None:
+    """THE NO-REGRESSION ARM. Each value here was scrubbed before this pattern existed, by a pass that
+    needed a label or a second token the encoded run could swallow. It must still go."""
+    for name, out in _every_entry_point(text).items():
+        assert "ZQXDOE" not in out and "Zqxdoe" not in out, f"{name}: {out!r}"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
         "GET /files/a%20b%20c%20d.txt",  # a run of %20 is ordinary text, however long
-        "path a%7Cb kept",  # one encoded separator is under the threshold, as one literal one is
+        # One encoded separator is under the threshold, as one literal one is. A stated residual on
+        # the pattern, not an endorsement: FHIR's `identifier=system%7Cvalue` keeps its value.
+        "path a%7Cb kept",
         "rate 50%25 of %7 cap",  # an escape that is not a separator, and a truncated one
         "id x%2Fy%2Fz",  # an encoded slash is not an HL7 separator
     ],
@@ -1911,9 +1933,10 @@ def test_a_placeholder_inside_a_password_does_not_shield_what_follows_it() -> No
 
 
 def test_the_real_producer_never_quotes_a_placeholder() -> None:
-    """Why the trade below is safe for the shape the backstop exists for. ``http.client`` quotes what
-    follows the LAST ``:``, and only when no ``]`` comes after it, so the "port" it writes can hold
-    neither. Handed the hostile netloc above, it quotes only the real password and the host."""
+    """Why the stated residual on ``_INVALID_URL_USERINFO`` cannot reach the shape the backstop exists
+    for. ``http.client`` quotes what follows the LAST ``:``, and only when no ``]`` comes after it, so
+    the "port" it writes holds neither. Handed the hostile netloc above, it quotes only the real
+    password and the host."""
     with pytest.raises(http.client.InvalidURL) as caught:
         http.client.HTTPConnection(f"u:[redacted]@x:{_PW_REAL}@host.example")
     message = str(caught.value)
@@ -1921,13 +1944,58 @@ def test_the_real_producer_never_quotes_a_placeholder() -> None:
     assert _PW_REAL not in redact(message)
 
 
-def test_the_stated_trade_text_holding_the_scrubbed_form_keeps_what_follows_it() -> None:
-    """THE RESIDUAL #2312 ACCEPTS, pinned so it stays visible. Text that already holds the scrubbed
-    form, opener then ``[redacted]@``, is exactly what a first pass writes. A pass that also scrubbed
-    past it would not be a fixed point, so what follows such a span is left alone. Only a string BUILT
-    to hold that form can reach this, and ``http.client`` cannot write one (the arm above)."""
+def test_a_match_may_start_on_the_scrubbed_form_and_still_take_what_follows() -> None:
+    """The start is not guarded, so text that opens with the scrubbed form is no shield. Only the
+    tail's crossing of a LATER scrubbed span is refused."""
     text = f"nonnumeric port: '[redacted]@x {_PW_REAL}@host.example'"
-    assert redact(text) == text
+    assert redact(text) == "nonnumeric port: '[redacted]@host.example'"
+
+
+def test_a_later_pass_finishes_a_password_whose_last_at_was_past_the_bound() -> None:
+    """Why the start is not guarded. A password with an inner ``@`` and its last ``@`` past the bound
+    is scrubbed only to the inner one. A later pass sees a shorter line and reaches the last one. The
+    stored error runs ``safe_exc`` then ``safe_text``, so that is the path that must finish it. A
+    start guard kept the hundred characters after the inner ``@``."""
+    text = "nonnumeric port: '" + "a" * 200 + "@" + "q7" * 50 + "@host.example'"
+    once = redact(text)
+    assert "q7" * 50 in once, "one pass already reaches the last @, so the fixture is mis-sized"
+    assert "q7" not in redact(once)
+    assert "q7" not in safe_text(safe_exc(ValueError(text)), limit=100_000)
+
+
+def _opener_then_scrubbed_span() -> str:
+    """An opener with no ``@`` of its own, then a credential message. The first pass cannot reach the
+    second ``@`` from the first opener (it is past the bound) and scrubs only the second span. That
+    shortens the line enough for the next pass to reach it. Only the tail guard stops that pass."""
+    return "nonnumeric port: 'abc'" + " keep" * 44 + f" nonnumeric port: '{_PW_TWO}@h2.example' end"
+
+
+def test_the_tail_guard_fixture_reaches_across_without_it() -> None:
+    """THE POSITIVE CONTROL for the arm below. Its first opener is NOT scrubbed on the first pass, so
+    only the tail guard, never a start guard, can be what holds the fixed point."""
+    once = _pre_2312_scrub(_opener_then_scrubbed_span())
+    assert "nonnumeric port: 'abc'" in once, "the first pass reached the second @ after all"
+    assert "keep" not in _pre_2312_scrub(once), "the old backstop no longer swallows this gap"
+
+
+def test_the_tail_never_crosses_a_later_scrubbed_span() -> None:
+    """BACKLOG #2312, the arm that fails if the tail guard is removed."""
+    once = redact(_opener_then_scrubbed_span())
+    assert _PW_TWO not in once
+    assert redact(once) == once
+    assert "keep" in redact(once)
+
+
+def test_the_tail_guard_spells_the_form_the_scrub_writes() -> None:
+    """THE DRIFT GATE for the copy inside the tail guard. The pattern spells the opener and the
+    placeholder again there, as literals for the static regex gate. If either drifts from the form
+    the scrub writes, the guard stops recognising it and the fixed point breaks silently."""
+    form = redaction._USERINFO_OPENER + re.escape(redaction._REDACTED) + "@"
+    assert f"n(?!{form[1:]})" in redaction._INVALID_URL_USERINFO.pattern
+    written = redaction._INVALID_URL_USERINFO.sub(
+        lambda m: f"{m.group(1)}{redaction._REDACTED}@", f"x {redaction._USERINFO_OPENER}pw0@h"
+    )
+    assert written == f"x {redaction._USERINFO_OPENER}{redaction._REDACTED}@h"
 
 
 #: Inputs shaped to make the backstop work hardest: openers with no ``@``, scrubbed forms with the
@@ -1948,7 +2016,10 @@ _ENCODED_HOSTILE = {
     "unfinished-escapes": "%7",
     "bare-percents": "%",
     "one-separator-tokens": "a%7Cb ",
-    "one-of-each-kind": "a|b%7C",
+    # A literal separator per token, so the literal pass leaves it and the pattern restarts after it.
+    "restart-after-literal": "a|b c%7Cd ",
+    # Past the screen, then a body lookahead at every '%' before the one separator.
+    "escapes-beside-one-separator": "a%20%20%20%20%7Cb ",
 }
 
 

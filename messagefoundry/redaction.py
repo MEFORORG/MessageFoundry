@@ -123,27 +123,39 @@ _HL7_FIELD_RUN = re.compile(r"(?<![^\s|^~&])[^\s|^~&]*+[|^~&][^\s|^~&]*+(?:[|^~&
 #: ``%7E`` and ``%26`` for ``| ^ ~ &``, either case (BACKLOG #2171). A FHIR search such as
 #: ``identifier=MRN%7C12345&name=DOE%5EJANE`` carries one literal separator and two encoded ones, so
 #: :data:`_HL7_FIELD_RUN` read it as below its threshold and passed it through. Literal and encoded
-#: separators count together toward the same two, and the run is scrubbed whole, as that pattern does.
+#: separators count together toward the same two, and the run is scrubbed whole.
 #:
 #: **A pattern of its own, because the guard on :data:`_HL7_FIELD_RUN` cannot hold three characters.**
 #: Python's lookbehind is fixed-width, so ``%7C`` cannot join that pattern's one-character guard class.
 #: The encoded form is matched in place rather than decoded and rescanned, so nothing here allocates a
 #: second copy of a peer's text. A lone ``%20`` (or any other escape) is ordinary body text.
 #:
-#: Linear for the same reason as :data:`_HL7_FIELD_RUN`. The lookbehind admits a start only after
-#: whitespace, a literal separator or the start of the text. A match from a token's start takes the
-#: whole token whenever it holds two separators, since the body stops only at a separator or the
-#: token's end. So a token that survives holds at most one separator, and gets at most two attempts.
-#: The body's lookahead is a fixed three-character test that fails on its first character everywhere
-#: but a ``%``. ``[redacted]`` holds no separator of either kind, so it never matches.
+#: **It stops at quotes, brackets, braces, angle brackets and commas, where the literal pattern does
+#: not.** Those characters bound a URL quoted inside JSON, XML or a DICOM dump, and the structured
+#: passes read the label just past them. Taking the whole token swallowed that label and left its
+#: value, so ``<meta><source value="...%7C1%5EMR"/></meta><name><family value="DOE"/>`` kept ``DOE``,
+#: which the structured pass had scrubbed before this pattern existed. It runs LAST among the flat
+#: passes for the same reason: run before :data:`_NAME_RUN`, it took the second token of ``DOE
+#: JANE%7Cx%7Cy`` and left ``DOE`` under the two-token threshold.
 #:
-#: Residuals, at least these: a double-encoded separator (``%257C``), and an encoded CUSTOM delimiter
-#: that MSH declares (:func:`_sniff_delimiters` reads only the literal header).
+#: Linear for the same reason as :data:`_HL7_FIELD_RUN`. The lookbehind is the exact complement of the
+#: body's class, so a start is admitted only after whitespace, a literal separator, a stop character
+#: or the start of the text. A match from a segment's start takes the whole segment whenever it holds
+#: two separators, since the body stops only at a separator or the segment's end. So a segment that
+#: survives holds at most one separator and gets at most two attempts. The body's lookahead fails on
+#: its first character everywhere but a ``%``. ``[redacted]`` holds no separator, so it never matches.
+#:
+#: Residuals, at least these: a single encoded separator, as with a single literal one (so FHIR's
+#: ``identifier=system%7Cvalue`` keeps its value); a run split by a stop character into parts with one
+#: separator each; a double-encoded separator (``%257C``); and an encoded CUSTOM delimiter that MSH
+#: declares (:func:`_sniff_delimiters` reads only the literal header).
 _HL7_ENCODED_FIELD_RUN = re.compile(
-    r"(?<![^\s|^~&])(?:(?!%(?:7[CcEe]|5[Ee]|26))[^\s|^~&])*+"
-    r"(?:[|^~&]|%(?:7[CcEe]|5[Ee]|26))(?:(?!%(?:7[CcEe]|5[Ee]|26))[^\s|^~&])*+"
-    r"(?:(?:[|^~&]|%(?:7[CcEe]|5[Ee]|26))(?:(?!%(?:7[CcEe]|5[Ee]|26))[^\s|^~&])*+)+"
+    r"""(?<![^\s|^~&"'<>{}(),])(?:(?!%(?:7[CcEe]|5[Ee]|26))[^\s|^~&"'<>{}(),])*+"""
+    r"""(?:[|^~&]|%(?:7[CcEe]|5[Ee]|26))(?:(?!%(?:7[CcEe]|5[Ee]|26))[^\s|^~&"'<>{}(),])*+"""
+    r"""(?:(?:[|^~&]|%(?:7[CcEe]|5[Ee]|26))(?:(?!%(?:7[CcEe]|5[Ee]|26))[^\s|^~&"'<>{}(),])*+)+"""
 )
+#: An encoded separator anywhere: the screen that keeps text without one off the pass above.
+_ENCODED_SEPARATOR = re.compile(r"%(?:7[CcEe]|5[Ee]|26)")
 
 #: A **date / birthdate run** in free text: an ISO ``YYYY-MM-DD`` / US ``MM-DD-YYYY`` (``-`` or ``/``
 #: separator) or a bare HL7 8-digit ``YYYYMMDD``. A DOB is a direct identifier, and a free-text leak like
@@ -426,22 +438,26 @@ _USERINFO_TAIL_MAX = 256
 #: A password tail longer than the bound is NOT matched -- the construction-time refusal in
 #: ``transports/rest.py`` ``refuse_url_credentials`` is the primary control, and this is its backstop.
 #:
-#: **It leaves its own output alone, so a second pass is a no-op (BACKLOG #2312).** The greedy tail
-#: used to reach past a span it had already scrubbed. Each scrub shortens the line, so two spans more
-#: than the bound apart on the first pass could fall inside it on the next, and the second pass then
-#: swallowed everything between them. ``safe_exc`` then ``safe_text`` is exactly such a second pass.
-#: Two lookaheads stop that. A match may not START on an already-scrubbed span (the opener followed by
-#: ``[redacted]@``), and its tail may not CROSS one, meaning the opener and placeholder together.
+#: **Its tail never crosses a span it already scrubbed (BACKLOG #2312).** The greedy tail used to.
+#: Each scrub shortens the line, so two spans more than the bound apart on the first pass could fall
+#: inside it on the next, and the second pass swallowed everything between them. ``safe_exc`` then
+#: ``safe_text`` is exactly such a second pass. Now an ``n`` in the tail may not open the scrubbed
+#: form, the opener then ``[redacted]@``, so a second pass over two scrubbed spans changes nothing.
+#: The guard sits on the ``n`` alone so every other character stays on the engine's fast path.
 #:
-#: **The tail stays greedy to the last ``@``, and the scrubbed form is keyed on the opener as well as
-#: the placeholder, both on purpose.** A bare ``[redacted]@`` in the tail does not stop it, so text
-#: like ``'u:[redacted]@x:PW@host'`` still loses ``PW``. What it now leaves alone is text that already
-#: holds the scrubbed form, and every such tail holds a ``]``. ``http.client`` never writes one there:
-#: it quotes what follows the last ``:`` only when no ``]`` comes after it, so its quoted "port" holds
-#: neither ``:`` nor ``]``. A string built to hold the scrubbed form with a real password after it
-#: keeps that password, which is the residual this trade accepts.
+#: **A match may still START on a scrubbed span, and that is deliberate.** A password with an inner
+#: ``@`` whose last ``@`` is past the bound is scrubbed only to the inner one, and a later pass, once
+#: the line is shorter, finishes it. Refusing that start kept the rest of such a password in the
+#: stored error. The cost is that an ``@`` between a scrubbed span and the next opener can also come
+#: within reach on a later pass, which only adds redaction.
+#:
+#: **The scrubbed form is keyed on the opener as well as the placeholder.** A bare ``[redacted]@`` in
+#: the tail does not stop it, so ``'u:[redacted]@x:PW@host'`` still loses ``PW``. The residual is text
+#: an earlier opener would have scrubbed up to a later scrubbed form; that later opener scrubs from its
+#: own start instead. Every such tail holds a ``]``, and ``http.client`` never writes one: it quotes
+#: what follows the last ``:`` only when no ``]`` comes after it.
 _INVALID_URL_USERINFO = re.compile(
-    r"(nonnumeric port: ')(?!\[redacted\]@)(?:(?!nonnumeric port: '\[redacted\]@)[^\r\n]){1,256}@"
+    r"(nonnumeric port: ')(?:[^\r\nn]|n(?!onnumeric port: '\[redacted\]@)){1,256}@"
 )
 
 #: The widest match :data:`_INVALID_URL_USERINFO` can make: the opener, the longest tail it admits,
@@ -1474,10 +1490,11 @@ def redact(text: str) -> str:
     redaction); the goal is that a raw HL7 body — or a free-text name/DOB — embedded in an exception
     message can't reach a log or the stored ``last_error``/``detail``. NOT de-identification (PHI.md §9).
 
-    Order matters: HL7-shaped content (:data:`_HL7_SEGMENT`, then :data:`_HL7_FIELD_RUN` and its
-    percent-encoded twin :data:`_HL7_ENCODED_FIELD_RUN`, then the separator-aware pass for a message
-    that declares delimiters outside the defaults) is handled first, so the free-text passes (:data:`_MRN_LABELLED`, :data:`_DATE_RUN`, then :data:`_NAME_RUN`) only
-    see delimiter-free text. The structured-shape passes (:func:`_redact_structured`: JSON keys, DICOM tags and labels,
+    Order matters: HL7-shaped content (:data:`_HL7_SEGMENT`, then :data:`_HL7_FIELD_RUN`, then the
+    separator-aware pass for a message that declares delimiters outside the defaults) is handled first,
+    so the free-text passes (:data:`_MRN_LABELLED`, :data:`_DATE_RUN`, then :data:`_NAME_RUN`) only
+    see delimiter-free text. The percent-encoded run (:data:`_HL7_ENCODED_FIELD_RUN`) comes after
+    them, so it cannot split a name run. The structured-shape passes (:func:`_redact_structured`: JSON keys, DICOM tags and labels,
     XML elements) run LAST, so they can only add redaction to what the others left (the section
     comment above them says what running them first cost). The free-text heuristic narrows the prior
     residual to adversarial *single-token* identifiers (a lone name with no second token, no date) — for which the "never put PHI in an exception message"
@@ -1582,25 +1599,26 @@ def _redact_flat(text: str, *, widened: bool, credentials: bool) -> str:
     :func:`_redact_structured`, repeated to a fixed point.
 
     ``credentials=False`` skips the backstop, which the widened stage of :func:`redact` does. The
-    first stage has already run it. The skip was written when the backstop was not idempotent: its
-    tail is greedy to the LAST ``@`` on a line, so a further run over ``'[redacted]@host' ...
-    '[redacted]@host'`` swallowed everything between two scrubbed spans, and a clamp dropping the later
+    first stage has already run it. The skip was written when the backstop's greedy tail swallowed
+    everything between two spans it had scrubbed, on any further run, and a clamp dropping the later
     span kept what the unclamped scan removed (the clamp fuzz in ``tests/test_redaction.py`` measured
-    it). BACKLOG #2312 made the backstop leave its own output alone (:data:`_INVALID_URL_USERINFO`), so
-    a repeated call (``safe_exc`` then ``safe_text``) no longer swallows that gap either.
+    it). BACKLOG #2312 stopped the tail crossing a scrubbed span (:data:`_INVALID_URL_USERINFO`), so a
+    repeated call (``safe_exc`` then ``safe_text``) no longer swallows that gap.
 
-    **What is still not re-checked, stated because the reason above is easy to over-read.** A
-    credential span that only a WIDENED scrub completes (one that removes an escaped line break inside
-    a ``name`` string, joining an opener's line to its ``@``) is not re-checked: #1711 did not catch
-    that either. And an opener whose ``@`` was past the bound can come within it on a LATER call, once
-    a field run or a name inside the would-be tail has been shortened to the placeholder; that call
-    then scrubs the rest of the tail. It only adds redaction, and :func:`safe_text` lists it."""
+    **The backstop is still not a strict fixed point, which is why the skip stays.** An ``@`` that was
+    past the bound on the first run can come within it on a later one, once a scrub has shortened the
+    line: an ``@`` after a scrubbed span, or one behind a field run or a name inside the would-be tail.
+    That later run scrubs the rest of the tail, which only adds redaction, and :func:`safe_text` lists
+    it. Whether the skip is still worth its cost is a separate question from #2312.
+
+    **What is not re-checked, stated because the reason above is easy to over-read.** A credential
+    span that only a WIDENED scrub completes (one that removes an escaped line break inside a ``name``
+    string, joining an opener's line to its ``@``) is not re-checked: #1711 did not catch that
+    either."""
     if credentials:
         text = _INVALID_URL_USERINFO.sub(lambda m: f"{m.group(1)}{_REDACTED}@", text)
     scrubbed = _HL7_SEGMENT.sub(lambda m: f"{m.group(1)}|{_REDACTED}", text)
     scrubbed = _HL7_FIELD_RUN.sub(_REDACTED, scrubbed)
-    if "%" in scrubbed:  # BACKLOG #2171; every encoded separator holds one, so most text skips it
-        scrubbed = _HL7_ENCODED_FIELD_RUN.sub(_REDACTED, scrubbed)
     # BACKLOG #1572. The passes above assume `| ^ ~ &`; MSH DECLARES the real set per message, so a
     # feed using `*` and `$` kept its identifiers. Sniff, and run a separator-aware pass only when the
     # declared set reaches outside the defaults — widening the hardcoded class instead would have been
@@ -1621,7 +1639,12 @@ def _redact_flat(text: str, *, widened: bool, credentials: bool) -> str:
     scrubbed = _DATE_RUN.sub(_REDACTED, scrubbed)
     # The callback only where a label could end a run, so ordinary text keeps the C-speed constant.
     has_label = "MRN" in scrubbed or "Mrn" in scrubbed
-    return _NAME_RUN.sub(_name_run_replacement if has_label else _REDACTED, scrubbed)
+    scrubbed = _NAME_RUN.sub(_name_run_replacement if has_label else _REDACTED, scrubbed)
+    # BACKLOG #2171, last so it cannot take a name run's second token (see the pattern). The screen is
+    # a C-speed search, so text without an encoded separator never pays the pattern's lookahead.
+    if "%" in scrubbed and _ENCODED_SEPARATOR.search(scrubbed):
+        scrubbed = _HL7_ENCODED_FIELD_RUN.sub(_REDACTED, scrubbed)
+    return scrubbed
 
 
 def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
