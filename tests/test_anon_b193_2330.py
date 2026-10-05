@@ -436,3 +436,35 @@ def test_a_bare_leak_report_cannot_know_what_was_emptied(leak: Any) -> None:
     ``anonymize_checked`` can fill ``blanked_fields``, and this pins that the field says so."""
     report = leak.leak_report(_site_message("EVN|A01|"), rules=engine_rules.DEFAULT_RULES)
     assert report.blanked_fields == ()
+
+
+# --- item 6: a six-digit date that reads two ways -------------------------------------------------
+
+# EVN-2 value -> what the DATE kind must write.
+_SIX_DIGIT_CASES = {
+    # July 2011, or 7 November 2020. Kept, the output would show the second reading's month.
+    "reads as YYYYMM and as YYMMDD": ("201107", ""),
+    "the same with an offset": ("201107+0500", ""),
+    "the same with a precision code": ("201107^L", ""),
+    # The accepted cost: a true year and month whose year ends in 01 to 12.
+    "a true YYYYMM that also fits": ("200803", ""),
+    # Not a YYMMDD: 26 is no month, so only one reading exists and the year is kept.
+    "only a YYYYMM": ("202603", "202601"),
+    "a year ending in 00": ("200011", "200001"),
+    "a year ending in 13": ("201311", "201301"),
+    # Eight digits and four digits are not ambiguous in this way.
+    "a full date in an ambiguous year": ("20110703", "20110101"),
+    "a bare year": ("2011", "2011"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_SIX_DIGIT_CASES))
+@_EACH_ADAPTER
+def test_a_six_digit_date_with_two_readings_is_emptied(
+    adapter: Callable[..., str], case: str
+) -> None:
+    value, expected = _SIX_DIGIT_CASES[case]
+    blanked: list[str] = []
+    out = adapter(_site_message("EVN|A01|" + value + "|x"), salt=_SALT, blanked=blanked)
+    assert _field_of(out, "EVN-2") == expected
+    assert blanked == ([] if expected else ["EVN-2"])

@@ -1821,8 +1821,10 @@ What the `date` kind does to a value:
   puts the addresses in the coverage report as `blanked_fields`, and
   `python -m tee anonymize-captures` adds a count per address to its run summary. It is a record
   and not a refusal. A caller of plain `anonymize` gets the list only by passing `blanked`.
-- A six-digit `YYMMDD` whose first four digits happen to read as a year and a month, such as
-  `201107`, still passes as `YYYYMM`. Its output keeps those four digits.
+- It scrubs a six-digit value to empty when the value reads two ways. `201107` is July 2011 as
+  `YYYYMM`, and 7 November 2020 as `YYMMDD`. Kept as a year and a month, it would show the real
+  month of the second reading. The cost: a true `YYYYMM` whose year ends in `01` to `12`, such as
+  `200803`, is emptied as well. Both are recorded as emptied.
 - It keeps the HL7 null `""` as it is.
 
 **These gaps keep the output short of Safe Harbor, at least:**

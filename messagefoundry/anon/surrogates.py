@@ -255,6 +255,11 @@ _DTM: re.Pattern[str] = re.compile(
     """,
     re.VERBOSE,
 )
+#: A two-digit year, a month and a day. A six-digit value that fits BOTH this and ``YYYYMM`` has no
+#: certain reading: ``201107`` is July 2011, or 7 November 2020. Kept as a year and a month it
+#: would show the real month of the second reading, so it is scrubbed to empty (BACKLOG #2330).
+#: The cost is a true ``YYYYMM`` whose year ends in 01 to 12, such as ``200803``: it is emptied too.
+_YYMMDD: re.Pattern[str] = re.compile(r"[0-9]{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12][0-9]|3[01])")
 #: What everything between the year and the offset becomes, cut to the original's width: month and
 #: day ``01`` so the value stays a valid date (hl7apy refuses a ``00`` month), then zeros.
 _DATE_FILL = "0101000000.0000"
@@ -273,7 +278,8 @@ def surrogate_date(rep: str, keyer: Keyer, seps: Seps) -> str:
 
     A TS precision component (TS.2) survives when it is a known code. A value that is not a valid
     DTM (a group out of range, a non-ASCII digit, prose or a stray component) is **scrubbed to
-    empty**, never passed through: no faithful surrogate exists for it. The HL7 explicit null
+    empty**, never passed through: no faithful surrogate exists for it. So is a year and a month
+    that also reads as a two-digit year, a month and a day (``_YYMMDD``). The HL7 explicit null
     ``""`` carries nothing and is kept.
     """
     return _filled_date(rep, seps)
@@ -288,6 +294,8 @@ def _filled_date(rep: str, seps: Seps) -> str:
     if match is None or ts2 not in _TS_PRECISION:
         return ""
     year, rest, offset = match.groups()
+    if _YYMMDD.fullmatch(year + (rest or "")):
+        return ""
     return year + _DATE_FILL[: len(rest or "")] + ("+0000" if offset else "") + sep + ts2
 
 
