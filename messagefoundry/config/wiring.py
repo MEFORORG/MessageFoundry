@@ -955,8 +955,8 @@ def FhirLookup(
     # see". Authorable here for the same reason as the pair above.
     tls_hop_attested: bool = False,
     tls_hop_attested_reason: str | None = None,
-    # ADR 0173: the per-connection revocation attestation for this lookup's SMART token hop, the one
-    # verifying hop on a lookup that carries the revocation refusal. That refusal names this lever, so
+    # ADR 0173: the per-connection revocation attestation for this lookup's two verifying hops, the
+    # https read itself (BACKLOG #2193) and its SMART token hop. Each refusal names this lever, so
     # it must be authorable here too.
     tls_revocation_attested: bool = False,
     tls_revocation_attested_reason: str | None = None,
@@ -1001,9 +1001,11 @@ def FhirLookup(
     and the same loosening report.
 
     ``tls_revocation_attested`` / ``tls_revocation_attested_reason`` (ADR 0173) attest that a
-    revocation-checking PKI covers the SMART token endpoint this lookup signs in to, so an enforcing
-    instance does not refuse that verifying hop. Same coherence rules, and the reason is recorded in
-    the WARNING logged when the attestation suppresses the refusal.
+    revocation-checking PKI covers BOTH verifying hops of this lookup: the https read to the FHIR
+    server (BACKLOG #2193) and the SMART token endpoint it signs in to, which is often a different
+    host. One declaration crosses both, as an outbound's does, so the reason must hold for both.
+    Same coherence rules, and the reason is recorded in the WARNING each hop logs when the
+    attestation suppresses its refusal.
 
     ``tls_ca_file`` (BACKLOG #1180) pins this hop to one private CA. What it does, and what it does
     not, is stated once in ``docs/CONNECTIONS.md``, "Pinning a private CA per connection"."""
@@ -5340,8 +5342,9 @@ def revocation_attested_hops(registry: Registry) -> list[tuple[str, str]]:
 
     It walks **all three** tables the pair is authorable on: ``inbound`` (an mTLS listener, the
     ``check_inbound_revocation`` refusal), ``outbound`` (the ``RevocationHopGuard``) and
-    ``fhir_lookups`` (the SMART token hop a lookup signs in to). All three carry it as typed fields,
-    like ``cleartext_accepted``, and this reads those fields: a copy in a ``FhirLookupSpec``'s
+    ``fhir_lookups`` (a lookup's https read and the SMART token hop it signs in to). All three carry
+    it as typed fields, like ``cleartext_accepted``, and this reads those fields: a copy in a
+    ``FhirLookupSpec``'s
     ``settings`` dict is never trusted, because the executor strips it. Names are prefixed
     ``inbound:`` and ``fhir_lookup:`` because those are separate namespaces that could otherwise
     collide with an outbound's name.

@@ -1240,7 +1240,10 @@ class FhirLookupExecutor:
         # the runner. A FhirLookup connection has no Destination to carry it (unlike every other
         # HTTP-family hop), which is why this executor's opener map could not name an internal CA at
         # all. `None` (a direct test build) = the OS trust store, byte-identical.
-        from messagefoundry.transports.smart import token_provider_from_settings
+        from messagefoundry.transports.smart import (
+            revocation_attestation_from_settings,
+            token_provider_from_settings,
+        )
 
         self._base: dict[str, str] = {}
         self._headers: dict[str, dict[str, str]] = {}
@@ -1348,6 +1351,21 @@ class FhirLookupExecutor:
                     _no_redirect_opener(*proxy_handlers, trust_anchor=lookup_anchor)
                     if proxy_handlers or lookup_anchor.narrows
                     else _NO_REDIRECT_OPENER
+                )
+                # BACKLOG #2193 (ADR 0173): the read hop verifies the FHIR server's certificate, but
+                # stdlib ssl checks no OCSP or CRL, so a revoked certificate would still be accepted on
+                # the hop that pulls patient data back. Called AFTER the opener, and handed it, so a
+                # [tls].crl_file that reached THIS lookup's own context relaxes the refusal and a
+                # lookup the CRL never reached keeps it (BACKLOG #2188).
+                rev_attested, rev_reason, _ = revocation_attestation_from_settings(s)
+                refuse_unrevoked_verified_hop(
+                    scheme,
+                    url,
+                    connector=f"FhirLookup {cname!r}",
+                    revocation_attested=rev_attested,
+                    revocation_attested_reason=rev_reason,
+                    opener=self._opener[cname],
+                    connection=label,
                 )
             else:
                 # verify_tls=false makes the https hop MITM-able — a posture-keyed insecure hop (#200).

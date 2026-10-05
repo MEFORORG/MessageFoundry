@@ -270,19 +270,27 @@ duplicate name (across **any** of these files) and an inbound that binds a route
 > **refused at construction** (`messagefoundry check` / dry-run / reload / the `serve` pre-flight), not
 > merely warned. **At least nine** hops carry that gate — the connection-level ones are
 > **MLLP-over-TLS, REST, SOAP, FHIR, DICOMweb (https), EMAIL/SMTP, and a connection's SMART token
-> endpoint**, plus some that are not connections at all: the **PostgreSQL store hop**, the
+> endpoint**, and since BACKLOG #2193 **the DICOM C-STORE SCU with `tls=true`, an FTPS upload, a
+> `Direct()` relay that sets a `username`, and an https `FhirLookup` read**, plus some that are not
+> connections at all: the **PostgreSQL store hop**, the
 > **`[logging]` TLS syslog forwarder**, and the **OIDC token and JWKS legs**, which are checked when
 > `serve` builds the auth service rather than by `messagefoundry check`. Read it as "at least these" rather than as a covered estate
 > (SDS-3.6); the count moved from seven with [ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)
 > §4.3 and each gated hop names itself when it refuses. On a stock instance that means `MLLP(..., tls=True)`, an
 > `https://` `Rest()`/`Soap()`/`FHIR()`/`DICOMweb()` destination and an `Email()` STARTTLS relay are all
 > refused **once they point off-box** — including the worked examples below, which are written to show
-> the connector, not to pass the posture.
+> the connector, not to pass the posture. So are `DICOM(..., tls=True)`, an `Ftp(..., tls=True)`
+> upload, a `Direct()` relay with a `username`, and an `https://` `FhirLookup()`.
+>
+> **A first `serve` start does not treat every refusal alike** (measured for BACKLOG #2193). It
+> builds each outbound on its own, so a refused outbound is recorded failed and the rest of the
+> graph starts. It builds the lookups once for the whole graph, so a refused `FhirLookup` stops
+> the start. `messagefoundry check`, dry-run and reload fail as a whole in both cases.
 >
 > **At the shipped default the ways across are:** keep the hop on **loopback**; load a CRL with
 > `[tls].crl_file` where it reaches the hop; or attest this one connection with
 > **`tls_revocation_attested = true`** plus a mandatory **`tls_revocation_attested_reason`** — an
-> `outbound()` keyword, or a **top-level** `connections.toml` key beside `cleartext_accepted` (not under
+> `outbound()` or `FhirLookup()` keyword, or a **top-level** `connections.toml` key beside `cleartext_accepted` (not under
 > `[settings]`). The attestation says a revocation-checking PKI or terminator backs *this* hop, and
 > each construction it lets through on an enforcing instance logs a WARNING carrying the reason
 > ([ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)).
@@ -295,8 +303,8 @@ duplicate name (across **any** of these files) and an inbound that binds a route
 > a fix: `[security].enforcement = warn` downgrades it to a WARN. Nothing silences it instance-wide
 > any more — the synthetic declaration that did was retired in [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md).
 >
-> **The engine's other verifying TLS hops are not gated at all** — the DICOM C-STORE SCU with
-> `tls=true`, FTPS, the `Database(...)` destination / `DatabasePoll(...)` source, the SQL Server store
+> **Some of the engine's other verifying TLS hops are not gated at all** — the inbound FTPS poll,
+> the `Database(...)` destination / `DatabasePoll(...)` source, the SQL Server store
 > hop, LDAPS — so confirming the refusal on MLLP tells you nothing about those: revocation there is your
 > PKI's job, and `MEFOR_TLS_REVOCATION_ATTESTED` is not consulted for them. Full treatment:
 > [DEPLOYMENT.md §Revocation-guard behavior](DEPLOYMENT.md#revocation-guard-behavior).
@@ -1217,8 +1225,8 @@ poll/write shape against a remote server, selected by an internal `protocol` set
 | `private_key` | both | — | **`Sftp` only** — the **text** of an **RSA** private key, not a path; a **secret**, via `env()`. See *RSA key text only* below the table. |
 | `key_password` | both | — | **`Sftp` only** — **refused** (BACKLOG #1352): an encrypted SFTP key cannot meet the [wrap floor](#encrypted-private-keys-must-meet-the-wrap-floor), so supply `private_key` unencrypted through `env()`. Setting this fails at `check` |
 | `known_hosts` | both | — | **`Sftp` only** — an *additional* `known_hosts` file (the system host keys are always loaded) |
-| `tls` | both | `false` | **`Ftp` only** — `true` selects **FTPS** (explicit TLS); `false` is plain FTP |
-| `tls_allow_expired` | both | `false` | **`Ftp` only** — honour an FTPS server cert whose validity period has lapsed while still verifying the chain, and the hostname too unless a hand-built spec sets `tls_check_hostname = false` (#129, ADR 0094). Same contract as the [MLLP `tls_allow_expired` row](#mllp--mllp): **no posture gate and no escape variable covers it**. It is reported, in both directions, by the per-build WARNING, `messagefoundry check` and `security_loosenings()`; CORRECTED 2026-10-01, this row said no loosening register covered it, and the inbound poller was in fact listed nowhere until then. The FTPS hop has **no revocation gate either**, so an expired *and* revoked partner certificate crosses here with nothing refusing it. Put the connection name and a removal date in your own risk register |
+| `tls` | both | `false` | **`Ftp` only** — `true` selects **FTPS** (explicit TLS); `false` is plain FTP. An FTPS **upload** to an off-box host is **refused on a stock instance** unless `[tls].crl_file` reaches the hop or the connection declares `tls_revocation_attested` with a reason (BACKLOG #2193). The inbound FTPS poll has no such gate |
+| `tls_allow_expired` | both | `false` | **`Ftp` only** — honour an FTPS server cert whose validity period has lapsed while still verifying the chain, and the hostname too unless a hand-built spec sets `tls_check_hostname = false` (#129, ADR 0094). Same contract as the [MLLP `tls_allow_expired` row](#mllp--mllp): **no posture gate and no escape variable covers it**. It is reported, in both directions, by the per-build WARNING, `messagefoundry check` and `security_loosenings()`; CORRECTED 2026-10-01, this row said no loosening register covered it, and the inbound poller was in fact listed nowhere until then. The FTPS *upload* has a revocation gate since BACKLOG #2193. The inbound FTPS poll has **none**, so an expired *and* revoked partner certificate crosses there with nothing refusing it. Put the connection name and a removal date in your own risk register |
 | `tls_ca_file` | both | — | **`Ftp` only, FTPS** (#1180) — pins this hop to one private CA. See [Pinning a private CA per connection](#pinning-a-private-ca-per-connection-tls_ca_file) |
 | `pattern` | in | `*.hl7` | filename glob to pick up |
 | `poll_seconds` | in | `5.0` | poll interval. It is also the **settle window**: a file is read only once it lists at the same size as at the last poll that saw it (BACKLOG #2071), so every file waits at least one poll. The gate is always on and has no setting. It reads the listed size alone, so it cannot see a same-size rewrite, nor anything on a server that lists every file at size 0. |
@@ -2087,7 +2095,7 @@ these messages, and the SMTP relay accepts them before anyone tries.
 | `trust_anchor` | — (required) | path to the PEM/DER CA the `recipient_cert` must chain to |
 | `port` | `587` | `587` = STARTTLS submission; `465` = implicit TLS (`SMTP_SSL`) |
 | `subject` | `""` | static `Subject` |
-| `username` / `password` | — | optional SMTP `AUTH` credentials (secrets — via `env()`) |
+| `username` / `password` | — | optional SMTP `AUTH` credentials (secrets — via `env()`). Setting a `username` makes the relay a credential hop: to an off-box host it is then **refused on a stock instance** unless `[tls].crl_file` reaches the hop or the connection declares `tls_revocation_attested` with a reason (BACKLOG #2193). With no `username` the relay carries no revocation gate |
 | `use_tls` | `true` | STARTTLS by default. `false` is refused unless `MEFOR_ALLOW_INSECURE_TLS` is set, and SMTP `AUTH` over cleartext is **refused outright**. **WARNING: this is not the same posture as `Email(...)` — the shipped enforcing default does not close it.** `Direct()` consults the **raw** escape variable directly: it does **not** route through the shared cleartext-hop authority, so `[security].enforcement = enforce` does **not** clamp it and `cleartext_accepted` / `cleartext_reason` on the outbound are **not consulted** (declaring them changes nothing here). With the variable set, a cleartext-SMTP Direct hop crosses on a production-PHI enforcing instance. The S/MIME body stays signed + encrypted either way — but the SMTP envelope (sender, recipients, subject) does not. |
 | `timeout_seconds` | `30.0` | passed to the `smtplib` constructor (covers connect and each command) |
 | `encoding` | `utf-8` | charset the body is encoded with before signing |
@@ -2586,8 +2594,8 @@ behind the console's "Test Connection"). Egress is gated by `[egress].allowed_tc
 | `max_object_bytes` | `134217728` (128 MiB) | reject an over-cap object **before** dialing (permanent — no retry) |
 | `timeout_seconds` | `30.0` | ACSE/DIMSE/network timeout |
 | `connect_timeout` | `10.0` | association-request (TCP connect) timeout |
-| `tls` / `tls_ca_file` / `tls_cert_file` / `tls_key_file` | `false` / — | **DICOM-over-TLS**: verify the peer's server cert (`tls_ca_file` pins the anchor); `tls_cert_file`/`tls_key_file` opt into **mTLS**. There is **no `tls_verify=false`** on this connector — chain and hostname are always verified. It also carries **no revocation gate** (unlike MLLP/REST/SOAP/FHIR/DICOMweb/EMAIL), so `tls=true` here is *not* refused on a stock instance — and a revoked PACS certificate is your PKI's problem, not the engine's |
-| `tls_allow_expired` | `false` | **(#129, ADR 0094)** tolerate an **expired** PACS certificate with chain + hostname still verified. Combined with the missing revocation gate above, this hop can be pinned to a certificate that is **both expired and revoked** with nothing refusing it — **no posture gate and no escape variable**. It **is reported**: a WARNING at each build, a `tls-allow-expired` line in `messagefoundry check` and a `security_loosenings()` entry, and so `GET /security/posture` (CORRECTED 2026-10-01: this row said `security_loosenings()` never reports it, stale since BACKLOG #333) (see the [MLLP row](#mllp--mllp)) |
+| `tls` / `tls_ca_file` / `tls_cert_file` / `tls_key_file` | `false` / — | **DICOM-over-TLS**: verify the peer's server cert (`tls_ca_file` pins the anchor); `tls_cert_file`/`tls_key_file` opt into **mTLS**. There is **no `tls_verify=false`** on this connector — chain and hostname are always verified. Since BACKLOG #2193 it carries the **revocation gate** MLLP/REST/SOAP/FHIR/DICOMweb/EMAIL carry: `tls=true` to an off-box PACS **is refused on a stock instance** unless `[tls].crl_file` reaches the hop or the connection declares `tls_revocation_attested` with a reason (CORRECTED 2026-10-04: this row said the hop had no revocation gate and was not refused) |
+| `tls_allow_expired` | `false` | **(#129, ADR 0094)** tolerate an **expired** PACS certificate with chain + hostname still verified. Combined with a `tls_revocation_attested` declaration, this hop can be pinned to a certificate that is **both expired and revoked** with nothing in the engine refusing it — **no posture gate and no escape variable**. It **is reported**: a WARNING at each build, a `tls-allow-expired` line in `messagefoundry check` and a `security_loosenings()` entry, and so `GET /security/posture` (CORRECTED 2026-10-01: this row said `security_loosenings()` never reports it, stale since BACKLOG #333) (see the [MLLP row](#mllp--mllp)) |
 | `tls_key_password` | `None` → unencrypted key | passphrase for a PKCS#8-encrypted mTLS-client `tls_key_file` (`env()`-sourced); it must meet the [wrap floor](#encrypted-private-keys-must-meet-the-wrap-floor). Same fail-fast semantics as the inbound SCP (no/wrong passphrase raises at construction, never a TTY hang). |
 
 **Status → retry classification.** C-STORE **Success** (`0x0000`) / a **Warning** (`0xB0xx`, stored with a

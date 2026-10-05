@@ -1143,8 +1143,9 @@ transport's list is set, an outbound of that transport not on it is **refused at
 > [CONNECTIONS.md](CONNECTIONS.md#attesting-a-hop-secure-tls_hop_attested). The `[logging]`
 > forwarder's `forward_hop_attested` (above) is its instance-level sibling. The revocation gate's
 > per-connection `tls_revocation_attested` is a different claim. It is also settable, with a mandatory
-> `tls_revocation_attested_reason`, as an `inbound()`/`outbound()` keyword or a top-level
-> `connections.toml` key
+> `tls_revocation_attested_reason`, as an `inbound()`/`outbound()`/`FhirLookup()` keyword or a
+> top-level `connections.toml` key. On a `FhirLookup`, one declaration lifts two refusals: the
+> https read and the lookup's SMART token endpoint
 > ([ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)).
 > It governs revocation on a *verifying* hop only and never reaches a cleartext or verify-off hop.
 >

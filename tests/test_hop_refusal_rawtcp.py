@@ -144,6 +144,7 @@ def dicom_cfg(
     reason: str | None = None,
     accepted: bool = False,
     accept_reason: str | None = None,
+    revocation_attested: bool = False,
 ) -> Destination:
     settings: dict[str, object] = {"ae_title": "MF_SCU", "host": host, "port": 104}
     if tls:
@@ -152,6 +153,10 @@ def dicom_cfg(
         name="OB_DICOM",
         type=ConnectorType.DIMSE,
         settings=settings,
+        tls_revocation_attested=revocation_attested,
+        tls_revocation_attested_reason="revocation-checking PKI at the partner edge"
+        if revocation_attested
+        else None,
         **_hop_fields(attested, reason, accepted, accept_reason),
     )
 
@@ -263,8 +268,10 @@ def test_mllp_tls_has_no_hop_guard() -> None:
 
 
 def test_dicom_tls_has_no_hop_guard() -> None:
+    # Like the MLLP arm above: the verified hop carries a revocation guard since vault BACKLOG #2193,
+    # so attest revocation to keep the subject here, which is that the CLEARTEXT guard is None.
     with active_hop_posture(PROD_PHI):
-        dest = DicomScuDestination(dicom_cfg(REMOTE, tls=True))
+        dest = DicomScuDestination(dicom_cfg(REMOTE, tls=True, revocation_attested=True))
     assert dest._hop_guard is None
 
 
