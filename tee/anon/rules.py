@@ -32,8 +32,10 @@ from pathlib import Path
 
 #: A whole-FIELD HL7 address: a 3-char segment id then ``-`` then a 1-based field number
 #: (``PID-5``, ``MRG-1``). Component paths (``PID-5.1``) are rejected — surrogates compose a whole
-#: field's value (ADR 0030 §3), so rules address whole fields only.
-_FIELD_PATH_RE = re.compile(r"^[A-Z][A-Z0-9]{2}-\d+$")
+#: field's value (ADR 0030 §3), so rules address whole fields only. The number is ASCII digits with
+#: no leading zero: ``PID-0`` is the segment id itself, which the tee would overwrite, and ``PID-05``
+#: or a non-ASCII digit names a field the two adapters and the leak-check would read differently.
+_FIELD_PATH_RE = re.compile(r"[A-Z][A-Z0-9]{2}-[1-9][0-9]*")
 
 
 class SurrogateKind(StrEnum):
@@ -56,7 +58,7 @@ class SurrogateKind(StrEnum):
 class RuleError(ValueError):
     """A rule the data layer refuses: a malformed ``anon.toml`` overlay, one that tries to express
     something the data layer deliberately cannot (ADR 0030 §2 — selection only, never logic), or
-    a :class:`FieldRule` built in code with an unknown kind."""
+    a :class:`FieldRule` built in code with an unknown kind or a path that is not a whole field."""
 
 
 def _coerce_kind(path: str, raw: object) -> SurrogateKind:
@@ -72,13 +74,26 @@ def _coerce_kind(path: str, raw: object) -> SurrogateKind:
         ) from None
 
 
+def _check_field_path(path: object) -> None:
+    """Refuse a path that is not a whole-field address. ``fullmatch``, so a trailing newline, a
+    lower-case segment id and a component path all fail here, for a rule built in code and for an
+    overlay key alike."""
+    if not isinstance(path, str) or _FIELD_PATH_RE.fullmatch(path) is None:
+        raise RuleError(
+            f"rule path {path!r} is not a whole-field HL7 address like 'PID-5' "
+            "(component paths and free text are rejected — selection is field-level only)"
+        )
+
+
 @dataclass(frozen=True)
 class FieldRule:
     """One rule: scrub the whole field at ``path`` with surrogate ``kind``.
 
     ``kind`` is normalized to THIS package's :class:`SurrogateKind` on construction, so a plain
     ``"drop"`` string, or the other package's member, becomes the member here. An unknown kind
-    raises :class:`RuleError` at construction, not at the first message. A rule built by the other
+    raises :class:`RuleError` at construction, not at the first message. So does a ``path`` that is
+    not a whole-field address: ``pid-29`` would match no segment and scrub nothing, and ``PID-29.1``
+    would fail inside the tee on the first message (BACKLOG #2330). A rule built by the other
     package still carries that package's member, which is why the adapters and the leak-check
     compare a kind by value rather than by identity.
     """
@@ -87,6 +102,7 @@ class FieldRule:
     kind: SurrogateKind
 
     def __post_init__(self) -> None:
+        _check_field_path(self.path)
         object.__setattr__(self, "kind", _coerce_kind(self.path, self.kind))
 
 
@@ -189,11 +205,7 @@ class AnonError(ValueError):
 
 
 def _validate_path(path: str) -> str:
-    if not _FIELD_PATH_RE.match(path):
-        raise RuleError(
-            f"rule path {path!r} is not a whole-field HL7 address like 'PID-5' "
-            "(component paths and free text are rejected — selection is field-level only)"
-        )
+    _check_field_path(path)
     return path
 
 

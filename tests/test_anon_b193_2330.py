@@ -10,13 +10,17 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Callable
+from pathlib import Path
+from typing import Any
 
 import pytest
 
 from messagefoundry.anon import DEFAULT_RULES, SurrogateKind
 from messagefoundry.anon import anonymize as engine_anonymize
+from messagefoundry.anon import rules as engine_rules
 from tee.anon import DEFAULT_RULES as TEE_DEFAULT_RULES
 from tee.anon import anonymize as tee_anonymize
+from tee.anon import rules as tee_rules
 
 _SALT = "b193-salt-0123456789abcdef"
 _HEADER = r"MSH|^~\&|SAPP|SFAC|RAPP|RFAC|20260315142233||ADT^A01|MSGCTRL|P|2.5.1"
@@ -102,3 +106,45 @@ def test_a_date_of_birth_is_replaced_at_the_same_width(
 
 def test_both_adapters_agree_on_the_date_fields() -> None:
     assert _date_fields_out(engine_anonymize) == _date_fields_out(tee_anonymize)
+
+
+# --- item 5: a rule built in code has its path checked --------------------------------------------
+
+_BAD_PATHS = (
+    "pid-29",  # lower case: matched no segment, so the rule silently did nothing
+    "PID-29.1",  # a component path: a raw ValueError inside the tee, on the first message
+    "PID-0",  # the segment id itself, which the tee would overwrite
+    "PID-05",  # a leading zero: the tee reads field 5, the leak-check reads no rule
+    "PID-" + chr(0x0665),  # a non-ASCII digit, which int() and a regex digit class both accept
+    "PID-5\n",  # a trailing newline, which a bare match with an end anchor lets through
+    "PID5",
+    "PATIENT-5",
+    "",
+)
+
+
+@pytest.mark.parametrize("path", _BAD_PATHS)
+@pytest.mark.parametrize("module", (engine_rules, tee_rules), ids=("engine", "tee"))
+def test_a_field_rule_refuses_a_path_that_is_not_a_whole_field(module: Any, path: str) -> None:
+    with pytest.raises(module.RuleError, match="not a whole-field HL7 address"):
+        module.FieldRule(path, module.SurrogateKind.DATE)
+
+
+@pytest.mark.parametrize("module", (engine_rules, tee_rules), ids=("engine", "tee"))
+def test_a_field_rule_refuses_a_path_that_is_not_a_string(module: Any) -> None:
+    with pytest.raises(module.RuleError, match="not a whole-field HL7 address"):
+        module.FieldRule(29, module.SurrogateKind.DATE)
+
+
+@pytest.mark.parametrize("path", ("PID-29", "ZPD-2", "IN2-3", "MSH-14", "OBX-120"))
+@pytest.mark.parametrize("module", (engine_rules, tee_rules), ids=("engine", "tee"))
+def test_a_field_rule_accepts_a_whole_field_path(module: Any, path: str) -> None:
+    assert module.FieldRule(path, "date").path == path
+
+
+@pytest.mark.parametrize("module", (engine_rules, tee_rules), ids=("engine", "tee"))
+def test_an_overlay_key_is_held_to_the_same_path_check(module: Any, tmp_path: Path) -> None:
+    overlay = tmp_path / "anon.toml"
+    overlay.write_text('[hl7.fields]\n"PID-05" = "date"\n', encoding="utf-8")
+    with pytest.raises(module.RuleError, match="not a whole-field HL7 address"):
+        module.load_rules(overlay)
