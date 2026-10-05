@@ -130,6 +130,8 @@ class _WireProxy:
         while True:
             try:
                 conn, _ = self._listener.accept()
+            except TimeoutError:
+                continue  # idle, not closed: a slow test must still find the proxy serving
             except OSError:
                 return
             conn.settimeout(5)
