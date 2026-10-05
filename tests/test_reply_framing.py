@@ -933,6 +933,8 @@ _OIDC_BAD: dict[str, bytes] = {
     "negative-size": _TE + b"-5\r\n" + b"A" * 20_000,
     "size-0x": _chunked_json(b"0x%x" % len(_TOKEN_JSON)),
     "size-underscore": _chunked_json(b"1_5"),
+    # int() accepts the sign, so http.client alone reads this reply whole and at the right length
+    "size-plus": _chunked_json(b"+%x" % len(_TOKEN_JSON)),
     "header-defect": _OK
     + b"Content-Length: 3\r\nTransfer-Encoding : chunked\r\n\r\n"
     + _chunked_json(b"%x" % len(_TOKEN_JSON))[len(_TE) :],
@@ -960,10 +962,19 @@ def test_oidc_jwks_fetch_refuses_malformed_framing(shape: str) -> None:
     assert not isinstance(raised.value, (JwksError, ValueError))
 
 
-def test_oidc_reads_legal_chunk_framing() -> None:
+#: Legal size lines for the OIDC reads. "plain" is hex digits and nothing else: the plain chunked
+#: control BACKLOG #1979 asks for. It differs from the "size-plus" arm of _OIDC_BAD by the sign alone.
+_OIDC_LEGAL_SIZES: dict[str, bytes] = {
+    "plain": b"%x" % len(_TOKEN_JSON),
+    "extension": b"%X;ext=1" % len(_TOKEN_JSON),
+}
+
+
+@pytest.mark.parametrize("shape", list(_OIDC_LEGAL_SIZES), ids=list(_OIDC_LEGAL_SIZES))
+def test_oidc_reads_legal_chunk_framing(shape: str) -> None:
     from messagefoundry.auth.oidc_http import jwks_fetcher
 
-    raw = _chunked_json(b"%X;ext=1" % len(_TOKEN_JSON))
+    raw = _chunked_json(_OIDC_LEGAL_SIZES[shape])
     with _serve(raw) as url:
         assert _exchange(url) == {"id_token": "x.y.z"}
     with _serve(raw) as url:
