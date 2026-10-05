@@ -306,13 +306,17 @@ class HttpAuthError(ValueError):
 #: ``NegativeAckError.code`` of a send refused by :func:`auth_challenge_refused`.
 AUTH_CHALLENGE_REFUSED_CODE = "auth-challenge-refused"
 
-#: The FIXED text every HTTP-family arm reports for a wire-time :class:`HttpAuthError`, after its own
-#: hop label. ``HttpAuthError``'s message quotes the peer's algorithm token and scheme word, so it
-#: stays on the cause and never reaches ``queue.last_error`` or a test-connection reply. One text for
-#: the endpoint's 401 and the web proxy's 407: the raise does not say which it was.
+#: The FIXED text the destination and ``FhirLookup`` arms report for a wire-time
+#: :class:`HttpAuthError`, after their own hop label. ``HttpAuthError``'s message quotes the peer's
+#: algorithm token and scheme word, so it stays on the cause and never reaches ``queue.last_error``
+#: or a test-connection reply. One text for the endpoint's 401 and the web proxy's 407: the refusal
+#: names its peer only inside that message, and nothing here parses it.
+#:
+#: SHORT ON PURPOSE. ``safe_exc`` cuts a stored error at 200 characters, after the class name, the
+#: hop label and the URL, so a longer text lost the one word an operator can act on.
 AUTH_CHALLENGE_REFUSED = (
-    "sent an authentication challenge the engine will not answer: the endpoint or the web proxy "
-    "asked for an HTTP Digest hash other than SHA-256, or its challenge cannot be answered"
+    "met an authentication challenge the engine will not answer: "
+    "it answers only HTTP Digest with SHA-256"
 )
 
 
@@ -321,11 +325,12 @@ def auth_challenge_refused(label: str) -> NegativeAckError:
 
     ``HttpAuthError`` is a ``ValueError``, so each send's ``(ValueError, InvalidURL)`` arm caught it
     and reported ``bad-request-value``: a permanent fault of ONE message, which dead-letters the row
-    and sends an operator looking for a bad header or URL. The fault is the connection's. Every queued
-    message would meet the same challenge, so this is a configuration fault (ADR 0095 Amendment A):
-    under the default ``credential_fault_policy`` the delivery worker stops the lane and keeps the
-    queue. A retry would help nothing, and an origin Digest retry first re-sends the body without a
-    credential, because urllib answers a challenge only after the peer has seen the request."""
+    and would send an operator looking for a bad header or URL. The fault is the connection's. The
+    peer sends the same challenge to each request, so this is a configuration fault (ADR 0095
+    Amendment B): under the default ``credential_fault_policy`` the delivery worker stops the lane
+    and keeps the queue. A retry would help nothing, and an origin Digest retry first re-sends the
+    body without a credential, because urllib answers a challenge only after the peer has seen the
+    request."""
     return NegativeAckError(
         f"{label} {AUTH_CHALLENGE_REFUSED}",
         code=AUTH_CHALLENGE_REFUSED_CODE,

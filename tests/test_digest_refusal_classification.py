@@ -4,14 +4,15 @@
 
 ``HttpAuthError`` is a ``ValueError``. Each HTTP-family send caught it in its
 ``(ValueError, InvalidURL)`` arm and reported "rejected an invalid request value", code
-``bad-request-value``: a permanent fault of one message. So a refused Digest challenge dead-lettered
-every queued row in turn and sent the operator looking for a bad header.
+``bad-request-value``: a permanent fault of one message. So a refused Digest challenge would
+dead-letter every queued row in turn, and would send an operator looking for a bad header.
 
 Two layers, because either alone can pass on a broken fix:
 
-* **Every arm, with the refusal injected.** Ten arms: ``_post`` and ``_probe`` on REST, SOAP, FHIR
-  and DICOMweb, and ``_get`` and ``_probe`` on the ``FhirLookup`` read. Each has a control showing a
-  genuine bad request value still reports as one.
+* **Ten arms, with the refusal injected.** ``_post`` and ``_probe`` on REST, SOAP, FHIR and
+  DICOMweb, and ``_get`` and ``_probe`` on the ``FhirLookup`` read. Each has a control showing a
+  genuine bad request value still reports as one. The token hop in ``smart.py`` has its own arm and
+  its own test, in ``tests/test_outbound_forward_proxy.py``.
 * **On the wire, through the real opener.** A loopback peer sends the challenge, so the refusal is
   the one the Digest handlers raise and not one a test invented. A SHA-256 challenge is the control:
   it is answered and the send succeeds, so the new arm does not swallow a working exchange.
@@ -259,7 +260,10 @@ class _Challenger:
 
         self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
         self.url = f"http://127.0.0.1:{self._server.server_address[1]}"
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        # A short poll, so shutdown() does not wait out serve_forever's default half second.
+        self._thread = threading.Thread(
+            target=self._server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+        )
 
     def __enter__(self) -> _Challenger:
         self._thread.start()

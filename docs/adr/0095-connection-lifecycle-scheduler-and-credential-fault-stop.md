@@ -283,14 +283,31 @@ and the queue would stay. The alert would read
 `configuration fault (auth-challenge-refused); lane stopped, queue retained (#2083)`. Under
 `"dead_letter"` the one row dead-letters, or every member of a coalesced batch.
 
-A retry was the other choice, and it was not taken. `smart.py` maps the same refusal on the token
-hop to a retryable `DeliveryError`, because a token request carries no message body. A delivery
-does. urllib answers an endpoint's challenge only after a first send, so each retry would send the
-body once more with no credential. A retry also could not succeed until someone changes the peer or
-the connection.
+A retry was the other choice, and it was not taken. urllib answers an endpoint's challenge only
+after a first send, so each retry would send the message body once more with no credential. A retry
+also could not succeed until someone changes the peer or the connection.
 
-The cost is the one A.2 accepts for a credential stop. A peer that sends one bad challenge by
-mistake stops the lane until an operator reloads or restarts it. A stopped lane keeps every message.
+The token hop is left as it was. `smart.request_token` maps the same refusal to a retryable
+`DeliveryError`. So a bearer connection behind a Digest web proxy would get either outcome: a retry
+when the token must be minted, and a stop when a cached token lets the delivery hop meet the 407.
+That difference is open, and this amendment does not settle it.
+
+The costs, at least these:
+
+- A peer that sends one bad challenge by mistake would stop the lane until an operator reloads or
+  restarts it. A stopped lane keeps every message, which is the trade A.2 makes for a credential
+  stop.
+- "Every row would meet the same refusal" is weaker here than for FTP. An FTP refusal comes while
+  the session opens, before any message. An HTTP challenge answers one request, and a FHIR request
+  path is built per message. A peer that challenges one path differently would stop the lane on that
+  one row, and the row would stay at the head of the queue. `credential_fault_policy="dead_letter"`
+  is the way out.
+- The stop is not absolute where a stage dispatcher drains the lane (the pooled claim mode).
+  `RegistryRunner.notify_work` re-arms every stopped lane there, and a replay or a resend calls it.
+  The head row would then be sent once more before the lane stops again.
+- Under `"stop"` only the code reaches the operator. `_stop_lane_retaining` logs and alerts the
+  code, and the released row keeps no `last_error`. The fixed text shows on a test-connection, and
+  in `last_error` under `"dead_letter"`.
 
 The probe arms and the `FhirLookup` read are not deliveries, so they carry no fault marker. A probe
 raises a plain `DeliveryError`, and the read raises `FhirLookupError`. Both use the same fixed text.
