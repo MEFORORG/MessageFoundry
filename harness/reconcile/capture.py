@@ -45,7 +45,43 @@ log = logging.getLogger(__name__)
 
 
 class CaptureSink:
-    """Bind one or more MLLP ports, ACK every received message, and append each to a JSONL capture."""
+    """Bind one or more MLLP ports, ACK every received message, and append each to a JSONL capture.
+
+    ``anonymizer`` is an optional de-identifier (ADR 0030 §6). When set, each captured body passes
+    through it at the single ``_write`` choke point, so the JSONL carries de-identified bodies.
+    That is NOT a claim that they are PHI-free. docs/PHI.md section 9 lists what
+    ``anonymize_checked`` refuses, and what a clean return still lets through.
+
+    Before you share a capture, know at least this:
+
+    * The coverage report lists the addresses of fields no rule mapped. It does not cover every
+      field: the first MSH line is outside it, for one. The sink gets a string back and never
+      sees that report. Pass ``on_report`` yourself, and read the summary.
+    * The sink anonymizes each body once and keeps no raw copy. If the summary names a field
+      that carries PHI, discard the capture, add a rule for that field, and capture again.
+    * A tally covers one run, and the sink appends. A file that already held lines has bodies
+      that no summary covers.
+    * Each record's ``control_id`` is the MSH-10 the sink read before the anonymizer ran. It is
+      written as received.
+    * Any anonymizer error drops the message, and the sender still gets its ``AA``. A weak salt
+      is one such error, so check the salt before you start. Only ``anon_failed`` counts the
+      drops, so check that too.
+
+    For example::
+
+        from messagefoundry.anon import Keyer, anonymize_checked
+        from messagefoundry.anon.leak import CoverageTally
+
+        Keyer(salt)  # raises here on a weak salt, before any message is dropped
+        tally = CoverageTally()
+        sink = CaptureSink(out, anonymizer=lambda raw: anonymize_checked(
+            raw, salt=salt, on_report=tally.add))
+        ...  # run the capture, then after ``await sink.stop()``:
+        print(tally.summary(), file=sys.stderr)
+        print(f"dropped by the anonymizer: {sink.anon_failed}", file=sys.stderr)
+
+    ``tests/test_reconcile_capture.py`` runs that wiring.
+    """
 
     def __init__(
         self,
@@ -65,9 +101,9 @@ class CaptureSink:
         self._max_frame_bytes = resolve_max_frame_bytes(max_frame_bytes)
         self._ports = tuple(ports)
         self._ack_mode = ack_mode
-        # Optional de-identifier (ADR 0030 §6): when set, each captured message is anonymized at the
-        # single _write choke point so the persisted JSONL carries PHI-free bodies. Wire it as e.g.
-        # ``anonymizer=lambda raw: anonymize_checked(raw, salt=salt)``.
+        # Optional de-identifier (ADR 0030 §6), applied at the single _write choke point. The class
+        # docstring shows it wired as ``anonymize_checked`` with ``on_report``, and says what to
+        # check before sharing the capture.
         self._anonymizer = anonymizer
         self._servers: list[asyncio.Server] = []
         self._writers: set[asyncio.StreamWriter] = set()
