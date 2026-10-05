@@ -19,6 +19,7 @@ and for no other reason.
 from __future__ import annotations
 
 import datetime
+import inspect
 import ssl
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -334,6 +335,14 @@ def test_the_rest_ech_refusal_offers_only_a_lever_that_can_cross_it(pki: dict[st
     assert "Configure [tls].crl_file so the engine checks a CRL on this hop" in default
     assert "egress proxy" in default
     assert "tls_revocation_attested=true" in default
+
+
+def test_opener_is_a_required_keyword() -> None:
+    """A default of ``None`` is what let four destinations call the guard with no opener and be
+    refused with a CRL loaded. Required, a new caller that forgets it fails at the call."""
+    param = inspect.signature(rest.refuse_unrevoked_verified_hop).parameters["opener"]
+    assert param.default is inspect.Parameter.empty
+    assert param.kind is inspect.Parameter.KEYWORD_ONLY
 
 
 # --- which opener the guard is handed, by identity ------------------------------------------------

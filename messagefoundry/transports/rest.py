@@ -918,7 +918,7 @@ def refuse_unrevoked_verified_hop(
     connector: str,
     revocation_attested: bool = False,
     revocation_attested_reason: str | None = None,
-    opener: urllib.request.OpenerDirector | None = None,
+    opener: urllib.request.OpenerDirector | None,
     ways_across: str | None = None,
     connection: str | None,
 ) -> None:
@@ -942,7 +942,9 @@ def refuse_unrevoked_verified_hop(
     advice to configure the CRL it already has. **Callers that pass it must call this AFTER building
     the opener**, and after every later statement that replaces it or adds a handler to it.
 
-    Pass ``None`` in at least these cases:
+    It is REQUIRED, with no default, so a caller cannot leave it out by accident: a hop whose opener
+    carries a CRL would then be refused and told to configure the CRL it has (vault BACKLOG #2188).
+    Pass ``None`` on purpose, in at least these cases:
 
     - A caller whose hop rides the shared import-time opener, which can carry no CRL. Passing that
       opener gives the same answer.
