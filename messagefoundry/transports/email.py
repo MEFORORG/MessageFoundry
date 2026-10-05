@@ -168,8 +168,9 @@ def envelope_address_problem(address: str) -> str | None:
     bracketed address literal, which the character test already refuses, so a bare dotted quad
     names no mail domain (vault BACKLOG #2911, a Manager decision under the owner's driver rule).
     An all-digits test would not be enough: ``inet_aton`` reads ``10.0.0.0x1`` and ``0x7f000001``
-    as IPv4 addresses too. No top-level domain starts with a digit, so the letter test refuses
-    every such form and no real domain."""
+    as IPv4 addresses too. No public top-level domain starts with a digit, so the letter test
+    refuses every such form and no public domain. A private DNS name whose last label starts with
+    a digit is refused too."""
     if parseaddr(address)[1] != address:
         return "does not read back as the same address"
     local, at, domain = address.rpartition("@")

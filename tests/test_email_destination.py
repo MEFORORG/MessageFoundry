@@ -893,7 +893,7 @@ def _sender_shapes() -> dict[str, str]:
 
 #: Domains of hostname characters in a shape no mail domain takes, mapped to the words of the refusal.
 #: Each passed the address rule before vault BACKLOG #2911, which tested the domain's characters
-#: alone. The unit test below takes every shape; the shared tables take two (see _DOMAIN_ON_THE_WIRE).
+#: alone. The unit test below takes every shape; the shared tables take a few (_DOMAIN_ON_THE_WIRE).
 _DOMAIN_SHAPES = {
     "domain-trailing-dot": ("a@example.org.", "empty label"),
     "domain-double-dot": ("a@example..org", "empty label"),
@@ -920,9 +920,9 @@ _DOMAIN_CONTROLS = [
 ]
 
 #: The domain shapes the shared tables carry, so every cell that reads them (Email, Direct, alert
-#: mail) is shown to refuse one before any connection. Every cell calls the same rule, so two
-#: shapes show the call; the unit test proves each shape. The dotted quad is the decided one, and the
-#: hex form is the one an all-digits test would have missed.
+#: mail) is shown to refuse one before any connection. Every cell calls the same rule, so these
+#: three show the call; the unit test proves each shape. The dotted quad is the decided one, and
+#: the hex form is the one an all-digits test would have missed.
 _DOMAIN_ON_THE_WIRE = {
     k: _DOMAIN_SHAPES[k][0]
     for k in ("domain-trailing-dot", "domain-dotted-quad", "domain-hex-last-part")
@@ -1037,6 +1037,16 @@ def test_a_trailing_dot_recipient_never_matched_the_recipient_domain_list() -> N
     assert "allowed_recipient_domains" in str(refused.value)
     # Control: the same domain without the dot passes, so the refusal above is the dot.
     check_egress_allowed(_email_dest("smtp.hospital.example", recipients=["a@example.org"]), e)
+
+
+def test_a_listed_hex_ip_domain_is_refused_by_the_shape_rule_at_the_gate() -> None:
+    # The list's own validator accepts this entry, so before vault BACKLOG #2911 the recipient
+    # matched it and passed the gate. Only the shape rule refuses it, which the reason pins.
+    address = _DOMAIN_SHAPES["domain-hex-last-part"][0]
+    e = _relay_listed([address.rpartition("@")[2]])
+    dest = _email_dest("smtp.hospital.example", recipients=[address])
+    with pytest.raises(WiringError, match="start with a letter"):
+        check_egress_allowed(dest, e)
 
 
 def test_recipient_domains_do_not_gate_direct() -> None:

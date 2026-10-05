@@ -1985,7 +1985,7 @@ report, plain text); this connector delivers it to `host:port` from `sender` to 
 | Param | Type | Default | Notes |
 |---|---|---|---|
 | `host` | str / `env()` | — (required) | SMTP server host. |
-| `sender` | str / `env()` | — (required) | `From:` address, and the envelope sender (`MAIL FROM`) that bounces go to. It must be one plain `local@domain` under the same rule as each recipient, so a display name, a group or an encoded word is refused at load. Its domain is not checked against `[egress].allowed_recipient_domains`. |
+| `sender` | str / `env()` | — (required) | `From:` address, and the envelope sender (`MAIL FROM`) that bounces go to. It must be one plain `local@domain` under the same rule as each recipient, so a display name, a group or an encoded word is refused at load. The full address rule, the domain's shape included, is in [CONFIGURATION.md `[egress]`](CONFIGURATION.md#egress). Its domain is not checked against `[egress].allowed_recipient_domains`. |
 | `recipients` | list[str] / str / `env()` | — (required) | `To:` address(es). An `env()` may be the whole value; one inside the list is refused at load. An entry with a line break is refused at load too. |
 | `port` | int / `env()` | `587` | `587` = STARTTLS submission; `465` = implicit TLS (`SMTP_SSL`). |
 | `subject` | str / `env()` | `""` | Static subject (a per-message subject is a Phase-2 follow-up). |
