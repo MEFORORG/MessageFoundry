@@ -690,6 +690,35 @@ async def test_local_sessions_and_signed_out_users_are_never_probed() -> None:
         await store.close()
 
 
+async def test_a_user_whose_only_session_is_idle_is_not_probed() -> None:
+    """BACKLOG #2283: the validator refuses an idle-dead session, so it is not a live session and
+    must not cost a directory bind. A session one minute inside the idle window is the control."""
+    import time
+
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap({"idler": _principal("idler"), "active": _principal("active")})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        idle = service.session_idle_seconds
+        now = time.time()
+        for username, last_used in (("idler", now - idle - 60), ("active", now - idle + 60)):
+            await store.create_user(
+                user_id=username, username=username, auth_provider="ad", password_generated=False
+            )
+            await store.create_session(
+                token_hash=f"{username}-hash",
+                user_id=username,
+                expires_at=now + 3600,
+                now=last_used,
+            )
+
+        await service.reconcile_directory_sessions()
+        assert ldap.probes == ["active"], "an account holding only an idle session was probed"
+    finally:
+        await store.close()
+
+
 async def test_a_pass_never_exceeds_its_bind_budget() -> None:
     """Directory-load bound: a pass costs one bind per probed principal, so a large estate must
     degrade to a longer effective interval rather than a bind storm."""

@@ -5088,7 +5088,10 @@ class AuthService:
                 # passes keeps its "already reported" mark and is not reported again on its next
                 # sign-in.
                 still_unkeyed.add(user.id)
-            if not await self._store.list_sessions(user.id):
+            # With the validator's idle timeout (BACKLOG #2283), so an account whose only sessions
+            # are idle-dead costs no directory bind. Such a row comes back only if the idle setting
+            # is raised, and the next pass then sees it live and probes it.
+            if not await self._store.list_sessions(user.id, idle_seconds=self.session_idle_seconds):
                 continue
             if is_unkeyed:
                 # BACKLOG #2027 (ADR 0184 AC-5): never probed by name. Filtered HERE rather than
@@ -5739,6 +5742,11 @@ class AuthService:
         fully signed-in device by signing in over and over (BACKLOG #2076). A pending sign-in gets
         no shorter life: a user who must enrol a factor does it on that session.
 
+        That caller can still push the real user's own pending sign-in out of the pending group,
+        and that stands (BACKLOG #2283). Until the factor is proven the two sign-ins are the same
+        to the engine, so no rank can favour one. The user loses a half-finished sign-in and signs
+        in again, while the caller holding the password gains no access from it.
+
         The price is a bound of twice the cap. If the user later stops owing a factor (MFA turned
         off, the last factor removed, a role change under the administrators scope), the pending
         rows count as full ones until the next cap run, which then keeps the newest ``cap``.
@@ -5911,12 +5919,17 @@ class AuthService:
         committed its own writes (an enabled factor, stored recovery codes, a consumed code), so an
         exception would strand the user with neither token and lose recovery codes they never saw.
         Skipping one cap run costs at most one session over the cap until the next sign-in runs it.
+
+        **The catch is broad on purpose (BACKLOG #2283).** Every call inside is a store read or
+        write, and each backend raises its own driver's errors, which ``auth/`` may not import, as
+        the first-seen login-address read says. A cancellation is not an ``Exception``, so it still
+        propagates.
         """
         try:
             session = await self._store.get_session(hash_token(token))
             if session is not None:
                 await self._enforce_session_cap(session.user_id)
-        except Exception:
+        except Exception:  # noqa: BLE001 -- driver errors vary by backend; see the docstring
             _log.exception("session cap after a completed second factor failed; skipped this run")
 
     async def identity_for_token(
@@ -9529,6 +9542,9 @@ class AuthService:
         for user in await self._store.list_users():
             if user.auth_provider != AuthProvider.AD.value or user.disabled:
                 continue
+            # No idle timeout here, unlike the reconciler (BACKLOG #2283). Revoking costs no
+            # directory bind, and an idle row left unrevoked would come back on the old mapping if
+            # the idle setting were later raised.
             if not await self._store.list_sessions(user.id):
                 continue
             revoked += await self._store.revoke_user_sessions(user.id)
