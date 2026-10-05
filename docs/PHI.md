@@ -1866,7 +1866,11 @@ refuses.
 **A keep on a field the default rules scrub turns that scrub off.** Keeping `PID-5` to clear a
 refusal leaves the patient name in the output as captured. `load_rules` logs a WARNING for each
 such field. The line names the field and the kind of scrub it lost, never a value. A keep on a
-field with no default rule logs nothing.
+field with no default rule logs nothing. `python -m tee anonymize-captures` also prints one
+`warning:` line that lists those fields, and `--log-level` cannot hide it.
+
+**The tee reads the overlay once, before the first message.** An overlay it cannot read or parse,
+or one that breaks the schema, refuses the whole run with one `error:` line and writes no dataset.
 
 **Expect it to refuse conformant traffic until the rule map is finished.** The measured corpus
 came from `messagefoundry generate --count 2 --seed 1710`, run for every type: 186 messages. With
