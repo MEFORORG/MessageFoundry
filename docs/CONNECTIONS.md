@@ -2369,6 +2369,20 @@ blocks**: your authorization server registers the scopes it will grant, and a re
 take a working feed offline. It also stays quiet when a request is too *narrow* — that is a correctness
 question, and asking for a letter the server never registered fails the token request outright.
 
+**Wildcard scope and audience.** `check` also prints an advisory `oauth-request` line (vault BACKLOG
+#2334). It names three things, on both composers:
+
+- a wildcard token in an `oauth2_scope`, such as `*` or `claims.*`. A named scope is never graded,
+  because that vocabulary belongs to your partner.
+- a `smart_audience` that is not the token URL.
+- an `oauth2_audience` that is a URL on a different scheme, host or port from the connection's `url`.
+  An audience that is not a URL is an opaque API identifier, and is never graded.
+
+Each of these can be a correct setup, so the line **never blocks**. It compares literal values only.
+`check` does not resolve `env()`, so the line also names every setting it could not compare. The
+examples in this file write the endpoint and token URLs as `env()`, so an audience on a connection
+written that way is listed as not compared. Read that list as "not checked", not as "clean".
+
 Put **every** secret in `env()` (`token_url`/`client_id`/`private_key`/`private_key_password`); the minted
 access token and `client_assertion` are runtime-only — never logged or persisted. (The signing key comes
 from `MEFOR_VALUE_*`, so a SMART outbound isn't shipped as a loaded `samples/config` route — adapt the

@@ -73,6 +73,9 @@ So is ``smart-scope`` (#1159, ASVS 10.2.3) — it names every SMART-authenticate
 requested ``smart_scope`` asks for permission letters the connection's declared ``interaction`` cannot
 spend. Advisory because a SMART authorization server registers scopes per app and MAY grant a subset of
 what is requested, so refusing a requested string risks taking a working clinical feed offline.
+So is ``oauth-request`` (vault BACKLOG #2334, ASVS 10.2.3) — it names a wildcard ``oauth2_scope``, and a
+``smart_audience`` or ``oauth2_audience`` that does not match its endpoint. It compares literal values
+only, so it also names every setting it could not compare because a value is an ``env()`` reference.
 So is ``oidc-auth-params`` (#1159, ASVS 10.2.3) — the relying-party half of that same verb. It reports
 the ``[auth]`` authorization parameters the federated login sends that nothing else screens: the
 ``oidc_scopes`` / ``oidc_username_claim`` pair, ``oidc_acr_values`` against ``oidc_required_acr_values``,
@@ -277,6 +280,9 @@ def run_checks(
         # #1159 / ASVS 10.2.3: name every SMART connection asking for more FHIR authority than its
         # declared interaction can spend. Advisory, and a refusal was ruled out — see the check.
         _check_smart_scope(config_dir),
+        # vault BACKLOG #2334 / ASVS 10.2.3: the three OAuth request settings no rule read, a wildcard
+        # oauth2_scope and an audience that is not its endpoint. Advisory -- see the check.
+        _check_oauth_request(config_dir),
         # #1159 / ASVS 10.2.3, the relying-party half of the same verb: the authorization parameters
         # the OIDC login sends that nothing else screens. Advisory — see the check.
         _check_oidc_auth_params(
@@ -2563,13 +2569,15 @@ def _check_smart_scope(config_dir: str | Path) -> CheckResult:
     **It computes a requirement from the connection's declared shape and compares the request against
     it** — :func:`~messagefoundry.config.wiring.overbroad_smart_scopes` — rather than pattern-matching
     a ``*`` character in the scope string. A character match would let an over-broad NON-wildcard scope
-    on a create-only connection pass unremarked while reading as a control.
+    on a create-only connection pass unremarked while reading as a control. That holds for
+    ``smart_scope``, where a shape exists to compute from. The generic OAuth2 leg has none, so its
+    line, :func:`_check_oauth_request`, can only name a wildcard, and says that is all it reads.
 
     What it deliberately stays quiet about is in that function's docstring: under-grant, the resource
     half of the scope, ``transaction``/``batch``, a plain ``Rest()`` with SMART auth, an unparseable
-    scope vocabulary, and the generic OAuth2 leg. Each silence is a case where computing a requirement
-    would be guessing, and an advisory that fires on a valid configuration teaches operators to ignore
-    it.
+    scope vocabulary, and the generic OAuth2 leg, which ``oauth-request`` reads instead. Each silence
+    is a case where computing a requirement would be guessing, and an advisory that fires on a valid
+    configuration teaches operators to ignore it.
 
     It states the clean case out loud rather than going quiet, on the ``alert-smtp-tls`` convention, so
     a passing line is never confused with a check that did not run. SKIPs when the graph will not load
@@ -2606,6 +2614,54 @@ def _check_smart_scope(config_dir: str | Path) -> CheckResult:
             "(SMART v2: c=create, r=read, u=update, d=delete, s=search)"
         ),
     )
+
+
+def _check_oauth_request(config_dir: str | Path) -> CheckResult:
+    """Name a wildcard ``oauth2_scope``, and a ``smart_audience`` or ``oauth2_audience`` that does not
+    match its endpoint (vault BACKLOG #2334, ASVS 10.2.3).
+
+    These three settings reached the wire through one ``str(...)`` conversion with no rule reading
+    them. ``smart-scope`` covers ``smart_scope`` only. The three rules and their deliberate silences
+    are in :func:`~messagefoundry.config.wiring.oauth_request_advisories`, the single reader.
+
+    **Advisory (``required=False``).** Each finding can be a correct configuration: a partner may
+    register only a wildcard scope, and a server may document an audience that is not its endpoint.
+    So the line reports and never refuses, under any ``[security].enforcement``.
+
+    **It says what it did not look at.** The reader compares literal values only, and an ``env()``
+    reference is unresolved here. A quiet line on such a configuration is not a clean one, so every
+    setting the reader could not compare is named. It states the clean case out loud, and SKIPs when
+    the graph will not load, the same convention as its siblings."""
+    from messagefoundry.config.wiring import WiringError, load_config, oauth_request_advisories
+
+    name = "oauth-request"
+    try:
+        registry = load_config(config_dir)
+    except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
+        return CheckResult(
+            name, ok=True, required=False, skipped=True, detail=f"config did not load: {exc}"
+        )
+    read = oauth_request_advisories(registry)
+    if read.findings:
+        listed = "; ".join(f"{conn}: {reason}" for conn, reason in read.findings)
+        detail = (
+            f"{len(read.findings)} OAuth request setting(s) are worth a second look: {listed}. "
+            "A wildcard scope asks for everything in its namespace, so name the scopes the feed "
+            "uses. An audience that differs from its endpoint is correct only when the "
+            "authorization server documents that audience"
+        )
+    else:
+        detail = (
+            "no OAuth2 connection requests a wildcard scope, and no audience that could be compared "
+            "differs from its endpoint"
+        )
+    if read.not_compared:
+        skipped = "; ".join(f"{conn} ({reason})" for conn, reason in read.not_compared)
+        detail += (
+            f". NOT COMPARED: {len(read.not_compared)} setting(s), because check reads literal "
+            f"values and does not resolve env(): {skipped}"
+        )
+    return CheckResult(name, ok=True, required=False, detail=detail)
 
 
 def _check_static_credentials(
