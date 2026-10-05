@@ -1917,6 +1917,8 @@ def test_the_gate_fold_table_holds_every_character_case_insensitive_matching_rea
     expected = {0x0130, 0x0131, 0x017F, 0x212A}
     found = {ord(c) for c in measured}
     assert expected <= found, f"the scan found {sorted(f'U+{cp:04X}' for cp in found)}"
+    # The same floor, counted on the mapping the absence assertion below walks.
+    assert len(measured) >= len(expected), f"the scan found only {len(measured)} fold character(s)"
     table = dict(scrub_mod._GATE_FOLDS)
     missing = {
         f"U+{ord(c):04X}->{letter}" for c, letter in measured.items() if table.get(c) != letter
