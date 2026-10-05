@@ -3,8 +3,9 @@
 """A log value holding a Unicode line separator stays ONE record in both log tail readers (vault
 BACKLOG #2563).
 
-``scrub_control_chars`` escapes C0 and DEL only, so U+0085, U+2028 and U+2029 reach the log file as
-themselves. ``str.splitlines`` ends a line at each of them, and at VT, FF and U+001C to U+001E too.
+``scrub_control_chars`` escaped C0 and DEL only until vault BACKLOG #2815, so U+0085, U+2028 and
+U+2029 reached the log file as themselves, and a line written before that or by another tool still
+can. ``str.splitlines`` ends a line at each of them, and at VT, FF and U+001C to U+001E too.
 Both readers used it: the web console viewer (``api.app._read_log_tail``) and the support bundle
 (``support.bundle._log_tail``, then ``redact_log_text`` a second time). So one logged value holding
 one of them showed as two records. The readers now split with ``split_log_lines``.
@@ -30,7 +31,8 @@ from messagefoundry.support.redact import (
 )
 
 #: Every code point ``str.splitlines`` ends a line at that is NOT a line ending of the log file.
-#: The first three pass ``scrub_control_chars`` unescaped, which is the audit's forged-line case.
+#: The first three passed ``scrub_control_chars`` unescaped before vault BACKLOG #2815, which is the
+#: audit's forged-line case.
 #: The C0 ones are escaped at write time; they are here so a foreign-written line cannot split either.
 _NOT_A_LINE_END = [chr(cp) for cp in (0x85, 0x2028, 0x2029, 0x0B, 0x0C, 0x1C, 0x1D, 0x1E)]
 _LINE_SEPARATOR = chr(0x2028)

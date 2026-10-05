@@ -1725,39 +1725,54 @@ def test_serve_time_sync_ok_within_threshold_starts_clean(
 # one copy silently does not apply to the other, and nothing reports the omission.
 #
 # These tests pin the RELATIONSHIP rather than either set's contents, which is what survives a
-# deliberate widening: widen `_is_control_char` and the table follows automatically, and if it does
+# deliberate widening: widen `_is_control_char` and the log follows automatically, and if it does
 # not, the first test goes red naming the code points that drifted.
 #
 # The table and the function both moved from `logging_setup` into `controlchars` on BACKLOG #1591;
 # that module's docstring says why. These tests import from the new home.
+#
+# THE RELATIONSHIP CHANGED ON VAULT BACKLOG #2815, OPENLY. The log alphabet used to be EXACTLY
+# `_is_control_char` minus tab. It is now that set plus `controlchars.CONTROL_CATEGORIES`, minus
+# tab, because C1, the bidirectional controls and U+2028/U+2029 reached the log file raw.
+# `controlchars._escapes_in_a_log_line` says why the refusal predicate itself was not widened.
+
+#: Past U+FFFF, one code point from each category the log escapes there, and two it must not.
+_ASTRAL_SAMPLE = (0xE0001, 0xF0000, 0x10FFFF, 0x1F600, 0x20000)
 
 
-def test_the_log_escape_table_is_the_controlchars_alphabet_minus_tab() -> None:
-    """The whole of limb 3, as one assertion about the DIFFERENCE.
+def test_the_log_alphabet_is_the_controlchars_alphabet_plus_the_control_categories_minus_tab() -> (
+    None
+):
+    """The whole relationship, as assertions about DIFFERENCES, over the shipped function.
 
-    Not "the table has 32 entries" -- that pins a number and would have to be edited by whoever
-    widens the alphabet, which is precisely the person who should be told rather than asked to
-    update a constant. This pins the SUBTRACTION, so a legitimate widening passes untouched and a
+    Not "the log escapes N code points" -- that pins a number and would have to be edited by
+    whoever widens an alphabet, which is precisely the person who should be told rather than asked
+    to update a constant. A legitimate widening of either source passes untouched, and a
     divergence names its own code points.
     """
-    from messagefoundry.controlchars import _CTRL_TRANSLATION, _is_control_char
+    import unicodedata
 
-    # RANGE 0x100, matching the table's own build range. It used to stop at 0x80, which made this
-    # test assert the opposite of what it claims: widen `_is_control_char` to C1 (the deliberate
-    # change the module exists to make cheap) and the table follows, `alphabet` does not, and the
-    # second assertion fails saying controlchars had been widened alone -- naming the wrong side.
-    alphabet = {cp for cp in range(0x100) if _is_control_char(chr(cp))}
-    escaped = set(_CTRL_TRANSLATION)
+    from messagefoundry.controlchars import (
+        CONTROL_CATEGORIES,
+        _is_control_char,
+        scrub_control_chars,
+    )
 
-    assert alphabet - escaped == {0x09}, (
-        f"the log escape table and controlchars have drifted: "
-        f"{sorted(hex(c) for c in (alphabet - escaped) - {0x09})} are screened as control "
-        f"characters but not escaped in a log line"
+    domain = [*range(0x10000), *_ASTRAL_SAMPLE]
+    screened = {cp for cp in domain if _is_control_char(chr(cp))}
+    categories = {cp for cp in domain if unicodedata.category(chr(cp)) in CONTROL_CATEGORIES}
+    escaped = {cp for cp in domain if scrub_control_chars(chr(cp)) != chr(cp)}
+
+    wanted = (screened | categories) - {0x09}
+    missing = sorted(hex(c) for c in wanted - escaped)
+    extra = sorted(hex(c) for c in escaped - wanted)
+    assert not missing and not extra, (
+        f"the log alphabet has drifted from controlchars plus CONTROL_CATEGORIES, minus tab: "
+        f"{missing} pass a log line raw, and {extra} are escaped though neither source names them "
+        f"-- one side has been widened or narrowed alone"
     )
-    assert not escaped - alphabet, (
-        f"the log table escapes {sorted(hex(c) for c in escaped - alphabet)}, which controlchars "
-        f"does not treat as control characters -- one of the two has been widened alone"
-    )
+    # Inside ASCII the log and the refusals still agree, so the widening is only past ASCII.
+    assert {cp for cp in escaped if cp < 0x80} == screened - {0x09}
 
 
 def test_tab_is_the_only_control_character_left_intact() -> None:
@@ -1774,6 +1789,7 @@ def test_tab_is_the_only_control_character_left_intact() -> None:
     assert _CTRL_TRANSLATION[0x0D] == "\\r", "CR is the injection vector and must be escaped"
     assert _CTRL_TRANSLATION[0x00] == "\\x00"
     assert _CTRL_TRANSLATION[0x7F] == "\\x7f", "DEL is in the alphabet and must still be escaped"
+    assert _CTRL_TRANSLATION[0x85] == "\\x85", "NEL ends a line for str.splitlines (#2815)"
 
 
 def test_a_tab_survives_the_real_scrub_and_a_newline_does_not() -> None:
@@ -1787,6 +1803,148 @@ def test_a_tab_survives_the_real_scrub_and_a_newline_does_not() -> None:
     assert "\t" in scrubbed, "the tab was escaped; a log line lost its benign whitespace"
     assert "\n" not in scrubbed, "a real newline survived; one record can now forge a second line"
     assert scrubbed == "before\tafter\\nnext"
+
+
+# --- vault BACKLOG #2815: every sink configure_logging installs escapes the wider alphabet -------
+
+#: One or more code points from each class #2815 names. Built from integers, so no editor or diff
+#: tool can show or rewrite one as a line break, a space or a reordering.
+_LOG_ESCAPED_CLASSES = {
+    "c1": (0x85, 0x9B),
+    "bidi": (0x200E, 0x200F, *range(0x202A, 0x202F), *range(0x2066, 0x206A), 0x061C),
+    "separator": (0x2028, 0x2029),
+    # A lone surrogate made every UTF-8 or cp1252 sink fail the write before #2815.
+    "surrogate": (0xDCFF,),
+}
+
+#: Ordinary non-ASCII text that must reach the log unchanged: Latin-1 and Latin Extended letters,
+#: Greek, and CJK. The control for every escape assertion below.
+_PLAIN_NON_ASCII = "Ångström café Müller Łódź Ελλάδα 東京 서울"
+
+
+def _write_one_record_through_every_sink(
+    fmt: str, text: str, tmp_path: Any, capsys: pytest.CaptureFixture[str]
+) -> list[str]:
+    """Configure logging as ``serve`` does, with the opt-in log file, log ``text`` in the message
+    AND in an exception, and return what each sink received: stdout, then the file.
+
+    EACH HANDLER GETS ITS OWN FRESH RECORD. A filter rewrites the record in place, so a record
+    dispatched through the logger reaches the file handler already escaped by the stdout handler's
+    chain, and the file assertions would pass with no chain on the file handler at all."""
+    from messagefoundry.logging_setup import LogFile
+
+    log_path = tmp_path / "engine.log"
+    configure_logging("INFO", fmt=fmt, log_file=LogFile(path=str(log_path)))
+    logger = logging.getLogger("messagefoundry.test2815")
+    try:
+        raise ValueError(f"exception said {text}")
+    except ValueError:
+        exc_info = sys.exc_info()
+    handlers = logging.getLogger().handlers
+    assert len(handlers) == 2, handlers
+    for handler in handlers:
+        record = logger.makeRecord(
+            logger.name, logging.ERROR, __file__, 0, "message said %s", (text,), exc_info
+        )
+        handler.handle(record)
+        handler.flush()
+    # newline="" keeps a raw CR as a CR, so a separator test can see one.
+    return [capsys.readouterr().out, log_path.read_text(encoding="utf-8", newline="")]
+
+
+def _assert_logged(fmt: str, out: str, shown: str) -> None:
+    """``out`` holds one record whose message and exception both read ``... said <shown>``."""
+    if fmt == "json":
+        (record,) = (json.loads(line) for line in out.splitlines() if line)
+        assert record["message"] == f"message said {shown}"
+        assert f"exception said {shown}" in record["exception"]
+    else:
+        assert f"message said {shown}" in out
+        assert f"exception said {shown}" in out
+
+
+@pytest.mark.parametrize("fmt", ["text", "json"])
+@pytest.mark.parametrize("kind", sorted(_LOG_ESCAPED_CLASSES))
+def test_every_configured_sink_escapes_the_wider_log_alphabet(
+    fmt: str, kind: str, tmp_path: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Before #2815 every one of these reached stdout and the log file raw, in both formats: the
+    scrub escaped C0 and DEL only, and ``json.dumps(ensure_ascii=False)`` escapes C0 only. The
+    expected spelling comes from the ``unicode_escape`` codec, not from the module under test."""
+    codes = _LOG_ESCAPED_CLASSES[kind]
+    text = "start" + "".join(chr(c) for c in codes) + "end"
+    shown = "start" + "".join(chr(c).encode("unicode_escape").decode() for c in codes) + "end"
+    outputs = _write_one_record_through_every_sink(fmt, text, tmp_path, capsys)
+    for sink, out in zip(("stdout", "file"), outputs, strict=True):
+        raw = [hex(c) for c in codes if chr(c) in out]
+        assert not raw, f"{fmt} {sink}: {raw} reached the sink raw"
+        _assert_logged(fmt, out, shown)
+
+
+@pytest.mark.parametrize("fmt", ["text", "json"])
+def test_ordinary_non_ascii_text_reaches_every_sink_unchanged(
+    fmt: str, tmp_path: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The control for the test above: the wider alphabet is control characters, not non-ASCII."""
+    for out in _write_one_record_through_every_sink(fmt, _PLAIN_NON_ASCII, tmp_path, capsys):
+        _assert_logged(fmt, out, _PLAIN_NON_ASCII)
+
+
+def test_the_c0_escape_is_unchanged_by_the_wider_alphabet() -> None:
+    """C0 and DEL are escaped exactly as before #2815, written out independently of the table:
+    CR and LF readable, tab kept, every other one ``\\xNN``, and printable ASCII untouched."""
+    from messagefoundry.controlchars import scrub_control_chars
+
+    for code in range(0x80):
+        char = chr(code)
+        if char == "\n":
+            expected = "\\n"
+        elif char == "\r":
+            expected = "\\r"
+        elif char == "\t" or 0x20 <= code < 0x7F:
+            expected = char
+        else:
+            expected = f"\\x{code:02x}"
+        assert scrub_control_chars(char) == expected, hex(code)
+
+
+def test_the_self_filling_table_is_bounded_and_decides_past_its_bound() -> None:
+    """The BMP is remembered; past U+FFFF at most ``_ASTRAL_MEMO_LIMIT`` code points are, and one
+    past the bound is still decided correctly. A fresh table, so no earlier test's fill hides the
+    first-lookup path. Membership is read with ``in``, which never calls ``__missing__``."""
+    from messagefoundry.controlchars import (
+        _ASTRAL_MEMO_LIMIT,
+        _CTRL_TRANSLATION,
+        _LogTranslation,
+    )
+
+    table = _LogTranslation(_CTRL_TRANSLATION)
+    assert chr(0x2028).translate(table) == "\\u2028"
+    assert 0x2028 in table
+    assert "A".translate(table) == "A"
+    astral = range(0x10000, 0x10000 + _ASTRAL_MEMO_LIMIT + 2)
+    for code in astral:
+        chr(code).translate(table)
+    assert sum(1 for code in table if code > 0xFFFF) == _ASTRAL_MEMO_LIMIT
+    over = astral[-1]
+    assert over not in table
+    assert chr(0xE0001).translate(table) == "\\U000e0001"  # a tag character, past the bound
+    assert chr(over).translate(table) == chr(over)
+
+
+def test_a_new_record_cannot_carry_a_separator_into_the_log_file(
+    tmp_path: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Every ``str.splitlines`` line end except LF reaches the file escaped, so a reader that splits
+    with it -- the tray's View Log, a shipper, a viewer drawing U+2028 as a break -- sees one record
+    per line for records written from here on. A line already in a file, or written by another
+    tool, is unaffected; the in-engine readers still split with ``split_log_lines`` for that."""
+    from tests.test_log_tail_line_split import _NOT_A_LINE_END
+
+    breaks = "".join(_NOT_A_LINE_END) + "\r"
+    _stdout, file_text = _write_one_record_through_every_sink("text", breaks, tmp_path, capsys)
+    # The file was read with newline="", so a raw CR survives; CRLF counts once either way.
+    assert len(file_text.splitlines()) == file_text.count("\n")
 
 
 # --- BACKLOG #1572: the installed chain must scrub a CUSTOM-delimiter body --------------------------

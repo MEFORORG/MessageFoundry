@@ -54,7 +54,7 @@ the interface is already disabled the event cannot fire, so no hook is installed
 paid.
 
 No engine state. It imports the standard library and ``messagefoundry.controlchars``, which
-imports nothing, so any package may import it.
+imports only the standard library, so any package may import it.
 """
 
 from __future__ import annotations
@@ -153,8 +153,10 @@ def _ascii(name: str) -> str:
     named with the six characters of an escape is not logged the same as the character that
     escape stands for.
 
-    This covers this module's one line. A lone surrogate in any other log line fails the same two
-    sinks the same way.
+    This covers this module's one line. A lone surrogate in any other log line failed the same two
+    sinks the same way until vault BACKLOG #2815; the handlers' log escape now escapes it as
+    ``\\udcff``. A printable character a sink cannot encode is not in that escape's alphabet, so
+    this function is still what keeps such a name on a strict standard output.
     """
     return name.encode("unicode_escape").decode("ascii")
 

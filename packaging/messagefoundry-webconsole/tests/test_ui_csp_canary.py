@@ -437,6 +437,54 @@ async def test_only_all_canary_batches_are_silenced(
             assert not [rec for rec in caplog.records if rec.levelno >= logging.WARNING]
 
 
+#: What a report sender can put in a summarised field that a reader of the log would act on: an
+#: 8-bit CSI, NEL, a right-to-left override and isolate, and the Unicode line separator. Built from
+#: integers so no editor shows one as a break or a reordering. ESC is the C0 control.
+_REPORT_HOSTILE = tuple(chr(c) for c in (0x1B, 0x9B, 0x85, 0x202E, 0x2066, 0x2069, 0x2028))
+
+
+@pytest.mark.parametrize("fmt", ["text", "json"])
+async def test_a_hostile_report_reaches_the_log_escaped(
+    engine: Engine, caplog: pytest.LogCaptureFixture, fmt: str
+) -> None:
+    """Vault BACKLOG #2815, end to end. The route is public, and ``_csp_report_summary`` copies a
+    field into the WARNING verbatim, so the sender chooses characters in the log line. Through the
+    filters every configured handler carries, none of them reaches the sink raw, in either format.
+    Before #2815 only ESC was escaped."""
+    import io
+
+    from messagefoundry.logging_setup import _install_phi_filters, _make_formatter
+
+    sink = io.StringIO()
+    handler = logging.StreamHandler(sink)
+    handler.setFormatter(_make_formatter(fmt))
+    _install_phi_filters(handler)
+    route_log = logging.getLogger("messagefoundry_webconsole.routes.core")
+    route_log.addHandler(handler)
+    service = await _service(engine)
+    try:
+        # Set the level as the sibling tests do, so an ambient level cannot drop the WARNING.
+        async with _client(engine, service, scheme="https") as c:
+            with caplog.at_level(logging.WARNING, logger="messagefoundry_webconsole.routes.core"):
+                r = await c.post(
+                    "/ui/csp-report",
+                    json={
+                        "csp-report": {
+                            "blocked-uri": "inline",
+                            "document-uri": "".join(_REPORT_HOSTILE),
+                        }
+                    },
+                )
+            assert r.status_code == 204
+    finally:
+        route_log.removeHandler(handler)
+    written = sink.getvalue()
+    assert "CSP violation report" in written, (
+        "the probe never reached the sink, so it proves nothing"
+    )
+    assert [hex(ord(ch)) for ch in _REPORT_HOSTILE if ch in written] == []
+
+
 # --- the documented degrade contract --------------------------------------------------------------
 
 

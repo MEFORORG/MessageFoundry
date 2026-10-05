@@ -1336,7 +1336,10 @@ installed by `_install_phi_filters`, reached through `configure_logging` in the 
    scrubbed or carry a written reason
    (`tests/test_logging_credential_scrub.py`). **Usernames are deliberately out of scope** — see
    the residual note on stream 4 below.
-4. **`ControlCharScrubFilter`** — CR/LF + C0/DEL escaping (log-injection defence, ASVS 16.4.1).
+4. **`ControlCharScrubFilter`** — escapes CR/LF and the rest of the log alphabet, which includes at
+   least the C1 controls, the bidirectional controls and U+2028/U+2029 (log-injection defence, ASVS
+   16.4.1). The alphabet is stated once, in `_escapes_in_a_log_line` in
+   [`controlchars.py`](../messagefoundry/controlchars.py); read it there.
 
 `redact()` rewrites only HL7-shaped spans plus date/DOB runs and multi-token name runs, so ordinary
 operational lines are untouched. This makes `safe_exc()` (above) the explicit chokepoint and the global
@@ -1399,8 +1402,9 @@ false` is the explicit opt-out. The full knob set is `forward_host`/`_port`/`_pr
 `forward_hop_attested`/`forward_hop_attested_reason`. The forwarder is wired in
 [`logging_setup.configure_logging`](../messagefoundry/logging_setup.py), and the **same four handler
 filters** above are installed on **every** sink, so the forwarded stream carries the identical
-PHI-redaction + log-injection guarantees as stdout; `json.dumps` additionally escapes control characters
-so a record can't break the one-line-per-record framing — JSON is therefore the recommended (and
+PHI-redaction + log-injection guarantees as stdout. `json.dumps` additionally escapes the C0 controls
+so a record can't break the one-line-per-record framing; it leaves the C1 controls and U+2028/U+2029
+raw, which is why filter 4 escapes them first. JSON is therefore the recommended (and
 default) off-box `forward_format`; the `text` format is best-effort framing (a multi-line traceback
 spans lines).
 
