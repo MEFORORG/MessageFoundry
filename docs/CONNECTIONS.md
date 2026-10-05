@@ -2403,9 +2403,10 @@ question, and asking for a letter the server never registered fails the token re
   never graded.
 
 Each of these can be a correct setup, so the line **never blocks**. It compares literal values only.
-`check` does not resolve `env()`, so the line also names every setting it could not compare. The
-examples in this file write the endpoint and token URLs as `env()`, so an audience on a connection
-written that way is listed as not compared. Read that list as "not checked", not as "clean".
+`check` does not resolve `env()`, so the line also names every setting it could not compare, each
+with its reason. The examples in this file write the endpoint and token URLs as `env()`, so a URL
+audience on a connection written that way is listed as not compared. Read that list as "not
+checked", not as "clean".
 
 Put **every** secret in `env()` (`token_url`/`client_id`/`private_key`/`private_key_password`); the minted
 access token and `client_assertion` are runtime-only — never logged or persisted. (The signing key comes

@@ -23,7 +23,8 @@ from messagefoundry.transports.http_auth import (
     with_oauth2_client_credentials,
 )
 
-_DOC = Path(__file__).resolve().parents[1] / "docs" / "CONNECTIONS.md"
+_REPO = Path(__file__).resolve().parents[1]
+_DOC = _REPO / "docs" / "CONNECTIONS.md"
 _TOKEN_URL = "https://auth.example.invalid/token"
 
 
@@ -68,3 +69,10 @@ def test_the_connections_doc_records_the_same_default() -> None:
     text = _DOC.read_text(encoding="utf-8")
     assert '`auth_style` defaults to `"basic"`' in text
     assert "vault BACKLOG #2206" in text
+
+
+def test_this_module_is_in_the_docs_only_lane() -> None:
+    # The test above pins text in a Markdown file. A docs-only pull request skips the main suite, so
+    # without this membership a reworded sentence would merge green and fail the next code change.
+    ci = (_REPO / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert f"tests/{Path(__file__).name}" in ci

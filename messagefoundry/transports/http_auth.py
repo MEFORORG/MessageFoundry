@@ -91,9 +91,10 @@ def oauth2_auth_configured(s: Mapping[str, Any]) -> bool:
     ON means ``oauth2_token_url`` is present and ``oauth2_enabled`` is not switched off. The SINGLE
     definition, shared by at least :func:`oauth2_cc_provider_from_settings` (which builds the provider),
     the mutual-exclusion screen in :func:`bearer_provider_from_settings`, the static-credential hop
-    reader (BACKLOG #1182) and :func:`~messagefoundry.config.wiring.oauth_request_advisories`. Before it existed the builder treated any falsy ``oauth2_enabled`` as off while the
-    screen treated only a literal ``False`` as off. Off is the conservative reading, so a falsy value is
-    off, the same rule :func:`~messagefoundry.transports.smart.smart_auth_configured` states."""
+    reader (BACKLOG #1182) and :func:`~messagefoundry.config.wiring.oauth_request_advisories`.
+    Before it existed the builder treated any falsy ``oauth2_enabled`` as off while the screen treated
+    only a literal ``False`` as off. Off is the conservative reading, so a falsy value is off, the same
+    rule :func:`~messagefoundry.transports.smart.smart_auth_configured` states."""
     return bool(s.get("oauth2_token_url")) and bool(s.get("oauth2_enabled", True))
 
 

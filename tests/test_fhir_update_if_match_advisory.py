@@ -154,6 +154,27 @@ def test_check_says_none_out_loud(tmp_path: Path) -> None:
     assert r.detail == "every path-form FHIR update declares an If-Match that check can read"
 
 
+def test_check_says_there_is_nothing_to_read_when_no_update_takes_the_path_form(
+    tmp_path: Path,
+) -> None:
+    # "None exist" is a different line from "all declare one".
+    r = _line(_config(tmp_path, 'outbound("OB", FHIR(url=_BASE, interaction="update"))\n'))
+    assert r.ok and not r.skipped
+    assert r.detail == (
+        "no FHIR connection sets update_url_form='path', so there is no update to read"
+    )
+
+
+def test_an_env_dynamic_headers_is_not_called_on(tmp_path: Path) -> None:
+    body = (
+        'outbound("OB", FHIR(url=_BASE, interaction="update", update_url_form="path",\n'
+        '         dynamic_headers=env("dyn")))\n'
+    )
+    assert _read(tmp_path, body) == [
+        ("OB", "dynamic_headers is an env() reference, which check does not resolve")
+    ]
+
+
 def test_check_skips_rather_than_reporting_clean_on_an_unloadable_config(tmp_path: Path) -> None:
     cfg = tmp_path / "config"
     cfg.mkdir()

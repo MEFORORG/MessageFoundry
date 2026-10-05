@@ -5315,11 +5315,13 @@ def path_form_fhir_updates_without_if_match(registry: Registry) -> list[tuple[st
             str(key).lower() == "if-match" for key in headers
         ):
             continue
-        stamped = (
-            "dynamic_headers is on, so a Handler may stamp If-Match per message"
-            if settings.get("dynamic_headers")
-            else "dynamic_headers is off, so no Handler can add one"
-        )
+        dynamic = settings.get("dynamic_headers")
+        if isinstance(dynamic, EnvRef):
+            stamped = "dynamic_headers is an env() reference, which check does not resolve"
+        elif dynamic:
+            stamped = "dynamic_headers is on, so a Handler may stamp If-Match per message"
+        else:
+            stamped = "dynamic_headers is off, so no Handler can add one"
         out.append((name, unread + stamped))
     return out
 
@@ -5656,14 +5658,16 @@ def _http_origin(value: str) -> tuple[str, str, int] | None:
 
     Built on :func:`_split_address`, so it inherits that function's refusals: a credential holding an
     unencoded ``/`` returns ``None`` here, never the head of the credential as a "host". A missing
-    port becomes the scheme's default, so two spellings of one origin compare equal. ``None`` covers
-    every value that is not such a URL: an opaque API identifier, a ``urn:``, a URL that does not
-    parse."""
-    parsed = _split_address(value) if "://" in value else None
+    port becomes the scheme's default and a trailing dot on the host is dropped, so those spellings
+    of one origin compare equal. ``None`` covers every value that is not such a URL: an opaque API
+    identifier, a ``urn:``, a URL that does not parse. It also covers a valid URL with an ``@`` after
+    the authority, which :func:`_split_address` refuses whole; the caller names that as not compared.
+    """
+    parsed = _split_address(value)
     if parsed is None or parsed[0] not in _HTTP_DEFAULT_PORTS:
         return None
     scheme, host, port = parsed
-    return scheme, host, int(port) if port else _HTTP_DEFAULT_PORTS[scheme]
+    return scheme, host.rstrip("."), int(port) if port else _HTTP_DEFAULT_PORTS[scheme]
 
 
 def _origin_label(origin: tuple[str, str, int]) -> str:
@@ -5765,7 +5769,13 @@ def oauth_request_advisories(registry: Registry) -> OAuthRequestAdvisories:
         if settings.get("oauth2_scope"):
             scope = literal(name, settings, "oauth2_scope")
             if scope is not None and (wild := _wildcard_scope_tokens(scope)):
-                findings.append((name, f"oauth2_scope requests a wildcard: {' '.join(wild)}"))
+                # The token is operator-typed text bound for a terminal, so one that would not
+                # print as itself is described, not echoed.
+                shown = " ".join(
+                    token if token.isascii() and token.isprintable() else "(a token not shown)"
+                    for token in wild
+                )
+                findings.append((name, f"oauth2_scope requests a wildcard: {shown}"))
         if not settings.get("oauth2_audience"):
             return
         audience = literal(name, settings, "oauth2_audience")

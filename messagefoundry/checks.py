@@ -2466,6 +2466,7 @@ def _check_fhir_update_if_match(config_dir: str | Path) -> CheckResult:
     from messagefoundry.config.wiring import (
         WiringError,
         load_config,
+        path_form_fhir_updates,
         path_form_fhir_updates_without_if_match,
     )
 
@@ -2478,12 +2479,14 @@ def _check_fhir_update_if_match(config_dir: str | Path) -> CheckResult:
         )
     plain = path_form_fhir_updates_without_if_match(registry)
     if not plain:
-        return CheckResult(
-            name,
-            ok=True,
-            required=False,
-            detail="every path-form FHIR update declares an If-Match that check can read",
+        # The reader returns only the connections it names, so ask the wider reader whether there
+        # was anything to read. "None exist" and "all declare one" are different lines.
+        clean = (
+            "every path-form FHIR update declares an If-Match that check can read"
+            if path_form_fhir_updates(registry)
+            else "no FHIR connection sets update_url_form='path', so there is no update to read"
         )
+        return CheckResult(name, ok=True, required=False, detail=clean)
     listed = "; ".join(f"{conn} ({note})" for conn, note in plain)
     return CheckResult(
         name,
@@ -2707,14 +2710,14 @@ def _check_oauth_request(config_dir: str | Path) -> CheckResult:
         )
     else:
         detail = (
-            "no oauth2_scope contains a '*', and no audience that could be compared differs from "
-            "its endpoint"
+            "no oauth2_scope that could be read contains a '*', and no audience that could be "
+            "compared differs from its endpoint"
         )
     if read.not_compared:
         skipped = "; ".join(f"{conn} ({reason})" for conn, reason in read.not_compared)
         detail += (
-            f". NOT COMPARED: {len(read.not_compared)} setting(s), because check reads literal "
-            f"string values and does not resolve env(): {skipped}"
+            f". NOT COMPARED: {len(read.not_compared)} setting(s), each for the reason beside "
+            f"it; check reads literal values and does not resolve env(): {skipped}"
         )
     return CheckResult(name, ok=True, required=False, detail=detail)
 

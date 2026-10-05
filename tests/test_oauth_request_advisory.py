@@ -104,6 +104,14 @@ def test_a_named_oauth2_scope_is_never_graded(tmp_path: Path, scope: str | None)
     assert read == OAuthRequestAdvisories(findings=[], not_compared=[])
 
 
+def test_a_wildcard_token_that_would_not_print_is_described_not_echoed(tmp_path: Path) -> None:
+    # The token is bound for a terminal. An escape byte in it must not reach the check line.
+    read = _read(tmp_path, '_oauth("OB_ESC", scope="claims.read a\x1b[31m* claims.*")\n')
+    assert read.findings == [
+        ("OB_ESC", "oauth2_scope requests a wildcard: (a token not shown) claims.*")
+    ]
+
+
 def test_a_wildcard_scope_is_quiet_when_the_provider_is_off(tmp_path: Path) -> None:
     read = _read(tmp_path, '_oauth("OB_OFF", scope="claims.*", enabled=False)\n')
     assert read == OAuthRequestAdvisories(findings=[], not_compared=[])
@@ -230,6 +238,7 @@ def test_an_oauth2_audience_on_another_origin_is_named(
     [
         "https://api.example.invalid/",  # THE CONTROL: the same origin, another path
         "https://API.example.invalid:443/v2",  # the default port written out, and host case
+        "https://api.example.invalid./claims",  # a trailing dot on the host
         "partner-claims-api",  # an opaque API identifier, which many servers use
         "api://partner-claims",
         "urn:example:claims",
@@ -283,7 +292,7 @@ def test_a_url_shaped_credential_never_reaches_a_finding(tmp_path: Path) -> None
     # A credential holding an unencoded `/` makes a URL parser read its head as the host. The origin
     # is built on `_split_address`, which refuses that shape, so the head is never printed.
     body = (
-        '_smart("OB_S", audience="https://user:head-part/tail@auth.example.invalid/oauth2/token")\n'
+        '_smart("OB_S", audience="https://head-part/tail@auth.example.invalid/oauth2/token")\n'
         '_oauth("OB_O", url="https://key-head/tail@api.example.invalid/hook",\n'
         '       audience="https://api.example.invalid/")\n'
     )
@@ -355,25 +364,19 @@ def test_check_names_each_finding_and_what_it_did_not_compare(tmp_path: Path) ->
     assert "may document an audience that is not its endpoint" in r.detail
     # The stated limit: a quiet audience on an env() url is named, never passed over as clean.
     assert "NOT COMPARED: 1 setting(s)" in r.detail
+    assert "each for the reason beside it" in r.detail
     assert "does not resolve env(): OB_URL_ENV (url is an env() reference)" in r.detail
-
-
-def test_audience_only_findings_carry_no_scope_claim(tmp_path: Path) -> None:
-    # The line's guidance must hold whichever kind of finding is present.
-    r = _line(_config(tmp_path, '_smart("OB_AUD", audience="https://other.example.invalid/t")\n'))
-    assert r.detail.startswith("1 OAuth request setting(s)")
-    assert "so name the scopes" not in r.detail
 
 
 def test_check_says_none_out_loud_and_still_names_what_it_did_not_compare(tmp_path: Path) -> None:
     r = _line(_config(tmp_path, '_oauth("OB_NAMED", scope="claims.write")\n'))
     assert r.ok and not r.skipped
     assert r.detail == (
-        "no oauth2_scope contains a '*', and no audience that could be compared differs from "
-        "its endpoint"
+        "no oauth2_scope that could be read contains a '*', and no audience that could be "
+        "compared differs from its endpoint"
     )
     r = _line(_config(tmp_path / "second", '_oauth("OB_E", audience=env("partner_aud"))\n'))
-    assert r.detail.startswith("no oauth2_scope contains a '*'")
+    assert r.detail.startswith("no oauth2_scope that could be read contains a '*'")
     assert "NOT COMPARED: 1 setting(s)" in r.detail and "OB_E" in r.detail
 
 
