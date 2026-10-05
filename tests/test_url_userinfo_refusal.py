@@ -76,6 +76,8 @@ SECRET = "S3CRETPW"
 #: * ``numeric_head_*`` -- a password whose head before the ``/``, ``?`` or ``#`` is a NUMBER, so the
 #:   port check passes and only the ``@`` after the port gives it away (BACKLOG #2686).
 #: * ``empty_head_slash`` -- a password that STARTS with ``/``: an empty port, which also passes.
+#: * ``encoded_colon_*`` -- ``%3A`` for the ``:``. urllib unquotes the host, so it dials the head
+#:   as a port exactly as if the colon were written plain.
 _USERINFO_SHAPES = {
     "plain": f"https://svc:{SECRET}@endpoint.example.invalid/x",
     "port": f"https://svc:{SECRET}@endpoint.example.invalid:8443/x",
@@ -87,6 +89,8 @@ _USERINFO_SHAPES = {
     "numeric_head_query": f"https://svc:4821?{SECRET}@endpoint.example.invalid/x",
     "numeric_head_fragment": f"https://svc:4821#{SECRET}@endpoint.example.invalid/x",
     "empty_head_slash": f"https://svc:/{SECRET}@endpoint.example.invalid/x",
+    "encoded_colon_numeric_head": f"https://svc%3A4821/{SECRET}@endpoint.example.invalid/x",
+    "encoded_colon_slash_in_pw": f"https://svc%3A{SECRET}/tail@endpoint.example.invalid/x",
 }
 
 
@@ -271,11 +275,12 @@ def test_redact_url_never_echoes_a_port_that_is_not_a_number() -> None:
 @pytest.mark.parametrize(
     "url",
     [
-        *(u for u in _USERINFO_SHAPES.values() if "/tail@" in u or "4821" in u),
-        f"https://svc:/{SECRET}@h.example.invalid/x",
+        # Every shape whose userinfo urlsplit does not see. The three it does see keep their host.
+        *(v for k, v in _USERINFO_SHAPES.items() if k not in {"plain", "port", "user_only"}),
         f"https://svc:{SECRET}?tail@h.example.invalid/x",
         f"https://svc:{SECRET}#tail@h.example.invalid/x",
-        # The row's own proxy shape: a forward-proxy URL is not refused, so this is its only guard.
+        # The row's own shape, a proxy URL. Nothing renders a proxy URL through this helper now
+        # (ProxyConfig.redacted is gone), so this pins the helper, not a proxy log line.
         f"http://svc:{SECRET}/tail@proxy.example.invalid:3128",
         f"http://svc:4821/{SECRET}@proxy.example.invalid:3128",
     ],
@@ -299,6 +304,8 @@ def test_redact_url_withholds_the_host_for_any_at_after_the_authority() -> None:
     assert _redact_url("https://api.example.invalid:8443/x?q=1#f") == (
         "https://api.example.invalid:8443/x"
     )
+    # A userinfo urlsplit does see is dropped, and the real host kept.
+    assert _redact_url(_USERINFO_SHAPES["port"]) == "https://endpoint.example.invalid:8443/x"
 
 
 def test_an_at_after_a_port_is_refused_with_the_fix_named() -> None:

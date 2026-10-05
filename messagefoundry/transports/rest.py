@@ -430,9 +430,12 @@ def _expiry_relaxed_opener(
     )
 
 
-def _names_a_port(p: urllib.parse.SplitResult) -> bool:
-    """Does the authority carry a ``:`` port field, empty or not? Read past an IPv6 literal's ``]``."""
-    return ":" in p.netloc.rpartition("@")[2].rpartition("]")[2]
+def _port_field(netloc: str) -> str | None:
+    """The authority's port field as urllib dials it, or ``None`` when it names none. Unquoted,
+    because urllib unquotes the host before ``http.client`` splits the port off, so ``svc%3A12``
+    dials port 12. Read past an IPv6 literal's ``]``; the caller has already refused userinfo."""
+    hostport = urllib.parse.unquote(netloc).rpartition("]")[2]
+    return hostport.partition(":")[2] if ":" in hostport else None
 
 
 def _redact_url(url: str) -> str:
@@ -448,9 +451,10 @@ def _redact_url(url: str) -> str:
     an unencoded ``/``, ``?`` or ``#`` ends the authority early, so the username is read as the host
     and the password's tail, with the real host, as the path. ``svc:12/ss@host`` and an ``@`` that is
     only an email in a query look the same to a parser, so neither names a host, as ``_peer_label``
-    does in ``config/wiring.py``."""
+    does in ``config/wiring.py``. A ``%`` in the host is withheld too: ``svc%3APW%40host`` is a
+    userinfo that urllib unquotes, and ``hostname`` would print it whole."""
     p = urllib.parse.urlsplit(url)
-    if "@" in f"{p.path}{p.query}{p.fragment}":
+    if "@" in f"{p.path}{p.query}{p.fragment}" or "%" in p.netloc.rpartition("@")[2]:
         return f"{p.scheme}://<redacted>"
     try:
         port = f":{p.port}" if p.port else ""
@@ -475,13 +479,14 @@ def refuse_url_credentials(
     out in the request line and the ``Host`` header. So the shape never authenticated anything, and its
     error text carried the password into ``queue.last_error`` and the test-connection reply.
 
-    THREE CHECKS, because ``urlsplit`` misses two shapes. An ``@`` in the authority is userinfo; it is
-    tested after unquoting because urllib unquotes the host, so ``%40`` leaks exactly like ``@``. A port
-    that is not a number is what a password holding an unencoded ``/``, ``?`` or ``#`` looks like: the
-    authority stops there, no ``@`` is seen, and the password's head becomes the port. When that head
-    is a number or empty, the port passes, so an ``@`` after a port is the third check (BACKLOG
-    #2686). An EMPTY port (``host:/``) with no ``@`` after it passes, because ``urlsplit`` reads it as
-    no port and ``http.client`` as the default.
+    At least three shapes are refused, all read after unquoting, because urllib unquotes the host: so
+    ``%40`` leaks exactly like ``@`` and ``%3A`` names a port like ``:``. An ``@`` in the authority is
+    userinfo. A port that is not a number is what a password holding an unencoded ``/``, ``?`` or
+    ``#`` looks like: the authority stops there, no ``@`` is seen, and the password's head becomes the
+    port. When that head is a number or empty the port passes, so an ``@`` after a port is refused
+    too (BACKLOG #2686). An EMPTY port (``host:/``) with no ``@`` after it passes, because ``urlsplit``
+    reads it as no port and ``http.client`` as the default. Not every shape is caught: an ``@`` with
+    no port is ordinary path text, and the comment on the third check names another.
 
     ``proxy_url`` is deliberately NOT screened here: a forward-proxy URL legitimately carries its own
     credentials, and #1207 masks them for display.
@@ -494,14 +499,10 @@ def refuse_url_credentials(
             f"{setting} must not carry credentials in the URL (the user:password@ part); "
             f"set them in {use} instead"
         )
-    # Raised after the handler ends: the port's ValueError quotes the port field, which is the
-    # password in ``https://svc:PW/path``, and ``from None`` would leave it on ``__context__`` (#1796).
-    numeric_port = True
-    try:
-        p.port  # noqa: B018 - evaluated only for the ValueError a non-numeric port raises
-    except ValueError:
-        numeric_port = False
-    if not numeric_port:
+    # Read as a string, never through ``p.port``: its ValueError quotes the port field, which is the
+    # password in ``https://svc:PW/path`` (#1796). The length cap keeps ``int`` from raising either.
+    port = _port_field(p.netloc)
+    if port and not (port.isascii() and port.isdigit() and len(port) <= 5 and int(port) <= 65535):
         raise error(
             f"{setting} has a port that is not a number from 0 to 65535. A password written "
             f"into the URL can cause this; set credentials in {use} instead"
@@ -512,10 +513,11 @@ def refuse_url_credentials(
     # An ``@`` in a query value after a real path still passes; so does any ``@`` with no port. That
     # leaves a password such as ``12/a?b`` constructible; ``_redact_url`` still withholds it.
     tail = p.path + (p.query if not p.path else "") + p.fragment
-    if _names_a_port(p) and "@" in tail:
+    if port is not None and "@" in tail:
         raise error(
             f"{setting} has a port followed by an '@'. A password written into the URL can cause "
-            f"this; set credentials in {use} instead, and write a literal '@' as %40"
+            f"this; set credentials in {use} instead. Write a literal '@' as %40, or leave out a "
+            "default port"
         )
 
 
