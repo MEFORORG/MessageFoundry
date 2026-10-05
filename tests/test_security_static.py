@@ -630,7 +630,7 @@ _UNSCANNABLE_RE_PATTERNS = {
     "messagefoundry/secretscrub.py": (
         "'(?i)\\\\b(' + _LABEL_PREFIX + '(?:' + _alternation(_TOKEN_WORDS) + '))\\\\b\\\\s*[:=]\\\\s*(?:(?:bearer|basic|digest)\\\\s+)?(?:' + _GUARDED_QUOTED_VALUE + '|' + _PLAIN_VALUE + ')'",
         "'(?i)\\\\b(bearer)\\\\s+(?=[\\'\\\\\"]?[^\\\\s\\'\\\\\",;]{4})' + _PLAIN_SCHEME_VALUE",
-        "'\\\\b(' + re.escape(_ENV_PREFIX) + '[A-Z0-9_]+)\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*(?:' + _GUARDED_BRACED_VALUE + f'(?![^{_PLAIN_TERMINATORS}])|' + _GUARDED_QUOTED_VALUE + '|' + _PLAIN_VALUE + '[\\'\\\\\"]?)'",
+        "'\\\\b(' + re.escape(_ENV_PREFIX) + '[A-Z0-9_]+)\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*(?:' + _GUARDED_BRACED_VALUE + f'(?![^{_PLAIN_TERMINATORS}])' + '|(?=' + _GUARDED_QUOTED_VALUE + ')[\\'\\\\\"][^\\\\s\\'\\\\\"]*+[\\'\\\\\"]|' + _GUARDED_QUOTED_VALUE + '|' + _PLAIN_VALUE + '[\\'\\\\\"]?)'",
         "'(?i)\\\\b(' + _LABEL_PREFIX + '(?:' + _alternation(_CREDENTIAL_WORDS) + '))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*(?:' + _ODBC_BRACED + '|' + _QUOTED_VALUE + '|' + _ODBC_BRACED_OVERRUN + '|' + _PLAIN_KV_VALUE + ')'",
         "'(?i)\\\\b(' + _LABEL_PREFIX + '(?:' + _alternation(_KEY_MATERIAL_WORDS) + '))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*(?:' + _GUARDED_BRACED_VALUE + f'(?![^{_KEY_TERMINATORS}])|' + _GUARDED_QUOTED_VALUE + '|' + _PLAIN_KEY_VALUE + ')'",
     ),

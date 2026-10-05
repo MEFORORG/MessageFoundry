@@ -93,15 +93,16 @@ _LABEL_PREFIX = r"(?:[A-Za-z0-9]+[._-]){0,6}"
 # The quoted and braced value fragments (BACKLOG #1685). ``_ODBC_BRACED``, ``_QUOTED_VALUE`` and the
 # overrun are ``_CREDENTIAL_KV``'s only. ``_MEFOR_SECRET``, ``_BEARER`` and ``_KEY_MATERIAL`` take the
 # GUARDED forms, which refuse any value whose closer may belong to a later label and fall back to the
-# plain class: ``token='abc, password='p w'`` would otherwise print "p w". Every guard, and why
-# ``_BEARER`` takes no brace form, is stated once, on the same fragments in
-# ``messagefoundry/secretscrub.py``.
+# plain class: ``token='abc, password='p w'`` would otherwise print "p w". The guarded quoted form
+# leaves its closer in the text, as the plain classes always did, because a later pass needs it there.
+# Every guard, why the closer stays, and why ``_BEARER`` takes no brace form, are stated once, on the
+# same fragments in ``messagefoundry/secretscrub.py``.
 _ODBC_BRACED = r"\{(?:[^}]|\}\})*+\}(?!\})"
 _QUOTED_VALUE = "'[^'\r\n]*+'|\"[^\"\r\n]*+\""
 _ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
 _GUARDED_QUOTED_VALUE = (
-    "'(?:[^'\"{\r\n:=]++|[:=](?!\\s*+'))*+'(?!\\s*+[:=])"
-    '|"(?:[^\'"{\r\n:=]++|[:=](?!\\s*+"))*+"(?!\\s*+[:=])'
+    "'(?:[^'\"{\\s:=]++|(?:[:=]|[^\\S\r\n])++(?!'))*+(?='(?!\\s*+[:=]))"
+    '|"(?:[^\'"{\\s:=]++|(?:[:=]|[^\\S\r\n])++(?!"))*+(?="(?!\\s*+[:=]))'
 )
 _GUARDED_BRACED_VALUE = r"\{(?:[^}'\"\r\n]|\}\})*+\}(?!\})"
 
@@ -254,7 +255,11 @@ _MEFOR_SECRET = re.compile(
     r"\b(MEFOR_[A-Z0-9_]+)\b['\"]?\s*[:=]\s*"
     r"(?:"
     + _GUARDED_BRACED_VALUE
-    + rf"(?![^{_PLAIN_TERMINATORS}])|"
+    + rf"(?![^{_PLAIN_TERMINATORS}])"
+    # A quoted value with no space in it, closer and all: the span the old plain class took.
+    + r"|(?="
+    + _GUARDED_QUOTED_VALUE
+    + r")['\"][^\s'\"]*+['\"]|"
     + _GUARDED_QUOTED_VALUE
     + r"|"
     + _PLAIN_VALUE
@@ -291,7 +296,7 @@ _MEFOR_SECRET = re.compile(
 # value: without that guard ``MEFOR_X={a}bc`` would redact ``{a}`` and print "bc". ``_BEARER`` takes a
 # quoted value and no braced one, because ``session=`` and ``token=`` carry dict and JSON reprs in this
 # engine's log text. Anything a guarded form refuses -- an unclosed quote, a closer that may belong to
-# a later label -- falls back to the plain class, which is the old behaviour.
+# a later label -- falls back to the plain class, which carries the stop and is otherwise the old one.
 #
 # THE FRAGMENTS ARE RESTATED RATHER THAN IMPORTED, which follows this module's shape rather than
 # setting it: ``_LABEL_PREFIX``, ``_BEARER``, ``_MEFOR_SECRET``, ``_CREDENTIAL_KV``, ``_KEY_MATERIAL``,
