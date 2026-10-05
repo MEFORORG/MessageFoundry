@@ -175,7 +175,111 @@ nothing prompts.
 
 ## Remove one
 
-**Which copy you run decides which checkout it searches.** `remove.ps1` anchors on its own location,
+`remove.ps1` has two removal routes and one listing.
+
+| Route | Reaches | Refuses, before it removes anything |
+|---|---|---|
+| `-Name <dir>` | The `<repo>-<dir>` sibling of the checkout that copy of the script lives in | Uncommitted tracked changes. A detached HEAD no ref holds. An unlanded ledger number. |
+| `-Path <path>` | Any registered linked worktree that is not under `.claude/worktrees` | Everything `-Name` refuses, and the list in the next section. |
+| `-List` | Nothing. It is read-only. | It prints each worktree, its class, and which route reaches it. |
+
+### `-Path` is the checked route, and a session may run it
+
+`-Path` removes a finished worktree that no `-Name` can spell: a harness scratchpad, a hand-made
+directory, a worktree of another layout. It removes the **directory** and never the **branch**. It
+does not take `-DeleteBranch`, so that holds by construction.
+
+```powershell
+pwsh -NoProfile -File <primary>\scripts\worktree\remove.ps1 -List
+pwsh -NoProfile -File <primary>\scripts\worktree\remove.ps1 -Path C:\path\to\the\finished\worktree
+```
+
+**A session runs it exactly like that, with no other switch.** `-Force` and
+`-AllowOrphanedAllocations` are the owner's. If the script refuses, that is final for a session: it
+tells the user what was refused and why, and stops.
+
+**This reverses the earlier posture, for removal only.** Until 2026-10-04 the worktree gate's rule 3d
+told a session that removing any tree it was not standing in was the user's to run. The owner's
+instruction that day, in session: *"let's change the gate so that sessions can run these but still
+have the protection this was designed for"*. Rule 3d still denies a raw `git worktree remove` aimed
+at another tree. Its deny text now names this route, because the script can make checks the gate
+cannot. (Vault BACKLOG #1017.)
+
+`-Path` refuses at least these, and `-Force` overrides none of them. The header of
+[`scripts/worktree/remove.ps1`](../scripts/worktree/remove.ps1) is the source of record; this list
+is a copy for readers and can lag it.
+
+- `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR` or `GIT_INDEX_FILE` set in the environment.
+- A path component that ends in a dot or a space. Windows drops both, so it names another directory.
+- Anything that is not a registered linked worktree of this clone, matched on its full path as git
+  records it. That covers the primary, another repository's worktree, a plain directory, and a
+  junction, `subst` or 8.3 spelling of a real worktree.
+- The tree you are standing in, and a tree that holds the copy of the script being run.
+- A tree under `.claude/worktrees`. The next section says why.
+- A tree that holds another registered worktree.
+- A tree git has locked.
+- A detached HEAD whose commit no ref holds.
+- A commit that only the tree's HEAD reflog holds, or only one of its own per-worktree refs
+  (`refs/worktree`, `refs/bisect`, `refs/rewritten`). The removal deletes that reflog and those
+  refs, so nothing would reach the commit afterwards. This one can refuse a harmless tree: a commit
+  replaced by an amend counts, although the branch's own reflog still holds it.
+- A tree the session registry records a session in.
+- Any tree at all, when the session registry cannot be read.
+- A tree that still holds a work claim, or any tree when a claim file cannot be read. So this
+  route never releases a claim: the work lands, or the claim is released, first.
+- A tree whose own git directory was written to in the last six hours, by a commit, a checkout, a
+  merge or a fetch.
+
+Without `-Force` it also refuses uncommitted tracked changes, untracked files, ignored files, and
+files flagged skip-worktree or assume-unchanged. **One exception:** an *ignored directory* named
+`.venv`, `node_modules`, `__pycache__`, `.pytest_cache`, `.mypy_cache` or `.ruff_cache` goes with
+the worktree. An *untracked* directory of one of those names still refuses. So does an ignored
+*file* of one, and so does a directory of one that is a junction or a symlink. Other ignored
+entries refuse too, such as a generated `out/` directory, a local certificate pair, or a
+`.claude/seat.local.txt`.
+
+`-AllowOrphanedAllocations` is the only override for a tree that owns an unlanded ledger number.
+
+Without `-Force` the script also passes no `--force` to git. So git makes its own check at the
+moment it deletes, and refuses a tree with modified or untracked files. That covers a file written
+between the script's check and the removal. Git's check does not list ignored files.
+
+### What `-Path` does not reach, and what it does not see
+
+**It does not reach a tree under `.claude/worktrees`.** That is where the Claude Code harness puts
+a session's or a subagent's worktree. The occupancy check reads the directory a session was
+*launched* in. A subagent started with `isolation: worktree` is recorded under its **parent's**
+directory, so its tree would read as empty. A deletion route whose check fails open on a
+population is worse than no route to it, so there is none. (BACKLOG #1038, Manager decision
+batch 184.) Removing one of those trees stays the user's decision.
+
+One layout overlaps. `new.ps1` run from a linked worktree makes its sibling **beside that
+worktree**, and for a harness-made worktree that is also under `.claude/worktrees`. `-Path`
+refuses it like the rest. The copy of `remove.ps1` in that linked worktree still removes it by
+`-Name`.
+
+**The session registry does not see where a session works, so two other signals are read.** The
+registry records a launch directory. A subagent Builder is recorded under its parent's directory,
+and so is any session that works in a tree by absolute path. On this machine that is the ordinary
+case: the sessions sit under `.claude/worktrees` and the work sits in sibling trees. A review of
+the first version of this route found that the registry check alone would have removed trees of a
+running batch.
+
+So `-Path` also refuses on a held **claim** and on **recent git activity**, the last two entries in
+the list above. A claim names the worktree that took it, whoever launched the session. Git activity
+is read from the tree's own git directory. Neither is proof that a tree is free:
+
+- Work that was never claimed, in a tree nobody has committed to for six hours, passes both.
+- The six hours are a judgement. A long test run after a last commit can outlast them.
+- A tree that passes both is still removed only if it is clean.
+
+**The occupancy check is on `-Path` only.** `-Name` has none, and it also keeps its blanket
+`git worktree prune`, which `-Path` does not run because a blanket prune drops other worktrees'
+registrations too.
+
+### `-Name` removes the sibling this copy made
+
+**Which copy you run decides which checkout `-Name` searches.** `remove.ps1` anchors on its own location,
 not on your cwd, so run the copy that lives in the checkout the worktree was created **from** — which
 is not necessarily the primary, because `new.ps1` anchors the same way and creates its worktree
 beside *itself*. Invoked by absolute path it works from any cwd outside the worktree being removed
@@ -201,9 +305,10 @@ unmerged commits is **kept** and named, with its tip printed so you can act on i
 
 `-RepoRoot <path>` points the script at a checkout other than its own. It exists so the most
 destructive script in this directory can be **execution-tested**
-([`tests/test_worktree_remove.py`](../tests/test_worktree_remove.py) drives it against a synthetic
-repo); without it the only repository a test could reach was this one, so the branch-delete path was
-covered by review alone. (BACKLOG #1037.)
+([`tests/test_worktree_remove.py`](../tests/test_worktree_remove.py) drives `-Name` against a synthetic
+repo, and [`tests/test_worktree_remove_path.py`](../tests/test_worktree_remove_path.py) drives `-Path`
+and `-List`); without it the only repository a test could reach was this one, so the branch-delete
+path was covered by review alone. (BACKLOG #1037.)
 
 ## "Will be permanently discarded" is an INDEX test, not a LOSS test — `recoverable.ps1`
 
