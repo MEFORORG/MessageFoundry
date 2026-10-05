@@ -51,21 +51,13 @@ class LeakCheckUnavailable(RuntimeError):
     """The publish-guard scanner could not be located (not run from a source checkout)."""
 
 
-def _guard_path(module_file: str) -> Path:
-    """The ONE path the publish guard may be loaded from (BACKLOG #2344).
-
-    ``parents[2]`` of ``<root>/messagefoundry/anon/leak.py`` is ``<root>``, the folder that holds
-    this package: the repository root in a source checkout, ``site-packages`` in an installed wheel.
-    The path is built, never searched for. The loader used to try every folder above this file and
-    run the first match, so a file at this path above an installed copy would have run. ``<root>``
-    is as far out as it may look: whoever can write that folder can already change what this
-    process imports, and a folder above it carries no such trust."""
-    return Path(module_file).resolve().parents[2] / "scripts" / "security" / "scan_forbidden.py"
-
-
 @lru_cache(maxsize=1)
 def _scanner() -> ModuleType:
-    candidate = _guard_path(__file__)
+    # ONE path, built and never searched for (BACKLOG #2344). parents[2] is the folder that holds
+    # this package: the repository root in a checkout, site-packages in an installed wheel. Whoever
+    # can write that folder can already change what this process imports; a folder above it carries
+    # no such trust, so no folder above it is tried.
+    candidate = Path(__file__).resolve().parents[2] / "scripts" / "security" / "scan_forbidden.py"
     if candidate.is_file():
         spec = importlib.util.spec_from_file_location("mefor_anon_scan_forbidden", candidate)
         if spec is not None and spec.loader is not None:

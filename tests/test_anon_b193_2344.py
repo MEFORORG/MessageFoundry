@@ -24,6 +24,7 @@ from tee.anon import leak as tee_leak
 
 _ROOT = Path(__file__).resolve().parents[1]
 _GUARD_PARTS = ("scripts", "security", "scan_forbidden.py")
+_MESSAGE = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1"
 
 # A stand-in guard. The marker write is its first statement, so the marker records the run even
 # if a caller later rejects the module.
@@ -35,31 +36,29 @@ _PLANTED = (
     "    return []\n"
 )
 
-# Where a guard is planted, as a path from the folder two levels ABOVE the import root. The import
-# root is ``above2/above1/root``, and the module sits at ``<root>/<package>/anon/leak.py``.
-_ABOVE_THE_ROOT = {
-    "one folder above the import root": ("above2", "above1"),
-    "two folders above the import root": ("above2",),
-}
-_INSIDE_THE_PACKAGE = {
-    "the package folder": ("above2", "above1", "root", "{package}"),
-    "the anon folder": ("above2", "above1", "root", "{package}", "anon"),
-}
-_WRONG_PLACES = _ABOVE_THE_ROOT | _INSIDE_THE_PACKAGE
+# A place is ``module_file.parents[n]``. The module sits at ``<root>/<package>/anon/leak.py``, so
+# 2 is the import root, the one place a guard may load from.
+_IMPORT_ROOT = 2
+_WRONG_PLACES = [
+    pytest.param(0, id="the anon folder"),
+    pytest.param(1, id="the package folder"),
+    pytest.param(3, id="one folder above the import root"),
+    pytest.param(4, id="two folders above the import root"),
+]
 
 
 def _module_file(tmp_path: Path, package: str) -> Path:
-    """A stand-in ``leak.py`` under a made-up import root, deep enough to have folders above it."""
+    """A stand-in ``leak.py`` under a made-up import root, with two folders above that root."""
     path = tmp_path / "above2" / "above1" / "root" / package / "anon" / "leak.py"
     path.parent.mkdir(parents=True)
     path.write_text("", encoding="utf-8")
     return path
 
 
-def _plant(tmp_path: Path, folder: tuple[str, ...], package: str) -> Path:
+def _plant(folder: Path) -> Path:
     """Plant the stand-in guard under ``folder`` and return the marker it would write."""
-    guard = tmp_path.joinpath(*(part.format(package=package) for part in folder), *_GUARD_PARTS)
-    guard.parent.mkdir(parents=True, exist_ok=True)
+    guard = folder.joinpath(*_GUARD_PARTS)
+    guard.parent.mkdir(parents=True)
     guard.write_text(_PLANTED, encoding="utf-8")
     return guard.with_name("RAN")
 
@@ -73,25 +72,25 @@ def _engine_load(monkeypatch: pytest.MonkeyPatch, module_file: Path) -> ModuleTy
     return engine_leak._scanner.__wrapped__()
 
 
-@pytest.mark.parametrize("where", sorted(_WRONG_PLACES))
+@pytest.mark.parametrize("depth", _WRONG_PLACES)
 def test_the_engine_loader_does_not_run_a_guard_planted_anywhere_but_the_import_root(
-    where: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    depth: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     module_file = _module_file(tmp_path, "messagefoundry")
-    marker = _plant(tmp_path, _WRONG_PLACES[where], "messagefoundry")
+    marker = _plant(module_file.parents[depth])
     with pytest.raises(engine_leak.LeakCheckUnavailable):
         _engine_load(monkeypatch, module_file)
-    assert not marker.exists(), f"a guard planted in {where} ran"
+    assert not marker.exists()
 
 
-@pytest.mark.parametrize("where", sorted(_WRONG_PLACES))
+@pytest.mark.parametrize("depth", _WRONG_PLACES)
 def test_the_tee_loader_does_not_run_a_guard_planted_anywhere_but_the_import_root(
-    where: str, tmp_path: Path
+    depth: int, tmp_path: Path
 ) -> None:
     module_file = _module_file(tmp_path, "tee")
-    marker = _plant(tmp_path, _WRONG_PLACES[where], "tee")
+    marker = _plant(module_file.parents[depth])
     assert tee_leak._load_publish_guard(module_file) is None
-    assert not marker.exists(), f"a guard planted in {where} ran"
+    assert not marker.exists()
 
 
 def test_the_engine_loader_runs_the_guard_at_the_import_root(
@@ -99,7 +98,7 @@ def test_the_engine_loader_runs_the_guard_at_the_import_root(
 ) -> None:
     """The control for the tests above: the marker does appear when a guard runs."""
     module_file = _module_file(tmp_path, "messagefoundry")
-    marker = _plant(tmp_path, ("above2", "above1", "root"), "messagefoundry")
+    marker = _plant(module_file.parents[_IMPORT_ROOT])
     loaded = _engine_load(monkeypatch, module_file)
     assert marker.exists()
     assert loaded.__file__ == str(marker.with_name("scan_forbidden.py"))
@@ -108,7 +107,7 @@ def test_the_engine_loader_runs_the_guard_at_the_import_root(
 def test_the_tee_loader_runs_the_guard_at_the_import_root(tmp_path: Path) -> None:
     """The control for the tee tests above."""
     module_file = _module_file(tmp_path, "tee")
-    marker = _plant(tmp_path, ("above2", "above1", "root"), "tee")
+    marker = _plant(module_file.parents[_IMPORT_ROOT])
     assert tee_leak._load_publish_guard(module_file) is not None
     assert marker.exists()
 
@@ -117,8 +116,8 @@ def test_the_guard_at_the_import_root_wins_over_one_planted_above_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     module_file = _module_file(tmp_path, "messagefoundry")
-    ours = _plant(tmp_path, ("above2", "above1", "root"), "messagefoundry")
-    planted = _plant(tmp_path, ("above2", "above1"), "messagefoundry")
+    ours = _plant(module_file.parents[_IMPORT_ROOT])
+    planted = _plant(module_file.parents[_IMPORT_ROOT + 1])
     _engine_load(monkeypatch, module_file)
     assert ours.exists()
     assert not planted.exists()
@@ -130,13 +129,13 @@ def test_the_leak_check_still_refuses_when_no_guard_is_at_the_import_root(
     """Fail-closed: with a guard planted above and none at the root, the check raises. It does
     not report the text clean."""
     module_file = _module_file(tmp_path, "messagefoundry")
-    marker = _plant(tmp_path, ("above2", "above1"), "messagefoundry")
+    marker = _plant(module_file.parents[_IMPORT_ROOT + 1])
     monkeypatch.setattr(engine_leak, "__file__", str(module_file))
     monkeypatch.setattr(engine_leak, "_scanner", engine_leak._scanner.__wrapped__)
     with pytest.raises(engine_leak.LeakCheckUnavailable):
-        engine_leak.leak_check("MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1")
+        engine_leak.leak_check(_MESSAGE)
     with pytest.raises(engine_leak.LeakCheckUnavailable):
-        engine_leak.leak_report("MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1")
+        engine_leak.leak_report(_MESSAGE)
     assert not marker.exists()
 
 
@@ -145,9 +144,9 @@ def test_both_loaders_resolve_to_this_checkout() -> None:
     expected = _ROOT.joinpath(*_GUARD_PARTS)
     assert expected.is_file()
     assert Path(str(engine_leak._scanner().__file__)) == expected
-    guard = tee_leak._load_publish_guard()
-    assert isinstance(guard, ModuleType)
-    assert Path(str(guard.__file__)) == expected
+    # ``_GUARD`` is what the tee loaded at import, which is the call that matters there.
+    assert isinstance(tee_leak._GUARD, ModuleType)
+    assert Path(str(tee_leak._GUARD.__file__)) == expected
 
 
 def _loops_over_parents(source: str) -> list[int]:
