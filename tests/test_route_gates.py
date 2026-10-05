@@ -15,11 +15,16 @@ bite and not only to agree with today's tree.
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 import pytest
 from fastapi import APIRouter, Depends, FastAPI, Request, WebSocket
+from fastapi.routing import APIWebSocketRoute
+from starlette.routing import Mount
+from starlette.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from messagefoundry.api.app import create_app
 from messagefoundry.api.security import (
@@ -379,6 +384,60 @@ def test_the_walk_descends_into_a_mounted_application_with_routes() -> None:
     rows = _rows_by_key(app)
     assert rows[("GET", "/mounted/inner")].gate is None
     assert (route_gates.MOUNT_METHOD, "/mounted") not in rows
+
+
+@pytest.mark.parametrize("hook_on", ["outer", "inner"])
+def test_a_mounted_apps_socket_hooks_are_read_from_that_app(hook_on: str) -> None:
+    """Vault BACKLOG #2846. A socket inside a mounted application sees that application as
+    ``websocket.app``, because Starlette sets ``scope["app"]`` as a request enters each app. The walk
+    read its hook slots from the OUTER app, so it reported a hook the socket never runs and missed
+    one it does. Each case fails on that walk."""
+    inner = FastAPI(openapi_url=None)
+    inner.add_api_websocket_route("/ws", _hooked)
+    outer = FastAPI()
+    outer.mount("/mounted", inner)
+    (outer if hook_on == "outer" else inner).state.probe_hook = authorize_probe
+    (row,) = _ws_rows(outer)
+    assert row.path == "/mounted/ws"
+    expected = ("authorize_ws",) if hook_on == "outer" else ("authorize_probe", "authorize_ws")
+    assert row.gates == expected, row
+
+
+def test_a_socket_in_a_mounted_app_runs_the_mounted_apps_hook_at_request_time() -> None:
+    """The premise of the test above, measured on a live handshake rather than assumed."""
+    ran: list[str] = []
+
+    def recorder(name: str) -> Callable[..., Awaitable[tuple[None, None]]]:
+        async def hook(websocket: WebSocket, *permissions: Permission) -> tuple[None, None]:
+            ran.append(name)
+            await websocket.close()
+            return None, None
+
+        return hook
+
+    inner = FastAPI(openapi_url=None)
+    inner.add_api_websocket_route("/ws", _hooked)
+    inner.state.probe_hook = recorder("inner")
+    outer = FastAPI()
+    outer.state.probe_hook = recorder("outer")
+    outer.mount("/mounted", inner)
+    with (
+        TestClient(outer) as client,
+        contextlib.suppress(WebSocketDisconnect, RuntimeError),
+        client.websocket_connect("/mounted/ws"),
+    ):
+        pass
+    assert ran[:1] == ["inner"], ran
+
+
+def test_a_mount_of_bare_routes_reads_socket_hooks_from_the_outer_app() -> None:
+    """A mount with no app of its own sets no ``scope["app"]``, so its socket sees the outer app."""
+    outer = FastAPI()
+    outer.routes.append(Mount("/bare", routes=[APIWebSocketRoute("/ws", _hooked)]))
+    outer.state.probe_hook = authorize_probe
+    (row,) = _ws_rows(outer)
+    assert row.path == "/bare/ws"
+    assert row.gates == ("authorize_probe", "authorize_ws"), row
 
 
 def test_a_mount_with_no_routes_stays_one_ungated_row(ui_app: FastAPI) -> None:

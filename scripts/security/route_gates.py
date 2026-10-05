@@ -70,6 +70,7 @@ from typing import Any
 from fastapi import FastAPI
 from fastapi import routing as fastapi_routing
 from fastapi.routing import APIRoute, APIWebSocketRoute
+from starlette.applications import Starlette
 from starlette.routing import BaseRoute, Mount
 
 from messagefoundry.api.app import create_app
@@ -306,9 +307,12 @@ def _own_nodes(func: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.AST]:
 
 
 def websocket_gates(
-    route: APIWebSocketRoute, app: FastAPI
+    route: APIWebSocketRoute, app: Starlette
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """``(gate names in the order they run, permission wire strings)`` for one WebSocket route.
+
+    ``app`` is the application the socket sees as ``websocket.app``: for a route inside a mounted
+    application, that application rather than the outer one.
 
     A ``require*()`` dependency counts first, read by :func:`gate_of` as for HTTP. Then the endpoint's
     own body, not its nested functions: every bare-name call whose callee resolves to a coroutine
@@ -461,7 +465,24 @@ def _kind(declared_on: Any, effective: Any, *, websocket: bool) -> tuple[str, st
     return (KIND_PUBLIC if declaration.public else KIND_IN_BODY), reason
 
 
-def _walk(routes: Sequence[BaseRoute], prefix: str, app: FastAPI) -> Iterator[RouteRow]:
+def _state_owner(mount: Mount, outer: Starlette) -> Starlette:
+    """The app whose ``state`` a socket under ``mount`` reads as ``websocket.app.state``.
+
+    Every Starlette app sets ``scope["app"]`` to itself as a request enters it, so a socket inside a
+    mounted application sees that application, not the outer one (vault BACKLOG #2846). A mount of
+    bare routes has no app of its own, so its sockets still see ``outer``. Middleware a mount wraps
+    around its app is unwrapped through each layer's ``app``, up to a fixed depth."""
+    target: object = mount.app
+    for _ in range(32):
+        if isinstance(target, Starlette):
+            return target
+        target = getattr(target, "app", None)
+        if target is None:
+            break
+    return outer
+
+
+def _walk(routes: Sequence[BaseRoute], prefix: str, app: Starlette) -> Iterator[RouteRow]:
     for route, effective in _effective_routes(routes):
         path = prefix + (getattr(effective, "path", None) or "")
         if isinstance(route, APIRoute):
@@ -501,8 +522,9 @@ def _walk(routes: Sequence[BaseRoute], prefix: str, app: FastAPI) -> Iterator[Ro
             )
         elif isinstance(effective, Mount) and effective.routes:
             # A mounted application with routes of its own. Its routes are walked under the mount's
-            # path, so one the engine's refusal cannot reach still shows up here as ungated.
-            yield from _walk(effective.routes, path, app)
+            # path, so one the engine's refusal cannot reach still shows up here as ungated. Its
+            # sockets read their hooks from the mounted app's state, so the walk reads that too.
+            yield from _walk(effective.routes, path, _state_owner(effective, app))
         else:
             # Anything else Starlette mounted: a plain ``Route`` (the OpenAPI/docs endpoints) or a
             # ``Mount`` with no routes (the /ui static tree). It carries no FastAPI dependency
