@@ -27,6 +27,7 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry.controlchars import scrub_control_chars
 from messagefoundry.logging_setup import build_stderr_handler, configure_logging
 from messagefoundry.store import MessageStore, audit_tee
 from messagefoundry.store.audit_tee import emit_audit_tee
@@ -287,6 +288,134 @@ def test_emit_audit_tee_redacts_bare_delimiter_run_without_segment(audit_capture
     line = audit_capture.messages[0]
     assert "DOE" not in line and "JANE" not in line
     assert "[redacted]" in line
+
+
+# --- the record must still be JSON after the configured handlers' filters run ---------------------
+#
+# Spelled with chr() so this file carries no raw control character of its own. Most overlap
+# `tests/test_logging.py`'s `_LOG_ESCAPED_CLASSES` and `_ASTRAL_SAMPLE`, which lack DEL and the
+# soft hyphen; written out so the samples this defect needs are visible beside it.
+_LOG_ALPHABET_SAMPLES = {
+    "del": chr(0x7F),
+    "c1_nel": chr(0x85),
+    "soft_hyphen": chr(0xAD),
+    "bidi_rlo": chr(0x202E),
+    "line_separator": chr(0x2028),
+    "lone_surrogate": chr(0xDCFF),
+    "astral_tag": chr(0xE0001),
+    "astral_private_use": chr(0xF0000),
+}
+
+#: The characters whose pre-fix spelling a collector could not parse: the scrub wrote ``\x..`` or
+#: ``\U........``, which JSON does not define. The others came out as ``\u....`` and parsed.
+_BROKE_THE_OLD_ENCODING = ("del", "c1_nel", "soft_hyphen", "astral_tag", "astral_private_use")
+
+
+def _teed_through_configured_stdout(
+    fmt: str, actor: str, detail: str, capsys
+) -> tuple[str, str, dict]:
+    """Emit one tee record through the stdout handler ``serve`` installs, with every filter on it.
+
+    Returns the physical stdout line, the inner audit document as a collector receives it, and that
+    document parsed. Inside ``_handlerless_process`` so the configured handler does not outlive the
+    test."""
+    with _handlerless_process():
+        configure_logging("INFO", fmt=fmt)
+        capsys.readouterr()  # drop anything configuring logging printed
+        emit_audit_tee(
+            action="auth.login_failed",
+            actor=actor,
+            channel_id=None,
+            detail=detail,
+            ts=1.0,
+            row_id=1,
+            seq=1,
+            row_hash=_HASH,
+        )
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if "auth.login_failed" in ln]
+    assert len(lines) == 1, lines
+    line = lines[0]
+    if fmt == "json":
+        inner = json.loads(line)["message"]
+    else:
+        inner = line.split("messagefoundry.audit: ", 1)[1]
+    return line, inner, json.loads(inner)
+
+
+@pytest.mark.parametrize("fmt", ["text", "json"])
+@pytest.mark.parametrize("kind", sorted(_LOG_ALPHABET_SAMPLES))
+def test_the_tee_parses_as_json_after_the_log_scrub(fmt: str, kind: str, capsys) -> None:
+    """The handlers' control-character scrub must leave the tee's document valid JSON.
+
+    It spells part of the log alphabet as ``\\x7f`` or ``\\U000e0001``, which is not JSON, so a
+    DEL, C1, soft hyphen or astral code point in a typed sign-in name left a collector unable to
+    parse the record. Each character must now come back from ``json.loads`` exactly as it went in.
+    The rest of the sample is ASCII, so the physical line must be printable ASCII: the character
+    travelled as an escape, never raw."""
+    char = _LOG_ALPHABET_SAMPLES[kind]
+    actor = f"user{char}name"
+    detail = f"refused {char} here"
+    line, _inner, record = _teed_through_configured_stdout(fmt, actor, detail, capsys)
+
+    assert record["actor"] == actor
+    assert record["detail"] == detail  # through `safe_text`, which leaves these characters alone
+    assert all(0x20 <= ord(ch) < 0x7F for ch in line), ascii(line)
+
+
+@pytest.mark.parametrize("kind", _BROKE_THE_OLD_ENCODING)
+def test_the_old_encoding_really_broke_under_the_scrub(kind: str) -> None:
+    """The control for the test above: these characters are the discriminating ones. Serialized the
+    old way and then scrubbed, the document does not parse. Without this, a scrub that stopped
+    touching them would make the round-trip test pass whatever the encoding."""
+    old = json.dumps({"actor": _LOG_ALPHABET_SAMPLES[kind]}, ensure_ascii=False)
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(scrub_control_chars(old))
+
+
+@pytest.mark.parametrize("fmt", ["text", "json"])
+@pytest.mark.parametrize(
+    ("actor", "spelled"),
+    [
+        ("alice", '"actor": "alice"'),
+        # Ordinary non-ASCII is not in the log alphabet, so it stays raw on the line.
+        (f"Jos{chr(0xE9)} {chr(0x5F20)}{chr(0x4F1F)}", f'"actor": "Jos{chr(0xE9)} {chr(0x5F20)}'),
+        # The form `ensure_ascii=True` would have broken: with the accent escaped, the name-run
+        # pattern found a word boundary before it and redacted "Ana Luc".
+        (f"Ana Luc{chr(0xED)}a", f'"actor": "Ana Luc{chr(0xED)}a"'),
+    ],
+)
+def test_a_clean_or_plain_non_ascii_actor_round_trips(
+    fmt: str, actor: str, spelled: str, capsys
+) -> None:
+    _line, inner, record = _teed_through_configured_stdout(fmt, actor, "ok", capsys)
+    assert record["actor"] == actor
+    assert spelled in inner
+
+
+@pytest.mark.parametrize("fmt", ["text", "json"])
+@pytest.mark.parametrize(
+    ("actor", "needle"),
+    [
+        # Not in the log alphabet: `ensure_ascii=True` escaped it and the name shipped.
+        (f"DOE{chr(0xA0)}JANE", "DOE"),
+        # In the alphabet, but the scrub already spells it as JSON. Escaped before the filters, it
+        # fused with the next word, so the name and the credential value shipped.
+        (f"{chr(0x200E)}DOE JANE", "DOE"),
+        (f"{chr(0x200E)}password=hunter2", "hunter2"),
+        # Raw, this separator kept the encoded-separator pass off; escaped early, the pass ran and
+        # took the closing quote, so the record stopped parsing.
+        (f"x%7Cy%7Cz{chr(0x2028)}", None),
+    ],
+)
+def test_the_redaction_filters_see_what_they_saw_before(
+    fmt: str, actor: str, needle: str | None, capsys
+) -> None:
+    """Records that parsed before this fix are filtered as before. Each case is one an earlier draft
+    of the fix regressed, measured through the configured chain; the helper's ``json.loads`` is the
+    parse check."""
+    line, _inner, _record = _teed_through_configured_stdout(fmt, actor, "ok", capsys)
+    if needle is not None:
+        assert needle not in line, line
 
 
 def test_emit_audit_tee_is_best_effort_on_logging_failure(audit_capture, monkeypatch) -> None:
