@@ -22,8 +22,8 @@ import pytest
 from messagefoundry.anon import leak as engine_leak
 from tee.anon import leak as tee_leak
 
-_ROOT = Path(__file__).resolve().parents[1]
 _GUARD_PARTS = ("scripts", "security", "scan_forbidden.py")
+_CHECKOUT_GUARD = Path(__file__).resolve().parents[1].joinpath(*_GUARD_PARTS)
 _MESSAGE = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1"
 
 # A stand-in guard. The marker write is its first statement, so the marker records the run even
@@ -139,14 +139,16 @@ def test_the_leak_check_still_refuses_when_no_guard_is_at_the_import_root(
     assert not marker.exists()
 
 
+@pytest.mark.skipif(
+    not _CHECKOUT_GUARD.is_file(),
+    reason="needs scripts/security/scan_forbidden.py beside tests/ (absent outside a checkout)",
+)
 def test_both_loaders_resolve_to_this_checkout() -> None:
     """In a source checkout the one path each loader builds is the repository's own guard."""
-    expected = _ROOT.joinpath(*_GUARD_PARTS)
-    assert expected.is_file()
-    assert Path(str(engine_leak._scanner().__file__)) == expected
+    assert Path(str(engine_leak._scanner().__file__)) == _CHECKOUT_GUARD
     # ``_GUARD`` is what the tee loaded at import, which is the call that matters there.
     assert isinstance(tee_leak._GUARD, ModuleType)
-    assert Path(str(tee_leak._GUARD.__file__)) == expected
+    assert Path(str(tee_leak._GUARD.__file__)) == _CHECKOUT_GUARD
 
 
 def _loops_over_parents(source: str) -> list[int]:
@@ -164,10 +166,12 @@ def _loops_over_parents(source: str) -> list[int]:
     ]
 
 
-@pytest.mark.parametrize("rel", ["messagefoundry/anon/leak.py", "tee/anon/leak.py"])
-def test_neither_leak_module_walks_the_folders_above_it(rel: str) -> None:
-    """The bound is one computed path, not a search that stops somewhere."""
-    assert _loops_over_parents((_ROOT / rel).read_text(encoding="utf-8")) == []
+@pytest.mark.parametrize("module", [engine_leak, tee_leak], ids=["engine", "tee"])
+def test_neither_leak_module_loops_over_its_parents(module: ModuleType) -> None:
+    """A cheap tripwire for the old loop's shape only. The planted-file tests above are the real
+    check: any search that tries the nearest folder first runs one of their guards."""
+    source = Path(str(module.__file__)).read_text(encoding="utf-8")
+    assert _loops_over_parents(source) == []
 
 
 def test_the_parents_loop_detector_fires() -> None:

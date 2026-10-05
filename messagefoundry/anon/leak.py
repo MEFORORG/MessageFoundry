@@ -54,9 +54,9 @@ class LeakCheckUnavailable(RuntimeError):
 @lru_cache(maxsize=1)
 def _scanner() -> ModuleType:
     # ONE path, built and never searched for (BACKLOG #2344). parents[2] is the folder that holds
-    # this package: the repository root in a checkout, site-packages in an installed wheel. Whoever
-    # can write that folder can already change what this process imports; a folder above it carries
-    # no such trust, so no folder above it is tried.
+    # this package: the repository root in a checkout, the install's package folder from a wheel.
+    # Why that folder is the limit is stated once, in docs/DANGEROUS-FUNCTIONALITY.md, in the
+    # paragraph that starts "`anon/leak.py` loads one file by path".
     candidate = Path(__file__).resolve().parents[2] / "scripts" / "security" / "scan_forbidden.py"
     if candidate.is_file():
         spec = importlib.util.spec_from_file_location("mefor_anon_scan_forbidden", candidate)
@@ -65,8 +65,9 @@ def _scanner() -> ModuleType:
             spec.loader.exec_module(module)
             return module
     raise LeakCheckUnavailable(
-        "could not locate scripts/security/scan_forbidden.py — the anonymizer leak-check requires "
-        "the source checkout (it is a dev/migration tool, not an installed-wheel runtime)"
+        f"could not locate the publish guard at {candidate} (the only path tried) — the anonymizer "
+        "leak-check requires the source checkout, with this package imported from it (it is a "
+        "dev/migration tool, not an installed-wheel runtime)"
     )
 
 
