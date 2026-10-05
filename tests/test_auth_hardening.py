@@ -753,7 +753,13 @@ def test_secret_in_config_file_warns(tmp_path: Path, caplog: pytest.LogCaptureFi
 # --- L14: the session reaper purges expired sessions -------------------------
 
 
-async def test_session_reaper_purges_expired_sessions(engine: Engine) -> None:
+async def test_session_reaper_purges_expired_sessions(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from messagefoundry.api import app as api_app
+
+    # The reaper waits one interval before its first pass (BACKLOG #2283), so shorten it.
+    monkeypatch.setattr(api_app, "_SESSION_REAP_INTERVAL", 0.01)
     await engine.store.create_user(
         user_id="u",
         username="reaper",
@@ -794,13 +800,15 @@ async def test_session_reaper_skips_a_pass_after_a_forward_clock_step(
     """BACKLOG #2283: a forward wall-clock step makes every session look idle, and a purge cannot
     be undone. The pass that sees the wall clock outrun the monotonic clock deletes nothing. The
     next pass compares against that one, so a step that holds is purged by then. A drift inside the
-    tolerance is the control: that pass purges as usual."""
+    tolerance is the control: that pass purges as usual. The first reading is a baseline and purges
+    nothing, so a clock already wrong at start-up is never purged by on sight."""
     from messagefoundry.api import app as api_app
 
     monkeypatch.setattr(api_app, "_SESSION_REAP_INTERVAL", 0)
     hour = 3600.0
     tolerance = api_app._SESSION_REAP_STEP_TOLERANCE
-    # (wall, monotonic) per pass. Pass 2 drifts inside the tolerance; pass 3 steps forward by a day.
+    # (wall, monotonic) per reading. Reading 0 is the start-up baseline. Pass 1 drifts inside the
+    # tolerance; pass 2 steps forward by a day; pass 3 holds the step.
     readings = [
         (1_000.0, 50.0),
         (1_000.0 + hour + tolerance, 50.0 + hour),
@@ -831,8 +839,9 @@ async def test_session_reaper_skips_a_pass_after_a_forward_clock_step(
     await asyncio.wait_for(done.wait(), timeout=5)
     with contextlib.suppress(asyncio.CancelledError):
         await task
-    assert purged == [readings[0][0], readings[1][0], readings[3][0]], (
-        "the pass after a forward clock step purged; each purge must also use the pass's own reading"
+    assert purged == [readings[1][0], readings[3][0]], (
+        "the reaper purged on its start-up baseline or right after a forward clock step; each purge"
+        " must also use its own pass's reading"
     )
 
 
