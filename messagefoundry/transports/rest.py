@@ -84,7 +84,7 @@ from messagefoundry.transports.bounded_read import (
     drain_bounded,
     hop_identity,
     is_never_proxied_host,
-    read_accepted_reply_text,
+    read_2xx_reply_text,
 )
 from messagefoundry.transports.signing import MessageSigner, signer_from_destination
 
@@ -2284,9 +2284,9 @@ class RestDestination(DestinationConnector):
                 # ASVS 15.2.2: bounded on the socket read, so the drain cannot be turned into an
                 # unbounded buffer by a partner that answers a POST with an arbitrarily large body.
                 # vault BACKLOG #2180: the status here is 2xx, so an over-cap body must not re-send.
-                # With capture off nothing reads the body, and the message is delivered. With
+                # With capture off nothing looks inside the body, and the message is delivered. With
                 # capture on the body is stored and may be passed on, so the refusal is permanent.
-                body = read_accepted_reply_text(
+                body = read_2xx_reply_text(
                     resp,
                     connector=self._hop,
                     encoding=self.encoding,

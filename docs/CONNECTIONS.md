@@ -1378,19 +1378,26 @@ redirect**) raise a permanent `NegativeAckError`, so the message **dead-letters 
 than blocking the FIFO lane on a request the endpoint will never accept.
 
 **A 2xx reply over the byte bound (vault BACKLOG #2180).** The engine keeps at most 16 MiB of a reply
-body. A retry after a 2xx would send again a request the partner has already answered, so in every
-row below but the last an over-size body does not cause a re-send. What happens instead depends on
+body. A retry after a 2xx would send again a request the partner has already answered, so on these
+four destinations an over-size body does not cause a re-send. What happens instead depends on
 whether the engine needs the body (owner ruling 2026-10-05). This table is the one place that lists
 the four HTTP destinations, and their own sections point here.
 
-| Destination | `capture_response` | An over-size body after a 2xx |
-|---|---|---|
-| REST | off | **delivered**: nothing looks at the body, so it is dropped and a WARNING names the connection |
-| REST | on | **permanent refusal**, code `reply-too-large`: the reply would be stored and may be passed on, so the message dead-letters once |
-| SOAP | off or on | **permanent refusal**: a `Fault` can sit inside a 2xx body, so the engine cannot tell the outcome |
-| DICOMweb | off or on | **permanent refusal**: a `FailedSOPSequence` can sit inside a 2xx body |
-| FHIR | off | **delivered**, with the same WARNING. For an update sent as a transaction, see the FHIR section |
-| FHIR | on | not covered by the ruling. It is still a `DeliveryError`, so the lane retries and the request is sent again |
+| Destination | Write | `capture_response` | An over-size body after a 2xx |
+|---|---|---|---|
+| REST | any | off | **delivered**: nothing looks inside the body, so it is dropped and a WARNING names the connection |
+| REST | any | on | **permanent refusal**, code `reply-too-large`: the reply would be stored and may be passed on, so the message dead-letters once |
+| SOAP | any | off or on | **permanent refusal**: a `Fault` can sit inside a 2xx body, so the engine cannot tell the outcome |
+| DICOMweb | any | off or on | **permanent refusal**: a `FailedSOPSequence` can sit inside a 2xx body |
+| FHIR | an update the engine sends as a transaction | off or on | **permanent refusal**: the engine reads that reply for the entry's own status, so it cannot tell the outcome |
+| FHIR | any other write | off | **delivered**, with the same WARNING |
+| FHIR | any other write | on | **permanent refusal**: the reply would be stored and may be passed on, as for REST |
+
+The two FHIR refusals are the batch 191 Manager's reading of the owner ruling of 2026-10-05, which
+names the principle and not these two cases. "An update the engine sends as a transaction" is
+`interaction="update"` or `conditional="if-match"` with the default `update_url_form`. Every other
+FHIR write is in the last two rows: a create, the other conditional forms, an update in the path
+form, and a `transaction` or `batch` `Bundle` a Handler built.
 
 A message that dead-letters this way got a 2xx, but the engine could not read the reply. The partner
 may have applied it, and on SOAP or DICOMweb the unread body may have held a rejection. Its stored
@@ -2245,10 +2252,9 @@ What a site needs to know:
 - If a server answers 2xx while the entry's own `response.status` failed, the message is classified on
   that entry status, like any other HTTP status. An entry status that does not read as an HTTP code is
   logged as a warning, and the 2xx reply counts as delivered.
-- A reply body over the byte bound is dropped before the engine looks inside it, so its entry status
-  is not seen. With `capture_response` off the 2xx counts as delivered, as it does for any reply the
-  engine cannot read. An entry that failed inside such a reply is therefore recorded as delivered. See
-  *A 2xx reply over the byte bound* under REST.
+- A reply body over the byte bound is not kept, so the engine cannot see the entry's status. The
+  update is then a permanent refusal, code `reply-too-large`, in either capture mode, and it is not
+  sent again. It is not recorded as delivered. See *A 2xx reply over the byte bound* under REST.
 - `capture_response_headers` still captures `ETag`, `Location` and `Last-Modified`. They come from the
   entry, which describes the updated resource, and an entry field hides a reply header of the same
   name. They keep the entry's formats: `Last-Modified` is a FHIR instant, not an HTTP-date, and

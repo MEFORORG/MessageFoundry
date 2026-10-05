@@ -77,7 +77,7 @@ from messagefoundry.transports.bounded_read import (
     EgressReplyError,
     drain_bounded,
     hop_identity,
-    read_accepted_reply_text,
+    read_2xx_reply_text,
     read_bounded_text,
 )
 
@@ -1029,7 +1029,7 @@ class FhirDestination(DestinationConnector):
                 # both are a permanent refusal. A wrapped update's reply is read for the entry
                 # status, so without it the outcome is unknown. With capture on the reply is
                 # stored and may be passed on.
-                body = read_accepted_reply_text(
+                body = read_2xx_reply_text(
                     resp,
                     connector=self._hop,
                     encoding=self.encoding,

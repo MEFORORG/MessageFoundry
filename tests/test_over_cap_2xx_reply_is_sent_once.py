@@ -3,12 +3,12 @@
 """An over-cap reply body after a 2xx is not sent again (vault BACKLOG #2180).
 
 Before this, a 2xx whose body was over the byte bound raised ``ResponseTooLargeError``, a retryable
-``DeliveryError``. The partner had already accepted the request, so on a first deployment each retry
-would have sent it again, and the message would then have dead-lettered although it was delivered.
+``DeliveryError``. The partner had already answered 2xx, so on a first deployment each retry would
+have sent the request again, and the message would then have dead-lettered when the retries ran out.
 
 The owner ruling of 2026-10-05 judges such a reply by who reads the body:
 
-* nothing reads it: the message is delivered, the body is dropped, and a WARNING is logged.
+* nothing looks inside it: the message is delivered, the body is dropped, and a WARNING is logged.
   REST with capture off, and a plain FHIR write with capture off;
 * the engine reads it to know the outcome, or passes it on: a permanent refusal, and no
   re-send. SOAP, DICOMweb and REST with capture on.
@@ -57,7 +57,7 @@ from messagefoundry.transports.bounded_read import (
     REPLY_TOO_LARGE_CODE,
     ResponseTooLargeError,
     TruncatedResponseError,
-    read_accepted_reply_text,
+    read_2xx_reply_text,
 )
 from tests.test_bounded_egress_reads import _ExactResp, _FakeOpener, _UnboundedResp
 from tests.test_digest_refusal_classification import _FACTORY, _LABEL, _build, _Stops
@@ -82,7 +82,7 @@ def test_an_unused_over_cap_body_reads_as_empty_and_warns(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     with caplog.at_level(logging.WARNING):
-        text = read_accepted_reply_text(
+        text = read_2xx_reply_text(
             _ExactResp(_REPLY_FILL * 65, status=201),
             limit=64,
             connector="REST connection 'OB_X'",
@@ -101,7 +101,7 @@ def test_an_unused_over_cap_body_reads_as_empty_and_warns(
 
 def test_a_used_over_cap_body_is_a_permanent_refusal() -> None:
     with pytest.raises(NegativeAckError) as ei:
-        read_accepted_reply_text(
+        read_2xx_reply_text(
             _ExactResp(_REPLY_FILL * 65, status=201),
             limit=64,
             connector="SOAP connection 'OB_X'",
@@ -128,7 +128,7 @@ def test_a_body_at_the_bound_comes_back_whole(
 ) -> None:
     """THE CONTROL: the helper changes nothing at or under the bound."""
     with caplog.at_level(logging.WARNING):
-        text = read_accepted_reply_text(
+        text = read_2xx_reply_text(
             _ExactResp(b"y" * 64),
             limit=64,
             connector="c",
@@ -150,7 +150,7 @@ def test_a_truncated_body_is_still_raised_as_it_was(body_is_needed: bool) -> Non
     """Only the byte bound is handled. A truncated reply after a 2xx is still a retryable
     ``TruncatedResponseError``, in both modes: that is a different question, left alone."""
     with pytest.raises(TruncatedResponseError):
-        read_accepted_reply_text(
+        read_2xx_reply_text(
             _ShortResp(b"y" * 5),
             limit=64,
             connector="c",
@@ -167,7 +167,7 @@ def test_an_over_cap_body_on_another_status_is_left_to_the_caller(
     """The helper is for a 2xx. Handed a reply with any other status it changes nothing, so a
     wrong call cannot record a refused request as delivered, or claim a 2xx that never came."""
     with caplog.at_level(logging.WARNING), pytest.raises(ResponseTooLargeError) as ei:
-        read_accepted_reply_text(
+        read_2xx_reply_text(
             _ExactResp(_REPLY_FILL * 65, status=status),
             limit=64,
             connector="c",
@@ -204,7 +204,7 @@ def test_an_over_cap_body_with_no_status_to_show_fails_closed(
     if status is not _ABSENT:
         reader.status = status  # type: ignore[attr-defined]
     with caplog.at_level(logging.WARNING), pytest.raises(ResponseTooLargeError) as ei:
-        read_accepted_reply_text(
+        read_2xx_reply_text(
             reader, limit=64, connector="c", encoding="utf-8", body_is_needed=body_is_needed
         )
     assert not isinstance(ei.value, NegativeAckError)
@@ -217,7 +217,7 @@ def test_the_status_guard_lets_every_2xx_through(
 ) -> None:
     """THE CONTROL for the two tests above: the guard refuses nothing inside 200 to 299."""
     with caplog.at_level(logging.WARNING):
-        text = read_accepted_reply_text(
+        text = read_2xx_reply_text(
             _ExactResp(_REPLY_FILL * 65, status=status),
             limit=64,
             connector="c",
@@ -235,7 +235,7 @@ def test_the_stored_refusal_keeps_its_code_under_a_long_connection_name() -> Non
     name = "OB_" + "LONGPARTNER_" * 5 + "ADT"
     assert len(name) > 60
     with pytest.raises(NegativeAckError) as ei:
-        read_accepted_reply_text(
+        read_2xx_reply_text(
             _ExactResp(_REPLY_FILL * 65),
             limit=64,
             connector=f"DICOMweb connection {name!r}",

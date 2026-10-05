@@ -86,7 +86,7 @@ from messagefoundry.transports.bounded_read import (
     build_strict_opener,
     drain_bounded,
     hop_identity,
-    read_accepted_reply_text,
+    read_2xx_reply_text,
     read_bounded_text,
 )
 
@@ -905,7 +905,7 @@ class SoapDestination(DestinationConnector):
                 # vault BACKLOG #2180: the status here is 2xx, so an over-cap body must not
                 # re-send. A Fault can sit inside a 2xx, so send() reads this body in both capture
                 # modes, and the refusal is permanent.
-                body = read_accepted_reply_text(
+                body = read_2xx_reply_text(
                     resp, connector=self._hop, encoding=self.encoding, body_is_needed=True
                 )
                 status = int(getattr(resp, "status", 200))

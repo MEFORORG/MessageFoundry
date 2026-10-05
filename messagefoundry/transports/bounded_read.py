@@ -20,17 +20,20 @@ refuse is a *reply* to a request the engine made.
 **An over-cap reply is retried, except after a 2xx on a delivery.** :class:`ResponseTooLargeError`
 subclasses :class:`~messagefoundry.transports.base.DeliveryError`, so an over-cap reply lands on
 the retry-then-dead-letter path an unreadable reply has always taken (a timeout mid-read, a reset
-socket). That is still what a token endpoint, a probe and the alert webhook get.
+socket). A token endpoint's over-cap reply still takes that path: the mint fails inside a delivery,
+before the message is sent, and the worker retries the delivery. A probe and the alert webhook
+raise the error to their own caller instead, and nothing retries those.
 
 A delivery that already holds a 2xx status is different, because a retry would send again a
 request the partner answered 2xx (vault BACKLOG #2180, owner ruling 2026-10-05).
-:func:`read_accepted_reply_text` reads that body and states the rule. In short, an over-cap body
+:func:`read_2xx_reply_text` reads that body and states the rule. In short, an over-cap body
 there is either dropped with a WARNING or refused for good with code :data:`REPLY_TOO_LARGE_CODE`,
 which is a dead-letter cause the bound did not have before. Each destination's ``_post`` says
-which, and ``docs/CONNECTIONS.md`` has the table.
+which, and ``docs/CONNECTIONS.md`` has the table. The four HTTP destinations all read their 2xx
+reply through it.
 
-**Not every delivery is covered.** At least these still retry, and so send again: FHIR with
-``capture_response`` on, and a reply that is truncated or misframed after a 2xx.
+**Only the byte bound is covered.** At least a reply that is truncated or misframed after a 2xx
+still retries, and so sends the request again.
 
 **A ceiling is not a completeness check, and this module once carried only the ceiling** (BACKLOG
 #1575). Bounding the read answered "did the peer send too much?" and nothing answered "did the peer
@@ -145,7 +148,7 @@ __all__ = [
     "drain_bounded",
     "hop_identity",
     "is_never_proxied_host",
-    "read_accepted_reply_text",
+    "read_2xx_reply_text",
     "read_bounded",
     "read_bounded_text",
     "read_reply_body",
@@ -214,9 +217,8 @@ class ResponseTooLargeError(EgressReplyError):
     worker retries it under the connection's own retry policy and dead-letters it the same way it
     dead-letters any other reply the engine could not read.
 
-    Most deliveries do not let it travel that far once a 2xx status has arrived, because a retry
-    would re-send the request. See :func:`read_accepted_reply_text`, and the module docstring for
-    the deliveries that still do.
+    A destination that reads its 2xx reply through :func:`read_2xx_reply_text` does not let it
+    travel that far, because a retry would re-send the request.
     """
 
 
@@ -1198,11 +1200,11 @@ def read_bounded_text(
     return read_bounded(reader, limit=limit, connector=connector).decode(encoding, errors="replace")
 
 
-#: The ``code`` of the permanent refusal :func:`read_accepted_reply_text` raises.
+#: The ``code`` of the permanent refusal :func:`read_2xx_reply_text` raises.
 REPLY_TOO_LARGE_CODE = "reply-too-large"
 
 
-def read_accepted_reply_text(
+def read_2xx_reply_text(
     reader: _SupportsRead,
     *,
     limit: int = DEFAULT_MAX_RESPONSE_BYTES,
@@ -1222,14 +1224,16 @@ def read_accepted_reply_text(
     What it does cause depends on ``body_is_needed`` (owner ruling 2026-10-05). This is the one
     place in code that states the rule:
 
-    * ``False`` -- the caller can call the message delivered without this body. Returns ``""``
-      and logs a WARNING. The WARNING carries ``connector``, the status and the bound, and no
-      byte of the reply. Most such callers never look at the body. A FHIR wrapped update would
-      have looked in it for the entry status, and takes a reply it cannot read as delivered.
+    * ``False`` -- nothing looks inside this body, so the caller can call the message delivered
+      without it. Returns ``""`` and logs a WARNING. The WARNING carries ``connector``, the
+      status and the bound, and no byte of the reply.
     * ``True`` -- the engine needs the body to know the outcome, or passes it on. Raises a
       permanent :class:`~messagefoundry.transports.base.NegativeAckError` with code
       :data:`REPLY_TOO_LARGE_CODE`, so the row dead-letters once and is not sent again. A reply
       the engine could not read is not recorded as delivered.
+
+    Which FHIR writes need the body is the batch 191 Manager's reading of that ruling. It is
+    stated at the call in ``transports/fhir.py``.
 
     Only the byte bound is handled here. A truncated or misframed reply still raises as
     :func:`read_bounded_text` raises it, and is still retried.

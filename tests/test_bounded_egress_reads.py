@@ -173,7 +173,7 @@ def test_the_bound_is_enforced_on_the_read_not_after_it() -> None:
 
 def test_the_refusal_is_a_delivery_error_not_a_permanent_nak() -> None:
     """A peer-side fault stays transient: the class itself is a plain ``DeliveryError``. A delivery
-    that already holds a 2xx does not let it travel, and ``read_accepted_reply_text`` decides
+    that already holds a 2xx does not let it travel, and ``read_2xx_reply_text`` decides
     there (vault BACKLOG #2180). ``tests/test_over_cap_2xx_reply_is_sent_once.py`` covers that."""
     assert issubclass(ResponseTooLargeError, DeliveryError)
     assert not issubclass(ResponseTooLargeError, NegativeAckError)
@@ -297,7 +297,7 @@ def _dicomweb() -> DicomWebDestination:
 
 def test_rest_post_reads_no_more_than_the_bound_of_an_unbounded_reply() -> None:
     """The read still stops one byte past the bound. What an over-cap body then means after a 2xx
-    is vault BACKLOG #2180: with capture off nothing reads it, so it comes back empty."""
+    is vault BACKLOG #2180: with capture off nothing looks inside it, so it comes back empty."""
     dest = _rest()
     resp = _UnboundedResp()
     dest._opener = _FakeOpener(resp)  # type: ignore[assignment]
@@ -897,7 +897,7 @@ def test_a_truncated_reply_never_carries_the_partial_body_on_the_exception_chain
 #: The readers, plus the helpers that pass a ``connector`` label on to one unchanged.
 _READERS = frozenset(
     {
-        "read_accepted_reply_text",
+        "read_2xx_reply_text",
         "read_bounded",
         "read_bounded_text",
         "drain_bounded",
