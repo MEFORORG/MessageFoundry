@@ -67,12 +67,15 @@ from messagefoundry.transports.dicom import recover_dicom_object_bytes
 from messagefoundry.transports.rest import (
     _NO_REDIRECT_OPENER,
     _RETRYABLE_4XX,
+    AUTH_CHALLENGE_REFUSED,
+    HttpAuthError,
     InsecureHopGuard,
     ProxyConfig,
     _insecure_opener,
     _no_redirect_opener,
     _redact_url,
     assert_probe_hop,
+    auth_challenge_refused,
     egress_route_from_settings,
     enforce_outbound_length_limits,
     http_family_trust_anchor,
@@ -430,6 +433,11 @@ class DicomWebDestination(DestinationConnector):
             raise DeliveryError(
                 f"DICOMweb {_redact_url(self.base_url)} unreachable: {exc.reason}"
             ) from exc
+        except HttpAuthError as exc:
+            # BACKLOG #2323: as in _post, with the fixed text on the DeliveryError a probe raises.
+            raise DeliveryError(
+                f"DICOMweb {_redact_url(self.base_url)} {AUTH_CHALLENGE_REFUSED}"
+            ) from exc
         except (ValueError, http.client.InvalidURL) as exc:
             # BACKLOG #1793: the probe is the test-connection reply, so an escaped InvalidURL put its
             # text -- which can hold a password -- in front of anyone holding connections:test.
@@ -482,6 +490,10 @@ class DicomWebDestination(DestinationConnector):
             raise DeliveryError(
                 f"DICOMweb {_redact_url(self.base_url)} unreachable: {exc.reason}"
             ) from exc
+        except HttpAuthError as exc:
+            # BACKLOG #2323: the web proxy's refused Digest challenge is the connection's fault, not
+            # this object's. Before the ValueError arm, which it would otherwise match.
+            raise auth_challenge_refused(f"DICOMweb {_redact_url(self.base_url)}") from exc
         except (ValueError, http.client.InvalidURL) as exc:
             # urllib rejected an illegal request value (a CRLF in a header/URL slipped past the guard). A
             # retry re-sends the same request → permanent. PHI-safe: redacted url only.

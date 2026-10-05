@@ -305,6 +305,39 @@ class HttpAuthError(ValueError):
     because the Digest handlers live beside the opener plumbing and ``http_auth`` imports this module."""
 
 
+#: ``NegativeAckError.code`` of a send refused by :func:`auth_challenge_refused`.
+AUTH_CHALLENGE_REFUSED_CODE = "auth-challenge-refused"
+
+#: The FIXED text the destination and ``FhirLookup`` arms report for a wire-time
+#: :class:`HttpAuthError`, after their own hop label. ``HttpAuthError``'s message quotes the peer's
+#: algorithm token and scheme word, so it stays on the cause and never reaches ``queue.last_error``
+#: or a test-connection reply. One text for the endpoint's 401 and the web proxy's 407: the refusal
+#: names its peer only inside that message, and nothing here parses it.
+#:
+#: SHORT, AND THE HASH NAME COMES FIRST. ``safe_exc`` cuts a stored error at 200 characters, after
+#: the class name, the hop label and the URL, so the tail of a long text is what an operator loses.
+AUTH_CHALLENGE_REFUSED = (
+    "met a non-SHA-256 or unanswerable authentication challenge; the engine will not answer it"
+)
+
+
+def auth_challenge_refused(label: str) -> NegativeAckError:
+    """The delivery failure for a wire-time :class:`HttpAuthError` on ``label``'s hop (BACKLOG #2323).
+
+    ``HttpAuthError`` is a ``ValueError``, so each send's ``(ValueError, InvalidURL)`` arm caught it
+    and reported ``bad-request-value``: a permanent fault of ONE message, which dead-letters the row
+    and would send an operator looking for a bad header or URL. The fault is the connection's, so
+    this is a configuration fault: under the default ``credential_fault_policy`` the delivery
+    worker stops the lane and keeps the queue. ADR 0095 Amendment B is the source of record for
+    why a stop was chosen over a retry, and for where that reasoning is weak."""
+    return NegativeAckError(
+        f"{label} {AUTH_CHALLENGE_REFUSED}",
+        code=AUTH_CHALLENGE_REFUSED_CODE,
+        permanent=True,
+        config_fault=True,
+    )
+
+
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Refuse to follow HTTP redirects (ASVS 15.3.2): a 3xx could divert a PHI-bearing POST to an
     unintended host. Returning ``None`` makes urllib raise the 3xx as an ``HTTPError`` instead of
@@ -2161,6 +2194,10 @@ class RestDestination(DestinationConnector):
             return  # any other status (the host answered) → reachable
         except urllib.error.URLError as exc:  # DNS / connection refused / TLS / timeout
             raise DeliveryError(f"REST {_redact_url(self.url)} unreachable: {exc.reason}") from exc
+        except HttpAuthError as exc:
+            # BACKLOG #2323: before the ValueError arm, which it would otherwise match. A probe
+            # raises only DeliveryError, so it carries the fixed text and no fault marker.
+            raise DeliveryError(f"REST {_redact_url(self.url)} {AUTH_CHALLENGE_REFUSED}") from exc
         except (ValueError, http.client.InvalidURL) as exc:
             # BACKLOG #1793: classified like _post's arm, so the probe reply carries no urllib text.
             raise DeliveryError(
@@ -2274,6 +2311,10 @@ class RestDestination(DestinationConnector):
             ) from exc
         except urllib.error.URLError as exc:  # DNS / connection refused / TLS / timeout
             raise DeliveryError(f"REST {_redact_url(self.url)} unreachable: {exc.reason}") from exc
+        except HttpAuthError as exc:
+            # BACKLOG #2323: a refused Digest challenge is the connection's fault, not this
+            # message's. Before the ValueError arm, which it would otherwise match.
+            raise auth_challenge_refused(f"REST {_redact_url(self.url)}") from exc
         except (ValueError, http.client.InvalidURL) as exc:
             # Backstop for an illegal request value urllib rejects -- the arm fhir.py and dicomweb.py
             # already carry and this connector did not (BACKLOG #1663). A retry re-sends the same

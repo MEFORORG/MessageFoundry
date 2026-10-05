@@ -92,6 +92,8 @@ from messagefoundry.transports.bounded_read import (
 # Reuse REST's hardened HTTP plumbing — same transports/ package, same no-redirect + TLS posture.
 from messagefoundry.transports.rest import (
     _NO_REDIRECT_OPENER,
+    AUTH_CHALLENGE_REFUSED,
+    HttpAuthError,
     InsecureHopGuard,
     ProxyConfig,
     _expiry_relaxed_opener,
@@ -100,6 +102,7 @@ from messagefoundry.transports.rest import (
     _NoRedirectHandler,
     _redact_url,
     assert_probe_hop,
+    auth_challenge_refused,
     capture_response_headers,
     egress_route_from_settings,
     enforce_outbound_length_limits,
@@ -833,6 +836,9 @@ class SoapDestination(DestinationConnector):
             return  # any other status (the host answered) → reachable
         except urllib.error.URLError as exc:
             raise DeliveryError(f"SOAP {_redact_url(self.url)} unreachable: {exc.reason}") from exc
+        except HttpAuthError as exc:
+            # BACKLOG #2323: as in _post, with the fixed text on the DeliveryError a probe raises.
+            raise DeliveryError(f"SOAP {_redact_url(self.url)} {AUTH_CHALLENGE_REFUSED}") from exc
         except (ValueError, http.client.InvalidURL) as exc:
             # BACKLOG #1793: the probe is the test-connection reply; see the same arm in _post.
             raise DeliveryError(
@@ -932,6 +938,10 @@ class SoapDestination(DestinationConnector):
             ) from exc
         except urllib.error.URLError as exc:
             raise DeliveryError(f"SOAP {_redact_url(self.url)} unreachable: {exc.reason}") from exc
+        except HttpAuthError as exc:
+            # BACKLOG #2323: a refused Digest challenge is the connection's fault, not this
+            # message's. Before the ValueError arm, which it would otherwise match.
+            raise auth_challenge_refused(f"SOAP {_redact_url(self.url)}") from exc
         except (ValueError, http.client.InvalidURL) as exc:
             # BACKLOG #1793: the same arm as rest.py's _post, and the same reasoning. Without it an
             # InvalidURL escaped as an internal error, and its text could hold a password.
