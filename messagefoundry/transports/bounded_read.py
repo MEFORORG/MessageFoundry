@@ -1214,8 +1214,9 @@ def read_accepted_reply_text(
 
     Call it where the status is already known to be 2xx. In a destination's ``_post`` that is
     inside ``with opener.open(...)``, because urllib raises every other status as an ``HTTPError``.
-    A reader that reports a status outside 2xx gets :func:`read_bounded_text` unchanged, so a
-    wrong call cannot record a refused request as delivered.
+    The helper checks this itself, and fails closed: unless ``reader.status`` is an integer from
+    200 to 299, an over-cap body raises as :func:`read_bounded_text` raises it. So a reader with
+    another status, or with none it can show, is never recorded as delivered here.
 
     The partner answered 2xx, so an over-cap body must not cause a re-send (vault BACKLOG #2180).
     What it does cause depends on ``body_is_needed`` (owner ruling 2026-10-05). This is the one
@@ -1237,7 +1238,7 @@ def read_accepted_reply_text(
         return read_bounded_text(reader, limit=limit, connector=connector, encoding=encoding)
     except ResponseTooLargeError:
         status = getattr(reader, "status", None)
-        if isinstance(status, int) and not 200 <= status < 300:
+        if not (isinstance(status, int) and 200 <= status < 300):
             raise
         # A 2xx is handled below, outside the handler. The traceback reaches the frame that holds
         # the bytes read so far, a whole bound of them, and an error raised in here would keep
@@ -1256,7 +1257,7 @@ def read_accepted_reply_text(
         "%s answered with status %s and a response body over the %d-byte bound; "
         "the body is dropped and the message is recorded as delivered",
         connector,
-        status if isinstance(status, int) else "2xx",
+        status,
         limit,
     )
     return ""

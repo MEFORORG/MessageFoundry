@@ -178,6 +178,57 @@ def test_an_over_cap_body_on_another_status_is_left_to_the_caller(
     assert caplog.records == []
 
 
+class _BareReader:
+    """A reader with no ``status`` of its own, as a binary file handle has none."""
+
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def read(self, amt: int = -1) -> bytes:
+        return self._body if amt < 0 else self._body[:amt]
+
+
+_ABSENT = object()
+
+
+@pytest.mark.parametrize("body_is_needed", [False, True])
+@pytest.mark.parametrize(
+    "status", [_ABSENT, None, "200", 200.0, True], ids=["absent", "None", "str", "float", "bool"]
+)
+def test_an_over_cap_body_with_no_status_to_show_fails_closed(
+    status: object, body_is_needed: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The guard fails closed. A reader that cannot show an integer 2xx is not taken for one, so
+    an over-cap body is never recorded as delivered on a guess."""
+    reader = _BareReader(_REPLY_FILL * 65)
+    if status is not _ABSENT:
+        reader.status = status  # type: ignore[attr-defined]
+    with caplog.at_level(logging.WARNING), pytest.raises(ResponseTooLargeError) as ei:
+        read_accepted_reply_text(
+            reader, limit=64, connector="c", encoding="utf-8", body_is_needed=body_is_needed
+        )
+    assert not isinstance(ei.value, NegativeAckError)
+    assert caplog.records == []
+
+
+@pytest.mark.parametrize("status", [200, 204, 299])
+def test_the_status_guard_lets_every_2xx_through(
+    status: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    """THE CONTROL for the two tests above: the guard refuses nothing inside 200 to 299."""
+    with caplog.at_level(logging.WARNING):
+        text = read_accepted_reply_text(
+            _ExactResp(_REPLY_FILL * 65, status=status),
+            limit=64,
+            connector="c",
+            encoding="utf-8",
+            body_is_needed=False,
+        )
+    assert text == ""
+    (record,) = caplog.records
+    assert f"answered with status {status} and" in record.getMessage()
+
+
 def test_the_stored_refusal_keeps_its_code_under_a_long_connection_name() -> None:
     """A dead-lettered row keeps the error text, cut at 200 characters, and not the code. So the
     code and "not sent again" come first, where a long connection name cannot push them out."""
