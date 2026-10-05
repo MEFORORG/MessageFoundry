@@ -27,7 +27,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import pytest
 
@@ -202,6 +202,11 @@ def test_the_lookback_is_the_slowest_ack_between_its_floor_and_its_two_caps() ->
     assert runner._reload_lookback(0.0, 0.2) == pytest.approx(
         0.1
     )  # the half-hold cap beats the floor
+    # So a send made when the hold started, as old as the hold at the request, is outside the
+    # window however late the request goes out and whatever the ACKs took (BACKLOG #2936).
+    for held in (0.2, 0.6, 2.6, 60.0, 600.0):
+        for slowest_ack in (0.0, 0.1, 3.0, 600.0):
+            assert runner._reload_lookback(slowest_ack, held) <= held / 2
 
 
 async def test_a_quick_reload_adds_no_hold() -> None:
@@ -375,15 +380,19 @@ async def test_a_failed_probe_cancels_the_hold() -> None:
         await hold_task
 
 
-def _real_driver(port: int) -> ConnScaleDriver:
+def _driver[D: ConnScaleDriver](kind: type[D], port: int) -> D:
     metrics = LiveMetrics(Counters(), Histogram(), Histogram())
-    return ConnScaleDriver(
+    return kind(
         host="127.0.0.1",
         base_port=port,
         count=1,
         correlator=Correlator(1000, metrics),
         metrics=metrics,
     )
+
+
+def _real_driver(port: int) -> ConnScaleDriver:
+    return _driver(ConnScaleDriver, port)
 
 
 async def test_a_dropped_connection_opens_a_new_socket_and_the_driver_sees_it() -> None:
@@ -597,34 +606,87 @@ def _outgoing(seq: int) -> Outgoing:
     return Outgoing(seq=seq, code="ADT", control_id=f"C{seq}", payload=payload)
 
 
-async def _no_ack_fault_step(*, unacked_just_before_reload: bool) -> NoLoss:
-    """One connection, a 1.2 s hold, the probe at 0.6 s. 2 sends are ACKed, then 28 go unACKed
+class _WatchedDriver(ConnScaleDriver):
+    """A real driver that keeps what the probe's strand watch saw, so a failure can say where each
+    stranded send stood against the window. The probe opens the watch right after it sets the
+    window, with no await between, so the watch's clock readings are the request's."""
+
+    request_ns = 0  # `perf_counter_ns` at the request, the clock the send times are on
+    request_at = 0.0  # the loop clock at the request, the clock the hold is measured on
+    slowest_ack_at_request_s = 0.0
+    strand_ns: tuple[int, ...] = ()  # the send time of every send the watch saw stranded
+
+    def watch_strands(self) -> None:
+        self.request_ns = time.perf_counter_ns()
+        self.request_at = asyncio.get_running_loop().time()
+        self.slowest_ack_at_request_s = self.slowest_ack_s
+        super().watch_strands()
+
+    def end_strand_watch(self) -> list[int]:
+        log = super().end_strand_watch()
+        self.strand_ns = tuple(log)
+        return log
+
+
+@dataclass(frozen=True)
+class _FaultStep:
+    """What `_no_ack_fault_step` produced: the reconcile's verdict, and the window's own terms."""
+
+    result: NoLoss
+    why: str  # where the stranded sends stood against the window, for an assertion's message
+
+
+async def _no_ack_fault_step(
+    *, unacked_just_before_reload: bool, sends_late_s: float = 0.0, probe_late_s: float = 0.0
+) -> _FaultStep:
+    """One connection, a 1.2 s hold, the probe 0.6 s into it. 2 sends are ACKed, 28 go unACKed
     until the reload closes the socket, then 6 more after it are ACKed: 28 of 36 unconfirmed, 78%.
 
-    ``unacked_just_before_reload`` places the 28 at 0.55 s, inside the window. Otherwise they go
-    out at 0 s with the 2, and have waited 0.6 s for an ACK when the reload fires. The lookback is
-    at most half of that 0.6 s whatever the ACKs took, so they are outside the window.
+    BY DEFAULT THE 28 ARE PLACED BY ORDERING, NOT WALL CLOCK (BACKLOG #2936). All 30 sends are
+    written first, and the hold's start is read only after that. So when the request goes out each
+    has waited at least as long as the hold has run, and the lookback is never more than half of
+    that (`_reload_lookback`), whatever the ACKs took. They are outside the window however late a
+    loaded runner writes the sends or fires the probe.
+
+    ``unacked_just_before_reload`` starts the hold first and writes the 28 at 0.55 s into it, 50 ms
+    before the request and inside the window. THAT HALF STILL RESTS ON TWO TIMERS: a runner that
+    lets more than the lookback (0.25 s at least) pass between the sends and the request ages them
+    out of the window.
+
+    ``sends_late_s`` and ``probe_late_s`` inject that late runner: a wait before any send is made,
+    and a wait before the probe is entered.
     """
     engine = _NoAckEngine(ack_first=2)
     server = await asyncio.start_server(engine.on_client, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
-    driver = _real_driver(port)
+    driver = _driver(_WatchedDriver, port)
     counters = driver._m.counters
     loop = asyncio.get_running_loop()
     hold = 1.2
+
+    def emit(seqs: range) -> None:
+        for seq in seqs:
+            driver._emit_one(_outgoing(seq))
+
     try:
         await driver.open(connect_batch=1, batch_pause_s=0.0)
         while driver.generations()[0] < 1:
             await asyncio.sleep(0.01)
-        started = loop.time()
+        await asyncio.sleep(sends_late_s)
+        if unacked_just_before_reload:
+            started = loop.time()
+            emit(range(2))
+        else:
+            emit(range(30))
+            deadline = loop.time() + 5.0
+            while counters.sent < 30 and loop.time() < deadline:
+                await asyncio.sleep(0.005)
+            started = loop.time()  # after the last write, so no send is younger than the hold
 
         async def run_hold() -> None:
-            for seq in range(2):
-                driver._emit_one(_outgoing(seq))
             if unacked_just_before_reload:
                 await asyncio.sleep(max(0.0, started + 0.55 - loop.time()))
-            for seq in range(2, 30):
-                driver._emit_one(_outgoing(seq))
+                emit(range(2, 30))
             await asyncio.sleep(max(0.0, started + hold - loop.time()))
 
         async def reload() -> tuple[float | None, bool]:
@@ -637,13 +699,13 @@ async def _no_ack_fault_step(*, unacked_just_before_reload: bool) -> NoLoss:
             return 0.01, False
 
         async def after_reload(seconds: float) -> None:
-            for seq in range(30, 36):
-                driver._emit_one(_outgoing(seq))
+            emit(range(30, 36))
             deadline = loop.time() + 5.0
             while counters.acked + counters.nak < 8 and loop.time() < deadline:
                 await asyncio.sleep(0.01)
 
         hold_task = asyncio.create_task(run_hold())
+        await asyncio.sleep(probe_late_s)
         account = await runner._reload_mid_hold(
             driver=driver,
             counters=counters,
@@ -660,13 +722,28 @@ async def _no_ack_fault_step(*, unacked_just_before_reload: bool) -> NoLoss:
     # The control on the fault itself: the shape really is 28 of 36 unconfirmed.
     assert (counters.sent, counters.acked, counters.timeouts) == (36, 8, 28), counters
     counters.sink_received = engine.read  # every read frame delivered: only the ACKs are missing
-    return runner._reconcile(
+    result = runner._reconcile(
         counters,
         _engine_sample(0),
         _engine_sample(engine.read),
         unconfirmed_budget=1,
         reload=account,
     )
+    ages = [(driver.request_ns - ns) / 1e9 for ns in driver.strand_ns]
+    why = (
+        f"{account.stranded} send(s) inside the window and {account.aged} before it; "
+        f"lookback_s={account.lookback_s:.3f}, from a hold {driver.request_at - started:.3f} s old "
+        f"at the request (of {hold} s) and a slowest ACK of {driver.slowest_ack_at_request_s:.3f} s; "
+        f"the {len(ages)} stranded send(s) were {max(ages, default=0.0):.3f} s old at the request "
+        f"at the oldest and {min(ages, default=0.0):.3f} s at the newest; {result.detail}"
+    )
+    return _FaultStep(result, why)
+
+
+def _assert_the_fault_was_judged(step: _FaultStep) -> None:
+    assert not step.result.ok, step.why
+    assert "28 unconfirmed sends exceed the stranding budget" in step.result.detail, step.why
+    assert "28 send(s) the reload's close found already waiting" in step.result.detail, step.why
 
 
 async def test_a_no_ack_fault_before_the_reload_is_not_excused_as_its_stranding() -> None:
@@ -675,18 +752,29 @@ async def test_a_no_ack_fault_before_the_reload_is_not_excused_as_its_stranding(
     # SCOPE: the budget still forgives up to three quarters of the sends it judges, so the window
     # changes the verdict only where the aged sends pass that line. 28 of 36 is one over it. The
     # third assertion pins the window's own classification, which does not depend on the budget.
-    result = await _no_ack_fault_step(unacked_just_before_reload=False)
-    assert not result.ok, result.detail
-    assert "28 unconfirmed sends exceed the stranding budget" in result.detail
-    assert "28 send(s) the reload's close found already waiting" in result.detail
+    _assert_the_fault_was_judged(await _no_ack_fault_step(unacked_just_before_reload=False))
+
+
+@pytest.mark.parametrize(
+    "late", [{"sends_late_s": 0.45}, {"probe_late_s": 0.5}], ids=["sends late", "probe late"]
+)
+async def test_a_late_runner_cannot_move_that_fault_into_the_window(late: dict[str, float]) -> None:
+    # BACKLOG #2936. The control above failed twice in the merge queue on windows-2025, with all 28
+    # sends excused. It then read the hold's start BEFORE handing the sends to a task, and trusted
+    # the sender to write them at once. Injected into that layout, the first wait here reproduced
+    # the red: written 0.45 s into the hold, the sends were 0.16 s old at the request, inside the
+    # 0.25 s floor. The second did not, at 0.5 s or at 2 s: the lookback stops at half the hold so
+    # far, so a late probe cannot reach a send made when the hold started. What made the sends late
+    # on that runner was not found.
+    _assert_the_fault_was_judged(await _no_ack_fault_step(unacked_just_before_reload=False, **late))
 
 
 async def test_the_same_sends_made_just_before_the_reload_are_excused() -> None:
     # THE OTHER HALF: the same 28 sends, written 50 ms before the request, are what the reload
     # strands on a healthy engine. They are excused, so the window is what separates the two.
-    result = await _no_ack_fault_step(unacked_just_before_reload=True)
-    assert result.ok, result.detail
-    assert "28 send(s) stranded by the reload probe" in result.detail
+    step = await _no_ack_fault_step(unacked_just_before_reload=True)
+    assert step.result.ok, step.why
+    assert "28 send(s) stranded by the reload probe" in step.result.detail, step.why
 
 
 # --- after the reload: a slow engine is waited for, a silent one still fails (BACKLOG #1292) -------
