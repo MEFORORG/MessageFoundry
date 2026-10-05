@@ -134,9 +134,9 @@ async def assert_session_rotation_contract(store: Any, *, user_id: str = "rot-u1
 async def assert_session_supersession_contract(store: Any, *, user_id: str = "sup-u1") -> None:
     """Drive ``supersede_session`` through its contract on any backend (BACKLOG #2146).
 
-    It is the login supersession's single revoke-and-return statement. What makes it safe against a
-    concurrent ``rotate_session`` is that each is ONE statement on the same row, so the store orders
-    them: whichever commits second finds the row already changed.
+    It is the login supersession's revoke-and-return operation. Why it is safe against a concurrent
+    ``rotate_session`` is ``AuthStore.supersede_session``'s docstring to say. This contract drives
+    the two one after the other, in both orders, and pins what each order must leave behind.
     """
     now = time.time()
     await store.create_user(

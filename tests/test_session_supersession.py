@@ -228,8 +228,7 @@ async def test_a_rotation_racing_the_supersession_cannot_keep_the_session_live(
         monkeypatch.setattr(store, name, _then_rotate)
 
     for name in ("get_session", "supersede_session"):
-        if hasattr(store, name):
-            _inject(name)
+        _inject(name)
     new = await _token(service, supersedes=prior)
 
     assert rotations, "the injection never fired, so this measured nothing"
@@ -244,19 +243,29 @@ async def test_a_rotation_racing_the_supersession_cannot_keep_the_session_live(
 async def test_a_touch_just_before_the_revoke_still_audits_a_live_session(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Review finding on BACKLOG #2146. A request on the old cookie can touch the session just
-    # before the revoke. The liveness check must read its clock after the revoke, as the validator
-    # would, or that touch makes a live session look stamped ahead and the audit row is lost.
+    # Review finding on BACKLOG #2146. A request on the old cookie can touch the session after the
+    # supersession read its clock but before the revoke. That touch must not make a live session
+    # look stamped ahead, or the audit row is lost. The clock STEPS on every read, so the touch is
+    # strictly later than the clock the revoke was stamped with; equal readings could not tell the
+    # two orders apart.
     service = await _service(store)
     prior = await _token(service)
     prior_hash = hash_token(prior)
-    real = store.supersede_session
+    real_supersede = store.supersede_session
+    base, reads = time.time(), [0]
+
+    def _stepping() -> float:
+        reads[0] += 1
+        return base + reads[0] * 0.001
 
     async def _touched_first(token_hash: str, *, now: float) -> object:
-        await store.touch_session(token_hash, now=time.time())
-        return await real(token_hash, now=now)
+        touched = time.time()
+        assert touched > now, "the stepping clock did not separate the touch from the revoke stamp"
+        await store.touch_session(token_hash, now=touched)
+        return await real_supersede(token_hash, now=now)
 
     monkeypatch.setattr(store, "supersede_session", _touched_first)
+    monkeypatch.setattr(time, "time", _stepping)
     await _token(service, supersedes=prior)
     assert not await _live(service, prior)
     assert await _superseded(store) == [

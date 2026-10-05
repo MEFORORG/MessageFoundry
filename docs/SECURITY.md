@@ -3289,10 +3289,11 @@ the token being replaced, and the engine ends it as the console legs do, before 
 engine client (`EngineClient.login`) both name the token they replace in `supersedes`. The Python
 client names only a token the engine issued to it, never one adopted with `set_token`.
 
-A step-up gives a session a new token. The supersession finds and ends the presented session in one
-atomic store operation, so a step-up cannot land between the two (BACKLOG #2146). If the
-supersession runs first, a later step-up on that session fails and asks the user to sign in again.
-**One case stays open.** A step-up can finish while the sign-in is still in progress, before the
+Every elevation gives a session a new token: completing MFA, a step-up, a passkey ceremony or a
+password re-check. The supersession finds and ends the presented session in one atomic store
+operation, so an elevation cannot land between the two (BACKLOG #2146). If the supersession runs
+first, a later elevation on that session fails and asks the user to sign in again. **One case stays
+open.** An elevation in another tab can finish while the sign-in is still in progress, before the
 supersession runs. That window covers the credential check, and on federated sign-in the round trip
 to the identity provider. The presented token then names no session, so nothing is ended. The
 session lives on under its new token until it expires, because the engine does not record which
