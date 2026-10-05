@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import datetime
 import logging
+import ssl
 from pathlib import Path
 
 import pytest
@@ -47,8 +48,10 @@ from messagefoundry.pipeline.wiring_runner import build_check_registry
 from messagefoundry.redaction import redact
 from messagefoundry.secretscrub import scrub_credentials
 from messagefoundry.transports import dicom as dicom_module
+from messagefoundry.transports import remotefile as remotefile_module
 from messagefoundry.transports.dicom import DicomScuDestination
 from messagefoundry.transports.fhir import FhirLookupExecutor
+from messagefoundry.transports.remotefile import RemoteFileDestination, _FtpClient
 from messagefoundry.transports.rest import _NO_REDIRECT_OPENER, opener_tls_context
 
 ENFORCING = HopPosture(enforcing=True)
@@ -344,4 +347,110 @@ def test_a_plaintext_dicom_association_is_the_cleartext_refusal_not_this_one() -
     with active_hop_posture(ENFORCING), pytest.raises(InsecureHopRefused) as exc:
         DicomScuDestination(_scu(REMOTE, tls=False))
     assert "plaintext DIMSE" in str(exc.value)
+    assert "revocation" not in str(exc.value)
+
+
+# --- FTPS upload, the destination (transports/remotefile.py) ---------------------------------------
+
+
+def _ftps(host: str, *, protocol: str = "ftps", **kw: object) -> Destination:
+    extra = kw.pop("settings", {})
+    assert isinstance(extra, dict)
+    settings: dict[str, object] = {
+        "host": host,
+        "remote_dir": "/in",
+        "protocol": protocol,
+        **extra,
+    }
+    return _dest("OB_FTPS", ConnectorType.REMOTEFILE, settings, **kw)  # type: ignore[arg-type]
+
+
+def _ftps_context(dest: RemoteFileDestination) -> ssl.SSLContext | None:
+    """The context the destination's own client will hand to ``ftplib.FTP_TLS``."""
+    client = dest._client
+    assert isinstance(client, _FtpClient)
+    return client._context
+
+
+def test_an_ftps_upload_is_refused_when_it_checks_no_revocation() -> None:
+    # THE CONTROL. Before #2193 this constructed: the file's only hop guard was for anonymous ftp.
+    with (
+        active_hop_posture(ENFORCING),
+        pytest.raises(InsecureHopRefused, match="revocation") as exc,
+    ):
+        RemoteFileDestination(_ftps(REMOTE))
+    assert "connection 'OB_FTPS';" in str(exc.value)
+
+
+def test_an_ftps_upload_is_admitted_when_a_crl_reaches_its_own_context(bare_crl: str) -> None:
+    with active_hop_posture(ENFORCING):
+        dest = RemoteFileDestination(_ftps(REMOTE, policy=_crl_policy(bare_crl)))
+    assert context_checks_revocation(_ftps_context(dest)) is True
+
+
+def test_a_configured_crl_does_not_admit_an_ftps_upload_whose_context_lacks_it(
+    bare_crl: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guard reads the client's context, never the setting. The policy carries a CRL and the
+    context the client ends up holding does not, so the hop must stay refused."""
+    real = remotefile_module._ftps_ssl_context
+    monkeypatch.setattr(
+        remotefile_module,
+        "_ftps_ssl_context",
+        lambda settings, *, trust_anchor_policy=None, name="": real(settings, name=name),
+    )
+    with active_hop_posture(ENFORCING), pytest.raises(InsecureHopRefused, match="revocation"):
+        RemoteFileDestination(_ftps(REMOTE, policy=_crl_policy(bare_crl)))
+
+
+def test_an_ftps_upload_crosses_on_its_attestation_and_is_audited(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with active_hop_posture(ENFORCING), caplog.at_level(logging.WARNING):
+        RemoteFileDestination(_ftps(REMOTE, attested=True))
+    shipped = _shipped(_audit(caplog))
+    assert "connection 'OB_FTPS';" in shipped and REASON in shipped
+    assert "REMOTEFILE ftps destination" in shipped
+
+
+def test_an_ftps_upload_on_loopback_still_crosses(bare_crl: str) -> None:
+    with active_hop_posture(ENFORCING):
+        dest = RemoteFileDestination(_ftps(LOOPBACK, policy=_crl_policy(bare_crl)))
+    assert context_checks_revocation(_ftps_context(dest)) is False
+
+
+def test_an_ftps_upload_warns_but_builds_when_not_enforcing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with active_hop_posture(NOT_ENFORCING), caplog.at_level(logging.WARNING):
+        RemoteFileDestination(_ftps(REMOTE))
+    assert any("revocation" in r.getMessage() for r in caplog.records)
+
+
+def test_an_ftps_upload_built_outside_the_gate_is_unchanged() -> None:
+    RemoteFileDestination(_ftps(REMOTE))
+
+
+def test_an_ftps_upload_that_verifies_nothing_takes_no_revocation_guard(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Disjoint gates. ``tls_verify=false`` has no verified certificate whose revocation could
+    matter, so its own refusal owns it under an enforcing posture. Where the escape permits the hop,
+    the guard is not taken at all: a non-enforcing posture WARNs on every guarded hop, and no such
+    line appears here."""
+    off = {"tls_verify": False}
+    with active_hop_posture(ENFORCING), pytest.raises(ValueError, match="tls_verify=false") as exc:
+        RemoteFileDestination(_ftps(REMOTE, settings=off))
+    assert "revocation" not in str(exc.value)
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    with active_hop_posture(NOT_ENFORCING), caplog.at_level(logging.WARNING):
+        RemoteFileDestination(_ftps(REMOTE, settings=off))
+    assert any("verification is DISABLED" in r.getMessage() for r in caplog.records)
+    assert not any("revocation" in r.getMessage() for r in caplog.records)
+
+
+def test_an_anonymous_plain_ftp_upload_is_the_cleartext_refusal_not_this_one() -> None:
+    with active_hop_posture(ENFORCING), pytest.raises(InsecureHopRefused) as exc:
+        RemoteFileDestination(_ftps(REMOTE, protocol="ftp"))
+    assert "cleartext anonymous FTP" in str(exc.value)
     assert "revocation" not in str(exc.value)
