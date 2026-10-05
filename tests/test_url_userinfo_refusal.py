@@ -55,7 +55,12 @@ from messagefoundry.transports.egress import (
 )
 from messagefoundry.transports.fhir import FhirDestination, FhirLookupExecutor
 from messagefoundry.transports.http_auth import HttpAuthError, OAuth2ClientCredentialsProvider
-from messagefoundry.transports.rest import RestDestination, _redact_url
+from messagefoundry.transports.rest import (
+    RestDestination,
+    _redact_url,
+    proxy_config_from_settings,
+    refuse_url_credentials,
+)
 from messagefoundry.transports.smart import SmartAuthError, SmartBackendTokenProvider
 from messagefoundry.transports.soap import SoapDestination
 from tests.test_dicomweb import _FakeOpener
@@ -91,6 +96,9 @@ _USERINFO_SHAPES = {
     "empty_head_slash": f"https://svc:/{SECRET}@endpoint.example.invalid/x",
     "encoded_colon_numeric_head": f"https://svc%3A4821/{SECRET}@endpoint.example.invalid/x",
     "encoded_colon_slash_in_pw": f"https://svc%3A{SECRET}/tail@endpoint.example.invalid/x",
+    # ``%5D`` in the head: unquoted, it reads as an IPv6 literal's end and hides the port from the
+    # dialling reader, so the raw reader must still see it.
+    "encoded_bracket_head": f"https://svc:ab%5Dc/{SECRET}@endpoint.example.invalid/x",
 }
 
 
@@ -183,6 +191,7 @@ def test_the_refusal_leaves_ordinary_urls_alone() -> None:
         "https://api.example.invalid/users/@me?who=a@b",
         "https://api.example.invalid:8443/x?who=a@b",
         "https://api.example.invalid:8443/users/%40me",
+        "https://api.example.invalid:08443/x",  # a leading zero: urlsplit and http.client accept it
         "https://api.example.invalid:/x",
         "https://[::1]:8443/x",
         "https://[::1]:8443/x?who=a@b",
@@ -283,6 +292,8 @@ def test_redact_url_never_echoes_a_port_that_is_not_a_number() -> None:
         # (ProxyConfig.redacted is gone), so this pins the helper, not a proxy log line.
         f"http://svc:{SECRET}/tail@proxy.example.invalid:3128",
         f"http://svc:4821/{SECRET}@proxy.example.invalid:3128",
+        # The refusal's own %40 advice, followed for a credential: it constructs, so this is its guard.
+        f"https://svc:4821/{SECRET}%40endpoint.example.invalid/x",
     ],
 )
 def test_redact_url_withholds_every_part_of_a_password_cut_short(url: str) -> None:
@@ -314,6 +325,34 @@ def test_an_at_after_a_port_is_refused_with_the_fix_named() -> None:
     with pytest.raises(ValueError, match="%40") as exc:
         RestDestination(_dest(ConnectorType.REST, "https://api.example.invalid:8443/users/@me"))
     assert "@me" not in str(exc.value)
+
+
+def test_a_url_urlsplit_cannot_parse_is_refused_without_echoing_it() -> None:
+    """``urlsplit`` raises a plain ``ValueError`` quoting the whole netloc when a character folds to
+    a delimiter under NFKC, here a fullwidth solidus inside the password."""
+    with pytest.raises(WiringError) as exc:
+        refuse_url_credentials(
+            f"https://svc:{SECRET}／q@endpoint.example.invalid/x", "'url'", error=WiringError
+        )
+    assert SECRET not in str(exc.value)
+    assert exc.value.__context__ is None  # raised after the handler, so no chain carries it
+
+
+def test_the_proxy_config_repr_carries_no_credential() -> None:
+    """``ProxyConfig.redacted`` is gone, and the dataclass repr is what a traceback or an assertion
+    diff would print. The URL and the Basic header stay out of it, as the digest recipe's do."""
+    cfg = proxy_config_from_settings(
+        {
+            "proxy_url": f"https://u:{SECRET}@proxy.example.invalid:3128",
+            "proxy_user": "pu",
+            "proxy_password": SECRET,
+        },
+        dest_scheme="https",
+        connection="OB_2686",
+    )
+    assert cfg is not None
+    assert SECRET not in repr(cfg), repr(cfg)
+    assert "Basic" not in repr(cfg), repr(cfg)
 
 
 # --- 3. DICOMweb and SOAP classify an InvalidURL instead of letting it escape --------------------------

@@ -430,12 +430,31 @@ def _expiry_relaxed_opener(
     )
 
 
-def _port_field(netloc: str) -> str | None:
-    """The authority's port field as urllib dials it, or ``None`` when it names none. Unquoted,
-    because urllib unquotes the host before ``http.client`` splits the port off, so ``svc%3A12``
-    dials port 12. Read past an IPv6 literal's ``]``; the caller has already refused userinfo."""
-    hostport = urllib.parse.unquote(netloc).rpartition("]")[2]
-    return hostport.partition(":")[2] if ":" in hostport else None
+def _port_fields(netloc: str) -> tuple[str, ...]:
+    """Every port field a reader takes from ``netloc``; empty when no reader sees a port.
+
+    Two readers, because they disagree. ``urlsplit`` reads the RAW authority, after an IPv6
+    literal's ``]`` or else after the first ``:``. urllib unquotes the host before ``http.client``
+    reads it, after the last ``:`` that follows any ``]``. So ``svc%3A12`` dials port 12, and
+    ``svc:ab%5Dc`` hides its port from ``http.client`` alone. The caller has refused userinfo."""
+    fields: list[str] = []
+    raw = netloc.partition("]")[2] if netloc.startswith("[") else netloc
+    if ":" in raw:
+        fields.append(raw.partition(":")[2])
+    dial = urllib.parse.unquote(netloc)
+    colon = dial.rfind(":")
+    if colon > dial.rfind("]"):
+        fields.append(dial[colon + 1 :])
+    return tuple(fields)
+
+
+def _is_port(value: str) -> bool:
+    """Is ``value`` empty or a number from 0 to 65535? Leading zeros count, since ``urlsplit`` and
+    ``http.client`` both accept them. The length is capped before ``int``, so nothing raises."""
+    digits = value.lstrip("0")
+    return value == "" or (
+        value.isascii() and value.isdigit() and len(digits) <= 5 and int(digits or "0") <= 65535
+    )
 
 
 def _redact_url(url: str) -> str:
@@ -451,10 +470,14 @@ def _redact_url(url: str) -> str:
     an unencoded ``/``, ``?`` or ``#`` ends the authority early, so the username is read as the host
     and the password's tail, with the real host, as the path. ``svc:12/ss@host`` and an ``@`` that is
     only an email in a query look the same to a parser, so neither names a host, as ``_peer_label``
-    does in ``config/wiring.py``. A ``%`` in the host is withheld too: ``svc%3APW%40host`` is a
-    userinfo that urllib unquotes, and ``hostname`` would print it whole."""
+    does in ``config/wiring.py``. The ``@`` is read after unquoting, so ``%40`` counts. A host that
+    holds ``@`` or ``:`` once unquoted is withheld too: ``svc%3APW%40host`` is a userinfo urllib
+    unquotes, and ``hostname`` would print it whole. An IPv6 literal, zone and all, keeps its host."""
     p = urllib.parse.urlsplit(url)
-    if "@" in f"{p.path}{p.query}{p.fragment}" or "%" in p.netloc.rpartition("@")[2]:
+    encoded_userinfo = not p.netloc.rpartition("@")[2].startswith("[") and any(
+        c in urllib.parse.unquote(p.hostname or "") for c in "@:"
+    )
+    if encoded_userinfo or "@" in urllib.parse.unquote(f"{p.path}{p.query}{p.fragment}"):
         return f"{p.scheme}://<redacted>"
     try:
         port = f":{p.port}" if p.port else ""
@@ -493,16 +516,27 @@ def refuse_url_credentials(
 
     PHI- and secret-safe: names the setting, never the URL or any part of it. ``error`` keeps each
     seam's own ``ValueError`` subclass, so a caller catching ``HttpAuthError`` still catches this."""
-    p = urllib.parse.urlsplit(url)
+    # Raised after the handler ends: urlsplit's NFKC ValueError quotes the whole netloc, password and
+    # all, and ``from None`` would leave it on ``__context__`` (#1796).
+    try:
+        parsed: urllib.parse.SplitResult | None = urllib.parse.urlsplit(url)
+    except ValueError:
+        parsed = None
+    if parsed is None:
+        raise error(
+            f"{setting} is not a URL that can be parsed. A password written into the URL can "
+            f"cause this; set credentials in {use} instead"
+        )
+    p = parsed
     if "@" in urllib.parse.unquote(p.netloc):
         raise error(
             f"{setting} must not carry credentials in the URL (the user:password@ part); "
             f"set them in {use} instead"
         )
-    # Read as a string, never through ``p.port``: its ValueError quotes the port field, which is the
-    # password in ``https://svc:PW/path`` (#1796). The length cap keeps ``int`` from raising either.
-    port = _port_field(p.netloc)
-    if port and not (port.isascii() and port.isdigit() and len(port) <= 5 and int(port) <= 65535):
+    # Read as strings, never through ``p.port``: its ValueError quotes the port field, which is the
+    # password in ``https://svc:PW/path`` (#1796).
+    ports = _port_fields(p.netloc)
+    if not all(_is_port(port) for port in ports):
         raise error(
             f"{setting} has a port that is not a number from 0 to 65535. A password written "
             f"into the URL can cause this; set credentials in {use} instead"
@@ -513,7 +547,7 @@ def refuse_url_credentials(
     # An ``@`` in a query value after a real path still passes; so does any ``@`` with no port. That
     # leaves a password such as ``12/a?b`` constructible; ``_redact_url`` still withholds it.
     tail = p.path + (p.query if not p.path else "") + p.fragment
-    if port is not None and "@" in tail:
+    if ports and "@" in tail:
         raise error(
             f"{setting} has a port followed by an '@'. A password written into the URL can cause "
             f"this; set credentials in {use} instead. Write a literal '@' as %40, or leave out a "
@@ -1375,10 +1409,11 @@ class ProxyConfig:
     target host (a destination / a token endpoint), returning ``None`` when that host is bypassed (#128)
     or is a loopback host, which is never proxied (vault BACKLOG #2579)."""
 
-    proxies: tuple[tuple[str, str], ...]  # (("http", url), ("https", url)); () when use_default
+    # Kept out of the repr, as the digest recipe's fields are: the URL may carry user:password@.
+    proxies: tuple[tuple[str, str], ...] = field(repr=False)  # () when use_default
     use_default: bool  # True → ProxyHandler() reading getproxies() ("Use Default Web Proxy", #112)
     bypass: tuple[str, ...]
-    auth_header: tuple[tuple[str, str], ...]  # (("Proxy-Authorization", "Basic .."),) or ()
+    auth_header: tuple[tuple[str, str], ...] = field(repr=False)  # Proxy-Authorization, or ()
     digest: _ProxyDigestRecipe | None
     # The declaring connection's name, for a log record. A name, never a setting value.
     connection: str | None = None
