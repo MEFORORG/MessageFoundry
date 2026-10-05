@@ -76,6 +76,7 @@ from typing import Any, ClassVar, cast
 from messagefoundry.auth.trust_anchors import inbound_ca_cadata, refuse_an_unread_ca_pin
 from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.tls_policy import (
+    RevocationHopGuard,
     TrustAnchorPolicy,
     apply_connection_tls_ciphers,
     build_verifying_client_context,
@@ -1289,6 +1290,23 @@ class DicomScuDestination(DestinationConnector):
         )
         if self._hop_guard is not None:
             self._hop_guard.enforce_construction()
+        # BACKLOG #2193 (ADR 0173): a DICOM-over-TLS association verifies the PACS certificate, but
+        # stdlib ssl checks no OCSP or CRL, so a revoked certificate would still be accepted on a hop
+        # that carries imaging objects. Taken whenever TLS is on: this connector has no verify-off
+        # arm, so a context here always verifies. Handed `self._ssl`, the context the association
+        # really dials with, so a [tls].crl_file that reached this hop relaxes the refusal and a hop
+        # it never reached keeps it. Disjoint from the cleartext guard above, which is taken only
+        # when TLS is off.
+        if self._ssl is not None:
+            RevocationHopGuard.capture(
+                host=self._host,
+                cell="DICOM C-STORE client (SCU) over TLS",
+                description="verified DICOM-over-TLS association (no revocation check)",
+                attested=config.tls_revocation_attested,
+                attested_reason=config.tls_revocation_attested_reason,
+                connection=config.name,
+                context=self._ssl,
+            ).enforce_construction()
 
     async def send(
         self, payload: str, *, metadata: Mapping[str, str] | None = None

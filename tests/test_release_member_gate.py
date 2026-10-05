@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -52,6 +53,8 @@ from forbidden_members import (  # noqa: E402
     main,
     split_violation,
 )
+
+from tests._workflow_contexts import needs_of  # noqa: E402
 
 #: hatchling names every sdist member ``<project>-<version>/...``. The fixtures carry it because the
 #: denylist's whole claim is that a prefix cannot launder a basename, and a fixture with no prefix
@@ -599,9 +602,15 @@ def _publishing_jobs() -> dict[str, JobDict]:
     DERIVED, NOT LISTED. The reported defect was a job with no gate, so a test naming today's three
     jobs would go green the day a fourth is added -- which is the same failure one layer up. A job
     qualifies if any step publishes to PyPI or uploads to a GitHub release.
+
+    A PUBLISH-ONLY job (vault BACKLOG #2631, limb 1) builds nothing and so gates nothing itself: it
+    publishes files another job gated, after checking them against that job's digests. Such a job
+    is replaced here by the job that gated its files, which `_gating_job` finds and checks, so every
+    test below grades the job where the gate has to be.
     """
+    jobs = _jobs()
     out: dict[str, JobDict] = {}
-    for jid, job in _jobs().items():
+    for jid, job in jobs.items():
         for step in _steps(job):
             uses = str(step.get("uses") or "")
             run = str(step.get("run") or "")
@@ -610,9 +619,39 @@ def _publishing_jobs() -> dict[str, JobDict]:
                 or "gh release upload" in run
                 or "gh release create" in run
             ):
-                out[jid] = job
+                gid = _gating_job(jid, job)
+                out[gid] = jobs[gid]
                 break
     return out
+
+
+#: How a publish-only job names the job whose digests it checks.
+_DIGEST_SOURCE = re.compile(r"needs\.([\w-]+)\.outputs\.pypi-digests")
+
+
+def _gating_job(jid: str, job: JobDict) -> str:
+    """``jid`` when the job runs the gate itself; else the job whose gated files it publishes.
+
+    For a publish-only job this ASSERTS the chain that makes the substitution honest: a step
+    checks the download against `needs.<producer>.outputs.pypi-digests` before any publish step,
+    and `<producer>` is in the job's `needs:`.
+    """
+    steps = _steps(job)
+    if any(_GATE_INVOCATION in str(s.get("run") or "") for s in steps):
+        return jid
+    checks = [
+        (i, m.group(1))
+        for i, s in enumerate(steps)
+        if (m := _DIGEST_SOURCE.search(str((s.get("env") or {}).get("EXPECTED") or "")))
+    ]
+    assert len(checks) == 1, f"{jid} publishes with no gate and no single digest check: {checks}"
+    at, producer = checks[0]
+    publish_at = [i for i, s in enumerate(steps) if "gh-action-pypi-publish" in str(s.get("uses"))]
+    assert publish_at and at < min(publish_at), f"{jid} checks digests after it publishes"
+    assert producer in needs_of(job), (
+        f"{jid} checks {producer}'s digests without needing {producer}"
+    )
+    return producer
 
 
 def test_the_publishing_job_set_is_the_one_we_think_it_is() -> None:
@@ -704,6 +743,9 @@ def test_the_toolkit_gate_keeps_its_id_and_the_upload_reads_it() -> None:
         s
         for s in steps
         if "upload-artifact" in str(s.get("uses") or "")
+        # The dry-run upload, by name: the PyPI hand-over (vault BACKLOG #2631) also carries
+        # toolkit-dist/, but runs on the implicit success(), so no gate guard is needed there.
+        and (s.get("with") or {}).get("name") == "release-artifacts"
         and "toolkit-dist/" in str((s.get("with") or {}).get("path") or "")
     ]
     assert len(uploads) == 1, "the release job's dry-run upload no longer carries toolkit-dist/"
@@ -730,7 +772,7 @@ def test_each_job_gates_the_artifacts_it_actually_builds() -> None:
     reason, not about the leak.
     """
     expected = {
-        # The toolkit wheel is built and published inside the engine job (ADR 0201).
+        # The toolkit wheel is built and gated inside the engine job (ADR 0201); publish-pypi uploads it.
         "release": ("dist/", "toolkit-dist/"),
         "release-webconsole": ("webconsole-dist/",),
         "release-harness": ("harness-dist/",),

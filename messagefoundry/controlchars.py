@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""The C0/DEL control-character test, written once (BACKLOG #1253).
+"""The control-character alphabets, each written once: the C0/DEL test (BACKLOG #1253) and the
+wider log alphabet built on it (vault BACKLOG #2815).
 
 WHAT THIS REPLACES. ``ord(ch) < 0x20 or ord(ch) == 0x7F`` was written out seven times across six
 files -- two in ``transports/fhir.py`` and one each in ``config/codeset_edit.py``,
@@ -16,13 +17,13 @@ appropriate: a raise suits a path context, a bool suits a filter, and the except
 refusal and its own message. A flag parameter would have re-created the coupling the item exists to
 remove, one indirection further away. What a call site CANNOT sensibly keep its own copy of is the
 alphabet, or a neutraliser derived from it -- so :func:`strip_control_chars` and
-:func:`scrub_control_chars` are here beside :func:`has_control_char`, all three built from the one
-predicate. (This paragraph replaced a "shares the predicate, not the action" thesis that its own
-module had already outgrown: a reader taking that literally puts the next neutraliser elsewhere,
+:func:`scrub_control_chars` are here beside :func:`has_control_char`, all three built on the one
+predicate, which the escape widens. (This paragraph replaced a "shares the predicate, not the
+action" thesis that its own module had already outgrown: a reader taking that literally puts the next neutraliser elsewhere,
 which is how the escape table came to live in ``logging_setup``.)
 
 THE TWO NEUTRALISERS ARE DIFFERENT AND ONE MUST NEVER BE "SIMPLIFIED" INTO THE OTHER. Beside the
-refusals, that makes three actions over one predicate:
+refusals, that makes three actions built on one predicate:
 
   * REJECT -- six sites. A control character in a value that reaches a URL path, a header, a
     filename or a config field is refused outright.
@@ -35,13 +36,15 @@ refusals, that makes three actions over one predicate:
     ``corepoint_import.py`` and ``uploads.py`` strip too. The upload filename is display-only and
     never locates a file, so the #1238 ruling does not reach it either.
   * ESCAPE -- every log line, :func:`scrub_control_chars`. Neither refuses nor deletes: it renders
-    the code point as a readable backslash escape, so one record cannot become two.
+    the code point as a readable backslash escape, so one record cannot become two. Its alphabet is
+    WIDER than the other two arms' (vault BACKLOG #2815); :func:`_escapes_in_a_log_line` states it.
 
 WHY ESCAPE LIVES HERE, WHICH IS THE ONE FACT WORTH STATING ONCE (BACKLOG #1591). It was defined in
 ``logging_setup`` until ``logging_guard`` needed it, and ``logging_setup`` imports
 ``logging_guard`` -- so reaching upwards is a cycle and copying the table down is the two-copy drift
-``_is_control_char`` below exists to close. This module imports nothing, so it is the one place both
-can reach. Nothing else about that move is load-bearing; the other files cite this paragraph.
+``_is_control_char`` below exists to close. This module imports only the standard library, so it is
+the one place both can reach. Nothing else about that move is load-bearing; the other files cite
+this paragraph.
 
 DELIBERATELY NOT FOLDED IN. ``parsing/sniff.py``'s ``nontext_upload_reason`` counts the same code
 points, but it is a different predicate. It works on bytes, not characters. It also subtracts its
@@ -63,16 +66,26 @@ THE POINT IS THE COPYING PRACTICE, not the seven known lines. If you need this t
 
 from __future__ import annotations
 
+import unicodedata
+
+#: The Unicode general categories a reader of TEXT may act on rather than show: the C0 and C1
+#: controls and DEL (``Cc``), the bidirectional and other format controls (``Cf``), the line and
+#: paragraph separators (``Zl``, ``Zp``), a lone surrogate (``Cs``), and the private-use and
+#: unassigned code points (``Co``, ``Cn``), which this interpreter's Unicode tables cannot vouch
+#: for. At least two rules escape these: the log (:func:`_escapes_in_a_log_line`) and
+#: :mod:`messagefoundry.terminal_text`'s ``keep_printable_unicode`` mode, which imports it from
+#: here. ``scripts/service/import-db-ca.ps1`` mirrors the set by hand, so change it there too.
+#: Defined here, not there, so this module keeps importing nothing from the engine.
+CONTROL_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp", "Cs", "Co", "Cn"})
+
 
 #: C0 controls (U+0000-U+001F) plus DEL (U+007F). NOT a general "is this printable" test: it is
 #: deliberately blind to C1 (U+0080-U+009F) and to Unicode separators, because every call site
 #: screens values destined for byte-oriented sinks -- a request line, a header, a path -- where C0
 #: and DEL are the injection alphabet. Widening it is a behaviour change at seven call sites at
-#: once, which is exactly the leverage this module exists to provide; make it deliberately.
-#: The log file is a sink read back as text, and a separator passing the scrub reaches it raw. The
-#: engine's own log tail readers end a line at LF, CR and CRLF only (``support.redact.split_log_lines``,
-#: vault BACKLOG #2563), so there it stays inside one record; a new reader should split there too. A
-#: tool outside the engine that opens the raw file may still break the line at it.
+#: once, and at the log escape, which is built on it; that is exactly the leverage this module
+#: exists to provide, so make it deliberately. The log is the one sink read back as TEXT, so it
+#: escapes more than this; see :func:`_escapes_in_a_log_line`.
 def _is_control_char(ch: str) -> bool:
     """THE ONE DEFINITION of the alphabet this module screens for (BACKLOG #1273).
 
@@ -112,40 +125,84 @@ def strip_control_chars(text: str) -> str:
     return "".join(ch for ch in text if not _is_control_char(ch))
 
 
-# C0 control characters (and DEL) escaped to keep one log record on one line. CR/LF are the
-# log-injection vector; tab (0x09) is left intact as benign whitespace.
-#
-# THE ALPHABET IS _is_control_char's, MINUS TAB (BACKLOG #1273, limb 3), and THE SUBTRACTION IS
-# WRITTEN AS ONE rather than as a second table. It used to be re-derived in ``logging_setup`` as
-# `range(0x20)` plus a separate `0x7F` line. The two agreed, so nothing was mis-escaped; the cost is
-# the future-tense one #1239 named and #1253 acted on, that a later widening applied to one copy
-# silently does not apply to the other. Measured: _is_control_char 33 code points, this table 32,
-# symmetric difference {0x09}. One code point of divergence is a subtraction, not a different
-# predicate -- unlike the parsing/sniff.py carve-out the module docstring keeps separate.
-#
-# RANGE 0x100, NOT 0x80, AND THAT IS THE DIFFERENCE BETWEEN A REAL FOLD AND A COSMETIC ONE. The
-# alphabet is C0+DEL today, so both bounds produce the identical 32 entries. But
-# `_is_control_char`'s docstring names widening to C1 (U+0080-U+009F) as the deliberate change this
-# shared module exists to make cheap, and a 0x80 bound would silently NOT follow it: the escape
-# table would keep the old alphabet while every other call site moved, which is the exact two-copy
-# drift limb 3 removes. Iterating past the current boundary costs 128 predicate calls at import and
-# makes the widening propagate by construction.
-#
-# TAB IS THE ONLY SUBTRACTION and test_tab_is_the_only_control_character_left_intact pins it. CR/LF
-# are excluded from the comprehension because they get the readable escapes below, not because they
-# are tolerated -- they are the injection vector this whole table exists for. A comprehension rather
-# than a `for` loop so the index does not survive as a module global: this is a leaf every other
-# module imports, and it should export nothing it did not mean to.
-_CTRL_TRANSLATION: dict[int, str] = {0x0A: "\\n", 0x0D: "\\r"} | {
-    cp: f"\\x{cp:02x}"
-    for cp in range(0x100)
-    if _is_control_char(chr(cp)) and cp not in (0x09, 0x0A, 0x0D)
+def _escapes_in_a_log_line(ch: str) -> bool:
+    """THE LOG ALPHABET, the one statement of it (vault BACKLOG #2815): what
+    :func:`_is_control_char` screens for, plus every character whose Unicode category is in
+    :data:`CONTROL_CATEGORIES`, minus TAB.
+
+    THIS REVERSES THE OLD DESIGN, ON PURPOSE. Until #2815 the log escaped exactly
+    ``_is_control_char`` minus tab (BACKLOG #1273, limb 3, closed as a refactor; no owner ruling set
+    that alphabet). But a log is read back as TEXT, by tools the engine does not control, so C1,
+    the explicit bidirectional controls and U+2028/U+2029 reaching the file raw let a reader split
+    one record or have its order overridden. (Right-to-left LETTERS are printable and stay; a
+    bidi-aware viewer still reorders digits beside them, which no escape of controls can stop.)
+    Widening ``_is_control_char`` instead would change what seven call sites REFUSE
+    (a URL path, a header, a file name, a config field), which is a different and larger change.
+    So this function names its two sources and adds nothing of its own; ``tests/test_logging.py``
+    pins that relationship.
+
+    What it costs: an invisible character with a legitimate textual use is shown as an escape, at
+    least the soft hyphen (U+00AD), the zero-width joiners (U+200C, U+200D) and the byte-order mark
+    (U+FEFF). So is a code point this interpreter's Unicode tables do not assign (category ``Cn``).
+    Accented letters, CJK and every other printable character are unchanged."""
+    return ch != "\t" and (_is_control_char(ch) or unicodedata.category(ch) in CONTROL_CATEGORIES)
+
+
+def _log_escape(code: int) -> str:
+    """Python's own escape for one code point (``\\x85``, ``\\u2028``, ``\\U000e0001``).
+    ``ascii`` spells it, not this module. A backslash in the text is not doubled, as it never was
+    for C0, so peer text that spells an escape reads the same as an escaped character."""
+    return ascii(chr(code))[1:-1]
+
+
+# The log alphabet up to U+00FF, as a ``str.translate`` table: the whole table for ASCII text, and
+# the seed of :class:`_LogTranslation` for the rest. ``ascii`` spells CR and LF as the readable
+# ``\r`` and ``\n``; tab is absent because the predicate leaves it out. RANGE 0x100 SO THE C1 BLOCK
+# IS SEEDED, and a widening of ``_is_control_char`` anywhere in it reaches the table by construction
+# (BACKLOG #1273, limb 3). A comprehension rather than a ``for`` loop so the index does not survive
+# as a module global: this is a leaf every other module imports, and it should export nothing it did
+# not mean to.
+_CTRL_TRANSLATION: dict[int, str] = {
+    cp: _log_escape(cp) for cp in range(0x100) if _escapes_in_a_log_line(chr(cp))
 }
+
+#: How many code points past U+FFFF :class:`_LogTranslation` remembers.
+_ASTRAL_MEMO_LIMIT = 0x1000
+
+
+class _LogTranslation(dict[int, str | int]):
+    """The log alphabet over every code point, as a ``str.translate`` table that fills itself.
+
+    The category set is too large to tabulate at import, so a code point the table has not seen is
+    decided on first lookup and remembered. A character that stays is remembered as its own code
+    point, which ``str.translate`` reads as "unchanged" without a string per entry. The Basic
+    Multilingual Plane is remembered whole, at most 65,536 entries. Past U+FFFF at most
+    :data:`_ASTRAL_MEMO_LIMIT` are remembered, so a peer sending many distinct astral code points
+    cannot grow the table, and filling that share slows only later astral text, never the rest.
+    One C-level translate pass then serves CJK, Greek or Cyrillic text at about the cost of
+    Latin-1."""
+
+    def __init__(self, seed: dict[int, str]) -> None:
+        super().__init__(seed)
+        self._astral = 0
+
+    def __missing__(self, code: int) -> str | int:
+        value: str | int = _log_escape(code) if _escapes_in_a_log_line(chr(code)) else code
+        if code <= 0xFFFF:
+            self[code] = value
+        elif self._astral < _ASTRAL_MEMO_LIMIT:
+            self._astral += 1
+            self[code] = value
+        return value
+
+
+_LOG_TRANSLATION = _LogTranslation(_CTRL_TRANSLATION)
 
 
 def scrub_control_chars(text: str) -> str:
-    """Escape C0 control characters and DEL (tab kept as benign whitespace) so no part of ``text`` can
-    begin a new physical line or drive a terminal.
+    """Escape every character in the log alphabet (:func:`_escapes_in_a_log_line`; tab kept as
+    benign whitespace) so no part of ``text`` can begin a new physical line, override the order a
+    reader sees with a bidirectional control, or drive a terminal.
 
     The single definition of that translation, reached for at least three kinds of call site.
     ``logging_setup.ControlCharScrubFilter`` applies it to every record on a configured handler. A
@@ -155,10 +212,14 @@ def scrub_control_chars(text: str) -> str:
     :mod:`messagefoundry.logging_guard` needs it because its recovery notices bypass
     ``Handler.handle`` by design, so no filter chain ever sees them (BACKLOG #1591).
 
-    Idempotent: the escaped forms contain no control characters. ``str.translate`` over a dict,
-    deliberately -- one C-level pass, no regex engine, no backtracking and no recursion, which is
-    what makes it safe on the log write guard's failure path."""
-    return text.translate(_CTRL_TRANSLATION)
+    Idempotent: every escape is printable ASCII. One ``str.translate`` pass, deliberately: ASCII
+    text over the exact table, anything else over :class:`_LogTranslation`. No regex engine and no
+    backtracking. A code point the table has not remembered costs one shallow Python call; if even
+    that fails on the log write guard's failure path, ``logging_guard._guarded`` substitutes its
+    placeholder rather than raising."""
+    if text.isascii():
+        return text.translate(_CTRL_TRANSLATION)
+    return text.translate(_LOG_TRANSLATION)
 
 
 def scrub_log_argument(text: str) -> str:
@@ -166,7 +227,7 @@ def scrub_log_argument(text: str) -> str:
 
     The result equals ``scrub_control_chars(text)`` for every input, which
     ``tests/test_controlchars.py`` pins. The two ``replace`` calls use the same escapes as the
-    table, and the ``translate`` then escapes every other control character.
+    table, and :func:`scrub_control_chars` then escapes the rest of the log alphabet.
 
     WHY A CALL SITE NEEDS IT WHEN EVERY HANDLER ALREADY SCRUBS. ``ControlCharScrubFilter`` escapes
     the whole record on every configured handler, so on a shipped handler this changes nothing a

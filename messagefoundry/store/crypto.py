@@ -103,6 +103,7 @@ this code can enforce. See the PR for the acceptance statement.
 from __future__ import annotations
 
 import base64
+import contextlib
 import ctypes
 import hashlib
 import json
@@ -113,6 +114,8 @@ import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+
+from messagefoundry.redaction import json_loads_or_refusal
 
 #: An audit-chain MAC provider (ADR 0138 follow-up). Given the canonical row bytes it returns the row's
 #: MAC as a string — used INSTEAD of the in-process ``hmac.new(key, …)`` when the crypto must run inside
@@ -480,7 +483,11 @@ class CipherError(Exception):
     with no matching key, a failed AEAD tag (corrupt blob, or a key/old key that wasn't supplied), a
     malformed value, **or an unknown marker version / algorithm id** (M9 — fail-closed, never a silent
     pass-through). Call sites **contain** this (dead-letter the row) rather than letting a raw
-    ``cryptography`` exception escape into a worker."""
+    ``cryptography`` exception escape into a worker.
+
+    It also covers a **corrupt row** that no key fixes (BACKLOG #2308): a value whose tag verified
+    but whose plaintext is not UTF-8, or, at an eager read seam (:func:`decrypt_json_cell`), is not
+    JSON. The message says which, so an operator is not sent looking for a missing key."""
 
 
 class StoreKeylessError(RuntimeError):
@@ -501,20 +508,34 @@ def decrypt_json_cell(cipher: Cipher, stored: str, *, aad: bytes | None, table: 
 
     The keyless-open trap (#241 F2): with no key configured the identity cipher returns an ``mfenc:``
     value unchanged, so ``json.loads`` raises a raw, un-actionable ``JSONDecodeError``. This detects
-    that case (``is_encrypted`` is True) and raises :class:`StoreKeylessError` naming ``table`` + the
-    remedy instead. A **keyed** cipher that cannot decrypt a row already raises the operator-facing
-    :class:`CipherError` from :meth:`Cipher.decrypt` below — that propagates unchanged (still
-    fail-closed); callers **must not** swallow it into a silent skip. A genuinely malformed *legacy
-    plaintext* value (not encrypted) surfaces its ``JSONDecodeError`` unchanged — a real data problem,
-    not a keyless open — so it is never mis-reported as a missing key."""
+    that case (``is_encrypted`` is True and the cipher does not encrypt) and raises
+    :class:`StoreKeylessError` naming ``table`` + the remedy instead. A **keyed** cipher that cannot
+    decrypt a row already raises the operator-facing :class:`CipherError` from :meth:`Cipher.decrypt`
+    below — that propagates unchanged (still fail-closed); callers **must not** swallow it into a
+    silent skip.
+
+    Two more refusals, and neither carries the cell (BACKLOG #2308). A **keyed** cipher that decrypts
+    an ``mfenc:`` row which then is not JSON raises :class:`CipherError` saying the row is corrupt,
+    never that no key is configured. A malformed *legacy plaintext* value (not encrypted) raises
+    ``json.JSONDecodeError``, a real data problem rather than a keyless open, so it is never
+    mis-reported as a missing key. That error is a body-free copy: an empty ``doc``, a message naming
+    the table and the position, and no chain. json's own error keeps the whole cell on ``.doc``."""
     plaintext = cipher.decrypt(stored, aad=aad)  # keyed: raises CipherError on an undecryptable row
-    try:
-        return json.loads(plaintext)
-    except json.JSONDecodeError:
-        if not cipher.is_encrypted(stored):
-            raise
-    # Raised OUTSIDE the handler, so the decode error is not chained (BACKLOG #2085): its .doc is the
-    # whole cell, which a keyed cipher with a corrupt row would have decrypted to plaintext.
+    # json_loads_or_refusal returns rather than raises, so each refusal below is raised outside any
+    # handler and nothing rides __cause__ or __context__ (BACKLOG #2308).
+    value, refusal = json_loads_or_refusal(plaintext)
+    if refusal is None:
+        return value
+    if not cipher.is_encrypted(stored):
+        reason = f"store table {table!r} holds a value that is not JSON ({refusal})"
+        legacy = json.JSONDecodeError(reason, "", 0)
+        legacy.args = (reason,)  # json appends "line 1 column 1 (char 0)", which would mislead
+        raise legacy
+    if cipher.encrypts:
+        raise CipherError(
+            f"store table {table!r} holds an encrypted value that decrypted under the configured "
+            f"key but is not JSON ({refusal}); the row is corrupt"
+        )
     raise StoreKeylessError(
         f"store table {table!r} carries encrypted rows (mfenc: markers) but no store "
         "encryption key is configured; set MEFOR_STORE_ENCRYPTION_KEY to the key that wrote "
@@ -1292,11 +1313,18 @@ class AesGcmCipher(_UnmarkedPolicy):
             pt = bytearray(decrypted)
             locked = _lock_memory(pt)
             try:
-                return pt.decode("utf-8")
+                # A UnicodeDecodeError's .object is the decrypted plaintext, so it is suppressed and
+                # the refusal raised after the block, chaining nothing (BACKLOG #2308, the Transit
+                # twin's shape). The tag verified, so no other key is tried: the row is corrupt.
+                with contextlib.suppress(UnicodeDecodeError):
+                    return pt.decode("utf-8")
             finally:
                 _secure_zero(pt)
                 if locked:
                     _unlock_memory(pt)
+            raise CipherError(
+                f"decrypted value is not valid UTF-8 (key_id={key_id!r}); the row is corrupt"
+            )
         raise CipherError(
             f"no configured key decrypts this value (key_id={key_id!r}); if rotating, supply the "
             "prior key via MEFOR_STORE_ENCRYPTION_KEYS_RETIRED"

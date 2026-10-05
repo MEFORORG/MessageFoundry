@@ -203,8 +203,8 @@ def test_corpus_from_file_rejects_empty_and_malformed(tmp_path) -> None:
 
 # --- tee anonymize-captures: PHI-safety guards (ANON-9) --------------------------------------------
 
-# A forbidden token (a routable IP) in a KEPT field (MSH-4, sending facility). MSH is never scrubbed
-# by the rule pass, so the IP survives anonymization and trips the leak_check -> LeakError. The tee's
+# A forbidden token (a routable IP) in a KEPT field (MSH-4, sending facility). No default rule names
+# an MSH field, so the IP survives anonymization and trips the leak_check -> LeakError. The tee's
 # vendored IP detector keeps a literal default even without the publish guard, so this runs on the OSS
 # mirror too.
 #
@@ -355,10 +355,11 @@ def test_tee_anonymize_captures_logs_coverage_on_the_refusing_path(
     assert _LEAK_IP not in line and "DOE" not in line
 
 
-def test_tee_anonymize_captures_prints_coverage_to_real_stderr_at_info_only(tmp_path) -> None:
+def test_tee_anonymize_captures_prints_coverage_to_real_stderr_at_every_log_level(tmp_path) -> None:
     # The two tests above read pytest's log capture, which installs its own root handler, so the
     # CLI's own logging setup never runs there. A real process is the only place that proves the
-    # operator SEES the line at the default level, and that --log-level WARNING hides it.
+    # operator SEES the line at the default level. --log-level WARNING used to hide it, and it is
+    # the only record of what passed, so a quieter level now prints it plain (BACKLOG #2247).
     db = str(tmp_path / "tee.db")
     _seed_capture(db, _ZPD_RAW.encode("latin-1"))
     env = {**os.environ, "MEFOR_ANON_SALT": _SALT}
@@ -377,7 +378,11 @@ def test_tee_anonymize_captures_prints_coverage_to_real_stderr_at_info_only(tmp_
     console = _console_without_temp_paths(default, tmp_path)
     for needle in ("ZZTEST", "SYNTH", "19700101", "DOE", "JOHN", "999"):
         assert needle not in console
-    assert "coverage:" not in run("quiet.jsonl", "--log-level", "WARNING")
+    quiet = run("quiet.jsonl", "--log-level", "WARNING")
+    assert "INFO tee.anonymize" not in quiet  # the level still quiets the log line itself
+    assert quiet.count("coverage: 1 message(s) reached the leak-check") == 1
+    assert "ZPD-2 x1" in quiet
+    assert default.count("coverage: 1 message(s) reached the leak-check") == 1  # never twice
 
 
 def test_tee_anonymize_captures_require_full_coverage_refuses_an_undecided_field(

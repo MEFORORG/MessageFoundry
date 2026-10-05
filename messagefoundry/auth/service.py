@@ -22,7 +22,6 @@ import os
 import secrets
 import time
 import unicodedata
-import urllib.parse
 import urllib.request
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
@@ -104,7 +103,12 @@ from messagefoundry.config.secretprovider import (
     resolve_connector_secret,
 )
 from messagefoundry.config.settings import AuthSettings
-from messagefoundry.config.tls_policy import HopPosture, RevocationHopGuard
+from messagefoundry.config.tls_policy import (
+    HopPosture,
+    InsecureHopRefused,
+    RevocationHopGuard,
+    hop_url_host,
+)
 from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.credential import constant_time_equal
 from messagefoundry.store.base import AdminStore
@@ -225,14 +229,18 @@ _NEW_IP_DEDUP_MAX = 4096
 # With _NEW_IP_DEDUP_MAX it bounds the cache at 4096 x 9 address keys.
 _NEW_IP_PER_SESSION_MAX = 8
 
-# The first-seen login-address signal (BACKLOG #288, ASVS 8.2.4). It reads the account's own
-# ``auth.login_success`` audit rows at every session mint, so both bounds are there to keep that read
-# cheap: at most this many rows, from at most this far back. An address last used before the window,
-# or beyond the newest rows, reads as NEW -- the signal answers "seen RECENTLY", and erring that way
-# costs one challenge and one notice, never a refused login.
+# The first-seen login-address signal (BACKLOG #288, ASVS 8.2.4). Its baseline is the store's
+# per-account ``known_login_addresses`` record (vault BACKLOG #2145), read at every session mint with
+# one primary-key lookup. An address last seen before this window reads as NEW -- the signal answers
+# "seen RECENTLY", and erring that way costs one challenge and one notice, never a refused login. The
+# same window is the record's retention: each write prunes that account's rows older than it.
 _LOGIN_ADDRESS_LOOKBACK_SECONDS = 90 * 86400
-_LOGIN_ADDRESS_HISTORY_ROWS = 200
-# One ``login_new_ip`` notice per account per this many seconds (see ``_login_new_ip_notice_due``).
+# The longest host key the record keeps, in UTF-16 code units, matching the SQL Server NVARCHAR(256)
+# column. An IP address's key is at most 45 characters; a longer key is not remembered, so it reads as
+# NEW at every sign-in.
+_LOGIN_ADDRESS_KEY_MAX = 256
+# One ``login_new_ip`` notice per account and address per this many seconds, in each engine process
+# (see ``_login_new_ip_notice_due``). The audit row is not debounced.
 _LOGIN_NEW_IP_NOTICE_SECONDS = 900.0
 
 
@@ -245,14 +253,24 @@ class _LoginAddress(Enum):
 
     KNOWN = "known"
     NEW = "new"
-    # The account has never completed a sign-in and holds no ``auth.login_success`` row with an
-    # address, so every address would be "first seen". Challenging and notifying here would fire on
-    # every account's first login, which is noise, not signal.
+    # The account has never completed a sign-in and has no known address, so every address would be
+    # "first seen". Challenging and notifying here would fire on every account's first login, which is
+    # noise, not signal.
     UNEVALUATED_NO_BASELINE = "no_baseline"
     # The caller passed no client address (an in-process caller, or an ASGI scope with no client).
     UNEVALUATED_UNKNOWN_ADDRESS = "unknown_address"
-    # The history read raised. A store fault must not turn this signal into a refused login.
+    # The baseline read raised. A store fault must not turn this signal into a refused login.
     UNEVALUATED_READ_FAILED = "read_failed"
+
+
+#: The verdicts under which a LOCAL sign-in that owes no factor adds its address to the known record,
+#: and under which a factor enrolment does (vault BACKLOG #2145). Not ``NEW``: on the local leg that verdict withholds the step-up window, which
+#: is the challenge, and writing the address would let the next sign-in from it skip that challenge.
+#: Not ``UNEVALUATED_READ_FAILED``: a sign-in the signal could not judge is no evidence about its
+#: address. See ``_mark_login_address_known``.
+_LOGIN_VERDICTS_THAT_SEED_THE_BASELINE = frozenset(
+    {_LoginAddress.KNOWN, _LoginAddress.UNEVALUATED_NO_BASELINE}
+)
 
 
 def _host_key(address: str) -> str:
@@ -278,20 +296,6 @@ def _host_key(address: str) -> str:
 #: the one row that says the session's cap is now reached, or write nothing because the address is a
 #: repeat or the cap was already reached.
 _NewIpFlag = Literal["audit", "audit_cap_reached", "repeat", "over_cap"]
-
-
-def _owed_a_factor(detail: object) -> bool:
-    """Whether an ``auth.login_success`` detail records a sign-in that still owed a second factor.
-
-    Only the local leg writes the ``mfa_required`` key. A detail that does not parse counts as not
-    owed, which keeps the row in the baseline: the fail-open direction for a challenge-only signal."""
-    if not isinstance(detail, str):
-        return False
-    try:
-        parsed = json.loads(detail)
-    except ValueError:
-        return False
-    return isinstance(parsed, dict) and parsed.get("mfa_required") is True
 
 
 # Bounds on the per-session re-proof failure counts (BACKLOG #1138). A count is NEVER evicted while
@@ -1736,9 +1740,20 @@ _IDP_WAYS_ACROSS = (
     "in it: a certificate not already in the hop's trust store refuses start."
 )
 
-#: Stands in for a URL with no host. NOT the empty string: `is_loopback_hop_host("")` is True, so an
-#: empty host would take the on-box carve-out and a guard that cannot name its host would ALLOW.
-_NO_HOST = "(no host)"
+
+def _idp_leg_host(url: str | None, leg: str) -> str:
+    """The host of one OIDC leg, read by the shared hop check (BACKLOG #2207).
+
+    A URL that names no host raises :class:`InsecureHopRefused`, whatever the posture. A stand-in
+    host used to go to the guard instead, which refused it under ``enforce`` and only warned
+    outside it. The type is the one this hop's other refusal raises, so ``serve`` and
+    ``provision-admin`` report it as they report that one. ``messagefoundry verify`` shows it as an
+    ERROR on its revocation row, because it is raised while the guards are captured. The text is
+    the shared check's own and names no part of the URL."""
+    try:
+        return hop_url_host(url or "", cell=f"[auth] OIDC {leg}")
+    except ValueError as exc:
+        raise InsecureHopRefused(str(exc)) from exc
 
 
 def idp_revocation_guards(
@@ -1746,10 +1761,15 @@ def idp_revocation_guards(
 ) -> tuple[RevocationHopGuard, ...]:
     """Capture the #201 revocation guard for each OIDC leg, token endpoint first (BACKLOG #1887).
 
-    Pure: it decides nothing and logs nothing. :func:`_refuse_idp_revocation` enforces what it
-    returns, and ``messagefoundry verify`` reads each guard's
+    Apart from the refusal below, it decides nothing and logs nothing.
+    :func:`_refuse_idp_revocation` enforces what it returns, and ``messagefoundry verify`` reads each
+    guard's
     :meth:`~messagefoundry.config.tls_policy.RevocationHopGuard.disposition` (BACKLOG #1923), so the
-    report and the engine read one rule rather than two copies of it."""
+    report and the engine read one rule rather than two copies of it.
+
+    A leg whose URL names no host is refused here, whatever the posture (:func:`_idp_leg_host`,
+    BACKLOG #2207). Only unvalidated settings reach that: the ``[auth]`` validator refuses a
+    missing URL and a host outside the allow-list."""
     context = opener_tls_context(opener, connector="OIDC identity provider (token + JWKS)")
     legs = (
         (
@@ -1761,8 +1781,7 @@ def idp_revocation_guards(
     )
     return tuple(
         RevocationHopGuard.capture(
-            # _NO_HOST is reached only by unvalidated settings: the validator refuses a missing URL.
-            host=urllib.parse.urlsplit(url or "").hostname or _NO_HOST,
+            host=_idp_leg_host(url, leg),
             cell=f"[auth] OIDC {leg} (verified TLS, no revocation check)",
             description=(
                 f"carries {carries} over verified TLS but performs no certificate revocation checking"
@@ -3053,8 +3072,8 @@ class AuthService:
         mfa_required = not combined and self._mfa_required_for(
             user, identity.roles, second_factor_enrolled=await self._second_factor_enrolled(user)
         )
-        # BACKLOG #288. Classified BEFORE record_login_success and the mint: both write state this
-        # sign-in would otherwise find (``last_login_at``, then its own ``auth.login_success`` row).
+        # BACKLOG #288. Classified BEFORE record_login_success and the mint: ``last_login_at`` is state
+        # this sign-in would otherwise find, and so is the known-address row it may write below.
         address = await self._classify_login_address(user, client)
         if not mfa_required:
             # BACKLOG #1638. CLEARED AT FULL AUTHENTICATION, NOT AT THE PASSWORD STEP. This call
@@ -3082,6 +3101,10 @@ class AuthService:
         await self._record_login_address(
             address, user, client=client, provider="local", mechanism=None
         )
+        # vault BACKLOG #2145: a sign-in that still owes a factor writes nothing here; the factor
+        # leg that finishes it does. A combined sign-in has proved its code, as verify_mfa would.
+        if not mfa_required and (combined or address in _LOGIN_VERDICTS_THAT_SEED_THE_BASELINE):
+            await self._mark_login_address_known(user.id, client)
         success_detail: dict[str, Any] = {"provider": "local", "mfa_required": mfa_required}
         if combined:
             success_detail["second_factor"] = "totp"
@@ -4059,6 +4082,9 @@ class AuthService:
         elevation = await self._elevated_hash(
             token_hash, ceremony="reauth_oidc", actor=user.username, client=client
         )
+        if elevation.ok:
+            # vault BACKLOG #2145, as in reauth.
+            await self._mark_login_address_known(user.id, client, step_up=True)
         if purpose is not None and not grant_refused and elevation.token is not None:
             # (3) The purpose-bound grant, against the NEW hash.
             self._grant_action_step_up(hash_token(elevation.token), purpose)
@@ -4464,6 +4490,14 @@ class AuthService:
             # ``verify_mfa`` and ``finish_webauthn_assertion`` are the two legs that finish the job,
             # and both clear the counter themselves.
             await self._store.record_login_success(user.id)
+            # vault BACKLOG #2145, closing the #2156 review's R1-1: only a directory sign-in that owes
+            # nothing more marks its address known. The audit baseline this replaced counted a
+            # directory row that still owed a factor, because that row carries no marker of it.
+            # NEW is written too: no directory session is ever seeded, so withholding the write
+            # would challenge nothing and would only repeat the notice at every sign-in from an
+            # address its owner keeps using. A failed read is no evidence, so it writes nothing.
+            if address is not _LoginAddress.UNEVALUATED_READ_FAILED:
+                await self._mark_login_address_known(user.id, client)
         return LoginOutcome(
             ok=True,
             token=token,
@@ -6597,6 +6631,10 @@ class AuthService:
             elevation = await self._elevated(
                 token, ceremony="reauth", actor=identity.username, client=client
             )
+            if elevation.ok:
+                # vault BACKLOG #2145: a step-up on an account that owes no factor is how a
+                # first-seen address passes its challenge, so it becomes known.
+                await self._mark_login_address_known(identity.user_id, client, step_up=True)
             if purpose is not None and not grant_refused and elevation.token is not None:
                 # (3) Purpose-bound grants are minted AFTER, against the NEW hash -- minted against the
                 # old one they would be stranded on a hash nothing resolves any more.
@@ -6915,8 +6953,10 @@ class AuthService:
         """Whether two client addresses denote the same host, by :func:`_host_key`. At least these
         match: an exact match, both loopback (this keeps the loopback default a genuine no-op
         rather than a string mismatch), and one the IPv4-mapped IPv6 form of the other. Both
-        address signals compare by :func:`_host_key`, so they agree on what counts as a new
-        address (BACKLOG #2159)."""
+        address signals compare by :func:`_host_key`, so they agree on when two addresses are one
+        host (BACKLOG #2159). They share no baseline, so they can disagree about which address is
+        new; docs/SECURITY.md, item 6 of the administrative-interface defense-in-depth list, says
+        when and why (vault BACKLOG #2145)."""
         return _host_key(a) == _host_key(b)
 
     def _first_new_ip_flag(self, token_hash: str, address_key: str) -> _NewIpFlag:
@@ -6955,63 +6995,139 @@ class AuthService:
     async def _classify_login_address(self, user: UserRecord, client: str | None) -> _LoginAddress:
         """The first-seen login-address signal's verdict for one sign-in (BACKLOG #288, ASVS 8.2.4).
 
-        Call it BEFORE the mint and before this login's own ``auth.login_success`` row is written,
-        or the login would always find itself. There is no new query and no schema change: the
-        baseline is read through the ``list_audit`` filter all three store backends implement, and
-        ADR 0150 put the address on every row.
+        Call it BEFORE the mint and before :meth:`_mark_login_address_known` can run for this sign-in,
+        or the login could find itself.
 
-        **THE BASELINE IS ADDRESSES THAT FINISHED AUTHENTICATING, not addresses that got past the
-        password.** ``auth.login_success`` is written at the password step even when a second
-        factor is still owed, so a row whose detail says ``mfa_required: true`` is skipped: counting
-        it would let a holder of the password alone plant an address as known. The factor legs'
-        own rows, ``auth.mfa_verified`` and ``auth.webauthn_verified``, supply those addresses
-        instead, and are read only when the first read found no match. A directory row carries no
-        such marker, so on the directory leg a password-step row still counts; that residual is
-        recorded in docs/SECURITY.md.
+        **THE BASELINE IS THE ACCOUNT'S KNOWN-ADDRESS RECORD** (vault BACKLOG #2145): the host keys
+        that :meth:`_mark_login_address_known` writes, which says when, read through the record's
+        primary key on the account id. It replaced a baseline read from ``audit_log``, which has no
+        actor index and could not tell a finished sign-in from one that stopped at the password on
+        the directory leg. Keyed on the
+        account id, so a re-created namesake inherits nothing, and the account's deletion removes it.
 
-        Each read is bounded by ``_LOGIN_ADDRESS_HISTORY_ROWS`` and by a floor of the later of
-        ``_LOGIN_ADDRESS_LOOKBACK_SECONDS`` ago and the account's ``created_at``. The second bound
-        keeps a re-created account from inheriting a deleted namesake's addresses, since the audit
-        actor is a username. Addresses compare as :meth:`_same_host` does, so ``127.0.0.1`` and
-        ``::1`` are one host here too.
+        Only rows seen within ``_LOGIN_ADDRESS_LOOKBACK_SECONDS`` count. Addresses compare by
+        :func:`_host_key`, so ``127.0.0.1`` and ``::1`` are one host, and so are ``10.0.0.1`` and
+        ``::ffff:10.0.0.1``.
 
-        ``user.last_login_at`` separates the two empty-history cases. None means the account has
-        never completed a sign-in, so there is no baseline and the verdict fails open. A set value
-        with no matching address means the account is known but this address is not: NEW.
+        With no match, the verdict is NEW unless the account has no baseline at all: no
+        ``last_login_at`` and no row of any age. Both are needed. A first sign-in finished through
+        factor enrolment writes a row but never stamps ``last_login_at``, so an account that did that
+        and then sat idle past the lookback still has a baseline, and its next sign-in is judged
+        rather than failed open. That case costs the one extra read, outside the lookback.
 
         A failed read fails open as ``UNEVALUATED_READ_FAILED``. The exception classes differ per
         store backend (sqlite3, asyncpg, pyodbc), none of which ``auth/`` may import, so the catch
         is broad; it is logged, and the caller audits the verdict."""
         if not client:
             return _LoginAddress.UNEVALUATED_UNKNOWN_ADDRESS
-        since = max(time.time() - _LOGIN_ADDRESS_LOOKBACK_SECONDS, user.created_at)
-        client_key = _host_key(client)
-        seen = False
+        since = time.time() - _LOGIN_ADDRESS_LOOKBACK_SECONDS
         try:
-            for action in ("auth.login_success", "auth.mfa_verified", "auth.webauthn_verified"):
-                rows = await self._store.list_audit(
-                    actor=user.username,
-                    action=action,
-                    since=since,
-                    limit=_LOGIN_ADDRESS_HISTORY_ROWS,
-                )
-                addresses = [
-                    str(row["client"])
-                    for row in rows
-                    if row["client"] and not _owed_a_factor(row["detail"])
-                ]
-                seen = seen or bool(addresses)
-                if any(_host_key(address) == client_key for address in addresses):
-                    return _LoginAddress.KNOWN
+            known = await self._store.list_known_login_addresses(user.id, since=since)
+            if _host_key(client) in known:
+                return _LoginAddress.KNOWN
+            if (
+                not known
+                and user.last_login_at is None
+                and not await self._store.list_known_login_addresses(user.id, since=0.0)
+            ):
+                return _LoginAddress.UNEVALUATED_NO_BASELINE
         except Exception:
+            # Worded for both callers: a sign-in goes on unchallenged, and an enrolment
+            # (``_mark_login_address_known``) records nothing.
             _log.exception(
-                "first-seen login-address read failed for %s; the sign-in proceeds unchallenged",
+                "first-seen login-address read failed for %s; the address is left unevaluated: "
+                "it is not challenged, and only a proved factor will record it",
                 user.username,
             )
             return _LoginAddress.UNEVALUATED_READ_FAILED
-        if not seen and user.last_login_at is None:
-            return _LoginAddress.UNEVALUATED_NO_BASELINE
         return _LoginAddress.NEW
+
+    async def _mark_login_address_known(
+        self,
+        user_id: str,
+        client: str | None,
+        *,
+        step_up: bool = False,
+        enrolment: UserRecord | None = None,
+    ) -> None:
+        """Add ``client`` to the account's known-address record, the baseline
+        :meth:`_classify_login_address` reads (vault BACKLOG #2145).
+
+        **CALL IT ONLY WHERE A SIGN-IN HAS FINISHED EVERY FACTOR IT OWES, AND PASSED THE FIRST-SEEN
+        CHALLENGE IF IT HAD ONE.** Writing any earlier lets a holder of the first factor alone plant
+        an address as known. So it is called at:
+
+        * a local sign-in that owes no factor, when its address was KNOWN or there was no baseline
+          yet, or when it was a combined sign-in that proved a TOTP code in the same request. A NEW
+          address is not written there: that sign-in's challenge is the step-up it has not done yet;
+        * a directory sign-in that owes nothing more, NEW included, because no directory session is
+          seeded whatever the verdict, so there is no challenge to bypass. Not after a failed read.
+          Under the shipped ``require_mfa`` every Kerberos session owes a factor, and so does an
+          OIDC one minted while ``oidc_require_mfa_claim`` is off. Such a sign-in writes nothing
+          here, and the factor leg below writes for it;
+        * a second factor proved at the MFA gate (``verify_mfa``, ``finish_webauthn_assertion``),
+          once the session has rotated, whether it finishes a sign-in or a step-up. Only
+          ``verify_mfa`` also moves the session's anchor (see :meth:`_same_host`);
+        * a factor enrolment confirmed, first or later (``confirm_mfa_enrollment``,
+          ``finish_webauthn_registration``); a first one is how a first sign-in under
+          ``require_mfa`` finishes. Those callers pass the account as ``enrolment``, and an address
+          that classifies NEW is not written: ADR 0197 Amendment A lets a holder of the password
+          alone enrol an authenticator they control, so the enrolment proves nothing about the
+          address. That only delays such a holder: a code from their own authenticator at the MFA
+          gate then records it, and the enrolment's own notice is the alarm for that case;
+        * a step-up re-proof (``reauth``, ``complete_oidc_step_up``), once the session has rotated,
+          with ``step_up`` set. It writes only for an account that owes no second factor. That is
+          how a first-seen address on a no-factor sign-in passes its challenge. An account that owes
+          a factor passes it at the factor legs instead, so a password-only step-up from a roamed
+          session cannot plant its address. "Owes" is asked of the ACCOUNT, as an unverified
+          session of it would be, never of this session's own stamp. So under ``require_mfa`` no
+          directory step-up writes, even an IdP step-up that re-proved the MFA claim. A later sign-in
+          from that host records it once that sign-in finishes, at the cost of one more notice.
+
+        Best-effort and never refusing: a failed read or write is logged, and the sign-in it records
+        has already succeeded. A lost write costs a challenge and notice at the next sign-in from
+        that address, and on the local no-factor leg at every one until a step-up records it. A host
+        key longer than ``_LOGIN_ADDRESS_KEY_MAX`` UTF-16 code units is not written. Each write is
+        followed by a prune of the account's rows older than the lookback, the record's only
+        retention, in its own call, so a failed prune never reads as a lost write.
+
+        The catches are broad for the reason :meth:`_classify_login_address` states, except that a
+        programming error (``AttributeError``, ``TypeError``) is re-raised rather than logged."""
+        if not client:
+            return
+        try:
+            key = _host_key(client)
+            if len(key.encode("utf-16-le")) // 2 > _LOGIN_ADDRESS_KEY_MAX:
+                return
+            if step_up:
+                user = await self._store.get_user(user_id)
+                if user is None or await self._unverified_session_owes_factor(user):
+                    return
+            if enrolment is not None and (
+                await self._classify_login_address(enrolment, client)
+                not in _LOGIN_VERDICTS_THAT_SEED_THE_BASELINE
+            ):
+                return
+            now = time.time()
+            await self._store.remember_login_address(user_id, key, now=now)
+        except (AttributeError, TypeError):
+            raise
+        except Exception:
+            _log.exception(
+                "could not record a known sign-in address; the ceremony it records stands"
+            )
+            return
+        try:
+            await self._store.forget_login_addresses(
+                user_id, before=now - _LOGIN_ADDRESS_LOOKBACK_SECONDS
+            )
+        except (AttributeError, TypeError):
+            raise
+        except Exception:
+            _log.warning(
+                "could not prune old known sign-in addresses; the address itself was recorded",
+                exc_info=True,
+            )
 
     def _login_new_ip_notice_due(self, user_id: str, client: str | None) -> bool:
         """At most one ``login_new_ip`` notice per (account, address) per
@@ -7552,6 +7668,11 @@ class AuthService:
             client=client,
             detail={"issued_credential": True} if user.must_change_password else None,
         )
+        # vault BACKLOG #2145: a first sign-in under require_mfa finishes HERE, so without this it
+        # left no baseline and the account's next sign-in failed open again. Not for a NEW
+        # address: see _mark_login_address_known. Last, after the audit row and the notice, so a
+        # programming error it re-raises cannot drop either.
+        await self._mark_login_address_known(identity.user_id, client, enrolment=user)
         return elevation
 
     async def verify_mfa(
@@ -7651,9 +7772,17 @@ class AuthService:
                 self._restart_new_ip_dedupe(hash_token(token))
                 await self._store.record_login_success(user.id, now=now)
                 await self._audit("auth.mfa_verified", actor=user.username, client=client)
-                return await self._elevated(
+                elevation = await self._elevated(
                     token, ceremony="mfa_verify", actor=user.username, client=client
                 )
+                if elevation.ok:
+                    # vault BACKLOG #2145: the factor is proved from this address. Recorded INSIDE
+                    # the account's queue: a local ``login`` classifies under the same queue, so a
+                    # sign-in queued behind this one finds the address written rather than reading
+                    # NEW and writing a spurious ``auth.login_new_ip`` row and notice. Kerberos, OIDC
+                    # and passkey legs take no queue, so on those that race stays open.
+                    await self._mark_login_address_known(user.id, client)
+                return elevation
             # Wrong code: register the failure through the SAME machinery the password path uses, so
             # the per-account lockout + ACCOUNT_LOCKED notification fire on sustained MFA guessing.
             # On the SECOND-STEP counter: the caller holds a session, so it has proved the first step.
@@ -8168,6 +8297,9 @@ class AuthService:
         await self._notify_security(
             MFA_ENABLED, username=user.username, email=user.notify_email, client=client
         )
+        if elevation.ok:
+            # vault BACKLOG #2145, as in confirm_mfa_enrollment, and last for the same reason.
+            await self._mark_login_address_known(identity.user_id, client, enrolment=user)
         return elevation
 
     async def begin_webauthn_assertion(self, token: str | None, *, rp_id: str) -> str | None:
@@ -8337,9 +8469,13 @@ class AuthService:
         # ordering by parity rather than by necessity.
         await self._store.record_login_success(user.id, now=now)
         await self._audit("auth.webauthn_verified", actor=user.username, client=client)
-        return await self._elevated(
+        elevation = await self._elevated(
             token, ceremony="webauthn_assert", actor=user.username, client=client
         )
+        if elevation.ok:
+            # vault BACKLOG #2145, as in verify_mfa.
+            await self._mark_login_address_known(user.id, client)
+        return elevation
 
     async def delete_webauthn_credential(
         self, identity: Identity, credential_id_hash: str, *, client: str | None = None

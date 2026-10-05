@@ -14,7 +14,9 @@ separate, centralized framework; see PHI.md §9). It errs toward over-redaction.
 spans it also applies a **conservative free-text heuristic** (date/DOB runs, multi-token name runs and
 a number after an ``MRN`` label; see :func:`redact`), so a delimiter-free leak like ``raise ValueError("patient DOE JANE dob 1980-05-05
 not found")`` is narrowed too. The delimiters are **read from MSH** rather than assumed, so a feed
-declaring ``*`` and ``$`` is covered too (:func:`_sniff_delimiters`, BACKLOG #1572). Three
+declaring ``*`` and ``$`` is covered too (:func:`_sniff_delimiters`, BACKLOG #1572), and a
+percent-encoded default separator in a URL counts like the literal one (:data:`_HL7_ENCODED_FIELD_RUN`,
+BACKLOG #2171). Three
 **structured** shapes get label-anchored passes of their own, because they hand every pattern above
 single tokens by construction: FHIR (or any) JSON keyed ``family``/``given``/``name``/``birthDate``/
 ``identifier``/``telecom``/``address``, DICOM group ``(0010,xxxx)`` tag dumps and ``PatientName=``-style
@@ -116,6 +118,103 @@ _HL7_SEGMENT = re.compile(r"\b([A-Z][A-Z0-9]{2})\|[^\r\n]*")
 #: would still stall the loop. **Linear is what makes a window that generous affordable**, and the
 #: bound is what keeps a linear scan from being charged 16 MiB of a peer's choosing.
 _HL7_FIELD_RUN = re.compile(r"(?<![^\s|^~&])[^\s|^~&]*+[|^~&][^\s|^~&]*+(?:[|^~&][^\s|^~&]*+)+")
+
+#: A field run whose separators are PERCENT-ENCODED, in a URL or a form body: ``%7C``, ``%5E``,
+#: ``%7E`` and ``%26`` for ``| ^ ~ &``, either case (BACKLOG #2171). A FHIR search such as
+#: ``identifier=MRN%7C12345&name=DOE%5EJANE`` carries one literal separator and two encoded ones, so
+#: :data:`_HL7_FIELD_RUN` read it as below its threshold and passed it through. Literal and encoded
+#: separators count together toward the same two, and the run is scrubbed whole.
+#:
+#: **A pattern of its own, because the guard on :data:`_HL7_FIELD_RUN` cannot hold three characters.**
+#: Python's lookbehind is fixed-width, so ``%7C`` cannot join that pattern's one-character guard class.
+#: The encoded form is matched in place rather than decoded and rescanned, so nothing here allocates a
+#: second copy of a peer's text. A lone ``%20`` (or any other escape) is ordinary body text.
+#:
+#: **It runs AFTER both stages of :func:`redact`, not among the flat passes.** Taking a whole token
+#: can swallow a label another pass reads, and leave that label's value behind: an XML element or JSON
+#: key glued to the run, an ``mrn:`` or ``PatientID=`` after it, or the second token of a name run.
+#: Run first, it kept values those passes had scrubbed before it existed. Run last, every such value
+#: is already gone, so inside this module it only adds redaction. A filter that runs AFTER this
+#: module is a different case, and :data:`_CREDENTIAL_AHEAD` is the answer to it. :func:`redact`
+#: says when the run applies and what follows it.
+#:
+#: Linear for the same reason as :data:`_HL7_FIELD_RUN`. The lookbehind admits a start only after
+#: whitespace, a literal separator or the start of the text. A match from a token's start takes the
+#: whole token whenever it holds two separators, since the body stops only at a separator or the
+#: token's end. So a token that survives holds at most one separator, and gets at most two attempts.
+#: The body's lookahead fails on its first character everywhere but a ``%``. ``[redacted]`` holds no
+#: separator of either kind, so it never matches.
+#:
+#: Like the literal pattern it takes the whole token, so a URL holding one ``&`` and one ``%26``
+#: loses its host too. Residuals, at least these: a single encoded separator, as with a single
+#: literal one (so FHIR's ``identifier=system%7Cvalue`` keeps its value); every run in a text that
+#: holds a credential shape (:data:`_CREDENTIAL_AHEAD`), the credential backstop's opener or
+#: anything the widened stage reads (:func:`redact` says why), which is left as the two stages
+#: leave it;
+#: a double-encoded separator (``%257C``); and an encoded CUSTOM delimiter that MSH declares
+#: (:func:`_sniff_delimiters` reads only the literal header). The LITERAL pattern has no such rule:
+#: a credential label glued to a pipe run still goes with it, which is older than this pattern and
+#: is not fixed here.
+_HL7_ENCODED_FIELD_RUN = re.compile(
+    r"(?<![^\s|^~&])(?:(?!%(?:7[CcEe]|5[Ee]|26))[^\s|^~&])*+"
+    r"(?:[|^~&]|%(?:7[CcEe]|5[Ee]|26))(?:(?!%(?:7[CcEe]|5[Ee]|26))[^\s|^~&])*+"
+    r"(?:(?:[|^~&]|%(?:7[CcEe]|5[Ee]|26))(?:(?!%(?:7[CcEe]|5[Ee]|26))[^\s|^~&])*+)+"
+)
+#: An encoded separator anywhere: the screen that keeps text without one off the pass above.
+_ENCODED_SEPARATOR = re.compile(r"%(?:7[CcEe]|5[Ee]|26)")
+
+#: What a credential filter after this module reads, at least these shapes: a credential label with
+#: its separator, a bare ``bearer`` scheme, a password inside a URL, or a credential query key. While
+#: the text holds one, :func:`redact` does not apply the encoded run to that text at all.
+#:
+#: **Why this module looks for credentials (PR 2011, review finding 1).** The log handler chain runs
+#: the credential filters AFTER this module (``logging_setup._install_phi_filters``). The encoded
+#: run replaces a whole token and the stages then run again. Either step can take a mark those
+#: filters read: the label, its separator, a quote or a brace, or the end of a label-anchored value
+#: that then reads on over the label. Measured at 6563110bab through that chain,
+#: ``x%7Cy%7Cz,password: <value>`` kept its value under each of 26 glue characters, where the
+#: redactor before BACKLOG #2171 scrubbed every one.
+#:
+#: **The rule is whole-text on purpose, and three narrower ones were measured wrong.** Keeping the
+#: label inside the replaced token, skipping only the tokens a credential match could reach, and
+#: skipping only the second run of the stages each held on one call and failed somewhere else. The
+#: last failed on the engine's usual error log, which redacts twice: :func:`safe_exc` or
+#: :func:`safe_text` first, then the handler's filter. So a text that holds any of these gets
+#: exactly what it got before BACKLOG #2171, on every call. The price is stated: an encoded run in
+#: such a text keeps its text, as it did then.
+#:
+#: **The answer should be the same on a second call over the first call's output, and it is where
+#: only the credential filters wrote in between.** They keep what this pattern reads:
+#: ``label=<redacted>``, ``bearer <redacted>``, ``scheme://user:<redacted>@`` and ``code=<redacted>``
+#: all still match.
+#:
+#: **It would NOT be the same where something else rewrites the text between two calls, so
+#: :func:`redact` also leaves the run off any text that holds a character that is not printable.**
+#: ``ControlCharScrubFilter`` runs after the credential filters and writes a line break or a control
+#: character as visible text. A record that two handlers filter, or that the support bundle reads
+#: back, then reaches a second call as ONE line, and a label or a URL password that was split across
+#: the break becomes readable there. A run replaced on the first call cannot be put back. Measured
+#: on a fuzz of 200,000 texts through two handlers, texts where a planted value survived that the
+#: redactor before BACKLOG #2171 scrubbed: 312 without this rule, 0 with it. ``str.isprintable`` is
+#: wider than that filter's own set, on purpose. The price is large and stated: a traceback is many
+#: lines, so no encoded run in one is scrubbed. Moving the credential filters ahead of this module
+#: in the log chain would lift it.
+#:
+#: **Each arm is a copy of its source, or wider.** The label arm is ``secretscrub``'s own: the same
+#: ``\b``, the same bounded dotted prefix as ``_LABEL_PREFIX``, the same words, and the separator.
+#: The URL arm is ``_DSN_PASSWORD`` without its scheme. The query arm is
+#: ``logging_setup._CREDENTIAL_QUERY_KEYS``. This module is stdlib-only and cannot import them, so
+#: ``tests/test_redaction.py`` holds each arm to its source, and checks by behaviour that this
+#: pattern matches every text either filter changes. A plain literal, so the static regex gate reads
+#: it. The prefix bound keeps the scan linear, as it does there.
+_CREDENTIAL_AHEAD = re.compile(
+    r"""\b(?:MEFOR_[A-Z0-9_]+|(?i:(?:[A-Za-z0-9]+[._-]){0,6}(?:"""
+    r"""encryption_keys_retired|intake_api_key_next|encryption_key|authorization|private_key"""
+    r"""|passphrase|credential|password|session|api_key|api-key|apikey|bearer|passwd|secret"""
+    r"""|token|pass|pwd)))\b['"]?\s*[:=]"""
+    r"""|(?i:\bbearer)\s|://[^\s:/@]+:[^\s/@]+@"""
+    r"""|(?i:\b(?:code|state|id_token|access_token|token|session_state)=)"""
+)
 
 #: A **date / birthdate run** in free text: an ISO ``YYYY-MM-DD`` / US ``MM-DD-YYYY`` (``-`` or ``/``
 #: separator) or a bare HL7 8-digit ``YYYYMMDD``. A DOB is a direct identifier, and a free-text leak like
@@ -397,7 +496,28 @@ _USERINFO_TAIL_MAX = 256
 #: attacker-influenceable log text; the literal prefix limits it to one bounded walk per occurrence.
 #: A password tail longer than the bound is NOT matched -- the construction-time refusal in
 #: ``transports/rest.py`` ``refuse_url_credentials`` is the primary control, and this is its backstop.
-_INVALID_URL_USERINFO = re.compile(r"(nonnumeric port: ')[^\r\n]{1,256}@")
+#:
+#: **Its tail never crosses a span it already scrubbed (BACKLOG #2312).** The greedy tail used to.
+#: Each scrub shortens the line, so two spans more than the bound apart on the first pass could fall
+#: inside it on the next, and the second pass swallowed everything between them. ``safe_exc`` then
+#: ``safe_text`` is exactly such a second pass. Now an ``n`` in the tail may not open the scrubbed
+#: form, the opener then ``[redacted]@``, so a second pass over two scrubbed spans changes nothing.
+#: The guard sits on the ``n`` alone, so its lookahead runs only where the form could start.
+#:
+#: **A match may still START on a scrubbed span, and that is deliberate.** A password with an inner
+#: ``@`` whose last ``@`` is past the bound is scrubbed only to the inner one, and a later pass, once
+#: the line is shorter, finishes it. Refusing that start kept the rest of such a password in the
+#: stored error. The cost is that an ``@`` between a scrubbed span and the next opener can also come
+#: within reach on a later pass, which only adds redaction.
+#:
+#: **The scrubbed form is keyed on the opener as well as the placeholder.** A bare ``[redacted]@`` in
+#: the tail does not stop it, so ``'u:[redacted]@x:PW@host'`` still loses ``PW``. The residual is text
+#: an earlier opener would have scrubbed up to a later scrubbed form; that later opener scrubs from its
+#: own start instead. Every such tail holds a ``]``, and ``http.client`` never writes one: it quotes
+#: what follows the last ``:`` only when no ``]`` comes after it.
+_INVALID_URL_USERINFO = re.compile(
+    r"(nonnumeric port: ')(?:[^\r\nn]|n(?!onnumeric port: '\[redacted\]@)){1,256}@"
+)
 
 #: The widest match :data:`_INVALID_URL_USERINFO` can make: the opener, the longest tail it admits,
 #: and the ``@`` that closes it. An opener further back of a cut than this has its whole span inside
@@ -432,8 +552,10 @@ _REDACT_WINDOW = 64 * 1024
 
 #: The characters :func:`_clamp` may cut at. Whitespace is the boundary because a pattern survives a
 #: cut when it either cannot contain whitespace at all or still matches with its tail gone:
-#: :data:`_HL7_FIELD_RUN` and :data:`_DATE_RUN` are built from classes that exclude ``\s`` outright,
-#: and :data:`_HL7_SEGMENT` goes on matching from its own header whatever is cut off its tail.
+#: :data:`_HL7_FIELD_RUN`, :data:`_HL7_ENCODED_FIELD_RUN` and :data:`_DATE_RUN` are built from classes
+#: that exclude ``\s`` outright, and :data:`_HL7_SEGMENT` goes on matching from its own header whatever
+#: is cut off its tail. So a cut cannot fall inside an encoded run, which is kept or dropped whole
+#: (BACKLOG #2171, pinned in ``tests/test_redaction.py``).
 #: :data:`_NAME_RUN` has neither property, and the token walk in :func:`_clamp` is there for it.
 #:
 #: **A pattern with a REQUIRED tail past a space has neither property, and this module has one.**
@@ -1431,10 +1553,11 @@ def redact(text: str) -> str:
     separator-aware pass for a message that declares delimiters outside the defaults) is handled first,
     so the free-text passes (:data:`_MRN_LABELLED`, :data:`_DATE_RUN`, then :data:`_NAME_RUN`) only
     see delimiter-free text. The structured-shape passes (:func:`_redact_structured`: JSON keys, DICOM tags and labels,
-    XML elements) run LAST, so they can only add redaction to what the others left (the section
+    XML elements) run after those within each round, so they can only add redaction to what the others left (the section
     comment above them says what running them first cost). The free-text heuristic narrows the prior
     residual to adversarial *single-token* identifiers (a lone name with no second token, no date) — for which the "never put PHI in an exception message"
-    convention remains the control. Meant to be idempotent, since the literal ``[redacted]`` substituted
+    convention remains the control. The percent-encoded run (:data:`_HL7_ENCODED_FIELD_RUN`) comes
+    after all of them, as the last paragraph here says. Meant to be idempotent, since the literal ``[redacted]`` substituted
     in is built never to re-match a pattern; it is not quite, and :func:`safe_text` names the known
     exceptions.
 
@@ -1464,7 +1587,50 @@ def redact(text: str) -> str:
 
     **The second stage runs only when its triggers are present** (:func:`_needs_widened_stage`). On
     text without them it would re-run the #1711 passes over their own fixed point and change nothing
-    the widened rules own, at double the cost on every log record."""
+    the widened rules own, at double the cost on every log record.
+
+    **The percent-encoded run runs after both stages, and only on a text that holds no credential
+    shape and nothing the widened stage reads (BACKLOG #2171).** Its pattern says why it comes last: run among the stages, it took labels
+    and name tokens the other passes needed. :data:`_CREDENTIAL_AHEAD` says why a credential shape
+    anywhere in the text switches it off: a text that holds one is returned as the two stages left
+    it, which is what this function returned before the run existed. The backstop's own opener
+    (:data:`_USERINFO_OPENER`) switches it off the same way: the run could take the opener's quote
+    or the closing ``@``, and a later call that could reach the span then finds no span. Where the
+    run does apply and changes the text, both
+    stages run once more over its output, so a pass that reads what it left still sees it. The
+    backstop cannot match on that run, since its opener is not in the text.
+    The screen is a C-speed search, so text without an encoded separator pays nothing more, and the
+    credential scan runs only once a qualifying run is found.
+
+    **A text the widened stage could read is left alone too** (:func:`_needs_widened_stage`). Those
+    rules keep some values by their surroundings: a bare value under a JSON ``name`` stays while more
+    text follows it, and goes once it ends the text. :func:`safe_text` strips and cuts, so a second
+    call can scrub what the first kept, but only while the key is still there. A run that took a
+    key glued to its token left that value in view on the second call, where the stages alone scrub
+    it: measured at 1 text in 200,000 on a fuzz, at every head of the pull request before this rule,
+    and 0 in 600,000 with it. That zero is a measurement, not a proof for the first-stage labels."""
+    out = _redact_stages(text)
+    if "%" not in out or _ENCODED_SEPARATOR.search(out) is None:
+        return out
+    if _HL7_ENCODED_FIELD_RUN.search(out) is None:
+        return out
+    # This module's own bound note is joined by a line break (:data:`_TRAILING_NOTES`). It is the one
+    # unprintable character that is not a peer's, so it is set aside before the test below.
+    note = _TRAILING_NOTES.search(out) if out.endswith("unscanned]") else None
+    body = out if note is None else out[: note.start()]
+    if (
+        not body.isprintable()
+        or _USERINFO_OPENER in out
+        or _needs_widened_stage(out)
+        or _CREDENTIAL_AHEAD.search(out) is not None
+    ):
+        return out
+    return _redact_stages(_HL7_ENCODED_FIELD_RUN.sub(_REDACTED, out))
+
+
+def _redact_stages(text: str) -> str:
+    """The two stages of :func:`redact`: the #1711 passes to their fixed point, then the widened ones
+    when :func:`_needs_widened_stage` says a widened rule could match."""
     first = _redact_rounds(text, widened=False)
     if not _needs_widened_stage(first):
         return first
@@ -1511,17 +1677,19 @@ def _needs_widened_stage(text: str) -> bool:
 
 def _redact_rounds(text: str, *, widened: bool) -> str:
     """One stage of :func:`redact`: the flat and structured passes, repeated to a fixed point."""
+    credentials = not widened
     for _ in range(_STRUCTURED_ROUNDS):
         if not text:
             return text
-        flat = _redact_flat(text, widened=widened, credentials=not widened)
+        flat = _redact_flat(text, widened=widened, credentials=credentials)
         text = _redact_structured(flat, widened=widened)
         if text == flat:
             return text
-    return _redact_flat(text, widened=widened, credentials=not widened)
+    return _redact_flat(text, widened=widened, credentials=credentials)
 
 
-#: The most rounds one stage of :func:`redact` takes, so a call takes at most twice this. Measured over 200,000 fuzzed inputs from the alphabet of
+#: The most rounds one stage of :func:`redact` takes. A call runs two stages, and runs both again when
+#: the encoded run changed the text, so it takes at most four times this. Measured over 200,000 fuzzed inputs from the alphabet of
 #: ``test_redact_is_a_fixed_point_over_random_structure``: none needed more than 3, the last of them
 #: the round that confirms nothing changed. The cap is set well above that so a peer has to build
 #: many nested layers of uncovering to reach it; an input that does gets one last flat round, and
@@ -1535,17 +1703,22 @@ def _redact_flat(text: str, *, widened: bool, credentials: bool) -> str:
     :func:`_redact_structured`, repeated to a fixed point.
 
     ``credentials=False`` skips the backstop, which the widened stage of :func:`redact` does. The
-    first stage has already run it, and it is not idempotent: its tail is greedy to the LAST ``@`` on
-    a line, so a further run over ``'[redacted]@host' ... '[redacted]@host'`` swallows everything
-    between two scrubbed spans. Running it again in the second stage added that over-redaction to
-    every text with a widened trigger, and it depends on a later span, so a clamp dropping that span
-    kept what the unclamped scan removed (the clamp fuzz in ``tests/test_redaction.py`` measured it).
+    first stage has already run it. The skip was written when the backstop's greedy tail swallowed
+    everything between two spans it had scrubbed, on any further run, and a clamp dropping the later
+    span kept what the unclamped scan removed (the clamp fuzz in ``tests/test_redaction.py`` measured
+    it). BACKLOG #2312 stopped the tail crossing a scrubbed span (:data:`_INVALID_URL_USERINFO`), so a
+    repeated call (``safe_exc`` then ``safe_text``) no longer swallows that gap.
 
-    **What the skip does not do, stated because the reason above is easy to over-read.** The first
-    stage still re-runs the backstop each round, so a repeated call (``safe_exc`` then ``safe_text``)
-    can still swallow a gap; that predates BACKLOG #2079. And a credential span that only a WIDENED
-    scrub completes (one that removes an escaped line break inside a ``name`` string, joining an
-    opener's line to its ``@``) is not re-checked: #1711 did not catch that either."""
+    **The backstop is still not a strict fixed point, which is why the skip stays.** An ``@`` that was
+    past the bound on the first run can come within it on a later one, once a scrub has shortened the
+    line: an ``@`` after a scrubbed span, or one behind a field run or a name inside the would-be tail.
+    That later run scrubs the rest of the tail, which only adds redaction, and :func:`safe_text` lists
+    it. Whether the skip is still worth its cost is a separate question from #2312.
+
+    **What is not re-checked, stated because the reason above is easy to over-read.** A credential
+    span that only a WIDENED scrub completes (one that removes an escaped line break inside a ``name``
+    string, joining an opener's line to its ``@``) is not re-checked: #1711 did not catch that
+    either."""
     if credentials:
         text = _INVALID_URL_USERINFO.sub(lambda m: f"{m.group(1)}{_REDACTED}@", text)
     scrubbed = _HL7_SEGMENT.sub(lambda m: f"{m.group(1)}|{_REDACTED}", text)
@@ -1595,8 +1768,9 @@ def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
 
     **It is not strictly idempotent, and the known exceptions all only add redaction or shorten the
     text.** At least these: a truncated result re-truncates with a new ``(+N chars)`` count; the
-    credential backstop can swallow the gap between two scrubbed spans on a further pass
-    (:func:`_redact_flat`); an unquoted DICOM label value can take the truncation note with it; and
+    credential backstop can reach an ``@`` on a further pass that was past its bound on the first,
+    once another pass shortened the text in between (:func:`_redact_flat`; the gap between two spans
+    it scrubbed itself is no longer one, BACKLOG #2312); an unquoted DICOM label value can take the truncation note with it; and
     (BACKLOG #2079) a kept operator string under a JSON ``name``/``address`` that ``limit`` cuts is left
     unterminated, which a further pass scrubs, so ``"IB_ACME_ADT…(+N chars)`` becomes ``"[redacted]``
     and loses the note that the text was cut."""

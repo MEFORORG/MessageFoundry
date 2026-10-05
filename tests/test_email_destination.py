@@ -28,7 +28,7 @@ from messagefoundry.config.tls_policy import (
 from messagefoundry.config.wiring import WiringError
 from messagefoundry.transports.base import DeliveryError
 from messagefoundry.transports.egress import check_egress_allowed
-from messagefoundry.transports.email import EmailDestination
+from messagefoundry.transports.email import EmailDestination, envelope_address_problem
 from messagefoundry.transports.mllp import InsecureHopGuard
 from tests._egress_policy import permitting
 
@@ -891,7 +891,44 @@ def _sender_shapes() -> dict[str, str]:
     return shapes
 
 
-_SENDER_SHAPES = _sender_shapes()
+#: Domains of hostname characters in a shape no mail domain takes, mapped to the words of the refusal.
+#: Each passed the address rule before vault BACKLOG #2911, which tested the domain's characters
+#: alone. The unit test below takes every shape; the shared tables take a few (_DOMAIN_ON_THE_WIRE).
+_DOMAIN_SHAPES = {
+    "domain-trailing-dot": ("a@example.org.", "empty label"),
+    "domain-double-dot": ("a@example..org", "empty label"),
+    "domain-leading-dot": ("a@.example.org", "empty label"),
+    "domain-leading-hyphen": ("a@-mx.example.org", "hyphen"),
+    "domain-trailing-hyphen": ("a@mx-.example.org", "hyphen"),
+    "domain-long-label": ("a@" + "x" * 64 + ".example.org", "longer than 63"),
+    "domain-dotted-quad": ("a@10.0.0.1", "start with a letter"),
+    "domain-numeric-last-label": ("a@example.123", "start with a letter"),
+    # inet_aton reads both as IPv4 addresses, so an all-digits test alone would pass them.
+    "domain-hex-last-part": ("a@10.0.0.0x1", "start with a letter"),
+    "domain-hex-whole": ("a@0x7f000001", "start with a letter"),
+}
+
+#: Plain addresses the domain rule must still pass: a hyphen inside a label, digits in a label that
+#: is not the last, a 63-character label, and an xn-- label, whose hyphens sit inside it.
+_DOMAIN_CONTROLS = [
+    "a@example.org",
+    "a@mail-relay.example.net",
+    "a@mx1.example.org",
+    "a@10.mail.example.com",
+    "a@" + "x" * 63 + ".example.org",
+    "a@xn--bcher-kva.example.com",
+]
+
+#: The domain shapes the shared tables carry, so every cell that reads them (Email, Direct, alert
+#: mail) is shown to refuse one before any connection. Every cell calls the same rule, so these
+#: three show the call; the unit test proves each shape. The dotted quad is the decided one, and
+#: the hex form is the one an all-digits test would have missed.
+_DOMAIN_ON_THE_WIRE = {
+    k: _DOMAIN_SHAPES[k][0]
+    for k in ("domain-trailing-dot", "domain-dotted-quad", "domain-hex-last-part")
+}
+
+_SENDER_SHAPES = _sender_shapes() | _DOMAIN_ON_THE_WIRE
 
 
 def _recipient_shapes() -> dict[str, str]:
@@ -913,7 +950,7 @@ def _recipient_shapes() -> dict[str, str]:
     return shapes
 
 
-_RECIPIENT_SHAPES = _recipient_shapes()
+_RECIPIENT_SHAPES = _recipient_shapes() | _DOMAIN_ON_THE_WIRE
 
 #: Both tables as (setting, value) pairs, for a test that refuses either half of the envelope.
 _REFUSED_ADDRESSES = [("sender", v) for v in _SENDER_SHAPES.values()] + [
@@ -968,6 +1005,48 @@ async def test_a_sender_that_is_not_one_plain_address_is_refused_before_any_conn
         EmailDestination(dest)
     assert wire.connections == 0
     assert wire.mail_lines == []
+
+
+# --- the domain's shape (vault BACKLOG #2911) --------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("address", "why"), list(_DOMAIN_SHAPES.values()), ids=list(_DOMAIN_SHAPES)
+)
+def test_a_domain_of_host_characters_in_the_wrong_shape_is_refused(address: str, why: str) -> None:
+    problem = envelope_address_problem(address)
+    assert problem is not None and why in problem
+    # The reason never quotes the address or its domain.
+    assert address.rpartition("@")[2] not in problem
+
+
+@pytest.mark.parametrize("address", _DOMAIN_CONTROLS)
+def test_a_plain_domain_still_passes_the_address_rule(address: str) -> None:
+    assert envelope_address_problem(address) is None
+
+
+def test_a_trailing_dot_recipient_never_matched_the_recipient_domain_list() -> None:
+    # The list drops a trailing dot from each entry at load, and the gate compares the recipient's
+    # domain as written. So "example.org." never matched "example.org", and the gate refused it
+    # before vault BACKLOG #2911 too, naming the domain as unlisted. It now refuses the shape first.
+    e = _relay_listed(["example.org."])
+    assert e.allowed_recipient_domains == ["example.org"]
+    dest = _email_dest("smtp.hospital.example", recipients=["a@example.org."])
+    with pytest.raises(WiringError, match="empty label") as refused:
+        check_egress_allowed(dest, e)
+    assert "allowed_recipient_domains" in str(refused.value)
+    # Control: the same domain without the dot passes, so the refusal above is the dot.
+    check_egress_allowed(_email_dest("smtp.hospital.example", recipients=["a@example.org"]), e)
+
+
+def test_a_listed_hex_ip_domain_is_refused_by_the_shape_rule_at_the_gate() -> None:
+    # The list's own validator accepts this entry, so before vault BACKLOG #2911 the recipient
+    # matched it and passed the gate. Only the shape rule refuses it, which the reason pins.
+    address = _DOMAIN_SHAPES["domain-hex-last-part"][0]
+    e = _relay_listed([address.rpartition("@")[2]])
+    dest = _email_dest("smtp.hospital.example", recipients=[address])
+    with pytest.raises(WiringError, match="start with a letter"):
+        check_egress_allowed(dest, e)
 
 
 def test_recipient_domains_do_not_gate_direct() -> None:

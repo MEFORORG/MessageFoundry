@@ -183,8 +183,8 @@ def _adr_analyze(args: argparse.Namespace) -> int:
 #: Unicode categories escaped before record text reaches a terminal: C0 and C1 controls (an ANSI
 #: escape, a bell, a NUL), format characters (a bidirectional override that reorders the line) and
 #: the line and paragraph separators. An ADR is read as data, and a terminal acts on these.
-#: ``messagefoundry.controlchars.scrub_control_chars`` is not reused: its alphabet is C0 and DEL
-#: only, pinned that way for byte-oriented sinks, and so it passes C1 and the bidi overrides.
+#: ``messagefoundry.controlchars.scrub_control_chars`` is not reused: it does not double a
+#: backslash, so record text spelling ``\x1b`` out would read as an escaped ESC.
 _ESCAPED_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
 
 

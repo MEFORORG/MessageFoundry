@@ -30,6 +30,7 @@ from messagefoundry.pipeline.alert_sinks import (
 from messagefoundry.pipeline.security_notify import security_notifier_from_settings
 from tests.test_email_destination import (
     _ALL_ATEXT_SENDER,
+    _DOMAIN_ON_THE_WIRE,
     _ENCODED_LOCAL,
     _NORMALISED_RECIPIENTS,
     _REFUSED_ADDRESS_IDS,
@@ -259,6 +260,13 @@ def test_alert_send_refuses_an_address_that_is_not_one_plain_mailbox_before_any_
         _send_to(wire.port, sender, recipients)
     assert wire.connections == 0
     assert wire.mail_lines == []
+
+
+def test_alert_send_refuses_a_bare_ip_domain_by_the_domain_rule(wire: _WireCapture) -> None:
+    # The reason pins the domain rule as what refused (vault BACKLOG #2911).
+    with pytest.raises(ValueError, match="start with a letter"):
+        _send_to(wire.port, _DOMAIN_ON_THE_WIRE["domain-dotted-quad"], ["ops@hospital.example"])
+    assert wire.connections == 0
 
 
 @pytest.mark.parametrize("field, value", _REFUSED_ADDRESSES, ids=_REFUSED_ADDRESS_IDS)
