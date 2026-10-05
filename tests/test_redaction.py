@@ -1990,8 +1990,9 @@ def test_every_credential_label_word_is_still_read_after_an_encoded_run(label: s
     ],
 )
 def test_a_credential_span_that_crosses_an_encoded_run_is_still_scrubbed(text: str) -> None:
-    """Every way a credential match can reach across the run's token: the label, the separator, an
-    auth scheme, or one end of a quoted or braced value inside it, and the rest outside."""
+    """Ways a credential match can reach across the run's token, at least these: the label, the
+    separator, an auth scheme, or one end of a quoted or braced value inside it, and the rest
+    outside."""
     _assert_the_chain_drops_the_credential(text)
 
 
@@ -2035,21 +2036,108 @@ def test_the_encoded_run_never_changes_which_label_owns_a_value(text: str) -> No
     _assert_the_chain_drops_the_credential(text)
 
 
+@pytest.mark.parametrize(
+    ("password", "word"),
+    [
+        ("password", "password"),
+        ("secret", "secret"),
+        ("Token", "Token"),
+        ("my.secret", "secret"),
+        ("prod-pass", "pass"),
+        ("db.basic-9", "basic"),
+        ("MEFOR_PROD_2024", "MEFOR_PROD_2024"),
+    ],
+)
+def test_a_url_password_spelled_like_a_label_word_goes_with_its_token(
+    password: str, word: str
+) -> None:
+    """A password with NO label, in a URL's userinfo, beside an encoded run in the query (PR 2011
+    review finding N1). At 6c018c5e16 the run kept bare label words, so the word came out between
+    two placeholders, whole or as the dot- or dash-bounded part of a longer password. THE CONTROL: the credential stage alone scrubs it, as ``origin/main`` did."""
+    text = f"GET https://svc:{password}@db.internal/fhir/Patient?identifier=x%7Cy%7Cz failed"
+    assert f":{password}@" not in secretscrub.scrub_credentials(text), "the control does not hold"
+    out = _through_the_log_filter_chain(text)
+    assert word not in out, out
+    assert "x%7Cy" not in out, f"the run survived with no credential label near it: {out!r}"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # The run's token ended a label-anchored PHI value. Run again, that pass read on past the
+        # placeholder and took the credential label after it.
+        "PatientID=123 url=http://h/fhir?identifier=a%7Cb%7Cc "
+        f"Authorization: Basic {_CREDENTIAL_VALUE}==",
+        f"PatientName=x key=a%7Cb%7Cc password:\n{_CREDENTIAL_VALUE}",
+        # No run on the credential's line at all. The second run of the flat passes finished a
+        # literal field run the first left, and that run held the label.
+        f"a&Doe Jane&password: {_CREDENTIAL_VALUE}\nGET /q?id=x%7Cy%7Cz",
+        # A scheme word, then a line break, then the value: the credential stage reads across it.
+        f'password: "aa {_CREDENTIAL_VALUE} token: Basic\nabc x%7Cy%7Cz"',
+        f'password: "aa {_CREDENTIAL_VALUE} Authorization: Digest\nabc x%7Cy%7Cz"',
+        # The closing brace is in the run's token, on a later line than the label.
+        f"PWD={{aa\n{_CREDENTIAL_VALUE} x%7Cy%7Cz}}",
+        f"PWD={{aa\nsecret: b\n{_CREDENTIAL_VALUE} x%7Cy%7Cz}}",
+    ],
+    ids=[
+        "run-ended-a-dicom-value",
+        "run-ended-a-dicom-value-next-line",
+        "second-run-finishes-a-literal-run",
+        "basic-scheme-then-line-break",
+        "digest-scheme-then-line-break",
+        "brace-closes-in-the-run-token",
+        "brace-with-a-label-inside",
+    ],
+)
+def test_a_text_with_a_credential_span_is_not_run_through_the_stages_again(text: str) -> None:
+    """The shapes the second code review found at 229e63cf82, where the span check itself held and
+    the second run of the stages, or a span one line short, still cost the credential."""
+    _assert_the_chain_drops_the_credential(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # A brace after a label whose value is never a brace must not protect the rest of the text.
+        '{"session": {"id": 7},\n "url": "GET /fhir/Patient?identifier=zqxdoe%7C4455667%7Cvanja"}',
+        # A brace value that closes on its own line protects that line only.
+        "PWD={abc}\nid zqxdoe%7C4455667%7Cvanja here",
+        # A carriage return ends a line, as it ends an HL7 segment.
+        "password: x\rid zqxdoe%7C4455667%7Cvanja here",
+    ],
+    ids=["brace-after-session", "closed-brace-on-its-own-line", "carriage-return"],
+)
+def test_a_credential_span_ends_with_its_line(text: str) -> None:
+    """THE PHI SIDE of the span: it must not reach past the line the value is on, or an encoded run
+    anywhere after a label would be left alone."""
+    out = redact(text)
+    for planted in ("zqxdoe", "4455667", "vanja"):
+        assert planted not in out, out
+
+
 def test_the_label_pattern_is_the_credential_stages_own() -> None:
     """THE DRIFT GATE. ``redaction`` is stdlib-only and cannot import ``secretscrub``, so the label
-    grammar is a copy: the prefix, the words and the environment prefix. This holds each to its
-    source."""
+    grammar is a copy: the prefix, the words, the environment prefix, the scheme words and the brace
+    value. This holds each to its source. It does not hold the rest of the value grammar: a new
+    value form in ``secretscrub`` that crosses a line needs ``_credential_spans`` widened by hand."""
     pattern = redaction._CREDENTIAL_LABEL_AHEAD.pattern
     assert secretscrub._LABEL_PREFIX in pattern
     assert secretscrub._ENV_PREFIX in pattern
-    spelled = pattern.split(secretscrub._LABEL_PREFIX + "(?:")[1].split(")")[0].split("|")
-    assert set(spelled) == {
+    words = pattern.split(secretscrub._LABEL_PREFIX)[1].split(")))")[0]
+    braced = words.split("(?P<braced>")[1].split(")")[0].split("|")
+    assert set(braced) == set(secretscrub._CREDENTIAL_WORDS)
+    assert set(re.findall(r"[a-z][a-z_-]+", words)) - {"braced"} == {
         *secretscrub._CREDENTIAL_WORDS,
         *secretscrub._TOKEN_WORDS,
         *secretscrub._KEY_MATERIAL_WORDS,
     }
-    # Longest first, as the source builds it, so a short word cannot shadow a longer one.
-    assert spelled == sorted(spelled, key=len, reverse=True)
+    scheme = r"(?:bearer|basic|digest)\s+"
+    assert scheme in pattern and scheme in secretscrub._BEARER.pattern
+    assert redaction._BRACED_VALUE.pattern == secretscrub._ODBC_BRACED
+    # Only the brace-valued pattern may hold the brace form, or the ``braced`` group is too narrow.
+    assert secretscrub._ODBC_BRACED in secretscrub._CREDENTIAL_KV.pattern
+    for other in (secretscrub._BEARER, secretscrub._KEY_MATERIAL, secretscrub._MEFOR_SECRET):
+        assert secretscrub._ODBC_BRACED not in other.pattern
 
 
 @pytest.mark.parametrize(
@@ -2099,7 +2187,8 @@ def test_a_run_no_credential_span_reaches_is_still_scrubbed(
         assert out == expected
     for planted in ("zqxdoe", "4455667", "vanja"):
         assert planted not in out, out
-    assert _CREDENTIAL_VALUE not in _through_the_log_filter_chain(text)
+    if _CREDENTIAL_VALUE in text:
+        assert _CREDENTIAL_VALUE not in _through_the_log_filter_chain(text)
 
 
 def test_the_stages_run_again_over_what_the_encoded_run_changed() -> None:
@@ -2108,7 +2197,8 @@ def test_the_stages_run_again_over_what_the_encoded_run_changed() -> None:
     inputs. THE CONTROL is the middle assertion: the name survives the stages and the run, so the
     second pass of the stages is what removes it."""
     text = "|%7C7788990~\tPatientName=<name> PatientName=;1980-05-05%7e%7e1980-05-05 Zqxdoe"
-    after_run = redaction._scrub_encoded_runs(redaction._redact_stages(text))
+    assert not redaction._credential_spans(text), "the second run needs a text with no span"
+    after_run = redaction._scrub_encoded_runs(redaction._redact_stages(text), [])
     assert "Zqxdoe" in after_run, "the control no longer holds"
     assert "Zqxdoe" not in redact(text)
 
@@ -2277,6 +2367,11 @@ _ENCODED_HOSTILE = {
     # label start at every segment, and each token here ends in a label the scan must find.
     "label-prefix-run": "a-b.c-" * 40 + "pass=x%7Cx%7Cy ",
     "label-words-no-separator": "pass-token.secret-" * 12 + "%7Cx%7Cy ",
+    # A label every few characters: one span, one line-end search and one brace walk per label
+    # if the span builder repeats its work.
+    "label-per-token": "pwd=a%7Cb ",
+    "open-brace-per-token": "pwd={a%7Cb ",
+    "closed-brace-per-token": "pwd={a%7Cb} ",
 }
 
 
