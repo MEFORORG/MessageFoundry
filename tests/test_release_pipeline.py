@@ -445,7 +445,7 @@ def test_release_pypi_publish_is_last_step_and_tag_gated() -> None:
     )
 
     publish = jobs["publish-pypi"]
-    assert publish.get("needs") in ("release", ["release"]), publish.get("needs")
+    assert needs_of(publish) == ["release"], needs_of(publish)
     last = publish["steps"][-1]
     assert str(last.get("name", "")).startswith("Publish to PyPI"), last
     assert (last.get("with") or {}).get("packages-dir") == "dist-pub/", last
@@ -3674,7 +3674,7 @@ def _publish_jobs() -> dict[str, dict]:
 
 def test_every_pypi_publish_runs_in_a_publish_only_job_that_names_the_environment() -> None:
     """Mutation: drop `environment: pypi` from a publish job, put a build or checkout step in one,
-    give one a write scope, or let one run on a dispatch. Red here."""
+    or give one a write scope. Red here. The dispatch guard is the next test but one."""
     problems: list[str] = []
     for key, job in _publish_jobs().items():
         if _environment(job) != _ENVIRONMENT:
@@ -3687,11 +3687,6 @@ def test_every_pypi_publish_runs_in_a_publish_only_job_that_names_the_environmen
                 problems.append(f"{key} checks out the repository")
             if "run" in step and not str(step.get("name", "")).startswith(_VERIFY_PREFIX):
                 problems.append(f"{key} runs a command: {step.get('name')!r}")
-        guard = _despace(str(job.get("if") or ""))
-        if not any(_despace(c) in guard for c in _GUARD_CONJUNCTIONS) or "||" in guard:
-            problems.append(
-                f"{key}'s job `if:` lacks the event-and-ref pair, so a dispatch would run it"
-            )
     assert not problems, "\n".join(problems)
 
 
@@ -3756,8 +3751,7 @@ def test_each_publish_job_checks_the_digests_its_producer_recorded() -> None:
         )
         assert m, steps[verify[0]]["env"]
         producer = m.group(1)
-        needs = job.get("needs")
-        assert producer in ([needs] if isinstance(needs, str) else list(needs or [])), (key, needs)
+        assert producer in needs_of(job), (key, needs_of(job))
         prod = jobs[producer]
         assert prod["outputs"]["pypi-digests"] == "${{ steps.pypi-digests.outputs.sha256 }}"
         digest = next(s for s in prod["steps"] if s.get("id") == "pypi-digests")

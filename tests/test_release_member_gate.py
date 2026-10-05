@@ -54,6 +54,8 @@ from forbidden_members import (  # noqa: E402
     split_violation,
 )
 
+from tests._workflow_contexts import needs_of  # noqa: E402
+
 #: hatchling names every sdist member ``<project>-<version>/...``. The fixtures carry it because the
 #: denylist's whole claim is that a prefix cannot launder a basename, and a fixture with no prefix
 #: would not test that claim.
@@ -646,8 +648,7 @@ def _gating_job(jid: str, job: JobDict) -> str:
     at, producer = checks[0]
     publish_at = [i for i, s in enumerate(steps) if "gh-action-pypi-publish" in str(s.get("uses"))]
     assert publish_at and at < min(publish_at), f"{jid} checks digests after it publishes"
-    needs = job.get("needs") or []
-    assert producer in ([needs] if isinstance(needs, str) else needs), (
+    assert producer in needs_of(job), (
         f"{jid} checks {producer}'s digests without needing {producer}"
     )
     return producer
