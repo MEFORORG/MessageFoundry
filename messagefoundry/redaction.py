@@ -197,24 +197,34 @@ _CREDENTIAL_LABEL_WORDS = (
 #:
 #: * a quote or a brace, wherever it sits, so a quoted or braced credential value that reaches across
 #:   the token still pairs as it did in the original text;
+#: * a ``;``, ``,`` or ``&``, where the credential stage ends a bare value, so a label BEFORE the
+#:   token cannot take a kept label inside it as its own value;
 #: * a ``:`` or ``=`` that LEADS the token, where the label is the token before it;
 #: * a credential label word (:data:`_CREDENTIAL_LABEL_WORDS`, or a ``MEFOR_`` variable name), with
 #:   the quote and separator directly after it.
 #:
-#: The label must not follow a letter or a digit, and must not run on into a word character. That is
-#: at least as wide as the credential stage's own ``\b`` and label prefix, and it keeps a word that
-#: merely CONTAINS one whole: ``COMPASS:`` is replaced, not kept as ``PASS:``. Every kept piece is a
-#: mark or a fixed word, so no text a partner chose survives beside the placeholder. One stated
-#: exception: text that IS one of these words (a value spelled ``secret``) stays as that word.
+#: **The label test is the credential stage's own, on purpose.** The same ``\b`` and the same
+#: bounded dotted prefix as ``secretscrub._LABEL_PREFIX`` decide what counts, and only the word at
+#: the end is kept: the prefix is text a partner can choose, so it goes with the rest. A narrower
+#: test would lose a label that stage reads. A wider one would hand it a label it never had, and that
+#: label would then take the next token as its value in place of the label that owned it. So a word
+#: that merely CONTAINS one is replaced whole: ``COMPASS:`` is not kept as ``PASS:``.
+#:
+#: Every kept piece is a mark or a fixed word, so no text a partner chose survives beside the
+#: placeholder. One stated exception: text that IS one of these words (a value spelled ``secret``)
+#: stays as that word. The prefix bound keeps the scan linear, as it does there.
 #:
 #: **The literal run does not do this.** :data:`_HL7_FIELD_RUN` still writes one placeholder over the
 #: whole token, so a credential label glued to a pipe run loses its value's label the same way. That
 #: defect is older than this pattern and is not fixed here.
+#:
+#: A plain literal, so the static regex gate reads it. ``tests/test_redaction.py`` holds its word
+#: list to :data:`_CREDENTIAL_LABEL_WORDS`.
 _ENCODED_RUN_KEPT = re.compile(
-    r"""["'{}]|^[:=]"""
-    r"""|(?<![A-Za-z0-9])(?:MEFOR_[A-Z0-9_]+|(?i:"""
-    + "|".join(re.escape(word) for word in sorted(_CREDENTIAL_LABEL_WORDS, key=len, reverse=True))
-    + r"""))(?!\w)(?:["']?[:=])?"""
+    r"""["'{};,&]|^[:=]|\b(?:MEFOR_[A-Z0-9_]+|(?i:(?:[A-Za-z0-9]+[._-]){0,6}(?P<word>"""
+    r"""encryption_keys_retired|intake_api_key_next|encryption_key|authorization|private_key"""
+    r"""|passphrase|credential|password|session|api_key|api-key|apikey|bearer|passwd|secret"""
+    r"""|digest|basic|token|pass|pwd)))\b(?:["']?[:=])?"""
 )
 _WORD_CHAR = re.compile(r"\w")
 
@@ -233,8 +243,10 @@ def _encoded_run_replacement(match: re.Match[str]) -> str:
     parts: list[str] = []
     pos = 0
     for kept in _ENCODED_RUN_KEPT.finditer(token):
-        parts.append(_scrub_gap(token[pos : kept.start()]))
-        parts.append(kept.group())
+        # A label's dotted prefix is not kept: it joins the stretch before it.
+        start = kept.start() if kept["word"] is None else kept.start("word")
+        parts.append(_scrub_gap(token[pos:start]))
+        parts.append(token[start : kept.end()])
         pos = kept.end()
     parts.append(_scrub_gap(token[pos:]))
     return "".join(parts)

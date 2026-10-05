@@ -1990,6 +1990,25 @@ def test_a_credential_span_that_crosses_an_encoded_run_is_still_scrubbed(text: s
     _assert_the_chain_drops_the_credential(text)
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        # A `;` ends the first label's bare value. Without it the kept label became that value.
+        f"secret: abc;x%7Cy%7C_password: {_CREDENTIAL_VALUE}",
+        # A leading `&` cannot start a bare value, so the first label has none.
+        f"db_password: &url%26x%7Cy%7Cdb_password: {_CREDENTIAL_VALUE}",
+        # `_password` after a pipe is not a label to the credential stage, so it must not be kept:
+        # kept, it took `secret:` as its value and left the real one.
+        f"x%7Cy|_password: secret: {_CREDENTIAL_VALUE}",
+    ],
+    ids=["value-ends-at-semicolon", "ampersand-leads-the-token", "not-a-label-to-the-stage"],
+)
+def test_a_kept_label_never_changes_which_label_owns_a_value(text: str) -> None:
+    """A kept label is only safe if the credential stage pairs labels and values as it did on the
+    original text. Each shape here kept its value at e68fbc2896, the first cut of this fix."""
+    _assert_the_chain_drops_the_credential(text)
+
+
 def test_the_label_words_the_encoded_run_keeps_cover_the_credential_vocabulary() -> None:
     """THE DRIFT GATE. ``redaction`` is stdlib-only and cannot import ``secretscrub``, so the words
     are duplicated literals. This holds the copy to a superset of the source."""
@@ -2002,7 +2021,11 @@ def test_the_label_words_the_encoded_run_keeps_cover_the_credential_vocabulary()
         assert set(source) <= kept
     for scheme in ("bearer", "basic", "digest"):
         assert scheme in kept and scheme in secretscrub._BEARER.pattern
-    assert secretscrub._ENV_PREFIX in redaction._ENCODED_RUN_KEPT.pattern
+    pattern = redaction._ENCODED_RUN_KEPT.pattern
+    assert secretscrub._ENV_PREFIX in pattern
+    # The pattern is a plain literal for the static regex gate, so its words are a second copy.
+    spelled = pattern.split("(?P<word>")[1].split(")")[0].split("|")
+    assert spelled == list(redaction._CREDENTIAL_LABEL_WORDS)
 
 
 @pytest.mark.parametrize(
