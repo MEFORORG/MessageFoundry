@@ -22,7 +22,6 @@ import os
 import secrets
 import time
 import unicodedata
-import urllib.parse
 import urllib.request
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
@@ -104,7 +103,12 @@ from messagefoundry.config.secretprovider import (
     resolve_connector_secret,
 )
 from messagefoundry.config.settings import AuthSettings
-from messagefoundry.config.tls_policy import HopPosture, RevocationHopGuard
+from messagefoundry.config.tls_policy import (
+    HopPosture,
+    InsecureHopRefused,
+    RevocationHopGuard,
+    hop_url_host,
+)
 from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.credential import constant_time_equal
 from messagefoundry.store.base import AdminStore
@@ -1736,9 +1740,20 @@ _IDP_WAYS_ACROSS = (
     "in it: a certificate not already in the hop's trust store refuses start."
 )
 
-#: Stands in for a URL with no host. NOT the empty string: `is_loopback_hop_host("")` is True, so an
-#: empty host would take the on-box carve-out and a guard that cannot name its host would ALLOW.
-_NO_HOST = "(no host)"
+
+def _idp_leg_host(url: str | None, leg: str) -> str:
+    """The host of one OIDC leg, read by the shared hop check (BACKLOG #2207).
+
+    A URL that names no host raises :class:`InsecureHopRefused`, whatever the posture. A stand-in
+    host used to go to the guard instead, which refused it under ``enforce`` and only warned
+    outside it. The type is the one this hop's other refusal raises, so ``serve`` and
+    ``provision-admin`` report it as they report that one. ``messagefoundry verify`` shows it as an
+    ERROR on its revocation row, because it is raised while the guards are captured. The text is
+    the shared check's own and names no part of the URL."""
+    try:
+        return hop_url_host(url or "", cell=f"[auth] OIDC {leg}")
+    except ValueError as exc:
+        raise InsecureHopRefused(str(exc)) from exc
 
 
 def idp_revocation_guards(
@@ -1746,10 +1761,15 @@ def idp_revocation_guards(
 ) -> tuple[RevocationHopGuard, ...]:
     """Capture the #201 revocation guard for each OIDC leg, token endpoint first (BACKLOG #1887).
 
-    Pure: it decides nothing and logs nothing. :func:`_refuse_idp_revocation` enforces what it
-    returns, and ``messagefoundry verify`` reads each guard's
+    Apart from the refusal below, it decides nothing and logs nothing.
+    :func:`_refuse_idp_revocation` enforces what it returns, and ``messagefoundry verify`` reads each
+    guard's
     :meth:`~messagefoundry.config.tls_policy.RevocationHopGuard.disposition` (BACKLOG #1923), so the
-    report and the engine read one rule rather than two copies of it."""
+    report and the engine read one rule rather than two copies of it.
+
+    A leg whose URL names no host is refused here, whatever the posture (:func:`_idp_leg_host`,
+    BACKLOG #2207). Only unvalidated settings reach that: the ``[auth]`` validator refuses a
+    missing URL and a host outside the allow-list."""
     context = opener_tls_context(opener, connector="OIDC identity provider (token + JWKS)")
     legs = (
         (
@@ -1761,8 +1781,7 @@ def idp_revocation_guards(
     )
     return tuple(
         RevocationHopGuard.capture(
-            # _NO_HOST is reached only by unvalidated settings: the validator refuses a missing URL.
-            host=urllib.parse.urlsplit(url or "").hostname or _NO_HOST,
+            host=_idp_leg_host(url, leg),
             cell=f"[auth] OIDC {leg} (verified TLS, no revocation check)",
             description=(
                 f"carries {carries} over verified TLS but performs no certificate revocation checking"

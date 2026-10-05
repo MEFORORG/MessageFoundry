@@ -92,6 +92,7 @@ from messagefoundry.transports.rest import (
     _insecure_opener,
     _no_redirect_opener,
     _redact_url,
+    assert_probe_hop,
     capture_response_headers,
     cleartext_acceptance_from_settings,
     egress_route_from_settings,
@@ -878,6 +879,8 @@ class FhirDestination(DestinationConnector):
         # Reachability only: a GET of the FHIR base metadata (CapabilityStatement) reaches the server
         # without POSTing a resource. Any HTTP response means the host answered; 401/403 means the
         # configured credentials would be rejected. Connection/DNS/TLS/timeout always fails.
+        # BACKLOG #2196: the hop re-check _post runs, before the bearer is minted below.
+        assert_probe_hop(self._hop_guard, self.base_url, connector="FHIR")
         url = f"{self.base_url.rstrip('/')}/metadata"
         headers = self._headers
         if self._token_provider is not None:
@@ -950,9 +953,7 @@ class FhirDestination(DestinationConnector):
         # a byte crosses. ``url`` is a per-message write path but its host is always the base_url host, so
         # a None guard (secure/loopback base) is byte-identical.
         if self._hop_guard is not None:
-            self._hop_guard.assert_send(
-                urllib.parse.urlsplit(self.base_url).hostname or "", _redact_url(self.base_url)
-            )
+            self._hop_guard.assert_send_url(self.base_url)
         data = encode_wire_body(payload, self.encoding, transport="FHIR")
         headers = {**self._headers, **extra_headers}
         if self._token_provider is not None:
@@ -1330,7 +1331,10 @@ class FhirLookupExecutor:
                 # server is the most on-point instance of 12.3.4's condition in the product, and it
                 # could not name an anchor at all.
                 lookup_anchor = http_family_trust_anchor(
-                    s, url=url, trust_anchor_policy=trust_anchor_policy
+                    s,
+                    url=url,
+                    trust_anchor_policy=trust_anchor_policy,
+                    cell=f"FhirLookup {cname!r}",
                 )
                 self._opener[cname] = (
                     _no_redirect_opener(*proxy_handlers, trust_anchor=lookup_anchor)
@@ -1420,15 +1424,15 @@ class FhirLookupExecutor:
         A refusal is a :class:`FhirLookupError`, like every other failure of this executor. The raw
         ``InsecureHopRefused`` is a ``ValueError``, which the sandbox worker does not catch, so it
         reached the Handler as a crash rather than as a lookup error (BACKLOG #2059). Its text names
-        the redacted base and the host, as the sibling arms here do."""
+        the redacted base and the host, as the sibling arms here do. For a base with no host it
+        names neither (BACKLOG #2207)."""
         from messagefoundry.config.fhir_lookup import FhirLookupError
 
         guard = self._hop_guard.get(connection)
         if guard is None:
             return
-        base = self._base[connection]
         try:
-            guard.assert_send(urllib.parse.urlsplit(base).hostname or "", _redact_url(base))
+            guard.assert_send_url(self._base[connection])
         except InsecureHopRefused as exc:
             raise FhirLookupError(f"{prefix}: {exc}") from exc
 

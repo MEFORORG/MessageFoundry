@@ -72,6 +72,7 @@ from messagefoundry.transports.rest import (
     _insecure_opener,
     _no_redirect_opener,
     _redact_url,
+    assert_probe_hop,
     egress_route_from_settings,
     enforce_outbound_length_limits,
     http_family_trust_anchor,
@@ -407,6 +408,8 @@ class DicomWebDestination(DestinationConnector):
         # Reachability only: an OPTIONS to the studies endpoint reaches the host without storing an object.
         # Any HTTP response means the host answered; 401/403 means the configured credentials would be
         # rejected (which a real store dead-letters). Connection/DNS/TLS/timeout always fails.
+        # BACKLOG #2196: the hop re-check _post runs, before a byte crosses.
+        assert_probe_hop(self._hop_guard, self.base_url, connector="DICOMweb")
         req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s) in __init__
             self._target_url, headers=self._headers, method="OPTIONS"
         )
@@ -448,9 +451,7 @@ class DicomWebDestination(DestinationConnector):
         # #200 (ADR 0092 decision 4): zero-I/O send-time re-assertion of a permitted insecure hop before
         # a byte crosses (a None guard — secure/loopback — is byte-identical).
         if self._hop_guard is not None:
-            self._hop_guard.assert_send(
-                urllib.parse.urlsplit(self.base_url).hostname or "", _redact_url(self.base_url)
-            )
+            self._hop_guard.assert_send_url(self.base_url)
         data, boundary = self._multipart_body(dicom_bytes)
         headers = {
             **self._headers,

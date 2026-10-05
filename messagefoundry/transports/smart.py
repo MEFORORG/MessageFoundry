@@ -724,7 +724,7 @@ def token_provider_from_settings(
         # exemption and the internal-vs-public decision key on the host actually being dialled. The
         # connection's own ``tls_ca_file`` still wins verbatim, exactly as it does on the data hop.
         trust_anchor=http_family_trust_anchor(
-            s, url=token_url, trust_anchor_policy=trust_anchor_policy
+            s, url=token_url, trust_anchor_policy=trust_anchor_policy, cell="smart_token_url"
         ),
     )
 
