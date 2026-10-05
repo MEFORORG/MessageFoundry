@@ -691,7 +691,7 @@ def test_the_quoted_value_repetitions_stay_non_backtracking() -> None:
     Structural rather than a stopwatch, for the reason the sibling guard already gives: a timing
     assertion on a shared runner flakes, and the property that matters is that the mitigation is
     there."""
-    for name in ("_ODBC_BRACED", "_QUOTED_VALUE", "_KV_QUOTED_VALUE"):
+    for name in ("_ODBC_BRACED", "_KV_QUOTED_VALUE"):
         fragment = getattr(redact_mod, name)
         assert "*+" in fragment, (
             f"{name} is {fragment!r} -- its repetition must stay POSSESSIVE. A plain '*' re-walks a "
@@ -2285,6 +2285,12 @@ def test_the_swallow_tests_fail_without_the_stop(monkeypatch: pytest.MonkeyPatch
 # a check on whole tokens missed ``01`` printing out of ``fv-A_1-01_password``.
 
 
+#: The plain quoted value ``_CREDENTIAL_KV`` shipped with, before it ran on past a later label's
+#: quote. No module pattern uses it on its own any more, so it is stated here, where the baseline
+#: and the controls that put it back need it.
+_PLAIN_QUOTED_VALUE = "'[^'\r\n]*+'|\"[^\"\r\n]*+\""
+
+
 def _pre_change_patterns() -> dict[str, re.Pattern[str]]:
     """The five value patterns as they stood before the stop and the guarded forms, built from the
     vocabulary both copies still share. Written in ``secretscrub``'s spelling, with a global fold;
@@ -2307,7 +2313,7 @@ def _pre_change_patterns() -> dict[str, re.Pattern[str]]:
             r"['\"]?\s*[:=]\s*(?:"
             + s._ODBC_BRACED
             + "|"
-            + s._QUOTED_VALUE
+            + _PLAIN_QUOTED_VALUE
             + "|"
             + s._ODBC_BRACED_OVERRUN
             + r"|['\"]?[^\s'\";,&]+)"
@@ -2467,13 +2473,17 @@ def _secret_passes_only(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _newly_printed_atoms(
-    monkeypatch: pytest.MonkeyPatch, shipped_patterns: dict[ModuleType, dict[str, re.Pattern[str]]]
+    monkeypatch: pytest.MonkeyPatch,
+    shipped_patterns: dict[ModuleType, dict[str, re.Pattern[str]]],
+    corpus: list[str] | None = None,
 ) -> tuple[list[str], int]:
     """``(atoms the shipped patterns print and the pre-change ones hid, count the reverse way)``.
 
-    ``shipped_patterns`` lets a control swap a mutated pattern set in for the real one."""
+    ``shipped_patterns`` lets a control swap a mutated pattern set in for the real one. ``corpus``
+    defaults to the review shapes and the two seeded generators."""
     _secret_passes_only(monkeypatch)
-    corpus = [*_REVIEW_SHAPES, *_fuzz_lines(4000), *_structured_lines(4000)]
+    if corpus is None:
+        corpus = [*_REVIEW_SHAPES, *_fuzz_lines(4000), *_structured_lines(4000)]
     surfaces = (("scrub_credentials", scrub_credentials), ("redact_log_line", redact_log_line))
 
     def outputs(patterns: dict[ModuleType, dict[str, re.Pattern[str]]]) -> dict[str, list[str]]:
@@ -2532,14 +2542,16 @@ def test_the_change_prints_no_value_the_pre_change_patterns_hid(
 
 
 def _mutated(old: str, new: str) -> dict[ModuleType, dict[str, re.Pattern[str]]]:
-    """The shipped stopped patterns with ``old`` replaced by ``new`` in every source that holds it."""
+    """The shipped stopped patterns with the fragment ``old`` names replaced by ``new`` in every source
+    that holds it. ``new`` is a module attribute's name where the module has one, and otherwise the
+    replacement text itself."""
     mutated: dict[ModuleType, dict[str, re.Pattern[str]]] = {}
     for module in (scrub_mod, redact_mod):
         by_name = {}
         for name in _STOPPED_PATTERNS:
             pattern: re.Pattern[str] = getattr(module, name)
             by_name[name] = re.compile(
-                pattern.pattern.replace(getattr(module, old), getattr(module, new) if new else ""),
+                pattern.pattern.replace(getattr(module, old), getattr(module, new, new)),
                 pattern.flags,
             )
         mutated[module] = by_name
@@ -2548,7 +2560,7 @@ def _mutated(old: str, new: str) -> dict[ModuleType, dict[str, re.Pattern[str]]]
 
 @pytest.mark.parametrize(
     ("old", "new"),
-    (("_GUARDED_QUOTED_VALUE", "_QUOTED_VALUE"), ("_HARD_SEPARATOR_BEHIND", "")),
+    (("_GUARDED_QUOTED_VALUE", _PLAIN_QUOTED_VALUE), ("_HARD_SEPARATOR_BEHIND", "")),
     ids=("unguarded-quote", "prefix-after-any-separator"),
 )
 def test_the_differential_sees_each_guard_removed(
@@ -2562,6 +2574,97 @@ def test_the_differential_sees_each_guard_removed(
         assert getattr(module, old) in source, f"{module.__name__}._BEARER does not hold {old}"
     newly, _hidden_now = _newly_printed_atoms(monkeypatch, _mutated(old, new))
     assert newly, f"with {old} removed the differential found nothing, so it cannot see that guard"
+
+
+# --- one label nested inside another label's quoted or braced value ------------------------------
+#
+# A shape neither generator above assembles often: an outer label whose quoted or braced value holds a
+# whole inner label and its value, then a tail. A review found ``_MEFOR_SECRET``'s braced form leaving
+# behind the quote the old class ate after "}", so the outer password closed on that quote and the
+# tail printed:
+#
+#   password='vq0 MEFOR_X={vq1}' vq2'   ->   password=<redacted> vq2'
+#
+# The pre-change patterns hid all of it. The arm below builds every family inside every family.
+
+#: The line the review found, kept verbatim.
+_BRACED_THEN_QUOTE_LINE = "password='vq0 MEFOR_X={vq1}' vq2'"
+
+#: At least one label of each family, underscored labels among them.
+_NESTED_LABELS = (
+    *("password", "client_secret", "token", "api_key", "authorization"),
+    *("private_key", "encryption_keys_retired", "MEFOR_A_PW"),
+)
+_NESTED_INNER_ASSIGNMENTS = ("=", ": ", "'=", "=Bearer ")
+_NESTED_INNER_VALUES = ("vq1", "'vq1'", '"vq1"', "{vq1}", "'vq1 vq3'", '"vq1 vq3"', "{vq1 vq3}")
+
+
+def _nested_label_lines() -> list[str]:
+    """Every outer label, with a single-quoted, double-quoted or braced value holding ``vq0``, a
+    separator and a whole inner label of every family, then a tail with or without a stray quote."""
+    lines: list[str] = []
+    for outer in _NESTED_LABELS:
+        for outer_assign in ("=", ": "):
+            for opener, closer in (("'", "'"), ('"', '"'), ("{", "}")):
+                tails = sorted(
+                    {"", f" vq2{closer}", f"vq2{closer}", " vq2'", ' vq2"', f"{closer} vq2"}
+                )
+                for inner in _NESTED_LABELS:
+                    for inner_assign in _NESTED_INNER_ASSIGNMENTS:
+                        for value in _NESTED_INNER_VALUES:
+                            for sep in (" ", ";"):
+                                head = (
+                                    f"{outer}{outer_assign}{opener}vq0{sep}"
+                                    f"{inner}{inner_assign}{value}{closer}"
+                                )
+                                lines.extend(head + tail for tail in tails)
+    return lines
+
+
+@pytest.mark.parametrize("surface", _SWALLOW_SURFACES, ids=lambda surface: surface[0])
+def test_a_braced_mefor_value_inside_a_quoted_password_hides_the_tail(
+    surface: tuple[str, Callable[[str], str]],
+) -> None:
+    """The review's line, on every surface: no value atom may print."""
+    name, apply = surface
+    out = apply(_BRACED_THEN_QUOTE_LINE)
+    printed = [atom for atom in ("vq0", "vq1", "vq2") if atom in out]
+    assert not printed, f"{name}: {printed} printed -- got {out!r}"
+
+
+def test_a_nested_label_prints_no_value_the_pre_change_patterns_hid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The nested corpus, on both surfaces: no value atom the old patterns hid may print now, except
+    as the underscored label prefix the RESIDUALS comment names. The reverse count must be above
+    zero, or the comparison proved nothing."""
+    corpus = _nested_label_lines()
+    assert _BRACED_THEN_QUOTE_LINE.replace("MEFOR_X", "MEFOR_A_PW") in corpus
+    newly, hidden_now = _newly_printed_atoms(monkeypatch, _shipped(), corpus)
+    assert not newly, f"{len(newly)} value atoms newly printed, first: {newly[:3]}"
+    assert hidden_now > 0, "the new patterns hid nothing the old printed, so nothing was compared"
+
+
+#: The guard and the quote after it, as ``_MEFOR_SECRET``'s braced form spells them in both copies.
+_BRACED_CLOSER_GUARD = r"(?![^\s'\"])"
+_BRACED_CLOSER_QUOTE = _BRACED_CLOSER_GUARD + r"['\"]?"
+
+
+def test_the_nested_arm_finds_the_braced_closer_leak(monkeypatch: pytest.MonkeyPatch) -> None:
+    """THE POSITIVE CONTROL. With the quote after the braced closer taken back out of
+    ``_MEFOR_SECRET`` in both copies, as it stood at 55490b2869, the nested arm must find the
+    review's line printing its tail."""
+    mutated = _shipped()
+    for module in (scrub_mod, redact_mod):
+        pattern: re.Pattern[str] = module._MEFOR_SECRET
+        assert _BRACED_CLOSER_QUOTE in pattern.pattern, f"{module.__name__}._MEFOR_SECRET changed"
+        source = pattern.pattern.replace(_BRACED_CLOSER_QUOTE, _BRACED_CLOSER_GUARD, 1)
+        mutated[module]["_MEFOR_SECRET"] = re.compile(source, pattern.flags)
+    newly, _hidden_now = _newly_printed_atoms(monkeypatch, mutated, _nested_label_lines())
+    line = _BRACED_THEN_QUOTE_LINE.replace("MEFOR_X", "MEFOR_A_PW")
+    assert any(repr(line) in row for row in newly), (
+        f"the arm missed {line!r}; it found {len(newly)} others, first {newly[:2]}"
+    )
 
 
 #: Lines where ``_CREDENTIAL_KV``'s quoted value must run on past a later label's opening quote, and
@@ -2595,13 +2698,13 @@ def test_a_quoted_credential_runs_on_past_a_later_labels_opening_quote(
 def test_the_run_on_shapes_print_under_the_plain_quoted_value(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """THE POSITIVE CONTROL. With the plain ``_QUOTED_VALUE`` put back into ``_CREDENTIAL_KV`` in both
+    """THE POSITIVE CONTROL. With :data:`_PLAIN_QUOTED_VALUE` put back into ``_CREDENTIAL_KV`` in both
     copies, every run-on shape must print a value, or the test above cannot fail."""
     _secret_passes_only(monkeypatch)
     for module in (scrub_mod, redact_mod):
         kv: re.Pattern[str] = module._CREDENTIAL_KV
         assert module._KV_QUOTED_VALUE in kv.pattern, f"{module.__name__}._CREDENTIAL_KV lost it"
-        plain = kv.pattern.replace(module._KV_QUOTED_VALUE, module._QUOTED_VALUE)
+        plain = kv.pattern.replace(module._KV_QUOTED_VALUE, _PLAIN_QUOTED_VALUE)
         monkeypatch.setattr(module, "_CREDENTIAL_KV", re.compile(plain, kv.flags))
     for line, values in _RUN_ON_SHAPES:
         for surface, apply in (
@@ -2640,6 +2743,8 @@ def test_both_copies_of_each_stopped_pattern_agree() -> None:
         *(case.line for case in QUOTED_VALUES),
         *_REVIEW_SHAPES,
         *_structured_lines(2000),
+        # Every fifth nested line: the braced MEFOR_ value's trailing quote is spelled in both copies.
+        *_nested_label_lines()[::5],
     ]
     compared = 0
     for name in _STOPPED_PATTERNS:
@@ -2675,9 +2780,10 @@ def _mefor_run(length: int) -> str:
 def test_the_value_walk_grows_linearly_in_line_length() -> None:
     """The stop is checked inside every plain value, on log text an attacker can influence, so it must
     stay linear. THE POSITIVE CONTROL is the same pattern with the MEFOR_ branch's ``\\b`` swapped for
-    the lookbehind the keyword branches use: then every "_" starts a walk to the end of the run, which
-    is the quadratic the ``\\b`` is there to stop. Measured 2026-10-04: 7.7x for the shipped pattern
-    against 48x to 50x for the control, across the same 8x span."""
+    the lookbehind ``(?<![A-Za-z0-9])``, which fires after every "_" where ``\\b`` cannot: then every
+    "_" starts a walk to the end of the run, which is the quadratic the ``\\b`` is there to stop.
+    Measured 2026-10-04: 7.7x for the shipped pattern against 48x to 50x for the control, across the
+    same 8x span."""
     head = r"\b(?-i:MEFOR_"
     for module in (scrub_mod, redact_mod):
         shipped: re.Pattern[str] = module._BEARER

@@ -608,8 +608,9 @@ _UNSCANNABLE_RE_PATTERNS = {
     #   position, because ``[^}]`` excludes the single character ``\}\}`` needs. The quantifier is
     #   POSSESSIVE, which this scanner reads as the mitigation rather than the shape, and correctly:
     #   it is what stops the walk retrying on a brace that never closes.
-    # * ``_QUOTED_VALUE`` is ``'[^'\r\n]*+'|"[^"\r\n]*+"`` -- a negated class that excludes its own
-    #   closer, possessive for the same reason.
+    # * the plain quoted value ``'[^'\r\n]*+'|"[^"\r\n]*+"`` -- a negated class that excludes its own
+    #   closer, possessive for the same reason. It is now the fast path inside ``_KV_QUOTED_VALUE``
+    #   rather than a constant of its own.
     # * ``_ODBC_BRACED_OVERRUN`` is ``\{[^\r\n]*`` -- one unbounded repetition of a negated class,
     #   quantified nowhere and inside no quantified group.
     #
@@ -632,7 +633,7 @@ _UNSCANNABLE_RE_PATTERNS = {
     "messagefoundry/secretscrub.py": (
         "'(?i)\\\\b(' + _LABEL_PREFIX + '(?:' + _alternation(_TOKEN_WORDS) + '))\\\\b\\\\s*[:=]\\\\s*(?:(?:bearer|basic|digest)\\\\s+)?(?:' + _GUARDED_QUOTED_VALUE + '|' + _PLAIN_VALUE + ')'",
         "'(?i)\\\\b(bearer)\\\\s+(?=[\\'\\\\\"]?[^\\\\s\\'\\\\\",;]{4})' + _PLAIN_SCHEME_VALUE",
-        "'\\\\b(' + re.escape(_ENV_PREFIX) + '[A-Z0-9_]+)\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*(?:' + _GUARDED_BRACED_VALUE + f'(?![^{_PLAIN_TERMINATORS}])' + '|(?=' + _GUARDED_QUOTED_VALUE + ')[\\'\\\\\"][^\\\\s\\'\\\\\"]*+[\\'\\\\\"]|' + _GUARDED_QUOTED_VALUE + '|' + _PLAIN_VALUE + '[\\'\\\\\"]?)'",
+        "'\\\\b(' + re.escape(_ENV_PREFIX) + '[A-Z0-9_]+)\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*(?:' + _GUARDED_BRACED_VALUE + f'(?![^{_PLAIN_TERMINATORS}])' + '[\\'\\\\\"]?|(?=' + _GUARDED_QUOTED_VALUE + ')[\\'\\\\\"][^\\\\s\\'\\\\\"]*+[\\'\\\\\"]|' + _GUARDED_QUOTED_VALUE + '|' + _PLAIN_VALUE + '[\\'\\\\\"]?)'",
         "'(?i)\\\\b(' + _LABEL_PREFIX + '(?:' + _alternation(_CREDENTIAL_WORDS) + '))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*(?:' + _ODBC_BRACED + '|' + _KV_QUOTED_VALUE + '|' + _ODBC_BRACED_OVERRUN + '|' + _PLAIN_KV_VALUE + ')'",
         "'(?i)\\\\b(' + _LABEL_PREFIX + '(?:' + _alternation(_KEY_MATERIAL_WORDS) + '))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*(?:' + _GUARDED_BRACED_VALUE + f'(?![^{_KEY_TERMINATORS}])|' + _GUARDED_QUOTED_VALUE + '|' + _PLAIN_KEY_VALUE + ')'",
     ),

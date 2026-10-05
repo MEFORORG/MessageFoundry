@@ -90,8 +90,9 @@ _MFB64 = re.compile(r"mfb64:v1:[A-Za-z0-9+/=]+")
 # ``tls_key_password`` — two prefix segments each) and nothing in this tree comes close.
 _LABEL_PREFIX = r"(?:[A-Za-z0-9]+[._-]){0,6}"
 
-# The quoted and braced value fragments (BACKLOG #1685). ``_ODBC_BRACED``, ``_QUOTED_VALUE`` and the
-# overrun are ``_CREDENTIAL_KV``'s only, and it takes the quoted one through ``_KV_QUOTED_VALUE``.
+# The quoted and braced value fragments (BACKLOG #1685). ``_ODBC_BRACED`` and the overrun are
+# ``_CREDENTIAL_KV``'s only, and its quoted value is ``_KV_QUOTED_VALUE``, whose fast path is the plain
+# quoted form; no pattern uses the plain form on its own.
 # ``_MEFOR_SECRET``, ``_BEARER`` and ``_KEY_MATERIAL`` take the GUARDED forms, which refuse at least
 # the measured shapes of a closer that belongs to someone else -- a later label's quote, a quote
 # inside a DSN password -- and fall back to the plain class: ``token='abc, password='p w'`` would
@@ -100,7 +101,6 @@ _LABEL_PREFIX = r"(?:[A-Za-z0-9]+[._-]){0,6}"
 # Every guard, why the closer stays, and why ``_BEARER`` takes no brace form, are stated once, on the
 # same fragments in ``messagefoundry/secretscrub.py``.
 _ODBC_BRACED = r"\{(?:[^}]|\}\})*+\}(?!\})"
-_QUOTED_VALUE = "'[^'\r\n]*+'|\"[^\"\r\n]*+\""
 _ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
 _GUARDED_QUOTED_VALUE = (
     "'(?:[^'\"{\\s:=]++|(?::(?!//)|=|[^\\S\r\n])++(?!'))*+(?='(?!\\s*+[:=]))"
@@ -142,12 +142,13 @@ _NOT_BEFORE_QUOTED_LABEL = (
 )
 
 
-# ``_CREDENTIAL_KV``'s quoted value: ``_QUOTED_VALUE``, except where the quote that would close it opens
-# a later label's value. There it takes that label and its value too, through the value's own closer,
-# so ``password='abc, private_key='p w q'`` no longer prints "p w q'". When it runs on and when it falls
-# back to ``_QUOTED_VALUE``'s span, what that was measured to cost, and why it stays linear, are stated
-# once, on the same fragment in ``messagefoundry/secretscrub.py``. Written as plain concatenation, not
-# built by a helper, so ``tests/test_security_static.py`` can resolve this copy and scan it.
+# ``_CREDENTIAL_KV``'s quoted value: the plain quoted form, except where the quote that would close it
+# opens a later label's value. There it takes that label and its value too, through the value's own
+# closer, so ``password='abc, private_key='p w q'`` no longer prints "p w q'". When it runs on and
+# when it falls back to the plain form's span, what that was measured to cost, and why it stays
+# linear, are stated once, on the same fragment in ``messagefoundry/secretscrub.py``. Written as plain
+# concatenation, not built by a helper, so ``tests/test_security_static.py`` can resolve this copy and
+# scan it.
 _RUN_ON_LABEL = (
     r"(?:(?=(?i:[abceipst]))"
     r"(?:(?i:pass(?:word|wd|phrase)?|pwd|secret|credential|encryption_key(?:s_retired)?|private_key"
@@ -286,21 +287,26 @@ _BEARER = re.compile(
 # nothing, so matching on it would redact operator diagnostics and buy no confidentiality: a labelled
 # "Authorization: Basic <cred>" is already carried by ``_BEARER``.
 #
-# The four-character floor is a LOOKAHEAD so the stop before a quoted label cannot take a match away:
-# asked of the stopped run, ``Bearer ab:password="v w"`` would fail the floor and print "ab".
+# The four-character floor is a LOOKAHEAD, so a stop that shortens the run cannot push it under the
+# floor: asked of the stopped run, ``Bearer ab:password="v w"`` would fail the floor and print "ab".
+# Where the first run is itself a quoted label the stop does refuse the match, on purpose; why is on
+# the same pattern in ``messagefoundry/secretscrub.py``.
 _AUTH_SCHEME = re.compile(r"(?i)\b(bearer)\s+(?=['\"]?[^\s'\",;]{4})" + _PLAIN_SCHEME_VALUE)
 
 # A MEFOR_* secret echoed as "MEFOR_FOO=value" or "MEFOR_FOO: value": never carry the value. The
 # optional quotes match the shape an error string produces — "(env 'MEFOR_VALUE_PW'='<value>')" — which
 # the unquoted form missed entirely. A quoted value is taken whole, and so is a braced one when its
-# closer ends the value, both through the guarded forms (explained at ``_CREDENTIAL_KV``).
+# closer ends the value, both through the guarded forms (explained at ``_CREDENTIAL_KV``). The braced
+# value takes one quote after its closer, as the old plain class did; why is on the same pattern in
+# ``messagefoundry/secretscrub.py``.
 _MEFOR_SECRET = re.compile(
     r"\b(MEFOR_[A-Z0-9_]+)\b['\"]?\s*[:=]\s*"
     r"(?:"
     + _GUARDED_BRACED_VALUE
     + rf"(?![^{_PLAIN_TERMINATORS}])"
-    # A quoted value with no space in it, closer and all: the span the old plain class took.
-    + r"|(?="
+    # The braced value's one trailing quote, then a quoted value with no space in it, closer and
+    # all: the span the old plain class took.
+    + r"['\"]?|(?="
     + _GUARDED_QUOTED_VALUE
     + r")['\"][^\s'\"]*+['\"]|"
     + _GUARDED_QUOTED_VALUE
