@@ -842,11 +842,6 @@ _BODY_ALLOWED: tuple[_Allowed, ...] = (
         _SAFE + "parse_path quotes only the operator's own field path, and the new error's text is "
         "that same string",
     ),
-    # ---- UNSAFE: in anon/, which batch-168's #1710 Builder holds, so not edited under #2085.
-    _Allowed(
-        "messagefoundry/anon/rules.py::load_rules::(OSError, tomllib.TOMLDecodeError)::RuleError",
-        _UNSAFE + "the TOMLDecodeError's .doc is the whole rules file; raise after the handler",
-    ),
 )
 
 

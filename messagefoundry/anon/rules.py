@@ -24,6 +24,7 @@ Pure stdlib — byte-identical with ``tee/anon/rules.py`` (parity test); no ``me
 
 from __future__ import annotations
 
+import logging
 import re
 import tomllib
 from dataclasses import dataclass
@@ -177,6 +178,9 @@ class AnonError(ValueError):
     so existing fail-closed call-site catches treat it as a drop-and-count."""
 
 
+_LOG = logging.getLogger(__name__)
+
+
 def _validate_path(path: str) -> str:
     if not _FIELD_PATH_RE.match(path):
         raise RuleError(
@@ -200,20 +204,40 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
         keep = ["PID-13"]  # cancel a default scrub, or record a field as reviewed and left intact
         drop = ["PID-40"]  # blank the field entirely
 
-    Any other table/key, a component path, or an unknown kind raises :class:`RuleError`.
+    Any other table/key, a component path, or an unknown kind raises :class:`RuleError`. So does
+    an overlay that cannot be read or parsed: that error names the file and, for bad TOML, a line
+    and column. It quotes nothing from the file, and it chains no other exception.
 
     A ``keep`` comes back as a :attr:`SurrogateKind.KEEP` rule. The anonymizer rewrites nothing for
     it; the leak-check counts the field as DECIDED for ``require_full_coverage`` and still scans
     it for PHI shapes (BACKLOG #1710).
+
+    A keep on a :data:`DEFAULT_RULES` path turns that default scrub off. Each one is logged at
+    WARNING, by field address and kind only; :func:`kept_defaults` lists them (BACKLOG #2268).
     """
     effective: dict[str, SurrogateKind] = {r.path: r.kind for r in DEFAULT_RULES}
     if overlay is None:
         return DEFAULT_RULES
 
+    # Each arm keeps one content-free fact. A TOMLDecodeError holds the whole file on ``.doc`` and
+    # a UnicodeDecodeError holds its bytes on ``.object``, so neither may reach the refusal's chain.
+    refusal: str | None = None
     try:
         data = tomllib.loads(overlay.read_text(encoding="utf-8"))
-    except (OSError, tomllib.TOMLDecodeError) as exc:
-        raise RuleError(f"cannot read anon overlay {overlay}: {exc}") from exc
+    except tomllib.TOMLDecodeError as exc:
+        refusal = f"invalid TOML at line {exc.lineno}, column {exc.colno}"
+    except UnicodeDecodeError:  # a ValueError, not an OSError
+        refusal = "the file is not UTF-8 text"
+    except RecursionError:  # tomllib recurses on nested arrays and tables
+        refusal = "the file nests too deeply to parse"
+    except ValueError:  # at least int()'s digit limit, which tomllib lets through as it is
+        refusal = "the file holds a value the TOML parser refused"
+    except OSError as exc:
+        refusal = exc.strerror or type(exc).__name__
+    if refusal is not None:
+        # Raised AFTER the handler, so neither __cause__ nor __context__ is set. ``from None``
+        # would not do: it leaves __context__ populated (BACKLOG #2310).
+        raise RuleError(f"cannot read anon overlay {overlay}: {refusal}")
 
     unknown_top = set(data) - {"hl7"}
     if unknown_top:
@@ -242,7 +266,28 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
         effective[_validate_path(path)] = SurrogateKind.DROP
 
     # A KEEP rule is returned, not dropped: it is the record that someone decided the field.
-    return tuple(FieldRule(path, kind) for path, kind in effective.items())
+    rules = tuple(FieldRule(path, kind) for path, kind in effective.items())
+    for cancelled in kept_defaults(rules):
+        _LOG.warning(
+            "anon overlay %s keeps %s, which turns off its default %s scrub: the field is left "
+            "as captured",
+            overlay,
+            cancelled.path,
+            cancelled.kind.value,
+        )
+    return rules
+
+
+def kept_defaults(rules: tuple[FieldRule, ...]) -> tuple[FieldRule, ...]:
+    """The :data:`DEFAULT_RULES` entries that ``rules`` keeps, so their scrub no longer runs.
+
+    A keep does two jobs. It records a field as reviewed for ``require_full_coverage``, and it
+    cancels any default scrub on that path. So a keep on ``PID-5`` turns the name scrub off,
+    whatever it was added for. :func:`load_rules` logs each one, and a caller with a console of
+    its own can repeat them there. Each entry is the default rule, so it names the lost kind.
+    """
+    kept = {r.path for r in rules if r.kind == SurrogateKind.KEEP}
+    return tuple(r for r in DEFAULT_RULES if r.path in kept)
 
 
 def _as_path_list(hl7: dict[str, object], key: str) -> list[str]:

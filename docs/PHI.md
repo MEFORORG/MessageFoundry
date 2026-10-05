@@ -1868,6 +1868,16 @@ keep = ["EVN-1", "OBX-2"]
 A kept field is still scanned for the shapes in the table above, so a dashed SSN in it still
 refuses.
 
+**A keep on a field the default rules scrub turns that scrub off.** A keep on `PID-5` leaves the
+patient name in the output as captured, whatever the keep was added for. A default-scrubbed field
+already counts as decided, so a keep on one never clears a refusal. `load_rules` logs a WARNING for each
+such field. The line names the field and the kind of scrub it lost, never a value. A keep on a
+field with no default rule logs nothing. `python -m tee anonymize-captures` also prints one
+`warning:` line that lists those fields, and `--log-level` cannot hide it.
+
+**The tee reads the overlay once, before the first message.** An overlay it cannot read or parse,
+or one that breaks the schema, refuses the whole run with one `error:` line and writes no dataset.
+
 **Expect it to refuse conformant traffic until the rule map is finished.** The measured corpus
 came from `messagefoundry generate --count 2 --seed 1710`, run for every type: 186 messages. With
 the switch on, all 186 refused. Mapping the dates and locations above did not change that count.
