@@ -204,7 +204,9 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
         keep = ["PID-13"]  # cancel a default scrub, or record a field as reviewed and left intact
         drop = ["PID-40"]  # blank the field entirely
 
-    Any other table/key, a component path, or an unknown kind raises :class:`RuleError`.
+    Any other table/key, a component path, or an unknown kind raises :class:`RuleError`. So does
+    an overlay that cannot be read or parsed: that error names the file and, for bad TOML, a line
+    and column. It quotes nothing from the file, and it chains no other exception.
 
     A ``keep`` comes back as a :attr:`SurrogateKind.KEEP` rule. The anonymizer rewrites nothing for
     it; the leak-check counts the field as DECIDED for ``require_full_coverage`` and still scans
@@ -217,10 +219,23 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
     if overlay is None:
         return DEFAULT_RULES
 
+    # Each arm keeps one content-free fact. A TOMLDecodeError holds the whole file on ``.doc`` and
+    # a UnicodeDecodeError holds its bytes on ``.object``, so neither may reach the refusal's chain.
+    refusal: str | None = None
     try:
         data = tomllib.loads(overlay.read_text(encoding="utf-8"))
-    except (OSError, tomllib.TOMLDecodeError) as exc:
-        raise RuleError(f"cannot read anon overlay {overlay}: {exc}") from exc
+    except tomllib.TOMLDecodeError as exc:
+        refusal = f"invalid TOML at line {exc.lineno}, column {exc.colno}"
+    except UnicodeDecodeError:  # a ValueError, not an OSError
+        refusal = "the file is not UTF-8 text"
+    except RecursionError:  # tomllib recurses on nested arrays and tables
+        refusal = "the file nests too deeply to parse"
+    except OSError as exc:
+        refusal = exc.strerror or type(exc).__name__
+    if refusal is not None:
+        # Raised AFTER the handler, so neither __cause__ nor __context__ is set. ``from None``
+        # would not do: it leaves __context__ populated (BACKLOG #2310).
+        raise RuleError(f"cannot read anon overlay {overlay}: {refusal}")
 
     unknown_top = set(data) - {"hl7"}
     if unknown_top:
