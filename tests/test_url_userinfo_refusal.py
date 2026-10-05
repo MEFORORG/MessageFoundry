@@ -73,6 +73,9 @@ SECRET = "S3CRETPW"
 #:   sees no ``@`` at all and reads the password's HEAD as a port: ``nonnumeric port: 'S3CRETPW'``.
 #: * ``colon_slash_in_pw`` -- the same, where the head ENDS in ``:``. ``urlsplit`` reads the port as
 #:   ``S3CRETPW:``, which is not empty, so it must not pass as the empty-port form ``host:/``.
+#: * ``numeric_head_*`` -- a password whose head before the ``/``, ``?`` or ``#`` is a NUMBER, so the
+#:   port check passes and only the ``@`` after the port gives it away (BACKLOG #2686).
+#: * ``empty_head_slash`` -- a password that STARTS with ``/``: an empty port, which also passes.
 _USERINFO_SHAPES = {
     "plain": f"https://svc:{SECRET}@endpoint.example.invalid/x",
     "port": f"https://svc:{SECRET}@endpoint.example.invalid:8443/x",
@@ -80,6 +83,10 @@ _USERINFO_SHAPES = {
     "encoded_at": f"https://svc%3A{SECRET}%40endpoint.example.invalid/x",
     "slash_in_pw": f"https://svc:{SECRET}/tail@endpoint.example.invalid/x",
     "colon_slash_in_pw": f"https://svc:{SECRET}:/tail@endpoint.example.invalid/x",
+    "numeric_head_slash": f"https://svc:4821/{SECRET}@endpoint.example.invalid/x",
+    "numeric_head_query": f"https://svc:4821?{SECRET}@endpoint.example.invalid/x",
+    "numeric_head_fragment": f"https://svc:4821#{SECRET}@endpoint.example.invalid/x",
+    "empty_head_slash": f"https://svc:/{SECRET}@endpoint.example.invalid/x",
 }
 
 
@@ -164,13 +171,17 @@ def test_the_ai_endpoint_refuses_a_credential(shape: str) -> None:
 def test_the_refusal_leaves_ordinary_urls_alone() -> None:
     """The control half. A screen that refuses every URL would pass everything above. An ``@`` in the
     PATH or QUERY is legitimate and must survive, and so must an explicit empty port, which
-    ``http.client`` reads as the default port."""
+    ``http.client`` reads as the default port. With a port, an ``@`` in a query value after a real
+    path survives, and so does a percent-encoded one in the path (BACKLOG #2686)."""
     for url in (
         "https://api.example.invalid/x",
         "https://api.example.invalid:8443/x",
         "https://api.example.invalid/users/@me?who=a@b",
+        "https://api.example.invalid:8443/x?who=a@b",
+        "https://api.example.invalid:8443/users/%40me",
         "https://api.example.invalid:/x",
         "https://[::1]:8443/x",
+        "https://[::1]:8443/x?who=a@b",
     ):
         RestDestination(_dest(ConnectorType.REST, url))
         DicomWebDestination(_dest(ConnectorType.DICOMWEB, url))
@@ -253,12 +264,49 @@ def test_redact_url_never_echoes_a_port_that_is_not_a_number() -> None:
     """``_redact_url`` is what every classified arm prints. A password head read as a port must not
     come back through it, and it must not RAISE there -- a raise inside an ``except`` arm escapes
     unclassified with ``urlsplit``'s own message, which quotes the port."""
-    assert (
-        _redact_url(f"https://svc:{SECRET}/tail@h.example.invalid/x")
-        == "https://svc/tail@h.example.invalid/x"
-    )
     assert _redact_url("http://127.0.0.1:abc/x") == "http://127.0.0.1/x"
     assert _redact_url("http://127.0.0.1:8080/x") == "http://127.0.0.1:8080/x"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        *(u for u in _USERINFO_SHAPES.values() if "/tail@" in u or "4821" in u),
+        f"https://svc:/{SECRET}@h.example.invalid/x",
+        f"https://svc:{SECRET}?tail@h.example.invalid/x",
+        f"https://svc:{SECRET}#tail@h.example.invalid/x",
+        # The row's own proxy shape: a forward-proxy URL is not refused, so this is its only guard.
+        f"http://svc:{SECRET}/tail@proxy.example.invalid:3128",
+        f"http://svc:4821/{SECRET}@proxy.example.invalid:3128",
+    ],
+)
+def test_redact_url_withholds_every_part_of_a_password_cut_short(url: str) -> None:
+    """BACKLOG #2686. A password holding an unencoded ``/``, ``?`` or ``#`` ends the authority early:
+    the username is read as the host and the password's tail, with the real host, as the path. The
+    old rendering kept both, as ``https://svc/tail@h.example.invalid/x``."""
+    out = _redact_url(url)
+    assert out == f"{url.partition('://')[0]}://<redacted>", out
+    for part in ("svc", SECRET, "tail", "4821"):
+        assert part not in out, out
+
+
+def test_redact_url_withholds_the_host_for_any_at_after_the_authority() -> None:
+    """The control half. An ``@`` that is only an email looks the same to a parser as a password
+    tail, so it names no host either, as ``_peer_label`` does. With no ``@`` the URL keeps its host,
+    port and path, and still drops the query."""
+    assert _redact_url("https://api.example.invalid/users/@me") == "https://<redacted>"
+    assert _redact_url("https://api.example.invalid:8443/x?who=a@b") == "https://<redacted>"
+    assert _redact_url("https://api.example.invalid:8443/x?q=1#f") == (
+        "https://api.example.invalid:8443/x"
+    )
+
+
+def test_an_at_after_a_port_is_refused_with_the_fix_named() -> None:
+    """The cost of closing the numeric-head shape: an ``@`` straight after a port, in the path, is
+    refused even when it holds no password, and the message names the fix."""
+    with pytest.raises(ValueError, match="%40") as exc:
+        RestDestination(_dest(ConnectorType.REST, "https://api.example.invalid:8443/users/@me"))
+    assert "@me" not in str(exc.value)
 
 
 # --- 3. DICOMweb and SOAP classify an InvalidURL instead of letting it escape --------------------------
@@ -406,6 +454,7 @@ def test_the_webhook_screen_leaves_an_ordinary_hook_alone() -> None:
         f"https://hooks.example.invalid/services/{SECRET}",
         "https://hooks.example.invalid:8443/x",
         "https://hooks.example.invalid/users/@me?who=a@b",
+        "https://hooks.example.invalid:8443/x?who=a@b",
     ):
         assert WebhookTransport(url).url == url
 
