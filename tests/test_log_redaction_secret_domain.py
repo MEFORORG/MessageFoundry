@@ -691,7 +691,7 @@ def test_the_quoted_value_repetitions_stay_non_backtracking() -> None:
     Structural rather than a stopwatch, for the reason the sibling guard already gives: a timing
     assertion on a shared runner flakes, and the property that matters is that the mitigation is
     there."""
-    for name in ("_ODBC_BRACED", "_QUOTED_VALUE"):
+    for name in ("_ODBC_BRACED", "_QUOTED_VALUE", "_KV_QUOTED_VALUE"):
         fragment = getattr(redact_mod, name)
         assert "*+" in fragment, (
             f"{name} is {fragment!r} -- its repetition must stay POSSESSIVE. A plain '*' re-walks a "
@@ -2349,6 +2349,13 @@ _REVIEW_SHAPES = (
     'pwd=vq1|token="vq2"|secret={vq3 vq4}',
     "pwd=vq1/session='vq2'/private_key={vq3 vq4}",
     "Bearer vq1/token='vq2'/secret=vq3 vq4",
+    # Round three: a stop left a later label's opening quote where ``_CREDENTIAL_KV``'s quoted value
+    # closed on it, and the value after it printed.
+    "pass='vq1 vq2+MEFOR_B_PW: vq3,private_key='vq4 vq5'",
+    "credential = 'vq0 MEFOR_A = vq1=intake_api_key_next:'vq6 vq7'",
+    # Round three: the two guards on running on past a later label's quote.
+    'pass\'="vq0;token=\'vq2 vq3=\')private_key="vq4;pwd = "vq6 vq7"',
+    "x_password='vq0 vq1;private_key: 'vq2 vq3:bearer_token: vq4=vq5; x_password'=vq6-vq7_x",
 )
 
 #: The alphabet the seeded fuzz builds lines from: labels of every family, separators, both quotes,
@@ -2378,12 +2385,18 @@ def _fuzz_lines(count: int) -> list[str]:
 #: almost never assembles a whole ``label=value`` unit, so a review found it blind to every leak it
 #: was asked to look for; this one is built from units.
 _UNIT_LABELS = (
-    *("password", "pwd", "secret", "client_secret", "ad_bind_password", "token", "api_key"),
-    *("session", "authorization", "bearer_token", "private_key", "encryption_key"),
-    *("encryption_keys_retired", "MEFOR_A", "MEFOR_B_PW", "x_password", "Bearer"),
+    *("password", "pwd", "pass", "secret", "credential", "client_secret", "ad_bind_password"),
+    *("token", "api_key", "session", "authorization", "Authorization", "bearer_token"),
+    *("private_key", "encryption_key", "encryption_keys_retired", "intake_api_key_next"),
+    *("MEFOR_A", "MEFOR_B_PW", "x_password", "Bearer"),
 )
 _UNIT_ASSIGNMENTS = ("=", ": ", " = ", "'=", "=Bearer ", ": Bearer ", "=Basic ")
-_UNIT_SEPARATORS = (";", "&", ",", "|", "/", " ", ".", "=", ":", "-", "_", ", ", "; ")
+#: "+", "(" and ")" were added after a review widened this corpus with them and found values the
+#: narrower one could not see printing.
+_UNIT_SEPARATORS = (
+    *(";", "&", ",", "|", "/", " ", ".", "=", ":", "-", "_", ", ", "; "),
+    *("+", "(", ")"),
+)
 
 
 def _structured_lines(count: int) -> list[str]:
@@ -2397,7 +2410,7 @@ def _structured_lines(count: int) -> list[str]:
             value = rng.choice(
                 (a, f"{a}-{b}_x", f"'{a} {b}'", f'"{a} {b}"', "{" + f"{a} {b}" + "}")
                 + (f"'{a} {b}", f'"{a}', f"{a},{b}", f"'{a}'", f"{a}={b}", "{" + a + "}" + b)
-                + (f"{a}_{b}",)
+                + (f"{a}_{b}", f"{a}:{b}", f"'{a} {b}='", f"({a}")
             )
             label = rng.choice(_UNIT_LABELS)
             assign = " " if label == "Bearer" else rng.choice(_UNIT_ASSIGNMENTS)
@@ -2488,11 +2501,16 @@ def test_the_change_prints_no_value_the_pre_change_patterns_hid(
     RESIDUALS comment names. The reverse count must be above zero, or the two sides never differed
     and the comparison proved nothing.
 
-    NOT A PROOF OVER ALL TEXT, and the gap is measured rather than assumed. Over 120,000 structured
-    lines on three other seeds, three lines printed an atom the old patterns hid for another reason:
-    a cascade in which a stray quote, or another label's value, used to cut a later pass short. Each
-    of the three also hides a value the old output printed. Six passes over rewritten text cannot
-    rule that class out; one scan that ends each value at the next label could."""
+    NOT A PROOF OVER ALL TEXT, and the gap is measured rather than assumed. The gap is a cascade, in
+    which a stray quote or another label's value used to cut a later pass short. Measured 2026-10-05
+    over 208,000 lines -- this corpus plus ten seeds of a generator built like the structured one,
+    20,000 lines each -- one line printed two atoms the old patterns hid, and it also hides the quoted
+    value the old output printed. A cascade need not trade, though. An earlier run of the same
+    measurement, on a narrower generator, found ``password='vq2 vq3|MEFOR_B_PW = "vq4+MEFOR_A='vq6'``:
+    the old MEFOR_ class ran on to the last quote, so the password's quoted value closed there; now
+    ``MEFOR_A`` takes that quote as its own closer, and " vq3" prints with nothing hidden in exchange.
+    Six passes over rewritten text cannot rule that class out; one scan that ends each value at the
+    next label could."""
     newly, hidden_now = _newly_printed_atoms(monkeypatch, _shipped())
     assert not newly, f"{len(newly)} value atoms newly printed, first: {newly[:3]}"
     assert hidden_now > 0, "the new patterns hid nothing the old printed, so nothing was compared"
@@ -2531,16 +2549,68 @@ def test_the_differential_sees_each_guard_removed(
     assert newly, f"with {old} removed the differential found nothing, so it cannot see that guard"
 
 
+#: Lines where ``_CREDENTIAL_KV``'s quoted value must run on past a later label's opening quote, and
+#: the value pieces that must not print. The first three printed on both copies before this change;
+#: the fourth printed only after the stop, which is the regression a review found.
+_RUN_ON_SHAPES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("password='rn-A1 rn-A2, private_key='rn-B1 rn-B2'", ("rn-A1", "rn-A2", "rn-B1", "rn-B2")),
+    ('password="rn-C1, encryption_key="rn-D1 rn-D2"', ("rn-C1", "rn-D1", "rn-D2")),
+    ("password='rn-E1 (truncated), secret='rn-F1 rn-F2'", ("rn-E1", "rn-F1", "rn-F2")),
+    (
+        "pass='rn-G1 rn-G2+MEFOR_B_PW: rn-G3,private_key='rn-H1 rn-H2'",
+        ("rn-G1", "rn-G2", "rn-G3", "rn-H1", "rn-H2"),
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    "case", _RUN_ON_SHAPES, ids=("then-key", "double-quoted", "same-family", "after-a-mefor-stop")
+)
+def test_a_quoted_credential_runs_on_past_a_later_labels_opening_quote(
+    case: tuple[str, tuple[str, ...]],
+) -> None:
+    """No value piece prints on any surface."""
+    line, values = case
+    for surface, apply in _SWALLOW_SURFACES:
+        out = apply(line)
+        printed = [value for value in values if value in out]
+        assert not printed, f"{surface}: {printed} printed -- got {out!r}"
+
+
+def test_the_run_on_shapes_print_under_the_plain_quoted_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE POSITIVE CONTROL. With the plain ``_QUOTED_VALUE`` put back into ``_CREDENTIAL_KV`` in both
+    copies, every run-on shape must print a value, or the test above cannot fail."""
+    _secret_passes_only(monkeypatch)
+    for module in (scrub_mod, redact_mod):
+        kv: re.Pattern[str] = module._CREDENTIAL_KV
+        assert module._KV_QUOTED_VALUE in kv.pattern, f"{module.__name__}._CREDENTIAL_KV lost it"
+        plain = kv.pattern.replace(module._KV_QUOTED_VALUE, module._QUOTED_VALUE)
+        monkeypatch.setattr(module, "_CREDENTIAL_KV", re.compile(plain, kv.flags))
+    for line, values in _RUN_ON_SHAPES:
+        for surface, apply in (
+            ("scrub_credentials", scrub_credentials),
+            ("redact", redact_log_line),
+        ):
+            assert any(value in apply(line) for value in values), f"{surface}: {line!r} hid all"
+
+
 def test_both_copies_of_each_stopped_pattern_agree() -> None:
     """The two modules restate these patterns by hand, and a one-sided edit must red HERE.
 
     They differ on purpose in spelling -- a scoped fold here, a derived alternation there -- so the
-    check is on what they MATCH, over an ASCII corpus where those spellings are equivalent."""
+    check is on what they MATCH, over an ASCII corpus where those spellings are equivalent. The quoted
+    values, the review shapes and the structured lines are in it because they are what reach the
+    braced and quoted alternates; the swallow family alone never does."""
     corpus = [
         *_swallow_family(),
         *(line for line, _values, _labels in SWALLOW_EXAMPLES),
         *(fam.line for fam in FAMILIES),
         *ORDINARY_DIAGNOSTICS,
+        *(case.line for case in QUOTED_VALUES),
+        *_REVIEW_SHAPES,
+        *_structured_lines(2000),
     ]
     compared = 0
     for name in _STOPPED_PATTERNS:
@@ -2599,7 +2669,11 @@ def test_the_value_walk_grows_linearly_in_line_length() -> None:
 
 
 def _walk_growth(pattern: re.Pattern[str]) -> float:
-    """Time at the long length over time at the short one, on :func:`_mefor_run`."""
-    small = _fastest(lambda text: pattern.sub("x", text), _mefor_run(_GROWTH_LENGTHS[0]), 3)
-    large = _fastest(lambda text: pattern.sub("x", text), _mefor_run(_GROWTH_LENGTHS[1]), 2)
+    """Time at the long length over time at the short one, on :func:`_mefor_run`.
+
+    The minimum over several rounds at each length, because one slow short-length sample inflates
+    the denominator and halves the reading. A review flagged that three and two rounds left this
+    open on a loaded hosted runner, where this file has seen a wall-clock assertion go red before."""
+    small = _fastest(lambda text: pattern.sub("x", text), _mefor_run(_GROWTH_LENGTHS[0]), 9)
+    large = _fastest(lambda text: pattern.sub("x", text), _mefor_run(_GROWTH_LENGTHS[1]), 3)
     return large / small
