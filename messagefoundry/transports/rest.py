@@ -312,11 +312,10 @@ AUTH_CHALLENGE_REFUSED_CODE = "auth-challenge-refused"
 #: or a test-connection reply. One text for the endpoint's 401 and the web proxy's 407: the refusal
 #: names its peer only inside that message, and nothing here parses it.
 #:
-#: SHORT ON PURPOSE. ``safe_exc`` cuts a stored error at 200 characters, after the class name, the
-#: hop label and the URL, so a longer text lost the one word an operator can act on.
+#: SHORT, AND THE HASH NAME COMES FIRST. ``safe_exc`` cuts a stored error at 200 characters, after
+#: the class name, the hop label and the URL, so the tail of a long text is what an operator loses.
 AUTH_CHALLENGE_REFUSED = (
-    "met an authentication challenge the engine will not answer: "
-    "it answers only HTTP Digest with SHA-256"
+    "met a non-SHA-256 or unanswerable authentication challenge; the engine will not answer it"
 )
 
 
@@ -325,12 +324,10 @@ def auth_challenge_refused(label: str) -> NegativeAckError:
 
     ``HttpAuthError`` is a ``ValueError``, so each send's ``(ValueError, InvalidURL)`` arm caught it
     and reported ``bad-request-value``: a permanent fault of ONE message, which dead-letters the row
-    and would send an operator looking for a bad header or URL. The fault is the connection's. The
-    peer sends the same challenge to each request, so this is a configuration fault (ADR 0095
-    Amendment B): under the default ``credential_fault_policy`` the delivery worker stops the lane
-    and keeps the queue. A retry would help nothing, and an origin Digest retry first re-sends the
-    body without a credential, because urllib answers a challenge only after the peer has seen the
-    request."""
+    and would send an operator looking for a bad header or URL. The fault is the connection's, so
+    this is a configuration fault: under the default ``credential_fault_policy`` the delivery
+    worker stops the lane and keeps the queue. ADR 0095 Amendment B is the source of record for
+    why a stop was chosen over a retry, and for where that reasoning is weak."""
     return NegativeAckError(
         f"{label} {AUTH_CHALLENGE_REFUSED}",
         code=AUTH_CHALLENGE_REFUSED_CODE,

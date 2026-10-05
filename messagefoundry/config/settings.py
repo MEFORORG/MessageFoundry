@@ -1897,8 +1897,8 @@ class PipelineSettings(_Section):
     # advance). A content-permanent reject (AR/CR, no-such-dir) is UNAFFECTED — it still dead-letters.
     # It also governs a permanent CONFIGURATION fault (BACKLOG #2083: an FTP server refusing AUTH TLS,
     # PROT P or the greeting, or demanding TLS of a plain session), which every row would meet alike.
-    # A REST, SOAP, FHIR or DICOMweb outbound raises that fault too, on an authentication challenge
-    # the engine will not answer (BACKLOG #2323).
+    # A REST, SOAP, FHIR or DICOMweb outbound raises that fault too, when its Digest handler refuses
+    # a challenge (BACKLOG #2323; ADR 0095 Amendment B says which challenges, and which are not).
     credential_fault_policy: Literal["stop", "dead_letter"] = Field(default="stop")
 
     # #147 (ADR 0095) per-connection active-window scheduler tick granularity (seconds). The runner

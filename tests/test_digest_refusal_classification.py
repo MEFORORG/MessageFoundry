@@ -52,7 +52,10 @@ from messagefoundry.transports.rest import (
 )
 from tests._egress_policy import permitting
 
-HTTPS_URL = "https://api.example.com/x"
+#: The query string is there to be dropped: without one ``_redact_url`` returns its input, and a
+#: text built from the raw URL would pass every equality below.
+HTTPS_URL = "https://api.example.com/x?site=SITE-QUERY"
+REDACTED_URL = "https://api.example.com/x"
 #: Off-box and unresolvable, so a proxied test that dialled direct would fail fast.
 PROXIED_URL = "http://api.partner.invalid/x"
 _WARN_DIAL = HopPosture(enforcing=False)
@@ -115,10 +118,6 @@ def _send(ctype: ConnectorType, dest: Any) -> Any:
     return dest._post("<x/>")
 
 
-def _redacted(dest: Any) -> str:
-    return str(getattr(dest, "base_url", None) or dest.url)
-
-
 # --- every destination arm, with the refusal injected ---------------------------------------------
 
 
@@ -133,7 +132,7 @@ def test_post_reports_a_refused_challenge_as_a_configuration_fault(ctype: Connec
     assert err.code == AUTH_CHALLENGE_REFUSED_CODE == "auth-challenge-refused"
     assert (err.permanent, err.config_fault, err.credential_fault) == (True, True, False)
     # Pinned as an equality: the fixed text, the redacted URL, and nothing of the peer's.
-    assert str(err) == f"{_LABEL[ctype]} {_redacted(dest)} {AUTH_CHALLENGE_REFUSED}"
+    assert str(err) == f"{_LABEL[ctype]} {REDACTED_URL} {AUTH_CHALLENGE_REFUSED}"
     assert "MD5-PEER-TOKEN" not in str(err)
     assert err.__cause__ is refused
 
@@ -156,7 +155,7 @@ def test_post_still_reports_a_bad_request_value_as_one(
     err = ei.value
     assert err.code == "bad-request-value"
     assert (err.permanent, err.config_fault, err.credential_fault) == (True, False, False)
-    assert str(err) == f"{_LABEL[ctype]} {_redacted(dest)} rejected an invalid request value"
+    assert str(err) == f"{_LABEL[ctype]} {REDACTED_URL} rejected an invalid request value"
 
 
 @pytest.mark.parametrize("ctype", list(_FACTORY), ids=lambda c: c.value)
@@ -168,7 +167,7 @@ def test_probe_reports_a_refused_challenge_with_the_fixed_text(ctype: ConnectorT
         dest._probe()
     # A probe raises a plain DeliveryError: there is no lane to stop on a test-connection.
     assert type(ei.value) is DeliveryError
-    assert str(ei.value) == f"{_LABEL[ctype]} {_redacted(dest)} {AUTH_CHALLENGE_REFUSED}"
+    assert str(ei.value) == f"{_LABEL[ctype]} {REDACTED_URL} {AUTH_CHALLENGE_REFUSED}"
     assert ei.value.__cause__ is refused
 
 
@@ -178,12 +177,13 @@ def test_probe_still_reports_a_bad_request_value_as_one(ctype: ConnectorType) ->
     dest._opener = _Raises(ValueError("Invalid header value b'x\\n'"))
     with pytest.raises(DeliveryError) as ei:
         dest._probe()
-    assert str(ei.value) == f"{_LABEL[ctype]} {_redacted(dest)} rejected an invalid request value"
+    assert str(ei.value) == f"{_LABEL[ctype]} {REDACTED_URL} rejected an invalid request value"
 
 
 # --- the FhirLookup read: only the web proxy's Digest handler is on this opener --------------------
 
-_LOOKUP_BASE = "https://fhir.example.org/fhir"
+_LOOKUP_BASE = "https://fhir.example.org/fhir?site=SITE-QUERY"
+_LOOKUP_REDACTED = "https://fhir.example.org/fhir"
 
 
 def _lookup(exc: Exception) -> FhirLookupExecutor:
@@ -195,7 +195,10 @@ def _lookup(exc: Exception) -> FhirLookupExecutor:
 
 
 _LOOKUP_ARMS: dict[str, tuple[Callable[[FhirLookupExecutor], Any], str]] = {
-    "_get": (lambda ex: ex._get("epic", f"{_LOOKUP_BASE}/Patient/1"), "fhir_lookup on 'epic'"),
+    "_get": (
+        lambda ex: ex._get("epic", "https://fhir.example.org/fhir/Patient/1"),
+        "fhir_lookup on 'epic'",
+    ),
     "_probe": (lambda ex: ex._probe("epic"), "FhirLookup 'epic'"),
 }
 
@@ -206,7 +209,7 @@ def test_fhir_lookup_reports_a_refused_challenge_with_the_fixed_text(arm: str) -
     refused = _refusal()
     with pytest.raises(FhirLookupError) as ei:
         call(_lookup(refused))
-    assert str(ei.value) == f"{prefix}: FHIR {_LOOKUP_BASE} {AUTH_CHALLENGE_REFUSED}"
+    assert str(ei.value) == f"{prefix}: FHIR {_LOOKUP_REDACTED} {AUTH_CHALLENGE_REFUSED}"
     assert ei.value.__cause__ is refused
 
 
@@ -215,7 +218,7 @@ def test_fhir_lookup_still_reports_a_bad_request_value_as_one(arm: str) -> None:
     call, prefix = _LOOKUP_ARMS[arm]
     with pytest.raises(FhirLookupError) as ei:
         call(_lookup(ValueError("Invalid header value b'x\\n'")))
-    assert str(ei.value) == f"{prefix}: FHIR {_LOOKUP_BASE} rejected an invalid request value"
+    assert str(ei.value) == f"{prefix}: FHIR {_LOOKUP_REDACTED} rejected an invalid request value"
 
 
 # --- on the wire: the refusal the Digest handlers really raise -------------------------------------

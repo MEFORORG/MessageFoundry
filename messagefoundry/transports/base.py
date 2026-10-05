@@ -497,9 +497,10 @@ class NegativeAckError(DeliveryError):
     ``config_fault`` (BACKLOG #2083) marks a permanent failure in the **connection's configuration**
     rather than in the message or the credential: an FTP server refusing ``AUTH TLS`` or ``PROT P``,
     demanding TLS of a plain session, or refusing the greeting; or an HTTP endpoint or web proxy
-    sending a Digest challenge the engine will not answer (BACKLOG #2323). Every queued row would
-    fail the same way, so the delivery worker stops the lane and keeps the queue, under the same
-    ``credential_fault_policy`` as a credential fault. Only meaningful when ``permanent`` is True.
+    sending a Digest challenge the engine refuses (BACKLOG #2323). Every queued row would fail the
+    same way, so the delivery worker stops the lane and keeps the queue, under the same
+    ``credential_fault_policy`` as a credential fault. ADR 0095 Amendment B says where "every row"
+    is weaker for HTTP than for FTP. Only meaningful when ``permanent`` is True.
     """
 
     def __init__(

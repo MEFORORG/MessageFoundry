@@ -301,13 +301,24 @@ The costs, at least these:
   the session opens, before any message. An HTTP challenge answers one request, and a FHIR request
   path is built per message. A peer that challenges one path differently would stop the lane on that
   one row, and the row would stay at the head of the queue. `credential_fault_policy="dead_letter"`
-  is the way out.
+  is the only way out found, and it is one value for the whole engine. Setting it would also turn
+  off the credential stop for every FTP and SFTP outbound.
 - The stop is not absolute where a stage dispatcher drains the lane (the pooled claim mode).
   `RegistryRunner.notify_work` re-arms every stopped lane there, and a replay or a resend calls it.
   The head row would then be sent once more before the lane stops again.
 - Under `"stop"` only the code reaches the operator. `_stop_lane_retaining` logs and alerts the
   code, and the released row keeps no `last_error`. The fixed text shows on a test-connection, and
   in `last_error` under `"dead_letter"`.
+- The `FhirLookup` read gets the new text and nothing else. A Handler that calls it behind a
+  refusing web proxy would still fail each message in turn, as before.
+
+The fault is raised only where a Digest handler is on the opener and refuses. These unanswered
+challenges do not raise it, at least: a Basic challenge and a Digest challenge with no nonce
+(both read as a plain 401 or 407), a Digest challenge whose `qop` urllib does not support (read as
+unreachable, and retried), and any challenge on a connection with no Digest set up. A DICOMweb
+endpoint challenge cannot raise it, since that destination has no origin Digest. A web proxy
+challenge can raise it only for an `http://` destination, since proxy Digest is refused for
+`https://`.
 
 The probe arms and the `FhirLookup` read are not deliveries, so they carry no fault marker. A probe
 raises a plain `DeliveryError`, and the read raises `FhirLookupError`. Both use the same fixed text.
