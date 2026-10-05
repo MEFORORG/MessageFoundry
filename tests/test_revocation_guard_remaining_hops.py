@@ -32,6 +32,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
+from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.tls_policy import (
     TLS_REVOCATION_ATTESTED_ENV,
@@ -43,6 +44,10 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.config.wiring import WiringError, load_config
 from messagefoundry.pipeline.wiring_runner import build_check_registry
+from messagefoundry.redaction import redact
+from messagefoundry.secretscrub import scrub_credentials
+from messagefoundry.transports import dicom as dicom_module
+from messagefoundry.transports.dicom import DicomScuDestination
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.rest import _NO_REDIRECT_OPENER, opener_tls_context
 
@@ -91,6 +96,29 @@ def _crl_policy(crl: str) -> TrustAnchorPolicy:
 def _audit(caplog: pytest.LogCaptureFixture) -> str:
     return " ".join(
         r.getMessage() for r in caplog.records if "operator attestation" in r.getMessage()
+    )
+
+
+def _shipped(text: str) -> str:
+    """The two text filters a shipped log line passes through. Either can eat a cell label."""
+    return scrub_credentials(redact(text))
+
+
+def _dest(
+    name: str,
+    ctype: ConnectorType,
+    settings: dict[str, object],
+    *,
+    attested: bool = False,
+    policy: TrustAnchorPolicy | None = None,
+) -> Destination:
+    return Destination(
+        name=name,
+        type=ctype,
+        settings=settings,
+        tls_revocation_attested=attested,
+        tls_revocation_attested_reason=REASON if attested else None,
+        trust_anchor_policy=policy or TrustAnchorPolicy(),
     )
 
 
@@ -235,3 +263,85 @@ def test_the_check_gate_refuses_an_undeclared_fhir_lookup_and_admits_a_declared_
         )
     audit = _audit(caplog)
     assert "connection 'fhir_lookup:epic';" in audit and REASON in audit
+
+
+# --- DICOM C-STORE SCU over TLS (transports/dicom.py) ----------------------------------------------
+
+
+def _scu(host: str, *, tls: bool = True, **kw: object) -> Destination:
+    settings: dict[str, object] = {"ae_title": "MF_SCU", "host": host, "port": 11112}
+    if tls:
+        settings["tls"] = True
+    return _dest("OB_PACS", ConnectorType.DIMSE, settings, **kw)  # type: ignore[arg-type]
+
+
+def test_a_dicom_tls_association_is_refused_when_it_checks_no_revocation() -> None:
+    # THE CONTROL. Before #2193 this constructed: the SCU's only hop guard was the cleartext one.
+    with (
+        active_hop_posture(ENFORCING),
+        pytest.raises(InsecureHopRefused, match="revocation") as exc,
+    ):
+        DicomScuDestination(_scu(REMOTE))
+    assert "connection 'OB_PACS';" in str(exc.value)
+
+
+def test_a_dicom_tls_association_is_admitted_when_a_crl_reaches_its_own_context(
+    bare_crl: str,
+) -> None:
+    with active_hop_posture(ENFORCING):
+        dest = DicomScuDestination(_scu(REMOTE, policy=_crl_policy(bare_crl)))
+    # The context the association will really dial with.
+    assert context_checks_revocation(dest._ssl) is True
+
+
+def test_a_configured_crl_does_not_admit_a_dicom_association_whose_context_lacks_it(
+    bare_crl: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guard reads the context, never the setting. Here the policy carries a CRL and the context
+    the SCU ends up holding does not, so the hop must stay refused. A guard keyed on
+    ``trust_anchor_policy.crl_file`` would admit it."""
+    real = dicom_module._client_ssl_context
+    monkeypatch.setattr(
+        dicom_module, "_client_ssl_context", lambda s, *, trust_anchor_policy=None: real(s)
+    )
+    with active_hop_posture(ENFORCING), pytest.raises(InsecureHopRefused, match="revocation"):
+        DicomScuDestination(_scu(REMOTE, policy=_crl_policy(bare_crl)))
+
+
+def test_a_dicom_tls_association_crosses_on_its_attestation_and_is_audited(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with active_hop_posture(ENFORCING), caplog.at_level(logging.WARNING):
+        DicomScuDestination(_scu(REMOTE, attested=True))
+    shipped = _shipped(_audit(caplog))
+    assert "connection 'OB_PACS';" in shipped and REASON in shipped
+    # The cell label survives the log filters, which scrub two adjacent all-capital tokens.
+    assert "DICOM C-STORE client (SCU) over TLS" in shipped
+
+
+def test_a_dicom_tls_association_on_loopback_still_crosses(bare_crl: str) -> None:
+    # On-box: not a network exposure, and no CRL is applied there even when one is configured.
+    with active_hop_posture(ENFORCING):
+        dest = DicomScuDestination(_scu(LOOPBACK, policy=_crl_policy(bare_crl)))
+    assert context_checks_revocation(dest._ssl) is False
+
+
+def test_a_dicom_tls_association_warns_but_builds_when_not_enforcing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with active_hop_posture(NOT_ENFORCING), caplog.at_level(logging.WARNING):
+        DicomScuDestination(_scu(REMOTE))
+    assert any("revocation" in r.getMessage() for r in caplog.records)
+
+
+def test_a_dicom_association_built_outside_the_gate_is_unchanged() -> None:
+    DicomScuDestination(_scu(REMOTE))
+
+
+def test_a_plaintext_dicom_association_is_the_cleartext_refusal_not_this_one() -> None:
+    """Disjoint gates. With TLS off there is no verified certificate, so the cleartext guard owns
+    the hop. Both raise the same type, so the MESSAGE is what tells them apart."""
+    with active_hop_posture(ENFORCING), pytest.raises(InsecureHopRefused) as exc:
+        DicomScuDestination(_scu(REMOTE, tls=False))
+    assert "plaintext DIMSE" in str(exc.value)
+    assert "revocation" not in str(exc.value)
