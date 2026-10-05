@@ -2718,6 +2718,48 @@ def test_a_single_token_longer_than_the_bound_is_dropped_whole() -> None:
     assert safe_exc(RuntimeError("x" * 5000), limit=50) == "RuntimeError: …(+5000 chars)"
 
 
+def _plain_words(length: int) -> str:
+    """``length`` characters of lowercase ten-letter tokens that ``redact`` leaves alone, ending on a
+    whole token."""
+    return ("abcdefghi " * (length // 10 + 1))[: length - 1] + "j"
+
+
+@pytest.mark.parametrize(
+    ("text", "kept"),
+    [
+        (_plain_words(190) + "…(+150 chars)", 190),
+        (_plain_words(170) + " [redaction bound: dropped 5_000 more chars unscanned]", 170),
+    ],
+    ids=["count-note", "bound-note"],
+)
+def test_a_further_call_does_not_split_a_note_an_earlier_call_wrote(text: str, kept: int) -> None:
+    """The store calls ``safe_text`` again on a value an emit site already bounded. The cut must not
+    keep half of the earlier note and glue its own after it, as in ``…(+150…(+7 chars)``. THE
+    CONTROL: the plain whole-token cut does fall inside the note on both texts."""
+    assert redact(text) == text
+    plain = redaction._whole_token_prefix(text, 200)
+    fragment = text[kept:plain].strip()
+    assert plain < len(text) and fragment.startswith(("…(+", "[redaction")), "no control"
+    assert safe_text(text, limit=200) == f"{text[:kept]}…(+{len(text) - kept} chars)"
+
+
+def test_the_store_pass_over_a_bounded_exception_writes_one_note() -> None:
+    """The path the store takes: ``safe_exc`` at the emit site, then ``safe_text`` at the store,
+    over token widths and message lengths near the bound. The stored text ends in exactly one note,
+    whole. THE CONTROL: on some of these the plain whole-token cut falls inside the first note."""
+    split = 0
+    for width in range(5, 60):
+        for length in range(150, 260):
+            words = ("a" * (width - 1) + " ") * (length // width + 1)
+            first = safe_exc(ValueError(words[: length - 1] + "j"))
+            plain = first[: redaction._whole_token_prefix(first, 200)]
+            split += len(first) > 200 and "…(+" in plain and not plain.endswith(" chars)")
+            stored = safe_text(first, limit=200)
+            assert stored.count("…(+") <= 1, stored
+            assert "…(+" not in stored or stored.endswith(" chars)"), stored
+    assert split > 0, "the control does not hold"
+
+
 # --- BACKLOG #1848: a whole-text dependency the clamp cannot hold ------------------------------------
 
 #: A headerless fragment in the fully-custom delimiters, then filler past the window, then the MSH

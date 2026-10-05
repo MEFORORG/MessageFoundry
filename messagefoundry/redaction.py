@@ -1046,7 +1046,9 @@ _JSON_BARE_CONTINUATION = re.compile(r"""(?:[ \t]++[^\s{}\[\](),:"']++(?!\())*+"
 #: re-applied to its own output at the store chokepoint, where that would erase the only sign the text
 #: was cut. Anchored at ``\Z`` so only a note last in the text is spared: a peer that writes the
 #: literal mid-payload ends nothing early, and a trailing one carries no PHI. :func:`safe_text`'s
-#: ``…(+N chars)`` count is not here because a second :func:`safe_text` re-truncates past it anyway.
+#: ``…(+N chars)`` count is not here. Before BACKLOG #1797 a second :func:`safe_text` always cut past
+#: it. Since then a first result can be shorter than its limit, so a second call can keep the count
+#: and a further pass can read it as a value; :func:`safe_text` lists that among its exceptions.
 _TRAILING_NOTES = re.compile(r"[\n ]\[redaction bound: dropped [0-9_]+ more chars unscanned\]\Z")
 
 
@@ -1784,6 +1786,32 @@ def _whole_token_prefix(text: str, limit: int) -> int:
     return len(text[:end].rstrip(_CUT_CHARS))
 
 
+#: The notes :func:`safe_text` writes, as opener and closer, in the reverse of the order it writes
+#: them. Each note holds a space, so the whole-token cut of a further call can fall inside one. No
+#: opener holds whitespace, so a cut, which falls on whitespace, never splits an opener itself.
+_OWN_NOTES = (("[redaction", " unscanned]"), ("…(+", " chars)"))
+
+
+def _clear_of_own_notes(text: str, kept: int) -> int:
+    """``kept`` moved back to before a note of this module that a cut at ``kept`` would split.
+
+    The store calls :func:`safe_text` again on a value an emit site already bounded, so the input can
+    end in this module's own notes. The whole-token cut sees the space inside a note as a boundary,
+    so it kept ``…(+150`` and then wrote its own note after it: ``…(+150…(+7 chars)``, two counts
+    glued together. So a note the cut would split goes whole, and the token it is glued to stays. The
+    new note's count still covers every character held back.
+
+    One pass, last note first: moving back before a split bound note lands just after a whole count
+    note, if there is one. Only the last opener of each kind before the cut is read. One a peer wrote
+    can only move the cut back, which drops more and never keeps more. Linear in ``kept``: each search
+    is bounded by it."""
+    for opener, closer in _OWN_NOTES:
+        start = text.rfind(opener, 0, kept)
+        if start != -1 and text.find(closer, start, kept) == -1:
+            kept = len(text[:start].rstrip(_CUT_CHARS))
+    return kept
+
+
 def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
     """A PHI-redacted, length-bounded rendering of a free-text diagnostic string — the string analog of
     :func:`safe_exc`, for error/detail text that isn't an exception object (joined strict-validation
@@ -1820,7 +1848,7 @@ def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
     head, dropped = _clamp(text, _REDACT_WINDOW)
     message = redact(head).strip()
     if len(message) > limit:
-        kept = _whole_token_prefix(message, limit)
+        kept = _clear_of_own_notes(message, _whole_token_prefix(message, limit))
         message = f"{message[:kept]}…(+{len(message) - kept} chars)"
     if dropped:
         message = f"{message} {_clamp_marker(dropped)}"

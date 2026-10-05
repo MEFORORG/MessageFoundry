@@ -5,10 +5,11 @@
 Three SQLite writers stored ``safe_text(x)[:200]``: ``response.detail`` (``record_ack_sent``),
 ``connection_event.reason`` and ``alert_instance.reason``. While :func:`safe_text` cut at exactly its
 limit, the outer slice dropped the ``(+N chars)`` note whole. Since #1797 the cut goes back to a
-whole token, so the head can be shorter than the limit and the outer slice kept part of the note:
-``...(+13`` for a true count of 132. That is a wrong number in the store. Each writer now passes the
-bound to :func:`safe_text` instead. Postgres and SQL Server carry the same three call sites in the
-same shape; their suites skip without a server, so only SQLite is exercised here.
+whole token, so the head can be shorter than the limit and the outer slice kept part of the note.
+On the fixture below it kept ``…(+`` and no digits at all, for a true count of 132; at other head
+lengths it keeps a truncated number. Each writer now passes the bound to :func:`safe_text` instead.
+Postgres and SQL Server carry the same three call sites in the same shape. Their suites skip without
+a server, so they are held here by reading their source, and only SQLite is exercised.
 
 The columns are ``TEXT`` on SQLite and Postgres and ``NVARCHAR(MAX)`` on SQL Server, so the note
 cannot overflow a declared width. The bound pinned here is the one :func:`safe_text` itself gives
@@ -29,6 +30,7 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry import store as store_package
 from messagefoundry.redaction import safe_text
 from messagefoundry.store.store import MessageStore
 
@@ -121,3 +123,19 @@ async def test_a_short_value_is_stored_unchanged(tmp_path: Path, write: Writer) 
     finally:
         await store.close()
     assert stored == "connect refused"
+
+
+#: An outer slice on a ``safe_text`` result, the shape #1797 removed.
+_SLICED = re.compile(r"safe_text\([^()]*\)\[:")
+#: The shape each of the three writers uses now.
+_BOUNDED = re.compile(r"safe_text\((?:detail|reason), limit=200\)")
+
+
+@pytest.mark.parametrize("module", ["store.py", "postgres.py", "sqlserver.py"])
+def test_every_backend_passes_the_bound_instead_of_slicing(module: str) -> None:
+    """Postgres and SQL Server have no server here, so their three writers are held by source. THE
+    CONTROL: the slice pattern does match the old spelling."""
+    assert _SLICED.search("safe_text(reason)[:200]"), "the control does not hold"
+    source = (Path(store_package.__file__).parent / module).read_text(encoding="utf-8")
+    assert _SLICED.search(source) is None
+    assert len(_BOUNDED.findall(source)) == 3
