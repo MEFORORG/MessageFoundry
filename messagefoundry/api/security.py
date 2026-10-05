@@ -522,11 +522,26 @@ def route_declaration_of(endpoint: object) -> RouteDeclaration | None:
     return found if isinstance(found, RouteDeclaration) else None
 
 
+def _top_level_calls(route: object) -> list[object]:
+    """The calls of ``route``'s top-level dependencies, the only ones the route check reads."""
+    dependencies = getattr(getattr(route, "dependant", None), "dependencies", None) or ()
+    return [dependency.call for dependency in dependencies]
+
+
+def route_has_gate(route: object) -> bool:
+    """True when one of ``route``'s top-level dependencies carries the gate mark."""
+    return any(is_route_gate(call) for call in _top_level_calls(route))
+
+
+def refusal_runs_on(route: object) -> bool:
+    """True when :func:`refuse_undeclared_route` is among ``route``'s top-level dependencies, which
+    is how ``create_app`` installs it on every route registered on the app."""
+    return any(call is refuse_undeclared_route for call in _top_level_calls(route))
+
+
 def route_is_declared(route: object, *, websocket: bool) -> bool:
     """True when ``route`` declares its authorization, as the module note above defines it."""
-    dependant = getattr(route, "dependant", None)
-    dependencies = getattr(dependant, "dependencies", None) or ()
-    if any(is_route_gate(dependency.call) for dependency in dependencies):
+    if route_has_gate(route):
         return True
     declared = route_declaration_of(getattr(route, "endpoint", None))
     if declared is None:
@@ -537,6 +552,61 @@ def route_is_declared(route: object, *, websocket: bool) -> bool:
 #: The route attribute that caches :func:`route_is_declared`. A route's dependencies and endpoint are
 #: fixed once it is registered, so the answer is worked out on its first request only.
 _DECLARED_CACHE_ATTR = "_mefor_route_declared"
+#: The route attribute that holds a refused route's :class:`_RefusalTally`.
+_REFUSALS_ATTR = "_mefor_route_refusals"
+
+#: The shortest gap between two ERROR lines for one refused route (vault BACKLOG #2846). The first
+#: refusal is always logged, and a burst costs one line a minute. Each line carries how many
+#: refusals came since the previous one. Refusals after a burst's last line are held only in the
+#: in-process tally (:func:`undeclared_route_refusals`). They reach the log only with the first
+#: refusal of that route that comes at least this long after the last line; no timer flushes them,
+#: and a restart loses them.
+REFUSAL_LOG_INTERVAL_SECONDS = 60.0
+
+
+@dataclass(slots=True)
+class _RefusalTally:
+    """How often one route was refused, and how many of those no log line has reported yet."""
+
+    total: int = 0
+    unlogged: int = 0
+    logged_at: float | None = None
+
+
+#: The tally for a refusal with no matched route in its scope. FastAPI always sets one, so this is
+#: a fallback that keeps such a refusal counted and throttled rather than logged every time.
+_UNKNOWN_ROUTE_REFUSALS = _RefusalTally()
+
+
+def undeclared_route_refusals(route: object) -> int:
+    """How many requests :func:`refuse_undeclared_route` has refused on ``route`` in this process."""
+    tally = getattr(route, _REFUSALS_ATTR, None)
+    return tally.total if isinstance(tally, _RefusalTally) else 0
+
+
+def _record_refusal(route: object) -> None:
+    """Count one refusal of ``route``, and log it at ERROR at most once per interval.
+
+    The line names the route's path TEMPLATE and the counts, never the request: no query string,
+    header or body reaches the log."""
+    tally = getattr(route, _REFUSALS_ATTR, None) if route is not None else _UNKNOWN_ROUTE_REFUSALS
+    if not isinstance(tally, _RefusalTally):
+        tally = _RefusalTally()
+        setattr(route, _REFUSALS_ATTR, tally)
+    tally.total += 1
+    tally.unlogged += 1
+    now = time.monotonic()
+    if tally.logged_at is not None and now - tally.logged_at < REFUSAL_LOG_INTERVAL_SECONDS:
+        return
+    log.error(
+        "refused route %s: it has no gate dependency and no public declaration "
+        "(%d refusals since the last log line, %d in all)",
+        getattr(route, "path", "<unknown>"),
+        tally.unlogged,
+        tally.total,
+    )
+    tally.logged_at = now
+    tally.unlogged = 0
 
 
 async def refuse_undeclared_route(connection: HTTPConnection) -> None:
@@ -544,7 +614,8 @@ async def refuse_undeclared_route(connection: HTTPConnection) -> None:
 
     An HTTP caller gets 403 with :data:`UNDECLARED_ROUTE_DETAIL`. A WebSocket is closed with policy
     violation (1008) before it is accepted. Either way the route is a defect in the code that
-    registered it, so its first refusal is logged at ERROR."""
+    registered it, so every refusal is counted, and an ERROR line is written at most once per
+    :data:`REFUSAL_LOG_INTERVAL_SECONDS` for each route. That constant says what the log misses."""
     websocket = connection.scope.get("type") == "websocket"
     route = connection.scope.get("route")
     declared = getattr(route, _DECLARED_CACHE_ATTR, None)
@@ -552,13 +623,9 @@ async def refuse_undeclared_route(connection: HTTPConnection) -> None:
         declared = route_is_declared(route, websocket=websocket)
         if route is not None:
             setattr(route, _DECLARED_CACHE_ATTR, declared)
-        if not declared:
-            log.error(
-                "refused route %s: it has no gate dependency and no public declaration",
-                getattr(route, "path", "<unknown>"),
-            )
     if declared:
         return
+    _record_refusal(route)
     if websocket:
         raise WebSocketException(status.WS_1008_POLICY_VIOLATION)
     raise HTTPException(status.HTTP_403_FORBIDDEN, UNDECLARED_ROUTE_DETAIL)
@@ -642,7 +709,7 @@ class AuthenticatedBeforeBodyRoute(APIRoute):
         if (
             not steps
             and self.body_field is not None
-            and any(d.call is refuse_undeclared_route for d in self.dependant.dependencies)
+            and refusal_runs_on(self)
             and not route_is_declared(self, websocket=False)
         ):
             # Vault BACKLOG #2604: a route that declares no authorization is refused before its

@@ -28,6 +28,7 @@ from tests._federated_unbind_store_contract import (
     _assert_session_binding_guard_contract,
 )
 from tests._lockout_store_contract import _assert_lockout_contract
+from tests._login_address_store_contract import _assert_login_address_contract
 
 
 async def _store() -> MessageStore:
@@ -135,6 +136,16 @@ async def test_lockout_counter_contract() -> None:
     store = await _store()
     try:
         await _assert_lockout_contract(store)
+    finally:
+        await store.close()
+
+
+async def test_login_address_store_contract() -> None:
+    """vault BACKLOG #2145: the known sign-in address record on SQLite. The live server suites run
+    the same contract against their own SQL bodies."""
+    store = await _store()
+    try:
+        await _assert_login_address_contract(store)
     finally:
         await store.close()
 

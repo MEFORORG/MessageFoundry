@@ -15,14 +15,27 @@ bite and not only to agree with today's tree.
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 import pytest
 from fastapi import APIRouter, Depends, FastAPI, Request, WebSocket
+from fastapi.routing import APIWebSocketRoute
+from starlette.middleware import Middleware
+from starlette.responses import PlainTextResponse
+from starlette.routing import Mount, Route
+from starlette.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from messagefoundry.api.app import create_app
-from messagefoundry.api.security import authorize_ws, mark_route_gate, require
+from messagefoundry.api.security import (
+    authorize_ws,
+    authorizes_in_body,
+    mark_route_gate,
+    public_route,
+    require,
+)
 from messagefoundry.auth.permissions import Permission
 from scripts.security import route_gates
 
@@ -37,6 +50,11 @@ def json_only_app() -> FastAPI:
 @pytest.fixture(scope="module")
 def ui_app() -> FastAPI:
     return create_app(serve_ui=True)
+
+
+@pytest.fixture(scope="module")
+def full_app() -> FastAPI:
+    return route_gates.full_surface_app()
 
 
 def _ws_rows(app: FastAPI) -> list[route_gates.RouteRow]:
@@ -375,15 +393,191 @@ def test_the_walk_descends_into_a_mounted_application_with_routes() -> None:
     assert (route_gates.MOUNT_METHOD, "/mounted") not in rows
 
 
+@pytest.mark.parametrize("hook_on", ["outer", "inner"])
+def test_a_mounted_apps_socket_hooks_are_read_from_that_app(hook_on: str) -> None:
+    """Vault BACKLOG #2846. A socket inside a mounted application sees that application as
+    ``websocket.app``, because Starlette sets ``scope["app"]`` as a request enters each app. The walk
+    read its hook slots from the OUTER app, so it reported a hook the socket never runs and missed
+    one it does. Each case fails on that walk."""
+    inner = FastAPI(openapi_url=None)
+    inner.add_api_websocket_route("/ws", _hooked)
+    outer = FastAPI()
+    outer.mount("/mounted", inner)
+    (outer if hook_on == "outer" else inner).state.probe_hook = authorize_probe
+    (row,) = _ws_rows(outer)
+    assert row.path == "/mounted/ws"
+    expected = ("authorize_ws",) if hook_on == "outer" else ("authorize_probe", "authorize_ws")
+    assert row.gates == expected, row
+
+
+class _PassThrough:
+    """An ASGI middleware that changes nothing, so a mount wraps its app in one layer."""
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        await self.app(scope, receive, send)
+
+
+def test_a_mounted_app_beneath_mount_middleware_is_still_the_state_owner() -> None:
+    """``_state_owner`` reads Starlette's private ``Mount._base_app``. This pins that it still
+    exists and is what the walk reads, so a Starlette rename reds a run here."""
+    inner = FastAPI(openapi_url=None)
+    inner.add_api_websocket_route("/ws", _hooked)
+    inner.state.probe_hook = authorize_probe
+    outer = FastAPI()
+    outer.routes.append(Mount("/mw", app=inner, middleware=[Middleware(_PassThrough)]))
+    (mount,) = [r for r in outer.routes if isinstance(r, Mount)]
+    assert getattr(mount, "_base_app", None) is inner
+    (row,) = _ws_rows(outer)
+    assert row.gates == ("authorize_probe", "authorize_ws"), row
+
+
+def test_a_plain_route_outside_the_refusal_still_reports_its_declaration() -> None:
+    app = FastAPI()
+
+    @public_route("a synthetic plain route")
+    async def plain(request: Request) -> PlainTextResponse:
+        return PlainTextResponse("ok")
+
+    app.routes.append(Route("/plain", plain))
+    row = _rows_by_key(app)[("GET", "/plain")]
+    assert (row.kind, row.declaration) == (route_gates.KIND_OUTSIDE, "a synthetic plain route")
+
+
+def test_a_socket_in_a_mounted_app_runs_the_mounted_apps_hook_at_request_time() -> None:
+    """The premise of ``test_a_mounted_apps_socket_hooks_are_read_from_that_app``, measured on a
+    live handshake rather than assumed."""
+    ran: list[str] = []
+
+    def recorder(name: str) -> Callable[..., Awaitable[tuple[None, None]]]:
+        async def hook(websocket: WebSocket, *permissions: Permission) -> tuple[None, None]:
+            ran.append(name)
+            await websocket.close()
+            return None, None
+
+        return hook
+
+    inner = FastAPI(openapi_url=None)
+    inner.add_api_websocket_route("/ws", _hooked)
+    inner.state.probe_hook = recorder("inner")
+    outer = FastAPI()
+    outer.state.probe_hook = recorder("outer")
+    outer.mount("/mounted", inner)
+    with (
+        TestClient(outer) as client,
+        contextlib.suppress(WebSocketDisconnect, RuntimeError),
+        client.websocket_connect("/mounted/ws"),
+    ):
+        pass
+    assert ran[:1] == ["inner"], ran
+
+
+def test_a_mount_of_bare_routes_reads_socket_hooks_from_the_outer_app() -> None:
+    """A mount with no app of its own sets no ``scope["app"]``, so its socket sees the outer app."""
+    outer = FastAPI()
+    outer.routes.append(Mount("/bare", routes=[APIWebSocketRoute("/ws", _hooked)]))
+    outer.state.probe_hook = authorize_probe
+    (row,) = _ws_rows(outer)
+    assert row.path == "/bare/ws"
+    assert row.gates == ("authorize_probe", "authorize_ws"), row
+
+
 def test_a_mount_with_no_routes_stays_one_ungated_row(ui_app: FastAPI) -> None:
     rows = _rows_by_key(ui_app)
     assert rows[(route_gates.MOUNT_METHOD, "/ui/static")].gate is None
 
 
-def test_the_full_surface_app_walks_the_flag_registered_routes(ui_app: FastAPI) -> None:
+# --- vault BACKLOG #2846: what the refusal makes of each row --------------------------------------------
+# Before #2846 a row carried no kind and no declaration, so a route public by design and one the engine
+# refuses to every caller both read as "no gate". Each test below fails on that walk.
+
+
+def test_each_row_says_whether_the_route_is_gated_public_in_body_refused_or_outside() -> None:
+    app = create_app()
+
+    @app.get("/zz/public")
+    @public_route("a synthetic public route")
+    async def zz_public() -> dict[str, str]:
+        return {"ok": "reached"}
+
+    @app.get("/zz/undeclared")
+    async def zz_undeclared() -> dict[str, str]:
+        return {"ok": "reached"}
+
+    @app.get("/zz/in-body-on-http")
+    @authorizes_in_body("only a WebSocket may say this")
+    async def zz_in_body_on_http() -> dict[str, str]:
+        return {"ok": "reached"}
+
+    app.add_api_websocket_route("/zz/ws-undeclared", _hooked)
+    sub = APIRouter()
+    sub.add_api_route("/zz/included", _ok)
+    app.include_router(sub)
+    inner = FastAPI(openapi_url=None)
+    inner.add_api_route("/inner", _ok)
+    app.mount("/zz/mounted", inner)
+
+    rows = _rows_by_key(app)
+    assert rows[("GET", "/zz/public")].kind == route_gates.KIND_PUBLIC
+    assert rows[("GET", "/zz/public")].declaration == "a synthetic public route"
+    assert rows[("GET", "/zz/undeclared")].kind == route_gates.KIND_REFUSED
+    assert rows[("GET", "/zz/undeclared")].declaration is None
+    # An HTTP route may not authorize in its body, so the engine refuses it; the reason still shows.
+    in_body = rows[("GET", "/zz/in-body-on-http")]
+    assert (in_body.kind, in_body.declaration) == (
+        route_gates.KIND_REFUSED,
+        "only a WebSocket may say this",
+    )
+    # Gates read from a socket's body do not declare it, so the engine refuses this one too.
+    socket = rows[(route_gates.WS_METHOD, "/zz/ws-undeclared")]
+    assert socket.gates and socket.kind == route_gates.KIND_REFUSED, socket
+    assert rows[("GET", "/zz/included")].kind == route_gates.KIND_REFUSED
+    # The outer app's refusal never runs inside a mount, so that row is outside it.
+    assert rows[("GET", "/zz/mounted/inner")].kind == route_gates.KIND_OUTSIDE
+    assert rows[("GET", "/messages")].kind == route_gates.KIND_GATED
+    assert rows[(route_gates.WS_METHOD, "/ws/stats")].kind == route_gates.KIND_IN_BODY
+    assert rows[(route_gates.WS_METHOD, "/ws/stats")].declaration
+
+
+def test_a_bare_app_with_no_refusal_reads_as_outside_it() -> None:
+    """The kind is what the refusal does, so an app that does not install it has no refused row."""
+    app = FastAPI()
+    app.add_api_route("/planted", _ok)
+    assert _rows_by_key(app)[("GET", "/planted")].kind == route_gates.KIND_OUTSIDE
+
+
+def test_the_shipped_surface_refuses_nothing_and_every_ungated_row_is_declared_public(
+    full_app: FastAPI,
+) -> None:
+    """On the app with every route-registering flag on, a row with no gate is public by design with
+    a reason, or sits outside the refusal (the docs and the static mount). None is refused."""
+    rows = route_gates.route_rows(full_app)
+    by_kind: dict[str, list[route_gates.RouteRow]] = {}
+    for row in rows:
+        by_kind.setdefault(row.kind, []).append(row)
+    assert not by_kind.get(route_gates.KIND_REFUSED), by_kind.get(route_gates.KIND_REFUSED)
+    assert len(by_kind[route_gates.KIND_GATED]) > 150, "the walk classified too few rows as gated"
+    public = by_kind[route_gates.KIND_PUBLIC]
+    assert ("POST", "/auth/login") in {(r.method, r.path) for r in public}
+    assert all(r.declaration and r.declaration.strip() for r in public), public
+    outside = {(r.method, r.path) for r in by_kind[route_gates.KIND_OUTSIDE]}
+    assert outside == {
+        (route_gates.MOUNT_METHOD, "/ui/static"),
+        ("GET", "/docs"),
+        ("GET", "/docs/oauth2-redirect"),
+        ("GET", "/openapi.json"),
+        ("GET", "/redoc"),
+    }, outside
+
+
+def test_the_full_surface_app_walks_the_flag_registered_routes(
+    ui_app: FastAPI, full_app: FastAPI
+) -> None:
     """The OIDC console routes register only with ``oidc_enabled`` on, so neither the default app nor
     a plain ``serve_ui`` app shows them. The full-surface app does."""
-    rows = _rows_by_key(route_gates.full_surface_app())
+    rows = _rows_by_key(full_app)
     for key in [("GET", "/ui/oidc/callback"), ("GET", "/docs"), ("GET", "/ui/login")]:
         assert key in rows, key
     assert ("GET", "/ui/oidc/callback") not in _rows_by_key(ui_app)

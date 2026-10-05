@@ -13,6 +13,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import time
 from typing import Any
 
 import pytest
@@ -952,3 +953,141 @@ async def test_extra_less_install_raises_legibly(monkeypatch: pytest.MonkeyPatch
         wa.registration_options(
             rp_id=RP, rp_name="MF", user_id="u", user_name="u", challenge=b"x" * 64
         )
+
+
+# --- the first-seen sign-in address record (vault BACKLOG #2145) ------------------------------------
+
+
+async def test_a_passkey_assertion_records_its_address_but_does_not_re_anchor() -> None:
+    """The assertion finishes a sign-in that owed a factor, so its address joins the account's
+    known-address record and the next sign-in from it is not reported. It does not move the
+    session's anchor (ADR 0068 decision 1), so the mid-session signal still reports that address.
+    The two signals are independent, and this pins where they part."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, password = await login_admin(service)
+        auth, token = await _enroll(service, identity, token)
+        uid = identity.user_id
+        # Neither the first sign-in nor the enrolment had a client address, so nothing is known yet.
+        assert await store.list_known_login_addresses(uid, since=0.0) == []
+
+        out = await service.login(ADMIN_USERNAME, password, client="10.5.5.5")
+        assert out.ok and out.mfa_required and out.token is not None
+        # The browser moved between the password and the passkey.
+        options = await service.begin_webauthn_assertion(out.token, rp_id=RP)
+        assert options is not None
+        challenge = base64url_to_bytes(json.loads(options)["challenge"])
+        elevation = await service.finish_webauthn_assertion(
+            out.token, auth.get_response(challenge), client="10.5.5.6", rp_id=RP, origin=ORIGIN
+        )
+        assert elevation.ok and elevation.token is not None
+
+        assert await store.list_known_login_addresses(uid, since=0.0) == ["10.5.5.6"]
+        assert await service.flag_new_client_ip(elevation.token, "10.5.5.6", path="/ui/x")
+
+        async def _rows(action: str) -> int:
+            return len(await store.list_audit(actor=ADMIN_USERNAME, action=action))
+
+        before = (await _rows("auth.login_new_ip"), await _rows("auth.login_address_unevaluated"))
+        again = await service.login(ADMIN_USERNAME, password, client="10.5.5.6")
+        assert again.ok
+        # Neither NEW nor failed open: the second count tells KNOWN apart from an unjudged verdict.
+        after = (await _rows("auth.login_new_ip"), await _rows("auth.login_address_unevaluated"))
+        assert after == before
+    finally:
+        await store.close()
+
+
+async def test_a_first_passkey_registration_finishes_the_first_sign_in_and_records_it() -> None:
+    """Under the shipped ``require_mfa`` a directory sign-in owes a factor, so it writes nothing to
+    the record. When the account's first factor is a passkey, the registration is what finishes that
+    first sign-in, so it writes the address; the next sign-in from there is judged KNOWN rather than
+    failed open again as a first sign-in."""
+    from messagefoundry.auth.ldap import AdPrincipal
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, require_mfa=True)
+        await create_admin(service)
+        principal = AdPrincipal(
+            username="aduser",
+            display_name="AD User",
+            email=None,
+            dn="CN=aduser,DC=x",
+            groups=frozenset(),
+            directory_object_id="1291e547-a91b-5700-88cb-a198a209fb05",
+        )
+        out = await service._complete_ad_login(principal, "10.6.6.6", mfa_verified=False)
+        assert out.ok and out.mfa_required
+        assert out.identity is not None and out.token is not None
+        uid = out.identity.user_id
+        assert await store.list_known_login_addresses(uid, since=0.0) == []
+
+        auth = SoftAuthenticator(rp_id=RP, origin=ORIGIN)
+        opts = json.loads(
+            await service.begin_webauthn_registration(
+                out.identity, token=out.token, rp_id=RP, rp_name="MessageFoundry"
+            )
+        )
+        elevation = await service.finish_webauthn_registration(
+            out.identity,
+            auth.create_response(base64url_to_bytes(opts["challenge"]), transports=["usb"]),
+            label="ad-key",
+            token=out.token,
+            client="10.6.6.6",
+            rp_id=RP,
+            origin=ORIGIN,
+        )
+        assert elevation.ok
+
+        assert await store.list_known_login_addresses(uid, since=0.0) == ["10.6.6.6"]
+        again = await service._complete_ad_login(principal, "10.6.6.6", mfa_verified=False)
+        assert again.ok
+        unevaluated = await store.list_audit(
+            actor="aduser", action="auth.login_address_unevaluated"
+        )
+        assert len(unevaluated) == 1, "the second sign-in failed open as a first one"
+        assert await store.list_audit(actor="aduser", action="auth.login_new_ip") == []
+    finally:
+        await store.close()
+
+
+async def test_a_passkey_registered_from_a_first_seen_address_records_nothing() -> None:
+    """The negative of the test above. ADR 0197 Amendment A lets a holder of the password alone
+    enrol an authenticator, so a registration from a first-seen address proves nothing about that
+    address and must not make it known. The directory test above shows a registration that does
+    write, from an account with no baseline yet; this one isolates the guard, and fails if the
+    registration leg stops passing the account as ``enrolment``."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, _token, password = await login_admin(service)
+        uid = identity.user_id
+        # The first sign-in had no client address, so the account's baseline is seeded directly.
+        await store.remember_login_address(uid, "10.7.7.7", now=time.time())
+        known = await service.login(ADMIN_USERNAME, password, client="10.7.7.7")
+        assert known.ok and known.identity is not None and known.token is not None
+        assert await store.list_known_login_addresses(uid, since=0.0) == ["10.7.7.7"]
+
+        opts = json.loads(
+            await service.begin_webauthn_registration(
+                known.identity, token=known.token, rp_id=RP, rp_name="MessageFoundry"
+            )
+        )
+        auth = SoftAuthenticator(rp_id=RP, origin=ORIGIN)
+        elevation = await service.finish_webauthn_registration(
+            known.identity,
+            auth.create_response(base64url_to_bytes(opts["challenge"]), transports=["usb"]),
+            label="roamed-key",
+            token=known.token,
+            client="198.51.100.90",
+            rp_id=RP,
+            origin=ORIGIN,
+        )
+
+        assert elevation.ok
+        assert await store.has_webauthn_credentials(uid)
+        assert await store.list_known_login_addresses(uid, since=0.0) == ["10.7.7.7"]
+    finally:
+        await store.close()
