@@ -7,6 +7,7 @@ safe_name() derives a safe label for a partner-chosen file name, which redact() 
 
 from __future__ import annotations
 
+import http.client
 import random
 import re
 import time
@@ -1738,6 +1739,123 @@ _MRN_HOSTILE = {
 def test_the_mrn_pass_stays_linear_and_affordable(unit: str) -> None:
     """8x the input must cost well under 64x the time, and a whole window stays well under a second
     on the event loop. The ratio ceiling is the one the structured passes use."""
+
+    def sized(chars: int) -> str:
+        return (unit * (chars // len(unit) + 1))[:chars]
+
+    small, large = sized(8 * 1024), sized(64 * 1024)
+    t_small = max(_best_of(lambda: redact(small)), 1e-4)
+    t_large = _best_of(lambda: redact(large))
+    assert t_large / t_small < 24, f"{t_large / t_small:.1f}x for 8x the input on {unit!r}"
+    window = sized(redaction._REDACT_WINDOW)
+    assert _best_of(lambda: redact(window)) < 0.5
+
+
+# --- BACKLOG #2312: the credential backstop leaves its own output alone ------------------------------
+
+#: The backstop as it shipped before #2312, for the positive control below and for nothing else.
+_PRE_2312_BACKSTOP = re.compile(r"(nonnumeric port: ')[^\r\n]{1,256}@")
+
+#: Synthetic passwords, lowercase-led and digit-bearing so no name or date pass is what removes them.
+_PW_ONE = "ab0c" * 25
+_PW_TWO = "zy9x" * 25
+_PW_REAL = "realpw7q"
+
+
+def _two_credential_spans() -> str:
+    """Two ``http.client`` credential messages on one line, placed so the second ``@`` is past the
+    bound from the first opener on the first pass and inside it once both passwords are scrubbed.
+
+    That geometry is the whole defect: each scrub shortens the line, so a span the first pass could not
+    reach comes within reach of the next. The ``keep`` words between are the operator text a second
+    pass used to swallow."""
+    return (
+        f"first nonnumeric port: '{_PW_ONE}@h1.example'"
+        + " keep" * 20
+        + f" nonnumeric port: '{_PW_TWO}@h2.example' end"
+    )
+
+
+def _pre_2312_scrub(text: str) -> str:
+    return _PRE_2312_BACKSTOP.sub(lambda m: f"{m.group(1)}[redacted]@", text)
+
+
+def test_the_two_span_fixture_really_reaches_across_on_the_old_backstop() -> None:
+    """THE POSITIVE CONTROL. An idempotence arm passes vacuously on a line no second pass could
+    change, so show the pre-fix backstop really does swallow this gap on its second run."""
+    once = _pre_2312_scrub(_two_credential_spans())
+    assert "keep" in once, "the first pass already spans the gap, so the fixture is mis-sized"
+    assert "keep" not in _pre_2312_scrub(once), (
+        "the old backstop no longer swallows this gap on a second pass"
+    )
+
+
+def test_the_credential_backstop_is_a_fixed_point_on_two_spans_it_scrubbed() -> None:
+    """BACKLOG #2312: a second pass over two scrubbed spans changes nothing, through ``redact`` and
+    through the stored-error pairing ``safe_exc`` then ``safe_text``."""
+    text = _two_credential_spans()
+    once = redact(text)
+    assert once == (
+        "first nonnumeric port: '[redacted]@h1.example'"
+        + " keep" * 20
+        + " nonnumeric port: '[redacted]@h2.example' end"
+    )
+    assert redact(once) == once
+
+    stored = safe_exc(ValueError(text), limit=100_000)
+    restored = safe_text(stored, limit=100_000)
+    assert restored == stored
+    for out in (once, stored, restored, redact_untrusted(text)):
+        assert _PW_ONE not in out and _PW_TWO not in out
+        assert "keep" in out and "h1.example" in out and "h2.example" in out
+
+
+def test_a_placeholder_inside_a_password_does_not_shield_what_follows_it() -> None:
+    """Text can carry ``[redacted]@`` itself, and the tail stays greedy to the LAST ``@``. So a bare
+    placeholder in the tail stops nothing, and the real password after it still goes. Only the
+    opener and placeholder together mark a span as already scrubbed."""
+    text = f"nonnumeric port: 'u:[redacted]@x:{_PW_REAL}@host.example'"
+    out = redact(text)
+    assert out == "nonnumeric port: '[redacted]@host.example'"
+    assert redact(out) == out
+    assert _PW_REAL not in redact_untrusted(text)
+    assert _PW_REAL not in safe_text(safe_exc(ValueError(text)))
+
+
+def test_the_real_producer_never_quotes_a_placeholder() -> None:
+    """Why the trade below is safe for the shape the backstop exists for. ``http.client`` quotes what
+    follows the LAST ``:``, and only when no ``]`` comes after it, so the "port" it writes can hold
+    neither. Handed the hostile netloc above, it quotes only the real password and the host."""
+    with pytest.raises(http.client.InvalidURL) as caught:
+        http.client.HTTPConnection(f"u:[redacted]@x:{_PW_REAL}@host.example")
+    message = str(caught.value)
+    assert message == f"nonnumeric port: '{_PW_REAL}@host.example'"
+    assert _PW_REAL not in redact(message)
+
+
+def test_the_stated_trade_text_holding_the_scrubbed_form_keeps_what_follows_it() -> None:
+    """THE RESIDUAL #2312 ACCEPTS, pinned so it stays visible. Text that already holds the scrubbed
+    form, opener then ``[redacted]@``, is exactly what a first pass writes. A pass that also scrubbed
+    past it would not be a fixed point, so what follows such a span is left alone. Only a string BUILT
+    to hold that form can reach this, and ``http.client`` cannot write one (the arm above)."""
+    text = f"nonnumeric port: '[redacted]@x {_PW_REAL}@host.example'"
+    assert redact(text) == text
+
+
+#: Inputs shaped to make the backstop work hardest: openers with no ``@``, scrubbed forms with the
+#: ``@`` missing so each lookahead reads nearly the whole form, and scrubbed spans packed tight.
+_BACKSTOP_HOSTILE = {
+    "openers-without-at": "nonnumeric port: '",
+    "near-scrubbed-forms": "nonnumeric port: '[redacted]",
+    "scrubbed-spans": "nonnumeric port: '[redacted]@h ",
+    "opener-then-at": "nonnumeric port: 'x@",
+}
+
+
+@pytest.mark.parametrize("unit", list(_BACKSTOP_HOSTILE.values()), ids=list(_BACKSTOP_HOSTILE))
+def test_the_credential_backstop_stays_linear_and_affordable(unit: str) -> None:
+    """8x the input must cost well under 64x the time, and a whole window stays well under a second
+    on the event loop. The same ceilings as the MRN pass above."""
 
     def sized(chars: int) -> str:
         return (unit * (chars // len(unit) + 1))[:chars]

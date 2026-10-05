@@ -397,7 +397,24 @@ _USERINFO_TAIL_MAX = 256
 #: attacker-influenceable log text; the literal prefix limits it to one bounded walk per occurrence.
 #: A password tail longer than the bound is NOT matched -- the construction-time refusal in
 #: ``transports/rest.py`` ``refuse_url_credentials`` is the primary control, and this is its backstop.
-_INVALID_URL_USERINFO = re.compile(r"(nonnumeric port: ')[^\r\n]{1,256}@")
+#:
+#: **It leaves its own output alone, so a second pass is a no-op (BACKLOG #2312).** The greedy tail
+#: used to reach past a span it had already scrubbed. Each scrub shortens the line, so two spans more
+#: than the bound apart on the first pass could fall inside it on the next, and the second pass then
+#: swallowed everything between them. ``safe_exc`` then ``safe_text`` is exactly such a second pass.
+#: Two lookaheads stop that. A match may not START on an already-scrubbed span (the opener followed by
+#: ``[redacted]@``), and its tail may not CROSS one, meaning the opener and placeholder together.
+#:
+#: **The tail stays greedy to the last ``@``, and the scrubbed form is keyed on the opener as well as
+#: the placeholder, both on purpose.** A bare ``[redacted]@`` in the tail does not stop it, so text
+#: like ``'u:[redacted]@x:PW@host'`` still loses ``PW``. What it now leaves alone is text that already
+#: holds the scrubbed form, and every such tail holds a ``]``. ``http.client`` never writes one there:
+#: it quotes what follows the last ``:`` only when no ``]`` comes after it, so its quoted "port" holds
+#: neither ``:`` nor ``]``. A string built to hold the scrubbed form with a real password after it
+#: keeps that password, which is the residual this trade accepts.
+_INVALID_URL_USERINFO = re.compile(
+    r"(nonnumeric port: ')(?!\[redacted\]@)(?:(?!nonnumeric port: '\[redacted\]@)[^\r\n]){1,256}@"
+)
 
 #: The widest match :data:`_INVALID_URL_USERINFO` can make: the opener, the longest tail it admits,
 #: and the ``@`` that closes it. An opener further back of a cut than this has its whole span inside
@@ -1535,17 +1552,19 @@ def _redact_flat(text: str, *, widened: bool, credentials: bool) -> str:
     :func:`_redact_structured`, repeated to a fixed point.
 
     ``credentials=False`` skips the backstop, which the widened stage of :func:`redact` does. The
-    first stage has already run it, and it is not idempotent: its tail is greedy to the LAST ``@`` on
-    a line, so a further run over ``'[redacted]@host' ... '[redacted]@host'`` swallows everything
-    between two scrubbed spans. Running it again in the second stage added that over-redaction to
-    every text with a widened trigger, and it depends on a later span, so a clamp dropping that span
-    kept what the unclamped scan removed (the clamp fuzz in ``tests/test_redaction.py`` measured it).
+    first stage has already run it. The skip was written when the backstop was not idempotent: its
+    tail is greedy to the LAST ``@`` on a line, so a further run over ``'[redacted]@host' ...
+    '[redacted]@host'`` swallowed everything between two scrubbed spans, and a clamp dropping the later
+    span kept what the unclamped scan removed (the clamp fuzz in ``tests/test_redaction.py`` measured
+    it). BACKLOG #2312 made the backstop leave its own output alone (:data:`_INVALID_URL_USERINFO`), so
+    a repeated call (``safe_exc`` then ``safe_text``) no longer swallows that gap either.
 
-    **What the skip does not do, stated because the reason above is easy to over-read.** The first
-    stage still re-runs the backstop each round, so a repeated call (``safe_exc`` then ``safe_text``)
-    can still swallow a gap; that predates BACKLOG #2079. And a credential span that only a WIDENED
-    scrub completes (one that removes an escaped line break inside a ``name`` string, joining an
-    opener's line to its ``@``) is not re-checked: #1711 did not catch that either."""
+    **What is still not re-checked, stated because the reason above is easy to over-read.** A
+    credential span that only a WIDENED scrub completes (one that removes an escaped line break inside
+    a ``name`` string, joining an opener's line to its ``@``) is not re-checked: #1711 did not catch
+    that either. And an opener whose ``@`` was past the bound can come within it on a LATER call, once
+    a field run or a name inside the would-be tail has been shortened to the placeholder; that call
+    then scrubs the rest of the tail. It only adds redaction, and :func:`safe_text` lists it."""
     if credentials:
         text = _INVALID_URL_USERINFO.sub(lambda m: f"{m.group(1)}{_REDACTED}@", text)
     scrubbed = _HL7_SEGMENT.sub(lambda m: f"{m.group(1)}|{_REDACTED}", text)
@@ -1595,8 +1614,9 @@ def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
 
     **It is not strictly idempotent, and the known exceptions all only add redaction or shorten the
     text.** At least these: a truncated result re-truncates with a new ``(+N chars)`` count; the
-    credential backstop can swallow the gap between two scrubbed spans on a further pass
-    (:func:`_redact_flat`); an unquoted DICOM label value can take the truncation note with it; and
+    credential backstop can reach an ``@`` on a further pass that was past its bound on the first,
+    once another pass shortened the text in between (:func:`_redact_flat`; the gap between two spans
+    it scrubbed itself is no longer one, BACKLOG #2312); an unquoted DICOM label value can take the truncation note with it; and
     (BACKLOG #2079) a kept operator string under a JSON ``name``/``address`` that ``limit`` cuts is left
     unterminated, which a further pass scrubs, so ``"IB_ACME_ADT…(+N chars)`` becomes ``"[redacted]``
     and loses the note that the text was cut."""
