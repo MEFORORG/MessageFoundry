@@ -126,6 +126,17 @@ def test_an_overlay_nested_past_the_parser_is_a_rule_error(
 
 
 @_BOTH
+def test_a_number_past_the_digit_limit_is_a_rule_error(rules: ModuleType, tmp_path: Path) -> None:
+    # tomllib lets int()'s own ValueError through, so this one is not a TOMLDecodeError.
+    overlay = tmp_path / "anon.toml"
+    overlay.write_text(f"{_PLANTED} = " + "7" * 5000, encoding="utf-8")
+    with pytest.raises(rules.RuleError) as caught:
+        rules.load_rules(overlay)
+
+    _assert_bare(caught.value)
+
+
+@_BOTH
 def test_a_missing_overlay_is_a_rule_error_naming_the_file(
     rules: ModuleType, tmp_path: Path
 ) -> None:

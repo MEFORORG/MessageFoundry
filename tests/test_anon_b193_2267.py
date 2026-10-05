@@ -139,6 +139,10 @@ def test_the_rules_are_loaded_once_for_the_whole_run(
 
     assert len(run_loads) == 1
     assert row_loads == []
+    # Control: the per-row counter does fire when a caller hands over the path, so the empty
+    # list above means the loop no longer does.
+    tee.anon.anonymize_checked(_raw("C9").decode("latin-1"), salt=_SALT, overlay=Path(overlay))
+    assert len(row_loads) == 1
     # And the overlay it loaded is the one each row got: PID-8 is dropped in every record.
     records = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
     assert len(records) == _ROWS

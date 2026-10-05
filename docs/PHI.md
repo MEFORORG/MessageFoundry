@@ -1863,8 +1863,9 @@ keep = ["EVN-1", "OBX-2"]
 A kept field is still scanned for the shapes in the table above, so a dashed SSN in it still
 refuses.
 
-**A keep on a field the default rules scrub turns that scrub off.** Keeping `PID-5` to clear a
-refusal leaves the patient name in the output as captured. `load_rules` logs a WARNING for each
+**A keep on a field the default rules scrub turns that scrub off.** A keep on `PID-5` leaves the
+patient name in the output as captured, whatever the keep was added for. A default-scrubbed field
+already counts as decided, so a keep on one never clears a refusal. `load_rules` logs a WARNING for each
 such field. The line names the field and the kind of scrub it lost, never a value. A keep on a
 field with no default rule logs nothing. `python -m tee anonymize-captures` also prints one
 `warning:` line that lists those fields, and `--log-level` cannot hide it.

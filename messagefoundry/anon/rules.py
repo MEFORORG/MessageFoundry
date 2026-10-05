@@ -230,6 +230,8 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
         refusal = "the file is not UTF-8 text"
     except RecursionError:  # tomllib recurses on nested arrays and tables
         refusal = "the file nests too deeply to parse"
+    except ValueError:  # at least int()'s digit limit, which tomllib lets through as it is
+        refusal = "the file holds a value the TOML parser refused"
     except OSError as exc:
         refusal = exc.strerror or type(exc).__name__
     if refusal is not None:
@@ -280,8 +282,8 @@ def kept_defaults(rules: tuple[FieldRule, ...]) -> tuple[FieldRule, ...]:
     """The :data:`DEFAULT_RULES` entries that ``rules`` keeps, so their scrub no longer runs.
 
     A keep does two jobs. It records a field as reviewed for ``require_full_coverage``, and it
-    cancels any default scrub on that path. So keeping ``PID-5`` to clear a coverage refusal also
-    turns the name scrub off. :func:`load_rules` logs each one, and a caller with a console of
+    cancels any default scrub on that path. So a keep on ``PID-5`` turns the name scrub off,
+    whatever it was added for. :func:`load_rules` logs each one, and a caller with a console of
     its own can repeat them there. Each entry is the default rule, so it names the lost kind.
     """
     kept = {r.path for r in rules if r.kind == SurrogateKind.KEEP}
