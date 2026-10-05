@@ -58,7 +58,7 @@ operate it over a localhost HTTP API. See [ARCHITECTURE.md](ARCHITECTURE.md) for
 and who are comfortable validating a pre-1.0 tool against their own traffic before trusting it. A single
 engine node on a trusted network is the simplest pilot; **native TLS** (API + MLLP) and an opt-in
 **active-passive failover** cluster on a shared server-DB store (PostgreSQL or SQL Server) are both built when you need them (see
-§2/§6/§14). Native MFA (TOTP and passkeys), off-box log forwarding and the de-identification
+§2/§6/§14). Native MFA (TOTP and passkeys), off-box log forwarding and the HL7 v2 de-identification
 framework are built too (§2). What is genuinely *not* there yet is listed in §2 — track those items
 and pilot the parts that are ready. (Horizontal *active-active*
 scale-out was dropped and is not a planned milestone; active-passive HA is the supported HA model.)
@@ -97,7 +97,7 @@ use the table below alongside them when planning.
 |---|---|
 | **Transport TLS for raw TCP / X12** | ❌ Not built — those two connectors are plaintext-only; keep them on loopback or front with a TLS-terminating proxy. (API + MLLP **do** have native TLS — see §6/[DEPLOYMENT.md](DEPLOYMENT.md).) |
 | **`ack_after=delivered`** (defer the ACK until downstream delivery) | ❌ Not built — requesting it is rejected at config load. Only **ACK-on-receipt** exists, so a routing/transform/delivery failure happens **after** the sender was already told `AA` and will **not** NAK back. Operators rely on the message disposition + alerts, not the ACK. |
-| **De-identification on the AI-assist path** | ❌ Not built. The AI assistant's `deidentified` scope falls back to `code_only`. The de-identification framework itself is built ([ADR 0030](adr/0030-anonymization-test-harness-tee.md), `messagefoundry/anon/`) and builds test datasets. |
+| **De-identification on the AI-assist path** | ❌ Not built. The AI assistant's `deidentified` scope falls back to `code_only`. The de-identification framework itself is built for HL7 v2 ([ADR 0030](adr/0030-anonymization-test-harness-tee.md), `messagefoundry/anon/`) and builds test datasets; other formats are not covered yet. |
 | **In-place SQLite → server-DB migration** | ❌ Not built. Server-DB deployments are **greenfield only** — there is no automatic carry-over of SQLite history. Drain and cut over deliberately (§13). |
 | **A throughput guarantee for your hardware** | **CAUTION:** By design. A baseline + tuning method is **published** ([TUNING-BASELINE.md](benchmarks/TUNING-BASELINE.md), Gate #3) as a two-tier gate — host-independent **conformance** invariants (hard) + **performance** numbers *"as measured on the reference config"*. Because the durable-write path is hardware-dependent, those msg/s are not a promise for your box. **Measure on your own hardware** (§9). |
 
@@ -414,8 +414,8 @@ Guidance for a clean first flow:
 Full references: **[SECURITY.md](SECURITY.md)**, **[PHI.md](PHI.md)**, and **[DEPLOYMENT.md](DEPLOYMENT.md)**
 (network exposure). MEFOR ships real auth, RBAC, audit, at-rest encryption, off-box log forwarding,
 and **native TLS** (API + MLLP, with a fail-closed off-loopback bind guard). Its native second factor
-is on by default, and it refuses to start without a store encryption key unless you opt out. The
-remaining transport gap is **raw TCP and X12**, which have no native TLS. Complete this checklist **before any real PHI flows**:
+is on by default, and the engine refuses to start without a store encryption key unless you opt
+out. The remaining transport gaps include **raw TCP and X12**, which have no native TLS. Complete this checklist **before any real PHI flows**:
 
 - [ ] **API off-loopback requires native TLS.** The API binds `127.0.0.1` by default. To reach it from
       another host, configure **in-process TLS** (`[api].tls_cert_file` + `[api].tls_key_file`,
@@ -425,16 +425,17 @@ remaining transport gap is **raw TCP and X12**, which have no native TLS. Comple
       proxy-to-engine hop is then plaintext and securing it is your job). A non-loopback bind **without**
       TLS (or a trusted terminator) is **refused at startup**. **Never use `--allow-insecure-bind` for
       real PHI** — it is a loud dev-only escape that puts bearer tokens and PHI on the wire in cleartext.
-      (With auth disabled, a non-loopback bind is refused unconditionally.)
+      (`serve` always requires sign-in; there is no switch that turns it off.)
 - [ ] **MLLP off-loopback requires native TLS too.** MLLP-over-TLS is built: set `tls = true` +
       `tls_cert_file`/`tls_key_file` per connection (opt-in mTLS via `tls_ca_file`; ≥ TLS 1.2). MLLP is
       **plaintext by default**, and a non-loopback plaintext MLLP bind is refused. **Raw TCP and X12 have
       no transport TLS** — keep them on a trusted segment or proxy-terminate. Full matrix:
       [DEPLOYMENT.md](DEPLOYMENT.md).
-- [ ] **Turn on at-rest encryption and make it mandatory:** mint a key with `messagefoundry gen-key`
-      (or a Windows DPAPI-protected key file via `messagefoundry protect-key`), set
-      `MEFOR_STORE_ENCRYPTION_KEY`, **and** set `[store].require_encryption = true` so the engine
-      refuses to start unencrypted.
+- [ ] **Give at-rest encryption its key and make it mandatory:** mint a key with `messagefoundry gen-key`
+      (or a Windows DPAPI-protected key file via `messagefoundry protect-key`) and set
+      `MEFOR_STORE_ENCRYPTION_KEY`. The engine already refuses to start without one by default. Also
+      set `[store].require_encryption = true`, so the audited opt-out
+      (`[security].allow_unencrypted_phi`) cannot start it unencrypted either.
 - [ ] **Enable volume encryption (BitLocker/LUKS).** App-level encryption protects message *bodies*;
       the `summary` / `control_id` / `message_type` columns and the `-wal`/`-shm`/temp files are **not**
       app-encrypted and rely on volume encryption.
@@ -744,7 +745,8 @@ message, and confirm the **"wiring started"** banner in `service.out.log`.
 
 **Log management:** logs land under `<DataDir>\logs` via NSSM. Configure rotation, keep the level at
 `INFO` or above (DEBUG can leak PHI — §6), treat `service.out/err.log` as **potential-PHI artifacts**
-(ACL them; don't ship them off-box — off-box logging is deferred), and include them in your retention
+(ACL them; don't copy these raw files off-box — `[logging].forward_*` forwards a PHI-redacted
+stream to your collector instead), and include them in your retention
 policy.
 
 **Graceful drain for maintenance:** `Stop-Service MessageFoundry` reaches the engine as Ctrl+C,
