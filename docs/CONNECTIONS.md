@@ -2240,6 +2240,21 @@ For a server like these, a connection can opt back into the plain form:
 outbound("OB_EPIC_OBS", FHIR(url=env("epic_fhir_base"), conditional="if-match", update_url_form="path"))
 ```
 
+**A plain `interaction="update"` sends no `If-Match` header.** Only `conditional="if-match"` adds one. So
+a server that requires `If-Match` on update would refuse a plain update, and the message would
+dead-letter. There are three ways to send the header:
+
+- Set `conditional="if-match"`, as the example does. Each resource then needs a `meta.versionId`.
+- Put a static `If-Match` in `headers`. It is the same on every message, so it only helps where the
+  server accepts one fixed value.
+- Set `dynamic_headers=True` and have a Handler stamp `If-Match` per message.
+
+`messagefoundry check` prints an advisory `fhir-update-if-match` line. It names each path-form update
+with no `conditional="if-match"` and no static `If-Match`. It **never blocks**: it cannot tell which
+server a connection points at, and it cannot see a header a Handler stamps. The sourcing for which
+Oracle Health resources require the header stops at "most" in the bullet above. Check the vendor's page
+for the resource you write. This is vault BACKLOG #2570.
+
 With `update_url_form="path"`, an `update` or `if-match` is sent as `PUT {base}/{ResourceType}/{id}`:
 
 - The id must match the FHIR id grammar, `[A-Za-z0-9\-\.]{1,64}`, and must not be only dots. Any other id
@@ -2314,6 +2329,12 @@ is reusable at every endpoint it is registered with, while the assertion's `aud`
 pinned token endpoint and the key never leaves the engine (BACKLOG #1158). Pass `algorithm="RS256"` for
 a generic partner — the `RS384` default below is SMART's own requirement, not this engine's.
 
+**If you stay on `with_oauth2_client_credentials(...)`**, its `auth_style` defaults to `"basic"`. The
+client id and secret then ride an `Authorization: Basic` header on every token request.
+`auth_style="post"` puts them in the form body. Both styles send the secret itself, so the stronger
+option above is a choice you make per connection. Why `basic` stays the default is recorded once, in
+that function's docstring in `messagefoundry/transports/http_auth.py` (vault BACKLOG #2206).
+
 | `with_smart_backend(...)` arg | Default | Notes |
 |---|---|---|
 | `token_url` | — (required) | the authorization server's token endpoint (`https`; `env()`). **Also gated by `[egress].allowed_http`** — it is a second egress host. |
@@ -2368,6 +2389,24 @@ line naming any connection that requests letters its declared interaction cannot
 blocks**: your authorization server registers the scopes it will grant, and a refusal computed here could
 take a working feed offline. It also stays quiet when a request is too *narrow* — that is a correctness
 question, and asking for a letter the server never registered fails the token request outright.
+
+**Wildcard scope and audience.** `check` also prints an advisory `oauth-request` line (vault BACKLOG
+#2334). It names three things:
+
+- on `with_oauth2_client_credentials(...)`, a `scope` token that contains a `*`, such as `*` or
+  `claims.*`. A named scope is never graded, because that vocabulary belongs to your partner. It does
+  not read a SMART `scope`; the `smart-scope` line above does.
+- on `with_smart_backend(...)`, an `audience` that is not exactly the `token_url`. It is sent as
+  written, so letter case and a trailing slash count.
+- on `with_oauth2_client_credentials(...)`, an `audience` that is a URL on a different scheme, host or
+  port from the connection's `url`. An audience that is not a URL is an opaque API identifier, and is
+  never graded.
+
+Each of these can be a correct setup, so the line **never blocks**. It compares literal values only.
+`check` does not resolve `env()`, so the line also names every setting it could not compare, each
+with its reason. The examples in this file write the endpoint and token URLs as `env()`, so a URL
+audience on a connection written that way is listed as not compared. Read that list as "not
+checked", not as "clean".
 
 Put **every** secret in `env()` (`token_url`/`client_id`/`private_key`/`private_key_password`); the minted
 access token and `client_assertion` are runtime-only — never logged or persisted. (The signing key comes

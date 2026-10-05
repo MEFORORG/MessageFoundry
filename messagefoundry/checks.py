@@ -73,6 +73,9 @@ So is ``smart-scope`` (#1159, ASVS 10.2.3) — it names every SMART-authenticate
 requested ``smart_scope`` asks for permission letters the connection's declared ``interaction`` cannot
 spend. Advisory because a SMART authorization server registers scopes per app and MAY grant a subset of
 what is requested, so refusing a requested string risks taking a working clinical feed offline.
+So is ``oauth-request`` (vault BACKLOG #2334, ASVS 10.2.3) — it names a wildcard ``oauth2_scope``, and a
+``smart_audience`` or ``oauth2_audience`` that does not match its endpoint. It compares literal values
+only, so it also names every setting it could not compare because a value is an ``env()`` reference.
 So is ``oidc-auth-params`` (#1159, ASVS 10.2.3) — the relying-party half of that same verb. It reports
 the ``[auth]`` authorization parameters the federated login sends that nothing else screens: the
 ``oidc_scopes`` / ``oidc_username_claim`` pair, ``oidc_acr_values`` against ``oidc_required_acr_values``,
@@ -274,9 +277,15 @@ def run_checks(
         # vault BACKLOG #2550: every FHIR connection that puts the update id back in the URL, a
         # listed loosening of owner ruling R3. Advisory, as tls_allow_expired is -- see the check.
         _check_fhir_update_path_form(config_dir),
+        # vault BACKLOG #2570: every path-form update that declares no If-Match, which a server
+        # requiring one on update would refuse. Advisory -- see the check.
+        _check_fhir_update_if_match(config_dir),
         # #1159 / ASVS 10.2.3: name every SMART connection asking for more FHIR authority than its
         # declared interaction can spend. Advisory, and a refusal was ruled out — see the check.
         _check_smart_scope(config_dir),
+        # vault BACKLOG #2334 / ASVS 10.2.3: the three OAuth request settings no rule read, a wildcard
+        # oauth2_scope and an audience that is not its endpoint. Advisory -- see the check.
+        _check_oauth_request(config_dir),
         # #1159 / ASVS 10.2.3, the relying-party half of the same verb: the authorization parameters
         # the OIDC login sends that nothing else screens. Advisory — see the check.
         _check_oidc_auth_params(
@@ -2441,6 +2450,61 @@ def _check_fhir_update_path_form(config_dir: str | Path) -> CheckResult:
     )
 
 
+def _check_fhir_update_if_match(config_dir: str | Path) -> CheckResult:
+    """Name every path-form ``FHIR()`` update that declares no ``If-Match`` (vault BACKLOG #2570).
+
+    A plain ``interaction="update"`` sends its ``PUT`` with no ``If-Match`` header, and a server that
+    requires one on update would refuse it, so the message would dead-letter. The set and what it
+    cannot see are in :func:`~messagefoundry.config.wiring.path_form_fhir_updates_without_if_match`.
+
+    **Advisory (``required=False``), for two reasons, each enough.** Nothing in a connection names
+    the server's vendor, so this cannot know whether the server requires the header. And a Handler
+    can stamp ``If-Match`` through ``dynamic_headers``, which no load-time check can see. So the line
+    reports, says both limits, and never refuses.
+
+    SKIPs when the graph will not load, the same convention as its siblings."""
+    from messagefoundry.config.wiring import (
+        WiringError,
+        load_config,
+        path_form_fhir_updates,
+        path_form_fhir_updates_without_if_match,
+    )
+
+    name = "fhir-update-if-match"
+    try:
+        registry = load_config(config_dir)
+    except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
+        return CheckResult(
+            name, ok=True, required=False, skipped=True, detail=f"config did not load: {exc}"
+        )
+    plain = path_form_fhir_updates_without_if_match(registry)
+    if not plain:
+        # The reader returns only the connections it names, so ask the wider reader whether there
+        # was anything to read. "None exist" and "all declare one" are different lines.
+        clean = (
+            "every path-form FHIR update declares an If-Match that check can read"
+            if path_form_fhir_updates(registry)
+            else "no FHIR connection sets update_url_form='path', so there is no update to read"
+        )
+        return CheckResult(name, ok=True, required=False, detail=clean)
+    listed = "; ".join(f"{conn} ({note})" for conn, note in plain)
+    return CheckResult(
+        name,
+        ok=True,
+        required=False,
+        detail=(
+            f"{len(plain)} path-form FHIR update(s) have no If-Match that check can read: "
+            f"{listed}. A server "
+            "that requires If-Match on update refuses such a request, and the message would "
+            "dead-letter. Oracle Health documents that requirement on most of the resources it "
+            "lets a client update (docs/CONNECTIONS.md, 'Vendor compatibility and the path-form "
+            "opt-in'). Set conditional='if-match', which needs meta.versionId on the resource, or "
+            "a static If-Match in headers. Advisory: check cannot tell which server a connection "
+            "points at, or see a header a Handler stamps"
+        ),
+    )
+
+
 def _check_revocation_attested(config_dir: str | Path) -> CheckResult:
     """Surface every connection that declares ``tls_revocation_attested`` (ADR 0173), with its reason.
 
@@ -2563,13 +2627,15 @@ def _check_smart_scope(config_dir: str | Path) -> CheckResult:
     **It computes a requirement from the connection's declared shape and compares the request against
     it** — :func:`~messagefoundry.config.wiring.overbroad_smart_scopes` — rather than pattern-matching
     a ``*`` character in the scope string. A character match would let an over-broad NON-wildcard scope
-    on a create-only connection pass unremarked while reading as a control.
+    on a create-only connection pass unremarked while reading as a control. That holds for
+    ``smart_scope``, where a shape exists to compute from. The generic OAuth2 leg has none, so its
+    line, :func:`_check_oauth_request`, can only name a wildcard, and says that is all it reads.
 
     What it deliberately stays quiet about is in that function's docstring: under-grant, the resource
     half of the scope, ``transaction``/``batch``, a plain ``Rest()`` with SMART auth, an unparseable
-    scope vocabulary, and the generic OAuth2 leg. Each silence is a case where computing a requirement
-    would be guessing, and an advisory that fires on a valid configuration teaches operators to ignore
-    it.
+    scope vocabulary, and the generic OAuth2 leg, which ``oauth-request`` reads instead. Each silence
+    is a case where computing a requirement would be guessing, and an advisory that fires on a valid
+    configuration teaches operators to ignore it.
 
     It states the clean case out loud rather than going quiet, on the ``alert-smtp-tls`` convention, so
     a passing line is never confused with a check that did not run. SKIPs when the graph will not load
@@ -2606,6 +2672,54 @@ def _check_smart_scope(config_dir: str | Path) -> CheckResult:
             "(SMART v2: c=create, r=read, u=update, d=delete, s=search)"
         ),
     )
+
+
+def _check_oauth_request(config_dir: str | Path) -> CheckResult:
+    """Name a wildcard ``oauth2_scope``, and a ``smart_audience`` or ``oauth2_audience`` that does not
+    match its endpoint (vault BACKLOG #2334, ASVS 10.2.3).
+
+    These three settings reached the wire through one ``str(...)`` conversion with no rule reading
+    them. ``smart-scope`` covers ``smart_scope`` only. The three rules and their deliberate silences
+    are in :func:`~messagefoundry.config.wiring.oauth_request_advisories`, the single reader.
+
+    **Advisory (``required=False``).** Each finding can be a correct configuration: a partner may
+    register only a wildcard scope, and a server may document an audience that is not its endpoint.
+    So the line reports and never refuses, under any ``[security].enforcement``.
+
+    **It says what it did not look at.** The reader compares literal string values only, and an
+    ``env()`` reference is unresolved here. A quiet line on such a configuration is not a clean one,
+    so every setting the reader could not compare is named. It states the clean case out loud, and
+    SKIPs when the graph will not load, the same convention as its siblings."""
+    from messagefoundry.config.wiring import WiringError, load_config, oauth_request_advisories
+
+    name = "oauth-request"
+    try:
+        registry = load_config(config_dir)
+    except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
+        return CheckResult(
+            name, ok=True, required=False, skipped=True, detail=f"config did not load: {exc}"
+        )
+    read = oauth_request_advisories(registry)
+    if read.findings:
+        listed = "; ".join(f"{conn}: {reason}" for conn, reason in read.findings)
+        detail = (
+            f"{len(read.findings)} OAuth request setting(s) are worth a second look: {listed}. "
+            "Each can be a correct setup: a partner may register only a wildcard scope, and an "
+            "authorization server may document an audience that is not its endpoint. Confirm "
+            "each against what the partner registered"
+        )
+    else:
+        detail = (
+            "no oauth2_scope that could be read contains a '*', and no audience that could be "
+            "compared differs from its endpoint"
+        )
+    if read.not_compared:
+        skipped = "; ".join(f"{conn} ({reason})" for conn, reason in read.not_compared)
+        detail += (
+            f". NOT COMPARED: {len(read.not_compared)} setting(s), each for the reason beside "
+            f"it; check reads literal values and does not resolve env(): {skipped}"
+        )
+    return CheckResult(name, ok=True, required=False, detail=detail)
 
 
 def _check_static_credentials(

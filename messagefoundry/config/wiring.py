@@ -158,10 +158,13 @@ __all__ = [
     "expiry_relaxed_hops",
     "hostname_unchecked_hops",
     "path_form_fhir_updates",
+    "path_form_fhir_updates_without_if_match",
     "query_credential_hops",
     "revocation_attested_hops",
     "unverified_generic_db_hops",
     "overbroad_smart_scopes",
+    "OAuthRequestAdvisories",
+    "oauth_request_advisories",
     "static_credential_db_hops",
 ]
 
@@ -5273,6 +5276,56 @@ def path_form_fhir_updates(registry: Registry) -> list[str]:
     )
 
 
+def path_form_fhir_updates_without_if_match(registry: Registry) -> list[tuple[str, str]]:
+    """Every path-form ``FHIR()`` update that declares no ``If-Match``, as ``(name, note)`` (vault
+    BACKLOG #2570).
+
+    The single reader of that set, on the contract of :func:`path_form_fhir_updates`, whose list it
+    narrows. Sorted by name.
+
+    A plain ``interaction="update"`` sends ``PUT {base}/{ResourceType}/{id}`` with no ``If-Match``
+    header. Only ``conditional="if-match"`` adds one, from the resource's ``meta.versionId``. A server
+    that requires ``If-Match`` on update would refuse the plain request, and the message would
+    dead-letter. ``docs/CONNECTIONS.md``, "Vendor compatibility and the path-form opt-in", records one
+    vendor that documents the requirement, and is where the sourcing for it stops.
+
+    A connection is named when all three hold: it takes the path form, its ``conditional`` is not
+    ``if-match``, and its static ``headers`` carry no ``If-Match`` key in any letter case.
+
+    **The note says what this reader cannot see.** A Handler can stamp ``If-Match`` per message when
+    ``dynamic_headers`` is on, and no load-time reader can know whether it does. A ``headers`` table
+    written as one ``env()`` reference is unresolved here. Both cases are still named, with the reason
+    in the note, so the set is "declares none", never "sends none".
+
+    There is no vendor setting to read, so this cannot tell which server a connection points at. It is
+    an inventory for review, not a verdict.
+
+    Pure: it reads the loaded graph and touches nothing else."""
+    out: list[tuple[str, str]] = []
+    for name in path_form_fhir_updates(registry):
+        settings = registry.outbound[name].spec.settings
+        if settings.get("conditional") == "if-match":
+            continue
+        headers = settings.get("headers")
+        unread = ""
+        # The whole table as one reference, the only shape `_reject_envref_headers` lets through.
+        if isinstance(headers, EnvRef):
+            unread = "its headers are an env() reference, which check does not resolve; "
+        elif isinstance(headers, Mapping) and any(
+            str(key).lower() == "if-match" for key in headers
+        ):
+            continue
+        dynamic = settings.get("dynamic_headers")
+        if isinstance(dynamic, EnvRef):
+            stamped = "dynamic_headers is an env() reference, which check does not resolve"
+        elif dynamic:
+            stamped = "dynamic_headers is on, so a Handler may stamp If-Match per message"
+        else:
+            stamped = "dynamic_headers is off, so no Handler can add one"
+        out.append((name, unread + stamped))
+    return out
+
+
 def revocation_attested_hops(registry: Registry) -> list[tuple[str, str]]:
     """Every connection that declares ``tls_revocation_attested``, as ``(name, reason)`` (ADR 0173).
 
@@ -5516,10 +5569,11 @@ def overbroad_smart_scopes(registry: Registry) -> list[tuple[str, str]]:
     composed with SMART auth, or any connector declaring no interaction; a scope string carrying no
     parseable FHIR resource scope; and the RESOURCE half, always.
 
-    The generic OAuth2 leg (``oauth2_scope``) is deliberately NOT covered, and that is a finding rather
-    than an omission: its scope vocabulary belongs to the partner (the shipped worked example is
-    ``claims.write``), so there is no declared shape to compute a requirement from and any screen over
-    it would be guessing at someone else's namespace.
+    The generic OAuth2 leg (``oauth2_scope``) is NOT graded HERE, because its scope vocabulary belongs
+    to the partner (the shipped worked example is ``claims.write``): there is no declared shape to
+    compute a requirement from. :func:`oauth_request_advisories` reads that leg instead, and it is a
+    different and much narrower rule. It names a wildcard token and nothing else, so it never guesses
+    at what a named scope in someone else's namespace permits.
 
     Pure — it reads the loaded graph and touches nothing else."""
     from messagefoundry.transports.fhir import scope_letters_for_shape
@@ -5571,6 +5625,192 @@ def overbroad_smart_scopes(registry: Registry) -> list[tuple[str, str]]:
         if (hit := one(fhir_lookup_record_name(spec.name), spec.settings, None)) is not None
     ]
     return sorted(out)
+
+
+@dataclass(frozen=True)
+class OAuthRequestAdvisories:
+    """What :func:`oauth_request_advisories` read, in two sorted ``(name, detail)`` lists.
+
+    ``findings`` are the settings worth a second look. ``not_compared`` are the settings the reader
+    could NOT grade, each with the reason. The second list exists so a quiet result is never read as
+    a clean one."""
+
+    findings: list[tuple[str, str]]
+    not_compared: list[tuple[str, str]]
+
+
+_HTTP_DEFAULT_PORTS: Final = {"http": 80, "https": 443}
+
+
+def _wildcard_scope_tokens(scope: str) -> list[str]:
+    """The tokens of a space-separated ``scope`` string that contain a ``*``.
+
+    That covers ``*``, ``claims.*``, ``*/*``, ``read:*`` and a prefix form such as ``Get*``. A
+    comma-joined list is one token on the wire, so it is named whole. RFC 6749 section 3.3 lets a
+    scope token carry ``*`` and gives it no meaning. This reader takes it as a wildcard, which is a
+    guess about a partner's vocabulary, so the token is named and never judged. A scope with no
+    ``*`` is never named, however many scopes it lists."""
+    return [token for token in scope.split() if "*" in token]
+
+
+def _http_origin(value: str) -> tuple[str, str, int] | None:
+    """``(scheme, host, port)`` of an absolute ``http``/``https`` URL, else ``None``.
+
+    Built on :func:`_split_address`, so it inherits that function's refusals: a credential holding an
+    unencoded ``/`` returns ``None`` here, never the head of the credential as a "host". A missing
+    port becomes the scheme's default and a trailing dot on the host is dropped, so those spellings
+    of one origin compare equal. ``None`` covers every value that is not such a URL: an opaque API
+    identifier, a ``urn:``, a URL that does not parse. It also covers a valid URL with an ``@`` after
+    the authority, which :func:`_split_address` refuses whole; the caller names that as not compared.
+    """
+    parsed = _split_address(value)
+    if parsed is None or parsed[0] not in _HTTP_DEFAULT_PORTS:
+        return None
+    scheme, host, port = parsed
+    return scheme, host.rstrip("."), int(port) if port else _HTTP_DEFAULT_PORTS[scheme]
+
+
+def _origin_label(origin: tuple[str, str, int]) -> str:
+    """``scheme://host:port``, from the parts :func:`_http_origin` kept. No userinfo, path or query."""
+    return "{}://{}:{}".format(*origin)
+
+
+def oauth_request_advisories(registry: Registry) -> OAuthRequestAdvisories:
+    """The outbound OAuth request settings worth a second look: a wildcard ``oauth2_scope``, and a
+    ``smart_audience`` or ``oauth2_audience`` that does not match its endpoint (vault BACKLOG #2334,
+    ASVS 10.2.3).
+
+    The SINGLE reader of that set, on the contract of :func:`overbroad_smart_scopes`, so
+    ``messagefoundry check`` and any later surface cannot disagree. Lookup names are prefixed
+    ``fhir_lookup:``. All three settings reach the wire through one ``str(...)`` conversion and
+    nothing else read them before this.
+
+    **Three rules, each narrow on purpose**, because an advisory that fires on a valid configuration
+    teaches operators to ignore it:
+
+    * ``oauth2_scope`` becomes the ``scope`` form field of the token request. A token is named only
+      when it contains a ``*`` (:func:`_wildcard_scope_tokens`). The vocabulary belongs to the
+      partner, so a named scope is never graded, and neither is a long list of them. This is a
+      character rule, and it is the only one available on this leg: there is no declared shape to
+      compute from, as there is for ``smart_scope``. So it catches the widest request and nothing
+      subtler. ``smart_scope`` is not read here at all.
+    * ``smart_audience`` becomes the ``aud`` claim of the signed client assertion, which defaults to
+      the token URL. It is sent as written, so it is named whenever it is set and is not exactly
+      that URL, down to letter case and a trailing slash. A server may document a different
+      audience, so this can be correct, and the check line says so.
+    * ``oauth2_audience`` becomes the ``audience`` form field. It is named when it is an absolute
+      ``http``/``https`` URL whose scheme, host and port differ from the connection's ``url``. An
+      audience that is not a URL is an opaque API identifier, which many servers use, so it is never
+      graded.
+
+    **It reads literal values only, and that limit is large.** An ``env()`` reference is unresolved in
+    the loaded graph, exactly as :func:`query_credential_hops` records for ``url``. Measured
+    2026-10-04 over the tracked tree: all five worked examples of the two composers spell the endpoint
+    ``url`` and the token URL as ``env()``, and none sets an audience. So on a configuration written
+    the documented way, both audience rules have nothing to compare. No construction-time reader of
+    the resolved values exists, as one does for a query credential. Each setting that could not be
+    compared is returned in ``not_compared`` with the reason, so the check line can say what it did
+    not look at. The scope rule is far less affected: the composers type ``scope`` as a plain string,
+    and all five examples write a literal.
+
+    **Quiet when the provider is off**, through the two shared predicates, imported lazily on the
+    precedent :func:`overbroad_smart_scopes` states: ``smart_auth_configured`` and
+    ``oauth2_auth_configured``. A ``FhirLookup`` is read on the SMART leg only, because its executor
+    builds no other provider.
+
+    **No value of an unresolved reference is ever rendered.** A finding shows the wildcard tokens, or
+    origins built by :func:`_http_origin`; a path, a query and a userinfo are never copied.
+
+    Pure: it reads the loaded graph and touches nothing else."""
+    from messagefoundry.transports.http_auth import oauth2_auth_configured
+    from messagefoundry.transports.smart import smart_auth_configured
+
+    findings: list[tuple[str, str]] = []
+    not_compared: list[tuple[str, str]] = []
+
+    def literal(name: str, settings: Mapping[str, Any], key: str) -> str | None:
+        """The setting when it is a string. Otherwise ``None``, with the reason recorded."""
+        value = settings.get(key)
+        if isinstance(value, str):
+            return value
+        reason = "an env() reference" if isinstance(value, EnvRef) else "not a string"
+        not_compared.append((name, f"{key} is {reason}"))
+        return None
+
+    def smart_leg(name: str, settings: Mapping[str, Any]) -> None:
+        if not smart_auth_configured(settings) or not settings.get("smart_audience"):
+            return
+        audience = literal(name, settings, "smart_audience")
+        token_url = None if audience is None else literal(name, settings, "smart_token_url")
+        if audience is None or token_url is None or audience == token_url:
+            return
+        aud_origin, token_origin = _http_origin(audience), _http_origin(token_url)
+        if audience.rstrip("/").lower() == token_url.rstrip("/").lower():
+            how = "it differs only by letter case or a trailing slash, and it is sent as written"
+        elif aud_origin is None:
+            how = "it is not an http(s) URL that check can read"
+        elif token_origin is None:
+            how = (
+                f"it names {_origin_label(aud_origin)}, and the token URL is not an http(s) URL "
+                "that check can read"
+            )
+        elif aud_origin != token_origin:
+            how = (
+                f"it names {_origin_label(aud_origin)} and the token endpoint is "
+                f"{_origin_label(token_origin)}"
+            )
+        else:
+            how = f"it is on the same origin, {_origin_label(token_origin)}, and is a different URL"
+        findings.append((name, f"smart_audience is not the token URL: {how}"))
+
+    def oauth2_leg(name: str, settings: Mapping[str, Any]) -> None:
+        if not oauth2_auth_configured(settings):
+            return
+        if settings.get("oauth2_scope"):
+            scope = literal(name, settings, "oauth2_scope")
+            if scope is not None and (wild := _wildcard_scope_tokens(scope)):
+                # The token is operator-typed text bound for a terminal, so one that would not
+                # print as itself is described, not echoed.
+                shown = " ".join(
+                    token if token.isascii() and token.isprintable() else "(a token not shown)"
+                    for token in wild
+                )
+                findings.append((name, f"oauth2_scope requests a wildcard: {shown}"))
+        if not settings.get("oauth2_audience"):
+            return
+        audience = literal(name, settings, "oauth2_audience")
+        if audience is None:
+            return
+        aud_origin = _http_origin(audience)
+        if aud_origin is None:
+            # Not a URL means an opaque API identifier, which has nothing to be compared with. A
+            # value that starts like a URL and does not parse is a different case, and is named.
+            if audience.strip().lower().startswith(("http://", "https://")):
+                not_compared.append(
+                    (name, "oauth2_audience is an http(s) URL that check cannot read")
+                )
+            return
+        url = literal(name, settings, "url")
+        if url is None:
+            return
+        url_origin = _http_origin(url)
+        if url_origin is None:
+            not_compared.append((name, "url is not an http(s) URL that check can read"))
+        elif url_origin != aud_origin:
+            findings.append(
+                (
+                    name,
+                    f"oauth2_audience names {_origin_label(aud_origin)} and the connection "
+                    f"calls {_origin_label(url_origin)}",
+                )
+            )
+
+    for oc in registry.outbound.values():
+        smart_leg(oc.name, oc.spec.settings)
+        oauth2_leg(oc.name, oc.spec.settings)
+    for spec in registry.fhir_lookups.values():
+        smart_leg(fhir_lookup_record_name(spec.name), spec.settings)
+    return OAuthRequestAdvisories(findings=sorted(findings), not_compared=sorted(not_compared))
 
 
 def _call_site() -> tuple[str | None, int | None]:
