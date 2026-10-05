@@ -15,7 +15,10 @@ across the five anonymizer test files failed. The tee arms stayed green, which i
 
 from __future__ import annotations
 
+import importlib
 from collections.abc import Callable
+from types import ModuleType
+from typing import Any
 
 import pytest
 
@@ -124,18 +127,103 @@ def test_a_message_with_no_msh_keeps_its_own_refusal() -> None:
             side("ZZTEST SYNTH|wrapped note", salt=_SALT)
 
 
+def _refuses(normalized: Callable[..., str], msg: str, paths: tuple[str, ...]) -> bool:
+    try:
+        normalized(msg, paths)
+    except ValueError:
+        return True
+    return False
+
+
 def test_the_leak_check_and_the_anonymizer_use_one_definition() -> None:
-    """``has_unreachable_line`` is the leak-check's own walk, so the two cannot drift apart: for
-    each line, the anonymizer refuses exactly when the leak-check reports a malformed line."""
-    lines = ["ZZTEST SYNTH|x", "LEE", "ZOE", "msh|x", "PV2", "PV2|", "KIM|F", "ZPD|free", "  "]
+    """For each line and each rule set, the anonymizer refuses exactly when the leak-check reports
+    a malformed line. The rule sets matter: a bare ``ZPD`` flips with them."""
+    lines = ["ZZTEST SYNTH|x", "LEE", "ZOE", "msh|x", "PV2", "PV2|", "KIM|F", "ZPD|free", "ZPD"]
+    rule_sets: tuple[tuple[str, ...], ...] = ((), ("ZPD-1",), ("PID-5", "NK1-2"))
+    seen: set[tuple[str, bool]] = set()
     for leak, normalized in ((engine_leak, engine_normalized), (tee_leak, tee_normalized)):
-        for line in lines:
-            msg = _msg(line)
-            reported = leak.MALFORMED_LINE_HIT in leak.structural_phi_hits(msg, set())
-            assert leak.has_unreachable_line(msg) is reported, line
-            try:
-                normalized(msg)
-                refused = False
-            except ValueError:
-                refused = True
-            assert refused is reported, line
+        for paths in rule_sets:
+            for line in lines:
+                msg = _msg(line)
+                reported = leak.MALFORMED_LINE_HIT in leak.structural_phi_hits(msg, set(paths))
+                assert _refuses(normalized, msg, paths) is reported, (line, paths)
+                seen.add((line, reported))
+    # Both outcomes occur, and the bare Z id is the line whose outcome the rules decide.
+    assert ("ZPD", True) in seen and ("ZPD", False) in seen
+    assert ("LEE", True) in seen and ("LEE", False) not in seen
+    assert ("PV2", False) in seen and ("PV2", True) not in seen
+
+
+# --- a rule naming a segment is the operator's decision about it ------------------------------------
+# Review finding on the first cut of this change: the anonymizer judged a bare id with no rules in
+# hand, so it refused a bare ``ZPD`` that a rule names while the leak-check, given the same rules,
+# passed it. Both now get the same rule paths. A message ending in a bare ``ZPD`` under a rule for
+# ``ZPD-1`` also anonymized on main before this item, so refusing it was a new refusal.
+
+_BARE_ZPD = "\r".join((_HEADER, _PID, "ZPD"))
+_SIDES = pytest.mark.parametrize(
+    ("plain", "checked", "leak"),
+    [
+        (engine_anonymize, engine_anonymize_checked, engine_leak),
+        (tee_anonymize, tee_anonymize_checked, tee_leak),
+    ],
+    ids=("engine", "tee"),
+)
+
+
+def _outcomes(
+    plain: Callable[..., str], checked: Callable[..., str], leak: ModuleType, rules: tuple[Any, ...]
+) -> tuple[bool, bool, bool]:
+    """Whether plain ``anonymize``, ``anonymize_checked`` and ``leak_report`` each ACCEPT the bare
+    ``ZPD`` message under ``rules``."""
+    accepted: list[bool] = []
+    for entry in (plain, checked):
+        try:
+            out = entry(_BARE_ZPD, salt=_SALT, rules=rules)
+        except ValueError as exc:
+            assert "a line no rule can reach" in str(exc)
+            accepted.append(False)
+        else:
+            assert out.endswith("\rZPD")
+            accepted.append(True)
+    hits = leak.leak_report(_BARE_ZPD, rules=rules).hits
+    assert hits in ([], [leak.MALFORMED_LINE_HIT])
+    accepted.append(hits == [])
+    return accepted[0], accepted[1], accepted[2]
+
+
+@_SIDES
+def test_a_bare_id_that_a_rule_names_is_accepted_by_all_three(
+    plain: Callable[..., str], checked: Callable[..., str], leak: ModuleType
+) -> None:
+    rules = (*_default_rules(leak), _rule(leak, "ZPD-1", "name"))
+    assert _outcomes(plain, checked, leak, rules) == (True, True, True)
+
+
+@_SIDES
+def test_a_bare_z_id_that_no_rule_names_is_refused_by_all_three(
+    plain: Callable[..., str], checked: Callable[..., str], leak: ModuleType
+) -> None:
+    """The control: without the rule, the same message is refused, by the same three."""
+    assert _outcomes(plain, checked, leak, _default_rules(leak)) == (False, False, False)
+
+
+@_SIDES
+def test_a_keep_rule_does_not_make_a_bare_id_reachable(
+    plain: Callable[..., str], checked: Callable[..., str], leak: ModuleType
+) -> None:
+    """A KEEP rule rewrites nothing, so the leak-check does not count it as mapping the segment,
+    and the anonymizer is not handed it. The three still agree: all refuse."""
+    rules = (*_default_rules(leak), _rule(leak, "ZPD-1", "keep"))
+    assert _outcomes(plain, checked, leak, rules) == (False, False, False)
+
+
+def _default_rules(leak: ModuleType) -> tuple[Any, ...]:
+    """The default rules of the package ``leak`` belongs to (engine or tee)."""
+    package = importlib.import_module(leak.__name__.rsplit(".", 1)[0])
+    return tuple(package.DEFAULT_RULES)
+
+
+def _rule(leak: ModuleType, path: str, kind: str) -> Any:
+    package = importlib.import_module(leak.__name__.rsplit(".", 1)[0])
+    return package.FieldRule(path, package.SurrogateKind(kind))

@@ -1757,7 +1757,7 @@ these cases:
 | A dashed SSN (`NNN-NN-NNNN`) appears | Fields no rule maps |
 | A punctuated US phone number (`NNN-NNN-NNNN` or `(NNN) NNN-NNNN`) appears | Fields no rule maps |
 | A CX identifier typed `MR` or `MRN` appears | Fields no rule maps |
-| A line no rule can reach (`AnonError`, raised by the anonymizer before the leak-check runs): its first field is not a segment id (a lowercase second `msh` line included), or it has no field separator and is not a segment id the message's HL7 version defines (a wrapped `LEE` or `ZOE`). A bare `PV2` is a legal empty segment and passes | Every line after the MSH header |
+| A line no rule can reach (`AnonError`, raised by the anonymizer before the leak-check runs): its first field is not a segment id (a lowercase second `msh` line included), or it has no field separator and is not a segment id that the message's HL7 version defines or that a rule names (a wrapped `LEE` or `ZOE`). A bare `PV2` is a legal empty segment and passes | Every line after the MSH header |
 | The denylist tables did not load, and the caller passed `require_live_denylist=True` | The token source |
 
 **Everything else in a field no rule maps passes.** That includes a name, a date, an undashed SSN,
@@ -1780,8 +1780,15 @@ names it. Any other id is shown as `(unknown segment)`, so `KIM|F` appears as
   passes as an empty segment. With no readable version in MSH-12, any id that some HL7 version
   defines does.
 
-A bare Z-segment id, such as `ZPD` with no field separator, is refused. Nothing tells it apart
-from a wrapped `ZOE`. Add the trailing separator (`ZPD|`) to the line, then run again.
+A bare Z-segment id, such as `ZPD` with no field separator, is refused unless a rule that
+rewrites a field names that segment. Nothing else tells it apart from a wrapped `ZOE`. A `keep`
+does not count, because it rewrites nothing. To get such a line through, map a field of the
+segment in an `anon.toml` overlay, or add the trailing separator (`ZPD|`), then run again. The
+anonymizer and the leak-check apply this to the same rules, so they accept and refuse the same
+lines.
+
+A bare id from a later HL7 version than MSH-12 names is refused too: `SFT` came in with 2.5, so a
+bare `SFT` in a 2.3 message is not an empty segment.
 
 A line holding only whitespace or control characters is dropped before anything else runs. So is
 whitespace at the very end of the message. The engine and the tee used to disagree on both.

@@ -25,6 +25,7 @@ from __future__ import annotations
 import importlib.util
 import re
 from collections import Counter
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -248,7 +249,9 @@ def _line_is_malformed(fields: list[str], defined: frozenset[str] | set[str]) ->
 
     A segment with no fields is legal HL7, so a bare ``PV2`` is an empty segment and is left
     alone. A bare ``LEE`` or ``ZOE`` is three letters of untrusted text that no rule can address,
-    so it is malformed. Only a defined id counts: a Z-prefix alone does not (BACKLOG #2247)."""
+    so it is malformed. ``defined`` is the ids the message's HL7 version defines plus the ids a
+    rule names, so a bare ``ZPD`` is an empty segment only when a rule names ``ZPD``. A Z-prefix
+    alone does not count (BACKLOG #2247)."""
     seg_id = fields[0]
     if not _SEGMENT_ID.fullmatch(seg_id):
         return True
@@ -350,11 +353,16 @@ def structural_phi_hits(text: str, mapped_paths: set[str]) -> list[str]:
     return hits
 
 
-def has_unreachable_line(text: str) -> bool:
+def has_unreachable_line(text: str, mapped_paths: Iterable[str] = ()) -> bool:
     """True if ``text`` holds a line no rule can reach, by the same walk the leak-check uses.
     ``normalized_message`` refuses on it, so plain ``anonymize`` and ``anonymize_checked`` agree
-    (BACKLOG #2246). False when the message has no parseable MSH; the adapters refuse that."""
-    return any(address == _MALFORMED_LINE for address, _ in unmapped_field_values(text, set()))
+    (BACKLOG #2246). False when the message has no parseable MSH; the adapters refuse that.
+
+    ``mapped_paths`` is the paths of the rules that rewrite a field, the same set
+    :func:`structural_phi_hits` is given. A segment id one of them names may stand bare, so this
+    and the leak-check accept and refuse the same lines for the same rules."""
+    paths = set(mapped_paths)
+    return any(address == _MALFORMED_LINE for address, _ in unmapped_field_values(text, paths))
 
 
 #: Fields ``require_full_coverage`` needs no rule for, but only while the value has the expected
