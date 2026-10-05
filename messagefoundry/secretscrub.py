@@ -64,8 +64,7 @@ The last is the adversarial ceiling, stated rather than hidden: log text is atta
 :data:`_LABEL_PREFIX`'s bounded repetition is O(6N) per word-boundary start position, so a long
 dotted-or-hyphenated run that names every family defeats every admission gate. It is not a NEW class of
 hazard -- :func:`messagefoundry.redaction.redact` costs **33 ms** on the same 6 KB line, before this
-module runs at all. ``support/redact.py`` runs this same pass over ``GET /logs/tail`` and the support
-archive (BACKLOG #2694), so the same ceiling applies there.
+module runs at all, and ``support/redact.py`` has the identical property on ``GET /logs/tail`` today.
 THE CEILING IS A ``_LABEL_PREFIX`` NUMBER AND IT IS THE WHOLE CEILING, which is a claim only since
 BACKLOG #1547: :data:`_DSN_PASSWORD`'s scheme class was reachable from every word boundary in the same
 "." and "-" run, so the same run carrying a ``://`` cost 302 ms at 16 KB rather than 21 ms. That one is
@@ -117,7 +116,7 @@ __all__ = [
 #: What a scrubbed credential VALUE is replaced with. Matches
 #: :class:`logging_setup.CredentialQueryScrubFilter`, so one log line cannot carry two spellings of
 #: "a credential was here". A caller wanting a different marker passes ``placeholder=`` --
-#: ``support/redact.py`` passes its ``[REDACTED]`` (BACKLOG #2694).
+#: ``support/redact.py``'s ``[REDACTED]`` is the one that will.
 CREDENTIAL_PLACEHOLDER = "<redacted>"
 
 #: Label tails that mean "a credential value follows". Bare ``key`` is deliberately absent: it is
@@ -320,16 +319,8 @@ _CREDENTIAL_KV = re.compile(
 # COMMA-JOINED LIST (``store/keyprovider.py::_split_retired``), so a comma terminator would redact the
 # first retired key and print the rest. Whitespace, quotes, ";" and "&" still terminate, so a redaction
 # cannot swallow the rest of a log line. RESIDUAL, stated because this pattern does not cover it: a
-# list written with a SPACE after the comma leaves its later elements unmatched. The support-bundle
-# surface has a long-base64 sweep after this pass that may catch them; the write-time surface has none.
-#
-# MERGING THIS PATTERN WITH ``_CREDENTIAL_KV`` WAS MEASURED, COSTED AND DECLINED (2026-09-06, on the
-# support-bundle copy this module has since replaced). One combined pass was worth 12.3 percent on
-# realistic log text and 30.6 on a base64url line. It is refused on a test property, not on the
-# number. ``tests/test_log_redaction_secret_domain.py`` proves a secret family's own pattern does the
-# work by disabling it (``test_each_family_survives_when_its_own_patterns_are_disabled``), and one
-# merged pattern cannot be disabled for one credential class without the other. Do not re-derive this
-# and take it.
+# list written with a SPACE after the comma leaves its later elements unmatched -- and unlike the
+# support-bundle surface there is no long-base64 sweep behind this one to catch them.
 _KEY_MATERIAL = re.compile(
     r"(?i)\b(" + _LABEL_PREFIX + r"(?:" + _alternation(_KEY_MATERIAL_WORDS) + r"))\b"
     r"['\"]?\s*[:=]\s*['\"]?[^\s'\";&]+"
@@ -393,8 +384,8 @@ _KEY_MATERIAL = re.compile(
 # ``...://`` match here and matched under neither earlier spelling. Over-redaction is the safe
 # direction for a credential pass and group 1 is kept, so a reader loses nothing to it.
 #
-# Pinned five ways in ``tests/test_log_redaction_secret_domain.py``, which guards BOTH surfaces that
-# run this pattern: the anchor structurally, the growth with a stopwatch against the pre-#1547 pattern as its
+# Pinned five ways in ``tests/test_log_redaction_secret_domain.py``, which guards BOTH copies of this
+# vocabulary: the anchor structurally, the growth with a stopwatch against the pre-#1547 pattern as its
 # control, a COUNT of which patterns one ``scrub_credentials`` call actually applies -- which was a
 # share of wall-clock cost until that share went red on a hosted runner for a reason that was not a
 # regression here, recorded in full beside the test's ``_PATTERN_APPLICATIONS`` -- the shapes that must
