@@ -344,16 +344,24 @@ def test_a_date_rule_on_an_msh_field_is_applied_and_still_not_exempt(
     site-code pass rewrites the ``YYYYMM`` it left, because the exemption stops at an MSH line.
     So the two sides give the same bytes and neither keeps the filled date. The control is the
     same value in a segment the exemption does reach."""
-    rules = (
-        *DEFAULT_RULES,
-        engine_rules.FieldRule("MSH-13", SurrogateKind.DATE),
-        engine_rules.FieldRule("ZPD-1", SurrogateKind.DATE),
-    )
+    paths = ("MSH-13", "ZPD-1")
     msg = _msg(
         _HEADER + "|" + _YEAR_MONTH, "PID|1||12345^^^HOSP^MR||DOE^JOHN", "ZPD|" + _YEAR_MONTH
     )
-    engine = engine_anonymize(msg, salt=_SALT, rules=rules)
-    tee = tee_anonymize(msg, salt=_SALT, rules=rules)
+    # Each side gets rules built from its own package's classes, as a real caller would.
+    engine = engine_anonymize(
+        msg,
+        salt=_SALT,
+        rules=(*DEFAULT_RULES, *(engine_rules.FieldRule(p, SurrogateKind.DATE) for p in paths)),
+    )
+    tee = tee_anonymize(
+        msg,
+        salt=_SALT,
+        rules=(
+            *TEE_DEFAULT_RULES,
+            *(tee_rules.FieldRule(p, tee_rules.SurrogateKind.DATE) for p in paths),
+        ),
+    )
     assert engine == tee
     header, _pid, zpd = tee.split("\r")
     assert header.split("|")[12] not in (_YEAR_MONTH, _FILLED)  # MSH-13 sits at split index 12
