@@ -258,3 +258,73 @@ Tests: `tests/test_connection_scheduler.py`, at least
 `test_a_log_halt_is_not_restarted_or_re_paged_by_every_window_tick`,
 `test_a_reload_that_edits_a_schedule_replaces_its_calendar` and
 `test_a_window_open_that_cannot_bind_is_recorded_and_alerted_once`.
+
+## Amendment B (2026-10-04): a refused HTTP Digest challenge is a configuration fault (BACKLOG #2323, batch 191)
+
+> **Status of this amendment: recorded 2026-10-04 by a Builder seat for batch 191.** It describes
+> the code in the pull request for BACKLOG #2323. Amendment A stays as written. This amendment adds
+> one more place that raises the fault class A.1 defines.
+
+A.1 lists the FTP refusals that are configuration faults. The HTTP family now raises one too.
+
+The Digest handlers refuse a challenge they will not answer: a hash other than SHA-256, a malformed
+challenge, or a scheme other than Digest or Basic. They raise `HttpAuthError`, which is a
+`ValueError`. Before #2323, each send caught it as a bad request value and reported
+`bad-request-value`. That is a content-permanent reject, so every queued row would dead-letter in
+turn.
+
+The refusal is the connection's, not the message's. The endpoint or the web proxy sends the same
+challenge to every request. So `rest.auth_challenge_refused` builds a `NegativeAckError` with code
+`auth-challenge-refused`, `permanent` and `config_fault`. `_post` raises it on the REST, SOAP, FHIR
+and DICOMweb destinations.
+
+Nothing in the delivery worker changed. Under `credential_fault_policy="stop"` the lane would stop
+and the queue would stay. The alert would read
+`configuration fault (auth-challenge-refused); lane stopped, queue retained (#2083)`. Under
+`"dead_letter"` the one row dead-letters, or every member of a coalesced batch.
+
+A retry was the other choice, and it was not taken. urllib answers an endpoint's challenge only
+after a first send, so each retry would send the message body once more with no credential. A retry
+also could not succeed until someone changes the peer or the connection.
+
+The token hop is left as it was. `smart.request_token` maps the same refusal to a retryable
+`DeliveryError`. So a bearer connection behind a Digest web proxy would get either outcome: a retry
+when the token must be minted, and a stop when a cached token lets the delivery hop meet the 407.
+That difference is open, and this amendment does not settle it.
+
+The costs, at least these:
+
+- A peer that sends one bad challenge by mistake would stop the lane until an operator reloads or
+  restarts it. A stopped lane keeps every message, which is the trade A.2 makes for a credential
+  stop.
+- "Every row would meet the same refusal" is weaker here than for FTP. An FTP refusal comes while
+  the session opens, before any message. An HTTP challenge answers one request, and a FHIR request
+  path is built per message. A peer that challenges one path differently would stop the lane on that
+  one row, and the row would stay at the head of the queue. `credential_fault_policy="dead_letter"`
+  is the only way out found, and it is one value for the whole engine. Setting it would also turn
+  off the credential stop for every FTP and SFTP outbound.
+- The stop is not absolute where a stage dispatcher drains the lane (the pooled claim mode).
+  `RegistryRunner.notify_work` re-arms every stopped lane there, and a replay or a resend calls it.
+  The head row would then be sent once more before the lane stops again.
+- Under `"stop"` only the code reaches the operator. `_stop_lane_retaining` logs and alerts the
+  code, and the released row keeps no `last_error`. The fixed text shows on a test-connection, and
+  in `last_error` under `"dead_letter"`.
+- The `FhirLookup` read gets the new text and nothing else. A Handler that calls it behind a
+  refusing web proxy would still fail each message in turn, as before.
+
+The fault is raised only where a Digest handler is on the opener and refuses. These unanswered
+challenges do not raise it, at least: a Basic challenge and a Digest challenge with no nonce
+(both read as a plain 401 or 407), a Digest challenge whose `qop` urllib does not support (read as
+unreachable, and retried), and any challenge on a connection with no Digest set up. A DICOMweb
+endpoint challenge cannot raise it, since that destination has no origin Digest. A web proxy
+challenge can raise it only for an `http://` destination, since proxy Digest is refused for
+`https://`.
+
+The probe arms and the `FhirLookup` read are not deliveries, so they carry no fault marker. A probe
+raises a plain `DeliveryError`, and the read raises `FhirLookupError`. Both use the same fixed text.
+The peer's algorithm token and scheme word stay on the cause and never reach `queue.last_error`.
+
+Tests: `tests/test_digest_refusal_classification.py`, at least
+`test_post_reports_a_refused_challenge_as_a_configuration_fault`,
+`test_post_still_reports_a_bad_request_value_as_one` and
+`test_a_refused_challenge_stops_the_lane_and_keeps_the_row`.

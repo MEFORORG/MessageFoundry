@@ -92,6 +92,8 @@ from messagefoundry.transports.bounded_read import (
 # Reuse REST's hardened HTTP plumbing — same transports/ package, same no-redirect + TLS posture.
 from messagefoundry.transports.rest import (
     _NO_REDIRECT_OPENER,
+    AUTH_CHALLENGE_REFUSED,
+    HttpAuthError,
     InsecureHopGuard,
     ProxyConfig,
     _expiry_relaxed_opener,
@@ -99,6 +101,8 @@ from messagefoundry.transports.rest import (
     _no_redirect_opener,
     _NoRedirectHandler,
     _redact_url,
+    assert_probe_hop,
+    auth_challenge_refused,
     capture_response_headers,
     egress_route_from_settings,
     enforce_outbound_length_limits,
@@ -418,21 +422,6 @@ class SoapDestination(DestinationConnector):
         # Message-independent, so they are bounded once here rather than on every send.
         enforce_signature_header_limits(self._signer, connector="SOAP destination")
 
-        # #201 (ADR 0078 amendment): the verify-ON https hops below (mTLS + the shared verifying opener)
-        # validate the peer cert but do no OCSP/CRL revocation (stdlib ssl has none) — refuse an
-        # off-loopback production-PHI verified hop unless revocation is attested. Gated on verify-ON so it
-        # is disjoint from the verify_tls=false / cleartext #200 gates (verify_tls=false takes the else
-        # branch below); loopback / synthetic / non-prod / attested stay byte-identical.
-        if bool(s.get("verify_tls", True)):
-            refuse_unrevoked_verified_hop(
-                scheme,
-                self.url,
-                connector="SOAP destination",
-                revocation_attested=config.tls_revocation_attested,
-                revocation_attested_reason=config.tls_revocation_attested_reason,
-                connection=config.name,
-            )
-
         # #1180 (ADR 0093): the client trust anchor, shared by every VERIFYING branch below. Not
         # resolved on the verify_tls=false branch, which is CERT_NONE and has no roots to choose.
         anchor = http_family_trust_anchor(
@@ -518,6 +507,25 @@ class SoapDestination(DestinationConnector):
                 # cannot reach this hop (ASVS 12.1.2).
                 self._opener = _no_redirect_opener()
             self._opener.add_handler(digest)
+
+        # #201 (ADR 0078 amendment): the verify-ON https hops above (mTLS, expiry-relaxed and the plain
+        # verifying opener) validate the peer cert but do no OCSP/CRL revocation (stdlib ssl has none)
+        # — refuse an off-loopback production-PHI verified hop unless revocation is attested or this
+        # hop's own opener checks a CRL. Gated on verify-ON so it is disjoint from the verify_tls=false
+        # / cleartext #200 gates.
+        #
+        # Below every statement that builds or replaces `self._opener`, and no opener with
+        # tls_allow_expired: see refuse_unrevoked_verified_hop.
+        if bool(s.get("verify_tls", True)):
+            refuse_unrevoked_verified_hop(
+                scheme,
+                self.url,
+                connector="SOAP destination",
+                revocation_attested=config.tls_revocation_attested,
+                revocation_attested_reason=config.tls_revocation_attested_reason,
+                opener=None if bool(s.get("tls_allow_expired", False)) else self._opener,
+                connection=config.name,
+            )
 
         # ADR 0015 amendment (#236): body-secret substitution. Parsed last so the credential validation
         # runs after the hop/TLS posture is settled. Empty tuple (no body_secrets) → send() is
@@ -809,6 +817,8 @@ class SoapDestination(DestinationConnector):
         # this one does not mint a bearer -- it ships ``self.url`` and ``self._headers`` verbatim, and
         # both were bounded at construction. A gate here could not fire on any input, and a guard that
         # cannot fail reads as coverage without being it.
+        # BACKLOG #2196: the hop re-check _post runs, before a byte crosses.
+        assert_probe_hop(self._hop_guard, self.url, connector="SOAP")
         req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s) in __init__
             self.url, headers=self._headers, method="HEAD"
         )
@@ -826,6 +836,9 @@ class SoapDestination(DestinationConnector):
             return  # any other status (the host answered) → reachable
         except urllib.error.URLError as exc:
             raise DeliveryError(f"SOAP {_redact_url(self.url)} unreachable: {exc.reason}") from exc
+        except HttpAuthError as exc:
+            # BACKLOG #2323: as in _post, with the fixed text on the DeliveryError a probe raises.
+            raise DeliveryError(f"SOAP {_redact_url(self.url)} {AUTH_CHALLENGE_REFUSED}") from exc
         except (ValueError, http.client.InvalidURL) as exc:
             # BACKLOG #1793: the probe is the test-connection reply; see the same arm in _post.
             raise DeliveryError(
@@ -845,9 +858,7 @@ class SoapDestination(DestinationConnector):
         # #200 (ADR 0092 decision 4): zero-I/O send-time re-assertion of a permitted insecure hop before
         # a byte crosses (a None guard — secure/loopback — is byte-identical).
         if self._hop_guard is not None:
-            self._hop_guard.assert_send(
-                urllib.parse.urlsplit(self.url).hostname or "", _redact_url(self.url)
-            )
+            self._hop_guard.assert_send_url(self.url)
         # payload is the FINAL wire body (in WS-* mode send() already wrapped + stamped the envelope),
         # so signing over these bytes covers exactly what the partner receives.
         data = encode_wire_body(payload, self.encoding, transport="SOAP")
@@ -927,6 +938,10 @@ class SoapDestination(DestinationConnector):
             ) from exc
         except urllib.error.URLError as exc:
             raise DeliveryError(f"SOAP {_redact_url(self.url)} unreachable: {exc.reason}") from exc
+        except HttpAuthError as exc:
+            # BACKLOG #2323: a refused Digest challenge is the connection's fault, not this
+            # message's. Before the ValueError arm, which it would otherwise match.
+            raise auth_challenge_refused(f"SOAP {_redact_url(self.url)}") from exc
         except (ValueError, http.client.InvalidURL) as exc:
             # BACKLOG #1793: the same arm as rest.py's _post, and the same reasoning. Without it an
             # InvalidURL escaped as an internal error, and its text could hold a password.

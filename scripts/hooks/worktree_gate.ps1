@@ -67,7 +67,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.09.30.2"
+$GateVersion = "2026.10.04.1"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
@@ -2471,8 +2471,12 @@ function Get-RootCommonDirCmp($Root) {
 #     checkout, <its parent>/<its leaf>-<Name>; from the primary that is <repo-parent>/<repo-name>-<Name>.
 #     spawn.ps1 calls it for that sibling form only. With -Nested it makes
 #     <main worktree>/.claude/worktrees/<Name>, whichever checkout's copy runs. Either way it copies the
-#     leak-gate token list, builds the .venv and holds the add lock. remove.ps1 tears down only
-#     the sibling; a nested tree has NO scripted teardown (see new.ps1's Show-NextSteps for why).
+#     leak-gate token list, builds the .venv and holds the add lock. remove.ps1 has two removal
+#     routes (vault BACKLOG #1017). -Name tears down only the sibling of the checkout its copy lives
+#     in. -Path is the checked route: any registered linked worktree that is NOT under
+#     .claude/worktrees. So a tree under .claude/worktrees has NO scripted teardown, with one
+#     overlap: a sibling made beside a linked worktree sits there too, and that worktree's copy
+#     still removes it by -Name (see new.ps1's Show-NextSteps for why the rest are not reached).
 #   * The Claude Code harness makes a NESTED one at <main worktree>/.claude/worktrees/<slug> --
 #     `claude --worktree`, and a subagent's `isolation: worktree`. MEASURED 2026-09-30 for the second:
 #     a subagent whose parent session sat in a nested tree still got its own tree under the MAIN
@@ -2559,6 +2563,31 @@ Your own worktree is nested under .claude/worktrees, where the Claude Code harne
 -Branch is the git ref; -Name is only the DIRECTORY, which cannot contain '/':
         pwsh -NoProfile -File $newHintQ -Branch $(Get-SafeForCommand $Dest) -Name $(Get-SafeForCommand $DestSlug)
 "@
+}
+
+# Does <governed primary>\scripts\worktree\<Script> declare -<Parameter>? Rule 3d asks it of remove.ps1
+# and Path, the checked removal route (vault BACKLOG #1017). The installed hook is decoupled from the
+# checkout it names, so that script can predate the route, and printing the command then hands the
+# reader a line that dies at parameter binding -- the #1032 defect. One file read, deny path only.
+# FAILS CLOSED, the same way the -Nested probe in Get-OwnWorktreeRemedy does: $true only on a positive
+# answer from PowerShell's own parser, which reads the param block and so ignores a commented-out
+# declaration. A missing file, a parse error or any exception is $false. It cannot throw.
+# IT IS A NAME PROBE, NOT A BEHAVIOUR PROBE: it says the line will bind, not what the script then checks.
+# That -Nested probe is the same ten lines with new.ps1 and Nested written in. It is left alone here
+# because it is rule 3b's and this change is rule 3d's text; it can call this function later.
+function Test-ScriptDeclaresParameter([string]$GovDisplay, [string]$Script, [string]$Parameter) {
+    try {
+        $scriptPath = Join-Path (Join-Path (Join-Path $GovDisplay 'scripts') 'worktree') $Script
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$parseErrors)
+        if ($ast -and $ast.ParamBlock -and @($parseErrors).Count -eq 0) {
+            return (@($ast.ParamBlock.Parameters |
+                        Where-Object { $_.Name.VariablePath.UserPath -eq $Parameter }).Count -gt 0)
+        }
+    }
+    catch { }
+    return $false
 }
 
 # Rule 3b -- MOVING THE HEAD of a LINKED WORKTREE that belongs to some other session. Rule 3 below
@@ -3660,72 +3689,6 @@ What to do instead:
         $selfTop = Get-ComparablePath "$(& git -C $cwdRaw rev-parse --show-toplevel 2>$null)".Trim()
         $isSelf = $victimTop -and $selfTop -and ($victimTop -eq $selfTop)
 
-        # WHICH FAMILY IS THE VICTIM IN? The remedy has to be one that can actually reach it, and until
-        # now neither of the two this rule named could (BACKLOG #1057):
-        #
-        #   * `remove.ps1 -Name <dir>` resolves only the <primary>-<dir> sibling; handed anything else it
-        #     fails Test-Path and throws "No such worktree". (Since BACKLOG #1038, `-Nested` also
-        #     resolves <primary>/.claude/worktrees/<dir>. This rule does not print it yet: the not-
-        #     sibling branch below names `git worktree remove`, which reaches every family. Which
-        #     mechanism makes which layout: the WHICH MECHANISM MADE THIS WORKTREE block above.)
-        #   * `prune-merged.ps1` excludes anything with a `.claude/worktrees/` path segment OUTRIGHT --
-        #     its own header says so, and -Name cannot reach them either. That exclusion is deliberate:
-        #     those are the trees a live session gets relocated into.
-        #
-        # Census on this clone 2026-08-06: 45 sibling worktrees, 8 Claude-managed, 4 other -- and every
-        # live session sat in the 8. So the refused caller was reliably handed a command that throws and
-        # a tool that reports nothing about their tree. Same defect as #1032, one rule over: there, rule
-        # 3b printed a new.ps1 command new.ps1 refuses to run. A refusal the reader cannot act on is the
-        # standing invitation to route around the guard, which costs more than the refusal buys.
-        #
-        # THIS BRANCHES THE REMEDY STRING ONLY. Which worktrees rule 3d refuses is untouched, and no
-        # security decision reads $isSibling -- which is what makes a misclassification cheap here and
-        # not in rule 3c. FAILURE DIRECTION, pinned by test rather than asserted: a junction or UNC
-        # spelling breaks the prefix match, classifies NOT-sibling, and the not-sibling remedy is a
-        # literal `git worktree remove <abs path>` that is valid for EVERY family, siblings included.
-        # The dangerous direction needs a non-sibling to SPURIOUSLY match `<primary>-<name>`, which an
-        # unresolved alias makes less likely rather than more.
-        $govLeaf = Split-Path $govWt.Display -Leaf
-        $sibPrefix = "$($govWt.Compare)-"
-        $isSibling = $victimTop -and $victimTop.StartsWith($sibPrefix) -and
-                     -not $victimTop.Substring($sibPrefix.Length).Contains('/')
-        # NAME the directory rather than printing `<directory-name>`. The gate has just resolved the
-        # path; leaving the caller to substitute a placeholder into a command is a second chance to get
-        # it wrong, and it is the reason the own-tree branch was unrunnable for the sibling family too.
-        $sibName = if ($isSibling) { (Split-Path $victimTopRaw -Leaf).Substring($govLeaf.Length + 1) } else { $null }
-        # QUOTED, both arguments, through the shared command helper (BACKLOG #1035/#1040). The path comes
-        # from the operator's allowlist and $sibName from a directory leaf, and a space in either -- an
-        # ordinary thing on Windows -- makes this line exit 64 before -Name is ever bound. Measured: with
-        # a primary at `<tmp>/Pri mary` the unquoted form dies with "The argument '<tmp>/Pri' is not
-        # recognized as the name of a script file"; quoted, the identical line exits 0.
-        $removeCmd = if ($isSibling) {
-            "pwsh -NoProfile -File $(Get-SafeForCommand $govWt.Display -Suffix '\scripts\worktree\remove.ps1')" +
-            " -Name $(Get-SafeForCommand $sibName)"
-        }
-        else {
-            "git -C `"$($govWt.Display)`" worktree remove `"$victimTopRaw`""
-        }
-        # The sibling family KEEPS prune-merged.ps1 and that is not politeness: it is dry-run by default,
-        # it consults occupancy, and it re-reads its fence immediately before each removal. For the family
-        # it covers it is strictly better than a bare `git worktree remove`, so the fix must not become
-        # "stop naming the scripts" -- a test pins that it is still offered here.
-        $cleanupBullet = if ($isSibling) {
-            @"
-  * Cleaning up merged worktrees is a maintenance job with its own dry-run-by-default tool. Run it and
-    READ what it proposes before applying anything:
-        pwsh -NoProfile -File $(Get-SafeForCommand $govWt.Display -Suffix '\scripts\worktree\prune-merged.ps1')
-"@
-        }
-        else {
-            @"
-  * prune-merged.ps1 CANNOT help with this one, so do not reach for it: it skips anything under
-    .claude/worktrees and anything that is not a <repo>-<name> sibling, by design, and its -Name cannot
-    reach them either. If this tree really must go, that is the user's call and this is the command --
-    it is not yours to run:
-        $removeCmd
-"@
-        }
-
         # FOLD THE OPERATOR'S SPELLING BEFORE IT ENTERS A REASON, which every other rule in this file
         # already does and this one did not. It matters MORE after the quote-aware tokeniser above:
         # the old `-split '\s+'` could not produce a token containing whitespace, so the interpolation
@@ -3734,6 +3697,219 @@ What to do instead:
         # the reason, so it owns the fold. (A newline still cannot arrive here -- segments are split
         # per line above -- so this closes the reachable half, not a whole class.)
         $victimMsg = Get-SafeForMessage $victimRaw
+        $govMsg = Get-SafeForMessage $govWt.Display
+        $listCmd = "git -C $(Get-SafeForCommand $govWt.Display) worktree list"
+        # `move` HAS ITS OWN TWO TEXTS, AND THEY COME FIRST. Both verbs reach this rule, and the
+        # removal texts further down talk about deletion, the surviving branch and remove.ps1, none of
+        # which is true of a move. A move deletes nothing: what it breaks is every record keyed on the
+        # old PATH. Being first also means a move never reads remove.ps1 to build text it will not print.
+        #
+        # THE BACKTICKS IN THESE TEXTS ARE DOUBLED, and the removal text's were not. In an expandable
+        # here-string a single backtick is an escape, so the old ``remove.ps1 -DeleteBranch`` printed a
+        # CARRIAGE RETURN in place of its first two characters and dropped the other backticks.
+        # Write-Deny exits, so the second call in each pair runs only when the first did not.
+        if ($wtVerb -eq 'move') {
+            if ($isSelf) {
+                Write-Deny -Rule "3d" -Detail "git worktree $wtVerb (own worktree)" -Reason @"
+BLOCKED: 'git worktree $wtVerb $victimMsg' acts on THE WORKTREE THIS SESSION IS RUNNING IN.
+
+This is not somebody else's tree and nothing here says it is. Moving your own checkout mid-session
+changes the path under the files you are working on. This session's working directory would name a
+directory that is no longer there, and so would every claim, allocation and seat record keyed on
+that path.
+
+There is no version of this you can run from here.
+
+What to do instead:
+  * If the work needs a different directory, make a new worktree there and leave this one where it is.
+  * If this tree really must sit somewhere else, that is the user's decision, after this session
+    ends. Tell them: "I want the worktree $victimMsg moved, and I need you to decide."
+"@
+            }
+            Write-Deny -Rule "3d" -Detail "git worktree $wtVerb" -Reason @"
+BLOCKED: 'git worktree $wtVerb $victimMsg' acts on a worktree of $govMsg that is NOT the tree
+this session is running in. This gate cannot tell whether another session is using it -- it has no
+occupancy or authorship signal -- so it refuses rather than guess.
+
+If it IS in use, moving it takes the directory out from under that session. Its working directory
+stops existing, and it finds out when its next file read fails. Every claim, allocation and seat
+record keyed on the old path stops matching too, and an allocation cannot be re-keyed.
+
+What to do instead:
+  * There is no checked route for a move, and a session does not run one. If the tree must sit
+    somewhere else, that is the user's decision. Tell them: "I want the worktree $victimMsg moved,
+    and I need you to decide."
+  * To see where each worktree sits and what it is on, look:
+        $listCmd
+"@
+        }
+
+        # WHICH ROUTE CAN REACH THE VICTIM? The remedy has to be one that can actually reach it
+        # (BACKLOG #1057), and since vault BACKLOG #1017 there are three, each with its own reach.
+        # Which mechanism makes which layout: the WHICH MECHANISM MADE THIS WORKTREE block above.
+        #
+        #   * `remove.ps1 -Path <abs path>` is the CHECKED route: any registered linked worktree that
+        #     is NOT under .claude/worktrees. It refuses a tree a session is recorded in, an unreadable
+        #     session registry, and a tree holding anything uncommitted; its own header has the list.
+        #     It runs as a script, so the removal inside it never reaches this rule, which scans the
+        #     tool call's command line. That is what makes it a route a session can run.
+        #   * `remove.ps1 -Name <dir>` resolves only the <primary>-<dir> sibling. It has no occupancy
+        #     check. It is printed only as the fallback below.
+        #   * `prune-merged.ps1` is dry-run by default and consults occupancy, for siblings only. It
+        #     excludes anything with a `.claude/worktrees/` path segment OUTRIGHT.
+        #
+        # A TREE UNDER .claude/worktrees GETS NO COMMAND AT ALL, ON PURPOSE (BACKLOG #1038, Manager
+        # decision batch 184). The occupancy check behind -Path reads the directory a session was
+        # launched in, and a subagent under `isolation: worktree` is recorded under its PARENT's, so
+        # its tree reads as empty. The engine's -Path refuses that population for this reason; the
+        # text does not print the command for it against any governed repository.
+        #
+        # THE HUMAN WAS THE ONLY ACTUATOR HERE UNTIL 2026-10-04, AND THAT POSTURE IS REVERSED FOR
+        # REMOVAL ONLY. Both deny texts used to hand the removal to the user ("it is not yours to
+        # run"). Owner instruction, in session, that day: "let's change the gate so that sessions can
+        # run these but still have the protection this was designed for". So the text now names the
+        # checked route and says a session may run it. A raw `git worktree remove` is still denied,
+        # exactly as before, and -Force stays the user's: no -Force command is printed.
+        #
+        # THE -Path LINE IS PRINTED ONLY WHEN THE PRIMARY'S remove.ps1 DECLARES IT
+        # (Test-ScriptDeclaresParameter). Otherwise the text says that script predates the route, and the
+        # sibling family keeps the -Name line it had.
+        #
+        # THIS BRANCHES THE REMEDY STRING ONLY. Which worktrees rule 3d refuses is untouched, and no
+        # allow or deny decision reads $isSibling, $isManaged or $pathRoute -- which is what makes a
+        # misclassification cheap here and not in rule 3c. FAILURE DIRECTIONS, pinned by test: a
+        # junction or UNC spelling breaks the sibling prefix match and classifies NOT-sibling, which
+        # costs the prune-merged.ps1 line and nothing else, because the -Path line takes the resolved
+        # path either way. A managed tree misread as NOT managed is handed a -Path line the engine's
+        # script refuses by its own check; the reverse costs a route.
+        $govLeaf = Split-Path $govWt.Display -Leaf
+        $sibPrefix = "$($govWt.Compare)-"
+        $isSibling = $victimTop -and $victimTop.StartsWith($sibPrefix) -and
+                     -not $victimTop.Substring($sibPrefix.Length).Contains('/')
+        $isManaged = $victimTop -and ($victimTop -match '/\.claude/worktrees(/|$)')
+        # THE PRIMARY ITSELF IS NOBODY'S TO REMOVE. Git never removes a main worktree and the script
+        # refuses it by name, so printing the -Path line for it would hand the reader a dead end.
+        $isPrimary = $victimTop -and ($victimTop -eq $govWt.Compare)
+        $pathRoute = (-not $isManaged) -and (-not $isPrimary) -and
+                     (Test-ScriptDeclaresParameter $govWt.Display 'remove.ps1' 'Path')
+        # NAME the directory rather than printing `<directory-name>`. The gate has just resolved the
+        # path; leaving the caller to substitute a placeholder into a command is a second chance to get
+        # it wrong, and it is the reason the own-tree branch was unrunnable for the sibling family too.
+        $sibName = if ($isSibling) { (Split-Path $victimTopRaw -Leaf).Substring($govLeaf.Length + 1) } else { $null }
+        # QUOTED, every argument, through the shared command helper (BACKLOG #1035/#1040). The path comes
+        # from the operator's allowlist, $sibName from a directory leaf and the victim from git, and a
+        # space in any of them -- an ordinary thing on Windows -- makes the line exit 64 before the
+        # parameter is ever bound. Measured: with a primary at `<tmp>/Pri mary` the unquoted form dies
+        # with "The argument '<tmp>/Pri' is not recognized as the name of a script file"; quoted, the
+        # identical line exits 0. The not-sibling line used to be a raw `git -C "..." worktree remove
+        # "..."` in DOUBLE quotes, which expand `$( )`; it is gone, and nothing replaced it with git.
+        $removeScriptQ = Get-SafeForCommand $govWt.Display -Suffix '\scripts\worktree\remove.ps1'
+        $victimTopMsg = Get-SafeForMessage $victimTopRaw
+        $removeCmd = if ($pathRoute) {
+            "pwsh -NoProfile -File $removeScriptQ -Path $(Get-SafeForCommand $victimTopRaw)"
+        }
+        elseif ($isSibling) {
+            "pwsh -NoProfile -File $removeScriptQ -Name $(Get-SafeForCommand $sibName)"
+        }
+        else { '' }
+        # One sentence, said in two of the texts below.
+        $predatesWhy = "The remove.ps1 in $govMsg predates ``-Path``, the route that checks a tree before removing it"
+        # Why there is no command, for the two shapes that get none. Prose, so it is folded, not quoted.
+        $noRouteWhy = if ($isPrimary) {
+            @"
+THIS IS THE PRIMARY CHECKOUT, AND NOTHING REMOVES IT. Git refuses to remove a main worktree, and
+    so does every script here. Every other worktree of this repository hangs off it.
+"@
+        }
+        elseif ($isManaged) {
+            @"
+THIS GATE NAMES NO SCRIPT FOR THIS TREE, and that is deliberate. It is under .claude/worktrees,
+    where the Claude Code harness puts a session or a subagent. The occupancy check behind
+    ``remove.ps1 -Path`` reads the directory a session was LAUNCHED in, and a subagent's tree is
+    recorded under its parent's, so the check would read it as empty. prune-merged.ps1 skips it for
+    the same reason.
+"@
+        }
+        else {
+            @"
+THERE IS NO CHECKED ROUTE FOR THIS TREE YET.
+    $predatesWhy,
+    and prune-merged.ps1 skips anything that is not a <repo>-<name> sibling. Updating that checkout
+    brings the route.
+"@
+        }
+        # The sibling family KEEPS prune-merged.ps1 and that is not politeness: it is dry-run by default,
+        # it consults occupancy, and it re-reads its fence immediately before each removal. A test pins
+        # that it is still offered here.
+        $pruneBullet = if ($isSibling) {
+            @"
+  * Cleaning up merged worktrees is a maintenance job with its own dry-run-by-default tool. Run it and
+    READ what it proposes before applying anything:
+        pwsh -NoProfile -File $(Get-SafeForCommand $govWt.Display -Suffix '\scripts\worktree\prune-merged.ps1')
+
+"@
+        }
+        else { '' }
+        $routeBullet = if ($pathRoute) {
+            @"
+  * A FINISHED tree has a checked route, and a session may run it. It makes checks this gate cannot,
+    at least these: the tree holds no uncommitted or untracked work, and no session is recorded in
+    it. Build caches such as .venv and node_modules go with the tree unchecked. It removes the
+    directory and never the branch. Run exactly this line, with no other switch:
+        $removeCmd
+  * IF THE SCRIPT REFUSES, STOP. Tell the user what it refused and why, in its own words. A refusal
+    is final for a session: -Force is the user's switch, and so is any other route.
+"@
+        }
+        elseif ($isSibling -and -not $isManaged) {
+            @"
+  * $predatesWhy,
+    so there is no checked single-tree route yet. If this tree must go now, tell the user: "I want
+    the worktree $victimTopMsg removed, and the checked route is not in that checkout yet."
+"@
+        }
+        elseif ($isPrimary) {
+            @"
+  * $noRouteWhy
+    If the whole checkout is to go, that is the user's decision, and it is not a worktree operation.
+"@
+        }
+        else {
+            @"
+  * $noRouteWhy
+    Removing $victimTopMsg is the user's decision. Tell them so. They run ``git worktree remove``
+    from outside it, and nothing there checks whether a session is still in it.
+"@
+        }
+        # The own-tree text: the removal runs from OUTSIDE, after this session, by whoever is there.
+        $ownRouteLines = if ($pathRoute) {
+            @"
+session ends." The removal runs from OUTSIDE this tree, by the user or by a session
+    standing somewhere else. It checks the tree first and removes the directory, never the branch:
+        $removeCmd
+    Whoever runs it adds no other switch. If it refuses, that is final for a session.
+"@
+        }
+        elseif ($isSibling) {
+            @"
+session ends." Removal is theirs to run from OUTSIDE this tree:
+        $removeCmd
+"@
+        }
+        elseif ($isPrimary) {
+            @"
+session ends." That is theirs to decide.
+    $noRouteWhy
+"@
+        }
+        else {
+            @"
+session ends." Removal is theirs to decide and to run, from OUTSIDE this tree, with
+    ``git worktree remove``. Nothing there checks whether a session is still in it.
+    $noRouteWhy
+"@
+        }
+
         if ($isSelf) {
             Write-Deny -Rule "3d" -Detail "git worktree $wtVerb (own worktree)" -Reason @"
 BLOCKED: 'git worktree $wtVerb $victimMsg' acts on THE WORKTREE THIS SESSION IS RUNNING IN.
@@ -3748,35 +3924,32 @@ files you are working on, and the removal has to happen from OUTSIDE this tree, 
 What to do instead:
   * Finish and COMMIT anything you still want. A commit survives the tree being deleted; a dirty tree
     does not.
-  * Then ask the user, in these words: "I am finished in $victimMsg and it can be removed once this
-    session ends." Removal is theirs to run from OUTSIDE this tree:
-        $removeCmd
+  * Then say so, in these words: "I am finished in $victimMsg and it can be removed once this
+    $ownRouteLines
   * If you only wanted to leave it, just stop using it -- an unused worktree costs disk, not correctness.
 "@
         }
         else {
             Write-Deny -Rule "3d" -Detail "git worktree $wtVerb" -Reason @"
-BLOCKED: 'git worktree $wtVerb $victimMsg' acts on a worktree of $($govWt.Display) that is NOT the tree
+BLOCKED: 'git worktree $wtVerb $victimMsg' acts on a worktree of $govMsg that is NOT the tree
 this session is running in. This gate cannot tell whether another session is using it -- it has no
-occupancy or authorship signal -- so it refuses rather than guess.
+occupancy or authorship signal -- so it refuses the raw git command rather than guess.
 
 If it IS in use, removing it deletes that session's WORKING TREE and any uncommitted work in it. There
 is no undo for the uncommitted half, and the session using it finds out when its next file read fails.
 That asymmetry is why the default is refusal even though the tree may well be abandoned.
 
-THE BRANCH SURVIVES, and this refusal used to say otherwise. `git worktree remove` does not touch the
-branch -- deleting one is a separate act (`remove.ps1 -DeleteBranch`, or `git branch -d` by hand). So
-anything COMMITTED there is still reachable by name after the tree is gone; it is the dirty tree that
-is unrecoverable. Overstating the harm is not a safe error in a refusal: a reader who knows git spots
-that the gate is wrong about git, and a control that is wrong about its own subject is the one people
-route around.
+THE BRANCH SURVIVES, and this refusal used to say otherwise. ``git worktree remove`` does not touch the
+branch -- deleting one is a separate act (``remove.ps1 -Name <dir> -DeleteBranch``, or ``git branch -d`` by
+hand). So anything COMMITTED there is still reachable by name after the tree is gone; it is the dirty
+tree that is unrecoverable. Overstating the harm is not a safe error in a refusal: a reader who knows
+git spots that the gate is wrong about git, and a control that is wrong about its own subject is the
+one people route around.
 
 What to do instead:
-$cleanupBullet
-  * To find out whether a worktree is still in use, look rather than delete:
-        git -C "$($govWt.Display)" worktree list
-  * If you are certain it is abandoned and must go now, that is the user's call, not yours. Say so:
-    "I want to remove the worktree $victimMsg and I need you to confirm it is not in use."
+$routeBullet
+$pruneBullet  * To find out whether a worktree is still in use, look rather than delete:
+        $listCmd
 "@
         }
     }

@@ -17,8 +17,10 @@ The route walk's own tests for the same blind spots are in ``tests/test_route_ga
 
 from __future__ import annotations
 
+import contextlib
 import inspect
-from collections.abc import AsyncIterator
+import logging
+from collections.abc import AsyncIterator, Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +33,7 @@ from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 import messagefoundry.api.app as app_module
+import messagefoundry.api.security as security_module
 from messagefoundry.api.app import create_app, create_managed_app
 from messagefoundry.api.security import (
     UNDECLARED_ROUTE_DETAIL,
@@ -38,10 +41,20 @@ from messagefoundry.api.security import (
     public_route,
     require,
     route_is_declared,
+    undeclared_route_refusals,
 )
 from messagefoundry.auth.permissions import Permission
 from messagefoundry.auth.service import AuthService
-from messagefoundry.config.settings import AuthSettings, EgressSettings
+from messagefoundry.config.settings import (
+    AiSettings,
+    AlertsSettings,
+    ApprovalsSettings,
+    AuthSettings,
+    EgressSettings,
+    SecuritySettings,
+    ServiceStatusSettings,
+    StoreSettings,
+)
 from messagefoundry.pipeline import Engine
 from scripts.security import route_gates
 
@@ -50,6 +63,12 @@ pytest.importorskip("messagefoundry_webconsole")
 
 def _route_keys(app: FastAPI) -> set[tuple[str, str]]:
     return {(r.method, r.path) for r in route_gates.route_rows(app)}
+
+
+def _walked_create_app() -> Callable[..., FastAPI]:
+    """The `create_app` the walk's `full_surface_app` calls, read where a test can replace it."""
+    factory: Callable[..., FastAPI] = vars(route_gates)["create_app"]
+    return factory
 
 
 def _without_refusal(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -109,7 +128,7 @@ def test_no_create_app_flag_registers_a_route_the_full_surface_app_lacks(full_ap
     boolean ``create_app`` takes must add no route, or the walk would never see it."""
     full = _route_keys(full_app)
     flipped = 0
-    for name, param in inspect.signature(create_app).parameters.items():
+    for name, param in inspect.signature(_walked_create_app()).parameters.items():
         if not isinstance(param.default, bool) or name in route_gates.ROUTE_REGISTERING_FLAGS:
             continue
         flipped_app = route_gates.full_surface_app(**{name: not param.default})
@@ -117,6 +136,121 @@ def test_no_create_app_flag_registers_a_route_the_full_surface_app_lacks(full_ap
         assert not extra, f"create_app({name}={not param.default}) registers {sorted(extra)}"
         flipped += 1
     assert flipped >= 5, f"only {flipped} boolean flags were flipped; the signature read went wrong"
+
+
+# Vault BACKLOG #2846: the test above flips only a parameter whose default is a bool, so a parameter
+# defaulting to None, a string or a tuple was never tried. Each such parameter is listed here with
+# the values to try in its place. A new one fails the signature pin below until it is listed, which is
+# the point at which someone decides whether it registers a route.
+
+
+@contextlib.asynccontextmanager
+async def _noop_lifespan(app: FastAPI) -> AsyncIterator[None]:
+    yield
+
+
+#: Every non-bool ``create_app`` parameter, and the non-default values to build the full-surface app
+#: with. ``engine`` and ``auth`` need a live store, so the async test below covers them.
+_NON_BOOL_VALUES: dict[str, tuple[Any, ...]] = {
+    "lifespan": (_noop_lifespan,),
+    "ai_settings": (AiSettings(),),
+    "store_settings": (StoreSettings(),),
+    "security_settings": (SecuritySettings(),),
+    "approvals": (ApprovalsSettings(),),
+    "alerts_settings": (AlertsSettings(),),
+    "service_settings": (ServiceStatusSettings(),),
+    "ws_allowed_origins": (("https://console.example.test",),),
+    "public_origin": ("https://console.example.test",),
+    "oidc_authorization_endpoint": ("https://idp.example.test/authorize",),
+    "webauthn_rp_from_request": (True, False),
+    "tls_client_cert_identities": ({"CN=Example Issuer": {"CN=svc.example.test": "svc"}},),
+    "trusted_proxies": (("10.0.0.1",),),
+    "log_dir": ("synthetic-log-dir",),
+    "configured_log_level": ("INFO",),
+}
+_NON_BOOL_BUILT_BY_FIXTURE = frozenset({"engine", "auth"})
+
+
+def _unlisted_non_bool_parameters() -> set[str]:
+    signature = inspect.signature(_walked_create_app())
+    non_bool = {n for n, p in signature.parameters.items() if not isinstance(p.default, bool)}
+    return non_bool - _NON_BOOL_VALUES.keys() - _NON_BOOL_BUILT_BY_FIXTURE
+
+
+def _routes_added_by(
+    tries: Mapping[str, tuple[Any, ...]], full: set[tuple[str, str]]
+) -> dict[str, list[tuple[str, str]]]:
+    """The routes each listed value adds to the full-surface app, keyed ``name=value``."""
+    added: dict[str, list[tuple[str, str]]] = {}
+    for name, values in tries.items():
+        for value in values:
+            extra = _route_keys(route_gates.full_surface_app(**{name: value})) - full
+            if extra:
+                added[f"{name}={value!r}"] = sorted(extra)
+    return added
+
+
+def test_every_non_bool_create_app_parameter_is_listed() -> None:
+    unlisted = _unlisted_non_bool_parameters()
+    assert not unlisted, (
+        f"create_app gained non-bool parameter(s) {sorted(unlisted)}. List each in _NON_BOOL_VALUES "
+        "with a value to try, so the test below checks whether it registers a route."
+    )
+    signature = inspect.signature(_walked_create_app())
+    stale = (_NON_BOOL_VALUES.keys() | _NON_BOOL_BUILT_BY_FIXTURE) - signature.parameters.keys()
+    assert not stale, f"listed but no longer a create_app parameter: {sorted(stale)}"
+
+
+def test_no_non_bool_create_app_parameter_registers_a_route_the_full_surface_app_lacks(
+    full_app: FastAPI,
+) -> None:
+    added = _routes_added_by(_NON_BOOL_VALUES, _route_keys(full_app))
+    assert not added, f"these create_app values register routes the walk never sees: {added}"
+
+
+def _create_app_with(new_parameter: inspect.Parameter) -> Any:
+    """``create_app`` with one more keyword parameter, which registers ``/zz/new`` when set."""
+    real = _walked_create_app()
+
+    def planted(*args: Any, **kwargs: Any) -> FastAPI:
+        value = kwargs.pop(new_parameter.name, new_parameter.default)
+        app = real(*args, **kwargs)
+        if value != new_parameter.default:
+
+            @app.get("/zz/new")
+            @public_route("a synthetic route a new parameter registers")
+            async def new() -> dict[str, str]:
+                return {"ok": "reached"}
+
+        return app
+
+    signature = inspect.signature(real)
+    planted.__signature__ = signature.replace(  # type: ignore[attr-defined]
+        parameters=[*signature.parameters.values(), new_parameter]
+    )
+    return planted
+
+
+def test_a_new_non_bool_parameter_fails_the_pin_and_one_that_registers_a_route_is_caught(
+    full_app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for the two tests above: each one bites on a parameter planted to break it."""
+    parameter = inspect.Parameter(
+        "extra_routes_from", inspect.Parameter.KEYWORD_ONLY, default=None, annotation="str | None"
+    )
+    monkeypatch.setattr(route_gates, "create_app", _create_app_with(parameter))
+    assert _unlisted_non_bool_parameters() == {"extra_routes_from"}
+    added = _routes_added_by({"extra_routes_from": ("synthetic",)}, _route_keys(full_app))
+    assert added == {"extra_routes_from='synthetic'": [("GET", "/zz/new")]}, added
+
+
+async def test_the_engine_and_auth_arguments_register_no_route_the_full_surface_app_lacks(
+    engine: Engine, full_app: FastAPI
+) -> None:
+    service = AuthService(engine.store, AuthSettings())
+    await service.initialize()
+    built = route_gates.full_surface_app(engine=engine, auth=service)
+    assert not _route_keys(built) - _route_keys(full_app)
 
 
 @pytest.fixture
@@ -347,6 +481,38 @@ def test_a_websocket_that_declares_nothing_is_refused_and_one_that_declares_is_s
         assert getattr(refusal, "status_code", None) == 403 or refusal.code == 1008, refusal
         with client.websocket_connect("/zz/ws-declared"):
             pass
+
+
+async def test_every_refusal_is_counted_and_the_log_is_throttled_not_silenced(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Vault BACKLOG #2846. The refusal used to log only the first time it worked a route out, so
+    every later refusal of that route wrote nothing. Now each one is counted, and a line is written
+    at most once per interval, carrying how many refusals it stands for. The line names the route
+    template and never the request, so a query string a caller sent does not reach the log."""
+    app = _planted_app()
+    route = next(r for r in app.routes if getattr(r, "path", None) == "/zz/undeclared")
+    refusals = "messagefoundry.api.security"
+    monkeypatch.setattr(security_module, "REFUSAL_LOG_INTERVAL_SECONDS", 3600.0)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+        with caplog.at_level(logging.ERROR, logger=refusals):
+            for _ in range(3):
+                assert (await client.get("/zz/undeclared?mrn=SECRET-MRN")).status_code == 403
+        throttled = [r.getMessage() for r in caplog.records if r.name == refusals]
+        assert undeclared_route_refusals(route) == 3
+        assert len(throttled) == 1, throttled
+        assert "(1 refusals since the last log line, 1 in all)" in throttled[0]
+
+        caplog.clear()
+        monkeypatch.setattr(security_module, "REFUSAL_LOG_INTERVAL_SECONDS", 0.0)
+        with caplog.at_level(logging.ERROR, logger=refusals):
+            assert (await client.get("/zz/undeclared?mrn=SECRET-MRN")).status_code == 403
+        (line,) = [r.getMessage() for r in caplog.records if r.name == refusals]
+    assert undeclared_route_refusals(route) == 4
+    assert line.startswith("refused route /zz/undeclared:"), line
+    assert "(3 refusals since the last log line, 4 in all)" in line, line
+    assert "mrn" not in "".join(throttled + [line])
 
 
 def test_a_declaration_needs_a_reason() -> None:

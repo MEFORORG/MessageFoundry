@@ -123,8 +123,12 @@ reported here: `MEFOR_ALLOW_INSECURE_TLS` (the `enforcement = warn` entry names 
 > enumerated deviations above, except `update_url_form` (its entry says which records it has). It is
 > **not yet** an exhaustive register of every security-relevant
 > switch in every section: `[store].encrypt` / `trust_server_certificate` and
-> `[auth].enabled` / `require_mfa` / `ad_tls_verify` /
-> `oidc_require_mfa_claim` are gated by their own serve-time refusals and are **not** reported here.
+> `[auth].ad_tls_verify` are gated by their own serve-time refusals and are **not** reported here.
+> `[auth].enabled` is no longer a config key: `serve` always requires sign-in and refuses the key at
+> load (vault BACKLOG #2719). `[auth].oidc_require_mfa_claim` is not reported either, and it has
+> no serve-time refusal of its own. Turned off, it mints every OIDC session with no factor met. While
+> `[security].require_mfa` is on, that session then owes an engine factor at the access gate.
+> `require_mfa` itself is reported: see its entry below.
 > That gap is enumerated in the floor test's exemption set, so it is a written decision rather than an
 > accident, and a *new* switch in either section cannot join it silently. Closing it is owed work.
 
@@ -977,7 +981,7 @@ This section is kept rather than deleted, because the claim it used to make is t
 ### `tls_revocation_attested = true` on a connection — revocation checked outside the engine
 > **Connection-scoped**, both directions: an `inbound()`/`outbound()` keyword, or a **top-level**
 > `connections.toml` key (not under `[settings]`), always paired with a mandatory
-> `tls_revocation_attested_reason`.
+> `tls_revocation_attested_reason`. A `FhirLookup()` takes the same keyword pair.
 > [ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)
 > §1.5 item 4.
 - **What you lose:** the engine's refusal of a *verifying* TLS hop that checks no certificate
@@ -985,6 +989,9 @@ This section is kept rather than deleted, because the claim it used to make is t
   OCSP or CRL). On an mTLS listener it is the `check_inbound_revocation` refusal of a listener with
   `tls_ca_file` and no `tls_crl_file`. With the attestation set, a revoked but unexpired certificate on
   that hop is accepted **unless your PKI or terminator stops it**, because the engine will not.
+  **On a `FhirLookup`, one declaration lifts two refusals** (BACKLOG #2193): the https read to the
+  FHIR server, and the SMART token endpoint the lookup signs in to. Those are often two hosts, so
+  the reason has to hold for both.
 - **When acceptable:** a revocation-checking PKI or terminator really does cover this hop, and you can
   name it. That name belongs in the reason. On a listener, prefer `tls_crl_file`, which checks
   revocation in the engine and needs no attestation.

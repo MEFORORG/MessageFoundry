@@ -276,15 +276,25 @@ def test_the_reconcile_report_prints_message_keys_and_differences_escaped() -> N
 
 
 def test_the_shared_rule_imports_only_the_standard_library() -> None:
-    # harness/load/rigadmin.py imports it from a file that promises the standard library only.
+    # harness/load/rigadmin.py imports it from a file that promises the standard library only. The
+    # one engine import is `controlchars`, which holds CONTROL_CATEGORIES (vault BACKLOG #2815), and
+    # that leaf is held to the standard library alone, so the promise survives the hop.
     import ast
     import sys
     from pathlib import Path
 
+    import messagefoundry.controlchars as leaf
     import messagefoundry.terminal_text as module
 
-    tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
-    imported = {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
-    imported |= {n.module or "" for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
-    assert imported, "the walk found no import at all, so it proves nothing"
-    assert {name.split(".")[0] for name in imported} <= set(sys.stdlib_module_names)
+    def imports(path: str | None) -> set[str]:
+        assert path is not None
+        tree = ast.parse(Path(path).read_text(encoding="utf-8"))
+        found = {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
+        found |= {n.module or "" for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
+        assert found, f"the walk found no import at all in {path}, so it proves nothing"
+        return found
+
+    stdlib = set(sys.stdlib_module_names)
+    rule = imports(module.__file__)
+    assert {name.split(".")[0] for name in rule - {"messagefoundry.controlchars"}} <= stdlib
+    assert {name.split(".")[0] for name in imports(leaf.__file__)} <= stdlib

@@ -56,8 +56,10 @@ does not, because every call in a handler would then need an entry. So is a broa
 handler count), and a ``raise err`` of an error caught by an inner handler nested inside a
 body-holding one (that error's ``__context__`` is the body error, but the innermost-name skip passes
 it). And so is a body-holding error that propagates unwrapped (``RawMessage.json`` let json's own
-error out until #2085), or one caught behind a helper, such as the environment values loader. Frame locals are also
-out of scope: the raised exception's own
+error out until #2085), or one caught behind a helper. The environment values loader was that case:
+its two guards chained a TOMLDecodeError holding the whole value file until BACKLOG #2307 moved both
+raises out of their handlers, and ``tests/test_refusals_carry_no_chain.py`` drives them by hand,
+because this scan still cannot see them. Frame locals are also out of scope: the raised exception's own
 ``__traceback__`` reaches the same frame whether or not the chain is cut, so ``from None`` could never
 have hidden them either. The scan covers ``messagefoundry/`` and ``messagefoundry_toolkit/`` (ADR 0201
 moves engine code there); ``tee/`` and ``harness/`` are not
@@ -839,11 +841,6 @@ _BODY_ALLOWED: tuple[_Allowed, ...] = (
         "messagefoundry/store/content_search.py::make_spec::HL7PeekError::ContentSearchError",
         _SAFE + "parse_path quotes only the operator's own field path, and the new error's text is "
         "that same string",
-    ),
-    # ---- UNSAFE: in anon/, which batch-168's #1710 Builder holds, so not edited under #2085.
-    _Allowed(
-        "messagefoundry/anon/rules.py::load_rules::(OSError, tomllib.TOMLDecodeError)::RuleError",
-        _UNSAFE + "the TOMLDecodeError's .doc is the whole rules file; raise after the handler",
     ),
 )
 

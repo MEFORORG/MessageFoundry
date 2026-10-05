@@ -78,7 +78,7 @@ label, would silently stop scrubbing a credential whose label is longer than the
 silent security narrowing for time on a synthetic input, against a cost this module does not dominate,
 is the wrong direction.
 
-WHAT KEEPS THE REAL NUMBERS SMALL is the admission gating described below -- a casefolded substring
+WHAT KEEPS THE REAL NUMBERS SMALL is the admission gating described below -- a folded substring
 test, not a compiled alternation, and one per pass rather than one shared. Between them they took the
 plain line from 4.4 us to 0.9 us and the credential line from 7.8 us to 3.7 us; the 6 KB run naming no
 credential word went from 0.39 ms to 15 us.
@@ -405,45 +405,86 @@ def _keep_label(m: re.Match[str], placeholder: str) -> str:
 # --- ADMISSION GATING: what makes a per-record credential pass affordable --------------------------
 #
 # THE INVARIANT, and it is what makes gating safe rather than merely fast: a pattern whose label
-# alternates come from tuple W cannot match text containing none of W's members. So skipping that
-# pattern when no member is present cannot narrow what the pass sees. That is a property of building
-# the gate and the pattern from ONE tuple, not a claim about the regexes, and
-# ``test_the_hint_gates_never_change_the_result`` compares the gated and ungated passes over every
-# fixture rather than trusting the argument.
+# alternates come from tuple W cannot match text whose :func:`_gate_fold` contains none of W's
+# members. So skipping that pattern when no member is present cannot narrow what the pass sees. That
+# is a property of building the gate and the pattern from ONE tuple, PLUS one claim about the regex
+# engine: that :data:`_GATE_FOLDS` holds every character ``(?i)`` reads as an ASCII letter. That
+# claim is measured, not argued; see the table. ``test_the_hint_gates_never_change_the_result``
+# compares the gated and ungated passes over every fixture rather than trusting either half.
 #
-# A CASEFOLDED SUBSTRING TEST, NOT A COMPILED ALTERNATION, and the difference is the whole cost of
+# A FOLDED SUBSTRING TEST, NOT A COMPILED ALTERNATION, and the difference is the whole cost of
 # this module. A ``(?i)`` alternation defeats sre's literal-prefix optimisation, so the engine
 # trial-matches every branch at every start position: measured on a plain 67-char line, the union
 # alternation cost 5.07 us and was 100 percent of what this module added, while one ``casefold()``
 # plus ``in`` tests costs 0.40 us. On a real credential line, folding ONCE and reusing the folded
 # string for all six per-pass gates took the pass from 8.21 us to 2.93 us.
 #
-# ``casefold`` RATHER THAN ``lower``, AND IT IS THE TEXT SIDE THAT CARRIES THAT. The patterns are
-# ``(?i)`` and Python's case-insensitive matching folds beyond ASCII -- measured on this interpreter,
-# ``(?i)s`` matches U+017F and ``(?i)k`` matches U+212A -- while ``lower()`` leaves both alone. So a
-# ``lower()``-folded TEXT does not admit a line the pattern behind it would have matched, which is the
-# one direction a gate must never fail in. ``test_the_gate_folds_the_way_the_patterns_match_not_the_way
-# _str_lower_does`` pins it with the leaked credential as the control.
+# NEITHER ``lower`` NOR ``casefold`` IS ENOUGH ON ITS OWN, AND IT IS THE TEXT SIDE THAT CARRIES
+# THAT. The patterns are ``(?i)`` and Python's case-insensitive matching folds beyond ASCII. ``lower``
+# leaves U+017F and U+212A alone, though ``(?i)s`` and ``(?i)k`` match them;
+# ``test_the_gate_folds_the_way_the_patterns_match_not_the_way_str_lower_does`` pins that with the
+# leaked credential as the control. ``casefold`` handles those two but not U+0130 or U+0131. So
+# :data:`_GATE_FOLDS` maps the characters first, and ``casefold`` after it is now defence in depth
+# for the two the table also carries. The characters and the leak they closed are stated on the table.
 #
-# FOLDING THE WORDS IS A NO-OP TODAY and is written as ``casefold`` only so the two sides cannot
-# diverge: every member of every tuple above is ASCII, so ``lower`` and ``casefold`` agree on all of
-# them. Stated because a mutation run scored the word-side fold as unkillable, which is correct and
-# would otherwise read as missing coverage.
+# FOLDING THE WORDS IS A NO-OP TODAY and goes through :func:`_gate_fold` only so the two sides cannot
+# diverge: every member of every tuple above is ASCII, so ``lower``, ``casefold`` and the gate fold
+# agree on all of them. Stated because a mutation run scored the word-side fold as unkillable, which
+# is correct and would otherwise read as missing coverage.
 #
 # ``_MEFOR_SECRET`` is the exception in the other direction: it is case-SENSITIVE, so a folded gate
 # merely admits lines it will not match, which is free.
 
 
+#: Non-ASCII characters that Python's case-insensitive matching treats as an ASCII letter, with that
+#: letter: at least every one the scan below finds on the interpreter the suite runs on.
+#: :func:`_gate_fold` maps each to its letter before ``casefold``, so the folded text holds a keyword
+#: wherever a ``(?i)`` pattern could match one.
+#:
+#: WHY ``casefold`` NEEDS THIS. ``(?i)i`` matches U+0130 and U+0131, but ``casefold`` turns U+0130
+#: into "i" plus a combining dot (U+0307) and leaves U+0131 alone. Neither gives a plain "i", so a
+#: label such as ``API_KEY=`` spelled with either one was refused by the gate before any pattern ran.
+#: Its value then passed the write-time filters verbatim, which would print the credential on first
+#: deployment. ``test_the_old_gate_fails_the_fold_character_test`` reproduces the leak with this table
+#: emptied.
+#:
+#: MEASURED, NOT RECALLED. Scanning every code point above ASCII against ``(?i)[a-z]`` on this
+#: interpreter finds at least these four, and
+#: ``test_the_gate_fold_table_holds_every_character_case_insensitive_matching_reads_as_a_letter``
+#: re-runs that scan and fails on any character this table lacks. That check covers the interpreter
+#: the suite runs on; a newer Unicode database is checked only when the suite runs under it. Two of
+#: the four ``casefold`` already handles (U+017F and U+212A fold to "s" and "k"). They are listed
+#: anyway, so the table is the whole measured set rather than the part one fold happens to miss.
+#:
+#: Built with ``chr()`` so no encoding layer between here and disk can change a character.
+_GATE_FOLDS: tuple[tuple[str, str], ...] = (
+    (chr(0x0130), "i"),  # LATIN CAPITAL LETTER I WITH DOT ABOVE: casefolds to "i" + U+0307
+    (chr(0x0131), "i"),  # LATIN SMALL LETTER DOTLESS I: casefold leaves it unchanged
+    (chr(0x017F), "s"),  # LATIN SMALL LETTER LONG S
+    (chr(0x212A), "k"),  # KELVIN SIGN
+)
+
+
+def _gate_fold(text: str) -> str:
+    """``text`` folded for the admission gate: each :data:`_GATE_FOLDS` character mapped to its ASCII
+    letter, then ``casefold``. An ASCII line skips the mapping, and ``str.isascii`` is a flag read in
+    CPython, so the common record pays nothing for it."""
+    if not text.isascii():
+        for char, letter in _GATE_FOLDS:
+            text = text.replace(char, letter)
+    return text.casefold()
+
+
 def _folded(words: tuple[str, ...]) -> tuple[str, ...]:
-    """``words`` casefolded, for substring admission against casefolded text."""
-    return tuple(w.casefold() for w in words)
+    """``words`` through :func:`_gate_fold`, for substring admission against gate-folded text."""
+    return tuple(_gate_fold(w) for w in words)
 
 
 _CREDENTIAL_HINT = _folded(_CREDENTIAL_WORDS)
 _TOKEN_HINT = _folded(_TOKEN_WORDS)
 _KEY_MATERIAL_HINT = _folded(_KEY_MATERIAL_WORDS)
-_SCHEME_HINT = ("bearer",)
-_ENV_HINT = (_ENV_PREFIX.casefold(),)
+_SCHEME_HINT = _folded(("bearer",))
+_ENV_HINT = _folded((_ENV_PREFIX,))
 _DSN_HINT = (_DSN_MARKER,)
 
 #: The union of every per-pass gate, reduced by SUBSUMPTION: a word containing another word of the set
@@ -497,7 +538,7 @@ def scrub_credentials(text: str, *, placeholder: str = CREDENTIAL_PLACEHOLDER) -
     second pass finds a label whose value is already the placeholder and rewrites it to itself. The
     reject path returns the SAME object, so a caller's ``scrubbed != message`` takes CPython's
     pointer-identity fast path."""
-    folded = text.casefold()
+    folded = _gate_fold(text)
     if not _admits(folded, _ANY_HINT):
         return text
     return _run(text, placeholder, folded)

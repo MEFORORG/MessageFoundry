@@ -440,7 +440,7 @@ def _last_resort(message: str) -> None:
 #: slicing BEFORE the credential pass can cut the terminator a pattern needs -- truncating
 #: ``postgres://u:pw@host`` mid-password leaves ``_DSN_PASSWORD`` no trailing ``@`` to match, and the
 #: prefix of the secret is then published unmasked. Slicing an already-escaped string can at worst
-#: cut ``\xNN`` short, which cannot produce a control character.
+#: cut one backslash escape short, which cannot produce a control character.
 _DIAGNOSTIC_LIMIT = 1000
 
 #: Returned when the scrubbers themselves raise. A literal, with nothing at all from the input and
@@ -471,7 +471,7 @@ def _guarded(scrub: Callable[[str], str], text: str, *, fallback: str) -> str:
     detail: slicing BEFORE the credential pass can cut the terminator a pattern needs — truncating
     ``postgres://u:pw@host`` mid-password leaves ``_DSN_PASSWORD`` no trailing ``@`` to match, and
     the prefix of the secret is then published unmasked. Slicing an already-escaped string can at
-    worst cut a ``\\xNN`` escape short, which cannot produce a control character."""
+    worst cut one backslash escape short, which cannot produce a control character."""
     try:
         return scrub(text)[:_DIAGNOSTIC_LIMIT]
     except Exception as exc:

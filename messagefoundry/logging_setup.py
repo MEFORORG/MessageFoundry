@@ -52,7 +52,8 @@ from messagefoundry.config.tls_policy import (
 )
 
 # The escape table and this function were DEFINED here until BACKLOG #1591 and now live in
-# controlchars, which imports nothing and is therefore reachable from ``logging_guard`` too. That
+# controlchars, which imports only the standard library and is therefore reachable from
+# ``logging_guard`` too. That
 # module's docstring carries the reasoning; this is now an ordinary import of a leaf.
 from messagefoundry.controlchars import scrub_control_chars
 from messagefoundry.keywrap import load_checked_cert_chain
@@ -164,8 +165,8 @@ def _rewrite_record(
 
 
 class ControlCharScrubFilter(logging.Filter):
-    """Neutralize CR/LF and other control characters in the rendered log message to prevent log
-    injection / forging (ASVS 16.4.1).
+    """Neutralize CR/LF and the rest of the log alphabet in the rendered log message to prevent log
+    injection / forging (ASVS 16.4.1). The alphabet is ``controlchars._escapes_in_a_log_line``'s.
 
     Untrusted MLLP peer data and HL7-derived exception text reach the general log; without this a
     crafted value containing a newline could inject a forged log line into NSSM's captured stdout.
@@ -342,8 +343,10 @@ class JsonFormatter(logging.Formatter):
 
     PHI redaction + control-char scrubbing run upstream as **handler filters** (see
     :func:`configure_logging`), so by the time ``format`` runs ``record.getMessage()`` and
-    ``record.exc_text`` are already redacted; ``json.dumps`` additionally escapes any residual control
-    characters, so a record can never break the one-object-per-line framing (ASVS 16.4.1). UTC ``Z``
+    ``record.exc_text`` are already redacted; ``json.dumps`` additionally escapes any residual C0
+    control, so a record can never break the one-object-per-line framing (ASVS 16.4.1). It leaves the
+    C1 controls and U+2028/U+2029 raw under ``ensure_ascii=False``, so a filter-less handler gets no
+    escape for those (vault BACKLOG #2815); the configured handlers' scrub filter covers them. UTC ``Z``
     timestamps match the text formatter (16.2.2). The exception/stack fields are populated **and
     already redacted** by :class:`RedactionFilter` (which clears ``exc_info`` after rendering), so they
     are emitted from ``exc_text``/``stack_info`` without re-rendering the raw exception."""

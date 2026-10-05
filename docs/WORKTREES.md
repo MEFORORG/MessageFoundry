@@ -175,7 +175,111 @@ nothing prompts.
 
 ## Remove one
 
-**Which copy you run decides which checkout it searches.** `remove.ps1` anchors on its own location,
+`remove.ps1` has two removal routes and one listing.
+
+| Route | Reaches | Refuses, before it removes anything |
+|---|---|---|
+| `-Name <dir>` | The `<repo>-<dir>` sibling of the checkout that copy of the script lives in | Uncommitted tracked changes. A detached HEAD no ref holds. An unlanded ledger number. |
+| `-Path <path>` | Any registered linked worktree that is not under `.claude/worktrees` | Everything `-Name` refuses, and the list in the next section. |
+| `-List` | Nothing. It is read-only. | It prints each worktree, its class, and which route reaches it. |
+
+### `-Path` is the checked route, and a session may run it
+
+`-Path` removes a finished worktree that no `-Name` can spell: a harness scratchpad, a hand-made
+directory, a worktree of another layout. It removes the **directory** and never the **branch**. It
+does not take `-DeleteBranch`, so that holds by construction.
+
+```powershell
+pwsh -NoProfile -File <primary>\scripts\worktree\remove.ps1 -List
+pwsh -NoProfile -File <primary>\scripts\worktree\remove.ps1 -Path C:\path\to\the\finished\worktree
+```
+
+**A session runs it exactly like that, with no other switch.** `-Force` and
+`-AllowOrphanedAllocations` are the owner's. If the script refuses, that is final for a session: it
+tells the user what was refused and why, and stops.
+
+**This reverses the earlier posture, for removal only.** Until 2026-10-04 the worktree gate's rule 3d
+told a session that removing any tree it was not standing in was the user's to run. The owner's
+instruction that day, in session: *"let's change the gate so that sessions can run these but still
+have the protection this was designed for"*. Rule 3d still denies a raw `git worktree remove` aimed
+at another tree. Its deny text now names this route, because the script can make checks the gate
+cannot. (Vault BACKLOG #1017.)
+
+`-Path` refuses at least these, and `-Force` overrides none of them. The header of
+[`scripts/worktree/remove.ps1`](../scripts/worktree/remove.ps1) is the source of record; this list
+is a copy for readers and can lag it.
+
+- `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR` or `GIT_INDEX_FILE` set in the environment.
+- A path component that ends in a dot or a space. Windows drops both, so it names another directory.
+- Anything that is not a registered linked worktree of this clone, matched on its full path as git
+  records it. That covers the primary, another repository's worktree, a plain directory, and a
+  junction, `subst` or 8.3 spelling of a real worktree.
+- The tree you are standing in, and a tree that holds the copy of the script being run.
+- A tree under `.claude/worktrees`. The next section says why.
+- A tree that holds another registered worktree.
+- A tree git has locked.
+- A detached HEAD whose commit no ref holds.
+- A commit that only the tree's HEAD reflog holds, or only one of its own per-worktree refs
+  (`refs/worktree`, `refs/bisect`, `refs/rewritten`). The removal deletes that reflog and those
+  refs, so nothing would reach the commit afterwards. This one can refuse a harmless tree: a commit
+  replaced by an amend counts, although the branch's own reflog still holds it.
+- A tree the session registry records a session in.
+- Any tree at all, when the session registry cannot be read.
+- A tree that still holds a work claim, or any tree when a claim file cannot be read. So this
+  route never releases a claim: the work lands, or the claim is released, first.
+- A tree whose own git directory was written to in the last six hours, by a commit, a checkout, a
+  merge or a fetch.
+
+Without `-Force` it also refuses uncommitted tracked changes, untracked files, ignored files, and
+files flagged skip-worktree or assume-unchanged. **One exception:** an *ignored directory* named
+`.venv`, `node_modules`, `__pycache__`, `.pytest_cache`, `.mypy_cache` or `.ruff_cache` goes with
+the worktree. An *untracked* directory of one of those names still refuses. So does an ignored
+*file* of one, and so does a directory of one that is a junction or a symlink. Other ignored
+entries refuse too, such as a generated `out/` directory, a local certificate pair, or a
+`.claude/seat.local.txt`.
+
+`-AllowOrphanedAllocations` is the only override for a tree that owns an unlanded ledger number.
+
+Without `-Force` the script also passes no `--force` to git. So git makes its own check at the
+moment it deletes, and refuses a tree with modified or untracked files. That covers a file written
+between the script's check and the removal. Git's check does not list ignored files.
+
+### What `-Path` does not reach, and what it does not see
+
+**It does not reach a tree under `.claude/worktrees`.** That is where the Claude Code harness puts
+a session's or a subagent's worktree. The occupancy check reads the directory a session was
+*launched* in. A subagent started with `isolation: worktree` is recorded under its **parent's**
+directory, so its tree would read as empty. A deletion route whose check fails open on a
+population is worse than no route to it, so there is none. (BACKLOG #1038, Manager decision
+batch 184.) Removing one of those trees stays the user's decision.
+
+One layout overlaps. `new.ps1` run from a linked worktree makes its sibling **beside that
+worktree**, and for a harness-made worktree that is also under `.claude/worktrees`. `-Path`
+refuses it like the rest. The copy of `remove.ps1` in that linked worktree still removes it by
+`-Name`.
+
+**The session registry does not see where a session works, so two other signals are read.** The
+registry records a launch directory. A subagent Builder is recorded under its parent's directory,
+and so is any session that works in a tree by absolute path. On this machine that is the ordinary
+case: the sessions sit under `.claude/worktrees` and the work sits in sibling trees. A review of
+the first version of this route found that the registry check alone would have removed trees of a
+running batch.
+
+So `-Path` also refuses on a held **claim** and on **recent git activity**, the last two entries in
+the list above. A claim names the worktree that took it, whoever launched the session. Git activity
+is read from the tree's own git directory. Neither is proof that a tree is free:
+
+- Work that was never claimed, in a tree nobody has committed to for six hours, passes both.
+- The six hours are a judgement. A long test run after a last commit can outlast them.
+- A tree that passes both is still removed only if it is clean.
+
+**The occupancy check is on `-Path` only.** `-Name` has none, and it also keeps its blanket
+`git worktree prune`, which `-Path` does not run because a blanket prune drops other worktrees'
+registrations too.
+
+### `-Name` removes the sibling this copy made
+
+**Which copy you run decides which checkout `-Name` searches.** `remove.ps1` anchors on its own location,
 not on your cwd, so run the copy that lives in the checkout the worktree was created **from** — which
 is not necessarily the primary, because `new.ps1` anchors the same way and creates its worktree
 beside *itself*. Invoked by absolute path it works from any cwd outside the worktree being removed
@@ -201,9 +305,10 @@ unmerged commits is **kept** and named, with its tip printed so you can act on i
 
 `-RepoRoot <path>` points the script at a checkout other than its own. It exists so the most
 destructive script in this directory can be **execution-tested**
-([`tests/test_worktree_remove.py`](../tests/test_worktree_remove.py) drives it against a synthetic
-repo); without it the only repository a test could reach was this one, so the branch-delete path was
-covered by review alone. (BACKLOG #1037.)
+([`tests/test_worktree_remove.py`](../tests/test_worktree_remove.py) drives `-Name` against a synthetic
+repo, and [`tests/test_worktree_remove_path.py`](../tests/test_worktree_remove_path.py) drives `-Path`
+and `-List`); without it the only repository a test could reach was this one, so the branch-delete
+path was covered by review alone. (BACKLOG #1037.)
 
 ## "Will be permanently discarded" is an INDEX test, not a LOSS test — `recoverable.ps1`
 
@@ -1507,3 +1612,133 @@ down: Not properly terminated` line at 98-99 percent progress, and the job dies 
 
 A local run carrying no summary line, no `node down` line and exit 0 shares none of that. It also
 cannot share the mechanism, which needs `-n` to exist at all.
+
+## Deleting a scratch folder: `remove-scratch.ps1`
+
+The tracked `.claude/settings.json` denies `Bash(rm -rf:*)` and
+`PowerShell(Remove-Item -Recurse -Force:*)`. Those two rules are a blanket. A session cannot delete
+a folder tree anywhere, including a temp folder it made a minute ago, so the owner ends up running
+the delete by hand.
+
+[`remove-scratch.ps1`](../scripts/worktree/remove-scratch.ps1) is the checked route. It leaves both
+rules alone. It deletes a folder tree only when it can show the delete is safe.
+
+```powershell
+scripts\worktree\remove-scratch.ps1 C:\Users\me\AppData\Local\Temp\rv-a C:\Users\me\AppData\Local\Temp\rv-b
+scripts\worktree\remove-scratch.ps1 -Delete C:\Users\me\AppData\Local\Temp\rv-a
+```
+
+The first line is a **dry run**, which is the default. It prints what would go, with a file count
+and a byte count, and one receipt line per check. Only `-Delete` deletes.
+
+**The bias is fixed: a false refusal is a minor annoyance, a false delete destroys work.** Every
+check that cannot reach a confident answer refuses. No switch turns a check off.
+
+Give several folders as separate arguments. The script judges each one alone, and one refusal does
+not stop the others. It takes literal paths only. A wildcard is refused on purpose: a pattern deletes
+whatever matches on the day it runs. Let your shell expand the pattern, and read the dry run first.
+
+### The checks, in the order the receipt prints them
+
+The first refusal stops that target.
+
+| Check | What it refuses |
+|---|---|
+| `spelling` | Anything but a plain drive-absolute path: a UNC or device path, a relative path, `.` or `..`, a component ending in a dot or a space, an 8.3 short name, a colon after the drive letter, a wildcard, a reserved device name. Forward slashes are accepted. |
+| `temp-root` | A target that is not strictly inside the temp root. Under `<root>\claude`, anything but the inside of a session scratchpad. |
+| `exists` | A path that does not exist, a single file, and a name that is stored under a different spelling. |
+| `reparse` | A reparse point (junction, symbolic link, mount point, cloud placeholder) on the path from the drive root down, or anywhere inside the tree. The script never follows one. |
+| `git` | A `.git` entry at any depth, a bare repository, a folder inside either, and any overlap with a registered worktree. |
+| `cwd` | A target the calling shell is standing in. |
+| `sessions` | A registry the script cannot read, a session working inside the target, and any other session's scratchpad. |
+| `idle` | A tree with anything created or modified inside the idle window. |
+| `in-use` | With `-Delete` only: a folder that cannot be renamed, because some process holds a handle inside it. |
+
+**The temp root is `<LocalApplicationData>\Temp`, read from the known-folder API.** It is not read
+from `TEMP` or `TMP`. Those are environment variables, and `[IO.Path]::GetTempPath()` follows a
+forged `TMP`. When `TEMP` is spelled any other way, the script prints a note and refuses every
+target. That includes a machine with a redirected temp folder, and a machine whose `TEMP` is an 8.3
+spelling of the same folder.
+
+**Under `<root>\claude`, only `claude\<project>\<session id>\scratchpad\<name>` or deeper can pass.**
+The scratchpad folder itself, a session folder and a project folder are refused.
+
+**A scratchpad worktree goes through [`remove.ps1`](../scripts/worktree/remove.ps1), never this
+script.** The worktrees compared are those of the repository the script lives in, and of every root
+in the worktree gate's own list.
+
+### Whose folder it is
+
+The script works out its caller by walking its own parent processes. The nearest one whose pid
+holds a LIVE record in the session registry is the caller. It does not trust
+`CLAUDE_CODE_SESSION_ID`, because any process can set that.
+
+| Target | Verdict of the `sessions` check | Idle window |
+|---|---|---|
+| Inside the caller's own scratchpad | Passes | 10 minutes |
+| Inside any other session's scratchpad | **Refused outright**, whether that session is live, dead or absent from the registry | none |
+| Anywhere else under the temp root | Passes, unless a session the fence cannot rule out is working inside it | 60 minutes |
+
+A dead session can be resumed, and its scratchpad is its notes. That is why a dead session's
+scratchpad is refused too.
+
+**A subagent shares its parent's session id.** So "the caller's own scratchpad" covers a whole
+session family, and the caller cannot list its own workers. That is why its own scratchpad still
+waits ten minutes.
+
+`-IdleMinutes` can raise a window. It can never lower one. The idle check reads creation time as
+well as write time, because a copied or extracted tree keeps old write times. A stamp in the future
+refuses. So does a stamp the script cannot read at all, such as a time past the year 9999: an
+unreadable stamp is not an old one.
+
+### What it cannot see
+
+It cannot see at least these. Say them wherever you recommend the script.
+
+- **A folder at the top of the temp root has no owner the script can name.** Another session's
+  `mkdtemp` folder and another program's working folder look the same. Only the 60-minute window and
+  the rename protect them. A program that keeps old files and holds none open can lose them.
+- **A session that only reads a folder.** Reading leaves no creation or write stamp, and no open
+  handle between reads. A tree somebody is still reading can go once its window has passed: an
+  hour, or ten minutes inside the caller's own scratchpad.
+- A session that never registered.
+- A child session with no registry record of its own. The caller walk passes over it and stops at
+  its nearest registered ancestor, so the script judges it as that ancestor.
+- A session that writes into the target by absolute path while its working directory is somewhere
+  else.
+- A hard link. Deleting one name leaves the file's other names alone.
+
+### How the delete runs
+
+1. The script renames the folder to `<name>.removing-<id>`. Windows refuses that rename while any
+   file inside is open, so a refusal here changes nothing on disk.
+2. It deletes the renamed tree bottom-up, one entry at a time, and never through a reparse point.
+3. If a delete fails part-way, it lists exactly what remains under the renamed folder.
+
+One case that ends part-done is a file whose name ends in a dot. Windows drops that dot from the
+path, so the delete finds nothing and the file stays.
+
+| Exit code | Meaning |
+|---|---|
+| 0 | Every target passed. |
+| 1 | At least one target was refused, or the script itself failed. |
+| 3 | At least one delete was left part-done. |
+
+Exit 1 does not mean nothing was deleted. Read the `SUMMARY` line for that. A check that throws
+refuses its own target, and the run goes on to the next one.
+
+### Test-only parameters
+
+`-TempRoot` re-roots the script for tests, and it can only narrow. It must sit strictly inside the
+real temp root and outside `<root>\claude`. `-ConfigRoot` reads a fixture session registry instead
+of the real one. `-RepoRoot` adds one repository whose worktrees are compared. Both work only
+together with `-TempRoot`.
+
+Narrow is about reach. Two things do loosen, for targets under `-TempRoot` only. A fixture registry
+hides the real sessions from the `sessions` check. And a folder laid out as
+`claude\<project>\<caller's session id>\scratchpad\<name>` below `-TempRoot` takes the 10-minute
+window. The rename still refuses a folder that any process is standing in.
+
+[`tests/test_worktree_remove_scratch.py`](../tests/test_worktree_remove_scratch.py) drives the real
+script under a pytest `tmp_path`. It runs on Windows only. The ubuntu leg skips the whole file,
+because the script judges Windows paths against a Windows known folder.

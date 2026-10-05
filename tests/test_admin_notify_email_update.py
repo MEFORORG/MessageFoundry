@@ -372,7 +372,20 @@ async def test_naming_the_stored_address_again_writes_and_sends_nothing() -> Non
         await store.close()
 
 
-@pytest.mark.parametrize("bad", ["", "   ", "x", "a@example.org, b@example.org"])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "",
+        "   ",
+        "x",
+        "a@example.org, b@example.org",
+        # Host characters in a shape no mail domain takes (vault BACKLOG #2911).
+        "a@example..org",
+        "a@-mx.example.org",
+        "a@10.0.0.1",
+        "a@10.0.0.0x1",
+    ],
+)
 async def test_a_blank_or_malformed_address_is_refused_before_anything_is_written(
     bad: str,
 ) -> None:
