@@ -89,6 +89,7 @@ from messagefoundry.transports.signing import MessageSigner, signer_from_destina
 
 __all__ = [
     "DYNAMIC_HEADER_PREFIX",
+    "ECH_HOP_WAYS_ACROSS",
     "InsecureHopGuard",
     "ProxyConfig",
     "RestDestination",
@@ -961,6 +962,17 @@ def opener_tls_context(
     return None if handler is None else urllib_handler_context(handler, connector=connector)
 
 
+#: The ways across a revocation refusal for a hop re-addressed to an ECH sidecar (ADR 0139). The
+#: connection-shaped default offers ``[tls].crl_file`` and an egress proxy, and neither can cross
+#: this hop: the sidecar makes the TLS connection to the peer, so the engine consults no CRL for it,
+#: and ``ech_egress`` excludes ``proxy_url``. Fixed text, with no URL part and no setting value.
+ECH_HOP_WAYS_ACROSS = (
+    "This hop goes through an ECH sidecar, which makes the TLS connection to the peer itself, so "
+    "a CRL configured on the engine cannot check it. Set tls_revocation_attested=true with a "
+    "tls_revocation_attested_reason on this connection."
+)
+
+
 def refuse_unrevoked_verified_hop(
     scheme: str,
     url: str,
@@ -968,7 +980,8 @@ def refuse_unrevoked_verified_hop(
     connector: str,
     revocation_attested: bool = False,
     revocation_attested_reason: str | None = None,
-    opener: urllib.request.OpenerDirector | None = None,
+    opener: urllib.request.OpenerDirector | None,
+    ways_across: str | None = None,
     connection: str | None,
 ) -> None:
     """Refuse a VERIFYING ``https`` hop that does no certificate revocation checking (#201, ADR 0078 amend).
@@ -989,8 +1002,29 @@ def refuse_unrevoked_verified_hop(
     that resolved against THIS hop's host — making the anchor ``narrow`` and putting
     ``VERIFY_CRL_CHECK_LEAF`` on a per-hop opener — relaxes the gate instead of being refused with
     advice to configure the CRL it already has. **Callers that pass it must call this AFTER building
-    the opener**; omitting it keeps the pre-#1498 behaviour, which is correct for a caller whose hop
-    rides the shared import-time opener that can carry no CRL.
+    the opener**, and after every later statement that replaces it or adds a handler to it.
+
+    It is REQUIRED, with no default, so a caller cannot leave it out by accident: a hop whose opener
+    carries a CRL would then be refused and told to configure the CRL it has (vault BACKLOG #2188).
+    Pass ``None`` on purpose, in at least these cases:
+
+    - A caller whose hop rides the shared import-time opener, which can carry no CRL. Passing that
+      opener gives the same answer.
+    - A hop re-addressed to an ECH sidecar (ADR 0139). ``None`` is required there: the engine dials
+      the loopback sidecar and the sidecar verifies the real peer, so no context the engine holds
+      checks that peer's certificate (vault BACKLOG #2188 for the REST destination, #2169 for the
+      SMART and OAuth2 token hop).
+    - An opener built with ``tls_allow_expired`` (ADR 0094). ``None`` is required there too.
+      :func:`~messagefoundry.config.tls_policy.relax_verify_expiry` sets
+      ``X509_V_FLAG_NO_CHECK_TIME`` on its context, and OpenSSL applies that flag to a CRL's
+      validity window as well as the certificate's: a CRL past ``nextUpdate`` is then accepted at
+      the handshake. A CRL on that context is not a check that may relax this refusal, so the hop
+      stays refused unless attested (vault BACKLOG #2188).
+
+    ``ways_across`` replaces the remediation sentence of the refusal for a hop the connection-shaped
+    default does not fit (:attr:`RevocationHopGuard.ways_across`). An ECH hop passes
+    :data:`ECH_HOP_WAYS_ACROSS`, so its refusal offers only a lever that can cross it. ``None``
+    keeps the default.
 
     ``connection`` is the declaring connection's name, recorded in the audit line logged when an
     attestation crosses the refusal, so the record leads back to the declaration (ADR 0173).
@@ -1007,6 +1041,7 @@ def refuse_unrevoked_verified_hop(
         attested_reason=revocation_attested_reason,
         connection=connection,
         context=None if opener is None else opener_tls_context(opener, connector=connector),
+        ways_across=ways_across,
     ).enforce_construction()
 
 
@@ -1897,19 +1932,6 @@ class RestDestination(DestinationConnector):
                 connection=config.name,
             )
         if bool(s.get("verify_tls", True)):
-            # #201 (ADR 0078 amendment): the verify-ON https hop validates the peer cert but does no
-            # OCSP/CRL revocation (stdlib ssl has none) — refuse an off-loopback production-PHI verified
-            # hop unless revocation is attested (loopback / synthetic / non-prod / attested byte-identical).
-            # Composes with #200: it keys on the verify-ON https path, disjoint from the cleartext /
-            # verify-off gates above, so no hop is ever double-refused.
-            refuse_unrevoked_verified_hop(
-                scheme,
-                self.url,
-                connector="REST destination",
-                revocation_attested=config.tls_revocation_attested,
-                revocation_attested_reason=config.tls_revocation_attested_reason,
-                connection=config.name,
-            )
             # #129 (ADR 0094): granular expiry-only relaxation — verify chain + hostname but tolerate an
             # expired server cert (opt-in; default off = the shared verifying opener, byte-identical). It
             # keeps verification ON, so it is NOT an insecure hop in the #200 sense (no refusal keys on it).
@@ -1977,6 +1999,28 @@ class RestDestination(DestinationConnector):
             # loopback rule alone already dials every accepted sidecar direct, so this adds no
             # routing. It makes "no proxy on this hop" hold by construction as well as by rule.
             self._opener = _no_redirect_opener(urllib.request.ProxyHandler({}))
+        if bool(s.get("verify_tls", True)):
+            # #201 (ADR 0078 amendment): the verify-ON https hop validates the peer cert but does no
+            # OCSP/CRL revocation (stdlib ssl has none) — refuse an off-loopback production-PHI verified
+            # hop unless revocation is attested or this hop's own opener checks a CRL. Composes with
+            # #200: it keys on the verify-ON https path, disjoint from the cleartext / verify-off gates
+            # above, so no hop is ever double-refused.
+            #
+            # Last in __init__, below every statement that builds or replaces `self._opener`, and no
+            # opener with an ECH sidecar or tls_allow_expired: see refuse_unrevoked_verified_hop.
+            no_crl_evidence = self._ech_sidecar is not None or bool(
+                s.get("tls_allow_expired", False)
+            )
+            refuse_unrevoked_verified_hop(
+                scheme,
+                self.url,
+                connector="REST destination",
+                revocation_attested=config.tls_revocation_attested,
+                revocation_attested_reason=config.tls_revocation_attested_reason,
+                opener=None if no_crl_evidence else self._opener,
+                ways_across=ECH_HOP_WAYS_ACROSS if self._ech_sidecar is not None else None,
+                connection=config.name,
+            )
 
     def _ech_request(
         self, data: bytes | None, headers: dict[str, str], method: str

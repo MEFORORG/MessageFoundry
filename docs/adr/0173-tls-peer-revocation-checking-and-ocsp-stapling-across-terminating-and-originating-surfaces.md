@@ -16,8 +16,10 @@
   **Every open row §7.1 names now has a tracker, BACKLOG #2193 or #2194, so those rows no longer
   need #1498 open.** The Lander filed both on 2026-09-27 for Manager batch 164. This ADR names them
   as of 2026-10-02. §7.1 says which rows each covers. **A hop §7.1 never found has no tracker,**
-  including any no-context hop beyond those #2194 lists. Two rows §7.1 grades *Guarded* carry open
-  defects, #2188 and #2169, which §7.1 points to. The open owner questions in §1.1 and §2.1 do not
+  including any no-context hop beyond those #2194 lists. The two defects on rows §7.1 grades
+  *Guarded*, #2188 and #2169, are built; the §4.3 note of 2026-10-04 says how. *(Corrected
+  2026-10-04. This sentence read: "Two rows §7.1 grades *Guarded* carry open defects, #2188 and
+  #2169, which §7.1 points to.")* The open owner questions in §1.1 and §2.1 do not
   hold #1498 open.
   *Until 2026-10-02 this paragraph read: "#1498 stays open until three things hold. Each hop §7.1
   grades *Needs a guard* has a tracking item of its own. The hops §7.1's reads could not see are
@@ -674,6 +676,67 @@ write a number a reader treats as coverage. *(Stale since the #1498 build: the s
 now withdraws the count reason and declines on the S/MIME argument alone. §7.1 grades DIRECT as an
 owner question.)*
 
+**Note, 2026-10-04 -- with an ECH sidecar, the HTTP-family guard is handed no opener (BACKLOG #2169
+and #2188).** Correction 1 above says a CRL on the token hop lives in that hop's opener. That holds
+only while the engine dials the token host itself. With `ech_sidecar` set, `_post_token` re-addresses
+the POST to the loopback sidecar, and the sidecar makes its own TLS connection to the token host
+(ADR 0139). The provider's opener then only ever meets the sidecar. A `[tls].crl_file` covering the
+token host still lands on that opener, and the guard read it, so the refusal was lifted with no
+revocation check behind it.
+
+BACKLOG #2169 offered two ways to close this: pass no opener on the ECH arm, or require the
+attestation there. **The first was chosen.** `_open_token_hop` passes
+`opener=None if ech_sidecar is not None else self._opener`, one expression serving the SMART and the
+OAuth2 token hop. Two reasons:
+
+- It holds by construction. The guard cannot read a context it was never given, so no later change
+  to how that opener is built can relax the ECH arm.
+- It delivers the second option's outcome without a second rule. With no context `crl_checked` is
+  false, and `refuse_unrevoked_verified_hop` has no `proxy_proven` parameter. So on an enforcing
+  instance only a loopback token host or the per-connection `tls_revocation_attested` crosses.
+
+**The refusal on the ECH arm names the attestation alone.** The default text offers
+`[tls].crl_file` and an egress proxy, and neither can cross an ECH hop. So
+`refuse_unrevoked_verified_hop` takes `ways_across`, and both ECH callers pass the fixed text
+`ECH_HOP_WAYS_ACROSS`. Where the guard runs, a non-loopback ECH hop on an enforcing instance
+crosses on the attestation alone. On the REST destination the guard runs only with `verify_tls`
+true, as before; with `verify_tls=false` the hop is the verify-off gate's (#200), ECH or not.
+
+The REST destination's ECH arm takes the same value, under BACKLOG #2188. That item moved the guard
+in the REST, SOAP, FHIR and DICOMweb destinations below the last statement that builds or replaces
+the opener, and passed that opener, so a CRL that reaches one of those hops now relaxes its refusal.
+REST with a sidecar passes none, for the reason above: the sidecar verifies the destination, not the
+engine.
+
+The engine cannot see whether a sidecar checks revocation. On the ECH arm the attestation is the
+operator's statement that it does, or that the PKI behind the hop does.
+
+**An opener built with `tls_allow_expired` hands the guard no opener either**, on REST, SOAP and
+FHIR. `relax_verify_expiry` sets `X509_V_FLAG_NO_CHECK_TIME` on that context, and OpenSSL applies
+the flag to a CRL's validity window as well as the certificate's. Measured on CPython 3.14.6 /
+OpenSSL 3.5.7: a CRL past `nextUpdate` refuses the handshake with "CRL has expired" without the
+flag, and the same handshake is accepted with it. So that arm stays refused unless attested, as it
+was before #2188.
+The MLLP destination's guard reads a context built the same way. That hop is not changed here.
+
+`opener` is now a required keyword, so a new caller cannot omit it and bring back the false
+refusal.
+
+**One audit line still over-states.** A hop that crosses because its context checks a CRL, and that
+also sets `tls_revocation_attested`, is logged as crossing "without certificate revocation
+checking". The record says more than happened and loses nothing. A one-condition fix was built and
+reverted on this branch: it also silenced the line for an MLLP hop with `tls_allow_expired`, a CRL
+and the attestation, where the line was the only record of the attestation.
+
+The Status paragraph and the two §7.1 rows that called #2188 and #2169 open defects carry a
+correction dated 2026-10-04.
+
+Pinned by `tests/test_token_hop_revocation_guard_with_ech_sidecar.py` for the token hop, and by
+`tests/test_http_destination_revocation_guard_reads_its_opener.py` for the four destinations. Two
+cases there carry the ECH claim, `test_an_ech_sidecar_and_a_crl_still_refuse_the_token_hop` and
+`test_rest_with_an_ech_sidecar_and_a_crl_is_still_refused`. Each pairs its refusal with a control in
+which the same CRL relaxes the same hop without a sidecar.
+
 ## 5. Consequences
 
 **Positive**
@@ -866,8 +929,8 @@ proposed accept, and only an owner ruling makes it one.
 |---|---|---|---|
 | `transports/mllp.py`, `_mllp_ssl_context`, client arm, `tls_verify=true` | HL7 message bodies | **Guarded** | `RevocationHopGuard.capture` in the MLLP destination, taken only when the context verifies |
 | `transports/mllp.py`, `_mllp_ssl_context`, client arm, `tls_verify=false` | HL7 message bodies | **Verify-off** | refused on an enforcing instance even with the escape set (#200) |
-| rest.py's shared opener and `_expiry_relaxed_opener`; `transports/soap.py`, `_client_cert_opener`, as used by the REST, SOAP, FHIR and DICOMweb destinations | message bodies, and any credential the destination sends | **Guarded** | `refuse_unrevoked_verified_hop` in each destination's `__init__`, on its verifying branch, whichever opener serves the hop. *(Added 2026-10-02: open defect BACKLOG #2188. The guard runs before the opener is built, so a CRL that reaches the hop cannot relax the refusal.)* |
-| `transports/smart.py`, `_TokenEndpointProvider._open_token_hop` (the shared opener, or a per-provider one), as used by `SmartBackendTokenProvider` (the SMART token endpoint) | the signed `client_assertion` | **Guarded** | `refuse_unrevoked_verified_hop`, called in `_open_token_hop` (§4.3, correction 1; one call site for both token hops since BACKLOG #2115). *(Added 2026-10-02: open defect BACKLOG #2169, on this row and the OAuth2 row below. With an ECH sidecar set, the guard reads a context that never checks the token peer, so a CRL can relax the refusal.)* |
+| rest.py's shared opener and `_expiry_relaxed_opener`; `transports/soap.py`, `_client_cert_opener`, as used by the REST, SOAP, FHIR and DICOMweb destinations | message bodies, and any credential the destination sends | **Guarded** | `refuse_unrevoked_verified_hop` in each destination's `__init__`, on its verifying branch, whichever opener serves the hop. *(Corrected 2026-10-04: BACKLOG #2188 is built. The guard now runs after the opener is built and reads it, so a CRL that reaches the hop relaxes the refusal. A hop behind an ECH sidecar, or one built with `tls_allow_expired`, hands the guard no opener and stays refused unless attested (§4.3). The note this replaces, added 2026-10-02, read: "open defect BACKLOG #2188. The guard runs before the opener is built, so a CRL that reaches the hop cannot relax the refusal.")* |
+| `transports/smart.py`, `_TokenEndpointProvider._open_token_hop` (the shared opener, or a per-provider one), as used by `SmartBackendTokenProvider` (the SMART token endpoint) | the signed `client_assertion` | **Guarded** | `refuse_unrevoked_verified_hop`, called in `_open_token_hop` (§4.3, correction 1; one call site for both token hops since BACKLOG #2115). *(Corrected 2026-10-04: BACKLOG #2169 is built, on this row and the OAuth2 row below. With an ECH sidecar set, the guard is handed no opener, so a CRL cannot relax the refusal (§4.3). The note this replaces, added 2026-10-02, read: "open defect BACKLOG #2169, on this row and the OAuth2 row below. With an ECH sidecar set, the guard reads a context that never checks the token peer, so a CRL can relax the refusal.")* |
 | the same `_open_token_hop`, as used by `OAuth2ClientCredentialsProvider` in `transports/http_auth.py` (the OAuth2 client-credentials token hop) | the client secret, the access token | **Guarded** | the same `refuse_unrevoked_verified_hop` call (BACKLOG #2112, PR 1670). It was unguarded at `800cb7461`. `http_auth.py` builds no opener of its own since BACKLOG #2115 |
 | the shared opener, as used by `FhirLookupExecutor` in `transports/fhir.py` (the `fhir_lookup` read) | a static bearer or basic credential, or a SMART-minted access token; FHIR resources back | **Needs a guard, tracked by #2193** | the file's only revocation call is in the FHIR destination. A lookup connection is not a destination |
 | the shared opener, as used by `transports/ai_broker.py` | the `[ai]` API key; code sent for assistance | **Needs a guard, tracked by #2193** | no revocation call in the file |
