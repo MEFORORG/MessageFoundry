@@ -1634,11 +1634,17 @@ the same permission set on the same method reds CI until it is listed here.
 > **The per-name connection routes do not tell a scoped caller which names exist (BACKLOG #2551).**
 > This covers at least `GET /connections/{name}/metadata` and `POST /connections/{name}/test`,
 > `/test-credential`, `/start`, `/stop` and `/restart`. Each checks the scope before it looks the
-> name up. A scoped caller gets one 403, one body and one `auth.channel_denied` row in three cases:
-> an inbound outside its scope, a shared outbound, and a name that exists nowhere. A name in the
-> caller's own scope that exists nowhere still answers 404, as any unknown name does for an
-> unscoped caller. Names still show elsewhere. At least the Prometheus exposition above and
-> `GET /alerts/rules` list them, and `POST /connections/{name}/flag` has no per-channel check.
+> name up. A scoped caller reaches only an inbound in its own scope. Every other name gets one 403,
+> one body and one `auth.channel_denied` row: an inbound outside its scope, any outbound, and a
+> name that exists nowhere. That holds even when the caller's scope lists the outbound or the
+> unknown name, since a scope is not checked against the registry (BACKLOG #2640). Only an
+> unscoped caller gets 404 for an unknown name. So a denial row can name a channel inside the
+> actor's own scope, for example one a reload removed. Read such a row as a miss, not a probe.
+> With the engine not started there is no graph and no name exists. Every route still checks the
+> scope first, so a name outside it gets the 403. A name inside it gets 503 from the first three
+> routes and 404 from the control routes, with no denial row. Names still show elsewhere. At
+> least the Prometheus exposition above and `GET /alerts/rules` list them, and
+> `POST /connections/{name}/flag` has no per-channel check.
 > `tests/test_channel_rbac.py` pins the six routes, not that list.
 
 > **`/config/reload` executes Python** from the target directory in-process, so it is constrained
