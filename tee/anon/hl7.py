@@ -24,10 +24,11 @@ from .rules import AnonError, FieldRule, SurrogateKind
 from .surrogates import (
     Seps,
     normalized_message,
+    obx5_kind,
     preserve_obx5_value,
     read_message_seps,
     scrub_message_site_codes,
-    surrogate_field,
+    surrogate_field_recorded,
 )
 
 
@@ -76,11 +77,16 @@ def _field_num(path: str) -> int:
     return int(path.split("-", 1)[1])
 
 
-def anonymize_message(raw: str, keyer: Keyer, rules: tuple[FieldRule, ...]) -> str:
+def anonymize_message(
+    raw: str, keyer: Keyer, rules: tuple[FieldRule, ...], blanked: list[str] | None = None
+) -> str:
     """De-identify one HL7 v2 message: apply ``rules`` field-by-field, then the site-code pass.
 
     Pure + deterministic for a given ``keyer``. Raises :class:`AnonError` (carrying no body) when the
     message has no parseable MSH / encoding characters — fail closed, matching the engine adapter.
+
+    ``blanked``, when given, collects the address of every field the ``DATE`` kind scrubbed to empty
+    (``surrogate_field_recorded``), as the engine adapter does.
     """
     _refuse_unwritable_rules(rules)
     text = normalized_message(raw, tuple(rule.path for rule in rules))
@@ -106,9 +112,11 @@ def anonymize_message(raw: str, keyer: Keyer, rules: tuple[FieldRule, ...]) -> s
             if _skip_obx5(rule, fields, seps):
                 continue
             if index < len(fields):
-                fields[index] = surrogate_field(rule.kind, fields[index], keyer, seps)
+                fields[index] = surrogate_field_recorded(
+                    rule.path, _kind_for(rule, fields), fields[index], keyer, seps, blanked
+                )
     encoded = "\r".join(field_sep.join(fields) for fields in segments)
-    return scrub_message_site_codes(encoded, keyer)
+    return scrub_message_site_codes(encoded, keyer, rules)
 
 
 def _skip_obx5(rule: FieldRule, fields: list[str], seps: Seps) -> bool:
@@ -122,3 +130,11 @@ def _skip_obx5(rule: FieldRule, fields: list[str], seps: Seps) -> bool:
         fields[5] if len(fields) > 5 else None,
         seps,
     )
+
+
+def _kind_for(rule: FieldRule, fields: list[str]) -> SurrogateKind:
+    """The kind to apply: the rule's own, except that the OBX-5 free-text rule hands a date-typed
+    value to the ``DATE`` kind -- see :func:`obx5_kind`, which is where that decision lives."""
+    if rule.path != "OBX-5" or rule.kind != SurrogateKind.FREETEXT:
+        return rule.kind
+    return obx5_kind(fields[2] if len(fields) > 2 else None)

@@ -342,7 +342,7 @@ def _structural_reasons(value: str, seps: Seps) -> list[str]:
 
 def structural_phi_hits(text: str, mapped_paths: set[str]) -> list[str]:
     """Structural PHI-shape hits over the fields no rule matched — reasons name the shape + field
-    ADDRESS only (e.g. ``"unmapped SSN-shaped value in GT1-16"``), never the offending value, so the
+    ADDRESS only (e.g. ``"unmapped SSN-shaped value in ZPD-4"``), never the offending value, so the
     result is safe to raise/log. Empty when the message has no parseable MSH.
 
     A line with a malformed segment id is a hit by itself, whatever it holds: no rule can reach it,
@@ -414,6 +414,9 @@ class LeakReport:
     * ``token_floor_reason`` — why the denylist is not trustworthy, or ``None`` if it is.
     * ``undecided_fields`` — the addresses present that no rule scrubs, no ``keep`` names and
       :data:`ALWAYS_DECIDED` does not excuse; ``require_full_coverage`` refuses on them.
+    * ``blanked_fields`` — the addresses where the ``DATE`` kind scrubbed a value it could
+      not keep to empty. Only ``anonymize_checked`` fills it: this report is built from the
+      output, where an emptied field looks like one that was never sent (BACKLOG #2330).
     """
 
     hits: list[str]
@@ -422,6 +425,7 @@ class LeakReport:
     token_tables_live: bool
     token_floor_reason: str | None
     undecided_fields: tuple[str, ...] = ()
+    blanked_fields: tuple[str, ...] = ()
 
 
 def leak_report(text: str, *, rules: tuple[FieldRule, ...] | None = None) -> LeakReport:
@@ -434,7 +438,8 @@ def leak_report(text: str, *, rules: tuple[FieldRule, ...] | None = None) -> Lea
     when ``rules`` is supplied**; a bare-string call is the legacy token-only behaviour.
     """
     token_hits = scan_text(text, include_estate=True)
-    if message_has_site_code(text):
+    # The rules scope this check too: a field the DATE kind filled is not a site code (#2330).
+    if message_has_site_code(text, rules or ()):
         token_hits.append("site-code pattern")
     undecided: tuple[str, ...] = ()
     if rules is None:
@@ -544,6 +549,7 @@ class CoverageTally:
         self.messages = 0
         self.counts: Counter[str] = Counter()
         self.undecided: Counter[str] = Counter()
+        self.blanked: Counter[str] = Counter()
         self.full_coverage = full_coverage
         self.denylist_live = True
 
@@ -551,6 +557,7 @@ class CoverageTally:
         self.messages += 1
         self.counts.update(report.unmapped_fields)
         self.undecided.update(report.undecided_fields)
+        self.blanked.update(report.blanked_fields)
         self.denylist_live = self.denylist_live and denylist_is_live(report)
 
     def summary(self) -> str:
@@ -564,4 +571,9 @@ class CoverageTally:
         if self.full_coverage:
             todo = ", ".join(f"{a} x{n}" for a, n in sorted(self.undecided.items())) or "none"
             text += f" Fields that need a rule or a keep for require_full_coverage: {todo}."
+        if self.blanked:
+            gone = ", ".join(f"{a} x{n}" for a, n in sorted(self.blanked.items()))
+            text += (
+                f" Date fields emptied because the value was not a timestamp it could keep: {gone}."
+            )
         return text

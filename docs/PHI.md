@@ -1846,6 +1846,8 @@ and fills the rest of the value at the same width. BACKLOG #2248 added it.
 | `PV1-44`, `PV1-45` | Admit and discharge times | `date` |
 | `ORC-9` | Order transaction time | `date` |
 | `OBR-7`, `OBX-14` | Observation times | `date` |
+| `AIS-4`, `RXA-3`, `RXA-4`, `PR1-5`, `FT1-4` | Appointment, administration, procedure and transaction times | `date` |
+| `GT1-8`, `IN1-18`, `NK1-16` | Dates of birth of the guarantor, the insured and a contact | `dob`, a fabricated date, like `PID-7`. A time after the eight date digits is kept. Anything else after them is dropped |
 | `PID-12` | County code | `freetext`, the whole field becomes `[REDACTED]` |
 | `PV1-3` | Assigned patient location | `freetext`, the whole field becomes `[REDACTED]` |
 
@@ -1862,10 +1864,15 @@ What the `date` kind does to a value:
 - It keeps a TS precision code such as `^S` in the second component.
 - It scrubs a value that is not a valid HL7 timestamp to empty. Every group must be in range and
   in ASCII digits, and the year must fall in 1850 to 2199. So a US `03152026` is scrubbed rather
-  than kept as the year `0315`. A date field that carries text is never passed through. Nothing
-  records that a field was emptied.
-- A six-digit `YYMMDD` whose first four digits happen to read as a year and a month, such as
-  `201107`, still passes as `YYYYMM`. Its output keeps those four digits.
+  than kept as the year `0315`. A date field that carries text is never passed through.
+- It records each field it emptied that way, by address and never by value. `anonymize_checked`
+  puts the addresses in the coverage report as `blanked_fields`, and
+  `python -m tee anonymize-captures` adds a count per address to its run summary. It is a record
+  and not a refusal. A caller of plain `anonymize` gets the list only by passing `blanked`.
+- It scrubs a six-digit value to empty when the value reads two ways. `201107` is July 2011 as
+  `YYYYMM`, and 7 November 2020 as `YYMMDD`. Kept as a year and a month, it would show the real
+  month of the second reading. The cost: a true `YYYYMM` whose year ends in `01` to `12`, such as
+  `200803`, is emptied as well. Both are recorded as emptied.
 - It keeps the HL7 null `""` as it is.
 
 **These gaps keep the output short of Safe Harbor, at least:**
@@ -1875,13 +1882,23 @@ What the `date` kind does to a value:
   not hide the day.
 - The order and accession numbers `ORC-2`, `ORC-3`, `OBR-2` and `OBR-3` are not mapped. Safe
   Harbor counts an accession number as an identifier.
-- Other date fields are not mapped. Over the generated corpus, full dates still come through in
-  `AIS-4`, `RXA-3`, `RXA-4`, `PR1-5` and `FT1-4`. A date-typed `OBX-5` result, such as a last
-  menstrual period, is kept whole by the `OBX-5` allowlist. `GT1-8`, `IN1-18` and `NK1-16` are
-  dates of birth with no rule.
-- When a site-code prefix of `19` or `20` is configured, the site-code pass rewrites a six-digit
-  `YYYYMM` output with a salted code. That value then differs between datasets and is no longer a
-  valid date.
+- A date field outside the table above has no rule. BACKLOG #2330 mapped the eight that were
+  known to come through whole. Nobody has checked every HL7 date field, so read the coverage
+  report for others.
+- A `FT1-4` that holds a date range with an end date is scrubbed to empty. The `date` kind reads
+  one timestamp, and a second one after the component separator is not a precision code.
+- An `OBX-5` result whose `OBX-2` type is `DT` or `TS`, such as a last menstrual period, takes the
+  `date` kind too: the year stays, and a value that is not a valid timestamp is scrubbed to
+  empty. A date under any other type gets that type's treatment. So a date sent as `NM` is still
+  kept whole, and one sent as `DTM` or `ST` is redacted whole.
+- When a site-code prefix of `19` or `20` is configured, a six-digit `YYYYMM` has the shape of a
+  site code. The site-code pass and the leak-check's site-code test skip a field that the `date`
+  kind filled, so the filled date stays a date. Two things follow. A site code that reads as a
+  year and a month, sitting in a date field, leaves as its first four digits and `01`. And a
+  `dob` field is not skipped, so a fabricated `YYYYMM` date of birth is still rewritten into a
+  number that is not a date. A site code that is itself a year followed by `01` leaves whole.
+  The skip needs the rules: `leak_check` called with no rules, and the publish gate's own scan
+  of a committed file, still flag a kept `YYYYMM` date under such a prefix.
 
 Do not shift the dates to fix the `MSH-7` gap. The kept `MSH-7` minus a shifted `EVN-2` gives back
 the shift.
@@ -1925,7 +1942,8 @@ or one that breaks the schema, refuses the whole run with one `error:` line and 
 came from `messagefoundry generate --count 2 --seed 1710`, run for every type: 186 messages. With
 the switch on, all 186 refused. Mapping the dates and locations above did not change that count.
 It removed 6 of the 72 undecided field addresses, and 553 of the 2,115 undecided fields across the
-corpus. Every message still carries at least one coded field that needs a rule or a `keep`:
+corpus. These counts predate the rules BACKLOG #2330 and #2645 added, and nobody has measured them
+again. Every message still carries at least one coded field that needs a rule or a `keep`:
 
 | Undecided field | Messages |
 | --- | --- |
