@@ -4388,7 +4388,8 @@ jobs:
       # its stop, and a service that is not Stopped after it still fails the step. The stop is sent
       # ONCE: that job shows a stop that arrived, and a lost one goes red here with the state the
       # Service Control Manager reports, which is the reading that would justify a resend. The
-      # line the step prints holds the two readings the open question above is short of.
+      # line the step prints holds what the open question above is short of: the state before the
+      # stop, the command's exit code, and the state as it returned.
       #
       # `if: always()`, so this also runs after a failed install, when there is no service. That is
       # said in one line and the step passes: the red is the earlier step's, and an error from a
@@ -4404,9 +4405,12 @@ jobs:
           if (-not (Get-Service -Name EventLog -ErrorAction SilentlyContinue)) {
             throw "CONTROL FAILED: this read cannot see the EventLog service, so it cannot say MessageFoundry is not installed"
           }
-          if (-not (Get-Service -Name MessageFoundry -ErrorAction SilentlyContinue)) {
+          $registered = Get-Service -Name MessageFoundry -ErrorAction SilentlyContinue
+          if (-not $registered) {
             "no MessageFoundry service is registered, so there is nothing to stop"
           } else {
+            # Read now: the object keeps the first status it reads, and this one is from before the stop.
+            $before = $registered.Status
             & "$env:SMOKE_NSSM_DIR\nssm.exe" stop MessageFoundry
             $stopExit = $LASTEXITCODE
             $global:LASTEXITCODE = 0
@@ -4416,7 +4420,7 @@ jobs:
               Start-Sleep -Milliseconds 500
             }
             $status = (Get-Service -Name MessageFoundry).Status
-            "the stop command exited $stopExit; the service read $asReturned as it returned and $status after the wait"
+            "the service read $before before the stop; the stop command exited $stopExit; the service read $asReturned as it returned and $status after the wait"
             if ($status -ne "Stopped") {
               throw "the service did not stop within 30 seconds; the Service Control Manager reports $status"
             }
