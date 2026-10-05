@@ -333,7 +333,9 @@ def rig(tmp_path: Path) -> Rig:
 @pytest.fixture(scope="module")
 def sleeper() -> Iterator[int]:
     """A live process that is NOT an ancestor of the script, to stand for another live session."""
-    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(900)"])
+    # An hour, not minutes: under -n this module's tests interleave with slower files, and a
+    # sleeper that exits early turns the LIVE cases into DEAD ones. Teardown kills it either way.
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(3600)"])
     try:
         yield proc.pid
     finally:
@@ -379,6 +381,25 @@ def test_delete_removes_the_tree_and_leaves_no_renamed_folder(rig: Rig) -> None:
     assert "deleted=1" in r.summary and "refused=0" in r.summary, r.out
     assert [p.name for p in rig.root.iterdir()] == ["keep"]
     assert _snapshot(keep) == ["a.txt [5]", "sub", "sub\\b.bin [7]"]
+
+
+def test_a_name_holding_wildcard_characters_is_taken_literally(rig: Rig) -> None:
+    rig.caller()
+    # To PowerShell `a[1]` is a pattern that matches `a1`. The script must read it as a name.
+    bracketed = rig.tree(rig.root / "a[1]" / "build (x86) & co")
+    (rig.root / "a1" / ".git").mkdir(parents=True)
+    plain = rig.tree(rig.root / "a1" / "build (x86) & co")
+    _age(rig.root / "a[1]", 600)
+    _age(rig.root / "a1", 600)
+
+    r = rig.run(bracketed, plain)
+
+    assert r.code == 1, r.out
+    r.deleted(bracketed)
+    r.refused(plain, "git", "sits inside the git checkout")
+    assert sorted(p.name for p in rig.root.iterdir()) == ["a1", "a[1]"]
+    assert list((rig.root / "a[1]").iterdir()) == []
+    assert _snapshot(plain) == ["a.txt [5]", "sub", "sub\\b.bin [7]"]
 
 
 def test_each_target_is_judged_alone_and_the_exit_code_says_one_was_refused(rig: Rig) -> None:
@@ -941,8 +962,8 @@ def test_a_delete_that_stops_part_way_lists_exactly_what_remains(rig: Rig) -> No
     victim = rig.tree(rig.root / "victim")
     stuck = victim / "sub" / "b.bin"
 
-    def icacls(*args: str) -> None:
-        subprocess.run(["icacls", *args], check=True, capture_output=True, text=True)
+    def icacls(*args: str, check: bool = True) -> None:
+        subprocess.run(["icacls", *args], check=check, capture_output=True, text=True)
 
     # Deny deleting the file, and deny its folder the right to delete children. The top folder can
     # still be renamed, so the delete starts and then cannot finish.
@@ -965,4 +986,5 @@ def test_a_delete_that_stops_part_way_lists_exactly_what_remains(rig: Rig) -> No
         assert remains == [str(tomb / "sub"), str(tomb / "sub" / "b.bin")], r.out
         assert any(line.startswith(f"failed: {tomb / 'sub' / 'b.bin'}") for line in b.extra), r.out
     finally:
-        icacls(str(rig.root), "/remove:d", EVERYONE, "/T", "/C")
+        # check=False: a failed restore must not replace the assertion that explains the test.
+        icacls(str(rig.root), "/remove:d", EVERYONE, "/T", "/C", check=False)

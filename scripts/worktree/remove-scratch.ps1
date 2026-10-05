@@ -77,27 +77,34 @@
     session id, so "the caller's own scratchpad" covers a whole session family. That is why the
     caller's own scratchpad still waits out a window: the caller cannot list its own workers.
 
-    WHAT IT CANNOT SEE. State these wherever this script is recommended:
+    WHAT IT CANNOT SEE. At least these. State them wherever this script is recommended:
       * A folder at the top of the temp root belongs to nobody the script can name. Another session's
         `mkdtemp` folder and another program's working folder look the same. Only the 60-minute idle
         window and the rename protect them, so a program that keeps old files and holds none open
         can lose them.
       * A session that never registered, and a session that writes into the target by absolute path
         from a working directory somewhere else. occupancy.ps1 says the same of every cwd-keyed fence.
+      * A session that only READS a folder. Reading leaves no creation or write stamp, and no open
+        handle between reads, so a tree somebody has been reading for over an hour can go.
+      * A child session with no registry record of its own. The caller walk passes over it and stops
+        at its nearest registered ancestor, so it is judged as that ancestor.
       * A hard link. Deleting one name leaves the file's other names alone.
 
     IF A DELETE FAILS PART-WAY the script lists exactly what remains, under the renamed folder, and
     exits 3. It never deletes through a reparse point that appeared after the walk; it leaves it.
 
-    EXIT CODES. 0 every target passed. 1 at least one target was refused. 3 at least one delete was
-    left part-done.
+    EXIT CODES. 0 every target passed. 1 at least one target was refused, or the script itself failed
+    (a bad parameter, say). 3 at least one delete was left part-done. Read the SUMMARY line for what
+    was deleted: exit 1 does not mean nothing was.
 
     -TempRoot RE-ROOTS THE SCRIPT FOR TESTS, AND CAN ONLY NARROW IT. It must itself sit strictly
     inside the real temp root and outside <root>\claude, so a re-rooted run reaches nothing the plain
     run could not. -ConfigRoot (a fixture session registry, read INSTEAD of the real one) and
     -RepoRoot (one more repository whose worktrees are compared) work only together with -TempRoot.
-    A fixture registry does hide the real sessions from the sessions check, for targets under
-    -TempRoot only. The rename still refuses a folder any process is standing in.
+    NARROW IS ABOUT REACH, AND TWO THINGS DO LOOSEN, for targets under -TempRoot only. A fixture
+    registry hides the real sessions from the sessions check. And a folder laid out as
+    claude\<project>\<caller's session id>\scratchpad\<name> below -TempRoot takes the 10-minute
+    window. The rename still refuses a folder any process is standing in.
 
     See docs/WORKTREES.md, section "Deleting a scratch folder".
 
@@ -445,59 +452,57 @@ if (-not $runFault) {
 $sidPattern = '\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\z'
 $checkNames = @('spelling', 'temp-root', 'exists', 'reparse', 'git', 'cwd', 'sessions', 'idle', 'in-use')
 
-# Judge one target. Returns the receipt and, when every check passed, the measured tree.
-function Test-Target([string]$Raw) {
-    $receipt = [ordered]@{}
-    $out = @{ Receipt = $receipt; Ok = $false; Full = $Raw; Tree = $null }
+# Run the checks for one target, in order, writing each result into $receipt and the verdict into $out.
+function Invoke-Checks([string]$Raw, $receipt, $out) {
     function Fail([string]$check, [string]$why) { $receipt[$check] = "REFUSED $why" }
 
-    if ($runFault) { Fail 'run' $runFault; return $out }
+    if ($runFault) { Fail 'run' $runFault; return }
 
     $s = Split-StrictPath $Raw
-    if (-not $s.Ok) { Fail 'spelling' $s.Why; return $out }
+    if (-not $s.Ok) { Fail 'spelling' $s.Why; return }
     $full = $s.Full
     $out.Full = $full
     $receipt['spelling'] = 'PASS plain drive-absolute path'
 
-    if ($full -ieq $root) { Fail 'temp-root' 'the target is the temp root itself'; return $out }
-    if (-not (Test-Inside $full $root)) { Fail 'temp-root' "the target is not inside the temp root '$root'"; return $out }
+    if ($full -ieq $root) { Fail 'temp-root' 'the target is the temp root itself'; return }
+    if (-not (Test-Inside $full $root)) { Fail 'temp-root' "the target is not inside the temp root '$root'"; return }
     $rel = @($full.Substring($root.Length + 1) -split '\\')
     $ownerSid = ''
     if ($rel[0] -ieq 'claude') {
         if ($rel.Count -lt 5 -or $rel[3] -ine 'scratchpad') {
             Fail 'temp-root' "under '$root\claude' only the inside of a session scratchpad is deletable (claude\<project>\<session id>\scratchpad\<name>)"
-            return $out
+            return
         }
-        if ($rel[2] -notmatch $sidPattern) { Fail 'temp-root' "'$($rel[2])' is not a session id, so the owner of this scratchpad cannot be looked up"; return $out }
+        if ($rel[2] -notmatch $sidPattern) { Fail 'temp-root' "'$($rel[2])' is not a session id, so the owner of this scratchpad cannot be looked up"; return }
         $ownerSid = $rel[2]
     }
     $receipt['temp-root'] = "PASS inside '$root', $($rel.Count) level(s) down"
 
     $t = Resolve-TruePath $s.Drive $s.Parts
-    if ($t.State -eq 'missing') { Fail 'exists' $t.Why; return $out }
-    if ($t.State -eq 'reparse') { $receipt['exists'] = 'not decided'; Fail 'reparse' "on the path: $($t.Why)"; return $out }
-    if ($t.State -ne 'ok') { Fail 'exists' $t.Why; return $out }
-    if (-not ($t.Leaf.Attributes -band $DirectoryFlag)) { Fail 'exists' 'the target is a file; this script deletes folder trees only'; return $out }
+    if ($t.State -eq 'missing') { Fail 'exists' $t.Why; return }
+    if ($t.State -eq 'reparse') { $receipt['exists'] = 'not decided'; Fail 'reparse' "on the path: $($t.Why)"; return }
+    if ($t.State -ne 'ok') { Fail 'exists' $t.Why; return }
+    if (-not ($t.Leaf.Attributes -band $DirectoryFlag)) { Fail 'exists' 'the target is a file; this script deletes folder trees only'; return }
     # From here on the path is the one spelled from the stored names.
     $full = $t.Path
     $out.Full = $full
     $receipt['exists'] = 'PASS a directory, stored under the name given'
 
     $tree = Measure-Tree $full
-    if ($tree.WalkFault) { Fail 'reparse' "the tree could not be walked: $($tree.WalkFault)"; return $out }
-    if ($tree.ReparseFault) { Fail 'reparse' $tree.ReparseFault; return $out }
+    if ($tree.WalkFault) { Fail 'reparse' "the tree could not be walked: $($tree.WalkFault)"; return }
+    if ($tree.ReparseFault) { Fail 'reparse' $tree.ReparseFault; return }
     $receipt['reparse'] = 'PASS none on the path, none in the tree'
 
-    if ($tree.GitFault) { Fail 'git' $tree.GitFault; return $out }
+    if ($tree.GitFault) { Fail 'git' $tree.GitFault; return }
     # A checkout that starts between the target and the real temp root, the root included. Above the
     # temp root is not this script's business: the temp root is disposable whatever sits over it.
     $up = Split-Path $full -Parent
     while ($up -and (($up -ieq $realRoot) -or (Test-Inside $up $realRoot))) {
         $names = @()
         try { $names = @([IO.DirectoryInfo]::new($up).GetFileSystemInfos() | ForEach-Object { $_.Name }) }
-        catch { Fail 'git' "could not look for a git checkout at '$up': $($_.Exception.Message)"; return $out }
-        if ($names -contains '.git') { Fail 'git' "the target sits inside the git checkout at '$up'"; return $out }
-        if (Test-BareShape $names) { Fail 'git' "the target sits inside the bare git repository at '$up'"; return $out }
+        catch { Fail 'git' "could not look for a git checkout at '$up': $($_.Exception.Message)"; return }
+        if ($names -contains '.git') { Fail 'git' "the target sits inside the git checkout at '$up'"; return }
+        if (Test-BareShape $names) { Fail 'git' "the target sits inside the bare git repository at '$up'"; return }
         $up = Split-Path $up -Parent
     }
     $norm = ConvertTo-Norm $full
@@ -505,34 +510,34 @@ function Test-Target([string]$Raw) {
         $wn = ConvertTo-Norm $w
         if ($wn -eq $norm -or $wn.StartsWith("$norm/") -or $norm.StartsWith("$wn/")) {
             Fail 'git' "the registered worktree '$w' is, holds or sits inside the target; use remove.ps1 for a worktree"
-            return $out
+            return
         }
     }
     $receipt['git'] = "PASS no git entry at any depth, no checkout above it, $($worktreePaths.Count) registered worktree(s) of $reposCompared repositor$(if ($reposCompared -eq 1) { 'y' } else { 'ies' }) compared"
 
     foreach ($here in @($PWD.ProviderPath, [Environment]::CurrentDirectory)) {
         $hn = ConvertTo-Norm $here
-        if ($hn -eq $norm -or $hn.StartsWith("$norm/")) { Fail 'cwd' "the shell running this script is standing in the target ('$here')"; return $out }
+        if ($hn -eq $norm -or $hn.StartsWith("$norm/")) { Fail 'cwd' "the shell running this script is standing in the target ('$here')"; return }
     }
     $receipt['cwd'] = 'PASS'
 
     $inCwd = @($records | Where-Object { $_.Veto -and ($_.CwdNorm -eq $norm -or $_.CwdNorm.StartsWith("$norm/")) })
     if ($inCwd.Count -gt 0) {
         Fail 'sessions' "$($inCwd.Count) session(s) the fence cannot rule out have their working directory in the target: $(($inCwd | ForEach-Object { "$($_.State) $($_.Sid) pid $($_.Pid)" }) -join '; ')"
-        return $out
+        return
     }
     $sessionNote = "registry $registryLine; no session's working directory is in the target"
     $window = $OtherIdleMinutes
     if ($ownerSid) {
         if (-not $callerSid) {
             Fail 'sessions' "the target is in the scratchpad of session $ownerSid, and no ancestor of this process holds a LIVE session record, so the script cannot show the scratchpad is the caller's own"
-            return $out
+            return
         }
         if ($ownerSid -ine $callerSid) {
             $owners = @($records | Where-Object { $_.Sid -ieq $ownerSid })
             $state = if ($owners.Count -gt 0) { ($owners | ForEach-Object { "$($_.State) pid $($_.Pid)" }) -join '; ' } else { 'no registry record' }
             Fail 'sessions' "the target is in the scratchpad of session $ownerSid ($state), and the caller is session $callerSid. Another session's scratchpad is never deleted, live or not: a dead session can be resumed"
-            return $out
+            return
         }
         $sessionNote += "; the scratchpad is the caller's own (ancestor pid $callerPid holds the LIVE record for $callerSid)"
         $window = $OwnScratchpadIdleMinutes
@@ -544,12 +549,25 @@ function Test-Target([string]$Raw) {
     if ($age -lt $window) {
         $ageText = if ($age -lt 0) { 'in the future' } else { "$([int][Math]::Floor($age)) minute(s) ago" }
         Fail 'idle' "'$($tree.NewestPath)' was created or modified $ageText, inside the $window-minute window"
-        return $out
+        return
     }
     $receipt['idle'] = "PASS newest entry is $([int][Math]::Floor($age)) minute(s) old, window $window"
 
     $out.Ok = $true
     $out.Tree = $tree
+}
+
+# Judge one target. Returns the receipt and, when every check passed, the measured tree. A check that
+# THROWS has not reached a confident answer, so it refuses this target and the run goes on to the next.
+function Test-Target([string]$Raw) {
+    $receipt = [ordered]@{}
+    $out = @{ Receipt = $receipt; Ok = $false; Full = $Raw; Tree = $null }
+    try { Invoke-Checks $Raw $receipt $out | Out-Null }
+    catch {
+        $out.Ok = $false
+        $out.Tree = $null
+        $receipt['error'] = "REFUSED a check threw, so it reached no answer: $($_.Exception.Message)"
+    }
     return $out
 }
 
@@ -597,7 +615,9 @@ foreach ($raw in $Path) {
         $counts.would++
     }
 
-    if ($receipt.Contains('run')) { Write-Host "  run: $($receipt['run'])" }
+    foreach ($c in @('run', 'error')) {
+        if ($receipt.Contains($c)) { Write-Host "  ${c}: $($receipt[$c])" }
+    }
     foreach ($c in $checkNames) {
         $v = if ($receipt.Contains($c)) { $receipt[$c] } else { 'not run (an earlier check refused)' }
         Write-Host "  ${c}: $v"

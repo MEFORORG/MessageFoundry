@@ -1586,12 +1586,16 @@ well as write time, because a copied or extracted tree keeps old write times.
 
 ### What it cannot see
 
-Say these wherever you recommend the script.
+It cannot see at least these. Say them wherever you recommend the script.
 
 - **A folder at the top of the temp root has no owner the script can name.** Another session's
   `mkdtemp` folder and another program's working folder look the same. Only the 60-minute window and
   the rename protect them. A program that keeps old files and holds none open can lose them.
+- **A session that only reads a folder.** Reading leaves no creation or write stamp, and no open
+  handle between reads. A tree somebody has been reading for over an hour can go.
 - A session that never registered.
+- A child session with no registry record of its own. The caller walk passes over it and stops at
+  its nearest registered ancestor, so the script judges it as that ancestor.
 - A session that writes into the target by absolute path while its working directory is somewhere
   else.
 - A hard link. Deleting one name leaves the file's other names alone.
@@ -1606,8 +1610,11 @@ Say these wherever you recommend the script.
 | Exit code | Meaning |
 |---|---|
 | 0 | Every target passed. |
-| 1 | At least one target was refused. |
+| 1 | At least one target was refused, or the script itself failed. |
 | 3 | At least one delete was left part-done. |
+
+Exit 1 does not mean nothing was deleted. Read the `SUMMARY` line for that. A check that throws
+refuses its own target, and the run goes on to the next one.
 
 ### Test-only parameters
 
@@ -1616,8 +1623,10 @@ real temp root and outside `<root>\claude`. `-ConfigRoot` reads a fixture sessio
 of the real one. `-RepoRoot` adds one repository whose worktrees are compared. Both work only
 together with `-TempRoot`.
 
-A fixture registry hides the real sessions from the `sessions` check, for targets under `-TempRoot`
-only. The rename still refuses a folder that any process is standing in.
+Narrow is about reach. Two things do loosen, for targets under `-TempRoot` only. A fixture registry
+hides the real sessions from the `sessions` check. And a folder laid out as
+`claude\<project>\<caller's session id>\scratchpad\<name>` below `-TempRoot` takes the 10-minute
+window. The rename still refuses a folder that any process is standing in.
 
 [`tests/test_worktree_remove_scratch.py`](../tests/test_worktree_remove_scratch.py) drives the real
 script under a pytest `tmp_path`. It runs on Windows only. The ubuntu leg skips the whole file,
