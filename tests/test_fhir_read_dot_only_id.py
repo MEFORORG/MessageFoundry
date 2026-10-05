@@ -95,7 +95,8 @@ async def test_read_issues_no_request_for_a_dot_only_id(dots: str) -> None:
     ex, opener = _executor()
     with pytest.raises(FhirLookupError, match="read id is not a valid FHIR id") as ei:
         await ex.read("epic", f"Patient/{dots}")
-    assert "'epic'" in str(ei.value)  # names the connection, never the query
+    assert "'epic'" in str(ei.value)  # names the connection ...
+    assert f"Patient/{dots}" not in str(ei.value)  # ... and never the query
     assert opener.requests == []
 
 

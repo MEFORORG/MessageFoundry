@@ -176,8 +176,9 @@ _TRANSIENT_ISSUE_CODES = frozenset(
 # allow-listed host (the [egress].allowed_http gate pins the host, not the path).
 # `\Z`, never `$`: Python's `$` also matches immediately BEFORE a final newline, so `^[A-Za-z]+$`
 # accepted "Patient\n" and the gate did not enforce the grammar it advertises. Anchoring the pattern
-# fixes every caller at once -- `match` vs `fullmatch` is a property of the CALL, and there are three
-# call sites (`_validate_path_token`, two in `_resolve_read_url`), so a per-call fix leaves the next one to re-introduce it.
+# fixes every caller at once -- `match` vs `fullmatch` is a property of the CALL, and there are at
+# least three call sites (`_validate_path_token`, two in `_resolve_read_url`), so a per-call fix
+# leaves the next one to re-introduce it.
 _FHIR_TYPE_RE = re.compile(r"^[A-Za-z]+\Z")
 _FHIR_ID_RE = re.compile(r"^[A-Za-z0-9.\-]{1,64}\Z")
 # An id that goes into a URL PATH: the id grammar, minus an id of only dots ('.', '..', '...').
