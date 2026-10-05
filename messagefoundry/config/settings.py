@@ -7175,13 +7175,18 @@ def security_loosenings(
     interpreter (vault BACKLOG #2701), and
     ``[store].schema_management = auto`` on a server backend (#305). It is NOT yet
     an exhaustive registry of every security-relevant switch in every section; ``[store]``/``[auth]``
-    carry others (``encrypt``, ``trust_server_certificate``, ``enabled``, ``require_mfa``,
-    ``ad_tls_verify``, ``oidc_require_mfa_claim``,
-    ``password_check_breached``) that are gated elsewhere and are not reported here. That list is
-    enumerated in the floor test's exemption set so the gap is a written decision that a new switch
-    cannot silently join. That set also holds at least one switch this registry DOES report,
-    ``ad_allow_insecure_ldap``, because its entry needs a live ``ldap://`` bind that the floor's lone
-    flip never builds; its own tests pin it.
+    carry others (``encrypt``, ``trust_server_certificate``, ``enabled``, ``ad_tls_verify``,
+    ``oidc_require_mfa_claim``, ``password_check_breached``) that are not reported here. Most are
+    gated elsewhere. ``enabled`` has no config key: ``serve`` always requires sign-in (vault BACKLOG
+    #2719). ``oidc_require_mfa_claim`` has no serve-time refusal of its own: turned off, it mints
+    every OIDC session with no factor met, and while ``require_mfa`` is on that session owes an
+    engine factor. The parenthetical list above is enumerated in the floor test's exemption set so
+    the gap is a written decision that a new switch cannot silently join. That set also holds at
+    least two switches this registry DOES report. One is ``require_mfa``: a loaded config reports it
+    as the ``[security]`` switch below, and its ``[auth]`` field is only the desugared copy (an
+    embedder that builds ``AuthSettings`` itself with it off is not reported). The other is
+    ``ad_allow_insecure_ldap``, because its entry needs a live ``ldap://`` bind that the floor's
+    lone flip never builds; its own tests pin it.
 
     **``[auth].initial_password_expiry_hours`` is also unreported, and BACKLOG #1245 made it
     load-bearing — recorded here as the written decision this paragraph demands, not left implied.**

@@ -46,9 +46,14 @@ levels:
   `[security].enforcement = enforce`, without an effective peer control. **CORRECTED 2026-10-03:** this
   said the listener was not built.
 
-The security controls that only become material off-loopback (MFA, mTLS, certificate revocation,
-off-box logs) are **delegated to the org's environment** (IdP/AD, PKI, SIEM, network controls) and
-documented per deployment — see [DEPLOYMENT.md](DEPLOYMENT.md) and [§11](#11-hardening-roadmap).
+The security controls that only become material off-loopback (mTLS, certificate revocation,
+off-box logs) are **built into the engine**, and each leans on the org's environment.
+Its PKI issues the certificates and the CRL files the engine checks, its SIEM receives the forwarded
+logs, and its network controls stay its own. Each is documented per deployment — see
+[DEPLOYMENT.md](DEPLOYMENT.md) and [§11](#11-hardening-roadmap).
+MFA is not among them. The engine enforces its own second factor (`[security].require_mfa`, on by
+default) on any bind. Which accounts it covers, directory and OIDC sign-ins included, is stated in
+[SECURITY.md](SECURITY.md#multi-factor-authentication-totp-wp-14).
 
 | Actor / vector | In scope? | Mitigation |
 |---|---|---|
@@ -57,7 +62,7 @@ documented per deployment — see [DEPLOYMENT.md](DEPLOYMENT.md) and [§11](#11-
 | Stolen DB file / backup | Yes | At-rest body + `summary`/`metadata` encryption (built — §3) + required volume encryption for WAL/temp |
 | PHI in logs / CI output / shell redirects | **Yes** | "Never log bodies" rule + global log redaction (`RedactionFilter`) + `safe_exc()` chokepoint + prod-DEBUG startup guard (built — §7) |
 | Eavesdropper on the **internal LAN** (MLLP / API) | Yes | **API/WSS TLS + MLLP-over-TLS built** (Gate #4, §4) — *enable them*; the bind-guard refuses non-loopback plaintext; + your network segmentation |
-| Compromised internal host / lateral movement | Partly | Network segmentation + TLS + required auth + at-rest encryption; off-box log shipping (delegate to your SIEM — §11) for evidence beyond the host |
+| Compromised internal host / lateral movement | Partly | Network segmentation + TLS + required auth + at-rest encryption; off-box log forwarding to your SIEM (built; set `[logging].forward_*` — §11) for evidence beyond the host |
 | **Public-internet attacker** | **Out of scope by design** | MEFOR is **not** internet-facing (trust boundary above); off-loopback exposure is internal-only and TLS-required |
 | Misconfigured outbound destination | Yes | Destination allowlist (`[egress].allowed_*`, §4) |
 
