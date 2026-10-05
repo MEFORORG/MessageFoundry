@@ -1393,11 +1393,19 @@ the four HTTP destinations, and their own sections point here.
 | FHIR | any other write | off | **delivered**, with the same WARNING |
 | FHIR | any other write | on | **permanent refusal**: the reply would be stored and may be passed on, as for REST |
 
+**Which rows the ruling itself covers.** The owner ruling of 2026-10-05 names the principle: judge
+an over-size body after a 2xx by who reads it. It does not name the FHIR rows that refuse. Refusing
+them is a reading of that ruling made when this was built (BACKLOG #2180), and the owner may reverse
+that reading. It covers every FHIR write with `capture_response` on, and an update the engine sends
+as a transaction with it off. The ruling's own wording puts FHIR on the delivered side, which is
+what the one remaining FHIR row does: any other write, with `capture_response` off.
+
 "An update the engine sends as a transaction" is `conditional="if-match"`, or `interaction="update"`
 with no `conditional`, each with the default `update_url_form`. Every other FHIR write is in the
 last two rows. That is at least a create, `conditional="conditional-update"` or `"if-none-exist"`
-under any `interaction`, an update in the path form, and a `transaction` or `batch` `Bundle` a
-Handler built. The engine does not read the reply to a Handler's own `Bundle` for its entry statuses.
+under `interaction="create"` or `"update"`, an update in the path form, and a `transaction` or
+`batch` `Bundle` a Handler built. The engine does not read the reply to a Handler's own `Bundle` for
+its entry statuses.
 
 A message that dead-letters this way got a 2xx, but the engine could not read the reply. The partner
 may have applied it. On SOAP, on DICOMweb, and on a FHIR update sent as a transaction, the unread

@@ -1028,6 +1028,10 @@ class FhirDestination(DestinationConnector):
                 # two cases are a permanent refusal. A wrapped update's reply is read for the
                 # entry status, so without it the outcome is unknown. With capture on the reply
                 # is stored and may be passed on.
+                # The owner ruling of 2026-10-05 names that principle and not these two refusals.
+                # Refusing them is a reading of the ruling made when this was built, and the
+                # owner may reverse that reading. The ruling's own wording covers the plain write
+                # with capture off.
                 body = read_2xx_reply_text(
                     resp,
                     connector=self._hop,

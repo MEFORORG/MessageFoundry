@@ -15,7 +15,9 @@ The owner ruling of 2026-10-05 judges such a reply by who reads the body:
 
 Two FHIR cases are a refusal on the same principle: an update the engine wraps in a transaction,
 whose reply it reads for the entry status, in either capture mode; and any FHIR write with capture
-on, whose reply is passed on.
+on, whose reply is passed on. The ruling names the principle and not these FHIR refusals. Refusing
+them is a reading of it made when this was built, and the owner may reverse that reading. If that
+happens, the FHIR rows of ``_RULED`` that say ``_REFUSED`` are the ones to change.
 
 Three layers:
 
