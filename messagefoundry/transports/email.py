@@ -9,6 +9,9 @@ plain-text SMTP message to a configured server and maps the outcome onto the eng
   capture, exactly like File).
 - **connect/EHLO/STARTTLS/AUTH/send failure** (``smtplib.SMTPException`` / ``OSError`` /
   ``TimeoutError``) → :class:`DeliveryError` (transient — the staged queue retries with backoff).
+- **a body the configured ``encoding`` cannot encode** → the permanent, content-free
+  :class:`~messagefoundry.transports.base.NegativeAckError` that
+  :func:`~messagefoundry.transports.base.encode_wire_body` raises (dead-lettered, never retried).
 
 Standard library only (``smtplib`` + ``email.message``) — no new dependency (ADR 0029 §"What this
 must not break"; CLAUDE.md §7). The synchronous SMTP core is **lifted** from
@@ -74,6 +77,7 @@ from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
     DestinationConnector,
+    encode_wire_body,
     register_destination,
 )
 from messagefoundry.transports.mllp import InsecureHopGuard
@@ -506,6 +510,11 @@ class EmailDestination(DestinationConnector):
         return None
 
     def _build_message(self, payload: str) -> EmailMessage:
+        # set_content() below encodes with a bare str.encode(charset), whose UnicodeEncodeError names
+        # a character of the message and holds the whole payload on `.object`. The shared helper fails
+        # permanent and content-free instead (see its docstring). set_content() repeats the same call,
+        # so it cannot fail after this one.
+        encode_wire_body(payload, self.encoding, transport=f"Email {self.host}:{self.port}")
         msg = EmailMessage()
         msg["Subject"] = self.subject
         self._envelope.address(msg)

@@ -10,8 +10,11 @@ import smtplib
 import socket
 import ssl
 import threading
+import traceback
 from collections.abc import Iterator
+from email import message_from_bytes
 from email.message import EmailMessage
+from email.policy import default as default_policy
 from pathlib import Path
 from typing import Any
 
@@ -26,11 +29,18 @@ from messagefoundry.config.tls_policy import (
     active_hop_posture,
 )
 from messagefoundry.config.wiring import WiringError
-from messagefoundry.transports.base import DeliveryError
+from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.egress import check_egress_allowed
 from messagefoundry.transports.email import EmailDestination, envelope_address_problem
 from messagefoundry.transports.mllp import InsecureHopGuard
 from tests._egress_policy import permitting
+from tests.test_encode_wire_body import (
+    CJK_CHAR,
+    PAYLOAD,
+    SECRET_CHAR,
+    _assert_content_free,
+    _escapes,
+)
 
 
 class _FakeSMTP:
@@ -1331,3 +1341,71 @@ async def test_an_approved_mechanism_still_authenticates(monkeypatch: pytest.Mon
     await d.send("body")
     [smtp] = _FakeSMTP.instances
     assert smtp.auth_mechanism == "LOGIN", "should fall through CRAM-MD5 to the approved LOGIN"
+
+
+# --- an unencodable body fails content-free (see encode_wire_body) ----------------------------------
+
+#: Synthetic. The marker must be unreachable from the raised error by any route.
+_BODY_MARKER = "ZZSYNTHMARKER42"
+_NON_ASCII_BODY = f"{PAYLOAD}NTE|1||{_BODY_MARKER}\r"
+
+
+def _body_dest(port: int, encoding: str) -> EmailDestination:
+    base = _wire_dest(port, ["a@hospital.example"])
+    return EmailDestination(
+        base.model_copy(update={"settings": {**base.settings, "encoding": encoding}})
+    )
+
+
+@pytest.mark.parametrize("encoding", ["us-ascii", "latin-1"])
+async def test_an_unencodable_body_is_a_permanent_content_free_refusal(
+    wire: _WireCapture, encoding: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Classified exactly as Direct classifies it, and nothing of the message reaches the text, the
+    repr, the stored error column (``safe_exc``), a formatted traceback, the log, or the chain.
+
+    Before the fix ``set_content`` raised a bare UnicodeEncodeError: its text named the offending
+    character and its ``.object`` held the whole payload, so the first assertion fails."""
+    d = _body_dest(wire.port, encoding)
+    with caplog.at_level("DEBUG"), pytest.raises(Exception) as ei:  # noqa: B017
+        await d.send(_NON_ASCII_BODY)
+    exc = ei.value
+    assert _BODY_MARKER not in str(getattr(exc, "object", "")), "the error carries the payload"
+    _assert_content_free(exc, encoding=encoding)
+    for where, text in {
+        "traceback": "".join(traceback.format_exception(exc)),
+        "log": "\n".join(record.getMessage() for record in caplog.records),
+    }.items():
+        assert _BODY_MARKER not in text, f"message content reached the {where}"
+        for ch in (SECRET_CHAR, CJK_CHAR):
+            for form in _escapes(ch):
+                assert form not in text, f"a message character reached the {where} as {form!r}"
+    # The same bytes never encode on a retry, so the row dead-letters on the first attempt. A bad
+    # MESSAGE, so neither flag may stop the whole lane.
+    assert isinstance(exc, NegativeAckError)
+    assert exc.permanent is True and exc.code == "encoding"
+    assert exc.credential_fault is False and exc.config_fault is False
+    assert wire.connections == 0, "nothing is dialled for a message that never built"
+
+
+@pytest.mark.parametrize(
+    ("encoding", "payload", "wire_charset"),
+    [
+        ("utf-8", _NON_ASCII_BODY, "utf-8"),
+        # The email package writes latin-1 under its MIME name.
+        ("latin-1", _NON_ASCII_BODY.replace(CJK_CHAR, ""), "iso-8859-1"),
+    ],
+    ids=["utf-8", "latin-1"],
+)
+async def test_an_encodable_body_still_reaches_the_wire(
+    wire: _WireCapture, encoding: str, payload: str, wire_charset: str
+) -> None:
+    """POSITIVE CONTROL. A guard that refused every non-ASCII body would pass the test above. The
+    guard keys on the codec: latin-1 carries the e-acute it can encode."""
+    await _body_dest(wire.port, encoding).send(payload)
+    sent = message_from_bytes(b"".join(wire.data), policy=default_policy)
+    assert isinstance(sent, EmailMessage)
+    body = sent.get_content()
+    assert _BODY_MARKER in body
+    assert SECRET_CHAR in body
+    assert sent.get_content_charset() == wire_charset
