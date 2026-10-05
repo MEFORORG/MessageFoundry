@@ -793,7 +793,8 @@ _SMOKE_STOP_CALL = f"& {_SMOKE_NSSM} stop MessageFoundry"
 # What nssm 2.24 printed, with exit 1, in the job the ci.yml comment names.
 _NSSM_UNEXPECTED = "MessageFoundry: Unexpected status SERVICE_RUNNING in response to STOP control."
 _NOTHING_TO_STOP = "no MessageFoundry service is registered, so there is nothing to stop"
-_SLEPT = "STAND-IN SLEEP 500"
+# The unit closes the token: without it "500" would also count a sleep of 5000.
+_SLEPT = "STAND-IN SLEEP 500 ms"
 
 
 @functools.cache
@@ -809,14 +810,19 @@ def _smoke_stop_script() -> str:
 
 
 def _run_smoke_stop(
-    tmp_path: Path, *, nssm_exit: int, states: list[str], sees_services: bool = True
+    tmp_path: Path, *, nssm_exit: int, states: list[str] | None
 ) -> subprocess.CompletedProcess[str]:
     """Run the step's script as the runner does, and return the process: its exit code is the
     step's result.
 
     ``states`` is what the stand-in Get-Service reports for MessageFoundry on successive reads (the
-    last value repeats); an empty list means no such service. ``sees_services`` False makes it
-    report no EventLog service either, which is a read that can see nothing.
+    last value repeats). An empty list means no such service. None is a read that can see no
+    service at all: no MessageFoundry and no EventLog either.
+
+    NOTHING HERE MAY REACH A REAL SERVICE, and a developer's machine can have a real MessageFoundry
+    service. The script's one nssm call is pointed at the stub, Get-Service is a stand-in, and the
+    other commands that change a service are stand-ins that throw. So an edit that adds one of
+    those to the step fails here and does not run it.
 
     THE WRAPPER IS THE RUNNER'S. GitHub runs a pwsh step as ``pwsh -command ". '{0}'"``, puts
     ``$ErrorActionPreference = 'stop'`` first, and ends the script by exiting with $LASTEXITCODE
@@ -828,26 +834,33 @@ def _run_smoke_stop(
     if shutil.which("pwsh") is None:
         pytest.skip("SKIP (nothing run): pwsh not on PATH")
     script = _smoke_stop_script()
-    # The stub takes any arguments, so what is sent, and to which service, is read from the text.
-    # How many times it is sent is counted from the stub's own message, in the arms below.
-    assert script.count(_SMOKE_NSSM) == 1 and script.count(_SMOKE_STOP_CALL) == 1, (
-        f"expected the step to name the checked nssm.exe once, as {_SMOKE_STOP_CALL!r}:\n{script}"
+    # The stub takes any arguments, so what is sent, and to which service, is read from the text:
+    # one whole line, so a longer service name or an extra argument does not match. How many
+    # times it is sent is counted from the stub's own message, in the arms below.
+    calls = [line.strip() for line in script.splitlines() if _SMOKE_NSSM in line]
+    assert calls == [_SMOKE_STOP_CALL] and script.count(_SMOKE_NSSM) == 1, (
+        f"expected the step to name the checked nssm.exe once, as {_SMOKE_STOP_CALL!r}: {calls}"
     )
     stub = _nssm_stub(
         tmp_path / f"nssm-smoke-stop-{uuid.uuid4().hex}",
         message=_NSSM_UNEXPECTED,
         exit_code=nssm_exit,
     )
-    states_ps = "@(" + ", ".join(_psq(s) for s in states) + ")"
+    states_ps = "@(" + ", ".join(_psq(s) for s in states or []) + ")"
     stand_ins = f"""$ErrorActionPreference = 'stop'
 $PSNativeCommandUseErrorActionPreference = $true
 $global:States = {states_ps}
 $global:Reads = 0
+foreach ($changes in 'Stop-Service', 'Start-Service', 'Restart-Service', 'Set-Service', 'sc.exe') {{
+  Set-Item -Path "function:global:$changes" -Value {{
+    throw "the step ran $($MyInvocation.MyCommand.Name), which this harness does not stand in for"
+  }}
+}}
 function Get-Service {{
   param([string]$Name, $ErrorAction)
   $status = $null
   if ($Name -eq 'EventLog') {{
-    if ({"$true" if sees_services else "$false"}) {{ $status = 'Running' }}
+    if ({"$false" if states is None else "$true"}) {{ $status = 'Running' }}
   }} elseif ($Name -ne 'MessageFoundry') {{
     throw "the stand-in was asked for an unexpected service: $Name"
   }} elseif ($global:States.Count -gt 0) {{
@@ -861,7 +874,7 @@ function Get-Service {{
     throw "Cannot find any service with service name '$Name'."
   }}
 }}
-function Start-Sleep {{ param($Milliseconds) "STAND-IN SLEEP $Milliseconds" }}
+function Start-Sleep {{ param($Milliseconds) "STAND-IN SLEEP $Milliseconds ms" }}
 """
     f = tmp_path / f"smoke-stop-{uuid.uuid4().hex}.ps1"
     f.write_text(
@@ -886,11 +899,14 @@ def test_the_smoke_stop_passes_when_the_scm_confirms_a_stop_nssm_called_failed(
 
     The stub's message on stderr is the control: it shows the stub ran and exited through the
     path the step reads, so the pass is not a pass over a command that never launched.
+
+    Every scripted state but the two StopPending reads is different, so each printed reading can
+    only have come from its own read.
     """
     r = _run_smoke_stop(
         tmp_path,
         nssm_exit=1,
-        states=["Running", "Running", "StopPending", "StopPending", "Stopped"],
+        states=["StartPending", "Running", "StopPending", "StopPending", "Stopped"],
     )
     said = r.stdout + r.stderr
     assert said.count(_NSSM_UNEXPECTED) == 1, (
@@ -901,12 +917,18 @@ def test_the_smoke_stop_passes_when_the_scm_confirms_a_stop_nssm_called_failed(
         "the step failed on a stop the Service Control Manager confirmed, so nssm's exit code "
         f"still decides it (exit {r.returncode}):\n{said[:2000]}"
     )
-    assert "read Running before the stop; the stop command exited 1;" in r.stdout, (
-        "the step no longer prints the state before the stop and nssm's exit code, which are "
-        f"readings BACKLOG #2747 is short of:\n{said[:2000]}"
-    )
     # The first two states answer "is it registered" and "what did it read as nssm returned".
     # The wait then read StopPending twice, slept twice, and ended on Stopped.
+    printed = [line for line in r.stdout.splitlines() if line.startswith("the service read ")]
+    assert printed == [
+        "the service read StartPending before the stop; the stop command exited 1; "
+        "the service read Running as it returned",
+        "the service read Stopped after the wait",
+    ], (
+        "the step no longer prints the state before the stop, nssm's exit code and the state as "
+        f"it returned, each from its own read, BEFORE the wait:\n{said[:2000]}"
+    )
+    assert r.stdout.index(printed[0]) < r.stdout.index(_SLEPT) < r.stdout.index(printed[1])
     assert r.stdout.count(_SLEPT) == 2, f"the wait did not end when the service stopped:\n{said}"
 
 
@@ -915,12 +937,15 @@ def test_the_smoke_stop_still_fails_on_a_service_that_never_stops(tmp_path: Path
     service stays Running: the step fails, names the state, and gave up after its bound.
 
     A service that hangs in its drain reads StopPending for the whole wait, and that is not
-    Stopped either. That arm runs under an nssm that exits 1, so neither code decides the step.
+    Stopped either. Both states run under both exit codes, so neither code decides the step:
+    exit 1 over a service still Running is the incident's own output with a stop that was lost.
+    StartPending and Paused are there so that only Stopped counts as stopped.
 
     The state is read from the line the step prints. The failure's own text says the same, but
     pwsh wraps an error at the width of the console it inherits, and a phrase can be split there.
     """
-    for nssm_exit, stuck in ((0, "Running"), (1, "StopPending")):
+    arms = [(code, state) for state in ("Running", "StopPending") for code in (0, 1)]
+    for nssm_exit, stuck in [*arms, (0, "StartPending"), (0, "Paused")]:
         r = _run_smoke_stop(tmp_path, nssm_exit=nssm_exit, states=["Running", "Running", stuck])
         said = r.stdout + r.stderr
         assert said.count(_NSSM_UNEXPECTED) == 1, (
@@ -931,7 +956,7 @@ def test_the_smoke_stop_still_fails_on_a_service_that_never_stops(tmp_path: Path
             f"a service still {stuck} passed the step under an nssm that exited {nssm_exit}:\n"
             f"{said[:2000]}"
         )
-        assert f"and {stuck} after the wait" in r.stdout, said[:2000]
+        assert f"the service read {stuck} after the wait" in r.stdout.splitlines(), said[:2000]
         # 60 waits of 500 ms: the bound the failure message states, and a bound at all.
         assert r.stdout.count(_SLEPT) == 60, (
             f"the wait is not 60 reads of 500 ms ({r.stdout.count(_SLEPT)} sleeps), so 'within 30 "
@@ -960,7 +985,7 @@ def test_the_smoke_stop_does_not_read_a_blind_scm_as_nothing_to_stop(tmp_path: P
     """A read that can see no service at all must not pass as "not installed" over an engine that
     is still running. The stand-in reports no EventLog service and no MessageFoundry service, which
     is what such a read returns. The step fails on its control and does not say nothing to stop."""
-    r = _run_smoke_stop(tmp_path, nssm_exit=0, states=[], sees_services=False)
+    r = _run_smoke_stop(tmp_path, nssm_exit=0, states=None)
     said = r.stdout + r.stderr
     assert r.returncode != 0 and "CONTROL FAILED" in said, said[:2000]
     assert _NOTHING_TO_STOP not in said, said[:2000]

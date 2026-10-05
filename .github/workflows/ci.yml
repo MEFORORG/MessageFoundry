@@ -4384,18 +4384,20 @@ jobs:
       # ci-gate's needs, so that red failed the merge group over a service that stopped. Why this
       # copy read RUNNING back is NOT established, and nothing below depends on the answer.
       #
-      # So the Service Control Manager is asked, with the same bounded wait the token step uses for
-      # its stop, and a service that is not Stopped after it still fails the step. The stop is sent
-      # ONCE: that job shows a stop that arrived, and a lost one goes red here with the state the
-      # Service Control Manager reports, which is the reading that would justify a resend. The
-      # line the step prints holds what the open question above is short of: the state before the
-      # stop, the command's exit code, and the state as it returned.
+      # So the Service Control Manager is asked, with the bounded wait the token step uses for its
+      # stop. A service that is not Stopped after the wait still fails the step. The stop is sent
+      # ONCE, because that job shows a stop that arrived. A lost stop goes red here with the state
+      # the Service Control Manager reports, and that reading is what would justify a resend.
       #
-      # `if: always()`, so this also runs after a failed install, when there is no service. That is
-      # said in one line and the step passes: the red is the earlier step's, and an error from a
+      # The first line the step prints holds what the open question above is short of: the state
+      # before the stop, the command's exit code, and the state as the command returned. It is
+      # printed before the wait, so a run that ends inside the wait still shows it.
+      #
+      # `if: always()`, so this also runs after a failed install, when there is no service. The
+      # step says so in one line and passes. The red is the earlier step's, and an error from a
       # stop sent to nothing would read as a second fault. The control is a service Windows always
-      # has, so a read that can see no service at all is not taken for "not installed" over an
-      # engine that is still running.
+      # has. Without it, a read that can see no service at all would pass as "not installed" over
+      # an engine that is still running.
       - name: Stop the service (graceful)
         if: always()
         run: |
@@ -4415,12 +4417,13 @@ jobs:
             $stopExit = $LASTEXITCODE
             $global:LASTEXITCODE = 0
             $asReturned = (Get-Service -Name MessageFoundry).Status
+            "the service read $before before the stop; the stop command exited $stopExit; the service read $asReturned as it returned"
             foreach ($i in 1..60) {
               if ((Get-Service -Name MessageFoundry).Status -eq "Stopped") { break }
               Start-Sleep -Milliseconds 500
             }
             $status = (Get-Service -Name MessageFoundry).Status
-            "the service read $before before the stop; the stop command exited $stopExit; the service read $asReturned as it returned and $status after the wait"
+            "the service read $status after the wait"
             if ($status -ne "Stopped") {
               throw "the service did not stop within 30 seconds; the Service Control Manager reports $status"
             }
