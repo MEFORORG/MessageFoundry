@@ -200,6 +200,16 @@ class _PgConn:
         return _txn()
 
 
+class _NoPool:
+    """Stands in for the asyncpg pool. A session method that reaches it borrowed outside
+    ``_timed_acquire``, so with no acquire timeout (BACKLOG #1052)."""
+
+    def __getattr__(self, name: str) -> Any:
+        raise AssertionError(
+            f"a session method used self._pool.{name}, a borrow outside the bounded helper"
+        )
+
+
 def _pg_store(seen: list[tuple[str, tuple[Any, ...]]]) -> Any:
     from messagefoundry.store.postgres import PostgresStore
 
@@ -212,9 +222,9 @@ def _pg_store(seen: list[tuple[str, tuple[Any, ...]]]) -> Any:
         yield _PgConn(seen)
 
     store._timed_acquire = _timed_acquire
-    # Any borrow that bypasses the bounded helper reaches this and fails the test by name, rather
-    # than an AttributeError deep inside asyncpg.
-    store._pool = None
+    # Any borrow that bypasses the bounded helper reaches this and fails with a message naming the
+    # bypass, rather than with a bare AttributeError.
+    store._pool = _NoPool()
     return store
 
 

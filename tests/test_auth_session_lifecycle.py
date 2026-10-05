@@ -318,7 +318,12 @@ def _factor_ceremony_scan(source: str) -> tuple[set[str], set[str], list[str]]:
     in an inner function that may never run does not count for the one around it. "Before" is
     source order, not control flow, so a stamp in a branch that returns early still counts. That
     errs toward calling a re-proof a factor ceremony, which fails the set comparison loudly rather
-    than passing it quietly."""
+    than passing it quietly.
+
+    It still misses at least one shape, which errs the quiet way: a stamp written by a CALLER of
+    the function that elevates, as when a public method stamps and then hands off to a private
+    one that elevates. Stamps are followed down into helpers, never up into callers. Every shipped
+    ceremony stamps in the function that elevates."""
     import ast
 
     tree = ast.parse(source)
@@ -462,14 +467,17 @@ def test_only_the_service_module_elevates() -> None:
     it and could skip the cap unseen, so none may exist."""
     from pathlib import Path
 
-    root = Path(__file__).resolve().parents[1] / "messagefoundry"
-    service = root / "auth" / "service.py"
-    files = sorted(root.rglob("*.py"))
-    # The controls: the walk reached the package, and the needle finds the elevations that exist.
-    assert len(files) > 100, f"the walk found {len(files)} files under {root}"
+    repo = Path(__file__).resolve().parents[1]
+    service = repo / "messagefoundry" / "auth" / "service.py"
+    # Every first-party package the engine runs in-process: the engine, the web console it mounts
+    # at /ui, and the toolkit.
+    packages = ("messagefoundry", "messagefoundry_webconsole", "messagefoundry_toolkit")
+    files = sorted(path for package in packages for path in (repo / package).rglob("*.py"))
+    # The controls: the walk reached the packages, and the needle finds the elevations that exist.
+    assert len(files) > 100, f"the walk found {len(files)} files under {packages}"
     assert service in files and "._elevated(" in service.read_text(encoding="utf-8")
     callers = [
-        str(path.relative_to(root))
+        str(path.relative_to(repo))
         for path in files
         if path != service
         and any(f".{name}(" in path.read_text(encoding="utf-8") for name in _ELEVATE)
