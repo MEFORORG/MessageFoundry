@@ -39,6 +39,7 @@ from scripts.security.dast_auth_sweep import (
     is_refused,
     load_policy,
     main,
+    ungated_not_declared_public,
     write_probe_outcome,
 )
 from scripts.security.dast_target import (
@@ -59,6 +60,14 @@ _UNREACHABLE_ROUTE = "/service/identity"
 
 def _policy() -> dict[str, Any]:
     return load_policy(_POLICY)
+
+
+def _declared_public(policy: dict[str, Any]) -> list[dict[str, Any]]:
+    """The allow-list as a clean receipt reports it: each route declared public, with a reason."""
+    return [
+        {**entry, "kind": route_gates.KIND_PUBLIC, "declaration": "synthetic reason"}
+        for entry in policy["anonymous_allowlist"]
+    ]
 
 
 @pytest.fixture(scope="module")
@@ -206,6 +215,12 @@ def test_ungated_routes_are_exactly_the_documented_anonymous_set(
         f"{sorted(documented - observed)}. A route with no require*() gate is reachable by anyone."
     )
     assert len(observed) == receipt["ungated_http_rows"]
+    # Vault BACKLOG #2846: the allow-list names routes public BY DESIGN. A route the engine refuses to
+    # every caller also has no gate, so each listed route must also read as declared public, with a
+    # reason, or the set above could not tell the two apart. The rule is the shipped one evaluate()
+    # applies, so this test does not keep a copy of it.
+    undeclared = ungated_not_declared_public(receipt)
+    assert not undeclared, f"ungated routes not declared public with a reason: {undeclared}"
 
     # The WebSocket route cannot be probed with an HTTP request, so the sweep excludes it. Its gate is
     # read from the endpoint body (BACKLOG #2057, tests/test_route_gates.py), and the row is REPORTED as
@@ -456,7 +471,7 @@ def test_a_policy_without_floors_fails_closed(tmp_path: Path) -> None:
             "bfla_probes": 19,
             "write_reached": 47,
             "write_bfla_probes": 43,
-            "ungated_routes": policy["anonymous_allowlist"],
+            "ungated_routes": _declared_public(policy),
         },
         policy,
     )
@@ -586,7 +601,7 @@ def test_a_write_pass_that_never_ran_fails_closed() -> None:
         "reached": 46,
         "bfla_probes": 19,
         "unreached_unexplained": 0,
-        "ungated_routes": policy["anonymous_allowlist"],
+        "ungated_routes": _declared_public(policy),
         "findings": [],
     }
     code, errors = evaluate(receipt, policy)
@@ -612,7 +627,7 @@ def test_the_bfla_canary_floors_the_write_pass_separately() -> None:
         "write_reached": 47,
         "write_bfla_probes": 43,
         "unreached_unexplained": 0,
-        "ungated_routes": policy["anonymous_allowlist"],
+        "ungated_routes": _declared_public(policy),
         "findings": [],
         "canary": "bfla",
         "bfla_violations": 19,
@@ -636,7 +651,7 @@ def test_too_many_destroyed_sessions_is_a_could_not_measure() -> None:
         "write_reached": 47,
         "write_bfla_probes": 43,
         "unreached_unexplained": 0,
-        "ungated_routes": policy["anonymous_allowlist"],
+        "ungated_routes": _declared_public(policy),
         "findings": [],
         "write_session_rebuilds": int(policy["max_write_session_rebuilds"]) + 1,
         "write_session_rebuild_rows": ["POST /auth/logout"],
@@ -768,7 +783,7 @@ def test_bfla_oracle_treats_404_as_a_violation() -> None:
         "write_bfla_probes": 43,
         "bfla_violations": 1,
         "unreached_unexplained": 0,
-        "ungated_routes": policy["anonymous_allowlist"],
+        "ungated_routes": _declared_public(policy),
         "findings": [
             {
                 "method": "GET",
@@ -798,7 +813,7 @@ def test_an_unexplained_unreached_operation_is_a_finding() -> None:
         "write_reached": 47,
         "write_bfla_probes": 43,
         "unreached_unexplained": 3,
-        "ungated_routes": policy["anonymous_allowlist"],
+        "ungated_routes": _declared_public(policy),
         "findings": [],
     }
     code, errors = evaluate(receipt, policy)
@@ -822,12 +837,56 @@ def test_a_newly_ungated_route_reds_the_run() -> None:
         "write_reached": 47,
         "write_bfla_probes": 43,
         "unreached_unexplained": 0,
-        "ungated_routes": [*policy["anonymous_allowlist"], {"method": "GET", "path": "/messages"}],
+        # Declared public with a reason, so only the set check can catch it: the route is public
+        # but missing from the reviewed allow-list.
+        "ungated_routes": [
+            *_declared_public(policy),
+            {
+                "method": "GET",
+                "path": "/messages",
+                "kind": route_gates.KIND_PUBLIC,
+                "declaration": "synthetic reason",
+            },
+        ],
         "findings": [],
     }
     code, errors = evaluate(receipt, policy)
     assert code == 1
     assert any("/messages" in line for line in errors), errors
+
+
+@pytest.mark.parametrize(
+    "row_change",
+    [{"kind": route_gates.KIND_REFUSED}, {"declaration": None}, {"kind": None}],
+    ids=["refused", "no-reason", "no-kind"],
+)
+def test_an_allow_listed_route_that_is_not_declared_public_reds_the_run(
+    row_change: dict[str, Any],
+) -> None:
+    """Vault BACKLOG #2846. The (method, path) set alone cannot tell a route public by design from
+    one the engine refuses to every caller, so ``evaluate()`` reads each row's kind and reason too.
+    Each case passed ``evaluate()`` before #2846."""
+    policy = _policy()
+    rows = _declared_public(policy)
+    clean: dict[str, Any] = {
+        "gated_http_rows": 99,
+        "route_rows_examined": 105,
+        "negative_probes": 198,
+        "reached": 46,
+        "bfla_probes": 19,
+        "write_reached": 47,
+        "write_bfla_probes": 43,
+        "unreached_unexplained": 0,
+        "ungated_routes": rows,
+        "findings": [],
+    }
+    # The control: the same receipt with every row declared public passes, so the red below comes
+    # from the one changed row and not from the helper or the receipt.
+    assert evaluate(clean, policy) == (0, [])
+    changed = {**rows[0], **row_change}
+    code, errors = evaluate({**clean, "ungated_routes": [changed, *rows[1:]]}, policy)
+    assert code == 1, errors
+    assert any("not declared public" in line and changed["path"] in line for line in errors), errors
 
 
 # =====================================================================================================

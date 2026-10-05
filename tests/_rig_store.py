@@ -29,7 +29,14 @@ from __future__ import annotations
 import os
 
 # Children of ``users`` before it: on SQL Server a DELETE is refused while a row still refers to it.
-_TABLES = ("audit_log", "sessions", "webauthn_credentials", "user_roles", "users")
+_TABLES = (
+    "audit_log",
+    "sessions",
+    "webauthn_credentials",
+    "known_login_addresses",
+    "user_roles",
+    "users",
+)
 
 
 async def reset_accounts(backend: str) -> None:

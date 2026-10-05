@@ -505,8 +505,9 @@ def _ninth_sweep_problems(config_text: str, connections_text: str) -> list[str]:
             "first-seen address is born with no window (BACKLOG #288)"
         )
     for clause in (
-        "not among its recent completed sign-ins (the newest 200 of each kind, at most 90 days "
-        "back)",
+        "not among its recent completed sign-ins (the hosts it finished a sign-in or passed a "
+        "step-up from, at most 90 days back)",
+        "A step-up from that address passes the challenge; signing in again does not.",
         "first-seen address challenge (BACKLOG #288)",
         "The check fails open",
         "counts from any address (ADR 0197)",
@@ -630,8 +631,7 @@ def test_the_ninth_sweep_rows_rest_on_code_that_still_says_so() -> None:
     assert not reconcile.hold_latches(undetermined=1, latched=False)
     assert not reconcile.hold_latches(undetermined=0, latched=True)
 
-    # The first-seen address baseline: 200 rows of each kind, 90 days back.
-    assert auth_service._LOGIN_ADDRESS_HISTORY_ROWS == 200
+    # The first-seen address baseline: the known-address record, 90 days back (vault BACKLOG #2145).
     assert auth_service._LOGIN_ADDRESS_LOOKBACK_SECONDS == 90 * 86400
 
     # The directory-password sign-in is refused, not dispatched.

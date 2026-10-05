@@ -135,10 +135,12 @@ _DESCRIPTIONS = {
     # BACKLOG #288. States what happened and what it cost the session, and nothing about blocking:
     # the sign-in was NOT refused, so a notice implying it was would be false. "Started", because
     # the notice fires at the password step, before any second factor the account owes is proven.
-    # No "if this was not you" line: the shared closing below already says it.
+    # No "if this was not you" line: the shared closing below already says it. "Not finished a
+    # sign-in from": an address whose earlier sign-ins never completed every factor or step-up is
+    # still first-seen (vault BACKLOG #2145), so "not signed in from" would be false.
     LOGIN_NEW_IP: (
         "Someone started a sign-in to your account with valid credentials from a client address it "
-        "has not signed in from recently. It was not blocked."
+        "has not recently finished a sign-in from. It was not blocked."
     ),
 }
 
