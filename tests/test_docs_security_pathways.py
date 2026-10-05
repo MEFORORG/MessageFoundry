@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import dataclasses
 import functools
 import inspect
 import itertools
@@ -2520,4 +2521,337 @@ def test_the_eleventh_sweep_says_no_doc_delegates_directory_mfa() -> None:
         "`[auth].oidc_require_mfa_claim` is off." in doc
     ), (
         "docs/SECURITY.md's Browser AD login paragraph must state the directory rule (BACKLOG #1133)."
+    )
+
+
+#: A sentence saying a capability is absent or still to come. Matched on text with the Markdown
+#: emphasis stripped, so "*not* there yet" and "**MFA**" read as plain words.
+_ABSENT = re.compile(
+    r"\broadmap\b|\bnot there yet\b|n't built\b|\bnot (?:yet )?built\b|\bremaining\b[^.]*\bgaps?\b"
+    r"|\bplanned\b",
+    re.IGNORECASE,
+)
+
+#: The engine's second factor under any name a doc gives it.
+_SECOND_FACTOR = re.compile(
+    r"\bMFA\b|\bTOTP\b|\bpasskeys?\b|second factor|two-factor|multi-factor", re.IGNORECASE
+)
+
+
+def _clauses(text: str) -> list[str]:
+    """``text`` flattened and cut at sentence ends, semicolons and table-cell bars, with emphasis and
+    blockquote markers removed.
+
+    The unit a claim lives in. A cut at ``;`` keeps "X is built; Y is on the roadmap" from reading
+    as a claim that X is on the roadmap. A blockquote's ``>`` would otherwise split a phrase that
+    wraps across its lines."""
+    plain = _flat(re.sub(r"(?m)^[ \t]*>[ \t]?", "", text)).replace("*", "")
+    return [c for c in re.split(r"(?<=[.!?;])\s+|\s*\|\s*", plain) if c]
+
+
+def _doc(name: str) -> str:
+    return (_ROOT / name).read_text(encoding="utf-8")
+
+
+def test_the_twelfth_sweep_probes_mfa_and_the_first_factor_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The code half of the twelfth 6.1.3 re-read (BACKLOG #1133). Four docs outside the three the
+    earlier sweeps read still said MFA was not built, that the sign-in form offers an AD provider,
+    and that a first factor may be a passkey. The test below refuses those claims; this pins the
+    code they contradict, so a change that makes an old claim true again reds here first."""
+    # 1. MFA is built and on: the default, both factor kinds, and the access gate on `require`.
+    assert AuthSettings.model_fields["require_mfa"].default is True
+    for enrol in ("begin_mfa_enrollment", "begin_webauthn_registration"):
+        assert inspect.iscoroutinefunction(getattr(AuthService, enrol, None)), (
+            f"AuthService.{enrol} is gone; the README and the early-adopter guide say TOTP and "
+            "passkeys are built."
+        )
+    assert _called(
+        ast.parse(textwrap.dedent(inspect.getsource(api_security.require))), "mfa_satisfied"
+    ), (
+        "api.security.require no longer asks mfa_satisfied; the docs say the factor is an access gate."
+    )
+
+    # 2. The first factor of an account the requirement covers is TOTP. The ninth sweep pins the
+    #    covered local refusal end to end; this adds the arms the docs now also state: a directory
+    #    account and a local account outside the requirement may register a passkey first. A real
+    #    service and store, with the account row swapped and the first store read past the gate
+    #    raising a sentinel, so "passed the gate" is told from "refused at it" with no WebAuthn extra.
+    from messagefoundry.store.store import MessageStore
+
+    class _PastTheGate(Exception):
+        pass
+
+    async def past_the_gate(_user_id: str) -> list[object]:
+        raise _PastTheGate
+
+    async def probe() -> dict[str, str]:
+        store = await MessageStore.open(":memory:")
+        try:
+            on = AuthService(store, AuthSettings())  # require_mfa on, the shipped default
+            await on.initialize()
+            off = AuthService(store, AuthSettings(require_mfa=False))
+            created = await on.create_local_user(
+                username="holder12",
+                display_name=None,
+                email="holder12@example.org",
+                roles=["viewer"],
+                actor="test-admin",
+            )
+            out = await on.login("holder12", created.credential.password)
+            assert out.ok and out.identity is not None and out.token is not None
+            identity, token = out.identity, out.token
+            row = await store.get_user(identity.user_id)
+            assert row is not None and not row.totp_enabled
+            monkeypatch.setattr(store, "list_webauthn_credentials", past_the_gate)
+            arms = {
+                "covered local, no TOTP": (on, row),
+                "covered local, TOTP": (on, dataclasses.replace(row, totp_enabled=True)),
+                "local, requirement off": (off, row),
+                "directory, no TOTP": (on, dataclasses.replace(row, auth_provider="ad")),
+            }
+            seen: dict[str, str] = {}
+            for arm, (service, record) in arms.items():
+
+                async def get_user(_user_id: str, _record: UserRecord = record) -> UserRecord:
+                    return _record
+
+                monkeypatch.setattr(store, "get_user", get_user)
+                try:
+                    await service.begin_webauthn_registration(
+                        identity, token=token, rp_id="localhost", rp_name="t"
+                    )
+                    seen[arm] = "returned"
+                except service_module.FactorEnrolmentRequired:
+                    seen[arm] = "refused"
+                except _PastTheGate:
+                    seen[arm] = "passed"
+            return seen
+        finally:
+            await store.close()
+
+    assert asyncio.run(probe()) == {
+        "covered local, no TOTP": "refused",
+        "covered local, TOTP": "passed",
+        "local, requirement off": "passed",
+        "directory, no TOTP": "passed",
+    }, (
+        "the first-passkey order changed. docs/REMOTE-CONSOLE.md and docs/BROWSER-SUPPORT.md say a "
+        "covered local account enrols TOTP first and a directory account or a local account outside "
+        "the requirement may register a passkey first."
+    )
+    # ...and a covered account cannot then drop the TOTP that came first.
+    disable = ast.parse(textwrap.dedent(inspect.getsource(AuthService.disable_mfa)))
+    assert _called(disable, "_covered_by_requirement"), (
+        "disable_mfa no longer refuses a covered account's TOTP removal; docs/BROWSER-SUPPORT.md "
+        "says a covered local account keeps its TOTP."
+    )
+    # A session owing a factor it already holds cannot enrol another (so a passkey-only account in a
+    # browser with no WebAuthn cannot add TOTP to get past the gate).
+    assert service_module.STEP_UP_ACTION_MFA_ENROLL in AuthService._PENDING_REFUSED_ACTIONS
+
+    # 3. A TOTP or recovery code at the MFA gate opens a step-up window, so a Windows SSO session's
+    #    first sensitive action does not always force the directory-password step-up.
+    assert _called(_service_func("verify_mfa"), "mark_session_reauthed")
+
+    # 4. No serve-time refusal reads oidc_require_mfa_claim. The modules that read it are derived, so
+    #    a new reader anywhere in the engine (a serve gate in __main__ or api/app.py, say) reds here
+    #    until someone decides whether it refuses the off value. In every reader, no ``if`` that
+    #    tests the claim for OFF holds a ``raise`` anywhere in its body. The settings check that
+    #    does raise refuses the ON value with nothing to match. A refusal written another way (an
+    #    exit code, a ``not (a or b)``) still slips past; this is a tripwire, not a proof.
+    from messagefoundry.config import settings as settings_module
+
+    claim = "oidc_require_mfa_claim"
+
+    def _is_the_claim(node: ast.AST) -> bool:
+        return isinstance(node, ast.Attribute) and node.attr == claim
+
+    def _tests_for_off(test: ast.AST) -> bool:
+        return any(
+            (isinstance(u, ast.UnaryOp) and isinstance(u.op, ast.Not) and _is_the_claim(u.operand))
+            or (
+                isinstance(u, ast.Compare)
+                and _is_the_claim(u.left)
+                and any(isinstance(c, ast.Constant) and c.value is False for c in u.comparators)
+            )
+            for u in ast.walk(test)
+        )
+
+    trees = {
+        rel: ast.parse((_ROOT / rel).read_text(encoding="utf-8"))
+        for rel in {site for site, _holder in _name_reference_sites(claim)}
+    }
+    assert sorted(trees) == [
+        "messagefoundry/auth/service.py",
+        "messagefoundry/config/settings.py",
+        "messagefoundry/verify/federation.py",
+    ], (
+        f"the modules reading {claim} changed: {sorted(trees)}. If a new one refuses the off value "
+        "at serve, docs/SECURITY-LOOSENING.md's scope note (no serve-time refusal of its own) is stale."
+    )
+    refusing: list[tuple[str, ast.If]] = [
+        (name, n)
+        for name, tree in trees.items()
+        for n in ast.walk(tree)
+        if isinstance(n, ast.If)
+        and any(_is_the_claim(a) for a in ast.walk(n.test))
+        and any(isinstance(r, ast.Raise) for s in n.body for r in ast.walk(s))
+    ]
+    assert any(name.endswith("config/settings.py") for name, _ in refusing), (
+        f"the settings check that refuses {claim} = true with nothing to match is gone"
+    )
+    off_refusals = [f"{name}:{n.lineno}" for name, n in refusing if _tests_for_off(n.test)]
+    assert not off_refusals, (
+        f"{off_refusals} now raise when {claim} is off; restate docs/SECURITY-LOOSENING.md's "
+        "scope note."
+    )
+    # 5. The posture registry DOES report require_mfa off, so the scope note must not list it among
+    #    the switches it leaves out.
+    loosenings = ast.parse(textwrap.dedent(inspect.getsource(settings_module.security_loosenings)))
+    assert any(
+        isinstance(n, ast.Tuple)
+        and n.elts
+        and isinstance(n.elts[0], ast.Constant)
+        and n.elts[0].value == "require_mfa"
+        for n in ast.walk(loosenings)
+    ), "security_loosenings no longer reports require_mfa; restate docs/SECURITY-LOOSENING.md."
+
+
+# The twelfth 6.1.3 re-read (BACKLOG #1133) held the cell at partial on four shipped docs outside
+# SECURITY.md, CONFIGURATION.md and CONNECTIONS.md (owner ruling 2026-10-02: those count), and raised
+# four lower-confidence lines, each confirmed wrong against the code before it was changed. The probe
+# above pins the code. Each test below refuses one CLAIM rather than one sentence wherever the claim
+# can be told apart from its correction, so a reworded return of it still reds.
+
+
+@pytest.mark.parametrize("name", ["README.md", "docs/EARLY-ADOPTER-GUIDE.md"])
+def test_the_twelfth_sweep_no_doc_says_mfa_is_missing(name: str) -> None:
+    """README.md said MFA "remain[s] on the roadmap", and the early-adopter guide said three times
+    that MFA is not there yet, not built, or a remaining gap. No clause may pair the second factor,
+    under any of its names, with absence. The subject must occur, or the scan examined nothing."""
+    clauses = _clauses(_doc(name))
+    subject = [c for c in clauses if _SECOND_FACTOR.search(c)]
+    assert subject, f"{name} no longer names the second factor at all, so this check reads nothing"
+    stale = [c for c in subject if _ABSENT.search(c)]
+    assert not stale, (
+        f"{name} says MFA is missing or still to come: {stale}. `[security].require_mfa` is on by "
+        "default and TOTP and passkeys are built (BACKLOG #1133)."
+    )
+
+
+def test_the_twelfth_sweep_user_guide_offers_no_provider_choice() -> None:
+    """docs/USER-GUIDE.md told the operator to pick a Provider, with Active Directory shown when the
+    engine advertises it. The form has no selector, and the steps must name the links it does
+    render, read from the form itself."""
+    guide = _doc("docs/USER-GUIDE.md")
+    start = guide.index("### Opening and signing in to the console")
+    signing_in = guide[start : guide.index("\n### ", start + 1)]
+    # A choice on the form, worded with or without the word "provider": a choosing word, or the
+    # old "appears", beside a provider or one of the two provider names.
+    chooser = [
+        c
+        for c in _clauses(signing_in)
+        if re.search(r"(?i:\bproviders?\b)|\bActive Directory\b|\bAD\b|\bLocal\b", c)
+        and re.search(r"\b(pick|choose|select|selector|dropdown|appears)\b", c, re.IGNORECASE)
+    ]
+    assert not chooser, (
+        f"docs/USER-GUIDE.md's sign-in steps offer a provider choice again: {chooser}. The form has "
+        "no selector and the engine refuses provider=ad (BACKLOG #1137)."
+    )
+    from messagefoundry_webconsole import pages
+
+    form = str(pages.login(None, sso_enabled=True, oidc_enabled=True))
+    links = re.findall(r"<a [^>]*>([^<]+)</a>", form)
+    assert links, "the sign-in form renders no directory link; re-derive the USER-GUIDE step"
+    for link in links:
+        assert link in _flat(signing_in), (
+            f"docs/USER-GUIDE.md's sign-in steps must name the form's {link!r} link."
+        )
+
+
+def test_the_twelfth_sweep_remote_console_sends_a_covered_account_to_totp_first() -> None:
+    """docs/REMOTE-CONSOLE.md's X-MFA-Required row said "Enrol TOTP or a passkey". A covered local
+    account's first passkey is refused until it holds TOTP."""
+    row = _flat(
+        next(
+            line
+            for line in _doc("docs/REMOTE-CONSOLE.md").splitlines()
+            if line.startswith("| Signed in, but every route returns `403` with `X-MFA-Required")
+        )
+    )
+    assert not re.search(r"TOTP or a passkey", row), (
+        "docs/REMOTE-CONSOLE.md offers TOTP or a passkey as the first factor again; "
+        "begin_webauthn_registration refuses a covered local account's first passkey."
+    )
+    # The refusal is quoted as the text the operator sees, read from the code that sends it.
+    assert "TOTP first" in row and f"`{service_module.ENROL_AUTHENTICATOR_FIRST}`" in row, (
+        "docs/REMOTE-CONSOLE.md's X-MFA-Required row must say TOTP comes first and quote the "
+        "refusal the engine sends."
+    )
+
+
+def test_the_twelfth_sweep_phi_does_not_delegate_mfa() -> None:
+    """docs/PHI.md listed MFA among controls "delegated to the org's environment (IdP/AD, ...)"."""
+    delegated = [
+        c
+        for c in _clauses(_doc("docs/PHI.md"))
+        if re.search(r"\bMFA\b", c) and re.search(r"\bdelegated\b", c)
+    ]
+    assert not delegated, (
+        f"docs/PHI.md delegates MFA to the org's environment again: {delegated}. The engine's own "
+        "factor gates local and directory accounts while require_mfa is on (BACKLOG #1133)."
+    )
+
+
+def test_the_twelfth_sweep_feature_map_sso_row_names_the_mfa_window() -> None:
+    """docs/FEATURE-MAP.md said a Windows SSO session's first sensitive action forces the
+    directory-password step-up. A code proved at /ui/mfa stamps a window first (`verify_mfa`)."""
+    sso_row = _flat(
+        next(
+            line
+            for line in _doc("docs/FEATURE-MAP.md").splitlines()
+            if line.startswith("| Passwordless Windows SSO (Kerberos / SPNEGO)")
+        )
+    )
+    assert "first sensitive action forces" not in sso_row and "`/ui/mfa`" in sso_row, (
+        "docs/FEATURE-MAP.md's Windows SSO row must say a code proved at /ui/mfa opens the step-up "
+        "window, not that the first sensitive action always forces one."
+    )
+    # The window does not reach an action-bound route: its grant comes only from a step-up (the
+    # fifth sweep pins the two minters), so the row must keep that caveat beside the /ui/mfa clause.
+    assert "require_action_step_up" in sso_row, (
+        "docs/FEATURE-MAP.md's Windows SSO row must say an action-bound route still asks for the "
+        "step-up after a code at /ui/mfa."
+    )
+
+
+def test_the_twelfth_sweep_loosening_note_gives_the_claim_gate_no_refusal() -> None:
+    """docs/SECURITY-LOOSENING.md said `oidc_require_mfa_claim` is gated by its own serve-time
+    refusal, and listed `require_mfa` among the switches the registry does not report. No serve gate
+    reads the first, and the registry reports the second (the probe above)."""
+    clauses = _clauses(_doc("docs/SECURITY-LOOSENING.md"))
+    unreported = [c for c in clauses if "not reported" in c and "`require_mfa`" in c]
+    assert not unreported, (
+        f"docs/SECURITY-LOOSENING.md says require_mfa is not reported again: {unreported}. "
+        "security_loosenings() reports it."
+    )
+    loosening = [c for c in clauses if "oidc_require_mfa_claim" in c and "serve-time refusal" in c]
+    assert loosening and all("no serve-time refusal of its own" in c for c in loosening), (
+        f"docs/SECURITY-LOOSENING.md gives oidc_require_mfa_claim a serve-time refusal of its own "
+        f"again: {loosening}. No serve gate reads it."
+    )
+
+
+def test_the_twelfth_sweep_browser_support_does_not_say_a_passkey_is_never_alone() -> None:
+    """docs/BROWSER-SUPPORT.md said "A passkey is never the only factor". A directory account and a
+    local account outside the requirement can register one with no TOTP (the probe above)."""
+    assert not re.search(
+        r"passkey (?:is|can) never (?:be )?the only factor",
+        _flat(_doc("docs/BROWSER-SUPPORT.md")),
+        re.IGNORECASE,
+    ), (
+        "docs/BROWSER-SUPPORT.md says a passkey is never the only factor again; a directory account "
+        "and a local account outside the requirement can hold one alone."
     )
