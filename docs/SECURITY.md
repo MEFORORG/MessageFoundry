@@ -2442,9 +2442,10 @@ outside the map.
 and Auditor roles hold it with no PHI permission. `monitoring:diagnose` (the alert route) is held only
 by the built-in Operator and Administrator, which both hold `messages:view_summary` too; a custom role
 may hold `monitoring:diagnose` without it, and that role is the one the alert gate masks. A holder gets each reason as a fixed `****` until a per-item `reveal=<id>` act, which
-needs `messages:view_summary`, charges the PHI-read budget, and is audited. They are also still
-defended by `safe_exc()` at the emit site plus `safe_text(reason)[:200]` at the store, then
-cipher-encrypted (PHI.md §2/§7); the scrubber is not de-identification, which is why the gate exists.
+needs `messages:view_summary`, charges the PHI-read budget, and is audited. The store also passes
+both through `safe_text(reason, limit=200)`, then cipher-encrypts them (PHI.md §2/§7).
+`connection_event.reason` is scrubbed by `safe_exc()` at the emit site as well. PHI.md §3's PL-2
+block states the bound. The scrubber is not de-identification, which is why the gate exists.
 Every other field of the two models stays readable under the route's monitoring permission, and CI
 asserts each is on a reviewed non-PHI list.
 

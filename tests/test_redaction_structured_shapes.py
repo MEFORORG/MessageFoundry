@@ -689,11 +689,16 @@ def test_a_cut_inside_an_address_strands_no_street_number() -> None:
 
 
 def test_safe_text_over_a_long_kept_name_only_ever_adds_redaction() -> None:
-    """The one stated exception to ``safe_text`` idempotence: a kept operator string the limit cuts is
-    unterminated, so a second pass scrubs it. Pinned so it stays over-redaction and never a leak."""
+    """One stated exception to ``safe_text`` idempotence: a ``name`` key the limit leaves last has the
+    count read as its value by a second pass, which scrubs it. Pinned so it stays over-redaction and
+    never a leak.
+
+    Before BACKLOG #1797 the limit cut the kept string in half and a second pass scrubbed the
+    unterminated head. The limit now drops a token it would split, so the string goes whole on the
+    first pass and only the count is left for the second to eat."""
     once = safe_text('{"name": "IB_ACME_ADT_' + "X" * 300 + '"}')
-    assert "IB_ACME_ADT_" in once
-    assert safe_text(once) == '{"name": "[redacted]'
+    assert once == '{"name":…(+316 chars)'
+    assert safe_text(once) == '{"name":…([redacted] [redacted])'
 
 
 # --- nothing the BACKLOG #1711 redactor removed may survive (BACKLOG #2079) ---------------------------
