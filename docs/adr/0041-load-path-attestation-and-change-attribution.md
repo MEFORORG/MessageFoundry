@@ -110,6 +110,20 @@ behaviour with an unchanged fingerprint. **Implementation:**
 [`config/fingerprint.py`](../../messagefoundry/config/fingerprint.py) + a splat into the existing
 reload-audit detail; a fingerprint failure is logged and never blocks the audit.
 
+*Note 2026-10-04 (vault BACKLOG #2597, step 4): a start now compares its fingerprint with the
+store's baseline and alerts on a change.* The baseline is the newest usable `config_loaded`,
+`config_reload` or `connection_flag_set` row from any node or engine shard, since all of them share
+one config directory and a node id changes on every restart. A flag toggle's row carries the digest
+of the whole directory as written, but only when the toggle was the one change since the load;
+otherwise it carries the loaded digest, so a toggle never vouches for an edit nobody loaded. Only
+the `fingerprint` key is compared. The detail now records a
+`scheme` tag, and a baseline under another scheme, or with none, is not comparable, so a change to
+what is hashed does not read as a changed config. A change raises the `config_changed` alert, and the
+start row records `comparison`, `previous_fingerprint` and `changed`. The check is alert-only: a
+failed or slow baseline read never blocks the start. Which rows a later start passes over, and the
+limit on how far back it looks, are stated once in
+[CONFIGURATION.md](../CONFIGURATION.md) under `[alerts]`, `config_changed`.
+
 ### D2 — Dual-control `config:deploy`  *(BUILT — BACKLOG #53, shipped in 0.2.9; drafted as "planned")*
 
 Add `config:deploy` / `POST /config/reload` to the configurable dual-control `[approvals]` gated set, so a

@@ -1194,6 +1194,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/pipeline/engine.py": frozenset(
         {
             "compare:via messagefoundry.pipeline.secret_rotation",
+            # Vault BACKLOG #2597: set_connection_flag compares two public config digests with
+            # fingerprint_matches (constant time), as the provenance route in api/app.py does.
+            "compare:via messagefoundry.config.fingerprint",
             "hash:via messagefoundry.config.fingerprint",
             "mac:via messagefoundry.pipeline.secret_rotation",
         }

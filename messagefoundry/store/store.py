@@ -4580,6 +4580,9 @@ CREATE TABLE IF NOT EXISTS audit_log (
     row_hash    TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_audit_ts ON audit_log(ts);
+-- The newest row of a few actions (recent_audit_of): the start's config baseline read, vault BACKLOG
+-- #2597. Without it that read walks the whole chain newest-first until one of the actions turns up.
+CREATE INDEX IF NOT EXISTS ix_audit_action ON audit_log(action, id);
 
 -- There is no table beside audit_log that says where its keying starts. Whether a chain is keyed is
 -- decided by the process that holds the key, and the first range's key is named by the chain's own
@@ -10901,6 +10904,33 @@ class MessageStore:
                 f"SELECT * FROM audit_log{where} ORDER BY id DESC LIMIT ?", params
             )
             return list(await cur.fetchall())
+
+    async def recent_audit_of(self, actions: Sequence[str], *, limit: int) -> list[dict[str, Any]]:
+        """Up to ``limit`` newest audit rows whose action is one of ``actions``, newest first (vault
+        BACKLOG #2597).
+
+        Returns ``id``, ``ts``, ``actor``, ``action`` and ``detail``. Each action is its own seek on
+        ``ix_audit_action`` for its newest ``limit`` rows, then the newest ``limit`` of those: a plain
+        ``IN (...) ORDER BY id DESC`` would fetch and sort every matching row. Every action and the
+        limit are bound ``?`` values; only the branch count shapes the SQL. An empty ``actions``
+        matches nothing."""
+        if not actions or limit < 1:
+            return []
+        branches = " UNION ALL ".join(
+            "SELECT * FROM (SELECT id, ts, actor, action, detail FROM audit_log"
+            f" WHERE action = ? ORDER BY id DESC LIMIT ?) b{i}"
+            for i in range(len(actions))
+        )
+        params: list[object] = []
+        for action in actions:
+            params += [action, limit]
+        params.append(limit)
+        async with self._read() as db:
+            cur = await db.execute(
+                f"SELECT * FROM ({branches}) u ORDER BY id DESC LIMIT ?", tuple(params)
+            )
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
 
     async def security_events_for_user(
         self, username: str, *, limit: int = 100

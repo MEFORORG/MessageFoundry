@@ -28,11 +28,22 @@ from pathlib import Path
 
 from messagefoundry.credential import constant_time_equal
 
-__all__ = ["config_fingerprint", "config_fingerprint_detail", "fingerprint_matches"]
+__all__ = [
+    "FINGERPRINT_SCHEME",
+    "config_fingerprint",
+    "config_fingerprint_detail",
+    "fingerprint_matches",
+]
 
 # Version the scheme so a future change to *what* is hashed (or *how*) is itself detectable in the
 # trail — a fingerprint produced by v1 can never collide with one produced by a later revision.
 _SCHEME = b"mefor-cfg-fp:v1\n"
+
+#: The scheme tag :func:`config_fingerprint_detail` records beside each digest. Two digests are
+#: comparable only under one scheme: a start compares its own digest with the store's last recorded
+#: one only when the tags match, so a change to what is hashed reads as "not comparable" rather than
+#: as a changed config (vault BACKLOG #2597).
+FINGERPRINT_SCHEME = _SCHEME.decode("ascii").strip()
 
 # Every file ``load_config`` consumes that defines the running graph's behaviour, transport config,
 # or reference data. Globs are relative to the config dir. NB: ``*.py`` deliberately covers
@@ -98,11 +109,16 @@ def config_fingerprint_detail(directory: str | Path) -> dict[str, object]:
 
     ``git_head`` is included only when ``directory`` resolves inside a git work tree whose commit can
     be read purely from files; it is advisory provenance, not the integrity anchor (the content
-    ``fingerprint`` is). Keys: ``fingerprint`` (str), ``files`` (int), and optionally ``git_head``.
+    ``fingerprint`` is). Keys: ``fingerprint`` (str), ``scheme`` (str, :data:`FINGERPRINT_SCHEME`),
+    ``files`` (int), and optionally ``git_head``.
     """
     base = Path(directory)
     entries = _iter_entries(base)
-    detail: dict[str, object] = {"fingerprint": _fold(entries), "files": len(entries)}
+    detail: dict[str, object] = {
+        "fingerprint": _fold(entries),
+        "scheme": FINGERPRINT_SCHEME,
+        "files": len(entries),
+    }
     head = _git_head(base)
     if head is not None:
         detail["git_head"] = head

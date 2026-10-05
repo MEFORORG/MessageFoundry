@@ -53,7 +53,7 @@ from messagefoundry.config.tls_policy import (
     build_smtp_tls_context,
     smtp_login_approved,
 )
-from messagefoundry.pipeline.alerts import intake_pause_detail
+from messagefoundry.pipeline.alerts import config_changed_detail, intake_pause_detail
 
 # Not lazy, unlike the two transports imports below: the shared webhook opener is built at import.
 # Importing this module already loads the transports package through pipeline/__init__.py, so these
@@ -1133,6 +1133,45 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
     def store_privilege_clean(self, name: str) -> None:
         # #305: the INVERSE — no page; auto-resolves the open store_privilege_warning via _AUTO_RESOLVE.
         self._record_state({"type": "store_privilege_clean", "connection": name}, "info")
+
+    def config_changed(
+        self,
+        name: str,
+        *,
+        fingerprint: str,
+        previous_fingerprint: str,
+        node: str | None,
+        shard: str | None,
+        baseline_action: str,
+        baseline_actor: str | None,
+        baseline_at: str,
+        baseline_node: str | None,
+    ) -> None:
+        # vault BACKLOG #2597: the start's config differs from the store's baseline. The
+        # subject (`config:<12 hex>`) stands in for "connection", so each distinct config is its own
+        # instance; nothing auto-resolves it. Digests, node and shard labels, an action name, a
+        # username and a time only: never the config dir, a git commit or message content.
+        self._emit(
+            {
+                "type": "config_changed",
+                "connection": name,
+                "detail": config_changed_detail(
+                    fingerprint=fingerprint,
+                    previous_fingerprint=previous_fingerprint,
+                    baseline_action=baseline_action,
+                    baseline_node=baseline_node,
+                    baseline_at=baseline_at,
+                ),
+                "fingerprint": fingerprint,
+                "previous_fingerprint": previous_fingerprint,
+                "node": node,
+                "shard": shard,
+                "baseline_action": baseline_action,
+                "baseline_actor": baseline_actor,
+                "baseline_at": baseline_at,
+                "baseline_node": baseline_node,
+            }
+        )
 
     def leadership_acquired(self, node: str, *, role: str, epoch: int | None = None) -> None:
         # #145: a node went non-leader→leader (HA failover / election). The node id stands in for

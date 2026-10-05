@@ -1216,6 +1216,38 @@ of its resume line. This clears a pause that an earlier run left open when it st
 measured between its resume line and its limit reports nothing until it leaves that band, because
 another node on the same store may still be paused there.
 
+**`config_changed` says a start loaded different config bytes than the store's baseline** (vault
+BACKLOG #2597). At each start the engine compares its config fingerprint (ADR 0041 D1) with the
+newest usable `config_loaded`, `config_reload` or `connection_flag_set` audit row. That row may come
+from any node or engine shard, because they all share one config directory. A start that sees a
+change raises `config_changed` once. Its `config_loaded` row records the outcome as `comparison`
+(`compared`, `no_start_digest`, `no_baseline`, `degraded_baseline`, `scheme_mismatch` or
+`read_failed`), plus `previous_fingerprint` and `changed`. Starts that race, such as engine shards
+started together, can each raise it; the alert list folds them into one instance.
+
+- A change applied with `POST /config/reload` and then restarted does not alert. A change that only
+  a restart picked up does, by design: nothing else tells that deploy apart from an unrecorded edit.
+- A connection flag toggle does not alert either. Its row vouches for the directory it wrote only
+  when nothing else changed since the load, so a toggle never hides an edit nobody loaded.
+- A fresh store, a baseline row with no fingerprint, or one taken under another fingerprint scheme
+  raises nothing. The engine logs that at INFO.
+- The check is alert-only. A baseline read that fails or takes over five seconds is logged at
+  WARNING, and the start goes on.
+- A start that never checked its config, because its read failed or it took no fingerprint,
+  marks its own row `baseline_unchecked`, and every flag toggle row that process writes too. A
+  later start passes over those rows, and over any row whose detail is not a JSON object (at
+  WARNING), and compares against the newest usable row before them. So the change the unchecked
+  start could not see is reported by the next start that can read. A config reload is not marked:
+  applying the directory by reload vouches for it.
+- The pass-over looks through the newest 50 config rows at most. If none is usable, the start
+  begins a new baseline and says at WARNING that a change made before those rows is not reported.
+
+Its `connection` is `config:` plus the first 12 hex characters of the new fingerprint, so each
+distinct config is its own alert. Nothing resolves it; an operator does. A rule cannot attach a
+`control_action` to it. The payload holds both fingerprints, this process's node and engine shard,
+and the baseline row's action, actor, time and node, plus a one-line `detail`. It carries no config
+path, no git commit and no message content.
+
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `webhook_url` | str | _unset_ | enable the **webhook** transport: HTTP `POST` the event as JSON here (fronts Slack/Teams/PagerDuty/custom inbound webhooks). |
@@ -1248,7 +1280,7 @@ silences an event you didn't name. Matching is pure config (no code/`eval`).
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `event_type` | str | `any` | match this event. The validator (`AlertRule._check_event_type`) accepts `any` plus the names in `_ALERT_EVENT_TYPES` (`messagefoundry/config/settings.py`), and **rejects anything else at config load**, so a typo is loud rather than a rule that never matches. That set is the source of record; at the time of writing it holds at least: `ad_reconcile_aborted`, `ad_reconcile_held`, `ad_session_revoked`, `administrator_granted`, `approval_approver_provenance`, `approval_stale_requester`, `approval_too_early`, `backup_failed`, `cert_expiry`, `connection_error`, `connection_stopped`, `dr_activated`, `gcm_invocations`, `initial_credential_expiring`, `intake_paused`, `integrity_drift`, `lane_stuck`, `leadership_acquired`, `log_write_failed`, `message_stall`, `queue_buildup`, `saturation`, `secret_rotation`, `storage_threshold`, `store_privilege_warning`, `update_available`. Note the **event names are shorter than the prose names** used elsewhere in this file — the secret-rotation reminder is routed as `secret_rotation`, not `secret_rotation_due` |
+| `event_type` | str | `any` | match this event. The validator (`AlertRule._check_event_type`) accepts `any` plus the names in `_ALERT_EVENT_TYPES` (`messagefoundry/config/settings.py`), and **rejects anything else at config load**, so a typo is loud rather than a rule that never matches. That set is the source of record; at the time of writing it holds at least: `ad_reconcile_aborted`, `ad_reconcile_held`, `ad_session_revoked`, `administrator_granted`, `approval_approver_provenance`, `approval_stale_requester`, `approval_too_early`, `backup_failed`, `cert_expiry`, `config_changed`, `connection_error`, `connection_stopped`, `dr_activated`, `gcm_invocations`, `initial_credential_expiring`, `intake_paused`, `integrity_drift`, `lane_stuck`, `leadership_acquired`, `log_write_failed`, `message_stall`, `queue_buildup`, `saturation`, `secret_rotation`, `storage_threshold`, `store_privilege_warning`, `update_available`. Note the **event names are shorter than the prose names** used elsewhere in this file — the secret-rotation reminder is routed as `secret_rotation`, not `secret_rotation_due` |
 | `connection` | str (glob) | `*` | glob over the connection name (e.g. `OB_*`, `IB_ACME_*`) |
 | `min_depth` | int | _unset_ | `queue_buildup` only — match only when pending depth is at/over this |
 | `min_oldest_seconds` | num | _unset_ | `queue_buildup` only — …or the oldest pending message has waited at least this long |

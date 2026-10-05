@@ -553,6 +553,10 @@ class Engine:
         # fingerprinting failed. Read by GET /config/provenance to report the running commit
         # and detect on-disk DRIFT. Holds only a one-way hash + a commit sha — never resolved env values.
         self.loaded_config_fingerprint: dict[str, object] | None = None
+        # vault BACKLOG #2597: True when this process's start never checked its config against the
+        # store's baseline (the read failed, or the start took no digest). Every config row it writes
+        # is then marked, so a later start passes over it to the last checked baseline.
+        self.config_baseline_unchecked = False
 
     @classmethod
     async def create(
@@ -1777,7 +1781,9 @@ class Engine:
         reloads the startup ``--config`` dir."""
         await self.reload(propagate=False)
 
-    async def set_connection_flag(self, name: str, *, direction: str, flagged: bool) -> None:
+    async def set_connection_flag(
+        self, name: str, *, direction: str, flagged: bool
+    ) -> dict[str, object] | None:
         """Set the operator "object of interest" flag on a ``connections.toml``-managed connection (#131,
         ADR 0007 amendment) — the FIRST console→``connections.toml`` write seam.
 
@@ -1793,9 +1799,19 @@ class Engine:
         FORK: a *code-first* connection has no TOML home, so the console flag is refused there (the
         universal-object flag would need a store table, deliberately not built) — when no config dir is
         known, or when the validated write fails. The caller maps that to a 409.
+
+        Returns the ADR 0041 D1 fingerprint the caller's ``connection_flag_set`` row records (vault
+        BACKLOG #2597). A start compares its own digest with that row. When the directory held the
+        loaded bytes before this write, it is the digest of the directory just written, taken under
+        the same lock, and :attr:`loaded_config_fingerprint` moves to it, since the flag was
+        reflected live. Otherwise some other edit sits on disk unloaded, and a digest of the whole
+        directory would vouch for it, so the loaded digest is returned unchanged and the next start
+        reports the difference. ``None`` when no loaded digest exists, or when the toggle was the
+        one change but the digest after it could not be taken; the write still stands either way.
         """
         from messagefoundry.config import connections_edit
         from messagefoundry.config.connections_file import CONNECTIONS_FILE_NAME
+        from messagefoundry.config.fingerprint import fingerprint_matches
         from messagefoundry.pipeline.wiring_runner import build_check_registry
 
         if direction not in ("inbound", "outbound"):
@@ -1845,6 +1861,14 @@ class Engine:
         # two concurrent config:deploy flag toggles can't interleave (lost update / racing temp files);
         # the write itself runs off the event loop (file I/O + a full load_config in its validate callback).
         async with self._toml_write_lock:
+            # vault BACKLOG #2597: whether the directory still holds the bytes the running graph
+            # loaded, read before this write changes it. See the return below. With no loaded
+            # digest there is nothing to vouch against, so the two reads are skipped.
+            loaded = self.loaded_config_fingerprint
+            loaded_fp = loaded.get("fingerprint") if loaded is not None else None
+            before = None
+            if isinstance(loaded_fp, str):
+                before, _reason = await self.fingerprint_bundle(cfg_dir)
             await asyncio.to_thread(_write)
 
             # Reflect it live, in place (cosmetic field only — no connector rebuild, no reload).
@@ -1858,6 +1882,31 @@ class Engine:
                     rr.registry.outbound[name] = replace(
                         rr.registry.outbound[name], flagged=flagged
                     )
+            # Still under the lock, so no second toggle lands between the write and its digest. The
+            # digest covers the whole directory, so it may vouch for this toggle only when the toggle
+            # is the one change since the load. Otherwise another edit is on disk that the running
+            # graph never loaded, and the row keeps the loaded digest, so the next start reports it.
+            if (
+                before is None
+                or not isinstance(loaded_fp, str)
+                or not fingerprint_matches(before.get("fingerprint"), loaded_fp)
+            ):
+                return loaded
+            # The write has landed, so an unexpected failure here is logged and costs the digest,
+            # never the answer: a raise would report a landed write as failed, with no audit row.
+            try:
+                after, _reason = await self.fingerprint_bundle(cfg_dir)
+            except Exception:  # noqa: BLE001 - see the comment above; logged, never silent
+                log.exception("connection flag written; its config fingerprint was not taken")
+                after = None
+            if after is None:
+                # No digest of what is on disk now. The loaded one would read as a change at the
+                # next start, so the row records none and that start compares nothing.
+                return None
+            # The running graph now matches these bytes (the flag was reflected live), so the
+            # provenance baseline moves with it.
+            self.loaded_config_fingerprint = after
+            return after
 
     @property
     def running_config_dir(self) -> Path | None:

@@ -609,6 +609,8 @@ _SCHEMA: list[str] = [
         row_hash   TEXT NOT NULL
     )""",
     "CREATE INDEX IF NOT EXISTS ix_audit_ts ON audit_log(ts)",
+    # recent_audit_of: the start's config baseline read (vault BACKLOG #2597).
+    "CREATE INDEX IF NOT EXISTS ix_audit_action ON audit_log(action, id)",
     # No table beside audit_log says where its keying starts: the process that holds the key decides,
     # and the chain's own row at sequence number 1 (the genesis row) names the first range's key.
     # Per-key AES-GCM invocation bound (ASVS 11.3.4) — see the SQLite `_SCHEMA` for the
@@ -7085,6 +7087,27 @@ class PostgresStore:
         params.append(limit)
         sql = f"SELECT * FROM audit_log{where} ORDER BY id DESC LIMIT ${len(params)}"
         return await self._fetchall(sql, *params)
+
+    async def recent_audit_of(self, actions: Sequence[str], *, limit: int) -> list[dict[str, Any]]:
+        """Up to ``limit`` newest audit rows whose action is one of ``actions``, newest first (vault
+        BACKLOG #2597).
+
+        Returns ``id``, ``ts``, ``actor``, ``action`` and ``detail``. Each action is its own seek on
+        ``ix_audit_action`` for its newest ``limit`` rows, then the newest ``limit`` of those, so the
+        plan cannot become a backward walk of the primary key filtering on ``action``. The limit is
+        ``$1`` and each action a later ``$N``; only the branch count shapes the SQL. An empty
+        ``actions`` matches nothing."""
+        if not actions or limit < 1:
+            return []
+        branches = " UNION ALL ".join(
+            "SELECT * FROM (SELECT id, ts, actor, action, detail FROM audit_log"
+            f" WHERE action = ${i + 2} ORDER BY id DESC LIMIT $1) b{i}"
+            for i in range(len(actions))
+        )
+        rows = await self._fetchall(
+            f"SELECT * FROM ({branches}) u ORDER BY id DESC LIMIT $1", limit, *actions
+        )
+        return [dict(r) for r in rows]
 
     async def security_events_for_user(self, username: str, *, limit: int = 100) -> Sequence[Row]:
         """A user's own security events (``auth.*``), most-recent-first — for ``GET
