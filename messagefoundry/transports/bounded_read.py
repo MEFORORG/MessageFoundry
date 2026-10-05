@@ -628,6 +628,10 @@ class StrictHTTPResponse(http.client.HTTPResponse):
     builds the connection's ``response_class``, reads the status line and the header block through
     the response's stream, and never calls ``begin``. A guard that ``begin`` put on would miss that
     head. Built here, it covers both reads with no copy of ``_tunnel``.
+
+    **Only the bare-CR check reaches a** ``CONNECT`` **reply.** ``_tunnel`` keeps the raw header
+    lines and parses none, so :func:`reply_framing_fault` never sees that head. At least a header
+    line with no colon, and a control character in a value, still open the tunnel.
     """
 
     def __init__(
