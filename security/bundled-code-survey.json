@@ -91,7 +91,8 @@
       "A module adapted from another project that says so in other words, or does not say so. So `adapted_modules` lists what was found and is not a full list.",
       "Whether a file matches the project it names. No file was compared with its source.",
       "Text in a file whose name ends in none of `suffixes`, and anything inside a compiled file.",
-      "A wheel that was not fetched, or a wheel for another platform."
+      "A wheel that was not fetched, or a wheel for another platform.",
+      "What a large `.py` module holds, where it was not opened as a possible table. At least these were not opened: each `.py` file over 100 KB in `anyio`, `click`, `fastapi`, `pyasn1`, `pydantic`, `pydantic-core` and `typing-extensions`, and `ldap3/protocol/oid.py`, about 127 KB, which its name suggests is a table of object identifiers. So a `no` under `data` does not rest on every large module having been opened."
     ]
   },
   "control": {
@@ -112,7 +113,7 @@
         "pip/_vendor/__init__.py"
       ]
     },
-    "note": "pip vendors its dependencies in source form. The directory rule fired on `pip/_vendor`. The licence rule fired on the files under `licenses/src/pip/_vendor`, each named for a vendored project. The size rule fired on `pip/_vendor/certifi/cacert.pem`, 234,354 bytes. The word `vendored` hit `pip/_vendor/__init__.py`, first at line 26, and the word search hit 35 files of the wheel in all. The top-level rule did not fire, because pip's one top-level name is its own. So that rule has no control here. The sha256 is the one PyPI states for the file: pip is in no lock here.",
+    "note": "pip vendors its dependencies in source form. The directory rule fired on `pip/_vendor`. The licence rule fired on the files under `licenses/src/pip/_vendor`, each named for a vendored project. The size rule fired on `pip/_vendor/certifi/cacert.pem`, 234,354 bytes. The word `vendored` hit `pip/_vendor/__init__.py`, first at line 26, and the word search hit 35 files of the wheel in all. The top-level rule did not fire, because pip's one top-level name is its own. So that rule has no control here. The sha256 is the one PyPI states for the file. Two locks in this repository pin pip, `uv.lock` and `ci/locks/ci-scanners.lock`, and both pin pip 26.2. The control is pip 26.2.1, a different version. So its hash cannot be checked against a lock in this repository.",
     "word": "vendored"
   },
   "wheels": [

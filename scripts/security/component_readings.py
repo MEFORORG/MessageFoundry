@@ -943,6 +943,14 @@ def _listed_count(search: Mapping[str, Any], key: str) -> str:
     return str(len(listed)) if isinstance(listed, list) and listed else "no recorded"
 
 
+def _listed_names(search: Mapping[str, Any], key: str) -> str:
+    """The entries the record's search lists under ``key``, each in code marks, or that none is."""
+    listed = search.get(key)
+    if not (isinstance(listed, list) and listed):
+        return "not recorded"
+    return ", ".join(f"`{item}`" for item in listed)
+
+
 def _first(paths: object) -> str:
     """The first path a control rule fired on, or that none is recorded."""
     return str(paths[0]) if isinstance(paths, list) and paths else "not recorded"
@@ -971,10 +979,11 @@ def _render_adapted(wheels: list[Mapping[str, Any]], labels: Mapping[str, str]) 
         "",
         f"The word search ran over the {searched} wheels that were fetched. It hit "
         + _count(sum(counts.values()), "file", "files")
-        + f". Counted in files: {counts[ADAPTED]} hold a single module adapted from another "
-        f"project, {counts[COPIED_LINES]} hold lines copied into a wheel's own module, and "
-        f"{counts[PROSE]} hold prose that marks no copy, such as a project's own licence "
-        "header. The record lists each hit under its wheel.",
+        + f". Counted in files: {_count(counts[ADAPTED], 'holds', 'hold')} a single module "
+        f"adapted from another project, {_count(counts[COPIED_LINES], 'holds', 'hold')} lines "
+        f"copied into a wheel's own module, and {_count(counts[PROSE], 'holds', 'hold')} prose "
+        "that marks no copy, such as a project's own licence header. The record lists each hit "
+        "under its wheel.",
     ]
     rows = [
         f"| `{w['name']}` | `{m.get('file')}` | {m.get('project')} | "
@@ -1005,8 +1014,11 @@ def _render_adapted(wheels: list[Mapping[str, Any]], labels: Mapping[str, str]) 
                 f"`{line.get('path')}`, {line.get('files')} files, version {line.get('version')}. "
                 "That is the same project, so it is not counted as another project's source. An "
                 f"advisory against that line would name `{wheel['name']}`, at that line's own "
-                "version numbers. The reading above asks about the pinned version only, so no "
-                "advisory was read at that line's version.",
+                "version numbers. The reading above asks OSV for every advisory recorded under "
+                "that name, at any version, and for the ones that affect the pinned version. An "
+                "advisory OSV records against that line would be among the first. Nothing was "
+                f"asked at version {line.get('version')}, so the reading does not say which "
+                "advisories affect that line.",
             ]
     return out
 
@@ -1123,10 +1135,14 @@ def _render_survey(survey: Mapping[str, Any], labels: Mapping[str, str]) -> list
         f"for a directory with one of {_listed_count(search, 'directories')} vendoring names, a "
         "top-level name beyond the project's own, a licence file named for another project, a "
         "large file that is not a Python module, and any of "
-        f"{_listed_count(search, 'words')} marker words in the text files. The record gives "
+        f"{_listed_count(search, 'words')} marker words. The words were looked for in each file "
+        f"outside `.dist-info` whose name ends in one of {_listed_count(search, 'suffixes')} "
+        f"suffixes: {_listed_names(search, 'suffixes')}. The record gives "
         "the names, the size and the words under `search`. A Python module was opened as a "
         "possible table only where its name or size suggested one, which is a judgement and "
-        "not an exact rule. No file was compared with the project it names.",
+        "not an exact rule. Not every large module was opened. Under `cannot_see`, the record "
+        "names large modules that were not, so a count of not found does not rest on every "
+        "large module having been read. No file was compared with the project it names.",
         "",
         "As a control, the same search was run over "
         f"`{control.get('file', 'not recorded')}`, a wheel known to vendor source and not one "

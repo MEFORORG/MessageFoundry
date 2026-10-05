@@ -503,7 +503,9 @@ another project that does not say so in one of the listed words is not in it.
 `pydantic` also holds a second release line of its own project: `pydantic/v1`, 27 files, version
 1.10.26. That is the same project, so it is not counted as another project's source. An advisory
 against that line would name `pydantic`, at that line's own version numbers. The reading above asks
-about the pinned version only, so no advisory was read at that line's version.
+OSV for every advisory recorded under that name, at any version, and for the ones that affect the
+pinned version. An advisory OSV records against that line would be among the first. Nothing was
+asked at version 1.10.26, so the reading does not say which advisories affect that line.
 
 5 wheels carry another project's data and none of its code: `certifi`, `hl7apy`, `idna`, `ldap3`,
 `tzdata`. Not designated among them: `tzdata`. Under the criterion above, that owes no route. No
@@ -518,10 +520,14 @@ and for a second Linux x86_64 wheel where the lock carries more than one.
 
 The source and data answers rest on the same wheels, fetched again. The search looked for a
 directory with one of 15 vendoring names, a top-level name beyond the project's own, a licence file
-named for another project, a large file that is not a Python module, and any of 12 marker words in
-the text files. The record gives the names, the size and the words under `search`. A Python module
-was opened as a possible table only where its name or size suggested one, which is a judgement and
-not an exact rule. No file was compared with the project it names.
+named for another project, a large file that is not a Python module, and any of 12 marker words. The
+words were looked for in each file outside `.dist-info` whose name ends in one of 10 suffixes:
+`.py`, `.pyi`, `.pyx`, `.pxd`, `.pxi`, `.c`, `.h`, `.txt`, `.md`, `.rst`. The record gives the
+names, the size and the words under `search`. A Python module was opened as a possible table only
+where its name or size suggested one, which is a judgement and not an exact rule. Not every large
+module was opened. Under `cannot_see`, the record names large modules that were not, so a count of
+not found does not rest on every large module having been read. No file was compared with the
+project it names.
 
 As a control, the same search was run over `pip-26.2.1-py3-none-any.whl`, a wheel known to vendor
 source and not one of the wheels surveyed. The directory search fired on `pip/_vendor`. The
