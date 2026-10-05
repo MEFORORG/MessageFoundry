@@ -3853,8 +3853,9 @@ THERE IS NO CHECKED ROUTE FOR THIS TREE YET.
         $routeBullet = if ($pathRoute) {
             @"
   * A FINISHED tree has a checked route, and a session may run it. It makes checks this gate cannot,
-    at least these: nothing in the tree is uncommitted, and no session is recorded in it. It removes
-    the directory and never the branch. Run exactly this line, with no other switch:
+    at least these: the tree holds no uncommitted or untracked work, and no session is recorded in
+    it. Build caches such as .venv and node_modules go with the tree unchecked. It removes the
+    directory and never the branch. Run exactly this line, with no other switch:
         $removeCmd
   * IF THE SCRIPT REFUSES, STOP. Tell the user what it refused and why, in its own words. A refusal
     is final for a session: -Force is the user's switch, and so is any other route.

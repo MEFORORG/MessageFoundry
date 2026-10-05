@@ -432,10 +432,14 @@ if ($byPath) {
     }
     $pending = @($statusLines | Where-Object { $_ -and $_ -cnotmatch $exemptIgnored })
     # A TOLERATED NAME IS NOT ENOUGH: THE DIRECTORY MUST BE A REAL ONE, INSIDE THE TREE. A junction or
-    # symlink named `node_modules` can point at a directory somewhere else, and a recursive delete
-    # that follows it takes content this worktree never held. So a tolerated directory that is a
-    # reparse point, or that cannot be read, goes back on the pending list. This reads the named
-    # directory only, not what is inside it.
+    # symlink named `node_modules` points at a directory somewhere else, so it is not this tree's
+    # cache to throw away. A tolerated directory that is a reparse point, or that cannot be read,
+    # goes back on the pending list. This reads the named directory only, not what is inside it.
+    # MEASURED on git 2.55.0.windows.5, and recorded so the reason is not overstated: git does NOT
+    # delete through a junction. In four cases the outside content survived. What git does do is
+    # drop the registration, exit 0 and leave the directory behind, which this guard prevents for a
+    # top-level junction. A junction INSIDE a tolerated directory still ends that way, and the
+    # script does not look at the directory after a zero exit.
     foreach ($line in @($statusLines | Where-Object { $_ -cmatch $exemptIgnored })) {
         $rel = $line.Substring(3).TrimEnd('/')
         $isRealDirectory = $false
