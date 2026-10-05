@@ -805,10 +805,11 @@ async def test_session_reaper_skips_a_pass_after_a_forward_clock_step(
     nothing, so a clock already wrong at start-up is never purged by on sight."""
     from messagefoundry.api import app as api_app
 
-    monkeypatch.setattr(api_app, "_SESSION_REAP_INTERVAL", 0)
-    monkeypatch.setattr(api_app, "_SESSION_REAP_FIRST_DELAY", 0)
+    # The default 30-minute window, where the tolerance is its 600 s ceiling.
+    idle = 1800.0
+    tolerance = api_app._session_reap_step_tolerance(idle)
+    assert tolerance == api_app._SESSION_REAP_STEP_TOLERANCE
     hour = 3600.0
-    tolerance = api_app._SESSION_REAP_STEP_TOLERANCE
     # (wall, monotonic) per reading. Reading 0 is the start-up baseline. Pass 1 drifts inside the
     # tolerance; pass 2 steps forward by a day; pass 3 holds the step.
     readings = [
@@ -817,6 +818,68 @@ async def test_session_reaper_skips_a_pass_after_a_forward_clock_step(
         (1_000.0 + 2 * hour + tolerance + 86_400, 50.0 + 2 * hour),
         (1_000.0 + 3 * hour + tolerance + 86_400, 50.0 + 3 * hour),
     ]
+    purged = await _run_reaper(monkeypatch, readings, idle_seconds=idle)
+    assert purged == [readings[1][0], readings[3][0]], (
+        "the reaper purged on its start-up baseline or right after a forward clock step; each purge"
+        " must also use its own pass's reading"
+    )
+
+
+async def test_session_reaper_tolerance_scales_with_a_short_idle_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #2283: with a 5-minute idle window, a forward step of 400 s is longer than the window,
+    so a purge right after it deletes every session nobody used during the step. A fixed 600 s
+    tolerance let that pass through. The tolerance is half the window here, 150 s, so that pass is
+    skipped. A drift just inside it is the control, and a step that holds is purged by the next
+    pass."""
+    from messagefoundry.api import app as api_app
+
+    idle = 300.0
+    tolerance = api_app._session_reap_step_tolerance(idle)
+    assert tolerance == idle / 2
+    hour = 3600.0
+    step = 400.0
+    assert tolerance < step < api_app._SESSION_REAP_STEP_TOLERANCE, "the step must sit between"
+    assert step > idle, "the step must be long enough to make every unused session look idle"
+    readings = [
+        (1_000.0, 50.0),
+        (1_000.0 + hour + tolerance - 1, 50.0 + hour),
+        (1_000.0 + 2 * hour + tolerance - 1 + step, 50.0 + 2 * hour),
+        (1_000.0 + 3 * hour + tolerance - 1 + step, 50.0 + 3 * hour),
+    ]
+    purged = await _run_reaper(monkeypatch, readings, idle_seconds=idle)
+    assert purged == [readings[1][0], readings[3][0]], (
+        "the reaper purged right after a forward step longer than the idle window, because its"
+        " tolerance did not shrink with the window"
+    )
+
+
+def test_session_reap_step_tolerance_is_half_the_idle_window_up_to_its_ceiling() -> None:
+    from messagefoundry.api import app as api_app
+
+    ceiling = api_app._SESSION_REAP_STEP_TOLERANCE
+    assert api_app._session_reap_step_tolerance(None) == ceiling
+    assert api_app._session_reap_step_tolerance(1800) == ceiling
+    assert api_app._session_reap_step_tolerance(1200) == ceiling
+    assert api_app._session_reap_step_tolerance(600) == 300
+    assert api_app._session_reap_step_tolerance(60) == 30
+    # Zero refuses every row already, so a step cannot cost a session the validator would accept.
+    assert api_app._session_reap_step_tolerance(0) == ceiling
+
+
+async def _run_reaper(
+    monkeypatch: pytest.MonkeyPatch,
+    readings: list[tuple[float, float]],
+    *,
+    idle_seconds: float,
+) -> list[float | None]:
+    """Run the reaper over ``readings`` of (wall, monotonic), one per pass after the baseline, and
+    return the ``now`` each purge was given."""
+    from messagefoundry.api import app as api_app
+
+    monkeypatch.setattr(api_app, "_SESSION_REAP_INTERVAL", 0)
+    monkeypatch.setattr(api_app, "_SESSION_REAP_FIRST_DELAY", 0)
     wall = iter(r[0] for r in readings)
     mono = iter(r[1] for r in readings)
     purged: list[float | None] = []
@@ -836,15 +899,14 @@ async def test_session_reaper_skips_a_pass_after_a_forward_clock_step(
             raise asyncio.CancelledError from None
 
     task = asyncio.create_task(
-        _session_reaper(_Store(), idle_seconds=600, wall=_wall, mono=lambda: next(mono))  # type: ignore[arg-type]
+        _session_reaper(  # type: ignore[arg-type]
+            _Store(), idle_seconds=idle_seconds, wall=_wall, mono=lambda: next(mono)
+        )
     )
     await asyncio.wait_for(done.wait(), timeout=5)
     with contextlib.suppress(asyncio.CancelledError):
         await task
-    assert purged == [readings[1][0], readings[3][0]], (
-        "the reaper purged on its start-up baseline or right after a forward clock step; each purge"
-        " must also use its own pass's reading"
-    )
+    return purged
 
 
 # --- F1: /dead-letters gates the PHI summary the same way as /messages -------
