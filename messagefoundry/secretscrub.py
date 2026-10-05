@@ -112,6 +112,12 @@ now redacts the second password. THE NEW CEILING is a 6 KB value whose run ends 
 forces the token walk: 24 against 764 us, linear at 7.6x to 8.0x for 8x the length over four
 adversarial shapes, a quoted run of spaces among them. That is well under this module's 21 ms ceiling
 above, and under the 33 ms the PHI pass spends on such a line.
+
+WHAT :data:`_KV_QUOTED_VALUE` COSTS, measured 2026-10-05 the same way, against the plain quoted form in
+the same pattern. The paragraph above predates it. An ordinary quoted credential line is level, 4.05
+against 4.04 us, because its fast path is the plain form. A quoted value whose last character is "=" or
+a space takes the walk: 3.95 against 4.54 us, and 44 against 572 us for a 6 KB one. Linear, and under
+the ceiling above.
 """
 
 from __future__ import annotations
@@ -279,7 +285,8 @@ _ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
 # already ended at or just past that quote. The text between the stop and the quote is a separator,
 # the label and its ":" or "=". The stop also requires :data:`_GUARDED_QUOTED_VALUE` to match the
 # whole quoted value, so the label's own pattern is sure to take it, and to take it past where the old
-# value ended. So, WITHIN ONE PASS, a stop can newly print label text and never a value. ACROSS PASSES
+# value ended. So, WITHIN ONE PASS, a stop newly prints label text, and a value only in the one trade
+# written down at the end of this comment. ACROSS PASSES
 # IT CAN, and the differential test measures how often: the text a stop leaves behind is not the text
 # the old class left, so a later pass over it can end somewhere else. A stray quote or a later label
 # used to cut a later pass short, and now does not. It is rare, and most such lines also hide a value
@@ -357,7 +364,7 @@ _ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
 #
 #   token='abc (truncated), password='p w'   ->  token=<redacted>p w'
 #
-# So the walk refuses four shapes, and a refused value falls back to the plain class:
+# So the walk refuses at least these five shapes, and a refused value falls back to the plain class:
 #
 # * a closer right after a run of ":", "=" and spaces. That closer is a label's OPENING quote, after
 #   ``password='``, ``password = '`` or ``authorization: Bearer '``. It also refuses a value that
@@ -367,6 +374,12 @@ _ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
 #   password took the password's closer, an earlier pass stealing a later pass's quote.
 # * a "{" inside, for the same reason: a braced value under a later label may close after this
 #   value's closer, and ``_CREDENTIAL_KV``'s overrun may run past it to the end of the line.
+# * a "://" inside. A URL's password may hold an apostrophe, so ``token='a postgres://u:p'w@h``
+#   closed on it, ``_DSN_PASSWORD`` no longer matched, and "w@h" printed. Found by the second review
+#   round; the plain class stops at the space and leaves the DSN whole.
+#
+# These are the ways measured so far that a closer can belong to someone else, not a proof there are
+# no more.
 #
 # THE CLOSER IS LEFT IN THE TEXT, by a lookahead, and that is load-bearing. The plain classes always
 # stopped AT a quote, so a later pass found it there: as the closer of an earlier value it had opened
@@ -378,8 +391,8 @@ _ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
 # DETERMINISTIC AND POSSESSIVE, so linear: the two branches of the walk cannot match the same
 # character, and each takes a whole run, so a long run of spaces is walked once.
 _GUARDED_QUOTED_VALUE = (
-    "'(?:[^'\"{\\s:=]++|(?:[:=]|[^\\S\r\n])++(?!'))*+(?='(?!\\s*+[:=]))"
-    '|"(?:[^\'"{\\s:=]++|(?:[:=]|[^\\S\r\n])++(?!"))*+(?="(?!\\s*+[:=]))'
+    "'(?:[^'\"{\\s:=]++|(?::(?!//)|=|[^\\S\r\n])++(?!'))*+(?='(?!\\s*+[:=]))"
+    '|"(?:[^\'"{\\s:=]++|(?::(?!//)|=|[^\\S\r\n])++(?!"))*+(?="(?!\\s*+[:=]))'
 )
 
 # The braced value for ``_MEFOR_SECRET`` and ``_KEY_MATERIAL``, guarded the same way and for the same
@@ -422,11 +435,27 @@ _NOT_BEFORE_QUOTED_LABEL = (
 )
 
 
-#: A label of any family up to where its value starts, for :data:`_KV_QUOTED_VALUE`.
-_RUN_ON_LABEL = r"(?:" + _LABEL_HEAD + r"|" + _MEFOR_LABEL_HEAD + r")"
-#: Up to the next quote of one kind, or to a label whose value opens with one, whichever comes first.
+#: A label of any family up to where its value starts, for :data:`_KV_QUOTED_VALUE`. Unlike
+#: :data:`_LABEL_HEAD` it takes no quote after the keyword and no line break, so a run-on can never
+#: cross a line or end on a ``'label'=`` echo's own quote.
+_RUN_ON_LABEL = (
+    r"(?:(?=(?i:[" + _KEYWORD_INITIALS + r"]))"
+    r"(?:(?i:" + _alternation(_CREDENTIAL_WORDS + _KEY_MATERIAL_WORDS) + r")\b"
+    r"[^\S\r\n]*+[:=][^\S\r\n]*+"
+    r"|(?i:" + _alternation(_TOKEN_WORDS) + r")\b[^\S\r\n]*+[:=][^\S\r\n]*+"
+    r"(?:(?i:bearer|basic|digest)[^\S\r\n]++)?)"
+    r"|\b(?-i:" + re.escape(_ENV_PREFIX) + r"[A-Z0-9_]++)\b[^\S\r\n]*+[:=][^\S\r\n]*+)"
+)
+#: The outer walk: up to the next quote of one kind, or to a label whose value opens with one.
 _SQ_RUN_ON_WALK = r"(?:[^'\r\nA-Za-z0-9]|(?!" + _RUN_ON_LABEL + r"')[A-Za-z0-9]++)*+"
 _DQ_RUN_ON_WALK = r"(?:[^\"\r\nA-Za-z0-9]|(?!" + _RUN_ON_LABEL + r"\")[A-Za-z0-9]++)*+"
+#: The inner walk, over the later label's value. It stops at anything a later pass could read past
+#: the closer: either quote, a "{", a "://", any label at all, and any character outside ASCII, so
+#: a keyword spelled with a fold character stops it in both copies alike.
+_RUN_ON_INNER = (
+    r"(?:[^'\"{:\r\nA-Za-z0-9\x80-\U0010ffff]|:(?!//)"
+    r"|(?!" + _RUN_ON_LABEL + r")(?-i:[A-Za-z0-9])++)*+"
+)
 
 # ``_CREDENTIAL_KV``'s quoted value: :data:`_QUOTED_VALUE`, except where the quote that would close it
 # OPENS A LATER LABEL'S VALUE. There it takes that label and its value as well, through the value's own
@@ -437,35 +466,42 @@ _DQ_RUN_ON_WALK = r"(?:[^\"\r\nA-Za-z0-9]|(?!" + _RUN_ON_LABEL + r"\")[A-Za-z0-9
 # opening quote, so the outer value closed at the end of the line and hid everything. With the stop
 # that quote stayed, the outer value closed on it, and "pk1 pk2" printed.
 #
-# WHEN IT RUNS ON, AND WHEN IT FALLS BACK. Where no label opens with the closing quote, it is the same
-# walk as :data:`_QUOTED_VALUE`. Where one does, it runs on to the later value's closer only if that
-# closer is a plain one: the later value must reach it without meeting a third label that opens with
-# the same quote, and it must not be followed by ":" or "=", the quote of a ``'label'=`` echo. Otherwise
-# it closes on the later label's opening quote, exactly as :data:`_QUOTED_VALUE` did, and leaves the
-# rest to the passes after it. Both guards were measured: without them, running on swallowed a third
-# label that the plain form had left for ``_CREDENTIAL_KV``'s next match, and printed its value. With
-# them, over the 208,000 lines the differential test's docstring names, it cut the lines printing a
-# value the pre-change patterns hid from five to one, that one among the five, and hid 1,622 more
-# value atoms than the plain form in the same place. Only ``_CREDENTIAL_KV`` takes it: the GUARDED forms already
-# refuse a closer right after a ":" or "=", and fall back to a plain class.
+# WHEN IT RUNS ON, AND WHEN IT FALLS BACK. Where no label opens with the closing quote, it takes the
+# same span as :data:`_QUOTED_VALUE`. Where one does, it runs on to the later value's closer only when
+# that value is plain: :data:`_RUN_ON_INNER` must reach the closer without meeting another quote, a
+# "{", a "://", any label or a character outside ASCII, and the closer must not be followed by ":" or
+# "=", the quote of a ``'label'=`` echo. Otherwise it closes on the later label's opening quote, as
+# :data:`_QUOTED_VALUE` did, and leaves the rest to the passes after it. Every guard was measured, in
+# two review rounds: without them the run-on carried on over text a later pass used to read past the
+# closer -- a third label, a braced or other-quoted value holding the quote, an unclosed "{", a DSN
+# password holding an apostrophe, a keyword spelled with a fold character -- and printed its tail.
+# Only ``_CREDENTIAL_KV`` takes it: the GUARDED forms refuse a closer right after a ":" or "=".
 #
-# LINEAR. Each walk is the plain one, a run or one other character at a time, with the label check in
-# front of each run only. It ends at the next quote, or at most at the one after it, so walks from two
-# labels cannot share more than the span between two quotes.
+# THE FAST PATH IS THE PLAIN FORM, and the two agree wherever it is taken. A run-on needs a label
+# head ending right before the first quote after the opening one, and every head ends in ":", "=" or
+# a space. So when the character before that quote is none of those, the plain span is the answer
+# and no walk runs. Without it an ordinary quoted credential line cost 45 percent more, measured by
+# the second review round.
+#
+# LINEAR. Each walk is a run or one other character at a time, with the label check in front of each
+# run only. The outer walk ends at the first quote after the opening one; the inner walk ends at the
+# next quote after that. So walks from two labels cannot share more than the span of three quotes.
 _KV_QUOTED_VALUE = (
-    r"'"
+    r"'[^'\r\n]*+(?<![:=\s])'"
+    + r"|'"
     + _SQ_RUN_ON_WALK
     + r"(?:"
     + _RUN_ON_LABEL
     + r"(?=')(?:'"
-    + _SQ_RUN_ON_WALK
+    + _RUN_ON_INNER
     + r"(?='(?!\s*+[:=])))?+)?+'"
+    + r"|\"[^\"\r\n]*+(?<![:=\s])\""
     + r"|\""
     + _DQ_RUN_ON_WALK
     + r"(?:"
     + _RUN_ON_LABEL
     + r"(?=\")(?:\""
-    + _DQ_RUN_ON_WALK
+    + _RUN_ON_INNER
     + r"(?=\"(?!\s*+[:=])))?+)?+\""
 )
 
@@ -593,7 +629,8 @@ _MEFOR_SECRET = re.compile(
 # * A ``MEFOR_*`` value holding a connection string with a braced password, as in
 #   ``MEFOR_STORE_DSN=Server=h;PWD={p w}``, still prints " w}". The stop does not fire before a
 #   braced value, for the reason given at :data:`_NOT_BEFORE_QUOTED_LABEL`.
-# All three printed the same text before BACKLOG #1685's remainder; none is new.
+# Each of the four residuals above, from the unclosed quote on, printed the same text before BACKLOG
+# #1685's remainder; none is new.
 _CREDENTIAL_KV = re.compile(
     r"(?i)\b(" + _LABEL_PREFIX + r"(?:" + _alternation(_CREDENTIAL_WORDS) + r"))\b"
     r"['\"]?\s*[:=]\s*"
