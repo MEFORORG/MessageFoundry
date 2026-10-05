@@ -1378,8 +1378,22 @@ is refused when the connector is built. The error names the setting and never th
 at least `url` on REST, SOAP, FHIR, DICOMweb and `FhirLookup`, plus `oauth2_token_url`, `smart_token_url`
 and `[ai].endpoint`. The shape never worked: `urllib` does not send URL userinfo as auth, and its error
 text carried the password into `last_error`. Put credentials in `basic_user`/`basic_password` or
-`bearer_token` (or the `oauth2_*`/`smart_*` settings), each via `env()`. `proxy_url` is not refused,
-because a forward proxy URL may carry its own credentials.
+`bearer_token` (or the `oauth2_*`/`smart_*` settings), each via `env()`. `proxy_url` is not covered
+by this rule. It has its own, below.
+
+**A proxy URL with credentials is refused unless it is written `https://` (vault BACKLOG #2572).**
+`urllib` sends a `user:password@` from a proxy URL to the proxy as a `Proxy-Authorization: Basic`
+header. Such a proxy is refused before each request, whether it comes from `proxy_url`, from
+`HTTP_PROXY` or `HTTPS_PROXY`, or from the system proxy settings. That covers at least REST, SOAP,
+FHIR, DICOMweb, `FhirLookup`, the token endpoints, the alert webhook, the OIDC legs and the AI
+broker. A connection with such a `proxy_url` still builds, and each send then fails with this
+error. The error names no part of the proxy URL, and `[security].enforcement` does not relax it. A
+request that goes direct is not refused: one to a loopback host, or to a host that `NO_PROXY` or the
+system bypass list names. A connection's own `proxy_no_proxy` is not that list. A host it names
+skips the connection's `proxy_url` and still follows a proxy from the environment.
+**Writing the proxy `https://` is not refused, and it does not protect the credentials either:**
+`urllib` sends `CONNECT`, with the credential header, before any TLS. Take the credentials out of
+the proxy URL.
 
 **Idempotency — operator responsibility.** Delivery is **at-least-once**, so a retry **re-sends** the
 request. The receiving endpoint **must be idempotent** (an idempotency key, a natural upsert, or a
