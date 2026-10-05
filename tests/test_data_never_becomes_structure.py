@@ -793,12 +793,21 @@ async def test_a_stop_before_the_first_message_hands_nothing_over_and_still_prun
     src._handler = handler
     original = split_mod.split_batch_bytes
     loop = asyncio.get_running_loop()
+    stop_ran = threading.Event()
+
+    def _set_stop() -> None:
+        src._stop.set()
+        stop_ran.set()
 
     def _stop_on_the_batch(raw: bytes, encoding: str) -> list[bytes]:
         # The split runs in a worker thread, so the stop is set on the loop, where the Event lives.
-        # The callback is queued before the split's own result, so it runs first.
+        # The worker then waits until the loop has run it. Queueing it is not enough: when the
+        # worker finishes before the loop has registered the future's done-callback, asyncio
+        # completes the awaited future without yielding, and the poller reads the flag while the
+        # stop is still queued. The wait is a bound, never a delay: it returns as the stop runs.
         if raw.count(b"MSH") > 1:
-            loop.call_soon_threadsafe(src._stop.set)
+            loop.call_soon_threadsafe(_set_stop)
+            stop_ran.wait(30)
         return original(raw, encoding)
 
     monkeypatch.setattr(
@@ -806,6 +815,9 @@ async def test_a_stop_before_the_first_message_hands_nothing_over_and_still_prun
     )
     await _settle(src)
     await src._poll_once()
+    # The stop ran while b.hl7 was being split. Without this, a split that never reached the stop
+    # would leave the assertions below passing for the wrong reason.
+    assert stop_ran.is_set()
     # a.hl7 was handed over and recorded; b.hl7 met the stop before its first message.
     assert [b.decode("utf-8").split("|")[9] for b in handler.bodies] == ["CTRL1"]
     assert len(ledger.keys) == 1 and ledger.pruned == 1
