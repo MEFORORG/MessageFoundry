@@ -139,6 +139,8 @@ class QuotedValue:
     line: str
     fragments: tuple[str, ...]
     survives: tuple[str, ...]
+    #: The module pattern that must do the work, which the mutation fixture disables.
+    pattern: str = "_CREDENTIAL_KV"
 
 
 def odbc_line(value: str) -> str:
@@ -207,6 +209,47 @@ QUOTED_VALUES: tuple[QuotedValue, ...] = (
         ("pw-Qsc_A-29", "pw-Qsc_B-30"),
         ("connect failed", "retrying"),
     ),
+    # BACKLOG #1685's REMAINDER: the other label patterns, which kept their plain classes after the
+    # rows above were fixed and printed the tail the same way. Measured at 50a4a3dccb, on both copies:
+    # ``MEFOR_A_PW='v w'`` came out as ``MEFOR_A_PW=<redacted> w'``. Each row declares the one pattern
+    # that must do the work, so the mutation fixture proves it; the labels are chosen so no other
+    # pattern reaches them.
+    QuotedValue(
+        "mefor_single_quoted_space",
+        "startup MEFOR_VALUE_PW='pw-Mq_A-41 pw-Mq_B-42' loaded",
+        ("pw-Mq_A-41", "pw-Mq_B-42"),
+        ("startup", "loaded"),
+        "_MEFOR_SECRET",
+    ),
+    QuotedValue(
+        # A braced value is taken whole only when its closer ENDS the value, here at the space.
+        "mefor_braced_space",
+        "startup MEFOR_VALUE_PW={pw-Mb_A-43 pw-Mb_B-44} loaded",
+        ("pw-Mb_A-43", "pw-Mb_B-44"),
+        ("startup", "loaded"),
+        "_MEFOR_SECRET",
+    ),
+    QuotedValue(
+        "bearer_double_quoted_space",
+        'rest connector bearer_token="tk-Bq_A-45 tk-Bq_B-46" configured',
+        ("tk-Bq_A-45", "tk-Bq_B-46"),
+        ("rest connector", "configured"),
+        "_BEARER",
+    ),
+    QuotedValue(
+        "key_material_single_quoted_space",
+        "signing setup private_key='pk-Kq_A-47 pk-Kq_B-48' for IB_ACME_ADT",
+        ("pk-Kq_A-47", "pk-Kq_B-48"),
+        ("signing setup", "for IB_ACME_ADT"),
+        "_KEY_MATERIAL",
+    ),
+    QuotedValue(
+        "key_material_braced_space",
+        "store opened encryption_key={ek-Kb_A-49 ek-Kb_B-50} active",
+        ("ek-Kb_A-49", "ek-Kb_B-50"),
+        ("store opened", "active"),
+        "_KEY_MATERIAL",
+    ),
 )
 
 
@@ -220,7 +263,7 @@ QUOTED_FAMILIES: tuple[Family, ...] = tuple(
         name=f"quoted_{case.name}",
         line=case.line,
         secret=case.fragments[-1],
-        patterns=("_CREDENTIAL_KV",),
+        patterns=(case.pattern,),
     )
     for case in QUOTED_VALUES
 )
@@ -546,6 +589,33 @@ def test_no_fragment_of_a_quoted_credential_value_reaches_the_bundle(case: Quote
 
     eaten = [context for context in case.survives if context not in out]
     assert not eaten, f"{case.name}: the redaction ate {eaten} -- got {out!r}"
+
+
+def _write_time_filtered(line: str) -> str:
+    """``line`` after :class:`CredentialScrubFilter` alone, as a handler would emit it."""
+    record = logging.LogRecord("mefor.test", logging.ERROR, __file__, 1, line, None, None)
+    assert CredentialScrubFilter().filter(record)
+    return record.getMessage()
+
+
+@pytest.mark.parametrize("case", QUOTED_VALUES, ids=lambda c: c.name)
+def test_no_fragment_of_a_quoted_credential_value_reaches_the_write_time_scrub(
+    case: QuotedValue,
+) -> None:
+    """The same rows on the WRITE-TIME copy of the vocabulary, which the test above cannot reach.
+
+    ``secretscrub`` keeps its own copy of every pattern, and BACKLOG #1685's remainder was fixed in
+    both, so both are pinned on the same rows: ``scrub_credentials`` and the handler filter that
+    calls it. The rest of the line must survive here too."""
+    for surface, out in (
+        ("scrub_credentials", scrub_credentials(case.line)),
+        ("CredentialScrubFilter", _write_time_filtered(case.line)),
+    ):
+        survivors = [fragment for fragment in case.fragments if fragment in out]
+        assert not survivors, f"{surface} {case.name}: {survivors} survived -- got {out!r}"
+        assert CREDENTIAL_PLACEHOLDER in out, f"{surface} {case.name}: nothing redacted -- {out!r}"
+        eaten = [context for context in case.survives if context not in out]
+        assert not eaten, f"{surface} {case.name}: the redaction ate {eaten} -- got {out!r}"
 
 
 def test_a_first_closing_brace_pattern_would_still_leak_the_doubled_brace_row() -> None:
@@ -1969,3 +2039,269 @@ def test_the_old_gate_fails_the_fold_character_test(monkeypatch: pytest.MonkeyPa
     assert all(chr(0x0130) in line or chr(0x0131) in line for line in leaked), [
         ascii(line) for line in leaked
     ]
+
+
+# --- a plain value must not run on into a LATER quoted label ----------------------------------------
+#
+# A plain value class ran across a separator into a later credential label and ended at that label's
+# opening quote. The later pattern never saw its label, so the quoted value printed. Measured on both
+# copies at 50a4a3dccb, in plain ASCII. Why the fix stops only before a QUOTE, and where in the label it
+# stops, is stated once, on ``_NOT_BEFORE_QUOTED_LABEL`` in ``messagefoundry/secretscrub.py``.
+
+#: The patterns whose plain value class carries the stop, in both modules.
+_STOPPED_PATTERNS = ("_MEFOR_SECRET", "_BEARER", "_AUTH_SCHEME", "_CREDENTIAL_KV", "_KEY_MATERIAL")
+
+#: The three shapes the finding was filed with: the line, every value piece that must not print, and
+#: the labels that must stay visible so a reader can tell which credentials were there.
+SWALLOW_EXAMPLES: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
+    (
+        'connect failed api_token=tk-Sw_A-61;password="pw-Sw_B-62 pw-Sw_C-63" for svc',
+        ("tk-Sw_A-61", "pw-Sw_B-62", "pw-Sw_C-63"),
+        ("api_token=", "password="),
+    ),
+    (
+        'connect failed session=ss-Sw_D-64;private_key="pk-Sw_E-65 pk-Sw_F-66" for svc',
+        ("ss-Sw_D-64", "pk-Sw_E-65", "pk-Sw_F-66"),
+        ("session=", "private_key="),
+    ),
+    (
+        'connect failed pwd=pw-Sw_G-67:password="pw-Sw_H-68 pw-Sw_I-69" for svc',
+        ("pw-Sw_G-67", "pw-Sw_H-68", "pw-Sw_I-69"),
+        ("pwd=", "password="),
+    ),
+)
+
+#: The generated family: a first label from every family, each separator the finding named, then a
+#: second label from every family with a quoted value holding a space. Underscored labels are in both
+#: positions on purpose; ``client_secret`` after a separator is the shape a stop at the keyword missed.
+_SWALLOW_FIRST_LABELS = (
+    "password",
+    "pwd",
+    "client_secret",
+    "api_token",
+    "session",
+    "authorization",
+    "private_key",
+    "encryption_keys_retired",
+    "MEFOR_STORE_PW",
+)
+_SWALLOW_SEPARATORS = (";", "&", ",", ":", "=", "|", ".")
+_SWALLOW_SECOND_LABELS = (
+    "password",
+    "ad_bind_password",
+    "secret",
+    "token",
+    "api_key",
+    "bearer_token",
+    "private_key",
+    "intake_api_key_next",
+    "MEFOR_VALUE_PW",
+)
+_SWALLOW_VALUES = ("fv-Fst_V-01", "sv-Snd_A-02", "sv-Snd_B-03")
+
+
+def _swallow_family() -> list[str]:
+    first_value, second_head, second_tail = _SWALLOW_VALUES
+    return [
+        f"connect failed {first}={first_value}{sep}{second}={q}{second_head} {second_tail}{q} for svc"
+        for first in _SWALLOW_FIRST_LABELS
+        for sep in _SWALLOW_SEPARATORS
+        for second in _SWALLOW_SECOND_LABELS
+        for q in ("'", '"')
+    ]
+
+
+#: Every surface the stop protects: the write-time pass, the handler filter that calls it, and the
+#: read-time bundle redactor.
+_SWALLOW_SURFACES: tuple[tuple[str, Callable[[str], str]], ...] = (
+    ("scrub_credentials", scrub_credentials),
+    ("CredentialScrubFilter", _write_time_filtered),
+    ("redact_log_line", redact_log_line),
+)
+
+
+@pytest.mark.parametrize(
+    "example",
+    SWALLOW_EXAMPLES,
+    ids=("token-then-password", "session-then-key", "pwd-then-password"),
+)
+def test_a_plain_value_does_not_swallow_a_later_quoted_label(
+    example: tuple[str, tuple[str, ...], tuple[str, ...]],
+) -> None:
+    """No value piece prints, and both labels stay visible, on every surface."""
+    line, values, labels = example
+    for surface, apply in _SWALLOW_SURFACES:
+        out = apply(line)
+        printed = [value for value in values if value in out]
+        assert not printed, f"{surface}: {printed} printed -- got {out!r}"
+        hidden = [label for label in labels if label not in out]
+        assert not hidden, f"{surface}: the labels {hidden} were swallowed -- got {out!r}"
+
+
+def test_no_two_label_line_prints_either_value() -> None:
+    """The generated family, every line on every surface: neither value may print."""
+    lines = _swallow_family()
+    assert len(lines) == 9 * 7 * 9 * 2
+    failures = [
+        f"{surface}: {line!r} -> {out!r}"
+        for line in lines
+        for surface, apply in _SWALLOW_SURFACES
+        if any(value in (out := apply(line)) for value in _SWALLOW_VALUES)
+    ]
+    assert not failures, f"{len(failures)} lines printed a value, first: {failures[:5]}"
+
+
+def _without_the_stop(module: ModuleType) -> dict[str, re.Pattern[str]]:
+    """``module``'s stopped patterns rebuilt with the stop cut out of their source.
+
+    What remains is each plain class as it was before the stop, beside the quoted and braced forms.
+    So this is the pre-fix value behaviour for the swallow shapes, which is what a positive control
+    for them needs. Each source must CONTAIN the stop, or the cut changed nothing and proves nothing."""
+    rebuilt: dict[str, re.Pattern[str]] = {}
+    for name in _STOPPED_PATTERNS:
+        pattern: re.Pattern[str] = getattr(module, name)
+        source = pattern.pattern
+        assert module._NOT_BEFORE_QUOTED_LABEL in source, f"{module.__name__}.{name} has no stop"
+        assert module._NOT_AT_QUOTED_LABEL in source, f"{module.__name__}.{name} has no first stop"
+        source = source.replace(module._NOT_BEFORE_QUOTED_LABEL, "")
+        source = source.replace(module._NOT_AT_QUOTED_LABEL, "")
+        rebuilt[name] = re.compile(source, pattern.flags)
+    return rebuilt
+
+
+def _patched_without_the_stop(monkeypatch: pytest.MonkeyPatch) -> None:
+    for module in (scrub_mod, redact_mod):
+        for name, pattern in _without_the_stop(module).items():
+            monkeypatch.setattr(module, name, pattern)
+
+
+def test_the_swallow_tests_fail_without_the_stop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """THE POSITIVE CONTROL. With the stop cut out of both copies, every example must print a value
+    on every surface, and so must most of the family. Otherwise the two tests above cannot fail."""
+    _patched_without_the_stop(monkeypatch)
+    for line, values, _labels in SWALLOW_EXAMPLES:
+        for surface, apply in _SWALLOW_SURFACES:
+            out = apply(line)
+            assert any(value in out for value in values), f"{surface}: {line!r} did not leak"
+    leaked = [
+        line
+        for line in _swallow_family()
+        if any(value in scrub_credentials(line) for value in _SWALLOW_VALUES)
+    ]
+    # Measured 2026-10-04: every line whose first label's class does not already stop at the
+    # separator. A floor rather than the exact count, so a later widening of a terminator set does not
+    # red this for the wrong reason; it is far above zero, which is the property that matters.
+    assert len(leaked) >= 500, f"only {len(leaked)} family lines leaked without the stop"
+
+
+#: A token carrying both a hyphen and an underscore: every value sentinel in this file has that shape,
+#: and no label does, so it tells a printed VALUE from printed label text.
+_SENTINEL = re.compile(r"[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)+")
+
+
+def _sentinels(text: str) -> set[str]:
+    return {t for t in _SENTINEL.findall(text) if "-" in t and "_" in t}
+
+
+def test_the_stop_never_prints_a_value_the_stop_free_patterns_hide(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A DIFFERENTIAL, because the stop's whole safety claim is relative: it may print label text, and
+    never a value the patterns without it would have hidden. Run over this file's fixtures and the
+    generated family, on every surface, against the same patterns with the stop cut out."""
+    corpus = [
+        *_swallow_family(),
+        *(line for line, _values, _labels in SWALLOW_EXAMPLES),
+        *(fam.line for fam in FAMILIES),
+        *ORDINARY_DIAGNOSTICS,
+    ]
+    shipped = {surface: [apply(line) for line in corpus] for surface, apply in _SWALLOW_SURFACES}
+    _patched_without_the_stop(monkeypatch)
+    newly_printed: list[str] = []
+    fixed = 0
+    for surface, apply in _SWALLOW_SURFACES:
+        for line, out in zip(corpus, shipped[surface], strict=True):
+            stop_free = apply(line)
+            for token in _sentinels(line):
+                if token in out and token not in stop_free:
+                    newly_printed.append(f"{surface}: {token} in {line!r}")
+                if token in stop_free and token not in out:
+                    fixed += 1
+    assert not newly_printed, f"the stop printed values: {newly_printed[:5]}"
+    # The differential compared outputs that DIFFER, or it compared nothing.
+    assert fixed > 0, (
+        "the stop changed no output in the corpus, so this differential proves nothing"
+    )
+
+
+def test_both_copies_of_each_stopped_pattern_agree() -> None:
+    """The two modules restate these patterns by hand, and a one-sided edit must red HERE.
+
+    They differ on purpose in spelling -- a scoped fold here, a derived alternation there -- so the
+    check is on what they MATCH, over an ASCII corpus where those spellings are equivalent."""
+    corpus = [
+        *_swallow_family(),
+        *(line for line, _values, _labels in SWALLOW_EXAMPLES),
+        *(fam.line for fam in FAMILIES),
+        *ORDINARY_DIAGNOSTICS,
+    ]
+    compared = 0
+    for name in _STOPPED_PATTERNS:
+        ours, theirs = getattr(redact_mod, name), getattr(scrub_mod, name)
+        for line in corpus:
+            spans = [m.span() for m in ours.finditer(line)]
+            assert spans == [m.span() for m in theirs.finditer(line)], f"{name} differs on {line!r}"
+            compared += len(spans)
+    assert compared > 1000, f"only {compared} matches were compared"
+
+
+def test_every_keyword_passes_the_stops_first_letter_gate() -> None:
+    """The stop gates its keyword alternation on the keyword's first letter. A keyword whose first
+    letter the gate lacks would never stop a value, silently. Driven by the vocabulary tuples, so a
+    word added to them reaches this check in both copies."""
+    words = scrub_mod._CREDENTIAL_WORDS + scrub_mod._KEY_MATERIAL_WORDS + scrub_mod._TOKEN_WORDS
+    for module in (scrub_mod, redact_mod):
+        label = re.compile(module._QUOTED_LABEL)
+        for word in words:
+            for spelling in (word, word.upper()):
+                assert label.match(f'{spelling}="'), (
+                    f"{module.__name__}: {spelling} misses the gate"
+                )
+
+
+#: The input the growth arm runs: a long MEFOR_MEFOR_... name inside a token value, ending on a quote
+#: so the fast path cannot take it and every run is checked.
+def _mefor_run(length: int) -> str:
+    return "token=x;" + "MEFOR_" * (length // 6) + '"'
+
+
+def test_the_value_walk_grows_linearly_in_line_length() -> None:
+    """The stop is checked inside every plain value, on log text an attacker can influence, so it must
+    stay linear. THE POSITIVE CONTROL is the same pattern with the MEFOR_ branch's ``\\b`` swapped for
+    the lookbehind the keyword branches use: then every "_" starts a walk to the end of the run, which
+    is the quadratic the ``\\b`` is there to stop. Measured 2026-10-04: 7.7x for the shipped pattern
+    against 48x to 50x for the control, across the same 8x span."""
+    head = r"\b(?-i:MEFOR_"
+    for module in (scrub_mod, redact_mod):
+        shipped: re.Pattern[str] = module._BEARER
+        assert head in shipped.pattern, f"{module.__name__}._BEARER lost its MEFOR_ branch head"
+        control = re.compile(
+            shipped.pattern.replace(head, r"(?<![A-Za-z0-9])(?-i:MEFOR_"), shipped.flags
+        )
+        control_growth = _walk_growth(control)
+        assert control_growth > _MAX_GROWTH, (
+            f"{module.__name__}: the quadratic control grew only {control_growth:.1f}x, so this "
+            "box or this input cannot show the hazard and the shipped reading proves nothing"
+        )
+        growth = _walk_growth(shipped)
+        assert growth <= _MAX_GROWTH, (
+            f"{module.__name__}._BEARER grew {growth:.1f}x for 8x the line length, against "
+            f"{control_growth:.1f}x for the quadratic control in this same run"
+        )
+
+
+def _walk_growth(pattern: re.Pattern[str]) -> float:
+    """Time at the long length over time at the short one, on :func:`_mefor_run`."""
+    small = _fastest(lambda text: pattern.sub("x", text), _mefor_run(_GROWTH_LENGTHS[0]), 3)
+    large = _fastest(lambda text: pattern.sub("x", text), _mefor_run(_GROWTH_LENGTHS[1]), 2)
+    return large / small
