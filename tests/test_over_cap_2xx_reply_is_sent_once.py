@@ -8,10 +8,14 @@ would have sent it again, and the message would then have dead-lettered although
 
 The owner ruling of 2026-10-05 judges such a reply by who reads the body:
 
-* nothing reads it (REST with capture off, FHIR): the message is delivered, the body is dropped,
-  and a WARNING is logged;
-* the engine reads it to know the outcome, or passes it on (SOAP, DICOMweb, REST with capture on):
-  a permanent refusal, and no re-send.
+* nothing reads it: the message is delivered, the body is dropped, and a WARNING is logged.
+  REST with capture off, and a plain FHIR write with capture off;
+* the engine reads it to know the outcome, or passes it on: a permanent refusal, and no
+  re-send. SOAP, DICOMweb and REST with capture on.
+
+Two FHIR cases are the batch 191 Manager's reading of that ruling, and both are a refusal: an
+update the engine wraps in a transaction, whose reply it reads for the entry status, in either
+capture mode; and any FHIR write with capture on, whose reply is passed on.
 
 Three layers:
 
@@ -210,8 +214,7 @@ def _payload(ctype: ConnectorType) -> str:
     return json.dumps({"note": _PAYLOAD_MARKER})
 
 
-#: What the ruling names, as (connector, extra settings) -> the delivered side or the refused side.
-#: FHIR with capture on is absent on purpose: see the last test in this file.
+#: Every destination and mode, as (connector, extra settings) -> the delivered or the refused side.
 _DELIVERED = "delivered"
 _REFUSED = "refused"
 _RULED: list[tuple[ConnectorType, dict[str, Any], str]] = [
@@ -221,9 +224,21 @@ _RULED: list[tuple[ConnectorType, dict[str, Any], str]] = [
     (ConnectorType.SOAP, {"capture_response": True}, _REFUSED),
     (ConnectorType.DICOMWEB, {"capture_response": False}, _REFUSED),
     (ConnectorType.DICOMWEB, {"capture_response": True}, _REFUSED),
+    # A plain FHIR write with capture off has no reader. THE CONTROL for the three rows after it.
     (ConnectorType.FHIR, {"capture_response": False}, _DELIVERED),
-    # An update goes out wrapped in a transaction, and its reply is parsed for the entry status.
-    (ConnectorType.FHIR, {"capture_response": False, "interaction": "update"}, _DELIVERED),
+    # The Manager's reading: with capture on the reply is passed on, as a REST reply is.
+    (ConnectorType.FHIR, {"capture_response": True}, _REFUSED),
+    # The Manager's reading: an update goes out wrapped in a transaction, and the engine reads
+    # the reply for the entry status. So the outcome is unknown without it, in either mode.
+    (ConnectorType.FHIR, {"capture_response": False, "interaction": "update"}, _REFUSED),
+    (ConnectorType.FHIR, {"capture_response": True, "interaction": "update"}, _REFUSED),
+    # THE CONTROL for the two rows above: the same update sent as a plain PUT is not wrapped, so
+    # nothing reads its reply. It is the wrap that decides, and not the word update.
+    (
+        ConnectorType.FHIR,
+        {"capture_response": False, "interaction": "update", "update_url_form": "path"},
+        _DELIVERED,
+    ),
 ]
 
 
@@ -231,7 +246,8 @@ def _case_id(case: tuple[ConnectorType, dict[str, Any], str]) -> str:
     ctype, over, _ = case
     capture = "capture-on" if over.get("capture_response") else "capture-off"
     interaction = f"-{over['interaction']}" if "interaction" in over else ""
-    return f"{ctype.value}-{capture}{interaction}"
+    form = f"-{over['update_url_form']}" if "update_url_form" in over else ""
+    return f"{ctype.value}-{capture}{interaction}{form}"
 
 
 @pytest.mark.parametrize("case", _RULED, ids=_case_id)
@@ -411,7 +427,7 @@ async def test_an_over_cap_2xx_is_sent_once_and_recorded_as_ruled(
         dest = _build(ctype, f"{partner.url}/x?site={_URL_MARKER}", **over)
         with caplog.at_level(logging.WARNING):
             got = await _deliver(tmp_path, dest, _payload(ctype))
-    # THE ITEM: the partner accepted the request, so it must never see it twice.
+    # THE ITEM: the partner answered 2xx, so it must never see the request twice.
     assert len(partner.requests) == 1, partner.requests
     assert got.outcomes == [_ItemOutcome.PROCESSED]
     assert got.stopped == [], "one over-cap reply must not stop the lane"
@@ -450,16 +466,20 @@ _IN_CAP_BODY = {
 }
 
 
-@pytest.mark.parametrize("ctype", list(_FACTORY), ids=lambda c: c.value)
-@pytest.mark.parametrize("capture", [False, True], ids=["capture-off", "capture-on"])
+@pytest.mark.parametrize("case", _RULED, ids=_case_id)
 async def test_an_in_cap_2xx_is_delivered_as_before(
-    ctype: ConnectorType, capture: bool, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    case: tuple[ConnectorType, dict[str, Any], str],
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """THE CONTROL: a reply under the bound is delivered once, in every mode, and with capture on
-    its body is stored whole. No new WARNING is logged for it."""
+    """THE CONTROL: a reply under the bound is delivered once in every case, the refused ones
+    included, and with capture on its body is stored whole. No new WARNING is logged for it.
+    So what refuses a case above is the size of its reply, and not the case."""
+    ctype, over, _ = case
+    capture = bool(over["capture_response"])
     body = _IN_CAP_BODY[ctype]
     with _Partner(200, body) as partner:
-        dest = _build(ctype, f"{partner.url}/x", capture_response=capture)
+        dest = _build(ctype, f"{partner.url}/x", **over)
         with caplog.at_level(logging.WARNING):
             got = await _deliver(tmp_path, dest, _payload(ctype))
     assert len(partner.requests) == 1
@@ -487,31 +507,3 @@ async def test_an_over_cap_body_on_a_500_is_retried_as_before(
     assert "HTTP 500" in got.last_error
     assert REPLY_TOO_LARGE_CODE not in got.last_error
     assert got.captured == []
-
-
-# --- the case the ruling does not name ------------------------------------------------------------
-
-
-async def test_fhir_with_capture_on_is_not_changed_by_this_item(
-    tmp_path: Path, over_cap_body: bytes
-) -> None:
-    """**Not a decision.** The ruling names FHIR on the delivered side, because nothing reads its
-    reply. With ``capture_response`` on, the reply is stored and can be passed on through
-    ``reingress_to`` or ``reply_from``, as a REST reply is, and the ruling names no side for that.
-    So this item leaves the arm alone, and an over-cap 2xx there is still retried and sent again.
-
-    This test records what the code does today, so that a change to it is made on purpose."""
-    dest = _build(ConnectorType.FHIR, "https://partner.example.com/fhir", capture_response=True)
-    resp = _UnboundedResp()
-    dest._opener = _FakeOpener(resp)
-    with pytest.raises(ResponseTooLargeError) as ei:
-        await dest.send(_payload(ConnectorType.FHIR))
-    # Still the reader's own text: the connection, and no part of the URL.
-    assert str(ei.value).startswith(f"FHIR connection {CONNECTION!r} returned")
-    assert "partner.example.com" not in str(ei.value)
-    assert resp.requested == [DEFAULT_MAX_RESPONSE_BYTES + 1]
-    with _Partner(200, over_cap_body) as partner:
-        wired = _build(ConnectorType.FHIR, f"{partner.url}/fhir", capture_response=True)
-        got = await _deliver(tmp_path, wired, _payload(ConnectorType.FHIR))
-    assert len(partner.requests) == _OFFERS
-    assert got.row_status == OutboxStatus.PENDING.value

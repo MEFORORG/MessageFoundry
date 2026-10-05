@@ -880,7 +880,7 @@ class FhirDestination(DestinationConnector):
         outer, bundle = _as_transaction(
             base, request, {**self._static_conditionals, **extra_headers}, payload
         )
-        body, status, headers = self._post(bundle, "POST", base, outer)
+        body, status, headers = self._post(bundle, "POST", base, outer, wrapped=True)
         captured, outcome = _unwrap_transaction_reply(body, headers, self.capture_response_headers)
         return body, status, captured, outcome
 
@@ -964,8 +964,16 @@ class FhirDestination(DestinationConnector):
             ) from exc
 
     def _post(
-        self, payload: str, method: str, url: str, extra_headers: dict[str, str]
+        self,
+        payload: str,
+        method: str,
+        url: str,
+        extra_headers: dict[str, str],
+        *,
+        wrapped: bool = False,
     ) -> tuple[str, int, dict[str, str]]:
+        # ``wrapped``: the payload is the one-entry transaction _exchange built around an update,
+        # so the caller reads the reply for the entry status (vault BACKLOG #2180).
         # #200 (ADR 0092 decision 4): zero-I/O send-time re-assertion of a permitted insecure hop before
         # a byte crosses. ``url`` is a per-message write path but its host is always the base_url host, so
         # a None guard (secure/loopback base) is byte-identical.
@@ -1014,26 +1022,19 @@ class FhirDestination(DestinationConnector):
             with self._opener.open(req, timeout=self.timeout) as resp:
                 # ASVS 15.2.2: bounded on the socket read. A FHIR write returns the created resource
                 # or an OperationOutcome, both orders of magnitude under the 16 MiB ceiling.
-                if self.capture_response:
-                    # vault BACKLOG #2180 does not reach this arm. With capture on the reply is
-                    # stored and may be passed on, and the owner ruling of 2026-10-05 names no
-                    # side for that. So an over-cap body here is still retried, as before.
-                    body = read_bounded_text(
-                        resp,
-                        connector=self._hop,
-                        encoding=self.encoding,
-                    )
-                else:
-                    # vault BACKLOG #2180: the status here is 2xx, so an over-cap body must not
-                    # re-send. With capture off the message is delivered and the body dropped. A
-                    # wrapped update then meets an empty body, which _unwrap_transaction_reply
-                    # takes as delivered, as it takes any reply it cannot read.
-                    body = read_accepted_reply_text(
-                        resp,
-                        connector=self._hop,
-                        encoding=self.encoding,
-                        body_is_needed=False,
-                    )
+                # vault BACKLOG #2180: the status here is 2xx, so an over-cap body must not
+                # re-send. The owner ruling of 2026-10-05 decides by who reads the body. A plain
+                # write with capture off has no reader, so it is delivered and the body dropped.
+                # The other two cases are the batch 191 Manager's reading of that ruling, and
+                # both are a permanent refusal. A wrapped update's reply is read for the entry
+                # status, so without it the outcome is unknown. With capture on the reply is
+                # stored and may be passed on.
+                body = read_accepted_reply_text(
+                    resp,
+                    connector=self._hop,
+                    encoding=self.encoding,
+                    body_is_needed=wrapped or self.capture_response,
+                )
                 status = int(getattr(resp, "status", 200))
                 # #154: capture only the allow-listed response headers (empty allow-list → {}).
                 headers_out = capture_response_headers(
