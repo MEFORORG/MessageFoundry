@@ -1834,8 +1834,10 @@ What the `date` kind does to a value:
   report for others.
 - A `FT1-4` that holds a date range with an end date is scrubbed to empty. The `date` kind reads
   one timestamp, and a second one after the component separator is not a precision code.
-- A date-typed `OBX-5` result, such as a last menstrual period, is kept whole by the `OBX-5`
-  allowlist.
+- An `OBX-5` result whose `OBX-2` type is `DT` or `TS`, such as a last menstrual period, takes the
+  `date` kind too: the year stays, and a value that is not a valid timestamp is scrubbed to
+  empty. A date under any other type gets that type's treatment. So a date sent as `NM` is still
+  kept whole, and one sent as `DTM` or `ST` is redacted whole.
 - When a site-code prefix of `19` or `20` is configured, the site-code pass rewrites a six-digit
   `YYYYMM` output with a salted code. That value then differs between datasets and is no longer a
   valid date.

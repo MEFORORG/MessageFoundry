@@ -22,6 +22,7 @@ from .rules import AnonError, FieldRule, SurrogateKind
 from .surrogates import (
     Seps,
     normalized_message,
+    obx5_kind,
     preserve_obx5_value,
     read_message_seps,
     scrub_message_site_codes,
@@ -58,7 +59,7 @@ def anonymize_message(raw: str, keyer: Keyer, rules: tuple[FieldRule, ...]) -> s
             if _skip_obx5(rule, fields, seps):
                 continue
             if fnum < len(fields):
-                fields[fnum] = surrogate_field(rule.kind, fields[fnum], keyer, seps)
+                fields[fnum] = surrogate_field(_kind_for(rule, fields), fields[fnum], keyer, seps)
     encoded = "\r".join(field_sep.join(fields) for fields in segments)
     return scrub_message_site_codes(encoded, keyer)
 
@@ -74,3 +75,11 @@ def _skip_obx5(rule: FieldRule, fields: list[str], seps: Seps) -> bool:
         fields[5] if len(fields) > 5 else None,
         seps,
     )
+
+
+def _kind_for(rule: FieldRule, fields: list[str]) -> SurrogateKind:
+    """The kind to apply: the rule's own, except that the OBX-5 free-text rule hands a date-typed
+    value to the ``DATE`` kind -- see :func:`obx5_kind`, which is where that decision lives."""
+    if rule.path != "OBX-5" or rule.kind != SurrogateKind.FREETEXT:
+        return rule.kind
+    return obx5_kind(fields[2] if len(fields) > 2 else None)

@@ -455,7 +455,11 @@ def scrub_message_site_codes(text: str, keyer: Keyer) -> str:
 #: nobody thought of: an embedded document (``ED``, an OBX-5 base64 payload — ADR 0028 §7), a
 #: reference pointer (``RP``), a vendor Z-type, or an OBX with no OBX-2 at all. Under a blocklist an
 #: ED document would reach a fixture un-redacted on first use; under the allowlist it is redacted.
-_NUMERIC_OBX_TYPES = frozenset({"NM", "SN", "DT", "TM", "TS"})
+_NUMERIC_OBX_TYPES = frozenset({"NM", "SN", "TM"})
+#: A date-typed OBX-5 (a last menstrual period, a collection time) is a date like any other, so it
+#: is NOT preserved: it takes the ``DATE`` kind, which keeps the year only (BACKLOG #2330). ``DTM``
+#: is not listed, so a value declared ``DTM`` stays redacted whole.
+_DATE_OBX_TYPES = frozenset({"DT", "TS"})
 _CODED_OBX_TYPES = frozenset({"ID", "IS"})
 _CODED_ELEMENT_OBX_TYPES = frozenset({"CE", "CWE"})
 
@@ -465,7 +469,7 @@ _CODED_ELEMENT_OBX_TYPES = frozenset({"CE", "CWE"})
 #: and fails closed on one that is not conformant.
 _CODED_ELEMENT_TEXT_COMPONENTS = (2, 5, 9)
 
-#: The characters a conformant NM/SN/DT/TM/TS subcomponent is drawn from: digits, sign, decimal point,
+#: The characters a conformant NM/SN/TM subcomponent is drawn from: digits, sign, decimal point,
 #: and the comparator / range / timezone-offset punctuation. No letters and no whitespace, so prose
 #: cannot pass. Separators are excluded because the value is split on the message's OWN separators
 #: (read from MSH) before a part is matched — this class never sees one.
@@ -513,8 +517,11 @@ def preserve_obx5_value(value_type: str | None, value: str | None, seps: Seps) -
       falls straight through to ``False``; and
     * the value must LOOK like the type it claims. A declared type is never taken on trust, because
       an OBX labelled ``NM`` whose OBX-5 carries a sentence is exactly the narrative the ``FREETEXT``
-      rule exists to redact. Numeric and temporal values are matched against their character class;
-      a coded value must be a bare token; a coded ELEMENT must additionally carry no text component.
+      rule exists to redact. Numeric and time-of-day values are matched against their character
+      class; a coded value must be a bare token; a coded ELEMENT must additionally carry no text
+      component.
+
+    A date type (``DT``, ``TS``) is never preserved. :func:`obx5_kind` says what it gets instead.
     """
     declared = (value_type or "").strip().upper()
     text = value or ""
@@ -528,3 +535,12 @@ def preserve_obx5_value(value_type: str | None, value: str | None, seps: Seps) -
     if declared in _CODED_ELEMENT_OBX_TYPES:
         return _coded_element_is_bare(text, seps)
     return False
+
+
+def obx5_kind(value_type: str | None) -> SurrogateKind:
+    """The kind the OBX-5 free-text rule applies to a value :func:`preserve_obx5_value` did not
+    preserve: ``DATE`` when OBX-2 declares a date type, so the year survives and nothing else does,
+    and the blunt ``FREETEXT`` redact for everything else. A value under a date label that is not a
+    valid timestamp is scrubbed to empty by the ``DATE`` kind, so prose cannot pass as a date."""
+    declared = (value_type or "").strip().upper()
+    return SurrogateKind.DATE if declared in _DATE_OBX_TYPES else SurrogateKind.FREETEXT

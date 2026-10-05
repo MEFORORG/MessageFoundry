@@ -358,7 +358,7 @@ _OBX5_REDACTED = {
 _OBX5_PRESERVED = {
     "numeric (NM)": ("OBX|1|NM|8480-6^Systolic^LN||128|mm[Hg]", "128"),
     "structured numeric (SN)": ("OBX|1|SN|RG^Range^L||>^100|", ">^100"),
-    "timestamp (TS)": ("OBX|1|TS|CL^Collected^L||20260101120000|", "20260101120000"),
+    "time of day (TM)": ("OBX|1|TM|CL^Collected^L||120000|", "120000"),
     "coded id (ID)": ("OBX|1|ID|SX^Sex^L||F|", "F"),
     "CWE with no text component": ("OBX|1|CWE|DX^Diagnosis^L||I10^^ICD10|", "I10^^ICD10"),
 }

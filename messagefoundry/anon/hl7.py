@@ -16,7 +16,8 @@ adversarial parity tests pin them):
 * any malformed-structure error from the parser is caught and re-raised as a body-free
   :class:`AnonError` rather than crashing the caller or leaking the body in a traceback; and
 * OBX-5 is preserved only against an **allowlist** of value types (``preserve_obx5_value``) — an
-  unrecognized, absent or empty OBX-2 means the value is redacted, never passed through.
+  unrecognized, absent or empty OBX-2 means the value is redacted, never passed through. A value
+  under a date type keeps its year only (``obx5_kind``).
 
 Never string-slices raw HL7: surrogation goes through ``Message.set``'s whole-field write, and the
 site-code pass splits only on the message's actual separators.
@@ -31,6 +32,7 @@ from .rules import AnonError, FieldRule, SurrogateKind
 from .surrogates import (
     Seps,
     normalized_message,
+    obx5_kind,
     preserve_obx5_value,
     read_message_seps,
     scrub_message_site_codes,
@@ -63,7 +65,8 @@ def anonymize_message(raw: str, keyer: Keyer, rules: tuple[FieldRule, ...]) -> s
                     continue
                 if _skip_obx5(rule, msg, occ, value, seps):
                     continue
-                msg.set(rule.path, surrogate_field(rule.kind, value, keyer, seps), occurrence=occ)
+                kind = _kind_for(rule, msg, occ)
+                msg.set(rule.path, surrogate_field(kind, value, keyer, seps), occurrence=occ)
         encoded = msg.encode()
     except AnonError:
         raise  # already a body-free refusal with its own reason; do not relabel it "malformed"
@@ -81,3 +84,11 @@ def _skip_obx5(rule: FieldRule, msg: Message, occurrence: int, value: str, seps:
     if rule.path != "OBX-5" or rule.kind != SurrogateKind.FREETEXT:
         return False
     return preserve_obx5_value(msg.field("OBX-2", occurrence=occurrence), value, seps)
+
+
+def _kind_for(rule: FieldRule, msg: Message, occurrence: int) -> SurrogateKind:
+    """The kind to apply: the rule's own, except that the OBX-5 free-text rule hands a date-typed
+    value to the ``DATE`` kind -- see :func:`obx5_kind`, which is where that decision lives."""
+    if rule.path != "OBX-5" or rule.kind != SurrogateKind.FREETEXT:
+        return rule.kind
+    return obx5_kind(msg.field("OBX-2", occurrence=occurrence))
