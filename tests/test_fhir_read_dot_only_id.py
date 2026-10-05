@@ -35,7 +35,12 @@ import pytest
 from messagefoundry.config.fhir_lookup import FhirLookupError
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.transports import egress
-from messagefoundry.transports.fhir import _FHIR_ID_RE, FhirLookupExecutor, _resolve_read_url
+from messagefoundry.transports.fhir import (
+    _FHIR_ID_RE,
+    _FHIR_PATH_ID_RE,
+    FhirLookupExecutor,
+    _resolve_read_url,
+)
 from tests.test_fhir_lookup import _FakeOpener
 
 HOST = "fhir.example.org"
@@ -62,14 +67,15 @@ def _executor(
 
 
 @pytest.mark.parametrize("dots", DOT_ONLY)
-def test_the_id_grammar_alone_does_not_refuse_dots(dots: str) -> None:
-    """What the refusal tests below rest on, and why the dot-only check exists.
+def test_the_plain_id_grammar_admits_dots_and_the_path_id_grammar_does_not(dots: str) -> None:
+    """What the refusal tests below rest on, and why a path id has its own pattern.
 
-    The grammar gate accepts each of these, and percent-encoding leaves each as it is. So the
-    ``ValueError`` those tests see can come only from the dot-only check. If this test ever fails,
-    the grammar has been tightened and that check may have become redundant."""
+    The plain id grammar accepts each of these, and percent-encoding leaves each as it is. So the
+    ``ValueError`` those tests see can come only from the path-id pattern. If the first line ever
+    fails, the plain grammar has been tightened and the second pattern may have become redundant."""
     assert _FHIR_ID_RE.match(dots)
     assert urllib.parse.quote(dots, safe="") == dots
+    assert not _FHIR_PATH_ID_RE.match(dots)
 
 
 @pytest.mark.parametrize("dots", DOT_ONLY)
@@ -105,14 +111,15 @@ async def test_read_sends_the_exact_url_for_an_id_that_contains_a_dot() -> None:
 
 
 class _RecordingServer:
-    """A loopback HTTP server that keeps each request target exactly as the client sent it."""
+    """A loopback HTTP server that keeps each request line exactly as the client sent it."""
 
     def __init__(self) -> None:
-        targets: list[str] = []
+        request_lines: list[str] = []
 
         class _Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self) -> None:
-                targets.append(self.path)  # the raw request target, never normalised by the server
+                # Not self.path: http.server rewrites a leading '//' there. This is the raw line.
+                request_lines.append(self.requestline)
                 self.send_response(200)
                 self.send_header("Content-Type", "application/fhir+json")
                 self.send_header("Content-Length", str(len(PATIENT)))
@@ -122,7 +129,7 @@ class _RecordingServer:
             def log_message(self, format: str, *args: object) -> None:
                 return None
 
-        self.targets = targets
+        self.request_lines = request_lines
         self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
         self.base = f"http://127.0.0.1:{self._server.server_address[1]}/fhir"
         # shutdown() waits out one poll, and the default poll is half a second.
@@ -153,13 +160,17 @@ def test_the_engine_sends_the_path_as_written(server: _RecordingServer, last_seg
     This calls ``_get`` with a hand-built URL, which is the only way a dot-only path can reach the
     opener now that ``read`` refuses one. It answers "would the engine itself have changed the
     target": no. ``a.b`` is the control that shows the recorder is live and reads a different path
-    for a different input."""
+    for a different input.
+
+    This records a finding, not a rule. If ``_get`` ever refuses or removes a dot segment itself,
+    the ``.`` and ``..`` cases here should change with it: that would be a second gate, not a
+    regression."""
     ex = FhirLookupExecutor(
         {"lk": {"url": server.base}}, egress=EgressSettings(deny_by_default=False)
     )
     body, status = ex._get("lk", f"{server.base}/Patient/{last_segment}")
     assert status == 200 and json.loads(body)["resourceType"] == "Patient"
-    assert server.targets == [f"/fhir/Patient/{last_segment}"]
+    assert server.request_lines == [f"GET /fhir/Patient/{last_segment} HTTP/1.1"]
 
 
 # --- 3. the allowlist: asked once, for the base, about host and port ---------
@@ -168,6 +179,10 @@ def test_the_engine_sends_the_path_as_written(server: _RecordingServer, last_seg
 async def test_the_allowlist_is_asked_once_for_the_base_url_and_never_per_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Why no allowlist stood between a dot-only id and the request: it is not asked per read.
+
+    This records a finding, not a rule. A per-read egress check would be a gain, and this test
+    should then change to say what that check is asked."""
     asked: list[str] = []
     real = egress._http_egress_allowed
 

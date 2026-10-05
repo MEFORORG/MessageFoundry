@@ -174,14 +174,25 @@ _TRANSIENT_ISSUE_CODES = frozenset(
 # the message-derived path segments so a crafted resource can't smuggle '/', '..', '?', '#', or '@'
 # into the request path and redirect a PHI-bearing write to a different resource/operation on the same
 # allow-listed host (the [egress].allowed_http gate pins the host, not the path).
-# An id that is '.' or '..' and nothing else PASSES the id grammar, which stops '..' only where a
-# '/' comes with it. So each site that puts an id in a path also calls `_is_dot_only`.
 # `\Z`, never `$`: Python's `$` also matches immediately BEFORE a final newline, so `^[A-Za-z]+$`
 # accepted "Patient\n" and the gate did not enforce the grammar it advertises. Anchoring the pattern
 # fixes every caller at once -- `match` vs `fullmatch` is a property of the CALL, and there are three
-# call sites (:189, :698, :704), so a per-call fix leaves the next one to re-introduce it.
+# call sites (`_validate_path_token`, two in `_resolve_read_url`), so a per-call fix leaves the next one to re-introduce it.
 _FHIR_TYPE_RE = re.compile(r"^[A-Za-z]+\Z")
 _FHIR_ID_RE = re.compile(r"^[A-Za-z0-9.\-]{1,64}\Z")
+# An id that goes into a URL PATH: the id grammar, minus an id of only dots ('.', '..', '...').
+# `_FHIR_ID_RE` admits all three, and percent-encoding leaves '.' as it is, so each would be sent as
+# the last path segment. '.' and '..' are RFC 3986 dot segments (section 5.2.4). The engine does not
+# remove them: it sends the path as built, and the [egress].allowed_http check compares the base
+# URL's host and port when the connection is built, so it never sees a per-call path. A proxy or
+# server that removes dot segments after the engine would read 'Patient/..' as the base and
+# 'Patient/.' as the type, on the same allow-listed host (vault BACKLOG #1589).
+# tests/test_fhir_read_dot_only_id.py pins the engine half of that; what a given proxy or server
+# does was not measured. '...' is no dot segment: it is refused only because an id of dots alone is
+# never a real resource id. Used by at least the update id (`_require_id`) and the `fhir_lookup`
+# read id (`_resolve_read_url`). `_FHIR_ID_RE` stays the plain grammar for an id-typed value that is
+# not a path segment, such as meta.versionId inside an ETag.
+_FHIR_PATH_ID_RE = re.compile(r"^(?!\.+\Z)[A-Za-z0-9.\-]{1,64}\Z")
 
 
 def _operation_outcome(body: str) -> dict[str, Any] | None:
@@ -311,26 +322,6 @@ def _validate_path_token(value: str, pattern: re.Pattern[str], field: str) -> st
             permanent=True,
         )
     return value
-
-
-def _is_dot_only(segment: str) -> bool:
-    """Whether a path segment that already passed ``_FHIR_ID_RE`` is dots alone (``.``, ``..``, ``...``).
-
-    The id grammar admits all three, and percent-encoding leaves ``.`` as it is, so each would reach
-    the request path. Both id sites refuse one, each with its own exception type: a write in
-    ``FhirDestination._require_id`` and a ``fhir_lookup`` read in ``_resolve_read_url``.
-
-    ``.`` and ``..`` are RFC 3986 dot segments (section 5.2.4). The engine does not remove them: it
-    sends the path as built, and the ``[egress].allowed_http`` check compares the base URL's host
-    and port when the connection is built, so it never sees a per-call path. A proxy or server that
-    removes dot segments after the engine would read ``Patient/..`` as the base and ``Patient/.``
-    as the type, on the same allow-listed host (vault BACKLOG #1589).
-    ``tests/test_fhir_read_dot_only_id.py`` pins the engine half of that. What a given proxy or
-    server does was not measured. ``...`` is no dot segment; it is refused only because an id of
-    dots alone is never a real resource id.
-
-    True for an empty string too, so a caller checks for a missing id first."""
-    return not segment.strip(".")
 
 
 class _FhirRequest(NamedTuple):
@@ -825,15 +816,9 @@ class FhirDestination(DestinationConnector):
         # path gates serve both.
         _reject_control_chars(peek.id, "resource id")
         # Grammar-gate the message-derived id so '../$reindex'-style traversal can't redirect the write.
-        _validate_path_token(peek.id, _FHIR_ID_RE, "resource id")
-        if _is_dot_only(peek.id):
-            # The id grammar admits '.' and '..', which a path resolver reads as this level or the
-            # parent: 'Patient/..' would aim the write at the base.
-            raise NegativeAckError(
-                "FHIR resource id is not a valid FHIR token/id",
-                code="bad-request-value",
-                permanent=True,
-            )
+        # The path-id pattern also refuses '.' and '..', which a path resolver reads as this level or
+        # the parent: 'Patient/..' would aim the write at the base.
+        _validate_path_token(peek.id, _FHIR_PATH_ID_RE, "resource id")
         return peek.id
 
     @staticmethod
@@ -1172,8 +1157,7 @@ def _resolve_read_url(
     path = type_seg
     if len(segments) == 2:
         resource_id = segments[1]
-        # Dots alone pass the grammar and quote() leaves them as they are; see `_is_dot_only`.
-        if not _FHIR_ID_RE.match(resource_id) or _is_dot_only(resource_id):
+        if not _FHIR_PATH_ID_RE.match(resource_id):  # also refuses an id of only dots
             raise ValueError("FHIR read id is not a valid FHIR id")
         path = f"{type_seg}/{urllib.parse.quote(resource_id, safe='')}"
     url = f"{base.rstrip('/')}/{path}"
