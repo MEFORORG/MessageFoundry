@@ -98,8 +98,11 @@ def _kernel32() -> ctypes.CDLL:
     return k32
 
 
-def _stamp(path: Path, when: float) -> None:
-    """Set creation, access and write time of ONE entry, never through a reparse point."""
+def _stamp(path: Path, when: float, created: float | None = None) -> None:
+    """Set creation, access and write time of ONE entry, never through a reparse point.
+
+    ``created`` sets a creation time that differs from the other two.
+    """
     if sys.platform != "win32":
         raise RuntimeError("Windows only")
     k32 = _kernel32()
@@ -109,9 +112,11 @@ def _stamp(path: Path, when: float) -> None:
     if handle is None or handle == ctypes.c_void_p(-1).value:
         raise ctypes.WinError(ctypes.get_last_error())
     try:
+        born = when if created is None else created
+        made = ctypes.c_ulonglong(int(born * 10_000_000) + _FILETIME_EPOCH)
         ticks = ctypes.c_ulonglong(int(when * 10_000_000) + _FILETIME_EPOCH)
         ref = ctypes.byref(ticks)
-        if not k32.SetFileTime(handle, ref, ref, ref):
+        if not k32.SetFileTime(handle, ctypes.byref(made), ref, ref):
             raise ctypes.WinError(ctypes.get_last_error())
     finally:
         k32.CloseHandle(handle)
@@ -425,9 +430,9 @@ def test_every_unplain_spelling_of_an_existing_folder_is_refused(rig: Rig) -> No
     r = rig.run(*spellings.values(), control, cwd=rig.root)
 
     assert r.code == 1, r.out
-    for label, spelling in spellings.items():
-        b = r.block(spelling)
-        assert b.refused_by() == ["spelling"], f"{label}: {r.out}"
+    # One comparison over every spelling, so a failure names each one that got through.
+    got = {label: r.block(spelling).refused_by() for label, spelling in spellings.items()}
+    assert got == dict.fromkeys(spellings, ["spelling"]), r.out
     r.deleted(control)
     assert _snapshot(victim) == before
     assert sorted(p.name for p in rig.root.iterdir()) == ["victim-long-name"]
@@ -855,28 +860,32 @@ def test_one_fresh_entry_anywhere_refuses_and_creation_time_counts(rig: Rig) -> 
     rig.caller()
     deep = rig.tree(rig.root / "deep")
     _stamp(deep / "sub" / "b.bin", time.time() - 60)
-    # Old write times on entries created just now: what an extracted or copied tree looks like.
-    copied = rig.root / "copied"
-    (copied / "sub").mkdir(parents=True)
-    (copied / "sub" / "b.bin").write_bytes(b"1234567")
+    # An old write time on an entry created two minutes ago: what an extracted or copied file
+    # looks like. One rig has it on a file inside, the other on the target folder itself.
     old = time.time() - 36000
-    for entry in (copied / "sub" / "b.bin", copied / "sub", copied):
-        os.utime(entry, (old, old))
+    copied = rig.tree(rig.root / "copied")
+    _stamp(copied / "sub" / "b.bin", old, created=time.time() - 120)
+    copied_top = rig.tree(rig.root / "copied-top")
+    _stamp(copied_top, old, created=time.time() - 120)
     future = rig.tree(rig.root / "future")
     _stamp(future / "a.txt", time.time() + 86400)
     control = rig.tree(rig.root / "control")
 
-    r = rig.run(deep, copied, future, control)
+    r = rig.run(deep, copied, copied_top, future, control)
 
     assert r.code == 1, r.out
     assert (
         "b.bin' was created or modified 1 minute(s) ago" in r.refused(deep, "idle").receipt["idle"]
     )
-    r.refused(copied, "idle", "0 minute(s) ago")
+    assert (
+        "b.bin' was created or modified 2 minute(s) ago"
+        in (r.refused(copied, "idle").receipt["idle"])
+    )
+    r.refused(copied_top, "idle", "copied-top' was created or modified 2 minute(s) ago")
     r.refused(future, "idle", "in the future")
     r.deleted(control)
-    assert _snapshot(deep) == ["a.txt [5]", "sub", "sub\\b.bin [7]"]
-    assert _snapshot(copied) == ["sub", "sub\\b.bin [7]"]
+    for tree in (deep, copied, copied_top, future):
+        assert _snapshot(tree) == ["a.txt [5]", "sub", "sub\\b.bin [7]"]
 
 
 def test_IdleMinutes_raises_a_window_and_never_lowers_one(rig: Rig) -> None:

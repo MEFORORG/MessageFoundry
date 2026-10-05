@@ -1507,3 +1507,118 @@ down: Not properly terminated` line at 98-99 percent progress, and the job dies 
 
 A local run carrying no summary line, no `node down` line and exit 0 shares none of that. It also
 cannot share the mechanism, which needs `-n` to exist at all.
+
+## Deleting a scratch folder: `remove-scratch.ps1`
+
+The tracked `.claude/settings.json` denies `Bash(rm -rf:*)` and
+`PowerShell(Remove-Item -Recurse -Force:*)`. Those two rules are a blanket. A session cannot delete
+a folder tree anywhere, including a temp folder it made a minute ago, so the owner ends up running
+the delete by hand.
+
+[`remove-scratch.ps1`](../scripts/worktree/remove-scratch.ps1) is the checked route. It leaves both
+rules alone. It deletes a folder tree only when it can show the delete is safe.
+
+```powershell
+scripts\worktree\remove-scratch.ps1 C:\Users\me\AppData\Local\Temp\rv-a C:\Users\me\AppData\Local\Temp\rv-b
+scripts\worktree\remove-scratch.ps1 -Delete C:\Users\me\AppData\Local\Temp\rv-a
+```
+
+The first line is a **dry run**, which is the default. It prints what would go, with a file count
+and a byte count, and one receipt line per check. Only `-Delete` deletes.
+
+**The bias is fixed: a false refusal is a minor annoyance, a false delete destroys work.** Every
+check that cannot reach a confident answer refuses. No switch turns a check off.
+
+Give several folders as separate arguments. The script judges each one alone, and one refusal does
+not stop the others. It takes literal paths only. A wildcard is refused on purpose: a pattern deletes
+whatever matches on the day it runs. Let your shell expand the pattern, and read the dry run first.
+
+### The checks, in the order the receipt prints them
+
+The first refusal stops that target.
+
+| Check | What it refuses |
+|---|---|
+| `spelling` | Anything but a plain drive-absolute path: a UNC or device path, a relative path, `.` or `..`, a component ending in a dot or a space, an 8.3 short name, a colon after the drive letter, a wildcard, a reserved device name. Forward slashes are accepted. |
+| `temp-root` | A target that is not strictly inside the temp root. Under `<root>\claude`, anything but the inside of a session scratchpad. |
+| `exists` | A path that does not exist, a single file, and a name that is stored under a different spelling. |
+| `reparse` | A reparse point (junction, symbolic link, mount point, cloud placeholder) on the path from the drive root down, or anywhere inside the tree. The script never follows one. |
+| `git` | A `.git` entry at any depth, a bare repository, a folder inside either, and any overlap with a registered worktree. |
+| `cwd` | A target the calling shell is standing in. |
+| `sessions` | A registry the script cannot read, a session working inside the target, and any other session's scratchpad. |
+| `idle` | A tree with anything created or modified inside the idle window. |
+| `in-use` | With `-Delete` only: a folder that cannot be renamed, because some process holds a handle inside it. |
+
+**The temp root is `<LocalApplicationData>\Temp`, read from the known-folder API.** It is not read
+from `TEMP` or `TMP`. Those are environment variables, and `[IO.Path]::GetTempPath()` follows a
+forged `TMP`. When `TEMP` is spelled any other way, the script prints a note and refuses every
+target. That includes a machine with a redirected temp folder, and a machine whose `TEMP` is an 8.3
+spelling of the same folder.
+
+**Under `<root>\claude`, only `claude\<project>\<session id>\scratchpad\<name>` or deeper can pass.**
+The scratchpad folder itself, a session folder and a project folder are refused.
+
+**A scratchpad worktree goes through [`remove.ps1`](../scripts/worktree/remove.ps1), never this
+script.** The worktrees compared are those of the repository the script lives in, and of every root
+in the worktree gate's own list.
+
+### Whose folder it is
+
+The script works out its caller by walking its own parent processes. The nearest one whose pid
+holds a LIVE record in the session registry is the caller. It does not trust
+`CLAUDE_CODE_SESSION_ID`, because any process can set that.
+
+| Target | Verdict of the `sessions` check | Idle window |
+|---|---|---|
+| Inside the caller's own scratchpad | Passes | 10 minutes |
+| Inside any other session's scratchpad | **Refused outright**, whether that session is live, dead or absent from the registry | none |
+| Anywhere else under the temp root | Passes, unless a session the fence cannot rule out is working inside it | 60 minutes |
+
+A dead session can be resumed, and its scratchpad is its notes. That is why a dead session's
+scratchpad is refused too.
+
+**A subagent shares its parent's session id.** So "the caller's own scratchpad" covers a whole
+session family, and the caller cannot list its own workers. That is why its own scratchpad still
+waits ten minutes.
+
+`-IdleMinutes` can raise a window. It can never lower one. The idle check reads creation time as
+well as write time, because a copied or extracted tree keeps old write times.
+
+### What it cannot see
+
+Say these wherever you recommend the script.
+
+- **A folder at the top of the temp root has no owner the script can name.** Another session's
+  `mkdtemp` folder and another program's working folder look the same. Only the 60-minute window and
+  the rename protect them. A program that keeps old files and holds none open can lose them.
+- A session that never registered.
+- A session that writes into the target by absolute path while its working directory is somewhere
+  else.
+- A hard link. Deleting one name leaves the file's other names alone.
+
+### How the delete runs
+
+1. The script renames the folder to `<name>.removing-<id>`. Windows refuses that rename while any
+   file inside is open, so a refusal here changes nothing on disk.
+2. It deletes the renamed tree bottom-up, one entry at a time, and never through a reparse point.
+3. If a delete fails part-way, it lists exactly what remains under the renamed folder.
+
+| Exit code | Meaning |
+|---|---|
+| 0 | Every target passed. |
+| 1 | At least one target was refused. |
+| 3 | At least one delete was left part-done. |
+
+### Test-only parameters
+
+`-TempRoot` re-roots the script for tests, and it can only narrow. It must sit strictly inside the
+real temp root and outside `<root>\claude`. `-ConfigRoot` reads a fixture session registry instead
+of the real one. `-RepoRoot` adds one repository whose worktrees are compared. Both work only
+together with `-TempRoot`.
+
+A fixture registry hides the real sessions from the `sessions` check, for targets under `-TempRoot`
+only. The rename still refuses a folder that any process is standing in.
+
+[`tests/test_worktree_remove_scratch.py`](../tests/test_worktree_remove_scratch.py) drives the real
+script under a pytest `tmp_path`. It runs on Windows only. The ubuntu leg skips the whole file,
+because the script judges Windows paths against a Windows known folder.
