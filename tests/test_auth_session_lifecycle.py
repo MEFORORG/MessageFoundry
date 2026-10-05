@@ -300,39 +300,146 @@ async def test_a_password_step_up_never_revokes_the_session_it_hands_back() -> N
         await store.close()
 
 
+_ELEVATE = frozenset({"_elevated", "_elevated_hash"})
+_STAMP = "mark_session_mfa_verified"
+
+
+def _factor_ceremony_scan(source: str) -> tuple[set[str], set[str], list[str]]:
+    """Read ``source`` and sort every elevation's ceremony into ``(stamping, other, refusals)``.
+
+    A ceremony is STAMPING when the function that elevates writes the second-factor stamp BEFORE it
+    elevates, either directly or through a ``self.`` helper that does, at any depth. A refusal is
+    an elevation the scan cannot read: a ``ceremony`` that is missing or not a string literal.
+    Refusing it, rather than skipping it, is what closes the old scan's gap (BACKLOG #2283): a
+    ceremony named through a variable used to drop out of both sets and pass."""
+    import ast
+
+    tree = ast.parse(source)
+    functions = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)]
+
+    def _calls(fn: ast.AST) -> list[ast.Call]:
+        return [n for n in ast.walk(fn) if isinstance(n, ast.Call)]
+
+    def _attr(call: ast.Call) -> str | None:
+        return call.func.attr if isinstance(call.func, ast.Attribute) else None
+
+    # Which functions stamp, directly or through a `self.` helper. A fixed point, so a helper of a
+    # helper counts. Keyed by name; a name defined twice counts as stamping if either copy does.
+    stamps = {fn.name for fn in functions if any(_attr(c) == _STAMP for c in _calls(fn))}
+    while True:
+        more = {
+            fn.name
+            for fn in functions
+            if fn.name not in stamps
+            and any(
+                isinstance(c.func, ast.Attribute)
+                and isinstance(c.func.value, ast.Name)
+                and c.func.value.id == "self"
+                and c.func.attr in stamps
+                for c in _calls(fn)
+            )
+        }
+        if not more:
+            break
+        stamps |= more
+
+    stamping: set[str] = set()
+    other: set[str] = set()
+    refusals: list[str] = []
+    for fn in functions:
+        if fn.name in _ELEVATE:
+            continue  # the two wrappers pass `ceremony` through by name; they are not ceremonies
+        calls = _calls(fn)
+        stamp_lines = [c.lineno for c in calls if _attr(c) == _STAMP or _attr(c) in stamps]
+        for call in calls:
+            if _attr(call) not in _ELEVATE:
+                continue
+            ceremony = next((kw.value for kw in call.keywords if kw.arg == "ceremony"), None)
+            if not (isinstance(ceremony, ast.Constant) and isinstance(ceremony.value, str)):
+                refusals.append(f"{fn.name}:{call.lineno}")
+                continue
+            # The stamp must come first: rotation carries the stamp forward, and a stamp written
+            # after it lands on the retired hash and writes nothing.
+            stamped_first = any(line < call.lineno for line in stamp_lines)
+            (stamping if stamped_first else other).add(ceremony.value)
+    return stamping, other, refusals
+
+
 def test_the_factor_ceremony_set_matches_the_ceremonies_that_stamp() -> None:
     """``_FACTOR_CEREMONIES`` decides where the cap re-runs after an elevation. Pin it against the
-    code: every service method that stamps ``mark_session_mfa_verified`` and then elevates must name
-    a ceremony in the set, and no method that elevates WITHOUT stamping may. A new factor ceremony
-    that forgot the set would otherwise skip the cap silently."""
-    import ast
+    code: every function that stamps ``mark_session_mfa_verified`` and then elevates must name a
+    ceremony in the set, and no function that elevates WITHOUT stamping first may. A new factor
+    ceremony that forgot the set would otherwise skip the cap silently.
+
+    BACKLOG #2283 closed three gaps in the scan. It read only ``AuthService`` and only ``async``
+    methods; it now reads the whole module. A stamp made through a helper made the ceremony read as
+    a re-proof; helpers now count. A ceremony that was not a string literal was skipped; it is now
+    refused."""
     import inspect
-    import textwrap
 
     from messagefoundry.auth import service as service_module
 
-    tree = ast.parse(textwrap.dedent(inspect.getsource(service_module.AuthService)))
-    stamping: set[str] = set()
-    other: set[str] = set()
-    for fn in ast.walk(tree):
-        if not isinstance(fn, ast.AsyncFunctionDef):
-            continue
-        calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call)]
-        names = {c.func.attr for c in calls if isinstance(c.func, ast.Attribute)}
-        for call in calls:
-            if not (
-                isinstance(call.func, ast.Attribute)
-                and call.func.attr in {"_elevated", "_elevated_hash"}
-            ):
-                continue
-            for kw in call.keywords:
-                if kw.arg == "ceremony" and isinstance(kw.value, ast.Constant):
-                    target = stamping if "mark_session_mfa_verified" in names else other
-                    target.add(str(kw.value.value))
+    stamping, other, refusals = _factor_ceremony_scan(inspect.getsource(service_module))
+    assert refusals == [], (
+        f"an elevation names its ceremony in a form the scan cannot read: {refusals}"
+    )
     assert stamping, "found no stamping ceremony -- the scan is broken, not the code"
     assert other, "found no re-proof ceremony -- the scan is broken, not the code"
     assert stamping == service_module._FACTOR_CEREMONIES
     assert not other & service_module._FACTOR_CEREMONIES
+
+
+def test_the_factor_ceremony_scan_sees_each_gap_it_closed() -> None:
+    """The control for the scan above: each shape the old scan missed, fed to the new one."""
+    source = """
+class S:
+    async def _stamp_helper(self, token):
+        await self._store.mark_session_mfa_verified(token)
+
+    async def via_helper(self, token):
+        await self._stamp_helper(token)
+        return await self._elevated(token, ceremony="helper_factor")
+
+    def sync_stamp(self, token):
+        self._store.mark_session_mfa_verified(token)
+        return self._elevated(token, ceremony="sync_factor")
+
+    async def by_variable(self, token):
+        name = "hidden"
+        return await self._elevated(token, ceremony=name)
+
+    async def stamps_too_late(self, token):
+        out = await self._elevated(token, ceremony="late")
+        await self._store.mark_session_mfa_verified(token)
+        return out
+
+
+async def module_level(svc, token):
+    await svc._store.mark_session_mfa_verified(token)
+    return await svc._elevated_hash(token, ceremony="module_factor")
+"""
+    stamping, other, refusals = _factor_ceremony_scan(source)
+    assert stamping == {"helper_factor", "sync_factor", "module_factor"}
+    assert other == {"late"}
+    assert [r.split(":")[0] for r in refusals] == ["by_variable"]
+
+
+def test_only_the_service_module_elevates() -> None:
+    """The scan reads ``auth/service.py``. An elevation written in another module would sit outside
+    it and could skip the cap unseen, so none may exist."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "messagefoundry"
+    service = root / "auth" / "service.py"
+    callers = [
+        str(path.relative_to(root))
+        for path in root.rglob("*.py")
+        if path != service
+        and any(f".{name}(" in path.read_text(encoding="utf-8") for name in _ELEVATE)
+    ]
+    assert callers == [], (
+        f"an elevation outside auth/service.py escapes the ceremony scan: {callers}"
+    )
 
 
 # --- BACKLOG #2096: one liveness rule, in Python and in SQL ------------------------------------
