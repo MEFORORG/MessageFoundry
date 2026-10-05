@@ -1,0 +1,237 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
+"""The revocation-hop guard on outbound hops that verified a peer certificate and ran no guard
+(vault BACKLOG #2193, ADR 0173).
+
+ADR 0173's construction-time refusal already ran on the HTTP-family destinations, MLLP, EMAIL, the
+SMART token hop and others. These hops verified a peer certificate too, and called neither
+``refuse_unrevoked_verified_hop`` nor ``RevocationHopGuard.capture``: under an enforcing posture
+they would have accepted a revoked certificate with no refusal, no warning and no audit record.
+
+Each hop here gets the same three arms, because each arm alone proves too little:
+
+* **refused** under an enforcing posture with no CRL. This is the control the other arms relax.
+* **admitted** with a ``[tls].crl_file`` that reaches the hop's OWN context. It reads
+  ``VERIFY_CRL_CHECK_LEAF`` off the context the connector will really dial with, so it fails if the
+  guard runs before that context exists (vault BACKLOG #2188) or reads a look-alike beside it.
+* **still refused** where the same CRL is configured but cannot reach the hop. A guard that keyed on
+  the setting, and not on the context, would pass the first two arms and fail this one.
+
+Nothing here dials: construction reads settings only. All certificates and CRLs are synthetic.
+"""
+
+from __future__ import annotations
+
+import datetime
+import logging
+from pathlib import Path
+
+import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID
+
+from messagefoundry.config.settings import EgressSettings
+from messagefoundry.config.tls_policy import (
+    TLS_REVOCATION_ATTESTED_ENV,
+    HopPosture,
+    InsecureHopRefused,
+    TrustAnchorPolicy,
+    active_hop_posture,
+    context_checks_revocation,
+)
+from messagefoundry.config.wiring import WiringError, load_config
+from messagefoundry.pipeline.wiring_runner import build_check_registry
+from messagefoundry.transports.fhir import FhirLookupExecutor
+from messagefoundry.transports.rest import _NO_REDIRECT_OPENER, opener_tls_context
+
+ENFORCING = HopPosture(enforcing=True)
+NOT_ENFORCING = HopPosture(enforcing=False)
+
+REMOTE = "10.0.0.5"  # non-loopback, never dialled: construction reads settings only
+LOOPBACK = "127.0.0.1"
+REASON = "partner PKI runs OCSP at the site edge"
+
+_OPEN_EGRESS = EgressSettings(deny_by_default=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_blanket_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Start every test with the blanket attestation and the weakened-TLS escape unset, so neither
+    can stand in for the hop's own facts."""
+    monkeypatch.delenv(TLS_REVOCATION_ATTESTED_ENV, raising=False)
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+
+
+@pytest.fixture(scope="module")
+def bare_crl(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """A CRL with no CA beside it: the shape a hop on the system trust store loads. Synthetic."""
+    now = datetime.datetime.now(datetime.UTC)
+    day = datetime.timedelta(days=1)
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-2193-ca")])
+    crl = (
+        x509.CertificateRevocationListBuilder()
+        .issuer_name(name)
+        .last_update(now - 2 * day)
+        .next_update(now + 30 * day)
+        .sign(key, hashes.SHA256())
+    )
+    path = tmp_path_factory.mktemp("crl2193") / "crl_only.pem"
+    path.write_bytes(crl.public_bytes(serialization.Encoding.PEM))
+    return str(path)
+
+
+def _crl_policy(crl: str) -> TrustAnchorPolicy:
+    """The shipped default plus a CRL: ``system`` mode, no internal CA."""
+    return TrustAnchorPolicy(crl_file=crl)
+
+
+def _audit(caplog: pytest.LogCaptureFixture) -> str:
+    return " ".join(
+        r.getMessage() for r in caplog.records if "operator attestation" in r.getMessage()
+    )
+
+
+# --- FhirLookupExecutor: the live read hop (transports/fhir.py) ------------------------------------
+
+
+def _lookup(
+    settings: dict[str, object], *, policy: TrustAnchorPolicy | None = None, name: str = "epic"
+) -> FhirLookupExecutor:
+    return FhirLookupExecutor({name: settings}, egress=_OPEN_EGRESS, trust_anchor_policy=policy)
+
+
+def test_a_fhir_lookup_read_hop_is_refused_when_it_checks_no_revocation() -> None:
+    # THE CONTROL. Before #2193 this constructed: the read hop verified the server and ran no guard.
+    with (
+        active_hop_posture(ENFORCING),
+        pytest.raises(InsecureHopRefused, match="revocation") as exc,
+    ):
+        _lookup({"url": f"https://{REMOTE}/fhir"})
+    # The refusal names the lookup, in the lookup namespace, so an operator can find the declaration.
+    assert "connection 'fhir_lookup:epic';" in str(exc.value)
+
+
+def test_a_fhir_lookup_read_hop_is_admitted_when_a_crl_reaches_its_own_opener(
+    bare_crl: str,
+) -> None:
+    with active_hop_posture(ENFORCING):
+        executor = _lookup({"url": f"https://{REMOTE}/fhir"}, policy=_crl_policy(bare_crl))
+    # The opener this lookup will really dial through, not the shared import-time one.
+    opener = executor._opener["epic"]
+    assert opener is not _NO_REDIRECT_OPENER
+    assert context_checks_revocation(opener_tls_context(opener, connector="probe")) is True
+
+
+def test_a_configured_crl_does_not_admit_a_fhir_lookup_it_cannot_reach(bare_crl: str) -> None:
+    """A CRL on the policy is not a CRL on the hop. Of two lookups built by ONE executor with ONE
+    policy, the loopback one resolves no CRL and crosses on the on-box rule, and the remote one
+    crosses only because its own opener checks. Take the CRL away and the remote one is refused
+    while the loopback one still builds, so the guard is deciding per lookup."""
+    both: dict[str, dict[str, object]] = {
+        "onbox": {"url": f"https://{LOOPBACK}:8443/fhir"},
+        "epic": {"url": f"https://{REMOTE}/fhir"},
+    }
+    with active_hop_posture(ENFORCING):
+        executor = FhirLookupExecutor(
+            both, egress=_OPEN_EGRESS, trust_anchor_policy=_crl_policy(bare_crl)
+        )
+    assert executor._opener["onbox"] is _NO_REDIRECT_OPENER  # no CRL reached the on-box hop
+    with active_hop_posture(ENFORCING), pytest.raises(InsecureHopRefused, match="fhir_lookup:epic"):
+        FhirLookupExecutor(both, egress=_OPEN_EGRESS)
+    with active_hop_posture(ENFORCING):
+        FhirLookupExecutor({"onbox": both["onbox"]}, egress=_OPEN_EGRESS)
+
+
+def test_a_fhir_lookup_read_hop_crosses_on_its_own_attestation_and_is_audited(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    settings: dict[str, object] = {
+        "url": f"https://{REMOTE}/fhir",
+        "tls_revocation_attested": True,
+        "tls_revocation_attested_reason": REASON,
+    }
+    with active_hop_posture(ENFORCING), caplog.at_level(logging.WARNING):
+        _lookup(settings)
+    audit = _audit(caplog)
+    assert "connection 'fhir_lookup:epic';" in audit and REASON in audit
+    assert "FhirLookup 'epic' (verified TLS" in audit
+
+
+def test_the_hop_attestation_does_not_cross_the_fhir_lookup_revocation_refusal() -> None:
+    # `tls_hop_attested` answers a different question (is this cleartext hop secure). A guard that
+    # read it here would cross on the wrong operator claim.
+    settings: dict[str, object] = {
+        "url": f"https://{REMOTE}/fhir",
+        "tls_hop_attested": True,
+        "tls_hop_attested_reason": REASON,
+    }
+    with active_hop_posture(ENFORCING), pytest.raises(InsecureHopRefused, match="revocation"):
+        _lookup(settings)
+
+
+def test_a_fhir_lookup_read_hop_warns_but_builds_when_not_enforcing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with active_hop_posture(NOT_ENFORCING), caplog.at_level(logging.WARNING):
+        _lookup({"url": f"https://{REMOTE}/fhir"})
+    assert any("revocation" in r.getMessage() for r in caplog.records)
+
+
+def test_a_fhir_lookup_built_outside_the_gate_is_unchanged() -> None:
+    # No posture stamped: a direct build or an embedding. The guard no-ops, as its siblings do.
+    _lookup({"url": f"https://{REMOTE}/fhir"})
+
+
+def test_a_fhir_lookup_that_verifies_nothing_is_the_verify_off_refusal_not_this_one() -> None:
+    """Disjoint gates. A ``verify_tls=false`` lookup has no verified certificate whose revocation
+    could matter, so the verify-off refusal owns it. Both raise the same type, so the MESSAGE is
+    what tells them apart."""
+    with active_hop_posture(ENFORCING), pytest.raises(InsecureHopRefused) as exc:
+        _lookup({"url": f"https://{REMOTE}/fhir", "verify_tls": False})
+    assert "disables TLS certificate verification" in str(exc.value)
+    assert "revocation" not in str(exc.value)
+
+
+def _lookup_config(tmp_path: Path, *, declared: bool) -> Path:
+    attest = f', tls_revocation_attested=True, tls_revocation_attested_reason="{REASON}"'
+    (tmp_path / "lookup.py").write_text(
+        "from messagefoundry import FhirLookup\n"
+        f'FhirLookup("epic", url="https://ehr.example.org/fhir"{attest if declared else ""})\n',
+        encoding="utf-8",
+    )
+    return tmp_path
+
+
+def test_the_check_gate_refuses_an_undeclared_fhir_lookup_and_admits_a_declared_one(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """End to end through the gate ``messagefoundry check``, dry-run and reload all reach, with the
+    settings the runner really hands the executor. The typed declaration on ``FhirLookup()`` is the
+    authoring surface, and the mirror is what carries it to the read hop."""
+    undeclared = tmp_path / "undeclared"
+    undeclared.mkdir()
+    registry = load_config(_lookup_config(undeclared, declared=False), allow_empty=True)
+    with pytest.raises(WiringError, match="FhirLookup 'epic'.*revocation"):
+        build_check_registry(
+            registry,
+            inbound_bind_host=LOOPBACK,
+            env_values={},
+            egress=_OPEN_EGRESS,
+            posture=ENFORCING,
+        )
+    declared = tmp_path / "declared"
+    declared.mkdir()
+    registry = load_config(_lookup_config(declared, declared=True), allow_empty=True)
+    with caplog.at_level(logging.WARNING):
+        build_check_registry(
+            registry,
+            inbound_bind_host=LOOPBACK,
+            env_values={},
+            egress=_OPEN_EGRESS,
+            posture=ENFORCING,
+        )
+    audit = _audit(caplog)
+    assert "connection 'fhir_lookup:epic';" in audit and REASON in audit
