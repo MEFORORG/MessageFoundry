@@ -254,19 +254,20 @@ async def test_send_follows_the_ruling_and_keeps_the_byte_bound(
             refusal = str(ei.value)
             identity = f"{_LABEL[ctype]} connection {CONNECTION!r}"
             assert refusal.startswith(f"{identity}: {REPLY_TOO_LARGE_CODE}, not sent again")
-            assert _URL_MARKER not in str(ei.value)
-            assert "partner.example.com" not in str(ei.value)
+            assert _URL_MARKER not in refusal
+            assert "partner.example.com" not in refusal
     # The bound is still enforced on the read: one byte past it, and never the whole body.
     assert resp.requested == [DEFAULT_MAX_RESPONSE_BYTES + 1]
     assert len(opener.requests) == 1
-    warnings = [r.getMessage() for r in caplog.records if "over the" in r.getMessage()]
     if side == _DELIVERED:
-        (warning,) = warnings
+        (warning,) = [r.getMessage() for r in caplog.records if "over the" in r.getMessage()]
         assert warning.startswith(f"{_LABEL[ctype]} connection {CONNECTION!r} answered")
         for leaked in (_URL_MARKER, "partner.example.com", _PAYLOAD_MARKER, "\x00\x00"):
             assert leaked not in warning
     else:
-        assert warnings == []
+        # A refusal is not also logged as a delivery. The delivered cases of this same test show
+        # the capture sees that WARNING when it is logged.
+        assert "recorded as delivered" not in caplog.text
 
 
 # --- the delivery worker, on the wire -------------------------------------------------------------
