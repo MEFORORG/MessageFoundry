@@ -27,18 +27,18 @@ passes no ``cwd=``, so every path here is absolute.
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import shutil
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
 
 import pytest
 
-from tests.test_worktree_gate import assert_denied, run_gate
+from tests.test_worktree_gate import assert_denied, bash, run_gate
+from tests.test_worktree_gate_emitter import _outside_single_quotes
+from tests.test_worktree_remove_path import REAL_SCRIPTS, write_registry
 
 pytestmark = pytest.mark.skipif(
     shutil.which("pwsh") is None or shutil.which("git") is None,
@@ -46,11 +46,6 @@ pytestmark = pytest.mark.skipif(
 )
 
 _REPO = Path(__file__).resolve().parents[1]
-_REAL_SCRIPTS = (
-    "scripts/worktree/remove.ps1",
-    "scripts/coord/occupancy.ps1",
-    "scripts/coord/session-registry.ps1",
-)
 
 # A command-form line, by the gate's own definition: Protect-CommandLines sweeps exactly these.
 _COMMAND_LINE = re.compile(r"^\s{4,}(?:pwsh|git)\s")
@@ -72,16 +67,6 @@ def _git(*args: str, cwd: Path | None = None) -> str:
     return proc.stdout
 
 
-def _shell(command: str, cwd: Path | str, tool: str = "Bash") -> dict[str, Any]:
-    return {
-        "session_id": "s-1",
-        "cwd": str(cwd),
-        "hook_event_name": "PreToolUse",
-        "tool_name": tool,
-        "tool_input": {"command": command},
-    }
-
-
 def _build(tmp: Path, remove_ps1: str | None) -> SimpleNamespace:
     """A governed primary whose path CONTAINS A SPACE, with one worktree of each family.
 
@@ -97,7 +82,7 @@ def _build(tmp: Path, remove_ps1: str | None) -> SimpleNamespace:
     (primary / "seed.txt").write_text("seed\n", encoding="utf-8")
     # The scripts are COMMITTED, so every worktree is clean and the checked route has nothing to refuse.
     if remove_ps1 is None:
-        for rel in _REAL_SCRIPTS:
+        for rel in REAL_SCRIPTS:
             dest = primary / rel
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(_REPO / rel, dest)
@@ -118,7 +103,13 @@ def _build(tmp: Path, remove_ps1: str | None) -> SimpleNamespace:
     repos = tmp / "repos.txt"
     repos.write_text(f"{primary}\n", encoding="utf-8")
     return SimpleNamespace(
-        tmp=tmp, primary=primary, sibling=sibling, other=other, managed=managed, repos=repos
+        tmp=tmp,
+        primary=primary,
+        sibling=sibling,
+        other=other,
+        managed=managed,
+        repos=repos,
+        denies={},
     )
 
 
@@ -132,12 +123,23 @@ def repo(tmp_path_factory: pytest.TempPathFactory) -> SimpleNamespace:
 
 
 def _deny(repo: SimpleNamespace, family: str, standing_in: str, verb: str = "remove") -> str:
-    victim = getattr(repo, family)
-    cwd = victim if standing_in == "victim" else repo.primary
-    tail = ' "../elsewhere"' if verb == "move" else ""
-    return assert_denied(
-        run_gate(_shell(f'git worktree {verb} "{victim}"{tail}', cwd=cwd), repo.repos)
-    )
+    """The deny text for one (family, standing, verb), from a REAL hook run, remembered per rig.
+
+    The hook is deterministic for a fixed payload and nothing here changes a rig after it is built,
+    so there are twelve distinct texts for the shared rig and the tests ask for them about seventy
+    times. Each launch costs seconds on the Windows leg. The cache lives ON the rig, so a rig a test
+    builds for itself never reads another's.
+    """
+    key = (family, standing_in, verb)
+    if key not in repo.denies:
+        victim = getattr(repo, family)
+        cwd = victim if standing_in == "victim" else repo.primary
+        tail = ' "../elsewhere"' if verb == "move" else ""
+        repo.denies[key] = assert_denied(
+            run_gate(bash(f'git worktree {verb} "{victim}"{tail}', cwd=cwd), repo.repos)
+        )
+    text: str = repo.denies[key]
+    return text
 
 
 def _command_lines(reason: str) -> list[str]:
@@ -266,15 +268,20 @@ def test_every_command_rule_3d_prints_passes_this_same_gate(
     """A remedy this gate would refuse is a refusal the reader cannot act on. Every command-form line
     in every deny, both verbs, both standings, every family, is fed back through the hook."""
     scanned: list[str] = []
-    refused: list[str] = []
+    where: dict[str, str] = {}
     for family in _FAMILIES:
         for standing_in in ("victim", "primary"):
             for verb in ("remove", "move"):
                 for line in _command_lines(_deny(repo, family, standing_in, verb)):
                     scanned.append(f"[{family}/{standing_in}/{verb}] {line}")
-                    # From the PRIMARY: the route must run from outside the tree it removes.
-                    if run_gate(_shell(line, cwd=repo.primary, tool=tool), repo.repos) is not None:
-                        refused.append(scanned[-1])
+                    where.setdefault(line, scanned[-1])
+    # Each DISTINCT line once: the same `worktree list` line is printed by six of the texts.
+    # From the PRIMARY: the route must run from outside the tree it removes.
+    refused = [
+        label
+        for line, label in where.items()
+        if run_gate(bash(line, cwd=repo.primary, tool=tool), repo.repos) is not None
+    ]
 
     kinds = {
         "path": any("remove.ps1' -Path" in s for s in scanned),
@@ -289,25 +296,22 @@ def test_every_command_rule_3d_prints_passes_this_same_gate(
     # CONTROL, so the empty list above is a measurement. The raw git form of the same removal, quoted
     # the same way and sent from the same place, is still denied.
     raw = f"git -C '{repo.primary}' worktree remove '{repo.other}'"
-    assert_denied(run_gate(_shell(raw, cwd=repo.primary, tool=tool), repo.repos))
+    assert_denied(run_gate(bash(raw, cwd=repo.primary, tool=tool), repo.repos))
 
 
 def test_no_metacharacter_reaches_a_command_line_outside_a_quoted_span(
     repo: SimpleNamespace,
 ) -> None:
-    """The emitter suite's structural check, run over the text its stub fixtures cannot reach."""
+    """The emitter suite's structural check, with ITS scanner, run over the text its stub fixtures
+    cannot reach. That scanner has its own positive control in the emitter suite."""
     scanned = 0
     for family in _FAMILIES:
         for standing_in in ("victim", "primary"):
             for line in _command_lines(_deny(repo, family, standing_in)):
                 scanned += 1
-                inside = False
-                for ch in line:
-                    if ch == "'":
-                        inside = not inside
-                    elif not inside:
-                        assert ch not in '$`;|&"', f"{ch!r} outside a quoted span in: {line}"
-                assert not inside, f"unbalanced quote in: {line}"
+                exposed = {line[i] for i in _outside_single_quotes(line)}
+                assert not exposed & set('$`;|&"'), f"outside a quoted span in: {line}"
+                assert line.count("'") % 2 == 0, f"unbalanced quote in: {line}"
     assert scanned >= 6, f"only {scanned} command lines were scanned"
 
 
@@ -319,15 +323,7 @@ def test_the_printed_line_removes_a_finished_tree_and_leaves_its_branch(tmp_path
     """THE HEADLINE. The line is taken from the deny text and run exactly as printed, against the real
     script, from the primary. Its own fixture, because this one really removes a worktree."""
     rig = _build(tmp_path, None)
-    home = tmp_path / "home"
-    sessions = home / ".claude" / "sessions"
-    sessions.mkdir(parents=True)
-    elsewhere = tmp_path / "elsewhere"
-    elsewhere.mkdir()
-    (sessions / "1.json").write_text(
-        json.dumps({"cwd": str(elsewhere), "pid": 1, "sessionId": "clear", "startedAt": 0}),
-        encoding="utf-8",
-    )
+    home = write_registry(tmp_path, tmp_path / "home")
     tip = _git("rev-parse", "refs/heads/pad-branch", cwd=rig.primary).strip()
 
     reason = _deny(rig, "other", "primary")
@@ -378,6 +374,10 @@ def test_a_primary_whose_script_predates_the_route_is_not_handed_the_command(
     assert not _path_lines(other), other
     assert not [ln for ln in _command_lines(other) if "remove.ps1" in ln], other
     assert "predates" in other and "THERE IS NO CHECKED ROUTE FOR THIS TREE YET" in other
+    # The three variants differ only in what the probe parses, and every text below hangs off that one
+    # answer. So the other two texts are read once, for the first variant.
+    if remove_ps1 is not _NO_PATH_PARAMETER:
+        return
 
     sibling = _deny(rig, "sibling", "primary")
     assert not _path_lines(sibling), sibling
@@ -392,8 +392,9 @@ def test_the_fallback_fixtures_above_differ_from_the_real_script_only_in_the_rou
 ) -> None:
     """Non-vacuity for the test above: with the REAL script in place the same call prints the route,
     so "no -Path line" there was the probe answering, not a text that never prints one."""
-    assert _path_lines(_deny(repo, "other", "primary"))
-    assert "predates" not in _deny(repo, "other", "primary")
+    reason = _deny(repo, "other", "primary")
+    assert _path_lines(reason)
+    assert "predates" not in reason
 
 
 # ------------------------------------------------------------------ move is not removal

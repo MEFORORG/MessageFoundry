@@ -67,6 +67,38 @@ def _git(cwd: Path, *args: str) -> str:
     return proc.stdout
 
 
+#: remove.ps1 and the two scripts it dot-sources. A test that runs a COPY of the script needs all
+#: three. One list, shared with tests/test_worktree_gate_removal_route.py.
+REAL_SCRIPTS = (
+    "scripts/worktree/remove.ps1",
+    "scripts/coord/occupancy.ps1",
+    "scripts/coord/session-registry.ps1",
+)
+
+
+def write_registry(root: Path, home: Path, *occupied: Path) -> Path:
+    """Make ``home`` a USERPROFILE whose session registry is readable, and return it.
+
+    It always holds one record OUTSIDE every worktree, so the fence has something to examine. Each
+    path in ``occupied`` adds a record with no pid. That fences as UNREADABLE, which is a veto, so
+    the record reads as a session in that directory.
+    """
+    sessions = home / ".claude" / "sessions"
+    shutil.rmtree(sessions, ignore_errors=True)
+    sessions.mkdir(parents=True)
+    elsewhere = root / "elsewhere"
+    elsewhere.mkdir(exist_ok=True)
+    (sessions / "1.json").write_text(
+        json.dumps({"cwd": str(elsewhere), "pid": 1, "sessionId": "clear", "startedAt": 0}),
+        encoding="utf-8",
+    )
+    for i, cwd in enumerate(occupied, start=2):
+        (sessions / f"{i}.json").write_text(
+            json.dumps({"cwd": str(cwd), "sessionId": f"in-{i}"}), encoding="utf-8"
+        )
+    return home
+
+
 class Rig:
     """A synthetic primary at ``<root>/Repo`` plus a throwaway home holding a session registry."""
 
@@ -112,26 +144,7 @@ class Rig:
         return proc.returncode == 0
 
     def registry(self, *occupied: Path, home: Path | None = None) -> Path:
-        """A home whose registry is readable and holds one record OUTSIDE every worktree.
-
-        Each path in ``occupied`` adds a record with no pid. That fences as UNREADABLE, which is a
-        veto, so the record reads as a session in that directory.
-        """
-        target = home or self.home
-        sessions = target / ".claude" / "sessions"
-        shutil.rmtree(sessions, ignore_errors=True)
-        sessions.mkdir(parents=True)
-        elsewhere = self.root / "elsewhere"
-        elsewhere.mkdir(exist_ok=True)
-        (sessions / "1.json").write_text(
-            json.dumps({"cwd": str(elsewhere), "pid": 1, "sessionId": "clear", "startedAt": 0}),
-            encoding="utf-8",
-        )
-        for i, cwd in enumerate(occupied, start=2):
-            (sessions / f"{i}.json").write_text(
-                json.dumps({"cwd": str(cwd), "sessionId": f"in-{i}"}), encoding="utf-8"
-            )
-        return target
+        return write_registry(self.root, home or self.home, *occupied)
 
     def run(
         self,
@@ -198,12 +211,8 @@ def test_path_removes_a_clean_tree_no_name_can_spell_and_leaves_its_branch(rig: 
         encoding="utf-8",
     )
 
-    # Control: the -Name route cannot reach it, which is the gap this route fills.
-    by_name = rig.run("-Name", "done")
-    assert by_name.returncode != 0
-    assert "No such worktree" in _out(by_name)
-    assert wt.exists()
-
+    # No -Name can spell this path: tests/test_worktree_remove.py pins that -Name looks only at the
+    # <repo>-<name> sibling. That is the gap this route fills.
     proc = rig.run("-Path", str(wt))
 
     assert proc.returncode == 0, _out(proc)
@@ -282,11 +291,7 @@ def test_the_unsafe_spellings_and_inherited_git_variables_are_refused(rig: Rig) 
 
 def test_a_copy_of_the_script_inside_the_target_refuses_to_remove_it(rig: Rig) -> None:
     wt = rig.add(rig.scratch("selfhost"))
-    for rel in (
-        "scripts/worktree/remove.ps1",
-        "scripts/coord/occupancy.ps1",
-        "scripts/coord/session-registry.ps1",
-    ):
+    for rel in REAL_SCRIPTS:
         dest = wt / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(_REPO / rel, dest)
@@ -339,8 +344,9 @@ def test_a_target_holding_another_registered_worktree_is_refused(rig: Rig) -> No
     assert "contains 1 other registered worktree" in _out(proc), _out(proc)
     assert outer.exists() and inner.exists() and rig.is_registered(inner)
 
-    # Control: deepest first, both go.
-    assert rig.run("-Path", str(inner)).returncode == 0
+    # Control: with the inner tree gone, the same target goes. The inner one is taken out with git
+    # directly, because removing a clean tree by -Path is already pinned by the first test here.
+    _git(rig.primary, "worktree", "remove", str(inner))
     assert rig.run("-Path", str(outer)).returncode == 0
     assert not outer.exists()
 
@@ -477,12 +483,16 @@ def test_a_readable_registry_with_no_records_clears_the_target(rig: Rig) -> None
 
 def test_the_fence_is_on_path_only_so_name_still_runs_with_no_registry(rig: Rig) -> None:
     """The -Name tests in tests/test_worktree_remove.py set no USERPROFILE. A fence on -Name would
-    refuse on every runner with no session registry, so it must stay off that route."""
+    refuse on every runner with no session registry, so it must stay off that route.
+
+    The name is passed POSITIONALLY on purpose. ``remove.ps1 <name>`` bound before the script had
+    parameter sets, and adding them dropped it once: this is the call that would have caught that.
+    """
     sibling = rig.add(rig.primary.parent / "Repo-sib", "-b", "sib")
     nowhere = rig.root / "no-registry-home"
     nowhere.mkdir()
 
-    proc = rig.run("-Name", "sib", home=nowhere)
+    proc = rig.run("sib", home=nowhere)
 
     assert proc.returncode == 0, _out(proc)
     assert not sibling.exists()
@@ -652,16 +662,26 @@ def test_list_names_every_worktree_its_class_and_route_and_changes_nothing(rig: 
     sibling = rig.add(rig.primary.parent / "Repo-sib", "-b", "sib")
     scratch = rig.add(rig.scratch("pad"))
     managed = rig.add(rig.primary / ".claude" / "worktrees" / "cm")
+    # A tree BELOW a directory named like a sibling. Its path starts with the sibling prefix and its
+    # own leaf is one character, shorter than the prefix: the first version of -List cut the leaf
+    # before checking for the extra path level, and died on exactly this row.
+    below = rig.add(rig.primary.parent / "Repo-pins" / "x")
     before = _git(rig.primary, "worktree", "list", "--porcelain")
 
     proc = rig.run("-List")
 
     assert proc.returncode == 0, _out(proc)
-    rows = {ln.split()[0]: ln for ln in proc.stdout.splitlines() if ln.split()[:1] and "/" in ln}
-    assert "-Name,-Path" in rows["sibling"] and " sib " in rows["sibling"], proc.stdout
-    assert " -Path " in rows["other"] and "-Name" not in rows["other"], proc.stdout
-    assert " none " in rows["managed"], proc.stdout
-    assert "sibling 1, managed 1, other 1" in proc.stdout, proc.stdout
-    assert "-Name reaches 1 of 3 and -Path reaches 2" in proc.stdout, proc.stdout
+
+    def row(path: Path) -> str:
+        spelled = str(path).replace("\\", "/")
+        (line,) = [ln for ln in proc.stdout.splitlines() if ln.rstrip().endswith(spelled)]
+        return line
+
+    assert row(sibling).split()[:3] == ["sibling", "-Name,-Path", "sib"], proc.stdout
+    assert row(scratch).split()[:3] == ["other", "-Path", "-"], proc.stdout
+    assert row(below).split()[:3] == ["other", "-Path", "-"], proc.stdout
+    assert row(managed).split()[:3] == ["managed", "none", "-"], proc.stdout
+    assert "sibling 1, managed 1, other 2" in proc.stdout, proc.stdout
+    assert "-Name reaches 1 of 4 and -Path reaches 3" in proc.stdout, proc.stdout
     assert _git(rig.primary, "worktree", "list", "--porcelain") == before
-    assert sibling.exists() and scratch.exists() and managed.exists()
+    assert sibling.exists() and scratch.exists() and managed.exists() and below.exists()

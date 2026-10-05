@@ -90,7 +90,9 @@ param(
     # The worktree DIRECTORY component, not a branch -- removal is BY PATH below, so this finds a
     # worktree whose branch carries a '/' just fine, and -DeleteBranch reads the real branch from git.
     # \A..\z for the reason given in new.ps1's param block; keep all four copies identical.
-    [Parameter(Mandatory = $true, ParameterSetName = 'ByName')]
+    # Position 0, and -RepoRoot position 1, are what this script bound before it had parameter sets:
+    # `remove.ps1 alerts` must keep working.
+    [Parameter(Mandatory = $true, Position = 0, ParameterSetName = 'ByName')]
     [ValidatePattern('\A[A-Za-z0-9._-]+\z')]
     [string]$Name,
 
@@ -124,6 +126,7 @@ param(
     # Repo to operate on. Defaults to this script's own checkout -- which is what makes an absolute-
     # path invocation from ANY cwd resolve the checkout that owns the worktree. Tests point it at a
     # fixture so the real logic is what gets exercised.
+    [Parameter(Position = 1)]
     [string]$RepoRoot
 )
 
@@ -157,8 +160,9 @@ $RepoName = Split-Path $RepoRoot -Leaf
 $transientRefExcludes = @('--exclude=refs/stash', '--exclude=refs/prefetch/*', '--exclude=refs/bisect/*',
     '--exclude=refs/rewritten/*', '--exclude=refs/original/*')
 
-# A path with a .claude/worktrees segment, on a ConvertTo-Norm value. prune-merged.ps1 excludes the
-# same population outright, for the same reason.
+# A path with a .claude/worktrees segment ANYWHERE in it, on a ConvertTo-Norm value. prune-merged.ps1
+# excludes this population too, for the same reason; its own test needs a trailing slash and is asked
+# only of the primary's siblings, so the two are not the same expression. This one is the wider.
 $managedSegment = '/\.claude/worktrees(/|\z)'
 
 $PrimaryRoot = ''
@@ -182,23 +186,25 @@ if ($listing) {
     # CHECKOUT THIS COPY LIVES IN, because that is the only place this copy's -Name looks.
     Write-Host "Primary: $PrimaryRoot   this copy: $RepoRoot   linked worktrees: $($linked.Count)"
     $siblingPrefix = (ConvertTo-Norm (Join-Path $Parent $RepoName)) + '-'
+    # -Name's own pattern, read off the parameter rather than written out a fifth time.
+    $namePattern = ($MyInvocation.MyCommand.Parameters['Name'].Attributes |
+            Where-Object { $_ -is [System.Management.Automation.ValidatePatternAttribute] }).RegexPattern
     $counts = @{ sibling = 0; managed = 0; other = 0 }
-    $byNameCount = 0
     $byPathCount = 0
     foreach ($w in $linked) {
         $norm = ConvertTo-Norm $w.Path
         $leafName = ''
-        if ($norm.StartsWith($siblingPrefix)) {
+        # The no-further-slash test comes FIRST: only then is the leaf the whole remainder, and only
+        # then is it long enough to cut. A tree below a sibling has a short leaf of its own.
+        if ($norm.StartsWith($siblingPrefix) -and -not $norm.Substring($siblingPrefix.Length).Contains('/')) {
             $rest = (Split-Path $w.Path -Leaf).Substring($RepoName.Length + 1)
-            if (-not $norm.Substring($siblingPrefix.Length).Contains('/') -and $rest -match '\A[A-Za-z0-9._-]+\z') {
-                $leafName = $rest
-            }
+            if ($namePattern -and $rest -match $namePattern) { $leafName = $rest }
         }
         $isManaged = $norm -match $managedSegment
         $class = if ($leafName) { 'sibling' } elseif ($isManaged) { 'managed' } else { 'other' }
         $counts[$class]++
         $routes = @()
-        if ($leafName) { $routes += '-Name'; $byNameCount++ }
+        if ($leafName) { $routes += '-Name' }
         if (-not $isManaged) { $routes += '-Path'; $byPathCount++ }
         $how = if ($routes) { $routes -join ',' } else { 'none' }
         $flags = @()
@@ -213,7 +219,7 @@ if ($listing) {
     }
     Write-Host "Columns: class, route(s), -Name argument ('-' for none), branch, path."
     Write-Host ("sibling {0}, managed {1}, other {2}. -Name reaches {3} of {4} and -Path reaches {5}." -f
-        $counts.sibling, $counts.managed, $counts.other, $byNameCount, $linked.Count, $byPathCount)
+        $counts.sibling, $counts.managed, $counts.other, $counts.sibling, $linked.Count, $byPathCount)
     Write-Host ("A 'managed' row is under .claude/worktrees. -Path never removes one; the header of this " +
         "script says why.")
     return
@@ -386,7 +392,8 @@ if ($byPath) {
             $listedRecords += @(Get-ChildItem -LiteralPath (Join-Path $d.FullName 'sessions') -Filter *.json -File -Force -ErrorAction Stop).Count
         }
     }
-    catch { $listingError = $_.Exception.Message }
+    # Never empty, so an exception with no message cannot read as a clean listing.
+    catch { $listingError = "the second listing failed: $($_.Exception.Message)" }
     if ($listingError -or ($listedRoots -ne $occ.RootsExamined)) {
         $why = if ($listingError) { $listingError } else {
             "the receipt examined $($occ.RootsExamined) registry root(s) and a second listing found $listedRoots" }
@@ -478,6 +485,18 @@ else {
 #
 # CANNOT-TELL COUNTS AS AT-RISK. An unreadable allocation record might name this worktree, and an
 # unreadable ledger read might hide a heading. Both refuse.
+#
+# THE SPELLINGS A RECORD MAY NAME THIS WORKTREE BY, computed once and used by the allocation guard
+# here and the claim sweep after the removal, so the two cannot disagree about which tree this is.
+# -Name matches the resolved path alone, as it always has. -Path also matches `rev-parse
+# --show-toplevel` run inside the tree, which is the spelling alloc.ps1 and claim.ps1 record. It has
+# to be read now: after the removal there is no tree to ask. They are kept RAW and normalised by each
+# block with ConvertTo-Norm, after that block's own dot-source: on -Name the helper is not loaded yet.
+$targetSpellings = @($WorktreePath)
+if ($byPath) {
+    $ownTop = "$(& git -C $WorktreePath rev-parse --path-format=absolute --show-toplevel 2>$null)".Trim()
+    if ($LASTEXITCODE -eq 0 -and $ownTop) { $targetSpellings += $ownTop }
+}
 $allocDirRoot = ''
 $commonDirPre = "$(& git -C $GitRoot rev-parse --path-format=absolute --git-common-dir 2>$null)".Trim()
 if ($commonDirPre) { $allocDirRoot = Join-Path $commonDirPre 'mefor-coord/alloc' }
@@ -506,18 +525,14 @@ function Test-LedgerNumberOnMain([string]$Kind, [string]$Number) {
 
 if ($allocDirRoot -and (Test-Path -LiteralPath $allocDirRoot)) {
     . "$PSScriptRoot\..\coord\occupancy.ps1"
-    # Both spellings git gives this worktree: the path as resolved here, and `rev-parse
-    # --show-toplevel` run inside it, which is the one alloc.ps1 records and owns() compares against.
-    $allocOwners = @{ (ConvertTo-Norm $WorktreePath) = $true }
-    $allocTop = "$(& git -C $WorktreePath rev-parse --path-format=absolute --show-toplevel 2>$null)".Trim()
-    if ($LASTEXITCODE -eq 0 -and $allocTop) { $allocOwners[(ConvertTo-Norm $allocTop)] = $true }
+    $allocOwners = @($targetSpellings | ForEach-Object { ConvertTo-Norm $_ })
     $atRisk = @()
     $allocUnreadable = @()
     foreach ($f in @(Get-ChildItem -LiteralPath $allocDirRoot -Filter *.json -File -Recurse -EA SilentlyContinue | Sort-Object FullName)) {
         $a = $null
         try { $a = Get-Content -LiteralPath $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop }
         catch { $allocUnreadable += $f.Name; continue }
-        if (-not $allocOwners.ContainsKey((ConvertTo-Norm ([string]$a.worktree)))) { continue }
+        if ($allocOwners -notcontains (ConvertTo-Norm ([string]$a.worktree))) { continue }
         $onMain = Test-LedgerNumberOnMain ([string]$a.kind) ([string]$a.number)
         if ($onMain -ne $true) {
             $why = if ($null -eq $onMain) { 'COULD NOT CHECK origin/main' } else { 'not on origin/main' }
@@ -619,14 +634,14 @@ try {
     $commonDir = "$(& git -C $GitRoot rev-parse --path-format=absolute --git-common-dir 2>$null)".Trim()
     $claimsDir = if ($commonDir) { Join-Path $commonDir 'mefor-coord/claims' } else { '' }
     if ($claimsDir -and (Test-Path -LiteralPath $claimsDir)) {
-        $target = ConvertTo-Norm $WorktreePath
+        $claimHolders = @($targetSpellings | ForEach-Object { ConvertTo-Norm $_ })
         $released = @()
         $unreadable = @()
         foreach ($f in @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA SilentlyContinue | Sort-Object Name)) {
             $c = $null
             try { $c = Get-Content -LiteralPath $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop }
             catch { $unreadable += $f.Name; continue }
-            if ((ConvertTo-Norm ([string]$c.worktree)) -ne $target) { continue }
+            if ($claimHolders -notcontains (ConvertTo-Norm ([string]$c.worktree))) { continue }
             try {
                 Remove-Item -LiteralPath $f.FullName -Force -EA Stop
                 $released += [string]$c.key
