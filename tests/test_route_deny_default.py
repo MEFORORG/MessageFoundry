@@ -20,7 +20,7 @@ from __future__ import annotations
 import contextlib
 import inspect
 import logging
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +63,12 @@ pytest.importorskip("messagefoundry_webconsole")
 
 def _route_keys(app: FastAPI) -> set[tuple[str, str]]:
     return {(r.method, r.path) for r in route_gates.route_rows(app)}
+
+
+def _walked_create_app() -> Callable[..., FastAPI]:
+    """The `create_app` the walk's `full_surface_app` calls, read where a test can replace it."""
+    factory: Callable[..., FastAPI] = vars(route_gates)["create_app"]
+    return factory
 
 
 def _without_refusal(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -122,7 +128,7 @@ def test_no_create_app_flag_registers_a_route_the_full_surface_app_lacks(full_ap
     boolean ``create_app`` takes must add no route, or the walk would never see it."""
     full = _route_keys(full_app)
     flipped = 0
-    for name, param in inspect.signature(route_gates.create_app).parameters.items():
+    for name, param in inspect.signature(_walked_create_app()).parameters.items():
         if not isinstance(param.default, bool) or name in route_gates.ROUTE_REGISTERING_FLAGS:
             continue
         flipped_app = route_gates.full_surface_app(**{name: not param.default})
@@ -166,7 +172,7 @@ _NON_BOOL_BUILT_BY_FIXTURE = frozenset({"engine", "auth"})
 
 
 def _unlisted_non_bool_parameters() -> set[str]:
-    signature = inspect.signature(route_gates.create_app)
+    signature = inspect.signature(_walked_create_app())
     non_bool = {n for n, p in signature.parameters.items() if not isinstance(p.default, bool)}
     return non_bool - _NON_BOOL_VALUES.keys() - _NON_BOOL_BUILT_BY_FIXTURE
 
@@ -190,7 +196,7 @@ def test_every_non_bool_create_app_parameter_is_listed() -> None:
         f"create_app gained non-bool parameter(s) {sorted(unlisted)}. List each in _NON_BOOL_VALUES "
         "with a value to try, so the test below checks whether it registers a route."
     )
-    signature = inspect.signature(route_gates.create_app)
+    signature = inspect.signature(_walked_create_app())
     stale = (_NON_BOOL_VALUES.keys() | _NON_BOOL_BUILT_BY_FIXTURE) - signature.parameters.keys()
     assert not stale, f"listed but no longer a create_app parameter: {sorted(stale)}"
 
@@ -204,7 +210,7 @@ def test_no_non_bool_create_app_parameter_registers_a_route_the_full_surface_app
 
 def _create_app_with(new_parameter: inspect.Parameter) -> Any:
     """``create_app`` with one more keyword parameter, which registers ``/zz/new`` when set."""
-    real = route_gates.create_app
+    real = _walked_create_app()
 
     def planted(*args: Any, **kwargs: Any) -> FastAPI:
         value = kwargs.pop(new_parameter.name, new_parameter.default)
