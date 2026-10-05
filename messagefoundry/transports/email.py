@@ -147,6 +147,9 @@ _MAX_LOCAL = 64
 _MAX_ADDRESS = 254
 #: What a recipient's domain may hold: a hostname. Matching an allowlist entry also needs this.
 _DOMAIN_TEXT = frozenset(string.ascii_letters + string.digits + "-.")
+#: The RFC 1035 limit on one label of a domain. The whole domain needs no limit of its own here:
+#: :data:`_MAX_ADDRESS` already holds it to 252 characters, under the 253 that RFC allows.
+_MAX_LABEL = 63
 
 
 def envelope_address_problem(address: str) -> str | None:
@@ -157,7 +160,13 @@ def envelope_address_problem(address: str) -> str | None:
     and a hostname-shaped domain. ``smtplib`` writes an address it cannot re-read onto the
     ``RCPT TO`` line raw, so anything looser could put a mailbox there that is not the one checked.
     The ``[egress]`` recipient-domain check calls this, and so does :func:`checked_envelope`, which
-    also applies it to the sender, which is ``MAIL FROM``. The text names no part of the address."""
+    also applies it to the sender, which is ``MAIL FROM``. The text names no part of the address.
+
+    Hostname-shaped means labels of letters, digits and hyphens, 1 to 63 characters each, none
+    starting or ending with a hyphen. So an empty label, and a leading or trailing dot, are refused.
+    The last label may not be all digits. RFC 5321 section 4.1.3 writes an IP address only as a
+    bracketed address literal, which the character test already refuses, so a bare dotted quad
+    names no mail domain (vault BACKLOG #2911, a Manager decision under the owner's driver rule)."""
     if parseaddr(address)[1] != address:
         return "does not read back as the same address"
     local, at, domain = address.rpartition("@")
@@ -174,6 +183,15 @@ def envelope_address_problem(address: str) -> str | None:
         return "has a non-ASCII domain; write it in its ASCII xn-- form"
     if set(domain) - _DOMAIN_TEXT:
         return "has a domain that is not a host name"
+    labels = domain.split(".")
+    if not all(labels):
+        return "has a domain with an empty label, or a dot at its start or end"
+    if any(len(label) > _MAX_LABEL for label in labels):
+        return f"has a domain label longer than {_MAX_LABEL} characters"
+    if any(label[0] == "-" or label[-1] == "-" for label in labels):
+        return "has a domain label that starts or ends with a hyphen"
+    if labels[-1].isdigit():
+        return "has a domain whose last label is all digits, as a bare IP address is"
     return None
 
 
