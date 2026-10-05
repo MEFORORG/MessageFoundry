@@ -579,9 +579,10 @@ This section is kept rather than deleted, because the claim it used to make is t
 > #2354). A loopback `ldap://` address is refused too.
 > It is reported only while a plain bind is live, which needs at least `ad_enabled`,
 > sign-in (always on under `serve`) and an `ad_server` that is not `ldaps://`.
-- **What you lose:** the encryption and the server authentication on the AD hop. Both binds are SIMPLE
-  binds, so the service-account password and the password of every user who signs in or steps up cross
-  the network in cleartext. Nothing proves the far end is your domain controller, so a host on the path
+- **What you lose:** the encryption and the server authentication on the AD hop. The binds that remain
+  include the service account's and the step-up re-bind a directory user makes to confirm a sensitive
+  action. Each is a SIMPLE bind, so the service-account password and the password of every user who
+  steps up cross the network in cleartext. Nothing proves the far end is your domain controller, so a host on the path
   can read the passwords or answer as the directory.
 - **When acceptable:** a trusted-network dev or test box with a lab directory and throwaway accounts.
   Never with a real domain account.

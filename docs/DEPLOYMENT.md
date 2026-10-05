@@ -261,7 +261,7 @@ engine binds. Three planes sit at different exposure levels:
 |---|---|---|---|
 | **Management** | web console (`/ui`) / IDE → engine API | loopback by default (or a restricted management subnet) | auth + RBAC + full audit, **always on**: `serve` refuses to start with sign-in off on any bind, loopback included, and no setting turns it off (vault BACKLOG #2719); smallest surface — keep it off general-user VLANs |
 | **Data** | inbound feeds you *receive* (MLLP, TCP/X12, DB-poll) | the **internal network interface** — feeds come from other systems on your LAN, not `127.0.0.1` | **TLS on the wire where the channel has it** (enable MLLP-over-TLS; **TCP/X12 have none** — segment them) + the `[egress]`/ingress allow-lists + your network segmentation. PHI must not cross the LAN in cleartext |
-| **Inbound web service** | a partner *calls into* MEFOR (`Http()` source) | its own connector-owned socket | built (ADR 0023) — per-connection TLS + opt-in mTLS + IP allow-list, **no bearer/basic partner auth**. Both peer controls are **optional and unenforced** — a TLS-on listener with neither accepts any peer; see the caveat below |
+| **Inbound web service** | a partner *calls into* MEFOR (`Http()` source) | its own connector-owned socket | built (ADR 0023) — per-connection TLS + opt-in mTLS + IP allow-list, and partner authentication by `intake_auth` (`api_key`, `bearer` or `mtls_subject`; there is no HTTP Basic mode). An off-loopback listener with no effective peer control is **refused** under the default `[security].enforcement = enforce`, and only warned under `warn`; see the caveat below |
 
 The **management plane** is what you keep most contained; the **data plane is network-bound in any real
 install** (an EHR's MLLP feed is not on localhost) — which is exactly why MLLP-over-TLS and the
@@ -328,19 +328,24 @@ network surface even inside your LAN**, with its own bind/port in the connector 
 the management API, and it does not inherit the API's auth: harden it deliberately.
 
 - **Built:** per-connection TLS (`tls = true` + `tls_cert_file`/`tls_key_file`), opt-in **mTLS** via
-  `tls_ca_file`, a per-connection `source_ip_allowlist`, DoS caps (`max_connections`, `receive_timeout`,
-  `max_body_bytes`, `max_header_bytes`), and the off-loopback exposed-gate (`check_http_tls_exposure`).
-- **Not built:** any *application*-layer partner authentication — there is no bearer/basic credential
-  check on the listener, so **mTLS or the IP allow-list is the partner authentication**, or you front it
-  with an authenticating reverse proxy. The synchronous downstream-reply (SOAP-envelope) path is also a
-  defined ADR 0013 follow-on, not built: the first slice is respond-with-receipt only.
-- **Neither peer control is enforced — treat configuring one as mandatory, not optional.** The
-  off-loopback gate (`check_http_tls_exposure`) checks only that **TLS is on**; it never checks that a
-  peer control exists. So an off-loopback `Http()` with `tls = true`, no `tls_ca_file` and no
-  `source_ip_allowlist` **starts cleanly and accepts POSTs from anyone on the LAN** (`source_ip_allowlist`
-  defaults to *no restriction*). Do not infer the DICOM SCP's floor here: the SCP **does** refuse a
-  non-loopback bind with no peer control at construction, and the matrix below advertises that refusal —
-  the HTTP listener has no equivalent.
+  `tls_ca_file`, a per-connection `source_ip_allowlist`, partner authentication by `intake_auth`
+  (`api_key` or `bearer` with an `intake_api_key` read through `env()`, or `mtls_subject` with
+  `tls_ca_file` and `intake_client_subjects`), DoS caps (`max_connections`, `receive_timeout`,
+  `max_body_bytes`, `max_header_bytes`), the off-loopback exposed-gate (`check_http_tls_exposure`), and
+  the peer-control gate (`check_http_intake_auth`).
+- **Not built:** an HTTP Basic credential check. Use one of the three `intake_auth` modes, or front the
+  listener with an authenticating reverse proxy. The synchronous downstream-reply (SOAP-envelope) path is
+  also a defined ADR 0013 follow-on, not built: the first slice is respond-with-receipt only.
+- **Off loopback, a peer control is required, and TLS alone is not one.** `check_http_tls_exposure`
+  checks only that **TLS is on**. `check_http_intake_auth` runs beside it each time the engine starts
+  the connection, and again at `messagefoundry check`. Under the default `[security].enforcement =
+  enforce` it refuses to start an off-loopback `Http()` that has no effective peer control. Under
+  `warn` it only logs a warning, and the listener then accepts a POST from any peer that can reach it,
+  so configure a control anyway. Three things count as an effective control. One is `api_key` or `bearer` with a key, and
+  another is `mtls_subject` with a CA and a subject list. The third is a `source_ip_allowlist` whose
+  every entry is /8 or narrower for IPv4, or /32 or narrower for IPv6. `tls_ca_file` alone does not
+  count, because it accepts any certificate that CA ever signed.
+  `--allow-insecure-bind` does not waive this gate.
 
 ---
 
@@ -463,7 +468,7 @@ self-signed placeholder).
 |---|---|---|---|---|---|
 | **Engine API** (FastAPI/uvicorn) | `[security].local_access_only` = true → `127.0.0.1` | **Yes** — in-process via `tls_cert_file`/`tls_key_file`, *or* upstream via `tls_terminated_upstream` + `trusted_proxies`; `tls_min_version` (≥1.2); opt-in mTLS via `tls_client_ca_file`; HSTS over https | Bearer token + session RBAC — **always required**; no setting turns it off, and `serve` refuses to start without it on any bind (vault BACKLOG #2719) | — (auth-gated) | **Yes** — refused without an operator certificate or a trusted terminator, and `--allow-insecure-bind` is clamped inert on an enforcing PHI instance (the default) |
 | **MLLP source** | `[inbound].bind_host` = `127.0.0.1` | **Yes** — per-connection opt-in `tls=true` + `tls_cert_file`/`tls_key_file`; opt-in mTLS via `tls_ca_file`; ≥TLS 1.2. **Plaintext by default** | None (MLLP has no app auth) | — | **Yes** — non-loopback plaintext refused (`check_mllp_tls_exposure`) |
-| **HTTP source** (`Http()`, ADR 0023) | `[inbound].bind_host` = `127.0.0.1` | **Yes** — per-connection opt-in `tls=true` + `tls_cert_file`/`tls_key_file`; opt-in mTLS via `tls_ca_file`. **Plaintext by default** | mTLS client cert only — **no bearer/basic partner auth**, and **neither mTLS nor the IP allow-list is required**: with TLS on and both unset the listener accepts any peer | per-connection `source_ip_allowlist` — **optional, defaults to no restriction** | **Yes** — non-loopback plaintext refused (`check_http_tls_exposure`) — but the gate checks **only** that TLS is on, **never** that a peer control exists (unlike the DICOM SCP row below) |
+| **HTTP source** (`Http()`, ADR 0023) | `[inbound].bind_host` = `127.0.0.1` | **Yes** — per-connection opt-in `tls=true` + `tls_cert_file`/`tls_key_file`; opt-in mTLS via `tls_ca_file`. **Plaintext by default** | `intake_auth`: `api_key`, `bearer` or `mtls_subject` (no HTTP Basic mode). Default `none` | per-connection `source_ip_allowlist` — defaults to no restriction | **Yes** — non-loopback plaintext refused (`check_http_tls_exposure`), **and** `check_http_intake_auth` refuses a non-loopback listener with *no* effective peer control under `enforce`, and warns under `warn`. The caveat above lists what counts |
 | **DICOM C-STORE SCP** (`DICOM()`, ADR 0025) | `[inbound].bind_host` = `127.0.0.1` | **Yes** — per-connection opt-in `tls=true` + cert/key; opt-in mTLS via `tls_ca_file`. **Plaintext by default** | `calling_ae_allowlist` / `require_called_ae_title` / mTLS (DIMSE has no transport auth of its own) | per-connection `source_ip_allowlist` | **Yes** — non-loopback plaintext refused (`check_dimse_tls_exposure`), **and** a non-loopback SCP with *no* peer control (calling-AE allow-list, IP allow-list, or mTLS) is refused at construction |
 | **Raw TCP source** | `[inbound].bind_host` = `127.0.0.1` | **No** — plaintext only | None | — | **Yes** — non-loopback plaintext refused (`check_tcp_tls_exposure`, PR #558); no TLS to enable, so keep loopback / firewall-segment / proxy-terminate |
 | **X12 source** (ISA/IEA framed) | `[inbound].bind_host` = `127.0.0.1` | **No** — plaintext only (same socket plumbing as raw TCP) | None | — | **Yes** — non-loopback plaintext refused (`check_tcp_tls_exposure`, PR #558); keep loopback / firewall-segment / proxy-terminate |
@@ -779,7 +784,12 @@ service's store key in that shell first, see
 address is refused with a message naming `messagefoundry admin-set-notify-email`, which fills the
 missing address from the host. Or record the pull-only `/me/security-events` feed as accepted in
 writing with `[alerts].security_notifications_required = false`; with no Administrator, the engine then
-starts, logs one warning naming `provision-admin`, and nobody can sign in until it runs.
+starts and logs one warning naming `provision-admin`. On a new store, nobody can manage the engine
+until it runs. A Windows sign-in (Kerberos), where configured, is not refused for want of an
+Administrator. On a new store it creates its directory account with no role, because only an
+administrator can map a directory group to a role. That session reaches its own account and nothing a
+role grants. An OIDC sign-in on a new store is refused, because only an administrator can link it to
+an account. On a store that once had an Administrator, the group map and the links it left still apply.
 
 **Why the number differs, since it will look like an inconsistency.** The check needs the user
 table, and the pre-flight is synchronous and opens no store — so the only place the store and its

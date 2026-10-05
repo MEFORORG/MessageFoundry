@@ -39,7 +39,7 @@ from messagefoundry.api import security as api_security
 from messagefoundry.api.security import _PHI_VIEW_PERMISSIONS, require_service_cert
 from messagefoundry.auth import service as service_module
 from messagefoundry.auth.identity import AuthProvider
-from messagefoundry.auth.permissions import Permission, Role
+from messagefoundry.auth.permissions import BUILTIN_ROLE_PERMISSIONS, Permission, Role
 from messagefoundry.auth.policy import PasswordPolicy
 from messagefoundry.auth.service import AuthService, _directory_login_refusal
 from messagefoundry.config.models import ConnectorType, Source
@@ -3020,3 +3020,359 @@ def test_the_twelfth_sweep_loosening_note_does_not_gate_a_removed_key() -> None:
     )
     gated = [c for c in clauses if "`[auth].enabled`" in c and "serve-time refusal" in c]
     assert not gated, f"docs/SECURITY-LOOSENING.md gates the removed [auth].enabled again: {gated}"
+
+
+# The thirteenth 6.1.3 re-read (BACKLOG #1133, vault PR 2242) held the cell at partial on four more
+# sentences in shipped docs outside the three the early sweeps read, and asked whether "nobody can
+# sign in before `provision-admin`" holds for a directory sign-in. Each was checked against the code
+# before it was changed; the probe below pins what was checked, and each test after it refuses the
+# CLAIM rather than one sentence.
+
+
+def test_the_thirteenth_sweep_probes_the_code_the_docs_now_state(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The code facts the thirteenth sweep's sentences now state."""
+    from messagefoundry.auth.ldap import AdPrincipal
+    from messagefoundry.pipeline import wiring_runner
+    from messagefoundry.store.store import MessageStore
+    from messagefoundry_webconsole import _auth as console_auth
+
+    # 1. A pending browser session is redirected to /ui/mfa, not held there. The page forwards an
+    #    account with no factor to the account page, and the account page and the enrolment
+    #    factory both admit a pending session.
+    routes = _console_route_funcs()
+    assert any(
+        isinstance(n, ast.Constant) and n.value == "/ui/account?m=enroll_first"
+        for n in ast.walk(routes["GET /ui/mfa"])
+    ), "GET /ui/mfa no longer forwards an account with no factor to /ui/account"
+    for where, values in (
+        (
+            "GET /ui/account",
+            [
+                kw.value
+                for n in ast.walk(routes["GET /ui/account"])
+                if isinstance(n, ast.Call)
+                for kw in n.keywords
+                if kw.arg == "allow_mfa_pending"
+            ],
+        ),
+        (
+            "require_ui_reauth_only_action",
+            keyword_values(console_auth.require_ui_reauth_only_action, "allow_mfa_pending"),
+        ),
+    ):
+        flags = [v for v in values if isinstance(v, ast.Constant) and v.value is True]
+        assert flags, f"{where} no longer admits an MFA-pending session"
+    assert _called(routes["POST /ui/account/mfa/enroll"], "require_ui_reauth_only_action")
+
+    # 2. HTTP intake: three partner-authentication modes, no Basic, and a peer-control gate that
+    #    refuses under enforce, warns otherwise, runs at build and at check, and ignores the
+    #    cleartext escape.
+    with pytest.raises(WiringError, match="intake_auth must be one of"):
+        Http(port=8080, intake_auth="basic")  # type: ignore[arg-type]
+    exposed = {"host": "0.0.0.0", "tls": True, "tls_cert_file": "c.pem", "tls_key_file": "k.pem"}
+
+    def gate(enforcing: bool, **settings: Any) -> None:
+        wiring_runner.check_http_intake_auth(
+            Source(type=ConnectorType.HTTP, name="intake-in", settings={**exposed, **settings}),
+            "intake-in",
+            posture=HopPosture(enforcing=enforcing),
+        )
+
+    # The allow-list floors docs/DEPLOYMENT.md quotes, probed on both sides of each.
+    assert (
+        wiring_runner._INTAKE_ALLOWLIST_MIN_PREFIX_V4,
+        wiring_runner._INTAKE_ALLOWLIST_MIN_PREFIX_V6,
+    ) == (
+        8,
+        32,
+    ), "the intake allow-list floors moved; restate docs/DEPLOYMENT.md's caveat"
+    for refused in (
+        {},
+        {"tls_ca_file": "ca.pem"},
+        {"source_ip_allowlist": ["0.0.0.0/0"]},
+        {"source_ip_allowlist": ["10.0.0.0/7"]},
+        {"source_ip_allowlist": ["2001:db8::/31"]},
+    ):
+        with pytest.raises(WiringError):
+            gate(True, **refused)
+    with caplog.at_level(logging.WARNING):
+        gate(False)  # warned, not refused
+    assert any(
+        r.levelno == logging.WARNING and "no effective peer control" in r.getMessage()
+        for r in caplog.records
+    ), "check_http_intake_auth no longer warns under warn; restate docs/DEPLOYMENT.md"
+    gate(True, intake_auth="api_key", intake_api_key="k")
+    gate(True, intake_auth="bearer", intake_api_key="k")
+    gate(True, intake_auth="mtls_subject", tls_ca_file="ca.pem", intake_client_subjects=["CN:p"])
+    gate(True, source_ip_allowlist=["10.0.0.0/8", "2001:db8::/32"])
+    assert (
+        "allow_insecure_bind"
+        not in inspect.signature(wiring_runner.check_http_intake_auth).parameters
+    )
+    for caller in (
+        wiring_runner.RegistryRunner._start_inbound_unsafe,
+        wiring_runner._build_check_connectors,
+    ):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(caller)))
+        assert _called(tree, "check_http_intake_auth"), f"{caller.__name__} lost the intake gate"
+
+    # 3. The only directory bind a user's password reaches is the step-up re-bind. Two layers. In
+    #    the LDAP client, a connection is opened only by the service-account helper and by
+    #    `authenticate` (with its timing-equaliser, which only `authenticate` calls). In the engine,
+    #    only `_reauth_ad` reaches `authenticate`; simple-bind sign-in is retired.
+    ldap_tree = ast.parse(
+        (_ROOT / "messagefoundry" / "auth" / "ldap.py").read_text(encoding="utf-8")
+    )
+    ldap_funcs = [
+        f for f in ast.walk(ldap_tree) if isinstance(f, ast.FunctionDef | ast.AsyncFunctionDef)
+    ]
+    openers = sorted({f.name for f in ldap_funcs if _called(f, "Connection")})
+    assert openers == ["_equalizing_bind", "_service_conn", "authenticate"], (
+        f"the LDAP functions that open a connection changed: {openers}. Re-derive which binds carry "
+        "a user's password before trusting docs/SECURITY-LOOSENING.md's cleartext-LDAP loss."
+    )
+    assert sorted(f.name for f in ldap_funcs if _called(f, "_equalizing_bind")) == ["authenticate"]
+    # Every reference to the name, whatever its receiver, in the engine and the console. The two
+    # api/security.py holders are a parameter of that name, unrelated to the directory.
+    sites = sorted(set(_name_reference_sites("authenticate")))
+    assert sites == [
+        ("messagefoundry/api/security.py", "_gate"),
+        ("messagefoundry/api/security.py", "require_phi_read"),
+        ("messagefoundry/auth/service.py", "AuthService"),
+    ], (
+        f"the code referring to `authenticate` changed: {sites}. Re-derive which paths bind a "
+        "directory user before trusting docs/SECURITY-LOOSENING.md's cleartext-LDAP loss."
+    )
+    service_tree = ast.parse(textwrap.dedent(inspect.getsource(AuthService)))
+    binders = sorted(
+        {
+            f.name
+            for f in ast.walk(service_tree)
+            if isinstance(f, ast.FunctionDef | ast.AsyncFunctionDef)
+            and any(isinstance(n, ast.Attribute) and n.attr == "authenticate" for n in ast.walk(f))
+        }
+    )
+    assert binders == ["_reauth_ad"], (
+        f"the AuthService methods binding a directory user changed: {binders}. Restate the "
+        "cleartext-LDAP loss in docs/SECURITY-LOOSENING.md."
+    )
+
+    # 4. With the claim gate on, the default, an OIDC session is minted as having met the factor.
+    #    The tenth sweep's probe pins the grant to the setting; this pins the default it reads.
+    assert AuthSettings.model_fields["oidc_require_mfa_claim"].default is True
+
+    # 5. On a store with no Administrator a Windows sign-in is not refused: it mints a session on a
+    #    new directory row holding no role, still owing its factor. The role map and the federated
+    #    binding are both administrator-only, so nothing grants that row a role, and an OIDC
+    #    sign-in finds no account to sign in to.
+    principal = AdPrincipal(
+        username="jdoe",
+        display_name="J Doe",
+        email="jdoe@example.org",
+        dn="CN=jdoe,DC=x",
+        groups=frozenset({"cn=mf-admins,dc=x"}),
+        directory_object_id="0f0e0d0c-0b0a-0908-0706-050403020100",
+    )
+
+    class _OneUserDirectory:
+        def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
+            return principal if username == "jdoe" else None
+
+    monkeypatch.setattr(service_module, "kerberos_principal", lambda _t, _s: "jdoe")
+
+    async def probe() -> tuple[bool, frozenset[Permission], bool, list[str], bool]:
+        store = await MessageStore.open(":memory:")
+        try:
+            settings = AuthSettings(
+                ad_enabled=True,
+                kerberos_enabled=True,
+                ad_server="ldaps://x",
+                ad_user_search_base="DC=x",
+                ad_bind_dn="CN=svc,DC=x",
+                ad_bind_password="x",
+            )
+            service = AuthService(store, settings, ldap=_OneUserDirectory())  # type: ignore[arg-type]
+            await service.initialize()
+            assert not await service.has_enabled_administrator()
+            assert list(await store.list_ad_group_role_map()) == []
+            out = await service.authenticate_kerberos(b"spnego-token")
+            assert out.identity is not None
+            row = await store.get_user_by_username("jdoe")
+            assert row is not None and row.auth_provider == AuthProvider.AD.value
+            return (
+                out.ok,
+                out.identity.permissions,
+                out.mfa_required,
+                list(await store.get_user_role_ids(row.id)),
+                await service.has_enabled_administrator(),
+            )
+        finally:
+            await store.close()
+
+    assert asyncio.run(probe()) == (True, frozenset(), True, [], False), (
+        "a Windows sign-in on a store with no Administrator changed shape; restate the "
+        "provisioning passages in docs/DEPLOYMENT.md, docs/INSTALL-GUIDE.md and docs/SERVICE.md."
+    )
+    routes_tree = ast.parse(
+        (_ROOT / "messagefoundry" / "api" / "auth_routes.py").read_text(encoding="utf-8")
+    )
+    for route in ("set_ad_group_map", "bind_user_federated_identity"):
+        func = next(
+            n
+            for n in ast.walk(routes_tree)
+            if isinstance(n, ast.AsyncFunctionDef) and n.name == route
+        )
+        assert "Permission.USERS_MANAGE" in ast.unparse(func.args), f"{route} is not admin-only now"
+    assert [
+        r.value for r, p in BUILTIN_ROLE_PERMISSIONS.items() if Permission.USERS_MANAGE in p
+    ] == [Role.ADMINISTRATOR.value]
+    assert "FEDERATED_SUBJECT_NOT_BOUND" in {
+        n.id for n in ast.walk(_service_func("_authenticate_oidc")) if isinstance(n, ast.Name)
+    }, "_authenticate_oidc no longer refuses a federated identity bound to no account"
+
+
+def test_the_thirteenth_sweep_remote_console_redirects_rather_than_confines() -> None:
+    """docs/REMOTE-CONSOLE.md said a pending browser session "is confined to `/ui/mfa`". The gate
+    redirects it there, the page forwards an account with no factor to `/ui/account`, and the
+    account and enrolment pages admit it (the probe above)."""
+    row = _flat(
+        next(
+            line
+            for line in _doc("docs/REMOTE-CONSOLE.md").splitlines()
+            if line.startswith("| Signed in, but every route returns `403` with `X-MFA-Required")
+        )
+    )
+    held = re.findall(
+        r"\b(?:confined|restricted|limited|locked|kept|held)\b[^.;|]*`/ui/mfa`|\bonly `/ui/mfa`",
+        row,
+        re.IGNORECASE,
+    )
+    assert not held, f"docs/REMOTE-CONSOLE.md holds a pending session at /ui/mfa again: {held}"
+    assert any("`/ui/mfa`" in c and "redirect" in c for c in _clauses(row)), (
+        "docs/REMOTE-CONSOLE.md's X-MFA-Required row must say the session is redirected to /ui/mfa."
+    )
+
+
+def _deployment_intake_scopes() -> dict[str, str]:
+    """The three places docs/DEPLOYMENT.md describes the HTTP intake listener's partner auth."""
+    doc = _doc("docs/DEPLOYMENT.md")
+    lines = doc.splitlines()
+    start = doc.index("### Caveat — accepting inbound web-service calls")
+    end = doc.index("\n## ", start)
+    return {
+        "plane row": next(x for x in lines if x.startswith("| **Inbound web service**")),
+        "caveat": doc[start:end],
+        "matrix row": next(x for x in lines if x.startswith("| **HTTP source**")),
+    }
+
+
+#: An intake claim the code contradicts: no bearer mode, no partner authentication built, or a
+#: peer control that is optional or never enforced. The last three phrasings are true under
+#: `warn`, so a clause that names `warn` may use them.
+_INTAKE_STALE = re.compile(
+    r"\bno bearer\b|bearer/basic|partner authentication[^.]*\bnot built\b"
+    r"|\bunenforced\b|\bnot enforced\b|\bneither\b[^.]*\b(?:required|enforced)\b"
+    r"|\baccepts (?:any peer|POSTs from anyone)\b|\bstarts cleanly\b",
+    re.IGNORECASE,
+)
+
+
+@pytest.mark.parametrize("scope", ["plane row", "caveat", "matrix row"])
+def test_the_thirteenth_sweep_deployment_states_the_built_intake_auth(scope: str) -> None:
+    """docs/DEPLOYMENT.md said the HTTP intake listener has no bearer or basic partner auth and
+    that neither peer control is enforced. `intake_auth` offers `api_key`, `bearer` and
+    `mtls_subject`, and `check_http_intake_auth` refuses an off-loopback listener with no
+    effective peer control under enforce (the probe above)."""
+    text = _deployment_intake_scopes()[scope]
+    clauses = _clauses(text)
+    assert len(clauses) >= 5, (
+        f"docs/DEPLOYMENT.md's intake {scope} cut into {len(clauses)} clause(s), floor 5: the scan "
+        "reads too little to clear it."
+    )
+    stale = [
+        c
+        for c in clauses
+        if (m := _INTAKE_STALE.search(c))
+        and (re.search(r"bearer|partner authentication", m.group(0), re.I) or "`warn`" not in c)
+    ]
+    assert not stale, f"docs/DEPLOYMENT.md's intake {scope} contradicts the code again: {stale}"
+    flat = _flat(text)
+    for token in ("`intake_auth`", "`api_key`", "`bearer`", "`mtls_subject`"):
+        assert token in flat, f"docs/DEPLOYMENT.md's intake {scope} must name {token}"
+    if scope != "plane row":
+        assert "`check_http_intake_auth`" in flat, (
+            f"docs/DEPLOYMENT.md's intake {scope} must name the peer-control gate"
+        )
+
+
+def test_the_thirteenth_sweep_loosening_note_binds_no_user_at_sign_in() -> None:
+    """docs/SECURITY-LOOSENING.md said the password of every user who signs in crosses a plain
+    `ldap://` hop. Simple-bind sign-in is retired; the step-up re-bind is the only user bind left
+    (the probe above)."""
+    doc = _doc("docs/SECURITY-LOOSENING.md")
+    start = doc.index("### `[auth].ad_allow_insecure_ldap = true`")
+    section = doc[start : doc.index("\n### ", start + 1)]
+    clauses = [c for c in _clauses(section) if "password" in c]
+    assert clauses, "the cleartext-LDAP section names no password, so this check reads nothing"
+    at_sign_in = [
+        c
+        for c in clauses
+        if re.search(r"\bsign(?:s|ed|ing)? in\b|\blog(?:s|ged|ging)? (?:in|on)\b", c, re.I)
+    ]
+    assert not at_sign_in, (
+        f"docs/SECURITY-LOOSENING.md says a user's sign-in binds a password again: {at_sign_in}"
+    )
+    assert any(re.search(r"\bstep(?:s|-)? ?up\b", c) for c in clauses), (
+        "the cleartext-LDAP section must say the step-up re-bind carries the user's password"
+    )
+
+
+def test_the_thirteenth_sweep_phi_qualifies_the_second_factor_for_oidc() -> None:
+    """docs/PHI.md said the engine enforces its own second factor "on any bind". With
+    `oidc_require_mfa_claim` on, the default, an OIDC session meets it on the identity provider's
+    claim (the probe above). A paragraph that says the factor applies everywhere must say so."""
+    paragraphs = [p for p in re.split(r"\n\s*\n", _doc("docs/PHI.md")) if "require_mfa`" in p]
+    assert paragraphs, "docs/PHI.md names require_mfa nowhere, so this check reads nothing"
+    universal = [
+        p
+        for p in paragraphs
+        if re.search(r"\bany bind\b|\bevery (?:sign-in|session|bind)\b", _flat(p), re.I)
+    ]
+    assert universal, "docs/PHI.md no longer says where require_mfa applies; re-derive this check"
+    bare = [_flat(p)[:120] for p in universal if "oidc_require_mfa_claim" not in p]
+    assert not bare, (
+        f"docs/PHI.md says the engine's factor applies on any bind without the OIDC claim: {bare}"
+    )
+
+
+@pytest.mark.parametrize("name", ["docs/DEPLOYMENT.md", "docs/INSTALL-GUIDE.md", "docs/SERVICE.md"])
+def test_the_thirteenth_sweep_no_doc_says_nobody_can_sign_in_before_provisioning(
+    name: str,
+) -> None:
+    """Three docs said nobody can sign in before `provision-admin` runs. A Windows sign-in is not
+    refused for want of an Administrator: it creates a directory row holding no role (the probe
+    above). Nobody can MANAGE the engine; somebody can sign in."""
+    clauses = _clauses(_doc(name))
+    assert len(clauses) >= 250, (
+        f"{name} cut into {len(clauses)} clause(s), floor 250: the scan reads too little to clear it."
+    )
+    stale = [
+        c
+        for c in clauses
+        if re.search(r"\b(?:nobody|no one|no way)\b[^.;]*\bsign in\b", c, re.IGNORECASE)
+    ]
+    assert not stale, f"{name} says nobody can sign in before provisioning again: {stale}"
+    # Read in the provisioning paragraph itself, the one each doc opens with "creates no account on
+    # its own", so a Kerberos passage elsewhere cannot stand in for it.
+    passages = [
+        _flat(p)
+        for p in re.split(r"\n\s*\n", _doc(name))
+        if "creates no account on its own" in _flat(p)
+    ]
+    assert passages, f"{name} no longer says the engine creates no account; re-derive this check"
+    assert all(re.search(r"Kerberos[^.]*\.?[^.]*\bno role\b", p) for p in passages), (
+        f"{name} must say, where it provisions the first Administrator, that a Windows sign-in "
+        "before then holds no role"
+    )

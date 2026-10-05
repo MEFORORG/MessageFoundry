@@ -51,8 +51,12 @@ off-box logs) are **built into the engine**, and each leans on the org's environ
 Its PKI issues the certificates and the CRL files the engine checks, its SIEM receives the forwarded
 logs, and its network controls stay its own. Each is documented per deployment — see
 [DEPLOYMENT.md](DEPLOYMENT.md) and [§11](#11-hardening-roadmap).
-MFA is not among them. The engine enforces its own second factor (`[security].require_mfa`, on by
-default) on any bind. Which accounts it covers, directory and OIDC sign-ins included, is stated in
+MFA is not among them. The engine's own second factor (`[security].require_mfa`, on by default)
+applies on any bind, with one way to meet it outside the engine. While `[auth].oidc_require_mfa_claim`
+is on, the default, the engine checks the identity provider's token for an accepted MFA claim. An OIDC
+session whose token carries one has met the factor. Any other session the requirement covers proves an
+engine factor.
+Which accounts the requirement covers is stated in
 [SECURITY.md](SECURITY.md#multi-factor-authentication-totp-wp-14).
 
 | Actor / vector | In scope? | Mitigation |
