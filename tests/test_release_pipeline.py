@@ -347,8 +347,13 @@ def test_both_engine_sboms_reach_every_sink() -> None:
             lambda st: str(st.get("uses", "")).startswith("actions/attest-build-provenance@")
         ),
         "GitHub release assets": body(lambda st: "gh release create" in str(st.get("run") or "")),
+        # The dry-run upload, by its artifact name: the PyPI hand-over to the publish job is an
+        # upload-artifact step too (vault BACKLOG #2631), and carries no SBOM.
         "workflow artifact upload": body(
-            lambda st: str(st.get("uses", "")).startswith("actions/upload-artifact@")
+            lambda st: (
+                str(st.get("uses", "")).startswith("actions/upload-artifact@")
+                and (st.get("with") or {}).get("name") == "release-artifacts"
+            )
         ),
     }
     # Both walks below draw from this tuple: the Linux SBOM and the Windows one (PR 1849).
@@ -405,57 +410,45 @@ def _despace(text: str) -> str:
 
 
 def test_release_pypi_publish_is_last_step_and_tag_gated() -> None:
-    rel = _release()
-    # Isolate the `release` job (up to the next top-level job) so ordering is measured within it.
-    # The boundary is DERIVED rather than the name of whichever job happened to follow: this read
-    # `rel.split("\n  release-harness:")`, so inserting release-webconsole between the two silently
-    # widened the slice to include it and the assertion then measured the WRONG job's last step.
-    _start = rel.index("\n  release:") + 1
-    _next = re.search(r"^  [a-z][\w-]*:$", rel[_start:], re.M | re.I)
-    _after = re.search(
-        r"^  [a-z][\w-]*:$", rel[_start + (_next.end() if _next else 0) :], re.M | re.I
-    )
-    assert _after, "could not find the job after `release` — the workflow shape moved"
-    release_job = rel[_start:][: (_next.end() if _next else 0) + _after.start()]
+    """The irreversible PyPI upload runs LAST: in its own job, after the whole build job.
 
-    # Step boundaries are `      - name:` / `      - uses:` at the job's step indent.
-    steps = list(re.finditer(r"^      - (?:name|uses): (.+)$", release_job, re.M))
-    assert steps, "could not locate any steps in the release job"
-    last = steps[-1].group(1)
-    assert "Publish to PyPI" in last, (
-        f"the PyPI publish must be the LAST step in the release job (nothing may run AFTER the one "
-        f"irreversible sink) — last step is instead: {last!r}"
-    )
+    Since vault BACKLOG #2631 limb 1 the publish runs in `publish-pypi`, which needs `release`. So
+    "last" has two halves: the build job ends by handing the files over, after build, leak gate,
+    sign and the GitHub release; and the publish job ends with the engine upload.
 
-    # THE GUARD ITSELF IS SECTION (4b)'s, NOT THIS TEST'S. This block asserted the tag gate over raw
-    # text scoped to one step, which cannot see the JOB's `if` — so hoisting the pair to the job (the
-    # DRY-er shape (4b) deliberately accepts, and already how `release-webconsole` gates itself)
-    # would pass there and red here, two tests disagreeing about one invariant. (4b) parses the YAML,
-    # conjoins job and step, and covers every publishing step rather than this one; stating the
-    # rule once and linking is the whole of the fix. What stays here is what (4b) does NOT check:
-    # that the publish is the LAST step, and the step ORDER below.
+    THE GUARD ITSELF IS SECTION (4b)'s, NOT THIS TEST'S: it parses the YAML, conjoins job and step,
+    and covers every publishing step. What stays here is the ORDER.
 
-    # Publish (irreversible) must come AFTER build, leak-gate, sign and the GitHub release.
-    #
-    # This order is load-bearing, not cosmetic: the GitHub release is REVERSIBLE (deletable) and the
-    # PyPI upload is not (a version number is burned forever). Doing the reversible half first is what
-    # made the v0.3.1 publisher failure recoverable at all — a failed publish left a release we could
-    # delete and retry, rather than an un-retryable PyPI version with no release.
-    def idx(tok: str) -> int:
-        i = release_job.find(tok)
-        assert i != -1, f"expected marker missing from release job: {tok!r}"
-        return i
+    This order is load-bearing, not cosmetic: the GitHub release is REVERSIBLE (deletable) and the
+    PyPI upload is not (a version number is burned forever). Doing the reversible half first is what
+    made the v0.3.1 publisher failure recoverable at all.
+    """
+    jobs = _jobs()
+    steps = jobs["release"]["steps"]
+    names = [str(s.get("name") or s.get("uses") or "") for s in steps]
+
+    def at(pred: Callable[[dict], bool], what: str) -> int:
+        hits = [i for i, s in enumerate(steps) if pred(s)]
+        assert len(hits) == 1, f"expected one {what} step in `release`, found {hits}"
+        return hits[0]
 
     order = [
-        idx("Build sdist + wheel"),
-        idx("Leak gate — sdist MUST be package-only"),
-        idx("python -m sigstore sign"),
-        idx("Create or update the GitHub release"),
-        idx("Publish to PyPI"),
+        at(lambda s: str(s.get("name")) == "Build sdist + wheel", "build"),
+        at(lambda s: str(s.get("name", "")).startswith("Leak gate"), "leak gate"),
+        at(lambda s: "python -m sigstore sign" in str(s.get("run") or ""), "sign"),
+        at(lambda s: str(s.get("name")) == "Create or update the GitHub release", "release"),
+        at(lambda s: (s.get("with") or {}).get("name") == "pypi-engine", "hand-over"),
     ]
-    assert order == sorted(order), (
-        f"release steps are out of order — the irreversible PyPI upload must run last: {order}"
+    assert order == sorted(order) and order[-1] == len(steps) - 1, (order, names)
+    assert not any("gh-action-pypi-publish" in str(s.get("uses")) for s in steps), (
+        "the build job publishes to PyPI itself; the publish belongs to publish-pypi"
     )
+
+    publish = jobs["publish-pypi"]
+    assert publish.get("needs") in ("release", ["release"]), publish.get("needs")
+    last = publish["steps"][-1]
+    assert str(last.get("name", "")).startswith("Publish to PyPI"), last
+    assert (last.get("with") or {}).get("packages-dir") == "dist-pub/", last
 
 
 # --- (4b) every mutating step tests the EVENT as well as the ref (BACKLOG #1584) ---------------------
@@ -2338,13 +2331,13 @@ def _runs(needle: str) -> Callable[[dict], bool]:
     return lambda s: needle in _executed_shell(str(s.get("run") or ""))
 
 
-def test_the_toolkit_uploads_inside_the_release_job_before_the_engine() -> None:
+def test_the_toolkit_uploads_before_the_engine_from_the_publish_job() -> None:
     """ADR 0201 section 1: the toolkit's first upload claims its name, and the engine names it.
 
-    So, in the `release` job: the toolkit is built, gated and smoked before the reversible GitHub
-    release and far before any upload; its upload is tag-gated like every publish (section 4b); and it
-    runs immediately before the engine's upload, so a failure in it skips the engine's. A separate
-    job gated on a repository variable would reopen the window the order closes.
+    So the toolkit is built, gated and smoked in the `release` job before the reversible GitHub
+    release and the hand-over; and in `publish-pypi` its upload is tag-gated like every publish
+    (section 4b) and runs immediately before the engine's, so a failure in it skips the engine's.
+    A separate job gated on a repository variable would reopen the window the order closes.
     """
     steps = _release_steps()
     names = [str(s.get("name") or s.get("uses") or "") for s in steps]
@@ -2356,22 +2349,30 @@ def test_the_toolkit_uploads_inside_the_release_job_before_the_engine() -> None:
     gate = at("Member gate — the toolkit wheel")
     smoke = at("Smoke-check the toolkit wheel")
     github_release = at("Create or update the GitHub release")
-    toolkit_upload = at("Publish messagefoundry-toolkit to PyPI")
-    engine_upload = at("Publish to PyPI")
-    assert build < gate < smoke < github_release < toolkit_upload, names
-    assert engine_upload == toolkit_upload + 1 == len(steps) - 1, (
+    handover = at("Hand the PyPI files to the publish job")
+    assert build < gate < smoke < github_release < handover, names
+    assert "toolkit-dist/" in str(steps[handover]["with"]["path"]).split(), steps[handover]
+
+    publish = _jobs()["publish-pypi"]
+    pnames = [str(s.get("name") or s.get("uses") or "") for s in publish["steps"]]
+    toolkit_upload = next(
+        i for i, n in enumerate(pnames) if n.startswith("Publish messagefoundry-toolkit")
+    )
+    assert toolkit_upload == len(pnames) - 2 and pnames[-1].startswith("Publish to PyPI"), (
         "the toolkit upload must be the step immediately before the engine's, which stays last"
     )
-    upload = steps[toolkit_upload]
+    upload = publish["steps"][toolkit_upload]
     assert upload.get("with", {}).get("packages-dir") == "toolkit-dist/", upload
     assert upload.get("with", {}).get("skip-existing") is True, (
         "skip-existing keeps a re-run after a failed engine upload from dying on the toolkit's "
         "already-uploaded file (the v0.3.1 deadlock)"
     )
-    assert "PUBLISH_" not in str(upload.get("if") or ""), (
-        "the toolkit upload is gated on a repository variable -- ADR 0201 rejects that, because an "
-        "unset variable lets an engine that names the toolkit reach PyPI with the name unclaimed"
-    )
+    for cond in (str(upload.get("if") or ""), str(publish.get("if") or "")):
+        assert "PUBLISH_" not in cond, (
+            "the toolkit upload is gated on a repository variable -- ADR 0201 rejects that, because "
+            "an unset variable lets an engine that names the toolkit reach PyPI with the name "
+            "unclaimed"
+        )
     # Never into dist/: that would pull the toolkit into the engine smoke and the staged upload.
     assert "--outdir toolkit-dist" in str(steps[build].get("run") or "")
 
@@ -2413,14 +2414,15 @@ def test_the_toolkit_wheel_is_signed_attested_and_shipped_with_its_bundle() -> N
     upload = _release_step_index(
         lambda s: (
             "upload-artifact" in str(s.get("uses") or "")
+            and (s.get("with") or {}).get("name") == "release-artifacts"
             and "toolkit-dist/" in str((s.get("with") or {}).get("path") or "")
         ),
         "dry-run upload",
     )
     assert "toolkit-sigstore/" in str(steps[upload]["with"]["path"]).split(), steps[upload]
 
-    publish = _release_step_index(_named("Publish messagefoundry-toolkit"), "toolkit publish")
-    assert sign < move < attest < release < publish, (sign, move, attest, release, publish)
+    handover = _release_step_index(_named("Hand the PyPI files to the publish job"), "hand-over")
+    assert sign < move < attest < release < handover, (sign, move, attest, release, handover)
 
 
 @pytest.fixture
@@ -3640,3 +3642,202 @@ def test_the_publish_step_publishes_a_draft_and_leaves_a_published_release_alone
     published = [c for c in calls if c == f"release edit {_TAG} --draft=false"]
     assert len(published) == edits, f"gh calls: {calls}"
     assert not _uploads(calls), calls
+
+
+# --- (14) every PyPI publish runs in a publish-only job that names `pypi` (vault BACKLOG #2631) ------
+#
+# The environment key sits on a whole job. Put on a job that also builds, an approval on the
+# environment would gate the build too, and a tags-only environment would refuse the dispatch
+# dry-run at the job. So the key belongs on jobs that only publish, and those jobs never run on a
+# dispatch at all.
+
+_ENVIRONMENT = "pypi"
+_PUBLISH_ACTION = "pypa/gh-action-pypi-publish@"
+_VERIFY_PREFIX = "The downloaded files are the ones the build job gated"
+
+
+def _environment(job: dict) -> str | None:
+    env = job.get("environment")
+    return str(env.get("name")) if isinstance(env, dict) else (str(env) if env else None)
+
+
+def _publish_jobs() -> dict[str, dict]:
+    jobs = {
+        key: job
+        for key, job in _jobs().items()
+        if any(str(s.get("uses") or "").startswith(_PUBLISH_ACTION) for s in job["steps"])
+    }
+    # Liveness: the engine-and-toolkit, console and harness publishes.
+    assert len(jobs) >= 3, sorted(jobs)
+    return jobs
+
+
+def test_every_pypi_publish_runs_in_a_publish_only_job_that_names_the_environment() -> None:
+    """Mutation: drop `environment: pypi` from a publish job, put a build or checkout step in one,
+    give one a write scope, or let one run on a dispatch. Red here."""
+    problems: list[str] = []
+    for key, job in _publish_jobs().items():
+        if _environment(job) != _ENVIRONMENT:
+            problems.append(f"{key} publishes to PyPI without `environment: {_ENVIRONMENT}`")
+        if job.get("permissions") != {"id-token": "write"}:
+            problems.append(f"{key} holds {job.get('permissions')}, not only id-token: write")
+        for step in job["steps"]:
+            uses = str(step.get("uses") or "")
+            if uses.startswith("actions/checkout@"):
+                problems.append(f"{key} checks out the repository")
+            if "run" in step and not str(step.get("name", "")).startswith(_VERIFY_PREFIX):
+                problems.append(f"{key} runs a command: {step.get('name')!r}")
+        guard = _despace(str(job.get("if") or ""))
+        if not any(_despace(c) in guard for c in _GUARD_CONJUNCTIONS) or "||" in guard:
+            problems.append(
+                f"{key}'s job `if:` lacks the event-and-ref pair, so a dispatch would run it"
+            )
+    assert not problems, "\n".join(problems)
+
+
+def test_only_publish_jobs_name_the_environment() -> None:
+    """A build job naming it would put the approval in front of the build and the dry-run."""
+    named = {key for key, job in _jobs().items() if _environment(job)}
+    assert named == set(_publish_jobs()), (
+        f"jobs naming an environment: {sorted(named)}; only the publish jobs "
+        f"{sorted(_publish_jobs())} may"
+    )
+
+
+def test_a_dispatch_never_schedules_a_job_that_names_the_environment() -> None:
+    """The `pypi` environment admits only tags and waits for a reviewer. A dispatch from a branch
+    that reached a job naming it would be refused there, so the dry-run would fail. Every such job
+    carries the event-and-ref pair at JOB level, with no status function that could widen it.
+
+    Liveness: the publish jobs must be found. Mutation: move a job's pair to its steps, add
+    `|| always()`, or name the environment on a job without the pair. Red here.
+    """
+    named = {key: job for key, job in _jobs().items() if _environment(job)}
+    assert named, "no job names an environment; the derivation matched nothing"
+    problems = []
+    for key, job in named.items():
+        guard = _despace(str(job.get("if") or ""))
+        if not any(_despace(c) in guard for c in _GUARD_CONJUNCTIONS) or "||" in guard:
+            problems.append(f"{key}: `if:` {job.get('if')!r} lacks the event-and-ref pair")
+        widened = [f for f in ("always()", "cancelled()", "failure()") if f in guard]
+        if widened:
+            problems.append(f"{key}: `if:` widens the guard with {widened}")
+    assert not problems, "\n".join(problems)
+
+
+def test_the_engine_release_is_published_only_after_the_engine_is_on_pypi() -> None:
+    """Before the split, the engine's PyPI publish sat inside `release`, so the draft was
+    published only after it. The publish job keeps that order: a refused approval or a failed
+    upload leaves the GitHub release a draft. Mutation: drop `publish-pypi` from
+    `publish-github-release`'s `needs:`. Red here."""
+    assert "publish-pypi" in _upstream(_PUBLISH_JOB), sorted(_upstream(_PUBLISH_JOB))
+
+
+def test_each_publish_job_checks_the_digests_its_producer_recorded() -> None:
+    """The chain from the gated files to the published ones: the publish job needs its producer,
+    reads that producer's `pypi-digests` output, and checks it before any publish step; the
+    producer's output comes from its digest step, which digests the directories it hands over;
+    and every directory published was handed over."""
+    jobs = _jobs()
+    bodies = set()
+    for key, job in _publish_jobs().items():
+        steps = job["steps"]
+        verify = [
+            i for i, s in enumerate(steps) if str(s.get("name", "")).startswith(_VERIFY_PREFIX)
+        ]
+        publishes = [
+            i for i, s in enumerate(steps) if str(s.get("uses") or "").startswith(_PUBLISH_ACTION)
+        ]
+        assert len(verify) == 1 and verify[0] < min(publishes), (key, verify, publishes)
+        bodies.add(steps[verify[0]]["run"])
+        m = re.fullmatch(
+            r"\$\{\{\s*needs\.([\w-]+)\.outputs\.pypi-digests\s*\}\}",
+            str(steps[verify[0]]["env"]["EXPECTED"]),
+        )
+        assert m, steps[verify[0]]["env"]
+        producer = m.group(1)
+        needs = job.get("needs")
+        assert producer in ([needs] if isinstance(needs, str) else list(needs or [])), (key, needs)
+        prod = jobs[producer]
+        assert prod["outputs"]["pypi-digests"] == "${{ steps.pypi-digests.outputs.sha256 }}"
+        digest = next(s for s in prod["steps"] if s.get("id") == "pypi-digests")
+        handover = next(
+            s
+            for s in prod["steps"]
+            if str(s.get("uses") or "").startswith("actions/upload-artifact@")
+            and str((s.get("with") or {}).get("name", "")).startswith("pypi-")
+        )
+        handed = set(str(handover["with"]["path"]).split())
+        digested = set(re.findall(r"([\w-]+/)\*", digest["run"]))
+        assert handed == digested, (producer, handed, digested)
+        fetched = next(
+            s for s in steps if str(s.get("uses") or "").startswith("actions/download-artifact@")
+        )
+        assert fetched["with"]["name"] == handover["with"]["name"], (key, fetched["with"])
+        # WHERE THE FILES LAND. upload-artifact roots an artifact at the common ancestor of its
+        # paths, so ONE directory is stored without its own name, and several top-level ones keep
+        # theirs. Each handed-over directory must land at its own name, or the digest manifest and
+        # `packages-dir` point at nothing on a real tag; a dispatch never downloads, so only this
+        # catches it.
+        target = str(fetched["with"].get("path") or ".").rstrip("/") or "."
+        for directory in handed:
+            name = directory.rstrip("/")
+            landed = target if len(handed) == 1 else f"{target}/{name}".removeprefix("./")
+            assert landed == name, (key, directory, "lands at", landed)
+        for i in publishes:
+            assert steps[i]["with"]["packages-dir"] in handed, (key, steps[i]["with"])
+    assert len(bodies) == 1, "the publish jobs' digest checks differ; they must be one body"
+
+
+def _run_verify(tmp_path: Path, files: dict[str, bytes], manifest: str) -> tuple[int, str]:
+    work = tmp_path / "work"
+    for name, data in files.items():
+        (work / name).parent.mkdir(parents=True, exist_ok=True)
+        (work / name).write_bytes(data)
+    work.mkdir(exist_ok=True)
+    script = tmp_path / "verify.sh"
+    # The engine publish job's copy; the test above holds every copy to the same body.
+    body = next(
+        s["run"]
+        for s in _jobs()["publish-pypi"]["steps"]
+        if str(s.get("name", "")).startswith(_VERIFY_PREFIX)
+    )
+    script.write_bytes(body.encode("utf-8"))
+    env = {
+        **_posix_tool_env(),
+        "EXPECTED": manifest,
+        "RUNNER_TEMP": str(tmp_path).replace("\\", "/"),
+    }
+    rc, out = _run_leak_gate(require_bash(tmp_path, env), work, script, env)
+    assert rc not in (126, 127), explain_returncode(rc, "the digest check") + "\n" + out
+    return rc, out
+
+
+def _sha(data: bytes) -> str:
+    import hashlib
+
+    return hashlib.sha256(data).hexdigest()
+
+
+_FILES = {"dist-pub/a.whl": b"wheel\n", "toolkit-dist/b.whl": b"toolkit\n"}
+_MANIFEST = "\n".join(f"{_sha(d)}  {n}" for n, d in _FILES.items())
+
+
+@pytest.mark.parametrize(
+    ("files", "manifest", "ok", "needle"),
+    [
+        (_FILES, _MANIFEST, True, "verified 2 file(s)"),
+        ({**_FILES, "dist-pub/a.whl": b"other\n"}, _MANIFEST, False, "FAILED"),
+        ({**_FILES, "dist-pub/extra.whl": b"x\n"}, _MANIFEST, False, "not exactly the gated set"),
+        ({"dist-pub/a.whl": _FILES["dist-pub/a.whl"]}, _MANIFEST, False, "toolkit-dist/b.whl"),
+        (_FILES, "", False, "handed over no digests"),
+    ],
+    ids=["match", "changed-byte", "extra-file", "missing-file", "no-digests"],
+)
+def test_the_digest_check_refuses_anything_but_the_gated_files(
+    tmp_path: Path, files: dict[str, bytes], manifest: str, ok: bool, needle: str
+) -> None:
+    """EXECUTED. `match` is the positive control for the four refusals."""
+    rc, out = _run_verify(tmp_path, files, manifest)
+    assert (rc == 0) is ok, f"exit {rc}:\n{out}"
+    assert needle in out, out
