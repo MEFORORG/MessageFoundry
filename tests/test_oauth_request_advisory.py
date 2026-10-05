@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry import redaction
 from messagefoundry.checks import CheckResult, run_checks
 from messagefoundry.config.wiring import (
     OAuthRequestAdvisories,
@@ -363,9 +364,18 @@ def test_check_names_each_finding_and_what_it_did_not_compare(tmp_path: Path) ->
     assert "Each can be a correct setup" in r.detail
     assert "may document an audience that is not its endpoint" in r.detail
     # The stated limit: a quiet audience on an env() url is named, never passed over as clean.
-    assert "NOT COMPARED: 1 setting(s)" in r.detail
+    assert "Not compared: 1 setting(s)" in r.detail
     assert "each for the reason beside it" in r.detail
     assert "does not resolve env(): OB_URL_ENV (url is an env() reference)" in r.detail
+
+
+def test_the_check_line_survives_the_phi_name_heuristic(tmp_path: Path) -> None:
+    # The redaction scrubs two adjacent ALL-CAPS or Title-case words as a possible patient name.
+    # This line is built through a local variable, which the engine-text scan cannot see, so it is
+    # checked here as rendered, with every arm of the text present.
+    r = _line(_config(tmp_path, _MIXED))
+    assert "Not compared" in r.detail and "worth a second look" in r.detail
+    assert redaction._NAME_RUN.findall(r.detail) == []
 
 
 def test_check_says_none_out_loud_and_still_names_what_it_did_not_compare(tmp_path: Path) -> None:
@@ -377,7 +387,7 @@ def test_check_says_none_out_loud_and_still_names_what_it_did_not_compare(tmp_pa
     )
     r = _line(_config(tmp_path / "second", '_oauth("OB_E", audience=env("partner_aud"))\n'))
     assert r.detail.startswith("no oauth2_scope that could be read contains a '*'")
-    assert "NOT COMPARED: 1 setting(s)" in r.detail and "OB_E" in r.detail
+    assert "Not compared: 1 setting(s)" in r.detail and "OB_E" in r.detail
 
 
 def test_check_skips_rather_than_reporting_clean_on_an_unloadable_config(tmp_path: Path) -> None:
