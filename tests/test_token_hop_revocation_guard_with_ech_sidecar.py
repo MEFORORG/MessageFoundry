@@ -41,7 +41,11 @@ from messagefoundry.config.tls_policy import (
 from messagefoundry.config.wiring import Rest
 from messagefoundry.transports import build_destination, smart
 from messagefoundry.transports.http_auth import oauth2_cc_provider_from_settings
-from messagefoundry.transports.rest import opener_tls_context, refuse_unrevoked_verified_hop
+from messagefoundry.transports.rest import (
+    ECH_HOP_WAYS_ACROSS,
+    opener_tls_context,
+    refuse_unrevoked_verified_hop,
+)
 from messagefoundry.transports.smart import token_provider_from_settings
 
 PROD_PHI = HopPosture(enforcing=True)
@@ -159,6 +163,29 @@ def test_an_ech_sidecar_and_a_crl_still_refuse_the_token_hop(
     # CONTROL 2: the sidecar setting is valid, and the per-connection attestation still crosses.
     with active_hop_posture(PROD_PHI):
         _provider(name, settings, crl=bare_crl, ech=True, attested=True)
+
+
+@pytest.mark.parametrize("name", _PROVIDERS)
+def test_the_ech_token_hop_refusal_offers_only_a_lever_that_can_cross_it(
+    name: str, settings_for: dict[str, dict[str, object]], bare_crl: str
+) -> None:
+    """The default refusal offers ``[tls].crl_file`` and an egress proxy. Neither can cross an ECH
+    hop, so its refusal names the attestation alone, in fixed text."""
+    settings = settings_for[name]
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused, match="revocation") as exc:
+        _provider(name, settings, crl=bare_crl, ech=True)
+    text = str(exc.value)
+    assert ECH_HOP_WAYS_ACROSS in text
+    assert "tls_revocation_attested=true" in text and "tls_revocation_attested_reason" in text
+    assert "[tls].crl_file" not in text
+    assert "egress proxy" not in text
+    # CONTROL: without the sidecar, and with no CRL, the refusal is the default text, unchanged.
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused, match="revocation") as exc:
+        _provider(name, settings, crl=None, ech=False)
+    default = str(exc.value)
+    assert ECH_HOP_WAYS_ACROSS not in default
+    assert "Configure [tls].crl_file so the engine checks a CRL on this hop" in default
+    assert "egress proxy" in default
 
 
 @pytest.mark.parametrize("name", _PROVIDERS)

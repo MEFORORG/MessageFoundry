@@ -68,6 +68,7 @@ from messagefoundry.transports.bounded_read import (
 # do. rest.py imports this module's provider LAZILY (inside __init__) so there is no import cycle.
 from messagefoundry.transports.rest import (
     _NO_REDIRECT_OPENER,
+    ECH_HOP_WAYS_ACROSS,
     HttpAuthError,
     ProxyConfig,
     _no_redirect_opener,
@@ -384,6 +385,7 @@ class _TokenEndpointProvider(abc.ABC):
             revocation_attested=revocation_attested,
             revocation_attested_reason=revocation_attested_reason,
             opener=None if ech_sidecar is not None else self._opener,
+            ways_across=ECH_HOP_WAYS_ACROSS if ech_sidecar is not None else None,
             connection=revocation_connection,
         )
         self._proxy_auth: dict[str, str] = (

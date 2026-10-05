@@ -89,6 +89,7 @@ from messagefoundry.transports.signing import MessageSigner, signer_from_destina
 
 __all__ = [
     "DYNAMIC_HEADER_PREFIX",
+    "ECH_HOP_WAYS_ACROSS",
     "InsecureHopGuard",
     "ProxyConfig",
     "RestDestination",
@@ -899,6 +900,17 @@ def opener_tls_context(
     return None if handler is None else urllib_handler_context(handler, connector=connector)
 
 
+#: The ways across a revocation refusal for a hop re-addressed to an ECH sidecar (ADR 0139). The
+#: connection-shaped default offers ``[tls].crl_file`` and an egress proxy, and neither can cross
+#: this hop: the sidecar makes the TLS connection to the peer, so the engine consults no CRL for it,
+#: and ``ech_egress`` excludes ``proxy_url``. Fixed text, with no URL part and no setting value.
+ECH_HOP_WAYS_ACROSS = (
+    "This hop goes through an ECH sidecar, which makes the TLS connection to the peer itself, so "
+    "a CRL configured on the engine cannot check it. Set tls_revocation_attested=true with a "
+    "tls_revocation_attested_reason on this connection."
+)
+
+
 def refuse_unrevoked_verified_hop(
     scheme: str,
     url: str,
@@ -907,6 +919,7 @@ def refuse_unrevoked_verified_hop(
     revocation_attested: bool = False,
     revocation_attested_reason: str | None = None,
     opener: urllib.request.OpenerDirector | None = None,
+    ways_across: str | None = None,
     connection: str | None,
 ) -> None:
     """Refuse a VERIFYING ``https`` hop that does no certificate revocation checking (#201, ADR 0078 amend).
@@ -944,6 +957,11 @@ def refuse_unrevoked_verified_hop(
       the handshake. A CRL on that context is not a check that may relax this refusal, so the hop
       stays refused unless attested (vault BACKLOG #2188).
 
+    ``ways_across`` replaces the remediation sentence of the refusal for a hop the connection-shaped
+    default does not fit (:attr:`RevocationHopGuard.ways_across`). An ECH hop passes
+    :data:`ECH_HOP_WAYS_ACROSS`, so its refusal offers only a lever that can cross it. ``None``
+    keeps the default.
+
     ``connection`` is the declaring connection's name, recorded in the audit line logged when an
     attestation crosses the refusal, so the record leads back to the declaration (ADR 0173).
 
@@ -959,6 +977,7 @@ def refuse_unrevoked_verified_hop(
         attested_reason=revocation_attested_reason,
         connection=connection,
         context=None if opener is None else opener_tls_context(opener, connector=connector),
+        ways_across=ways_across,
     ).enforce_construction()
 
 
@@ -1944,6 +1963,7 @@ class RestDestination(DestinationConnector):
                 revocation_attested=config.tls_revocation_attested,
                 revocation_attested_reason=config.tls_revocation_attested_reason,
                 opener=None if no_crl_evidence else self._opener,
+                ways_across=ECH_HOP_WAYS_ACROSS if self._ech_sidecar is not None else None,
                 connection=config.name,
             )
 

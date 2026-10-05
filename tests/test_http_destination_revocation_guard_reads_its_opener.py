@@ -44,7 +44,7 @@ from messagefoundry.config.tls_policy import (
 from messagefoundry.config.wiring import FHIR, ConnectionSpec, DICOMweb, Rest, Soap
 from messagefoundry.transports import build_destination, dicomweb, fhir, rest, soap
 from messagefoundry.transports.http_auth import HttpAuthError
-from messagefoundry.transports.rest import opener_tls_context
+from messagefoundry.transports.rest import ECH_HOP_WAYS_ACROSS, opener_tls_context
 from tests.test_hop_refusal_revocation import (
     _crl_coverage_ca,
     _crl_coverage_server,
@@ -317,6 +317,23 @@ def test_rest_with_an_ech_sidecar_and_a_crl_is_still_refused(pki: dict[str, str]
     with active_hop_posture(PROD_PHI):
         dest = _build("REST", crl=pki["crl"], revocation_attested=True, extra=_ECH)
     assert _checks_a_crl(dest) is False  # the sidecar hop's opener carries no CRL
+
+
+def test_the_rest_ech_refusal_offers_only_a_lever_that_can_cross_it(pki: dict[str, str]) -> None:
+    """The default refusal offers ``[tls].crl_file`` and an egress proxy. Neither can cross an ECH
+    hop, so its refusal names the attestation alone, in fixed text."""
+    text = _refused("REST", crl=pki["crl"], extra=_ECH)
+    assert ECH_HOP_WAYS_ACROSS in text
+    assert "tls_revocation_attested=true" in text and "tls_revocation_attested_reason" in text
+    assert "[tls].crl_file" not in text
+    assert "egress proxy" not in text
+    assert REMOTE not in ECH_HOP_WAYS_ACROSS and SIDECAR not in ECH_HOP_WAYS_ACROSS
+    # CONTROL: without the sidecar the refusal is the connection-shaped default, unchanged.
+    default = _refused("REST")
+    assert ECH_HOP_WAYS_ACROSS not in default
+    assert "Configure [tls].crl_file so the engine checks a CRL on this hop" in default
+    assert "egress proxy" in default
+    assert "tls_revocation_attested=true" in default
 
 
 # --- which opener the guard is handed, by identity ------------------------------------------------
