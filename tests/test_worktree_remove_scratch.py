@@ -1076,7 +1076,15 @@ def _planted_copy(base: Path, anchor: str, planted: str) -> Path:
     ):
         (repo / rel).parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(_REPO / rel, repo / rel)
-    subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True, text=True)
+    # A repository with one commit: the script must be able to list its worktrees, and that should
+    # not rest on how git answers for a repository that has none yet.
+    for args in (
+        ["init", "-q", "-b", "main", str(repo)],
+        ["-C", str(repo), "config", "user.email", "t@example.invalid"],
+        ["-C", str(repo), "config", "user.name", "t"],
+        ["-C", str(repo), "commit", "-q", "--allow-empty", "-m", "seed"],
+    ):
+        subprocess.run(["git", *args], check=True, capture_output=True, text=True)
     script = repo / "scripts" / "worktree" / "remove-scratch.ps1"
     text = script.read_text(encoding="utf-8")
     assert text.count(anchor) == 1, f"the anchor line matched {text.count(anchor)} times"
