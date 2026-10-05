@@ -185,13 +185,22 @@ async def _assert_idle_rows_hidden_and_purged(store: Any, user_id: str) -> None:
         "the inventory hid a clock-stepped session the user must still be able to see and end"
     )
     assert idle not in listed, "the inventory listed an idle-expired session"
-    assert on_expiry not in listed, "the inventory listed a session at its absolute expiry"
-    assert listed == {fresh, on_idle, ahead}
+    # BACKLOG #2283: `expires_at == now` is live to the validator, so the inventory lists it. It used
+    # to hide it, the one instant where the list and the validator disagreed.
+    assert on_expiry in listed, "the inventory hid a session the validator still accepts"
+    past_expiry = await _session(store, u, created=base - 100, expires=base - 1)
+    listed = {s.token_hash for s in await store.list_sessions(u, now=base, idle_seconds=IDLE)}
+    assert past_expiry not in listed, "the inventory listed a session past its absolute expiry"
+    assert listed == {fresh, on_idle, on_expiry, ahead}
     unfiltered = {s.token_hash for s in await store.list_sessions(u, now=base)}
-    assert unfiltered == {fresh, on_idle, idle, ahead}, "no idle_seconds must mean the old filter"
+    assert unfiltered == {fresh, on_idle, idle, on_expiry, ahead}, (
+        "no idle_seconds must mean the expiry filter alone"
+    )
 
     await store.purge_expired_sessions(now=base)
     assert await store.get_session(idle) is not None, "no idle_seconds must mean no idle purge"
+    assert await store.get_session(past_expiry) is None, "an expired row survived the purge"
+    assert await store.get_session(on_expiry) is not None, "expires_at == now is still live"
     assert await store.purge_expired_sessions(now=base, idle_seconds=IDLE) >= 1
     assert await store.get_session(idle) is None, "an idle-expired row survived the purge"
     assert await store.get_session(on_idle) is not None, "idle == timeout is still live"

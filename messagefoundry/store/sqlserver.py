@@ -12158,13 +12158,13 @@ class SqlServerStore:
         now = time.time() if now is None else now
         if idle_seconds is None:
             rows = await self._fetchall(
-                "SELECT * FROM sessions WHERE user_id=? AND revoked_at IS NULL AND expires_at > ?"
+                "SELECT * FROM sessions WHERE user_id=? AND revoked_at IS NULL AND expires_at >= ?"
                 " ORDER BY last_used_at DESC",
                 (user_id, now),
             )
         else:
             rows = await self._fetchall(
-                "SELECT * FROM sessions WHERE user_id=? AND revoked_at IS NULL AND expires_at > ?"
+                "SELECT * FROM sessions WHERE user_id=? AND revoked_at IS NULL AND expires_at >= ?"
                 " AND ? - last_used_at <= ? ORDER BY last_used_at DESC",
                 (user_id, now, now, float(idle_seconds)),
             )

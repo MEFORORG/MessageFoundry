@@ -8262,14 +8262,14 @@ class PostgresStore:
         now = time.time() if now is None else now
         if idle_seconds is None:
             rows = await self._fetchall(
-                "SELECT * FROM sessions WHERE user_id=$1 AND revoked_at IS NULL AND expires_at > $2"
+                "SELECT * FROM sessions WHERE user_id=$1 AND revoked_at IS NULL AND expires_at >= $2"
                 " ORDER BY last_used_at DESC",
                 user_id,
                 now,
             )
         else:
             rows = await self._fetchall(
-                "SELECT * FROM sessions WHERE user_id=$1 AND revoked_at IS NULL AND expires_at > $2"
+                "SELECT * FROM sessions WHERE user_id=$1 AND revoked_at IS NULL AND expires_at >= $2"
                 " AND $2 - last_used_at <= $3 ORDER BY last_used_at DESC",
                 user_id,
                 now,

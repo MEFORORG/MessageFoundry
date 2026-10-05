@@ -2387,6 +2387,9 @@ class AuthStore(Protocol):
     ) -> list[SessionRecord]:
         """A user's unrevoked sessions not past their absolute expiry, most recently used first.
 
+        A row whose ``expires_at`` equals ``now`` is listed, because the validator still accepts it
+        at that instant (``SessionRecord.is_live``), and the purge keeps it too (BACKLOG #2283).
+
         With ``idle_seconds`` given, sessions idle for longer are hidden too, so the inventory a
         user reads does not list a session the validator refuses for idleness (BACKLOG #2096).
         Callers that only ask "does this user hold any session" pass nothing, and the answer is

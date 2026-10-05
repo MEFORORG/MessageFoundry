@@ -12315,13 +12315,13 @@ class MessageStore:
         async with self._read() as db:
             if idle_seconds is None:
                 cur = await db.execute(
-                    "SELECT * FROM sessions WHERE user_id=? AND revoked_at IS NULL AND expires_at > ?"
+                    "SELECT * FROM sessions WHERE user_id=? AND revoked_at IS NULL AND expires_at >= ?"
                     " ORDER BY last_used_at DESC",
                     (user_id, now),
                 )
             else:
                 cur = await db.execute(
-                    "SELECT * FROM sessions WHERE user_id=? AND revoked_at IS NULL AND expires_at > ?"
+                    "SELECT * FROM sessions WHERE user_id=? AND revoked_at IS NULL AND expires_at >= ?"
                     " AND ? - last_used_at <= ? ORDER BY last_used_at DESC",
                     (user_id, now, now, float(idle_seconds)),
                 )
