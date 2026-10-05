@@ -697,17 +697,14 @@ class FhirDestination(DestinationConnector):
             # no OCSP/CRL revocation — refuse an off-loopback production-PHI verified hop unless
             # revocation is attested or this hop's own opener checks a CRL (composes with #200).
             #
-            # LAST IN __init__, below every statement that builds or replaces `self._opener` (vault
-            # BACKLOG #2188). The guard reads that opener's TLS context, so a `[tls].crl_file` that
-            # reached this hop relaxes the refusal. Called above the opener it had no context to read,
-            # and refused a hop that checks a CRL while advising the operator to configure one.
+            # Last in __init__, below every statement that builds or replaces `self._opener`, and no
+            # opener with tls_allow_expired: see refuse_unrevoked_verified_hop.
             refuse_unrevoked_verified_hop(
                 scheme,
                 self.base_url,
                 connector="FHIR destination",
                 revocation_attested=config.tls_revocation_attested,
                 revocation_attested_reason=config.tls_revocation_attested_reason,
-                # None with tls_allow_expired: see refuse_unrevoked_verified_hop.
                 opener=None if bool(s.get("tls_allow_expired", False)) else self._opener,
                 connection=config.name,
             )

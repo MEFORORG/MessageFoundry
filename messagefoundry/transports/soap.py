@@ -510,10 +510,8 @@ class SoapDestination(DestinationConnector):
         # hop's own opener checks a CRL. Gated on verify-ON so it is disjoint from the verify_tls=false
         # / cleartext #200 gates.
         #
-        # BELOW every statement that builds or replaces `self._opener` (vault BACKLOG #2188). The guard
-        # reads that opener's TLS context, so a `[tls].crl_file` that reached this hop relaxes the
-        # refusal. Called above the opener it had no context to read, and refused a hop that checks a
-        # CRL while advising the operator to configure one.
+        # Below every statement that builds or replaces `self._opener`, and no opener with
+        # tls_allow_expired: see refuse_unrevoked_verified_hop.
         if bool(s.get("verify_tls", True)):
             refuse_unrevoked_verified_hop(
                 scheme,
@@ -521,7 +519,6 @@ class SoapDestination(DestinationConnector):
                 connector="SOAP destination",
                 revocation_attested=config.tls_revocation_attested,
                 revocation_attested_reason=config.tls_revocation_attested_reason,
-                # None with tls_allow_expired: see refuse_unrevoked_verified_hop.
                 opener=None if bool(s.get("tls_allow_expired", False)) else self._opener,
                 connection=config.name,
             )

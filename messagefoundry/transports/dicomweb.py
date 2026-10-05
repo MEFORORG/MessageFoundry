@@ -280,10 +280,7 @@ class DicomWebDestination(DestinationConnector):
             # on the verify-ON https path, disjoint from the cleartext/verify-off gates above, so no hop
             # is ever double-refused).
             #
-            # BELOW `self._opener` (vault BACKLOG #2188), which nothing later replaces. The guard reads
-            # that opener's TLS context, so a `[tls].crl_file` that reached this hop relaxes the
-            # refusal. Called above the opener it had no context to read, and refused a hop that checks
-            # a CRL while advising the operator to configure one.
+            # Below `self._opener`, which nothing later replaces: see refuse_unrevoked_verified_hop.
             refuse_unrevoked_verified_hop(
                 scheme,
                 self.base_url,

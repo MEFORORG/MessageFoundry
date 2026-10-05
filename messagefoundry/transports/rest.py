@@ -1946,15 +1946,8 @@ class RestDestination(DestinationConnector):
             # #200: it keys on the verify-ON https path, disjoint from the cleartext / verify-off gates
             # above, so no hop is ever double-refused.
             #
-            # LAST IN __init__, below every statement that builds or replaces `self._opener` (vault
-            # BACKLOG #2188). The guard reads that opener's TLS context, so a `[tls].crl_file` that
-            # reached this hop relaxes the refusal. Called above the opener it had no context to read,
-            # and refused a hop that checks a CRL while advising the operator to configure one.
-            #
-            # With an ECH sidecar it gets NO opener. The engine dials the loopback sidecar, which
-            # verifies the destination itself, so no context the engine holds checks that peer.
-            # With tls_allow_expired it gets none either: that opener skips validity-period checks,
-            # a CRL's own included, so its CRL is not evidence this guard accepts.
+            # Last in __init__, below every statement that builds or replaces `self._opener`, and no
+            # opener with an ECH sidecar or tls_allow_expired: see refuse_unrevoked_verified_hop.
             no_crl_evidence = self._ech_sidecar is not None or bool(
                 s.get("tls_allow_expired", False)
             )
