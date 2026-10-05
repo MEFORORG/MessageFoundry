@@ -112,8 +112,9 @@ def test_the_risky_component_guard_is_IN_the_lane() -> None:
     ``docs/RISKY-COMPONENTS.md`` is classified docs-only, so a pull request that edits only that page
     skips the main suite. ``tests/test_risky_component_designation.py`` holds the page's tables,
     counts and dates to its reference files: the ``security/runtime-closure-*.txt`` closures, the
-    ``docker/locks`` and ``security/locks`` files they copy, and ``security/risky-component-readings.json``. A page-only edit is
-    exactly how those drift. Without this pin, deleting the module from DOC_GUARDS passes every other
+    ``docker/locks`` and ``security/locks`` files they copy, ``security/risky-component-readings.json``
+    and ``security/bundled-code-survey.json`` (BACKLOG #2935). A page-only edit is exactly how those
+    drift. Without this pin, deleting the module from DOC_GUARDS passes every other
     check here, and the guard is met only in the merge queue.
 
     The reference files need no lane membership: they are not on the docs-only allowlist, so a change
@@ -135,6 +136,7 @@ def test_the_risky_component_guard_is_IN_the_lane() -> None:
     )
     for ref in (
         "security/risky-component-readings.json",
+        "security/bundled-code-survey.json",
         "security/runtime-closure-core.txt",
         "security/runtime-closure-sqlserver.txt",
         "security/runtime-closure-harness.txt",

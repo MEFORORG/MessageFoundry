@@ -94,6 +94,7 @@ from messagefoundry.transports.rest import (
     _insecure_opener,
     _no_redirect_opener,
     _redact_url,
+    assert_probe_hop,
     auth_challenge_refused,
     capture_response_headers,
     cleartext_acceptance_from_settings,
@@ -179,10 +180,24 @@ _TRANSIENT_ISSUE_CODES = frozenset(
 # allow-listed host (the [egress].allowed_http gate pins the host, not the path).
 # `\Z`, never `$`: Python's `$` also matches immediately BEFORE a final newline, so `^[A-Za-z]+$`
 # accepted "Patient\n" and the gate did not enforce the grammar it advertises. Anchoring the pattern
-# fixes every caller at once -- `match` vs `fullmatch` is a property of the CALL, and there are three
-# call sites (:189, :698, :704), so a per-call fix leaves the next one to re-introduce it.
+# fixes every caller at once -- `match` vs `fullmatch` is a property of the CALL, and there are at
+# least three call sites (`_validate_path_token`, two in `_resolve_read_url`), so a per-call fix
+# leaves the next one to re-introduce it.
 _FHIR_TYPE_RE = re.compile(r"^[A-Za-z]+\Z")
 _FHIR_ID_RE = re.compile(r"^[A-Za-z0-9.\-]{1,64}\Z")
+# An id that goes into a URL PATH: the id grammar, minus an id of only dots ('.', '..', '...').
+# `_FHIR_ID_RE` admits all three, and percent-encoding leaves '.' as it is, so each would be sent as
+# the last path segment. '.' and '..' are RFC 3986 dot segments (section 5.2.4). The engine does not
+# remove them: it sends the path as built, and the [egress].allowed_http check compares the base
+# URL's host and port when the connection is built, so it never sees a per-call path. A proxy or
+# server that removes dot segments after the engine would read 'Patient/..' as the base and
+# 'Patient/.' as the type, on the same allow-listed host (vault BACKLOG #1589).
+# tests/test_fhir_read_dot_only_id.py pins the engine half of that; what a given proxy or server
+# does was not measured. '...' is no dot segment: it is refused only because an id of dots alone is
+# never a real resource id. Used by at least the update id (`_require_id`) and the `fhir_lookup`
+# read id (`_resolve_read_url`). `_FHIR_ID_RE` stays the plain grammar for an id-typed value that is
+# not a path segment, such as meta.versionId inside an ETag.
+_FHIR_PATH_ID_RE = re.compile(r"^(?!\.+\Z)[A-Za-z0-9.\-]{1,64}\Z")
 
 
 def _operation_outcome(body: str) -> dict[str, Any] | None:
@@ -644,17 +659,6 @@ class FhirDestination(DestinationConnector):
             )
 
         if bool(s.get("verify_tls", True)):
-            # #201 (ADR 0078 amendment): the verify-ON https hop validates the FHIR-server cert but does no
-            # OCSP/CRL revocation — refuse an off-loopback production-PHI verified hop unless revocation is
-            # attested (loopback / synthetic / non-prod / attested byte-identical; composes with #200).
-            refuse_unrevoked_verified_hop(
-                scheme,
-                self.base_url,
-                connector="FHIR destination",
-                revocation_attested=config.tls_revocation_attested,
-                revocation_attested_reason=config.tls_revocation_attested_reason,
-                connection=config.name,
-            )
             # #129 (ADR 0094): granular expiry-only relaxation — verify chain + hostname but tolerate an
             # expired FHIR-server cert (opt-in; default off = the shared verifying opener, byte-identical).
             # #1180 (ADR 0093): the client trust anchor for this https hop.
@@ -706,6 +710,22 @@ class FhirDestination(DestinationConnector):
                 # cannot reach this hop (ASVS 12.1.2).
                 self._opener = _no_redirect_opener()
             self._opener.add_handler(digest)
+        if bool(s.get("verify_tls", True)):
+            # #201 (ADR 0078 amendment): the verify-ON https hop validates the FHIR-server cert but does
+            # no OCSP/CRL revocation — refuse an off-loopback production-PHI verified hop unless
+            # revocation is attested or this hop's own opener checks a CRL (composes with #200).
+            #
+            # Last in __init__, below every statement that builds or replaces `self._opener`, and no
+            # opener with tls_allow_expired: see refuse_unrevoked_verified_hop.
+            refuse_unrevoked_verified_hop(
+                scheme,
+                self.base_url,
+                connector="FHIR destination",
+                revocation_attested=config.tls_revocation_attested,
+                revocation_attested_reason=config.tls_revocation_attested_reason,
+                opener=None if bool(s.get("tls_allow_expired", False)) else self._opener,
+                connection=config.name,
+            )
 
     def _build_headers(self, s: dict[str, Any]) -> dict[str, str]:
         """FHIR media type on Content-Type + Accept + static ``headers`` + optional bearer/basic auth."""
@@ -806,15 +826,9 @@ class FhirDestination(DestinationConnector):
         # path gates serve both.
         _reject_control_chars(peek.id, "resource id")
         # Grammar-gate the message-derived id so '../$reindex'-style traversal can't redirect the write.
-        _validate_path_token(peek.id, _FHIR_ID_RE, "resource id")
-        if not peek.id.strip("."):
-            # The id grammar admits '.' and '..', which a path resolver reads as this level or the
-            # parent: 'Patient/..' would aim the write at the base.
-            raise NegativeAckError(
-                "FHIR resource id is not a valid FHIR token/id",
-                code="bad-request-value",
-                permanent=True,
-            )
+        # The path-id pattern also refuses '.' and '..', which a path resolver reads as this level or
+        # the parent: 'Patient/..' would aim the write at the base.
+        _validate_path_token(peek.id, _FHIR_PATH_ID_RE, "resource id")
         return peek.id
 
     @staticmethod
@@ -876,6 +890,8 @@ class FhirDestination(DestinationConnector):
         # Reachability only: a GET of the FHIR base metadata (CapabilityStatement) reaches the server
         # without POSTing a resource. Any HTTP response means the host answered; 401/403 means the
         # configured credentials would be rejected. Connection/DNS/TLS/timeout always fails.
+        # BACKLOG #2196: the hop re-check _post runs, before the bearer is minted below.
+        assert_probe_hop(self._hop_guard, self.base_url, connector="FHIR")
         url = f"{self.base_url.rstrip('/')}/metadata"
         headers = self._headers
         if self._token_provider is not None:
@@ -953,9 +969,7 @@ class FhirDestination(DestinationConnector):
         # a byte crosses. ``url`` is a per-message write path but its host is always the base_url host, so
         # a None guard (secure/loopback base) is byte-identical.
         if self._hop_guard is not None:
-            self._hop_guard.assert_send(
-                urllib.parse.urlsplit(self.base_url).hostname or "", _redact_url(self.base_url)
-            )
+            self._hop_guard.assert_send_url(self.base_url)
         data = encode_wire_body(payload, self.encoding, transport="FHIR")
         headers = {**self._headers, **extra_headers}
         if self._token_provider is not None:
@@ -1162,7 +1176,7 @@ def _resolve_read_url(
     path = type_seg
     if len(segments) == 2:
         resource_id = segments[1]
-        if not _FHIR_ID_RE.match(resource_id):
+        if not _FHIR_PATH_ID_RE.match(resource_id):  # also refuses an id of only dots
             raise ValueError("FHIR read id is not a valid FHIR id")
         path = f"{type_seg}/{urllib.parse.quote(resource_id, safe='')}"
     url = f"{base.rstrip('/')}/{path}"
@@ -1337,7 +1351,10 @@ class FhirLookupExecutor:
                 # server is the most on-point instance of 12.3.4's condition in the product, and it
                 # could not name an anchor at all.
                 lookup_anchor = http_family_trust_anchor(
-                    s, url=url, trust_anchor_policy=trust_anchor_policy
+                    s,
+                    url=url,
+                    trust_anchor_policy=trust_anchor_policy,
+                    cell=f"FhirLookup {cname!r}",
                 )
                 self._opener[cname] = (
                     _no_redirect_opener(*proxy_handlers, trust_anchor=lookup_anchor)
@@ -1427,15 +1444,15 @@ class FhirLookupExecutor:
         A refusal is a :class:`FhirLookupError`, like every other failure of this executor. The raw
         ``InsecureHopRefused`` is a ``ValueError``, which the sandbox worker does not catch, so it
         reached the Handler as a crash rather than as a lookup error (BACKLOG #2059). Its text names
-        the redacted base and the host, as the sibling arms here do."""
+        the redacted base and the host, as the sibling arms here do. For a base with no host it
+        names neither (BACKLOG #2207)."""
         from messagefoundry.config.fhir_lookup import FhirLookupError
 
         guard = self._hop_guard.get(connection)
         if guard is None:
             return
-        base = self._base[connection]
         try:
-            guard.assert_send(urllib.parse.urlsplit(base).hostname or "", _redact_url(base))
+            guard.assert_send_url(self._base[connection])
         except InsecureHopRefused as exc:
             raise FhirLookupError(f"{prefix}: {exc}") from exc
 

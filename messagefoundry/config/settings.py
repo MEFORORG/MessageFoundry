@@ -2714,8 +2714,8 @@ class AuthSettings(_Section):
     # re-verified its credential -- at login, via POST /me/reauth, or with a code at
     # POST /auth/mfa-verify (or their console twins) -- within this many seconds. A LOCAL login
     # that owes no second factor counts as the first verification (sudo-timestamp model) unless the
-    # account has signed in before and this address is not among its recent completed sign-ins (at
-    # most 200 rows of each kind and 90 days back; BACKLOG #288, _classify_login_address). That
+    # account has signed in before and this address is not among its recent completed sign-ins
+    # (BACKLOG #288; the record and its lookback are _classify_login_address's to say). That
     # check fails open on no address or a failed read. A combined password-plus-TOTP sign-in counts
     # from any address (ADR 0197). A directory login (Kerberos, OIDC) never does (BACKLOG #1144).
     # Default 5 minutes.

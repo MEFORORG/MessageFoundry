@@ -60,6 +60,7 @@ from messagefoundry.config.tls_policy import (
     enforce_insecure_hop,
     harden_cipher_suites,
     hop_name_prefix,
+    hop_url_host,
     insecure_hop_disposition,
     is_loopback_hop_host,
     narrow_to_approved_suites,
@@ -89,6 +90,7 @@ from messagefoundry.transports.signing import MessageSigner, signer_from_destina
 
 __all__ = [
     "DYNAMIC_HEADER_PREFIX",
+    "ECH_HOP_WAYS_ACROSS",
     "InsecureHopGuard",
     "ProxyConfig",
     "RestDestination",
@@ -365,6 +367,7 @@ def http_family_trust_anchor(
     *,
     url: str,
     trust_anchor_policy: TrustAnchorPolicy | None,
+    cell: str = "HTTP-family trust anchor",
 ) -> TrustAnchor:
     """Resolve the client trust anchor for an https hop in the HTTP egress family (#1180, ADR 0093).
 
@@ -375,11 +378,17 @@ def http_family_trust_anchor(
 
     Total by construction — a policy-less build (a direct test construction) resolves to
     :data:`~messagefoundry.config.tls_policy.SYSTEM_TRUST_ANCHOR`, which is the same value the shipped
-    default resolves to, so callers have ONE "nothing configured" value to handle rather than two."""
+    default resolves to, so callers have ONE "nothing configured" value to handle rather than two.
+
+    A ``url`` that names no host raises ``ValueError`` (:func:`hop_url_host`, BACKLOG #2207). Read as
+    ``""`` it took the loopback arm, which drops the instance CA and the CRL from a hop nobody can
+    place. ``cell`` leads that refusal. The two token-endpoint factories resolve the anchor before
+    their provider checks the URL, so they pass the setting's name and the operator learns which
+    URL to fix."""
     ca = settings.get("tls_ca_file")
     return resolve_trust_anchor(
         connection_ca_file=str(ca) if ca else None,
-        host=urllib.parse.urlsplit(url).hostname or "",
+        host=hop_url_host(url, cell=cell),
         policy=trust_anchor_policy if trust_anchor_policy is not None else TrustAnchorPolicy(),
     )
 
@@ -463,6 +472,33 @@ def _expiry_relaxed_opener(
     )
 
 
+def _port_fields(netloc: str) -> tuple[str, ...]:
+    """Every port field a reader takes from ``netloc``; empty when no reader sees a port.
+
+    Two readers, because they disagree. ``urlsplit`` reads the RAW authority, after an IPv6
+    literal's ``]`` or else after the first ``:``. urllib unquotes the host before ``http.client``
+    reads it, after the last ``:`` that follows any ``]``. So ``svc%3A12`` dials port 12, and
+    ``svc:ab%5Dc`` hides its port from ``http.client`` alone. The caller has refused userinfo."""
+    fields: list[str] = []
+    raw = netloc.partition("]")[2] if netloc.startswith("[") else netloc
+    if ":" in raw:
+        fields.append(raw.partition(":")[2])
+    dial = urllib.parse.unquote(netloc)
+    colon = dial.rfind(":")
+    if colon > dial.rfind("]"):
+        fields.append(dial[colon + 1 :])
+    return tuple(fields)
+
+
+def _is_port(value: str) -> bool:
+    """Is ``value`` empty or a number from 0 to 65535? Leading zeros count, since ``urlsplit`` and
+    ``http.client`` both accept them. The length is capped before ``int``, so nothing raises."""
+    digits = value.lstrip("0")
+    return value == "" or (
+        value.isascii() and value.isdigit() and len(digits) <= 5 and int(digits or "0") <= 65535
+    )
+
+
 def _redact_url(url: str) -> str:
     """``scheme://host[:port]/path`` only — drops query/userinfo so a token or PHI in the query
     string never reaches a log line.
@@ -470,8 +506,21 @@ def _redact_url(url: str) -> str:
     A port that is not a number is DROPPED, never echoed, and never raised (BACKLOG #1793). A password
     holding an unencoded ``/`` makes ``urlsplit`` read its head as the port, and ``SplitResult.port``
     raises a ``ValueError`` that quotes it. Every classified ``except`` arm calls this, so a raise here
-    would escape that arm unclassified, carrying the password head with it."""
+    would escape that arm unclassified, carrying the password head with it.
+
+    An ``@`` after the authority WITHHOLDS the host, port and path (BACKLOG #2686). A password holding
+    an unencoded ``/``, ``?`` or ``#`` ends the authority early, so the username is read as the host
+    and the password's tail, with the real host, as the path. ``svc:12/ss@host`` and an ``@`` that is
+    only an email in a query look the same to a parser, so neither names a host, as ``_peer_label``
+    does in ``config/wiring.py``. The ``@`` is read after unquoting, so ``%40`` counts. A host that
+    holds ``@`` or ``:`` once unquoted is withheld too: ``svc%3APW%40host`` is a userinfo urllib
+    unquotes, and ``hostname`` would print it whole. An IPv6 literal, zone and all, keeps its host."""
     p = urllib.parse.urlsplit(url)
+    encoded_userinfo = not p.netloc.rpartition("@")[2].startswith("[") and any(
+        c in urllib.parse.unquote(p.hostname or "") for c in "@:"
+    )
+    if encoded_userinfo or "@" in urllib.parse.unquote(f"{p.path}{p.query}{p.fragment}"):
+        return f"{p.scheme}://<redacted>"
     try:
         port = f":{p.port}" if p.port else ""
     except ValueError:
@@ -495,34 +544,56 @@ def refuse_url_credentials(
     out in the request line and the ``Host`` header. So the shape never authenticated anything, and its
     error text carried the password into ``queue.last_error`` and the test-connection reply.
 
-    TWO CHECKS, because ``urlsplit`` misses one shape. An ``@`` in the authority is userinfo; it is
-    tested after unquoting because urllib unquotes the host, so ``%40`` leaks exactly like ``@``. A port
-    that is not a number is what a password holding an unencoded ``/``, ``?`` or ``#`` looks like: the
-    authority stops there, no ``@`` is seen, and the password's head becomes the port. An EMPTY port
-    (``host:/``) passes, because ``urlsplit`` reads it as no port and ``http.client`` as the default.
+    At least three shapes are refused, all read after unquoting, because urllib unquotes the host: so
+    ``%40`` leaks exactly like ``@`` and ``%3A`` names a port like ``:``. An ``@`` in the authority is
+    userinfo. A port that is not a number is what a password holding an unencoded ``/``, ``?`` or
+    ``#`` looks like: the authority stops there, no ``@`` is seen, and the password's head becomes the
+    port. When that head is a number or empty the port passes, so an ``@`` after a port is refused
+    too (BACKLOG #2686). An EMPTY port (``host:/``) with no ``@`` after it passes, because ``urlsplit``
+    reads it as no port and ``http.client`` as the default. Not every shape is caught: an ``@`` with
+    no port is ordinary path text, and the comment on the third check names another.
 
     ``proxy_url`` is deliberately NOT screened here: a forward-proxy URL legitimately carries its own
     credentials, and #1207 masks them for display.
 
     PHI- and secret-safe: names the setting, never the URL or any part of it. ``error`` keeps each
     seam's own ``ValueError`` subclass, so a caller catching ``HttpAuthError`` still catches this."""
-    p = urllib.parse.urlsplit(url)
+    # Raised after the handler ends: urlsplit's NFKC ValueError quotes the whole netloc, password and
+    # all, and ``from None`` would leave it on ``__context__`` (#1796).
+    try:
+        parsed: urllib.parse.SplitResult | None = urllib.parse.urlsplit(url)
+    except ValueError:
+        parsed = None
+    if parsed is None:
+        raise error(
+            f"{setting} is not a URL that can be parsed. A password written into the URL can "
+            f"cause this; set credentials in {use} instead"
+        )
+    p = parsed
     if "@" in urllib.parse.unquote(p.netloc):
         raise error(
             f"{setting} must not carry credentials in the URL (the user:password@ part); "
             f"set them in {use} instead"
         )
-    # Raised after the handler ends: the port's ValueError quotes the port field, which is the
-    # password in ``https://svc:PW/path``, and ``from None`` would leave it on ``__context__`` (#1796).
-    numeric_port = True
-    try:
-        p.port  # noqa: B018 - evaluated only for the ValueError a non-numeric port raises
-    except ValueError:
-        numeric_port = False
-    if not numeric_port:
+    # Read as strings, never through ``p.port``: its ValueError quotes the port field, which is the
+    # password in ``https://svc:PW/path`` (#1796).
+    ports = _port_fields(p.netloc)
+    if not all(_is_port(port) for port in ports):
         raise error(
             f"{setting} has a port that is not a number from 0 to 65535. A password written "
             f"into the URL can cause this; set credentials in {use} instead"
+        )
+    # A numeric password head passes the port check (BACKLOG #2686): ``svc:12/ss@host`` reads as
+    # host ``svc``, port 12. Refused when an ``@`` follows the port in the path, or anywhere after
+    # it when the path is empty (the ``?`` and ``#`` heads), or in a fragment, which is never sent.
+    # An ``@`` in a query value after a real path still passes; so does any ``@`` with no port. That
+    # leaves a password such as ``12/a?b`` constructible; ``_redact_url`` still withholds it.
+    tail = p.path + (p.query if not p.path else "") + p.fragment
+    if ports and "@" in tail:
+        raise error(
+            f"{setting} has a port followed by an '@'. A password written into the URL can cause "
+            f"this; set credentials in {use} instead. Write a literal '@' as %40, or leave out a "
+            "default port"
         )
 
 
@@ -629,7 +700,15 @@ class InsecureHopGuard:
     connection: str | None = None
 
     def assert_send(self, host: str, redacted_url: str) -> None:
-        """Re-assert (zero I/O) that ``host`` is still a permitted hop under the captured posture."""
+        """Re-assert (zero I/O) that ``host`` is still a permitted hop under the captured posture.
+
+        An empty ``host`` is refused whatever the posture (BACKLOG #2207): the authority below reads
+        ``""`` as loopback and would ALLOW it. The text is fixed and names no part of the URL."""
+        if not host:
+            raise InsecureHopRefused(
+                f"{hop_name_prefix(self.connection)}{self.cell}: send-time refusal: the URL names "
+                "no host, so the hop cannot be judged on-box or off-box"
+            )
         if (
             _shipped_strict_disposition(
                 self.posture,
@@ -644,6 +723,39 @@ class InsecureHopGuard:
                 f"{hop_name_prefix(self.connection)}{self.cell}: send-time refusal — insecure hop to {host!r} ({redacted_url}) "
                 "is not permitted under the instance posture"
             )
+
+    def assert_send_url(self, url: str) -> None:
+        """:meth:`assert_send` for the hop ``url`` names. The HTTP-family send-time sites call it.
+
+        The host is read by :func:`hop_url_host`, the check the construction guards use, so a
+        caller of this method cannot fall through to ``""`` (BACKLOG #2207). Its ``ValueError``
+        becomes the :class:`InsecureHopRefused` that :meth:`assert_send` raises for an empty host,
+        so each caller reports a missing host as it reports any refused hop."""
+        try:
+            host = hop_url_host(url, cell=self.cell)
+        except ValueError:
+            host = ""
+        # _redact_url splits the URL again, so it is skipped for a URL that would not split.
+        self.assert_send(host, _redact_url(url) if host else "")
+
+
+def assert_probe_hop(guard: InsecureHopGuard | None, url: str, *, connector: str) -> None:
+    """Run a destination's send-time hop re-check for its test-connection probe (BACKLOG #2196).
+
+    The probe crosses the same hop as ``_post``, and the REST and FHIR probes mint a bearer for it.
+    So each ``_probe`` calls this first, before a token is minted or a byte crosses. A ``None``
+    guard (a secure or loopback hop) does nothing.
+
+    A refusal is a :class:`DeliveryError`, as a probe's other failures are. The raw
+    :class:`InsecureHopRefused` is a ``ValueError``, which would reach the test-connection route's
+    catch-all as an unclassified failure. The refusal text names the connection, the cell, the
+    host and the redacted URL, and no message content. For a URL with no host it names neither."""
+    if guard is None:
+        return
+    try:
+        guard.assert_send_url(url)
+    except InsecureHopRefused as exc:
+        raise DeliveryError(f"{connector} probe refused: {exc}") from exc
 
 
 def _enforce_shipped_hop(
@@ -734,24 +846,10 @@ def _hop_guard_host(url: str, *, cell: str) -> str:
     """The host the hop guards below decide on. A URL whose authority names none (``https:///x``,
     ``https://:443/x``) raises :class:`ValueError`, whatever the posture (BACKLOG #1924).
 
-    Each guard keys its on-box carve-out on :func:`is_loopback_hop_host`, which reads ``""`` as
-    loopback, and at least one caller elsewhere relies on that. So the old ``hostname or ""`` let
-    the one hop a guard cannot classify cross as on-box. What such a URL dials is not knowable here:
-    an empty host can resolve to this box's own network addresses rather than to loopback. So the
-    remedy is the URL, and no posture, attestation or acceptance crosses this.
-
-    A plain ``ValueError`` and not :class:`InsecureHopRefused`: the token-endpoint and Digest seams
-    re-raise that type with posture advice ("attest the hop", "declare cleartext_accepted") that
-    cannot fix a missing host. The loader surfaces both types the same way. The message names no
-    part of the URL, because a proxy URL's userinfo can spill into what ``urlsplit`` reads as its
-    path."""
-    host = urllib.parse.urlsplit(url).hostname
-    if not host:
-        raise ValueError(
-            f"{cell}: the URL names no host, so the hop cannot be judged on-box or off-box. "
-            "Give the URL a host."
-        )
-    return host
+    The check itself is :func:`~messagefoundry.config.tls_policy.hop_url_host`, which the send-time
+    re-checks and the trust-anchor lookups share (BACKLOG #2207). Its docstring says why the error
+    is a plain ``ValueError`` and why the message names no part of the URL."""
+    return hop_url_host(url, cell=cell)
 
 
 def refuse_cleartext_credential_hop(
@@ -932,6 +1030,17 @@ def opener_tls_context(
     return None if handler is None else urllib_handler_context(handler, connector=connector)
 
 
+#: The ways across a revocation refusal for a hop re-addressed to an ECH sidecar (ADR 0139). The
+#: connection-shaped default offers ``[tls].crl_file`` and an egress proxy, and neither can cross
+#: this hop: the sidecar makes the TLS connection to the peer, so the engine consults no CRL for it,
+#: and ``ech_egress`` excludes ``proxy_url``. Fixed text, with no URL part and no setting value.
+ECH_HOP_WAYS_ACROSS = (
+    "This hop goes through an ECH sidecar, which makes the TLS connection to the peer itself, so "
+    "a CRL configured on the engine cannot check it. Set tls_revocation_attested=true with a "
+    "tls_revocation_attested_reason on this connection."
+)
+
+
 def refuse_unrevoked_verified_hop(
     scheme: str,
     url: str,
@@ -939,7 +1048,8 @@ def refuse_unrevoked_verified_hop(
     connector: str,
     revocation_attested: bool = False,
     revocation_attested_reason: str | None = None,
-    opener: urllib.request.OpenerDirector | None = None,
+    opener: urllib.request.OpenerDirector | None,
+    ways_across: str | None = None,
     connection: str | None,
 ) -> None:
     """Refuse a VERIFYING ``https`` hop that does no certificate revocation checking (#201, ADR 0078 amend).
@@ -960,8 +1070,29 @@ def refuse_unrevoked_verified_hop(
     that resolved against THIS hop's host — making the anchor ``narrow`` and putting
     ``VERIFY_CRL_CHECK_LEAF`` on a per-hop opener — relaxes the gate instead of being refused with
     advice to configure the CRL it already has. **Callers that pass it must call this AFTER building
-    the opener**; omitting it keeps the pre-#1498 behaviour, which is correct for a caller whose hop
-    rides the shared import-time opener that can carry no CRL.
+    the opener**, and after every later statement that replaces it or adds a handler to it.
+
+    It is REQUIRED, with no default, so a caller cannot leave it out by accident: a hop whose opener
+    carries a CRL would then be refused and told to configure the CRL it has (vault BACKLOG #2188).
+    Pass ``None`` on purpose, in at least these cases:
+
+    - A caller whose hop rides the shared import-time opener, which can carry no CRL. Passing that
+      opener gives the same answer.
+    - A hop re-addressed to an ECH sidecar (ADR 0139). ``None`` is required there: the engine dials
+      the loopback sidecar and the sidecar verifies the real peer, so no context the engine holds
+      checks that peer's certificate (vault BACKLOG #2188 for the REST destination, #2169 for the
+      SMART and OAuth2 token hop).
+    - An opener built with ``tls_allow_expired`` (ADR 0094). ``None`` is required there too.
+      :func:`~messagefoundry.config.tls_policy.relax_verify_expiry` sets
+      ``X509_V_FLAG_NO_CHECK_TIME`` on its context, and OpenSSL applies that flag to a CRL's
+      validity window as well as the certificate's: a CRL past ``nextUpdate`` is then accepted at
+      the handshake. A CRL on that context is not a check that may relax this refusal, so the hop
+      stays refused unless attested (vault BACKLOG #2188).
+
+    ``ways_across`` replaces the remediation sentence of the refusal for a hop the connection-shaped
+    default does not fit (:attr:`RevocationHopGuard.ways_across`). An ECH hop passes
+    :data:`ECH_HOP_WAYS_ACROSS`, so its refusal offers only a lever that can cross it. ``None``
+    keeps the default.
 
     ``connection`` is the declaring connection's name, recorded in the audit line logged when an
     attestation crosses the refusal, so the record leads back to the declaration (ADR 0173).
@@ -978,6 +1109,7 @@ def refuse_unrevoked_verified_hop(
         attested_reason=revocation_attested_reason,
         connection=connection,
         context=None if opener is None else opener_tls_context(opener, connector=connector),
+        ways_across=ways_across,
     ).enforce_construction()
 
 
@@ -1380,12 +1512,12 @@ class ProxyConfig:
     target host (a destination / a token endpoint), returning ``None`` when that host is bypassed (#128)
     or is a loopback host, which is never proxied (vault BACKLOG #2579)."""
 
-    proxies: tuple[tuple[str, str], ...]  # (("http", url), ("https", url)); () when use_default
+    # Kept out of the repr, as the digest recipe's fields are: the URL may carry user:password@.
+    proxies: tuple[tuple[str, str], ...] = field(repr=False)  # () when use_default
     use_default: bool  # True → ProxyHandler() reading getproxies() ("Use Default Web Proxy", #112)
     bypass: tuple[str, ...]
-    auth_header: tuple[tuple[str, str], ...]  # (("Proxy-Authorization", "Basic .."),) or ()
+    auth_header: tuple[tuple[str, str], ...] = field(repr=False)  # Proxy-Authorization, or ()
     digest: _ProxyDigestRecipe | None
-    redacted: str  # a PHI/secret-safe rendering of the proxy for logs (never the raw URL/creds)
     # The declaring connection's name, for a log record. A name, never a setting value.
     connection: str | None = None
 
@@ -1590,7 +1722,6 @@ def proxy_config_from_settings(
             bypass=bypass,
             auth_header=(),
             digest=None,
-            redacted="default web proxy",
             connection=connection,
         )
     proxy_scheme = urllib.parse.urlsplit(proxy_url).scheme.lower()
@@ -1615,7 +1746,6 @@ def proxy_config_from_settings(
         bypass=bypass,
         auth_header=auth_header,
         digest=digest,
-        redacted=_redact_url(proxy_url),
         connection=connection,
     )
 
@@ -1870,19 +2000,6 @@ class RestDestination(DestinationConnector):
                 connection=config.name,
             )
         if bool(s.get("verify_tls", True)):
-            # #201 (ADR 0078 amendment): the verify-ON https hop validates the peer cert but does no
-            # OCSP/CRL revocation (stdlib ssl has none) — refuse an off-loopback production-PHI verified
-            # hop unless revocation is attested (loopback / synthetic / non-prod / attested byte-identical).
-            # Composes with #200: it keys on the verify-ON https path, disjoint from the cleartext /
-            # verify-off gates above, so no hop is ever double-refused.
-            refuse_unrevoked_verified_hop(
-                scheme,
-                self.url,
-                connector="REST destination",
-                revocation_attested=config.tls_revocation_attested,
-                revocation_attested_reason=config.tls_revocation_attested_reason,
-                connection=config.name,
-            )
             # #129 (ADR 0094): granular expiry-only relaxation — verify chain + hostname but tolerate an
             # expired server cert (opt-in; default off = the shared verifying opener, byte-identical). It
             # keeps verification ON, so it is NOT an insecure hop in the #200 sense (no refusal keys on it).
@@ -1950,6 +2067,28 @@ class RestDestination(DestinationConnector):
             # loopback rule alone already dials every accepted sidecar direct, so this adds no
             # routing. It makes "no proxy on this hop" hold by construction as well as by rule.
             self._opener = _no_redirect_opener(urllib.request.ProxyHandler({}))
+        if bool(s.get("verify_tls", True)):
+            # #201 (ADR 0078 amendment): the verify-ON https hop validates the peer cert but does no
+            # OCSP/CRL revocation (stdlib ssl has none) — refuse an off-loopback production-PHI verified
+            # hop unless revocation is attested or this hop's own opener checks a CRL. Composes with
+            # #200: it keys on the verify-ON https path, disjoint from the cleartext / verify-off gates
+            # above, so no hop is ever double-refused.
+            #
+            # Last in __init__, below every statement that builds or replaces `self._opener`, and no
+            # opener with an ECH sidecar or tls_allow_expired: see refuse_unrevoked_verified_hop.
+            no_crl_evidence = self._ech_sidecar is not None or bool(
+                s.get("tls_allow_expired", False)
+            )
+            refuse_unrevoked_verified_hop(
+                scheme,
+                self.url,
+                connector="REST destination",
+                revocation_attested=config.tls_revocation_attested,
+                revocation_attested_reason=config.tls_revocation_attested_reason,
+                opener=None if no_crl_evidence else self._opener,
+                ways_across=ECH_HOP_WAYS_ACROSS if self._ech_sidecar is not None else None,
+                connection=config.name,
+            )
 
     def _ech_request(
         self, data: bytes | None, headers: dict[str, str], method: str
@@ -2005,6 +2144,8 @@ class RestDestination(DestinationConnector):
         # the host answered, so a 405 (HEAD not allowed on a POST endpoint) is still a pass — but a 401/
         # 403 means the configured credentials would be rejected, which a real delivery dead-letters, so
         # surface it as a failure. Connection/DNS/TLS/timeout is always a fail.
+        # BACKLOG #2196: the hop re-check _post runs, before the bearer is minted below.
+        assert_probe_hop(self._hop_guard, self.url, connector="REST")
         headers = self._headers
         if self._token_provider is not None:
             # Acquire a real SMART token so reachability reflects the actual credentials (a token-
@@ -2081,9 +2222,7 @@ class RestDestination(DestinationConnector):
         # a single byte crosses — defense against a reload / per-message target sneaking PHI past the
         # construction-only gate. A None guard (secure/loopback hop) is byte-identical.
         if self._hop_guard is not None:
-            self._hop_guard.assert_send(
-                urllib.parse.urlsplit(self.url).hostname or "", _redact_url(self.url)
-            )
+            self._hop_guard.assert_send_url(self.url)
         data = encode_wire_body(payload, self.encoding, transport="REST")
         headers = self._headers
         if dynamic_headers or self._token_provider is not None or self._signer is not None:

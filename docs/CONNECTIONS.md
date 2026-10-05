@@ -1378,8 +1378,22 @@ is refused when the connector is built. The error names the setting and never th
 at least `url` on REST, SOAP, FHIR, DICOMweb and `FhirLookup`, plus `oauth2_token_url`, `smart_token_url`
 and `[ai].endpoint`. The shape never worked: `urllib` does not send URL userinfo as auth, and its error
 text carried the password into `last_error`. Put credentials in `basic_user`/`basic_password` or
-`bearer_token` (or the `oauth2_*`/`smart_*` settings), each via `env()`. `proxy_url` is not refused,
-because a forward proxy URL may carry its own credentials.
+`bearer_token` (or the `oauth2_*`/`smart_*` settings), each via `env()`. `proxy_url` is not covered
+by this rule. It has its own, below.
+
+**A proxy URL with credentials is refused unless it is written `https://` (vault BACKLOG #2572).**
+`urllib` sends a `user:password@` from a proxy URL to the proxy as a `Proxy-Authorization: Basic`
+header. Such a proxy is refused before each request, whether it comes from `proxy_url`, from
+`HTTP_PROXY` or `HTTPS_PROXY`, or from the system proxy settings. That covers at least REST, SOAP,
+FHIR, DICOMweb, `FhirLookup`, the token endpoints, the alert webhook, the OIDC legs and the AI
+broker. A connection with such a `proxy_url` still builds, and each send then fails with this
+error. The error names no part of the proxy URL, and `[security].enforcement` does not relax it. A
+request that goes direct is not refused: one to a loopback host, or to a host that `NO_PROXY` or the
+system bypass list names. A connection's own `proxy_no_proxy` is not that list. A host it names
+skips the connection's `proxy_url` and still follows a proxy from the environment.
+**Writing the proxy `https://` is not refused, and it does not protect the credentials either:**
+`urllib` sends `CONNECT`, with the credential header, before any TLS. Take the credentials out of
+the proxy URL.
 
 **Idempotency — operator responsibility.** Delivery is **at-least-once**, so a retry **re-sends** the
 request. The receiving endpoint **must be idempotent** (an idempotency key, a natural upsert, or a
@@ -1985,7 +1999,7 @@ report, plain text); this connector delivers it to `host:port` from `sender` to 
 | Param | Type | Default | Notes |
 |---|---|---|---|
 | `host` | str / `env()` | — (required) | SMTP server host. |
-| `sender` | str / `env()` | — (required) | `From:` address, and the envelope sender (`MAIL FROM`) that bounces go to. It must be one plain `local@domain` under the same rule as each recipient, so a display name, a group or an encoded word is refused at load. Its domain is not checked against `[egress].allowed_recipient_domains`. |
+| `sender` | str / `env()` | — (required) | `From:` address, and the envelope sender (`MAIL FROM`) that bounces go to. It must be one plain `local@domain` under the same rule as each recipient, so a display name, a group or an encoded word is refused at load. The full address rule, the domain's shape included, is in [CONFIGURATION.md `[egress]`](CONFIGURATION.md#egress). Its domain is not checked against `[egress].allowed_recipient_domains`. |
 | `recipients` | list[str] / str / `env()` | — (required) | `To:` address(es). An `env()` may be the whole value; one inside the list is refused at load. An entry with a line break is refused at load too. |
 | `port` | int / `env()` | `587` | `587` = STARTTLS submission; `465` = implicit TLS (`SMTP_SSL`). |
 | `subject` | str / `env()` | `""` | Static subject (a per-message subject is a Phase-2 follow-up). |
@@ -2064,7 +2078,7 @@ these messages, and the SMTP relay accepts them before anyone tries.
 | Setting | Default | Meaning |
 |---------|---------|---------|
 | `host` | — (required) | the SMTP / HISP relay host (the `[egress].allowed_direct` key; use `env()`) |
-| `sender` | — (required) | the Direct `From:` address, and the envelope sender (`MAIL FROM`) that bounces go to. It must be one plain `local@domain` that reads back unchanged, so a display name, a group or an encoded word is refused at load. Its domain is not gated. |
+| `sender` | — (required) | the Direct `From:` address, and the envelope sender (`MAIL FROM`) that bounces go to. It must be one plain `local@domain` that reads back unchanged, so a display name, a group or an encoded word is refused at load. The full address rule, the domain's shape included, is in [CONFIGURATION.md `[egress]`](CONFIGURATION.md#egress). Its domain is not gated. |
 | `recipients` | — (required) | the Direct `To:` address(es) — a list or a single string. Each address is held to the sender's rule after any display name or group is dropped, and `To:` and `RCPT TO` carry exactly that checked address. An entry with a line break is refused at load. |
 | `signing_cert` | — (required) | path to the sender's PEM/DER signing **certificate** |
 | `signing_key` | — (required) | path to the sender's PEM/DER signing **private key** |
@@ -2240,6 +2254,21 @@ For a server like these, a connection can opt back into the plain form:
 outbound("OB_EPIC_OBS", FHIR(url=env("epic_fhir_base"), conditional="if-match", update_url_form="path"))
 ```
 
+**A plain `interaction="update"` sends no `If-Match` header.** Only `conditional="if-match"` adds one. So
+a server that requires `If-Match` on update would refuse a plain update, and the message would
+dead-letter. There are three ways to send the header:
+
+- Set `conditional="if-match"`, as the example does. Each resource then needs a `meta.versionId`.
+- Put a static `If-Match` in `headers`. It is the same on every message, so it only helps where the
+  server accepts one fixed value.
+- Set `dynamic_headers=True` and have a Handler stamp `If-Match` per message.
+
+`messagefoundry check` prints an advisory `fhir-update-if-match` line. It names each path-form update
+with no `conditional="if-match"` and no static `If-Match`. It **never blocks**: it cannot tell which
+server a connection points at, and it cannot see a header a Handler stamps. The sourcing for which
+Oracle Health resources require the header stops at "most" in the bullet above. Check the vendor's page
+for the resource you write. This is vault BACKLOG #2570.
+
 With `update_url_form="path"`, an `update` or `if-match` is sent as `PUT {base}/{ResourceType}/{id}`:
 
 - The id must match the FHIR id grammar, `[A-Za-z0-9\-\.]{1,64}`, and must not be only dots. Any other id
@@ -2314,6 +2343,12 @@ is reusable at every endpoint it is registered with, while the assertion's `aud`
 pinned token endpoint and the key never leaves the engine (BACKLOG #1158). Pass `algorithm="RS256"` for
 a generic partner — the `RS384` default below is SMART's own requirement, not this engine's.
 
+**If you stay on `with_oauth2_client_credentials(...)`**, its `auth_style` defaults to `"basic"`. The
+client id and secret then ride an `Authorization: Basic` header on every token request.
+`auth_style="post"` puts them in the form body. Both styles send the secret itself, so the stronger
+option above is a choice you make per connection. Why `basic` stays the default is recorded once, in
+that function's docstring in `messagefoundry/transports/http_auth.py` (vault BACKLOG #2206).
+
 | `with_smart_backend(...)` arg | Default | Notes |
 |---|---|---|
 | `token_url` | — (required) | the authorization server's token endpoint (`https`; `env()`). **Also gated by `[egress].allowed_http`** — it is a second egress host. |
@@ -2368,6 +2403,24 @@ line naming any connection that requests letters its declared interaction cannot
 blocks**: your authorization server registers the scopes it will grant, and a refusal computed here could
 take a working feed offline. It also stays quiet when a request is too *narrow* — that is a correctness
 question, and asking for a letter the server never registered fails the token request outright.
+
+**Wildcard scope and audience.** `check` also prints an advisory `oauth-request` line (vault BACKLOG
+#2334). It names three things:
+
+- on `with_oauth2_client_credentials(...)`, a `scope` token that contains a `*`, such as `*` or
+  `claims.*`. A named scope is never graded, because that vocabulary belongs to your partner. It does
+  not read a SMART `scope`; the `smart-scope` line above does.
+- on `with_smart_backend(...)`, an `audience` that is not exactly the `token_url`. It is sent as
+  written, so letter case and a trailing slash count.
+- on `with_oauth2_client_credentials(...)`, an `audience` that is a URL on a different scheme, host or
+  port from the connection's `url`. An audience that is not a URL is an opaque API identifier, and is
+  never graded.
+
+Each of these can be a correct setup, so the line **never blocks**. It compares literal values only.
+`check` does not resolve `env()`, so the line also names every setting it could not compare, each
+with its reason. The examples in this file write the endpoint and token URLs as `env()`, so a URL
+audience on a connection written that way is listed as not compared. Read that list as "not
+checked", not as "clean".
 
 Put **every** secret in `env()` (`token_url`/`client_id`/`private_key`/`private_key_password`); the minted
 access token and `client_assertion` are runtime-only — never logged or persisted. (The signing key comes

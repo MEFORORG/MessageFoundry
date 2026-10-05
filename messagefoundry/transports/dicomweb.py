@@ -74,6 +74,7 @@ from messagefoundry.transports.rest import (
     _insecure_opener,
     _no_redirect_opener,
     _redact_url,
+    assert_probe_hop,
     auth_challenge_refused,
     egress_route_from_settings,
     enforce_outbound_length_limits,
@@ -267,20 +268,6 @@ class DicomWebDestination(DestinationConnector):
             connection=config.name,
         )
         if bool(s.get("verify_tls", True)):
-            # #201 (ADR 0078 amendment): the verify-ON https hop validates the DICOMweb-server cert but
-            # does no OCSP/CRL revocation (stdlib ssl has none) — refuse an off-loopback production-PHI
-            # verified STOW-RS hop unless revocation is attested (loopback / synthetic / non-prod /
-            # attested byte-identical). Same posture-keyed guard as its REST/SOAP/FHIR siblings; composes
-            # with #200 (fires only on the verify-ON https path, disjoint from the cleartext/verify-off
-            # gates above, so no hop is ever double-refused).
-            refuse_unrevoked_verified_hop(
-                scheme,
-                self.base_url,
-                connector="DICOMweb destination",
-                revocation_attested=config.tls_revocation_attested,
-                revocation_attested_reason=config.tls_revocation_attested_reason,
-                connection=config.name,
-            )
             # #1180 (ADR 0093): the client trust anchor for this STOW-RS hop.
             anchor = http_family_trust_anchor(
                 s, url=self.base_url, trust_anchor_policy=config.trust_anchor_policy
@@ -289,6 +276,23 @@ class DicomWebDestination(DestinationConnector):
                 _no_redirect_opener(*proxy_handlers, trust_anchor=anchor)
                 if proxy_handlers or anchor.narrows
                 else _NO_REDIRECT_OPENER
+            )
+            # #201 (ADR 0078 amendment): the verify-ON https hop validates the DICOMweb-server cert but
+            # does no OCSP/CRL revocation (stdlib ssl has none) — refuse an off-loopback production-PHI
+            # verified STOW-RS hop unless revocation is attested or this hop's own opener checks a CRL.
+            # Same posture-keyed guard as its REST/SOAP/FHIR siblings; composes with #200 (fires only
+            # on the verify-ON https path, disjoint from the cleartext/verify-off gates above, so no hop
+            # is ever double-refused).
+            #
+            # Below `self._opener`, which nothing later replaces: see refuse_unrevoked_verified_hop.
+            refuse_unrevoked_verified_hop(
+                scheme,
+                self.base_url,
+                connector="DICOMweb destination",
+                revocation_attested=config.tls_revocation_attested,
+                revocation_attested_reason=config.tls_revocation_attested_reason,
+                opener=self._opener,
+                connection=config.name,
             )
         else:
             # verify_tls=false makes the https hop MITM-able — a posture-keyed insecure hop (#200).
@@ -407,6 +411,8 @@ class DicomWebDestination(DestinationConnector):
         # Reachability only: an OPTIONS to the studies endpoint reaches the host without storing an object.
         # Any HTTP response means the host answered; 401/403 means the configured credentials would be
         # rejected (which a real store dead-letters). Connection/DNS/TLS/timeout always fails.
+        # BACKLOG #2196: the hop re-check _post runs, before a byte crosses.
+        assert_probe_hop(self._hop_guard, self.base_url, connector="DICOMweb")
         req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s) in __init__
             self._target_url, headers=self._headers, method="OPTIONS"
         )
@@ -453,9 +459,7 @@ class DicomWebDestination(DestinationConnector):
         # #200 (ADR 0092 decision 4): zero-I/O send-time re-assertion of a permitted insecure hop before
         # a byte crosses (a None guard — secure/loopback — is byte-identical).
         if self._hop_guard is not None:
-            self._hop_guard.assert_send(
-                urllib.parse.urlsplit(self.base_url).hostname or "", _redact_url(self.base_url)
-            )
+            self._hop_guard.assert_send_url(self.base_url)
         data, boundary = self._multipart_body(dicom_bytes)
         headers = {
             **self._headers,

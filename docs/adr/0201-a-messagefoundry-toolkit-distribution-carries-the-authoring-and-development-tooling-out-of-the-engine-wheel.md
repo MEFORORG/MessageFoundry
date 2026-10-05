@@ -241,6 +241,11 @@ before that upload.**
    The answer is a commitment, not a record that the publisher exists: slice 2 must not merge until
    it is in place.
 
+   **The blank environment is superseded (vault BACKLOG #2631, limb 1).** Every PyPI publish now
+   runs in a job that names the `pypi` environment. Once those jobs are on `main`, the owner sets
+   environment `pypi` on this publisher, as on the other three. A blank environment would accept a
+   token from any job in `release.yml`, so the environment's approval would not bind.
+
    A second review raised, from memory and not from Warehouse's code, that PyPI may create the
    project at the first matching token exchange, which could be the engine's own publish step. That
    would claim the name early, which is the safe direction. The build reads Warehouse's behaviour
