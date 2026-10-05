@@ -135,11 +135,15 @@ these: `auth/ldap.py` probes two `pyspnego` modules to learn whether Kerberos is
 `verify/checks.py` imports the ODBC driver and a fixed list of engine modules, and the package's
 `__init__.py` resolves its lazy exports from a fixed table.
 
-`anon/leak.py` loads one file by path: the publish guard's scanner. It walks up the folders above
-its own file and runs the first `scripts/security/scan_forbidden.py` it finds. In a source checkout
-that is the repository's own scanner. From an installed wheel, the walk continues above the install
-folder, so a file planted at that path in any parent folder would run. It serves the
-de-identification leak check only, and is not on the message path.
+`anon/leak.py` loads one file by path: the publish guard's scanner. It looks in one place only,
+`scripts/security/scan_forbidden.py` under the folder that holds the `messagefoundry` package. It
+builds that path from its own location and searches no other folder. In a source checkout the
+folder is the repository root, so the file is the repository's own scanner. From an installed wheel
+the folder is the one that holds the installed package files, normally `site-packages`. The wheel
+ships no such file, so the leak check refuses to run there. A file at that path in a folder above
+the install is never read. Whoever can write the folder that holds the package can already change
+what the process imports, so that folder is the limit. The loader serves the de-identification
+leak check only, and is not on the message path.
 
 `_child_bootstrap.py` loads the engine package by path, then runs a module by name.
 `python_child_argv` in `childenv.py` builds a command line that starts a Python child through it.
