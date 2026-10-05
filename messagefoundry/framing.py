@@ -193,10 +193,11 @@ class FrameCodec:
         return FrameDecoder(self, max_frame_bytes=max_frame_bytes)
 
 
-#: Line-end bytes a sender may put after a frame's end byte: MLLP's CR trailer, or CR LF. Up to
-#: :data:`_FRAME_TAIL_MAX` of them directly after a completed frame count as that frame's ending,
-#: however reads split them (vault BACKLOG #2847). The cap is what keeps a peer from trickling them
-#: to hold a listener's frame deadline off: past it, they are inter-frame noise like any byte.
+#: Line-end bytes a sender may put after a frame's end byte, such as MLLP's CR trailer or CR LF.
+#: Up to :data:`_FRAME_TAIL_MAX` of them, or of the codec's own ``trailer`` byte, directly after a
+#: completed frame count as that frame's ending, however reads split them (vault BACKLOG #2847).
+#: The cap is what keeps a peer from trickling them to hold a listener's frame deadline off: past
+#: it, they are inter-frame noise like any byte.
 _FRAME_TAIL_BYTES = frozenset(b"\r\n")
 _FRAME_TAIL_MAX = 2
 
@@ -252,8 +253,14 @@ class FrameDecoder:
 
     def _skip_tail(self, data: bytes, pos: int) -> int:
         """Step over the line-end bytes still owed to the last completed frame, from ``pos``."""
-        start, size, left = self._codec.start, len(data), self._tail_left
-        while left and pos < size and data[pos] in _FRAME_TAIL_BYTES and data[pos] != start:
+        start, trailer = self._codec.start, self._codec.trailer
+        size, left = len(data), self._tail_left
+        while (
+            left
+            and pos < size
+            and (data[pos] in _FRAME_TAIL_BYTES or data[pos] == trailer)
+            and data[pos] != start
+        ):
             pos += 1
             left -= 1
         # Any other byte ends the allowance: what follows it is not this frame's ending.

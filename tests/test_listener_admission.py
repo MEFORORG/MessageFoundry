@@ -27,7 +27,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Source
-from messagefoundry.framing import MLLP_CODEC, STX_ETX_CODEC
+from messagefoundry.framing import MLLP_CODEC, STX_ETX_CODEC, FrameCodec
 from messagefoundry.parsing.x12.interchange import X12FrameReader
 from messagefoundry.transports import admission
 from messagefoundry.transports.admission import ListenerAdmission, RefusalLog
@@ -469,6 +469,15 @@ def test_the_decoder_marks_only_a_frames_own_line_ends_as_trailer_only() -> None
     assert list(plain.feed(STX_ETX_CODEC.frame("P"))) == [b"P"]
     assert list(plain.feed(b"\r\n")) == []
     assert plain.trailer_only
+    # A configured trailer that is not a line end is part of the allowance too.
+    eot = FrameCodec(start=0x02, end=0x03, trailer=0x04).decoder()
+    assert list(eot.feed(b"\x02P\x03")) == [b"P"]
+    assert list(eot.feed(b"\x04")) == []
+    assert eot.trailer_only
+    # CONTROL: the same byte on a codec without that trailer is noise.
+    assert list(plain.feed(STX_ETX_CODEC.frame("P"))) == [b"P"]
+    assert list(plain.feed(b"\x04")) == []
+    assert not plain.trailer_only
 
 
 def test_the_x12_reader_reports_an_open_interchange() -> None:
