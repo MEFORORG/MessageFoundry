@@ -1162,8 +1162,9 @@ def test_the_section_checks_can_fail() -> None:
 #
 # OSV matches an advisory by PyPI name, so a flaw in code a wheel packs from another project does
 # not show in the reading above. ``security/bundled-code-survey.json`` answers, for every assessed
-# wheel, whether it carries such code, and records the route the page takes for a not-designated
-# wheel that does. The tests below hold the survey to the population and the page to the survey.
+# wheel, whether it carries a bundled copy of another project, and in what form: compiled code,
+# source code or data. It records the route the page takes for a not-designated wheel that carries
+# code in either form. The tests below hold the survey to the population and the page to the survey.
 
 _SURVEY_HEADING = "### What each wheel carries inside it"
 _HIGHLIGHTED = "**Highlighted as risky on what it carries:**"
@@ -1311,7 +1312,9 @@ def test_the_page_states_what_the_survey_found_and_the_route_each_wheel_took() -
 
 def test_the_survey_checks_can_fail() -> None:
     """RED when: a survey check stops seeing a missing answer, a missing route, a guessed "no" or
-    a stale page.
+    a stale page. That covers each form: a wheel with no source or data answer, another project's
+    source with no route, a route on a wheel that carries only data, a search with no control, and
+    a page that drops a form's row or its criterion.
 
     THE POSITIVE CONTROL FOR THE TWO TESTS ABOVE. Every mutation starts from two wheels picked by
     what they are, not by where they sit: a not-designated wheel shown to carry nothing, and a
