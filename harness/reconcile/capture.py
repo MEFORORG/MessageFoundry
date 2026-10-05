@@ -54,20 +54,25 @@ class CaptureSink:
 
     Before you share a capture, know at least this:
 
-    * The coverage report is the record of the fields no rule mapped. The sink gets a string back
-      and never sees that report. Pass ``on_report`` yourself, and read the summary.
+    * The coverage report lists the addresses of fields no rule mapped. It does not cover every
+      field: the first MSH line is outside it, for one. The sink gets a string back and never
+      sees that report. Pass ``on_report`` yourself, and read the summary.
+    * The sink anonymizes each body once and keeps no raw copy. If the summary names a field
+      that carries PHI, discard the capture, add a rule for that field, and capture again.
     * A tally covers one run, and the sink appends. A file that already held lines has bodies
       that no summary covers.
     * Each record's ``control_id`` is the MSH-10 the sink read before the anonymizer ran. It is
       written as received.
-    * Any anonymizer error drops the message, and a weak salt is one such error. Only
-      ``anon_failed`` counts the drops, so check it.
+    * Any anonymizer error drops the message, and the sender still gets its ``AA``. A weak salt
+      is one such error, so check the salt before you start. Only ``anon_failed`` counts the
+      drops, so check that too.
 
     For example::
 
-        from messagefoundry.anon import anonymize_checked
+        from messagefoundry.anon import Keyer, anonymize_checked
         from messagefoundry.anon.leak import CoverageTally
 
+        Keyer(salt)  # raises here on a weak salt, before any message is dropped
         tally = CoverageTally()
         sink = CaptureSink(out, anonymizer=lambda raw: anonymize_checked(
             raw, salt=salt, on_report=tally.add))
@@ -97,7 +102,8 @@ class CaptureSink:
         self._ports = tuple(ports)
         self._ack_mode = ack_mode
         # Optional de-identifier (ADR 0030 §6), applied at the single _write choke point. The class
-        # docstring says what a caller must wire and check before sharing the capture.
+        # docstring shows it wired as ``anonymize_checked`` with ``on_report``, and says what to
+        # check before sharing the capture.
         self._anonymizer = anonymizer
         self._servers: list[asyncio.Server] = []
         self._writers: set[asyncio.StreamWriter] = set()

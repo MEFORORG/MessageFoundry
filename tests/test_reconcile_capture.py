@@ -20,7 +20,7 @@ import pytest
 
 from harness.reconcile import __main__ as reconcile_cli
 from harness.reconcile.capture import CaptureSink
-from messagefoundry.anon import anonymize_checked
+from messagefoundry.anon import Keyer, anonymize_checked
 from messagefoundry.anon.leak import CoverageTally
 from messagefoundry.transports.mllp import DEFAULT_MAX_FRAME_BYTES, MLLPDecoder, frame
 from tests._mllp_over_cap import send_over_cap, send_valid_then_over_cap
@@ -96,7 +96,12 @@ def test_the_documented_on_report_wiring_hands_the_caller_a_coverage_report(tmp_
     The sink takes a str-to-str callable and never sees the report. So that closure is the only
     route by which the coverage report reaches whoever shares the capture. This runs the example
     as written. Drop ``on_report`` and the tally stays at zero messages."""
+    # The docstring is what a caller copies, so pin its wiring as well as running it here.
+    doc = CaptureSink.__doc__ or ""
+    assert "on_report=tally.add" in doc and "Keyer(salt)" in doc
+
     out = tmp_path / "cap.jsonl"
+    Keyer(_ANON_SALT)  # the example's own first step: a weak salt raises before any drop
     tally = CoverageTally()
 
     async def scenario() -> CaptureSink:

@@ -162,6 +162,26 @@ def test_no_links_into_private_paths() -> None:
         )
 
 
+# The anonymizer's two index rows said its output was "PHI-free", and the feature map called
+# `tee/anon/` a byte-identical copy (BACKLOG #2245). Neither was true. docs/PHI.md section 9 is the
+# record of what the leak-check refuses, so each row must link there. The ADR body is a dated
+# record and is not read here.
+_ANON_ROWS = (
+    (_FEATURE_MAP, "| De-identification framework (test harness + tee) |"),
+    (_REPO / "docs" / "adr" / "README.md", "| [0030](0030-anonymization-test-harness-tee.md) |"),
+)
+
+
+@pytest.mark.parametrize(("path", "row_start"), _ANON_ROWS, ids=("feature-map", "adr-index"))
+def test_the_anonymizer_rows_do_not_call_the_output_phi_free(path: Path, row_start: str) -> None:
+    rows = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.startswith(row_start)]
+    assert len(rows) == 1, f"{path.name}: expected one row starting {row_start!r}, got {len(rows)}"
+    row = rows[0]
+    for retired in ("PHI-free test datasets", "vendored byte-identical"):
+        assert retired not in row, f"{path.name} says {retired!r} again (BACKLOG #2245)."
+    assert "PHI.md#9-de-identification" in row, f"{path.name}: the row must link to PHI.md §9."
+
+
 def test_no_links_to_superseded_documents() -> None:
     """Never point the public catalog at a document banner-marked superseded."""
     bad: list[tuple[int, str]] = []
