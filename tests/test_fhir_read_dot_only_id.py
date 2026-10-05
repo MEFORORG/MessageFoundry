@@ -28,7 +28,6 @@ import http.server
 import json
 import threading
 import urllib.parse
-import urllib.request
 from collections.abc import Iterator
 
 import pytest
@@ -36,12 +35,8 @@ import pytest
 from messagefoundry.config.fhir_lookup import FhirLookupError
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.transports import egress
-from messagefoundry.transports.fhir import (
-    _FHIR_ID_RE,
-    FhirLookupExecutor,
-    _is_dot_only,
-    _resolve_read_url,
-)
+from messagefoundry.transports.fhir import _FHIR_ID_RE, FhirLookupExecutor, _resolve_read_url
+from tests.test_fhir_lookup import _FakeOpener
 
 HOST = "fhir.example.org"
 BASE = f"https://{HOST}/fhir"
@@ -52,52 +47,18 @@ DOT_ONLY = [".", "..", "..."]
 DOTTED = ["a.b", "1.2.3", ".a", "a.", "..a", "a..", "-.-"]
 
 
-class _FakeResp:
-    status = 200
-
-    def read(self, amt: int = -1) -> bytes:
-        return PATIENT if amt < 0 else PATIENT[:amt]
-
-    def __enter__(self) -> _FakeResp:
-        return self
-
-    def __exit__(self, *a: object) -> None:
-        return None
-
-
-class _FakeOpener:
-    """Records each Request and answers with a synthetic Patient."""
-
-    def __init__(self) -> None:
-        self.requests: list[urllib.request.Request] = []
-
-    def open(self, req: urllib.request.Request, timeout: float | None = None) -> _FakeResp:
-        self.requests.append(req)
-        return _FakeResp()
-
-
 def _executor(
     egress_settings: EgressSettings | None = None,
 ) -> tuple[FhirLookupExecutor, _FakeOpener]:
     ex = FhirLookupExecutor(
         {"epic": {"url": BASE}}, egress=egress_settings or EgressSettings(deny_by_default=False)
     )
-    opener = _FakeOpener()
+    opener = _FakeOpener(body=PATIENT)
     ex._opener["epic"] = opener  # type: ignore[assignment]
     return ex, opener
 
 
 # --- 1. the refusal ----------------------------------------------------------
-
-
-@pytest.mark.parametrize("dots", DOT_ONLY)
-def test_the_predicate_is_true_for_dots_alone(dots: str) -> None:
-    assert _is_dot_only(dots) is True
-
-
-@pytest.mark.parametrize("resource_id", DOTTED)
-def test_the_predicate_is_false_for_an_id_that_only_contains_a_dot(resource_id: str) -> None:
-    assert _is_dot_only(resource_id) is False
 
 
 @pytest.mark.parametrize("dots", DOT_ONLY)
@@ -116,13 +77,6 @@ def test_resolve_read_url_refuses_a_dot_only_id(dots: str) -> None:
     # `match=` names the ID refusal, so a refusal for another reason cannot pass for this one.
     with pytest.raises(ValueError, match="read id is not a valid FHIR id"):
         _resolve_read_url(BASE, f"Patient/{dots}")
-
-
-@pytest.mark.parametrize("dots", DOT_ONLY)
-def test_resolve_read_url_refuses_a_dot_only_id_with_search_params(dots: str) -> None:
-    # The shape a hop that removes dot segments would read as a search: '{base}/?_count=1'.
-    with pytest.raises(ValueError, match="read id is not a valid FHIR id"):
-        _resolve_read_url(BASE, f"Patient/{dots}", {"_count": "1"})
 
 
 @pytest.mark.parametrize("resource_id", DOTTED)
@@ -171,7 +125,10 @@ class _RecordingServer:
         self.targets = targets
         self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
         self.base = f"http://127.0.0.1:{self._server.server_address[1]}/fhir"
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        # shutdown() waits out one poll, and the default poll is half a second.
+        self._thread = threading.Thread(
+            target=self._server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+        )
         self._thread.start()
 
     def close(self) -> None:

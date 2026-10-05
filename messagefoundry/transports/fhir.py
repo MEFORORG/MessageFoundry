@@ -174,6 +174,8 @@ _TRANSIENT_ISSUE_CODES = frozenset(
 # the message-derived path segments so a crafted resource can't smuggle '/', '..', '?', '#', or '@'
 # into the request path and redirect a PHI-bearing write to a different resource/operation on the same
 # allow-listed host (the [egress].allowed_http gate pins the host, not the path).
+# An id that is '.' or '..' and nothing else PASSES the id grammar, which stops '..' only where a
+# '/' comes with it. So each site that puts an id in a path also calls `_is_dot_only`.
 # `\Z`, never `$`: Python's `$` also matches immediately BEFORE a final newline, so `^[A-Za-z]+$`
 # accepted "Patient\n" and the gate did not enforce the grammar it advertises. Anchoring the pattern
 # fixes every caller at once -- `match` vs `fullmatch` is a property of the CALL, and there are three
@@ -1170,8 +1172,7 @@ def _resolve_read_url(
     path = type_seg
     if len(segments) == 2:
         resource_id = segments[1]
-        # The id grammar admits '.' and '..', and quote() below leaves them alone, so each would be
-        # sent as the last path segment. `_is_dot_only` says what a later hop could make of that.
+        # Dots alone pass the grammar and quote() leaves them as they are; see `_is_dot_only`.
         if not _FHIR_ID_RE.match(resource_id) or _is_dot_only(resource_id):
             raise ValueError("FHIR read id is not a valid FHIR id")
         path = f"{type_seg}/{urllib.parse.quote(resource_id, safe='')}"
