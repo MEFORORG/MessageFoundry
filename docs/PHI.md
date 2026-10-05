@@ -1816,8 +1816,11 @@ What the `date` kind does to a value:
 - It keeps a TS precision code such as `^S` in the second component.
 - It scrubs a value that is not a valid HL7 timestamp to empty. Every group must be in range and
   in ASCII digits, and the year must fall in 1850 to 2199. So a US `03152026` is scrubbed rather
-  than kept as the year `0315`. A date field that carries text is never passed through. Nothing
-  records that a field was emptied.
+  than kept as the year `0315`. A date field that carries text is never passed through.
+- It records each field it emptied that way, by address and never by value. `anonymize_checked`
+  puts the addresses in the coverage report as `blanked_fields`, and
+  `python -m tee anonymize-captures` adds a count per address to its run summary. It is a record
+  and not a refusal. A caller of plain `anonymize` gets the list only by passing `blanked`.
 - A six-digit `YYMMDD` whose first four digits happen to read as a year and a month, such as
   `201107`, still passes as `YYYYMM`. Its output keeps those four digits.
 - It keeps the HL7 null `""` as it is.

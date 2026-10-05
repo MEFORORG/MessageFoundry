@@ -340,6 +340,30 @@ def surrogate_field(kind: SurrogateKind, value: str, keyer: Keyer, seps: Seps) -
     return seps.repetition.join(fn(rep, keyer, seps) for rep in reps)
 
 
+def surrogate_field_recorded(
+    path: str,
+    kind: SurrogateKind,
+    value: str,
+    keyer: Keyer,
+    seps: Seps,
+    blanked: list[str] | None,
+) -> str:
+    """:func:`surrogate_field`, and a record of the one case where a rule destroys a value without
+    anyone having decided that: the ``DATE`` kind scrubbing a repetition that is not a valid
+    timestamp to empty (BACKLOG #2330). ``path`` is appended to ``blanked`` once per field it
+    happens in. The address only, never the value, so the list is safe to log.
+
+    A ``DROP`` is not recorded: the rule map already says that field is blanked. Both adapters call
+    this, so the two cannot disagree about what counts.
+    """
+    out = surrogate_field(kind, value, keyer, seps)
+    if blanked is not None and kind == SurrogateKind.DATE:
+        pairs = zip(value.split(seps.repetition), out.split(seps.repetition), strict=True)
+        if any(before and not after for before, after in pairs):
+            blanked.append(path)
+    return out
+
+
 def scrub_site_codes(value: str, keyer: Keyer, seps: Seps) -> str:
     """Field-anchored site-code safety pass (ADR 0030 §5): replace any **whole component** that is
     exactly a site code with a fabricated non-site code of the same width, leaving a coincidental

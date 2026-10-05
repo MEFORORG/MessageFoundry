@@ -376,6 +376,9 @@ class LeakReport:
     * ``token_floor_reason`` — why the denylist is not trustworthy, or ``None`` if it is.
     * ``undecided_fields`` — the addresses present that no rule scrubs, no ``keep`` names and
       :data:`ALWAYS_DECIDED` does not excuse; ``require_full_coverage`` refuses on them.
+    * ``blanked_fields`` — the addresses where the ``DATE`` kind scrubbed a value that was not a
+      valid timestamp to empty. Only ``anonymize_checked`` fills it: this report is built from the
+      output, where an emptied field looks like one that was never sent (BACKLOG #2330).
     """
 
     hits: list[str]
@@ -384,6 +387,7 @@ class LeakReport:
     token_tables_live: bool
     token_floor_reason: str | None
     undecided_fields: tuple[str, ...] = ()
+    blanked_fields: tuple[str, ...] = ()
 
 
 def leak_report(text: str, *, rules: tuple[FieldRule, ...] | None = None) -> LeakReport:
@@ -480,6 +484,7 @@ class CoverageTally:
         self.messages = 0
         self.counts: Counter[str] = Counter()
         self.undecided: Counter[str] = Counter()
+        self.blanked: Counter[str] = Counter()
         self.full_coverage = full_coverage
         self.denylist_live = True
 
@@ -487,6 +492,7 @@ class CoverageTally:
         self.messages += 1
         self.counts.update(report.unmapped_fields)
         self.undecided.update(report.undecided_fields)
+        self.blanked.update(report.blanked_fields)
         self.denylist_live = self.denylist_live and report.token_tables_live
 
     def summary(self) -> str:
@@ -500,4 +506,7 @@ class CoverageTally:
         if self.full_coverage:
             todo = ", ".join(f"{a} x{n}" for a, n in sorted(self.undecided.items())) or "none"
             text += f" Fields that need a rule or a keep for require_full_coverage: {todo}."
+        if self.blanked:
+            gone = ", ".join(f"{a} x{n}" for a, n in sorted(self.blanked.items()))
+            text += f" Date fields emptied because the value was not a valid timestamp: {gone}."
         return text

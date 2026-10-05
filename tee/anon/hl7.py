@@ -26,7 +26,7 @@ from .surrogates import (
     preserve_obx5_value,
     read_message_seps,
     scrub_message_site_codes,
-    surrogate_field,
+    surrogate_field_recorded,
 )
 
 
@@ -38,11 +38,16 @@ def _field_num(path: str) -> int:
     return int(path.split("-", 1)[1])
 
 
-def anonymize_message(raw: str, keyer: Keyer, rules: tuple[FieldRule, ...]) -> str:
+def anonymize_message(
+    raw: str, keyer: Keyer, rules: tuple[FieldRule, ...], blanked: list[str] | None = None
+) -> str:
     """De-identify one HL7 v2 message: apply ``rules`` field-by-field, then the site-code pass.
 
     Pure + deterministic for a given ``keyer``. Raises :class:`AnonError` (carrying no body) when the
     message has no parseable MSH / encoding characters — fail closed, matching the engine adapter.
+
+    ``blanked``, when given, collects the address of every field the ``DATE`` kind scrubbed to empty
+    (``surrogate_field_recorded``), as the engine adapter does.
     """
     text = normalized_message(raw)
     parsed = read_message_seps(text)
@@ -59,7 +64,9 @@ def anonymize_message(raw: str, keyer: Keyer, rules: tuple[FieldRule, ...]) -> s
             if _skip_obx5(rule, fields, seps):
                 continue
             if fnum < len(fields):
-                fields[fnum] = surrogate_field(_kind_for(rule, fields), fields[fnum], keyer, seps)
+                fields[fnum] = surrogate_field_recorded(
+                    rule.path, _kind_for(rule, fields), fields[fnum], keyer, seps, blanked
+                )
     encoded = "\r".join(field_sep.join(fields) for fields in segments)
     return scrub_message_site_codes(encoded, keyer, rules)
 

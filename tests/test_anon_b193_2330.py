@@ -25,6 +25,7 @@ from messagefoundry.anon import surrogates as engine_surrogates
 from tee.anon import DEFAULT_RULES as TEE_DEFAULT_RULES
 from tee.anon import anonymize as tee_anonymize
 from tee.anon import anonymize_checked as tee_anonymize_checked
+from tee.anon import leak as tee_leak
 from tee.anon import rules as tee_rules
 from tee.anon import surrogates as tee_surrogates
 
@@ -340,3 +341,98 @@ def test_a_path_with_a_second_non_date_rule_is_not_exempt(
         engine_rules.FieldRule("EVN-2", SurrogateKind.ID),
     )
     assert module.message_has_site_code(_site_message("EVN|A01|" + _FILLED), rules)
+
+
+# --- item 7: a date scrubbed to empty leaves a record ---------------------------------------------
+
+_NOT_A_DATE = "2026-03-15"  # dashes: not an HL7 timestamp, so the DATE kind scrubs it to empty
+
+# EVN-2 value -> whether the anonymizer must record EVN-2 as emptied.
+_EVN2_CASES = {
+    "a malformed date": (_NOT_A_DATE, True),
+    "one malformed repetition": ("20260315~" + _NOT_A_DATE, True),
+    "a valid date": ("20260315142233", False),
+    "the HL7 null": ('""', False),
+    "an absent value": ("", False),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_EVN2_CASES))
+@_EACH_ADAPTER
+def test_anonymize_records_a_date_field_it_emptied(adapter: Callable[..., str], case: str) -> None:
+    value, recorded = _EVN2_CASES[case]
+    blanked: list[str] = []
+    out = adapter(_site_message("EVN|A01|" + value + "|x"), salt=_SALT, blanked=blanked)
+    assert blanked == (["EVN-2"] if recorded else [])
+    assert _NOT_A_DATE not in out
+
+
+@_EACH_ADAPTER
+def test_a_date_typed_obx5_that_was_emptied_is_recorded(adapter: Callable[..., str]) -> None:
+    blanked: list[str] = []
+    adapter(_site_message("OBX|1|DT|8665-2^LMP^LN||" + _NOT_A_DATE), salt=_SALT, blanked=blanked)
+    assert blanked == ["OBX-5"]
+
+
+@_EACH_ADAPTER
+def test_a_drop_or_a_redact_is_not_recorded_as_an_emptied_date(adapter: Callable[..., str]) -> None:
+    """A DROP is the rule map's own decision, and a redact leaves a marker. Neither is a surprise."""
+    rules = (
+        engine_rules.FieldRule("EVN-2", SurrogateKind.DROP),
+        engine_rules.FieldRule("EVN-3", SurrogateKind.FREETEXT),
+    )
+    blanked: list[str] = []
+    adapter(
+        _site_message("EVN|A01|" + _NOT_A_DATE + "|x"), salt=_SALT, rules=rules, blanked=blanked
+    )
+    assert blanked == []
+
+
+@pytest.mark.parametrize("checked", _CHECKED, ids=("engine", "tee"))
+def test_the_coverage_report_names_every_emptied_date_field_once(
+    checked: Callable[..., str],
+) -> None:
+    reports: list[Any] = []
+    message = _site_message(
+        "EVN|A01|" + _NOT_A_DATE,
+        "OBX|1|DT|8665-2^LMP^LN||" + _NOT_A_DATE,
+        "OBX|2|DT|8665-2^LMP^LN||" + _NOT_A_DATE,
+    )
+    checked(message, salt=_SALT, on_report=reports.append)
+    assert [report.blanked_fields for report in reports] == [("EVN-2", "OBX-5")]
+
+
+@pytest.mark.parametrize("checked", _CHECKED, ids=("engine", "tee"))
+def test_the_coverage_report_is_empty_when_nothing_was_emptied(
+    checked: Callable[..., str],
+) -> None:
+    reports: list[Any] = []
+    checked(_site_message("EVN|A01|20260315"), salt=_SALT, on_report=reports.append)
+    assert [report.blanked_fields for report in reports] == [()]
+
+
+@pytest.mark.parametrize(
+    ("checked", "leak"),
+    ((engine_anonymize_checked, engine_leak), (tee_anonymize_checked, tee_leak)),
+    ids=("engine", "tee"),
+)
+def test_the_run_summary_counts_emptied_date_fields_and_never_shows_a_value(
+    checked: Callable[..., str], leak: Any
+) -> None:
+    tally = leak.CoverageTally()
+    quiet = tally.summary()
+    for _ in range(2):
+        checked(_site_message("EVN|A01|" + _NOT_A_DATE), salt=_SALT, on_report=tally.add)
+    checked(_site_message("EVN|A01|20260315"), salt=_SALT, on_report=tally.add)
+    summary = tally.summary()
+    assert "Date fields emptied because the value was not a valid timestamp: EVN-2 x2." in summary
+    assert _NOT_A_DATE not in summary
+    assert "emptied" not in quiet  # no sentence at all when nothing was emptied
+
+
+@pytest.mark.parametrize("leak", (engine_leak, tee_leak), ids=("engine", "tee"))
+def test_a_bare_leak_report_cannot_know_what_was_emptied(leak: Any) -> None:
+    """The report is built from the output, where an emptied field looks like an absent one. Only
+    ``anonymize_checked`` can fill ``blanked_fields``, and this pins that the field says so."""
+    report = leak.leak_report(_site_message("EVN|A01|"), rules=engine_rules.DEFAULT_RULES)
+    assert report.blanked_fields == ()

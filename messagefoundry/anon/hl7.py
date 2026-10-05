@@ -36,7 +36,7 @@ from .surrogates import (
     preserve_obx5_value,
     read_message_seps,
     scrub_message_site_codes,
-    surrogate_field,
+    surrogate_field_recorded,
 )
 
 
@@ -44,11 +44,16 @@ def _segment_id(path: str) -> str:
     return path.split("-", 1)[0]
 
 
-def anonymize_message(raw: str, keyer: Keyer, rules: tuple[FieldRule, ...]) -> str:
+def anonymize_message(
+    raw: str, keyer: Keyer, rules: tuple[FieldRule, ...], blanked: list[str] | None = None
+) -> str:
     """De-identify one HL7 v2 message: apply ``rules`` field-by-field, then the site-code pass.
 
     Pure + deterministic for a given ``keyer`` (same message + salt → same fixture). Raises
     :class:`AnonError` (carrying no body) when the message cannot be safely anonymized — fail closed.
+
+    ``blanked``, when given, collects the address of every field the ``DATE`` kind scrubbed to empty
+    (``surrogate_field_recorded``). It is the caller's list; nothing else is written to it.
     """
     text = normalized_message(raw)
     parsed = read_message_seps(text)
@@ -66,7 +71,8 @@ def anonymize_message(raw: str, keyer: Keyer, rules: tuple[FieldRule, ...]) -> s
                 if _skip_obx5(rule, msg, occ, value, seps):
                     continue
                 kind = _kind_for(rule, msg, occ)
-                msg.set(rule.path, surrogate_field(kind, value, keyer, seps), occurrence=occ)
+                scrubbed = surrogate_field_recorded(rule.path, kind, value, keyer, seps, blanked)
+                msg.set(rule.path, scrubbed, occurrence=occ)
         encoded = msg.encode()
     except AnonError:
         raise  # already a body-free refusal with its own reason; do not relabel it "malformed"

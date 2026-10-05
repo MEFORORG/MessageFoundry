@@ -22,6 +22,7 @@ Public surface (same shape as the engine's):
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 
 from .hl7 import anonymize_message
@@ -60,14 +61,19 @@ def anonymize(
     salt: str,
     overlay: Path | None = None,
     rules: tuple[FieldRule, ...] | None = None,
+    blanked: list[str] | None = None,
 ) -> str:
-    """De-identify one HL7 v2 message with the secret ``salt`` and the effective rule set."""
+    """De-identify one HL7 v2 message with the secret ``salt`` and the effective rule set.
+
+    ``blanked``, when given, collects the address of every field the ``date`` kind scrubbed to empty
+    because its value was not a valid timestamp.
+    """
     keyer = Keyer(salt)
     if rules is None:
         rules = load_rules(overlay)
     # A KEEP rule is a decision to leave the field alone, so it rewrites nothing.
     rewrites = tuple(r for r in rules if r.kind != SurrogateKind.KEEP)
-    return anonymize_message(raw, keyer, rewrites)
+    return anonymize_message(raw, keyer, rewrites, blanked)
 
 
 def anonymize_checked(
@@ -90,10 +96,15 @@ def anonymize_checked(
     on both paths. The error names token categories and field shapes/addresses only, never a value.
     A clean return is not proof of PHI-free output: a name, an undashed number or a date in an
     unmapped field passes, so surface the ``on_report`` coverage on the clean path (BACKLOG #1710).
+    The report's ``blanked_fields`` names each field the ``date`` kind scrubbed to empty because the
+    value was not a valid timestamp; it is a record, not a refusal cause (BACKLOG #2330).
     """
     effective = rules if rules is not None else load_rules(overlay)
-    output = anonymize(raw, salt=salt, rules=effective)
-    report = leak_report(output, rules=effective)
+    blanked: list[str] = []
+    output = anonymize(raw, salt=salt, rules=effective, blanked=blanked)
+    report = replace(
+        leak_report(output, rules=effective), blanked_fields=tuple(sorted(set(blanked)))
+    )
     if on_report is not None:
         on_report(report)
     causes = list(report.hits)
