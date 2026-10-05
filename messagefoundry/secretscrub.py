@@ -100,6 +100,17 @@ succeeds. It is 3x a number that was already 250x below this module's own advers
 sibling shape with many such labels went the other way, 64 us against 141. Not bought down further: a
 ``{0,N}`` bound measured 32 us on that line and costs correctness elsewhere, for the reason
 :data:`_ODBC_BRACED` records.
+
+WHAT THE STOP BEFORE A QUOTED LABEL COSTS, measured 2026-10-04. A THIRD INSTRUMENT, comparable to
+neither paragraph above: one whole ``scrub_credentials`` call against the module as it stood at
+``50a4a3dccb``, minimum over interleaved rounds. The table above still holds, because every shape it
+names is level: the plain line 0.62 against 0.61 us, the credential line 3.35 against 3.36, a quoted
+credential line 3.07 against 3.08, and each 6 KB run ending at the end of the line within 2 percent.
+That is :data:`_NO_QUOTED_LABEL_AFTER`'s fast path; without it the credential line cost 41 percent
+more. A line where the stop actually runs pays for it: a two-label line 5.66 against 6.93 us, and it
+now redacts the second password. THE NEW CEILING is a 6 KB value whose run ends on a quote, which
+forces the token walk: 24 against 849 us, linear at 7.7x for 8x the length. That is well under this
+module's 21 ms ceiling above, and under the 33 ms the PHI pass spends on such a line.
 """
 
 from __future__ import annotations
@@ -198,43 +209,10 @@ def _alternation(words: tuple[str, ...]) -> str:
 # ``tls_key_password`` -- two prefix segments each) and nothing in this tree comes close.
 _LABEL_PREFIX = r"(?:[A-Za-z0-9]+[._-]){0,6}"
 
-# A bearer/authorization token or an opaque session token in a header-ish or "token=" shape.
-#
-# The ``(?:bearer|basic|digest)\s+`` group is load-bearing, not decoration: without it the value class
-# matches the AUTH SCHEME rather than the credential, so "Authorization: Bearer <tok>" redacts the word
-# "Bearer" and emits <tok> verbatim. That exact defect shipped green on the sibling surface for months
-# (BACKLOG #1183). Making the group optional keeps the plain "token=<tok>" shape working, and the value
-# class excludes quotes so a quoted credential loses the value, not the quote.
-_BEARER = re.compile(
-    r"(?i)\b(" + _LABEL_PREFIX + r"(?:" + _alternation(_TOKEN_WORDS) + r"))\b"
-    r"\s*[:=]\s*(?:(?:bearer|basic|digest)\s+)?['\"]?[^\s'\"]+"
-)
-
-# A bare auth scheme carrying its credential with no preceding header label -- "Bearer <tok>" as it
-# appears in a WWW-Authenticate echo or a client retry line. ``_BEARER`` cannot reach this: it requires
-# a ":" or "=" after the label, and there is none here. The scheme word is kept so a reviewer sees what
-# leaked.
-#
-# "bearer" ONLY, deliberately, even though ``_BEARER`` accepts basic and digest as scheme words. There
-# the header label guarantees the line is an authorization header; here nothing does, and both other
-# words are ordinary configuration vocabulary in this codebase -- ``transports/http_auth.py`` raises
-# "oauth2_auth_style must be 'basic' or 'post'" and ``transports/soap.py`` raises "ws_password_type
-# must be 'text'". A token that is also ordinary vocabulary discriminates nothing, so matching on it
-# would redact operator diagnostics and buy no confidentiality: a labelled "Authorization: Basic
-# <cred>" is already carried by ``_BEARER``.
-_AUTH_SCHEME = re.compile(r"(?i)\b(bearer)\s+['\"]?[^\s'\",;]{4,}")
-
-# A MEFOR_* secret echoed as "MEFOR_FOO=value" or "MEFOR_FOO: value": never carry the value. The
-# optional quotes match the shape ``resolve_env_settings`` produces -- "(env 'MEFOR_VALUE_PW'='<value>')"
-# -- which an unquoted form misses entirely.
-_MEFOR_SECRET = re.compile(
-    r"\b(" + re.escape(_ENV_PREFIX) + r"[A-Z0-9_]+)\b['\"]?\s*[:=]\s*['\"]?[^\s'\"]+['\"]?"
-)
-
 # A QUOTED value span, for the two quoting forms a credential value actually arrives in (BACKLOG
 # #1685). Both exist for one reason: a value is quoted PRECISELY so it may carry the characters that
-# would otherwise end it -- ";", "=" and spaces -- and those are exactly what the plain value class
-# below stops at. So the shipped pattern replaced the HEAD of a quoted password and printed the tail.
+# would otherwise end it -- ";", "=" and spaces -- and those are exactly what a plain value class
+# stops at. So the shipped pattern replaced the HEAD of a quoted password and printed the tail.
 #
 # Measured at 1aa2d6a1b, both shapes, on both credential surfaces:
 #
@@ -260,6 +238,11 @@ _MEFOR_SECRET = re.compile(
 # nothing in reach -- a shorter brace parse could only end at a "}" that is followed by another "}",
 # and ``(?!\})`` rejects exactly that. A ``{0,N}`` bound would buy no safety and would silently stop
 # matching a password longer than N, which is the one direction this module must not fail in.
+#
+# THE OTHER LABEL PATTERNS TAKE THESE TOO NOW, NOT ONLY ``_CREDENTIAL_KV`` (BACKLOG #1685's remainder).
+# The quoted form is in every label pattern below. The braced form is in ``_MEFOR_SECRET`` and
+# ``_KEY_MATERIAL`` only with a guard after the closer, and ``_BEARER`` does not take it; the reasons
+# are on ``_CREDENTIAL_KV``'s residuals.
 _ODBC_BRACED = r"\{(?:[^}]|\}\})*+\}(?!\})"
 _QUOTED_VALUE = "'[^'\r\n]*+'|\"[^\"\r\n]*+\""
 
@@ -278,6 +261,158 @@ _QUOTED_VALUE = "'[^'\r\n]*+'|\"[^\"\r\n]*+\""
 # carriage return into the redacted span and leave the line ending broken.
 _ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
 
+# Where an UNQUOTED value must stop early: just before a credential label whose value opens with a
+# quote. Every plain value class below checks for one, in the way described under "CHECKED ONCE PER
+# RUN" further down.
+#
+# THE DEFECT IT CLOSES. A plain value ran on across a separator into a LATER label and ended at that
+# label's opening quote. So the later pattern never saw its label, and the quoted value printed.
+# Measured on both copies at 50a4a3dccb, plain ASCII:
+#
+#   api_token=x;password="v w"    ->  api_token=<redacted>"v w"
+#   session=1;private_key="pk"    ->  session=<redacted>"pk"
+#   pwd=a:password="v w"          ->  pwd=<redacted>"v w"
+#
+# WHY IT STOPS ONLY BEFORE A QUOTE. That is what keeps the stop from printing anything a value class
+# used to hide. Every plain class here excludes both quote characters, so a value already ended at or
+# just past that quote. The text between the stop and the quote is a separator, the label and its
+# ":" or "=", and the label's own pattern then takes the quoted value whole. So a stop can newly print
+# label text, never a value. A label followed by a BRACE or a plain value gets no stop, because the
+# class used to run on past those, and stopping there would print what it used to hide.
+#
+# WHERE IN THE LABEL IT STOPS, which decides whose text a stop can print. A label may carry a prefix
+# (``_LABEL_PREFIX``), and a prefix joined by "." or "-" is just as much the tail of the value in front
+# of it -- ``fv-A_1.password`` could be either. So the stop lands at one of two places:
+#
+# * At the KEYWORD, in every other case: right after a separator, or after a dotted or hyphenated
+#   prefix. Such a prefix then stays inside the redacted span, and the keyword sits right after the
+#   placeholder, where a later pattern finds it.
+# * At the start of an UNDERSCORED prefix, such as ``client_secret``, where a word starts, but never at
+#   the start of the value. Stopping at the keyword there would leave the pass unable to resume: it
+#   restarts at the keyword, and its own ``\b`` cannot fire after "_". Measured, that left 956 of
+#   20,412 two-label lines printing, ``client_secret`` and ``ad_bind_password`` among them. This is
+#   the one place a stop prints a word the old class hid: in ``token=a-b_password="x"`` the "b" now
+#   prints as part of the label ``b_password``. That is the reading every label pattern here already
+#   gives such a run, and the cost is a word of label text against a whole quoted password. Leaving
+#   the start of the value out keeps ``token=fv_password="x"`` from printing "fv" the same way.
+#
+# CHECKED ONCE PER RUN OF LETTERS AND DIGITS, NOT PER CHARACTER. Each plain class below walks its value
+# as tokens -- a whole run of letters and digits, or one other character -- and checks the stop only in
+# front of a run. Every branch of the stop starts on a letter or digit that follows some other
+# character, which is exactly the start of a run, so the two agree; and for the same reason no
+# lookbehind is needed in front of the keyword. Per run is cheaper than per character, but not by
+# much on a hyphen-and-dot run, where every run is one character long. What keeps ordinary lines
+# level is the fast path at ``_NO_QUOTED_LABEL_AFTER``, which skips the walk entirely.
+#
+# THE MEFOR_ BRANCH KEEPS THE ``\b`` ITS OWN PATTERN HAS, and so does the prefix branch. That is a cost
+# decision. ``\b`` cannot fire inside a word, so a long MEFOR_MEFOR_... or a_a_a_... run offers one
+# walk rather than one per "_", which would be quadratic.
+#
+# LINEAR. A keyword is a fixed literal behind a one-letter gate. The prefix and MEFOR_ walks start only
+# at a word boundary, so no two of them share a character. The whitespace walks are possessive, so
+# nothing re-walks a run.
+#
+# RESIDUALS. A value glued by "_" straight onto a label of the SAME family, as in
+# ``pwd=a_password="v w"``, still prints the quoted value: no word starts in front of the keyword, so
+# the stop lands on the keyword, and the pass cannot resume there. A label of a later family is caught,
+# because it sees the keyword right after the placeholder. And in ``support/redact.py`` only, whose run
+# class is case-sensitive ASCII, a keyword spelled with a fold character such as U+017F as its FIRST
+# letter is not checked; this copy folds its run class and does not have that gap.
+#: The first letters of every label keyword. A one-character gate in front of the keyword alternation:
+#: a case-folded alternation is tried branch by branch, and most runs start with none of these.
+_KEYWORD_INITIALS = "".join(
+    sorted({word[0] for word in _CREDENTIAL_WORDS + _KEY_MATERIAL_WORDS + _TOKEN_WORDS})
+)
+_QUOTED_LABEL = (
+    r"(?=(?i:[" + _KEYWORD_INITIALS + r"]))"
+    r"(?:(?i:" + _alternation(_CREDENTIAL_WORDS + _KEY_MATERIAL_WORDS) + r")\b['\"]?\s*+[:=]\s*+"
+    r"|(?i:" + _alternation(_TOKEN_WORDS) + r")\b\s*+[:=]\s*+(?:(?i:bearer|basic|digest)\s++)?"
+    r")['\"]"
+)
+_MEFOR_QUOTED_LABEL = r"\b(?-i:" + re.escape(_ENV_PREFIX) + r"[A-Z0-9_]++)\b['\"]?\s*+[:=]\s*+['\"]"
+#: Checked before a value's FIRST run.
+_NOT_AT_QUOTED_LABEL = r"(?!" + _QUOTED_LABEL + r"|" + _MEFOR_QUOTED_LABEL + r")"
+#: Checked before every LATER run: the same, plus the underscored prefix.
+_NOT_BEFORE_QUOTED_LABEL = (
+    r"(?!(?:\b(?:[A-Za-z0-9]+_){1,6})?" + _QUOTED_LABEL + r"|" + _MEFOR_QUOTED_LABEL + r")"
+)
+
+# THE FAST PATH, which is what keeps an ordinary credential line near its old cost. A stop needs label
+# syntax that runs from inside the value to a quote, so the value's natural run must end on that
+# syntax: on a quote, or on whitespace followed by ":", "=", a quote, or an auth scheme word.
+# ``_NO_QUOTED_LABEL_AFTER`` rules all of those out, and when it holds the whole run is taken with no
+# check at all; only otherwise does the value walk token by token. The two paths give the same result,
+# because a stop is impossible whenever this lookahead passes. Without it the per-run check cost an
+# ordinary credential line 41 percent; the cost table in the module docstring has the numbers.
+_NO_QUOTED_LABEL_AFTER = r"(?!\s*+[:='\"]|\s++(?i:bearer|basic|digest)\s)"
+
+# The plain value classes, one per terminator set; the terminator sets are the ones each pattern
+# always had. Each is an optional opening quote, then the fast path, else the tokens described above.
+_PLAIN_VALUE = (
+    r"['\"]?(?:[^\s'\"]++" + _NO_QUOTED_LABEL_AFTER + r"|"
+    r"(?:" + _NOT_AT_QUOTED_LABEL + r"[A-Za-z0-9]++|[^A-Za-z0-9\s'\"])"
+    r"(?:" + _NOT_BEFORE_QUOTED_LABEL + r"[A-Za-z0-9]++|[^A-Za-z0-9\s'\"])*+)"
+)
+_PLAIN_KV_VALUE = (
+    r"['\"]?(?:[^\s'\";,&]++" + _NO_QUOTED_LABEL_AFTER + r"|"
+    r"(?:" + _NOT_AT_QUOTED_LABEL + r"[A-Za-z0-9]++|[^A-Za-z0-9\s'\";,&])"
+    r"(?:" + _NOT_BEFORE_QUOTED_LABEL + r"[A-Za-z0-9]++|[^A-Za-z0-9\s'\";,&])*+)"
+)
+_PLAIN_KEY_VALUE = (
+    r"['\"]?(?:[^\s'\";&]++" + _NO_QUOTED_LABEL_AFTER + r"|"
+    r"(?:" + _NOT_AT_QUOTED_LABEL + r"[A-Za-z0-9]++|[^A-Za-z0-9\s'\";&])"
+    r"(?:" + _NOT_BEFORE_QUOTED_LABEL + r"[A-Za-z0-9]++|[^A-Za-z0-9\s'\";&])*+)"
+)
+_PLAIN_SCHEME_VALUE = (
+    r"['\"]?(?:[^\s'\",;]++" + _NO_QUOTED_LABEL_AFTER + r"|"
+    r"(?:" + _NOT_AT_QUOTED_LABEL + r"[A-Za-z0-9]++|[^A-Za-z0-9\s'\",;])"
+    r"(?:" + _NOT_BEFORE_QUOTED_LABEL + r"[A-Za-z0-9]++|[^A-Za-z0-9\s'\",;])*+)"
+)
+
+# A bearer/authorization token or an opaque session token in a header-ish or "token=" shape.
+#
+# The ``(?:bearer|basic|digest)\s+`` group is load-bearing, not decoration: without it the value class
+# matches the AUTH SCHEME rather than the credential, so "Authorization: Bearer <tok>" redacts the word
+# "Bearer" and emits <tok> verbatim. That exact defect shipped green on the sibling surface for months
+# (BACKLOG #1183). Making the group optional keeps the plain "token=<tok>" shape working, and the value
+# class excludes quotes so a quoted credential loses the value, not the quote.
+#
+# A QUOTED value is taken whole, and a BRACED one is not; the reason is on ``_CREDENTIAL_KV``.
+_BEARER = re.compile(
+    r"(?i)\b(" + _LABEL_PREFIX + r"(?:" + _alternation(_TOKEN_WORDS) + r"))\b"
+    r"\s*[:=]\s*(?:(?:bearer|basic|digest)\s+)?"
+    r"(?:" + _QUOTED_VALUE + r"|" + _PLAIN_VALUE + r")"
+)
+
+# A bare auth scheme carrying its credential with no preceding header label -- "Bearer <tok>" as it
+# appears in a WWW-Authenticate echo or a client retry line. ``_BEARER`` cannot reach this: it requires
+# a ":" or "=" after the label, and there is none here. The scheme word is kept so a reviewer sees what
+# leaked.
+#
+# "bearer" ONLY, deliberately, even though ``_BEARER`` accepts basic and digest as scheme words. There
+# the header label guarantees the line is an authorization header; here nothing does, and both other
+# words are ordinary configuration vocabulary in this codebase -- ``transports/http_auth.py`` raises
+# "oauth2_auth_style must be 'basic' or 'post'" and ``transports/soap.py`` raises "ws_password_type
+# must be 'text'". A token that is also ordinary vocabulary discriminates nothing, so matching on it
+# would redact operator diagnostics and buy no confidentiality: a labelled "Authorization: Basic
+# <cred>" is already carried by ``_BEARER``.
+#
+# THE FOUR-CHARACTER FLOOR IS A LOOKAHEAD, so the stop before a quoted label cannot take a match away.
+# Asked of the stopped run instead, ``Bearer ab:password="v w"`` would fail the floor and print "ab",
+# which the unstopped pattern redacted.
+_AUTH_SCHEME = re.compile(r"(?i)\b(bearer)\s+(?=['\"]?[^\s'\",;]{4})" + _PLAIN_SCHEME_VALUE)
+
+# A MEFOR_* secret echoed as "MEFOR_FOO=value" or "MEFOR_FOO: value": never carry the value. The
+# optional quotes match the shape ``resolve_env_settings`` produces -- "(env 'MEFOR_VALUE_PW'='<value>')"
+# -- which an unquoted form misses entirely.
+#
+# A quoted value is taken whole, and so is a braced one when its closer ends the value; the guard is
+# on ``_CREDENTIAL_KV``'s residuals.
+_MEFOR_SECRET = re.compile(
+    r"\b(" + re.escape(_ENV_PREFIX) + r"[A-Z0-9_]+)\b['\"]?\s*[:=]\s*"
+    r"(?:" + _ODBC_BRACED + r"(?![^\s'\"])|" + _QUOTED_VALUE + r"|" + _PLAIN_VALUE + r"['\"]?)"
+)
+
 # A credential in a "<label>=<value>" pair: an ODBC "PWD=", a "password=" in a connection error, a
 # provider "secret=". The value class stops at the separators these actually appear inside (";" in an
 # ODBC string, "," and "&" in a query), so a redaction cannot swallow the rest of the line.
@@ -286,18 +421,23 @@ _ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
 # wins; the plain class keeps its own leading ``['\"]?`` so a value whose quote does not CLOSE on this
 # line still loses its head exactly as it did before.
 #
-# TWO RESIDUALS, WRITTEN DOWN RATHER THAN IMPLIED.
+# WHAT THE OTHER LABEL PATTERNS TAKE, AND WHAT IS STILL LEFT OPEN. Decided under BACKLOG #1685's
+# remainder; each choice keeps a pattern from printing anything its plain class used to hide.
 #
-# * An UNCLOSED quote falls back to the plain class, so ``password='wt-A wt-B`` (no closing quote)
-#   still prints " wt-B". The brace form gets an overrun and this does not, deliberately: a "{" after
-#   a credential label is unambiguous, while an apostrophe is ordinary prose, and a quote overrun
-#   would eat the rest of any line whose value merely CONTAINS one.
-# * The other three label=value patterns keep their own plain classes, so a quoted or braced value
-#   under THEIR labels leaks the same way. ``_MEFOR_SECRET`` is the most exposed of the three -- it
-#   runs first and its class stops at whitespace, and a ``MEFOR_*`` variable holding a connection
-#   string is exactly the echo shape its own comment cites. ``_BEARER`` is the one with a REASON to
-#   stay narrow rather than merely a lack of evidence: ``session=`` and ``token=`` legitimately carry
-#   a "{"-opening dict or JSON repr in this engine's log text, and the overrun would eat those lines.
+# * ``_MEFOR_SECRET`` and ``_KEY_MATERIAL`` take a quoted value whole, and a braced one whole when the
+#   closing "}" ENDS the value -- that is, when the next character is one their plain class stops at.
+#   Without that guard, ``MEFOR_X={a}bc`` would redact ``{a}`` and print "bc", which the plain class
+#   used to hide. A braced value that does not end there falls back to the plain class.
+# * ``_BEARER`` takes a quoted value and NOT a braced one. ``session=`` and ``token=`` legitimately
+#   carry a "{"-opening dict or JSON repr in this engine's log text, and taking braces would change
+#   those lines for no credential.
+# * An UNCLOSED quote falls back to the plain class in every pattern, so ``password='wt-A wt-B`` (no
+#   closing quote) still prints " wt-B". Only ``_CREDENTIAL_KV``'s brace form gets an overrun, and
+#   that is deliberate: a "{" after a credential label is unambiguous, while an apostrophe is ordinary
+#   prose, and a quote overrun would eat the rest of any line whose value merely CONTAINS one. An
+#   unclosed "{" under ``_MEFOR_SECRET`` or ``_KEY_MATERIAL`` falls back to the plain class too.
+# * A list under ``_KEY_MATERIAL`` written with a SPACE after each comma still prints its later
+#   elements; the reason is on that pattern.
 _CREDENTIAL_KV = re.compile(
     r"(?i)\b(" + _LABEL_PREFIX + r"(?:" + _alternation(_CREDENTIAL_WORDS) + r"))\b"
     r"['\"]?\s*[:=]\s*"
@@ -307,7 +447,9 @@ _CREDENTIAL_KV = re.compile(
     + _QUOTED_VALUE
     + r"|"
     + _ODBC_BRACED_OVERRUN
-    + r"|['\"]?[^\s'\";,&]+)"
+    + r"|"
+    + _PLAIN_KV_VALUE
+    + r")"
 )
 
 # Key MATERIAL in a "<label>=<value>" pair, where the label ends in a credential word neither pattern
@@ -320,10 +462,16 @@ _CREDENTIAL_KV = re.compile(
 # first retired key and print the rest. Whitespace, quotes, ";" and "&" still terminate, so a redaction
 # cannot swallow the rest of a log line. RESIDUAL, stated because this pattern does not cover it: a
 # list written with a SPACE after the comma leaves its later elements unmatched -- and unlike the
-# support-bundle surface there is no long-base64 sweep behind this one to catch them.
+# support-bundle surface there is no long-base64 sweep behind this one to catch them. It stays open
+# on purpose: after ", " the next element looks exactly like the next word of an ordinary sentence,
+# so running on past the space would eat operator prose on every line that names a key.
+#
+# A quoted value is taken whole, and so is a braced one when its closer ends the value; the guard is
+# on ``_CREDENTIAL_KV``'s residuals.
 _KEY_MATERIAL = re.compile(
     r"(?i)\b(" + _LABEL_PREFIX + r"(?:" + _alternation(_KEY_MATERIAL_WORDS) + r"))\b"
-    r"['\"]?\s*[:=]\s*['\"]?[^\s'\";&]+"
+    r"['\"]?\s*[:=]\s*"
+    r"(?:" + _ODBC_BRACED + r"(?![^\s'\";&])|" + _QUOTED_VALUE + r"|" + _PLAIN_KEY_VALUE + r")"
 )
 
 # An inline password in a URL-shaped DSN: "postgres://user:<pw>@host/db". The scheme and the user
