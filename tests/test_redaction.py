@@ -2068,3 +2068,69 @@ def test_the_backstop_and_the_encoded_run_stay_linear_and_affordable(unit: str) 
     assert t_large / t_small < 24, f"{t_large / t_small:.1f}x for 8x the input on {unit!r}"
     window = sized(redaction._REDACT_WINDOW)
     assert _best_of(lambda: redact(window)) < 0.5
+
+
+# --- BACKLOG #1797: the length bound never keeps half a token ---------------------------------------
+
+#: A synthetic identifier in the shape a database driver quotes one: bare digits in prose, which no
+#: pass recognises. No real PHI (PHI.md section 9).
+_BARE_IDENTIFIER = "900123456"
+
+
+def _identifier_straddling(limit: int) -> str:
+    """Prose whose bracketed identifier starts four characters before ``limit``, so ``text[:limit]``
+    would keep ``(900`` and drop the rest. Everything before it survives ``redact`` unchanged, which
+    the control arm below checks rather than assumes."""
+    lead = " duplicate key value violates unique constraint, the duplicate key value is "
+    pad = _filler(limit - 4 - len(lead))
+    return f"{pad}{lead}{_STRADDLING_TAIL}"
+
+
+#: What follows ``value is`` in the fixture above: every character the bound drops there.
+_STRADDLING_TAIL = f"({_BARE_IDENTIFIER}) already exists"
+
+
+def test_the_bound_does_not_keep_the_head_of_an_identifier_it_splits() -> None:
+    """The measured case: a 200-character bound sliced a driver message to ``... is (4242``, a partial
+    identifier that also looked redacted. A token the bound would split now goes whole."""
+    out = safe_exc(ValueError(_identifier_straddling(redaction._DEFAULT_LIMIT)))
+    assert out.startswith("ValueError: ")
+    assert "(900" not in out and "900" not in out, out
+    # The space before the identifier goes too, so the count is the tail plus one.
+    assert out.endswith(f"value is…(+{len(_STRADDLING_TAIL) + 1} chars)"), out
+
+
+def test_control_the_straddling_identifier_survives_redact_and_a_wider_bound() -> None:
+    """Non-vacuity for the arm above. ``redact`` leaves the identifier alone, and a bound past it keeps
+    it whole, so only the token cut removes it there.
+
+    **The second assertion pins a RESIDUAL, not a property to defend.** A bare identifier inside the
+    bound is kept. That half of BACKLOG #1797 waits on the posture decision the owner ruled on
+    2026-10-04 to take with #2644 under one ADR. Change it there, not by adding a pattern here."""
+    text = _identifier_straddling(redaction._DEFAULT_LIMIT)
+    assert redact(text) == text
+    assert f"({_BARE_IDENTIFIER})" in safe_text(text, limit=len(text))
+
+
+@pytest.mark.parametrize("limit", range(150, 230))
+def test_the_count_covers_every_character_the_bound_drops(limit: int) -> None:
+    """``(+N chars)`` plus what is kept accounts for the whole redacted text, wherever the bound falls:
+    inside a token, on whitespace, or on a whitespace run. And no kept token is a fragment."""
+    text = _identifier_straddling(200) + "  trailing words here"
+    full = redact(text).strip()
+    out = safe_text(text, limit=limit)
+    head, marker, rest = out.partition("…(+")
+    assert marker, out
+    count = int(rest.removesuffix(" chars)"))
+    assert len(head) + count == len(full)
+    assert len(head) <= limit
+    assert full.startswith(head)
+    assert head == full[: len(head)].rstrip()
+    assert len(head) == len(full) or full[len(head)] in redaction._CUT_CHARS
+
+
+def test_a_single_token_longer_than_the_bound_is_dropped_whole() -> None:
+    """No whitespace to cut back to means nothing is kept, the same choice ``_clamp`` makes for a
+    window with no boundary in it. The count is the whole token."""
+    assert safe_text("A1" * 300, limit=40) == "…(+600 chars)"
+    assert safe_exc(RuntimeError("x" * 5000), limit=50) == "RuntimeError: …(+5000 chars)"

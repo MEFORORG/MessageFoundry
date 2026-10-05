@@ -1658,6 +1658,30 @@ def _redact_flat(text: str, *, widened: bool, credentials: bool) -> str:
     return _NAME_RUN.sub(_name_run_replacement if has_label else _REDACTED, scrubbed)
 
 
+def _whole_token_prefix(text: str, limit: int) -> int:
+    """Length of the longest prefix of ``text``, at most ``limit`` characters, that ends on a whole
+    token. ``text`` must be longer than ``limit``.
+
+    **``text[:limit]`` cut an identifier in half and kept its head (BACKLOG #1797).** The bound runs
+    after :func:`redact`, so it cuts whatever the redactor did not recognise. A bare identifier in prose
+    is one such thing, and a driver message was measured rendered as ``...The duplicate key value is
+    (4242``. A partial identifier still narrows who it names, and it looks redacted. So the cut goes
+    back to the last :data:`_CUT_CHARS` boundary, and the token straddling ``limit`` is dropped whole.
+    A single token longer than ``limit`` leaves nothing, the same choice :func:`_clamp` makes for a
+    window with no whitespace in it.
+
+    **This drops a split token; it does not recognise one.** An identifier that ends before ``limit``
+    is kept, exactly as before. That is the other half of #1797, and it waits on an owner decision
+    about the posture of the arbitrary-text sites rather than on another pattern here.
+
+    Linear in ``limit``: :func:`_last_cut` searches back from ``limit`` only, and ``limit`` is the
+    answer's size, which is already bounded."""
+    # Searching through index ``limit`` itself, so a bound that falls ON whitespace splits nothing and
+    # keeps everything before it. -1 when there is no whitespace at all, which keeps nothing.
+    end = max(_last_cut(text, limit + 1), 0)
+    return len(text[:end].rstrip(_CUT_CHARS))
+
+
 def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
     """A PHI-redacted, length-bounded rendering of a free-text diagnostic string — the string analog of
     :func:`safe_exc`, for error/detail text that isn't an exception object (joined strict-validation
@@ -1673,8 +1697,12 @@ def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
     ``redact(text[:limit])`` — the module docstring says why that form leaks the name it was meant to
     catch.
 
+    **``limit`` cuts at a whole token too, never inside one (BACKLOG #1797).** A token straddling the
+    limit is dropped whole, so an identifier the redactor missed is never kept as its head
+    (:func:`_whole_token_prefix`).
+
     The two counts stay separate and each is exactly true: ``(+N chars)`` is redacted text this call
-    held back, and the bound note is raw characters no pattern ever looked at. One total would add a
+    held back, every character of it, and the bound note is raw characters no pattern ever looked at. One total would add a
     redacted length to an unredacted one and report a number that is neither. Nothing is dropped in the
     ordinary case, so the ordinary result is byte-identical to its pre-#1576 self.
 
@@ -1683,13 +1711,15 @@ def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
     credential backstop can reach an ``@`` on a further pass that was past its bound on the first,
     once another pass shortened the text in between (:func:`_redact_flat`; the gap between two spans
     it scrubbed itself is no longer one, BACKLOG #2312); an unquoted DICOM label value can take the truncation note with it; and
-    (BACKLOG #2079) a kept operator string under a JSON ``name``/``address`` that ``limit`` cuts is left
-    unterminated, which a further pass scrubs, so ``"IB_ACME_ADT…(+N chars)`` becomes ``"[redacted]``
-    and loses the note that the text was cut."""
+    (BACKLOG #2079) a JSON ``name``/``address`` key that ``limit`` leaves last has the count read as its
+    value by a further pass, so ``{"name":…(+316 chars)`` becomes ``{"name":…([redacted] [redacted])``
+    and loses how much was cut. Before BACKLOG #1797 the limit cut the kept string itself and left it
+    unterminated, which a further pass scrubbed the same way."""
     head, dropped = _clamp(text, _REDACT_WINDOW)
     message = redact(head).strip()
     if len(message) > limit:
-        message = f"{message[:limit]}…(+{len(message) - limit} chars)"
+        kept = _whole_token_prefix(message, limit)
+        message = f"{message[:kept]}…(+{len(message) - kept} chars)"
     if dropped:
         message = f"{message} {_clamp_marker(dropped)}"
     return message
