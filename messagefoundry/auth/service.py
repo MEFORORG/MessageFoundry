@@ -5823,9 +5823,9 @@ class AuthService:
 
         **Ordering is the whole control** (see each call site): every store stamp for this elevation
         must already have been written against the OLD hash before this runs, because the re-key
-        carries those columns forward, and every session UPDATE except ``revoke_session`` and
-        ``rotate_session`` is rowcount-blind — a stamp issued *after* the rotation silently writes
-        nothing. Any purpose-bound grant must be minted AFTER, against the NEW hash.
+        carries those columns forward, and every session stamp UPDATE is rowcount-blind (which
+        session writes report what they changed is :meth:`AuthStore.rotate_session`'s docstring to
+        say) — a stamp issued *after* the rotation silently writes nothing. Any purpose-bound grant must be minted AFTER, against the NEW hash.
         """
         return await self._rotate_session_hash(hash_token(token))
 
@@ -6031,23 +6031,31 @@ class AuthService:
         presented token is the whole point, whatever its state. (The per-user cap no longer relies on
         this. Since BACKLOG #1900 it counts only live rows and revokes lapsed ones itself.) Only a
         session that was still LIVE gets an audit row, so the trail does
-        not record the ending of something that had already ended. ``revoke_session`` reports no
-        rowcount, so the row is read back: a rotation that re-keyed it between the read and the
-        revoke leaves the old hash absent, and then no row claims a revoke that never happened.
+        not record the ending of something that had already ended.
+
+        **The read and the revoke are one atomic store operation (BACKLOG #2146).** Why that closes
+        the race with a concurrent rotation is :meth:`AuthStore.supersede_session`'s to say. It holds
+        across engine processes too, because engine shards serve the API from one shared store.
+
+        **A rotation that committed BEFORE that operation is a stated limit, not a race this
+        closes.** The presented hash then names no session, so this ends nothing, and the session
+        lives on under its new token. docs/SECURITY.md (ASVS 7.2.4, the supersession paragraphs)
+        states how wide that window is.
         Returns True when it audited.
         """
-        prior = await self._store.get_session(prior_hash)
-        if prior is None or prior.revoked_at is not None:
+        before = time.time()
+        prior = await self._store.supersede_session(prior_hash, now=before)
+        if prior is None:
             return False
-        now = time.time()
+        after = time.time()
         # The validator's own test, clock-step checks included (BACKLOG #2096): a row stamped ahead
-        # of `now` is one the validator would refuse, so ending it is not the end of a live session.
-        was_live = prior.is_live(now=now, idle_seconds=self.session_idle_seconds)
-        await self._store.revoke_session(prior_hash, now=now)
-        if not was_live:
-            return False
-        after = await self._store.get_session(prior_hash)
-        if after is None or after.revoked_at is None:
+        # of the clock is one the validator would refuse, so ending it is not the end of a live
+        # session. The revoke landed somewhere between `before` and `after`, so the row is judged at
+        # the latest moment it can show to have been used, clamped to that span. A touch that
+        # committed inside the call is then not mistaken for a clock step, a stamp past `after`
+        # still is one, and a session already over at `before` is not judged live by waiting.
+        moment = min(max(before, prior.last_used_at), after)
+        if not prior.is_live(now=moment, idle_seconds=self.session_idle_seconds):
             return False
         owner = await self._store.get_user(prior.user_id)
         await self._audit(
@@ -7758,7 +7766,7 @@ class AuthService:
             if await self._verify_second_factor(user, code, client=client, arrived=arrived):
                 # ORDER-CRITICAL: this whole three-write group lands against the OLD hash, and only
                 # then does the session rotate. Moving any of them after the rotation writes NOTHING
-                # and reports success — every session UPDATE but revoke/rotate is rowcount-blind.
+                # and reports success — every session stamp UPDATE is rowcount-blind.
                 # The 2nd factor is now satisfied; also seed the step-up window (the session has
                 # completed password + MFA) and clear the failure counter. (Initial enrollment has no
                 # factor to verify, so this never fires there — keeping the enrollment step-up gate

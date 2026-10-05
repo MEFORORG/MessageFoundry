@@ -388,7 +388,8 @@ def test_session_is_live_matches_the_sql_liveness_predicate() -> None:
 
 
 async def test_superseding_a_clock_stepped_session_is_not_audited_as_live() -> None:
-    """BACKLOG #2096, criterion 2: ``was_live`` uses the validator's rule, clock-step checks
+    """BACKLOG #2096, criterion 2: the supersession's liveness check (``was_live`` until BACKLOG
+    #2146 made it a check on the row the revoke returned) uses the validator's rule, clock-step checks
     included. A prior session stamped ahead of now is one the validator refuses, so ending it at a
     fresh sign-in must not write an ``auth.session_revoked`` row claiming a live session ended."""
     store = await _store()
