@@ -212,6 +212,7 @@ tests/test_worktree_install_daily_prune.py
 tests/test_worktree_new_cleanup_advice.py
 tests/test_worktree_new_no_track.py
 tests/test_worktree_prune_merged.py
+tests/test_worktree_remove_path.py
 tests/test_worktree_remove.py
 tests/test_worktree_selfheal_wiring.py
 tests/test_worktree_venv_constraint.py

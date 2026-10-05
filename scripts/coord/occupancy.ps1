@@ -236,6 +236,10 @@ Map every session record onto the worktree it was launched in, fenced for livene
 Returns a pscustomobject:
     RepoFound        [bool]   the -Repo hint resolved to a git repo at all
     Available        [bool]   the fence had something to examine (see the header)
+    RegistryRead     [bool]   the enumeration below completed without throwing. It is NOT proof that
+                              every root was read: the listing ignores a per-directory error, and a
+                              root whose sessions directory cannot be tested is never examined.
+                              remove.ps1 -Path pairs it with a second listing that stops on any error.
     Detail           [string] why it is unavailable, '' when it is available
     RootsExamined     [int]    config roots holding a sessions registry
     RecordsExamined   [int]    records that PARSED across those roots
@@ -257,7 +261,7 @@ function Get-WorktreeOccupancy {
     $worktrees = @(Get-RepoWorktrees $Repo)
     if ($worktrees.Count -eq 0) {
         return [pscustomobject]@{
-            RepoFound = $false; Available = $false
+            RepoFound = $false; Available = $false; RegistryRead = $false
             Detail = 'not inside a git repository -- nothing to scope occupancy to'
             RootsExamined = 0; RecordsExamined = 0; RecordsUnplaceable = 0; UnplaceableFiles = @()
             Worktrees = @(); PrimaryPath = ''; Sessions = @()
@@ -281,7 +285,7 @@ function Get-WorktreeOccupancy {
     catch {
         # An unreadable registry is an unavailable fence, never an empty one.
         return [pscustomobject]@{
-            RepoFound = $true; Available = $false
+            RepoFound = $true; Available = $false; RegistryRead = $false
             Detail = "session registry unreadable: $($_.Exception.Message)"
             RootsExamined = $roots.Count; RecordsExamined = 0; RecordsUnplaceable = 0; UnplaceableFiles = @()
             Worktrees = $worktrees; PrimaryPath = $primaryPath; Sessions = @()
@@ -384,7 +388,7 @@ function Get-WorktreeOccupancy {
     }
 
     return [pscustomobject]@{
-        RepoFound = $true; Available = $available; Detail = $detail
+        RepoFound = $true; Available = $available; RegistryRead = $true; Detail = $detail
         RootsExamined = $roots.Count; RecordsExamined = $records.Count
         RecordsUnplaceable = $faults.Count
         UnplaceableFiles = @($faults | ForEach-Object { "$($_.File) -- $($_.Why)" })
