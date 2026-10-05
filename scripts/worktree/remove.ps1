@@ -31,8 +31,9 @@
       * a target that CONTAINS another registered worktree, since the removal would delete that
         checkout too and leave it registered with no directory;
       * a target git has locked, which is git's own in-use flag;
-      * a DETACHED target whose HEAD commit is held by no ref, and a target whose HEAD reflog holds a
-        commit no ref holds. The removal deletes that reflog, so nothing would reach those commits;
+      * a DETACHED target whose HEAD commit is held by no ref, and a target whose HEAD reflog or own
+        per-worktree refs (refs/worktree, refs/bisect, refs/rewritten) hold a commit no shared ref
+        holds. The removal deletes that reflog and those refs, so nothing would reach the commits;
       * a target the session registry records a session in, or any target at all when the registry
         cannot be read (scripts/coord/occupancy.ps1 says why an unreadable fence must refuse). A
         registry that was read and holds no record at all clears the target. This fence sees only
@@ -322,23 +323,35 @@ if ($byPath) {
     # caller did not make. -Force does not override it. A commit a branch's own reflog still holds,
     # an amended one for example, is counted here too: this cannot tell the two apart, so it refuses.
     $logTips = @(& git -C $WorktreePath reflog show --format=%H HEAD 2>$null |
-            Where-Object { $_ -match '\A[0-9a-f]{40,64}\z' } | Sort-Object -Unique)
+            Where-Object { $_ -match '\A[0-9a-f]{40,64}\z' })
     if ($LASTEXITCODE -ne 0) {
         throw "Could not read the HEAD reflog of '$WorktreePath' (exit $LASTEXITCODE). Nothing was removed."
     }
+    # THE TREE'S OWN PER-WORKTREE REFS GO WITH IT TOO. refs/worktree/*, refs/bisect/* and
+    # refs/rewritten/* live in this worktree's admin directory, and the primary's `--glob=refs/*` below
+    # reads the PRIMARY's copies of those namespaces, never this tree's. So what they point at is
+    # checked the same way as the reflog. Read from INSIDE the target, which is the only place they
+    # resolve.
+    $ownRefTips = @(& git -C $WorktreePath for-each-ref '--format=%(objectname)' refs/worktree/ refs/bisect/ refs/rewritten/ 2>$null |
+            Where-Object { $_ -match '\A[0-9a-f]{40,64}\z' })
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not read the per-worktree refs of '$WorktreePath' (exit $LASTEXITCODE). Nothing was removed."
+    }
+    $logTips = @(@($logTips) + @($ownRefTips) | Sort-Object -Unique)
     # The tips ride on one command line, which has a length limit. Past it, refuse rather than sample.
     if ($logTips.Count -gt 400) {
-        throw ("The HEAD reflog of '$WorktreePath' names $($logTips.Count) commits, more than this route " +
-            "checks. Nothing was removed.")
+        throw ("The HEAD reflog and per-worktree refs of '$WorktreePath' name $($logTips.Count) commits, " +
+            "more than this route checks. Nothing was removed.")
     }
     if ($logTips.Count -gt 0) {
         $looseCommits = @(& git -C $GitRoot rev-list @logTips --not @transientRefExcludes --glob=refs/* 2>$null)
         if ($LASTEXITCODE -ne 0) {
-            throw "Could not tell whether a ref holds the commits in the HEAD reflog of '$WorktreePath'. Nothing was removed."
+            throw ("Could not tell whether a ref holds the commits in the HEAD reflog and per-worktree " +
+                "refs of '$WorktreePath'. Nothing was removed.")
         }
         if ($looseCommits.Count -gt 0) {
-            Write-Host ("REFUSED: the HEAD reflog of '$WorktreePath' holds $($looseCommits.Count) commit(s) " +
-                "that no ref holds:") -ForegroundColor Red
+            Write-Host ("REFUSED: the HEAD reflog or a per-worktree ref of '$WorktreePath' holds " +
+                "$($looseCommits.Count) commit(s) that no shared ref holds:") -ForegroundColor Red
             $looseCommits | Select-Object -First 5 | ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
             Write-Host "Keep one with:  git -C `"$GitRoot`" branch <name> <commit>" -ForegroundColor Red
             throw "Removing it would delete that reflog and leave those commits in no ref. Nothing was removed."
@@ -549,8 +562,15 @@ if ($DeleteBranch) {
 # Read before the removal, only to say afterwards which branch was left alone.
 $keptBranch = if ($byPath -and -not $entry.Detached) { [string]$entry.Branch } else { '' }
 
-# --force is needed regardless: the untracked .venv makes git consider the worktree non-empty.
-& git -C $GitRoot worktree remove --force $WorktreePath
+# -Name passes --force regardless: an untracked .venv makes git consider the worktree non-empty, and
+# that route lets untracked files go.
+# -Path WITHOUT -Force PASSES NO --force, so git makes its own check at the moment it deletes: it
+# refuses a tree with modified or untracked files. That closes the gap between the status read above
+# and the removal, for those two kinds. Git's check does not list ignored files, so the tolerated
+# cache directories still go, and so would an ignored file written in that gap.
+$removeArgs = @('worktree', 'remove')
+if (-not $byPath -or $Force) { $removeArgs += '--force' }
+& git -C $GitRoot @removeArgs $WorktreePath
 if ($LASTEXITCODE -ne 0) {
     $code = $LASTEXITCODE
     if ($byPath) {

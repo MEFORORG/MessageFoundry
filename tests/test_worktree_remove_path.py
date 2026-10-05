@@ -411,6 +411,28 @@ def test_a_commit_only_the_head_reflog_holds_is_refused_even_with_force(rig: Rig
     assert _git(rig.primary, "rev-parse", "keep-stray").strip() == stray
 
 
+def test_a_commit_only_a_per_worktree_ref_holds_is_refused(rig: Rig) -> None:
+    """``refs/worktree/*`` lives in the worktree's own admin directory and goes with it. The commit
+    here was never HEAD, so neither the detached check nor the reflog check can see it, and the
+    primary's ``--glob=refs/*`` reads the primary's copy of that namespace, not this tree's."""
+    wt = rig.add(rig.scratch("pinned"))
+    tree = _git(wt, "rev-parse", "HEAD^{tree}").strip()
+    aside = _git(wt, "commit-tree", tree, "-p", "HEAD", "-m", "kept aside").strip()
+    _git(wt, "update-ref", "refs/worktree/aside", aside)
+    assert aside not in _git(wt, "reflog", "show", "--format=%H", "HEAD")
+
+    proc = rig.run("-Path", str(wt), "-Force")
+
+    assert proc.returncode != 0
+    assert "per-worktree ref" in _out(proc) and aside in _out(proc), _out(proc)
+    assert wt.exists() and rig.is_registered(wt)
+
+    _git(rig.primary, "branch", "keep-aside", aside)
+    again = rig.run("-Path", str(wt))
+    assert again.returncode == 0, _out(again)
+    assert not wt.exists()
+
+
 # --- the occupancy fence -----------------------------------------------------------------------------
 
 
