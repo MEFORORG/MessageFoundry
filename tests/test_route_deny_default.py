@@ -17,6 +17,7 @@ The route walk's own tests for the same blind spots are in ``tests/test_route_ga
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import logging
 from collections.abc import AsyncIterator
@@ -44,7 +45,16 @@ from messagefoundry.api.security import (
 )
 from messagefoundry.auth.permissions import Permission
 from messagefoundry.auth.service import AuthService
-from messagefoundry.config.settings import AuthSettings, EgressSettings
+from messagefoundry.config.settings import (
+    AiSettings,
+    AlertsSettings,
+    ApprovalsSettings,
+    AuthSettings,
+    EgressSettings,
+    SecuritySettings,
+    ServiceStatusSettings,
+    StoreSettings,
+)
 from messagefoundry.pipeline import Engine
 from scripts.security import route_gates
 
@@ -112,7 +122,7 @@ def test_no_create_app_flag_registers_a_route_the_full_surface_app_lacks(full_ap
     boolean ``create_app`` takes must add no route, or the walk would never see it."""
     full = _route_keys(full_app)
     flipped = 0
-    for name, param in inspect.signature(create_app).parameters.items():
+    for name, param in inspect.signature(route_gates.create_app).parameters.items():
         if not isinstance(param.default, bool) or name in route_gates.ROUTE_REGISTERING_FLAGS:
             continue
         flipped_app = route_gates.full_surface_app(**{name: not param.default})
@@ -120,6 +130,121 @@ def test_no_create_app_flag_registers_a_route_the_full_surface_app_lacks(full_ap
         assert not extra, f"create_app({name}={not param.default}) registers {sorted(extra)}"
         flipped += 1
     assert flipped >= 5, f"only {flipped} boolean flags were flipped; the signature read went wrong"
+
+
+# Vault BACKLOG #2846: the test above flips only a parameter whose default is a bool, so a parameter
+# defaulting to None, a string or a tuple was never tried. Each such parameter is listed here with
+# the values to try in its place. A new one fails the signature pin below until it is listed, which is
+# the point at which someone decides whether it registers a route.
+
+
+@contextlib.asynccontextmanager
+async def _noop_lifespan(app: FastAPI) -> AsyncIterator[None]:
+    yield
+
+
+#: Every non-bool ``create_app`` parameter, and the non-default values to build the full-surface app
+#: with. ``engine`` and ``auth`` need a live store, so the async test below covers them.
+_NON_BOOL_VALUES: dict[str, tuple[Any, ...]] = {
+    "lifespan": (_noop_lifespan,),
+    "ai_settings": (AiSettings(),),
+    "store_settings": (StoreSettings(),),
+    "security_settings": (SecuritySettings(),),
+    "approvals": (ApprovalsSettings(),),
+    "alerts_settings": (AlertsSettings(),),
+    "service_settings": (ServiceStatusSettings(),),
+    "ws_allowed_origins": (("https://console.example.test",),),
+    "public_origin": ("https://console.example.test",),
+    "oidc_authorization_endpoint": ("https://idp.example.test/authorize",),
+    "webauthn_rp_from_request": (True, False),
+    "tls_client_cert_identities": ({"CN=Example Issuer": {"CN=svc.example.test": "svc"}},),
+    "trusted_proxies": (("10.0.0.1",),),
+    "log_dir": ("synthetic-log-dir",),
+    "configured_log_level": ("INFO",),
+}
+_NON_BOOL_BUILT_BY_FIXTURE = frozenset({"engine", "auth"})
+
+
+def _unlisted_non_bool_parameters() -> set[str]:
+    signature = inspect.signature(route_gates.create_app)
+    non_bool = {n for n, p in signature.parameters.items() if not isinstance(p.default, bool)}
+    return non_bool - _NON_BOOL_VALUES.keys() - _NON_BOOL_BUILT_BY_FIXTURE
+
+
+def _routes_added_by_non_bool_values(
+    full: set[tuple[str, str]],
+) -> dict[str, list[tuple[str, str]]]:
+    added: dict[str, list[tuple[str, str]]] = {}
+    for name, values in _NON_BOOL_VALUES.items():
+        for value in values:
+            extra = _route_keys(route_gates.full_surface_app(**{name: value})) - full
+            if extra:
+                added[f"{name}={value!r}"] = sorted(extra)
+    return added
+
+
+def test_every_non_bool_create_app_parameter_is_listed() -> None:
+    unlisted = _unlisted_non_bool_parameters()
+    assert not unlisted, (
+        f"create_app gained non-bool parameter(s) {sorted(unlisted)}. List each in _NON_BOOL_VALUES "
+        "with a value to try, so the test below checks whether it registers a route."
+    )
+    signature = inspect.signature(route_gates.create_app)
+    stale = (_NON_BOOL_VALUES.keys() | _NON_BOOL_BUILT_BY_FIXTURE) - signature.parameters.keys()
+    assert not stale, f"listed but no longer a create_app parameter: {sorted(stale)}"
+
+
+def test_no_non_bool_create_app_parameter_registers_a_route_the_full_surface_app_lacks(
+    full_app: FastAPI,
+) -> None:
+    added = _routes_added_by_non_bool_values(_route_keys(full_app))
+    assert not added, f"these create_app values register routes the walk never sees: {added}"
+
+
+def _create_app_with(new_parameter: inspect.Parameter) -> Any:
+    """``create_app`` with one more keyword parameter, which registers ``/zz/new`` when set."""
+    real = route_gates.create_app
+
+    def planted(*args: Any, **kwargs: Any) -> FastAPI:
+        value = kwargs.pop(new_parameter.name, new_parameter.default)
+        app = real(*args, **kwargs)
+        if value != new_parameter.default:
+
+            @app.get("/zz/new")
+            @public_route("a synthetic route a new parameter registers")
+            async def new() -> dict[str, str]:
+                return {"ok": "reached"}
+
+        return app
+
+    signature = inspect.signature(real)
+    planted.__signature__ = signature.replace(  # type: ignore[attr-defined]
+        parameters=[*signature.parameters.values(), new_parameter]
+    )
+    return planted
+
+
+def test_a_new_non_bool_parameter_fails_the_pin_and_one_that_registers_a_route_is_caught(
+    full_app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for the two tests above: each one bites on a parameter planted to break it."""
+    parameter = inspect.Parameter(
+        "extra_routes_from", inspect.Parameter.KEYWORD_ONLY, default=None, annotation="str | None"
+    )
+    monkeypatch.setattr(route_gates, "create_app", _create_app_with(parameter))
+    assert _unlisted_non_bool_parameters() == {"extra_routes_from"}
+    monkeypatch.setitem(_NON_BOOL_VALUES, "extra_routes_from", ("synthetic",))
+    added = _routes_added_by_non_bool_values(_route_keys(full_app))
+    assert added == {"extra_routes_from='synthetic'": [("GET", "/zz/new")]}, added
+
+
+async def test_the_engine_and_auth_arguments_register_no_route_the_full_surface_app_lacks(
+    engine: Engine, full_app: FastAPI
+) -> None:
+    service = AuthService(engine.store, AuthSettings())
+    await service.initialize()
+    built = route_gates.full_surface_app(engine=engine, auth=service)
+    assert not _route_keys(built) - _route_keys(full_app)
 
 
 @pytest.fixture

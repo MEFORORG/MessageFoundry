@@ -558,8 +558,10 @@ def route_rows(app: FastAPI | None = None) -> list[RouteRow]:
 
 
 #: The ``create_app`` flags that register routes. ``oidc_enabled`` registers its routes only beside
-#: ``serve_ui``. A test flips every boolean ``create_app`` takes and checks that none adds a route
-#: :func:`full_surface_app` lacks, so a new flag that registers routes reds a run until it is listed.
+#: ``serve_ui``; an ``auth`` service with OIDC on registers the same ones. A test flips every boolean
+#: ``create_app`` takes, and tries a listed value for every other parameter, and checks that none adds
+#: a route :func:`full_surface_app` lacks. A new flag that registers routes reds a run until it is
+#: listed here, and a new non-boolean parameter reds one until the test lists it (vault BACKLOG #2846).
 ROUTE_REGISTERING_FLAGS: tuple[str, ...] = ("expose_docs", "serve_ui", "oidc_enabled")
 
 
