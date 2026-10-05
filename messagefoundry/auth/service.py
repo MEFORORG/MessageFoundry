@@ -2071,6 +2071,9 @@ class AuthService:
         self._reconcile_last_probed: dict[str, float] = {}
         #: Latched mass-revoke circuit-breaker trip, cleared by the next clean pass.
         self._reconcile_alert: str | None = None
+        #: user_ids a breaker trip has not yet seen re-read on a pass that was not aborted
+        #: (BACKLOG #2136). `_mark_reconcile_clears` reports no breaker clear while one is signed in.
+        self._reconcile_unconfirmed: set[str] = set()
         #: user_id -> the outcome of that candidate's latest probe that reached the directory (ADR
         #: 0195 rule item 3). The undetermined-wave hold counts UNDETERMINED entries here across the
         #: probe rotation, so two unreadable accounts sampled on different passes are still two.
@@ -5208,12 +5211,20 @@ class AuthService:
         self._reconcile_strikes.update(plan.strikes)
         self._reconcile_outcomes.update(plan.outcomes)
         self._reconcile_hold_latched = plan.latched
+        # BACKLOG #2136. A trip makes every candidate unconfirmed until a pass that is not aborted
+        # reads it again, so a probe sample that missed the accounts behind the trip is no clear.
+        self._reconcile_unconfirmed.intersection_update(users)
+        if plan.aborted is None:
+            self._reconcile_unconfirmed.difference_update(plan.outcomes)
+        elif not plan.directory_outage:
+            self._reconcile_unconfirmed = set(users)
         if plan.aborted is not None:
             await self._abort_reconcile_pass(plan)
             if not plan.directory_outage:
                 # A held pass writes its own row even when the breaker also aborts it (ADR 0195 rule
                 # item 9). An outage judged nothing, so it leaves the hold's message alone.
                 await self._record_reconcile_hold(plan)
+                plan = self._mark_reconcile_clears(plan, users)
             await self._report_unkeyed_bindings(unkeyed, still_unkeyed=still_unkeyed)
             return plan
 
@@ -5256,7 +5267,53 @@ class AuthService:
         await self._report_unkeyed_bindings(unkeyed, still_unkeyed=still_unkeyed)
         # What the pass DID, which is what the caller alerts on: a scope revocation skipped at apply
         # time (ADR 0198) was audited as nothing, so it must page as nothing too.
-        return replace(plan, revocations=tuple(applied))
+        return replace(self._mark_reconcile_clears(plan, users), revocations=tuple(applied))
+
+    def _mark_reconcile_clears(
+        self, plan: reconcile.ReconcilePlan, users: Mapping[str, UserRecord]
+    ) -> reconcile.ReconcilePlan:
+        """Say on the plan whether this pass is EVIDENCE that each standing condition has cleared.
+
+        BACKLOG #2136. The lifespan task resolves the durable ``ad_reconcile_aborted`` and
+        ``ad_reconcile_held`` alert instances on these, on every pass that sets them. Those
+        instances outlive the process, and the strike and outcome records here do not. So "not
+        aborted" or "not held" is not enough: after a restart, or before the probe budget has
+        reached every account, a pass can read clear while the condition still stands.
+
+        * Both need an answer on record, from this process, for every signed-in account the pass
+          did not just revoke. A probe that could not reach the directory leaves none.
+        * The hold is clear when, on top of that, the pass did not hold and none of those answers
+          is undetermined. The second test does not rest on this node's hysteresis latch, which
+          another node on the store may not share.
+        * The breaker is clear when the pass was not aborted, every one of those accounts carries no
+          strike, at least one of them did not read undetermined, and every account signed in at
+          the last trip has been read again since by a pass that was not aborted. A pending strike
+          is a revocation the breaker has not judged yet, so it says nothing either way. A pass of
+          held accounts only cannot trip the breaker at all. And a trip on role or scope changes
+          leaves no strike, so a later probe sample that missed those accounts proves nothing.
+
+        ``users`` is this pass's candidate set. Every node on a store runs its own reconciler over
+        the same signed-in accounts and the same alert instance, so a clear rests on reading every
+        one of them.
+
+        **The cost is a missed clear, never a false one.** An account that never answers keeps
+        both instances open while it is signed in, and so does a reconciler that is switched off.
+        An operator resolves those by hand.
+        """
+        undetermined = reconcile.ProbeOutcome.UNDETERMINED
+        revoked = {r.user_id for r in plan.revocations}
+        ids = [uid for uid in users if uid not in revoked]
+        outcomes = [self._reconcile_outcomes.get(uid) for uid in ids]
+        covered = bool(ids) and None not in outcomes
+        hold_clear = covered and not plan.hold and undetermined not in outcomes
+        breaker_clear = (
+            covered
+            and plan.aborted is None
+            and any(o is not undetermined for o in outcomes)
+            and all(self._reconcile_strikes.get(uid, 0) == 0 for uid in ids)
+            and self._reconcile_unconfirmed.isdisjoint(ids)
+        )
+        return replace(plan, breaker_clear=breaker_clear, hold_clear=hold_clear)
 
     async def _refresh_cached_username(
         self,

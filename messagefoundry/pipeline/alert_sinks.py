@@ -121,6 +121,10 @@ _AUTO_RESOLVE: dict[str, str] = {
     "store_privilege_clean": "store_privilege_warning",
     # #290: a bound that cleared its resume line resolves the open intake pause for the same bound.
     "intake_resumed": "intake_paused",
+    # #2136: a reconcile pass that is evidence the breaker is not tripped, or that no hold stands,
+    # resolves the open instance of that alert. Both carry the fixed "directory-reconciler" label.
+    "ad_reconcile_breaker_cleared": "ad_reconcile_aborted",
+    "ad_reconcile_hold_released": "ad_reconcile_held",
 }
 
 _T = TypeVar("_T")
@@ -1059,6 +1063,14 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                 "detail": detail,
             }
         )
+
+    def ad_reconcile_breaker_cleared(self, name: str) -> None:
+        # #2136: the INVERSE -- no page; auto-resolves the open ad_reconcile_aborted via _AUTO_RESOLVE.
+        self._record_state({"type": "ad_reconcile_breaker_cleared", "connection": name}, "info")
+
+    def ad_reconcile_hold_released(self, name: str) -> None:
+        # #2136: the INVERSE -- no page; auto-resolves the open ad_reconcile_held via _AUTO_RESOLVE.
+        self._record_state({"type": "ad_reconcile_hold_released", "connection": name}, "info")
 
     def ad_session_revoked(self, name: str, *, reason: str) -> None:
         # ADR 0079 mechanism 2: a directory principal's sessions were revoked. Keyed on the username so

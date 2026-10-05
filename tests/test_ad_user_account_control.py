@@ -18,6 +18,7 @@ Synthetic data only; nothing here touches PHI.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -25,6 +26,7 @@ import sqlite3
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -32,10 +34,12 @@ import pytest
 from messagefoundry.api.app import _alert_reconcile_plan
 from messagefoundry.auth import ldap as ldap_module
 from messagefoundry.auth.ldap import DirectoryAnswer, LdapAuthenticator, _account_enabled
+from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.reconcile import HOLD_REASON, ReconcilePlan
 from messagefoundry.auth.service import AuthService
-from messagefoundry.config.settings import AuthSettings
-from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
+from messagefoundry.config.settings import _ALERT_EVENT_TYPES, AuthSettings
+from messagefoundry.pipeline.alert_sinks import _AUTO_RESOLVE, NotifierAlertSink
+from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.store.store import MessageStore
 from tests.test_alert_sinks import _drain, _RecordingTransport
 from tests.test_approval_requester_recheck import _Sink
@@ -294,7 +298,7 @@ async def _signed_in_estate(
         await store.close()
 
 
-async def _pass(service: AuthService, sink: _Sink | None = None) -> ReconcilePlan:
+async def _pass(service: AuthService, sink: AlertSink | None = None) -> ReconcilePlan:
     """One reconciler pass, alerted exactly as the API lifespan task alerts it."""
     plan = await service.reconcile_directory_sessions()
     _alert_reconcile_plan(plan, service, sink or _Sink())
@@ -792,3 +796,267 @@ async def test_the_held_alert_is_not_throttled_by_the_breaker_alert() -> None:
     assert [e["type"] for e in transport.events] == ["ad_reconcile_aborted", "ad_reconcile_held"]
     held = transport.events[1]
     assert held["undetermined"] == 2 and held["reason"] == HOLD_REASON
+
+
+# --- BACKLOG #2136: each standing reconcile alert resolves itself when it clears -----------------
+
+
+class _InverseSink(_Sink):
+    """Also records the two inverses, which the shared recorder lets fall through to the log."""
+
+    def ad_reconcile_breaker_cleared(self, name: str) -> None:
+        self.events.append(("ad_reconcile_breaker_cleared", name, {}))
+
+    def ad_reconcile_hold_released(self, name: str) -> None:
+        self.events.append(("ad_reconcile_hold_released", name, {}))
+
+
+#: Stands in for the auth service: the alerting reads only these two latched messages from it.
+_AUTH = SimpleNamespace(directory_reconcile_alert=None, directory_reconcile_hold=None)
+
+
+def _alerted(plan: ReconcilePlan) -> list[str]:
+    sink = _InverseSink()
+    _alert_reconcile_plan(plan, _AUTH, sink)  # type: ignore[arg-type]
+    return [e[0] for e in sink.events]
+
+
+@pytest.mark.parametrize(
+    ("plan", "expected"),
+    [
+        (
+            ReconcilePlan(probed=3, breaker_clear=True, hold_clear=True),
+            ["ad_reconcile_breaker_cleared", "ad_reconcile_hold_released"],
+        ),
+        (
+            ReconcilePlan(probed=3, hold=True, undetermined=2, held=("a", "b"), breaker_clear=True),
+            ["ad_reconcile_held", "ad_reconcile_breaker_cleared"],
+        ),
+        (
+            ReconcilePlan(probed=12, aborted="mass_revoke_breaker", hold_clear=True),
+            ["ad_reconcile_aborted", "ad_reconcile_hold_released"],
+        ),
+        (ReconcilePlan(probed=3), []),
+    ],
+    ids=["both-clear", "held", "tripped", "neither-proven"],
+)
+def test_each_clear_the_service_marks_is_raised_after_the_pages_on_every_pass(
+    plan: ReconcilePlan, expected: list[str]
+) -> None:
+    """The inverses come last, so a sink raising on one cannot cost a page. And they repeat on
+    every marked pass rather than once: a resolve is an idempotent update, so a repeat costs
+    nothing, while a once-only inverse whose fire-and-forget write failed would never be retried."""
+    assert _alerted(plan) == expected
+    assert _alerted(plan) == expected
+
+
+def test_the_inverses_resolve_their_alerts_and_are_not_rule_targetable() -> None:
+    assert _AUTO_RESOLVE["ad_reconcile_breaker_cleared"] == "ad_reconcile_aborted"
+    assert _AUTO_RESOLVE["ad_reconcile_hold_released"] == "ad_reconcile_held"
+    for inverse in ("ad_reconcile_breaker_cleared", "ad_reconcile_hold_released"):
+        assert inverse not in _ALERT_EVENT_TYPES
+        for cls in (LoggingAlertSink, NotifierAlertSink):
+            assert callable(getattr(cls, inverse, None)), f"{cls.__name__}.{inverse}"
+
+
+async def _settle(sink: NotifierAlertSink) -> None:
+    """Wait for the sink's fire-and-forget alert-state writes, so each pass is read after its own."""
+    while sink._state_tasks:
+        await asyncio.gather(*list(sink._state_tasks))
+
+
+async def _open_alerts(store: MessageStore) -> set[tuple[str, str]]:
+    return {(i.event_type, i.connection) for i in await store.list_active_alert_instances()}
+
+
+ABORTED = ("ad_reconcile_aborted", "directory-reconciler")
+HELD = ("ad_reconcile_held", "directory-reconciler")
+
+
+async def _left_open_by_an_earlier_run(store: MessageStore) -> None:
+    last_run = NotifierAlertSink([], store=store)
+    last_run.ad_reconcile_aborted(
+        "directory-reconciler", reason="mass_revoke_breaker", probed=12, detail="tripped"
+    )
+    last_run.ad_reconcile_held(
+        "directory-reconciler", reason=HOLD_REASON, undetermined=2, detail="held"
+    )
+    await _settle(last_run)
+    assert await _open_alerts(store) == {ABORTED, HELD}
+
+
+async def _alerted_pass(service: AuthService, sink: NotifierAlertSink) -> ReconcilePlan:
+    plan = await _pass(service, sink)
+    await _settle(sink)
+    return plan
+
+
+async def test_the_durable_held_instance_stays_open_while_held_and_resolves_on_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End to end: the real service, the real notifier and the real alert-instance table."""
+    names = ["u1", "u2", "ok1", "ok2", "ok3"]
+    async with _signed_in_estate(monkeypatch, names) as (directory, service, store, _tokens):
+        sink = NotifierAlertSink([], store=store)
+        directory.uac.update({"u1": ABSENT, "u2": ABSENT})
+        for _ in range(2):
+            plan = await _alerted_pass(service, sink)
+            assert plan.hold and not plan.hold_clear
+            assert await _open_alerts(store) == {HELD}
+        directory.uac.update({"u1": ENABLED, "u2": ENABLED})
+        plan = await _alerted_pass(service, sink)
+        assert plan.hold_clear and plan.breaker_clear
+        assert await _open_alerts(store) == set()
+
+
+async def test_a_breaker_trip_resolves_only_once_the_directory_reads_clean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pass that carries a pending strike is no evidence either way: the breaker has not judged
+    those accounts yet. So the first pass of a bad search base resolves nothing, the second trips,
+    and only a pass that reads every account clean resolves the trip."""
+    names = ["ok1", "ok2"] + [f"gone{i}" for i in range(10)]
+    async with _signed_in_estate(monkeypatch, names) as (directory, service, store, _tokens):
+        sink = NotifierAlertSink([], store=store)
+        saved = dict(directory.ids)
+        for name in names[2:]:
+            directory.delete(name)
+        first = await _alerted_pass(service, sink)
+        assert first.aborted is None and not first.breaker_clear  # strike 1: not judged yet
+        second = await _alerted_pass(service, sink)
+        assert second.aborted == "mass_revoke_breaker" and not second.breaker_clear
+        assert await _open_alerts(store) == {ABORTED}
+        directory.ids.update(saved)  # the search base is fixed
+        third = await _alerted_pass(service, sink)
+        assert third.aborted is None and third.breaker_clear
+        assert await _open_alerts(store) == set()
+
+
+async def test_a_trip_on_role_changes_is_not_cleared_by_a_sample_that_missed_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A role-change revocation leaves no strike, so the strike test alone cannot hold a trip open.
+    With a budget of two, the pass after the trip reads only the other two accounts, finds nothing
+    to revoke, and is not aborted. That is no evidence the trip has gone: the two accounts behind it
+    have not been read again. The next pass reads them and trips again."""
+    names = ["n1", "n2", "n3", "n4"]
+    budget = {"ad_session_recheck_max_users": 2, "ad_session_revoke_max": 0}
+    async with _signed_in_estate(monkeypatch, names, **budget) as estate:
+        _directory, service, store, _tokens = estate
+        by_id = sorted([(u.id, u.username) for u in await store.list_users()])
+        first_sample = [uid for uid, name in by_id if name in names][:2]
+        for uid in first_sample:  # roles the directory no longer grants
+            await store.set_user_roles(uid, [Role.VIEWER.value])
+        tripped = await _pass(service)
+        assert tripped.aborted == "mass_revoke_breaker"
+        other_sample = await _pass(service)
+        assert other_sample.aborted is None and other_sample.revocations == ()
+        assert not other_sample.breaker_clear
+        assert (await _pass(service)).aborted == "mass_revoke_breaker"
+
+
+async def test_a_resolve_the_store_failed_to_write_is_retried_on_the_next_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The notifier writes alert state fire-and-forget and only logs a failure. So the inverse is
+    raised on every clear pass, not once, and the next pass resolves what the last one could not."""
+    names = ["u1", "u2", "ok1", "ok2", "ok3"]
+    async with _signed_in_estate(monkeypatch, names) as (directory, service, store, _tokens):
+        sink = NotifierAlertSink([], store=store)
+        directory.uac.update({"u1": ABSENT, "u2": ABSENT})
+        assert (await _alerted_pass(service, sink)).hold
+        directory.uac.update({"u1": ENABLED, "u2": ENABLED})
+        real = store.resolve_alert_instances_for
+        failures = [sqlite3.OperationalError("synthetic: database is locked")]
+
+        async def failing_once(
+            *, event_type: str, connection: str, now: float | None = None
+        ) -> int:
+            if event_type == "ad_reconcile_held" and failures:
+                raise failures.pop()
+            return await real(event_type=event_type, connection=connection, now=now)
+
+        monkeypatch.setattr(store, "resolve_alert_instances_for", failing_once)
+        assert (await _alerted_pass(service, sink)).hold_clear
+        assert await _open_alerts(store) == {HELD}, "the failed resolve went through after all"
+        assert (await _alerted_pass(service, sink)).hold_clear
+        assert await _open_alerts(store) == set()
+
+
+async def test_a_pass_that_aborts_and_holds_marks_neither_clear(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    names = ["u1", "u2"] + [f"gone{i}" for i in range(10)]
+    async with _signed_in_estate(monkeypatch, names) as (directory, service, _store, _tokens):
+        directory.uac.update({"u1": ABSENT, "u2": ABSENT})
+        for name in names[2:]:
+            directory.delete(name)
+        await _pass(service)
+        plan = await _pass(service)
+        assert plan.aborted == "mass_revoke_breaker" and plan.hold
+        assert not plan.breaker_clear and not plan.hold_clear
+
+
+def _fresh_process(store: MessageStore, **settings: Any) -> AuthService:
+    """A new engine process on the same store: the alert instances survive, and the reconciler's
+    strike and outcome records start empty."""
+    return AuthService(store, _settings(**settings), ldap=LdapAuthenticator(_settings(**settings)))
+
+
+async def test_a_fresh_process_resolves_what_its_last_run_left_open_but_not_on_an_outage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _signed_in_estate(monkeypatch, ["jdoe", "asmith"]) as estate:
+        directory, _service, store, _tokens = estate
+        await _left_open_by_an_earlier_run(store)
+        service = _fresh_process(store)
+        await service.initialize()
+        sink = NotifierAlertSink([], store=store)
+        directory.down = True
+        assert (await _alerted_pass(service, sink)).directory_outage
+        assert await _open_alerts(store) == {ABORTED, HELD}
+        directory.down = False
+        plan = await _alerted_pass(service, sink)
+        assert plan.breaker_clear and plan.hold_clear
+        assert await _open_alerts(store) == set()
+
+
+async def test_a_fresh_process_against_a_still_bad_search_base_keeps_the_trip_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A restart resets every strike, so its first pass cannot trip the breaker even when nothing
+    was fixed. "Not aborted" there is not a clear, and the open trip must stay open."""
+    names = ["ok1", "ok2"] + [f"gone{i}" for i in range(10)]
+    async with _signed_in_estate(monkeypatch, names) as (directory, _service, store, _tokens):
+        await _left_open_by_an_earlier_run(store)
+        for name in names[2:]:
+            directory.delete(name)
+        service = _fresh_process(store)
+        await service.initialize()
+        sink = NotifierAlertSink([], store=store)
+        plan = await _alerted_pass(service, sink)
+        assert plan.aborted is None and not plan.breaker_clear
+        assert ABORTED in await _open_alerts(store)
+
+
+async def test_a_fresh_process_does_not_release_a_hold_its_budget_has_not_reached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With a budget of two, a fresh process's first pass reads only half the estate. The held
+    accounts are in the other half, so a clean first half is no evidence the hold has gone."""
+    names = ["n1", "n2", "n3", "n4"]
+    async with _signed_in_estate(monkeypatch, names, ad_session_recheck_max_users=2) as estate:
+        directory, _service, store, _tokens = estate
+        by_id = sorted([(u.id, u.username) for u in await store.list_users()])
+        order = [name for _id, name in by_id if name in names]
+        directory.uac.update(dict.fromkeys(order[2:], ABSENT))  # the second sample only
+        await _left_open_by_an_earlier_run(store)
+        service = _fresh_process(store, ad_session_recheck_max_users=2)
+        await service.initialize()
+        sink = NotifierAlertSink([], store=store)
+        first = await _alerted_pass(service, sink)
+        assert not first.hold and not first.hold_clear and not first.breaker_clear
+        assert await _open_alerts(store) == {ABORTED, HELD}
+        second = await _alerted_pass(service, sink)
+        assert second.hold and not second.hold_clear
+        assert HELD in await _open_alerts(store)

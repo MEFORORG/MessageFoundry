@@ -7830,7 +7830,16 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     held, aborted, skipped or unkeyed-binding row no longer ends the pass (BACKLOG #2137): the
     service logs it at ERROR and returns the plan, so these alerts still fire. A pass that raised
     part-way for another reason, such as inside one revocation, has already audited the revocations
-    it applied before that point; those rows stand, and no alert is raised for them."""
+    it applied before that point; those rows stand, and no alert is raised for them.
+
+    Each standing alert also gets its inverse, which pages nobody and resolves the open instance
+    (BACKLOG #2136): ``ad_reconcile_breaker_cleared`` and ``ad_reconcile_hold_released``. The auth
+    service decides when a pass is evidence of a clear (``plan.breaker_clear``, ``plan.hold_clear``;
+    see ``AuthService._mark_reconcile_clears``), so the alert and the service read one predicate.
+    An outage or a pass with no signed-in account sets neither. The inverse is raised on EVERY pass
+    that sets its flag, not once per clear: resolving is an idempotent update, a resolve the
+    notifier failed to write is retried that way, and a fresh process resolves an instance its last
+    run left open with no state of its own."""
     if plan.directory_outage:
         return
     if plan.aborted is not None:
@@ -7846,14 +7855,19 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
         for revocation in plan.revocations:
             sink.ad_session_revoked(revocation.username, reason=revocation.reason)
     if plan.hold:
-        # LAST, matching the auth service's order: a sink that raises here cannot suppress the
-        # breaker's or a revocation's alert for the same pass.
+        # After the breaker and the revocations, matching the auth service's order: a sink that
+        # raises here cannot suppress the breaker's or a revocation's alert for the same pass.
         sink.ad_reconcile_held(
             "directory-reconciler",
             reason=HOLD_REASON,
             undetermined=plan.undetermined,
             detail=auth.directory_reconcile_hold or HOLD_REASON,
         )
+    # The inverses LAST: they page nobody, so a sink raising on one cannot cost a page above.
+    if plan.breaker_clear:
+        sink.ad_reconcile_breaker_cleared("directory-reconciler")
+    if plan.hold_clear:
+        sink.ad_reconcile_hold_released("directory-reconciler")
 
 
 _INITIAL_CREDENTIAL_MAX_LEAD = 24 * 3600.0  # warn at most this long before the deadline
