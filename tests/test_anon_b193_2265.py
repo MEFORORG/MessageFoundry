@@ -66,6 +66,17 @@ def _tee_with(path: str, kind: SurrogateKind) -> tuple[TeeFieldRule, ...]:
     return (*TEE_DEFAULT_RULES, TeeFieldRule(path, kind.value))  # type: ignore[arg-type]
 
 
+def _unchecked(path: str, kind: str, module: ModuleType = engine_hl7) -> FieldRule:
+    """A rule built PAST the ``FieldRule`` path check, the way a subclass or a copied instance
+    could carry one. ``FieldRule`` refuses every unwritable path but ``MSH-1`` and ``MSH-2``
+    when the rule is built (BACKLOG #2330), so this is the only route left to the adapter's own
+    refusal for the other spellings. The adapter must not rest on the earlier check."""
+    rule: FieldRule = object.__new__(module.FieldRule)
+    object.__setattr__(rule, "path", path)
+    object.__setattr__(rule, "kind", module.SurrogateKind(kind))
+    return rule
+
+
 def _msh_lines(output: str) -> list[list[str]]:
     return [line.split("|") for line in output.split("\r") if line.startswith("MSH")]
 
@@ -153,9 +164,10 @@ def test_an_msh_rule_reads_the_messages_own_separators(anonymize: Callable[..., 
     assert out.split("\r")[-1].split("!")[6:9] == ["20260101120000", "", "ADT*A01"]
 
 
-#: Spellings ``load_rules`` accepts (the last one too: its pattern ends in ``$``, which matches
-#: before a final newline), then spellings only a rule built in code can carry. ``int()`` reads a
-#: number below 3 from every one of them, and ``int()`` is how the adapters read a path.
+#: ``int()`` reads a number below 3 from every one of these, and ``int()`` is how the adapters
+#: read a path. Only ``MSH-1`` and ``MSH-2`` are whole-field addresses, so only those two get past
+#: ``FieldRule`` and ``load_rules``; the path check refuses the rest first (BACKLOG #2330).
+_CONSTRUCTIBLE_UNWRITABLE_MSH_PATHS = ("MSH-1", "MSH-2")
 _UNWRITABLE_MSH_PATHS = [
     "MSH-0",
     "MSH-00",
@@ -187,13 +199,48 @@ def test_a_rule_that_would_rewrite_the_delimiters_is_refused(
     The field NUMBER decides, read the way the adapters read it: ``MSH-02`` is field 2 to
     ``int()``, so a text comparison with ``MSH-2`` would let it through and blank the encoding
     characters. A digits-only test such as ``str.isdecimal`` lets ``"MSH-2\\n"`` through the same
-    way. ``MSH-0`` would be split index -1 on the tee, the LAST field of the line."""
+    way. ``MSH-0`` would be split index -1 on the tee, the LAST field of the line.
+
+    The rule is built past the ``FieldRule`` path check, so every case here reaches the adapter's
+    own refusal. The two tests below show which of these spellings a caller can still build."""
     segment, _, number = path.partition("-")
     named = re.escape(f"{segment}-{int(number)}")
     with pytest.raises(ValueError, match=f"a rule names {named},") as exc:
-        anonymize(_MSG, salt=_SALT, rules=_with(path, kind))
+        anonymize(_MSG, salt=_SALT, rules=(*DEFAULT_RULES, _unchecked(path, kind.value)))
     assert isinstance(exc.value, (AnonError, TeeAnonError))
     assert _SSN not in str(exc.value) and "APP2" not in str(exc.value)
+
+
+@pytest.mark.parametrize("path", _CONSTRUCTIBLE_UNWRITABLE_MSH_PATHS)
+@pytest.mark.parametrize("kind", _REWRITING_KINDS, ids=lambda kind: kind.value)
+@_PLAIN
+def test_a_rule_a_caller_can_build_for_the_delimiters_is_refused_by_the_adapter(
+    anonymize: Callable[..., str], kind: SurrogateKind, path: str
+) -> None:
+    """``MSH-1`` and ``MSH-2`` are whole-field addresses, so ``FieldRule`` builds them. The
+    adapter's refusal is the only thing between such a rule and the delimiters."""
+    with pytest.raises(ValueError, match=f"a rule names {path},") as exc:
+        anonymize(_MSG, salt=_SALT, rules=_with(path, kind))
+    assert isinstance(exc.value, (AnonError, TeeAnonError))
+
+
+@pytest.mark.parametrize(
+    "path",
+    [p for p in _UNWRITABLE_MSH_PATHS if p not in _CONSTRUCTIBLE_UNWRITABLE_MSH_PATHS],
+    ids=repr,
+)
+@pytest.mark.parametrize("module", (engine_hl7, tee_hl7), ids=("engine", "tee"))
+def test_every_other_unwritable_spelling_is_refused_when_the_rule_is_built(
+    module: ModuleType, path: str
+) -> None:
+    """The earlier refusal: ``FieldRule`` takes only a whole-field address, so ``MSH-0``,
+    ``MSH-02`` and a path with a stray space or newline never become a rule (BACKLOG #2330).
+    The control is the two paths it does build."""
+    with pytest.raises(ValueError, match="not a whole-field HL7 address") as exc:
+        module.FieldRule(path, "drop")
+    assert type(exc.value).__name__ == "RuleError"
+    for built in _CONSTRUCTIBLE_UNWRITABLE_MSH_PATHS:
+        assert module.FieldRule(built, "drop").path == built
 
 
 @_PLAIN
@@ -207,9 +254,14 @@ def test_the_refusal_names_every_unwritable_field(anonymize: Callable[..., str])
 def test_a_rule_for_field_zero_of_any_segment_is_refused(anonymize: Callable[..., str]) -> None:
     """Field 0 is the segment id. Before, the tee blanked the id (split index 0) and the engine
     refused the message as malformed; both now give the same named refusal. ``PID-1`` is the
-    control: the lowest field a rule may rewrite outside MSH."""
+    control: the lowest field a rule may rewrite outside MSH.
+
+    ``FieldRule`` refuses ``PID-0`` when the rule is built (BACKLOG #2330), so no rule set built
+    the ordinary way carries it. The adapter is checked with a rule built past that check."""
+    with pytest.raises(ValueError, match="not a whole-field HL7 address"):
+        _with("PID-0", SurrogateKind.DROP)
     with pytest.raises(ValueError, match="a rule names PID-0,"):
-        anonymize(_MSG, salt=_SALT, rules=_with("PID-0", SurrogateKind.DROP))
+        anonymize(_MSG, salt=_SALT, rules=(*DEFAULT_RULES, _unchecked("PID-0", "drop")))
     out = anonymize(_MSG, salt=_SALT, rules=_with("PID-1", SurrogateKind.DROP))
     assert out.split("\r")[1].startswith("PID||")
 
@@ -218,13 +270,17 @@ def test_a_rule_for_field_zero_of_any_segment_is_refused(anonymize: Callable[...
 def test_the_refusal_lets_a_keep_and_a_non_field_path_through(module: ModuleType) -> None:
     """``anonymize`` strips KEEP rules before the adapter, so the exemption is pinned here, at the
     check itself. A path whose number ``int()`` cannot read is not this check's to refuse. The
-    last line is the control: the same paths with a rewriting kind are refused."""
+    last line is the control: the same paths with a rewriting kind are refused.
+
+    ``FieldRule`` builds only ``MSH-1`` and ``MSH-2`` of these paths, so the rest are built past
+    its path check. The first line is the case a caller can reach: a real ``keep`` rule."""
     refuse = module._refuse_unwritable_rules
-    keeps = tuple(module.FieldRule(p, "keep") for p in ("MSH-0", "MSH-1", "MSH-2", "PID-0"))
+    refuse(tuple(module.FieldRule(p, "keep") for p in _CONSTRUCTIBLE_UNWRITABLE_MSH_PATHS))
+    keeps = tuple(_unchecked(p, "keep", module) for p in ("MSH-0", "MSH-1", "MSH-2", "PID-0"))
     refuse(keeps)
-    refuse((module.FieldRule("MSH-9.1", "drop"), module.FieldRule("MSH", "drop")))
+    refuse((_unchecked("MSH-9.1", "drop", module), _unchecked("MSH", "drop", module)))
     with pytest.raises(ValueError, match="a rule names MSH-0, MSH-1, MSH-2, PID-0,"):
-        refuse(tuple(module.FieldRule(rule.path, "drop") for rule in keeps))
+        refuse(tuple(_unchecked(rule.path, "drop", module) for rule in keeps))
 
 
 @_NO_SCANNER
