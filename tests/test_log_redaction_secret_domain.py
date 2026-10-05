@@ -701,12 +701,14 @@ def test_the_quoted_value_repetitions_stay_non_backtracking() -> None:
             f"{name} is {fragment!r} -- it grew a repetition that is neither possessive nor bounded."
         )
 
-    # Anti-vacuity: both fragments must still be REACHED, or the assertions above pin dead strings.
+    # Anti-vacuity: every fragment must still be REACHED, or the assertions above pin dead strings.
     # Taken from the table rather than written fresh, so this cannot go green over a shape the suite
-    # does not actually cover.
+    # does not actually cover. The last line reaches ``_KV_QUOTED_VALUE``'s run-on branch, which no
+    # table case does: without it "rv-B1" prints.
     for name in ("brace_semicolon", "single_quoted_space"):
         case = next(c for c in QUOTED_VALUES if c.name == name)
         assert REDACTION_PLACEHOLDER in redact_log_line(case.line), name
+    assert "rv-B1" not in redact_log_line("password='rv-A1, private_key='rv-B1 rv-B2'")
 
 
 #: Diagnostics carrying no credential, which the credential patterns must NOT eat. Over-redaction is
@@ -2356,6 +2358,15 @@ _REVIEW_SHAPES = (
     # Round three: the two guards on running on past a later label's quote.
     'pass\'="vq0;token=\'vq2 vq3=\')private_key="vq4;pwd = "vq6 vq7"',
     "x_password='vq0 vq1;private_key: 'vq2 vq3:bearer_token: vq4=vq5; x_password'=vq6-vq7_x",
+    # Round four: the run-on read past text a later pass used to read past the closer, and the
+    # guarded quote closed inside a DSN password.
+    "password='vq0 token=' pwd={vq1' vq2}",
+    "password='vq0 token=' secret=\"vq1' vq2\"",
+    "password='vq0 token=' credential={vq1' vq2",
+    "password='vq0 token=' postgres://u:vq1'vq2@host/db",
+    "token='vq0 postgres://u:vq1'vq2@h/db",
+    "MEFOR_STORE_DSN='vq0 postgres://u:vq1'vq2@h/db",
+    "password='vq0 pwd'='vq1",
 )
 
 #: The alphabet the seeded fuzz builds lines from: labels of every family, separators, both quotes,
@@ -2411,6 +2422,10 @@ def _structured_lines(count: int) -> list[str]:
                 (a, f"{a}-{b}_x", f"'{a} {b}'", f'"{a} {b}"', "{" + f"{a} {b}" + "}")
                 + (f"'{a} {b}", f'"{a}', f"{a},{b}", f"'{a}'", f"{a}={b}", "{" + a + "}" + b)
                 + (f"{a}_{b}", f"{a}:{b}", f"'{a} {b}='", f"({a}")
+                # Values that hold the other quote or a brace, and a DSN password holding a quote:
+                # the second review round found the run-on and the guarded forms reading past them.
+                + ("{" + f"{a}' {b}" + "}", f'"{a}\' {b}"', f"'{a}\" {b}'", "{" + f"{a}' {b}")
+                + (f"pg://u:{a}'{b}@h",)
             )
             label = rng.choice(_UNIT_LABELS)
             assign = " " if label == "Bearer" else rng.choice(_UNIT_ASSIGNMENTS)
@@ -2504,9 +2519,9 @@ def test_the_change_prints_no_value_the_pre_change_patterns_hid(
     NOT A PROOF OVER ALL TEXT, and the gap is measured rather than assumed. The gap is a cascade, in
     which a stray quote or another label's value used to cut a later pass short. Measured 2026-10-05
     over 208,000 lines -- this corpus plus ten seeds of a generator built like the structured one,
-    20,000 lines each -- one line printed two atoms the old patterns hid, and it also hides the quoted
-    value the old output printed. A cascade need not trade, though. An earlier run of the same
-    measurement, on a narrower generator, found ``password='vq2 vq3|MEFOR_B_PW = "vq4+MEFOR_A='vq6'``:
+    20,000 lines each -- no line printed an atom the old patterns hid; with the plain quoted value back
+    in ``_CREDENTIAL_KV``, two did. A cascade can still happen, and need not trade. An earlier run of
+    the same measurement, on a narrower generator, found ``password='vq2 vq3|MEFOR_B_PW = "vq4+MEFOR_A='vq6'``:
     the old MEFOR_ class ran on to the last quote, so the password's quoted value closed there; now
     ``MEFOR_A`` takes that quote as its own closer, and " vq3" prints with nothing hidden in exchange.
     Six passes over rewritten text cannot rule that class out; one scan that ends each value at the
@@ -2596,6 +2611,20 @@ def test_the_run_on_shapes_print_under_the_plain_quoted_value(
             assert any(value in apply(line) for value in values), f"{surface}: {line!r} hid all"
 
 
+@pytest.mark.parametrize("fold", ("ſ", "ı"), ids=("long-s", "dotless-i"))
+def test_a_fold_character_label_stops_the_run_on_in_both_copies(fold: str) -> None:
+    """A later label spelled with a fold character must keep its value on both surfaces.
+
+    The bundle copy's walks do not fold case, so before the inner walk stopped at every character
+    outside ASCII, its run-on swallowed such a label and printed the value the write-time copy hid."""
+    label = "ſecret" if fold == "ſ" else "ıntake_api_key_next"
+    line = f"password='fc-A1 token=' {label}='fc-B1 fc-B2' tail"
+    for surface, apply in (("scrub_credentials", scrub_credentials), ("redact", redact_log_line)):
+        out = apply(line)
+        printed = [value for value in ("fc-A1", "fc-B1", "fc-B2") if value in out]
+        assert not printed, f"{surface}: {printed} printed -- got {ascii(out)}"
+
+
 def test_both_copies_of_each_stopped_pattern_agree() -> None:
     """The two modules restate these patterns by hand, and a one-sided edit must red HERE.
 
@@ -2677,3 +2706,35 @@ def _walk_growth(pattern: re.Pattern[str]) -> float:
     small = _fastest(lambda text: pattern.sub("x", text), _mefor_run(_GROWTH_LENGTHS[0]), 9)
     large = _fastest(lambda text: pattern.sub("x", text), _mefor_run(_GROWTH_LENGTHS[1]), 3)
     return large / small
+
+
+#: Inputs for the run-on walks, each about ``length`` long: the outer walk checking for a label before
+#: every run, the inner walk doing the same, the slow path forced by a closer after "=", and a MEFOR_
+#: run.
+_RUN_ON_GROWTH_SHAPES: tuple[Callable[[int], str], ...] = (
+    lambda length: "password='" + "pass " * (length // 5),
+    lambda length: "password='x, token='" + "pwd " * (length // 4) + "'",
+    lambda length: "password='" + "a=" * (length // 2) + "'",
+    lambda length: "password='" + "MEFOR_" * (length // 6),
+)
+
+
+def test_the_run_on_walks_grow_linearly_in_line_length() -> None:
+    """``_KV_QUOTED_VALUE`` checks for a label in front of every run inside a quoted value, on text
+    an attacker can influence, so it must stay linear. A bound with no quadratic control beside it,
+    unlike the stop's growth test above: it pins that nothing here grows faster than about linear,
+    on shapes the second review round timed at 7.6x to 8.3x for 8x the length."""
+    for module in (scrub_mod, redact_mod):
+        pattern: re.Pattern[str] = module._CREDENTIAL_KV
+
+        def sub(text: str, pattern: re.Pattern[str] = pattern) -> str:
+            return pattern.sub("x", text)
+
+        for shape in _RUN_ON_GROWTH_SHAPES:
+            small = _fastest(sub, shape(_GROWTH_LENGTHS[0]), 9)
+            large = _fastest(sub, shape(_GROWTH_LENGTHS[1]), 3)
+            growth = large / small
+            assert growth <= _MAX_GROWTH, (
+                f"{module.__name__}._CREDENTIAL_KV grew {growth:.1f}x for 8x the length on "
+                f"{shape(16)!r}"
+            )
