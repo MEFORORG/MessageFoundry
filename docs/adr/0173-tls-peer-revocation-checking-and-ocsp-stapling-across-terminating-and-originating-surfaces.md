@@ -720,8 +720,13 @@ was before #2188.
 The MLLP destination's guard reads a context built the same way. That hop is not changed here.
 
 `opener` is now a required keyword, so a new caller cannot omit it and bring back the false
-refusal. And a hop that crosses because its context checks a CRL is no longer logged as crossing
-"without certificate revocation checking" when `tls_revocation_attested` is also set.
+refusal.
+
+**One audit line still over-states.** A hop that crosses because its context checks a CRL, and that
+also sets `tls_revocation_attested`, is logged as crossing "without certificate revocation
+checking". The record says more than happened and loses nothing. A one-condition fix was built and
+reverted on this branch: it also silenced the line for an MLLP hop with `tls_allow_expired`, a CRL
+and the attestation, where the line was the only record of the attestation.
 
 The Status paragraph and the two §7.1 rows that called #2188 and #2169 open defects carry a
 correction dated 2026-10-04.
