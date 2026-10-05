@@ -25,6 +25,8 @@ from __future__ import annotations
 import datetime
 import logging
 import ssl
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -59,7 +61,7 @@ from messagefoundry.transports.rest import (
     opener_tls_context,
 )
 from tests.test_direct_transport import _mint_ca, _mint_leaf, _write_key, _write_pem
-from tests.test_revocation_audit_names_connection import _audit, _build_check, _shipped
+from tests.test_revocation_audit_names_connection import _build_check, _shipped
 
 ENFORCING = HopPosture(enforcing=True)
 NOT_ENFORCING = HopPosture(enforcing=False)
@@ -103,6 +105,84 @@ def _crl_policy(crl: str) -> TrustAnchorPolicy:
     return TrustAnchorPolicy(crl_file=crl)
 
 
+#: The logger every revocation refusal, warning and audit line is written to.
+_GUARD_LOGGER = "messagefoundry.config.tls_policy"
+
+
+class _GuardLog(logging.Handler):
+    """The messages one or more named loggers emitted, collected ON those loggers."""
+
+    def __init__(self, loggers: list[logging.Logger]) -> None:
+        super().__init__(level=logging.WARNING)
+        self.messages: list[str] = []
+        self._loggers = loggers
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.messages.append(record.getMessage())
+
+    def has(self, text: str) -> bool:
+        return any(text in message for message in self.messages)
+
+    @property
+    def audit(self) -> str:
+        """Every attested-crossing audit line, joined."""
+        return " ".join(m for m in self.messages if "operator attestation" in m)
+
+    def state(self) -> str:
+        """What an assertion prints when an expected line is missing: the facts that decide
+        whether a record reaches a logger's own handlers at all."""
+        loggers = "; ".join(
+            f"{lg.name}: level={lg.level} effective={lg.getEffectiveLevel()} "
+            f"disabled={lg.disabled} filters={len(lg.filters)}"
+            for lg in self._loggers
+        )
+        return (
+            f"captured {len(self.messages)} message(s): {self.messages!r}. "
+            f"logging.disable level={logging.root.manager.disable}. {loggers}"
+        )
+
+
+@contextmanager
+def _guard_log(*names: str) -> Iterator[_GuardLog]:
+    """Collect WARNING and above from the named loggers themselves, by default the guard's own.
+
+    Not ``caplog``. ``caplog`` reads records at the ROOT logger, so it depends on every logger
+    between the emitter and the root still propagating, on the root's level, and on pytest's
+    capture handler still being on the root. This suite changes all three between tests on
+    purpose (``tests/conftest.py`` quiets ``messagefoundry`` in each teardown window, and
+    ``tests/_root_logging.py`` rewrites the root's handler list), and a test elsewhere on the same
+    xdist worker can leave any of them changed. Read through ``caplog``, five arms of this file
+    lost their records in 2 of 13 runs under xdist on 2026-10-04, and passed alone every time. Which
+    of those three the lost records went through was NOT identified: eight further runs with a
+    probe attached did not reproduce it. ``test_the_guard_capture_does_not_depend_on_the_root_logger``
+    shows this capture holds under all of them.
+
+    A handler on the emitting logger sees the record before any of that. The logger's own level
+    is set, so a quieted parent cannot raise its effective level. ``logging.disable`` and the
+    logger's ``disabled`` flag are cleared for the block, as ``caplog.at_level`` clears the first,
+    because both drop a record before any handler runs. All of it is put back on exit.
+
+    This does not loosen what is asserted. The same messages are read; only where they are
+    collected moved."""
+    loggers = [logging.getLogger(name) for name in (names or (_GUARD_LOGGER,))]
+    sink = _GuardLog(loggers)
+    saved = [(lg, lg.level, lg.disabled) for lg in loggers]
+    disable_level = logging.root.manager.disable
+    logging.disable(logging.NOTSET)
+    for lg in loggers:
+        lg.setLevel(logging.WARNING)
+        lg.disabled = False
+        lg.addHandler(sink)
+    try:
+        yield sink
+    finally:
+        for lg, level, disabled in saved:
+            lg.removeHandler(sink)
+            lg.setLevel(level)
+            lg.disabled = disabled
+        logging.disable(disable_level)
+
+
 def _dest(
     name: str,
     ctype: ConnectorType,
@@ -119,6 +199,34 @@ def _dest(
         tls_revocation_attested_reason=REASON if attested else None,
         trust_anchor_policy=policy or TrustAnchorPolicy(),
     )
+
+
+def test_the_guard_capture_does_not_depend_on_the_root_logger(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The capture every log arm below reads through, under the states that lose a record on its
+    way to the root: the ``messagefoundry`` parent quieted as ``tests/conftest.py`` quiets it in a
+    teardown window, and logging disabled process-wide. The guard's line is still collected.
+
+    ``caplog`` is the CONTROL, and the only use of it in this file: in the same block it sees
+    nothing, so the hostile state is real and the pass above is the capture's doing."""
+    parent = logging.getLogger("messagefoundry")
+    saved = (parent.propagate, parent.level, logging.root.manager.disable)
+    parent.propagate = False
+    parent.setLevel(logging.CRITICAL + 10)
+    logging.disable(logging.CRITICAL)
+    try:
+        with active_hop_posture(NOT_ENFORCING), _guard_log() as log:
+            DicomScuDestination(_scu(REMOTE))
+        assert log.has("revocation"), log.state()
+        assert not any("revocation" in r.getMessage() for r in caplog.records)
+        # And the capture put back what it changed.
+        assert logging.root.manager.disable == logging.CRITICAL
+        assert logging.getLogger(_GUARD_LOGGER).level == logging.NOTSET
+    finally:
+        logging.disable(saved[2])
+        parent.setLevel(saved[1])
+        parent.propagate = saved[0]
 
 
 # --- FhirLookupExecutor: the live read hop (transports/fhir.py) ------------------------------------
@@ -190,19 +298,16 @@ def test_a_configured_crl_does_not_admit_a_fhir_lookup_whose_opener_lacks_it(
         _lookup({"url": f"https://{REMOTE}/fhir"}, policy=_crl_policy(bare_crl))
 
 
-def test_a_fhir_lookup_read_hop_crosses_on_its_own_attestation_and_is_audited(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
+def test_a_fhir_lookup_read_hop_crosses_on_its_own_attestation_and_is_audited() -> None:
     settings: dict[str, object] = {
         "url": f"https://{REMOTE}/fhir",
         "tls_revocation_attested": True,
         "tls_revocation_attested_reason": REASON,
     }
-    with active_hop_posture(ENFORCING), caplog.at_level(logging.WARNING):
+    with active_hop_posture(ENFORCING), _guard_log() as log:
         _lookup(settings)
-    audit = _audit(caplog)
-    assert "connection 'fhir_lookup:epic';" in audit and REASON in audit
-    assert "FhirLookup 'epic' (verified TLS" in audit
+    assert "connection 'fhir_lookup:epic';" in log.audit and REASON in log.audit, log.state()
+    assert "FhirLookup 'epic' (verified TLS" in log.audit
 
 
 def test_the_hop_attestation_does_not_cross_the_fhir_lookup_revocation_refusal() -> None:
@@ -217,12 +322,10 @@ def test_the_hop_attestation_does_not_cross_the_fhir_lookup_revocation_refusal()
         _lookup(settings)
 
 
-def test_a_fhir_lookup_read_hop_warns_but_builds_when_not_enforcing(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    with active_hop_posture(NOT_ENFORCING), caplog.at_level(logging.WARNING):
+def test_a_fhir_lookup_read_hop_warns_but_builds_when_not_enforcing() -> None:
+    with active_hop_posture(NOT_ENFORCING), _guard_log() as log:
         _lookup({"url": f"https://{REMOTE}/fhir"})
-    assert any("revocation" in r.getMessage() for r in caplog.records)
+    assert log.has("revocation"), log.state()
 
 
 def test_a_fhir_lookup_built_outside_the_gate_is_unchanged() -> None:
@@ -251,7 +354,7 @@ def _lookup_config(tmp_path: Path, *, declared: bool) -> Path:
 
 
 def test_the_check_gate_refuses_an_undeclared_fhir_lookup_and_admits_a_declared_one(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
 ) -> None:
     """End to end through the gate ``messagefoundry check``, dry-run and reload all reach, with the
     settings the runner really hands the executor. The typed declaration on ``FhirLookup()`` is the
@@ -264,10 +367,9 @@ def test_the_check_gate_refuses_an_undeclared_fhir_lookup_and_admits_a_declared_
     declared = tmp_path / "declared"
     declared.mkdir()
     registry = load_config(_lookup_config(declared, declared=True), allow_empty=True)
-    with caplog.at_level(logging.WARNING):
+    with _guard_log() as log:
         _build_check(registry)
-    audit = _audit(caplog)
-    assert "connection 'fhir_lookup:epic';" in audit and REASON in audit
+    assert "connection 'fhir_lookup:epic';" in log.audit and REASON in log.audit, log.state()
 
 
 # --- DICOM C-STORE SCU over TLS (transports/dicom.py) ----------------------------------------------
@@ -319,13 +421,11 @@ def test_a_configured_crl_does_not_admit_a_dicom_association_whose_context_lacks
         DicomScuDestination(_scu(REMOTE, policy=_crl_policy(bare_crl)))
 
 
-def test_a_dicom_tls_association_crosses_on_its_attestation_and_is_audited(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    with active_hop_posture(ENFORCING), caplog.at_level(logging.WARNING):
+def test_a_dicom_tls_association_crosses_on_its_attestation_and_is_audited() -> None:
+    with active_hop_posture(ENFORCING), _guard_log() as log:
         DicomScuDestination(_scu(REMOTE, attested=True))
-    shipped = _shipped(_audit(caplog))
-    assert "connection 'OB_PACS';" in shipped and REASON in shipped
+    shipped = _shipped(log.audit)
+    assert "connection 'OB_PACS';" in shipped and REASON in shipped, log.state()
     # The cell label survives the log filters, which scrub two adjacent all-capital tokens.
     assert "DICOM C-STORE client (SCU) over TLS" in shipped
 
@@ -337,12 +437,10 @@ def test_a_dicom_tls_association_on_loopback_still_crosses(bare_crl: str) -> Non
     assert context_checks_revocation(dest._ssl) is False
 
 
-def test_a_dicom_tls_association_warns_but_builds_when_not_enforcing(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    with active_hop_posture(NOT_ENFORCING), caplog.at_level(logging.WARNING):
+def test_a_dicom_tls_association_warns_but_builds_when_not_enforcing() -> None:
+    with active_hop_posture(NOT_ENFORCING), _guard_log() as log:
         DicomScuDestination(_scu(REMOTE))
-    assert any("revocation" in r.getMessage() for r in caplog.records)
+    assert log.has("revocation"), log.state()
 
 
 def test_a_dicom_association_built_outside_the_gate_is_unchanged() -> None:
@@ -406,13 +504,11 @@ def test_a_configured_crl_does_not_admit_an_ftps_upload_whose_context_lacks_it(
         RemoteFileDestination(_ftps(REMOTE, policy=_crl_policy(bare_crl)))
 
 
-def test_an_ftps_upload_crosses_on_its_attestation_and_is_audited(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    with active_hop_posture(ENFORCING), caplog.at_level(logging.WARNING):
+def test_an_ftps_upload_crosses_on_its_attestation_and_is_audited() -> None:
+    with active_hop_posture(ENFORCING), _guard_log() as log:
         RemoteFileDestination(_ftps(REMOTE, attested=True))
-    shipped = _shipped(_audit(caplog))
-    assert "connection 'OB_FTPS';" in shipped and REASON in shipped
+    shipped = _shipped(log.audit)
+    assert "connection 'OB_FTPS';" in shipped and REASON in shipped, log.state()
     assert "REMOTEFILE ftps destination" in shipped
 
 
@@ -422,12 +518,10 @@ def test_an_ftps_upload_on_loopback_still_crosses(bare_crl: str) -> None:
     assert context_checks_revocation(dest._client.tls_context) is False
 
 
-def test_an_ftps_upload_warns_but_builds_when_not_enforcing(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    with active_hop_posture(NOT_ENFORCING), caplog.at_level(logging.WARNING):
+def test_an_ftps_upload_warns_but_builds_when_not_enforcing() -> None:
+    with active_hop_posture(NOT_ENFORCING), _guard_log() as log:
         RemoteFileDestination(_ftps(REMOTE))
-    assert any("revocation" in r.getMessage() for r in caplog.records)
+    assert log.has("revocation"), log.state()
 
 
 def test_an_ftps_upload_built_outside_the_gate_is_unchanged() -> None:
@@ -435,20 +529,24 @@ def test_an_ftps_upload_built_outside_the_gate_is_unchanged() -> None:
 
 
 def test_an_ftps_upload_that_verifies_nothing_takes_no_revocation_guard(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Disjoint gates. ``tls_verify=false`` has no verified certificate whose revocation could
     matter, so its own refusal owns it under an enforcing posture. Where the escape permits the hop,
     the guard is not taken at all: a non-enforcing posture WARNs on every guarded hop, and no such
-    line appears here."""
+    line appears here. The connector's own verify-off warning, read through the same capture, is
+    what shows the capture was live when it saw no revocation line."""
     with active_hop_posture(ENFORCING), pytest.raises(ValueError, match="tls_verify=false") as exc:
         RemoteFileDestination(_ftps(REMOTE, tls_verify=False))
     assert "revocation" not in str(exc.value)
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
-    with active_hop_posture(NOT_ENFORCING), caplog.at_level(logging.WARNING):
+    with (
+        active_hop_posture(NOT_ENFORCING),
+        _guard_log(_GUARD_LOGGER, remotefile_module.logger.name) as log,
+    ):
         RemoteFileDestination(_ftps(REMOTE, tls_verify=False))
-    assert any("verification is DISABLED" in r.getMessage() for r in caplog.records)
-    assert not any("revocation" in r.getMessage() for r in caplog.records)
+    assert log.has("verification is DISABLED"), log.state()
+    assert not log.has("revocation"), log.state()
 
 
 def test_an_anonymous_plain_ftp_upload_is_the_cleartext_refusal_not_this_one() -> None:
@@ -542,28 +640,31 @@ def test_a_configured_crl_does_not_admit_a_direct_hop_whose_context_lacks_it(
 
 
 def test_a_credentialed_direct_hop_crosses_on_its_attestation_and_is_audited(
-    direct_material: dict[str, str], caplog: pytest.LogCaptureFixture
+    direct_material: dict[str, str],
 ) -> None:
-    with active_hop_posture(ENFORCING), caplog.at_level(logging.WARNING):
+    with active_hop_posture(ENFORCING), _guard_log() as log:
         DirectDestination(_direct(direct_material, REMOTE, attested=True))
-    shipped = _shipped(_audit(caplog))
-    assert "connection 'OB_DIRECT';" in shipped and REASON in shipped
+    shipped = _shipped(log.audit)
+    assert "connection 'OB_DIRECT';" in shipped and REASON in shipped, log.state()
     # The cell label survives the log filters, which scrub two adjacent all-capital tokens.
     assert "Direct destination (SMTP authentication over verified TLS)" in shipped
 
 
 def test_a_direct_hop_with_no_credential_still_takes_no_revocation_guard(
-    direct_material: dict[str, str], caplog: pytest.LogCaptureFixture
+    direct_material: dict[str, str],
 ) -> None:
     """The shipped S/MIME decision, kept for the case it argues. With no username the hop sends no
     credential, so it constructs under an enforcing posture with no CRL and no attestation. Under a
     non-enforcing posture every guarded hop WARNs, and no such line appears here, so the guard is
-    not taken at all."""
+    not taken at all. A credentialed hop built inside the SAME capture then does warn, which shows
+    the capture was live when it saw nothing."""
     with active_hop_posture(ENFORCING):
         DirectDestination(_direct(direct_material, REMOTE, credential=False))
-    with active_hop_posture(NOT_ENFORCING), caplog.at_level(logging.WARNING):
+    with active_hop_posture(NOT_ENFORCING), _guard_log() as log:
         DirectDestination(_direct(direct_material, REMOTE, credential=False))
-    assert not any("revocation" in r.getMessage() for r in caplog.records)
+        assert not log.has("revocation"), log.state()
+        DirectDestination(_direct(direct_material, REMOTE))
+        assert log.has("revocation"), log.state()
 
 
 def test_a_credentialed_direct_hop_on_loopback_still_crosses(
@@ -574,11 +675,11 @@ def test_a_credentialed_direct_hop_on_loopback_still_crosses(
 
 
 def test_a_credentialed_direct_hop_warns_but_builds_when_not_enforcing(
-    direct_material: dict[str, str], caplog: pytest.LogCaptureFixture
+    direct_material: dict[str, str],
 ) -> None:
-    with active_hop_posture(NOT_ENFORCING), caplog.at_level(logging.WARNING):
+    with active_hop_posture(NOT_ENFORCING), _guard_log() as log:
         DirectDestination(_direct(direct_material, REMOTE))
-    assert any("revocation" in r.getMessage() for r in caplog.records)
+    assert log.has("revocation"), log.state()
 
 
 def test_a_credentialed_direct_hop_built_outside_the_gate_is_unchanged(
