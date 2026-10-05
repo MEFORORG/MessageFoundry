@@ -38,6 +38,8 @@ refusals, that makes three actions built on one predicate:
   * ESCAPE -- every log line, :func:`scrub_control_chars`. Neither refuses nor deletes: it renders
     the code point as a readable backslash escape, so one record cannot become two. Its alphabet is
     WIDER than the other two arms' (vault BACKLOG #2815); :func:`_escapes_in_a_log_line` states it.
+    Its ``\\xNN`` and ``\\UXXXXXXXX`` spellings are not JSON, so a JSON document logged as a
+    message is serialized with :func:`json_dumps_for_log`, which spells those characters as JSON.
 
 WHY ESCAPE LIVES HERE, WHICH IS THE ONE FACT WORTH STATING ONCE (BACKLOG #1591). It was defined in
 ``logging_setup`` until ``logging_guard`` needed it, and ``logging_setup`` imports
@@ -66,6 +68,7 @@ THE POINT IS THE COPYING PRACTICE, not the seven known lines. If you need this t
 
 from __future__ import annotations
 
+import json
 import unicodedata
 
 #: The Unicode general categories a reader of TEXT may act on rather than show: the C0 and C1
@@ -220,6 +223,39 @@ def scrub_control_chars(text: str) -> str:
     if text.isascii():
         return text.translate(_CTRL_TRANSLATION)
     return text.translate(_LOG_TRANSLATION)
+
+
+#: The log alphabet up to U+00FF, spelled as JSON escapes. :func:`scrub_control_chars` spells these
+#: ``\xNN``, which JSON does not define. Above U+00FF the scrub's ``\uXXXX`` is already JSON, except
+#: past U+FFFF, which :func:`json_dumps_for_log` handles itself.
+_JSON_SPELLING: dict[int, str] = {cp: json.dumps(chr(cp))[1:-1] for cp in _CTRL_TRANSLATION}
+
+
+def json_dumps_for_log(obj: object) -> str:
+    """``json.dumps(obj, ensure_ascii=False)`` that stays valid JSON after
+    :func:`scrub_control_chars`, for a JSON document logged as a message (the off-box audit tee).
+
+    The scrub spells the log alphabet the way ``ascii()`` does. Up to U+00FF that is ``\\xNN`` and
+    past U+FFFF it is ``\\UXXXXXXXX``, and JSON defines neither, so a raw DEL, C1, soft hyphen or
+    astral format code point left the document unparseable. This spells exactly those characters
+    as JSON escapes (an astral one as a surrogate pair) before any filter runs. ``json.dumps``
+    already escapes C0 inside a string, and the alphabet can occur nowhere else in its output.
+
+    EVERY OTHER CHARACTER IS LEFT RAW, ON PURPOSE. The scrub still spells the BMP part of the
+    alphabet as ``\\uXXXX``, which is JSON. So a filter that runs before the scrub, such as the
+    redaction filter, sees those characters as it always did. An escape there would join the
+    following word (``\\u200eDOE`` has no word boundary), and redaction would miss the name. The
+    characters this does escape left the record unparseable before, so the redaction filter now
+    sees different text only in a record that could not be read anyway, or where it had removed
+    that character itself. That second case is at least a name joined by U+0085."""
+    document = json.dumps(obj, ensure_ascii=False).translate(_JSON_SPELLING)
+    # `max` is one C-level pass; the per-character walk runs only for text past U+FFFF.
+    if document.isascii() or max(document) <= chr(0xFFFF):
+        return document
+    return "".join(
+        json.dumps(ch)[1:-1] if ord(ch) > 0xFFFF and _escapes_in_a_log_line(ch) else ch
+        for ch in document
+    )
 
 
 def scrub_log_argument(text: str) -> str:

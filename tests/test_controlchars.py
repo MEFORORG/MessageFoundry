@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 import functools
+import json
 import re
 import warnings
 from pathlib import Path
@@ -22,6 +23,7 @@ import pytest
 from messagefoundry.controlchars import (
     _is_control_char,
     has_control_char,
+    json_dumps_for_log,
     scrub_control_chars,
     scrub_log_argument,
     strip_control_chars,
@@ -329,3 +331,28 @@ def test_the_detector_fires_on_each_spelling(source: str, kind: str) -> None:
 )
 def test_the_detector_does_not_fire_on_a_different_set(source: str) -> None:
     assert _rederivations(source) == []
+
+
+def test_json_dumped_for_the_log_still_parses_after_the_scrub_and_decodes_unchanged() -> None:
+    """Every BMP code point plus astral samples, as one JSON string: after the scrub, the
+    :func:`json_dumps_for_log` document still parses and decodes to the same text."""
+    # The surrogate block is left out of the run and one lone surrogate added on its own: a lone
+    # high surrogate escaped next to a lone low one decodes as ONE astral character, which is how
+    # JSON defines that pair, whichever side of the scrub spells it.
+    text = "".join(chr(c) for c in range(0x10000) if not 0xD800 <= c <= 0xDFFF) + "".join(
+        chr(c) for c in (0xDCFF, 0x1F600, 0xE0001, 0xF0000, 0x10FFFF)
+    )
+    # CONTROL: plain json.dumps does not survive the scrub, so the assertion below is not vacuous.
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(scrub_control_chars(json.dumps({"actor": text}, ensure_ascii=False)))
+    assert json.loads(scrub_control_chars(json_dumps_for_log({"actor": text}))) == {"actor": text}
+
+
+def test_json_dumped_for_the_log_escapes_only_what_the_scrub_would_spell_as_non_json() -> None:
+    """Everything else stays raw, so a filter that runs before the scrub sees what it saw before:
+    ordinary non-ASCII, a no-break space, and the part of the log alphabet the scrub already spells
+    as ``\\uXXXX`` (a left-to-right mark, a line separator, a lone surrogate)."""
+    kept = "".join(chr(c) for c in (0xE9, 0x5F20, 0xA0, 0x1F600, 0x200E, 0x2028, 0xDCFF))
+    assert json_dumps_for_log(kept) == json.dumps(kept, ensure_ascii=False)
+    escaped = "".join(chr(c) for c in (0x7F, 0x85, 0xAD, 0xE0001))
+    assert json_dumps_for_log(escaped) == '"\\u007f\\u0085\\u00ad\\udb40\\udc01"'
