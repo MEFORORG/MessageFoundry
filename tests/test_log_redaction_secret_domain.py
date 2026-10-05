@@ -24,9 +24,11 @@ third was added at BACKLOG #1547 and has its own measurements below:
    works" apart from "something else happened to cover it".
 
 2. **A domain narrower than the surface.** ``test_the_family_table_covers_every_applied_pattern``
-   derives the applied set by AST from the body of ``redact_log_line`` itself, and fails if any applied
-   pattern is neither claimed by a family nor named in ``NOT_A_SECRET_PATTERN``. Adding a pattern to the
-   module without a fixture reds this file; so does applying one and never declaring what it is for.
+   derives the applied set by AST from the body of ``redact_log_line`` itself, and one call down into
+   ``secretscrub`` since BACKLOG #2694 made the credential stage a ``scrub_credentials`` call (see
+   ``_surface_patterns``). It fails if any applied pattern is neither claimed by a family nor named in
+   ``NOT_A_SECRET_PATTERN``. Adding a pattern to either module without a fixture reds this file; so
+   does applying one and never declaring what it is for.
 
 3. **A COST domain narrower than the surface**, added at BACKLOG #1547 and the reason this file now
    reads two modules rather than one. A credential pattern can be correct and still be a denial of
@@ -37,8 +39,9 @@ third was added at BACKLOG #1547 and has its own measurements below:
    the cost guard now derives its subjects the way the coverage guard already did, over BOTH copies of
    the vocabulary: ``test_every_applied_credential_pattern_has_a_contained_scan_prefix`` for the
    structural property and ``test_the_dsn_scan_grows_linearly_in_line_length`` for the growth it is
-   bought for. Only the COST guards read ``secretscrub``; the coverage and fixture guards above stay
-   scoped to ``support/redact``, which has its own suite in ``tests/test_logging_credential_scrub.py``.
+   bought for. Since BACKLOG #2694 there is ONE copy of the vocabulary, in ``secretscrub``, and
+   ``support/redact`` calls it; the coverage and fixture guards above follow that call, and the
+   write-time surface keeps its own suite in ``tests/test_logging_credential_scrub.py``.
 
    A COST GUARD NEEDS A COVERAGE ARM BESIDE IT, and #1547 paid for that lesson TWICE on this one
    pattern. The first fix bounded the repetition, which made the cost guard green by making the pattern
@@ -210,9 +213,9 @@ QUOTED_VALUES: tuple[QuotedValue, ...] = (
 )
 
 
-#: The quoted rows as families, so they inherit this file's four parametrized assertions: the backstop
+#: The quoted rows as families, so they inherit this file's parametrized assertions: the backstop
 #: cannot reach the sentinel, the value is redacted, the DECLARED pattern is what did it, and the
-#: scoped case fold matches a global one. DERIVED rather than restated, so the two cannot drift.
+#: admission gate drops none of them. DERIVED rather than restated, so the two cannot drift.
 #:
 #: ``secret`` is the LAST fragment -- the piece the shipped pattern printed verbatim.
 QUOTED_FAMILIES: tuple[Family, ...] = tuple(
@@ -463,12 +466,43 @@ def _applied_gate_names(module: ModuleType, applier: str) -> set[str]:
     )
 
 
+def _surface_patterns(module: ModuleType, applier: str) -> dict[str, ModuleType]:
+    """Every compiled pattern one call of ``module.<applier>`` applies, mapped to the module owning it.
+
+    ONE CALL LEVEL INTO ``secretscrub``, AND ONLY THERE (BACKLOG #2694). ``redact_log_line`` no longer
+    states the six credential patterns: it calls ``scrub_credentials``, which applies them in ``_run``.
+    Reading the applier's own body would then find three patterns and miss the six doing the credential
+    work -- failure 2 of this file's docstring, a domain narrower than the surface. So when the applier
+    uses ``scrub_credentials``, the patterns that function and ``_run`` apply join the set, owned by
+    ``secretscrub``. The follow is keyed on the FUNCTION OBJECT rather than its name, so an alias still
+    reaches it. A name both modules define would make the owner ambiguous, so that reds here."""
+    owners = dict.fromkeys(_applied_pattern_names(module, applier), module)
+    if module is not scrub_mod and _applied_names(
+        module, applier, lambda _name, value: value is scrub_credentials
+    ):
+        for scrub_applier in ("scrub_credentials", "_run"):
+            for name in _applied_pattern_names(scrub_mod, scrub_applier):
+                assert owners.get(name, scrub_mod) is scrub_mod, (
+                    f"{name} is applied from both {module.__name__} and secretscrub, so which copy a "
+                    "guard reads is ambiguous. One vocabulary means one copy."
+                )
+                owners[name] = scrub_mod
+    return owners
+
+
 def test_the_family_table_covers_every_applied_pattern() -> None:
     """Every pattern redact_log_line applies is claimed by a family or named as a non-secret."""
-    applied = _applied_pattern_names(redact_mod, "redact_log_line")
-    # Positive control: the derivation must actually find patterns. A silently-empty domain would make
-    # every assertion below vacuously true, which is the failure this whole file exists to prevent.
-    assert len(applied) >= 5, f"AST derivation found only {sorted(applied)} -- instrument is broken"
+    owners = _surface_patterns(redact_mod, "redact_log_line")
+    applied = set(owners)
+    # Positive control: the derivation must actually find patterns, on BOTH sides of the call. A
+    # silently-empty domain would make every assertion below vacuously true, which is the failure this
+    # whole file exists to prevent; a domain that stopped following the call would lose six patterns.
+    local = sorted(name for name, owner in owners.items() if owner is redact_mod)
+    shared = sorted(name for name, owner in owners.items() if owner is scrub_mod)
+    assert len(local) >= 3 and len(shared) >= 6, (
+        f"AST derivation found {local} in support.redact and {shared} through secretscrub -- the "
+        "instrument is broken, or redact_log_line no longer calls scrub_credentials"
+    )
 
     claimed = {name for fam in FAMILIES for name in fam.patterns}
     unclaimed = applied - claimed - NOT_A_SECRET_PATTERN
@@ -516,9 +550,14 @@ def test_each_family_survives_when_its_own_patterns_are_disabled(
 
     A pass here means the declared patterns are the ones doing the work. A failure means something
     else in the chain -- the shared PHI pass, the long-base64 sweep, another secret pattern -- is
-    covering this family, so the family's own green is not evidence about its own pattern."""
+    covering this family, so the family's own green is not evidence about its own pattern.
+
+    Each pattern is disabled on the module that OWNS it, which since BACKLOG #2694 is ``secretscrub``
+    for the six credential patterns. ``secretscrub._run`` reads its module globals at call time, so
+    the swap reaches the object it applies."""
+    owners = _surface_patterns(redact_mod, "redact_log_line")
     for name in fam.patterns:
-        monkeypatch.setattr(redact_mod, name, NEVER_MATCHES)
+        monkeypatch.setattr(owners[name], name, NEVER_MATCHES)
     out = redact_log_line(fam.line)
     assert fam.secret in out, (
         f"{fam.name}: disabling {list(fam.patterns)} did NOT make the secret leak -- something else "
@@ -585,7 +624,8 @@ def test_an_unclosed_brace_redacts_to_the_end_of_the_line() -> None:
 
 
 def test_the_quoted_value_repetitions_stay_non_backtracking() -> None:
-    """THE READ-TIME COPY OF THE FRAGMENTS NEEDS ITS OWN BOUND GUARD, and this is it.
+    """THE QUOTED-VALUE FRAGMENTS NEED THEIR OWN BOUND GUARD, and this is it. They live in
+    ``secretscrub`` since BACKLOG #2694, which both surfaces run.
 
     ``test_every_applied_credential_pattern_has_a_contained_scan_prefix`` below pins
     ``_LABEL_PREFIX``'s ``{0,N}``, and every other applied pattern's containment, because an unbounded
@@ -596,15 +636,15 @@ def test_the_quoted_value_repetitions_stay_non_backtracking() -> None:
     are bare pattern-source strings rather than applied ``re.Pattern`` objects, so the derived set
     never sees them. They reach the same property by the other
     route -- a DETERMINISTIC repetition made POSSESSIVE, which cannot re-walk at all -- so what has to
-    be pinned is the ``*+``, not a bound. Without this, the read-time copy could be relaxed to a plain
-    ``*`` with the whole suite green, and this is the copy that feeds the support archive and
-    ``GET /logs/tail``.
+    be pinned is the ``*+``, not a bound. Without this, the fragments could be relaxed to a plain
+    ``*`` with the whole suite green, and they feed the support archive, ``GET /logs/tail`` and every
+    write-time log record.
 
     Structural rather than a stopwatch, for the reason the sibling guard already gives: a timing
     assertion on a shared runner flakes, and the property that matters is that the mitigation is
     there."""
     for name in ("_ODBC_BRACED", "_QUOTED_VALUE"):
-        fragment = getattr(redact_mod, name)
+        fragment = getattr(scrub_mod, name)
         assert "*+" in fragment, (
             f"{name} is {fragment!r} -- its repetition must stay POSSESSIVE. A plain '*' re-walks a "
             "value whose closer never arrives, on attacker-influenceable log text."
@@ -647,7 +687,7 @@ ORDINARY_DIAGNOSTICS = (
     "ws_password_type=text on the SOAP hop",
     # Three lines the key-material pattern (BACKLOG #1475) must leave alone: a header NAME, a PATH and
     # a REFERENCE. Why it uses literal alternates rather than a general rule is stated once, on
-    # ``_KEY_MATERIAL`` in ``messagefoundry/support/redact.py``. These pin the line survives INTACT;
+    # ``_KEY_MATERIAL_WORDS`` in ``messagefoundry/secretscrub.py``. These pin the line survives INTACT;
     # ``test_the_key_material_pattern_spares_the_engines_non_secret_siblings`` pins the reason.
     "intake_api_key_header=x-acme-key on the listener",
     "private_key_file=/etc/mefor/sign.pem loaded",
@@ -663,7 +703,7 @@ def test_ordinary_engine_diagnostics_are_not_eaten_by_the_credential_patterns(li
     )
 
 
-# --- the COST guards: one vocabulary, two copies, every applied pattern ---------------------------
+# --- the COST guards: one vocabulary, two surfaces, every applied pattern -------------------------
 #
 # WHY A SECOND KIND OF GUARD AT ALL. Everything above asks whether a pattern REDACTS. These ask what it
 # COSTS to ask, which is a security property in its own right on a pass that runs over
@@ -671,9 +711,10 @@ def test_ordinary_engine_diagnostics_are_not_eaten_by_the_credential_patterns(li
 # sender a way to hang a worker on first deployment.
 
 #: The credential surfaces the cost guards read: a module, and the function that APPLIES its patterns.
-#: BOTH copies, because the defect BACKLOG #1547 fixed shipped in both and a guard reading one of them
-#: cannot see the other regress. The pattern set is derived from the applying function by AST, so
-#: neither module can grow a pattern these guards do not check.
+#: BOTH surfaces, because the defect BACKLOG #1547 fixed shipped in both copies of the vocabulary that
+#: existed then. There is one copy since BACKLOG #2694, so the two surfaces now share six patterns and
+#: differ by the three ``support/redact`` keeps. The pattern set is derived by ``_surface_patterns``,
+#: so neither module can grow a pattern these guards do not check.
 CREDENTIAL_SURFACES: tuple[tuple[ModuleType, str], ...] = (
     (redact_mod, "redact_log_line"),
     (scrub_mod, "_run"),
@@ -947,30 +988,34 @@ def test_every_applied_credential_pattern_has_a_contained_scan_prefix() -> None:
         r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^\s/@]+@"
     )
 
-    checked: list[str] = []
+    checked: set[str] = set()
     excused: set[str] = set()
     for module, applier in CREDENTIAL_SURFACES:
-        applied = _applied_pattern_names(module, applier)
+        owners = _surface_patterns(module, applier)
         # Positive control on the derivation, per surface: a silently-empty set passes vacuously.
-        assert len(applied) >= 5, (
-            f"{module.__name__}.{applier}: AST derivation found only {sorted(applied)} -- the "
+        assert len(owners) >= 6, (
+            f"{module.__name__}.{applier}: AST derivation found only {sorted(owners)} -- the "
             "instrument is broken, not the patterns"
         )
-        for name in sorted(applied):
-            offenders = _unbounded_scan_repeats(getattr(module, name).pattern)
+        for name, owner in sorted(owners.items()):
+            offenders = _unbounded_scan_repeats(getattr(owner, name).pattern)
             if name in SCAN_UNBOUNDED_BY_DESIGN:
                 if offenders:
                     excused.add(name)
                 continue
             assert not offenders, (
-                f"{module.__name__}.{name} leaves {offenders} enterable in its scan prefix, which is "
+                f"{owner.__name__}.{name} leaves {offenders} enterable in its scan prefix, which is "
                 "quadratic in line length on log text an attacker can influence. Head it with a "
                 "(?<![C]) covering the repetition's own class (lossless, and what _DSN_PASSWORD "
                 "does), or bound the repetition (lossy -- read _repeat_cannot_restart first), or add "
                 "the name to SCAN_UNBOUNDED_BY_DESIGN with the reason it cannot be re-entered."
             )
-            checked.append(f"{module.__name__}.{name}")
-    assert len(checked) >= 10, f"only {checked} were checked -- both surfaces should be covered"
+            checked.add(f"{owner.__name__}.{name}")
+    # Counted as DISTINCT pattern objects: the six shared patterns are reached from both surfaces and
+    # are one pattern each. Two of support.redact's own (``_LONG_B64`` is excused below) plus six.
+    assert len(checked) >= 8, (
+        f"only {sorted(checked)} were checked -- both modules should be covered"
+    )
 
     # The exemption table is exact AND non-stale, the two-sided shape this file uses everywhere: an
     # entry excusing a pattern the checker no longer flags tells a reader about a hazard that is gone.
@@ -985,14 +1030,14 @@ def test_the_label_prefix_bound_still_reaches_the_labels_it_was_added_for() -> N
     """A bound low enough to be safe and too low to be useful passes the structural guard above while
     silently reverting the widening it was added for.
 
-    This is the half of the old narrow guard the structural widening does NOT subsume, kept and
-    extended to both copies of the vocabulary."""
-    for module in (redact_mod, scrub_mod):
-        assert re.fullmatch(r"\(\?:\[A-Za-z0-9\]\+\[\._-\]\)\{0,\d+\}", module._LABEL_PREFIX), (
-            f"{module.__name__}._LABEL_PREFIX is {module._LABEL_PREFIX!r} -- it must carry an explicit "
-            "{0,N} bound. With '*' or '+' the credential patterns become quadratic in line length "
-            "(827 ms on one 6 KB hyphen run, against 1.5 ms before the widening)."
-        )
+    This is the half of the old narrow guard the structural widening does NOT subsume. The bound has
+    ONE copy since BACKLOG #2694, in ``secretscrub``; the labels below are still asserted through
+    both surfaces, by behaviour."""
+    assert re.fullmatch(r"\(\?:\[A-Za-z0-9\]\+\[\._-\]\)\{0,\d+\}", scrub_mod._LABEL_PREFIX), (
+        f"secretscrub._LABEL_PREFIX is {scrub_mod._LABEL_PREFIX!r} -- it must carry an explicit "
+        "{0,N} bound. With '*' or '+' the credential patterns become quadratic in line length "
+        "(827 ms on one 6 KB hyphen run, against 1.5 ms before the widening)."
+    )
     for label in ("ad_bind_password", "tls_key_password", "client_secret", "bearer_token"):
         assert REDACTION_PLACEHOLDER in redact_log_line(f"{label}=pw-B0und_Chk-99")
         assert CREDENTIAL_PLACEHOLDER in scrub_credentials(f"{label}=pw-B0und_Chk-99")
@@ -1101,29 +1146,58 @@ def _sub_dsn(pattern: re.Pattern[str], line: str) -> str:
     return pattern.sub(lambda m: f"{m.group(1)}:<pw>@", line)
 
 
-def test_both_copies_of_the_dsn_pattern_are_the_same_source() -> None:
-    """The two surfaces carry this regex by hand, and a one-sided edit must red HERE.
+#: Pattern-source fragments ``secretscrub`` builds its credential patterns from. Not compiled, so the
+#: applied-pattern derivation cannot see them; named here so the absence check below covers them too.
+_CREDENTIAL_FRAGMENTS = ("_LABEL_PREFIX", "_ODBC_BRACED", "_QUOTED_VALUE", "_ODBC_BRACED_OVERRUN")
 
-    ``secretscrub`` scrubs at WRITE time and ``support/redact`` at READ time, and both keep their own
-    literal copy of ``_DSN_PASSWORD``. That duplication is deliberate -- the modules are neutral leaves
-    and neither imports the other's patterns -- but it has now been edited by hand twice under BACKLOG
-    #1547, and a narrowing shipped in BOTH copies both times.
 
-    NOTHING ELSE IN THIS FILE CATCHES A ONE-SIDED FIX DIRECTLY. The differential arm runs over both
-    modules, so it would red -- but only for corpus rows the earlier head happens to reach, and only
-    while that corpus keeps its shape. An equality on the source is one line, cannot go vacuous, and
-    names the real invariant: these are one pattern stored twice, not two patterns that happen to
-    agree."""
-    assert redact_mod._DSN_PASSWORD.pattern == scrub_mod._DSN_PASSWORD.pattern, (
-        "the read-time and write-time copies of _DSN_PASSWORD have diverged:\n"
-        f"  support/redact: {redact_mod._DSN_PASSWORD.pattern!r}\n"
-        f"  secretscrub   : {scrub_mod._DSN_PASSWORD.pattern!r}\n"
-        "A fix applied to one surface leaves the other leaking. Apply it to both, or state in both "
-        "files why they must differ and widen this guard."
+def test_the_bundle_redactor_holds_no_credential_pattern_of_its_own() -> None:
+    """ONE COPY OF THE VOCABULARY, AND THIS IS WHAT KEEPS IT ONE (BACKLOG #2694).
+
+    This replaces an equality on ``_DSN_PASSWORD``'s source across the two modules, written when each
+    kept its own copy and a narrowing had shipped in both, twice, under BACKLOG #1547. With one copy
+    that equality would compare a pattern to itself. The invariant it guarded is stronger now and is
+    asserted directly: ``support/redact`` APPLIES every credential pattern the write-time pass applies,
+    and DEFINES none of them.
+
+    A monkeypatch adding a word to ``secretscrub._CREDENTIAL_WORDS`` would test nothing, because the
+    patterns compile at import. So the "a shape added to one vocabulary reaches both" property is held
+    structurally here, and by behaviour in the parity sweep at the end."""
+    owners = _surface_patterns(redact_mod, "redact_log_line")
+    reached = {name for name, owner in owners.items() if owner is scrub_mod}
+    write_time = _applied_pattern_names(scrub_mod, "_run") | _applied_pattern_names(
+        scrub_mod, "scrub_credentials"
     )
-    assert redact_mod._DSN_PASSWORD.flags == scrub_mod._DSN_PASSWORD.flags, (
-        "the two copies compile with different flags, so the same source does not mean the same match."
+    assert len(write_time) >= 6, f"the write-time derivation found only {sorted(write_time)}"
+    assert reached == write_time, (
+        f"redact_log_line reaches {sorted(reached)} through secretscrub, but the write-time pass "
+        f"applies {sorted(write_time)}. The support bundle and GET /logs/tail no longer run the whole "
+        "credential pass."
     )
+
+    # ABSENCE BY NAME: no shadow copy under the shared names, patterns or fragments.
+    shadowed = sorted(n for n in (*write_time, *_CREDENTIAL_FRAGMENTS) if hasattr(redact_mod, n))
+    assert not shadowed, (
+        f"support/redact defines {shadowed} again. That is the second hand-kept copy BACKLOG #2694 "
+        "removed: a word added to secretscrub would stop reaching the bundle with nothing red."
+    )
+    # ABSENCE BY SOURCE, because a copy under a NEW name passes the check above.
+    shared_sources = {v.pattern for v in vars(scrub_mod).values() if isinstance(v, re.Pattern)}
+    copies = sorted(
+        name
+        for name, value in vars(redact_mod).items()
+        if isinstance(value, re.Pattern) and value.pattern in shared_sources
+    )
+    assert not copies, f"support/redact compiles secretscrub's pattern source again as {copies}"
+
+    # PARITY BY BEHAVIOUR: every family whose declared patterns are all secretscrub's is scrubbed by
+    # the write-time call alone, so the same fixture proves both surfaces.
+    parity = [fam for fam in FAMILIES if all(owners[p] is scrub_mod for p in fam.patterns)]
+    assert len(parity) >= 20, f"only {len(parity)} families run wholly through secretscrub"
+    for fam in parity:
+        out = scrub_credentials(fam.line)
+        assert fam.secret not in out, f"{fam.name}: the write-time pass printed it -- got {out!r}"
+        assert CREDENTIAL_PLACEHOLDER in out, f"{fam.name}: nothing marked -- got {out!r}"
 
 
 #: The leading runs the letter head could not reach AT ALL, which is the #1547 narrowing stated as
@@ -1169,30 +1243,30 @@ def test_the_dsn_head_redacts_everything_both_earlier_heads_did(
     secret = "pw-D5n_Pass-55"
     schemes_seen: set[str] = set()
     heads_seen: set[str] = set()
-    for module in (redact_mod, scrub_mod):
-        shipped = module._DSN_PASSWORD
-        for head in _DSN_LEADING_RUNS:
-            for scheme in _DSN_SCHEMES_THAT_MUST_REDACT:
-                line = f"store dsn {head}{scheme}://svc:{secret}@db.invalid:5432/mefor"
-                if not earlier_pattern.search(line):
-                    continue
-                schemes_seen.add(scheme)
-                heads_seen.add(head)
-                assert shipped.search(line), (
-                    f"{module.__name__}: {earlier_pattern.pattern!r} redacts {head[:16]!r}+"
-                    f"{scheme[:16]}... and the shipped head does not. That is a credential the "
-                    "previous spelling caught, lost to this one."
-                )
-                assert line.count("://") == 1, (
-                    "the output equality below compares whole lines and holds at ONE match site. "
-                    f"{head[:16]!r}+{scheme[:16]}... carries more than one DSN -- see this test's "
-                    "docstring before widening the corpus."
-                )
-                assert _sub_dsn(earlier_pattern, line) == _sub_dsn(shipped, line), (
-                    f"{module.__name__}: the shipped head rewrites {head[:16]!r}+{scheme[:16]}... "
-                    "differently from the spelling it replaced. Widening the head must not change "
-                    "what an operator reads back."
-                )
+    # ONE COPY since BACKLOG #2694: both surfaces apply ``secretscrub._DSN_PASSWORD``, which
+    # ``test_the_bundle_redactor_holds_no_credential_pattern_of_its_own`` pins.
+    shipped = scrub_mod._DSN_PASSWORD
+    for head in _DSN_LEADING_RUNS:
+        for scheme in _DSN_SCHEMES_THAT_MUST_REDACT:
+            line = f"store dsn {head}{scheme}://svc:{secret}@db.invalid:5432/mefor"
+            if not earlier_pattern.search(line):
+                continue
+            schemes_seen.add(scheme)
+            heads_seen.add(head)
+            assert shipped.search(line), (
+                f"{earlier_pattern.pattern!r} redacts {head[:16]!r}+{scheme[:16]}... and the "
+                "shipped head does not. That is a credential the previous spelling caught, lost to "
+                "this one."
+            )
+            assert line.count("://") == 1, (
+                "the output equality below compares whole lines and holds at ONE match site. "
+                f"{head[:16]!r}+{scheme[:16]}... carries more than one DSN -- see this test's "
+                "docstring before widening the corpus."
+            )
+            assert _sub_dsn(earlier_pattern, line) == _sub_dsn(shipped, line), (
+                f"the shipped head rewrites {head[:16]!r}+{scheme[:16]}... differently from the "
+                "spelling it replaced. Widening the head must not change what an operator reads back."
+            )
 
     # POSITIVE CONTROL ON THE CORPUS, OVER BOTH OF ITS DIMENSIONS. A differential over lines the
     # earlier pattern never matched is vacuously green, and the `continue` above is how that happens
@@ -1422,10 +1496,10 @@ def test_the_dsn_scan_grows_linearly_in_line_length() -> None:
     wall-clock cost stood beside them until it went red on a hosted runner; the comment above
     ``_PATTERN_APPLICATIONS`` is the record of that, and is the one place this file argues it.
 
-    NEITHER ARM IS RUN AGAINST ``redact_log_line``, and that is a property of the surface rather than
-    an omission. Its copy is ungated and scans every line either way, so no input distinguishes
-    "reached the pattern" from "did not" there -- measured before #1547 at 429 ms with the marker
-    against 516 ms without it, at 16 KB. Its linearity is covered by the growth subjects above.
+    THE COUNT ARM ALSO RUNS AGAINST ``redact_log_line`` since BACKLOG #2694. Before it, that surface
+    kept an ungated copy that scanned every line either way, so no input could tell "reached the
+    pattern" from "did not" there. Its credential stage is now this same gated call, so the count is
+    a real reading on both surfaces.
     """
     before = re.compile(_SHIPPED_BEFORE_DSN)
     before_growth = _growth(lambda text: before.sub("x", text), rounds=2)
@@ -1441,11 +1515,6 @@ def test_the_dsn_scan_grows_linearly_in_line_length() -> None:
     # rather than being inferred from the marked one. Without it a regression that made that sweep
     # pathological would have no timed coverage anywhere in this file.
     subjects: tuple[tuple[str, Callable[[str], object], bool], ...] = (
-        (
-            "support.redact._DSN_PASSWORD",
-            lambda text: redact_mod._DSN_PASSWORD.sub("x", text),
-            True,
-        ),
         ("secretscrub._DSN_PASSWORD", lambda text: scrub_mod._DSN_PASSWORD.sub("x", text), True),
         ("secretscrub.scrub_credentials", scrub_credentials, True),
         ("support.redact.redact_log_line", redact_log_line, True),
@@ -1569,12 +1638,29 @@ def test_the_dsn_scan_grows_linearly_in_line_length() -> None:
         "the fixture drifting instead; fix the run's wording, as that assertion says."
     )
 
+    # AND THROUGH THE BUNDLE SURFACE (BACKLOG #2694). The same reading, taken through
+    # ``redact_log_line``, says its credential stage is the gated call and not a second ungated pass.
+    bundle_ran = _patterns_applied_during(scrub_mod, applied, partial(redact_log_line, marked_run))
+    assert bundle_ran == Counter({"_DSN_PASSWORD": 1}), (
+        f"one redact_log_line call on the marked adversarial run applied {dict(bundle_ran)} of "
+        "secretscrub's patterns, not _DSN_PASSWORD exactly once. EMPTY means the bundle no longer "
+        "calls scrub_credentials; a second name means its credential stage bypasses the gates."
+    )
 
-#: Patterns whose case fold is scoped to an inline ``(?i:...)`` rather than set for the whole regex.
-#: The set is exact, so scoping a fourth pattern is a deliberate edit that also lands in the guard.
-SCOPED_CASE_FOLD_PATTERNS = ("_BEARER", "_CREDENTIAL_KV", "_KEY_MATERIAL")
 
-#: Lines the fold guard below runs in four case spellings each. Built from the fixtures this file
+#: The credential patterns that fold case, each with ONE global ``(?i)``. ``_MEFOR_SECRET`` is
+#: case-sensitive on purpose and is not here. Until BACKLOG #2694 ``support/redact`` kept its own copy
+#: of three of these with the fold scoped to each keyword alternation, ``(?i:...)``; the composition
+#: kept ``secretscrub``'s global fold, and the reason is pinned below.
+GLOBALLY_FOLDED_PATTERNS = (
+    "_BEARER",
+    "_AUTH_SCHEME",
+    "_CREDENTIAL_KV",
+    "_KEY_MATERIAL",
+    "_DSN_PASSWORD",
+)
+
+#: Lines the gate guard below runs in four case spellings each. Built from the fixtures this file
 #: already maintains, so it widens automatically as families and diagnostics are added, plus the
 #: label shapes that only ``_BEARER``'s second alternation reaches.
 _CASE_FOLD_CORPUS: tuple[str, ...] = (
@@ -1589,40 +1675,119 @@ _CASE_FOLD_CORPUS: tuple[str, ...] = (
 )
 
 
-@pytest.mark.parametrize("name", SCOPED_CASE_FOLD_PATTERNS)
-def test_a_scoped_case_fold_matches_exactly_what_a_global_one_would(name: str) -> None:
-    """Scoping ``(?i)`` down to ``(?i:...)`` is an OPTIMIZATION, so it must change no match.
+def _case_spelling_disagreements(pattern: re.Pattern[str]) -> list[str]:
+    """Corpus lines whose match spans change when the line is re-spelled in another case.
 
-    Three patterns fold case on an alternation of literal keywords instead of on the whole regex,
-    because a global fold also folds the scanned ``_LABEL_PREFIX`` class and costs 18 to 30 percent for
-    nothing. The reasoning and the numbers are on ``_BEARER`` in the module.
-
-    THE CONTROL IS THE PATTERN'S OWN SOURCE RECOMPILED WITH ``re.IGNORECASE``, which is the thing the
-    scoped form is claiming to be equivalent to. That makes this a structural guard rather than an
-    enumeration: it covers every ``(?i:...)`` site at once -- ``_BEARER`` has TWO, and its second one
-    is the load-bearing auth-scheme group -- and it covers the fourth site the day someone adds one.
-    Nine hand-picked spellings would cover only the sites that exist today.
-
-    THE HAZARD IT EXISTS FOR IS A PARTIAL EDIT. With one global flag, the fold could not be half
-    removed. As a local token repeated per alternation, a tidy-up can drop it from one site and leave
-    the others, and the shipped fixtures cannot see that: the family covering the auth-scheme line
-    declares ``_AUTH_SCHEME`` alongside ``_BEARER``, so it stays green on the other pattern's work --
-    this file's own "green a DIFFERENT pattern bought" failure, one layer down.
-    """
-    scoped: re.Pattern[str] = getattr(redact_mod, name)
-    globally_folded = re.compile(scoped.pattern, re.IGNORECASE)
-
-    # Positive control: a corpus that never exercises a case difference would make this vacuous.
-    assert any(line != line.upper() for line in _CASE_FOLD_CORPUS)
-
+    A pattern that folds case everywhere matches the same spans on ``line``, ``line.upper()``,
+    ``line.lower()`` and ``line.title()``. A spelling whose length differs is skipped, since its spans
+    cannot line up; the corpus is ASCII, so none is skipped today."""
+    out: list[str] = []
     for line in _CASE_FOLD_CORPUS:
+        spans = [m.span() for m in pattern.finditer(line)]
+        for variant in (line.upper(), line.lower(), line.title()):
+            if len(variant) == len(line) and [m.span() for m in pattern.finditer(variant)] != spans:
+                out.append(ascii(variant))
+    return out
+
+
+@pytest.mark.parametrize("name", GLOBALLY_FOLDED_PATTERNS)
+def test_the_credential_patterns_fold_case_globally(name: str) -> None:
+    """Each credential pattern folds case with one flag, and matches the same spans in every case
+    spelling of the corpus.
+
+    A scoped ``(?i:...)`` is a token repeated per alternation, and a tidy-up can drop it from one site
+    and leave the others; ``_BEARER``'s scheme group was the site where that leaked a token (BACKLOG
+    #1183). The flag check alone is not enough: an inline ``(?-i:...)`` group turns the fold off for
+    part of a pattern and leaves the flag set. The corpus comparison is the half that sees that, and
+    ``test_the_case_spelling_comparison_catches_an_inline_unfold`` shows it can fail."""
+    pattern: re.Pattern[str] = getattr(scrub_mod, name)
+    assert pattern.flags & re.IGNORECASE, f"secretscrub.{name} no longer folds case"
+    assert any(pattern.search(line) for line in _CASE_FOLD_CORPUS), (
+        f"secretscrub.{name} matches nothing in the corpus, so the comparison below proves nothing"
+    )
+    disagreements = _case_spelling_disagreements(pattern)
+    assert not disagreements, f"secretscrub.{name} matches differently in {disagreements[:5]}"
+
+
+def test_the_case_spelling_comparison_catches_an_inline_unfold() -> None:
+    """The control for the comparison above: ``_CREDENTIAL_KV`` with its keyword alternation wrapped
+    in ``(?-i:...)`` keeps the IGNORECASE flag and must still disagree somewhere in the corpus."""
+    words = scrub_mod._alternation(scrub_mod._CREDENTIAL_WORDS)
+    source = scrub_mod._CREDENTIAL_KV.pattern
+    assert f"(?:{words})" in source, "the control's rewrite no longer finds the keyword group"
+    unfolded = re.compile(source.replace(f"(?:{words})", f"(?-i:{words})", 1))
+    assert unfolded.flags & re.IGNORECASE
+    assert _case_spelling_disagreements(unfolded), "an inline unfold went unnoticed"
+
+
+#: Label-prefix heads: non-ASCII code points Python's case-insensitive matching folds into
+#: ``[A-Za-z]``, at least these four (``secretscrub._GATE_FOLDS`` records the measured set). Built
+#: with ``chr()`` so no encoding layer between here and disk can change one.
+_FOLD_ONLY_HEADS = tuple(chr(cp) for cp in (0x0130, 0x0131, 0x017F, 0x212A))
+
+
+def test_the_global_fold_reaches_a_label_the_scoped_fold_missed() -> None:
+    """WHY BACKLOG #2694 KEPT THE GLOBAL FOLD rather than moving ``secretscrub`` to the scoped one.
+
+    The scoped spelling ``support/redact`` used to carry was cheaper per pattern, and its comment said
+    it changed no match. That held for ASCII only. Under a global fold ``[A-Za-z0-9]`` in
+    ``_LABEL_PREFIX`` also admits the code points above, so a label opening on one of them is reached;
+    under the scoped fold the whole match fails and the value prints. The cost figures and the
+    differential that found these lines are stated once, in ``support/redact.py``.
+
+    THE CONTROL IS THAT SCOPED SPELLING, REBUILT HERE, and it must miss. Without it this test would
+    pass on a fold that reaches nothing new."""
+    scoped = re.compile(
+        r"\b(" + scrub_mod._LABEL_PREFIX + r"(?i:pass(?:word|wd|phrase)?|pwd|secret|credential))\b"
+        r"['\"]?\s*[:=]\s*['\"]?[^\s'\";,&]+"
+    )
+    secret = "pw-Fold_Edge-41"
+    for head in _FOLD_ONLY_HEADS:
+        line = f"connect failed {head}_password={secret} retrying"
+        assert scoped.search(line) is None, (
+            f"U+{ord(head):04X}: the control matched, so it proves nothing"
+        )
+        assert secret not in scrub_credentials(line), (
+            f"U+{ord(head):04X}: the write-time pass printed it"
+        )
+        assert secret not in redact_log_line(line), f"U+{ord(head):04X}: the bundle pass printed it"
+
+
+def test_the_hint_gate_admits_every_bundle_fixture() -> None:
+    """The admission gate ``scrub_credentials`` runs must not drop a line the ungated pass redacts.
+
+    ``support/redact`` ran its credential patterns UNGATED until BACKLOG #2694 composed this call.
+    The gate is NOT safe by construction alone. Building gate and pattern from one word tuple W covers
+    the words; it does not cover the fold, and a ``casefold``-only gate refused labels spelled with
+    U+0130 or U+0131 that the ``(?i)`` patterns match (``secretscrub._GATE_FOLDS``). So this checks it,
+    over THIS file's fixtures plus every fold-character keyword line ``_fold_lines`` builds, with the
+    bundle's own placeholder. ``tests/test_logging_credential_scrub.py`` checks the same over its own
+    fixtures."""
+    corpus = (
+        *_fold_lines(_measured_letter_folds()),
+        *_CASE_FOLD_CORPUS,
+        *(case.line for case in QUOTED_VALUES),
+        *(
+            f"store dsn {scheme}://svc:pw-D5n_Pass-55@db.invalid/mefor"
+            for scheme in _DSN_SCHEMES_THAT_MUST_REDACT
+        ),
+        *(
+            f"connect failed {name}={_REGISTRY_SENTINEL} for endpoint"
+            for name in _engine_credential_settings()
+        ),
+        *(f"connect failed {head}_password=pw-Fold_Edge-41" for head in _FOLD_ONLY_HEADS),
+    )
+    changed = 0
+    for line in corpus:
         for variant in (line, line.upper(), line.lower(), line.title()):
-            assert [(m.span(), m.group(1)) for m in scoped.finditer(variant)] == [
-                (m.span(), m.group(1)) for m in globally_folded.finditer(variant)
-            ], (
-                f"{name}: the scoped (?i:...) does not match what a global (?i) would, on {variant!r}. "
-                "A fold has been dropped from one alternation, or added to a span that changes a match."
+            gated = scrub_credentials(variant, placeholder=REDACTION_PLACEHOLDER)
+            ungated = scrub_mod._run(variant, REDACTION_PLACEHOLDER, None)
+            assert gated == ungated, (
+                f"the gate changed the result on {ascii(variant)}: {ascii(gated)}"
             )
+            changed += gated != variant
+    # Positive control: a corpus the pass never rewrites would make the equality vacuous.
+    assert changed >= 4 * len(FAMILIES), f"only {changed} variants were rewritten at all"
 
 
 @pytest.mark.parametrize("scheme", ("bearer", "Bearer", "basic", "Basic", "digest", "Digest"))
@@ -1631,12 +1796,11 @@ def test_the_bearer_pattern_folds_case_on_the_auth_scheme_word(
 ) -> None:
     """``_BEARER``'s optional ``(?:bearer|basic|digest)\\s+`` group must consume the auth scheme.
 
-    THIS IS NOT THE FOLD GUARD -- ``test_a_scoped_case_fold_matches_exactly_what_a_global_one_would``
-    is, and it covers this group's ``(?i:...)`` along with every other. This one covers what an
-    equivalence check structurally cannot: DELETING the scheme group leaves the scoped and the globally
-    folded spellings equivalent to each other, and leaks the credential. Without the group, ``\\S+``
-    matches the scheme WORD rather than the token, so "Authorization: Bearer <tok>" redacts "Bearer"
-    and prints <tok>. That is BACKLOG #1183's original defect.
+    THIS IS NOT THE FOLD GUARD -- ``test_the_credential_patterns_fold_case_globally`` is. This one
+    covers what a flag check structurally cannot: DELETING the scheme group leaves the flag in place
+    and leaks the credential. Without the group, the value class matches the scheme WORD rather than
+    the token, so "Authorization: Bearer <tok>" redacts "Bearer" and prints <tok>. That is BACKLOG
+    #1183's original defect.
 
     NOTHING ELSE IN THIS FILE CAN SEE THAT EITHER. ``authorization_bearer_header`` declares
     ``_AUTH_SCHEME`` beside ``_BEARER``, so it stays green on the other pattern's work -- this file's
@@ -1648,7 +1812,7 @@ def test_the_bearer_pattern_folds_case_on_the_auth_scheme_word(
     spellings of the same word (BEARER, BeArEr) cannot fail independently of the pair, so they would be
     one case wearing three names.
     """
-    monkeypatch.setattr(redact_mod, "_AUTH_SCHEME", NEVER_MATCHES)
+    monkeypatch.setattr(scrub_mod, "_AUTH_SCHEME", NEVER_MATCHES)
     secret = "sk-live-AbCdEf_1234-XYZ"
     out = redact_log_line(f"upstream sent Authorization: {scheme} {secret}")
     assert secret not in out, (
@@ -1776,8 +1940,8 @@ def test_the_excluded_settings_are_the_username_class_the_engine_itself_names() 
 def test_the_key_material_pattern_spares_the_engines_non_secret_siblings() -> None:
     """The five names #1475 widened onto have non-secret siblings one word away.
 
-    The reason literal alternates were chosen over a general rule is stated ONCE, on ``_KEY_MATERIAL``
-    in ``messagefoundry/support/redact.py``; this asserts the property that argument turns on rather
+    The reason literal alternates were chosen over a general rule is stated ONCE, on
+    ``_KEY_MATERIAL_WORDS`` in ``messagefoundry/secretscrub.py``; this asserts the property that argument turns on rather
     than restating it. ``intake_api_key_header`` is the sharpest case, and this test pins WHY it
     survives -- the engine does not classify it as a credential -- where ORDINARY_DIAGNOSTICS pins only
     that the line comes back unchanged.
