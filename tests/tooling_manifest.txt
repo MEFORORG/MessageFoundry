@@ -203,6 +203,7 @@ tests/test_usage_headroom_inject.py
 tests/test_worktree_gate_quoted_key.py
 tests/test_worktree_gate_receipts.py
 tests/test_worktree_gate_remedy_families.py
+tests/test_worktree_gate_removal_route.py
 tests/test_worktree_gate_rule_agnostic_coverage.py
 tests/test_worktree_gate_scope_wording.py
 tests/test_worktree_gate_shell_semantics.py
