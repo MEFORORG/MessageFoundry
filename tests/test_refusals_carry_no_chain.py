@@ -51,6 +51,7 @@ from messagefoundry.auth.webauthn import WebAuthnVerificationError, credential_i
 from messagefoundry.cli_common import _load_operator_json, _OperatorJsonError
 from messagefoundry.config.code_sets import CodeSetError, load_code_set
 from messagefoundry.config.connections_file import load_connections_file
+from messagefoundry.config.environments import load_environment_values
 from messagefoundry.config.models import ContentType
 from messagefoundry.config.settings import EgressSettings, StoreSettings
 from messagefoundry.config.wiring import InboundConnection, Registry, WiringError
@@ -66,6 +67,7 @@ from messagefoundry.parsing.peek import HL7PeekError, Peek
 from messagefoundry.pipeline import ingress_guards
 from messagefoundry.pipeline._sandbox_codec import SandboxCodecError, decode_frame
 from messagefoundry.pipeline.dr_backup import _read_manifest_from_tar
+from messagefoundry.pipeline.engine import Engine
 from messagefoundry.pipeline.ingress_guards import (
     IngressGuardError,
     admit_resubmitted_body,
@@ -90,6 +92,7 @@ from messagefoundry.transports.signing import (
 )
 from tests.test_ai_broker import _managed_ai
 from tests.test_builtin_hl7_hardening import _hl7_registry
+from tests.test_config_anchoring import _NO_ENV_GRAPH, _config_dir
 from tests.test_crypto_transit import _FakeTransit, _use_fake
 from tests.test_ingress_guard_parity import _inbound
 from tests.test_mllp_persistent import _dest as _mllp_dest
@@ -732,3 +735,114 @@ def test_an_unparseable_ack_keeps_the_parse_error_off_the_chain() -> None:
         _mllp_dest(1)._check_ack(b"not an ack " + _PLANTED.encode())
     assert str(caught.value).startswith("unparseable ACK: HL7PeekError: ")
     _assert_bare(caught.value)
+
+
+# ==== BACKLOG #2307: an unreadable environments/<env>.toml never rides a WiringError's chain ======
+#
+# tomllib keeps the whole document on a TOMLDecodeError's .doc and the file's bytes on a
+# UnicodeDecodeError's .object, so either guard chaining it carried every value the file holds.
+
+_ENV_FILES = pytest.mark.parametrize(
+    "content",
+    [
+        f'password = "{_PLANTED}"\nx = = 1\n'.encode(),
+        f'password = "{_PLANTED}"\n'.encode() + b"\xff",
+    ],
+    ids=["bad-toml", "bad-utf8"],
+)
+_GOOD_ENV = b'peer_host = "10.0.0.1"\n'
+
+
+def _env_file(root: Path, content: bytes) -> Path:
+    path = root / "environments" / "dev.toml"
+    path.parent.mkdir(exist_ok=True)
+    path.write_bytes(content)
+    return path
+
+
+def _read_env(root: Path) -> dict[str, Any]:
+    return load_environment_values(
+        base_dir=root, dir_name="environments", environment="dev", environ={}
+    )
+
+
+@_ENV_FILES
+def test_the_raw_value_file_error_holds_the_file(tmp_path: Path, content: bytes) -> None:
+    """Control: the loader's own error does hold the planted value, so a clean reading is clean."""
+    _env_file(tmp_path, content)
+    with pytest.raises(ValueError) as caught:
+        _read_env(tmp_path)
+    assert _holders(caught.value) != []
+
+
+def _serve_value_provider(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Drive ``serve`` to the app boundary, nothing bound, and return the value provider it built.
+
+    The provisions are the ones tests/test_config_anchoring.py gives a keyless dev serve."""
+    import uvicorn
+
+    import messagefoundry.api as api_mod
+    from messagefoundry.__main__ import main
+
+    for name in (
+        "MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND",
+        "MEFOR_SECURITY_ALLOW_UNENCRYPTED_PHI",
+        "MEFOR_SECURITY_ALLOW_UNENCRYPTED_PHI_UNDER_STRICT_ENFORCEMENT",
+    ):
+        monkeypatch.setenv(name, "true")
+    monkeypatch.setenv("MEFOR_ALERTS_SECURITY_NOTIFICATIONS_REQUIRED", "false")
+    captured: dict[str, Any] = {}
+
+    def _fake_app(**kwargs: Any) -> object:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(api_mod, "create_managed_app", _fake_app)
+    monkeypatch.setattr(uvicorn, "run", lambda *_a, **_kw: None)
+    monkeypatch.setattr("messagefoundry.last_resort.install_excepthook", lambda: None)
+    cfg = _config_dir(tmp_path, _NO_ENV_GRAPH)
+    argv = ["serve", "--project-root", str(tmp_path), "--config", str(cfg), "--env", "dev"]
+    assert main(argv) == 0
+    return captured["env_values_provider"]
+
+
+@_ENV_FILES
+@pytest.mark.usefixtures("bounded_warn_only_retention", "verified_log_forwarding")
+def test_the_serve_value_provider_keeps_the_file_off_the_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content: bytes
+) -> None:
+    """The CLI closure, which serve's start gate and every reload call."""
+    env_file = _env_file(tmp_path, _GOOD_ENV)
+    provider = _serve_value_provider(tmp_path, monkeypatch)
+    assert provider()["peer_host"] == "10.0.0.1"  # control: the same provider reads a good file
+    env_file.write_bytes(content)
+    with pytest.raises(WiringError) as caught:
+        provider()
+    assert str(caught.value).startswith("could not read environment values from ")
+    assert "dev.toml" in str(caught.value)
+    _assert_bare(caught.value)
+
+
+@_ENV_FILES
+async def test_the_reload_guard_keeps_the_value_file_off_the_chain(
+    tmp_path: Path, content: bytes
+) -> None:
+    """The engine-side guard, with a provider shaped like the CLI's before it wraps its own read."""
+    env_file = _env_file(tmp_path, _GOOD_ENV)
+    eng = await Engine.create(
+        tmp_path / "e.db",
+        poll_interval=0.02,
+        env_values_provider=lambda: _read_env(tmp_path),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    await eng.start()
+    try:
+        cfg = tmp_path / "cfg"
+        cfg.mkdir()
+        env_file.write_bytes(content)
+        with pytest.raises(WiringError) as caught:
+            await eng.reload_detail(cfg, dry_run=True)
+        assert "so the live graph is unchanged: " in str(caught.value)
+        _assert_bare(caught.value)
+    finally:
+        await eng.stop()

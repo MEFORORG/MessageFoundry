@@ -4015,9 +4015,12 @@ def _serve(args: argparse.Namespace) -> int:
             # gate exists to prevent. No TypeError here, unlike the engine-side guard: that one wraps
             # an embedder's arbitrary callable, while this one wraps our own call into a function that
             # returns a dict or raises.
-            raise WiringError(
-                f"could not read environment values from {env_file}: {safe_exc(exc)}"
-            ) from exc
+            refusal = safe_exc(exc)
+        # Raised AFTER the handler, so neither __cause__ nor __context__ is set (BACKLOG #2307). A
+        # TOMLDecodeError keeps the whole document on .doc and a UnicodeDecodeError keeps the file's
+        # bytes on .object, so chaining either would carry every credential the file holds. `from None`
+        # would not do: it leaves __context__ set.
+        raise WiringError(f"could not read environment values from {env_file}: {refusal}")
 
     # ADR 0050 anchoring diagnostics. Emitted ONCE here at startup (NOT inside env_values(), which is
     # re-invoked on every reload), and they log resolved file PATHS only — never env() values or
