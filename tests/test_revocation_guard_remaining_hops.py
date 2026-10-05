@@ -24,10 +24,10 @@ from __future__ import annotations
 
 import datetime
 import logging
-import ssl
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 import pytest
 from cryptography import x509
@@ -183,6 +183,20 @@ def _guard_log(*names: str) -> Iterator[_GuardLog]:
         logging.disable(disable_level)
 
 
+def _without_the_policy[T](real: Callable[..., T]) -> Callable[..., T]:
+    """A stand-in for a context or anchor builder that hands ``real`` no trust-anchor policy.
+
+    Every other argument is forwarded as given, positional or keyword. The stand-in names none of
+    them, so it keeps working when the real builder gains a parameter, and a new argument still
+    reaches the real builder."""
+
+    def stand_in(*args: Any, **kwargs: Any) -> T:
+        kwargs["trust_anchor_policy"] = None
+        return real(*args, **kwargs)
+
+    return stand_in
+
+
 def _dest(
     name: str,
     ctype: ConnectorType,
@@ -288,11 +302,7 @@ def test_a_configured_crl_does_not_admit_a_fhir_lookup_whose_opener_lacks_it(
     on ``trust_anchor_policy.crl_file`` would admit it; the arm above cannot catch that, because its
     only CRL-less lookup is on loopback."""
     monkeypatch.setattr(
-        fhir_module,
-        "http_family_trust_anchor",
-        lambda s, *, url, trust_anchor_policy=None: http_family_trust_anchor(
-            s, url=url, trust_anchor_policy=None
-        ),
+        fhir_module, "http_family_trust_anchor", _without_the_policy(http_family_trust_anchor)
     )
     with active_hop_posture(ENFORCING), pytest.raises(InsecureHopRefused, match="revocation"):
         _lookup({"url": f"https://{REMOTE}/fhir"}, policy=_crl_policy(bare_crl))
@@ -413,9 +423,8 @@ def test_a_configured_crl_does_not_admit_a_dicom_association_whose_context_lacks
     """The guard reads the context, never the setting. Here the policy carries a CRL and the context
     the SCU ends up holding does not, so the hop must stay refused. A guard keyed on
     ``trust_anchor_policy.crl_file`` would admit it."""
-    real = dicom_module._client_ssl_context
     monkeypatch.setattr(
-        dicom_module, "_client_ssl_context", lambda s, *, trust_anchor_policy=None: real(s)
+        dicom_module, "_client_ssl_context", _without_the_policy(dicom_module._client_ssl_context)
     )
     with active_hop_posture(ENFORCING), pytest.raises(InsecureHopRefused, match="revocation"):
         DicomScuDestination(_scu(REMOTE, policy=_crl_policy(bare_crl)))
@@ -494,11 +503,10 @@ def test_a_configured_crl_does_not_admit_an_ftps_upload_whose_context_lacks_it(
 ) -> None:
     """The guard reads the client's context, never the setting. The policy carries a CRL and the
     context the client ends up holding does not, so the hop must stay refused."""
-    real = remotefile_module._ftps_ssl_context
     monkeypatch.setattr(
         remotefile_module,
         "_ftps_ssl_context",
-        lambda settings, *, trust_anchor_policy=None, name="": real(settings, name=name),
+        _without_the_policy(remotefile_module._ftps_ssl_context),
     )
     with active_hop_posture(ENFORCING), pytest.raises(InsecureHopRefused, match="revocation"):
         RemoteFileDestination(_ftps(REMOTE, policy=_crl_policy(bare_crl)))
@@ -630,11 +638,9 @@ def test_a_configured_crl_does_not_admit_a_direct_hop_whose_context_lacks_it(
     """The guard reads the context, never the setting. The policy carries a CRL and the context the
     destination ends up holding does not, so the hop must stay refused."""
 
-    def without_the_policy(**kw: object) -> ssl.SSLContext:
-        kw.pop("trust_anchor_policy", None)
-        return build_smtp_tls_context(**kw)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(direct_module, "build_smtp_tls_context", without_the_policy)
+    monkeypatch.setattr(
+        direct_module, "build_smtp_tls_context", _without_the_policy(build_smtp_tls_context)
+    )
     with active_hop_posture(ENFORCING), pytest.raises(InsecureHopRefused, match="revocation"):
         DirectDestination(_direct(direct_material, REMOTE, policy=_crl_policy(bare_crl)))
 
