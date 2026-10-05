@@ -1167,6 +1167,7 @@ def test_the_section_checks_can_fail() -> None:
 
 _SURVEY_HEADING = "### What each wheel carries inside it"
 _HIGHLIGHTED = "**Highlighted as risky on what it carries:**"
+_READ = "**Read from the carried project's own advisories:**"
 
 
 def _owed_a_route(survey: dict[str, Any]) -> set[str]:
@@ -1181,6 +1182,8 @@ def _survey_page_drift(page: str, survey: dict[str, Any]) -> list[str]:
     """Where the page's survey subsection disagrees with the record. Not through the renderer."""
     section = _region(_SURVEY_HEADING, _EXTRA_NAMES, page)
     found, _, highlighted = section.partition(f"\n{_HIGHLIGHTED}\n")
+    # A read route renders its own table after the highlighted one; its names are not highlights.
+    highlighted = highlighted.partition(f"\n{_READ}\n")[0]
     wheels = survey["wheels"]
     counts = {a: sum(w["carries"] == a for w in wheels) for a in component_readings.CARRIES}
     size = len(wheels)
