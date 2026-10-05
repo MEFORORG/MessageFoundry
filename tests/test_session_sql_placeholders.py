@@ -222,8 +222,16 @@ def _pg_store(seen: list[tuple[str, tuple[Any, ...]]]) -> Any:
         yield _PgConn(seen)
 
     store._timed_acquire = _timed_acquire
-    # Any borrow that bypasses the bounded helper reaches this and fails with a message naming the
-    # bypass, rather than with a bare AttributeError.
+
+    async def _execute_after_commit(sql: str, *args: Any) -> int:
+        # The one sanctioned unbounded borrow, for the two writes that follow a committed one
+        # (BACKLOG #2283). Recorded like every other statement.
+        await _PgConn(seen).execute(sql, *args)
+        return 1
+
+    store._execute_after_commit = _execute_after_commit
+    # Any other borrow that bypasses the bounded helper reaches this and fails with a message naming
+    # the bypass, rather than with a bare AttributeError.
     store._pool = _NoPool()
     return store
 

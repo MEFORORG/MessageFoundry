@@ -301,6 +301,52 @@ async def test_postgres_convenience_reads_are_bounded_too(method: str) -> None:
         await getattr(store, method)("SELECT 1")
 
 
+class _BusyPool(_GatedPool):
+    """A saturated pool: every borrow waits until the test frees a connection. ``execute`` stands
+    in for asyncpg's own ``Pool.execute``, which borrows inside with no timeout."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.statements: list[str] = []
+
+    async def execute(self, sql: str, *args: Any) -> str:
+        conn = await self.acquire()
+        try:
+            self.statements.append(sql)
+            return "UPDATE 2"
+        finally:
+            await self.release(conn)
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [("revoke_user_sessions", 2), ("rotate_session", True)],
+)
+async def test_postgres_post_commit_session_writes_wait_out_a_busy_pool(
+    name: str, expected: object
+) -> None:
+    """BACKLOG #2283: these two run after their caller's own write has committed -- a reset
+    password, a disabled account, a completed factor ceremony -- and nothing retries them. On the
+    bounded borrow a busy pool made them raise, leaving that account's other sessions live, or the
+    old token elevated and unrotated. They wait for a connection instead and finish once the pool
+    frees. The control proves the stand-in does time a bounded borrow out."""
+    pool = _BusyPool()
+    store = _postgres_store(pool)
+    with pytest.raises(StoreAcquireTimeout):
+        await store._execute("UPDATE sessions SET revoked_at=$1", 1.0)
+
+    calls = {
+        "revoke_user_sessions": lambda: store.revoke_user_sessions("u", now=1.0),
+        "rotate_session": lambda: store.rotate_session("a" * 64, new_token_hash="b" * 64),
+    }
+    task = asyncio.create_task(calls[name]())
+    await asyncio.sleep(FAST * 4)  # well past the acquire timeout
+    assert not task.done(), f"{name} gave up on a busy pool after its caller's write committed"
+    pool.gate.set()
+    assert await asyncio.wait_for(task, timeout=5) == expected
+    assert pool.statements and pool.statements[-1].startswith("UPDATE sessions")
+
+
 async def test_sqlserver_store_releases_a_healthy_borrow() -> None:
     """Positive control for the acquire/release restructure: the connection still goes back."""
     pool = _ReadyPool()
@@ -419,8 +465,13 @@ def test_postgres_borrows_outside_the_bounded_helper_are_pinned() -> None:
     # helper (BACKLOG #2283). Each needs its rowcount, which is why it called `self._pool.execute`:
     # `_execute` discarded asyncpg's status tag. `_execute` now returns the count, and both call it.
     # The CONNECTIONS.md note still says "at least", so this drop also leaves it true as written.
-    assert (len(store_sites), len(cluster_sites)) == (34, 0), (
-        "the measured population of pool borrows OUTSIDE the bounded helper moved from 34 (store)"
+    # Store 34 -> 35 later on 2026-10-05, and on purpose: both moved back out, into ONE helper,
+    # `_execute_after_commit` (BACKLOG #2283). Each runs after its caller's own write has committed
+    # (a reset password, a disable, a completed factor ceremony), and nothing retries it, so on the
+    # bounded borrow a busy pool left that account's sessions live or its old token unrotated.
+    # The helper keeps the count; its docstring gives the reasoning.
+    assert (len(store_sites), len(cluster_sites)) == (35, 0), (
+        "the measured population of pool borrows OUTSIDE the bounded helper moved from 35 (store)"
         " + 0 (cluster), measured 2026-10-05. Re-read the CONNECTIONS.md scope note before changing"
         " this number. Sites scanned:\n" + "\n".join(store_sites + cluster_sites)
     )

@@ -2242,10 +2242,30 @@ class PostgresStore:
 
     async def _execute(self, sql: str, *params: Any) -> int:
         """Run one write on a bounded borrow and return its row count, read from asyncpg's status
-        tag. Most callers ignore it; the session writes that report what they changed read it
-        (BACKLOG #2283), so none of them borrows around this helper to reach the tag."""
+        tag. Most callers ignore it; the session purge reads it (BACKLOG #2283). Two session writes that need the count borrow without the bound instead, for the
+        reason :meth:`_execute_after_commit` gives."""
         async with self._timed_acquire(record=False) as conn:
             return _rowcount(await conn.execute(sql, *params))
+
+    async def _execute_after_commit(self, sql: str, *params: Any) -> int:
+        """Run one session write that FOLLOWS a write its caller has already committed, and return
+        its row count. **The borrow is unbounded on purpose (BACKLOG #2283).**
+
+        ``rotate_session`` and ``revoke_user_sessions`` finish what an auth change started: a reset
+        password, a disabled account, a changed role, a completed factor ceremony. By the time they
+        run, that change is committed. Under ``[store].acquire_timeout`` a saturated pool would make
+        them raise after it, and nothing retries them: a reset password would leave every other
+        session live with no audit row, and a factor ceremony would leave the old token elevated and
+        unrotated. Waiting for a connection instead finishes the write once the pool frees, which is
+        what both did before BACKLOG #2283 moved them onto the bounded ``_execute``.
+
+        A bounded retry that fell back to this wait would end the same way, later, since each retry
+        rejoins the back of asyncpg's queue. Moving each write into its caller's transaction would
+        close the gap entirely, but every caller commits through a different store method on three
+        backends. ``self._pool.execute`` borrows inside asyncpg with no timeout and returns the
+        status tag the count is read from. ``tests/test_store_pool_acquire_timeout.py`` counts this
+        site among the pinned unbounded borrows."""
+        return _rowcount(await self._pool.execute(sql, *params))
 
     async def _count(self, table: str) -> int:
         row = await self._pool.fetchrow(f"SELECT COUNT(*) AS n FROM {table}")  # table is a constant
@@ -8308,10 +8328,10 @@ class PostgresStore:
     async def rotate_session(self, token_hash: str, *, new_token_hash: str) -> bool:
         """Re-key a live session in place (ASVS 7.2.4). See :meth:`AuthStore.rotate_session`.
 
-        Through ``self._execute``, which borrows under the acquire timeout and returns the
-        rowcount this op's contract is. It used ``self._pool.execute``, which acquires with no
-        timeout (BACKLOG #1052, #2283)."""
-        changed = await self._execute(
+        Through ``self._execute_after_commit``, which returns the rowcount this op's contract is,
+        and waits for a pooled connection without a timeout: a rotation follows a factor ceremony
+        that has already committed, so it must not fail on a busy pool (BACKLOG #2283)."""
+        changed = await self._execute_after_commit(
             "UPDATE sessions SET token_hash=$1 WHERE token_hash=$2 AND revoked_at IS NULL",
             new_token_hash,
             token_hash,
@@ -8341,8 +8361,9 @@ class PostgresStore:
     ) -> int:
         """Revoke a user's active sessions (all, or all but ``except_token_hash``). Returns the count."""
         now = time.time() if now is None else now
-        # Through `_execute`, the bounded borrow, as `rotate_session` explains (BACKLOG #2283).
-        return await self._execute(
+        # Unbounded, after the caller's own committed write, as `_execute_after_commit` explains
+        # (BACKLOG #2283).
+        return await self._execute_after_commit(
             "UPDATE sessions SET revoked_at=$1 WHERE user_id=$2 AND revoked_at IS NULL"
             " AND ($3::text IS NULL OR token_hash != $3)",
             now,
