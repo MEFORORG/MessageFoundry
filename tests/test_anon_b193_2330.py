@@ -299,11 +299,14 @@ def test_a_site_code_outside_a_date_field_is_still_scrubbed(
 def test_a_date_of_birth_field_is_not_exempt(
     adapter: Callable[..., str], century_site_prefix: str
 ) -> None:
-    """Only the DATE kind is exempt. The DOB kind can keep text after the eighth character, so its
-    output is not known to be free of a site code."""
-    rules = (engine_rules.FieldRule("ZPD-1", SurrogateKind.DOB),)
-    out = adapter(_site_message("ZPD|19800101^" + _SITE_CODE), salt=_SALT, rules=rules)
-    assert _SITE_CODE not in out
+    """Only the DATE kind is exempt. The value is one the DATE kind would write, so the path's kind
+    is the only thing that separates the two halves: DOB is checked, DATE is skipped."""
+    module = engine_surrogates if adapter is engine_anonymize else tee_surrogates
+    text = _site_message("ZPD|" + _FILLED)
+    assert module.message_has_site_code(text, (engine_rules.FieldRule("ZPD-1", SurrogateKind.DOB),))
+    assert not module.message_has_site_code(
+        text, (engine_rules.FieldRule("ZPD-1", SurrogateKind.DATE),)
+    )
 
 
 @_SURROGATES
@@ -425,7 +428,10 @@ def test_the_run_summary_counts_emptied_date_fields_and_never_shows_a_value(
         checked(_site_message("EVN|A01|" + _NOT_A_DATE), salt=_SALT, on_report=tally.add)
     checked(_site_message("EVN|A01|20260315"), salt=_SALT, on_report=tally.add)
     summary = tally.summary()
-    assert "Date fields emptied because the value was not a valid timestamp: EVN-2 x2." in summary
+    assert (
+        "Date fields emptied because the value was not a timestamp it could keep: EVN-2 x2."
+        in summary
+    )
     assert _NOT_A_DATE not in summary
     assert "emptied" not in quiet  # no sentence at all when nothing was emptied
 
@@ -468,3 +474,43 @@ def test_a_six_digit_date_with_two_readings_is_emptied(
     out = adapter(_site_message("EVN|A01|" + value + "|x"), salt=_SALT, blanked=blanked)
     assert _field_of(out, "EVN-2") == expected
     assert blanked == ([] if expected else ["EVN-2"])
+
+
+# --- found by the QA pass on this branch ----------------------------------------------------------
+
+# GT1-8 value -> what must NOT survive, and whether the time after the date is kept.
+_DOB_TAILS = {
+    "an SSN after the date": ("19570412 123-45-6789", "123-45-6789", ""),
+    "a name after the date": ("19570412^ROE^JANE", "ROE", ""),
+    "a US date": ("03/15/1957", "57", ""),
+    "a time and an offset": ("19570412083000-0500", "19570412", "083000-0500"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_DOB_TAILS))
+@_EACH_ADAPTER
+def test_a_date_of_birth_keeps_only_a_time_after_the_date(
+    adapter: Callable[..., str], case: str
+) -> None:
+    """GT1-8 used to be unmapped, so the leak-check scanned it. Mapped, it is not scanned, so the
+    DOB kind must not carry text through."""
+    value, gone, kept_tail = _DOB_TAILS[case]
+    out = _field_of(adapter(_site_message(_seg("GT1", f1="1", f8=value)), salt=_SALT), "GT1-8")
+    assert len(out) == 8 + len(kept_tail) and out[:8].isdigit() and out.endswith(kept_tail)
+    assert gone not in out[:8] and (kept_tail or gone not in out)
+
+
+@_EACH_ADAPTER
+def test_a_plus_sign_as_the_repetition_separator_does_not_break_the_record(
+    adapter: Callable[..., str],
+) -> None:
+    """The filled offset is +0000. Where the message declares + as its repetition separator, the
+    output holds more repetitions than the input, and the record must not be worked out from it."""
+    message = (
+        "MSH|^+\\&|SAPP|SFAC|RAPP|RFAC|20260315142233||ADT^A01|MSGCTRL|P|2.5.1"
+        "\rEVN|A01|20260315120000-0500"
+    )
+    blanked: list[str] = []
+    out = adapter(message, salt=_SALT, blanked=blanked)
+    assert _field_of(out, "EVN-2") == "20260101000000+0000"
+    assert blanked == []

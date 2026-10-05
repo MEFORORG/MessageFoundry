@@ -79,7 +79,7 @@ def anonymize(
     §7) is left for a real X12/FHIR feed; do not feed a non-HL7 body here.
 
     ``blanked``, when given, collects the address of every field the ``date`` kind scrubbed to empty
-    because its value was not a valid timestamp. :func:`anonymize_checked` puts those addresses in
+    because its value was not a timestamp it could keep. :func:`anonymize_checked` puts those addresses in
     the report for you; a caller of this function has no other record of them.
     """
     keyer = Keyer(salt)
@@ -126,7 +126,7 @@ def anonymize_checked(
     it and is still scanned for PHI shapes. The MSH header is outside its reach (BACKLOG #1710).
 
     The report's ``blanked_fields`` names each field the ``date`` kind scrubbed to empty because the
-    value was not a valid timestamp. It is a record, not a refusal cause (BACKLOG #2330).
+    value was not a timestamp it could keep. It is a record, not a refusal cause (BACKLOG #2330).
     """
     effective = rules if rules is not None else load_rules(overlay)
     blanked: list[str] = []

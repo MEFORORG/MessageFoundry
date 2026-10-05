@@ -1799,7 +1799,7 @@ and fills the rest of the value at the same width. BACKLOG #2248 added it.
 | `ORC-9` | Order transaction time | `date` |
 | `OBR-7`, `OBX-14` | Observation times | `date` |
 | `AIS-4`, `RXA-3`, `RXA-4`, `PR1-5`, `FT1-4` | Appointment, administration, procedure and transaction times | `date` |
-| `GT1-8`, `IN1-18`, `NK1-16` | Dates of birth of the guarantor, the insured and a contact | `dob`, a fabricated date at the same width, like `PID-7` |
+| `GT1-8`, `IN1-18`, `NK1-16` | Dates of birth of the guarantor, the insured and a contact | `dob`, a fabricated date, like `PID-7`. A time after the eight date digits is kept. Anything else after them is dropped |
 | `PID-12` | County code | `freetext`, the whole field becomes `[REDACTED]` |
 | `PV1-3` | Assigned patient location | `freetext`, the whole field becomes `[REDACTED]` |
 
@@ -1848,7 +1848,9 @@ What the `date` kind does to a value:
   kind filled, so the filled date stays a date. Two things follow. A site code that reads as a
   year and a month, sitting in a date field, leaves as its first four digits and `01`. And a
   `dob` field is not skipped, so a fabricated `YYYYMM` date of birth is still rewritten into a
-  number that is not a date.
+  number that is not a date. A site code that is itself a year followed by `01` leaves whole.
+  The skip needs the rules: `leak_check` called with no rules, and the publish gate's own scan
+  of a committed file, still flag a kept `YYYYMM` date under such a prefix.
 
 Do not shift the dates to fix the `MSH-7` gap. The kept `MSH-7` minus a shifted `EVN-2` gives back
 the shift.
@@ -1882,7 +1884,7 @@ refuses.
 came from `messagefoundry generate --count 2 --seed 1710`, run for every type: 186 messages. With
 the switch on, all 186 refused. Mapping the dates and locations above did not change that count.
 It removed 6 of the 72 undecided field addresses, and 553 of the 2,115 undecided fields across the
-corpus. These counts predate the eight date rules BACKLOG #2330 added, and nobody has measured them
+corpus. These counts predate the rules BACKLOG #2330 and #2645 added, and nobody has measured them
 again. Every message still carries at least one coded field that needs a rule or a `keep`:
 
 | Undecided field | Messages |

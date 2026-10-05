@@ -222,6 +222,11 @@ def surrogate_phone(rep: str, keyer: Keyer, seps: Seps) -> str:
     return f"{digits[:3]}-{digits[3:6]}-{digits[6:]}" if "-" in rep else digits
 
 
+#: What may follow the eight date digits of a date of birth: hours, minutes and seconds, a
+#: fraction and an offset. All optional, and nothing else.
+_DOB_TIME: re.Pattern[str] = re.compile(r"(?:[0-9]{2}){0,3}(?:\.[0-9]{1,4})?(?:[+-][0-9]{4})?")
+
+
 def surrogate_dob(rep: str, keyer: Keyer, seps: Seps) -> str:
     """A fabricated date of birth that **preserves the original's precision/width** (HL7 DT/TS allows
     ``YYYY`` / ``YYYYMM`` / ``YYYYMMDD`` and a TS time tail): ``1980`` → ``YYYY``, ``198001`` →
@@ -231,7 +236,13 @@ def surrogate_dob(rep: str, keyer: Keyer, seps: Seps) -> str:
     date8 = f"{rng.randrange(1920, 2022):04d}{rng.randrange(1, 13):02d}{rng.randrange(1, 29):02d}"
     if len(rep) < 8:
         return date8[: len(rep)]  # match the original's precision/width
-    return date8 + rep[8:]  # full date + preserved trailing time (TS), if any
+    # Only a time after eight digits is kept. Anything else there (a name, a second identifier, the
+    # year of a ``MM/DD/YYYY``) is dropped: a mapped field is not scanned by the leak-check, so
+    # text kept here would leave unseen (BACKLOG #2330).
+    head, tail = rep[:8], rep[8:]
+    if head.isascii() and head.isdigit() and _DOB_TIME.fullmatch(tail):
+        return date8 + tail
+    return date8
 
 
 #: An HL7 DTM, which is also a TS's first component, in ASCII digits with every group in range. The
@@ -362,14 +373,17 @@ def surrogate_field_recorded(
     happens in. The address only, never the value, so the list is safe to log.
 
     A ``DROP`` is not recorded: the rule map already says that field is blanked. Both adapters call
-    this, so the two cannot disagree about what counts.
+    this, each with the value it read, so they agree wherever they read the same value.
     """
-    out = surrogate_field(kind, value, keyer, seps)
-    if blanked is not None and kind == SurrogateKind.DATE:
-        pairs = zip(value.split(seps.repetition), out.split(seps.repetition), strict=True)
-        if any(before and not after for before, after in pairs):
-            blanked.append(path)
-    return out
+    # Asked of each INPUT repetition. The output is not split again: a filled ``+0000`` holds a
+    # ``+``, which a message may declare as its repetition separator.
+    if (
+        blanked is not None
+        and kind == SurrogateKind.DATE
+        and any(rep and not _filled_date(rep, seps) for rep in value.split(seps.repetition))
+    ):
+        blanked.append(path)
+    return surrogate_field(kind, value, keyer, seps)
 
 
 def scrub_site_codes(value: str, keyer: Keyer, seps: Seps) -> str:
@@ -441,10 +455,15 @@ def _date_output_test(rules: tuple[FieldRule, ...], seps: Seps) -> Callable[[lis
     * its value is already what the ``DATE`` kind writes, repetition by repetition. So text that
       never went through the kind, or a real site code that is not a filled date, is not skipped.
 
+    The OBX-5 case reads OBX-2 from the text it is given. A rule that rewrites OBX-2 hides the date
+    type, and that OBX-5 is then scrubbed as before the exemption existed.
+
     An MSH line is never skipped: the tee applies no rule there. What this lets through: a site
     code that reads as a year and a month, sitting in a date field, leaves as its first four digits
     and ``01``.
     """
+    if not _SITE_PREFIXES:
+        return lambda fields, index: False  # no site code can match, so there is nothing to skip
     kinds: dict[str, set[str]] = {}
     for rule in rules:
         if rule.kind != SurrogateKind.KEEP:  # a KEEP rewrites nothing, so it decides no output

@@ -66,7 +66,7 @@ def anonymize(
     """De-identify one HL7 v2 message with the secret ``salt`` and the effective rule set.
 
     ``blanked``, when given, collects the address of every field the ``date`` kind scrubbed to empty
-    because its value was not a valid timestamp.
+    because its value was not a timestamp it could keep.
     """
     keyer = Keyer(salt)
     if rules is None:
@@ -97,7 +97,7 @@ def anonymize_checked(
     A clean return is not proof of PHI-free output: a name, an undashed number or a date in an
     unmapped field passes, so surface the ``on_report`` coverage on the clean path (BACKLOG #1710).
     The report's ``blanked_fields`` names each field the ``date`` kind scrubbed to empty because the
-    value was not a valid timestamp; it is a record, not a refusal cause (BACKLOG #2330).
+    value was not a timestamp it could keep; it is a record, not a refusal cause (BACKLOG #2330).
     """
     effective = rules if rules is not None else load_rules(overlay)
     blanked: list[str] = []
