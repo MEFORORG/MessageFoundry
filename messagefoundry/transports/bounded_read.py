@@ -88,7 +88,9 @@ breaks a line at a lone CR. So ``X-A: a<CR>Content-Length: 5`` reaches the engin
 9112 section 2.2 lets a recipient treat that CR as invalid or as a space, and a proxy that does
 either sees one field and no length. :func:`reply_framing_fault` cannot see this, because the raw
 bytes are gone by the time it runs. :class:`StrictHTTPResponse` sees them as each line is read, and
-:func:`build_strict_opener` puts it on every opener the engine reads a partner reply through.
+:func:`build_strict_opener` puts it on every opener the engine reads a partner reply through. The
+same class reads a web proxy's own reply to ``CONNECT`` (vault BACKLOG #2170), so a bare CR there is
+refused before anything enters the tunnel.
 
 **A loopback hop is never sent through a web proxy** (vault BACKLOG #2579, ASVS 12.2.1). This rule
 is about the request, not the reply. It lives here because :func:`build_strict_opener` is the one
@@ -103,6 +105,7 @@ import functools
 import http.client
 import logging
 import re
+import socket
 import urllib.parse
 import urllib.request
 from collections.abc import Mapping
@@ -577,7 +580,7 @@ _BARE_CR_REASON = "a bare CR in the reply's status line or header block"
 
 
 class _BareCRGuard:
-    """Stands in for a response's stream while ``begin`` reads the head.
+    """Stands in for a response's stream until its head has been read.
 
     ``http.client`` reads the status line, any ``100 Continue`` head and the header block with
     ``readline`` alone, and each line it gets ends at LF. So every CR in a clean line is the one just
@@ -587,6 +590,7 @@ class _BareCRGuard:
     """
 
     def __init__(self, fp: _SupportsReadline) -> None:
+        #: The real stream. :class:`StrictHTTPResponse` puts it back once the head is read.
         self._fp = fp
 
     def readline(self, size: int = -1, /) -> bytes:
@@ -612,18 +616,33 @@ class StrictHTTPResponse(http.client.HTTPResponse):
 
     Set as ``response_class`` on the connections :class:`StrictHTTPHandler` and
     :class:`StrictHTTPSHandler` open. The body is read exactly as the stock class reads it.
+
+    **The guard goes on when the response is built, not in** ``begin`` (vault BACKLOG #2170).
+    ``http.client`` reads a proxy's reply to ``CONNECT`` in ``HTTPConnection._tunnel``. That method
+    builds the connection's ``response_class``, reads the status line and the header block through
+    the response's stream, and never calls ``begin``. A guard that ``begin`` put on would miss that
+    head. Built here, it covers both reads with no copy of ``_tunnel``.
     """
 
+    def __init__(
+        self,
+        sock: socket.socket,
+        debuglevel: int = 0,
+        method: str | None = None,
+        url: str | None = None,
+    ) -> None:
+        super().__init__(sock, debuglevel=debuglevel, method=method, url=url)
+        self.fp = cast("Any", _BareCRGuard(self.fp))
+
     def begin(self) -> None:
-        stream = self.fp
-        # Only begin() reads through the guard. The body reads come from the real stream.
-        self.fp = cast("Any", _BareCRGuard(stream))
         try:
             super().begin()
         finally:
-            # http.client sets fp to None when it closes on a bad status line. Leave that alone.
-            if self.fp is not None:
-                self.fp = stream
+            # The head is read, or refused. The body reads come from the real stream. http.client
+            # sets fp to None when it closes on a bad status line, and that is left alone.
+            guard = self.fp
+            if isinstance(guard, _BareCRGuard):
+                self.fp = cast("Any", guard._fp)
 
 
 class _StrictHTTPConnection(http.client.HTTPConnection):
