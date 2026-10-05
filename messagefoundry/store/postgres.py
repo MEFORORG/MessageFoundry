@@ -8305,13 +8305,15 @@ class PostgresStore:
     async def rotate_session(self, token_hash: str, *, new_token_hash: str) -> bool:
         """Re-key a live session in place (ASVS 7.2.4). See :meth:`AuthStore.rotate_session`.
 
-        Uses ``self._pool.execute`` rather than ``self._execute``: only the former returns asyncpg's
-        status tag, and this op's contract is its rowcount."""
-        result = await self._pool.execute(
-            "UPDATE sessions SET token_hash=$1 WHERE token_hash=$2 AND revoked_at IS NULL",
-            new_token_hash,
-            token_hash,
-        )
+        Borrows through ``_timed_acquire`` rather than calling ``self._execute``, which discards
+        asyncpg's status tag, and this op's contract is its rowcount. Not ``self._pool.execute``
+        either: that acquires with no timeout (BACKLOG #1052, #2283)."""
+        async with self._timed_acquire(record=False) as conn:
+            result = await conn.execute(
+                "UPDATE sessions SET token_hash=$1 WHERE token_hash=$2 AND revoked_at IS NULL",
+                new_token_hash,
+                token_hash,
+            )
         return _rowcount(result) > 0
 
     async def revoke_session(self, token_hash: str, *, now: float | None = None) -> None:
@@ -8337,13 +8339,15 @@ class PostgresStore:
     ) -> int:
         """Revoke a user's active sessions (all, or all but ``except_token_hash``). Returns the count."""
         now = time.time() if now is None else now
-        result = await self._pool.execute(
-            "UPDATE sessions SET revoked_at=$1 WHERE user_id=$2 AND revoked_at IS NULL"
-            " AND ($3::text IS NULL OR token_hash != $3)",
-            now,
-            user_id,
-            except_token_hash,
-        )
+        # The bounded borrow, as `rotate_session` explains (BACKLOG #2283).
+        async with self._timed_acquire(record=False) as conn:
+            result = await conn.execute(
+                "UPDATE sessions SET revoked_at=$1 WHERE user_id=$2 AND revoked_at IS NULL"
+                " AND ($3::text IS NULL OR token_hash != $3)",
+                now,
+                user_id,
+                except_token_hash,
+            )
         return _rowcount(result)
 
     async def enforce_session_cap(

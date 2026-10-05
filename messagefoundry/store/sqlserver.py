@@ -12196,21 +12196,26 @@ class SqlServerStore:
     async def rotate_session(self, token_hash: str, *, new_token_hash: str) -> bool:
         """Re-key a live session in place (ASVS 7.2.4). See :meth:`AuthStore.rotate_session`.
 
-        Hand-rolled rather than via ``self._execute``, which discards the cursor: this op's whole
-        contract is its rowcount. ``token_hash`` is ``NVARCHAR(64)`` and a hex digest is exactly 64
-        chars, so the clustered-PK row move is width-safe."""
+        This op's whole contract is whether a row was re-keyed, so it reads an ``OUTPUT`` rowset and
+        never ``cursor.rowcount`` (BACKLOG #2283). A session-wide ``SET NOCOUNT ON`` can leave the
+        count at ``-1`` for a zero-match UPDATE, and ``bool(-1)`` would report a revoked session
+        as re-keyed; ``_exec_terminal`` reads its fence the same way for the same reason. Hand-rolled
+        because ``_fetchall`` commits as a READ, and this is a durable write. ``token_hash`` is
+        ``NVARCHAR(64)`` and a hex digest is exactly 64 chars, so the clustered-PK row move is
+        width-safe."""
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
-                    "UPDATE sessions SET token_hash=? WHERE token_hash=? AND revoked_at IS NULL",
+                    "UPDATE sessions SET token_hash=? OUTPUT inserted.token_hash"
+                    " WHERE token_hash=? AND revoked_at IS NULL",
                     (new_token_hash, token_hash),
                 )
-                count = cur.rowcount
+                rows = await cur.fetchall()
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()
                 raise
-        return bool(count)
+        return bool(rows)
 
     async def revoke_session(self, token_hash: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
@@ -12250,15 +12255,7 @@ class SqlServerStore:
         if except_token_hash is not None:
             sql += " AND token_hash != ?"
             params.append(except_token_hash)
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                await cur.execute(sql, tuple(params))
-                count = cur.rowcount
-                await self._commit(conn)
-            except Exception:
-                await conn.rollback()
-                raise
-        return int(count) if count is not None else 0
+        return await self._execute(sql, tuple(params))
 
     async def enforce_session_cap(
         self,
@@ -12295,15 +12292,9 @@ class SqlServerStore:
         else:
             sql = "DELETE FROM sessions WHERE expires_at < ? OR ? - last_used_at > ?"
             params = (now, now, float(idle_seconds))
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                await cur.execute(sql, params)
-                count = cur.rowcount
-                await self._commit(conn)
-            except Exception:
-                await conn.rollback()
-                raise
-        return int(count) if count is not None else 0
+        # Through `_execute`, which owns the borrow, commit and rollback and returns the driver's
+        # count, rather than a hand-rolled copy of it (BACKLOG #2283).
+        return await self._execute(sql, params)
 
     async def stats(self) -> dict[str, int]:
         rows = await self._fetchall(
