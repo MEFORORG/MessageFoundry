@@ -242,7 +242,7 @@ reading the emitted decision — not by reading source alone.
 | Claim note refresh (`-Take -Note` on a held key) | manual | **NEW** — was a silent discard; refresh is now in place, so correcting a note never drops the claim |
 | Overlap session attribution | manual + gate | **FIXED** — longest-prefix, not first-hit. Linked worktrees are nested under the primary, so the primary's row used to absorb an arbitrary peer's session and report itself LIVE on `main` |
 | Claim / alloc / ledger gates | git hooks | LIVE |
-| `new.ps1` / `remove.ps1` / `prune-merged.ps1` | manual | LIVE. **CORRECTED 2026-09-30:** this read "sibling-layout only"; `new.ps1` now takes `-Nested` (BACKLOG #1038). `remove.ps1` and `prune-merged.ps1` are still sibling-only. An earlier correction here said `remove.ps1` took `-Nested` too; that route was withdrawn the same day |
+| `new.ps1` / `remove.ps1` / `prune-merged.ps1` | manual | LIVE. **CORRECTED 2026-09-30:** this read "sibling-layout only"; `new.ps1` now takes `-Nested` (BACKLOG #1038). `remove.ps1` and `prune-merged.ps1` are still sibling-only. An earlier correction here said `remove.ps1` took `-Nested` too; that route was withdrawn the same day. **CORRECTED 2026-10-04 (vault BACKLOG #1017):** `remove.ps1` is no longer sibling-only. Its `-Path` route reaches any registered linked worktree that is not under `.claude/worktrees`. `prune-merged.ps1` is unchanged |
 | `tests/test_worktree_gate*.py`, `test_install_gate_wiring.py` | CI + local | Was **85 green, and blind** — every one bound the repo copy; nothing read the installed copy or any live `settings.json`. Now 91 across six files, plus the local-only parity check below |
 
 Rule 4 being inert is **deliberate and announced** — the commit that landed it says "ships INERT …
@@ -452,6 +452,11 @@ shell writes.
 > written. `new.ps1` has since gained `-Nested`; `remove.ps1` and `prune-merged.ps1` are still
 > sibling-only, so a nested tree still has no scripted teardown. Which mechanism makes which layout is stated once, in the
 > "WHICH MECHANISM MADE THIS WORKTREE" block of `scripts/hooks/worktree_gate.ps1` -- read it there.
+>
+> **CORRECTED 2026-10-04 (vault BACKLOG #1017).** `remove.ps1` gained `-Path`, a checked route for any
+> registered linked worktree that is not under `.claude/worktrees`. So `remove.ps1` is no longer
+> sibling-only. The conclusion above still holds: a nested tree has no scripted teardown, because
+> `-Path` refuses that population on purpose.
 
 `new.ps1` builds **siblings** (`<parent>/<repo>-<name>`). Claude Code's own `--worktree`, the desktop app,
 and subagent isolation all build **nested** worktrees under `<primary>/.claude/worktrees/`. Both

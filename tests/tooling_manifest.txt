@@ -203,6 +203,7 @@ tests/test_usage_headroom_inject.py
 tests/test_worktree_gate_quoted_key.py
 tests/test_worktree_gate_receipts.py
 tests/test_worktree_gate_remedy_families.py
+tests/test_worktree_gate_removal_route.py
 tests/test_worktree_gate_rule_agnostic_coverage.py
 tests/test_worktree_gate_scope_wording.py
 tests/test_worktree_gate_shell_semantics.py
@@ -212,7 +213,9 @@ tests/test_worktree_install_daily_prune.py
 tests/test_worktree_new_cleanup_advice.py
 tests/test_worktree_new_no_track.py
 tests/test_worktree_prune_merged.py
+tests/test_worktree_remove_path.py
 tests/test_worktree_remove.py
+tests/test_worktree_remove_scratch.py
 tests/test_worktree_selfheal_wiring.py
 tests/test_worktree_venv_constraint.py
 tests/test_worktree_venv_extras_parity.py

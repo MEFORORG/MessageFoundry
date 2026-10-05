@@ -16,8 +16,10 @@
   **Every open row §7.1 names now has a tracker, BACKLOG #2193 or #2194, so those rows no longer
   need #1498 open.** The Lander filed both on 2026-09-27 for Manager batch 164. This ADR names them
   as of 2026-10-02. §7.1 says which rows each covers. **A hop §7.1 never found has no tracker,**
-  including any no-context hop beyond those #2194 lists. Two rows §7.1 grades *Guarded* carry open
-  defects, #2188 and #2169, which §7.1 points to. The open owner questions in §1.1 and §2.1 do not
+  including any no-context hop beyond those #2194 lists. The two defects on rows §7.1 grades
+  *Guarded*, #2188 and #2169, are built; the §4.3 note of 2026-10-04 says how. *(Corrected
+  2026-10-04. This sentence read: "Two rows §7.1 grades *Guarded* carry open defects, #2188 and
+  #2169, which §7.1 points to.")* The open owner questions in §1.1 and §2.1 do not
   hold #1498 open.
   *Until 2026-10-02 this paragraph read: "#1498 stays open until three things hold. Each hop §7.1
   grades *Needs a guard* has a tracking item of its own. The hops §7.1's reads could not see are
@@ -674,6 +676,67 @@ write a number a reader treats as coverage. *(Stale since the #1498 build: the s
 now withdraws the count reason and declines on the S/MIME argument alone. §7.1 grades DIRECT as an
 owner question.)*
 
+**Note, 2026-10-04 -- with an ECH sidecar, the HTTP-family guard is handed no opener (BACKLOG #2169
+and #2188).** Correction 1 above says a CRL on the token hop lives in that hop's opener. That holds
+only while the engine dials the token host itself. With `ech_sidecar` set, `_post_token` re-addresses
+the POST to the loopback sidecar, and the sidecar makes its own TLS connection to the token host
+(ADR 0139). The provider's opener then only ever meets the sidecar. A `[tls].crl_file` covering the
+token host still lands on that opener, and the guard read it, so the refusal was lifted with no
+revocation check behind it.
+
+BACKLOG #2169 offered two ways to close this: pass no opener on the ECH arm, or require the
+attestation there. **The first was chosen.** `_open_token_hop` passes
+`opener=None if ech_sidecar is not None else self._opener`, one expression serving the SMART and the
+OAuth2 token hop. Two reasons:
+
+- It holds by construction. The guard cannot read a context it was never given, so no later change
+  to how that opener is built can relax the ECH arm.
+- It delivers the second option's outcome without a second rule. With no context `crl_checked` is
+  false, and `refuse_unrevoked_verified_hop` has no `proxy_proven` parameter. So on an enforcing
+  instance only a loopback token host or the per-connection `tls_revocation_attested` crosses.
+
+**The refusal on the ECH arm names the attestation alone.** The default text offers
+`[tls].crl_file` and an egress proxy, and neither can cross an ECH hop. So
+`refuse_unrevoked_verified_hop` takes `ways_across`, and both ECH callers pass the fixed text
+`ECH_HOP_WAYS_ACROSS`. Where the guard runs, a non-loopback ECH hop on an enforcing instance
+crosses on the attestation alone. On the REST destination the guard runs only with `verify_tls`
+true, as before; with `verify_tls=false` the hop is the verify-off gate's (#200), ECH or not.
+
+The REST destination's ECH arm takes the same value, under BACKLOG #2188. That item moved the guard
+in the REST, SOAP, FHIR and DICOMweb destinations below the last statement that builds or replaces
+the opener, and passed that opener, so a CRL that reaches one of those hops now relaxes its refusal.
+REST with a sidecar passes none, for the reason above: the sidecar verifies the destination, not the
+engine.
+
+The engine cannot see whether a sidecar checks revocation. On the ECH arm the attestation is the
+operator's statement that it does, or that the PKI behind the hop does.
+
+**An opener built with `tls_allow_expired` hands the guard no opener either**, on REST, SOAP and
+FHIR. `relax_verify_expiry` sets `X509_V_FLAG_NO_CHECK_TIME` on that context, and OpenSSL applies
+the flag to a CRL's validity window as well as the certificate's. Measured on CPython 3.14.6 /
+OpenSSL 3.5.7: a CRL past `nextUpdate` refuses the handshake with "CRL has expired" without the
+flag, and the same handshake is accepted with it. So that arm stays refused unless attested, as it
+was before #2188.
+The MLLP destination's guard reads a context built the same way. That hop is not changed here.
+
+`opener` is now a required keyword, so a new caller cannot omit it and bring back the false
+refusal.
+
+**One audit line still over-states.** A hop that crosses because its context checks a CRL, and that
+also sets `tls_revocation_attested`, is logged as crossing "without certificate revocation
+checking". The record says more than happened and loses nothing. A one-condition fix was built and
+reverted on this branch: it also silenced the line for an MLLP hop with `tls_allow_expired`, a CRL
+and the attestation, where the line was the only record of the attestation.
+
+The Status paragraph and the two §7.1 rows that called #2188 and #2169 open defects carry a
+correction dated 2026-10-04.
+
+Pinned by `tests/test_token_hop_revocation_guard_with_ech_sidecar.py` for the token hop, and by
+`tests/test_http_destination_revocation_guard_reads_its_opener.py` for the four destinations. Two
+cases there carry the ECH claim, `test_an_ech_sidecar_and_a_crl_still_refuse_the_token_hop` and
+`test_rest_with_an_ech_sidecar_and_a_crl_is_still_refused`. Each pairs its refusal with a control in
+which the same CRL relaxes the same hop without a sidecar.
+
 ## 5. Consequences
 
 **Positive**
@@ -866,10 +929,10 @@ proposed accept, and only an owner ruling makes it one.
 |---|---|---|---|
 | `transports/mllp.py`, `_mllp_ssl_context`, client arm, `tls_verify=true` | HL7 message bodies | **Guarded** | `RevocationHopGuard.capture` in the MLLP destination, taken only when the context verifies |
 | `transports/mllp.py`, `_mllp_ssl_context`, client arm, `tls_verify=false` | HL7 message bodies | **Verify-off** | refused on an enforcing instance even with the escape set (#200) |
-| rest.py's shared opener and `_expiry_relaxed_opener`; `transports/soap.py`, `_client_cert_opener`, as used by the REST, SOAP, FHIR and DICOMweb destinations | message bodies, and any credential the destination sends | **Guarded** | `refuse_unrevoked_verified_hop` in each destination's `__init__`, on its verifying branch, whichever opener serves the hop. *(Added 2026-10-02: open defect BACKLOG #2188. The guard runs before the opener is built, so a CRL that reaches the hop cannot relax the refusal.)* |
-| `transports/smart.py`, `_TokenEndpointProvider._open_token_hop` (the shared opener, or a per-provider one), as used by `SmartBackendTokenProvider` (the SMART token endpoint) | the signed `client_assertion` | **Guarded** | `refuse_unrevoked_verified_hop`, called in `_open_token_hop` (§4.3, correction 1; one call site for both token hops since BACKLOG #2115). *(Added 2026-10-02: open defect BACKLOG #2169, on this row and the OAuth2 row below. With an ECH sidecar set, the guard reads a context that never checks the token peer, so a CRL can relax the refusal.)* |
+| rest.py's shared opener and `_expiry_relaxed_opener`; `transports/soap.py`, `_client_cert_opener`, as used by the REST, SOAP, FHIR and DICOMweb destinations | message bodies, and any credential the destination sends | **Guarded** | `refuse_unrevoked_verified_hop` in each destination's `__init__`, on its verifying branch, whichever opener serves the hop. *(Corrected 2026-10-04: BACKLOG #2188 is built. The guard now runs after the opener is built and reads it, so a CRL that reaches the hop relaxes the refusal. A hop behind an ECH sidecar, or one built with `tls_allow_expired`, hands the guard no opener and stays refused unless attested (§4.3). The note this replaces, added 2026-10-02, read: "open defect BACKLOG #2188. The guard runs before the opener is built, so a CRL that reaches the hop cannot relax the refusal.")* |
+| `transports/smart.py`, `_TokenEndpointProvider._open_token_hop` (the shared opener, or a per-provider one), as used by `SmartBackendTokenProvider` (the SMART token endpoint) | the signed `client_assertion` | **Guarded** | `refuse_unrevoked_verified_hop`, called in `_open_token_hop` (§4.3, correction 1; one call site for both token hops since BACKLOG #2115). *(Corrected 2026-10-04: BACKLOG #2169 is built, on this row and the OAuth2 row below. With an ECH sidecar set, the guard is handed no opener, so a CRL cannot relax the refusal (§4.3). The note this replaces, added 2026-10-02, read: "open defect BACKLOG #2169, on this row and the OAuth2 row below. With an ECH sidecar set, the guard reads a context that never checks the token peer, so a CRL can relax the refusal.")* |
 | the same `_open_token_hop`, as used by `OAuth2ClientCredentialsProvider` in `transports/http_auth.py` (the OAuth2 client-credentials token hop) | the client secret, the access token | **Guarded** | the same `refuse_unrevoked_verified_hop` call (BACKLOG #2112, PR 1670). It was unguarded at `800cb7461`. `http_auth.py` builds no opener of its own since BACKLOG #2115 |
-| the shared opener, as used by `FhirLookupExecutor` in `transports/fhir.py` (the `fhir_lookup` read) | a static bearer or basic credential, or a SMART-minted access token; FHIR resources back | **Needs a guard, tracked by #2193** | the file's only revocation call is in the FHIR destination. A lookup connection is not a destination |
+| the shared opener, as used by `FhirLookupExecutor` in `transports/fhir.py` (the `fhir_lookup` read) | a static bearer or basic credential, or a SMART-minted access token; FHIR resources back | **Guarded** | `refuse_unrevoked_verified_hop` in `FhirLookupExecutor.__init__`, on the verifying branch, called after that lookup's opener is built and handed it, so a `[tls].crl_file` that reaches the lookup's own context relaxes the refusal. The attestation is the lookup's typed `tls_revocation_attested`, mirrored into its settings by the runner. *(Graded "Needs a guard, tracked by #2193" until 2026-10-04, when BACKLOG #2193 built it. It read: "the file's only revocation call is in the FHIR destination. A lookup connection is not a destination".)* |
 | the shared opener, as used by `transports/ai_broker.py` | the `[ai]` API key; code sent for assistance | **Needs a guard, tracked by #2193** | no revocation call in the file |
 | `transports/email.py`, through `build_smtp_tls_context` | message bodies, the SMTP AUTH credential | **Guarded** | `RevocationHopGuard.capture` in the EMAIL destination |
 | `auth/oidc_http.py`, `build_idp_opener` | the client secret, the authorization code | **Guarded** | `_refuse_idp_revocation` in `auth/service.py` (BACKLOG #1887) |
@@ -879,15 +942,15 @@ proposed accept, and only an owner ruling makes it one.
 | `store/postgres.py`, `_build_ssl`, `trust_server_certificate` branch | the whole PHI store | **Verify-off** | refused on an enforcing instance before any context is built |
 | `transports/rest.py`, `_insecure_opener` | message bodies | **Verify-off** | the dev escape, clamped by ADR 0092 |
 | `config/tls_policy.py`, `build_smtp_tls_context`, `verify=False` arm | message bodies, alerts | **Verify-off** | EMAIL and DIRECT refuse it through ADR 0092's clamp. The alert sink cannot read that clamp, so on an enforcing instance the serve gate refuses it unless `[security].allow_unverified_alert_smtp_tls` is set |
-| `transports/dicom.py`, `_client_ssl_context` (the C-STORE SCU) | imaging objects | **Needs a guard, tracked by #2193** | a verifying PHI hop. Its only hop guard is an `InsecureHopGuard`, taken when TLS is off. An opt-in CRL can already reach it through `[tls].crl_file` on the trust anchor |
-| `transports/remotefile.py`, `_ftps_ssl_context`, verifying arm | message files, the FTP login | **Needs a guard, tracked by #2193** | the same shape as the SCU. The file's only hop guard is an `InsecureHopGuard` for anonymous plain FTP |
+| `transports/dicom.py`, `_client_ssl_context` (the C-STORE SCU) | imaging objects | **Guarded** | `RevocationHopGuard.capture` in `DicomScuDestination.__init__`, taken whenever TLS is on (this connector has no verify-off arm) and handed the context the association dials with, so a `[tls].crl_file` that reaches it through the trust anchor relaxes the refusal. *(Graded "Needs a guard, tracked by #2193" until 2026-10-04, when BACKLOG #2193 built it. It read: "a verifying PHI hop. Its only hop guard is an `InsecureHopGuard`, taken when TLS is off. An opt-in CRL can already reach it through `[tls].crl_file` on the trust anchor".)* |
+| `transports/remotefile.py`, `_ftps_ssl_context`, verifying arm, as used by `RemoteFileDestination` (the FTPS upload) | message files, the FTP login | **Guarded** | `RevocationHopGuard.capture` in `RemoteFileDestination.__init__`, called after the client is built and handed that client's own context, taken only when the context verifies. *(Graded "Needs a guard, tracked by #2193" until 2026-10-04, when BACKLOG #2193 built it. It read: "the same shape as the SCU. The file's only hop guard is an `InsecureHopGuard` for anonymous plain FTP". The row named no caller until then.)* **`RemoteFileSource`, the inbound FTPS poll, builds its context through the same function and still NEEDS A GUARD.** It is not covered by this grade, and it stays tracked by #2193's FTPS line, which is open for the poll. No CRL can reach that context today: the poll passes no trust policy, and `Source` carries none |
 | `transports/remotefile.py`, `_ftps_ssl_context`, `tls_verify=false` arm | message files, the FTP login | **Verify-off** | refused on an enforcing instance even with the escape set |
 | `auth/ldap.py`, `ldap3.Tls` in `_server`, `ad_tls_verify=true` | the service-account and user passwords | **Needs a guard, tracked by #2193** | a verifying credential hop, built outside the connector gate like the OIDC legs. **No CRL setting reaches it.** This read "`ldap3.Tls` holds no `SSLContext`, so `harden_crl_check` has nothing to act on". Since BACKLOG #2494 the engine builds that context, and it simply loads no CRL (CORRECTED 2026-09-30) |
 | `auth/ldap.py`, `ad_tls_verify=false` | the same passwords | **Verify-off** | refused on an enforcing instance (#329) |
 | `config/tls_policy.py`, `assert_ldap3_tls_suites` | the same passwords | **Not a separate hop** | since BACKLOG #2494 it builds the context the LDAPS row above handshakes on; it was a replica that never handshook (CORRECTED 2026-09-30) |
 | `pipeline/alert_sinks.py`, `send_plain_email`, through `build_smtp_tls_context` | alert bodies and per-user security-event notices (`pipeline/security_notify.py` sends through it too), the SMTP AUTH credential | **Needs a guard, tracked by #2193** | a verifying credential hop with no revocation guard, built outside the connector gate |
 | `pipeline/alert_sinks.py`, `_build_no_redirect_opener`, through `build_asserted_https_handler` (the alert webhook) | alert bodies; a Slack or Teams hook carries its secret in the URL | **Needs a guard, tracked by #2193** | a verifying credential hop with no revocation guard |
-| `transports/direct.py`, through `build_smtp_tls_context` | S/MIME-protected bodies, the SMTP AUTH credential | **Owner question** | a shipped comment declines the guard because S/MIME protects the body. That reason covers the body. It does not cover the AUTH credential when a username is set. *(Added 2026-10-02.)* #2193 tracks this row with a checklist line: guard the AUTH credential leg, and leave the S/MIME decline as it is. Manager batch 164 chose that line, as #2193 records. Building it reverses the shipped decline for the credential leg, and the grade then moves to *Guarded*. Declining it is an accept, which needs an owner ruling |
+| `transports/direct.py`, through `build_smtp_tls_context` | S/MIME-protected bodies, the SMTP AUTH credential | **Guarded** | `RevocationHopGuard.capture` in `DirectDestination.__init__`, taken when a username is set, called after the context is built and handed it. That is the AUTH credential leg. A DIRECT hop with no username sends no credential and takes no guard: the shipped comment's S/MIME reasoning covers that case, and its wording now says so. *(Graded "Owner question" until 2026-10-04, when BACKLOG #2193 built the credential leg. It read: "a shipped comment declines the guard because S/MIME protects the body. That reason covers the body. It does not cover the AUTH credential when a username is set. (Added 2026-10-02.) #2193 tracks this row with a checklist line: guard the AUTH credential leg, and leave the S/MIME decline as it is. Manager batch 164 chose that line, as #2193 records. Building it reverses the shipped decline for the credential leg, and the grade then moves to Guarded. Declining it is an accept, which needs an owner ruling".)* |
 | `apiclient/client.py`, `_build_verify_context`, `truststore` branch | session credentials | **Scoped out by this ADR** | §5 and §9: the OS verifier builds the chain |
 | `apiclient/client.py`, `_build_verify_context`, `cacert` branch | the login password, session tokens, message views | **Accepted by the owner (owner ruling 2026-09-27)** | a stdlib context, so §5 does not reach it. `RevocationHopGuard` keys on the engine's hop posture, which a client process does not hold, so no existing guard fits. Pinned to the engine's own self-signed certificate (ADR 0172), it has no issuer to revoke it. Pinned to a CA bundle, a revoked engine certificate would still verify. The owner accepted that CA-bundle gap. The ruling was an AskUserQuestion answer in Manager session `1a2e1f9a-6106-48d4-b09f-4f97d75d8780`. **Re-score trigger, in the ruling's words: "when the engine binds beyond loopback or a CA-bundle pin becomes the documented setup".** Both already exist as opt-ins. Remote access is supported and off by default (`docs/REMOTE-CONSOLE.md`). The `_build_verify_context` docstring says `cacert` takes a CA bundle or a self-signed engine certificate. The ruling does not say whether a site taking an opt-in fires the trigger. *(Graded Owner question at `ad41441ec`.)* |
 | `tray/probe.py`, `_pinned_context` and `build_verify` | nothing | **Not a PHI or credential hop** | tokenless `GET /health` and `GET /ui` only |
@@ -924,6 +987,123 @@ hops fall outside the reads and are ungraded. BACKLOG #2194 tracks grading the h
 *(Until 2026-10-02 this paragraph read "This ADR names no tracking item for any of them, so they
 are named here by subject only. Check the backlog ledger before filing one.")* **Do not read
 this table as a count of verifying hops.** Per SDS-3.6, it is "at least these".
+
+**Note 2026-10-04: the hops outside the reads, graded by name (BACKLOG #2194).** Read at engine
+`76355472a`. This note grades the hops the list above left ungraded. It builds no guard, documents
+no driver control and records no accept. Each fact carries its source: *code* was read in the
+engine at that commit, *measured* was run there, *documentation* was read on the vendor's page on
+2026-10-04, and *not established* means none of those settles it.
+
+**At least three statements above need a correction, and this note does not edit them.** It is
+appended whole, so the older text carries no marker in place. Read this note beside it.
+
+- "At least six hops" becomes eight rows when graded by name. DATABASE has two dialects that verify
+  differently, and `db_lookup` is a dial of its own.
+- "Some hops build no Python TLS context at all" no longer holds for the three Vault hops. Since
+  BACKLOG #300 the engine builds the context each Vault handshake runs on (*code*). The five ODBC
+  hops still build none (*code*).
+- "The two `requests`-based Vault clients" are two `_build_client` functions with at least five
+  callers (*code*). The Vault rows below name them.
+
+**The instrument.** `git grep -c "RevocationHopGuard\|refuse_unrevoked"` returned no hit in each of
+eight files: `store/sqlserver.py`, `transports/database.py`, `config/db_lookup.py`,
+`pipeline/reference_sync.py`, `store/keyprovider_vault.py`, `store/crypto_transit.py`,
+`config/secretprovider_vault.py` and `transports/strict_requests.py`. Control: the same pattern
+returns 3 for `store/postgres.py` and 6 for `transports/rest.py`. A per-file zero cannot see a
+guard that lives in a caller, as the OIDC guard does in `auth/service.py`. So the same pattern was
+also run over all of `messagefoundry/`. It hits 15 files, and none of them guards a hop in this
+note.
+
+**The interim grades.** These rows use two grades that are not among the eight above. The Manager
+that dispatched this pass is taking the choice between BACKLOG #2194's outcomes to the owner, so
+this note makes none. In the terms of the list above:
+
+- *No revocation check in the engine, driver behaviour not established, DECISION PENDING* stands
+  where *Owner question* does: the honest answer might be an accept.
+- *No revocation check, a guard is possible* is an unguarded verifying hop. Section 4.3's default
+  for one is *Needs a guard*, and the LDAPS row above carries that grade with no CRL setting
+  reaching it either. These rows read *Needs a guard, tracked by* an item once one names them.
+- The weakened arms the rows mention are *Verify-off* in the list's terms, and need no decision.
+
+| Hop (file, symbol) | What crosses | How it verifies the peer | Revocation check | Interim grade |
+|---|---|---|---|---|
+| SQL Server store: `store/sqlserver.py`, `connection_string` | the whole PHI store on that backend, and the SQL login under SQL authentication | ODBC Driver 18, named in the string. `Encrypt=yes` and `TrustServerCertificate=no` by default, emitted last (*code*). Microsoft's table says the driver checks the server certificate for that pair (*documentation*). With `ssl_root_cert` set, the string also carries `ServerCertificate=` (*code*); see the finding below. The weakened arm, `trust_server_certificate=true` or `encrypt=false`, is verify-off and is refused on an enforcing instance (*code*) | None in the engine (*code*). The driver's own: *not established* | **No revocation check in the engine, driver behaviour not established, DECISION PENDING** |
+| DATABASE connector, SQL Server preset: `transports/database.py`, `_build_dsn`, reached through `_build_connection` by `DatabaseDestination` and `DatabaseSource` | rows built from messages, rows polled into messages, the SQL login | The same two keywords, emitted last (*code*). The driver is the `odbc_driver` setting, which defaults to ODBC Driver 18 (*code*). This builder emits no `ServerCertificate=` (*code*). The weakened arm is verify-off: it is refused on an enforcing instance unless the connection declares `tls_hop_attested` (*code*) | None in the engine (*code*). The driver's own: *not established* | **No revocation check in the engine, driver behaviour not established, DECISION PENDING** |
+| DATABASE connector, generic dialect: `transports/database.py`, `_build_odbc_dsn`, the other arm of `_build_connection` | the same | The operator's driver and its own keywords. Only a keyword on `_ODBC_PARAM_ALLOWLIST` passes through `odbc_params` (*code*). The engine cannot tell whether a keyword's value verifies the peer, and the builder's docstring says so (*code*). `generic_cleartext_hop_guard` gates a connection that sets no TLS keyword, or sets one to a value meaning TLS is not required. On an enforcing instance it refuses that hop off-loopback unless the connection is attested or declares cleartext accepted (*code*). The psqlODBC and MySQL ODBC documentation was not read | None in the engine (*code*). The allowlist holds no CRL keyword, so a driver's own CRL option could not be set through the engine today (*code*). Each driver's own behaviour: *not established* | **No revocation check in the engine, driver behaviour not established, DECISION PENDING.** The list above does not name this arm |
+| `db_lookup` reads: `transports/database.py`, `DatabaseLookupExecutor.__init__` | lookup parameters taken from a message, the rows that come back, the SQL login | `_build_dsn(read_only=True)`, so the SQL Server preset row applies. The generic dialect cannot be reached from here (*code*) | None in the engine (*code*). The driver's own: *not established* | **No revocation check in the engine, driver behaviour not established, DECISION PENDING** |
+| DATABASE reference-sync source: `pipeline/reference_sync.py`, `database_source_dsn` and `_load_database_source` | reference rows, the SQL login | `_build_dsn` and a pool of its own, so the SQL Server preset row applies. A reference source takes no dialect (*code*) | None in the engine (*code*). The driver's own: *not established* | **No revocation check in the engine, driver behaviour not established, DECISION PENDING** |
+| Vault key provider: `store/keyprovider_vault.py`, `_build_client`. `store_vault_client`, which `check-privileges` uses, is the same build | the Vault token out, the store's data-encryption key back | `hvac` over `requests`. Each handshake runs on a fresh context from the factory `assert_hvac_tls_suites` returns, set per connection by `_narrowed_pool_classes` in `transports/strict_requests.py` (*code*). The context requires a verified peer and checks the host name (*measured*). It trusts the file `MEFOR_STORE_VAULT_CA_FILE` names. With that unset the engine passes no anchor, and the pinned libraries choose one: hvac reads `VAULT_CACERT` and `VAULT_CAPATH`, requests reads `REQUESTS_CA_BUNDLE` and `CURL_CA_BUNDLE`, and the certifi bundle is last (*code*, in hvac 2.4.0 and requests 2.34.2). `verify=False` is refused, and so is a connection that would verify no peer (*code*). Through an `https://` proxy there is a second verified leg, to the proxy, on its own context from the same factory (*code*). This note does not grade that leg as a row | None. The factory never calls `harden_crl_check` (*code*). A context it built had `VERIFY_CRL_CHECK_LEAF` clear and no CRL loaded, and the same read returned true for a control context with the flag set (*measured*, with hvac 2.4.0, requests 2.34.2 and urllib3 2.8.0). A search of those installed `requests` and `urllib3` packages found no CRL or OCSP handling (*code*) | **No revocation check, a guard is possible** |
+| Vault Transit cipher: `store/crypto_transit.py`, which calls the key provider's `_build_client` | the Vault token, and message bodies sent to Vault to encrypt and decrypt | The key provider's row applies: it is the same client build (*code*) | None, as the key provider's row | **No revocation check, a guard is possible** |
+| Vault secret provider: `config/secretprovider_vault.py`, its own `_build_client`. `secrets_vault_client`, which `check-privileges` uses, is the same build | the Vault token out, connector credentials back | The same shape as the key provider, proxy leg included, with `MEFOR_SECRETS_VAULT_CA_FILE` as its anchor (*code*) | None, as the key provider's row | **No revocation check, a guard is possible** |
+
+**What is open on the five ODBC hops.** BACKLOG #2194 names three outcomes for a hop: a guard, a
+documented driver control, or an accepted gap. This note chooses none. Per the grades list above,
+only an owner ruling makes a row an accept. What the reading found:
+
+- **No driver control was found to document for the Microsoft driver.** Three Microsoft Learn
+  pages for the ODBC Driver for SQL Server were fetched on 2026-10-04: "DSN and Connection String
+  Keywords", "Connecting from Linux or macOS" and the Windows release notes. None contains the
+  words revocation, CRL or OCSP, and none lists a keyword that turns a revocation check on
+  (*documentation*). The first two were read in full. The third was read through a summarising
+  fetch. Other Microsoft pages were not read. **So whether that driver checks revocation is not
+  established either way.** Three pages that are silent are not evidence that it does not.
+- **Other drivers were not read at all.** The generic dialect names any driver, and the preset's
+  `odbc_driver` setting can name one other than Driver 18 (*code*). For those, a driver control is
+  neither found nor ruled out. On the generic dialect the allowlist would have to admit its
+  keyword first.
+- **Where the Microsoft driver's TLS runs.** On Linux and macOS it uses the OpenSSL library and the
+  platform's certificate store (*documentation*). The three pages do not say what it uses on
+  Windows (*not established*).
+- **A guard would have no context to read.** `RevocationHopGuard.capture` learns that a hop checks
+  a CRL by reading `VERIFY_CRL_CHECK_LEAF` off that hop's own `SSLContext` (*code*). These hops
+  have none, so that arm could never fire for them.
+- **So on an enforcing instance a guard would have few ways across, and they differ by hop.** The
+  loopback carve-out applies to all five. A per-connection `tls_revocation_attested` exists on
+  `inbound()` and `outbound()`, so the DATABASE connector could carry one. `DatabaseLookup()` and
+  `DatabaseRef()` take `tls_hop_attested` only, and `StoreSettings` has no revocation attestation
+  (*code*). A guard on `db_lookup`, reference-sync or the store would therefore refuse every
+  off-loopback hop under `enforce`, unless a new lever were built with it. No declared egress
+  terminator exists for these hops either.
+
+**What is open on the three Vault hops.** The context exists, so a guard could read it, as
+`_refuse_store_revocation` does for the PostgreSQL store. Two facts shape that build (*code*):
+
+1. **The providers hold no hop posture.** They are built from the environment.
+   `_refuse_a_cleartext_vault_hop` in `transports/strict_requests.py` says so, and fails closed as
+   if the instance were enforcing. The posture is close by for two of the three: `open_store`
+   holds it where it calls `build_store_cipher`, and `capture(posture=...)` exists for a hop built
+   outside the gate. The secret provider's callers were not traced.
+2. **No CRL can reach the context.** `vault_client_verify_kwargs` builds a default
+   `TrustAnchorPolicy`, which carries none, and `requests_verify_from_anchor` refuses an anchor
+   that carries a `crl_file`. These hops have no attestation field either. So a guard built before
+   a CRL can load would allow a loopback Vault, warn on a non-enforcing instance, and refuse every
+   other Vault hop under `enforce`.
+
+BACKLOG #2194 says a hop that can take a guard gets a line in BACKLOG #2193. That line has not been
+added: #2193's checklist names none of these three. Until it is, #2194 stays open and is the item
+that holds these rows. So the Status line still holds where it says every open row here has a
+tracker, #2193 or #2194.
+
+**The store's `ssl_root_cert` pin bears on this grading, and is not fixed here.**
+`connection_string` emits `ServerCertificate=` beside `Encrypt=yes`, never `Encrypt=strict`
+(*code*). Microsoft's Linux and macOS page says of that keyword: "This option is only available
+when using strict encryption." `docs/ASVS-L2-PHASE0-CHANGES.md` is the record of that gap, and
+says the pin has not been measured on this posture. What it means for revocation: if the driver
+does apply the pin, the exact match replaces the standard checks, the trust chain among them
+(*documentation*). That branch would then have no chain for a revocation check to walk.
+
+**The counts, after this note.** The counts paragraph above covers the table above, and this note
+leaves it as written. Add these rows to it:
+
+- "At least six hops fall outside the reads and are ungraded" is superseded. Those hops are graded
+  here by name, as eight rows.
+- Five more rows wait on an owner answer, beside DIRECT.
+- Three more hops could take a guard, beside the seven BACKLOG #2193 tracks.
+- The ODBC drivers' own revocation behaviour is still not established.
+
+The heading in section 7, "SOME HOPS ARE STILL UNGRADED", now holds only in this sense: **read the
+eight as "at least these", per SDS-3.6.** This note re-read the hops the list named. It did not
+search for other hops of the same shape, and it did not grade the Vault proxy leg.
 
 ## 8. Sources that are stale, and must not be cited as current
 

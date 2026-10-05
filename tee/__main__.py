@@ -47,6 +47,7 @@ from tee import __version__, mefor_api
 from tee.anon import anonymize_checked
 from tee.anon.keying import Keyer
 from tee.anon.leak import CoverageTally
+from tee.anon.rules import RuleError, kept_defaults, load_rules
 from tee.correlate import CorepointOutput, CorrelateConfig
 from tee.relay import Endpoint, RelayConfig, TeeRelay
 from tee.report import build_report
@@ -331,7 +332,8 @@ def _build_parser() -> argparse.ArgumentParser:
         default="INFO",
         type=str.upper,
         choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
-        help="INFO (default) logs the unmapped-field coverage report; WARNING hides it",
+        help="log level for this run (default INFO). The unmapped-field coverage report is always "
+        "written to stderr: as an INFO log line, or as a plain line at a quieter level",
     )
 
     return parser
@@ -546,6 +548,24 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
+    # LOAD THE RULES ONCE, HERE, FOR THE SAME REASON: the overlay is a property of the run, and a
+    # bad one read inside the loop comes out as N failed messages (BACKLOG #2267).
+    try:
+        rules = load_rules(overlay)
+    except RuleError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    # Printed, not only logged by load_rules: --log-level ERROR hides that WARNING, and a keep
+    # that turns off a default scrub must not be hidden. Addresses and kinds only (BACKLOG #2268).
+    kept = kept_defaults(rules)
+    if kept:
+        print(
+            "warning: the overlay keeps "
+            + ", ".join(f"{rule.path} ({rule.kind.value})" for rule in kept)
+            + ", which turns off the default scrub of each: those fields are not rewritten",
+            file=sys.stderr,
+        )
+
     lines: list[str] = []
     coverage = CoverageTally(full_coverage=args.require_full_coverage)
     failed = 0
@@ -555,7 +575,7 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
             anon = anonymize_checked(
                 text,
                 salt=salt,
-                overlay=overlay,
+                rules=rules,
                 require_full_coverage=args.require_full_coverage,
                 on_report=coverage.add,
             )
@@ -570,7 +590,11 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
         )
     # On BOTH paths: a clean run is exactly where an unmapped field holding a name or a date goes
     # unnoticed, because the leak-check does not look for either (BACKLOG #1710).
-    _ANON_LOG.info("%s", coverage.summary())
+    # It is the only record of what passed, so a quieter --log-level must not lose it (BACKLOG #2247).
+    if _ANON_LOG.isEnabledFor(logging.INFO):
+        _ANON_LOG.info("%s", coverage.summary())
+    else:
+        print(coverage.summary(), file=sys.stderr)
     if failed:
         print(
             f"error: {failed} of {len(rows)} message(s) failed anonymization, still carried a "

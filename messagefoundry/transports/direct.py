@@ -69,9 +69,11 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.config.tls_policy import (
     InsecureHopRefused,
+    RevocationHopGuard,
     build_smtp_tls_context,
     smtp_login_approved,
 )
+from messagefoundry.controlchars import has_lone_surrogate
 from messagefoundry.keywrap import key_wrap_refusal
 from messagefoundry.transports.base import (
     DeliveryError,
@@ -243,6 +245,10 @@ class DirectDestination(DestinationConnector):
         self._envelope = checked_envelope("Direct destination", sender, s.get("recipients"))
         self.recipients = list(self._envelope.recipients)
         self.subject = str(s.get("subject", ""))
+        # The Email destination's rule. _probe_build below does not catch every surrogate; the
+        # has_lone_surrogate docstring says which (vault BACKLOG #2842).
+        if has_lone_surrogate(self.subject):
+            raise ValueError("Direct destination 'subject' holds a lone surrogate")
         username = s.get("username")
         password = s.get("password")
         self.username: str | None = str(username) if username else None
@@ -368,9 +374,11 @@ class DirectDestination(DestinationConnector):
                     "require a session bound to the host, not merely to the trust anchor"
                 )
         # Built once at construction (fail-fast), reused by every send. None when TLS is off entirely.
-        # DIRECT does not take a RevocationHopGuard even though the hop now verifies: the clinical
-        # payload is S/MIME-protected at the message layer, so the PHI argument is materially weaker
-        # than EMAIL's (ADR 0085). Recorded rather than silently omitted; the decision is unchanged.
+        # DIRECT WITH NO SMTP CREDENTIAL does not take a RevocationHopGuard even though the hop now
+        # verifies: the clinical payload is S/MIME-protected at the message layer, so the PHI
+        # argument is materially weaker than EMAIL's (ADR 0085). Recorded rather than silently
+        # omitted; the decision is unchanged for that case. It never covered a hop that also sends a
+        # credential, and that hop is guarded below (BACKLOG #2193).
         #
         # THE SECOND REASON THIS COMMENT USED TO GIVE IS WITHDRAWN, and it is worth saying why rather
         # than deleting it. It read: adding the guard "would make the enumerated count eight and force
@@ -393,6 +401,29 @@ class DirectDestination(DestinationConnector):
             if self.use_tls
             else None
         )
+        # BACKLOG #2193 (ADR 0173): the credential leg. S/MIME protects the message body. It does
+        # not protect the SMTP authentication exchange, which hands the username and password to
+        # whichever peer the certificate names, and stdlib ssl checks no OCSP or CRL, so a revoked
+        # certificate would still be accepted there. Taken only when a username is set, which is
+        # the S/MIME decline above narrowed to the case it argues. Called AFTER the context exists
+        # and handed it, so a [tls].crl_file that reached this hop relaxes the refusal. The three
+        # refusals above already require a credentialed hop to use TLS and to verify both the chain
+        # and the name, so the context here always verifies.
+        if self.username is not None:
+            RevocationHopGuard.capture(
+                host=self.host,
+                # "SMTP authentication", not the two-word all-capital spelling: the log redaction
+                # scrubs two adjacent all-capital tokens, and that label reached the log redacted.
+                cell="Direct destination (SMTP authentication over verified TLS)",
+                description=(
+                    "sends its SMTP authentication credential over verified TLS on SMTP "
+                    "(no revocation check)"
+                ),
+                attested=config.tls_revocation_attested,
+                attested_reason=config.tls_revocation_attested_reason,
+                connection=config.name,
+                context=self._tls_context,
+            ).enforce_construction()
 
     def _load_private_key(self, value: Any, password: Any) -> Any:
         """Load the sender's signing private key (PEM/DER, optionally passphrase-protected). PHI/secret-

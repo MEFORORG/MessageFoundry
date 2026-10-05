@@ -46,24 +46,25 @@ into ``\\u2014``. Its output is not pure ASCII, so it is for a stream already ha
 unencodable character (``messagefoundry.console_streams`` does that for the engine's command
 line).
 
-WHY THIS IS NOT IN :mod:`messagefoundry.controlchars`. That module states ONE alphabet, C0 plus
-DEL, and builds every screen and neutraliser from it; its docstring calls widening that alphabet a
-deliberate behaviour change at every call site at once, and it is deliberately blind to C1 and to
-bidirectional controls because its sinks are byte-oriented (a request line, a header, a log
-record). This rule is a different alphabet -- an allowlist of printable ASCII, not a denylist of
-C0 -- with a disambiguation step that one does not need. Putting it there would give that module
-two alphabets, which is the drift it exists to prevent. The log scrub keeps its own alphabet on
-purpose.
+WHY THIS IS NOT IN :mod:`messagefoundry.controlchars`. That module's refusals screen C0 plus DEL,
+because their sinks are byte-oriented (a request line, a header, a file name). This rule is a
+different alphabet -- an allowlist of printable ASCII, not a denylist of C0 -- with a
+disambiguation step that one does not need. The two share one thing: :data:`CONTROL_CATEGORIES`,
+which is defined in ``controlchars`` and imported here. The log escape there uses the same set,
+because a log is read back as text much as a terminal is (vault BACKLOG #2815).
 
-**This module imports only the standard library**, so a client tree (``harness/``, ``samples/``)
-may import it under ``tests/test_dependency_boundaries.py``, and a tool run beside an installed
-engine can import it lazily.
+**This module imports only the standard library and ``controlchars``**, a leaf that itself imports
+only the standard library, so a client tree (``harness/``, ``samples/``) may import it under
+``tests/test_dependency_boundaries.py``, and a tool run beside an installed engine can import it
+lazily.
 """
 
 from __future__ import annotations
 
 import re
 import unicodedata
+
+from messagefoundry.controlchars import CONTROL_CATEGORIES
 
 __all__ = ["CONTROL_CATEGORIES", "escape_for_terminal", "escape_json_for_terminal"]
 
@@ -74,11 +75,6 @@ __all__ = ["CONTROL_CATEGORIES", "escape_for_terminal", "escape_json_for_termina
 #: ``tests/test_terminal_text_console_sinks.py`` holds the spellings to each other over every code
 #: point instead.
 _NOT_SHOWN = r"[^\t\n -~]"
-
-#: The Unicode general categories ``keep_printable_unicode`` still escapes; see the module
-#: docstring. Stated once for this rule; the other category rules the module docstring names
-#: keep their own.
-CONTROL_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp", "Cs", "Co", "Cn"})
 
 #: A whole run of backslashes, or any character that is not printable ASCII. Matching the run
 #: whole keeps one pass linear however many backslashes a peer sends.

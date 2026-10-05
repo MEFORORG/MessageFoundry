@@ -358,7 +358,7 @@ _OBX5_REDACTED = {
 _OBX5_PRESERVED = {
     "numeric (NM)": ("OBX|1|NM|8480-6^Systolic^LN||128|mm[Hg]", "128"),
     "structured numeric (SN)": ("OBX|1|SN|RG^Range^L||>^100|", ">^100"),
-    "timestamp (TS)": ("OBX|1|TS|CL^Collected^L||20260101120000|", "20260101120000"),
+    "time of day (TM)": ("OBX|1|TM|CL^Collected^L||120000|", "120000"),
     "coded id (ID)": ("OBX|1|ID|SX^Sex^L||F|", "F"),
     "CWE with no text component": ("OBX|1|CWE|DX^Diagnosis^L||I10^^ICD10|", "I10^^ICD10"),
 }
@@ -596,10 +596,9 @@ _UNREACHABLE_LINES = pytest.mark.parametrize(
     [
         ("SMITH JANE|wrapped note", "SMITH"),  # first field is not a segment id
         ("LEE", "LEE"),  # a wrapped surname shaped like a segment id, with no field separator
-        (
-            "msh|ZZTEST SYNTH 123-45-6789",
-            "ZZTEST",
-        ),  # a second, lowercase MSH line is not the header
+        # A second, lowercase MSH line is not the header. It carries no SSN shape, so the
+        # malformed-line hit is the only one that can refuse it (BACKLOG #2247).
+        ("msh|ZZTEST SYNTH", "ZZTEST"),
     ],
     ids=("not-an-id", "no-separator", "second-msh"),
 )
@@ -611,21 +610,25 @@ _UNREACHABLE_LINES = pytest.mark.parametrize(
 def test_a_malformed_segment_line_is_refused_and_its_text_is_never_named(
     checked: Callable[..., str], line: str, needle: str
 ) -> None:
-    """A line no rule can reach is passed through untouched by the anonymizer. It is refused, and
-    its text never becomes an address.
+    """A line no rule can reach is refused, and its text never becomes an address.
 
-    Falsified: removing the ``_SEGMENT_ID`` branch from ``unmapped_field_values`` emitted the first
-    case clean and named ``SMITH JANE-1`` in the coverage report (RED), then restored.
+    The anonymizer refuses it first (BACKLOG #2246), so ``anonymize_checked`` raises ``AnonError``
+    before the leak-check runs. The leak-check still refuses the same line when it is called on
+    text directly, and there the malformed-line hit is the ONLY hit, so nothing else can be what
+    refused it.
     """
     msg = _msg(r"MSH|^~\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1", "PID|1||1^^^H^MR||X^Y", line)
     reports: list[object] = []
-    with pytest.raises(Exception, match="malformed segment id") as exc:
+    with pytest.raises(Exception, match="a line no rule can reach") as exc:
         checked(msg, salt=_SALT, on_report=reports.append)
-    assert type(exc.value).__name__ == "LeakError"
+    assert type(exc.value).__name__ == "AnonError"
     assert needle not in str(exc.value)
-    (report,) = reports
-    assert "(malformed segment)-0" in report.unmapped_fields  # type: ignore[attr-defined]
-    assert all(needle not in a for a in report.unmapped_fields)  # type: ignore[attr-defined]
+    assert reports == []  # refused before the leak-check, so no report was built
+    module = leak if checked is anonymize_checked else tee_leak
+    report = module.leak_report(msg, rules=DEFAULT_RULES)
+    assert report.hits == ["line with a malformed segment id, which no rule can reach"]
+    assert "(malformed segment)-0" in report.unmapped_fields
+    assert all(needle not in a for a in report.unmapped_fields)
 
 
 @_NO_SCANNER

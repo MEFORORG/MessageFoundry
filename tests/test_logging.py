@@ -4,6 +4,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import importlib.util
+import io
 import json
 import logging
 import logging.handlers
@@ -14,12 +17,14 @@ import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
 from functools import lru_cache
+from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
+from uvicorn.protocols.utils import get_path_with_query_string
 
-from messagefoundry import __main__
+from messagefoundry import __main__, secretscrub
 from messagefoundry.logging_setup import (
     _CREDENTIAL_QUERY_KEYS,
     ControlCharScrubFilter,
@@ -37,6 +42,7 @@ from messagefoundry.logging_setup import (
     configure_stderr_logging,
 )
 from messagefoundry.redaction import clamp_untrusted, redact
+from messagefoundry.secretscrub import CREDENTIAL_PLACEHOLDER
 from tests._phi_gate_provisions import make_syslog_ca_and_crl
 
 #: Synthetic HL7 (never real PHI) embedded in a log record so a redaction assertion has something to
@@ -1725,39 +1731,54 @@ def test_serve_time_sync_ok_within_threshold_starts_clean(
 # one copy silently does not apply to the other, and nothing reports the omission.
 #
 # These tests pin the RELATIONSHIP rather than either set's contents, which is what survives a
-# deliberate widening: widen `_is_control_char` and the table follows automatically, and if it does
+# deliberate widening: widen `_is_control_char` and the log follows automatically, and if it does
 # not, the first test goes red naming the code points that drifted.
 #
 # The table and the function both moved from `logging_setup` into `controlchars` on BACKLOG #1591;
 # that module's docstring says why. These tests import from the new home.
+#
+# THE RELATIONSHIP CHANGED ON VAULT BACKLOG #2815, OPENLY. The log alphabet used to be EXACTLY
+# `_is_control_char` minus tab. It is now that set plus `controlchars.CONTROL_CATEGORIES`, minus
+# tab, because C1, the bidirectional controls and U+2028/U+2029 reached the log file raw.
+# `controlchars._escapes_in_a_log_line` says why the refusal predicate itself was not widened.
+
+#: Past U+FFFF, one code point from each category the log escapes there, and two it must not.
+_ASTRAL_SAMPLE = (0xE0001, 0xF0000, 0x10FFFF, 0x1F600, 0x20000)
 
 
-def test_the_log_escape_table_is_the_controlchars_alphabet_minus_tab() -> None:
-    """The whole of limb 3, as one assertion about the DIFFERENCE.
+def test_the_log_alphabet_is_the_controlchars_alphabet_plus_the_control_categories_minus_tab() -> (
+    None
+):
+    """The whole relationship, as assertions about DIFFERENCES, over the shipped function.
 
-    Not "the table has 32 entries" -- that pins a number and would have to be edited by whoever
-    widens the alphabet, which is precisely the person who should be told rather than asked to
-    update a constant. This pins the SUBTRACTION, so a legitimate widening passes untouched and a
+    Not "the log escapes N code points" -- that pins a number and would have to be edited by
+    whoever widens an alphabet, which is precisely the person who should be told rather than asked
+    to update a constant. A legitimate widening of either source passes untouched, and a
     divergence names its own code points.
     """
-    from messagefoundry.controlchars import _CTRL_TRANSLATION, _is_control_char
+    import unicodedata
 
-    # RANGE 0x100, matching the table's own build range. It used to stop at 0x80, which made this
-    # test assert the opposite of what it claims: widen `_is_control_char` to C1 (the deliberate
-    # change the module exists to make cheap) and the table follows, `alphabet` does not, and the
-    # second assertion fails saying controlchars had been widened alone -- naming the wrong side.
-    alphabet = {cp for cp in range(0x100) if _is_control_char(chr(cp))}
-    escaped = set(_CTRL_TRANSLATION)
+    from messagefoundry.controlchars import (
+        CONTROL_CATEGORIES,
+        _is_control_char,
+        scrub_control_chars,
+    )
 
-    assert alphabet - escaped == {0x09}, (
-        f"the log escape table and controlchars have drifted: "
-        f"{sorted(hex(c) for c in (alphabet - escaped) - {0x09})} are screened as control "
-        f"characters but not escaped in a log line"
+    domain = [*range(0x10000), *_ASTRAL_SAMPLE]
+    screened = {cp for cp in domain if _is_control_char(chr(cp))}
+    categories = {cp for cp in domain if unicodedata.category(chr(cp)) in CONTROL_CATEGORIES}
+    escaped = {cp for cp in domain if scrub_control_chars(chr(cp)) != chr(cp)}
+
+    wanted = (screened | categories) - {0x09}
+    missing = sorted(hex(c) for c in wanted - escaped)
+    extra = sorted(hex(c) for c in escaped - wanted)
+    assert not missing and not extra, (
+        f"the log alphabet has drifted from controlchars plus CONTROL_CATEGORIES, minus tab: "
+        f"{missing} pass a log line raw, and {extra} are escaped though neither source names them "
+        f"-- one side has been widened or narrowed alone"
     )
-    assert not escaped - alphabet, (
-        f"the log table escapes {sorted(hex(c) for c in escaped - alphabet)}, which controlchars "
-        f"does not treat as control characters -- one of the two has been widened alone"
-    )
+    # Inside ASCII the log and the refusals still agree, so the widening is only past ASCII.
+    assert {cp for cp in escaped if cp < 0x80} == screened - {0x09}
 
 
 def test_tab_is_the_only_control_character_left_intact() -> None:
@@ -1774,6 +1795,7 @@ def test_tab_is_the_only_control_character_left_intact() -> None:
     assert _CTRL_TRANSLATION[0x0D] == "\\r", "CR is the injection vector and must be escaped"
     assert _CTRL_TRANSLATION[0x00] == "\\x00"
     assert _CTRL_TRANSLATION[0x7F] == "\\x7f", "DEL is in the alphabet and must still be escaped"
+    assert _CTRL_TRANSLATION[0x85] == "\\x85", "NEL ends a line for str.splitlines (#2815)"
 
 
 def test_a_tab_survives_the_real_scrub_and_a_newline_does_not() -> None:
@@ -1787,6 +1809,150 @@ def test_a_tab_survives_the_real_scrub_and_a_newline_does_not() -> None:
     assert "\t" in scrubbed, "the tab was escaped; a log line lost its benign whitespace"
     assert "\n" not in scrubbed, "a real newline survived; one record can now forge a second line"
     assert scrubbed == "before\tafter\\nnext"
+
+
+# --- vault BACKLOG #2815: every sink configure_logging installs escapes the wider alphabet -------
+
+#: One or more code points from each class #2815 names. Built from integers, so no editor or diff
+#: tool can show or rewrite one as a line break, a space or a reordering.
+_LOG_ESCAPED_CLASSES = {
+    "c1": (0x85, 0x9B),
+    "bidi": (0x200E, 0x200F, *range(0x202A, 0x202F), *range(0x2066, 0x206A), 0x061C),
+    "separator": (0x2028, 0x2029),
+    # A lone surrogate made every UTF-8 or cp1252 sink fail the write before #2815.
+    "surrogate": (0xDCFF,),
+}
+
+#: Ordinary non-ASCII text that must reach the log unchanged: Latin-1 and Latin Extended letters,
+#: Greek, and CJK. The control for every escape assertion below.
+_PLAIN_NON_ASCII = "Ångström café Müller Łódź Ελλάδα 東京 서울"
+
+
+def _write_one_record_through_every_sink(
+    fmt: str, text: str, tmp_path: Any, capsys: pytest.CaptureFixture[str]
+) -> list[str]:
+    """Configure logging as ``serve`` does, with the opt-in log file, log ``text`` in the message
+    AND in an exception, and return what each sink received: stdout, then the file.
+
+    EACH HANDLER GETS ITS OWN FRESH RECORD. A filter rewrites the record in place, so a record
+    dispatched through the logger reaches the file handler already escaped by the stdout handler's
+    chain, and the file assertions would pass with no chain on the file handler at all."""
+    from messagefoundry.logging_setup import LogFile
+
+    log_path = tmp_path / "engine.log"
+    configure_logging("INFO", fmt=fmt, log_file=LogFile(path=str(log_path)))
+    logger = logging.getLogger("messagefoundry.test2815")
+    try:
+        raise ValueError(f"exception said {text}")
+    except ValueError:
+        exc_info = sys.exc_info()
+    handlers = logging.getLogger().handlers
+    assert len(handlers) == 2, handlers
+    for handler in handlers:
+        record = logger.makeRecord(
+            logger.name, logging.ERROR, __file__, 0, "message said %s", (text,), exc_info
+        )
+        handler.handle(record)
+        handler.flush()
+    # newline="" keeps a raw CR as a CR, so a separator test can see one.
+    return [capsys.readouterr().out, log_path.read_text(encoding="utf-8", newline="")]
+
+
+def _assert_logged(fmt: str, out: str, shown: str) -> None:
+    """``out`` holds one record whose message and exception both read ``... said <shown>``."""
+    if fmt == "json":
+        (record,) = (json.loads(line) for line in out.splitlines() if line)
+        assert record["message"] == f"message said {shown}"
+        assert f"exception said {shown}" in record["exception"]
+    else:
+        assert f"message said {shown}" in out
+        assert f"exception said {shown}" in out
+
+
+@pytest.mark.parametrize("fmt", ["text", "json"])
+@pytest.mark.parametrize("kind", sorted(_LOG_ESCAPED_CLASSES))
+def test_every_configured_sink_escapes_the_wider_log_alphabet(
+    fmt: str, kind: str, tmp_path: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Before #2815 every one of these reached stdout and the log file raw, in both formats: the
+    scrub escaped C0 and DEL only, and ``json.dumps(ensure_ascii=False)`` escapes C0 only. The
+    expected spelling comes from the ``unicode_escape`` codec, not from the module under test."""
+    codes = _LOG_ESCAPED_CLASSES[kind]
+    # A class with no code points would log "startend" and pass every assertion below.
+    assert len(codes) >= 1, f"{kind} names no code points"
+    text = "start" + "".join(chr(c) for c in codes) + "end"
+    shown = "start" + "".join(chr(c).encode("unicode_escape").decode() for c in codes) + "end"
+    outputs = _write_one_record_through_every_sink(fmt, text, tmp_path, capsys)
+    for sink, out in zip(("stdout", "file"), outputs, strict=True):
+        raw = [hex(c) for c in codes if chr(c) in out]
+        assert not raw, f"{fmt} {sink}: {raw} reached the sink raw"
+        _assert_logged(fmt, out, shown)
+
+
+@pytest.mark.parametrize("fmt", ["text", "json"])
+def test_ordinary_non_ascii_text_reaches_every_sink_unchanged(
+    fmt: str, tmp_path: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The control for the test above: the wider alphabet is control characters, not non-ASCII."""
+    for out in _write_one_record_through_every_sink(fmt, _PLAIN_NON_ASCII, tmp_path, capsys):
+        _assert_logged(fmt, out, _PLAIN_NON_ASCII)
+
+
+def test_the_c0_escape_is_unchanged_by_the_wider_alphabet() -> None:
+    """C0 and DEL are escaped exactly as before #2815, written out independently of the table:
+    CR and LF readable, tab kept, every other one ``\\xNN``, and printable ASCII untouched."""
+    from messagefoundry.controlchars import scrub_control_chars
+
+    for code in range(0x80):
+        char = chr(code)
+        if char == "\n":
+            expected = "\\n"
+        elif char == "\r":
+            expected = "\\r"
+        elif char == "\t" or 0x20 <= code < 0x7F:
+            expected = char
+        else:
+            expected = f"\\x{code:02x}"
+        assert scrub_control_chars(char) == expected, hex(code)
+
+
+def test_the_self_filling_table_is_bounded_and_decides_past_its_bound() -> None:
+    """The BMP is remembered; past U+FFFF at most ``_ASTRAL_MEMO_LIMIT`` code points are, and one
+    past the bound is still decided correctly. A fresh table, so no earlier test's fill hides the
+    first-lookup path. Membership is read with ``in``, which never calls ``__missing__``."""
+    from messagefoundry.controlchars import (
+        _ASTRAL_MEMO_LIMIT,
+        _CTRL_TRANSLATION,
+        _LogTranslation,
+    )
+
+    table = _LogTranslation(_CTRL_TRANSLATION)
+    assert chr(0x2028).translate(table) == "\\u2028"
+    assert 0x2028 in table
+    assert "A".translate(table) == "A"
+    astral = range(0x10000, 0x10000 + _ASTRAL_MEMO_LIMIT + 2)
+    for code in astral:
+        chr(code).translate(table)
+    assert sum(1 for code in table if code > 0xFFFF) == _ASTRAL_MEMO_LIMIT
+    over = astral[-1]
+    assert over not in table
+    assert chr(0xE0001).translate(table) == "\\U000e0001"  # a tag character, past the bound
+    assert chr(over).translate(table) == chr(over)
+
+
+def test_a_new_record_cannot_carry_a_separator_into_the_log_file(
+    tmp_path: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Every ``str.splitlines`` line end except LF reaches the file escaped, so a reader that splits
+    with it -- the tray's View Log, a shipper, a viewer drawing U+2028 as a break -- sees one record
+    per line for records written from here on. A line already in a file, or written by another
+    tool, is unaffected; the in-engine readers still split with ``split_log_lines`` for that."""
+    from tests.test_log_tail_line_split import _NOT_A_LINE_END
+
+    breaks = "".join(_NOT_A_LINE_END) + "\r"
+    _stdout, file_text = _write_one_record_through_every_sink("text", breaks, tmp_path, capsys)
+    # The file was read with newline="", so a raw CR survives; CRLF counts once either way.
+    assert len(file_text.splitlines()) == file_text.count("\n")
 
 
 # --- BACKLOG #1572: the installed chain must scrub a CUSTOM-delimiter body --------------------------
@@ -1817,6 +1983,307 @@ def test_the_installed_chain_scrubs_a_custom_delimiter_body() -> None:
     for identifier in ("Z9998887", "DOE", "JANE"):
         assert identifier not in out, f"{identifier!r} reached the sink through the installed chain"
     assert "ValueError" in out and "cannot transform" in out  # type + non-PHI context kept
+
+
+# --- BACKLOG #1547: a request target through the installed access-log chain -----------------------
+#
+# The scheme scan in ``secretscrub._DSN_PASSWORD`` was quadratic on a delimiter-free run, and an
+# unauthenticated request target reached it through ``uvicorn.access``. The pattern is fixed and timed
+# directly in ``tests/test_log_redaction_secret_domain.py``; the arm below is the acceptance test the
+# item names, which drives the same input through the chain production installs.
+#
+# The next three constants MIRROR ``_GROWTH_LENGTHS``, ``_MAX_GROWTH`` and ``_SHIPPED_BEFORE_DSN`` in
+# that file. They are copied rather than imported so this arm does not move when that file is
+# rewired. The reasoning behind each value is recorded there and not repeated here; if that file
+# retunes one, retune its mirror in the same change.
+_ACCESS_GROWTH_LENGTHS = (2048, 16384)
+_ACCESS_MAX_GROWTH = 24.0
+_PRE_1547_DSN_PASSWORD = r"(?i)\b([a-z][a-z0-9+.\-]*://[^\s:/@]+):[^\s/@]+@"
+
+#: uvicorn's access-log format, as ``h11_impl`` and ``httptools_impl`` pass it to
+#: ``access_logger.info``. With ``log_config=None`` no ``AccessFormatter`` is installed, so the root
+#: handler renders it through the engine's own formatter.
+#: ``test_the_access_format_this_file_copies_is_uvicorns`` pins the copy to uvicorn's source.
+_UVICORN_ACCESS_FORMAT = '%s - "%s %s HTTP/%s" %d'
+
+#: At least the ``re.Pattern`` methods that apply the pattern to text. A recorder that watched ``sub``
+#: alone would stay quiet if ``_run`` moved to ``subn`` or ``finditer``. The growth test checks this
+#: set covers every public callable of ``re.Pattern``.
+_APPLYING_METHODS = frozenset(
+    {"findall", "finditer", "fullmatch", "match", "scanner", "search", "split", "sub", "subn"}
+)
+
+
+#: The query that carries ``://``, the marker that opens the DSN gate, as the item measured it.
+_MARKED_QUERY = "x=://"
+
+
+def _hostile_run(length: int) -> str:
+    """An alternating letter-and-hyphen run of ``length`` characters."""
+    return ("a-" * (length // 2 + 1))[:length]
+
+
+def _request_target(length: int, query: str = _MARKED_QUERY) -> str:
+    """The item's own shape: ``/`` + an alternating letter-and-hyphen run + ``?`` + ``query``."""
+    return f"/{_hostile_run(length)}?{query}"
+
+
+def _emit_access(target: str) -> None:
+    """One access record, emitted the way uvicorn emits it for a 401 on ``target``."""
+    logging.getLogger("uvicorn.access").info(
+        _UVICORN_ACCESS_FORMAT, "127.0.0.1:50123", "GET", target, "1.1", 401
+    )
+
+
+def _timed_emit(target: str) -> float:
+    """Seconds one access record on ``target`` took to pass every installed handler."""
+    start = time.perf_counter()
+    _emit_access(target)
+    return time.perf_counter() - start
+
+
+def _access_growth(rounds: int) -> float:
+    """Emit time at the long target over emit time at the short one, both with the DSN marker.
+
+    The emits run inside a coroutine on a running event loop, the way uvicorn's own emit does. A
+    ``logging`` emit is synchronous, so every handler filter runs on the loop thread and nothing else
+    on that loop runs until it returns: its duration IS the stall a waiting coroutine sees. That is
+    why this times the emit rather than a sleeping ticker, whose scheduler jitter on Windows swamps
+    the short length.
+
+    Each endpoint keeps its MINIMUM, the statistic load inflates least, and the short and long emits
+    alternate so load that comes and goes lands on both endpoints rather than on one block."""
+    short_target = _request_target(_ACCESS_GROWTH_LENGTHS[0])
+    long_target = _request_target(_ACCESS_GROWTH_LENGTHS[1])
+
+    async def measure() -> tuple[float, float]:
+        short = long_ = float("inf")
+        for _ in range(rounds):
+            short = min(short, _timed_emit(short_target))
+            long_ = min(long_, _timed_emit(long_target))
+        return short, long_
+
+    short, long_ = asyncio.run(measure())
+    return long_ / short
+
+
+class _CountingPattern:
+    """A compiled pattern that counts each time it is applied to text holding ``needle``, and is
+    otherwise the real one.
+
+    The swap is process-wide, so a record another thread logs during the window would be counted too
+    if every application were. Counting only text that holds this test's own run keeps such a record
+    out of the reading."""
+
+    def __init__(self, pattern: re.Pattern[str], needle: str, seen: list[str]) -> None:
+        self._pattern = pattern
+        self._needle = needle
+        self._seen = seen
+
+    def __getattr__(self, attr: str) -> Any:
+        # An instance built without __init__ (copy, pickle) would otherwise recurse on _pattern.
+        if "_pattern" not in self.__dict__:
+            raise AttributeError(attr)
+        target = getattr(self._pattern, attr)
+        if attr not in _APPLYING_METHODS:
+            return target
+
+        def counted(*args: Any, **kwargs: Any) -> Any:
+            texts = (a for a in (*args, *kwargs.values()) if isinstance(a, str))
+            if any(self._needle in text for text in texts):
+                self._seen.append(attr)
+            return target(*args, **kwargs)
+
+        return counted
+
+
+def _dsn_passes_during(monkeypatch: pytest.MonkeyPatch, target: str) -> int:
+    """How many times ``secretscrub._DSN_PASSWORD`` was applied to one access record on ``target``.
+
+    ``secretscrub._run`` reads the pattern from the module global on every call, so swapping the
+    global reaches the object the installed filter applies. The needle is the target's first 64
+    characters, all inside the hostile run, which no filter rewrites."""
+    seen: list[str] = []
+    recorder = _CountingPattern(secretscrub._DSN_PASSWORD, target[:64], seen)
+    with monkeypatch.context() as m:
+        m.setattr(secretscrub, "_DSN_PASSWORD", recorder)
+        _emit_access(target)
+    return len(seen)
+
+
+@pytest.fixture
+def _uvicorn_loggers_restored() -> Iterator[None]:
+    """``configure_logging`` sets level, propagation and handlers on uvicorn's named loggers, which
+    neither root-logger restore puts back. Put them back, so these arms leave no order dependence."""
+    names = ("uvicorn", "uvicorn.error", "uvicorn.access")
+    saved = {
+        name: (lg.level, lg.propagate, lg.handlers[:])
+        for name in names
+        for lg in (logging.getLogger(name),)
+    }
+    try:
+        yield
+    finally:
+        for name, (level, propagate, handlers) in saved.items():
+            lg = logging.getLogger(name)
+            lg.setLevel(level)  # setLevel, not assignment: it clears the isEnabledFor cache
+            lg.propagate = propagate
+            lg.handlers[:] = handlers
+
+
+@pytest.mark.usefixtures("_uvicorn_loggers_restored")
+def test_a_hostile_request_target_costs_the_access_log_chain_linear_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #1547's acceptance arm: the row's request target, through the chain production installs.
+
+    ``configure_logging`` builds the root handler and routes ``uvicorn.access`` into it, as ``serve``
+    does with ``log_config=None``. This arm installs the default stdout sink only, with no log file
+    and no forwarder. The record is emitted on ``uvicorn.access`` with uvicorn's own format and
+    argument tuple, so every filter on every installed handler runs on it. Each further filtered sink
+    repeats the pass, which the count below asserts as one pass per filtered handler.
+
+    One measurement covers both halves of the item. The emit runs on a running event loop and is
+    synchronous there, so its growth across lengths is the growth of the loop stall a client could
+    cause without authenticating, on first deployment. The arm bounds that GROWTH and not the stall's
+    size: an absolute budget is a reading about the runner as much as the code, and a cost-share arm
+    built that way went red on a hosted Windows runner and was deleted.
+
+    THE POSITIVE CONTROL runs in the same test: the pre-#1547 pattern is swapped into the module the
+    filter reads, and the same harness must then break the growth bound. Without it, a fast box would
+    pass whatever the pattern did.
+
+    THE NEGATIVE ARM IS A COUNT, NOT A CLOCK. The unmarked target still costs every other filter its
+    time, so a timing ratio between the two would measure the other filters. Instead the DSN pass is
+    counted: once per filtered handler on the marked line, never on an unmarked one. Two unmarked
+    queries are counted. The item's own ``x=nothing`` names no credential word, so the entry gate
+    turns it away. ``token=nothing`` passes the entry gate, which leaves the DSN gate as the only
+    thing between it and the scan. The marked count also proves the growth readings are about a
+    chain in which the DSN pass actually ran.
+
+    NOT COVERED HERE, ON PURPOSE: ``messagefoundry/support/redact.py`` carries a twin of this pattern.
+    No logging handler applies it; ``redact_log_line`` does, at READ time, over log text already
+    stored, such as a log tail or a support bundle. A stored access line DOES reach it that way, so the
+    same hostile target is scanned by the twin when the log is read back, off this emit path. Its
+    growth is covered by the growth arm in ``tests/test_log_redaction_secret_domain.py``, and the same
+    file pins the two copies as identical.
+    """
+    monkeypatch.setattr(sys, "stdout", io.StringIO())
+    configure_logging("INFO")
+    filtered = [
+        handler
+        for handler in logging.getLogger().handlers
+        if any(isinstance(f, CredentialScrubFilter) for f in handler.filters)
+    ]
+    assert filtered, "configure_logging installed no handler carrying the credential scrub"
+
+    # The structural arms first: they say what the timings below are about. The recorder can only
+    # count a method it wraps, so a public re.Pattern callable missing from the set would read as a
+    # quiet zero.
+    public = [
+        name
+        for name in dir(re.Pattern)
+        if not name.startswith("_") and callable(getattr(re.Pattern, name, None))
+    ]
+    # An empty or near-empty walk proves nothing, and "nothing uncovered" over it would pass. The
+    # floor sits well under the real count on purpose: it catches a blind walk, and it must not
+    # red on a stdlib method being added or removed.
+    assert len(public) >= 5, f"re.Pattern showed only {sorted(public)} as public callables"
+    uncovered = {name for name in public if name not in _APPLYING_METHODS}
+    assert not uncovered, f"_APPLYING_METHODS does not cover re.Pattern's {sorted(uncovered)}"
+    longest = _ACCESS_GROWTH_LENGTHS[1]
+    marked_passes = _dsn_passes_during(monkeypatch, _request_target(longest))
+    assert marked_passes == len(filtered), (
+        f"the marked target applied the DSN pattern {marked_passes} times across {len(filtered)} "
+        "filtered handler(s). Zero means the record never reached the pass, so the timings below would "
+        "be about other filters; more than one per handler means the pass now runs repeatedly."
+    )
+    # ``token=nothing`` is only a test of the DSN gate if the entry gate lets it through.
+    assert secretscrub._admits(
+        _request_target(longest, "token=nothing").casefold(), secretscrub._ANY_HINT
+    )
+    for query in ("x=nothing", "token=nothing"):
+        unmarked_passes = _dsn_passes_during(monkeypatch, _request_target(longest, query))
+        assert unmarked_passes == 0, (
+            f"the target with ?{query}, which carries no '://', applied the DSN pattern "
+            f"{unmarked_passes} times. The gates in front of it no longer key on the marker, so "
+            "access lines without one now pay for the scan."
+        )
+
+    with monkeypatch.context() as m:
+        m.setattr(secretscrub, "_DSN_PASSWORD", re.compile(_PRE_1547_DSN_PASSWORD))
+        before_growth = _access_growth(rounds=3)
+    assert before_growth > _ACCESS_MAX_GROWTH, (
+        f"with the pre-#1547 pattern swapped in, the access chain grew only {before_growth:.1f}x "
+        f"across {_ACCESS_GROWTH_LENGTHS}, under the {_ACCESS_MAX_GROWTH}x bound. This harness is not "
+        "exercising the scan, so the assertion below cannot fail. Fix the harness, not the bound."
+    )
+
+    growth = _access_growth(rounds=5)
+    assert growth <= _ACCESS_MAX_GROWTH, (
+        f"one access record grew {growth:.1f}x for 8x the request-target length, over the "
+        f"{_ACCESS_MAX_GROWTH}x bound; the pre-#1547 pattern measured {before_growth:.0f}x in this "
+        "run. Something in the installed chain scans this target in more than linear time, and the "
+        "emit holds the event loop for all of it."
+    )
+
+
+@pytest.mark.usefixtures("_uvicorn_loggers_restored")
+@pytest.mark.parametrize(
+    "lead",
+    ("", "9-", "x" * 200),
+    ids=("bare-scheme", "digit-led-run", "glued-200-char-run"),
+)
+def test_a_dsn_in_a_request_target_is_redacted_by_the_installed_chain(
+    monkeypatch: pytest.MonkeyPatch, lead: str
+) -> None:
+    """The fix kept the redaction: a synthetic DSN password in an access line never reaches the sink.
+
+    Same chain and same emit as the growth arm above. The leading runs are the two shapes #1547's
+    earlier fixes lost on the way to linear time: a run opening on a non-letter, which a letter-only
+    scheme head refused, and a scheme glued to a long word run, which a bounded scheme class could
+    not reach. A pattern made linear by matching less fails one of these.
+
+    The password names no credential word, so ``://`` is the only thing admitting the line to the
+    credential pass, which is the case a real DSN password usually is. The precondition below checks
+    that rather than assuming it."""
+    sink = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", sink)
+    configure_logging("INFO")
+    # A fixture value, not a secret. CodeQL reads a name like ``secret`` or ``password`` as sensitive
+    # data, so naming it that way makes the emit below a py/clear-text-logging-sensitive-data alert.
+    sentinel = "not-a-real-pw-1547"
+    target = f"/x?next={lead}postgres://svc:{sentinel}@db.invalid:5432/mefor"
+    assert not secretscrub._admits(target.replace("://", "-").casefold(), secretscrub._ANY_HINT), (
+        "the target names a credential word besides '://', so this arm no longer tests the marker"
+    )
+    _emit_access(target)
+    out = sink.getvalue()
+    assert "GET /x?next=" in out, f"the access line did not reach the sink: {out!r}"
+    assert sentinel not in out
+    assert f"postgres://svc:{CREDENTIAL_PLACEHOLDER}@db.invalid" in out
+
+
+@pytest.mark.parametrize("module", ("h11_impl", "httptools_impl"))
+def test_the_access_format_this_file_copies_is_uvicorns(module: str) -> None:
+    """The growth arm emits a hand-copied access record. Pin the copy to the installed uvicorn's own
+    source, so an upgrade that changes the format reds here rather than leaving the arm measuring a
+    record uvicorn no longer writes. Read as text, because importing ``httptools_impl`` needs the
+    optional ``httptools`` package."""
+    spec = importlib.util.find_spec(f"uvicorn.protocols.http.{module}")
+    assert spec is not None and spec.origin is not None, f"uvicorn has no {module}"
+    source = Path(spec.origin).read_text(encoding="utf-8")
+    # The target argument is uvicorn's rendering of path and query. The arms put '://' in the raw
+    # query, so a uvicorn that started quoting the query would make them model a line it never writes.
+    assert "get_path_with_query_string(self.scope)" in source
+    rendered = get_path_with_query_string(
+        cast(Any, {"path": "/a-a-a", "query_string": _MARKED_QUERY.encode("ascii")})
+    )
+    assert rendered == f"/a-a-a?{_MARKED_QUERY}", f"uvicorn now renders the target as {rendered!r}"
+    assert "access_logger.info(" in source and f"'{_UVICORN_ACCESS_FORMAT}'" in source, (
+        f"uvicorn's {module} no longer calls access_logger.info with {_UVICORN_ACCESS_FORMAT!r}. "
+        "Update the copy and the argument tuple _emit_access passes."
+    )
 
 
 # BACKLOG #1967: this file's serve fixtures test other gates, so they bound the two warn-only

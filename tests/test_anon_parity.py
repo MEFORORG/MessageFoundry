@@ -64,6 +64,12 @@ _ADVERSARIAL = [
     _US_DATE_IN_EVN6,
     "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPV1|1|I|WARD^1^A^MAIN" + "|" * 41 + "junk|x",
     "MSH!*~\\&!A!B!C!D!20260101!!ADT*A01!M1!P!2.5.1\rEVN!A01!20260315142233.12-0500*S",
+    # BACKLOG #2265: a second MSH line. The engine re-encodes it from a parsed header-style
+    # segment and the tee from a field split, and the default rules must leave it alone on both.
+    # No default rule names an MSH field, so this case cannot show MSH-RULE parity; that is in
+    # tests/test_anon_b193_2265.py.
+    "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||9^^^H^MR||X^Y"
+    "\rMSH|^~\\&|A2|B2|C|D|20260102||ADT^A01|M2|P|2.5.1",
 ]
 # Inputs neither side can safely anonymize — BOTH must fail closed (refuse, never emit).
 _REFUSED = ["", "PID|1||9^^^H^MR||DOE^JOHN", "MSH|^~|A|B", "not hl7 at all"]
@@ -115,7 +121,9 @@ def test_leak_tables_load_empty_without_the_publish_guard(tmp_path: Path) -> Non
     # Where no guard is reachable (an installed wheel with no scripts/ above it) the token tables
     # must load EMPTY -- never a stale or fragmented copy -- so no customer/vendor token ships in
     # the tee. Exercise the loader against a tree that has no scripts/security above it.
-    assert tee_leak._load_publish_guard(tmp_path / "no-guard-here" / "leak.py") is None
+    # The loader tries one path, under parents[2] of the file it is given (BACKLOG #2344). Shape
+    # the stand-in like the package so that folder is inside tmp_path.
+    assert tee_leak._load_publish_guard(tmp_path / "root" / "tee" / "anon" / "leak.py") is None
 
 
 def test_leak_tables_are_sourced_from_the_guard_when_present() -> None:
@@ -158,6 +166,9 @@ _LEAK_PARITY_INPUTS = [
     # BACKLOG #1710 step 1: the fixed list's shape checks (a short code, a code plus text).
     "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||1^^^H^MR||X^Y||19800101|M"
     "\rPV1|1|I^SMITH JOHN\rNTE|DOE JANE",
+    # BACKLOG #2265: a second MSH line with a dashed number in MSH-8, which no default rule maps.
+    "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||1^^^H^MR||X^Y"
+    "\rMSH|^~\\&|A2|B2|C|D|20260102|123-45-6789|ADT^A01|M2|P|2.5.1",
 ]
 
 

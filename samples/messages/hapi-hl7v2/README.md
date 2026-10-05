@@ -39,6 +39,11 @@ mirrors `IN1` at a shifted offset. **No ad-hoc redaction logic was written** (§
 rules, don't reimplement beside the framework). The salt is not recorded — these surrogates are
 final, not reversible, and the file is not intended to be re-derived.
 
+The overlay itself was not committed with the corpus. Most of its fields are default rules now
+(BACKLOG #2645). The rest, `IN1-4` and the `DST` fields, are in
+[`tests/fixtures/anon/batch_18.anon.toml`](../../../tests/fixtures/anon/batch_18.anon.toml), which
+says why each is not a default. Its kinds were worked out again from this corpus, not recovered.
+
 **What was deliberately preserved**, because it is what the corpus is *for* — 18 messages, 133
 lines, every segment in its original order with unchanged field counts, CRLF line endings, the
 `//` and `/* */` comments, `""` null markers, `~~` repetitions, the OBX narrative text, the

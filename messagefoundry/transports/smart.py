@@ -68,6 +68,7 @@ from messagefoundry.transports.bounded_read import (
 # do. rest.py imports this module's provider LAZILY (inside __init__) so there is no import cycle.
 from messagefoundry.transports.rest import (
     _NO_REDIRECT_OPENER,
+    ECH_HOP_WAYS_ACROSS,
     HttpAuthError,
     ProxyConfig,
     _no_redirect_opener,
@@ -370,13 +371,21 @@ class _TokenEndpointProvider(abc.ABC):
         # InsecureHopRefused propagates rather than being re-wrapped as the provider's error: the
         # guard's own message names this hop and its ways across, which a re-wrap would discard, and
         # both are ValueError subclasses so the loader surfaces either identically.
+        #
+        # WITH AN ECH SIDECAR THE GUARD GETS NO OPENER (vault BACKLOG #2169). `_post_token`
+        # re-addresses the POST to the loopback sidecar, and the sidecar makes its own TLS connection
+        # to the token host. So this opener's context only ever meets the sidecar. A `[tls].crl_file`
+        # covering the token host still lands on it, and reading it here lifted the refusal with no
+        # check behind it. On an enforcing instance a non-loopback token host then crosses on the
+        # per-connection attestation alone.
         refuse_unrevoked_verified_hop(
             scheme,
             token_url,
             connector=f"{self._LABEL} token endpoint",
             revocation_attested=revocation_attested,
             revocation_attested_reason=revocation_attested_reason,
-            opener=self._opener,
+            opener=None if ech_sidecar is not None else self._opener,
+            ways_across=ECH_HOP_WAYS_ACROSS if ech_sidecar is not None else None,
             connection=revocation_connection,
         )
         self._proxy_auth: dict[str, str] = (
@@ -628,7 +637,8 @@ def revocation_attestation_from_settings(
     reason and the connection's name (:data:`MIRRORED_CONNECTION_SETTING`, written for every
     connection, so a REFUSAL names it too) into the resolved settings. This is the one reader of those
     keys for both bearer providers (BACKLOG #2112, #2115), as ``cleartext_acceptance_from_settings``
-    is for the cleartext twin."""
+    is for the cleartext twin. The ``fhir_lookup`` read hop reads them through it too
+    (BACKLOG #2193): a lookup has no ``Destination``, so the mirror is where its declaration is."""
     reason = s.get("tls_revocation_attested_reason")
     connection = s.get(MIRRORED_CONNECTION_SETTING)
     return (
@@ -715,7 +725,7 @@ def token_provider_from_settings(
         # exemption and the internal-vs-public decision key on the host actually being dialled. The
         # connection's own ``tls_ca_file`` still wins verbatim, exactly as it does on the data hop.
         trust_anchor=http_family_trust_anchor(
-            s, url=token_url, trust_anchor_policy=trust_anchor_policy
+            s, url=token_url, trust_anchor_policy=trust_anchor_policy, cell="smart_token_url"
         ),
     )
 

@@ -99,6 +99,36 @@ for the checkouts named in its allowlist:
    past it, so it stops the accident and not a determined bypass). This closes the gap the old rule left
    open — that a worktree "may switch its own branch freely."
 
+3d. **A `git worktree remove` or `git worktree move` aimed at a governed worktree.** Every rule above
+   protects a tree from being swapped. This one protects it from being deleted or relocated. The gate
+   has no occupancy or authorship signal, so it cannot tell an abandoned tree from one in use, and it
+   refuses the raw command for both. It refuses the tree the session is standing in too, with its own
+   text.
+
+   **The deny text names a checked route for removal, and a session may run it.** That route is
+   `scripts\worktree\remove.ps1 -Path <path>`. It makes the checks this gate cannot: it refuses a tree
+   a session is recorded in, an unreadable session registry, and a tree holding anything uncommitted.
+   It removes the directory and never the branch. The removal inside the script does not reach this
+   rule, because the gate reads the tool call's command line and not what a script goes on to run.
+   [WORKTREES.md](WORKTREES.md) section "Remove one" lists what the route refuses.
+
+   **This reverses the earlier posture, for removal only.** Until 2026-10-04 both deny texts handed the
+   removal to the user. Owner instruction that day, in session: *"let's change the gate so that
+   sessions can run these but still have the protection this was designed for"*. What is refused did
+   not change. `-Force` stays the user's switch, and the text prints no `-Force` command. A refusal
+   from the script is final for a session. (Vault BACKLOG #1017.)
+
+   Some cases get no command. A tree under `.claude/worktrees` gets none, because the occupancy
+   check cannot see a subagent there. The primary checkout gets none, because nothing removes it.
+   A governed checkout whose `remove.ps1` predates `-Path` gets a line saying so. A `move` gets
+   its own text: there is no checked route for a move.
+
+This list is not the whole rule set. The hook itself,
+[`scripts/hooks/worktree_gate.ps1`](../scripts/hooks/worktree_gate.ps1), is the source of record.
+
+**The new deny text takes effect only after the hook is re-installed.** The hook runs from a copy
+outside every checkout, and `install-gate.ps1` is the owner's to run. See "Installing" below.
+
 **Everything else is allowed.** Reads are never gated — asking a question or planning in the primary stays
 frictionless. Writes into any worktree, the scratchpad, or any other repo are allowed **from a session
 sitting in the primary**: there is no need to `cd`, relocate, or restart. Worktrees that git nests *inside*

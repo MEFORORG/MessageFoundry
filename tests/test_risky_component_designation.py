@@ -69,6 +69,8 @@ _PAIRS = (
 )
 #: The dated public-metadata snapshot the ASVS-example section is held to (BACKLOG #1189).
 _READINGS = _ROOT / "security" / "risky-component-readings.json"
+#: The hand-made survey of what each pinned wheel carries inside it (BACKLOG #2935).
+_SURVEY = _ROOT / "security" / "bundled-code-survey.json"
 
 #: The headings that bound the page's classified regions. The core tables run from the tier 1
 #: heading to the sqlserver heading, the sqlserver tables from there to the harness heading, and
@@ -554,7 +556,7 @@ def test_dependabot_does_not_write_the_closure_file(path: Path) -> None:
 
 @pytest.mark.parametrize(
     "path",
-    [_DOC, *(f for pair in _PAIRS for f in pair), _READINGS],
+    [_DOC, *(f for pair in _PAIRS for f in pair), _READINGS, _SURVEY],
     ids=lambda p: p.name,
 )
 def test_the_tracked_paths_exist(path: Path) -> None:
@@ -748,6 +750,11 @@ _RERENDER = "python scripts/security/component_readings.py --render-only"
 
 def _snapshot() -> dict[str, Any]:
     data: dict[str, Any] = json.loads(_READINGS.read_text(encoding="utf-8"))
+    return data
+
+
+def _survey() -> dict[str, Any]:
+    data: dict[str, Any] = json.loads(_SURVEY.read_text(encoding="utf-8"))
     return data
 
 
@@ -1069,7 +1076,7 @@ def test_the_rendered_section_is_the_tracked_one() -> None:
     """
     page = _DOC.read_text(encoding="utf-8")
     expected = component_readings.render_section(
-        _snapshot(), component_readings.designation_labels(page)
+        _snapshot(), component_readings.designation_labels(page), _survey()
     )
     assert component_readings.section_of(page) == expected, (
         f"the readings section in {_DOC.name} is stale or hand-edited. Re-render: {_RERENDER}"
@@ -1095,7 +1102,8 @@ def test_the_section_checks_can_fail() -> None:
     data = _snapshot()
     labels = component_readings.designation_labels(page)
     tracked = component_readings.section_of(page)
-    assert tracked == component_readings.render_section(data, labels)
+    survey = _survey()
+    assert tracked == component_readings.render_section(data, labels, survey)
     assert not _stated_facts_drift(page, data)
 
     # Whatever the first reading's verdict is, invert it, so this works on any future snapshot.
@@ -1112,11 +1120,11 @@ def test_the_section_checks_can_fail() -> None:
     }
     moved = {**data, "reread_by": "2099-01-01"}
     for changed in (flipped, moved):
-        assert component_readings.render_section(changed, labels) != tracked
+        assert component_readings.render_section(changed, labels, survey) != tracked
         assert _stated_facts_drift(page, changed)
     # Dropping a designation always shows: a risky row's column, or the not-risky grouping, moves.
     unlabelled = {k: v for k, v in labels.items() if k != next(iter(labels))}
-    assert component_readings.render_section(data, unlabelled) != tracked
+    assert component_readings.render_section(data, unlabelled, survey) != tracked
     # Any table row naming a component: a flagged one, or a not-risky group row.
     row = next(ln for ln in tracked.splitlines() if ln.startswith("| `"))
     assert _stated_facts_drift(page.replace(row + "\n", ""), data)
@@ -1148,6 +1156,230 @@ def test_the_section_checks_can_fail() -> None:
         }
         drift = _stated_facts_drift(page, changed)
         assert any(line.startswith(problem) for line in drift), (change, drift)
+
+
+# --- What each wheel carries inside it (BACKLOG #2935) ----------------------------------------------
+#
+# OSV matches an advisory by PyPI name, so a flaw in code a wheel packs from another project does
+# not show in the reading above. ``security/bundled-code-survey.json`` answers, for every assessed
+# wheel, whether it carries such code, and records the route the page takes for a not-designated
+# wheel that does. The tests below hold the survey to the population and the page to the survey.
+
+_SURVEY_HEADING = "### What each wheel carries inside it"
+_HIGHLIGHTED = "**Highlighted as risky on what it carries:**"
+_READ = "**Read from the carried project's own advisories:**"
+
+
+def _owed_a_route(survey: dict[str, Any]) -> set[str]:
+    """The not-designated names the survey did not show to carry nothing.
+
+    This module's own reading of the tiers and of the record, not the generator's rule.
+    """
+    return {w["name"] for w in survey["wheels"] if w["carries"] != "no"} - _designated()
+
+
+def _survey_page_drift(page: str, survey: dict[str, Any]) -> list[str]:
+    """Where the page's survey subsection disagrees with the record. Not through the renderer."""
+    section = _region(_SURVEY_HEADING, _EXTRA_NAMES, page)
+    # Three tables, in this order; the second and third are each there only when a wheel took
+    # that route. Split from the end, so a missing middle table does not swallow the last one.
+    head, _, read = section.partition(f"\n{_READ}\n")
+    found, _, highlighted = head.partition(f"\n{_HIGHLIGHTED}\n")
+    wheels = survey["wheels"]
+    counts = {a: sum(w["carries"] == a for w in wheels) for a in component_readings.CARRIES}
+    size = len(wheels)
+    sentence = (
+        f"**Carries another project's compiled code: {counts['yes']} of {size}. Does not: "
+        f"{counts['no']}. Not established: {counts['not established']}. {counts['yes']} plus "
+        f"{counts['no']} plus {counts['not established']} is {size}.**"
+    )
+    problems = []
+    if sentence not in " ".join(section.split()):
+        problems.append(f"the page does not state {sentence!r}")
+    carrying = {w["name"] for w in wheels if w["carries"] != "no"}
+    if _table_names(found) != carrying:
+        problems.append(
+            f"found: page names {sorted(_table_names(found))}, the survey {sorted(carrying)}"
+        )
+    for label, table, route in (("highlighted", highlighted, "highlight"), ("read", read, "read")):
+        want = {w["name"] for w in wheels if w.get("route") == route}
+        if _table_names(table) != want:
+            problems.append(
+                f"{label}: page names {sorted(_table_names(table))}, the survey {sorted(want)}"
+            )
+    return problems
+
+
+def test_every_assessed_wheel_has_a_survey_answer_and_every_owed_route_is_recorded() -> None:
+    """RED when: a name in an assessed closure has no survey answer, the survey answers for a name
+    no closure carries, or a not-designated wheel that carries another project's compiled code,
+    or whose answer is not established, has no route.
+
+    The names are held to the closure files here, not to the snapshot, so a dependency that enters
+    a closure needs a survey answer in the same pull request. A version bump alone does not turn
+    this red: the survey is dated to the snapshot's pins, like the readings.
+    """
+    survey = _survey()
+    names = sorted(w["name"] for w in survey["wheels"])
+    assert len(names) >= 20, f"{_SURVEY.name} parsed to {len(names)} answers"
+    assert names == sorted(_assessed_population()), (
+        f"{_SURVEY.name} does not answer for exactly the assessed closures: "
+        f"missing {sorted(_assessed_population().keys() - set(names))}, "
+        f"stray {sorted(set(names) - _assessed_population().keys())}"
+    )
+    page = _DOC.read_text(encoding="utf-8")
+    problems = component_readings.survey_problems(
+        survey, _snapshot(), component_readings.designation_labels(page)
+    )
+    assert problems == [], f"{_SURVEY.name} is incomplete:\n  " + "\n  ".join(problems)
+    routed = {w["name"] for w in survey["wheels"] if w.get("route") in component_readings.ROUTES}
+    assert _owed_a_route(survey) == routed, (
+        f"owed a route: {sorted(_owed_a_route(survey))}; routed: {sorted(routed)}"
+    )
+
+
+def test_the_page_states_what_the_survey_found_and_the_route_each_wheel_took() -> None:
+    """RED when: the page's survey tables or counts disagree with the record.
+
+    Independent of the renderer: see ``_survey_page_drift``. The exact text is held by
+    ``test_the_rendered_section_is_the_tracked_one``.
+    """
+    drift = _survey_page_drift(_DOC.read_text(encoding="utf-8"), _survey())
+    assert drift == [], "the survey subsection disagrees with its record:\n  " + "\n  ".join(drift)
+
+
+def test_the_survey_checks_can_fail() -> None:
+    """RED when: a survey check stops seeing a missing answer, a missing route, a guessed "no" or
+    a stale page.
+
+    THE POSITIVE CONTROL FOR THE TWO TESTS ABOVE. Every mutation starts from two wheels picked by
+    what they are, not by where they sit: a not-designated wheel shown to carry nothing, and a
+    designated one. Each is first rewritten into a known shape, so this holds whatever routes a
+    later survey records.
+    """
+    page = _DOC.read_text(encoding="utf-8")
+    data, survey = _snapshot(), _survey()
+    labels = component_readings.designation_labels(page)
+    wheels = survey["wheels"]
+    carried = [{"name": "another project", "version": "1.0"}]
+    plain = next(w for w in wheels if w["name"] not in labels and w["carries"] == "no")
+    ranked = next(w for w in wheels if w["name"] in labels)
+    # The same two wheels in a known shape: one routed and highlighted, one designated and carrying.
+    routed = {
+        **plain,
+        "carries": "yes",
+        "projects": carried,
+        "evidence_kind": component_readings.METADATA_ONLY,
+        "files_read": [],
+        "route": "highlight",
+        "route_reason": "a reason",
+    }
+    designated = {
+        **ranked,
+        "carries": "yes",
+        "projects": carried,
+        "evidence_kind": component_readings.METADATA_ONLY,
+        "files_read": [],
+        "route": None,
+    }
+    base = [routed if w is plain else designated if w is ranked else w for w in wheels]
+
+    def problems(changed: list[dict[str, Any]]) -> list[str]:
+        return component_readings.survey_problems({**survey, "wheels": changed}, data, labels)
+
+    def swap(target: dict[str, Any], **change: Any) -> list[dict[str, Any]]:
+        return [{**w, **change} if w is target else w for w in base]
+
+    assert problems(base) == []
+    read = {"source": "a source", "date": "2026-01-01", "version": "1.0", "result": "a result"}
+    assert problems(swap(routed, route="read", read=read)) == []
+    name, rank = routed["name"], designated["name"]
+    for changed, problem in (
+        (base[1:], f"no survey answer for ['{base[0]['name']}']"),
+        ([*base, {**base[0], "name": "not-a-member"}], "the survey answers for ['not-a-member']"),
+        ([*base, base[0]], f"the survey answers for {base[0]['name']} twice"),
+        (swap(routed, pinned="0.0.0-not-the-pin"), f"{name}: surveyed at"),
+        (swap(routed, surveyed="not a date"), f"{name}: no date"),
+        (swap(routed, route=None), f"{name}: not designated"),
+        (swap(routed, route_reason=None), f"{name}: not designated"),
+        (swap(routed, route_reason=" "), f"{name}: not designated"),
+        (swap(routed, route="read"), f"{name}: a read route must record"),
+        (swap(routed, route="read", read={**read, "result": None}), f"{name}: a read route"),
+        (swap(designated, route="highlight"), f"{rank}: a route is recorded"),
+        (swap(designated, carries="maybe"), f"{rank}: the answer 'maybe'"),
+        (swap(designated, projects=[]), f"{rank}: the answer 'yes' does not match"),
+        (swap(designated, projects=[{"name": "x"}]), f"{rank}: the answer 'yes' does not match"),
+        (swap(designated, evidence=None), f"{rank}: no evidence"),
+        (swap(designated, evidence_kind="hearsay"), f"{rank}: no evidence"),
+        # A guessed "no", resting on metadata that lists no file.
+        (swap(designated, carries="no", projects=[]), f"{rank}: project metadata cannot"),
+    ):
+        found = problems(changed)
+        assert any(line.startswith(problem) for line in found), (problem, found)
+    # The files behind an answer, on the tracked record: none named, another version's file, and
+    # a none-any answer that says a wheel carries or that names a file with another tag.
+    tagged = next(w for w in wheels if w["evidence_kind"] == component_readings.TAG_AND_LIST)
+    stem = tagged["name"]
+    unnamed, none_any = f"{stem}: the files read are not named", f"{stem}: a none-any answer"
+    for change, problem in (
+        ({"files_read": []}, unnamed),
+        ({"files_read": [{"file": f"{stem}-0.0.0-py3-none-any.whl"}]}, unnamed),
+        ({"carries": "yes", "projects": carried}, none_any),
+        ({"files_read": [{"file": f"{stem}-{tagged['pinned']}.tar.gz"}]}, none_any),
+    ):
+        found = problems([{**w, **change} if w is tagged else w for w in wheels])
+        assert any(line.startswith(problem) for line in found), (problem, found)
+    # A source-tree answer that names no source distribution, and a file-list answer that names
+    # one. Built from a tracked source-tree answer, so it holds with no file-list answer on record.
+    sourced = next(w for w in wheels if w["evidence_kind"] == component_readings.SOURCE_TREE)
+    only_wheels = [f for f in sourced["files_read"] if f["file"].endswith(".whl")]
+    assert only_wheels and len(only_wheels) < len(sourced["files_read"]), sourced["name"]
+    mismatch = f"{sourced['name']}: the files read do not match the evidence kind"
+    no_source: dict[str, Any] = {"files_read": only_wheels}
+    as_file_list: dict[str, Any] = {"evidence_kind": component_readings.FILE_LIST}
+    for kind_change in (no_source, as_file_list):
+        found = problems([{**w, **kind_change} if w is sourced else w for w in wheels])
+        assert any(line.startswith(mismatch) for line in found), (kind_change, found)
+    # Both changes together are a true file-list answer, which passes.
+    both = {**no_source, **as_file_list}
+    assert problems([{**w, **both} if w is sourced else w for w in wheels]) == []
+    # A source-tree answer that names no wheel, a file with no hash, a file whose version only
+    # starts with the pin, and a metadata answer that names a file it did not read.
+    stem, pin = sourced["name"], sourced["pinned"]
+    first = sourced["files_read"][0]
+    longer = {**first, "file": first["file"].replace(f"-{pin}-", f"-{pin}.1-", 1)}
+    assert longer != first, f"{first['file']} does not carry the pin {pin} as written"
+    sdists = [f for f in sourced["files_read"] if f not in only_wheels]
+    for files_change, problem in (
+        (sdists, f"{stem}: the files read do not match the evidence kind"),
+        ([{"file": first["file"]}, *sourced["files_read"][1:]], f"{stem}: a file read has no sha"),
+        ([longer, *sourced["files_read"][1:]], f"{stem}: the files read are not named, or not at"),
+    ):
+        found = problems([{**w, "files_read": files_change} if w is sourced else w for w in wheels])
+        assert any(line.startswith(problem) for line in found), (problem, found)
+    found = problems(swap(designated, files_read=only_wheels))
+    assert any(line.startswith(f"{rank}: a project-metadata answer names") for line in found)
+    # The names owed a route, by this module's own rule, follow the answer.
+    assert name in _owed_a_route({**survey, "wheels": base})
+    assert name not in _owed_a_route(survey)
+
+    # The page side. Each mutated survey is rendered into a copy of the page, which then agrees
+    # with that survey and disagrees with every other one.
+    assert _survey_page_drift(page, survey) == []
+    as_read = swap(routed, route="read", read=read)
+    for changed, table in ((base, "highlighted:"), (as_read, "read:")):
+        mutated = {**survey, "wheels": changed}
+        rendered = component_readings.render_page(page, data, mutated)
+        assert _survey_page_drift(rendered, mutated) == []
+        assert f"| `{name}` |" in _region(_SURVEY_HEADING, _EXTRA_NAMES, rendered)
+        drift = _survey_page_drift(page, mutated)
+        assert any(line.startswith(table) for line in drift), (table, drift)
+        assert component_readings.section_of(rendered) != component_readings.section_of(page)
+    # A row dropped from the first table moves no count, so only the names check can see it.
+    section = _region(_SURVEY_HEADING, _EXTRA_NAMES, page)
+    row = next(ln for ln in section.splitlines() if ln.startswith("| `"))
+    drift = _survey_page_drift(page.replace(row + "\n", "", 1), survey)
+    assert [line.partition(":")[0] for line in drift] == ["found"], drift
 
 
 def test_the_generator_reads_a_component_from_fake_replies() -> None:

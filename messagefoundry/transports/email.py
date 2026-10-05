@@ -69,7 +69,7 @@ from messagefoundry.config.tls_policy import (
     build_smtp_tls_context,
     smtp_login_approved,
 )
-from messagefoundry.controlchars import has_control_char
+from messagefoundry.controlchars import has_control_char, has_lone_surrogate
 from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
@@ -326,6 +326,10 @@ class EmailDestination(DestinationConnector):
             # send, where it dead-letters as an internal error. Refuse it here, at load.
             if _holds_control_char(value):
                 raise ValueError(f"Email destination '{name}' holds a control character")
+        # Why: has_lone_surrogate (vault BACKLOG #2842). The sender needs no such check: the address
+        # rule below already refuses any non-ASCII sender.
+        if has_lone_surrogate(self.subject):
+            raise ValueError("Email destination 'subject' holds a lone surrogate")
         # Each recipient gets the rule the [egress] check applies, held here too so no build path
         # that skips that check can put an unchecked mailbox on the RCPT line. The sender is MAIL
         # FROM, where bounces go, so it gets the same rule (vault BACKLOG #2841). The headers are

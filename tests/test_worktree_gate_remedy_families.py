@@ -13,6 +13,11 @@ that most often reaches this rule that command *throws*.
   header says so, and ``-Name`` cannot reach them either. That exclusion is deliberate: those are the
   trees a live session gets relocated into.
 
+* ``remove.ps1 -Path <abs path>`` is the checked route added under vault BACKLOG #1017. The gate prints
+  it only when the governed primary's ``remove.ps1`` declares ``-Path``. THE FIXTURE HERE HAS NO SCRIPTS,
+  so every test in this file drives the FALLBACK text, the one a primary that predates the route gets.
+  The text with the route in it is driven by ``tests/test_worktree_gate_removal_route.py``.
+
 Census on this clone 2026-08-06: 45 sibling worktrees, 8 Claude-managed, 4 other -- and all six live
 sessions sat in the 8. So the remedy failed for the population that actually hits the rule.
 
@@ -181,14 +186,22 @@ def test_the_remedy_rule_3d_prints_can_actually_reach_the_worktree(
         assert not re.search(r"pwsh[^\n]*remove\.ps1", remedy), (
             "remove.ps1 was offered as a command; -Name cannot resolve outside <primary>-<name>"
         )
-        # ...so the remedy must contain a literal git command, and it must NAME THE VICTIM, which is
-        # what distinguishes an offered route from the refusal quoting itself back.
+        # ...so the remedy must still name the act and NAME THE VICTIM, which is what distinguishes a
+        # route from the refusal quoting itself back.
+        #
+        # IN PROSE, NOT AS A COMMAND LINE, since vault BACKLOG #1017. This used to assert a literal
+        # `git -C ... worktree remove ...` line. That line is the very command this rule refuses, so
+        # a reader who ran it was refused again; the text now says the removal is the user's decision
+        # and names `git worktree remove` in a sentence. The command-line half is asserted absent.
         #
         # Separators folded on both sides: `git rev-parse --show-toplevel` returns FORWARD slashes on
         # Windows while pathlib renders backslashes, so a literal compare fails on a path that is
         # correct. Folding is the honest compare here -- it is the same path, differently spelled.
         assert re.search(r"worktree\s+remove", remedy), (
-            "a family neither script can reach still needs a runnable route"
+            "a family no script can reach must still be told what removes it"
+        )
+        assert not re.search(r"(?m)^\s{4,}git\s[^\n]*worktree\s+remove", remedy), (
+            "a raw `git worktree remove` was printed as a command; this rule refuses that command"
         )
         assert str(victim).replace("\\", "/").casefold() in remedy.replace("\\", "/").casefold(), (
             f"the route must NAME the victim, not leave it to be substituted: {victim}\n{remedy}"
@@ -226,8 +239,10 @@ def test_a_junction_spelling_of_a_sibling_fails_toward_the_universal_remedy(
     """The classifier's failure DIRECTION, pinned rather than asserted in a comment.
 
     A junction or UNC spelling can break the `<primary>-<name>` prefix match. That misclassifies a
-    sibling as 'other', and the 'other' remedy is a literal `git worktree remove <abs path>` -- valid for
-    every family, siblings included. So the failure costs a less idiomatic suggestion and nothing else.
+    sibling as 'other', and the 'other' remedy names the tree by its resolved path -- the checked
+    `remove.ps1 -Path` line where the primary has it, and in this fixture, which has no scripts, a
+    sentence saying the removal is the user's. So the failure costs the prune-merged.ps1 line and
+    nothing else.
 
     The dangerous direction is the opposite: a non-sibling classified AS sibling emits a `remove.ps1
     -Name` that throws. That needs a path to SPURIOUSLY match the prefix, which an unresolved junction
