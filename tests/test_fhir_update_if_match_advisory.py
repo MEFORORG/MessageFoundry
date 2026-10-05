@@ -108,13 +108,37 @@ def test_an_env_headers_table_is_named_with_the_reason(tmp_path: Path) -> None:
     assert note.startswith("its headers are an env() reference, which check does not resolve; ")
 
 
+def test_a_literal_header_named_env_is_not_an_env_reference(tmp_path: Path) -> None:
+    # `{"env": ...}` is the shape of a connections.toml reference. Here it is a real header table.
+    body = (
+        'outbound("OB", FHIR(url=_BASE, interaction="update", update_url_form="path",\n'
+        '         headers={"env": "prod"}))\n'
+    )
+    assert _read(tmp_path, body) == [("OB", "dynamic_headers is off, so no Handler can add one")]
+
+
+def test_the_set_is_a_subset_of_the_path_form_reader(tmp_path: Path) -> None:
+    from messagefoundry.config.wiring import path_form_fhir_updates
+
+    body = _PLAIN + (
+        'outbound("OB_ETAG", FHIR(url=_BASE, conditional="if-match", update_url_form="path"))\n'
+        'outbound("OB_A_PLAIN", FHIR(url=_BASE, interaction="update", update_url_form="path"))\n'
+    )
+    registry = load_config(_config(tmp_path, body))
+    named = [name for name, _ in path_form_fhir_updates_without_if_match(registry)]
+    assert named == ["OB_A_PLAIN", "OB_PLAIN"]  # sorted, as the path-form reader is
+    assert set(named) < set(path_form_fhir_updates(registry))
+
+
 def test_check_names_the_connection_and_says_both_limits(tmp_path: Path) -> None:
     body = _PLAIN + (
         'outbound("OB_ETAG", FHIR(url=_BASE, conditional="if-match", update_url_form="path"))\n'
     )
     r = _line(_config(tmp_path, body))
     assert r.ok and not r.required and not r.skipped and not r.blocking
-    assert r.detail.startswith("1 path-form FHIR update(s) declare no If-Match header: OB_PLAIN (")
+    assert r.detail.startswith(
+        "1 path-form FHIR update(s) have no If-Match that check can read: OB_PLAIN ("
+    )
     assert "OB_ETAG" not in r.detail
     assert "conditional='if-match', which needs meta.versionId" in r.detail
     assert "a static If-Match in headers" in r.detail
@@ -127,7 +151,7 @@ def test_check_says_none_out_loud(tmp_path: Path) -> None:
     body = 'outbound("OB", FHIR(url=_BASE, conditional="if-match", update_url_form="path"))\n'
     r = _line(_config(tmp_path, body))
     assert r.ok and not r.skipped
-    assert r.detail == "no path-form FHIR update is declared without an If-Match"
+    assert r.detail == "every path-form FHIR update declares an If-Match that check can read"
 
 
 def test_check_skips_rather_than_reporting_clean_on_an_unloadable_config(tmp_path: Path) -> None:

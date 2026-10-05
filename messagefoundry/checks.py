@@ -2482,7 +2482,7 @@ def _check_fhir_update_if_match(config_dir: str | Path) -> CheckResult:
             name,
             ok=True,
             required=False,
-            detail="no path-form FHIR update is declared without an If-Match",
+            detail="every path-form FHIR update declares an If-Match that check can read",
         )
     listed = "; ".join(f"{conn} ({note})" for conn, note in plain)
     return CheckResult(
@@ -2490,7 +2490,8 @@ def _check_fhir_update_if_match(config_dir: str | Path) -> CheckResult:
         ok=True,
         required=False,
         detail=(
-            f"{len(plain)} path-form FHIR update(s) declare no If-Match header: {listed}. A server "
+            f"{len(plain)} path-form FHIR update(s) have no If-Match that check can read: "
+            f"{listed}. A server "
             "that requires If-Match on update refuses such a request, and the message would "
             "dead-letter. Oracle Health documents that requirement on most of the resources it "
             "lets a client update (docs/CONNECTIONS.md, 'Vendor compatibility and the path-form "
@@ -2682,10 +2683,10 @@ def _check_oauth_request(config_dir: str | Path) -> CheckResult:
     register only a wildcard scope, and a server may document an audience that is not its endpoint.
     So the line reports and never refuses, under any ``[security].enforcement``.
 
-    **It says what it did not look at.** The reader compares literal values only, and an ``env()``
-    reference is unresolved here. A quiet line on such a configuration is not a clean one, so every
-    setting the reader could not compare is named. It states the clean case out loud, and SKIPs when
-    the graph will not load, the same convention as its siblings."""
+    **It says what it did not look at.** The reader compares literal string values only, and an
+    ``env()`` reference is unresolved here. A quiet line on such a configuration is not a clean one,
+    so every setting the reader could not compare is named. It states the clean case out loud, and
+    SKIPs when the graph will not load, the same convention as its siblings."""
     from messagefoundry.config.wiring import WiringError, load_config, oauth_request_advisories
 
     name = "oauth-request"
@@ -2700,20 +2701,20 @@ def _check_oauth_request(config_dir: str | Path) -> CheckResult:
         listed = "; ".join(f"{conn}: {reason}" for conn, reason in read.findings)
         detail = (
             f"{len(read.findings)} OAuth request setting(s) are worth a second look: {listed}. "
-            "A wildcard scope asks for everything in its namespace, so name the scopes the feed "
-            "uses. An audience that differs from its endpoint is correct only when the "
-            "authorization server documents that audience"
+            "Each can be a correct setup: a partner may register only a wildcard scope, and an "
+            "authorization server may document an audience that is not its endpoint. Confirm "
+            "each against what the partner registered"
         )
     else:
         detail = (
-            "no OAuth2 connection requests a wildcard scope, and no audience that could be compared "
-            "differs from its endpoint"
+            "no oauth2_scope contains a '*', and no audience that could be compared differs from "
+            "its endpoint"
         )
     if read.not_compared:
         skipped = "; ".join(f"{conn} ({reason})" for conn, reason in read.not_compared)
         detail += (
             f". NOT COMPARED: {len(read.not_compared)} setting(s), because check reads literal "
-            f"values and does not resolve env(): {skipped}"
+            f"string values and does not resolve env(): {skipped}"
         )
     return CheckResult(name, ok=True, required=False, detail=detail)
 

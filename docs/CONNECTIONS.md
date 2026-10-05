@@ -2331,11 +2331,9 @@ a generic partner — the `RS384` default below is SMART's own requirement, not 
 
 **If you stay on `with_oauth2_client_credentials(...)`**, its `auth_style` defaults to `"basic"`. The
 client id and secret then ride an `Authorization: Basic` header on every token request.
-`auth_style="post"` puts them in the form body. Both styles send the secret itself. `basic` stays the
-default for two reasons (vault BACKLOG #2206, decided 2026-10-04). RFC 6749 section 2.3.1 says an
-authorization server MUST support HTTP Basic for a client with a password, and that the form-body style
-is NOT RECOMMENDED. And a public-key style cannot be a default, because it needs a key only you can
-supply. So the stronger option above is a choice you make per connection.
+`auth_style="post"` puts them in the form body. Both styles send the secret itself, so the stronger
+option above is a choice you make per connection. Why `basic` stays the default is recorded once, in
+that function's docstring in `messagefoundry/transports/http_auth.py` (vault BACKLOG #2206).
 
 | `with_smart_backend(...)` arg | Default | Notes |
 |---|---|---|
@@ -2393,13 +2391,16 @@ take a working feed offline. It also stays quiet when a request is too *narrow* 
 question, and asking for a letter the server never registered fails the token request outright.
 
 **Wildcard scope and audience.** `check` also prints an advisory `oauth-request` line (vault BACKLOG
-#2334). It names three things, on both composers:
+#2334). It names three things:
 
-- a wildcard token in an `oauth2_scope`, such as `*` or `claims.*`. A named scope is never graded,
-  because that vocabulary belongs to your partner.
-- a `smart_audience` that is not the token URL.
-- an `oauth2_audience` that is a URL on a different scheme, host or port from the connection's `url`.
-  An audience that is not a URL is an opaque API identifier, and is never graded.
+- on `with_oauth2_client_credentials(...)`, a `scope` token that contains a `*`, such as `*` or
+  `claims.*`. A named scope is never graded, because that vocabulary belongs to your partner. It does
+  not read a SMART `scope`; the `smart-scope` line above does.
+- on `with_smart_backend(...)`, an `audience` that is not exactly the `token_url`. It is sent as
+  written, so letter case and a trailing slash count.
+- on `with_oauth2_client_credentials(...)`, an `audience` that is a URL on a different scheme, host or
+  port from the connection's `url`. An audience that is not a URL is an opaque API identifier, and is
+  never graded.
 
 Each of these can be a correct setup, so the line **never blocks**. It compares literal values only.
 `check` does not resolve `env()`, so the line also names every setting it could not compare. The

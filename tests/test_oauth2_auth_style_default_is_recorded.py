@@ -2,10 +2,13 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The OAuth2 client-credentials ``auth_style`` default and its record agree (vault BACKLOG #2206).
 
-The default stayed ``"basic"`` by decision, and the reasons are written in two places: the
-``with_oauth2_client_credentials`` docstring and ``docs/CONNECTIONS.md``. A record of a default goes
-stale the day the default moves, so this pins the three code sites to the two records. Changing the
-default without rewriting the record turns it red.
+The default stayed ``"basic"`` by decision. The reasons are written once, in the
+``with_oauth2_client_credentials`` docstring, and ``docs/CONNECTIONS.md`` states the default and
+points there. A record of a default goes stale the day the default moves, so this pins the three
+code sites to both. Changing the default without rewriting the record turns it red.
+
+It reads ``docs/CONNECTIONS.md``, so it is in ``DOC_GUARDS`` in ``.github/workflows/ci.yml`` and a
+docs-only pull request still runs it.
 """
 
 from __future__ import annotations
