@@ -25,10 +25,12 @@ from messagefoundry.anon import DEFAULT_RULES, FieldRule, SurrogateKind
 from messagefoundry.anon import anonymize as engine_anonymize
 from messagefoundry.anon import anonymize_checked as engine_anonymize_checked
 from messagefoundry.anon import leak as engine_leak
+from messagefoundry.anon.surrogates import normalized_message as engine_normalized
 from tee.__main__ import main as tee_main
 from tee.anon import anonymize as tee_anonymize
 from tee.anon import anonymize_checked as tee_anonymize_checked
 from tee.anon import leak as tee_leak
+from tee.anon.surrogates import normalized_message as tee_normalized
 from tee.store import RelayStore
 
 _SALT = "b193-salt-0123456789abcdef"
@@ -228,22 +230,62 @@ _BLANKS = pytest.mark.parametrize(
         _BASE + "\r  \rNK1|1|Q^Z",  # one in the middle
         _BASE + "\r\x1a",  # a trailing SUB
         _BASE + "\r\x00\x00",  # NUL padding
-        _BASE + "\rNK1|1|Q^Z  ",  # whitespace after the last field of the last line
     ],
-    ids=("trailing", "trailing-tab", "leading", "middle", "sub", "nul", "last-field"),
+    ids=("trailing", "trailing-tab", "leading", "middle", "sub", "nul"),
 )
 
 
 @_BLANKS
-def test_engine_and_tee_agree_on_blank_lines_and_trailing_whitespace(raw: str) -> None:
+def test_engine_and_tee_agree_on_blank_lines(raw: str) -> None:
     """Reproduced, then fixed. The engine's parser trims the message and the tee's splitter does
-    not, so a trailing ``"  "`` line survived on the tee only, and trailing spaces in the last
-    field gave the two a different surrogate. Both now see the same normalized text."""
+    not, so a trailing ``"  "`` line survived on the tee only. Both now drop a blank line."""
     engine = engine_anonymize(raw, salt=_SALT)
     tee = tee_anonymize(raw, salt=_SALT)
     assert engine == tee
     assert all(line.strip() for line in engine.split("\r"))  # no blank line is emitted
-    assert engine == engine.rstrip()
+
+
+@pytest.mark.parametrize("tail", ["  ", "\xc3\xa0", "\xc5\xa0", "\xc3\x85"], ids=repr)
+def test_the_end_of_the_last_field_is_not_trimmed(tail: str) -> None:
+    """The first cut of this fix right-trimmed the whole message. On a latin-1 capture, which is
+    what the tee reads, bytes 0xA0 and 0x85 are whitespace to Python, so the trim cut a UTF-8
+    character in half. It also gave one value a different surrogate at the end of a message than
+    in the middle. Review finding; the trim is gone, and the last field keeps its bytes."""
+    last = "\r".join((_HEADER, _PID, "ZPD|free" + tail))
+    middle = "\r".join((_HEADER, "ZPD|free" + tail, _PID))
+    for normalized in (engine_normalized, tee_normalized):
+        assert normalized(last).endswith("ZPD|free" + tail)
+    out_last = tee_anonymize(last, salt=_SALT).split("\r")
+    out_middle = tee_anonymize(middle, salt=_SALT).split("\r")
+    assert out_last[2] == out_middle[1] == "ZPD|free" + tail  # the same line, either place
+
+
+# --- review findings on the first cut ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize("header_id", ["MSH", "FHS", "BHS"])
+def test_a_bare_header_id_is_refused_on_both_sides(header_id: str) -> None:
+    """Each is a segment id every HL7 version defines, so the bare-id allowance let it through.
+    The engine's parser refuses a bare ``MSH`` and the tee emitted it, so the two disagreed. A
+    header segment carries the separators and cannot stand bare."""
+    raw = f"{_BASE}\r{header_id}"
+    for leak in (engine_leak, tee_leak):
+        assert leak.has_unreachable_line(raw)
+    for side in (engine_anonymize, tee_anonymize):
+        with pytest.raises(ValueError, match="a line no rule can reach"):
+            side(raw, salt=_SALT)
+    assert not engine_leak.has_unreachable_line(f"{_BASE}\rPV2")  # the control: PV2 still stands
+
+
+@pytest.mark.parametrize("version", ["2.²", "²", "2.5.٣", "2..1", "x"])
+def test_an_odd_hl7_version_never_raises_out_of_the_check(version: str) -> None:
+    """MSH-12 is untrusted. A superscript two passes ``str.isdigit`` and ``int`` then raises a
+    ``ValueError`` that quotes it, outside the adapters' body-free conversion. The version is
+    read as unknown instead, which widens the table to every version."""
+    raw = "\r".join((_HEADER.replace("2.5.1", version), _PID, "PV2"))
+    for leak in (engine_leak, tee_leak):
+        assert leak.known_segments(version) == leak.known_segments("")
+    assert engine_anonymize(raw, salt=_SALT) == tee_anonymize(raw, salt=_SALT)
 
 
 def test_a_blank_line_is_dropped_and_the_lines_around_it_are_kept() -> None:

@@ -122,7 +122,8 @@ def anonymize_checked(
     cause in its own right — the strict lever for a deployment that must not de-identify with the
     customer denylist unloaded. It defaults **off**: the structural detectors are the live backstop,
     and CI/OSS/fork runs legitimately have no token source. ``on_report`` receives the full
-    :class:`LeakReport` on both the clean and the refusing path (default: no emission).
+    :class:`LeakReport` on the clean path and on a leak-check refusal (default: no emission). It is
+    NOT called when :func:`anonymize` itself refuses the message with :class:`AnonError`.
 
     ``require_full_coverage`` (default off) refuses any present field that no rule scrubs and no
     ``anon.toml`` ``keep`` names, other than :data:`.leak.ALWAYS_DECIDED` (set ids, PID-8, PV1-2).

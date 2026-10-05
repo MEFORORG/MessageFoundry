@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import importlib
 from collections.abc import Callable
+from pathlib import Path
 from types import ModuleType
 from typing import Any
 
@@ -30,6 +31,14 @@ from tee.anon import anonymize as tee_anonymize
 from tee.anon import anonymize_checked as tee_anonymize_checked
 from tee.anon import leak as tee_leak
 from tee.anon.surrogates import normalized_message as tee_normalized
+
+# The engine leak-check loads scripts/security/scan_forbidden.py, which an installed wheel lacks.
+pytestmark = pytest.mark.skipif(
+    not (
+        Path(__file__).resolve().parents[1] / "scripts" / "security" / "scan_forbidden.py"
+    ).exists(),
+    reason="the engine leak-check needs scripts/security/scan_forbidden.py",
+)
 
 _SALT = "b193-salt-0123456789abcdef"
 _HEADER = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1"

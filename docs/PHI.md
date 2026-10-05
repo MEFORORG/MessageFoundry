@@ -1790,14 +1790,18 @@ lines.
 A bare id from a later HL7 version than MSH-12 names is refused too: `SFT` came in with 2.5, so a
 bare `SFT` in a 2.3 message is not an empty segment.
 
-A line holding only whitespace or control characters is dropped before anything else runs. So is
-whitespace at the very end of the message. The engine and the tee used to disagree on both.
+A line holding only whitespace or control characters is dropped before anything else runs. The
+engine and the tee used to disagree on one at the start or end of a message. They still differ on
+whitespace after the last field of the last line: the engine's parser trims it and the tee keeps
+it. A bare `MSH`, `FHS` or `BHS` line is refused; a header segment carries the separators.
 
 A second MSH line in capitals is checked, and its fields are numbered as MSH fields.
 
 **The coverage report is the record of those fields.** It lists the address of every present
-field that no rule mapped, never its value. A caller gets it through `on_report` on both paths, and
-inside the `LeakError` on a refusal. `python -m tee anonymize-captures` logs it at INFO once per
+field that no rule mapped, never its value. A caller gets it through `on_report` on the clean path
+and on a leak-check refusal, and inside the `LeakError`. A message the anonymizer refuses with
+`AnonError` (no parseable MSH, or a line no rule can reach) gets no report, and the
+`anonymize-captures` coverage line does not count it. `python -m tee anonymize-captures` logs it at INFO once per
 run, after it has checked the captures, with a count per address. A quieter `--log-level` does not
 hide it: the line is then printed plain to stderr. It says the denylist tables were live only when
 they loaded and passed the floor check on every message. Read that list before you share

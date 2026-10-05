@@ -88,7 +88,7 @@ def anonymize_checked(
     off) makes a non-live token source a refusal cause; ``require_full_coverage`` (default off)
     refuses any present field no rule scrubs and no ``keep`` names, other than set ids, PID-8 and
     PV1-2, and a kept field is still scanned; ``on_report`` receives the :class:`LeakReport`
-    on both paths. The error names token categories and field shapes/addresses only, never a value.
+    on the clean path and on a leak-check refusal, not when :func:`anonymize` raises :class:`AnonError`. The error names token categories and field shapes/addresses only, never a value.
     A clean return is not proof of PHI-free output: a name, an undashed number or a date in an
     unmapped field passes, so surface the ``on_report`` coverage on the clean path (BACKLOG #1710).
     """

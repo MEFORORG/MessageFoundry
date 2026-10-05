@@ -373,7 +373,10 @@ def normalized_message(raw: str, mapped_paths: tuple[str, ...] = ()) -> str:
     whitespace or control characters (NUL padding, a trailing SUB). Dropping them keeps the engine's
     parser from choking on a blank segment and keeps it byte-aligned with the tee's pure splitter.
     The engine's parser trims a leading or trailing whitespace-only line and the tee's splitter kept
-    it, so the two disagreed until both dropped it here (BACKLOG #2247).
+    it, so the two disagreed until both dropped it here (BACKLOG #2247). Whitespace after the last
+    field of the last line is NOT trimmed here: on a latin-1 capture that would cut a UTF-8
+    character ending in 0xA0 or 0x85 in half. The engine's parser still trims it, so the two
+    still differ on that input.
 
     Then REFUSE a message holding a line no rule can reach (BACKLOG #2246): one whose first field
     is not a segment id, or bare text that is not a segment id the message's HL7 version defines
@@ -392,7 +395,6 @@ def normalized_message(raw: str, mapped_paths: tuple[str, ...] = ()) -> str:
     text = "\r".join(
         seg for seg in text.split("\r") if not all(c.isspace() or not c.isprintable() for c in seg)
     )
-    text = text.rstrip()  # the engine's parser trims the message end; the tee's splitter does not
     if has_unreachable_line(text, mapped_paths):
         raise AnonError(
             "message has a line no rule can reach (a malformed segment id) — refusing to emit; "

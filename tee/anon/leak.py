@@ -212,7 +212,9 @@ _SEGMENT_TABLE_CHANGES: tuple[tuple[str, str, str], ...] = (
 
 def _version_key(version: str) -> tuple[int, ...] | None:
     parts = version.strip().split(".")
-    if not all(part.isdigit() for part in parts):
+    # ASCII digits only: a superscript two passes str.isdigit() and then int() raises on it,
+    # and MSH-12 is untrusted text that must not reach an error message (BACKLOG #2246).
+    if not all(part.isascii() and part.isdigit() for part in parts):
         return None
     return tuple(int(part) for part in parts)
 
@@ -243,6 +245,10 @@ def known_segments(version: str) -> frozenset[str]:
     return chosen if chosen is not None else _ANY_VERSION_SEGMENTS
 
 
+#: Header segments. Each carries its own separators, so none is ever a legal bare line.
+_HEADER_SEGMENTS: frozenset[str] = frozenset({"MSH", "FHS", "BHS"})
+
+
 def _line_is_malformed(fields: list[str], defined: frozenset[str] | set[str]) -> bool:
     """True if no rule can reach this line. Either its first field is not a well-formed segment
     id, or the line has no field separator and its text is not an id in ``defined``.
@@ -251,11 +257,12 @@ def _line_is_malformed(fields: list[str], defined: frozenset[str] | set[str]) ->
     alone. A bare ``LEE`` or ``ZOE`` is three letters of untrusted text that no rule can address,
     so it is malformed. ``defined`` is the ids the message's HL7 version defines plus the ids a
     rule names, so a bare ``ZPD`` is an empty segment only when a rule names ``ZPD``. A Z-prefix
-    alone does not count (BACKLOG #2247)."""
+    alone does not count (BACKLOG #2247). A header id (``MSH``, ``FHS``, ``BHS``) never stands
+    bare: it carries the separators, and the engine's parser refuses one that the tee would emit."""
     seg_id = fields[0]
     if not _SEGMENT_ID.fullmatch(seg_id):
         return True
-    return len(fields) == 1 and seg_id not in defined
+    return len(fields) == 1 and (seg_id not in defined or seg_id in _HEADER_SEGMENTS)
 
 
 def unmapped_field_values(text: str, mapped_paths: set[str]) -> list[tuple[str, str]]:
