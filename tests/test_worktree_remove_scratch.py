@@ -98,10 +98,22 @@ def _kernel32() -> ctypes.CDLL:
     return k32
 
 
-def _stamp(path: Path, when: float, created: float | None = None) -> None:
+#: A FILETIME past the year 9999. Windows stores it; no .NET DateTime can hold it.
+UNREADABLE_TICKS = 0x7FFF000000000000
+
+
+def _stamp(
+    path: Path,
+    when: float,
+    created: float | None = None,
+    *,
+    created_ticks: int | None = None,
+    written_ticks: int | None = None,
+) -> None:
     """Set creation, access and write time of ONE entry, never through a reparse point.
 
-    ``created`` sets a creation time that differs from the other two.
+    ``created`` sets a creation time that differs from the other two. The two ``_ticks`` arguments
+    set a raw FILETIME, for a stamp that no Unix time can express.
     """
     if sys.platform != "win32":
         raise RuntimeError("Windows only")
@@ -114,9 +126,14 @@ def _stamp(path: Path, when: float, created: float | None = None) -> None:
     try:
         born = when if created is None else created
         made = ctypes.c_ulonglong(int(born * 10_000_000) + _FILETIME_EPOCH)
-        ticks = ctypes.c_ulonglong(int(when * 10_000_000) + _FILETIME_EPOCH)
-        ref = ctypes.byref(ticks)
-        if not k32.SetFileTime(handle, ctypes.byref(made), ref, ref):
+        seen = ctypes.c_ulonglong(int(when * 10_000_000) + _FILETIME_EPOCH)
+        wrote = ctypes.c_ulonglong(seen.value)
+        if created_ticks is not None:
+            made = ctypes.c_ulonglong(created_ticks)
+        if written_ticks is not None:
+            wrote = ctypes.c_ulonglong(written_ticks)
+        refs = [ctypes.byref(made), ctypes.byref(seen), ctypes.byref(wrote)]
+        if not k32.SetFileTime(handle, *refs):
             raise ctypes.WinError(ctypes.get_last_error())
     finally:
         k32.CloseHandle(handle)
@@ -306,8 +323,9 @@ class Rig:
         env: dict[str, str] | None = None,
         temp_root: Path | str | None = None,
         config_root: Path | str | None = None,
+        script: Path | None = None,
     ) -> Result:
-        argv = ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(SCRIPT)]
+        argv = ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(script or SCRIPT)]
         root = self.root if temp_root is None else temp_root
         if root != "":
             argv += ["-TempRoot", str(root)]
@@ -378,7 +396,7 @@ def test_a_dry_run_is_the_default_and_changes_nothing(rig: Rig) -> None:
 def test_delete_removes_the_tree_and_leaves_no_renamed_folder(rig: Rig) -> None:
     rig.caller()
     victim = rig.tree(rig.root / "victim")
-    os.chmod(victim / "a.txt", 0o444)  # a read-only file must not stop the delete
+    os.chmod(victim / "a.txt", stat.S_IREAD)  # a read-only file must not stop the delete
     keep = rig.tree(rig.root / "keep")
 
     # Forward slashes are accepted.
@@ -943,6 +961,32 @@ def test_IdleMinutes_raises_a_window_and_never_lowers_one(rig: Rig) -> None:
     r.deleted(own_30)
 
 
+@pytest.mark.parametrize("which", ["write time", "creation time", "the folder itself"])
+def test_a_stamp_that_cannot_be_read_refuses_the_target(rig: Rig, which: str) -> None:
+    """A time past the year 9999 reads as nothing in PowerShell, and nothing is not "old"."""
+    rig.caller()
+    victim = rig.tree(rig.root / "victim")
+    control = rig.tree(rig.root / "control")
+    old = time.time() - 36000
+    if which == "write time":
+        marked = victim / "sub" / "b.bin"
+        _stamp(marked, old, written_ticks=UNREADABLE_TICKS)
+    elif which == "creation time":
+        marked = victim / "sub" / "b.bin"
+        _stamp(marked, old, created_ticks=UNREADABLE_TICKS)
+    else:
+        marked = victim
+        _stamp(marked, old, written_ticks=UNREADABLE_TICKS)
+
+    r = rig.run(victim, control)
+
+    assert r.code == 1, r.out
+    b = r.refused(victim, "idle", "could not be read, so the tree cannot be shown idle")
+    assert f"'{marked}'" in b.receipt["idle"], r.out
+    r.deleted(control)
+    assert _snapshot(victim) == ["a.txt [5]", "sub", "sub\\b.bin [7]"]
+
+
 # --- rule 9: the rename, and a delete that stops part-way ---------------------------------------
 
 
@@ -1007,3 +1051,101 @@ def test_a_delete_that_stops_part_way_lists_exactly_what_remains(rig: Rig) -> No
         for entry in _entries(rig.root):
             if entry.name == "stuck.":
                 os.unlink(_literal(entry))
+
+
+# --- a check or a delete that throws -------------------------------------------------------------
+#
+# Nothing in the script throws on demand, so these three tests plant one line in a COPY of it. The
+# copy lives in a throwaway repository under tmp_path, because the script lists the worktrees of the
+# repository it sits in. The real script is never written to.
+
+_AFTER_SPELLING = "    $receipt['spelling'] = 'PASS plain drive-absolute path'"
+_DELETE_ENTRY = (
+    "function Remove-TreeNoFollow([string]$Dir, "
+    "[System.Collections.Generic.List[string]]$Failures) {"
+)
+
+
+def _planted_copy(base: Path, anchor: str, planted: str) -> Path:
+    """A copy of the script with ``planted`` as a new line directly under the line ``anchor``."""
+    repo = base / "copy"
+    for rel in (
+        "scripts/worktree/remove-scratch.ps1",
+        "scripts/coord/occupancy.ps1",
+        "scripts/coord/session-registry.ps1",
+    ):
+        (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(_REPO / rel, repo / rel)
+    subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True, text=True)
+    script = repo / "scripts" / "worktree" / "remove-scratch.ps1"
+    text = script.read_text(encoding="utf-8")
+    assert text.count(anchor) == 1, f"the anchor line matched {text.count(anchor)} times"
+    script.write_text(text.replace(anchor, f"{anchor}\n{planted}"), encoding="utf-8")
+    return script
+
+
+def test_a_check_that_throws_refuses_its_own_target_and_the_run_goes_on(rig: Rig) -> None:
+    rig.caller()
+    boom = rig.tree(rig.root / "boom")
+    control = rig.tree(rig.root / "control")
+    script = _planted_copy(
+        rig.base, _AFTER_SPELLING, "    if ($Raw -like '*boom') { throw 'planted failure' }"
+    )
+
+    r = rig.run(boom, control, script=script)
+
+    assert r.code == 1, r.out
+    b = r.block(boom)
+    assert b.refused_by() == ["error"], r.out
+    assert "planted failure" in b.receipt["error"], r.out
+    assert b.verdict.endswith("Nothing was deleted."), r.out
+    r.deleted(control)
+    assert "targets=2 deleted=1 would-delete=0 refused=1 partial=0" in r.summary, r.out
+    assert _snapshot(boom) == ["a.txt [5]", "sub", "sub\\b.bin [7]"]
+
+
+def test_a_delete_that_throws_after_the_rename_still_says_where_the_tree_went(rig: Rig) -> None:
+    rig.caller()
+    boom = rig.tree(rig.root / "boom")
+    control = rig.tree(rig.root / "control")
+    script = _planted_copy(
+        rig.base,
+        _DELETE_ENTRY,
+        "    if ($Dir -like '*boom.removing-*') { throw 'planted delete failure' }",
+    )
+
+    r = rig.run(boom, control, script=script)
+
+    assert r.code == 3, r.out
+    b = r.block(boom)
+    left = [p for p in rig.root.iterdir() if p.name.startswith("boom")]
+    assert len(left) == 1 and re.fullmatch(r"boom\.removing-[0-9a-f]{8}", left[0].name), left
+    tomb = left[0]
+    assert b.verdict.startswith(f"PARTIAL {boom}: the delete stopped part-way"), r.out
+    assert f"renamed to '{tomb}' and 3 entries remain" in b.verdict, r.out
+    assert "failed: the delete threw: planted delete failure" in b.extra, r.out
+    remains = sorted(line[len("remains: ") :] for line in b.extra if line.startswith("remains: "))
+    assert remains == [str(tomb / "a.txt"), str(tomb / "sub"), str(tomb / "sub" / "b.bin")], r.out
+    assert _snapshot(tomb) == ["a.txt [5]", "sub", "sub\\b.bin [7]"]
+    r.deleted(control)
+    assert "targets=2 deleted=1 would-delete=0 refused=0 partial=1" in r.summary, r.out
+
+
+def test_a_delete_that_records_a_failure_is_never_reported_as_deleted(rig: Rig) -> None:
+    rig.caller()
+    ghost = rig.tree(rig.root / "ghost")
+    # The delete finishes and the folder is gone, but one failure was recorded on the way.
+    script = _planted_copy(
+        rig.base,
+        _DELETE_ENTRY,
+        "    if ($Dir -like '*ghost.removing-????????') { $Failures.Add('planted failure note') }",
+    )
+
+    r = rig.run(ghost, script=script)
+
+    assert r.code == 3, r.out
+    b = r.block(ghost)
+    assert b.verdict.startswith(f"PARTIAL {ghost}: the delete stopped part-way"), r.out
+    assert "failed: planted failure note" in b.extra, r.out
+    assert "deleted=0" in r.summary and "partial=1" in r.summary, r.out
+    assert list(rig.root.iterdir()) == []

@@ -1582,7 +1582,9 @@ session family, and the caller cannot list its own workers. That is why its own 
 waits ten minutes.
 
 `-IdleMinutes` can raise a window. It can never lower one. The idle check reads creation time as
-well as write time, because a copied or extracted tree keeps old write times.
+well as write time, because a copied or extracted tree keeps old write times. A stamp in the future
+refuses. So does a stamp the script cannot read at all, such as a time past the year 9999: an
+unreadable stamp is not an old one.
 
 ### What it cannot see
 
@@ -1592,7 +1594,8 @@ It cannot see at least these. Say them wherever you recommend the script.
   `mkdtemp` folder and another program's working folder look the same. Only the 60-minute window and
   the rename protect them. A program that keeps old files and holds none open can lose them.
 - **A session that only reads a folder.** Reading leaves no creation or write stamp, and no open
-  handle between reads. A tree somebody has been reading for over an hour can go.
+  handle between reads. A tree somebody is still reading can go once its window has passed: an
+  hour, or ten minutes inside the caller's own scratchpad.
 - A session that never registered.
 - A child session with no registry record of its own. The caller walk passes over it and stops at
   its nearest registered ancestor, so the script judges it as that ancestor.

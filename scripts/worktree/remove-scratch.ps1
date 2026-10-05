@@ -63,8 +63,8 @@
       idle        Nothing in the tree was created or modified inside a window: 10 minutes for the
                   caller's own scratchpad, 60 minutes for everything else under the temp root.
                   Creation time counts as well as write time, because an extracted or copied tree
-                  keeps old write times. A stamp in the future refuses. -IdleMinutes can raise a
-                  window and never lower it.
+                  keeps old write times. A stamp in the future refuses, and so does a stamp that
+                  cannot be read at all. -IdleMinutes can raise a window and never lower it.
       in-use      -Delete only. The folder is renamed to <name>.removing-<id> before anything is
                   deleted. Windows refuses that rename while any process holds a handle anywhere in
                   the tree, so a refusal here changes nothing on disk.
@@ -85,7 +85,8 @@
       * A session that never registered, and a session that writes into the target by absolute path
         from a working directory somewhere else. occupancy.ps1 says the same of every cwd-keyed fence.
       * A session that only READS a folder. Reading leaves no creation or write stamp, and no open
-        handle between reads, so a tree somebody has been reading for over an hour can go.
+        handle between reads, so a tree somebody is still reading can go once its window has passed:
+        an hour, or ten minutes inside the caller's own scratchpad.
       * A child session with no registry record of its own. The caller walk passes over it and stops
         at its nearest registered ancestor, so it is judged as that ancestor.
       * A hard link. Deleting one name leaves the file's other names alone.
@@ -201,16 +202,33 @@ function Test-BareShape([string[]]$Names) {
     return (($Names -contains 'HEAD') -and ($Names -contains 'objects') -and ($Names -contains 'refs'))
 }
 
+# The later of an entry's creation and write time, or $null when either one cannot be read.
+#
+# A STAMP THAT CANNOT BE READ IS NOT AN OLD STAMP. Windows stores times no [datetime] can hold (past
+# the year 9999). PowerShell then returns $null from the property and raises nothing, and $null
+# compares as older than every date. Reading it that way let a file stamped far in the future pass
+# the idle check, measured 2026-10-04 with FILETIME 0x7FFF000000000000. So the caller refuses on $null.
+function Get-NewerStamp($Entry) {
+    $made = $null
+    $written = $null
+    try { $made = $Entry.CreationTimeUtc; $written = $Entry.LastWriteTimeUtc } catch { return $null }
+    if (($made -isnot [datetime]) -or ($written -isnot [datetime])) { return $null }
+    if ($made -gt $written) { return $made }
+    return $written
+}
+
 # Measure a tree without ever following a reparse point. It walks EVERYTHING it may enter, so each of
-# the three fault fields is the whole answer for its own check: WalkFault (a directory could not be
-# listed), ReparseFault (the first reparse point inside), GitFault (the first git shape inside).
+# the four fault fields is the whole answer for its own check: WalkFault (a directory could not be
+# listed), ReparseFault (the first reparse point inside), GitFault (the first git shape inside),
+# StampFault (the first entry whose creation or write time could not be read).
 function Measure-Tree([string]$Root) {
     $r = @{
-        WalkFault = ''; ReparseFault = ''; GitFault = ''
+        WalkFault = ''; ReparseFault = ''; GitFault = ''; StampFault = ''
         Files = 0; Dirs = 0; Bytes = [long]0; Newest = [datetime]::MinValue; NewestPath = ''
     }
-    $top = [IO.DirectoryInfo]::new($Root)
-    $r.Newest = if ($top.CreationTimeUtc -gt $top.LastWriteTimeUtc) { $top.CreationTimeUtc } else { $top.LastWriteTimeUtc }
+    $stamp = Get-NewerStamp ([IO.DirectoryInfo]::new($Root))
+    if ($null -eq $stamp) { $r.StampFault = "the creation or write time of '$Root' could not be read" }
+    else { $r.Newest = $stamp }
     $r.NewestPath = $Root
     $stack = [System.Collections.Generic.Stack[string]]::new()
     $stack.Push($Root)
@@ -228,8 +246,11 @@ function Measure-Tree([string]$Root) {
                 continue
             }
             if (($e.Name -ieq '.git') -and -not $r.GitFault) { $r.GitFault = "'$($e.FullName)' is a git entry inside the tree" }
-            $stamp = if ($e.CreationTimeUtc -gt $e.LastWriteTimeUtc) { $e.CreationTimeUtc } else { $e.LastWriteTimeUtc }
-            if ($stamp -gt $r.Newest) { $r.Newest = $stamp; $r.NewestPath = $e.FullName }
+            $stamp = Get-NewerStamp $e
+            if ($null -eq $stamp) {
+                if (-not $r.StampFault) { $r.StampFault = "the creation or write time of '$($e.FullName)' could not be read" }
+            }
+            elseif ($stamp -gt $r.Newest) { $r.Newest = $stamp; $r.NewestPath = $e.FullName }
             if ($e.Attributes -band $DirectoryFlag) { $r.Dirs++; $stack.Push($e.FullName) }
             else { $r.Files++; $r.Bytes += $e.Length }
         }
@@ -545,6 +566,7 @@ function Invoke-Checks([string]$Raw, $receipt, $out) {
     $receipt['sessions'] = "PASS $sessionNote"
 
     if ($IdleMinutes -gt $window) { $window = $IdleMinutes }
+    if ($tree.StampFault) { Fail 'idle' "$($tree.StampFault), so the tree cannot be shown idle"; return }
     $age = ([datetime]::UtcNow - $tree.Newest).TotalMinutes
     if ($age -lt $window) {
         $ageText = if ($age -lt 0) { 'in the future' } else { "$([int][Math]::Floor($age)) minute(s) ago" }
@@ -598,13 +620,16 @@ foreach ($raw in $Path) {
         if ($renamed) {
             $receipt['in-use'] = "PASS renamed to '$tomb' with no handle open inside"
             # Past the rename a throw must still end in a verdict that says where the tree went.
-            $gone = $false
-            try {
-                Remove-TreeNoFollow $tomb $failures
-                $gone = -not [IO.Directory]::Exists($tomb)
-                if (-not $gone) { $remains = @(Get-Remains $tomb) }
-            }
+            try { Remove-TreeNoFollow $tomb $failures }
             catch { $failures.Add("the delete threw: $($_.Exception.Message)") }
+            # DELETED needs BOTH: nothing failed, and the folder is gone. Exists alone answers false
+            # on any probe error, and a failure that left nothing behind is still not a clean delete.
+            $gone = ($failures.Count -eq 0) -and -not [IO.Directory]::Exists($tomb)
+            # What remains is listed whether or not the delete threw: a throw is when it matters most.
+            if (-not $gone) {
+                try { $remains = @(Get-Remains $tomb) }
+                catch { $failures.Add("what remains could not be listed: $($_.Exception.Message)") }
+            }
             if (-not $gone) {
                 $verdict = "PARTIAL $($res.Full): the delete stopped part-way. The tree was renamed to '$tomb' and $($remains.Count) entr$(if ($remains.Count -eq 1) { 'y remains' } else { 'ies remain' }) under it."
                 $counts.partial++
