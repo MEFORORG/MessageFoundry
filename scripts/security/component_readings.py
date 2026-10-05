@@ -739,7 +739,8 @@ def survey_problems(
                 problems.append(f"{name}: no answer for {form} that is one of {CARRIES}")
                 continue
             if (said == "yes") != bool(named) or not all(
-                _said(p.get("name")) and _said(p.get("version")) for p in named
+                isinstance(p, Mapping) and _said(p.get("name")) and _said(p.get("version"))
+                for p in named
             ):
                 problems.append(f"{name}: the {form} answer {said!r} does not match the projects")
             if not _said(answer.get("evidence")):
@@ -770,10 +771,11 @@ _FORM_WORDS = {"compiled": "compiled code", "source": "source code", "data": "da
 SURVEY_CRITERION = (
     "**This page's criterion.** A wheel that is not designated is owed a route when it carries "
     "another project's code, compiled or source. A wheel that carries only another project's "
-    "data is listed below with what it carries. It is owed no route, because data is read and "
-    "not run. That line is this page's choice, and a reader can draw it elsewhere: data still "
-    "decides things, as a list of root certificates decides what is trusted. A wheel whose "
-    "answer is not established, for any form, is treated as carrying code."
+    "data is listed below with what it carries. It is owed no route, because data holds another "
+    "project's tables and none of its logic. That holds where the tables are kept as generated "
+    "Python modules too. That line is this page's choice, and a reader can draw it elsewhere: "
+    "data still decides things, as a list of root certificates decides what is trusted. A wheel "
+    "whose answer is not established, for any form, is treated as carrying code."
 )
 
 
@@ -807,7 +809,10 @@ def _form_evidence(wheel: Mapping[str, Any], form: str) -> str:
 def survey_counts(wheels: Iterable[Mapping[str, Any]], form: str) -> str:
     """The page's count sentence for one form, with its arithmetic."""
     said = [form_answer(w, form).get("carries") for w in wheels]
-    yes, no, unknown = (said.count(answer) for answer in CARRIES)
+    # Anything that is not a plain yes or no counts as not established, a missing answer too, so
+    # the arithmetic printed is always true.
+    yes, no = said.count("yes"), said.count("no")
+    unknown = len(said) - yes - no
     return (
         f"**Carries another project's {_FORM_WORDS[form]}: {yes} of {len(said)}. Does not: {no}. "
         f"Not established: {unknown}. {yes} plus {no} plus {unknown} is {len(said)}.**"
@@ -819,7 +824,8 @@ def _render_survey(survey: Mapping[str, Any], labels: Mapping[str, str]) -> list
     wheels = sorted(survey["wheels"], key=lambda w: str(w["name"]))
     size = len(wheels)
     routed = [w for w in wheels if _needs_route(w, labels)]
-    control = survey.get("control") or {}
+    control = survey.get("control")
+    control = control if isinstance(control, Mapping) else {}
 
     def route(wheel: Mapping[str, Any]) -> str:
         if wheel["name"] in labels:
@@ -865,16 +871,22 @@ def _render_survey(survey: Mapping[str, Any], labels: Mapping[str, str]) -> list
         names = [
             f"`{w['name']}`"
             for w in wheels
-            if not carries_anything(w) and w.get("evidence_kind") == kind
+            if w.get("carries") == "no" and w.get("evidence_kind") == kind
         ]
         if names:
             out += [
                 "",
                 _count(len(names), "wheel was", "wheels were")
-                + f" found to carry none, in any form. The compiled answer rests on the {kind}: "
+                + f" found to carry no compiled code, on the evidence of the {kind}: "
                 + ", ".join(names)
                 + ".",
             ]
+    clear = sum(not carries_anything(w) for w in wheels)
+    out += [
+        "",
+        _count(clear, "wheel has", "wheels have")
+        + " no row in the table: nothing from another project was found in any form.",
+    ]
     data_only = [
         w for w in wheels if not carries_code(w) and form_answer(w, "data").get("carries") == "yes"
     ]
@@ -908,8 +920,9 @@ def _render_survey(survey: Mapping[str, Any], labels: Mapping[str, str]) -> list
         "search looked for a vendoring directory, a top-level name beyond the project's own, a "
         "licence file named for another project, and large data files. It reads names, sizes "
         "and marked text. So it can miss a copy kept under an ordinary name inside a wheel's own "
-        f"package. As a control, the same search was run over `{control.get('file')}`, a wheel "
-        f"known to vendor source. It fired on `{control.get('fired_on')}`.",
+        "package. As a control, the same search was run over "
+        f"`{control.get('file', 'not recorded')}`, a wheel known to vendor source. It fired on "
+        f"`{control.get('fired_on', 'not recorded')}`.",
     ]
     # The two kinds of evidence that fall short of the paragraphs above, each naming its wheels.
     for kind, lead, rests_on in (

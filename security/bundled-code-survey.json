@@ -755,11 +755,11 @@
         "carries": "yes",
         "projects": [
           {
-            "name": "The project's own 1.x line, pydantic",
+            "name": "pydantic 1.x, a separately released line of the same project,",
             "version": "1.10.26"
           }
         ],
-        "evidence": "The wheel's 111 files were listed again. The directory `pydantic/v1` holds 27 files, a copy of the project's own 1.x line, and its `version.py` gives 1.10.26. That line is released separately on PyPI under the same name. An advisory against it would be filed under version numbers below 2, which the pinned 2.13.5 is not. One file in that copy, `datetime_parse.py`, says it was taken from Django. The one top-level name is `pydantic`, no other directory has a vendoring name, and no licence file is named for another project."
+        "evidence": "The wheel's 111 files were listed again. The directory `pydantic/v1` holds 27 files, a copy of the project's own 1.x line, and its `version.py` gives 1.10.26. That line is released separately on PyPI under the same name. An advisory against that line names `pydantic`, at version numbers below 2. It is counted here because it is a second, separately released copy inside the wheel. One file in that copy, `datetime_parse.py`, says it was taken from Django. The one top-level name is `pydantic`, no other directory has a vendoring name, and no licence file is named for another project."
       },
       "data": {
         "carries": "no",
@@ -1199,7 +1199,7 @@
             "version": "2026d"
           }
         ],
-        "evidence": "The wheel's 633 files were listed again. 605 of them are compiled time zone files under `tzdata/zoneinfo`, beside `tzdata.zi` and four `.tab` tables. `tzdata/__init__.py` gives `IANA_VERSION` as 2026d, and `tzdata.zi` opens with the same version."
+        "evidence": "The wheel's 633 files were listed again. 598 of them are compiled time zone files under `tzdata/zoneinfo`, each opening with the `TZif` signature, beside `tzdata.zi` and four `.tab` tables. `tzdata/__init__.py` gives `IANA_VERSION` as 2026d, and `tzdata.zi` opens with the same version."
       },
       "route": null,
       "route_reason": null,

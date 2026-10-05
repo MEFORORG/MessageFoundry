@@ -1180,7 +1180,7 @@ _CRITERION = (
     "A wheel that is not designated is owed a route when it carries another project's code, "
     "compiled or source.",
     "A wheel that carries only another project's data is listed below with what it carries.",
-    "It is owed no route, because data is read and not run.",
+    "It is owed no route, because data holds another project's tables and none of its logic.",
     "A wheel whose answer is not established, for any form, is treated as carrying code.",
 )
 
@@ -1225,7 +1225,8 @@ def _survey_page_drift(page: str, survey: dict[str, Any]) -> list[str]:
     problems = []
     for form, words in _FORMS.items():
         said = [_said(w, form) for w in wheels]
-        yes, no, unknown = (said.count(a) for a in component_readings.CARRIES)
+        yes, no = said.count("yes"), said.count("no")
+        unknown = size - yes - no
         sentence = (
             f"**Carries another project's {words}: {yes} of {size}. Does not: {no}. "
             f"Not established: {unknown}. {yes} plus {no} plus {unknown} is {size}.**"
@@ -1449,7 +1450,7 @@ def test_the_survey_checks_can_fail() -> None:
     # Data alone owes no route and takes none. Code in source form owes one, and takes it.
     assert one({"data": yes}) == []
     assert one({"source": yes, **reason}) == []
-    for change, problem in (
+    for form_change, problem in (
         ({"source": None}, f"{name}: no answer for source"),
         ({"data": {**yes, "carries": "maybe"}}, f"{name}: no answer for data"),
         ({"source": {**yes, "projects": []}}, f"{name}: the source answer 'yes' does not match"),
@@ -1463,7 +1464,7 @@ def test_the_survey_checks_can_fail() -> None:
         # A route on a wheel that carries only data.
         ({"data": yes, **reason}, f"{name}: a route is recorded"),
     ):
-        found = one(change)
+        found = one(form_change)
         assert any(line.startswith(problem) for line in found), (problem, found)
     # A guessed "no" for a form, on a wheel nobody listed.
     guessed = problems(swap(routed, source={**unknown, "carries": "no"}))
@@ -1494,11 +1495,11 @@ def test_the_survey_checks_can_fail() -> None:
         assert component_readings.section_of(rendered) != component_readings.section_of(page)
     # A wheel that carries only data, and one that carries source: each is rendered into a copy of
     # the page, and the tracked page then lacks its row, its count and its place in the data list.
-    for change, wanted in (
+    for page_change, wanted in (
         ({"data": yes}, {"the page does not state", "found", "row", "data only"}),
         ({"source": yes, **reason}, {"the page does not state", "found", "row", "highlighted"}),
     ):
-        mutated = {**survey, "wheels": [{**w, **change} if w is plain else w for w in wheels]}
+        mutated = {**survey, "wheels": [{**w, **page_change} if w is plain else w for w in wheels]}
         rendered = component_readings.render_page(page, data, mutated)
         assert _survey_page_drift(rendered, mutated) == []
         drift = _survey_page_drift(page, mutated)
@@ -1512,16 +1513,36 @@ def test_the_survey_checks_can_fail() -> None:
     drift = _survey_page_drift(page.replace(rows[0] + "\n", "", 1), survey)
     assert {line.partition(":")[0] for line in drift} <= {"found", "row"} and drift, drift
     # A wheel with more than one row keeps its name when one row goes, so only the row check sees.
-    names = [row.split("`")[1] for row in rows]
-    twice = next(row for row in rows if names.count(row.split("`")[1]) > 1)
-    drift = _survey_page_drift(page.replace(twice + "\n", "", 1), survey)
+    # The wheel is built here, so this holds when no tracked wheel has more than one row.
+    two = {"source": yes, "data": yes, **reason}
+    mutated = {**survey, "wheels": [{**w, **two} if w is plain else w for w in wheels]}
+    rendered = component_readings.render_page(page, data, mutated)
+    row = f"| `{name}` | {plain['pinned']} | data |"
+    kept = [ln for ln in rendered.splitlines() if not ln.startswith(row)]
+    assert len(kept) == len(rendered.splitlines()) - 1, row
+    drift = _survey_page_drift("\n".join(kept), mutated)
     assert [line.partition(":")[0] for line in drift] == ["row"], drift
     # The criterion, stated once: dropped, and reversed.
     assert _CRITERION[2] in " ".join(section.split())
-    for edit in ("", "It is owed a route all the same."):
-        drift = _survey_page_drift(
-            page.replace("because data is read and not run.", edit, 1), survey
-        )
+    # The page wraps its lines, so the sentence is matched across any white space.
+    words = [
+        "It",
+        "is",
+        "owed",
+        "no",
+        "route,",
+        "because",
+        "data",
+        "holds",
+        "another",
+        "project's",
+        "tables",
+    ]
+    sentence = re.compile(r"\s+".join(re.escape(word) for word in words))
+    for edit in ("", "It is owed a route all the same, though data holds another project's tables"):
+        edited = sentence.sub(edit, page, count=1)
+        assert edited != page, "the criterion sentence was not found on the page"
+        drift = _survey_page_drift(edited, survey)
         assert [line.partition(":")[0] for line in drift] == ["criterion"], drift
 
 

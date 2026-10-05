@@ -417,7 +417,8 @@ does not repeat it.
 
 **This page's criterion.** A wheel that is not designated is owed a route when it carries another
 project's code, compiled or source. A wheel that carries only another project's data is listed below
-with what it carries. It is owed no route, because data is read and not run. That line is this
+with what it carries. It is owed no route, because data holds another project's tables and none of
+its logic. That holds where the tables are kept as generated Python modules too. That line is this
 page's choice, and a reader can draw it elsewhere: data still decides things, as a list of root
 certificates decides what is trusted. A wheel whose answer is not established, for any form, is
 treated as carrying code.
@@ -443,7 +444,7 @@ The table has one row for each wheel and form where the answer is not a plain no
 | `httptools` | 0.8.0 | compiled code | llhttp 9.4.1; http-parser 2.9.4 | wheel file list and source tree | designated, tier 3 |
 | `idna` | 3.20 | data | IDNA and UTS 46 mapping tables, Unicode 18.0.0 | wheel file list | designated, tier 3 |
 | `ldap3` | 2.9.1 | data | Directory server schemas (Active Directory 2012 R2, 389 Directory Server, eDirectory 8.8.8 and 9.1.4, OpenLDAP slapd 2.4), versions as the file names give them | wheel file list | designated, tier 2 |
-| `pydantic` | 2.13.5 | source code | The project's own 1.x line, pydantic 1.10.26 | wheel file list | designated, tier 1 |
+| `pydantic` | 2.13.5 | source code | pydantic 1.x, a separately released line of the same project, 1.10.26 | wheel file list | designated, tier 1 |
 | `pydantic-core` | 2.46.5 | compiled code | Rust crates, the 104 entries of the source distribution's `Cargo.lock` | wheel file list and source tree | designated, tier 1 |
 | `pyside6-addons` | 6.11.2 | compiled code | Qt, version not established | project metadata | highlighted below |
 | `pyside6-addons` | 6.11.2 | source code | not established | wheel not fetched | highlighted below |
@@ -455,16 +456,18 @@ The table has one row for each wheel and form where the answer is not a plain no
 | `tzdata` | 2026.4 | data | IANA Time Zone Database 2026d | wheel file list | none owed: data only |
 | `uvloop` | 0.22.1 | compiled code | libuv 1.48.0 | wheel file list and source tree | highlighted below |
 
-20 wheels were found to carry none, in any form. The compiled answer rests on the wheel tag and file
-list: `aioodbc`, `aiosqlite`, `annotated-doc`, `annotated-types`, `anyio`, `argon2-cffi`, `click`,
-`fastapi`, `h11`, `httpcore`, `httpx`, `pyasn1`, `pycparser`, `pyspnego`, `starlette`, `tomlkit`,
-`truststore`, `typing-extensions`, `typing-inspection`, `uvicorn`.
+26 wheels were found to carry no compiled code, on the evidence of the wheel tag and file list:
+`aioodbc`, `aiosqlite`, `annotated-doc`, `annotated-types`, `anyio`, `argon2-cffi`, `certifi`,
+`click`, `fastapi`, `h11`, `hl7apy`, `httpcore`, `httpx`, `idna`, `ldap3`, `pyasn1`, `pycparser`,
+`pydantic`, `pyspnego`, `starlette`, `tomlkit`, `truststore`, `typing-extensions`,
+`typing-inspection`, `tzdata`, `uvicorn`.
 
-4 wheels were found to carry none, in any form. The compiled answer rests on the wheel file list and
-source tree: `psutil`, `pyodbc`, `sspilib`, `websockets`.
+4 wheels were found to carry no compiled code, on the evidence of the wheel file list and source
+tree: `psutil`, `pyodbc`, `sspilib`, `websockets`.
 
-1 wheel was found to carry none, in any form. The compiled answer rests on the wheel file list:
-`pyside6`.
+1 wheel was found to carry no compiled code, on the evidence of the wheel file list: `pyside6`.
+
+25 wheels have no row in the table: nothing from another project was found in any form.
 
 5 wheels carry another project's data and none of its code: `certifi`, `hl7apy`, `idna`, `ldap3`,
 `tzdata`. Not designated among them: `tzdata`. Under the criterion above, that owes no route. No
@@ -572,7 +575,7 @@ the markers must be exactly what the snapshot and the tiers above render, so a t
 `python scripts/security/component_readings.py --render-only`.
 
 The same test holds the survey of what each wheel carries,
-[`security/bundled-code-survey.json`](../security/bundled-code-survey.json), four ways (BACKLOG
+[`security/bundled-code-survey.json`](../security/bundled-code-survey.json), five ways (BACKLOG
 #2935). Every name in an assessed closure must have a survey answer, so a new dependency needs one
 in the same pull request. Each answer must cover compiled code, source code and data. A wheel that
 is not designated, and not shown to carry no code from another project, must have a recorded route.
