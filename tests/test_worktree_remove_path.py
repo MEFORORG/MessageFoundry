@@ -253,7 +253,7 @@ def test_path_removes_a_clean_tree_no_name_can_spell_and_leaves_its_branch(rig: 
     assert _git(rig.primary, "rev-parse", "refs/heads/done").strip() == tip
     assert "Branch 'done' was not touched" in proc.stdout
     # The fixture has no remote, so the one commit is on the local branch alone, and the run says so.
-    assert "1 commit(s) on 'done' are on no remote" in proc.stdout, proc.stdout
+    assert "1 commit(s) on 'done' are on no remote-tracking ref" in proc.stdout, proc.stdout
     assert theirs.exists(), "a claim held by a different, living worktree was released"
     assert elsewhere.exists()
 
@@ -280,6 +280,13 @@ def test_a_tree_that_still_holds_a_claim_is_refused_and_its_claim_is_left_alone(
     proc = rig.run("-Path", str(wt), "-Force")
     assert proc.returncode != 0
     assert "could not be parsed" in _out(proc) and "9001.json" in _out(proc), _out(proc)
+    assert wt.exists()
+
+    # A record that parses but names no worktree cannot be ruled out either.
+    claim.write_text(json.dumps({"key": "9001", "note": "no holder recorded"}), encoding="utf-8")
+    proc = rig.run("-Path", str(wt), "-Force")
+    assert proc.returncode != 0
+    assert "9001.json" in _out(proc), _out(proc)
     assert wt.exists()
 
     claim.unlink()
@@ -322,7 +329,13 @@ def test_a_live_session_recorded_in_a_parent_tree_does_not_clear_a_sibling_it_is
     _commit(sibling, "built.txt")
     claim = _claim(rig, "9191", sibling)
 
-    session = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
+    # THE BASE INTERPRETER, NOT sys.executable. In a Windows virtual environment sys.executable is a
+    # launcher stub that starts the real interpreter as a child, and kill() below would end the stub
+    # and leave that child sleeping. Its cwd is the fixture root, so nothing here holds a checkout.
+    interpreter = getattr(sys, "_base_executable", None) or sys.executable
+    session = subprocess.Popen(
+        [interpreter, "-c", "import time; time.sleep(300)"], cwd=str(rig.root)
+    )
     try:
         sessions = rig.home / ".claude" / "sessions"
         (sessions / f"{session.pid}.json").write_text(

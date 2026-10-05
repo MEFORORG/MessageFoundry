@@ -466,7 +466,8 @@ if ($byPath) {
             $c = $null
             try { $c = Get-Content -LiteralPath $f.FullName -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop }
             catch { $claimsUnreadable += $f.Name; continue }
-            if ($null -eq $c) { $claimsUnreadable += $f.Name; continue }
+            # A record that parses but names no worktree cannot be matched, so it cannot be ruled out.
+            if ($null -eq $c -or -not [string]$c.worktree) { $claimsUnreadable += $f.Name; continue }
             if ($claimTargets -contains (ConvertTo-Norm ([string]$c.worktree))) { $heldKeys += [string]$c.key }
         }
         if ($heldKeys.Count -gt 0 -or $claimsUnreadable.Count -gt 0) {
@@ -819,6 +820,7 @@ if ($keptBranch) {
     # that has already happened.
     $localOnly = "$(& git -C $GitRoot rev-list --count "refs/heads/$keptBranch" --not --remotes 2>$null)".Trim()
     if ($LASTEXITCODE -eq 0 -and $localOnly -match '\A\d+\z' -and [int]$localOnly -gt 0) {
-        Write-Host "NOTE: $localOnly commit(s) on '$keptBranch' are on no remote. They are kept on the local branch only."
+        Write-Host ("NOTE: $localOnly commit(s) on '$keptBranch' are on no remote-tracking ref, as of the last " +
+            "fetch. They are kept on the local branch.")
     }
 }
