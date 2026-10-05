@@ -51,17 +51,27 @@ class LeakCheckUnavailable(RuntimeError):
     """The publish-guard scanner could not be located (not run from a source checkout)."""
 
 
+def _guard_path(module_file: str) -> Path:
+    """The ONE path the publish guard may be loaded from (BACKLOG #2344).
+
+    ``parents[2]`` of ``<root>/messagefoundry/anon/leak.py`` is ``<root>``, the folder that holds
+    this package: the repository root in a source checkout, ``site-packages`` in an installed wheel.
+    The path is built, never searched for. The loader used to try every folder above this file and
+    run the first match, so a file at this path above an installed copy would have run. ``<root>``
+    is as far out as it may look: whoever can write that folder can already change what this
+    process imports, and a folder above it carries no such trust."""
+    return Path(module_file).resolve().parents[2] / "scripts" / "security" / "scan_forbidden.py"
+
+
 @lru_cache(maxsize=1)
 def _scanner() -> ModuleType:
-    here = Path(__file__).resolve()
-    for parent in here.parents:
-        candidate = parent / "scripts" / "security" / "scan_forbidden.py"
-        if candidate.is_file():
-            spec = importlib.util.spec_from_file_location("mefor_anon_scan_forbidden", candidate)
-            if spec is not None and spec.loader is not None:
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
-                return module
+    candidate = _guard_path(__file__)
+    if candidate.is_file():
+        spec = importlib.util.spec_from_file_location("mefor_anon_scan_forbidden", candidate)
+        if spec is not None and spec.loader is not None:
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
     raise LeakCheckUnavailable(
         "could not locate scripts/security/scan_forbidden.py — the anonymizer leak-check requires "
         "the source checkout (it is a dev/migration tool, not an installed-wheel runtime)"

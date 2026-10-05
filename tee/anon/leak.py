@@ -33,19 +33,25 @@ from .surrogates import Seps, message_has_site_code, read_message_seps
 
 
 def _load_publish_guard(_start: Path | None = None) -> object | None:
-    """Load the owner-managed guard (``scripts/security/scan_forbidden.py``) by path, walking up from
-    this file. It is the SINGLE source for the token tables, so none live literally here. Absent from an
-    installed wheel with no ``scripts/`` → returns ``None`` and the tables load empty. ``_start``
-    overrides the search origin for tests."""
+    """Load the owner-managed guard (``scripts/security/scan_forbidden.py``) by path. It is the SINGLE
+    source for the token tables, so none live literally here. Absent from an installed wheel with no
+    ``scripts/`` → returns ``None`` and the tables load empty. ``_start`` stands in for this file's
+    path in tests.
+
+    ONE path is tried (BACKLOG #2344). ``parents[2]`` of ``<root>/tee/anon/leak.py`` is ``<root>``,
+    the folder that holds the ``tee`` package: the repository root in a source checkout. The path is
+    built, never searched for. This used to try every folder above the file and run the first match,
+    at import, so a file at this path above a copied-out tee would have run. ``<root>`` is as far out
+    as it may look: whoever can write that folder can already change what this process imports, and a
+    folder above it carries no such trust."""
     origin = (_start if _start is not None else Path(__file__)).resolve()
-    for parent in origin.parents:
-        candidate = parent / "scripts" / "security" / "scan_forbidden.py"
-        if candidate.exists():
-            spec = importlib.util.spec_from_file_location("tee_anon_publish_guard", candidate)
-            if spec is not None and spec.loader is not None:
-                mod = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(mod)
-                return mod
+    candidate = origin.parents[2] / "scripts" / "security" / "scan_forbidden.py"
+    if candidate.is_file():
+        spec = importlib.util.spec_from_file_location("tee_anon_publish_guard", candidate)
+        if spec is not None and spec.loader is not None:
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
     return None
 
 
