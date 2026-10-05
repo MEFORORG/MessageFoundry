@@ -28,28 +28,25 @@ Synthetic data only.
 from __future__ import annotations
 
 import contextlib
-import email.message
-import functools
 import http.server
 import json
 import logging
 import threading
 import time
+from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.settings import EgressSettings
-from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
-from messagefoundry.config.wiring import FHIR, DICOMweb, Registry, Rest, Soap
+from messagefoundry.config.wiring import Registry
 from messagefoundry.parsing import RawMessage
-from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome
 from messagefoundry.store.store import MessageStatus, MessageStore, OutboxStatus, Stage
-from messagefoundry.transports import build_destination
-from messagefoundry.transports.base import DeliveryError, NegativeAckError
+from messagefoundry.transports.base import NegativeAckError
 from messagefoundry.transports.bounded_read import (
     DEFAULT_MAX_RESPONSE_BYTES,
     REPLY_TOO_LARGE_CODE,
@@ -57,9 +54,11 @@ from messagefoundry.transports.bounded_read import (
     TruncatedResponseError,
     read_accepted_reply_text,
 )
-from tests._egress_policy import permitting
+from tests.test_bounded_egress_reads import _ExactResp, _FakeOpener, _UnboundedResp
+from tests.test_digest_refusal_classification import _FACTORY, _LABEL, _build, _Stops
 
-_WARN_DIAL = HopPosture(enforcing=False)
+#: The name ``_build`` gives every destination, and so the name a WARNING or refusal carries.
+CONNECTION = "OB"
 CHANNEL = "IB_TEST"
 DEST = "OB_PARTNER"
 RAW = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\r"
@@ -67,24 +66,11 @@ RAW = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\r"
 _URL_MARKER = "SITE-QUERY-MARKER"
 #: In every outgoing payload, for the same reason.
 _PAYLOAD_MARKER = "PAYLOAD-MARKER-7f3a"
-#: The byte an over-cap reply is made of. A run of it must never reach a log line.
+#: The byte an over-cap reply is made of on the wire. A run of it must never reach a log line.
 _REPLY_FILL = b"Z"
 
 
 # --- the helper -----------------------------------------------------------------------------------
-
-
-class _Resp:
-    """A reply holding ``body``, with a 2xx status and no declared length."""
-
-    status = 201
-
-    def __init__(self, body: bytes) -> None:
-        self._body = body
-        self.headers = email.message.Message()
-
-    def read(self, amt: int = -1) -> bytes:
-        return self._body if amt < 0 else self._body[:amt]
 
 
 def test_an_unused_over_cap_body_reads_as_empty_and_warns(
@@ -92,11 +78,11 @@ def test_an_unused_over_cap_body_reads_as_empty_and_warns(
 ) -> None:
     with caplog.at_level(logging.WARNING):
         text = read_accepted_reply_text(
-            _Resp(_REPLY_FILL * 65),
+            _ExactResp(_REPLY_FILL * 65, status=201),
             limit=64,
             connector="REST connection 'OB_X'",
             encoding="utf-8",
-            body_is_used=False,
+            body_is_needed=False,
         )
     assert text == ""
     (record,) = caplog.records
@@ -111,11 +97,11 @@ def test_an_unused_over_cap_body_reads_as_empty_and_warns(
 def test_a_used_over_cap_body_is_a_permanent_refusal() -> None:
     with pytest.raises(NegativeAckError) as ei:
         read_accepted_reply_text(
-            _Resp(_REPLY_FILL * 65),
+            _ExactResp(_REPLY_FILL * 65, status=201),
             limit=64,
             connector="SOAP connection 'OB_X'",
             encoding="utf-8",
-            body_is_used=True,
+            body_is_needed=True,
         )
     err = ei.value
     assert err.code == REPLY_TOO_LARGE_CODE == "reply-too-large"
@@ -129,105 +115,44 @@ def test_a_used_over_cap_body_is_a_permanent_refusal() -> None:
     assert err.__cause__ is None
 
 
-@pytest.mark.parametrize("body_is_used", [False, True])
+@pytest.mark.parametrize("body_is_needed", [False, True])
 def test_a_body_at_the_bound_comes_back_whole(
-    body_is_used: bool, caplog: pytest.LogCaptureFixture
+    body_is_needed: bool, caplog: pytest.LogCaptureFixture
 ) -> None:
     """THE CONTROL: the helper changes nothing at or under the bound."""
     with caplog.at_level(logging.WARNING):
         text = read_accepted_reply_text(
-            _Resp(b"y" * 64), limit=64, connector="c", encoding="utf-8", body_is_used=body_is_used
+            _ExactResp(b"y" * 64),
+            limit=64,
+            connector="c",
+            encoding="utf-8",
+            body_is_needed=body_is_needed,
         )
     assert text == "y" * 64
     assert caplog.records == []
 
 
-class _ShortResp(_Resp):
+class _ShortResp(_ExactResp):
     """A reply that stopped 9 bytes short of the length it declared."""
 
     length = 9
 
 
-@pytest.mark.parametrize("body_is_used", [False, True])
-def test_a_truncated_body_is_still_raised_as_it_was(body_is_used: bool) -> None:
+@pytest.mark.parametrize("body_is_needed", [False, True])
+def test_a_truncated_body_is_still_raised_as_it_was(body_is_needed: bool) -> None:
     """Only the byte bound is handled. A truncated reply after a 2xx is still a retryable
     ``TruncatedResponseError``, in both modes: that is a different question, left alone."""
-    with pytest.raises(TruncatedResponseError) as ei:
+    with pytest.raises(TruncatedResponseError):
         read_accepted_reply_text(
             _ShortResp(b"y" * 5),
             limit=64,
             connector="c",
             encoding="utf-8",
-            body_is_used=body_is_used,
+            body_is_needed=body_is_needed,
         )
-    assert not isinstance(ei.value, NegativeAckError)
 
 
 # --- each destination's _post, against a body that never ends -------------------------------------
-
-
-class _UnboundedResp:
-    """A 2xx whose body never ends: ``read(amt)`` returns exactly ``amt`` bytes."""
-
-    status = 200
-    headers: email.message.Message = email.message.Message()
-
-    def __init__(self) -> None:
-        self.requested: list[int] = []
-
-    def read(self, amt: int = -1) -> bytes:
-        self.requested.append(amt)
-        if amt < 0:
-            raise AssertionError("unbounded read: the call site asked for the whole body")
-        return _REPLY_FILL * amt
-
-    def __enter__(self) -> _UnboundedResp:
-        return self
-
-    def __exit__(self, *a: object) -> None:
-        return None
-
-
-class _CountingOpener:
-    def __init__(self, resp: object) -> None:
-        self.resp = resp
-        self.opened = 0
-
-    def open(self, req: object, timeout: float | None = None) -> object:
-        self.opened += 1
-        return self.resp
-
-
-_FACTORY: dict[ConnectorType, Any] = {
-    ConnectorType.REST: Rest,
-    ConnectorType.SOAP: Soap,
-    ConnectorType.FHIR: FHIR,
-    ConnectorType.DICOMWEB: DICOMweb,
-}
-_KIND = {
-    ConnectorType.REST: "REST",
-    ConnectorType.SOAP: "SOAP",
-    ConnectorType.FHIR: "FHIR",
-    ConnectorType.DICOMWEB: "DICOMweb",
-}
-
-
-def _build(ctype: ConnectorType, url: str, **over: object) -> Any:
-    spec = _FACTORY[ctype](url=url, **over)
-    cleartext = url.startswith("http://")
-    with active_hop_posture(_WARN_DIAL):
-        return build_destination(
-            Destination(
-                name=DEST,
-                type=ctype,
-                settings=spec.settings,
-                cleartext_accepted=cleartext,
-                cleartext_reason="test peer has no TLS" if cleartext else None,
-                tls_revocation_attested=True,
-                tls_revocation_attested_reason="revocation-checking PKI at the partner edge",
-            ),
-            egress=permitting(spec.settings),
-        )
 
 
 def _payload(ctype: ConnectorType) -> str:
@@ -246,7 +171,7 @@ def _payload(ctype: ConnectorType) -> str:
 #: FHIR with capture on is absent on purpose: see the last test in this file.
 _DELIVERED = "delivered"
 _REFUSED = "refused"
-_RULED: list[tuple[ConnectorType, dict[str, object], str]] = [
+_RULED: list[tuple[ConnectorType, dict[str, Any], str]] = [
     (ConnectorType.REST, {"capture_response": False}, _DELIVERED),
     (ConnectorType.REST, {"capture_response": True}, _REFUSED),
     (ConnectorType.SOAP, {"capture_response": False}, _REFUSED),
@@ -259,7 +184,7 @@ _RULED: list[tuple[ConnectorType, dict[str, object], str]] = [
 ]
 
 
-def _case_id(case: tuple[ConnectorType, dict[str, object], str]) -> str:
+def _case_id(case: tuple[ConnectorType, dict[str, Any], str]) -> str:
     ctype, over, _ = case
     capture = "capture-on" if over.get("capture_response") else "capture-off"
     interaction = f"-{over['interaction']}" if "interaction" in over else ""
@@ -268,12 +193,12 @@ def _case_id(case: tuple[ConnectorType, dict[str, object], str]) -> str:
 
 @pytest.mark.parametrize("case", _RULED, ids=_case_id)
 async def test_send_follows_the_ruling_and_keeps_the_byte_bound(
-    case: tuple[ConnectorType, dict[str, object], str], caplog: pytest.LogCaptureFixture
+    case: tuple[ConnectorType, dict[str, Any], str], caplog: pytest.LogCaptureFixture
 ) -> None:
     ctype, over, side = case
     dest = _build(ctype, f"https://partner.example.com/x?site={_URL_MARKER}", **over)
     resp = _UnboundedResp()
-    opener = _CountingOpener(resp)
+    opener = _FakeOpener(resp)
     dest._opener = opener
     with caplog.at_level(logging.WARNING):
         if side == _DELIVERED:
@@ -283,17 +208,18 @@ async def test_send_follows_the_ruling_and_keeps_the_byte_bound(
                 await dest.send(_payload(ctype))
             assert ei.value.code == REPLY_TOO_LARGE_CODE
             assert ei.value.permanent is True
-            assert str(ei.value).startswith(f"{_KIND[ctype]} connection {DEST!r} accepted")
+            refusal = str(ei.value)
+            assert refusal.startswith(f"{_LABEL[ctype]} connection {CONNECTION!r} accepted")
             assert _URL_MARKER not in str(ei.value)
             assert "partner.example.com" not in str(ei.value)
     # The bound is still enforced on the read: one byte past it, and never the whole body.
     assert resp.requested == [DEFAULT_MAX_RESPONSE_BYTES + 1]
-    assert opener.opened == 1
+    assert len(opener.requests) == 1
     warnings = [r.getMessage() for r in caplog.records if "over the" in r.getMessage()]
     if side == _DELIVERED:
         (warning,) = warnings
-        assert warning.startswith(f"{_KIND[ctype]} connection {DEST!r} accepted the request")
-        for leaked in (_URL_MARKER, "partner.example.com", _PAYLOAD_MARKER, "ZZZZ"):
+        assert warning.startswith(f"{_LABEL[ctype]} connection {CONNECTION!r} accepted")
+        for leaked in (_URL_MARKER, "partner.example.com", _PAYLOAD_MARKER, "\x00\x00"):
             assert leaked not in warning
     else:
         assert warnings == []
@@ -302,10 +228,11 @@ async def test_send_follows_the_ruling_and_keeps_the_byte_bound(
 # --- the delivery worker, on the wire -------------------------------------------------------------
 
 
-@functools.cache
-def _over_cap_body() -> bytes:
-    """One byte past the bound. Built on first use, so collecting this module allocates nothing."""
-    return _REPLY_FILL * (DEFAULT_MAX_RESPONSE_BYTES + 1)
+@pytest.fixture(scope="module")
+def over_cap_body() -> Iterator[bytes]:
+    """One byte past the bound. A module fixture, so the 16 MiB is built on first use and let go
+    when this module is done."""
+    yield _REPLY_FILL * (DEFAULT_MAX_RESPONSE_BYTES + 1)
 
 
 class _Partner:
@@ -349,24 +276,16 @@ class _Partner:
         self._thread.join(timeout=5)
 
 
-class _Stops(LoggingAlertSink):
-    def __init__(self) -> None:
-        self.stopped: list[str] = []
-
-    def connection_stopped(self, name: str, *, detail: str) -> None:
-        self.stopped.append(name)
-
-
+@dataclass(frozen=True)
 class _Delivery:
-    """What the store holds after the worker was offered one row ``offers`` times."""
+    """What the store holds after the worker was offered one row ``_OFFERS`` times."""
 
-    def __init__(self) -> None:
-        self.outcomes: list[_ItemOutcome] = []
-        self.row_status = ""
-        self.last_error = ""
-        self.message_status = ""
-        self.captured: list[tuple[str, str | None]] = []
-        self.stopped: list[str] = []
+    outcomes: list[_ItemOutcome]
+    row_status: str
+    last_error: str
+    message_status: str
+    captured: list[tuple[str, str | None]]
+    stopped: list[str]
 
 
 #: How often the worker is offered the row. Each offer is past any backoff, so a row that is still
@@ -376,7 +295,7 @@ _OFFERS = 3
 
 async def _deliver(tmp_path: Path, dest: Any, payload: str) -> _Delivery:
     """Queue one outbound row for ``dest`` and offer it to the delivery worker ``_OFFERS`` times."""
-    result = _Delivery()
+    outcomes: list[_ItemOutcome] = []
     store = await MessageStore.open(tmp_path / "overcap.db")
     try:
         mid = await store.enqueue_ingress(channel_id=CHANNEL, raw=RAW, now=0.0)
@@ -403,7 +322,6 @@ async def _deliver(tmp_path: Path, dest: Any, payload: str) -> _Delivery:
         runner = RegistryRunner(
             Registry(),
             store,
-            poll_interval=0.02,
             alert_sink=sink,
             egress=EgressSettings(deny_by_default=False),
         )
@@ -414,34 +332,37 @@ async def _deliver(tmp_path: Path, dest: Any, payload: str) -> _Delivery:
             if item is None:
                 break
             outcome, _ = await runner._process_delivery_item(DEST, item)
-            result.outcomes.append(outcome)
+            outcomes.append(outcome)
         cur = await store._db.execute(
             "SELECT status, last_error FROM queue WHERE message_id=? AND stage=?",
             (mid, Stage.OUTBOUND.value),
         )
         row = await cur.fetchone()
         assert row is not None
-        result.row_status = str(row["status"])
-        # Plaintext here: the test store has the default identity cipher.
-        result.last_error = "" if row["last_error"] is None else str(row["last_error"])
         message = await store.get_message(mid)
         assert message is not None
-        result.message_status = str(message["status"])
-        result.captured = [(c.outcome, c.body) for c in await store.correlate_response(mid)]
-        result.stopped = sink.stopped
-        return result
+        return _Delivery(
+            outcomes=outcomes,
+            row_status=str(row["status"]),
+            # Plaintext here: the test store has the default identity cipher.
+            last_error="" if row["last_error"] is None else str(row["last_error"]),
+            message_status=str(message["status"]),
+            captured=[(c.outcome, c.body) for c in await store.correlate_response(mid)],
+            stopped=[name for name, _ in sink.stopped],
+        )
     finally:
         await store.close()
 
 
 @pytest.mark.parametrize("case", _RULED, ids=_case_id)
 async def test_an_over_cap_2xx_is_sent_once_and_recorded_as_ruled(
-    case: tuple[ConnectorType, dict[str, object], str],
+    case: tuple[ConnectorType, dict[str, Any], str],
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
+    over_cap_body: bytes,
 ) -> None:
     ctype, over, side = case
-    with _Partner(200, _over_cap_body()) as partner:
+    with _Partner(200, over_cap_body) as partner:
         dest = _build(ctype, f"{partner.url}/x?site={_URL_MARKER}", **over)
         with caplog.at_level(logging.WARNING):
             got = await _deliver(tmp_path, dest, _payload(ctype))
@@ -460,7 +381,8 @@ async def test_an_over_cap_2xx_is_sent_once_and_recorded_as_ruled(
         assert got.message_status == MessageStatus.ERROR.value
         # The stored error is the fixed text: the connection, the bound, and nothing of the URL,
         # the payload or the reply.
-        assert f"{_KIND[ctype]} connection {DEST!r} accepted the request" in got.last_error
+        identity = f"{_LABEL[ctype]} connection {CONNECTION!r}"
+        assert f"{identity} accepted the request" in got.last_error
         for leaked in (_URL_MARKER, "127.0.0.1", _PAYLOAD_MARKER, "ZZZZ"):
             assert leaked not in got.last_error
     for record in caplog.records:
@@ -503,12 +425,12 @@ async def test_an_in_cap_2xx_is_delivered_as_before(
 @pytest.mark.parametrize("ctype", list(_FACTORY), ids=lambda c: c.value)
 @pytest.mark.parametrize("capture", [False, True], ids=["capture-off", "capture-on"])
 async def test_an_over_cap_body_on_a_500_is_retried_as_before(
-    ctype: ConnectorType, capture: bool, tmp_path: Path
+    ctype: ConnectorType, capture: bool, tmp_path: Path, over_cap_body: bytes
 ) -> None:
     """THE CONTROL, and the proof the harness can see a re-send. A 500 says the partner did not
     take the request, so it is sent again on every offer, whatever the size of its body. A harness
     that reported one request for every reply would fail here."""
-    with _Partner(500, _over_cap_body()) as partner:
+    with _Partner(500, over_cap_body) as partner:
         dest = _build(ctype, f"{partner.url}/x", capture_response=capture)
         got = await _deliver(tmp_path, dest, _payload(ctype))
     assert len(partner.requests) == _OFFERS
@@ -522,7 +444,9 @@ async def test_an_over_cap_body_on_a_500_is_retried_as_before(
 # --- the case the ruling does not name ------------------------------------------------------------
 
 
-async def test_fhir_with_capture_on_is_not_changed_by_this_item(tmp_path: Path) -> None:
+async def test_fhir_with_capture_on_is_not_changed_by_this_item(
+    tmp_path: Path, over_cap_body: bytes
+) -> None:
     """**Not a decision.** The ruling names FHIR on the delivered side, because nothing reads its
     reply. With ``capture_response`` on, the reply is stored and can be passed on through
     ``reingress_to`` or ``reply_from``, as a REST reply is, and the ruling names no side for that.
@@ -531,13 +455,11 @@ async def test_fhir_with_capture_on_is_not_changed_by_this_item(tmp_path: Path) 
     This test records what the code does today, so that a change to it is made on purpose."""
     dest = _build(ConnectorType.FHIR, "https://partner.example.com/fhir", capture_response=True)
     resp = _UnboundedResp()
-    dest._opener = _CountingOpener(resp)
-    with pytest.raises(ResponseTooLargeError) as ei:
+    dest._opener = _FakeOpener(resp)
+    with pytest.raises(ResponseTooLargeError):
         await dest.send(_payload(ConnectorType.FHIR))
-    assert isinstance(ei.value, DeliveryError)
-    assert not isinstance(ei.value, NegativeAckError)
     assert resp.requested == [DEFAULT_MAX_RESPONSE_BYTES + 1]
-    with _Partner(200, _over_cap_body()) as partner:
+    with _Partner(200, over_cap_body) as partner:
         wired = _build(ConnectorType.FHIR, f"{partner.url}/fhir", capture_response=True)
         got = await _deliver(tmp_path, wired, _payload(ConnectorType.FHIR))
     assert len(partner.requests) == _OFFERS

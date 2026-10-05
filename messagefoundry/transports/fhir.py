@@ -1032,7 +1032,7 @@ class FhirDestination(DestinationConnector):
                         resp,
                         connector=self._hop,
                         encoding=self.encoding,
-                        body_is_used=False,
+                        body_is_needed=False,
                     )
                 status = int(getattr(resp, "status", 200))
                 # #154: capture only the allow-listed response headers (empty allow-list → {}).

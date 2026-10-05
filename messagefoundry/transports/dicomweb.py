@@ -482,7 +482,7 @@ class DicomWebDestination(DestinationConnector):
                     resp,
                     connector=self._hop,
                     encoding=self.encoding,
-                    body_is_used=True,
+                    body_is_needed=True,
                 )
                 status = int(getattr(resp, "status", 200))
                 return body, status

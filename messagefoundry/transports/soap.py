@@ -906,7 +906,7 @@ class SoapDestination(DestinationConnector):
                 # re-send. A Fault can sit inside a 2xx, so send() reads this body in both capture
                 # modes, and the refusal is permanent.
                 body = read_accepted_reply_text(
-                    resp, connector=self._hop, encoding=self.encoding, body_is_used=True
+                    resp, connector=self._hop, encoding=self.encoding, body_is_needed=True
                 )
                 status = int(getattr(resp, "status", 200))
                 # #154: capture only the allow-listed response headers (empty allow-list → {}).

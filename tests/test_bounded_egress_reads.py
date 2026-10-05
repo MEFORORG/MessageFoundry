@@ -960,56 +960,22 @@ def test_the_url_scan_can_still_find_one() -> None:
     assert not _url_bearing_connectors('drain_bounded(resp, connector=f"{self._hop} probe")')
 
 
-def test_each_destination_names_its_connection_and_not_its_host(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
+def test_each_destination_names_its_connection_and_not_its_host() -> None:
+    """The probes. What ``_post`` names after a 2xx is in
+    ``tests/test_over_cap_2xx_reply_is_sent_once.py``, for the refusal and the WARNING alike."""
     rest, soap, fhir, dicomweb = _rest(), _soap(), _fhir(), _dicomweb()
-    probes: list[tuple[object, Callable[[], object], str, str]] = [
+    cases: list[tuple[object, Callable[[], object], str, str]] = [
         (rest, rest._probe, "REST connection 'OB_REST' probe", "api.example.com"),
         (soap, soap._probe, "SOAP connection 'OB_SOAP' probe", "api.example"),
         (fhir, fhir._probe, "FHIR connection 'OB_FHIR' probe", "fhir.example.org"),
         (dicomweb, dicomweb._probe, "DICOMweb connection 'OB_DCMWEB' probe", "pacs.example.org"),
     ]
-    for dest, call, identity, host in probes:
+    for dest, call, identity, host in cases:
         dest._opener = _FakeOpener(_UnboundedResp())  # type: ignore[attr-defined]
         with pytest.raises(ResponseTooLargeError) as err:
             call()
         assert str(err.value).startswith(identity + " returned")
         assert host not in str(err.value)
-    # After a 2xx an over-cap body is refused for good where the body is read (vault BACKLOG #2180).
-    refused: list[tuple[object, Callable[[], object], str, str]] = [
-        (soap, lambda: soap._post("<env:Envelope/>"), "SOAP connection 'OB_SOAP'", "api.example"),
-        (
-            dicomweb,
-            lambda: dicomweb._post(b"\x00" * 128 + b"DICM"),
-            "DICOMweb connection 'OB_DCMWEB'",
-            "pacs.example.org",
-        ),
-    ]
-    for dest, call, identity, host in refused:
-        dest._opener = _FakeOpener(_UnboundedResp())  # type: ignore[attr-defined]
-        with pytest.raises(NegativeAckError) as refusal:
-            call()
-        assert str(refusal.value).startswith(identity + " accepted the request")
-        assert host not in str(refusal.value)
-    # Where nothing reads it, the body is dropped and a WARNING names the connection instead.
-    delivered: list[tuple[object, Callable[[], object], str, str]] = [
-        (rest, lambda: rest._post("<payload/>"), "REST connection 'OB_REST'", "api.example.com"),
-        (
-            fhir,
-            lambda: fhir._post("{}", "POST", f"{FHIR_BASE}/Patient", {}),
-            "FHIR connection 'OB_FHIR'",
-            "fhir.example.org",
-        ),
-    ]
-    for dest, call, identity, host in delivered:
-        dest._opener = _FakeOpener(_UnboundedResp())  # type: ignore[attr-defined]
-        caplog.clear()
-        with caplog.at_level(logging.WARNING):
-            call()
-        (warning,) = [r.getMessage() for r in caplog.records]
-        assert warning.startswith(identity + " accepted the request")
-        assert host not in warning
 
 
 def test_the_lookup_the_token_endpoint_and_the_ai_broker_name_no_host(ec_pem: str) -> None:

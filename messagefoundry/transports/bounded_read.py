@@ -26,9 +26,9 @@ A delivery that already holds a 2xx status is different, because the partner has
 request and a retry would send it again (vault BACKLOG #2180). :func:`read_accepted_reply_text`
 reads that body, and an over-cap one is judged by who reads it (owner ruling 2026-10-05):
 
-* **Nothing reads the body:** the message is recorded delivered, the body is dropped, and a
+* **Nothing needs the body:** the message is recorded delivered, the body is dropped, and a
   WARNING names the connection.
-* **The engine reads the body to know the outcome, or passes it on:** a permanent
+* **The engine needs the body to know the outcome, or passes it on:** a permanent
   :class:`~messagefoundry.transports.base.NegativeAckError` with code
   :data:`REPLY_TOO_LARGE_CODE`. The row dead-letters once. This is a dead-letter cause the bound
   did not have before.
@@ -1212,7 +1212,7 @@ def read_accepted_reply_text(
     limit: int = DEFAULT_MAX_RESPONSE_BYTES,
     connector: str,
     encoding: str,
-    body_is_used: bool,
+    body_is_needed: bool,
 ) -> str:
     """:func:`read_bounded_text` for the body of a delivery's reply, once its 2xx status is in.
 
@@ -1220,12 +1220,13 @@ def read_accepted_reply_text(
     inside ``with opener.open(...)``, because urllib raises every other status as an ``HTTPError``.
 
     The partner accepted the request, so an over-cap body must not cause a re-send (vault BACKLOG
-    #2180). What it does cause depends on ``body_is_used`` (owner ruling 2026-10-05):
+    #2180). What it does cause depends on ``body_is_needed`` (owner ruling 2026-10-05):
 
-    * ``False`` -- nothing reads this body. Returns ``""`` and logs a WARNING, so the caller
-      records the message as delivered. The WARNING carries ``connector``, the status and the
-      bound, and no byte of the reply.
-    * ``True`` -- the engine reads the body to know the outcome, or passes it on. Raises a
+    * ``False`` -- the caller can call the message delivered without this body. Returns ``""``
+      and logs a WARNING. The WARNING carries ``connector``, the status and the bound, and no
+      byte of the reply. Most such callers never read the body. A FHIR wrapped update would have
+      read it for the entry status, and takes a reply it cannot read as delivered.
+    * ``True`` -- the engine needs the body to know the outcome, or passes it on. Raises a
       permanent :class:`~messagefoundry.transports.base.NegativeAckError` with code
       :data:`REPLY_TOO_LARGE_CODE`, so the row dead-letters once and is not sent again. A reply
       the engine could not read is not recorded as delivered.
@@ -1240,7 +1241,7 @@ def read_accepted_reply_text(
         # bytes read so far, a whole bound of them, and an error raised in here would keep that
         # frame alive on its __context__ until the worker let go of it.
         pass
-    if body_is_used:
+    if body_is_needed:
         raise NegativeAckError(
             f"{connector} accepted the request with a 2xx status, but its response body is over "
             f"the {limit}-byte bound and this connection needs that body. Not sent again: check "
@@ -1251,8 +1252,7 @@ def read_accepted_reply_text(
     status = getattr(reader, "status", None)
     logger.warning(
         "%s accepted the request (status %s) with a response body over the %d-byte bound; "
-        "nothing reads the body on this connection, so the message is recorded as delivered "
-        "and the body is dropped",
+        "the body is dropped unread and the message is recorded as delivered",
         connector,
         status if isinstance(status, int) else "2xx",
         limit,
