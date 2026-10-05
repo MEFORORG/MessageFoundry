@@ -130,29 +130,30 @@ _HL7_FIELD_RUN = re.compile(r"(?<![^\s|^~&])[^\s|^~&]*+[|^~&][^\s|^~&]*+(?:[|^~&
 #: The encoded form is matched in place rather than decoded and rescanned, so nothing here allocates a
 #: second copy of a peer's text. A lone ``%20`` (or any other escape) is ordinary body text.
 #:
-#: **It stops at quotes, brackets, braces, angle brackets and commas, where the literal pattern does
-#: not.** Those characters bound a URL quoted inside JSON, XML or a DICOM dump, and the structured
-#: passes read the label just past them. Taking the whole token swallowed that label and left its
-#: value, so ``<meta><source value="...%7C1%5EMR"/></meta><name><family value="DOE"/>`` kept ``DOE``,
-#: which the structured pass had scrubbed before this pattern existed. It runs LAST among the flat
-#: passes for the same reason: run before :data:`_NAME_RUN`, it took the second token of ``DOE
-#: JANE%7Cx%7Cy`` and left ``DOE`` under the two-token threshold.
+#: **It runs AFTER both stages of :func:`redact`, not among the flat passes.** Taking a whole token
+#: can swallow a label another pass reads, and leave that label's value behind: an XML element or JSON
+#: key glued to the run, an ``mrn:`` or ``PatientID=`` after it, or the second token of a name run.
+#: Run first, it kept values those passes had scrubbed before it existed. Run last, every such value
+#: is already gone, so it can only add redaction. :func:`redact` then runs both stages once more over
+#: what it changed.
 #:
-#: Linear for the same reason as :data:`_HL7_FIELD_RUN`. The lookbehind is the exact complement of the
-#: body's class, so a start is admitted only after whitespace, a literal separator, a stop character
-#: or the start of the text. A match from a segment's start takes the whole segment whenever it holds
-#: two separators, since the body stops only at a separator or the segment's end. So a segment that
-#: survives holds at most one separator and gets at most two attempts. The body's lookahead fails on
-#: its first character everywhere but a ``%``. ``[redacted]`` holds no separator, so it never matches.
+#: Linear for the same reason as :data:`_HL7_FIELD_RUN`. The lookbehind admits a start only after
+#: whitespace, a literal separator or the start of the text. A match from a token's start takes the
+#: whole token whenever it holds two separators, since the body stops only at a separator or the
+#: token's end. So a token that survives holds at most one separator, and gets at most two attempts.
+#: The body's lookahead fails on its first character everywhere but a ``%``. ``[redacted]`` holds no
+#: separator of either kind, so it never matches.
 #:
-#: Residuals, at least these: a single encoded separator, as with a single literal one (so FHIR's
-#: ``identifier=system%7Cvalue`` keeps its value); a run split by a stop character into parts with one
-#: separator each; a double-encoded separator (``%257C``); and an encoded CUSTOM delimiter that MSH
-#: declares (:func:`_sniff_delimiters` reads only the literal header).
+#: Like the literal pattern it takes the whole token, so a URL holding one ``&`` and one ``%26`` loses
+#: its host too. Residuals, at least these: a single encoded separator, as with a single literal one
+#: (so FHIR's ``identifier=system%7Cvalue`` keeps its value); a label a LATER filter reads, such as the
+#: credential scrub in :mod:`messagefoundry.logging_setup`, glued to a run (``x%7Cy%7Cz;password:``),
+#: which the literal pattern shares; a double-encoded separator (``%257C``); and an encoded CUSTOM
+#: delimiter that MSH declares (:func:`_sniff_delimiters` reads only the literal header).
 _HL7_ENCODED_FIELD_RUN = re.compile(
-    r"""(?<![^\s|^~&"'<>{}(),])(?:(?!%(?:7[CcEe]|5[Ee]|26))[^\s|^~&"'<>{}(),])*+"""
-    r"""(?:[|^~&]|%(?:7[CcEe]|5[Ee]|26))(?:(?!%(?:7[CcEe]|5[Ee]|26))[^\s|^~&"'<>{}(),])*+"""
-    r"""(?:(?:[|^~&]|%(?:7[CcEe]|5[Ee]|26))(?:(?!%(?:7[CcEe]|5[Ee]|26))[^\s|^~&"'<>{}(),])*+)+"""
+    r"(?<![^\s|^~&])(?:(?!%(?:7[CcEe]|5[Ee]|26))[^\s|^~&])*+"
+    r"(?:[|^~&]|%(?:7[CcEe]|5[Ee]|26))(?:(?!%(?:7[CcEe]|5[Ee]|26))[^\s|^~&])*+"
+    r"(?:(?:[|^~&]|%(?:7[CcEe]|5[Ee]|26))(?:(?!%(?:7[CcEe]|5[Ee]|26))[^\s|^~&])*+)+"
 )
 #: An encoded separator anywhere: the screen that keeps text without one off the pass above.
 _ENCODED_SEPARATOR = re.compile(r"%(?:7[CcEe]|5[Ee]|26)")
@@ -443,7 +444,7 @@ _USERINFO_TAIL_MAX = 256
 #: inside it on the next, and the second pass swallowed everything between them. ``safe_exc`` then
 #: ``safe_text`` is exactly such a second pass. Now an ``n`` in the tail may not open the scrubbed
 #: form, the opener then ``[redacted]@``, so a second pass over two scrubbed spans changes nothing.
-#: The guard sits on the ``n`` alone so every other character stays on the engine's fast path.
+#: The guard sits on the ``n`` alone, so its lookahead runs only where the form could start.
 #:
 #: **A match may still START on a scrubbed span, and that is deliberate.** A password with an inner
 #: ``@`` whose last ``@`` is past the bound is scrubbed only to the inner one, and a later pass, once
@@ -1494,7 +1495,7 @@ def redact(text: str) -> str:
     separator-aware pass for a message that declares delimiters outside the defaults) is handled first,
     so the free-text passes (:data:`_MRN_LABELLED`, :data:`_DATE_RUN`, then :data:`_NAME_RUN`) only
     see delimiter-free text. The percent-encoded run (:data:`_HL7_ENCODED_FIELD_RUN`) comes after
-    them, so it cannot split a name run. The structured-shape passes (:func:`_redact_structured`: JSON keys, DICOM tags and labels,
+    everything, as the last paragraph here says. The structured-shape passes (:func:`_redact_structured`: JSON keys, DICOM tags and labels,
     XML elements) run LAST, so they can only add redaction to what the others left (the section
     comment above them says what running them first cost). The free-text heuristic narrows the prior
     residual to adversarial *single-token* identifiers (a lone name with no second token, no date) — for which the "never put PHI in an exception message"
@@ -1528,7 +1529,22 @@ def redact(text: str) -> str:
 
     **The second stage runs only when its triggers are present** (:func:`_needs_widened_stage`). On
     text without them it would re-run the #1711 passes over their own fixed point and change nothing
-    the widened rules own, at double the cost on every log record."""
+    the widened rules own, at double the cost on every log record.
+
+    **The percent-encoded run runs after both stages (BACKLOG #2171).** Its pattern says why: run
+    among them, it took labels and name tokens the other passes needed. When it changes the text, both
+    stages run once more over its output, so a pass that reads what it left still sees it. The screen
+    is a C-speed search, so text without an encoded separator pays nothing more."""
+    out = _redact_stages(text)
+    if "%" not in out or _ENCODED_SEPARATOR.search(out) is None:
+        return out
+    encoded = _HL7_ENCODED_FIELD_RUN.sub(_REDACTED, out)
+    return out if encoded == out else _redact_stages(encoded)
+
+
+def _redact_stages(text: str) -> str:
+    """The two stages of :func:`redact`: the #1711 passes to their fixed point, then the widened ones
+    when :func:`_needs_widened_stage` says a widened rule could match."""
     first = _redact_rounds(text, widened=False)
     if not _needs_widened_stage(first):
         return first
@@ -1639,12 +1655,7 @@ def _redact_flat(text: str, *, widened: bool, credentials: bool) -> str:
     scrubbed = _DATE_RUN.sub(_REDACTED, scrubbed)
     # The callback only where a label could end a run, so ordinary text keeps the C-speed constant.
     has_label = "MRN" in scrubbed or "Mrn" in scrubbed
-    scrubbed = _NAME_RUN.sub(_name_run_replacement if has_label else _REDACTED, scrubbed)
-    # BACKLOG #2171, last so it cannot take a name run's second token (see the pattern). The screen is
-    # a C-speed search, so text without an encoded separator never pays the pattern's lookahead.
-    if "%" in scrubbed and _ENCODED_SEPARATOR.search(scrubbed):
-        scrubbed = _HL7_ENCODED_FIELD_RUN.sub(_REDACTED, scrubbed)
-    return scrubbed
+    return _NAME_RUN.sub(_name_run_replacement if has_label else _REDACTED, scrubbed)
 
 
 def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:

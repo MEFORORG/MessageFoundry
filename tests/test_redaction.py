@@ -1807,14 +1807,37 @@ def test_the_fhir_search_shape_is_scrubbed_through_every_entry_point() -> None:
         '{"id":"a%7Cb%7Cc","name": "Zqxdoe"}',
         # Before the name run, the encoded run took JANE and left ZQXDOE under the two-token threshold.
         "patient ZQXDOE JANE%7Cx%7Cy",
+        # A DICOM keyword glued to the run by punctuation, with its value in the next token.
+        "lookup failed: url=/q?a=x%7Cy%7Cz;PatientID= ZQXDOE",
+        # The same for a labelled MRN, which only the widened stage reads.
+        "lookup failed: x%7Cy%7Cz;mrn: 4455667",
     ],
-    ids=["xml-label", "json-key", "name-run"],
+    ids=["xml-label", "json-key", "name-run", "dicom-keyword", "mrn-label"],
 )
 def test_the_encoded_run_takes_no_label_or_name_another_pass_needed(text: str) -> None:
     """THE NO-REGRESSION ARM. Each value here was scrubbed before this pattern existed, by a pass that
-    needed a label or a second token the encoded run could swallow. It must still go."""
+    needed a label or a second token the encoded run could swallow. It must still go, which is why
+    the run comes after both stages of ``redact``."""
     for name, out in _every_entry_point(text).items():
-        assert "ZQXDOE" not in out and "Zqxdoe" not in out, f"{name}: {out!r}"
+        for planted in ("ZQXDOE", "Zqxdoe", "4455667"):
+            assert planted not in out, f"{name}: {out!r}"
+
+
+def test_a_fhir_or_list_is_one_run() -> None:
+    """FHIR joins alternatives with a comma, which must not split the run into one-separator parts."""
+    text = "GET /fhir/Patient?identifier=urn%7C4455667,urn%7C7788990"
+    for name, out in _every_entry_point(text).items():
+        assert "4455667" not in out and "7788990" not in out, f"{name}: {out!r}"
+
+
+def test_the_screen_spells_the_separators_the_pattern_counts() -> None:
+    """THE DRIFT GATE for the screen. ``redact`` skips the encoded run when ``_ENCODED_SEPARATOR``
+    finds nothing, so a separator the pattern counts and the screen does not would pass unscrubbed.
+    Every ``%`` in the pattern must be inside a copy of the screen's own spelling."""
+    pattern = redaction._HL7_ENCODED_FIELD_RUN.pattern
+    screen = redaction._ENCODED_SEPARATOR.pattern
+    assert screen in pattern
+    assert "%" not in pattern.replace(screen, "")
 
 
 @pytest.mark.parametrize(
@@ -2009,17 +2032,18 @@ _BACKSTOP_HOSTILE = {
 
 
 #: Inputs shaped to make the encoded-run pass work hardest: a match every few characters, escapes
-#: that are not separators, a separator prefix that never completes, and one-separator tokens.
+#: that are not separators, a separator prefix that never completes, and one-separator tokens. Every
+#: unit but the first holds one encoded separator per token, so the screen lets it through and the
+#: pattern's body lookahead runs at every ``%`` without a match to end the attempt early.
 _ENCODED_HOSTILE = {
     "many-matches": "a%7Cb%5Ec ",
-    "non-separator-escapes": "%20",
-    "unfinished-escapes": "%7",
-    "bare-percents": "%",
-    "one-separator-tokens": "a%7Cb ",
+    "non-separator-escapes": "a%20%20%20%20%7Cb ",
+    "unfinished-escapes": "%7%7%7%7%7Cb ",
+    "bare-percents": "%%%%%7Cb ",
     # A literal separator per token, so the literal pass leaves it and the pattern restarts after it.
     "restart-after-literal": "a|b c%7Cd ",
-    # Past the screen, then a body lookahead at every '%' before the one separator.
-    "escapes-beside-one-separator": "a%20%20%20%20%7Cb ",
+    # One long token with one separator: a single attempt walks all of it.
+    "one-long-token": "%20" * 1000 + "%7C ",
 }
 
 
