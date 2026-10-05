@@ -1,0 +1,762 @@
+{
+  "subject": "Survey of which pinned wheels carry another project's compiled code (BACKLOG #2935, ASVS 15.1.4)",
+  "survey_date": "2026-10-04",
+  "readings": "security/risky-component-readings.json",
+  "method": [
+    "The population and the pins are those of the readings snapshot named above.",
+    "A wheel tagged none-any holds no compiled code; the tag is the evidence.",
+    "For any other wheel, the pinned Linux x86_64 wheel for CPython 3.14 or abi3, and the Windows amd64 one, were downloaded from PyPI, their sha256 checked against the lock, and their contents listed. Nothing was installed or run. Extension modules were searched as bytes for needed-library names and version strings.",
+    "A file list cannot show code linked into an extension, so the pinned source distribution was read as well, hash-checked the same way.",
+    "The four PySide6 wheels were not fetched. Their answers rest on PyPI project metadata.",
+    "Where an answer could not be established, it is recorded as not established and the wheel is treated as carrying."
+  ],
+  "sources": {
+    "pypi_release": "https://pypi.org/pypi/<name>/<version>/json",
+    "locks": [
+      "requirements.lock",
+      "security/locks/requirements-harness.lock"
+    ]
+  },
+  "wheels": [
+    {
+      "name": "aioodbc",
+      "pinned": "0.5.0",
+      "carries": "no",
+      "projects": [],
+      "evidence_kind": "wheel tag",
+      "evidence": "PyPI lists one wheel for the pinned version, `aioodbc-0.5.0-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "files_read": [
+        {
+          "file": "aioodbc-0.5.0-py3-none-any.whl",
+          "sha256": "bcaf16f007855fa4bf0ce6754b1f72c6c5a3d544188849577ddd55c5dc42985e"
+        }
+      ],
+      "route": null,
+      "route_reason": null
+    },
+    {
+      "name": "aiosqlite",
+      "pinned": "0.22.1",
+      "carries": "no",
+      "projects": [],
+      "evidence_kind": "wheel tag",
+      "evidence": "PyPI lists one wheel for the pinned version, `aiosqlite-0.22.1-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "files_read": [
+        {
+          "file": "aiosqlite-0.22.1-py3-none-any.whl",
+          "sha256": "21c002eb13823fad740196c5a2e9d8e62f6243bd9e7e4a1f87fb5e44ecb4fceb"
+        }
+      ],
+      "route": null,
+      "route_reason": null
+    },
+    {
+      "name": "annotated-doc",
+      "pinned": "0.0.5",
+      "carries": "no",
+      "projects": [],
+      "evidence_kind": "wheel tag",
+      "evidence": "PyPI lists one wheel for the pinned version, `annotated_doc-0.0.5-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "files_read": [
+        {
+          "file": "annotated_doc-0.0.5-py3-none-any.whl",
+          "sha256": "117bac03a25ede5df5440e855b32d556049ca169ead221505badf432fed4b101"
+        }
+      ],
+      "route": null,
+      "route_reason": null
+    },
+    {
+      "name": "annotated-types",
+      "pinned": "0.8.0",
+      "carries": "no",
+      "projects": [],
+      "evidence_kind": "wheel tag",
+      "evidence": "PyPI lists one wheel for the pinned version, `annotated_types-0.8.0-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "files_read": [
+        {
+          "file": "annotated_types-0.8.0-py3-none-any.whl",
+          "sha256": "f072f4d804ea359e4eaf198b1af7a8b0943881a87f31bb764f8bf219bb9419e0"
+        }
+      ],
+      "route": null,
+      "route_reason": null
+    },
+    {
+      "name": "anyio",
+      "pinned": "4.15.1",
+      "carries": "no",
+      "projects": [],
+      "evidence_kind": "wheel tag",
+      "evidence": "PyPI lists one wheel for the pinned version, `anyio-4.15.1-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "files_read": [
+        {
+          "file": "anyio-4.15.1-py3-none-any.whl",
+          "sha256": "6152fdbbf9a77fdec97731721bebf7c4c44f7c29b424b0065826173efc7ed101"
+        }
+      ],
+      "route": null,
+      "route_reason": null
+    },
+    {
+      "name": "argon2-cffi",
+      "pinned": "25.1.0",
+      "carries": "no",
+      "projects": [],
+      "evidence_kind": "wheel tag",
+      "evidence": "PyPI lists one wheel for the pinned version, `argon2_cffi-25.1.0-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "files_read": [
+        {
+          "file": "argon2_cffi-25.1.0-py3-none-any.whl",
+          "sha256": "fdc8b074db390fccb6eb4a3604ae7231f219aa669a2652e0f20e16ba513d5741"
+        }
+      ],
+      "route": null,
+      "route_reason": null
+    },
+    {
+      "name": "argon2-cffi-bindings",
+      "pinned": "26.1.0",
+      "carries": "yes",
+      "projects": [
+        {
+          "name": "Argon2 reference implementation (phc-winner-argon2)",
+          "version": "not established"
+        }
+      ],
+      "evidence_kind": "wheel file list and source tree",
+      "evidence": "The wheel holds one extension module, `_ffi`, and no bundled library. The source distribution carries the Argon2 reference implementation under `extras/libargon2`, and the extension holds its `ARGON2_VERSION` symbols, so it is compiled in. The tree names no release beyond a changelog that starts at 20171227.",
+      "files_read": [
+        {
+          "file": "argon2_cffi_bindings-26.1.0-cp310-abi3-manylinux_2_26_x86_64.manylinux_2_28_x86_64.whl",
+          "sha256": "27f1821903e2ceadcb88ec2b45ef190897b7682449c772f4d9b53e42c520cf29"
+        },
+        {
+          "file": "argon2_cffi_bindings-26.1.0-cp310-abi3-win_amd64.whl",
+          "sha256": "2c36ff87b5dfaa477d0bd51e9d7f6abdae7c8955d2983c97419085d842154b3e"
+        },
+        {
+          "file": "argon2_cffi_bindings-26.1.0.tar.gz",
+          "sha256": "63505c71542a44b68b1e38060450fb006404170da375feb31af153e7f9c6205d"
+        }
+      ],
+      "route": null,
+      "route_reason": null
+    },
+    {
+      "name": "certifi",
+      "pinned": "2026.7.22",
+      "carries": "no",
+      "projects": [],
+      "evidence_kind": "wheel tag",
+      "evidence": "PyPI lists one wheel for the pinned version, `certifi-2026.7.22-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "files_read": [
+        {
+          "file": "certifi-2026.7.22-py3-none-any.whl",
+          "sha256": "62f22742b58a1a33014a2b6b706588a8d7e2a88ae7bd1a6ebe8c992928483775"
+        }
+      ],
+      "route": null,
+      "route_reason": null
+    },
+    {
+      "name": "cffi",
+      "pinned": "2.1.1",
+      "carries": "yes",
+      "projects": [
+        {
+          "name": "libffi",
+          "version": "not established"
+        }
+      ],
+      "evidence_kind": "wheel file list and source tree",
+      "evidence": "The wheel holds one extension module, `_cffi_backend`, and no bundled library. The Linux module names only libc and libpthread as needed libraries and holds libffi's own messages, and `setup.py` builds against libffi, so libffi is linked in. The source distribution carries libffi sources for Windows under `src/c/libffi_x86_x64`. Neither states a libffi version.",
+      "files_read": [
+        {
+          "file": "cffi-2.1.1-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+          "sha256": "b0431303acaea1089ad4b3e9ce4e6518193def1118d4073ca848635ee4ea2e96"
+        },
+        {
+          "file": "cffi-2.1.1-cp314-cp314-win_amd64.whl",
+          "sha256": "3222ba5d678f80a030e6afbcc33dc1ae5cb45facabb61cee2c7016b8432fde48"
+        },
+        {
+          "file": "cffi-2.1.1.tar.gz",
+          "sha256": "dd31f52ea1086513bb9df30f8fcee9b8918323ae067a3d5b78bc826a000712be"
+        }
+      ],
+      "route": null,
+      "route_reason": null
+    },
+    {
+      "name": "click",
+      "pinned": "8.5.0",
+      "carries": "no",
+      "projects": [],
+      "evidence_kind": "wheel tag",
+      "evidence": "PyPI lists one wheel for the pinned version, `click-8.5.0-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "files_read": [
+        {
+          "file": "click-8.5.0-py3-none-any.whl",
+          "sha256": "255bc9599cf7748b4b1a446ccc735421bd08a2ae529a8b88597d3de5664ee360"
+        }
+      ],
+      "route": null,
+      "route_reason": null
+    },
+    {
+      "name": "cryptography",
+      "pinned": "50.0.1",
+      "carries": "yes",
+      "projects": [
+        {
+          "name": "OpenSSL",
+          "version": "4.0.2"
+        },
+        {
+          "name": "Rust crates, the 40 entries of the source distribution's `Cargo.lock`",
+          "version": "as locked"
+        }
+      ],
+      "evidence_kind": "wheel file list and source tree",
+      "evidence": "The wheel holds one extension module, `_rust`, and no bundled library. That module holds the string `OpenSSL 4.0.2 25 Aug 2026` on both platforms, so OpenSSL is linked in. The source distribution's `Cargo.lock` names the Rust crates built into it.",
+      "files_read": [
+        {
+          "file": "cryptography-50.0.1-cp311-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+          "sha256": "ff838d62ec1bfce4f9ba7fa16f4a7b554cd8d0c299e6be37502161a660c84eef"
+        },
+        {
+          "file": "cryptography-50.0.1-cp311-abi3-win_amd64.whl",
+          "sha256": "aed8db4f6d71c51efb89530e12d9464e7bf2923d46c3205dc794a2a93f8c0648"
+        },
+        {
+          "file": "cryptography-50.0.1.tar.gz",
+          "sha256": "5dd9bda1c12b4162f6ff568eeb5e0ff956c28d14406e875cfe8a63a2d414ff20"
+        }
+      ],
+      "route": null,
+      "route_reason": null
+    },
+    {
+      "name": "fastapi",
+      "pinned": "0.141.1",
+      "carries": "no",
+      "projects": [],
+      "evidence_kind": "wheel tag",
+      "evidence": "PyPI lists one wheel for the pinned version, `fastapi-0.141.1-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "files_read": [
+        {
+          "file": "fastapi-0.141.1-py3-none-any.whl",
+          "sha256": "bfb91aa2d334c61cb35ba9a116fc123b3d3df31640b801cf57a7a78ec3f603b3"
+        }
+      ],
+      "route": null,
+      "route_reason": null
+    },
+    {
+      "name": "h11",
+      "pinned": "0.16.0",
+      "carries": "no",
+      "projects": [],
+      "evidence_kind": "wheel tag",
+      "evidence": "PyPI lists one wheel for the pinned version, `h11-0.16.0-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "files_read": [
+        {
+          "file": "h11-0.16.0-py3-none-any.whl",
+          "sha256": "63cf8bbe7522de3bf65932fda1d9c2772064ffb3dae62d55932da54b31cb6c86"
+        }
+      ],
+      "route": null,
+      "route_reason": null
+    },
+    {
+      "name": "hl7apy",
+      "pinned": "1.3.5",
+      "carries": "no",
+      "projects": [],
+      "evidence_kind": "wheel tag",
+      "evidence": "PyPI lists one wheel for the pinned version, `hl7apy-1.3.5-py2.py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "files_read": [
+        {
+          "file": "hl7apy-1.3.5-py2.py3-none-any.whl",
+          "sha256": "c8b80ff5ad020bf9c1e68a6395cf45cb78db621f65569d1798c46eb1b657e27b"
+        }
+      ],
+      "route": null,
+      "route_reason": null
+    },
+    {
+      "name": "httpcore",
+      "pinned": "1.0.9",
+      "carries": "no",
+      "projects": [],
+      "evidence_kind": "wheel tag",
+      "evidence": "PyPI lists one wheel for the pinned version, `httpcore-1.0.9-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "files_read": [
+        {
+          "file": "httpcore-1.0.9-py3-none-any.whl",
+          "sha256": "2d400746a40668fc9dec9810239072b40b4484b640a8c38fd654a024c7a1bf55"
+        }
+      ],
+      "route": null,
+      "route_reason": null
+    },
+    {
+      "name": "httptools",
+      "pinned": "0.8.0",
+      "carries": "yes",
+      "projects": [
+        {
+          "name": "llhttp",
+          "version": "9.4.1"
+        },
+        {
+          "name": "http-parser",
+          "version": "2.9.4"
+        }
+      ],
+      "evidence_kind": "wheel file list and source tree",
+      "evidence": "The wheel holds two extension modules and no bundled library. The source distribution carries both parsers under `vendor/`, and their headers give the versions.",
+      "files_read": [
+        {
+          "file": "httptools-0.8.0-cp314-cp314-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl",
+          "sha256": "c4a9f1707e4823d54dfec6c33fa3697d302aed536ed352a7ebb5a061ddb869d0"
+        },
+        {
+          "file": "httptools-0.8.0-cp314-cp314-win_amd64.whl",
+          "sha256": "19d1ee275bb59ba2643ba9a3a1e51cc0c788caf2b8df506368e03f56fdd08527"
+        },
+        {
+          "file": "httptools-0.8.0.tar.gz",
+          "sha256": "6b2a32f18d97e16e90827d7a819ffa8dbd8cc245fc4e1fa9d1095b54ef4bd999"
+        }
+      ],
+      "route": null,
+      "route_reason": null
+    },
+    {
+      "name": "httpx",
+      "pinned": "0.28.1",
+      "carries": "no",
+      "projects": [],
+      "evidence_kind": "wheel tag",
+      "evidence": "PyPI lists one wheel for the pinned version, `httpx-0.28.1-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "files_read": [
+        {
+          "file": "httpx-0.28.1-py3-none-any.whl",
+          "sha256": "d909fcccc110f8c7faf814ca82a9a4d816bc5a6dbfea25d6591d6985b8ba59ad"
+        }
+      ],
+      "route": null,
+      "route_reason": null
+    },
+    {
+      "name": "idna",
+      "pinned": "3.20",
+      "carries": "no",
+      "projects": [],
+      "evidence_kind": "wheel tag",
+      "evidence": "PyPI lists one wheel for the pinned version, `idna-3.20-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "files_read": [
+        {
+          "file": "idna-3.20-py3-none-any.whl",
+          "sha256": "ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c"
+        }
+      ],
+      "route": null,
+      "route_reason": null
+    },
+    {
+      "name": "ldap3",
+      "pinned": "2.9.1",
+      "carries": "no",
+      "projects": [],
+      "evidence_kind": "wheel tag",
+      "evidence": "PyPI lists one wheel for the pinned version, `ldap3-2.9.1-py2.py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "files_read": [
+        {
+          "file": "ldap3-2.9.1-py2.py3-none-any.whl",
+          "sha256": "5869596fc4948797020d3f03b7939da938778a0f9e2009f7a072ccf92b8e8d70"
+        }
+      ],
+      "route": null,
+      "route_reason": null
+    },
+    {
+      "name": "psutil",
+      "pinned": "7.2.2",
+      "carries": "no",
+      "projects": [],
+      "evidence_kind": "wheel file list and source tree",
+      "evidence": "The wheel holds one extension module and no bundled library. The Linux module names only libc and libpthread as needed libraries. The source distribution holds psutil's own C sources and no other project's, and `setup.py` links operating-system libraries only.",
+      "files_read": [
+        {
+          "file": "psutil-7.2.2-cp36-abi3-manylinux2010_x86_64.manylinux_2_12_x86_64.manylinux_2_28_x86_64.whl",
+          "sha256": "076a2d2f923fd4821644f5ba89f059523da90dc9014e85f8e45a5774ca5bc6f9"
+        },
+        {
+          "file": "psutil-7.2.2-cp37-abi3-win_amd64.whl",
+          "sha256": "eb7e81434c8d223ec4a219b5fc1c47d0417b12be7ea866e24fb5ad6e84b3d988"
+        },
+        {
+          "file": "psutil-7.2.2.tar.gz",
+          "sha256": "0746f5f8d406af344fd547f1c8daa5f5c33dbc293bb8d6a16d80b4bb88f59372"
+        }
+      ],
+      "route": null,
+      "route_reason": null
+    },
+    {
+      "name": "pyasn1",
+      "pinned": "0.6.4",
+      "carries": "no",
+      "projects": [],
+      "evidence_kind": "wheel tag",
+      "evidence": "PyPI lists one wheel for the pinned version, `pyasn1-0.6.4-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "files_read": [
+        {
+          "file": "pyasn1-0.6.4-py3-none-any.whl",
+          "sha256": "deda9277cfd454080ec40b207fb6df82206a3a2688735233cdcd8d3d565f088b"
+        }
+      ],
+      "route": null,
+      "route_reason": null
+    },
+    {
+      "name": "pycparser",
+      "pinned": "3.0",
+      "carries": "no",
+      "projects": [],
+      "evidence_kind": "wheel tag",
+      "evidence": "PyPI lists one wheel for the pinned version, `pycparser-3.0-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "files_read": [
+        {
+          "file": "pycparser-3.0-py3-none-any.whl",
+          "sha256": "b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992"
+        }
+      ],
+      "route": null,
+      "route_reason": null
+    },
+    {
+      "name": "pydantic",
+      "pinned": "2.13.5",
+      "carries": "no",
+      "projects": [],
+      "evidence_kind": "wheel tag",
+      "evidence": "PyPI lists one wheel for the pinned version, `pydantic-2.13.5-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "files_read": [
+        {
+          "file": "pydantic-2.13.5-py3-none-any.whl",
+          "sha256": "346a034f080da3755d8e9cb5e00e8b07de1d39e4f6e2c87d8ab7cafa0b269a73"
+        }
+      ],
+      "route": null,
+      "route_reason": null
+    },
+    {
+      "name": "pydantic-core",
+      "pinned": "2.46.5",
+      "carries": "yes",
+      "projects": [
+        {
+          "name": "Rust crates, the 104 entries of the source distribution's `Cargo.lock`",
+          "version": "as locked"
+        }
+      ],
+      "evidence_kind": "wheel file list and source tree",
+      "evidence": "The wheel holds one extension module and no bundled library. The source distribution's `Cargo.lock` names the Rust crates built into it, among them `regex` 1.12.3, `url` 2.5.8, `idna` 1.1.0, `jiter` 0.14.0 and `speedate` 0.17.0.",
+      "files_read": [
+        {
+          "file": "pydantic_core-2.46.5-cp314-cp314-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+          "sha256": "54d510bac3ee52247af28ed4bb18a1e799f040ac60fd2bf5ccd4c92f1fbe786f"
+        },
+        {
+          "file": "pydantic_core-2.46.5-cp314-cp314-win_amd64.whl",
+          "sha256": "fa10ef4112775900e7a0661068635eb67b2ab824fbde764de6e0e21982a93db0"
+        },
+        {
+          "file": "pydantic_core-2.46.5.tar.gz",
+          "sha256": "10416c15b8839ecc4ef4d0885da76da6fd0f67333a0eb8aff6d93c4b8f2910fc"
+        }
+      ],
+      "route": null,
+      "route_reason": null
+    },
+    {
+      "name": "pyodbc",
+      "pinned": "5.3.0",
+      "carries": "no",
+      "projects": [],
+      "evidence_kind": "wheel file list and source tree",
+      "evidence": "The wheel holds one extension module and no bundled library. The Linux module names `libodbc.so.2` as a needed library and the wheel does not carry it, so the ODBC driver manager is the host's. The source distribution holds pyodbc's own sources only.",
+      "files_read": [
+        {
+          "file": "pyodbc-5.3.0-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+          "sha256": "08b2439500e212625471d32f8fde418075a5ddec556e095e5a4ba56d61df2dc6"
+        },
+        {
+          "file": "pyodbc-5.3.0-cp314-cp314-win_amd64.whl",
+          "sha256": "58635a1cc859d5af3f878c85910e5d7228fe5c406d4571bffcdd281375a54b39"
+        },
+        {
+          "file": "pyodbc-5.3.0.tar.gz",
+          "sha256": "2fe0e063d8fb66efd0ac6dc39236c4de1a45f17c33eaded0d553d21c199f4d05"
+        }
+      ],
+      "route": null,
+      "route_reason": null
+    },
+    {
+      "name": "pyside6",
+      "pinned": "6.11.2",
+      "carries": "not established",
+      "projects": [],
+      "evidence_kind": "project metadata",
+      "evidence": "The wheel was not fetched or listed. PyPI gives it a platform tag and a size of about 0.6 MB, and its metadata requires `shiboken6`, `PySide6_Essentials` and `PySide6_Addons` at the same version. That does not show whether it holds a compiled file.",
+      "files_read": [],
+      "route": "highlight",
+      "route_reason": "The answer is not established, so the wheel is treated as carrying. A file listing of the pinned wheel would settle it."
+    },
+    {
+      "name": "pyside6-addons",
+      "pinned": "6.11.2",
+      "carries": "yes",
+      "projects": [
+        {
+          "name": "Qt",
+          "version": "not established"
+        }
+      ],
+      "evidence_kind": "project metadata",
+      "evidence": "The wheel was not fetched or listed. Its PyPI description says it includes Qt modules, and PyPI lists the Linux wheel at about 175 MB. The Qt version inside was not read.",
+      "files_read": [],
+      "route": "highlight",
+      "route_reason": "It holds compiled Qt modules, among them the web engine, multimedia and PDF modules. The harness imports none of them, but an install puts them on disk. A flaw filed against Qt names Qt, not `pyside6-addons`, so the vulnerability-history reading would not show it."
+    },
+    {
+      "name": "pyside6-essentials",
+      "pinned": "6.11.2",
+      "carries": "yes",
+      "projects": [
+        {
+          "name": "Qt",
+          "version": "not established"
+        }
+      ],
+      "evidence_kind": "project metadata",
+      "evidence": "The wheel was not fetched or listed. Its PyPI description says it includes the essential Qt modules, and PyPI lists the Linux wheel at about 80 MB. The Qt version inside was not read.",
+      "files_read": [],
+      "route": null,
+      "route_reason": null
+    },
+    {
+      "name": "pyspnego",
+      "pinned": "0.12.2",
+      "carries": "no",
+      "projects": [],
+      "evidence_kind": "wheel tag",
+      "evidence": "PyPI lists one wheel for the pinned version, `pyspnego-0.12.2-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "files_read": [
+        {
+          "file": "pyspnego-0.12.2-py3-none-any.whl",
+          "sha256": "04e7c9260ced15197b3f42b891ffa30fa98c37bb09372c5c2bf927bcdfe30b53"
+        }
+      ],
+      "route": null,
+      "route_reason": null
+    },
+    {
+      "name": "shiboken6",
+      "pinned": "6.11.2",
+      "carries": "not established",
+      "projects": [],
+      "evidence_kind": "project metadata",
+      "evidence": "The wheel was not fetched or listed. PyPI gives it a platform tag and a size between about 0.3 MB and 1.8 MB by platform. That does not show what compiled files it holds beyond the binding runtime.",
+      "files_read": [],
+      "route": null,
+      "route_reason": null
+    },
+    {
+      "name": "sspilib",
+      "pinned": "0.6.0",
+      "carries": "no",
+      "projects": [],
+      "evidence_kind": "wheel file list and source tree",
+      "evidence": "The Windows wheel holds sspilib's own extension modules and no bundled library. The lock carries a hash for the Windows wheel and the source distribution only. The Linux wheel on PyPI, which the lock does not carry, bundles a `libsspi` library.",
+      "files_read": [
+        {
+          "file": "sspilib-0.6.0-cp311-abi3-win_amd64.whl",
+          "sha256": "b841fabe630101d9e2be6ba56407a2a539087ee85d6ca1477748c21135c9f636"
+        },
+        {
+          "file": "sspilib-0.6.0.tar.gz",
+          "sha256": "b4d4e3402230f14cd93999f3953619163075bcaca3e13dcf2ab5942c269627f4"
+        }
+      ],
+      "route": null,
+      "route_reason": null
+    },
+    {
+      "name": "starlette",
+      "pinned": "1.7.0",
+      "carries": "no",
+      "projects": [],
+      "evidence_kind": "wheel tag",
+      "evidence": "PyPI lists one wheel for the pinned version, `starlette-1.7.0-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "files_read": [
+        {
+          "file": "starlette-1.7.0-py3-none-any.whl",
+          "sha256": "67f8e99895493dd2911a03f11314af6ceebeae4e704bb9f43dfc6a9db151c93e"
+        }
+      ],
+      "route": null,
+      "route_reason": null
+    },
+    {
+      "name": "tomlkit",
+      "pinned": "0.15.1",
+      "carries": "no",
+      "projects": [],
+      "evidence_kind": "wheel tag",
+      "evidence": "PyPI lists one wheel for the pinned version, `tomlkit-0.15.1-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "files_read": [
+        {
+          "file": "tomlkit-0.15.1-py3-none-any.whl",
+          "sha256": "177a05aece5a8ca5266fd3c448abb47b8d352f09d477d3ca8332db4d89b24304"
+        }
+      ],
+      "route": null,
+      "route_reason": null
+    },
+    {
+      "name": "truststore",
+      "pinned": "0.10.4",
+      "carries": "no",
+      "projects": [],
+      "evidence_kind": "wheel tag",
+      "evidence": "PyPI lists one wheel for the pinned version, `truststore-0.10.4-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "files_read": [
+        {
+          "file": "truststore-0.10.4-py3-none-any.whl",
+          "sha256": "adaeaecf1cbb5f4de3b1959b42d41f6fab57b2b1666adb59e89cb0b53361d981"
+        }
+      ],
+      "route": null,
+      "route_reason": null
+    },
+    {
+      "name": "typing-extensions",
+      "pinned": "4.16.0",
+      "carries": "no",
+      "projects": [],
+      "evidence_kind": "wheel tag",
+      "evidence": "PyPI lists one wheel for the pinned version, `typing_extensions-4.16.0-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "files_read": [
+        {
+          "file": "typing_extensions-4.16.0-py3-none-any.whl",
+          "sha256": "481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8"
+        }
+      ],
+      "route": null,
+      "route_reason": null
+    },
+    {
+      "name": "typing-inspection",
+      "pinned": "0.4.4",
+      "carries": "no",
+      "projects": [],
+      "evidence_kind": "wheel tag",
+      "evidence": "PyPI lists one wheel for the pinned version, `typing_inspection-0.4.4-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "files_read": [
+        {
+          "file": "typing_inspection-0.4.4-py3-none-any.whl",
+          "sha256": "65b8397ba37ccbce054456aaccddfc91e6e3083c92824df348d96ca832f3f147"
+        }
+      ],
+      "route": null,
+      "route_reason": null
+    },
+    {
+      "name": "tzdata",
+      "pinned": "2026.4",
+      "carries": "no",
+      "projects": [],
+      "evidence_kind": "wheel tag",
+      "evidence": "PyPI lists one wheel for the pinned version, `tzdata-2026.4-py2.py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "files_read": [
+        {
+          "file": "tzdata-2026.4-py2.py3-none-any.whl",
+          "sha256": "c2169a8b0a7a5e9674da5a135ccdfb2b3e671b333ed9fed17b41f73c34476e81"
+        }
+      ],
+      "route": null,
+      "route_reason": null
+    },
+    {
+      "name": "uvicorn",
+      "pinned": "0.49.0",
+      "carries": "no",
+      "projects": [],
+      "evidence_kind": "wheel tag",
+      "evidence": "PyPI lists one wheel for the pinned version, `uvicorn-0.49.0-py3-none-any.whl`. Its tag is `none-any`, so it holds no compiled code.",
+      "files_read": [
+        {
+          "file": "uvicorn-0.49.0-py3-none-any.whl",
+          "sha256": "ba3d14c3ee7e41c6c654c46c9eb489d33213cdd30aa1696eab1374337c13f68f"
+        }
+      ],
+      "route": null,
+      "route_reason": null
+    },
+    {
+      "name": "uvloop",
+      "pinned": "0.22.1",
+      "carries": "yes",
+      "projects": [
+        {
+          "name": "libuv",
+          "version": "1.48.0"
+        }
+      ],
+      "evidence_kind": "wheel file list and source tree",
+      "evidence": "The wheel holds one extension module, `loop`, of about 15 MB, and no bundled library. It names only libc, libpthread and librt as needed libraries and holds libuv's `uv_version_string` symbol. The source distribution carries libuv under `vendor/libuv`, its `include/uv/version.h` gives 1.48.0, and `setup.py` builds that copy unless told to use the system's. PyPI has no Windows wheel for it.",
+      "files_read": [
+        {
+          "file": "uvloop-0.22.1-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+          "sha256": "c1955d5a1dd43198244d47664a5858082a3239766a839b2102a269aaff7a4e25"
+        },
+        {
+          "file": "uvloop-0.22.1.tar.gz",
+          "sha256": "6c84bae345b9147082b17371e3dd5d42775bddce91f885499017f4607fdaf39f"
+        }
+      ],
+      "route": "highlight",
+      "route_reason": "libuv is the event loop's I/O layer, so the socket reads and writes of an engine that runs on `uvloop` go through it. An advisory against libuv names libuv, not `uvloop`, so the vulnerability-history reading would not show it."
+    },
+    {
+      "name": "websockets",
+      "pinned": "17.1",
+      "carries": "no",
+      "projects": [],
+      "evidence_kind": "wheel file list and source tree",
+      "evidence": "The wheel holds one extension module, `speedups`, and no bundled library. The Linux module names only libc and libpthread as needed libraries, and the source distribution holds one C file, the project's own.",
+      "files_read": [
+        {
+          "file": "websockets-17.1-cp314-cp314-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl",
+          "sha256": "6f42912fa9eb4cb7c7ec9fde9b3332ba339eb8a8811981043d4029599f3d950b"
+        },
+        {
+          "file": "websockets-17.1-cp314-cp314-win_amd64.whl",
+          "sha256": "2a4dc6ef83f4559e0d05f313a375cb38f63c986096a9da99fe94fdd779d313e5"
+        },
+        {
+          "file": "websockets-17.1.tar.gz",
+          "sha256": "acfea4c20bf54384883ea33b1240fc1db4f52e190823a4e2b334bc3e8bfca96a"
+        }
+      ],
+      "route": null,
+      "route_reason": null
+    }
+  ]
+}

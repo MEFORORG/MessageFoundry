@@ -314,7 +314,8 @@ can judge them.
 
 OSV matches an advisory to a component by its PyPI name. A flaw in code a wheel carries inside it,
 such as a compiled library, shows up here only when an advisory names the PyPI package. So nothing
-below shows that the code inside a wheel is free of known flaws.
+below shows that the code inside a wheel is free of known flaws. *What each wheel carries inside
+it*, further down, says which wheels carry such code and what this page does about each.
 
 These tests are mechanical. A small library that is finished can trip the first one without being
 neglected. The reading says where to look; it does not say the library is broken.
@@ -388,6 +389,60 @@ the two agree is where to look first.
 2 components are risky here and not designated above: `anyio` (vulnerability history), `click`
 (vulnerability history). The tiers did not designate them under the exposure criterion. The reading
 names them so that choice stays visible, and a reviewer can revisit it.
+
+### What each wheel carries inside it
+
+The vulnerability-history test reads advisories by PyPI name. This survey asks what that test
+cannot: whether each of the 40 pinned wheels carries compiled code from another project. It was made
+by hand on 2026-10-04, against the pins the snapshot reads. Its evidence, the files read and their
+hashes are recorded in [`security/bundled-code-survey.json`](../security/bundled-code-survey.json).
+A run of the script does not repeat it.
+
+**Carries another project's compiled code: 8 of 40. Does not: 30. Not established: 2. 8 plus 30 plus
+2 is 40.**
+
+A wheel whose answer is not established is treated as carrying.
+
+| Component | Pinned | Carries | Evidence | Route |
+|---|---|---|---|---|
+| `argon2-cffi-bindings` | 26.1.0 | Argon2 reference implementation (phc-winner-argon2) | wheel file list and source tree | designated, tier 2 |
+| `cffi` | 2.1.1 | libffi | wheel file list and source tree | designated, tier 2 |
+| `cryptography` | 50.0.1 | OpenSSL 4.0.2; Rust crates, the 40 entries of the source distribution's `Cargo.lock` | wheel file list and source tree | designated, tier 2 |
+| `httptools` | 0.8.0 | llhttp 9.4.1; http-parser 2.9.4 | wheel file list and source tree | designated, tier 3 |
+| `pydantic-core` | 2.46.5 | Rust crates, the 104 entries of the source distribution's `Cargo.lock` | wheel file list and source tree | designated, tier 1 |
+| `pyside6` | 6.11.2 | not established | project metadata | highlighted below |
+| `pyside6-addons` | 6.11.2 | Qt | project metadata | highlighted below |
+| `pyside6-essentials` | 6.11.2 | Qt | project metadata | designated, the `harness` extra |
+| `shiboken6` | 6.11.2 | not established | project metadata | designated, the `harness` extra |
+| `uvloop` | 0.22.1 | libuv 1.48.0 | wheel file list and source tree | highlighted below |
+
+26 wheels were found to carry none, on the evidence of the wheel tag: `aioodbc`, `aiosqlite`,
+`annotated-doc`, `annotated-types`, `anyio`, `argon2-cffi`, `certifi`, `click`, `fastapi`, `h11`,
+`hl7apy`, `httpcore`, `httpx`, `idna`, `ldap3`, `pyasn1`, `pycparser`, `pydantic`, `pyspnego`,
+`starlette`, `tomlkit`, `truststore`, `typing-extensions`, `typing-inspection`, `tzdata`, `uvicorn`.
+
+4 wheels were found to carry none, on the evidence of the wheel file list and source tree: `psutil`,
+`pyodbc`, `sspilib`, `websockets`.
+
+A wheel tagged `none-any` holds no compiled code at all. For a compiled wheel, a file list shows a
+bundled library and cannot show code linked into an extension, so the pinned source distribution was
+read too.
+
+A designated wheel is already highlighted, by its tier. 3 wheels are not designated and not shown to
+carry nothing. Each takes one of two routes: this page highlights it as risky on what it carries, or
+reads the carried project's own advisories.
+
+**Highlighted as risky on what it carries:**
+
+| Component | Carries | Why |
+|---|---|---|
+| `pyside6` | not established | The answer is not established, so the wheel is treated as carrying. A file listing of the pinned wheel would settle it. |
+| `pyside6-addons` | Qt | It holds compiled Qt modules, among them the web engine, multimedia and PDF modules. The harness imports none of them, but an install puts them on disk. A flaw filed against Qt names Qt, not `pyside6-addons`, so the vulnerability-history reading would not show it. |
+| `uvloop` | libuv 1.48.0 | libuv is the event loop's I/O layer, so the socket reads and writes of an engine that runs on `uvloop` go through it. An advisory against libuv names libuv, not `uvloop`, so the vulnerability-history reading would not show it. |
+
+No advisory for a carried project was read for these. A reader who needs that has to check the
+carried project's own security notices against the version named. Highlighting here does not move a
+wheel into a tier.
 
 ### The names the assessed extras add
 
