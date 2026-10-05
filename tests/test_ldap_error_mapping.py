@@ -3,19 +3,22 @@
 """BACKLOG #2566: a socket fault that is not an ldap3 error still maps to ``LdapError``.
 
 ldap3 wraps most socket faults in its own ``LDAPException`` subclasses, and ``auth/ldap.py`` used to
-catch only those. An ``OSError``, ``OverflowError``, ``TypeError`` or ``struct.error`` from the
-socket layer (BACKLOG #2546 found the ``struct.error``) escaped unmapped, so no ``LdapError``
-handler saw it and the Kerberos and OIDC sign-ins wrote no ``auth.login_error`` row.
+catch only those. An ``OSError``, ``OverflowError``, ``TypeError``, ``ValueError`` or
+``struct.error`` raised while opening a socket (BACKLOG #2546 found the ``struct.error``) escaped
+unmapped, so no ``LdapError`` handler saw it and the Kerberos and OIDC sign-ins wrote no
+``auth.login_error`` row.
 
 Each site is driven through the recording ldap3 doubles of ``tests/test_ldap_timeouts.py``, with one
-operation made to raise. Three properties are pinned:
+operation made to raise. Four properties are pinned:
 
-* the fault becomes ``LdapError`` with fixed text that names only its type, because a fault's own
-  message can carry directory data, and the fault is kept as the cause;
+* the fault becomes ``LdapError`` with fixed text that names only its type, and the fault is kept
+  as the cause;
 * an ``LDAPException`` keeps its own handler and text, even one that is also an ``OSError`` or
   ``TypeError``. That arm is the control, and it fails if the mapper swallows ldap3's own errors;
-* an absent account and a present one fail alike when the socket faults (ASVS 6.3.8, #1140), so
-  the decoy bind does not swallow the fault.
+* a ``TypeError`` where no socket opens is not mapped, because there it is a defect, and mapping
+  it would hide the defect as an outage;
+* an absent account and a present one fail alike on such a fault (ASVS 6.3.8, #1140), so the decoy
+  bind does not swallow it.
 
 PHI-free: synthetic directory names and passwords only.
 """
@@ -24,7 +27,6 @@ from __future__ import annotations
 
 import struct
 from collections.abc import Callable
-from types import SimpleNamespace
 from typing import Any
 
 import ldap3
@@ -43,6 +45,7 @@ _FAULTS = [
     pytest.param(lambda: OSError(_LEAK), "OSError", id="OSError"),
     pytest.param(lambda: OverflowError(_LEAK), "OverflowError", id="OverflowError"),
     pytest.param(lambda: TypeError(_LEAK), "TypeError", id="TypeError"),
+    pytest.param(lambda: ValueError(_LEAK), "ValueError", id="ValueError"),
     pytest.param(lambda: struct.error(_LEAK), "struct.error", id="struct.error"),
 ]
 
@@ -63,7 +66,10 @@ def _faulting(monkeypatch: pytest.MonkeyPatch, *, at: str, fault: BaseException)
     """Make one ldap3 operation raise ``fault``, over the doubles already installed.
 
     ``at`` is ``"open"`` (the service account's ``auto_bind`` connection), ``"search"``,
-    ``"user bind"``, ``"decoy bind"`` (the #1140 equalizing bind), ``"whoami"`` or ``"unbind"``.
+    ``"user build"`` (constructing alice's bind connection), ``"user bind"``, ``"decoy bind"``
+    (the #1140 equalizing bind) or ``"unbind"``. A bare fault at
+    ``open`` or a bind is the shape real ldap3 raises: with one candidate address, ``open()``
+    re-raises what ``settimeout`` or ``setsockopt`` raised.
     """
     base = ldap3.Connection  # the recording double, possibly shaped by _shape_search
 
@@ -72,12 +78,8 @@ def _faulting(monkeypatch: pytest.MonkeyPatch, *, at: str, fault: BaseException)
             super().__init__(server, **kwargs)
             if at == "open" and kwargs.get("auto_bind"):
                 raise fault
-            self.extend = SimpleNamespace(standard=SimpleNamespace(who_am_i=self._who_am_i))
-
-        def _who_am_i(self) -> str:
-            if at == "whoami":
+            if at == "user build" and str(kwargs.get("user", "")).startswith("CN=alice"):
                 raise fault
-            return "u:EXAMPLE\\svc"
 
         def search(self, **kwargs: Any) -> bool:
             if at == "search":
@@ -107,14 +109,13 @@ def _assert_mapped(err: pytest.ExceptionInfo[LdapError], fault: BaseException, n
 # --- probe_principal and resolve_principal: the Kerberos, OIDC and reconciler lookup -------------
 
 
-@pytest.mark.parametrize("at", ["open", "search"])
 @pytest.mark.parametrize(("make", "name"), _FAULTS)
 def test_probe_principal_maps_a_socket_fault(
-    monkeypatch: pytest.MonkeyPatch, at: str, make: Callable[[], BaseException], name: str
+    monkeypatch: pytest.MonkeyPatch, make: Callable[[], BaseException], name: str
 ) -> None:
     _install_fakes(monkeypatch)
     fault = make()
-    _faulting(monkeypatch, at=at, fault=fault)
+    _faulting(monkeypatch, at="open", fault=fault)
     authenticator = LdapAuthenticator(_ad_settings())
 
     with pytest.raises(LdapError) as err:
@@ -123,6 +124,25 @@ def test_probe_principal_maps_a_socket_fault(
     # resolve_principal is probe_principal with the answer dropped, so it must map the same way.
     with pytest.raises(LdapError):
         authenticator.resolve_principal("alice")
+
+
+@pytest.mark.parametrize("at", ["search", "user build", "unbind"])
+def test_a_type_error_where_no_socket_opens_is_not_hidden_as_an_outage(
+    monkeypatch: pytest.MonkeyPatch, at: str
+) -> None:
+    """THE NARROWING GUARD. A search or release runs on an open socket, where ldap3 re-raises a
+    socket.error as its own error, and building the user connection does no I/O. So a bare
+    TypeError at any of them is a defect, such as a bad keyword, and must escape as itself. Mapped,
+    the session reconciler would read it as an outage, log it at debug level and never revoke."""
+    _install_fakes(monkeypatch)
+    _faulting(monkeypatch, at=at, fault=TypeError("synthetic engine defect"))
+    authenticator = LdapAuthenticator(_ad_settings())
+
+    with pytest.raises(TypeError, match="synthetic engine defect"):
+        if at == "search":
+            authenticator.probe_principal("alice")
+        else:
+            authenticator.authenticate("alice", _PASSWORD)
 
 
 @pytest.mark.parametrize("make", _LDAP3_ERRORS)
@@ -148,7 +168,7 @@ def test_an_ldap3_error_keeps_its_own_handler_and_text(
 # LdapError, not an audit row.
 
 
-@pytest.mark.parametrize("at", ["open", "user bind", "unbind"])
+@pytest.mark.parametrize("at", ["open", "user bind"])
 @pytest.mark.parametrize(("make", "name"), _FAULTS)
 def test_authenticate_maps_a_socket_fault(
     monkeypatch: pytest.MonkeyPatch, at: str, make: Callable[[], BaseException], name: str
@@ -195,20 +215,6 @@ def test_an_absent_and_a_present_account_fail_alike_on_a_socket_fault(
     assert texts["absent"] == texts["present"], texts
 
 
-def test_the_decoy_bind_still_swallows_an_ldap3_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The decoy's own contract is unchanged: an ldap3 error from a bind against a DN that cannot
-    exist is the ordinary wrong-username answer, not a directory error (#1140)."""
-    _install_fakes(monkeypatch)
-    _shape_search(monkeypatch, uac=None)
-    _faulting(
-        monkeypatch,
-        at="decoy bind",
-        fault=ldap3.core.exceptions.LDAPSocketOpenError("synthetic ldap3 text"),
-    )
-
-    assert LdapAuthenticator(_ad_settings()).authenticate("ghost", _PASSWORD) is None
-
-
 # --- read_bind_account: check-privileges ----------------------------------------------------------
 
 
@@ -223,31 +229,6 @@ def test_read_bind_account_maps_a_socket_fault_at_the_bind(
     with pytest.raises(LdapError) as err:
         LdapAuthenticator(_ad_settings()).read_bind_account()
     _assert_mapped(err, fault, name)
-
-
-def test_read_bind_account_reports_a_socket_fault_after_the_bind_and_keeps_reading() -> None:
-    """After a good bind, a fault in Who am I or the group read is reported in the reading, as an
-    ldap3 error there is, and a fault in the release is dropped. None raises."""
-    expected = "AD directory call failed: OverflowError"
-    with pytest.MonkeyPatch.context() as mp:
-        _install_fakes(mp)
-        _faulting(mp, at="whoami", fault=OverflowError(_LEAK))
-        reading = LdapAuthenticator(_ad_settings()).read_bind_account()
-    assert reading.authzid is None and reading.whoami_error == f"Who am I failed: {expected}"
-    assert reading.problem is None, "the group read must still run after Who am I failed"
-
-    with pytest.MonkeyPatch.context() as mp:
-        _install_fakes(mp)
-        _faulting(mp, at="search", fault=OverflowError(_LEAK))
-        reading = LdapAuthenticator(_ad_settings()).read_bind_account()
-    assert reading.authzid == "u:EXAMPLE\\svc"
-    assert reading.problem == f"group membership not read: {expected}"
-
-    with pytest.MonkeyPatch.context() as mp:
-        _install_fakes(mp)
-        _faulting(mp, at="unbind", fault=OverflowError(_LEAK))
-        reading = LdapAuthenticator(_ad_settings()).read_bind_account()
-    assert reading.authzid == "u:EXAMPLE\\svc" and reading.problem is None
 
 
 # --- where an operator meets it: the audit row ----------------------------------------------------

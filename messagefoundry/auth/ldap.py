@@ -515,17 +515,23 @@ def _refuse_referral(conn: Any, operation: str) -> None:
 def _search(conn: Any, operation: str, **kwargs: Any) -> None:
     """``conn.search(**kwargs)``, refusing a referral result. Every search in this module goes
     through here, so none can read one as "no entries"; a test pins that."""
-    with _socket_faults_as_ldap_error():
-        conn.search(**kwargs)
+    conn.search(**kwargs)
     _refuse_referral(conn, operation)
 
 
-#: What an ldap3 call can raise that is not an ldap3 error (BACKLOG #2566). ldap3 wraps most socket
-#: faults in its own ``LDAPException`` subclasses, but not all. ``socket.settimeout`` raises
-#: ``OverflowError`` or ``TypeError`` on a bad value, and ldap3's POSIX ``setsockopt`` raised
-#: ``struct.error`` on a float (BACKLOG #2546). ``OSError`` covers ``ssl.SSLError`` and a raw socket
-#: error. At least these; a type not named here still escapes unmapped.
-_SOCKET_FAULTS: tuple[type[Exception], ...] = (OSError, OverflowError, TypeError, struct.error)
+#: What opening an ldap3 socket can raise that is not an ldap3 error (BACKLOG #2566). ldap3's
+#: ``_open_socket`` wraps a ``socket.error`` in its own ``LDAPSocketOpenError``, but not what
+#: ``settimeout`` and ``setsockopt`` raise on a bad value: ``OverflowError``, ``TypeError``, or the
+#: ``struct.error`` BACKLOG #2546 found. With one candidate address, ``open()`` re-raises that fault
+#: bare. ``ValueError`` is a host name that fails IDNA encoding in ``getaddrinfo``, which runs outside
+#: ldap3's per-address try. ``OSError`` covers what else escapes. At least these; others still escape.
+_SOCKET_FAULTS: tuple[type[Exception], ...] = (
+    OSError,
+    OverflowError,
+    TypeError,
+    ValueError,
+    struct.error,
+)
 
 
 @contextlib.contextmanager
@@ -535,11 +541,23 @@ def _socket_faults_as_ldap_error() -> Iterator[None]:
     Every caller maps ``LdapError`` to a directory failure, and the sign-in callers write
     ``auth.login_error``, so an unmapped fault would skip both and surface as an unhandled error.
 
-    **It wraps the ldap3 call alone, never the code that reads the answer.** A ``TypeError`` from
-    the engine's own parsing is a defect. Mapped, it would read as a directory outage, which the
-    session reconciler holds on and logs at debug level, so the defect would hide. An ``LDAPException``
-    passes through untouched, even one that is also an ``OSError`` or ``TypeError``, so its own
-    handler keeps its own text. The new text is fixed: the fault's message can carry directory data.
+    **It wraps only the ldap3 calls that OPEN a socket**: the service account's ``auto_bind``
+    construction and the explicit binds. An operation on an open socket needs none, because ldap3
+    already re-raises a ``socket.error`` there as its own ``LDAPSocket*Error``. A wider wrap would
+    catch the engine's own defects, such as a ``TypeError`` from a bad keyword or from parsing an
+    answer. Mapped, that reads as a directory outage, which the session reconciler holds on and logs
+    at debug level, so the defect would hide.
+
+    Two wraps are wider than the open, and each says why. The ``auto_bind`` construction checks its
+    keywords and opens in one call, so a renamed ldap3 keyword there would map; the real-ldap3 arms
+    of ``tests/test_ldap_referrals.py`` build that connection, so one would fail there first. And
+    ``authenticate`` wraps the whole decoy bind, which must neither map nor swallow by itself.
+
+    An ``LDAPException`` passes through untouched, even one that is also an ``OSError``,
+    ``TypeError`` or ``ValueError``, so its own handler keeps its own text. The new text is fixed
+    and names only the type: a fault's message is not the engine's to repeat. **That holds only for
+    a fault that reaches this wrap bare.** With more than one candidate address, ldap3 bundles each
+    address's fault into ``LDAPSocketOpenError``, whose text the ldap3 handler keeps.
     """
     import ldap3
 
@@ -697,10 +715,13 @@ class LdapAuthenticator:
         # ASVS 13.1.3: receive_timeout bounds every LDAP RESPONSE read on this connection (the bind and
         # each search). ldap3's default is None — an unresponsive DC would otherwise pin the thread-pool
         # worker AuthService dispatches this call on, since that dispatch has no asyncio.wait_for.
-        # auto_bind opens the socket here, so a socket fault surfaces here (BACKLOG #2566).
+        # auto_bind opens the socket here, so a socket fault surfaces here (BACKLOG #2566). The
+        # Server is built outside the wrap to keep engine code out of it. The timeout conversion
+        # stays inline, because tests/test_ldap_timeouts.py checks for that call at this site.
+        server = self._server()
         with _socket_faults_as_ldap_error():
             return ldap3.Connection(
-                self._server(),
+                server,
                 user=self._s.ad_bind_dn,
                 password=self._bind_password,  # resolved once in __init__ (env or a provider)
                 authentication=ldap3.SIMPLE,
@@ -725,9 +746,14 @@ class LdapAuthenticator:
 
         **A socket fault that is not an ldap3 error is NOT swallowed (BACKLOG #2566).** It propagates,
         and ``authenticate`` maps it to :class:`LdapError` exactly as it maps the real bind's. Both
-        branches open a socket to the same directory, so a fault there fails them alike; swallowing
+        branches open a socket to the same directory, so such a fault fails them alike; swallowing
         it here alone would answer "wrong password" for an absent account and "directory error" for
         a present one.
+
+        **What #2566 does not settle:** ldap3's OWN socket errors still differ between the branches.
+        This method swallows an ``LDAPSocketOpenError`` while the real bind's handler maps it, so a
+        directory that fails only the second connect answers the two differently. That predates
+        #2566 and is not changed here.
 
         **What this does NOT claim:** that wall-clock is now provably equal. It equalizes the code
         PATH, which is what the item measured; a directory may still answer ``invalidCredentials``
@@ -942,9 +968,10 @@ class LdapAuthenticator:
                     # does not — so relocating it into the bind path alone would let a DISABLED
                     # ACCOUNT AUTHENTICATE OVER SSO. Equalize the CALLER, never move the check.
                     #
-                    # A socket fault in the decoy bind is mapped HERE, the same way the real bind's
-                    # is below, so an absent and a present account fail alike (BACKLOG #2566).
-                    # Swallowing it inside _equalizing_bind would tell the two apart.
+                    # A _SOCKET_FAULTS error in the decoy is mapped HERE, the same way the real
+                    # bind's is below, so for those types an absent and a present account fail
+                    # alike (BACKLOG #2566). Swallowing it inside _equalizing_bind would tell the two
+                    # apart. That method's docstring says what this does not settle.
                     with _socket_faults_as_ldap_error():
                         self._equalizing_bind(password)
                     return None
@@ -963,17 +990,17 @@ class LdapAuthenticator:
                 )
                 # Released on BOTH paths. A rejected password is the common adversarial case, so
                 # returning early without unbinding would leave the connection to GC under exactly
-                # the load that matters (ASVS 13.1.3 — resource release). The bind opens the
-                # socket; the construction above does not (BACKLOG #2566).
+                # the load that matters (ASVS 13.1.3 — resource release).
                 try:
+                    # BACKLOG #2566: the bind opens the socket, so only the bind is wrapped. The
+                    # build above does no I/O, and the release runs on an open socket.
                     with _socket_faults_as_ldap_error():
                         bound = user_conn.bind()
                     if not bound:
                         _refuse_referral(user_conn, "user bind")
                         return None
                 finally:
-                    with _socket_faults_as_ldap_error():
-                        user_conn.unbind()
+                    user_conn.unbind()
                 groups = self._resolve_groups(svc, user_dn, info["memberOf"])
         except ldap3.core.exceptions.LDAPException as exc:
             raise LdapError(str(exc)) from exc
@@ -1058,15 +1085,11 @@ class LdapAuthenticator:
             # failure, and the group read still runs.
             whoami_error: str | None = None
             try:
-                with _socket_faults_as_ldap_error():
-                    answer = svc.extend.standard.who_am_i()
-                who = _authzid_text(answer)
-            except (ldap3.core.exceptions.LDAPException, LdapError) as exc:
+                who = _authzid_text(svc.extend.standard.who_am_i())
+            except ldap3.core.exceptions.LDAPException as exc:
                 # The type name only, as the group read below does: ldap3's text for an
-                # extended-operation error carries the directory's own diagnostic message. An
-                # LdapError is a mapped socket fault, whose fixed text names only its type.
-                why = str(exc) if isinstance(exc, LdapError) else type(exc).__name__
-                who, whoami_error = None, f"Who am I failed: {why}"
+                # extended-operation error carries the directory's own diagnostic message.
+                who, whoami_error = None, f"Who am I failed: {type(exc).__name__}"
             try:
                 _search(
                     svc,
@@ -1087,9 +1110,7 @@ class LdapAuthenticator:
         except ldap3.core.exceptions.LDAPException as exc:
             raise LdapError(str(exc)) from exc
         finally:
-            # The release only: a fault here would replace the reading or the error already in hand.
-            # Suppressing TypeError is safe only because the one ldap3 call is all this covers.
-            with contextlib.suppress(ldap3.core.exceptions.LDAPException, *_SOCKET_FAULTS):
+            with contextlib.suppress(ldap3.core.exceptions.LDAPException):
                 svc.unbind()
         if entry is None:
             # ldap3 does not raise on a failed search here, so the result code is the only record of
