@@ -39,6 +39,13 @@ the criteria and their windows, and a re-read date. The page section between the
 from the page's own tiers. ``tests/test_risky_component_designation.py`` re-derives every verdict
 and re-renders the section, WITHOUT the network, and fails if either differs from what is tracked.
 
+WHAT A WHEEL CARRIES is answered by a third file, ``security/bundled-code-survey.json`` (BACKLOG
+#2935): a survey, made by hand, of whether each pinned wheel carries another project's compiled
+code. This script never writes it. It renders it into the same page section, and
+``survey_problems`` holds it to the snapshot: one answer per reading at the reading's pin, and a
+route for each not-designated wheel that was not shown to carry nothing. A run that leaves the
+survey behind says so and exits 1, after writing the snapshot and the page.
+
 A full run needs the network and runs by hand, never in CI. Standard library only, like
 ``runtime_closure.py`` beside it, so it runs under any Python 3.11 or later with nothing installed:
 

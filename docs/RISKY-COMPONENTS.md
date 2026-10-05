@@ -149,6 +149,10 @@ looked at.
 That is 11, and 23 plus 11 is 34. The arithmetic is stated so a reader can check the set is closed
 rather than trusting that it is.
 
+Not designated is a statement about the tiers only. A wheel in this table can still carry another
+project's compiled code. *What each wheel carries inside it*, in the ASVS reading further down,
+says which wheels do and highlights the ones that are not designated.
+
 ## The `sqlserver` extra
 
 The SQL Server store backend and the `DATABASE` connector reach their database through `pyodbc`,
@@ -264,8 +268,14 @@ A flaw filed against Qt itself, and not against one of those PyPI names, does no
 reading. So the vulnerability-history example is read for the names of the wheels and not for the Qt
 they carry. A name in that reading's *Not risky on any of the three* table is under the same limit.
 
-That is a limit of the instrument, and this page does not close it. A reader who needs the Qt side
-has to check Qt's own security notices against the Qt version the pinned wheels carry.
+That is a limit of the instrument. The same generated reading answers it under *What each wheel
+carries inside it*. That survey says, for every wheel this page assesses, whether the pinned wheel
+carries another project's compiled code, and on what evidence. The designated wheels here are
+already highlighted by the table above. A wheel that is not designated, and that the survey did not
+show to carry nothing, is highlighted there as risky on what it carries.
+
+The survey did not fetch the PySide6 wheels and read no Qt advisory. A reader who needs the Qt side
+still has to check Qt's own security notices against the Qt version the pinned wheels carry.
 
 The pins to check are the ones in
 [`security/runtime-closure-harness.txt`](../security/runtime-closure-harness.txt). The table's
@@ -506,6 +516,17 @@ an extra that has a section on this page, and that the script does not read, tur
 Each verdict must follow from its recorded readings under the recorded criteria. The section between
 the markers must be exactly what the snapshot and the tiers above render, so a tier change needs
 `python scripts/security/component_readings.py --render-only`.
+
+The same test holds the survey of what each wheel carries,
+[`security/bundled-code-survey.json`](../security/bundled-code-survey.json), three ways (BACKLOG
+#2935). Every name in an assessed closure must have a survey answer, so a new dependency needs one
+in the same pull request. A wheel that is not designated, and not shown to carry nothing, must have
+a recorded route. And the page's survey tables must say what the record says.
+
+The survey is made by hand, and no script repeats it. It is dated to the pins the snapshot reads, so
+a version bump alone does not turn the test red. A re-read that moves a pin does: the script then
+names each wheel whose survey answer is behind, and the test fails until that wheel is surveyed
+again. The record's `method` says how each answer was reached.
 
 The test does not go red when the re-read date passes, because a date alone would then fail every
 unrelated pull request. Keeping the re-read date is a maintainer task. Run
