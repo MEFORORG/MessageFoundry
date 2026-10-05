@@ -42,7 +42,8 @@
     WHAT -Force OVERRIDES ON -Path: uncommitted tracked changes, untracked files, ignored files, and
     files flagged skip-worktree or assume-unchanged. Without -Force every one of those refuses, with
     ONE exception: an IGNORED directory named .venv, node_modules, __pycache__, .pytest_cache,
-    .mypy_cache or .ruff_cache goes with the worktree. An UNTRACKED directory of those names refuses.
+    .mypy_cache or .ruff_cache goes with the worktree. An UNTRACKED directory of those names refuses,
+    and so does one that is a junction or a symlink.
     -Force is the operator's switch. A session runs -Path without it, and a refusal is final for a
     session: it reports what was refused and why, and stops.
 
@@ -430,6 +431,22 @@ if ($byPath) {
         throw "git status failed in '$WorktreePath' (exit $LASTEXITCODE), so its changes are unknown. Nothing was removed."
     }
     $pending = @($statusLines | Where-Object { $_ -and $_ -cnotmatch $exemptIgnored })
+    # A TOLERATED NAME IS NOT ENOUGH: THE DIRECTORY MUST BE A REAL ONE, INSIDE THE TREE. A junction or
+    # symlink named `node_modules` can point at a directory somewhere else, and a recursive delete
+    # that follows it takes content this worktree never held. So a tolerated directory that is a
+    # reparse point, or that cannot be read, goes back on the pending list. This reads the named
+    # directory only, not what is inside it.
+    foreach ($line in @($statusLines | Where-Object { $_ -cmatch $exemptIgnored })) {
+        $rel = $line.Substring(3).TrimEnd('/')
+        $isRealDirectory = $false
+        try {
+            $item = Get-Item -LiteralPath (Join-Path $WorktreePath $rel) -Force -ErrorAction Stop
+            $isRealDirectory = $item.PSIsContainer -and
+                -not ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
+        }
+        catch { $isRealDirectory = $false }
+        if (-not $isRealDirectory) { $pending += "$line  (a link, or unreadable: not a plain directory)" }
+    }
     # git status does not look at a file flagged skip-worktree (S) or assume-unchanged (lower case), so
     # an edit to one is invisible above. Count every flagged file as pending: nothing here can tell an
     # edited one from an untouched one without reading it.
@@ -500,6 +517,14 @@ if ($byPath) {
 $allocDirRoot = ''
 $commonDirPre = "$(& git -C $GitRoot rev-parse --path-format=absolute --git-common-dir 2>$null)".Trim()
 if ($commonDirPre) { $allocDirRoot = Join-Path $commonDirPre 'mefor-coord/alloc' }
+elseif ($byPath) {
+    # -Path FAILS CLOSED HERE, and -Name keeps the behaviour it had. With no common dir there is no
+    # way to find the allocation records, and "no records found" must not be how that reads.
+    throw "git could not name the common git dir of '$GitRoot', so allocations are unknown. Nothing was removed."
+}
+# The same split for the listing below: on -Path an alloc directory that cannot be listed stops the
+# run; on -Name the listing error is still swallowed, as it always was.
+$allocListErrors = if ($byPath) { 'Stop' } else { 'SilentlyContinue' }
 
 function Test-LedgerNumberOnMain([string]$Kind, [string]$Number) {
     <# $true on origin/main, $false absent, $null CANNOT TELL (which the caller treats as at-risk).
@@ -528,7 +553,7 @@ if ($allocDirRoot -and (Test-Path -LiteralPath $allocDirRoot)) {
     $allocOwners = @($targetSpellings | ForEach-Object { ConvertTo-Norm $_ })
     $atRisk = @()
     $allocUnreadable = @()
-    foreach ($f in @(Get-ChildItem -LiteralPath $allocDirRoot -Filter *.json -File -Recurse -EA SilentlyContinue | Sort-Object FullName)) {
+    foreach ($f in @(Get-ChildItem -LiteralPath $allocDirRoot -Filter *.json -File -Recurse -EA $allocListErrors | Sort-Object FullName)) {
         $a = $null
         try { $a = Get-Content -LiteralPath $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop }
         catch { $allocUnreadable += $f.Name; continue }

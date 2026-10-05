@@ -118,9 +118,10 @@ for the checkouts named in its allowlist:
    not change. `-Force` stays the user's switch, and the text prints no `-Force` command. A refusal
    from the script is final for a session. (Vault BACKLOG #1017.)
 
-   Three cases get no command. A tree under `.claude/worktrees` gets none, because the occupancy
-   check cannot see a subagent there. A governed checkout whose `remove.ps1` predates `-Path` gets
-   a line saying so. A `move` gets its own text: there is no checked route for a move.
+   Some cases get no command. A tree under `.claude/worktrees` gets none, because the occupancy
+   check cannot see a subagent there. The primary checkout gets none, because nothing removes it.
+   A governed checkout whose `remove.ps1` predates `-Path` gets a line saying so. A `move` gets
+   its own text: there is no checked route for a move.
 
 This list is not the whole rule set. The hook itself,
 [`scripts/hooks/worktree_gate.ps1`](../scripts/hooks/worktree_gate.ps1), is the source of record.

@@ -279,7 +279,8 @@ def test_the_unsafe_spellings_and_inherited_git_variables_are_refused(rig: Rig) 
     # -Path does not take -DeleteBranch at all, so the branch cannot go by this route.
     with_branch = rig.run("-Path", str(wt), "-DeleteBranch")
     assert with_branch.returncode != 0
-    assert "Parameter set cannot be resolved" in _out(with_branch)
+    # The binder's own message is not asserted: its wording follows the host's language. That the
+    # run failed and the tree and branch are still there, asserted below, is the property.
 
     assert wt.exists() and rig.is_registered(wt)
     assert rig.branch_exists("careful")
@@ -587,6 +588,32 @@ def test_only_an_ignored_directory_with_a_tolerated_name_goes_without_force(rig:
     proc = rig.run("-Path", str(wt))
     assert proc.returncode == 0, _out(proc)
     assert not wt.exists()
+
+
+def test_a_tolerated_name_that_is_a_junction_out_of_the_tree_is_not_tolerated(rig: Rig) -> None:
+    """A junction named ``node_modules`` can point anywhere. A recursive delete that follows it takes
+    content the worktree never held, so the name alone must not clear it. Whether git reports the
+    junction as a directory or as a link, the run must refuse and the outside content must survive."""
+    wt = rig.add(rig.scratch("linked"))
+    outside = rig.root / "shared-packages"
+    outside.mkdir()
+    precious = outside / "precious.txt"
+    precious.write_text("lives outside every worktree\n", encoding="utf-8")
+    made = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(wt / "node_modules"), str(outside)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if made.returncode != 0:
+        pytest.skip(f"could not create a junction: {made.stderr or made.stdout}")
+
+    proc = rig.run("-Path", str(wt))
+
+    assert proc.returncode != 0, _out(proc)
+    assert "node_modules" in _out(proc), _out(proc)
+    assert wt.exists() and rig.is_registered(wt)
+    assert precious.read_text(encoding="utf-8") == "lives outside every worktree\n"
 
 
 def test_an_edit_hidden_by_skip_worktree_needs_force(rig: Rig) -> None:

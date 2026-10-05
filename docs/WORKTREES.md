@@ -205,7 +205,9 @@ have the protection this was designed for"*. Rule 3d still denies a raw `git wor
 at another tree. Its deny text now names this route, because the script can make checks the gate
 cannot. (Vault BACKLOG #1017.)
 
-`-Path` refuses all of these, and `-Force` overrides none of them:
+`-Path` refuses at least these, and `-Force` overrides none of them. The header of
+[`scripts/worktree/remove.ps1`](../scripts/worktree/remove.ps1) is the source of record; this list
+is a copy for readers and can lag it.
 
 - `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR` or `GIT_INDEX_FILE` set in the environment.
 - A path component that ends in a dot or a space. Windows drops both, so it names another directory.
@@ -227,10 +229,10 @@ cannot. (Vault BACKLOG #1017.)
 Without `-Force` it also refuses uncommitted tracked changes, untracked files, ignored files, and
 files flagged skip-worktree or assume-unchanged. **One exception:** an *ignored directory* named
 `.venv`, `node_modules`, `__pycache__`, `.pytest_cache`, `.mypy_cache` or `.ruff_cache` goes with
-the worktree. An *untracked* directory of one of those names still refuses, and so does an ignored
-*file* of one. Measured on 2026-10-04: 9 of 12 sampled sibling worktrees carried nothing outside
-that exception. The other three were refused for generated files such as `out/` and a local
-certificate pair.
+the worktree. An *untracked* directory of one of those names still refuses. So does an ignored
+*file* of one, and so does a directory of one that is a junction or a symlink. Other ignored
+entries refuse too, such as a generated `out/` directory, a local certificate pair, or a
+`.claude/seat.local.txt`.
 
 `-AllowOrphanedAllocations` is the only override for a tree that owns an unlanded ledger number.
 

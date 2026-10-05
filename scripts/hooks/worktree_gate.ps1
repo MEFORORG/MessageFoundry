@@ -3787,7 +3787,11 @@ What to do instead:
         $isSibling = $victimTop -and $victimTop.StartsWith($sibPrefix) -and
                      -not $victimTop.Substring($sibPrefix.Length).Contains('/')
         $isManaged = $victimTop -and ($victimTop -match '/\.claude/worktrees(/|$)')
-        $pathRoute = (-not $isManaged) -and (Test-ScriptDeclaresParameter $govWt.Display 'remove.ps1' 'Path')
+        # THE PRIMARY ITSELF IS NOBODY'S TO REMOVE. Git never removes a main worktree and the script
+        # refuses it by name, so printing the -Path line for it would hand the reader a dead end.
+        $isPrimary = $victimTop -and ($victimTop -eq $govWt.Compare)
+        $pathRoute = (-not $isManaged) -and (-not $isPrimary) -and
+                     (Test-ScriptDeclaresParameter $govWt.Display 'remove.ps1' 'Path')
         # NAME the directory rather than printing `<directory-name>`. The gate has just resolved the
         # path; leaving the caller to substitute a placeholder into a command is a second chance to get
         # it wrong, and it is the reason the own-tree branch was unrunnable for the sibling family too.
@@ -3811,12 +3815,19 @@ What to do instead:
         # One sentence, said in two of the texts below.
         $predatesWhy = "The remove.ps1 in $govMsg predates ``-Path``, the route that checks a tree before removing it"
         # Why there is no command, for the two shapes that get none. Prose, so it is folded, not quoted.
-        $noRouteWhy = if ($isManaged) {
+        $noRouteWhy = if ($isPrimary) {
             @"
-NO SCRIPT REMOVES THIS TREE, and that is deliberate. It is under .claude/worktrees, where the
-    Claude Code harness puts a session or a subagent. The occupancy check behind ``remove.ps1 -Path``
-    reads the directory a session was LAUNCHED in, and a subagent's tree is recorded under its
-    parent's, so the check would read it as empty. prune-merged.ps1 skips it for the same reason.
+THIS IS THE PRIMARY CHECKOUT, AND NOTHING REMOVES IT. Git refuses to remove a main worktree, and
+    so does every script here. Every other worktree of this repository hangs off it.
+"@
+        }
+        elseif ($isManaged) {
+            @"
+THIS GATE NAMES NO SCRIPT FOR THIS TREE, and that is deliberate. It is under .claude/worktrees,
+    where the Claude Code harness puts a session or a subagent. The occupancy check behind
+    ``remove.ps1 -Path`` reads the directory a session was LAUNCHED in, and a subagent's tree is
+    recorded under its parent's, so the check would read it as empty. prune-merged.ps1 skips it for
+    the same reason.
 "@
         }
         else {
@@ -3856,6 +3867,12 @@ THERE IS NO CHECKED ROUTE FOR THIS TREE YET.
     the worktree $victimTopMsg removed, and the checked route is not in that checkout yet."
 "@
         }
+        elseif ($isPrimary) {
+            @"
+  * $noRouteWhy
+    If the whole checkout is to go, that is the user's decision, and it is not a worktree operation.
+"@
+        }
         else {
             @"
   * $noRouteWhy
@@ -3876,6 +3893,12 @@ session ends." The removal runs from OUTSIDE this tree, by the user or by a sess
             @"
 session ends." Removal is theirs to run from OUTSIDE this tree:
         $removeCmd
+"@
+        }
+        elseif ($isPrimary) {
+            @"
+session ends." That is theirs to decide.
+    $noRouteWhy
 "@
         }
         else {

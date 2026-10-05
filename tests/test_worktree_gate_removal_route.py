@@ -192,10 +192,27 @@ def test_a_tree_under_claude_worktrees_gets_no_command_and_is_told_why(
     assert not _path_lines(reason), reason
     assert not [ln for ln in _command_lines(reason) if "remove.ps1" in ln], reason
     assert not [ln for ln in _command_lines(reason) if "prune-merged.ps1" in ln], reason
-    assert "NO SCRIPT REMOVES THIS TREE" in reason
+    assert "THIS GATE NAMES NO SCRIPT FOR THIS TREE" in reason
     assert ".claude/worktrees" in reason
     # Control for the three absences above: the same rule DOES print the route one family over.
     assert _path_lines(_deny(repo, "other", standing_in))
+
+
+def test_the_primary_itself_gets_no_command_because_nothing_removes_it(
+    repo: SimpleNamespace,
+) -> None:
+    """The script refuses the primary by name, so the -Path line for it would be a dead end: a remedy
+    that cannot work. Asked from a linked worktree, where the primary is "not the tree you are in"."""
+    reason = assert_denied(
+        run_gate(bash(f'git worktree remove "{repo.primary}"', cwd=repo.other), repo.repos)
+    )
+
+    assert "NOT the tree" in reason
+    assert not _path_lines(reason), reason
+    assert not [ln for ln in _command_lines(reason) if "remove.ps1" in ln], reason
+    assert "THIS IS THE PRIMARY CHECKOUT, AND NOTHING REMOVES IT" in reason
+    # Control: the same question about a linked worktree, from the same place, prints the route.
+    assert _path_lines(_deny(repo, "sibling", "primary"))
 
 
 def test_the_sibling_family_still_gets_the_dry_run_tool_and_the_others_do_not(
