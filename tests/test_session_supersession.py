@@ -205,8 +205,11 @@ async def test_a_rotation_racing_the_supersession_cannot_keep_the_session_live(
     # landing in that gap moved the row to a new hash and the revoke matched nothing. The session
     # lived on under the rotated token. This drives the rotation in right after the supersession's
     # FIRST store call that names the presented hash, whichever call that is, so it measures the
-    # gap rather than one implementation's method name. Either order is acceptable as an outcome
-    # only if the session ends: the rotation fails closed, or its new token does not validate.
+    # gap rather than one method name. Once that call has run, the session must end: the rotation
+    # fails closed, or its new token does not validate. A rotation that commits BEFORE that call is
+    # the stated limit, pinned in tests/_session_rotation_contract.py. If a later change reads the
+    # presented hash earlier in the sign-in, this fires there, and that read must not decide the
+    # revoke, or the gap is back.
     service = await _service(store)
     prior = await _token(service)
     prior_hash = hash_token(prior)
@@ -236,6 +239,29 @@ async def test_a_rotation_racing_the_supersession_cannot_keep_the_session_live(
     )
     assert not await _live(service, prior)
     assert await _live(service, new)
+
+
+async def test_a_touch_just_before_the_revoke_still_audits_a_live_session(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Review finding on BACKLOG #2146. A request on the old cookie can touch the session just
+    # before the revoke. The liveness check must read its clock after the revoke, as the validator
+    # would, or that touch makes a live session look stamped ahead and the audit row is lost.
+    service = await _service(store)
+    prior = await _token(service)
+    prior_hash = hash_token(prior)
+    real = store.supersede_session
+
+    async def _touched_first(token_hash: str, *, now: float) -> object:
+        await store.touch_session(token_hash, now=time.time())
+        return await real(token_hash, now=now)
+
+    monkeypatch.setattr(store, "supersede_session", _touched_first)
+    await _token(service, supersedes=prior)
+    assert not await _live(service, prior)
+    assert await _superseded(store) == [
+        {"scope": "superseded", "session": prior_hash[:12], "actor": "op"}
+    ]
 
 
 async def test_a_failed_sign_in_ends_nothing(store: MessageStore) -> None:

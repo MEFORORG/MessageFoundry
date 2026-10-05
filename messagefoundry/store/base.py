@@ -2414,9 +2414,10 @@ class AuthStore(Protocol):
         session to the password leg.
 
         Returns **True** when a row was re-keyed, **False** when there was none to re-key — the row
-        is gone, expired-and-purged, or ``revoked_at IS NOT NULL``. This is the one session UPDATE
-        that reports its rowcount: every other one is deliberately blind (a write against a dead hash
-        is a silent no-op), but a caller rotating a session is about to hand the new token to a user,
+        is gone, expired-and-purged, or ``revoked_at IS NOT NULL``. This and
+        :meth:`supersede_session`, which returns the row it revoked, are the single-session UPDATEs
+        that report what they changed: every other one is deliberately blind (a write against a dead
+        hash is a silent no-op), but a caller rotating a session is about to hand the new token to a user,
         so it must be able to fail closed if the session died underneath it.
         """
         ...
@@ -2443,7 +2444,8 @@ class AuthStore(Protocol):
         expired or idle is still revoked and returned. Its other columns are as the revoke found
         them, so the caller can judge whether the session was live, and ``revoked_at`` is ``now``.
 
-        **ONE statement, so it cannot interleave with :meth:`rotate_session` (BACKLOG #2146).** The
+        **ONE atomic operation, so it cannot interleave with :meth:`rotate_session` (BACKLOG
+        #2146).** It is one statement on Postgres and SQL Server, and one transaction on SQLite. The
         login supersession used to read the row and then revoke it by hash, and a rotation that
         re-keyed the row between the two left the revoke matching nothing, so the session lived on
         under its new hash. Here the store orders the two writes on the row. If this one runs first,

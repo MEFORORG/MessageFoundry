@@ -3289,12 +3289,14 @@ the token being replaced, and the engine ends it as the console legs do, before 
 engine client (`EngineClient.login`) both name the token they replace in `supersedes`. The Python
 client names only a token the engine issued to it, never one adopted with `set_token`.
 
-The supersession ends the presented session in one store statement, so a step-up that gives the
-same session a new token cannot slip between a read and the revoke (BACKLOG #2146). If the
-supersession runs first, the step-up then fails and asks the user to sign in again. If the step-up
-had already finished before the supersession ran, the presented token names no session any more.
-The session then lives on under its new token until it expires, because nothing records which token
-replaced the old one.
+A step-up gives a session a new token. The supersession finds and ends the presented session in one
+atomic store operation, so a step-up cannot land between the two (BACKLOG #2146). If the
+supersession runs first, a later step-up on that session fails and asks the user to sign in again.
+**One case stays open.** A step-up can finish while the sign-in is still in progress, before the
+supersession runs. That window covers the credential check, and on federated sign-in the round trip
+to the identity provider. The presented token then names no session, so nothing is ended. The
+session lives on under its new token until it expires, because the engine does not record which
+token replaced the old one.
 
 A session's `id` is its token hash, and that hash changes whenever the session completes MFA or a
 step-up. So an id shown on a sessions page can go stale. The console's revoke says "Nothing was

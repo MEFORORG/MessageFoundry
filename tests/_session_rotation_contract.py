@@ -154,12 +154,20 @@ async def assert_session_supersession_contract(store: Any, *, user_id: str = "su
     # --- the happy path: revoked, and the row comes back as the revoke found it ------------------
     live = _h()
     await store.create_session(
-        token_hash=live, user_id=user_id, expires_at=expires, client="10.1.2.3", now=now
+        token_hash=live,
+        user_id=user_id,
+        expires_at=expires,
+        client="10.1.2.3",
+        now=now,
+        auth_mechanism="oidc",
     )
+    await store.mark_session_mfa_verified(live, now=now + 1)
     before = await store.get_session(live)
     assert before is not None
     ended = await store.supersede_session(live, now=now + 5)
     assert ended is not None, "an unrevoked row must be revoked and returned"
+    # Every column, so a backend whose RETURNING / OUTPUT mapping drops one cannot pass: the
+    # optional columns are read with .get(), and a missing one would come back as None.
     assert ended.token_hash == live
     assert ended.user_id == user_id
     assert ended.created_at == before.created_at
@@ -167,6 +175,10 @@ async def assert_session_supersession_contract(store: Any, *, user_id: str = "su
     assert ended.last_used_at == before.last_used_at, (
         "the liveness columns must come back as the revoke found them"
     )
+    assert ended.client == "10.1.2.3"
+    assert ended.reauth_at == before.reauth_at and ended.reauth_at is not None
+    assert ended.mfa_verified_at == now + 1
+    assert ended.auth_mechanism == "oidc"
     assert ended.revoked_at == now + 5
     stored = await store.get_session(live)
     assert stored is not None and stored.revoked_at == now + 5, "the revoke was not persisted"

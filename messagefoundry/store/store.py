@@ -12382,17 +12382,25 @@ class MessageStore:
             await self._commit()
 
     async def supersede_session(self, token_hash: str, *, now: float) -> SessionRecord | None:
-        """Revoke and return in one statement (BACKLOG #2146). See :meth:`AuthStore.supersede_session`.
+        """Revoke, then read the row back in the SAME transaction (BACKLOG #2146). See
+        :meth:`AuthStore.supersede_session`.
 
-        The row is fetched BEFORE the commit: SQLite refuses to commit while a ``RETURNING``
-        statement still has rows to step through."""
+        Two statements here rather than one ``UPDATE ... RETURNING``, because ``RETURNING`` needs
+        SQLite 3.35 and a Linux Python can link an older system library. They are still one unit:
+        the writer lock orders them against every in-process writer, ``rotate_session`` included,
+        and the write lock the ``UPDATE`` takes holds until the commit, so no other process can
+        re-key the row between them."""
         async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
-                "UPDATE sessions SET revoked_at=? WHERE token_hash=? AND revoked_at IS NULL"
-                " RETURNING *",
+                "UPDATE sessions SET revoked_at=? WHERE token_hash=? AND revoked_at IS NULL",
                 (now, token_hash),
             )
-            row = await cur.fetchone()
+            row = None
+            if cur.rowcount:
+                cur = await self._db.execute(
+                    "SELECT * FROM sessions WHERE token_hash=?", (token_hash,)
+                )
+                row = await cur.fetchone()
             await self._commit()
         return SessionRecord.from_mapping(dict(row)) if row else None
 
