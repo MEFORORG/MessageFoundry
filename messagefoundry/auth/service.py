@@ -5088,10 +5088,12 @@ class AuthService:
                 # passes keeps its "already reported" mark and is not reported again on its next
                 # sign-in.
                 still_unkeyed.add(user.id)
-            # With the validator's idle timeout (BACKLOG #2283), so an account whose only sessions
-            # are idle-dead costs no directory bind. Such a row comes back only if the idle setting
-            # is raised, and the next pass then sees it live and probes it.
-            if not await self._store.list_sessions(user.id, idle_seconds=self.session_idle_seconds):
+            # Deliberately WITHOUT the idle timeout (BACKLOG #2283). An idle row can come back: a
+            # backward clock step or a raised idle setting makes the validator accept it again. So
+            # an account holding only idle rows is still probed, and a disabled one keeps accruing
+            # strikes. Filtered, a forward clock step would also make every account look idle,
+            # empty the candidate list, and let the prunes below drop every strike and the hold.
+            if not await self._store.list_sessions(user.id):
                 continue
             if is_unkeyed:
                 # BACKLOG #2027 (ADR 0184 AC-5): never probed by name. Filtered HERE rather than
@@ -9542,9 +9544,9 @@ class AuthService:
         for user in await self._store.list_users():
             if user.auth_provider != AuthProvider.AD.value or user.disabled:
                 continue
-            # No idle timeout here, unlike the reconciler (BACKLOG #2283). Revoking costs no
-            # directory bind, and an idle row left unrevoked would come back on the old mapping if
-            # the idle setting were later raised.
+            # No idle timeout here either, as in the reconciler (BACKLOG #2283): an idle row left
+            # unrevoked would come back on the old mapping after a backward clock step or a raised
+            # idle setting.
             if not await self._store.list_sessions(user.id):
                 continue
             revoked += await self._store.revoke_user_sessions(user.id)

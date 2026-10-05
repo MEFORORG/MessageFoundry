@@ -690,9 +690,10 @@ async def test_local_sessions_and_signed_out_users_are_never_probed() -> None:
         await store.close()
 
 
-async def test_a_user_whose_only_session_is_idle_is_not_probed() -> None:
-    """BACKLOG #2283: the validator refuses an idle-dead session, so it is not a live session and
-    must not cost a directory bind. A session one minute inside the idle window is the control."""
+async def test_a_user_whose_only_session_is_idle_is_still_probed() -> None:
+    """BACKLOG #2283: an idle session can come back, after a backward clock step or a raised idle
+    setting, so the reconciler keeps probing its account. Skipping it would let a disabled account
+    escape the strikes until its session revived. A session inside the idle window is the control."""
     import time
 
     store = await MessageStore.open(":memory:")
@@ -714,7 +715,9 @@ async def test_a_user_whose_only_session_is_idle_is_not_probed() -> None:
             )
 
         await service.reconcile_directory_sessions()
-        assert ldap.probes == ["active"], "an account holding only an idle session was probed"
+        assert sorted(ldap.probes) == ["active", "idler"], (
+            "an account holding only an idle session was skipped, though that session can revive"
+        )
     finally:
         await store.close()
 
