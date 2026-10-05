@@ -37,7 +37,12 @@
       * a target the session registry records a session in, or any target at all when the registry
         cannot be read (scripts/coord/occupancy.ps1 says why an unreadable fence must refuse). A
         registry that was read and holds no record at all clears the target. This fence sees only
-        the directory a session was launched in, never where it writes.
+        the directory a session was launched in, never where it writes, so on its own it is blind
+        to a subagent's tree. The next two refusals are the signals that are not;
+      * a target that still holds a work claim (claim.ps1), or any target when a claim file cannot
+        be read. So this route never releases a claim: the work has to land, or be released, first;
+      * a target whose own git directory was written to in the last six hours: a commit, a checkout,
+        a merge or a fetch. Nothing here can tell whether what did that has finished.
 
     WHAT -Force OVERRIDES ON -Path: uncommitted tracked changes, untracked files, ignored files, and
     files flagged skip-worktree or assume-unchanged. Without -Force every one of those refuses, with
@@ -301,6 +306,19 @@ else {
 # stands in a checkout that is about to go.
 $GitRoot = if ($byPath) { $PrimaryRoot } else { $RepoRoot }
 
+# THE SPELLINGS A RECORD MAY NAME THIS WORKTREE BY, computed once and used by every check that
+# matches a record to this tree: the claim refusal, the allocation guard, and the claim sweep after
+# the removal. So no two of them can disagree about which tree this is.
+# -Name matches the resolved path alone, as it always has. -Path also matches `rev-parse
+# --show-toplevel` run inside the tree, which is the spelling alloc.ps1 and claim.ps1 record. It has
+# to be read now: after the removal there is no tree to ask. They are kept RAW and normalised by each
+# block with ConvertTo-Norm, after that block's own dot-source: on -Name the helper is not loaded yet.
+$targetSpellings = @($WorktreePath)
+if ($byPath) {
+    $ownTop = "$(& git -C $WorktreePath rev-parse --path-format=absolute --show-toplevel 2>$null)".Trim()
+    if ($LASTEXITCODE -eq 0 -and $ownTop) { $targetSpellings += $ownTop }
+}
+
 # A DETACHED HEAD WHOSE COMMIT NO REF HOLDS is lost with the worktree: removal deletes the HEAD reflog
 # too, so nothing reaches it afterwards. -Force does not override it -- -Force means
 # "discard changes", nothing else. The shape is the vault remove.ps1's (vault PR 2125). Refs are read
@@ -416,6 +434,89 @@ if ($byPath) {
         throw "Target is occupied. Nothing was removed."
     }
 
+    # --- TWO IN-USE SIGNALS THAT DO NOT DEPEND ON WHERE A SESSION WAS LAUNCHED ---------------------
+    #
+    # THE FENCE ABOVE IS BLIND TO MOST OF WHAT THIS ROUTE REACHES, and that was measured, not feared.
+    # It reads the directory a session was LAUNCHED in. A subagent Builder is recorded under its
+    # parent's directory, and so is any session that works in a tree by absolute path. Read off this
+    # machine's live registry on 2026-10-05: of 18 live records, 17 sat under .claude/worktrees and 1
+    # in the primary. NONE sat in any of the 158 trees -Path reaches, while nine sibling trees of a
+    # running batch held 14 claims and fresh git state. With the fence alone, six of those nine
+    # would have been removed under their Builders. (Found by the Lander's review of PR 2014.)
+    #
+    # So two signals that cross that boundary are read as well. Neither is overridable by -Force,
+    # which means "discard changes" and nothing else. An operator who must remove such a tree now
+    # uses git from a plain terminal.
+    #
+    # SIGNAL ONE: A WORK CLAIM. claim.ps1 records the worktree that took a key, whoever launched the
+    # session. A tree that still holds a claim is work in flight: a Builder's claim on built work
+    # stays until the Lander releases it at landing. Refusing here also means this route never
+    # releases a claim early; the sweep after the removal finds nothing of this tree's to release.
+    # CANNOT-TELL REFUSES: a claim file that will not parse might name this tree.
+    $commonDirForClaims = "$(& git -C $PrimaryRoot rev-parse --path-format=absolute --git-common-dir 2>$null)".Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $commonDirForClaims) {
+        throw "git could not name the common git dir of '$PrimaryRoot', so claims are unknown. Nothing was removed."
+    }
+    $claimsDirPre = Join-Path $commonDirForClaims 'mefor-coord/claims'
+    if (Test-Path -LiteralPath $claimsDirPre) {
+        $claimTargets = @($targetSpellings | ForEach-Object { ConvertTo-Norm $_ })
+        $heldKeys = @()
+        $claimsUnreadable = @()
+        foreach ($f in @(Get-ChildItem -LiteralPath $claimsDirPre -Filter *.json -File -ErrorAction Stop | Sort-Object Name)) {
+            $c = $null
+            try { $c = Get-Content -LiteralPath $f.FullName -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop }
+            catch { $claimsUnreadable += $f.Name; continue }
+            if ($null -eq $c) { $claimsUnreadable += $f.Name; continue }
+            if ($claimTargets -contains (ConvertTo-Norm ([string]$c.worktree))) { $heldKeys += [string]$c.key }
+        }
+        if ($heldKeys.Count -gt 0 -or $claimsUnreadable.Count -gt 0) {
+            if ($heldKeys.Count -gt 0) {
+                Write-Host ("REFUSED: '$WorktreePath' still holds $($heldKeys.Count) work claim(s): " +
+                    "$($heldKeys -join ', ').") -ForegroundColor Red
+                Write-Host ("A held claim means the work is in flight or has not landed. It is released from " +
+                    "that worktree with claim.ps1 -Release, or by the Lander when the work lands.") -ForegroundColor Red
+            }
+            if ($claimsUnreadable.Count -gt 0) {
+                Write-Host ("REFUSED: $($claimsUnreadable.Count) claim file(s) could not be parsed, and one might " +
+                    "name this worktree: $($claimsUnreadable -join ', ').") -ForegroundColor Red
+            }
+            throw "Target still holds a work claim, or claims could not be read. Nothing was removed."
+        }
+    }
+
+    # SIGNAL TWO: RECENT GIT ACTIVITY. Every commit, checkout, merge and fetch a session makes in a
+    # tree rewrites a file in that tree's own git directory. The newest write time there is read, and
+    # a tree written to inside the quiet period refuses. The index is left out on purpose: a
+    # read-only `git status` can rewrite it, and a staged change leaves the tree dirty anyway.
+    # SIX HOURS is a judgement, not a measurement: long enough to cover a Builder between its last
+    # commit and the end of its checks, short enough that yesterday's trees are reachable. A clock
+    # that makes the newest write look like the future reads as recent, and refuses.
+    $quietHours = 6
+    $ownGitDir = "$(& git -C $WorktreePath rev-parse --absolute-git-dir 2>$null)".Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $ownGitDir) {
+        throw "Could not find the git directory of '$WorktreePath', so its last activity is unknown. Nothing was removed."
+    }
+    # ALSO LEFT OUT: `gitdir` and `commondir`. They are pointers, not activity, and git's own source
+    # rewrites the `gitdir` pointer when a linked tree older than a day is merely opened. The checks
+    # above open this tree, so counting that file would make every old tree look written-to just now.
+    # git 2.55.0.windows.5 was not seen to do it; another version may.
+    $stateFiles = @(Get-ChildItem -LiteralPath $ownGitDir -File -Force -ErrorAction Stop |
+            Where-Object { $_.Name -notlike 'index*' -and $_.Name -notin @('gitdir', 'commondir') })
+    $headLog = Join-Path $ownGitDir 'logs/HEAD'
+    if (Test-Path -LiteralPath $headLog) { $stateFiles += Get-Item -LiteralPath $headLog -Force -ErrorAction Stop }
+    if ($stateFiles.Count -eq 0) {
+        throw "The git directory of '$WorktreePath' holds no state file to date. Nothing was removed."
+    }
+    $newestState = $stateFiles | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+    $quietFor = [DateTime]::UtcNow - $newestState.LastWriteTimeUtc
+    if ($quietFor.TotalHours -lt $quietHours) {
+        Write-Host ("REFUSED: git last wrote to '$WorktreePath' $([int][Math]::Max(0, $quietFor.TotalMinutes)) " +
+            "minute(s) ago ($($newestState.Name)), inside the $quietHours-hour quiet period.") -ForegroundColor Red
+        Write-Host ("Something committed, checked out or fetched there recently, and no check here can tell " +
+            "whether it has finished.") -ForegroundColor Red
+        throw "Target was active recently. Nothing was removed."
+    }
+
     # EVERYTHING GIT WOULD DELETE IS SHOWN, whatever status.showUntrackedFiles says: tracked changes,
     # untracked files and ignored files all refuse without -Force. A -Path target is often another
     # session's checkout, so nothing goes on a guess about what is disposable.
@@ -506,18 +607,6 @@ else {
 #
 # CANNOT-TELL COUNTS AS AT-RISK. An unreadable allocation record might name this worktree, and an
 # unreadable ledger read might hide a heading. Both refuse.
-#
-# THE SPELLINGS A RECORD MAY NAME THIS WORKTREE BY, computed once and used by the allocation guard
-# here and the claim sweep after the removal, so the two cannot disagree about which tree this is.
-# -Name matches the resolved path alone, as it always has. -Path also matches `rev-parse
-# --show-toplevel` run inside the tree, which is the spelling alloc.ps1 and claim.ps1 record. It has
-# to be read now: after the removal there is no tree to ask. They are kept RAW and normalised by each
-# block with ConvertTo-Norm, after that block's own dot-source: on -Name the helper is not loaded yet.
-$targetSpellings = @($WorktreePath)
-if ($byPath) {
-    $ownTop = "$(& git -C $WorktreePath rev-parse --path-format=absolute --show-toplevel 2>$null)".Trim()
-    if ($LASTEXITCODE -eq 0 -and $ownTop) { $targetSpellings += $ownTop }
-}
 $allocDirRoot = ''
 $commonDirPre = "$(& git -C $GitRoot rev-parse --path-format=absolute --git-common-dir 2>$null)".Trim()
 if ($commonDirPre) { $allocDirRoot = Join-Path $commonDirPre 'mefor-coord/alloc' }
@@ -723,4 +812,13 @@ if ($DeleteBranch) {
 }
 
 Write-Host "Removed worktree '$WorktreePath'." -ForegroundColor Green
-if ($keptBranch) { Write-Host "Branch '$keptBranch' was not touched." }
+if ($keptBranch) {
+    Write-Host "Branch '$keptBranch' was not touched."
+    # Said out loud because the tree was the visible sign of this work: commits on no remote now
+    # live on the local branch alone. A note, never a refusal, and never a reason to fail a removal
+    # that has already happened.
+    $localOnly = "$(& git -C $GitRoot rev-list --count "refs/heads/$keptBranch" --not --remotes 2>$null)".Trim()
+    if ($LASTEXITCODE -eq 0 -and $localOnly -match '\A\d+\z' -and [int]$localOnly -gt 0) {
+        Write-Host "NOTE: $localOnly commit(s) on '$keptBranch' are on no remote. They are kept on the local branch only."
+    }
+}

@@ -38,7 +38,7 @@ import pytest
 
 from tests.test_worktree_gate import assert_denied, bash, run_gate
 from tests.test_worktree_gate_emitter import _outside_single_quotes
-from tests.test_worktree_remove_path import REAL_SCRIPTS, write_registry
+from tests.test_worktree_remove_path import REAL_SCRIPTS, settle_worktrees, write_registry
 
 pytestmark = pytest.mark.skipif(
     shutil.which("pwsh") is None or shutil.which("git") is None,
@@ -349,6 +349,9 @@ def test_the_printed_line_removes_a_finished_tree_and_leaves_its_branch(tmp_path
     # `exit $LASTEXITCODE` is load-bearing: without it `pwsh -File` returns 0 even when the script it
     # launched refused.
     script.write_text(line.strip() + "\nexit $LASTEXITCODE\n", encoding="utf-8")
+    # The route refuses a tree git wrote to inside its quiet period, and this one is seconds old.
+    # "Finished" includes "has been quiet", so the fixture dates its git state two days back.
+    settle_worktrees(rig.primary)
     proc = subprocess.run(
         ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(script)],
         cwd=str(rig.primary),

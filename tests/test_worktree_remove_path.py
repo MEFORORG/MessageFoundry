@@ -25,6 +25,8 @@ import json
 import os
 import shutil
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -74,6 +76,24 @@ REAL_SCRIPTS = (
     "scripts/coord/occupancy.ps1",
     "scripts/coord/session-registry.ps1",
 )
+
+
+def settle_worktrees(primary: Path) -> None:
+    """Date every linked worktree's own git state two days back, as if nothing had touched it since.
+
+    ``-Path`` refuses a tree whose git directory was written to inside its quiet period, and a
+    fixture tree is seconds old. This stands in for the passing of time, for every test that is
+    about some OTHER check. The quiet period itself is driven by the tests that pass
+    ``settle=False``, which leave a tree as fresh as it really is.
+    """
+    then = time.time() - 2 * 24 * 3600
+    admin = primary / ".git" / "worktrees"
+    if not admin.is_dir():
+        return
+    for tree in admin.iterdir():
+        for state in [*tree.iterdir(), tree / "logs" / "HEAD"]:
+            if state.is_file():
+                os.utime(state, (then, then))
 
 
 def write_registry(root: Path, home: Path, *occupied: Path) -> Path:
@@ -154,7 +174,10 @@ class Rig:
         script: Path | None = None,
         repo_root: Path | None = None,
         extra: dict[str, str] | None = None,
+        settle: bool = True,
     ) -> subprocess.CompletedProcess[str]:
+        if settle:
+            settle_worktrees(self.primary)
         argv = ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(script or SCRIPT)]
         if script is None or repo_root is not None:
             argv += ["-RepoRoot", str(repo_root or self.primary)]
@@ -200,16 +223,23 @@ def _common(rig: Rig) -> Path:
 # --- the one thing it is for ----------------------------------------------------------------------
 
 
-def test_path_removes_a_clean_tree_no_name_can_spell_and_leaves_its_branch(rig: Rig) -> None:
-    wt = rig.add(rig.scratch("done"))
-    tip = _git(wt, "rev-parse", "HEAD").strip()
+def _claim(rig: Rig, key: str, holder: Path) -> Path:
     claims = _common(rig) / "mefor-coord" / "claims"
-    claims.mkdir(parents=True)
-    claim = claims / "9001.json"
+    claims.mkdir(parents=True, exist_ok=True)
+    claim = claims / f"{key}.json"
     claim.write_text(
-        json.dumps({"key": "9001", "worktree": str(wt).replace("\\", "/"), "note": "t"}),
+        json.dumps({"key": key, "worktree": str(holder).replace("\\", "/"), "note": "t"}),
         encoding="utf-8",
     )
+    return claim
+
+
+def test_path_removes_a_clean_tree_no_name_can_spell_and_leaves_its_branch(rig: Rig) -> None:
+    wt = rig.add(rig.scratch("done"))
+    tip = _commit(wt, "finished.txt")
+    # A claim held by ANOTHER tree is not this tree's, and must neither block the run nor be touched.
+    elsewhere = rig.add(rig.scratch("other-work"))
+    theirs = _claim(rig, "9002", elsewhere)
 
     # No -Name can spell this path: tests/test_worktree_remove.py pins that -Name looks only at the
     # <repo>-<name> sibling. That is the gap this route fills.
@@ -222,8 +252,134 @@ def test_path_removes_a_clean_tree_no_name_can_spell_and_leaves_its_branch(rig: 
     assert rig.branch_exists("done")
     assert _git(rig.primary, "rev-parse", "refs/heads/done").strip() == tip
     assert "Branch 'done' was not touched" in proc.stdout
-    assert not claim.exists(), "the claim outlived its holder"
-    assert "9001" in proc.stdout
+    # The fixture has no remote, so the one commit is on the local branch alone, and the run says so.
+    assert "1 commit(s) on 'done' are on no remote" in proc.stdout, proc.stdout
+    assert theirs.exists(), "a claim held by a different, living worktree was released"
+    assert elsewhere.exists()
+
+
+# --- in use, by a signal that does not depend on where a session was launched ---------------------
+
+
+def test_a_tree_that_still_holds_a_claim_is_refused_and_its_claim_is_left_alone(rig: Rig) -> None:
+    """A claim crosses the boundary the session fence cannot: it names the WORKTREE that took a key,
+    whoever launched the session. So a held claim refuses, -Force included, and is never released
+    by this route. Once the claim is gone the same call removes the tree."""
+    wt = rig.add(rig.scratch("claimed"))
+    claim = _claim(rig, "9001", wt)
+
+    proc = rig.run("-Path", str(wt), "-Force")
+
+    assert proc.returncode != 0
+    assert "still holds 1 work claim(s): 9001" in _out(proc), _out(proc)
+    assert wt.exists() and rig.is_registered(wt)
+    assert claim.exists(), "the refusal released the claim it refused on"
+
+    # A claim file that will not parse might name this tree, so it refuses too.
+    claim.write_text("{ half-written", encoding="utf-8")
+    proc = rig.run("-Path", str(wt), "-Force")
+    assert proc.returncode != 0
+    assert "could not be parsed" in _out(proc) and "9001.json" in _out(proc), _out(proc)
+    assert wt.exists()
+
+    claim.unlink()
+    assert rig.run("-Path", str(wt)).returncode == 0
+    assert not wt.exists()
+
+
+def test_a_tree_git_wrote_to_recently_is_refused_until_it_has_been_quiet(rig: Rig) -> None:
+    """A commit rewrites files in the tree's own git directory. Inside the quiet period nothing can
+    tell whether whatever made it has finished, so the run refuses, -Force included."""
+    wt = rig.add(rig.scratch("warm"))
+    _commit(wt, "just-now.txt")
+
+    proc = rig.run("-Path", str(wt), "-Force", settle=False)
+
+    assert proc.returncode != 0
+    assert "Target was active recently" in _out(proc), _out(proc)
+    assert "quiet period" in _out(proc)
+    assert wt.exists() and rig.is_registered(wt)
+
+    # Control: the same tree and the same call, once its git state is two days old.
+    proc = rig.run("-Path", str(wt))
+    assert proc.returncode == 0, _out(proc)
+    assert not wt.exists()
+
+
+def test_a_live_session_recorded_in_a_parent_tree_does_not_clear_a_sibling_it_is_working_in(
+    rig: Rig,
+) -> None:
+    """THE CASE THE SESSION FENCE CANNOT SEE, staged for real. A session is launched in a tree under
+    .claude/worktrees and works in a SIBLING tree: a subagent Builder is recorded exactly this way.
+    Its record is LIVE, with a real running process, and it names the parent tree, not the sibling.
+
+    The fence therefore finds nobody in the sibling. What refuses is the claim, and with the claim
+    gone, the fresh git state. Only when both are absent does the tree go, which is the last step
+    here and the proof that the fence alone would have let it go from the start.
+    """
+    parent = rig.add(rig.primary / ".claude" / "worktrees" / "parent")
+    sibling = rig.add(rig.primary.parent / "Repo-b191")
+    _commit(sibling, "built.txt")
+    claim = _claim(rig, "9191", sibling)
+
+    session = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
+    try:
+        sessions = rig.home / ".claude" / "sessions"
+        (sessions / f"{session.pid}.json").write_text(
+            json.dumps(
+                {
+                    "cwd": str(parent),
+                    "pid": session.pid,
+                    "sessionId": "live-in-parent",
+                    "startedAt": int(time.time() * 1000),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        # Control for "the record is live and the fence is working": the parent tree itself would
+        # be refused as occupied, if this route reached it. It does not, so the fence is asked about
+        # a reachable tree by moving the record's cwd into the sibling for one run.
+        in_sibling = rig.root / "occupied-home"
+        occupied = in_sibling / ".claude" / "sessions"
+        occupied.mkdir(parents=True)
+        (occupied / f"{session.pid}.json").write_text(
+            json.dumps(
+                {
+                    "cwd": str(sibling),
+                    "pid": session.pid,
+                    "sessionId": "live-in-sibling",
+                    "startedAt": int(time.time() * 1000),
+                }
+            ),
+            encoding="utf-8",
+        )
+        seen = rig.run("-Path", str(sibling), home=in_sibling, settle=False)
+        assert seen.returncode != 0
+        assert "Target is occupied" in _out(seen) and "LIVE" in _out(seen), _out(seen)
+
+        # The real shape: recorded in the parent. The fence passes; the claim refuses.
+        proc = rig.run("-Path", str(sibling), settle=False)
+        assert proc.returncode != 0
+        assert "Target is occupied" not in _out(proc), _out(proc)
+        assert "still holds 1 work claim(s): 9191" in _out(proc), _out(proc)
+
+        # No claim, as for work that was never claimed: the fresh git state refuses.
+        claim.unlink()
+        proc = rig.run("-Path", str(sibling), settle=False)
+        assert proc.returncode != 0
+        assert "Target was active recently" in _out(proc), _out(proc)
+        assert sibling.exists() and rig.is_registered(sibling)
+        assert (sibling / "built.txt").is_file()
+
+        # Neither signal, and the session still LIVE in the parent: the tree goes. This is what the
+        # fence alone decides, and it is why the two signals above exist.
+        proc = rig.run("-Path", str(sibling))
+        assert proc.returncode == 0, _out(proc)
+        assert not sibling.exists()
+    finally:
+        session.kill()
+        session.wait(timeout=30)
 
 
 # --- what it must never be pointed at -------------------------------------------------------------
