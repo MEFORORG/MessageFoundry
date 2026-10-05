@@ -176,10 +176,24 @@ _TRANSIENT_ISSUE_CODES = frozenset(
 # allow-listed host (the [egress].allowed_http gate pins the host, not the path).
 # `\Z`, never `$`: Python's `$` also matches immediately BEFORE a final newline, so `^[A-Za-z]+$`
 # accepted "Patient\n" and the gate did not enforce the grammar it advertises. Anchoring the pattern
-# fixes every caller at once -- `match` vs `fullmatch` is a property of the CALL, and there are three
-# call sites (:189, :698, :704), so a per-call fix leaves the next one to re-introduce it.
+# fixes every caller at once -- `match` vs `fullmatch` is a property of the CALL, and there are at
+# least three call sites (`_validate_path_token`, two in `_resolve_read_url`), so a per-call fix
+# leaves the next one to re-introduce it.
 _FHIR_TYPE_RE = re.compile(r"^[A-Za-z]+\Z")
 _FHIR_ID_RE = re.compile(r"^[A-Za-z0-9.\-]{1,64}\Z")
+# An id that goes into a URL PATH: the id grammar, minus an id of only dots ('.', '..', '...').
+# `_FHIR_ID_RE` admits all three, and percent-encoding leaves '.' as it is, so each would be sent as
+# the last path segment. '.' and '..' are RFC 3986 dot segments (section 5.2.4). The engine does not
+# remove them: it sends the path as built, and the [egress].allowed_http check compares the base
+# URL's host and port when the connection is built, so it never sees a per-call path. A proxy or
+# server that removes dot segments after the engine would read 'Patient/..' as the base and
+# 'Patient/.' as the type, on the same allow-listed host (vault BACKLOG #1589).
+# tests/test_fhir_read_dot_only_id.py pins the engine half of that; what a given proxy or server
+# does was not measured. '...' is no dot segment: it is refused only because an id of dots alone is
+# never a real resource id. Used by at least the update id (`_require_id`) and the `fhir_lookup`
+# read id (`_resolve_read_url`). `_FHIR_ID_RE` stays the plain grammar for an id-typed value that is
+# not a path segment, such as meta.versionId inside an ETag.
+_FHIR_PATH_ID_RE = re.compile(r"^(?!\.+\Z)[A-Za-z0-9.\-]{1,64}\Z")
 
 
 def _operation_outcome(body: str) -> dict[str, Any] | None:
@@ -803,15 +817,9 @@ class FhirDestination(DestinationConnector):
         # path gates serve both.
         _reject_control_chars(peek.id, "resource id")
         # Grammar-gate the message-derived id so '../$reindex'-style traversal can't redirect the write.
-        _validate_path_token(peek.id, _FHIR_ID_RE, "resource id")
-        if not peek.id.strip("."):
-            # The id grammar admits '.' and '..', which a path resolver reads as this level or the
-            # parent: 'Patient/..' would aim the write at the base.
-            raise NegativeAckError(
-                "FHIR resource id is not a valid FHIR token/id",
-                code="bad-request-value",
-                permanent=True,
-            )
+        # The path-id pattern also refuses '.' and '..', which a path resolver reads as this level or
+        # the parent: 'Patient/..' would aim the write at the base.
+        _validate_path_token(peek.id, _FHIR_PATH_ID_RE, "resource id")
         return peek.id
 
     @staticmethod
@@ -1150,7 +1158,7 @@ def _resolve_read_url(
     path = type_seg
     if len(segments) == 2:
         resource_id = segments[1]
-        if not _FHIR_ID_RE.match(resource_id):
+        if not _FHIR_PATH_ID_RE.match(resource_id):  # also refuses an id of only dots
             raise ValueError("FHIR read id is not a valid FHIR id")
         path = f"{type_seg}/{urllib.parse.quote(resource_id, safe='')}"
     url = f"{base.rstrip('/')}/{path}"
