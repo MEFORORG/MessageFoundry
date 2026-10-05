@@ -537,6 +537,58 @@ def route_is_declared(route: object, *, websocket: bool) -> bool:
 #: The route attribute that caches :func:`route_is_declared`. A route's dependencies and endpoint are
 #: fixed once it is registered, so the answer is worked out on its first request only.
 _DECLARED_CACHE_ATTR = "_mefor_route_declared"
+#: The route attribute that holds a refused route's :class:`_RefusalTally`.
+_REFUSALS_ATTR = "_mefor_route_refusals"
+
+#: The shortest gap between two ERROR lines for one refused route (vault BACKLOG #2846). The first
+#: refusal is always logged. Each later line carries how many refusals it stands for, so a burst
+#: costs one line a minute and still loses no count.
+REFUSAL_LOG_INTERVAL_SECONDS = 60.0
+
+
+@dataclass(slots=True)
+class _RefusalTally:
+    """How often one route was refused, and how many of those no log line has reported yet."""
+
+    total: int = 0
+    unlogged: int = 0
+    logged_at: float | None = None
+
+
+#: The tally for a refusal with no matched route in its scope. FastAPI always sets one, so this is
+#: a fallback that keeps such a refusal counted and throttled rather than logged every time.
+_UNKNOWN_ROUTE_REFUSALS = _RefusalTally()
+
+
+def undeclared_route_refusals(route: object) -> int:
+    """How many requests :func:`refuse_undeclared_route` has refused on ``route`` in this process."""
+    tally = getattr(route, _REFUSALS_ATTR, None)
+    return tally.total if isinstance(tally, _RefusalTally) else 0
+
+
+def _record_refusal(route: object) -> None:
+    """Count one refusal of ``route``, and log it at ERROR at most once per interval.
+
+    The line names the route's path TEMPLATE and the counts, never the request: no query string,
+    header or body reaches the log."""
+    tally = getattr(route, _REFUSALS_ATTR, None) if route is not None else _UNKNOWN_ROUTE_REFUSALS
+    if not isinstance(tally, _RefusalTally):
+        tally = _RefusalTally()
+        setattr(route, _REFUSALS_ATTR, tally)
+    tally.total += 1
+    tally.unlogged += 1
+    now = time.monotonic()
+    if tally.logged_at is not None and now - tally.logged_at < REFUSAL_LOG_INTERVAL_SECONDS:
+        return
+    log.error(
+        "refused route %s: it has no gate dependency and no public declaration "
+        "(%d refusals since the last log line, %d in all)",
+        getattr(route, "path", "<unknown>"),
+        tally.unlogged,
+        tally.total,
+    )
+    tally.logged_at = now
+    tally.unlogged = 0
 
 
 async def refuse_undeclared_route(connection: HTTPConnection) -> None:
@@ -544,7 +596,8 @@ async def refuse_undeclared_route(connection: HTTPConnection) -> None:
 
     An HTTP caller gets 403 with :data:`UNDECLARED_ROUTE_DETAIL`. A WebSocket is closed with policy
     violation (1008) before it is accepted. Either way the route is a defect in the code that
-    registered it, so its first refusal is logged at ERROR."""
+    registered it, so every refusal is counted and logged at ERROR, at most once per
+    :data:`REFUSAL_LOG_INTERVAL_SECONDS` for each route."""
     websocket = connection.scope.get("type") == "websocket"
     route = connection.scope.get("route")
     declared = getattr(route, _DECLARED_CACHE_ATTR, None)
@@ -552,13 +605,9 @@ async def refuse_undeclared_route(connection: HTTPConnection) -> None:
         declared = route_is_declared(route, websocket=websocket)
         if route is not None:
             setattr(route, _DECLARED_CACHE_ATTR, declared)
-        if not declared:
-            log.error(
-                "refused route %s: it has no gate dependency and no public declaration",
-                getattr(route, "path", "<unknown>"),
-            )
     if declared:
         return
+    _record_refusal(route)
     if websocket:
         raise WebSocketException(status.WS_1008_POLICY_VIOLATION)
     raise HTTPException(status.HTTP_403_FORBIDDEN, UNDECLARED_ROUTE_DETAIL)

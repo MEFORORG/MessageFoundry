@@ -18,6 +18,7 @@ The route walk's own tests for the same blind spots are in ``tests/test_route_ga
 from __future__ import annotations
 
 import inspect
+import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,7 @@ from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 import messagefoundry.api.app as app_module
+import messagefoundry.api.security as security_module
 from messagefoundry.api.app import create_app, create_managed_app
 from messagefoundry.api.security import (
     UNDECLARED_ROUTE_DETAIL,
@@ -38,6 +40,7 @@ from messagefoundry.api.security import (
     public_route,
     require,
     route_is_declared,
+    undeclared_route_refusals,
 )
 from messagefoundry.auth.permissions import Permission
 from messagefoundry.auth.service import AuthService
@@ -347,6 +350,38 @@ def test_a_websocket_that_declares_nothing_is_refused_and_one_that_declares_is_s
         assert getattr(refusal, "status_code", None) == 403 or refusal.code == 1008, refusal
         with client.websocket_connect("/zz/ws-declared"):
             pass
+
+
+async def test_every_refusal_is_counted_and_the_log_is_throttled_not_silenced(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Vault BACKLOG #2846. The refusal used to log only the first time it worked a route out, so
+    every later refusal of that route wrote nothing. Now each one is counted, and a line is written
+    at most once per interval, carrying how many refusals it stands for. The line names the route
+    template and never the request, so a query string a caller sent does not reach the log."""
+    app = _planted_app()
+    route = next(r for r in app.routes if getattr(r, "path", None) == "/zz/undeclared")
+    refusals = "messagefoundry.api.security"
+    monkeypatch.setattr(security_module, "REFUSAL_LOG_INTERVAL_SECONDS", 3600.0)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+        with caplog.at_level(logging.ERROR, logger=refusals):
+            for _ in range(3):
+                assert (await client.get("/zz/undeclared?mrn=SECRET-MRN")).status_code == 403
+        throttled = [r.getMessage() for r in caplog.records if r.name == refusals]
+        assert undeclared_route_refusals(route) == 3
+        assert len(throttled) == 1, throttled
+        assert "(1 refusals since the last log line, 1 in all)" in throttled[0]
+
+        caplog.clear()
+        monkeypatch.setattr(security_module, "REFUSAL_LOG_INTERVAL_SECONDS", 0.0)
+        with caplog.at_level(logging.ERROR, logger=refusals):
+            assert (await client.get("/zz/undeclared?mrn=SECRET-MRN")).status_code == 403
+        (line,) = [r.getMessage() for r in caplog.records if r.name == refusals]
+    assert undeclared_route_refusals(route) == 4
+    assert line.startswith("refused route /zz/undeclared:"), line
+    assert "(3 refusals since the last log line, 4 in all)" in line, line
+    assert "SECRET-MRN" not in line and "mrn" not in "".join(throttled + [line])
 
 
 def test_a_declaration_needs_a_reason() -> None:
