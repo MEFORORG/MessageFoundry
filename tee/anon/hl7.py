@@ -43,15 +43,15 @@ def _refuse_delimiter_rules(rules: tuple[FieldRule, ...]) -> None:
     """Refuse a rule set that would rewrite MSH-0, MSH-1 or MSH-2 (a body-free :class:`AnonError`).
 
     The field NUMBER is compared, not the path text, so ``MSH-02`` is refused like ``MSH-2``. A
-    ``KEEP`` rewrites nothing, so it is allowed. The same check runs in both adapters (BACKLOG
-    #2265)."""
+    ``KEEP`` rewrites nothing, so it is allowed. A path that is not a whole-field address, which
+    ``load_rules`` refuses, is not this check's business and is left to the adapter as before.
+    The same check runs in both adapters (BACKLOG #2265)."""
+    rewrites = (r.path.partition("-") for r in rules if r.kind != SurrogateKind.KEEP)
     named = sorted(
         {
-            int(r.path.split("-", 1)[1])
-            for r in rules
-            if _segment_id(r.path) == "MSH"
-            and int(r.path.split("-", 1)[1]) < _FIRST_REWRITABLE_MSH_FIELD
-            and r.kind != SurrogateKind.KEEP
+            int(number)
+            for segment, _, number in rewrites
+            if segment == "MSH" and number.isdecimal() and int(number) < _FIRST_REWRITABLE_MSH_FIELD
         }
     )
     if named:
@@ -83,11 +83,12 @@ def anonymize_message(raw: str, keyer: Keyer, rules: tuple[FieldRule, ...]) -> s
         # An MSH rule applies to EVERY MSH line, as on the engine side: the leak-check counts an
         # MSH-N rule's field as scrubbed, so it must be (BACKLOG #2265). MSH-1 is the field
         # separator itself, so MSH-N sits one split index lower than any other segment's field N.
-        index = _field_num(rule.path) - (1 if seg_id == "MSH" else 0)
+        is_msh = seg_id == "MSH"
+        index = _field_num(rule.path) - (1 if is_msh else 0)
         for fields in segments:
             # The header may be spelled ``Msh``: the separators are read from it in any case, and
             # the leak-check skips it in any case, so an MSH rule must reach it in any case too.
-            if not fields or (fields[0].upper() if seg_id == "MSH" else fields[0]) != seg_id:
+            if (fields[0].upper() if is_msh else fields[0]) != seg_id:
                 continue
             if _skip_obx5(rule, fields, seps):
                 continue

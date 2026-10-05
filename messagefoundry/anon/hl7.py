@@ -52,15 +52,15 @@ def _refuse_delimiter_rules(rules: tuple[FieldRule, ...]) -> None:
     """Refuse a rule set that would rewrite MSH-0, MSH-1 or MSH-2 (a body-free :class:`AnonError`).
 
     The field NUMBER is compared, not the path text, so ``MSH-02`` is refused like ``MSH-2``. A
-    ``KEEP`` rewrites nothing, so it is allowed. The same check runs in both adapters (BACKLOG
-    #2265)."""
+    ``KEEP`` rewrites nothing, so it is allowed. A path that is not a whole-field address, which
+    ``load_rules`` refuses, is not this check's business and is left to the adapter as before.
+    The same check runs in both adapters (BACKLOG #2265)."""
+    rewrites = (r.path.partition("-") for r in rules if r.kind != SurrogateKind.KEEP)
     named = sorted(
         {
-            int(r.path.split("-", 1)[1])
-            for r in rules
-            if _segment_id(r.path) == "MSH"
-            and int(r.path.split("-", 1)[1]) < _FIRST_REWRITABLE_MSH_FIELD
-            and r.kind != SurrogateKind.KEEP
+            int(number)
+            for segment, _, number in rewrites
+            if segment == "MSH" and number.isdecimal() and int(number) < _FIRST_REWRITABLE_MSH_FIELD
         }
     )
     if named:

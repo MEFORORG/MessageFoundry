@@ -50,9 +50,9 @@ _CHECKED = pytest.mark.parametrize(
 _REWRITING_KINDS = tuple(kind for kind in SurrogateKind if kind != SurrogateKind.KEEP)
 
 
-def _with(path: str, kind: SurrogateKind | str) -> tuple[FieldRule, ...]:
+def _with(path: str, kind: SurrogateKind) -> tuple[FieldRule, ...]:
     """The default rules plus one rule. The tee coerces an engine ``FieldRule`` kind by value."""
-    return (*DEFAULT_RULES, FieldRule(path, kind))  # type: ignore[arg-type]
+    return (*DEFAULT_RULES, FieldRule(path, kind))
 
 
 def _tee_with(path: str, kind: SurrogateKind) -> tuple[TeeFieldRule, ...]:
@@ -84,18 +84,6 @@ def test_a_drop_rule_blanks_the_field_on_a_second_msh_line(anonymize: Callable[.
 
 @_NO_SCANNER
 @_CHECKED
-def test_the_leak_check_passes_only_an_output_the_rule_really_scrubbed(
-    checked: Callable[..., str],
-) -> None:
-    """The row's own case: a DROP rule names the field that holds a dashed number on a second MSH
-    line. The check may pass it, because the number is gone. Before the fix the tee passed it
-    with the number still there."""
-    out = checked(_MSG, salt=_SALT, rules=_with("MSH-8", SurrogateKind.DROP))
-    assert _SSN not in out
-
-
-@_NO_SCANNER
-@_CHECKED
 def test_a_rule_one_field_off_still_refuses(checked: Callable[..., str]) -> None:
     """The discriminating control: the rule names MSH-9, so MSH-8 is unmapped and is refused."""
     with pytest.raises(Exception, match="SSN-shaped value in MSH-8") as exc:
@@ -111,7 +99,6 @@ def test_every_rewriting_kind_gives_the_same_bytes_on_both_sides(kind: Surrogate
     tee = tee_anonymize(_MSG, salt=_SALT, rules=_tee_with("MSH-8", kind))
     assert engine == tee
     assert _SSN not in tee
-    assert _msh_lines(tee)[1][7] != _SSN
 
 
 @_PLAIN
@@ -160,7 +147,9 @@ def test_an_msh_rule_reads_the_messages_own_separators(anonymize: Callable[..., 
     assert out.split("\r")[-1].split("!")[6:9] == ["20260101120000", "", "ADT*A01"]
 
 
-@pytest.mark.parametrize("path", ["MSH-1", "MSH-2"])
+@pytest.mark.parametrize(
+    "path", ["MSH-0", "MSH-00", "MSH-1", "MSH-01", "MSH-2", "MSH-02", "MSH-002"]
+)
 @pytest.mark.parametrize("kind", _REWRITING_KINDS, ids=lambda kind: kind.value)
 @_PLAIN
 def test_a_rule_that_would_rewrite_the_delimiters_is_refused(
@@ -168,8 +157,13 @@ def test_a_rule_that_would_rewrite_the_delimiters_is_refused(
 ) -> None:
     """MSH-1 and MSH-2 hold the delimiters. Before the fix the engine emitted a header with no
     readable delimiters for some kinds, and the tee ignored the rule. Both now refuse, and the
-    refusal carries no message text."""
-    with pytest.raises(ValueError, match=f"a rule names {path}") as exc:
+    refusal carries no message text.
+
+    The field NUMBER decides, not the path text: ``MSH-02`` is field 2 to ``int()``, so a text
+    comparison with ``MSH-2`` would let it through and blank the encoding characters. ``MSH-0``
+    would be split index -1 on the tee, the LAST field of the line."""
+    number = int(path.split("-")[1])
+    with pytest.raises(ValueError, match=f"a rule names MSH-{number},") as exc:
         anonymize(_MSG, salt=_SALT, rules=_with(path, kind))
     assert isinstance(exc.value, (AnonError, TeeAnonError))
     assert _SSN not in str(exc.value) and "APP2" not in str(exc.value)
@@ -202,17 +196,22 @@ def test_a_keep_on_msh_2_is_allowed_and_the_field_is_still_scanned(
 @pytest.mark.parametrize(
     ("line", "path", "index"),
     [
+        (_SECOND, "MSH-8", 7),
         (rf"MSH|^~\&|APP2|{_SSN}", "MSH-4", 3),
         (rf"MSH|^~\&|APP2|FAC2|{_SSN}|", "MSH-5", 4),
         (rf"MSH|^~\&|APP2|FAC2|RCV|RFAC|2026|||||||||{_SSN}", "MSH-16", 15),
     ],
-    ids=("short-line", "middle-field", "last-field"),
+    ids=("the-row-case", "short-line", "middle-field", "last-field"),
 )
 def test_the_rule_and_the_check_agree_on_every_position(
     checked: Callable[..., str], line: str, path: str, index: int
 ) -> None:
     """Wherever the number sits on a later MSH line, the rule for that address removes it and
-    the rule for the address one lower does not. That is the same numbering the leak-check uses."""
+    the rule for the address one lower does not. That is the same numbering the leak-check uses.
+
+    The first row is the ledger row's own case: a DROP rule names the field that holds a dashed
+    number on a second MSH line. The check may pass it, because the number is gone. Before the
+    fix the tee passed it with the number still there."""
     assert line.split("|")[index] == _SSN
     msg = "\r".join((_HEADER, _PID, line))
     out = checked(msg, salt=_SALT, rules=_with(path, SurrogateKind.DROP))
@@ -252,20 +251,6 @@ def test_full_coverage_reports_the_scrubbed_msh_field_as_decided(
     (report,) = reports
     assert report.undecided_fields == ()  # type: ignore[attr-defined]
     assert _SSN not in out
-
-
-@pytest.mark.parametrize(
-    "path", ["MSH-0", "MSH-00", "MSH-01", "MSH-02", "MSH-002"], ids=lambda path: path
-)
-@_PLAIN
-def test_the_delimiter_refusal_reads_the_field_number_not_the_text(
-    anonymize: Callable[..., str], path: str
-) -> None:
-    """``MSH-02`` is field 2 to ``int()``, so a text comparison with ``MSH-2`` would let it
-    through and blank the encoding characters. ``MSH-0`` would be split index -1 on the tee, the
-    LAST field of the line."""
-    with pytest.raises(ValueError, match="a rule names MSH-[012]"):
-        anonymize(_MSG, salt=_SALT, rules=_with(path, SurrogateKind.DROP))
 
 
 def test_the_lowest_rewritable_msh_field_is_three() -> None:
