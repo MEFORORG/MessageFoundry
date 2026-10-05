@@ -23,12 +23,14 @@ from messagefoundry.anon import DEFAULT_RULES, AnonError, FieldRule, SurrogateKi
 from messagefoundry.anon import anonymize as engine_anonymize
 from messagefoundry.anon import anonymize_checked as engine_anonymize_checked
 from messagefoundry.anon import hl7 as engine_hl7
+from messagefoundry.anon import leak as engine_leak
 from tee.anon import DEFAULT_RULES as TEE_DEFAULT_RULES
 from tee.anon import AnonError as TeeAnonError
 from tee.anon import FieldRule as TeeFieldRule
 from tee.anon import anonymize as tee_anonymize
 from tee.anon import anonymize_checked as tee_anonymize_checked
 from tee.anon import hl7 as tee_hl7
+from tee.anon import leak as tee_leak
 
 _LEAK_SCANNER = Path(__file__).resolve().parents[1] / "scripts" / "security" / "scan_forbidden.py"
 _NO_SCANNER = pytest.mark.skipif(
@@ -330,16 +332,43 @@ def test_the_tee_applies_an_msh_rule_to_a_header_not_in_capitals() -> None:
         engine_anonymize(msg, salt=_SALT, rules=_with("MSH-4", SurrogateKind.FREETEXT))
 
 
-def test_a_later_line_not_in_capitals_is_not_an_msh_line_to_either_side() -> None:
-    """Only the HEADER is matched in any case. A later ``Msh`` line is not an MSH line to the
-    engine or to the leak-check, so the tee must leave it alone too: same bytes from both, and
-    the leak-check then refuses the line as one no rule can reach."""
-    later = _SECOND.replace("MSH", "Msh", 1)
-    msg = "\r".join((_HEADER, _PID, later))
-    engine = engine_anonymize(msg, salt=_SALT, rules=_with("MSH-8", SurrogateKind.DROP))
-    tee = tee_anonymize(msg, salt=_SALT, rules=_tee_with("MSH-8", SurrogateKind.DROP))
+#: A later MSH line not in capitals. ``Msh`` is not a segment id, so no rule can reach the line.
+_LATER_MSH_NOT_IN_CAPITALS = "\r".join((_HEADER, _PID, _SECOND.replace("MSH", "Msh", 1)))
+
+
+def test_a_later_line_not_in_capitals_is_refused_by_both_sides() -> None:
+    """A later ``Msh`` line is not an MSH line to the engine or to the leak-check, so no MSH rule
+    reaches it. Plain ``anonymize`` refuses the message on both sides before any rule runs
+    (BACKLOG #2246), so the number on that line is never emitted."""
+    with pytest.raises(AnonError, match="a line no rule can reach"):
+        engine_anonymize(
+            _LATER_MSH_NOT_IN_CAPITALS, salt=_SALT, rules=_with("MSH-8", SurrogateKind.DROP)
+        )
+    with pytest.raises(TeeAnonError, match="a line no rule can reach"):
+        tee_anonymize(
+            _LATER_MSH_NOT_IN_CAPITALS, salt=_SALT, rules=_tee_with("MSH-8", SurrogateKind.DROP)
+        )
+
+
+def test_the_tee_rule_loop_leaves_a_later_line_not_in_capitals_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the HEADER is matched in any case. This pins the tee's rule loop on its own, with
+    the earlier refusal switched off: the tee must leave a later ``Msh`` line alone, as the
+    engine does, so the two give the same bytes. The test above is the refusal a caller meets
+    first."""
+    for leak in (engine_leak, tee_leak):
+        monkeypatch.setattr(leak, "has_unreachable_line", lambda text, mapped_paths=(): False)
+    later = _LATER_MSH_NOT_IN_CAPITALS.split("\r")[-1]
+    engine = engine_anonymize(
+        _LATER_MSH_NOT_IN_CAPITALS, salt=_SALT, rules=_with("MSH-8", SurrogateKind.DROP)
+    )
+    tee = tee_anonymize(
+        _LATER_MSH_NOT_IN_CAPITALS, salt=_SALT, rules=_tee_with("MSH-8", SurrogateKind.DROP)
+    )
     assert engine == tee
     assert tee.split("\r")[-1] == later
+    assert _SSN in later  # the control: the line still carries the number, so "alone" is visible
 
 
 #: Messages with a later MSH line in shapes the one fixture above does not have.
