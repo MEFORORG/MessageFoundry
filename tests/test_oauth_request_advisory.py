@@ -126,7 +126,7 @@ def test_an_env_scope_is_named_as_not_compared(tmp_path: Path) -> None:
         ),
         (
             "https://auth.example.invalid/oauth2/other",
-            "both are on https://auth.example.invalid:443 and the path or query differs",
+            "it is on the same origin, https://auth.example.invalid:443, and is a different URL",
         ),
         ("urn:example:authorization-server", "it is not an http(s) URL"),
     ],

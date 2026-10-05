@@ -5774,7 +5774,7 @@ def oauth_request_advisories(registry: Registry) -> OAuthRequestAdvisories:
                 f"{_origin_label(token_origin)}"
             )
         else:
-            how = f"both are on {_origin_label(token_origin)} and the path or query differs"
+            how = f"it is on the same origin, {_origin_label(token_origin)}, and is a different URL"
         findings.append((name, f"smart_audience is not the token endpoint: {how}"))
 
     def oauth2_leg(name: str, settings: Mapping[str, Any]) -> None:
