@@ -334,8 +334,14 @@ the management API, and it does not inherit the API's auth: harden it deliberate
   `max_body_bytes`, `max_header_bytes`), the off-loopback exposed-gate (`check_http_tls_exposure`), and
   the peer-control gate (`check_http_intake_auth`).
 - **Not built:** an HTTP Basic credential check. Use one of the three `intake_auth` modes, or front the
-  listener with an authenticating reverse proxy. The synchronous downstream-reply (SOAP-envelope) path is
-  also a defined ADR 0013 follow-on, not built: the first slice is respond-with-receipt only.
+  listener with an authenticating reverse proxy.
+- **Synchronous reply, built (ADR 0154):** by default the listener answers `202 Accepted` on receipt.
+  With `reply_from` naming an outbound that captures its response, the HTTP turn instead waits up to
+  `reply_timeout` for that captured reply and returns it. That holds only when the partner succeeds:
+  a partner error dead-letters and the caller gets a fixed-JSON `502`, not the partner's own body.
+  `check_http_sync_reply` refuses a `reply_from` it cannot serve safely, for example one whose outbound
+  does not capture its response or would retry forever; see
+  [CONNECTIONS.md](CONNECTIONS.md#http-web-service-listener--http-inbound-only-adr-0023).
 - **Off loopback, a peer control is required, and TLS alone is not one.** `check_http_tls_exposure`
   checks only that **TLS is on**. `check_http_intake_auth` runs beside it each time the engine starts
   the connection, and again at `messagefoundry check`. Under the default `[security].enforcement =

@@ -331,7 +331,9 @@ engine writes, such as a File connection's, to `NT SERVICE\MessageFoundry` by na
 ### 4.5 Provision the first administrator
 
 Auth is **enabled by default**, and **the engine creates no account on its own**. Until you create the
-first Administrator, nobody can sign in. Do it once per store, at the host:
+first Administrator, nobody can manage the engine. A Windows sign-in (Kerberos), where configured, can
+still create a directory account before then, but that account holds no role. Create the
+Administrator once per store, at the host:
 
 1. Set the store key in your shell, the same `MEFOR_STORE_ENCRYPTION_KEY` the service runs with,
    unless it comes from `[store].encryption_key_file`, which the command reads too. Do not generate a
@@ -745,9 +747,9 @@ message, and confirm the **"wiring started"** banner in `service.out.log`.
 
 **Log management:** logs land under `<DataDir>\logs` via NSSM. Configure rotation, keep the level at
 `INFO` or above (DEBUG can leak PHI — §6), treat `service.out/err.log` as **potential-PHI artifacts**
-(ACL them; don't copy these raw files off-box — `[logging].forward_*` forwards a PHI-redacted
-stream to your collector instead), and include them in your retention
-policy.
+(ACL them; don't copy these raw files off-box — `[logging].forward_*` sends the collector a copy
+instead), and include them in your retention policy. The forwarded copy passes the same best-effort
+redaction filters as these files, so treat the collector's copy as potential PHI too.
 
 **Graceful drain for maintenance:** `Stop-Service MessageFoundry` reaches the engine as Ctrl+C,
 through NSSM. That, or Ctrl+C on a foreground `serve`, makes the ASGI lifespan call `engine.stop()`

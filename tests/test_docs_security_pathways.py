@@ -48,6 +48,7 @@ from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.config.wiring import Http, WiringError
 from messagefoundry.pipeline.wiring_runner import check_inbound_revocation
 from messagefoundry.store.store import LockoutCounter, UserRecord, lockout_escalates
+from tests._sign_in_claim import SIGN_IN_CLAIM
 
 _ROOT = Path(__file__).resolve().parent.parent
 _DOC = _ROOT / "docs" / "SECURITY.md"
@@ -3347,32 +3348,165 @@ def test_the_thirteenth_sweep_phi_qualifies_the_second_factor_for_oidc() -> None
     )
 
 
-@pytest.mark.parametrize("name", ["docs/DEPLOYMENT.md", "docs/INSTALL-GUIDE.md", "docs/SERVICE.md"])
+#: Shipped docs that carried the claim, at least, with a clause floor below each one's count today.
+#: Not every carrier: the IDE extension's own strings and dated records (CHANGELOG, ADRs) are outside.
+_PROVISIONING_DOCS = {
+    "README.md": 100,
+    "docs/SECURITY.md": 2000,
+    "docs/EARLY-ADOPTER-GUIDE.md": 300,
+    "docs/DEPLOYMENT.md": 250,
+    "docs/INSTALL-GUIDE.md": 250,
+    "docs/SERVICE.md": 250,
+}
+
+
+@pytest.mark.parametrize("name", sorted(_PROVISIONING_DOCS))
 def test_the_thirteenth_sweep_no_doc_says_nobody_can_sign_in_before_provisioning(
     name: str,
 ) -> None:
-    """Three docs said nobody can sign in before `provision-admin` runs. A Windows sign-in is not
+    """Six docs said nobody can sign in before `provision-admin` runs. A Windows sign-in is not
     refused for want of an Administrator: it creates a directory row holding no role (the probe
     above). Nobody can MANAGE the engine; somebody can sign in."""
     clauses = _clauses(_doc(name))
-    assert len(clauses) >= 250, (
-        f"{name} cut into {len(clauses)} clause(s), floor 250: the scan reads too little to clear it."
+    floor = _PROVISIONING_DOCS[name]
+    assert len(clauses) >= floor, (
+        f"{name} cut into {len(clauses)} clause(s), floor {floor}: the scan reads too little to "
+        "clear it."
     )
-    stale = [
-        c
-        for c in clauses
-        if re.search(r"\b(?:nobody|no one|no way)\b[^.;]*\bsign in\b", c, re.IGNORECASE)
-    ]
+    stale = [c for c in clauses if SIGN_IN_CLAIM.search(c)]
     assert not stale, f"{name} says nobody can sign in before provisioning again: {stale}"
-    # Read in the provisioning paragraph itself, the one each doc opens with "creates no account on
-    # its own", so a Kerberos passage elsewhere cannot stand in for it.
+    # Read in the provisioning paragraph itself: every paragraph that says the engine creates no
+    # account AND who cannot manage it must carry the Kerberos note, so a passage elsewhere cannot
+    # stand in for it. The README's quick-start line says only the first, and provisions nothing.
     passages = [
-        _flat(p)
+        flat
         for p in re.split(r"\n\s*\n", _doc(name))
-        if "creates no account on its own" in _flat(p)
+        if "creates no account on its own" in (flat := _flat(p)) and "nobody can manage" in flat
     ]
-    assert passages, f"{name} no longer says the engine creates no account; re-derive this check"
+    assert passages, f"{name} no longer says who cannot manage a new store; re-derive this check"
     assert all(re.search(r"Kerberos[^.]*\.?[^.]*\bno role\b", p) for p in passages), (
         f"{name} must say, where it provisions the first Administrator, that a Windows sign-in "
         "before then holds no role"
     )
+
+
+def test_the_thirteenth_sweep_second_round_probes_reply_logging_and_opt_in() -> None:
+    """The code facts the thirteenth sweep's second round states: the synchronous reply is built,
+    the forwarded log copy passes the same filters as stdout, and API mTLS and log forwarding act
+    only once configured, with forwarding required at serve under enforce."""
+    from messagefoundry import logging_setup
+    from messagefoundry.config import settings as settings_module
+    from messagefoundry.pipeline import wiring_runner
+
+    # 1. The synchronous captured reply (ADR 0154 increment B).
+    assert {"reply_from", "reply_timeout"} <= set(inspect.signature(Http).parameters)
+    assert callable(wiring_runner.check_http_sync_reply)
+
+    # 2. Each sink handler the engine builds gets the one filter chain, read per handler: every name
+    #    bound to a handler constructor is passed to `_install_phi_filters` in the same function.
+    sinks = {"_ForwardQueueHandler", "GuardedStreamHandler", "GuardedFileHandler", "StreamHandler"}
+    tree = ast.parse(textwrap.dedent(inspect.getsource(logging_setup)))
+    built: list[tuple[str, str]] = []
+    filtered: set[tuple[str, str]] = set()
+    for f in ast.walk(tree):
+        if not isinstance(f, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        for n in ast.walk(f):
+            if (
+                isinstance(n, ast.Assign)
+                and isinstance(n.value, ast.Call)
+                and ast.unparse(n.value.func).split(".")[-1] in sinks
+            ):
+                built += [(f.name, t.id) for t in n.targets if isinstance(t, ast.Name)]
+            if isinstance(n, ast.Call) and ast.unparse(n.func) == "_install_phi_filters":
+                filtered |= {(f.name, a.id) for a in n.args if isinstance(a, ast.Name)}
+    assert len(built) >= 3, f"the forwarder, stdout and file handler builders moved: {built}"
+    unfiltered = [b for b in built if b not in filtered]
+    assert not unfiltered, f"{unfiltered} build a log sink without the PHI filter chain"
+
+    # 3. Built is not on: no client CA and no collector by default, and serve's forwarding gate
+    #    refuses the default configuration.
+    assert settings_module.ApiSettings.model_fields["tls_client_ca_file"].default is None
+    assert settings_module.LoggingSettings.model_fields["forward_host"].default is None
+    assert settings_module.forwarding_gate_refusal(settings_module.LoggingSettings()) is not None
+
+
+def test_the_thirteenth_sweep_deployment_does_not_call_the_sync_reply_unbuilt() -> None:
+    """docs/DEPLOYMENT.md's intake caveat said the synchronous downstream reply was an ADR 0013
+    follow-on, not built, respond-with-receipt only. `reply_from` builds it (the probe above), and
+    CONNECTIONS.md says it shipped with ADR 0154 increment B."""
+    caveat = _deployment_intake_scopes()["caveat"]
+    clauses = _clauses(caveat)
+    assert len(clauses) >= 5, f"the intake caveat cut into {len(clauses)} clause(s), floor 5"
+    unbuilt = [
+        c
+        for c in clauses
+        if re.search(r"synchronous|SOAP|reply", c, re.I)
+        and re.search(r"not built|follow-on|receipt only", c, re.I)
+    ]
+    assert not unbuilt, f"docs/DEPLOYMENT.md calls the synchronous reply unbuilt again: {unbuilt}"
+    flat = _flat(caveat)
+    assert "`reply_from`" in flat, (
+        "the intake caveat must name reply_from, the setting that builds the synchronous reply"
+    )
+    # ...and must not promise a partner's own body on every answer: a partner error dead-letters.
+    assert "502" in flat, "the intake caveat must say a partner error reaches the caller as a 502"
+
+
+@pytest.mark.parametrize(
+    ("name", "floor"), [("docs/EARLY-ADOPTER-GUIDE.md", 300), ("docs/PHI.md", 1000)]
+)
+def test_the_thirteenth_sweep_no_doc_calls_the_forwarded_copy_phi_free(
+    name: str, floor: int
+) -> None:
+    """docs/EARLY-ADOPTER-GUIDE.md told the reader not to copy the potential-PHI log files off-box
+    because forwarding sends "a PHI-redacted stream" instead, and docs/PHI.md's forwarder row said
+    "the forwarded copy is PHI-redacted". The forwarded copy passes the same best-effort filters as
+    stdout (the probe above), and docs/PHI.md grades the log files and the spool both "Possibly"."""
+    clauses = _clauses(_doc(name))
+    assert len(clauses) >= floor, f"{name} cut into {len(clauses)} clause(s), floor {floor}"
+    forwarded = [c for c in clauses if re.search(r"forward|collector", c, re.I)]
+    assert forwarded, f"{name} names no log forwarding, so this check reads nothing"
+    phi_free = [
+        c
+        for c in forwarded
+        if re.search(
+            r"PHI-(?:redacted|free) (?:stream|copy)|redacted (?:stream|copy)"
+            r"|(?:copy|stream) is PHI-(?:redacted|free)",
+            c,
+            re.I,
+        )
+        and "best-effort" not in c
+    ]
+    assert not phi_free, f"{name} presents the forwarded log copy as PHI-free again: {phi_free}"
+    if name == "docs/EARLY-ADOPTER-GUIDE.md":
+        assert any("collector" in c and "potential PHI" in c for c in forwarded), (
+            "the guide must say the collector's copy is potential PHI too"
+        )
+
+
+def test_the_thirteenth_sweep_phi_says_built_is_not_on() -> None:
+    """docs/PHI.md said mTLS, revocation and off-box logs are "built into the engine" with nothing
+    on what turns them on, and sent the reader to section 11 for `forward_*`, which section 7
+    documents."""
+    doc = _doc("docs/PHI.md")
+    paragraphs = [
+        _flat(p)
+        for p in re.split(r"\n\s*\n", doc)
+        if "built into the engine" in _flat(p) and "mTLS" in p and "off-box" in p
+    ]
+    assert paragraphs, "docs/PHI.md no longer says the off-loopback controls are built"
+    for p in paragraphs:
+        for token in (
+            "`[api].tls_client_ca_file`",
+            "`[logging].forward_host`",
+            "`[logging].forward_tls_crl_file`",
+        ):
+            assert token in p, f"docs/PHI.md's built-controls paragraph must name {token}"
+    clauses = _clauses(doc)
+    assert len(clauses) >= 1000, f"docs/PHI.md cut into {len(clauses)} clause(s), floor 1000"
+    # _clauses strips emphasis asterisks, so `forward_*` reads as `forward_` here.
+    forward_rows = [c for c in clauses if "`[logging].forward_`" in c]
+    assert forward_rows, "docs/PHI.md names [logging].forward_* nowhere, so this reads nothing"
+    misdirected = [c for c in forward_rows if re.search(r"§11|#11-hardening", c)]
+    assert not misdirected, f"docs/PHI.md sends forward_* to section 11 again: {misdirected}"
