@@ -576,6 +576,8 @@ record for both.
 
 **Not decided here.** An account with no binding still enrols its first engine factor on proof of the
 directory credential alone. Closing that needs its own decision.
+[ADR 0207](0207-a-single-use-enrolment-code-for-a-directory-account-s-first-engine-factor.md) takes
+up that decision.
 
 ---
 
