@@ -7813,9 +7813,11 @@ async def _session_reaper(
     delete every row unused for more than ``idle_seconds - x`` real seconds, and every row with
     less than ``x`` seconds of absolute life left. With an idle window of 10 minutes or less, a step
     under the tolerance would then delete every session nobody used during it (BACKLOG #2283).
-    Purging as of the earlier instant cancels any step the guard lets through, at any idle setting:
-    a row goes only once the validator would refuse it at the true time. The cost is that a lapsed
-    row waits up to that much longer for a pass to delete it, and the validator refuses it meanwhile.
+    Purging as of the earlier instant cancels any ONE step the guard lets through, at any idle
+    setting: a row goes only once the validator would refuse it at the true time. Steps that each
+    pass the guard but add up across passes to more than the tolerance are not cancelled. The cost
+    is that a lapsed row waits up to that much longer for a pass to delete it, and the validator
+    refuses it meanwhile.
 
     **The first reading is a baseline, not a pass.** A wrong clock is likeliest at start-up, before
     time sync has run, and a first pass would have nothing to compare it with. So the reaper reads

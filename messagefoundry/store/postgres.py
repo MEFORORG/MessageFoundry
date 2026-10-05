@@ -2260,11 +2260,16 @@ class PostgresStore:
         unrotated. Waiting for a connection instead finishes the write once the pool frees, which is
         what both did before BACKLOG #2283 moved them onto the bounded ``_execute``.
 
+        This closes the gap at these two statements only. The same callers make other bounded
+        writes after their change commits, such as stamps and audit rows, and any of those can
+        still fail at the limit.
+
         Not every caller has committed first. At least "sign out everywhere else", an
         administrator's force sign-out and the directory reconciler when it writes no roles have no
-        earlier write, and they wait the same way, as they did before. A per-caller choice would need a store parameter on
-        all three backends. The wait has a known price, also as before: it holds whatever lock its
-        caller holds, such as a ceremony's per-account lock, until the pool frees.
+        earlier write, and they wait the same way, as they did before. A per-caller choice would
+        need a store parameter on all three backends. The wait has a known price, also as before:
+        it holds whatever lock its caller holds, such as a ceremony's per-account lock, until the
+        pool frees.
 
         A bounded retry that fell back to this wait would end the same way, later, since each retry
         rejoins the back of asyncpg's queue. Moving each write into its caller's transaction would
@@ -8335,9 +8340,8 @@ class PostgresStore:
     async def rotate_session(self, token_hash: str, *, new_token_hash: str) -> bool:
         """Re-key a live session in place (ASVS 7.2.4). See :meth:`AuthStore.rotate_session`.
 
-        Through ``self._execute_after_commit``, which returns the rowcount this op's contract is,
-        and waits for a pooled connection without a timeout: a rotation follows a factor ceremony
-        that has already committed, so it must not fail on a busy pool (BACKLOG #2283)."""
+        Through ``self._execute_after_commit``, which returns the rowcount this op's contract is.
+        Why that borrow has no timeout is its docstring's to say (BACKLOG #2283)."""
         changed = await self._execute_after_commit(
             "UPDATE sessions SET token_hash=$1 WHERE token_hash=$2 AND revoked_at IS NULL",
             new_token_hash,
@@ -8368,8 +8372,7 @@ class PostgresStore:
     ) -> int:
         """Revoke a user's active sessions (all, or all but ``except_token_hash``). Returns the count."""
         now = time.time() if now is None else now
-        # Unbounded, because most callers have already committed their own write, as
-        # `_execute_after_commit` explains (BACKLOG #2283).
+        # Unbounded; `_execute_after_commit` says why (BACKLOG #2283).
         return await self._execute_after_commit(
             "UPDATE sessions SET revoked_at=$1 WHERE user_id=$2 AND revoked_at IS NULL"
             " AND ($3::text IS NULL OR token_hash != $3)",
