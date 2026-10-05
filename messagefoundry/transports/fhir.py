@@ -85,13 +85,16 @@ from messagefoundry.transports.bounded_read import (
 from messagefoundry.transports.rest import (
     _NO_REDIRECT_OPENER,
     _RETRYABLE_4XX,
+    AUTH_CHALLENGE_REFUSED,
     MAX_OUTBOUND_HEADER_VALUE_LEN,
+    HttpAuthError,
     InsecureHopGuard,
     ProxyConfig,
     _expiry_relaxed_opener,
     _insecure_opener,
     _no_redirect_opener,
     _redact_url,
+    auth_challenge_refused,
     capture_response_headers,
     cleartext_acceptance_from_settings,
     egress_route_from_settings,
@@ -920,6 +923,11 @@ class FhirDestination(DestinationConnector):
             raise DeliveryError(
                 f"FHIR {_redact_url(self.base_url)} unreachable: {exc.reason}"
             ) from exc
+        except HttpAuthError as exc:
+            # BACKLOG #2323: as in _post, with the fixed text on the DeliveryError a probe raises.
+            raise DeliveryError(
+                f"FHIR {_redact_url(self.base_url)} {AUTH_CHALLENGE_REFUSED}"
+            ) from exc
         except (ValueError, http.client.InvalidURL) as exc:
             # BACKLOG #1793: classified like _post's arm, so the probe reply carries no urllib text.
             raise DeliveryError(
@@ -1044,6 +1052,10 @@ class FhirDestination(DestinationConnector):
             raise DeliveryError(
                 f"FHIR {_redact_url(self.base_url)} unreachable: {exc.reason}"
             ) from exc
+        except HttpAuthError as exc:
+            # BACKLOG #2323: a refused Digest challenge is the connection's fault, not this
+            # message's. Before the ValueError arm, which it would otherwise match.
+            raise auth_challenge_refused(f"FHIR {_redact_url(self.base_url)}") from exc
         except (ValueError, http.client.InvalidURL) as exc:
             # Backstop for an illegal request value urllib rejects (a CRLF in a header/URL that slipped
             # past the control-char guard, or a bad conditional_query) — a permanent failure (a retry
@@ -1529,6 +1541,13 @@ class FhirLookupExecutor:
             raise FhirLookupError(
                 f"fhir_lookup on {connection!r}: FHIR {_redact_url(base)} unreachable: {exc.reason}"
             ) from exc
+        except HttpAuthError as exc:
+            # BACKLOG #2323: this opener carries the web proxy's Digest handler, whose refusal is a
+            # ValueError the arm below would report as a bad request value. A FhirLookupError, as
+            # every failure of this Handler-side read is.
+            raise FhirLookupError(
+                f"fhir_lookup on {connection!r}: FHIR {_redact_url(base)} {AUTH_CHALLENGE_REFUSED}"
+            ) from exc
         except (ValueError, http.client.InvalidURL) as exc:
             # BACKLOG #1793: the destination's arm, for the Handler-side read. An escaped InvalidURL
             # reached messages.error as "handler error: ..." carrying urllib's text.
@@ -1618,6 +1637,11 @@ class FhirLookupExecutor:
         except urllib.error.URLError as exc:
             raise FhirLookupError(
                 f"FhirLookup {connection!r}: FHIR {_redact_url(base)} unreachable: {exc.reason}"
+            ) from exc
+        except HttpAuthError as exc:
+            # BACKLOG #2323: as in _get.
+            raise FhirLookupError(
+                f"FhirLookup {connection!r}: FHIR {_redact_url(base)} {AUTH_CHALLENGE_REFUSED}"
             ) from exc
         except (ValueError, http.client.InvalidURL) as exc:
             raise FhirLookupError(
