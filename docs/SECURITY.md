@@ -214,8 +214,12 @@ body, the early sign-in check above still answers before it. A route passes in o
   On an HTTP route with no gate, that mark does not count, so the route is refused.
 
 Any other route answers **403** `this route declares no authorization`, and a WebSocket is refused
-before it is accepted. The first refusal on a route is logged at ERROR, because such a route is a
-defect in the code that registered it. On a body-taking route built by the app's route class, the
+before it is accepted. Such a route is a defect in the code that registered it. The engine counts
+every refusal in memory and writes an ERROR line at most once a minute for each route. Each line
+names the route's path template, never the request, and says how many refusals came since the
+previous line. Refusals after a burst's last line stay in that count. They reach the log only with
+a later refusal of the same route, a minute or more after the last line. No API reads the count,
+and a restart loses it. On a body-taking route built by the app's route class, the
 refusal comes before the body is read. The check asks only that a route declared a gate. It does not check that
 the gate is correct.
 
