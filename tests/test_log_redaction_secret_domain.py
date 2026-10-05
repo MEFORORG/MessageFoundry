@@ -64,22 +64,25 @@ from __future__ import annotations
 
 import ast
 import inspect
+import logging
 import math
 import pathlib
 import re
 import re._constants as sre_constants
 import re._parser as sre_parser
+import string
 import time
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from functools import partial
+from functools import cache, partial
 from types import ModuleType
 from typing import Any
 
 import pytest
 
 from messagefoundry import secretscrub as scrub_mod
+from messagefoundry.logging_setup import CredentialScrubFilter, _install_phi_filters
 from messagefoundry.secretscrub import CREDENTIAL_PLACEHOLDER, scrub_credentials
 from messagefoundry.support import redact as redact_mod
 from messagefoundry.support.redact import REDACTION_PLACEHOLDER, redact_log_line
@@ -1464,7 +1467,7 @@ def test_the_dsn_scan_grows_linearly_in_line_length() -> None:
     # reasons recorded once above _PATTERN_APPLICATIONS.
     longest = _GROWTH_LENGTHS[1]
     marked_run = _adversarial_run(longest, marker=True)
-    folded = marked_run.casefold()
+    folded = scrub_mod._gate_fold(marked_run)
     gates = _applied_gate_names(scrub_mod, "_run")
     assert "_DSN_HINT" in gates and len(gates) >= 6, (
         f"the gate derivation found {sorted(gates)} in secretscrub._run, which does not look like the "
@@ -1481,7 +1484,7 @@ def test_the_dsn_scan_grows_linearly_in_line_length() -> None:
         "a second gate. Change the fixture's wording, and only then look at _run."
     )
     assert not scrub_mod._admits(
-        _adversarial_run(longest, marker=False).casefold(), scrub_mod._ANY_HINT
+        scrub_mod._gate_fold(_adversarial_run(longest, marker=False)), scrub_mod._ANY_HINT
     ), (
         "the unmarked run now names a credential word, so it no longer isolates the marker. The "
         "fixture has drifted -- fix the run, do not drop this assertion."
@@ -1816,3 +1819,153 @@ def test_redactor_is_the_backstop_for_both_named_surfaces() -> None:
     # redact_log_record applies redact_log_line to each piece of a line (vault BACKLOG #2563);
     # tests/test_log_tail_line_split.py pins that it redacts exactly what redact_log_line does.
     assert "from messagefoundry.support.redact import redact_log_record" in api
+
+
+# --- the admission gate admits every character (?i) reads as a keyword letter -----------------------
+#
+# Why the gate needs a fold table at all is stated once, on ``secretscrub._GATE_FOLDS``. These tests
+# drive the interpreter's own fold set, found by scanning, rather than the table under test.
+
+#: The value every fold-character line carries. Synthetic.
+_FOLD_VALUE = "Zq7-F0ld_Val-31"
+
+
+def _gated_keywords() -> tuple[str, ...]:
+    """Every word any per-pass gate in ``secretscrub._run`` keys on, read from the gates themselves
+    so a gate added to ``_run`` widens this corpus without an edit here. Some words (``bearer``,
+    ``pwd``, ``://``) hold none of the folded letters and so yield no line."""
+    gates = _applied_gate_names(scrub_mod, "_run")
+    assert "_CREDENTIAL_HINT" in gates and len(gates) >= 6, sorted(gates)
+    return tuple(sorted({word for name in gates for word in getattr(scrub_mod, name)}))
+
+
+@cache
+def _measured_letter_folds() -> dict[str, str]:
+    """Every non-ASCII character Python's case-insensitive matching reads as an ASCII letter, mapped to
+    that letter. Found by scanning every code point above ASCII, so it reports what THIS interpreter
+    does rather than what anybody remembers."""
+    every_char = "".join(chr(cp) for cp in range(0x80, 0x110000))
+    found: dict[str, str] = {}
+    for match in re.finditer("(?i)[a-z]", every_char):
+        char = match.group()
+        found[char] = next(
+            letter for letter in string.ascii_lowercase if re.fullmatch("(?i)" + letter, char)
+        )
+    return found
+
+
+def _fold_lines(folds: dict[str, str]) -> list[str]:
+    """Lines whose credential label carries fold characters, each with :data:`_FOLD_VALUE` as the
+    value. At least: one line per keyword, case spelling, fold character and position of its letter;
+    one with every such position replaced; and, per keyword, one MIXED line with a fold character for
+    every letter that has one (rotating where a letter has several), written as a snake_case label
+    with a ``:`` separator."""
+    by_letter: dict[str, list[str]] = {}
+    for char, letter in folds.items():
+        by_letter.setdefault(letter, []).append(char)
+    lines: list[str] = []
+    for word in _gated_keywords():
+        for spelling in (word, word.upper()):
+            for char, letter in folds.items():
+                spots = [i for i, c in enumerate(spelling) if c.lower() == letter]
+                labels = [spelling[:i] + char + spelling[i + 1 :] for i in spots]
+                if len(spots) > 1:
+                    labels.append("".join(char if c.lower() == letter else c for c in spelling))
+                lines.extend(f"connect failed {label}={_FOLD_VALUE} for svc" for label in labels)
+        used: Counter[str] = Counter()
+        mixed = []
+        for c in word:
+            options = by_letter.get(c)
+            mixed.append(options[used[c] % len(options)] if options else c)
+            used[c] += 1
+        if "".join(mixed) != word:
+            lines.append(f"connect failed svc_{''.join(mixed)}: {_FOLD_VALUE} for svc")
+    return lines
+
+
+def _through_write_time_filters(line: str) -> tuple[str, str, bool]:
+    """``line`` after :class:`CredentialScrubFilter` alone; after the whole chain
+    ``_install_phi_filters`` puts on every handler, in production order (the chain NSSM's stdout
+    capture and the off-box forwarder read); and whether the value was still on the record when the
+    chain reached ``CredentialScrubFilter``. The last one is how the caller tells a chain green this
+    filter earned from one an earlier filter bought."""
+    alone = logging.LogRecord("mefor.test", logging.ERROR, __file__, 1, line, None, None)
+    assert CredentialScrubFilter().filter(alone)
+    handler = logging.NullHandler()
+    _install_phi_filters(handler)
+    chained = logging.LogRecord("mefor.test", logging.ERROR, __file__, 1, line, None, None)
+    reached = False
+    for handler_filter in handler.filters:
+        assert isinstance(handler_filter, logging.Filter)
+        if isinstance(handler_filter, CredentialScrubFilter):
+            reached = _FOLD_VALUE in chained.getMessage()
+        handler_filter.filter(chained)
+    return alone.getMessage(), chained.getMessage(), reached
+
+
+def test_the_gate_fold_table_holds_every_character_case_insensitive_matching_reads_as_a_letter() -> (
+    None
+):
+    """``_GATE_FOLDS`` must hold every character the scan finds, each with the right letter.
+
+    A character missing from the table is one the gate may refuse while a ``(?i)`` pattern behind it
+    would match. That is the one direction a gate must never fail in. The table may hold more than the
+    scan finds; extra entries only admit more lines, which is free."""
+    measured = _measured_letter_folds()
+    # The scan must find something, or it proves nothing. These four are what it found when the table
+    # was written. The message is ASCII, so a cp1252 console can print the failure.
+    expected = {0x0130, 0x0131, 0x017F, 0x212A}
+    found = {ord(c) for c in measured}
+    assert expected <= found, f"the scan found {sorted(f'U+{cp:04X}' for cp in found)}"
+    table = dict(scrub_mod._GATE_FOLDS)
+    missing = {
+        f"U+{ord(c):04X}->{letter}" for c, letter in measured.items() if table.get(c) != letter
+    }
+    assert not missing, f"the gate fold table lacks {sorted(missing)}"
+
+
+def test_the_gate_admits_every_keyword_spelled_with_a_fold_character() -> None:
+    """Every keyword, spelled with fold characters, must lose its value on ``scrub_credentials``, on
+    ``CredentialScrubFilter`` alone and on the production filter chain. The gated pass must also
+    equal the ungated one.
+
+    The ungated ``_run`` must redact each line first, so there IS something for the gate to be wrong
+    about. ``test_the_old_gate_fails_the_fold_character_test`` is the control showing this test can
+    fail."""
+    lines = _fold_lines(_measured_letter_folds())
+    assert lines, "the corpus is empty, so this test proves nothing"
+    failures: list[str] = []
+    for line in lines:
+        if _FOLD_VALUE in scrub_mod._run(line, CREDENTIAL_PLACEHOLDER, None):
+            failures.append(f"ungated pattern misses {ascii(line)}")
+        if scrub_credentials(line) != scrub_mod._run(line, CREDENTIAL_PLACEHOLDER, None):
+            failures.append(f"the gate changed the result on {ascii(line)}")
+        alone, chained, reached = _through_write_time_filters(line)
+        if _FOLD_VALUE in alone:
+            failures.append(f"CredentialScrubFilter printed the value on {ascii(line)}")
+        if _FOLD_VALUE in chained:
+            failures.append(f"the production filter chain printed the value on {ascii(line)}")
+        # The chain arm is ARMED for the characters this fix is about. An earlier filter may remove
+        # some other values first (CredentialQueryScrubFilter takes a bare ``token=``), but a U+0130
+        # or U+0131 line must reach CredentialScrubFilter with its value, or the chain green above
+        # says nothing about the gate.
+        if (chr(0x0130) in line or chr(0x0131) in line) and not reached:
+            failures.append(f"an earlier filter removed the value first on {ascii(line)}")
+    assert not failures, "\n".join(failures)
+
+
+def test_the_old_gate_fails_the_fold_character_test(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The positive control. With the fold table emptied, the gate is ``casefold`` alone, which is
+    what shipped before, and some lines must then leak. Every line that leaks must carry U+0130 or
+    U+0131: ``casefold`` handles the other fold characters by itself. Not every such line leaks,
+    because some still hold a shorter keyword the old gate admits."""
+    monkeypatch.setattr(scrub_mod, "_GATE_FOLDS", ())
+    leaked = [
+        line
+        for line in _fold_lines(_measured_letter_folds())
+        if _FOLD_VALUE in scrub_credentials(line)
+    ]
+    assert leaked, "emptying the fold table leaked nothing, so the fold test cannot fail"
+    assert all(chr(0x0130) in line or chr(0x0131) in line for line in leaked), [
+        ascii(line) for line in leaked
+    ]
