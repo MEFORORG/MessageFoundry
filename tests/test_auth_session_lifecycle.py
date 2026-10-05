@@ -308,36 +308,50 @@ def _factor_ceremony_scan(source: str) -> tuple[set[str], set[str], list[str]]:
     """Read ``source`` and sort every elevation's ceremony into ``(stamping, other, refusals)``.
 
     A ceremony is STAMPING when the function that elevates writes the second-factor stamp BEFORE it
-    elevates, either directly or through a ``self.`` helper that does, at any depth. A refusal is
-    an elevation the scan cannot read: a ``ceremony`` that is missing or not a string literal.
-    Refusing it, rather than skipping it, is what closes the old scan's gap (BACKLOG #2283): a
-    ceremony named through a variable used to drop out of both sets and pass."""
+    elevates, either directly or through a helper that does, at any depth. A helper is matched by
+    the name it is called by, as a method on any receiver or as a bare module-level name. A
+    refusal is an elevation the scan cannot read: a ``ceremony`` that is missing or not a string
+    literal. Refusing it, rather than skipping it, is what closes the old scan's gap (BACKLOG
+    #2283): a ceremony named through a variable used to drop out of both sets and pass.
+
+    Each function is read by its OWN calls: a nested function is a function of its own, so a stamp
+    in an inner function that may never run does not count for the one around it. "Before" is
+    source order, not control flow, so a stamp in a branch that returns early still counts. That
+    errs toward calling a re-proof a factor ceremony, which fails the set comparison loudly rather
+    than passing it quietly."""
     import ast
 
     tree = ast.parse(source)
     functions = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)]
+    scopes = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
 
-    def _calls(fn: ast.AST) -> list[ast.Call]:
-        return [n for n in ast.walk(fn) if isinstance(n, ast.Call)]
+    def _calls(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.Call]:
+        found: list[ast.Call] = []
+        todo: list[ast.AST] = list(fn.body)
+        while todo:
+            node = todo.pop()
+            if isinstance(node, scopes):
+                continue  # its calls are its own
+            if isinstance(node, ast.Call):
+                found.append(node)
+            todo.extend(ast.iter_child_nodes(node))
+        return found
 
-    def _attr(call: ast.Call) -> str | None:
-        return call.func.attr if isinstance(call.func, ast.Attribute) else None
+    def _callee(call: ast.Call) -> str | None:
+        if isinstance(call.func, ast.Attribute):
+            return call.func.attr
+        if isinstance(call.func, ast.Name):
+            return call.func.id
+        return None
 
-    # Which functions stamp, directly or through a `self.` helper. A fixed point, so a helper of a
-    # helper counts. Keyed by name; a name defined twice counts as stamping if either copy does.
-    stamps = {fn.name for fn in functions if any(_attr(c) == _STAMP for c in _calls(fn))}
+    # Which functions stamp, directly or through a helper. A fixed point, so a helper of a helper
+    # counts. Keyed by name; a name defined twice counts as stamping if either copy does.
+    stamps = {fn.name for fn in functions if any(_callee(c) == _STAMP for c in _calls(fn))}
     while True:
         more = {
             fn.name
             for fn in functions
-            if fn.name not in stamps
-            and any(
-                isinstance(c.func, ast.Attribute)
-                and isinstance(c.func.value, ast.Name)
-                and c.func.value.id == "self"
-                and c.func.attr in stamps
-                for c in _calls(fn)
-            )
+            if fn.name not in stamps and any(_callee(c) in stamps for c in _calls(fn))
         }
         if not more:
             break
@@ -350,9 +364,9 @@ def _factor_ceremony_scan(source: str) -> tuple[set[str], set[str], list[str]]:
         if fn.name in _ELEVATE:
             continue  # the two wrappers pass `ceremony` through by name; they are not ceremonies
         calls = _calls(fn)
-        stamp_lines = [c.lineno for c in calls if _attr(c) == _STAMP or _attr(c) in stamps]
+        stamp_lines = [c.lineno for c in calls if _callee(c) == _STAMP or _callee(c) in stamps]
         for call in calls:
-            if _attr(call) not in _ELEVATE:
+            if _callee(call) not in _ELEVATE:
                 continue
             ceremony = next((kw.value for kw in call.keywords if kw.arg == "ceremony"), None)
             if not (isinstance(ceremony, ast.Constant) and isinstance(ceremony.value, str)):
@@ -371,10 +385,10 @@ def test_the_factor_ceremony_set_matches_the_ceremonies_that_stamp() -> None:
     ceremony in the set, and no function that elevates WITHOUT stamping first may. A new factor
     ceremony that forgot the set would otherwise skip the cap silently.
 
-    BACKLOG #2283 closed three gaps in the scan. It read only ``AuthService`` and only ``async``
-    methods; it now reads the whole module. A stamp made through a helper made the ceremony read as
-    a re-proof; helpers now count. A ceremony that was not a string literal was skipped; it is now
-    refused."""
+    BACKLOG #2283 closed gaps in the scan. It read only ``AuthService`` and only ``async`` methods;
+    it now reads the whole module. A stamp made through a helper made the ceremony read as a
+    re-proof; helpers now count. A ceremony that was not a string literal was skipped; it is now
+    refused. A stamp after the elevation, or inside a nested function, counted; neither does now."""
     import inspect
 
     from messagefoundry.auth import service as service_module
@@ -413,14 +427,33 @@ class S:
         await self._store.mark_session_mfa_verified(token)
         return out
 
+    async def via_module_helper(self, token):
+        await _module_stamp(self, token)
+        return await self._elevated(token, ceremony="module_helper_factor")
+
+    async def inner_stamp_never_runs(self, token):
+        async def inner():
+            await self._store.mark_session_mfa_verified(token)
+
+        return await self._elevated(token, ceremony="inner_only")
+
+
+async def _module_stamp(svc, token):
+    await svc._store.mark_session_mfa_verified(token)
+
 
 async def module_level(svc, token):
     await svc._store.mark_session_mfa_verified(token)
     return await svc._elevated_hash(token, ceremony="module_factor")
 """
     stamping, other, refusals = _factor_ceremony_scan(source)
-    assert stamping == {"helper_factor", "sync_factor", "module_factor"}
-    assert other == {"late"}
+    assert stamping == {
+        "helper_factor",
+        "sync_factor",
+        "module_factor",
+        "module_helper_factor",
+    }
+    assert other == {"late", "inner_only"}
     assert [r.split(":")[0] for r in refusals] == ["by_variable"]
 
 
@@ -431,9 +464,13 @@ def test_only_the_service_module_elevates() -> None:
 
     root = Path(__file__).resolve().parents[1] / "messagefoundry"
     service = root / "auth" / "service.py"
+    files = sorted(root.rglob("*.py"))
+    # The controls: the walk reached the package, and the needle finds the elevations that exist.
+    assert len(files) > 100, f"the walk found {len(files)} files under {root}"
+    assert service in files and "._elevated(" in service.read_text(encoding="utf-8")
     callers = [
         str(path.relative_to(root))
-        for path in root.rglob("*.py")
+        for path in files
         if path != service
         and any(f".{name}(" in path.read_text(encoding="utf-8") for name in _ELEVATE)
     ]
