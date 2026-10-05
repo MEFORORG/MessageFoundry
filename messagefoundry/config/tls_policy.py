@@ -1909,9 +1909,13 @@ def hop_url_host(url: str, *, cell: str) -> str:
     """The host a hop decision is keyed on. A URL whose authority names none (``https:///x``,
     ``https://:443/x``) raises :class:`ValueError`, whatever the posture (BACKLOG #1924, #2207).
 
-    The ONE reader of a hop URL's host for a hop guard, a send-time re-check or a trust-anchor
-    lookup. Each of those keys an on-box carve-out on :func:`is_loopback_hop_host`, which reads
-    ``""`` as loopback, and at least one caller elsewhere relies on that. So a site that wrote
+    The shared reader of a hop URL's host. At least the HTTP-family construction guards, their
+    send-time re-checks, the two trust-anchor lookups and the OIDC revocation guards call it. The
+    Vault hop guard in ``transports.strict_requests`` reads its address another way on purpose:
+    with the parser that requests dials by.
+
+    Each caller keys an on-box carve-out on :func:`is_loopback_hop_host`, which reads ``""`` as
+    loopback, and at least one caller elsewhere relies on that. So a site that wrote
     ``hostname or ""`` let the one hop it cannot classify cross as on-box. What such a URL dials is
     not knowable here: an empty host can resolve to this box's own network addresses rather than to
     loopback. So the remedy is the URL, and no posture, attestation or acceptance crosses this.
@@ -1932,7 +1936,7 @@ def hop_url_host(url: str, *, cell: str) -> str:
     if not host:
         raise ValueError(
             f"{cell}: the URL names no host, so the hop cannot be judged on-box or off-box. "
-            "Give the URL a host."
+            "Give the URL a host. A URL written with no scheme reads as one with no host."
         )
     return host
 

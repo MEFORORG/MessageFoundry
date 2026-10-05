@@ -1326,7 +1326,10 @@ class FhirLookupExecutor:
                 # server is the most on-point instance of 12.3.4's condition in the product, and it
                 # could not name an anchor at all.
                 lookup_anchor = http_family_trust_anchor(
-                    s, url=url, trust_anchor_policy=trust_anchor_policy
+                    s,
+                    url=url,
+                    trust_anchor_policy=trust_anchor_policy,
+                    cell=f"FhirLookup {cname!r}",
                 )
                 self._opener[cname] = (
                     _no_redirect_opener(*proxy_handlers, trust_anchor=lookup_anchor)

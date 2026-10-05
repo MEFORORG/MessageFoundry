@@ -225,7 +225,7 @@ _CELLS: dict[str, tuple[Any, Any, str, str, tuple[Any, ...]]] = {
         ConnectorType.DICOMWEB,
         DICOMweb,
         "http://pacs.example.org/dicom-web",
-        "base_url",
+        "_target_url",  # what the STOW-RS request dials, derived from base_url at construction
         (b"DICM",),
     ),
 }
@@ -253,7 +253,7 @@ def _destination(cell: str) -> tuple[DestinationConnector, _Opener, str, tuple[A
     opener = _Opener()
     dest._opener = opener  # type: ignore[attr-defined]
     dest._hop_guard = _open_guard()  # type: ignore[attr-defined]
-    assert getattr(dest, attr) == url
+    assert getattr(dest, attr).startswith(url)
     return dest, opener, attr, post_args
 
 
@@ -320,6 +320,16 @@ def test_a_fhir_lookup_whose_base_names_no_host_does_not_build(
             FhirLookupExecutor(
                 {"L": {"url": url, **extra}}, egress=EgressSettings(deny_by_default=False)
             )
+
+
+def test_the_fhir_lookup_refusal_names_the_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An executor holds several lookups, and nothing above it adds a name. So the refusal on the
+    verified https arm, which comes from the anchor lookup, has to say which lookup it is."""
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    lookups = {"GOOD": {"url": "https://127.0.0.1:8443/fhir"}, "BAD": {"url": "https:///fhir"}}
+    with active_hop_posture(_PROD), pytest.raises(ValueError, match="names no host") as err:
+        FhirLookupExecutor(lookups, egress=EgressSettings(deny_by_default=False))
+    assert str(err.value).startswith("FhirLookup 'BAD': ")
 
 
 def test_a_fhir_lookup_with_a_real_host_still_builds(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -4,11 +4,14 @@
 
 ADR 0092 decision 4 has each destination re-assert a permitted insecure hop at send time, before a
 byte crosses. ``_post`` did that; ``_probe``, which serves an operator's test connection, did not.
-The REST and FHIR probes also mint a bearer for the hop, so a skipped re-check there put a fresh
-token on a hop the send path would have refused.
+The REST and FHIR probes also mint a bearer for the hop, so the re-check has to come before the
+mint.
 
-Each case builds a destination whose cleartext hop is PERMITTED, proves the probe reaches the
-(fake) opener, then swaps in a guard that now refuses. Nothing here touches the network.
+This is defence in depth, as the send-time re-check itself is. The test-connection route builds a
+fresh connector and probes it at once, so the guard recomputes the decision construction just
+made. No state is known in which the two differ. So each case has to change the guard by hand: it
+builds a destination whose cleartext hop is PERMITTED, proves the probe reaches the (fake) opener,
+then swaps in a guard that now refuses. Nothing here touches the network.
 """
 
 from __future__ import annotations

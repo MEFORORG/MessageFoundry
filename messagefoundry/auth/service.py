@@ -22,7 +22,6 @@ import os
 import secrets
 import time
 import unicodedata
-import urllib.parse
 import urllib.request
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
@@ -1747,9 +1746,10 @@ def _idp_leg_host(url: str | None, leg: str) -> str:
 
     A URL that names no host raises :class:`InsecureHopRefused`, whatever the posture. A stand-in
     host used to go to the guard instead, which refused it under ``enforce`` and only warned
-    outside it. The type is the one this hop's other refusal raises, which ``serve``,
-    ``provision-admin`` and ``verify`` already report. The text is the shared check's own and
-    names no part of the URL."""
+    outside it. The type is the one this hop's other refusal raises, so ``serve`` and
+    ``provision-admin`` report it as they report that one. ``messagefoundry verify`` shows it as an
+    ERROR on its revocation row, because it is raised while the guards are captured. The text is
+    the shared check's own and names no part of the URL."""
     try:
         return hop_url_host(url or "", cell=f"[auth] OIDC {leg}")
     except ValueError as exc:

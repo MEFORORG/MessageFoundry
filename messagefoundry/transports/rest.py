@@ -629,7 +629,7 @@ class InsecureHopGuard:
             )
 
     def assert_send_url(self, url: str) -> None:
-        """:meth:`assert_send` for the hop ``url`` names. The call every send-time site makes.
+        """:meth:`assert_send` for the hop ``url`` names. The HTTP-family send-time sites call it.
 
         The host is read by :func:`hop_url_host`, the one check the construction guards use, so no
         site falls through to ``""`` (BACKLOG #2207). Its ``ValueError`` becomes the
