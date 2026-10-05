@@ -1393,12 +1393,11 @@ the four HTTP destinations, and their own sections point here.
 | FHIR | any other write | off | **delivered**, with the same WARNING |
 | FHIR | any other write | on | **permanent refusal**: the reply would be stored and may be passed on, as for REST |
 
-The two FHIR refusals are the batch 191 Manager's reading of the owner ruling of 2026-10-05, which
-names the principle and not these two cases. "An update the engine sends as a transaction" is
-`conditional="if-match"`, or `interaction="update"` with no `conditional`, each with the default
-`update_url_form`. Every other FHIR write is in the last two rows. That is at least a create,
-`conditional="conditional-update"` or `"if-none-exist"` under any `interaction`, an update in the
-path form, and a `transaction` or `batch` `Bundle` a Handler built.
+"An update the engine sends as a transaction" is `conditional="if-match"`, or `interaction="update"`
+with no `conditional`, each with the default `update_url_form`. Every other FHIR write is in the
+last two rows. That is at least a create, `conditional="conditional-update"` or `"if-none-exist"`
+under any `interaction`, an update in the path form, and a `transaction` or `batch` `Bundle` a
+Handler built. The engine does not read the reply to a Handler's own `Bundle` for its entry statuses.
 
 A message that dead-letters this way got a 2xx, but the engine could not read the reply. The partner
 may have applied it. On SOAP, on DICOMweb, and on a FHIR update sent as a transaction, the unread

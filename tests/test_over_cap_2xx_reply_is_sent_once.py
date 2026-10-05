@@ -13,9 +13,9 @@ The owner ruling of 2026-10-05 judges such a reply by who reads the body:
 * the engine reads it to know the outcome, or passes it on: a permanent refusal, and no
   re-send. SOAP, DICOMweb and REST with capture on.
 
-Two FHIR cases are the batch 191 Manager's reading of that ruling, and both are a refusal: an
-update the engine wraps in a transaction, whose reply it reads for the entry status, in either
-capture mode; and any FHIR write with capture on, whose reply is passed on.
+Two FHIR cases are a refusal on the same principle: an update the engine wraps in a transaction,
+whose reply it reads for the entry status, in either capture mode; and any FHIR write with capture
+on, whose reply is passed on.
 
 Three layers:
 
@@ -253,16 +253,19 @@ def test_the_stored_refusal_keeps_its_code_under_a_long_connection_name() -> Non
 # --- each destination's _post, against a body that never ends -------------------------------------
 
 
-def _payload(ctype: ConnectorType) -> str:
+def _payload(ctype: ConnectorType, over: dict[str, Any] | None = None) -> str:
     if ctype is ConnectorType.FHIR:
-        return json.dumps(
-            {
-                "resourceType": "Patient",
-                "id": "p1",
-                "meta": {"versionId": "3"},  # if-match sends it; the other forms ignore it
-                "note": _PAYLOAD_MARKER,
-            }
-        )
+        patient = {
+            "resourceType": "Patient",
+            "id": "p1",
+            "meta": {"versionId": "3"},  # if-match sends it; the other forms ignore it
+            "note": _PAYLOAD_MARKER,
+        }
+        if (over or {}).get("interaction") == "transaction":
+            # What a Handler hands over for this interaction: its own Bundle, sent as it is.
+            entry = {"resource": patient, "request": {"method": "POST", "url": "Patient"}}
+            return json.dumps({"resourceType": "Bundle", "type": "transaction", "entry": [entry]})
+        return json.dumps(patient)
     if ctype is ConnectorType.DICOMWEB:
         return RawMessage.from_bytes(
             b"\x00" * 128 + b"DICM" + _PAYLOAD_MARKER.encode(), "dicom"
@@ -273,7 +276,7 @@ def _payload(ctype: ConnectorType) -> str:
 
 
 #: At least these destinations and modes, as (connector, extra settings) -> the delivered or the
-#: refused side. Not here: a ``transaction`` or ``batch`` Bundle a Handler built.
+#: refused side. Not here: ``interaction="batch"``, which takes the path ``"transaction"`` takes.
 _DELIVERED = "delivered"
 _REFUSED = "refused"
 _RULED: list[tuple[ConnectorType, dict[str, Any], str]] = [
@@ -285,9 +288,9 @@ _RULED: list[tuple[ConnectorType, dict[str, Any], str]] = [
     (ConnectorType.DICOMWEB, {"capture_response": True}, _REFUSED),
     # A plain FHIR write with capture off has no reader. THE CONTROL for the three rows after it.
     (ConnectorType.FHIR, {"capture_response": False}, _DELIVERED),
-    # The Manager's reading: with capture on the reply is passed on, as a REST reply is.
+    # With capture on the reply is passed on, as a REST reply is.
     (ConnectorType.FHIR, {"capture_response": True}, _REFUSED),
-    # The Manager's reading: an update goes out wrapped in a transaction, and the engine reads
+    # An update goes out wrapped in a transaction, and the engine reads
     # the reply for the entry status. So the outcome is unknown without it, in either mode.
     (ConnectorType.FHIR, {"capture_response": False, "interaction": "update"}, _REFUSED),
     (ConnectorType.FHIR, {"capture_response": True, "interaction": "update"}, _REFUSED),
@@ -298,6 +301,9 @@ _RULED: list[tuple[ConnectorType, dict[str, Any], str]] = [
         {"capture_response": False, "interaction": "update", "update_url_form": "path"},
         _DELIVERED,
     ),
+    # THE CONTROL: a transaction Bundle the Handler built is not the engine's wrap. The engine
+    # never looks inside that reply, so nothing reads the body.
+    (ConnectorType.FHIR, {"capture_response": False, "interaction": "transaction"}, _DELIVERED),
     # The other way a write becomes a wrapped update: if-match, whatever the interaction says.
     (ConnectorType.FHIR, {"capture_response": False, "conditional": "if-match"}, _REFUSED),
     # THE CONTROL: the other conditional forms are not wrapped, even under interaction="update".
@@ -334,10 +340,10 @@ async def test_send_follows_the_ruling_and_keeps_the_byte_bound(
     dest._opener = opener
     with caplog.at_level(logging.WARNING):
         if side == _DELIVERED:
-            assert await dest.send(_payload(ctype)) is None
+            assert await dest.send(_payload(ctype, over)) is None
         else:
             with pytest.raises(NegativeAckError) as ei:
-                await dest.send(_payload(ctype))
+                await dest.send(_payload(ctype, over))
             assert ei.value.code == REPLY_TOO_LARGE_CODE
             assert ei.value.permanent is True
             refusal = str(ei.value)
@@ -499,7 +505,7 @@ async def test_an_over_cap_2xx_is_sent_once_and_recorded_as_ruled(
     with _Partner(200, over_cap_body) as partner:
         dest = _build(ctype, f"{partner.url}/x?site={_URL_MARKER}", **over)
         with caplog.at_level(logging.WARNING):
-            got = await _deliver(tmp_path, dest, _payload(ctype))
+            got = await _deliver(tmp_path, dest, _payload(ctype, over))
     # THE ITEM: the partner answered 2xx, so it must never see the request twice.
     assert len(partner.requests) == 1, partner.requests
     assert got.outcomes == [_ItemOutcome.PROCESSED]
@@ -554,7 +560,7 @@ async def test_an_in_cap_2xx_is_delivered_as_before(
     with _Partner(200, body) as partner:
         dest = _build(ctype, f"{partner.url}/x", **over)
         with caplog.at_level(logging.WARNING):
-            got = await _deliver(tmp_path, dest, _payload(ctype))
+            got = await _deliver(tmp_path, dest, _payload(ctype, over))
     assert len(partner.requests) == 1
     assert got.outcomes == [_ItemOutcome.PROCESSED]
     assert got.row_status == OutboxStatus.DONE.value

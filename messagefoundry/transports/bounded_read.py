@@ -26,7 +26,7 @@ least a probe, the alert webhook and a ``fhir_lookup`` raise the error to their 
 instead, and nothing retries those.
 
 A delivery that already holds a 2xx status is different, because a retry would send again a
-request the partner answered 2xx (vault BACKLOG #2180, owner ruling 2026-10-05).
+request the partner answered 2xx (vault BACKLOG #2180).
 :func:`read_2xx_reply_text` reads that body and states the rule. In short, an over-cap body
 there is either dropped with a WARNING or refused for good with code :data:`REPLY_TOO_LARGE_CODE`,
 which is a dead-letter cause the bound did not have before. Each destination's ``_post`` says
@@ -1223,8 +1223,8 @@ def read_2xx_reply_text(
     delivered here. An in-cap body is returned whatever the status: that is the caller's to judge.
 
     The partner answered 2xx, so an over-cap body must not cause a re-send (vault BACKLOG #2180).
-    What it does cause depends on ``body_is_needed`` (owner ruling 2026-10-05). This is the one
-    place in code that states the rule:
+    What it does cause depends on ``body_is_needed``, which says who reads the body. This is the
+    one place in code that states the rule:
 
     * ``False`` -- nothing looks inside this body, so the caller can call the message delivered
       without it. Returns ``""`` and logs a WARNING. The WARNING carries ``connector``, the
@@ -1234,8 +1234,7 @@ def read_2xx_reply_text(
       :data:`REPLY_TOO_LARGE_CODE`, so the row dead-letters once and is not sent again. A reply
       the engine could not read is not recorded as delivered.
 
-    Which FHIR writes need the body is the batch 191 Manager's reading of that ruling. It is
-    stated at the call in ``transports/fhir.py``.
+    Which FHIR writes need the body is stated at the call in ``transports/fhir.py``.
 
     Only the byte bound is handled here. A truncated or misframed reply still raises as
     :func:`read_bounded_text` raises it, and is still retried.

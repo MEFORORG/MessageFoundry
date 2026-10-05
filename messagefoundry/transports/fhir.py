@@ -1023,12 +1023,11 @@ class FhirDestination(DestinationConnector):
                 # ASVS 15.2.2: bounded on the socket read. A FHIR write returns the created resource
                 # or an OperationOutcome, both orders of magnitude under the 16 MiB ceiling.
                 # vault BACKLOG #2180: the status here is 2xx, so an over-cap body must not
-                # re-send. The owner ruling of 2026-10-05 decides by who reads the body. A plain
-                # write with capture off has no reader, so it is delivered and the body dropped.
-                # The other two cases are the batch 191 Manager's reading of that ruling, and
-                # both are a permanent refusal. A wrapped update's reply is read for the entry
-                # status, so without it the outcome is unknown. With capture on the reply is
-                # stored and may be passed on.
+                # re-send. What it does instead depends on who reads the body. A plain write with
+                # capture off has no reader, so it is delivered and the body dropped. The other
+                # two cases are a permanent refusal. A wrapped update's reply is read for the
+                # entry status, so without it the outcome is unknown. With capture on the reply
+                # is stored and may be passed on.
                 body = read_2xx_reply_text(
                     resp,
                     connector=self._hop,
