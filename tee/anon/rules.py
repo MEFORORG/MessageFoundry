@@ -91,12 +91,14 @@ class FieldRule:
 
 
 # The recommended default scrub map (ADR 0030 §3). Anything NOT listed is left intact — so the
-# routing/coded fields (MSH-7/9/10/12, NK1-3 relationship, IN1-2/3/4 plan codes, DG1/AL1/PR1,
-# OBR-4 service) survive untouched and correlation + parity-diff (#14) still work.
+# routing/coded fields (MSH-7/9/10/12, NK1-3 relationship, IN1-2/3/4 plan codes, DG1/AL1, the PR1
+# codes, OBR-4 service) survive untouched and correlation + parity-diff (#14) still work.
 #
 # The DATE and location rules map these Safe Harbor date and location fields, and that is NOT Safe
 # Harbor de-identification: MSH-7 keeps the full message time, the order and accession numbers
-# (ORC-2/3, OBR-2/3) are left unmapped, and so are other date fields (BACKLOG #2248).
+# (ORC-2/3, OBR-2/3) are left unmapped (BACKLOG #2248). The date fields BACKLOG #2330 listed are
+# mapped: an event date takes DATE, and a date of birth takes DOB like PID-7. A date field outside
+# that list still has no rule, and only the coverage report names it.
 #
 # MRG fields are scrubbed with the SAME kinds as their PID counterparts (MRG-1 with PID-3, MRG-4
 # with PID-5) and keyed on the same value, so an A40 merge's old-to-new linkage is preserved across
@@ -130,14 +132,17 @@ DEFAULT_RULES: tuple[FieldRule, ...] = (
     FieldRule("NK1-5", SurrogateKind.PHONE),
     FieldRule("NK1-6", SurrogateKind.PHONE),
     FieldRule("NK1-7", SurrogateKind.PHONE),
+    FieldRule("NK1-16", SurrogateKind.DOB),  # contact's date of birth
     # GT1 — guarantor
     FieldRule("GT1-3", SurrogateKind.NAME),
     FieldRule("GT1-5", SurrogateKind.ADDRESS),
     FieldRule("GT1-6", SurrogateKind.PHONE),
     FieldRule("GT1-7", SurrogateKind.PHONE),
+    FieldRule("GT1-8", SurrogateKind.DOB),  # guarantor's date of birth
     FieldRule("GT1-12", SurrogateKind.SSN),
     # IN1/IN2 — insurance (plan/company codes IN1-2/3/4 are KEPT by omission)
     FieldRule("IN1-16", SurrogateKind.NAME),
+    FieldRule("IN1-18", SurrogateKind.DOB),  # insured's date of birth
     FieldRule("IN1-19", SurrogateKind.ADDRESS),
     FieldRule("IN1-36", SurrogateKind.ID),
     FieldRule("IN1-49", SurrogateKind.ID),
@@ -167,6 +172,12 @@ DEFAULT_RULES: tuple[FieldRule, ...] = (
     FieldRule("OBX-16", SurrogateKind.PROVIDER),
     # NTE — notes / comments
     FieldRule("NTE-3", SurrogateKind.FREETEXT),
+    # Event dates in the scheduling, pharmacy, procedure and financial segments (BACKLOG #2330)
+    FieldRule("AIS-4", SurrogateKind.DATE),  # appointment start date/time
+    FieldRule("RXA-3", SurrogateKind.DATE),  # administration start date/time
+    FieldRule("RXA-4", SurrogateKind.DATE),  # administration end date/time
+    FieldRule("PR1-5", SurrogateKind.DATE),  # procedure date/time
+    FieldRule("FT1-4", SurrogateKind.DATE),  # transaction date
 )
 
 

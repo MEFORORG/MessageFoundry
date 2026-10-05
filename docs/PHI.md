@@ -1798,6 +1798,8 @@ and fills the rest of the value at the same width. BACKLOG #2248 added it.
 | `PV1-44`, `PV1-45` | Admit and discharge times | `date` |
 | `ORC-9` | Order transaction time | `date` |
 | `OBR-7`, `OBX-14` | Observation times | `date` |
+| `AIS-4`, `RXA-3`, `RXA-4`, `PR1-5`, `FT1-4` | Appointment, administration, procedure and transaction times | `date` |
+| `GT1-8`, `IN1-18`, `NK1-16` | Dates of birth of the guarantor, the insured and a contact | `dob`, a fabricated date at the same width, like `PID-7` |
 | `PID-12` | County code | `freetext`, the whole field becomes `[REDACTED]` |
 | `PV1-3` | Assigned patient location | `freetext`, the whole field becomes `[REDACTED]` |
 
@@ -1827,10 +1829,13 @@ What the `date` kind does to a value:
   not hide the day.
 - The order and accession numbers `ORC-2`, `ORC-3`, `OBR-2` and `OBR-3` are not mapped. Safe
   Harbor counts an accession number as an identifier.
-- Other date fields are not mapped. Over the generated corpus, full dates still come through in
-  `AIS-4`, `RXA-3`, `RXA-4`, `PR1-5` and `FT1-4`. A date-typed `OBX-5` result, such as a last
-  menstrual period, is kept whole by the `OBX-5` allowlist. `GT1-8`, `IN1-18` and `NK1-16` are
-  dates of birth with no rule.
+- A date field outside the table above has no rule. BACKLOG #2330 mapped the eight that were
+  known to come through whole. Nobody has checked every HL7 date field, so read the coverage
+  report for others.
+- A `FT1-4` that holds a date range with an end date is scrubbed to empty. The `date` kind reads
+  one timestamp, and a second one after the component separator is not a precision code.
+- A date-typed `OBX-5` result, such as a last menstrual period, is kept whole by the `OBX-5`
+  allowlist.
 - When a site-code prefix of `19` or `20` is configured, the site-code pass rewrites a six-digit
   `YYYYMM` output with a salted code. That value then differs between datasets and is no longer a
   valid date.
@@ -1867,7 +1872,8 @@ refuses.
 came from `messagefoundry generate --count 2 --seed 1710`, run for every type: 186 messages. With
 the switch on, all 186 refused. Mapping the dates and locations above did not change that count.
 It removed 6 of the 72 undecided field addresses, and 553 of the 2,115 undecided fields across the
-corpus. Every message still carries at least one coded field that needs a rule or a `keep`:
+corpus. These counts predate the eight date rules BACKLOG #2330 added, and nobody has measured them
+again. Every message still carries at least one coded field that needs a rule or a `keep`:
 
 | Undecided field | Messages |
 | --- | --- |
