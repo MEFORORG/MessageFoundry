@@ -62,7 +62,6 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from bisect import bisect_left
 from functools import lru_cache
 from string import ascii_lowercase, ascii_uppercase, whitespace
 from typing import Any
@@ -135,9 +134,9 @@ _HL7_FIELD_RUN = re.compile(r"(?<![^\s|^~&])[^\s|^~&]*+[|^~&][^\s|^~&]*+(?:[|^~&
 #: can swallow a label another pass reads, and leave that label's value behind: an XML element or JSON
 #: key glued to the run, an ``mrn:`` or ``PatientID=`` after it, or the second token of a name run.
 #: Run first, it kept values those passes had scrubbed before it existed. Run last, every such value
-#: is already gone, so inside this module it only adds redaction. :func:`redact` then runs both
-#: stages once more over what it changed. A filter that runs AFTER this module is a different case,
-#: and :data:`_CREDENTIAL_LABEL_AHEAD` is the answer to it.
+#: is already gone, so inside this module it only adds redaction. A filter that runs AFTER this
+#: module is a different case, and :data:`_CREDENTIAL_AHEAD` is the answer to it. :func:`redact`
+#: says when the run applies and what follows it.
 #:
 #: Linear for the same reason as :data:`_HL7_FIELD_RUN`. The lookbehind admits a start only after
 #: whitespace, a literal separator or the start of the text. A match from a token's start takes the
@@ -148,12 +147,13 @@ _HL7_FIELD_RUN = re.compile(r"(?<![^\s|^~&])[^\s|^~&]*+[|^~&][^\s|^~&]*+(?:[|^~&
 #:
 #: Like the literal pattern it takes the whole token, so a URL holding one ``&`` and one ``%26``
 #: loses its host too. Residuals, at least these: a single encoded separator, as with a single
-#: literal one (so FHIR's ``identifier=system%7Cvalue`` keeps its value); a token a credential span
-#: reaches, which :func:`_scrub_encoded_runs` leaves alone so the credential filter after this
-#: module still reads it; a double-encoded separator (``%257C``); and an encoded CUSTOM delimiter
-#: that MSH declares (:func:`_sniff_delimiters` reads only the literal header). The LITERAL pattern
-#: has no such skip: a credential label glued to a pipe run still goes with it, which is older
-#: than this pattern and is not fixed here.
+#: literal one (so FHIR's ``identifier=system%7Cvalue`` keeps its value); every run in a text that
+#: holds a credential shape (:data:`_CREDENTIAL_AHEAD`) or anything the widened stage reads
+#: (:func:`redact` says why), which is left as ``origin/main`` leaves it;
+#: a double-encoded separator (``%257C``); and an encoded CUSTOM delimiter that MSH declares
+#: (:func:`_sniff_delimiters` reads only the literal header). The LITERAL pattern has no such rule:
+#: a credential label glued to a pipe run still goes with it, which is older than this pattern and
+#: is not fixed here.
 _HL7_ENCODED_FIELD_RUN = re.compile(
     r"(?<![^\s|^~&])(?:(?!%(?:7[CcEe]|5[Ee]|26))[^\s|^~&])*+"
     r"(?:[|^~&]|%(?:7[CcEe]|5[Ee]|26))(?:(?!%(?:7[CcEe]|5[Ee]|26))[^\s|^~&])*+"
@@ -162,97 +162,46 @@ _HL7_ENCODED_FIELD_RUN = re.compile(
 #: An encoded separator anywhere: the screen that keeps text without one off the pass above.
 _ENCODED_SEPARATOR = re.compile(r"%(?:7[CcEe]|5[Ee]|26)")
 
-#: A credential label with its separator and any auth scheme word, as the credential stage reads
-#: them, or a bare ``bearer`` scheme with its value still to come. :func:`_credential_spans` reads it.
+#: Anything a credential filter after this module could match: a credential label with its
+#: separator, a bare ``bearer`` scheme, a password inside a URL, or a credential query key. While the
+#: text holds one, :func:`redact` does not apply the encoded run to that text at all.
 #:
-#: **Why this module looks for credentials at all (PR 2011, review finding 1).** The log handler
-#: chain runs the credential filters AFTER this module (``logging_setup._install_phi_filters``). A
-#: token replaced by one placeholder loses every mark those filters read: the label, its separator,
-#: the quote or brace that opens or closes a value. Measured at 6563110bab through that chain,
-#: ``x%7Cy%7Cz,password: <value>`` kept its value under each of 26 glue characters, and so did a
-#: quoted value whose first or last word was a run. ``origin/main`` scrubbed every one.
+#: **Why this module looks for credentials (PR 2011, review finding 1).** The log handler chain runs
+#: the credential filters AFTER this module (``logging_setup._install_phi_filters``). The encoded
+#: run replaces a whole token and the stages then run again. Either step can take a mark those
+#: filters read: the label, its separator, a quote or a brace, or the end of a label-anchored value
+#: that then reads on over the label. Measured at 6563110bab through that chain,
+#: ``x%7Cy%7Cz,password: <value>`` kept its value under each of 26 glue characters, where
+#: ``origin/main`` scrubbed every one.
 #:
-#: **So the encoded run leaves a token alone when a credential match could reach it**, and
-#: :func:`redact` does not run its stages again over a text that holds such a span. The token then
-#: reads as it did before this pattern existed. The price is stated: an encoded run inside such a
-#: span keeps its text, as it did before BACKLOG #2171, on every caller of :func:`redact` and not
-#: only on the log chain that needs it. Keeping only the label was tried first and measured wrong. A
-#: kept word gained a word boundary it never had, a later pass read a kept label as a name, and a
-#: password spelled like a label word stayed in view.
+#: **The rule is whole-text on purpose, and three narrower ones were measured wrong.** Keeping the
+#: label inside the replaced token, skipping only the tokens a credential match could reach, and
+#: skipping only the second run of the stages each held on one call and failed somewhere else. The
+#: last failed on the engine's usual error log, which redacts twice: :func:`safe_exc` or
+#: :func:`safe_text` first, then the handler's filter. So a text that holds any of these gets
+#: exactly what it got before BACKLOG #2171, on every call. The price is stated: an encoded run in
+#: such a text keeps its text, as it does on ``origin/main``.
 #:
-#: **The label test is the credential stage's own, on purpose**: the same ``\b``, the same bounded
-#: dotted prefix as ``secretscrub._LABEL_PREFIX``, the same words and scheme words. This module is
-#: stdlib-only and cannot import them, so they are copied, and ``tests/test_redaction.py`` holds the
-#: copy to the source. The ``braced`` group is the words whose value may be an ODBC brace. A plain
-#: literal, so the static regex gate reads it. The prefix bound keeps the scan linear, as it does
-#: there.
-_CREDENTIAL_LABEL_AHEAD = re.compile(
+#: **The answer has to be the same on a second call over the first call's output.** It is, because
+#: the credential filters keep what this pattern reads: ``label=<redacted>``, ``bearer <redacted>``,
+#: ``scheme://user:<redacted>@`` and ``code=<redacted>`` all still match. If the stages themselves
+#: take a label, ``origin/main`` took it too, and what is left holds nothing those filters read.
+#:
+#: **Each arm is a copy of its source, or wider.** The label arm is ``secretscrub``'s own: the same
+#: ``\b``, the same bounded dotted prefix as ``_LABEL_PREFIX``, the same words, and the separator.
+#: The URL arm is ``_DSN_PASSWORD`` without its scheme. The query arm is
+#: ``logging_setup._CREDENTIAL_QUERY_KEYS``. This module is stdlib-only and cannot import them, so
+#: ``tests/test_redaction.py`` holds each arm to its source, and checks by behaviour that this
+#: pattern matches every text either filter changes. A plain literal, so the static regex gate reads
+#: it. The prefix bound keeps the scan linear, as it does there.
+_CREDENTIAL_AHEAD = re.compile(
     r"""\b(?:MEFOR_[A-Z0-9_]+|(?i:(?:[A-Za-z0-9]+[._-]){0,6}(?:"""
-    r"""(?P<braced>passphrase|credential|password|passwd|secret|pass|pwd)"""
-    r"""|encryption_keys_retired|intake_api_key_next|encryption_key|authorization|private_key"""
-    r"""|session|api_key|api-key|apikey|bearer|token)))\b['"]?\s*[:=]\s*"""
-    r"""(?i:(?:bearer|basic|digest)\s+)?|(?i:\bbearer)\s+"""
+    r"""encryption_keys_retired|intake_api_key_next|encryption_key|authorization|private_key"""
+    r"""|passphrase|credential|password|session|api_key|api-key|apikey|bearer|passwd|secret"""
+    r"""|token|pass|pwd)))\b['"]?\s*[:=]"""
+    r"""|(?i:\bbearer)\s|://[^\s:/@]+:[^\s/@]+@"""
+    r"""|(?i:\b(?:code|state|id_token|access_token|token|session_state)=)"""
 )
-#: A closed ODBC brace value, as ``secretscrub._ODBC_BRACED`` spells it: it can span lines.
-_BRACED_VALUE = re.compile(r"\{(?:[^}]|\}\})*+\}(?!\})")
-
-
-def _credential_spans(text: str) -> list[tuple[int, int]]:
-    """Where a credential match could lie in ``text``: sorted, merged ``(start, end)`` pairs.
-
-    Each span runs from a label (:data:`_CREDENTIAL_LABEL_AHEAD`) to the end of the line its value
-    starts on, or the line a closed brace value ends on. That is meant to be at least as wide as the
-    match the credential stage would make there: a bare token, a quoted value with spaces, a brace.
-    A span that is too wide costs a kept run. One that is too narrow would cost a credential, so
-    widen it when the two disagree.
-
-    Linear. A line end is searched once per line, and a brace walk never starts inside a brace
-    value already found. A walk that fails has run to the end of the text, so every later one
-    would fail too and none is tried."""
-    spans: list[tuple[int, int]] = []
-    line_end = -1
-    brace_end = 0
-    brace_dead = False
-    for label in _CREDENTIAL_LABEL_AHEAD.finditer(text):
-        value = label.end()
-        if (
-            label["braced"] is not None
-            and not brace_dead
-            and value >= brace_end
-            and text.startswith("{", value)
-        ):
-            closed = _BRACED_VALUE.match(text, value)
-            if closed is None:
-                brace_dead = True
-            else:
-                brace_end = value = closed.end()
-        if value > line_end:
-            found = _LINE_END.search(text, value)
-            line_end = len(text) if found is None else found.start()
-        if spans and label.start() <= spans[-1][1]:
-            spans[-1] = (spans[-1][0], max(spans[-1][1], line_end))
-        else:
-            spans.append((label.start(), line_end))
-    return spans
-
-
-def _scrub_encoded_runs(text: str, spans: list[tuple[int, int]]) -> str:
-    """:data:`_HL7_ENCODED_FIELD_RUN` over ``text``, skipping each token one of ``spans`` reaches
-    (:func:`_credential_spans`)."""
-    if not spans:
-        return _HL7_ENCODED_FIELD_RUN.sub(_REDACTED, text)
-    starts = [start for start, _ in spans]
-
-    def replacement(match: re.Match[str]) -> str:
-        # Spans are sorted and disjoint, so only the last one starting before the token's end can
-        # overlap it.
-        at = bisect_left(starts, match.end()) - 1
-        if at >= 0 and spans[at][1] > match.start():
-            return match.group()
-        return _REDACTED
-
-    return _HL7_ENCODED_FIELD_RUN.sub(replacement, text)
-
 
 #: A **date / birthdate run** in free text: an ISO ``YYYY-MM-DD`` / US ``MM-DD-YYYY`` (``-`` or ``/``
 #: separator) or a bare HL7 8-digit ``YYYYMMDD``. A DOB is a direct identifier, and a free-text leak like
@@ -1627,28 +1576,31 @@ def redact(text: str) -> str:
     text without them it would re-run the #1711 passes over their own fixed point and change nothing
     the widened rules own, at double the cost on every log record.
 
-    **The percent-encoded run runs after both stages (BACKLOG #2171).** Its pattern says why: run
-    among them, it took labels and name tokens the other passes needed. When it changes the text, both
+    **The percent-encoded run runs after both stages, and only on a text that holds no credential
+    shape and nothing the widened stage reads (BACKLOG #2171).** Its pattern says why it comes last: run among the stages, it took labels
+    and name tokens the other passes needed. :data:`_CREDENTIAL_AHEAD` says why a credential shape
+    anywhere in the text switches it off: a text that holds one is returned as the two stages left
+    it, which is what ``origin/main`` returns. Where the run does apply and changes the text, both
     stages run once more over its output, so a pass that reads what it left still sees it. That second
-    run skips the credential backstop: the first run already applied it to the text a peer sent, and
-    on a line the run has shortened it can reach an ``@`` it could not reach before. So text holding
-    a qualifying run pays both stages twice. The screen is a C-speed search, so text without an
-    encoded separator pays nothing more.
+    run skips the credential backstop, which the first run already applied to the text a peer sent.
+    The screen is a C-speed search, so text without an encoded separator pays nothing more, and the
+    credential scan runs only once a qualifying run is found.
 
-    **Inside this module the run only adds redaction. Across the log filter chain it could remove a
-    label a later filter reads.** So it leaves a token alone where a credential span reaches it
-    (:func:`_scrub_encoded_runs`), and a text that holds any credential span does not get the second
-    run of the stages at all. That run can finish a scrub the first one left open, and a label-anchored
-    value or a field run that grows that way takes a credential label with it. At least two shapes did
-    so at 229e63cf82, which ``tests/test_redaction.py`` now holds."""
+    **A text the widened stage could read is left alone too** (:func:`_needs_widened_stage`). Those
+    rules keep some values by their surroundings: a bare value under a JSON ``name`` stays while more
+    text follows it, and goes once it ends the text. :func:`safe_text` strips and cuts, so a second
+    call can scrub what the first kept, but only while the key is still there. A run that took a
+    key glued to its token left that value in view on the second call, where ``origin/main`` scrubbed
+    it: measured at 1 text in 200,000 on a fuzz, at every head of the pull request before this rule,
+    and 0 in 600,000 with it. That zero is a measurement, not a proof for the first-stage labels."""
     out = _redact_stages(text)
     if "%" not in out or _ENCODED_SEPARATOR.search(out) is None:
         return out
-    spans = _credential_spans(out)
-    encoded = _scrub_encoded_runs(out, spans)
-    if spans or encoded == out:
-        return encoded
-    return _redact_stages(encoded, backstop=False)
+    if _HL7_ENCODED_FIELD_RUN.search(out) is None:
+        return out
+    if _CREDENTIAL_AHEAD.search(out) is not None or _needs_widened_stage(out):
+        return out
+    return _redact_stages(_HL7_ENCODED_FIELD_RUN.sub(_REDACTED, out), backstop=False)
 
 
 def _redact_stages(text: str, *, backstop: bool = True) -> str:
@@ -1727,8 +1679,8 @@ def _redact_flat(text: str, *, widened: bool, credentials: bool) -> str:
     :func:`_redact_structured`, repeated to a fixed point.
 
     ``credentials=False`` skips the backstop, which the widened stage of :func:`redact` does. The
-    first stage has already run it. The run after the encoded pass skips it in both stages, for
-    the reason :func:`redact` gives. The skip was written when the backstop's greedy tail swallowed
+    first stage has already run it. The run after the encoded pass skips it in both stages
+    (:func:`redact`). The skip was written when the backstop's greedy tail swallowed
     everything between two spans it had scrubbed, on any further run, and a clamp dropping the later
     span kept what the unclamped scan removed (the clamp fuzz in ``tests/test_redaction.py`` measured
     it). BACKLOG #2312 stopped the tail crossing a scrubbed span (:data:`_INVALID_URL_USERINFO`), so a
