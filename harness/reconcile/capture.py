@@ -67,10 +67,10 @@ class CaptureSink:
       is one such error, so check the salt before you start. Only ``anon_failed`` counts the
       drops, so check that too.
 
-    For example::
+    The example below uses three names. ``Keyer`` and ``anonymize_checked`` are in the
+    ``messagefoundry.anon`` package. ``CoverageTally`` is in that package's ``leak`` module.
 
-        from messagefoundry.anon import Keyer, anonymize_checked
-        from messagefoundry.anon.leak import CoverageTally
+    For example::
 
         Keyer(salt)  # raises here on a weak salt, before any message is dropped
         tally = CoverageTally()
