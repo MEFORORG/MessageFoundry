@@ -1896,9 +1896,10 @@ which HIPAA Safe Harbor counts as an identifier; a default rule now scrubs it.
   `anon.toml`, where a reviewer can see it.
 - A short value in a fixed-list field passes. A two-letter code in `PID-8` could still be
   initials.
-- On the engine side only, a rule for a field of a later `BHS` or `FHS` line is applied one
-  field to the left of the field the leak-check counts as scrubbed. So the field the check
-  skips can still hold its value. The tee numbers those lines the way the check does.
+- On the engine side only, a rule for a field of a `BHS` or `FHS` line is applied one field to
+  the left of the field the leak-check counts as scrubbed. So the field the check skips can
+  still hold its value. This affects the default check too, not only this switch. The tee
+  numbers those lines the way the check does.
 - On the engine side only, a later `MSH`, `BHS` or `FHS` line with fewer than two field
   separators is written back out of shape, and a rule can then land on the wrong text.
 

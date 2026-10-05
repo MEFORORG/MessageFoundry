@@ -20,7 +20,9 @@ import pytest
 from messagefoundry.anon import DEFAULT_RULES, AnonError, FieldRule, SurrogateKind
 from messagefoundry.anon import anonymize as engine_anonymize
 from messagefoundry.anon import anonymize_checked as engine_anonymize_checked
+from tee.anon import DEFAULT_RULES as TEE_DEFAULT_RULES
 from tee.anon import AnonError as TeeAnonError
+from tee.anon import FieldRule as TeeFieldRule
 from tee.anon import anonymize as tee_anonymize
 from tee.anon import anonymize_checked as tee_anonymize_checked
 
@@ -51,6 +53,11 @@ _REWRITING_KINDS = tuple(kind for kind in SurrogateKind if kind != SurrogateKind
 def _with(path: str, kind: SurrogateKind | str) -> tuple[FieldRule, ...]:
     """The default rules plus one rule. The tee coerces an engine ``FieldRule`` kind by value."""
     return (*DEFAULT_RULES, FieldRule(path, kind))  # type: ignore[arg-type]
+
+
+def _tee_with(path: str, kind: SurrogateKind) -> tuple[TeeFieldRule, ...]:
+    """The same rule set built from the tee's own classes, for a direct call to the tee."""
+    return (*TEE_DEFAULT_RULES, TeeFieldRule(path, kind.value))  # type: ignore[arg-type]
 
 
 def _msh_lines(output: str) -> list[list[str]]:
@@ -100,9 +107,8 @@ def test_a_rule_one_field_off_still_refuses(checked: Callable[..., str]) -> None
 @pytest.mark.parametrize("kind", _REWRITING_KINDS, ids=lambda kind: kind.value)
 def test_every_rewriting_kind_gives_the_same_bytes_on_both_sides(kind: SurrogateKind) -> None:
     """Each kind rewrites MSH-8 on the second line, and the two adapters agree byte for byte."""
-    rules = _with("MSH-8", kind)
-    engine = engine_anonymize(_MSG, salt=_SALT, rules=rules)
-    tee = tee_anonymize(_MSG, salt=_SALT, rules=rules)
+    engine = engine_anonymize(_MSG, salt=_SALT, rules=_with("MSH-8", kind))
+    tee = tee_anonymize(_MSG, salt=_SALT, rules=_tee_with("MSH-8", kind))
     assert engine == tee
     assert _SSN not in tee
     assert _msh_lines(tee)[1][7] != _SSN
@@ -227,23 +233,55 @@ def test_an_overlay_drop_reaches_a_second_msh_line_through_the_tee(tmp_path: Pat
 
 
 @_NO_SCANNER
-def test_full_coverage_counts_the_msh_rule_as_decided_because_it_was_applied() -> None:
-    """With the coverage switch on, the second line's MSH-8 is decided by its rule on both sides,
-    and the report lists the same undecided fields for each."""
-    rules = _with("MSH-8", SurrogateKind.DROP)
-    seen: list[tuple[str, ...]] = []
-    for checked in (engine_anonymize_checked, tee_anonymize_checked):
-        try:
-            checked(
-                _MSG,
-                salt=_SALT,
-                rules=rules,
-                require_full_coverage=True,
-                on_report=lambda report: seen.append(report.undecided_fields),
-            )
-        except Exception as exc:  # noqa: BLE001 - other undecided fields may refuse; not the point
-            assert _SSN not in str(exc)
-    engine_undecided, tee_undecided = seen
-    assert engine_undecided == tee_undecided
-    assert "MSH-8" not in tee_undecided
-    assert "MSH-7" in tee_undecided  # the control: an MSH field with no rule is still undecided
+@_CHECKED
+def test_full_coverage_reports_the_scrubbed_msh_field_as_decided(
+    checked: Callable[..., str],
+) -> None:
+    """With the coverage switch on, the second line's MSH-8 counts as decided, and that is now
+    true: the output the report describes no longer holds the number. Before the fix the tee
+    reported it decided with the number still in the output (RED on the tee)."""
+    rules = (
+        *_with("MSH-8", SurrogateKind.DROP),
+        *(FieldRule(f"MSH-{n}", SurrogateKind.KEEP) for n in (2, 3, 4, 5, 6, 7, 9, 10, 11, 12)),
+        FieldRule("PID-5", SurrogateKind.NAME),
+    )
+    reports: list[object] = []
+    out = checked(
+        _MSG, salt=_SALT, rules=rules, require_full_coverage=True, on_report=reports.append
+    )
+    (report,) = reports
+    assert report.undecided_fields == ()  # type: ignore[attr-defined]
+    assert _SSN not in out
+
+
+@pytest.mark.parametrize(
+    "path", ["MSH-0", "MSH-00", "MSH-01", "MSH-02", "MSH-002"], ids=lambda path: path
+)
+@_PLAIN
+def test_the_delimiter_refusal_reads_the_field_number_not_the_text(
+    anonymize: Callable[..., str], path: str
+) -> None:
+    """``MSH-02`` is field 2 to ``int()``, so a text comparison with ``MSH-2`` would let it
+    through and blank the encoding characters. ``MSH-0`` would be split index -1 on the tee, the
+    LAST field of the line."""
+    with pytest.raises(ValueError, match="a rule names MSH-[012]"):
+        anonymize(_MSG, salt=_SALT, rules=_with(path, SurrogateKind.DROP))
+
+
+def test_the_lowest_rewritable_msh_field_is_three() -> None:
+    """The control for the refusal above: MSH-3, also spelled MSH-03, is rewritten, not refused."""
+    for path in ("MSH-3", "MSH-03"):
+        engine = engine_anonymize(_MSG, salt=_SALT, rules=_with(path, SurrogateKind.DROP))
+        tee = tee_anonymize(_MSG, salt=_SALT, rules=_tee_with(path, SurrogateKind.DROP))
+        assert engine == tee
+        assert [line[2] for line in _msh_lines(tee)] == ["", ""]
+
+
+def test_the_tee_applies_an_msh_rule_to_a_header_not_in_capitals() -> None:
+    """The separators are read from an ``Msh`` header and the leak-check skips it as the header,
+    so the tee must apply an MSH rule to it. (The engine refuses such a message outright.)"""
+    msg = "\r".join((_HEADER.replace("MSH", "Msh", 1), _PID))
+    out = tee_anonymize(msg, salt=_SALT, rules=_tee_with("MSH-4", SurrogateKind.FREETEXT))
+    assert out.split("\r")[0].split("|")[3] == "[REDACTED]"
+    with pytest.raises(ValueError):
+        engine_anonymize(msg, salt=_SALT, rules=_with("MSH-4", SurrogateKind.FREETEXT))

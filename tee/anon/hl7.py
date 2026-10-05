@@ -33,21 +33,31 @@ def _segment_id(path: str) -> str:
     return path.split("-", 1)[0]
 
 
-#: MSH-1 and MSH-2 hold the message's own delimiters. A rule cannot rewrite them: the output would
-#: have no readable header, and the leak-check would then have no separators to walk it with.
-_DELIMITER_FIELDS = frozenset({"MSH-1", "MSH-2"})
+#: The first MSH field a rule may rewrite. MSH-1 and MSH-2 hold the message's own delimiters: with
+#: either rewritten the output has no readable header, and the leak-check has no separators to walk
+#: it with. MSH-0 is not a field at all.
+_FIRST_REWRITABLE_MSH_FIELD = 3
 
 
 def _refuse_delimiter_rules(rules: tuple[FieldRule, ...]) -> None:
-    """Refuse a rule set that would rewrite MSH-1 or MSH-2 (a body-free :class:`AnonError`). A
-    ``KEEP`` rewrites nothing, so it is allowed. Held the same in both adapters (BACKLOG #2265)."""
+    """Refuse a rule set that would rewrite MSH-0, MSH-1 or MSH-2 (a body-free :class:`AnonError`).
+
+    The field NUMBER is compared, not the path text, so ``MSH-02`` is refused like ``MSH-2``. A
+    ``KEEP`` rewrites nothing, so it is allowed. The same check runs in both adapters (BACKLOG
+    #2265)."""
     named = sorted(
-        {r.path for r in rules if r.path in _DELIMITER_FIELDS and r.kind != SurrogateKind.KEEP}
+        {
+            int(r.path.split("-", 1)[1])
+            for r in rules
+            if _segment_id(r.path) == "MSH"
+            and int(r.path.split("-", 1)[1]) < _FIRST_REWRITABLE_MSH_FIELD
+            and r.kind != SurrogateKind.KEEP
+        }
     )
     if named:
         raise AnonError(
-            f"a rule names {' and '.join(named)}, which hold the message's delimiters and cannot "
-            "be rewritten; refusing to emit"
+            f"a rule names {' and '.join(f'MSH-{n}' for n in named)}, which a rule cannot rewrite: "
+            "MSH-1 and MSH-2 hold the message's delimiters; refusing to emit"
         )
 
 
@@ -75,7 +85,9 @@ def anonymize_message(raw: str, keyer: Keyer, rules: tuple[FieldRule, ...]) -> s
         # separator itself, so MSH-N sits one split index lower than any other segment's field N.
         index = _field_num(rule.path) - (1 if seg_id == "MSH" else 0)
         for fields in segments:
-            if not fields or fields[0] != seg_id:
+            # The header may be spelled ``Msh``: the separators are read from it in any case, and
+            # the leak-check skips it in any case, so an MSH rule must reach it in any case too.
+            if not fields or (fields[0].upper() if seg_id == "MSH" else fields[0]) != seg_id:
                 continue
             if _skip_obx5(rule, fields, seps):
                 continue
