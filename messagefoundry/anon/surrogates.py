@@ -366,15 +366,41 @@ def scrub_site_codes(value: str, keyer: Keyer, seps: Seps) -> str:
     return seps.repetition.join(out_reps)
 
 
-def normalized_message(raw: str) -> str:
+def normalized_message(raw: str, mapped_paths: tuple[str, ...] = ()) -> str:
     """Canonicalize a message for anonymization (ADR 0030 §3) so BOTH adapters see the same structure:
     strip MLLP framing (VT ``\\x0b`` / FS ``\\x1c``), normalize line endings to the HL7 segment
-    separator ``\\r``, and drop empty segments (blank lines). Dropping empties is what keeps the
-    engine's parser from choking on a blank segment and keeps it byte-aligned with the tee's pure
-    splitter."""
+    separator ``\\r``, and drop every line that carries nothing: an empty one, and one holding only
+    whitespace or control characters (NUL padding, a trailing SUB). Dropping them keeps the engine's
+    parser from choking on a blank segment and keeps it byte-aligned with the tee's pure splitter.
+    The engine's parser trims a leading or trailing whitespace-only line and the tee's splitter kept
+    it, so the two disagreed until both dropped it here (BACKLOG #2247). Whitespace after the last
+    field of the last line is NOT trimmed here: on a latin-1 capture that would cut a UTF-8
+    character ending in 0xA0 or 0x85 in half. The engine's parser still trims it, so the two
+    still differ on that input.
+
+    Then REFUSE a message holding a line no rule can reach (BACKLOG #2246): one whose first field
+    is not a segment id, or bare text that is not a segment id the message's HL7 version defines
+    or a rule names. Such a line would pass through untouched, and a wrapped name or note is what
+    it tends to carry. Raises a body-free :class:`AnonError`, so plain ``anonymize`` and
+    ``anonymize_checked`` agree.
+
+    ``mapped_paths`` is the paths of the rules the caller will apply. The adapters pass them, so
+    the anonymizer and the leak-check judge a bare rule-named id (``ZPD``) the same way. A caller
+    with no rules passes nothing, and then only a version-defined id may stand bare."""
+    # Imported here because ``leak`` imports this module; the one definition of such a line is there.
+    from .leak import has_unreachable_line
+
     text = raw.replace("\x0b", "").replace("\x1c", "")
     text = text.replace("\r\n", "\r").replace("\n", "\r")
-    return "\r".join(seg for seg in text.split("\r") if seg)
+    text = "\r".join(
+        seg for seg in text.split("\r") if not all(c.isspace() or not c.isprintable() for c in seg)
+    )
+    if has_unreachable_line(text, mapped_paths):
+        raise AnonError(
+            "message has a line no rule can reach (a malformed segment id) — refusing to emit; "
+            "repair the line, then retry"
+        )
+    return text
 
 
 def read_message_seps(text: str) -> tuple[Seps, str] | None:

@@ -48,7 +48,7 @@ def anonymize_message(raw: str, keyer: Keyer, rules: tuple[FieldRule, ...]) -> s
     Pure + deterministic for a given ``keyer`` (same message + salt → same fixture). Raises
     :class:`AnonError` (carrying no body) when the message cannot be safely anonymized — fail closed.
     """
-    text = normalized_message(raw)
+    text = normalized_message(raw, tuple(rule.path for rule in rules))
     parsed = read_message_seps(text)
     if parsed is None:
         raise AnonError("message has no parseable MSH / encoding characters — refusing to emit")
