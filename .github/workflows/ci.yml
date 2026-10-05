@@ -276,7 +276,8 @@ jobs:
             tests/test_dangerous_functionality_doc.py
             tests/test_risky_component_designation.py
             tests/test_changelog_fragments.py
-            tests/test_architecture_diagrams.py"
+            tests/test_architecture_diagrams.py
+            tests/test_oauth2_auth_style_default_is_recorded.py"
           # FIVE MEMBERS LEFT THIS LIST WITH THE LEDGER (BACKLOG #1250), and this note exists because
           # the ruling above says removing a guard is a different act from adding one. They were
           # test_backlog_status_check, test_backlog_citation_check, test_dangling_citation_check,

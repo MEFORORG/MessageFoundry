@@ -125,7 +125,9 @@ def fhir_lookup(
 
     Call it inside a Handler at run time. ``query`` is **one of two read shapes**, both read-only:
 
-    * a **read-by-id**: ``fhir_lookup("epic", "Patient/123")`` → ``GET {base}/Patient/123``;
+    * a **read-by-id**: ``fhir_lookup("epic", "Patient/123")`` → ``GET {base}/Patient/123``. The id
+      is 1 to 64 letters, digits, ``-`` or ``.``, and must not be only dots. Any other id raises
+      :class:`FhirLookupError`, and nothing is sent;
     * a **search**: the path in ``query`` plus the fields in ``params`` —
       ``fhir_lookup("epic", "Patient", {"identifier": FhirToken("MRN", mrn)})`` → ``GET
       {base}/Patient?...``.
