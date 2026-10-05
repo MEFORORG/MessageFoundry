@@ -10,11 +10,12 @@ engine's by the parity test; the adapter/leak seams are behaviourally parallel (
 
 Public surface (same shape as the engine's):
 
-* :func:`anonymize` — de-identify one HL7 message.
+* :func:`anonymize` — de-identify one HL7 message. Raises :class:`AnonError` for a message with
+  no parseable MSH, or with a line no rule can reach (a malformed segment id).
 * :func:`anonymize_checked` — :func:`anonymize` + a fail-closed :func:`leak_report`; raises
-  :class:`LeakError` (token categories + PHI shapes/addresses only) on any surviving token, a
-  structural PHI shape in a field no rule mapped, or a line with a malformed segment id. A name,
-  an undashed number or a date in an unmapped field passes; only the coverage report records it.
+  :class:`LeakError` (token categories + PHI shapes/addresses only) on any surviving token or a
+  structural PHI shape in a field no rule mapped. A name, an undashed number or a date in an
+  unmapped field passes; only the coverage report records it.
 * :func:`leak_check` / :func:`leak_report` — token hits + structural PHI-shape detection over the
   unmapped fields + the unmapped-field coverage report (vendored twin of the engine's; BACKLOG #331).
 """
@@ -26,7 +27,7 @@ from pathlib import Path
 
 from .hl7 import anonymize_message
 from .keying import Keyer
-from .leak import LeakReport, coverage_clause, leak_check, leak_report
+from .leak import LeakReport, coverage_clause, leak_check, leak_report, refusal_advice
 from .rules import DEFAULT_RULES, AnonError, FieldRule, RuleError, SurrogateKind, load_rules
 
 __all__ = [
@@ -97,9 +98,11 @@ def anonymize_checked(
     if on_report is not None:
         on_report(report)
     causes = list(report.hits)
-    if require_live_denylist and report.token_floor_reason is not None:
+    denylist_refused = require_live_denylist and report.token_floor_reason is not None
+    if denylist_refused:
         causes.append(f"denylist not live: {report.token_floor_reason}")
-    if require_full_coverage and report.undecided_fields:
+    coverage_refused = require_full_coverage and bool(report.undecided_fields)
+    if coverage_refused:
         causes.append(
             f"{len(report.undecided_fields)} field(s) with no rule and no keep: "
             + ", ".join(report.undecided_fields)
@@ -108,8 +111,10 @@ def anonymize_checked(
         raise LeakError(
             "anonymized output failed the leak-check: "
             + "; ".join(sorted(set(causes)))
-            + " — refusing to emit (fail closed). Extend the rule map for a missed field, add a keep for"
-            + " a field you reviewed, or repair a line with a malformed segment id."
+            + " — refusing to emit (fail closed). "
+            + refusal_advice(
+                report, denylist_refused=denylist_refused, coverage_refused=coverage_refused
+            )
             + coverage_clause(report)
         )
     return output

@@ -331,7 +331,8 @@ def _build_parser() -> argparse.ArgumentParser:
         default="INFO",
         type=str.upper,
         choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
-        help="INFO (default) logs the unmapped-field coverage report; WARNING hides it",
+        help="log level for this run (default INFO). The unmapped-field coverage report is always "
+        "written to stderr: as an INFO log line, or as a plain line at a quieter level",
     )
 
     return parser
@@ -570,7 +571,11 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
         )
     # On BOTH paths: a clean run is exactly where an unmapped field holding a name or a date goes
     # unnoticed, because the leak-check does not look for either (BACKLOG #1710).
-    _ANON_LOG.info("%s", coverage.summary())
+    # It is the only record of what passed, so a quieter --log-level must not lose it (BACKLOG #2247).
+    if _ANON_LOG.isEnabledFor(logging.INFO):
+        _ANON_LOG.info("%s", coverage.summary())
+    else:
+        print(coverage.summary(), file=sys.stderr)
     if failed:
         print(
             f"error: {failed} of {len(rows)} message(s) failed anonymization, still carried a "

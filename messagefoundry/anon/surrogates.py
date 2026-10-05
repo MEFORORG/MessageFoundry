@@ -369,12 +369,31 @@ def scrub_site_codes(value: str, keyer: Keyer, seps: Seps) -> str:
 def normalized_message(raw: str) -> str:
     """Canonicalize a message for anonymization (ADR 0030 §3) so BOTH adapters see the same structure:
     strip MLLP framing (VT ``\\x0b`` / FS ``\\x1c``), normalize line endings to the HL7 segment
-    separator ``\\r``, and drop empty segments (blank lines). Dropping empties is what keeps the
-    engine's parser from choking on a blank segment and keeps it byte-aligned with the tee's pure
-    splitter."""
+    separator ``\\r``, and drop every line that carries nothing: an empty one, and one holding only
+    whitespace or control characters (NUL padding, a trailing SUB). Dropping them keeps the engine's
+    parser from choking on a blank segment and keeps it byte-aligned with the tee's pure splitter.
+    The engine's parser trims a leading or trailing whitespace-only line and the tee's splitter kept
+    it, so the two disagreed until both dropped it here (BACKLOG #2247).
+
+    Then REFUSE a message holding a line no rule can reach (BACKLOG #2246): one whose first field
+    is not a segment id, or bare text that is not a segment id the message's HL7 version defines.
+    Such a line would pass through untouched, and a wrapped name or note is what it tends to carry.
+    Raises a body-free :class:`AnonError`, so plain ``anonymize`` and ``anonymize_checked`` agree."""
+    # Imported here because ``leak`` imports this module; the one definition of such a line is there.
+    from .leak import has_unreachable_line
+
     text = raw.replace("\x0b", "").replace("\x1c", "")
     text = text.replace("\r\n", "\r").replace("\n", "\r")
-    return "\r".join(seg for seg in text.split("\r") if seg)
+    text = "\r".join(
+        seg for seg in text.split("\r") if not all(c.isspace() or not c.isprintable() for c in seg)
+    )
+    text = text.rstrip()  # the engine's parser trims the message end; the tee's splitter does not
+    if has_unreachable_line(text):
+        raise AnonError(
+            "message has a line no rule can reach (a malformed segment id) — refusing to emit; "
+            "repair the line, then retry"
+        )
+    return text
 
 
 def read_message_seps(text: str) -> tuple[Seps, str] | None:

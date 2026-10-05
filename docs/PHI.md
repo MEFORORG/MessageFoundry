@@ -1736,7 +1736,8 @@ Properties of the anonymizer:
 - **Field-anchored site-code scrub** — the site-code scrub is anchored to the field, not matched by
   loose string search.
 - **Fail-closed contract.** A message with **no parseable MSH / malformed** is **REFUSED** (raises
-  `AnonError`) — it never emits an un-scrubbed body.
+  `AnonError`) — it never emits an un-scrubbed body. So is a message holding a line no rule can
+  reach. Plain `anonymize` and `anonymize_checked` both refuse it, on the engine and on the tee.
 
 Surfaces: the **`python -m tee anonymize-captures`** subcommand and the test-harness
 `CaptureSink`/corpus hooks. [`scripts/security/scan_forbidden.py`](../scripts/security/scan_forbidden.py)
@@ -1756,7 +1757,7 @@ these cases:
 | A dashed SSN (`NNN-NN-NNNN`) appears | Fields no rule maps |
 | A punctuated US phone number (`NNN-NNN-NNNN` or `(NNN) NNN-NNNN`) appears | Fields no rule maps |
 | A CX identifier typed `MR` or `MRN` appears | Fields no rule maps |
-| A line no rule can reach: its first field is not a segment id (a lowercase second `msh` line included), or it has no field separator (a wrapped `LEE`, but also a legal empty segment such as `PV2`) | Every line after the MSH header |
+| A line no rule can reach (`AnonError`, raised by the anonymizer before the leak-check runs): its first field is not a segment id (a lowercase second `msh` line included), or it has no field separator and is not a segment id the message's HL7 version defines (a wrapped `LEE` or `ZOE`). A bare `PV2` is a legal empty segment and passes | Every line after the MSH header |
 | The denylist tables did not load, and the caller passed `require_live_denylist=True` | The token source |
 
 **Everything else in a field no rule maps passes.** That includes a name, a date, an undashed SSN,
@@ -1775,13 +1776,24 @@ names it. Any other id is shown as `(unknown segment)`, so `KIM|F` appears as
   starts with `Z`, such as `ZOE`, is still printed.
 - With no readable version in MSH-12, any id that some HL7 version defines is printed.
 - `LEE|` with only empty fields passes and is not reported at all.
+- A bare fragment that is a real segment id for the message's version, such as `ROL` or `CON`,
+  passes as an empty segment. With no readable version in MSH-12, any id that some HL7 version
+  defines does.
+
+A bare Z-segment id, such as `ZPD` with no field separator, is refused. Nothing tells it apart
+from a wrapped `ZOE`. Add the trailing separator (`ZPD|`) to the line, then run again.
+
+A line holding only whitespace or control characters is dropped before anything else runs. So is
+whitespace at the very end of the message. The engine and the tee used to disagree on both.
 
 A second MSH line in capitals is checked, and its fields are numbered as MSH fields.
 
 **The coverage report is the record of those fields.** It lists the address of every present
 field that no rule mapped, never its value. A caller gets it through `on_report` on both paths, and
 inside the `LeakError` on a refusal. `python -m tee anonymize-captures` logs it at INFO once per
-run, after it has checked the captures, with a count per address. Read that list before you share
+run, after it has checked the captures, with a count per address. A quieter `--log-level` does not
+hide it: the line is then printed plain to stderr. It says the denylist tables were live only when
+they loaded and passed the floor check on every message. Read that list before you share
 a dataset. Map any field that carries PHI in an `anon.toml` overlay, then run again.
 
 ### Dates and locations: mapped, and still NOT Safe Harbor de-identified
