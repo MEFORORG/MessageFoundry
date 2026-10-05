@@ -6,7 +6,8 @@
     "A wheel tagged none-any was downloaded, its sha256 checked against the lock, and its file list read for compiled files. Nothing was installed or run.",
     "For any other wheel, the pinned Linux x86_64 wheel for CPython 3.14 or abi3, and the Windows amd64 one, were downloaded and hash-checked the same way, and their contents listed. Extension modules were searched as bytes for needed-library names and version strings. A wheel for another platform was not read.",
     "A file list cannot show code linked into an extension, so the pinned source distribution was read as well, hash-checked the same way.",
-    "The four PySide6 wheels were not fetched. Their answers rest on PyPI project metadata.",
+    "The `pyside6-addons` and `pyside6-essentials` wheels were not fetched. Their answers rest on PyPI project metadata.",
+    "The `pyside6` and `shiboken6` wheels were fetched on 2026-10-05, hash-checked against the harness lock, and their contents listed. PyPI offers no source distribution for either, so those two answers rest on the wheel file lists alone.",
     "Where an answer could not be established, it is recorded as not established and the wheel is treated as carrying.",
     "Each answer carries the date it was made. A wheel surveyed again later carries its own date."
   ],
@@ -535,14 +536,23 @@
     {
       "name": "pyside6",
       "pinned": "6.11.2",
-      "carries": "not established",
+      "carries": "no",
       "projects": [],
-      "evidence_kind": "project metadata",
-      "evidence": "The wheel was not fetched or listed. PyPI gives it a platform tag and a size of about 0.6 MB, and its metadata requires `shiboken6`, `PySide6_Essentials` and `PySide6_Addons` at the same version. That does not show whether it holds a compiled file.",
-      "files_read": [],
-      "route": "highlight",
-      "route_reason": "The answer is not established, so the wheel is treated as carrying. A file listing of the pinned wheel would settle it.",
-      "surveyed": "2026-10-04"
+      "evidence_kind": "wheel file list",
+      "evidence": "Neither wheel holds a compiled file. Each holds three Python modules (`__init__.py`, `_config.py` and `_git_pyside_version.py`), typing stubs (59 `.pyi` files in the Linux wheel, 60 in the Windows one), a `py.typed` marker and the wheel's own metadata. No file in either starts with the ELF or the Windows executable signature. The wheel carries a platform tag all the same, and its metadata requires `shiboken6`, `PySide6_Essentials` and `PySide6_Addons` at the same version. PyPI offers no source distribution for it, and with no compiled file there is nothing for one to be linked into.",
+      "files_read": [
+        {
+          "file": "pyside6-6.11.2-cp310-abi3-manylinux_2_34_x86_64.whl",
+          "sha256": "dc6d03990489a5085842770718392ef5de36352d8f608d9a9fe03e60af4d7b66"
+        },
+        {
+          "file": "pyside6-6.11.2-cp310-abi3-win_amd64.whl",
+          "sha256": "3201d67e3c10be2eaedd3910ff0f02351eca7e88c95a291cde5e7f2f55ef207f"
+        }
+      ],
+      "route": null,
+      "route_reason": null,
+      "surveyed": "2026-10-05"
     },
     {
       "name": "pyside6-addons",
@@ -598,14 +608,28 @@
     {
       "name": "shiboken6",
       "pinned": "6.11.2",
-      "carries": "not established",
-      "projects": [],
-      "evidence_kind": "project metadata",
-      "evidence": "The wheel was not fetched or listed. PyPI gives it a platform tag and a size between about 0.3 MB and 1.8 MB by platform. That does not show what compiled files it holds beyond the binding runtime.",
-      "files_read": [],
+      "carries": "yes",
+      "projects": [
+        {
+          "name": "Microsoft Visual C++ runtime libraries (Windows wheel)",
+          "version": "14.44.35211.0, with two files at 14.24.28127.4"
+        }
+      ],
+      "evidence_kind": "wheel file list",
+      "evidence": "The Windows wheel holds shiboken's own extension module and library, and beside them ten Microsoft Visual C++ runtime libraries. Eight give file version 14.44.35211.0 in their own version strings: `concrt140.dll`, `msvcp140.dll`, `msvcp140_1.dll`, `msvcp140_2.dll`, `msvcp140_codecvt_ids.dll`, `vccorlib140.dll`, `vcruntime140.dll` and `vcruntime140_1.dll`. Two give 14.24.28127.4: `vcamp140.dll` and `vcomp140.dll`. The Linux wheel holds only shiboken's own extension module and `libshiboken6` library, which name libc, libm, libgcc_s and libstdc++ as needed libraries and bundle none of them. PyPI offers no source distribution for it, so what is compiled into shiboken's own libraries was not read.",
+      "files_read": [
+        {
+          "file": "shiboken6-6.11.2-cp310-abi3-manylinux_2_34_x86_64.whl",
+          "sha256": "7a7a0a72a9ed26c9bf77d42246b1c736486befb8f31aa2fb29957ea4cdd1c1c2"
+        },
+        {
+          "file": "shiboken6-6.11.2-cp310-abi3-win_amd64.whl",
+          "sha256": "6ab0eba1c904455df621f9a6df3ca2bb896bab8670572d2bc4e37804ae91f19a"
+        }
+      ],
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-04"
+      "surveyed": "2026-10-05"
     },
     {
       "name": "sspilib",

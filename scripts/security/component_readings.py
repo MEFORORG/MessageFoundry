@@ -160,10 +160,15 @@ SURVEY_HEADING = "### What each wheel carries inside it"
 #: counts as carrying wherever a route is decided: a guessed "no" is what the survey exists to stop.
 CARRIES = ("yes", "no", "not established")
 #: What an answer may rest on. A ``none-any`` wheel whose files were listed can only support "no".
-#: Project metadata lists no file, so it can never support "no".
+#: A source-tree answer names the source distribution it read. A file-list answer names wheels
+#: only: no source distribution was read, so it cannot show what is linked into a compiled file,
+#: and the guard cannot check its "no" beyond the files named. Project metadata lists no file, so
+#: it can never support "no".
 TAG_AND_LIST = "wheel tag and file list"
+SOURCE_TREE = "wheel file list and source tree"
+FILE_LIST = "wheel file list"
 METADATA_ONLY = "project metadata"
-EVIDENCE_KINDS = (TAG_AND_LIST, "wheel file list and source tree", METADATA_ONLY)
+EVIDENCE_KINDS = (TAG_AND_LIST, SOURCE_TREE, FILE_LIST, METADATA_ONLY)
 #: What the page does about a not-designated wheel that carries: highlight it as risky on what it
 #: carries, or read the carried project's own advisories. A ``read`` route records these fields.
 ROUTES = ("highlight", "read")
@@ -659,6 +664,10 @@ def survey_problems(
             carries != "no" or not all(f.endswith("-none-any.whl") for f in files)
         ):
             problems.append(f"{name}: a none-any answer needs a none-any wheel that carries none")
+        elif kind in (SOURCE_TREE, FILE_LIST) and (kind == SOURCE_TREE) == all(
+            f.endswith(".whl") for f in files
+        ):
+            problems.append(f"{name}: the files read do not match the evidence kind {kind!r}")
         route = wheel.get("route")
         if not _needs_route(wheel, labels):
             if route is not None:
@@ -744,13 +753,36 @@ def _render_survey(survey: Mapping[str, Any], labels: Mapping[str, str]) -> list
             ]
     out += [
         "",
-        "Each answer rests on the files the record names. A wheel tagged `none-any` had its file "
-        "list read as well as its tag. For a compiled wheel, the Linux x86_64 and Windows amd64 "
-        "wheels were read, where the lock carries them. A file list shows a bundled library and "
-        "cannot show code linked into an extension, so the pinned source distribution was read "
-        "too. A wheel for another platform was not read, and can carry something else.",
+        "Each answer rests on the evidence the record names. A wheel tagged `none-any` had its "
+        "file list read as well as its tag. For any other wheel that was fetched, the Linux "
+        "x86_64 and Windows amd64 wheels were read, where the lock carries them. A file list "
+        "shows a bundled library and cannot show code linked into an extension, so the pinned "
+        "source distribution was read too. A wheel for another platform was not read, and can "
+        "carry something else.",
+    ]
+    # The two kinds of evidence that fall short of the paragraph above, each naming its wheels.
+    for kind, joiner, lead, rests_on in (
+        (
+            FILE_LIST,
+            "or",
+            "No source distribution was read for {}.",
+            "the wheel file lists alone, which cannot show what is linked into a compiled file.",
+        ),
+        (
+            METADATA_ONLY,
+            "or",
+            "No wheel was fetched for {}.",
+            "PyPI project metadata, which lists no file.",
+        ),
+    ):
+        names = [f"`{w['name']}`" for w in wheels if w.get("evidence_kind") == kind]
+        if names:
+            whose = "Its answer rests on" if len(names) == 1 else "Their answers rest on"
+            out += ["", f"{lead.format(_series(names, joiner))} {whose} {rests_on}"]
+    out += [
         "",
-        "A designated wheel is already highlighted, by its tier. "
+        "A designated wheel is already highlighted, by its tier. No carried project's advisories "
+        "were read for a designated wheel. "
         + _count(len(routed), "wheel is", "wheels are")
         + " not designated and not shown to carry nothing. Each takes one of two routes: this "
         "page highlights it as risky on what it carries, or reads the carried project's own "

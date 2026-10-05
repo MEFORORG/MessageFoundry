@@ -1327,6 +1327,20 @@ def test_the_survey_checks_can_fail() -> None:
     ):
         found = problems([{**w, **change} if w is tagged else w for w in wheels])
         assert any(line.startswith(problem) for line in found), (problem, found)
+    # A source-tree answer that names no source distribution, and a file-list answer that names
+    # one. Built from a tracked source-tree answer, so it holds with no file-list answer on record.
+    sourced = next(w for w in wheels if w["evidence_kind"] == component_readings.SOURCE_TREE)
+    only_wheels = [f for f in sourced["files_read"] if f["file"].endswith(".whl")]
+    assert only_wheels and len(only_wheels) < len(sourced["files_read"]), sourced["name"]
+    mismatch = f"{sourced['name']}: the files read do not match the evidence kind"
+    no_source: dict[str, Any] = {"files_read": only_wheels}
+    as_file_list: dict[str, Any] = {"evidence_kind": component_readings.FILE_LIST}
+    for kind_change in (no_source, as_file_list):
+        found = problems([{**w, **kind_change} if w is sourced else w for w in wheels])
+        assert any(line.startswith(mismatch) for line in found), (kind_change, found)
+    # Both changes together are a true file-list answer, which passes.
+    both = {**no_source, **as_file_list}
+    assert problems([{**w, **both} if w is sourced else w for w in wheels]) == []
     # The names owed a route, by this module's own rule, follow the answer.
     assert name in _owed_a_route({**survey, "wheels": base})
     assert name not in _owed_a_route(survey)

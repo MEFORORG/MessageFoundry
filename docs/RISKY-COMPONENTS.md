@@ -125,7 +125,7 @@ What the dependency audit and the SBOM can and cannot see of it is stated once, 
 | `uvicorn` | the HTTP server that binds the socket | no |
 | `h11` | HTTP/1.1 message parsing | no |
 | `httptools` | compiled HTTP parsing | **yes** |
-| `websockets` | the WebSocket protocol for the console | no |
+| `websockets` | the WebSocket protocol for the console. The pinned wheel ships a compiled extension, `speedups` | **yes** |
 | `httpx` | outbound HTTP for every egress connector | no |
 | `httpcore` | connection and TLS handling beneath it | no |
 | `idna` | decodes domain names from untrusted sources | no |
@@ -223,7 +223,7 @@ On the reading of 2026-10-03, the harness imports four Qt modules: `QtCore`, `Qt
 
 | Component | Why not |
 |---|---|
-| `pyside6` | a metadistribution: the `PySide6` package initialiser, typing stubs and tool launchers. It parses no input, and it exists to pull in the other three. This row took it to ship no compiled module. The survey further down did not list the wheel's files, so it records that as not established |
+| `pyside6` | a metadistribution: the `PySide6` package initialiser, two small version and configuration modules, and typing stubs. It parses no input, and it exists to pull in the other three. It ships no compiled file: the survey further down listed the files of the pinned Linux x86_64 and Windows amd64 wheels and found none in either |
 | `pyside6-addons` | compiled, but it holds only Qt modules the harness never imports, among them the web engine, multimedia, PDF, serial port and HTTP server modules. None of them runs, so none sees input. A harness change that imports one needs this row read again |
 
 So 2 plus 2 is 4, and 34 plus 4 is 38.
@@ -406,12 +406,13 @@ names them so that choice stays visible, and a reviewer can revisit it.
 
 The vulnerability-history test reads advisories by PyPI name. This survey asks what that test
 cannot: whether each of the 40 pinned wheels carries compiled code from another project. It was made
-by hand on 2026-10-04, against the pins the snapshot reads. Its evidence, the files read and their
-hashes are recorded in [`security/bundled-code-survey.json`](../security/bundled-code-survey.json).
-A run of the script does not repeat it.
+by hand between 2026-10-04 and 2026-10-05, against the pins the snapshot reads. Its evidence, the
+files read and their hashes are recorded in
+[`security/bundled-code-survey.json`](../security/bundled-code-survey.json). A run of the script
+does not repeat it.
 
-**Carries another project's compiled code: 8 of 40. Does not: 30. Not established: 2. 8 plus 30 plus
-2 is 40.**
+**Carries another project's compiled code: 9 of 40. Does not: 31. Not established: 0. 9 plus 31 plus
+0 is 40.**
 
 A wheel whose answer is not established is treated as carrying.
 
@@ -422,10 +423,9 @@ A wheel whose answer is not established is treated as carrying.
 | `cryptography` | 50.0.1 | OpenSSL 4.0.2; Rust crates, the 40 entries of the source distribution's `Cargo.lock` | wheel file list and source tree | designated, tier 2 |
 | `httptools` | 0.8.0 | llhttp 9.4.1; http-parser 2.9.4 | wheel file list and source tree | designated, tier 3 |
 | `pydantic-core` | 2.46.5 | Rust crates, the 104 entries of the source distribution's `Cargo.lock` | wheel file list and source tree | designated, tier 1 |
-| `pyside6` | 6.11.2 | not established | project metadata | highlighted below |
 | `pyside6-addons` | 6.11.2 | Qt, version not established | project metadata | highlighted below |
 | `pyside6-essentials` | 6.11.2 | Qt, version not established | project metadata | designated, the `harness` extra |
-| `shiboken6` | 6.11.2 | not established | project metadata | designated, the `harness` extra |
+| `shiboken6` | 6.11.2 | Microsoft Visual C++ runtime libraries (Windows wheel) 14.44.35211.0, with two files at 14.24.28127.4 | wheel file list | designated, the `harness` extra |
 | `uvloop` | 0.22.1 | libuv 1.48.0 | wheel file list and source tree | highlighted below |
 
 26 wheels were found to carry none, on the evidence of the wheel tag and file list: `aioodbc`,
@@ -437,21 +437,29 @@ A wheel whose answer is not established is treated as carrying.
 4 wheels were found to carry none, on the evidence of the wheel file list and source tree: `psutil`,
 `pyodbc`, `sspilib`, `websockets`.
 
-Each answer rests on the files the record names. A wheel tagged `none-any` had its file list read as
-well as its tag. For a compiled wheel, the Linux x86_64 and Windows amd64 wheels were read, where
-the lock carries them. A file list shows a bundled library and cannot show code linked into an
-extension, so the pinned source distribution was read too. A wheel for another platform was not
-read, and can carry something else.
+1 wheel was found to carry none, on the evidence of the wheel file list: `pyside6`.
 
-A designated wheel is already highlighted, by its tier. 3 wheels are not designated and not shown to
-carry nothing. Each takes one of two routes: this page highlights it as risky on what it carries, or
-reads the carried project's own advisories.
+Each answer rests on the evidence the record names. A wheel tagged `none-any` had its file list read
+as well as its tag. For any other wheel that was fetched, the Linux x86_64 and Windows amd64 wheels
+were read, where the lock carries them. A file list shows a bundled library and cannot show code
+linked into an extension, so the pinned source distribution was read too. A wheel for another
+platform was not read, and can carry something else.
+
+No source distribution was read for `pyside6` or `shiboken6`. Their answers rest on the wheel file
+lists alone, which cannot show what is linked into a compiled file.
+
+No wheel was fetched for `pyside6-addons` or `pyside6-essentials`. Their answers rest on PyPI
+project metadata, which lists no file.
+
+A designated wheel is already highlighted, by its tier. No carried project's advisories were read
+for a designated wheel. 2 wheels are not designated and not shown to carry nothing. Each takes one
+of two routes: this page highlights it as risky on what it carries, or reads the carried project's
+own advisories.
 
 **Highlighted as risky on what it carries:**
 
 | Component | Carries | Why |
 |---|---|---|
-| `pyside6` | not established | The answer is not established, so the wheel is treated as carrying. A file listing of the pinned wheel would settle it. |
 | `pyside6-addons` | Qt, version not established | It holds compiled Qt modules, among them the web engine, multimedia and PDF modules. The harness imports none of them, but an install puts them on disk. A flaw filed against Qt names Qt, not `pyside6-addons`, so the vulnerability-history reading would not show it. |
 | `uvloop` | libuv 1.48.0 | libuv is the event loop's I/O layer, so the socket reads and writes of an engine that runs on `uvloop` go through it. An advisory against libuv names libuv, not `uvloop`, so the vulnerability-history reading would not show it. |
 
