@@ -8845,7 +8845,7 @@ class MessageStore:
             )
             enc_detail = (
                 self._enc(
-                    safe_text(detail)[:200],
+                    safe_text(detail, limit=200),  # whole: a slice cuts its note (#1797)
                     aad=cell_aad("response", "detail", message_id, dest, seq),
                 )
                 if detail
@@ -10411,7 +10411,7 @@ class MessageStore:
         # autoincrement, unknown here, so cell_aad can't use it (ASVS 11.3.3).
         reason_enc = (
             self._enc(
-                safe_text(reason)[:200],
+                safe_text(reason, limit=200),  # whole: a slice cuts its note (#1797)
                 aad=cell_aad("connection_event", "reason", connection, now, kind),
             )
             if reason
@@ -10511,7 +10511,7 @@ class MessageStore:
         # both the INSERT and the re-fire UPDATE that never sees the autoincrement id (ASVS 11.3.3).
         reason_enc = (
             self._enc(
-                safe_text(reason)[:200],
+                safe_text(reason, limit=200),  # whole: a slice cuts its note (#1797)
                 aad=cell_aad("alert_instance", "reason", event_type, connection),
             )
             if reason
@@ -12380,6 +12380,29 @@ class MessageStore:
                 (now, token_hash),
             )
             await self._commit()
+
+    async def supersede_session(self, token_hash: str, *, now: float) -> SessionRecord | None:
+        """Revoke, then read the row back in the SAME transaction (BACKLOG #2146). See
+        :meth:`AuthStore.supersede_session`.
+
+        Two statements here rather than one ``UPDATE ... RETURNING``, because ``RETURNING`` needs
+        SQLite 3.35 and a Linux Python can link an older system library. They are still one unit:
+        the writer lock orders them against every in-process writer, ``rotate_session`` included,
+        and the write lock the ``UPDATE`` takes holds until the commit, so no other process can
+        re-key the row between them."""
+        async with _writer_guard(self._db, self._lock):
+            cur = await self._db.execute(
+                "UPDATE sessions SET revoked_at=? WHERE token_hash=? AND revoked_at IS NULL",
+                (now, token_hash),
+            )
+            row = None
+            if cur.rowcount:
+                cur = await self._db.execute(
+                    "SELECT * FROM sessions WHERE token_hash=?", (token_hash,)
+                )
+                row = await cur.fetchone()
+            await self._commit()
+        return SessionRecord.from_mapping(dict(row)) if row else None
 
     async def revoke_user_sessions(
         self, user_id: str, *, except_token_hash: str | None = None, now: float | None = None

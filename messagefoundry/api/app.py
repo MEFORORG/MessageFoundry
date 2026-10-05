@@ -3115,25 +3115,27 @@ def create_app(
         engine: Engine, identity: Identity, name: str, client: str | None
     ) -> tuple[RegistryRunner, Literal["in", "out"]]:
         """The runner, and which side of its registry holds ``name``, checked against the caller's channel scope
-        BEFORE its existence is (BACKLOG #2551).
+        BEFORE its existence is (BACKLOG #2551, #2640).
 
-        A channel-scoped caller gets one answer, :func:`_deny_connection`, for an inbound outside its
-        scope, for any outbound (an outbound spans channels), and for a name that exists nowhere. Had
-        the 404 come first, on a first deployment such a caller could tell which names exist by
-        probing. An unscoped caller, or a scoped one naming a channel in its own scope, still gets
-        404 for an unknown name. An inbound wins when a name is both, as on the control routes.
-        Raises 503 when the engine has no runner."""
+        A channel-scoped caller reaches only an inbound in its own scope. Every other name gets one
+        answer, :func:`_deny_connection`: an inbound outside its scope, any outbound (an outbound spans
+        channels), and a name that exists nowhere, even one listed in its own scope. Had any of these
+        answered 404, on a first deployment such a caller could tell which names exist by probing.
+        Only an unscoped caller gets 404 for an unknown name. An inbound wins when a name is both, as
+        on the control routes. With no runner the scope is still checked first, so a scoped caller
+        gets the 503 only for a name its scope lists, which tells it nothing it does not know."""
         rr = engine.registry_runner
         if rr is None:
+            await _control_guard(engine, identity, name, client)
             raise HTTPException(503, "engine not started")
         if name in rr.registry.inbound:
             await _control_guard(engine, identity, name, client)  # inbound is per-channel
             return rr, "in"
+        if identity.allowed_channels is not None:
+            # An outbound, or a miss: the answer an out-of-scope inbound gets (BACKLOG #2640).
+            await _deny_connection(engine, identity, name, client)
         if name in rr.registry.outbound:
-            if identity.allowed_channels is not None:
-                await _deny_connection(engine, identity, name, client)
             return rr, "out"
-        await _control_guard(engine, identity, name, client)
         raise HTTPException(404, f"no such connection: {name}")
 
     async def _dual_role_control(
@@ -3150,8 +3152,10 @@ def create_app(
         (stopping an inbound halts intake, its delivery keeps draining). A shared outbound → a
         channel-scoped user is denied (an outbound spans channels; mirrors purge), else
         ``rr.<action>_outbound`` (stopping an outbound PAUSES delivery, retaining the queue). A name that
-        is neither still runs the per-channel guard first, so a scoped user gets a 403 for an out-of-scope
-        name rather than learning it doesn't exist, then 404. Returns ``{"name", "running"}``.
+        is neither gets 404 from an unscoped user. A channel-scoped user gets the audited out-of-scope
+        403 for it, even when its own scope lists the name, so no answer tells it which names exist
+        (BACKLOG #2551, #2640). With no runner no name exists: a scoped user gets the 403 for a name
+        outside its scope, and every other caller gets 404. Returns ``{"name", "running"}``.
 
         ``role`` disambiguates a name declared as BOTH an inbound and an outbound: ``"source"`` targets
         only the inbound, ``"destination"`` only the outbound. ``None`` (the bare-name JSON/legacy
@@ -3178,11 +3182,12 @@ def create_app(
                 engine, identity, name, action, role="source", running=running, client=client
             )
             return {"name": name, "running": running}
+        if rr is not None and identity.allowed_channels is not None:
+            # Past the inbound arm, a channel-scoped user can reach nothing: a shared outbound spans
+            # channels (mirrors purge), and a miss gets the same refusal so that no answer tells an
+            # outbound, an unknown name and an out-of-scope inbound apart (BACKLOG #2551, #2640).
+            await _deny_connection(engine, identity, name, client)
         if rr is not None and want_out and name in rr.registry.outbound:
-            # A shared outbound spans channels, so a channel-scoped user can't control one (mirrors purge).
-            # The refusal is the one an unknown name gets, so it names no outbound (BACKLOG #2551).
-            if identity.allowed_channels is not None:
-                await _deny_connection(engine, identity, name, client)
             try:
                 if action == "start":
                     await rr.start_outbound(name)
@@ -3204,8 +3209,8 @@ def create_app(
                 engine, identity, name, action, role="destination", running=running, client=client
             )
             return {"name": name, "running": running}
-        # Neither an inbound nor an outbound (or no runner). Run the per-channel guard first so a scoped
-        # user is 403'd for a name outside their scope (don't disclose existence), then 404.
+        # With a runner, only an unscoped user reaches here. With none, no name exists, so a 404
+        # after the scope check tells a scoped user nothing its own scope does not.
         await _control_guard(engine, identity, name, client)
         raise HTTPException(404, f"no such connection: {name}")
 

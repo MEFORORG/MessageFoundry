@@ -6132,7 +6132,7 @@ class SqlServerStore:
                 )
                 enc_detail = (
                     self._enc(
-                        safe_text(detail)[:200],
+                        safe_text(detail, limit=200),  # whole: a slice cuts its note (#1797)
                         aad=cell_aad("response", "detail", message_id, dest, seq),
                     )
                     if detail
@@ -6221,7 +6221,7 @@ class SqlServerStore:
         # Bound to (connection, ts, kind) — the id is IDENTITY, unknown here (ASVS 11.3.3).
         reason_enc = (
             self._enc(
-                safe_text(reason)[:200],
+                safe_text(reason, limit=200),  # whole: a slice cuts its note (#1797)
                 aad=cell_aad("connection_event", "reason", connection, now, kind),
             )
             if reason
@@ -6448,7 +6448,7 @@ class SqlServerStore:
         # both the UPDATE and the INSERT that never sees the IDENTITY id (ASVS 11.3.3).
         reason_enc = (
             self._enc(
-                safe_text(reason)[:200],
+                safe_text(reason, limit=200),  # whole: a slice cuts its note (#1797)
                 aad=cell_aad("alert_instance", "reason", event_type, connection),
             )
             if reason
@@ -12218,6 +12218,27 @@ class SqlServerStore:
             "UPDATE sessions SET revoked_at=? WHERE token_hash=? AND revoked_at IS NULL",
             (now, token_hash),
         )
+
+    async def supersede_session(self, token_hash: str, *, now: float) -> SessionRecord | None:
+        """Revoke and return in one statement (BACKLOG #2146). See :meth:`AuthStore.supersede_session`.
+
+        Hand-rolled because ``_fetchone`` commits as a READ, and this is a durable write. The rows
+        are drained before the commit, and ``_cursor`` frees the statement handle the ``OUTPUT``
+        clause leaves open."""
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await cur.execute(
+                    "UPDATE sessions SET revoked_at=? OUTPUT inserted.*"
+                    " WHERE token_hash=? AND revoked_at IS NULL",
+                    (now, token_hash),
+                )
+                columns = [c[0] for c in cur.description]
+                rows = await cur.fetchall()
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        return SessionRecord.from_mapping(dict(zip(columns, rows[0]))) if rows else None  # noqa: B905
 
     async def revoke_user_sessions(
         self, user_id: str, *, except_token_hash: str | None = None, now: float | None = None

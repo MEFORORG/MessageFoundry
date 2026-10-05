@@ -2414,9 +2414,10 @@ class AuthStore(Protocol):
         session to the password leg.
 
         Returns **True** when a row was re-keyed, **False** when there was none to re-key — the row
-        is gone, expired-and-purged, or ``revoked_at IS NOT NULL``. This is the one session UPDATE
-        that reports its rowcount: every other one is deliberately blind (a write against a dead hash
-        is a silent no-op), but a caller rotating a session is about to hand the new token to a user,
+        is gone, expired-and-purged, or ``revoked_at IS NOT NULL``. This and
+        :meth:`supersede_session`, which returns the row it revoked, are the single-session UPDATEs
+        that report what they changed: every other one is deliberately blind (a write against a dead
+        hash is a silent no-op), but a caller rotating a session is about to hand the new token to a user,
         so it must be able to fail closed if the session died underneath it.
         """
         ...
@@ -2435,6 +2436,24 @@ class AuthStore(Protocol):
     ) -> None: ...
 
     async def revoke_session(self, token_hash: str, *, now: float | None = None) -> None: ...
+
+    async def supersede_session(self, token_hash: str, *, now: float) -> SessionRecord | None:
+        """Revoke the unrevoked session ``token_hash`` names, and return its row as revoked.
+
+        Returns ``None`` when no unrevoked row has that hash, so nothing was written. A row that is
+        expired or idle is still revoked and returned. Its other columns are as the revoke found
+        them, so the caller can judge whether the session was live, and ``revoked_at`` is ``now``.
+
+        **ONE atomic operation, so it cannot interleave with :meth:`rotate_session` (BACKLOG
+        #2146).** It is one statement on Postgres and SQL Server, and one transaction on SQLite. The
+        login supersession used to read the row and then revoke it by hash, and a rotation that
+        re-keyed the row between the two left the revoke matching nothing, so the session lived on
+        under its new hash. Here the store orders the two writes on the row. If this one runs first,
+        the row is revoked and the rotation's ``revoked_at IS NULL`` guard refuses it, so the
+        rotation fails closed. If the rotation committed first, the hash names no row and this
+        returns ``None``.
+        """
+        ...
 
     async def revoke_user_sessions(
         self, user_id: str, *, except_token_hash: str | None = None, now: float | None = None

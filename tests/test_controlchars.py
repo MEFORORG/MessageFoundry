@@ -23,11 +23,35 @@ import pytest
 from messagefoundry.controlchars import (
     _is_control_char,
     has_control_char,
+    has_lone_surrogate,
     json_dumps_for_log,
     scrub_control_chars,
     scrub_log_argument,
     strip_control_chars,
 )
+
+
+@pytest.mark.parametrize("code", [0xD800, 0xDBFF, 0xDC00, 0xDFFF])
+def test_a_surrogate_is_caught_by_its_own_test_and_not_the_control_one(code: int) -> None:
+    # vault BACKLOG #2842: the two tests are separate, and a mail header needs both.
+    text = f"a{chr(code)}b"
+    assert has_lone_surrogate(text) is True
+    assert has_control_char(text) is False
+
+
+@pytest.mark.parametrize(
+    "codes", [(), (0x70,), (0xE9,), (0x60A3,), (0xD7FF,), (0xE000,), (0x1F600,)]
+)
+def test_encodable_text_holds_no_lone_surrogate(codes: tuple[int, ...]) -> None:
+    # Each side of the surrogate block, and an astral code point, which a str holds as ONE code
+    # point rather than as a UTF-16 pair.
+    assert has_lone_surrogate("".join(map(chr, codes))) is False
+
+
+def test_an_adjacent_high_and_low_surrogate_pair_is_still_caught() -> None:
+    # A surrogatepass decode can leave a pair as two code points. Strict UTF-8 cannot write either.
+    assert has_lone_surrogate(chr(0xD83D) + chr(0xDE00)) is True
+
 
 #: The set the predicate is defined to catch. Written independently of the implementation, so this
 #: is a second opinion rather than a restatement of the same expression.

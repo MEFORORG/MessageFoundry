@@ -9,6 +9,7 @@ never inflates message counts or touches disposition), and age-based retention.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from pathlib import Path
 
@@ -16,6 +17,10 @@ from messagefoundry.store.crypto import MARKER_PREFIX, generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
 
 ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
+# 48 lowercase words, 329 characters, none of which the redactor rewrites.
+_WORDS = ("after", "partial", "read", "of", "segment", "terminator", "framing", "error")
+_LONG_REASON = " ".join(_WORDS[i % len(_WORDS)] for i in range(48))
+_TRUNCATION_NOTE = re.compile(r"…\(\+(\d+) chars\)\Z")
 
 
 def _col_at_rest(db_path: Path, column: str) -> object:
@@ -123,7 +128,42 @@ async def test_reason_is_safe_text_scrubbed(tmp_path: Path) -> None:
 
 
 async def test_reason_truncated(tmp_path: Path) -> None:
+    # The store bounds `reason` with safe_text(reason, limit=200) (BACKLOG #1797). That keeps a head
+    # of at most 200 characters, cut back to a whole token, then appends the truncation note
+    # (_TRUNCATION_NOTE). So the stored value can be longer than 200. A one-token input keeps no head
+    # at all (the next test). Here "terminator" spans 195 to 205, so it straddles the bound and goes.
     store = await MessageStore.open(tmp_path / "ce_trunc.db")
+    try:
+        await store.record_connection_event(
+            connection="IB",
+            transport="mllp",
+            direction="inbound",
+            kind="framing_error",
+            reason=_LONG_REASON,
+            now=1.0,
+        )
+        events = await store.list_connection_events()
+    finally:
+        await store.close()
+    reason = events[0].reason
+    assert reason is not None
+    note = _TRUNCATION_NOTE.search(reason)
+    assert note is not None, f"the truncation note was cut: {reason[-20:]!r}"
+    head = reason[: note.start()]
+    assert 0 < len(head) <= 200
+    # Whole tokens: the head is a prefix of the input, and a space follows it there...
+    assert _LONG_REASON.startswith(head) and _LONG_REASON[len(head)] == " "
+    # ...and the token after it is the one that straddles the bound, so nothing more could fit.
+    assert _LONG_REASON.index(" ", len(head) + 1) > 200
+    # The count is every character held back, so head plus count is the whole input.
+    assert len(head) + int(note.group(1)) == len(_LONG_REASON)
+    # Not a hard 200: the note rides past the bound, and nothing slices it off.
+    assert len(reason) > 200
+
+
+async def test_reason_one_long_token_keeps_no_head(tmp_path: Path) -> None:
+    # The other edge: a token longer than the bound has no whole-token prefix, so none of it is kept.
+    store = await MessageStore.open(tmp_path / "ce_token.db")
     try:
         await store.record_connection_event(
             connection="IB",
@@ -134,9 +174,9 @@ async def test_reason_truncated(tmp_path: Path) -> None:
             now=1.0,
         )
         events = await store.list_connection_events()
-        assert events[0].reason is not None and len(events[0].reason) <= 200
     finally:
         await store.close()
+    assert events[0].reason == "…(+500 chars)"
 
 
 async def test_message_id_is_nullable_and_not_a_foreign_key(tmp_path: Path) -> None:

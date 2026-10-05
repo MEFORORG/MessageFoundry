@@ -1634,11 +1634,17 @@ the same permission set on the same method reds CI until it is listed here.
 > **The per-name connection routes do not tell a scoped caller which names exist (BACKLOG #2551).**
 > This covers at least `GET /connections/{name}/metadata` and `POST /connections/{name}/test`,
 > `/test-credential`, `/start`, `/stop` and `/restart`. Each checks the scope before it looks the
-> name up. A scoped caller gets one 403, one body and one `auth.channel_denied` row in three cases:
-> an inbound outside its scope, a shared outbound, and a name that exists nowhere. A name in the
-> caller's own scope that exists nowhere still answers 404, as any unknown name does for an
-> unscoped caller. Names still show elsewhere. At least the Prometheus exposition above and
-> `GET /alerts/rules` list them, and `POST /connections/{name}/flag` has no per-channel check.
+> name up. A scoped caller reaches only an inbound in its own scope. Every other name gets one 403,
+> one body and one `auth.channel_denied` row: an inbound outside its scope, any outbound, and a
+> name that exists nowhere. That holds even when the caller's scope lists the outbound or the
+> unknown name, since a scope is not checked against the registry (BACKLOG #2640). Only an
+> unscoped caller gets 404 for an unknown name. So a denial row can name a channel inside the
+> actor's own scope, for example one a reload removed. Read such a row as a miss, not a probe.
+> With the engine not started there is no graph and no name exists. Every route still checks the
+> scope first, so a name outside it gets the 403. A name inside it gets 503 from the first three
+> routes and 404 from the control routes, with no denial row. Names still show elsewhere. At
+> least the Prometheus exposition above and `GET /alerts/rules` list them, and
+> `POST /connections/{name}/flag` has no per-channel check.
 > `tests/test_channel_rbac.py` pins the six routes, not that list.
 
 > **`/config/reload` executes Python** from the target directory in-process, so it is constrained
@@ -2436,9 +2442,10 @@ outside the map.
 and Auditor roles hold it with no PHI permission. `monitoring:diagnose` (the alert route) is held only
 by the built-in Operator and Administrator, which both hold `messages:view_summary` too; a custom role
 may hold `monitoring:diagnose` without it, and that role is the one the alert gate masks. A holder gets each reason as a fixed `****` until a per-item `reveal=<id>` act, which
-needs `messages:view_summary`, charges the PHI-read budget, and is audited. They are also still
-defended by `safe_exc()` at the emit site plus `safe_text(reason)[:200]` at the store, then
-cipher-encrypted (PHI.md §2/§7); the scrubber is not de-identification, which is why the gate exists.
+needs `messages:view_summary`, charges the PHI-read budget, and is audited. The store also passes
+both through `safe_text(reason, limit=200)`, then cipher-encrypts them (PHI.md §2/§7).
+`connection_event.reason` is scrubbed by `safe_exc()` at the emit site as well. PHI.md §3's PL-2
+block states the bound. The scrubber is not de-identification, which is why the gate exists.
 Every other field of the two models stays readable under the route's monitoring permission, and CI
 asserts each is on a reviewed non-PHI list.
 
@@ -3288,6 +3295,16 @@ the token being replaced, and the engine ends it as the console legs do, before 
 `POST /auth/negotiate` has no body and revokes nothing. The VS Code extension and the Python
 engine client (`EngineClient.login`) both name the token they replace in `supersedes`. The Python
 client names only a token the engine issued to it, never one adopted with `set_token`.
+
+Every elevation gives a session a new token: completing MFA, a step-up, a passkey ceremony or a
+password re-check. The supersession finds and ends the presented session in one atomic store
+operation, so an elevation cannot land between the two (BACKLOG #2146). If the supersession runs
+first, a later elevation on that session fails and asks the user to sign in again. **One case stays
+open.** An elevation in another tab can finish while the sign-in is still in progress, before the
+supersession runs. That window covers the credential check, and on federated sign-in the round trip
+to the identity provider. The presented token then names no session, so nothing is ended. The
+session lives on under its new token until it expires, because the engine does not record which
+token replaced the old one.
 
 A session's `id` is its token hash, and that hash changes whenever the session completes MFA or a
 step-up. So an id shown on a sessions page can go stale. The console's revoke says "Nothing was
