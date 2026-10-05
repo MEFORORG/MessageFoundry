@@ -11,8 +11,11 @@ import smtplib
 import socket
 import ssl
 import threading
+import traceback
 from collections.abc import Iterator
+from email import message_from_bytes
 from email.message import EmailMessage
+from email.policy import default as default_policy
 from pathlib import Path
 from typing import Any
 
@@ -27,11 +30,20 @@ from messagefoundry.config.tls_policy import (
     active_hop_posture,
 )
 from messagefoundry.config.wiring import WiringError
-from messagefoundry.transports.base import DeliveryError
+from messagefoundry.redaction import safe_exc
+from messagefoundry.transports import email as email_module
+from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.egress import check_egress_allowed
 from messagefoundry.transports.email import EmailDestination, envelope_address_problem
 from messagefoundry.transports.mllp import InsecureHopGuard
 from tests._egress_policy import permitting
+from tests.test_encode_wire_body import (
+    CJK_CHAR,
+    PAYLOAD,
+    SECRET_CHAR,
+    _assert_content_free,
+    _escapes,
+)
 
 
 class _FakeSMTP:
@@ -1376,3 +1388,115 @@ async def test_an_approved_mechanism_still_authenticates(monkeypatch: pytest.Mon
     await d.send("body")
     [smtp] = _FakeSMTP.instances
     assert smtp.auth_mechanism == "LOGIN", "should fall through CRAM-MD5 to the approved LOGIN"
+
+
+# --- an unencodable body fails content-free (see encode_wire_body) ----------------------------------
+
+#: Synthetic. The marker must not be reachable from the raised error by the routes tested below.
+_BODY_MARKER = "ZZSYNTHMARKER42"
+_NON_ASCII_BODY = f"{PAYLOAD}NTE|1||{_BODY_MARKER}\r"
+_LONE_SURROGATE = "\ud800"
+
+
+def _body_dest(port: int, encoding: str) -> EmailDestination:
+    base = _wire_dest(port, ["a@hospital.example"])
+    return EmailDestination(
+        base.model_copy(update={"settings": {**base.settings, "encoding": encoding}})
+    )
+
+
+class _Py315SetContent(EmailMessage):
+    """Python 3.15's set_content() encodes with the email package's OUTPUT charset, so euc-jp is
+    encoded as iso-2022-jp. Modelled here so the required 3.14 suite drives that path: a bare
+    encode whose UnicodeEncodeError holds the whole payload on ``.object``."""
+
+    def set_content(self, *args: Any, **kwargs: Any) -> None:
+        str(args[0]).encode("iso-2022-jp")
+        super().set_content(*args, **kwargs)
+
+
+def _assert_refused_content_free(exc: BaseException, *, codec_named: str) -> None:
+    assert _BODY_MARKER not in str(getattr(exc, "object", "")), "the error carries the payload"
+    _assert_content_free(exc, encoding=codec_named)
+    # One line at a time, minus the File lines: a checkout path may itself hold "e9" or an accent.
+    frames = "".join(traceback.format_exception(exc)).splitlines()
+    surfaces = {
+        "str": str(exc),
+        "repr": repr(exc),
+        "stored error": safe_exc(exc),
+        "traceback": "\n".join(line for line in frames if not line.lstrip().startswith("File ")),
+    }
+    for where, text in surfaces.items():
+        assert _BODY_MARKER not in text, f"message content reached the {where}"
+        for ch in (SECRET_CHAR, CJK_CHAR, _LONE_SURROGATE):
+            for form in _escapes(ch):
+                assert form not in text, f"a message character reached the {where} as {form!r}"
+    # The same bytes never encode on a retry, so the row dead-letters on the first attempt. A bad
+    # MESSAGE, so neither flag may stop the whole lane.
+    assert isinstance(exc, NegativeAckError)
+    assert exc.permanent is True and exc.code == "encoding"
+    assert exc.credential_fault is False and exc.config_fault is False
+
+
+@pytest.mark.parametrize(
+    ("encoding", "payload"),
+    [
+        ("us-ascii", _NON_ASCII_BODY),
+        ("latin-1", _NON_ASCII_BODY),
+        # The shipped default: utf-8 refuses only a lone surrogate, which a Handler can still build.
+        ("utf-8", _NON_ASCII_BODY + _LONE_SURROGATE),
+    ],
+    ids=["us-ascii", "latin-1", "utf-8-lone-surrogate"],
+)
+async def test_an_unencodable_body_is_a_permanent_content_free_refusal(
+    wire: _WireCapture, encoding: str, payload: str
+) -> None:
+    """Classified exactly as Direct classifies it. Nothing of the message reaches the text, the
+    repr, ``safe_exc`` (what the delivery worker stores in ``queue.last_error`` and
+    ``message_events.detail``), the formatted traceback, or the chain read by attribute. Frame
+    LOCALS still hold the payload, as on every connector; this does not test them.
+
+    Before the fix ``set_content`` raised a bare UnicodeEncodeError: its text named the offending
+    character and its ``.object`` held the whole payload, so the first assertion fails."""
+    with pytest.raises(Exception) as ei:  # noqa: B017 - before the fix it is not a NegativeAckError
+        await _body_dest(wire.port, encoding).send(payload)
+    _assert_refused_content_free(ei.value, codec_named=encoding)
+    assert wire.connections == 0, "nothing is dialled for a message that never built"
+
+
+async def test_a_body_set_content_cannot_encode_is_refused_content_free(
+    wire: _WireCapture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The backstop. euc-jp encodes the e-acute, so the guard passes it, but 3.15's set_content()
+    encodes as iso-2022-jp, which cannot. Without the backstop the bare UnicodeEncodeError reaches
+    the worker carrying the payload."""
+    monkeypatch.setattr(email_module, "EmailMessage", _Py315SetContent)
+    with pytest.raises(Exception) as ei:  # noqa: B017 - before the fix it is not a NegativeAckError
+        await _body_dest(wire.port, "euc-jp").send(_NON_ASCII_BODY)
+    _assert_refused_content_free(ei.value, codec_named="euc-jp")
+    assert "UnicodeEncodeError" in str(ei.value), "the type name is the one safe detail kept"
+    assert wire.connections == 0
+
+
+@pytest.mark.parametrize(
+    ("encoding", "payload", "wire_charset"),
+    [
+        ("utf-8", _NON_ASCII_BODY, "utf-8"),
+        # The email package writes latin-1 under its MIME name.
+        ("latin-1", _NON_ASCII_BODY.replace(CJK_CHAR, ""), "iso-8859-1"),
+    ],
+    ids=["utf-8", "latin-1"],
+)
+async def test_an_encodable_body_still_reaches_the_wire(
+    wire: _WireCapture, encoding: str, payload: str, wire_charset: str
+) -> None:
+    """POSITIVE CONTROL. A guard that refused every non-ASCII body would pass the tests above. The
+    guard keys on the codec: latin-1 carries the e-acute it can encode."""
+    await _body_dest(wire.port, encoding).send(payload)
+    sent = message_from_bytes(b"".join(wire.data), policy=default_policy)
+    assert isinstance(sent, EmailMessage)
+    body = sent.get_content()
+    assert _BODY_MARKER in body
+    assert sent.get_content_charset() == wire_charset
+    for ch in (SECRET_CHAR, CJK_CHAR):
+        assert (ch in body) == (ch in payload), f"{ch!r} did not arrive as sent"
