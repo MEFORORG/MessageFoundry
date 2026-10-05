@@ -1778,6 +1778,12 @@ names it. Any other id is shown as `(unknown segment)`, so `KIM|F` appears as
 
 A second MSH line in capitals is checked, and its fields are numbered as MSH fields.
 
+**A rule for an MSH field is applied to every MSH line, the header included.** The engine and
+the tee both do this, so a field the leak-check counts as scrubbed on a later MSH line really was
+rewritten (BACKLOG #2265). No default rule names an MSH field, so the header is kept unless an
+overlay maps one. A rule that would rewrite `MSH-1` or `MSH-2` is refused: those two fields hold
+the message's delimiters. A `keep` on either is allowed, because it rewrites nothing.
+
 **The coverage report is the record of those fields.** It lists the address of every present
 field that no rule mapped, never its value. A caller gets it through `on_report` on both paths, and
 inside the `LeakError` on a refusal. `python -m tee anonymize-captures` logs it at INFO once per
@@ -1890,8 +1896,11 @@ which HIPAA Safe Harbor counts as an identifier; a default rule now scrubs it.
   `anon.toml`, where a reviewer can see it.
 - A short value in a fixed-list field passes. A two-letter code in `PID-8` could still be
   initials.
-- The tee applies no rule to an MSH field. A rule for a second MSH line's field counts as decided
-  there, but the tee leaves that field as it was and does not scan it.
+- On the engine side only, a rule for a field of a later `BHS` or `FHS` line is applied one
+  field to the left of the field the leak-check counts as scrubbed. So the field the check
+  skips can still hold its value. The tee numbers those lines the way the check does.
+- On the engine side only, a later `MSH`, `BHS` or `FHS` line with fewer than two field
+  separators is written back out of shape, and a rule can then land on the wrong text.
 
 Note: encryption-at-rest (§3) and log redaction (§7) are **not** de-identification — do not conflate
 "we encrypt" or "we redact logs" with "we de-identify."

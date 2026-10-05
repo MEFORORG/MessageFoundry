@@ -42,12 +42,31 @@ def _segment_id(path: str) -> str:
     return path.split("-", 1)[0]
 
 
+#: MSH-1 and MSH-2 hold the message's own delimiters. A rule cannot rewrite them: the output would
+#: have no readable header, and the leak-check would then have no separators to walk it with.
+_DELIMITER_FIELDS = frozenset({"MSH-1", "MSH-2"})
+
+
+def _refuse_delimiter_rules(rules: tuple[FieldRule, ...]) -> None:
+    """Refuse a rule set that would rewrite MSH-1 or MSH-2 (a body-free :class:`AnonError`). A
+    ``KEEP`` rewrites nothing, so it is allowed. Held the same in both adapters (BACKLOG #2265)."""
+    named = sorted(
+        {r.path for r in rules if r.path in _DELIMITER_FIELDS and r.kind != SurrogateKind.KEEP}
+    )
+    if named:
+        raise AnonError(
+            f"a rule names {' and '.join(named)}, which hold the message's delimiters and cannot "
+            "be rewritten; refusing to emit"
+        )
+
+
 def anonymize_message(raw: str, keyer: Keyer, rules: tuple[FieldRule, ...]) -> str:
     """De-identify one HL7 v2 message: apply ``rules`` field-by-field, then the site-code pass.
 
     Pure + deterministic for a given ``keyer`` (same message + salt → same fixture). Raises
     :class:`AnonError` (carrying no body) when the message cannot be safely anonymized — fail closed.
     """
+    _refuse_delimiter_rules(rules)
     text = normalized_message(raw)
     parsed = read_message_seps(text)
     if parsed is None:

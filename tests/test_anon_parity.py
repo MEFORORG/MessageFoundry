@@ -64,6 +64,10 @@ _ADVERSARIAL = [
     _US_DATE_IN_EVN6,
     "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPV1|1|I|WARD^1^A^MAIN" + "|" * 41 + "junk|x",
     "MSH!*~\\&!A!B!C!D!20260101!!ADT*A01!M1!P!2.5.1\rEVN!A01!20260315142233.12-0500*S",
+    # BACKLOG #2265: a second MSH line. Each side reaches it by a different route (a parsed
+    # header-style segment vs a field split), and the default rules must leave it alone on both.
+    "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||9^^^H^MR||X^Y"
+    "\rMSH|^~\\&|A2|B2|C|D|20260102||ADT^A01|M2|P|2.5.1",
 ]
 # Inputs neither side can safely anonymize — BOTH must fail closed (refuse, never emit).
 _REFUSED = ["", "PID|1||9^^^H^MR||DOE^JOHN", "MSH|^~|A|B", "not hl7 at all"]
@@ -158,6 +162,9 @@ _LEAK_PARITY_INPUTS = [
     # BACKLOG #1710 step 1: the fixed list's shape checks (a short code, a code plus text).
     "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||1^^^H^MR||X^Y||19800101|M"
     "\rPV1|1|I^SMITH JOHN\rNTE|DOE JANE",
+    # BACKLOG #2265: a second MSH line with a dashed number in MSH-8, which no default rule maps.
+    "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||1^^^H^MR||X^Y"
+    "\rMSH|^~\\&|A2|B2|C|D|20260102|123-45-6789|ADT^A01|M2|P|2.5.1",
 ]
 
 

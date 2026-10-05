@@ -33,6 +33,24 @@ def _segment_id(path: str) -> str:
     return path.split("-", 1)[0]
 
 
+#: MSH-1 and MSH-2 hold the message's own delimiters. A rule cannot rewrite them: the output would
+#: have no readable header, and the leak-check would then have no separators to walk it with.
+_DELIMITER_FIELDS = frozenset({"MSH-1", "MSH-2"})
+
+
+def _refuse_delimiter_rules(rules: tuple[FieldRule, ...]) -> None:
+    """Refuse a rule set that would rewrite MSH-1 or MSH-2 (a body-free :class:`AnonError`). A
+    ``KEEP`` rewrites nothing, so it is allowed. Held the same in both adapters (BACKLOG #2265)."""
+    named = sorted(
+        {r.path for r in rules if r.path in _DELIMITER_FIELDS and r.kind != SurrogateKind.KEEP}
+    )
+    if named:
+        raise AnonError(
+            f"a rule names {' and '.join(named)}, which hold the message's delimiters and cannot "
+            "be rewritten; refusing to emit"
+        )
+
+
 def _field_num(path: str) -> int:
     return int(path.split("-", 1)[1])
 
@@ -43,6 +61,7 @@ def anonymize_message(raw: str, keyer: Keyer, rules: tuple[FieldRule, ...]) -> s
     Pure + deterministic for a given ``keyer``. Raises :class:`AnonError` (carrying no body) when the
     message has no parseable MSH / encoding characters — fail closed, matching the engine adapter.
     """
+    _refuse_delimiter_rules(rules)
     text = normalized_message(raw)
     parsed = read_message_seps(text)
     if parsed is None:
@@ -51,14 +70,17 @@ def anonymize_message(raw: str, keyer: Keyer, rules: tuple[FieldRule, ...]) -> s
     segments = [seg.split(field_sep) for seg in text.split("\r")]
     for rule in rules:
         seg_id = _segment_id(rule.path)
-        fnum = _field_num(rule.path)
+        # An MSH rule applies to EVERY MSH line, as on the engine side: the leak-check counts an
+        # MSH-N rule's field as scrubbed, so it must be (BACKLOG #2265). MSH-1 is the field
+        # separator itself, so MSH-N sits one split index lower than any other segment's field N.
+        index = _field_num(rule.path) - (1 if seg_id == "MSH" else 0)
         for fields in segments:
-            if not fields or fields[0] != seg_id or seg_id == "MSH":
-                continue  # rules never target MSH (its field numbering is offset by MSH-1)
+            if not fields or fields[0] != seg_id:
+                continue
             if _skip_obx5(rule, fields, seps):
                 continue
-            if fnum < len(fields):
-                fields[fnum] = surrogate_field(rule.kind, fields[fnum], keyer, seps)
+            if index < len(fields):
+                fields[index] = surrogate_field(rule.kind, fields[index], keyer, seps)
     encoded = "\r".join(field_sep.join(fields) for fields in segments)
     return scrub_message_site_codes(encoded, keyer)
 
