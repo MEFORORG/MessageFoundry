@@ -66,8 +66,18 @@ class CaptureSink:
         self._ports = tuple(ports)
         self._ack_mode = ack_mode
         # Optional de-identifier (ADR 0030 §6): when set, each captured message is anonymized at the
-        # single _write choke point so the persisted JSONL carries PHI-free bodies. Wire it as e.g.
-        # ``anonymizer=lambda raw: anonymize_checked(raw, salt=salt)``.
+        # single _write choke point, so the persisted JSONL carries de-identified bodies. That is
+        # NOT a claim that they are PHI-free: docs/PHI.md section 9 lists what ``anonymize_checked``
+        # refuses and what a clean return still lets through. The coverage report is the record
+        # of the fields no rule mapped. This sink only ever gets a string back, so it never
+        # sees that report: pass ``on_report`` yourself, and read the summary before you share the
+        # capture. For example (``CoverageTally`` is in the anon package's ``leak`` module):
+        #     tally = CoverageTally()
+        #     sink = CaptureSink(out, anonymizer=lambda raw: anonymize_checked(
+        #         raw, salt=salt, on_report=tally.add))
+        #     ...  # run the capture, then after ``await sink.stop()``:
+        #     print(tally.summary(), file=sys.stderr)
+        # tests/test_reconcile_capture.py runs that wiring as written.
         self._anonymizer = anonymizer
         self._servers: list[asyncio.Server] = []
         self._writers: set[asyncio.StreamWriter] = set()
