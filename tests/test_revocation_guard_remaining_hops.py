@@ -47,12 +47,17 @@ from messagefoundry.config.tls_policy import (
 from messagefoundry.config.wiring import WiringError, load_config
 from messagefoundry.transports import dicom as dicom_module
 from messagefoundry.transports import direct as direct_module
+from messagefoundry.transports import fhir as fhir_module
 from messagefoundry.transports import remotefile as remotefile_module
 from messagefoundry.transports.dicom import DicomScuDestination
 from messagefoundry.transports.direct import DirectDestination
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.remotefile import RemoteFileDestination
-from messagefoundry.transports.rest import _NO_REDIRECT_OPENER, opener_tls_context
+from messagefoundry.transports.rest import (
+    _NO_REDIRECT_OPENER,
+    http_family_trust_anchor,
+    opener_tls_context,
+)
 from tests.test_direct_transport import _mint_ca, _mint_leaf, _write_key, _write_pem
 from tests.test_revocation_audit_names_connection import _audit, _build_check, _shipped
 
@@ -165,6 +170,24 @@ def test_a_configured_crl_does_not_admit_a_fhir_lookup_it_cannot_reach(bare_crl:
         FhirLookupExecutor(both, egress=_OPEN_EGRESS)
     with active_hop_posture(ENFORCING):
         FhirLookupExecutor({"onbox": both["onbox"]}, egress=_OPEN_EGRESS)
+
+
+def test_a_configured_crl_does_not_admit_a_fhir_lookup_whose_opener_lacks_it(
+    bare_crl: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guard reads the opener's context, never the setting. The policy carries a CRL and the
+    opener the lookup ends up holding does not, so a REMOTE lookup must stay refused. A guard keyed
+    on ``trust_anchor_policy.crl_file`` would admit it; the arm above cannot catch that, because its
+    only CRL-less lookup is on loopback."""
+    monkeypatch.setattr(
+        fhir_module,
+        "http_family_trust_anchor",
+        lambda s, *, url, trust_anchor_policy=None: http_family_trust_anchor(
+            s, url=url, trust_anchor_policy=None
+        ),
+    )
+    with active_hop_posture(ENFORCING), pytest.raises(InsecureHopRefused, match="revocation"):
+        _lookup({"url": f"https://{REMOTE}/fhir"}, policy=_crl_policy(bare_crl))
 
 
 def test_a_fhir_lookup_read_hop_crosses_on_its_own_attestation_and_is_audited(
