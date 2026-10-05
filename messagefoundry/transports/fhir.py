@@ -641,17 +641,6 @@ class FhirDestination(DestinationConnector):
             )
 
         if bool(s.get("verify_tls", True)):
-            # #201 (ADR 0078 amendment): the verify-ON https hop validates the FHIR-server cert but does no
-            # OCSP/CRL revocation — refuse an off-loopback production-PHI verified hop unless revocation is
-            # attested (loopback / synthetic / non-prod / attested byte-identical; composes with #200).
-            refuse_unrevoked_verified_hop(
-                scheme,
-                self.base_url,
-                connector="FHIR destination",
-                revocation_attested=config.tls_revocation_attested,
-                revocation_attested_reason=config.tls_revocation_attested_reason,
-                connection=config.name,
-            )
             # #129 (ADR 0094): granular expiry-only relaxation — verify chain + hostname but tolerate an
             # expired FHIR-server cert (opt-in; default off = the shared verifying opener, byte-identical).
             # #1180 (ADR 0093): the client trust anchor for this https hop.
@@ -703,6 +692,24 @@ class FhirDestination(DestinationConnector):
                 # cannot reach this hop (ASVS 12.1.2).
                 self._opener = _no_redirect_opener()
             self._opener.add_handler(digest)
+        if bool(s.get("verify_tls", True)):
+            # #201 (ADR 0078 amendment): the verify-ON https hop validates the FHIR-server cert but does
+            # no OCSP/CRL revocation — refuse an off-loopback production-PHI verified hop unless
+            # revocation is attested or this hop's own opener checks a CRL (composes with #200).
+            #
+            # LAST IN __init__, below every statement that builds or replaces `self._opener` (vault
+            # BACKLOG #2188). The guard reads that opener's TLS context, so a `[tls].crl_file` that
+            # reached this hop relaxes the refusal. Called above the opener it had no context to read,
+            # and refused a hop that checks a CRL while advising the operator to configure one.
+            refuse_unrevoked_verified_hop(
+                scheme,
+                self.base_url,
+                connector="FHIR destination",
+                revocation_attested=config.tls_revocation_attested,
+                revocation_attested_reason=config.tls_revocation_attested_reason,
+                opener=self._opener,
+                connection=config.name,
+            )
 
     def _build_headers(self, s: dict[str, Any]) -> dict[str, str]:
         """FHIR media type on Content-Type + Accept + static ``headers`` + optional bearer/basic auth."""

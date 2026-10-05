@@ -264,20 +264,6 @@ class DicomWebDestination(DestinationConnector):
             connection=config.name,
         )
         if bool(s.get("verify_tls", True)):
-            # #201 (ADR 0078 amendment): the verify-ON https hop validates the DICOMweb-server cert but
-            # does no OCSP/CRL revocation (stdlib ssl has none) — refuse an off-loopback production-PHI
-            # verified STOW-RS hop unless revocation is attested (loopback / synthetic / non-prod /
-            # attested byte-identical). Same posture-keyed guard as its REST/SOAP/FHIR siblings; composes
-            # with #200 (fires only on the verify-ON https path, disjoint from the cleartext/verify-off
-            # gates above, so no hop is ever double-refused).
-            refuse_unrevoked_verified_hop(
-                scheme,
-                self.base_url,
-                connector="DICOMweb destination",
-                revocation_attested=config.tls_revocation_attested,
-                revocation_attested_reason=config.tls_revocation_attested_reason,
-                connection=config.name,
-            )
             # #1180 (ADR 0093): the client trust anchor for this STOW-RS hop.
             anchor = http_family_trust_anchor(
                 s, url=self.base_url, trust_anchor_policy=config.trust_anchor_policy
@@ -286,6 +272,26 @@ class DicomWebDestination(DestinationConnector):
                 _no_redirect_opener(*proxy_handlers, trust_anchor=anchor)
                 if proxy_handlers or anchor.narrows
                 else _NO_REDIRECT_OPENER
+            )
+            # #201 (ADR 0078 amendment): the verify-ON https hop validates the DICOMweb-server cert but
+            # does no OCSP/CRL revocation (stdlib ssl has none) — refuse an off-loopback production-PHI
+            # verified STOW-RS hop unless revocation is attested or this hop's own opener checks a CRL.
+            # Same posture-keyed guard as its REST/SOAP/FHIR siblings; composes with #200 (fires only
+            # on the verify-ON https path, disjoint from the cleartext/verify-off gates above, so no hop
+            # is ever double-refused).
+            #
+            # BELOW `self._opener` (vault BACKLOG #2188), which nothing later replaces. The guard reads
+            # that opener's TLS context, so a `[tls].crl_file` that reached this hop relaxes the
+            # refusal. Called above the opener it had no context to read, and refused a hop that checks
+            # a CRL while advising the operator to configure one.
+            refuse_unrevoked_verified_hop(
+                scheme,
+                self.base_url,
+                connector="DICOMweb destination",
+                revocation_attested=config.tls_revocation_attested,
+                revocation_attested_reason=config.tls_revocation_attested_reason,
+                opener=self._opener,
+                connection=config.name,
             )
         else:
             # verify_tls=false makes the https hop MITM-able — a posture-keyed insecure hop (#200).
