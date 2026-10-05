@@ -522,11 +522,26 @@ def route_declaration_of(endpoint: object) -> RouteDeclaration | None:
     return found if isinstance(found, RouteDeclaration) else None
 
 
+def _top_level_calls(route: object) -> list[object]:
+    """The calls of ``route``'s top-level dependencies, the only ones the route check reads."""
+    dependencies = getattr(getattr(route, "dependant", None), "dependencies", None) or ()
+    return [dependency.call for dependency in dependencies]
+
+
+def route_has_gate(route: object) -> bool:
+    """True when one of ``route``'s top-level dependencies carries the gate mark."""
+    return any(is_route_gate(call) for call in _top_level_calls(route))
+
+
+def refusal_runs_on(route: object) -> bool:
+    """True when :func:`refuse_undeclared_route` is among ``route``'s top-level dependencies, which
+    is how ``create_app`` installs it on every route registered on the app."""
+    return any(call is refuse_undeclared_route for call in _top_level_calls(route))
+
+
 def route_is_declared(route: object, *, websocket: bool) -> bool:
     """True when ``route`` declares its authorization, as the module note above defines it."""
-    dependant = getattr(route, "dependant", None)
-    dependencies = getattr(dependant, "dependencies", None) or ()
-    if any(is_route_gate(dependency.call) for dependency in dependencies):
+    if route_has_gate(route):
         return True
     declared = route_declaration_of(getattr(route, "endpoint", None))
     if declared is None:
@@ -691,7 +706,7 @@ class AuthenticatedBeforeBodyRoute(APIRoute):
         if (
             not steps
             and self.body_field is not None
-            and any(d.call is refuse_undeclared_route for d in self.dependant.dependencies)
+            and refusal_runs_on(self)
             and not route_is_declared(self, websocket=False)
         ):
             # Vault BACKLOG #2604: a route that declares no authorization is refused before its

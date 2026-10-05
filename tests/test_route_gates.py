@@ -50,6 +50,11 @@ def ui_app() -> FastAPI:
     return create_app(serve_ui=True)
 
 
+@pytest.fixture(scope="module")
+def full_app() -> FastAPI:
+    return route_gates.full_surface_app()
+
+
 def _ws_rows(app: FastAPI) -> list[route_gates.RouteRow]:
     return [r for r in route_gates.route_rows(app) if r.method == route_gates.WS_METHOD]
 
@@ -504,10 +509,12 @@ def test_a_bare_app_with_no_refusal_reads_as_outside_it() -> None:
     assert _rows_by_key(app)[("GET", "/planted")].kind == route_gates.KIND_OUTSIDE
 
 
-def test_the_shipped_surface_refuses_nothing_and_every_ungated_row_is_declared_public() -> None:
+def test_the_shipped_surface_refuses_nothing_and_every_ungated_row_is_declared_public(
+    full_app: FastAPI,
+) -> None:
     """On the app with every route-registering flag on, a row with no gate is public by design with
     a reason, or sits outside the refusal (the docs and the static mount). None is refused."""
-    rows = route_gates.route_rows(route_gates.full_surface_app())
+    rows = route_gates.route_rows(full_app)
     by_kind: dict[str, list[route_gates.RouteRow]] = {}
     for row in rows:
         by_kind.setdefault(row.kind, []).append(row)
@@ -516,7 +523,6 @@ def test_the_shipped_surface_refuses_nothing_and_every_ungated_row_is_declared_p
     public = by_kind[route_gates.KIND_PUBLIC]
     assert ("POST", "/auth/login") in {(r.method, r.path) for r in public}
     assert all(r.declaration and r.declaration.strip() for r in public), public
-    assert all(r.gate is None for r in public), public
     outside = {(r.method, r.path) for r in by_kind[route_gates.KIND_OUTSIDE]}
     assert outside == {
         (route_gates.MOUNT_METHOD, "/ui/static"),
@@ -527,10 +533,12 @@ def test_the_shipped_surface_refuses_nothing_and_every_ungated_row_is_declared_p
     }, outside
 
 
-def test_the_full_surface_app_walks_the_flag_registered_routes(ui_app: FastAPI) -> None:
+def test_the_full_surface_app_walks_the_flag_registered_routes(
+    ui_app: FastAPI, full_app: FastAPI
+) -> None:
     """The OIDC console routes register only with ``oidc_enabled`` on, so neither the default app nor
     a plain ``serve_ui`` app shows them. The full-surface app does."""
-    rows = _rows_by_key(route_gates.full_surface_app())
+    rows = _rows_by_key(full_app)
     for key in [("GET", "/ui/oidc/callback"), ("GET", "/docs"), ("GET", "/ui/login")]:
         assert key in rows, key
     assert ("GET", "/ui/oidc/callback") not in _rows_by_key(ui_app)

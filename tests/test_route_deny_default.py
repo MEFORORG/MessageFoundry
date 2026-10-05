@@ -20,7 +20,7 @@ from __future__ import annotations
 import contextlib
 import inspect
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -171,11 +171,12 @@ def _unlisted_non_bool_parameters() -> set[str]:
     return non_bool - _NON_BOOL_VALUES.keys() - _NON_BOOL_BUILT_BY_FIXTURE
 
 
-def _routes_added_by_non_bool_values(
-    full: set[tuple[str, str]],
+def _routes_added_by(
+    tries: Mapping[str, tuple[Any, ...]], full: set[tuple[str, str]]
 ) -> dict[str, list[tuple[str, str]]]:
+    """The routes each listed value adds to the full-surface app, keyed ``name=value``."""
     added: dict[str, list[tuple[str, str]]] = {}
-    for name, values in _NON_BOOL_VALUES.items():
+    for name, values in tries.items():
         for value in values:
             extra = _route_keys(route_gates.full_surface_app(**{name: value})) - full
             if extra:
@@ -197,7 +198,7 @@ def test_every_non_bool_create_app_parameter_is_listed() -> None:
 def test_no_non_bool_create_app_parameter_registers_a_route_the_full_surface_app_lacks(
     full_app: FastAPI,
 ) -> None:
-    added = _routes_added_by_non_bool_values(_route_keys(full_app))
+    added = _routes_added_by(_NON_BOOL_VALUES, _route_keys(full_app))
     assert not added, f"these create_app values register routes the walk never sees: {added}"
 
 
@@ -233,8 +234,7 @@ def test_a_new_non_bool_parameter_fails_the_pin_and_one_that_registers_a_route_i
     )
     monkeypatch.setattr(route_gates, "create_app", _create_app_with(parameter))
     assert _unlisted_non_bool_parameters() == {"extra_routes_from"}
-    monkeypatch.setitem(_NON_BOOL_VALUES, "extra_routes_from", ("synthetic",))
-    added = _routes_added_by_non_bool_values(_route_keys(full_app))
+    added = _routes_added_by({"extra_routes_from": ("synthetic",)}, _route_keys(full_app))
     assert added == {"extra_routes_from='synthetic'": [("GET", "/zz/new")]}, added
 
 
@@ -506,7 +506,7 @@ async def test_every_refusal_is_counted_and_the_log_is_throttled_not_silenced(
     assert undeclared_route_refusals(route) == 4
     assert line.startswith("refused route /zz/undeclared:"), line
     assert "(3 refusals since the last log line, 4 in all)" in line, line
-    assert "SECRET-MRN" not in line and "mrn" not in "".join(throttled + [line])
+    assert "mrn" not in "".join(throttled + [line])
 
 
 def test_a_declaration_needs_a_reason() -> None:

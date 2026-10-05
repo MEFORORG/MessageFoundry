@@ -76,8 +76,9 @@ from starlette.routing import BaseRoute, Mount
 from messagefoundry.api.app import create_app
 from messagefoundry.api.security import (
     is_route_gate,
-    refuse_undeclared_route,
+    refusal_runs_on,
     route_declaration_of,
+    route_has_gate,
     route_is_declared,
 )
 from messagefoundry.auth.permissions import Permission
@@ -454,12 +455,11 @@ def _kind(declared_on: Any, effective: Any, *, websocket: bool) -> tuple[str, st
     ``route_is_declared``, so the walk and the refusal cannot disagree about a route."""
     declaration = route_declaration_of(getattr(declared_on, "endpoint", None))
     reason = declaration.reason if declaration is not None else None
-    served = getattr(getattr(effective, "dependant", None), "dependencies", None) or ()
-    if not any(d.call is refuse_undeclared_route for d in served):
+    if not refusal_runs_on(effective):
         return KIND_OUTSIDE, reason
     if not route_is_declared(declared_on, websocket=websocket):
         return KIND_REFUSED, reason
-    if any(is_route_gate(d.call) for d in declared_on.dependant.dependencies):
+    if route_has_gate(declared_on):
         return KIND_GATED, reason
     assert declaration is not None  # route_is_declared found no gate, so a declaration passed it
     return (KIND_PUBLIC if declaration.public else KIND_IN_BODY), reason
@@ -470,16 +470,10 @@ def _state_owner(mount: Mount, outer: Starlette) -> Starlette:
 
     Every Starlette app sets ``scope["app"]`` to itself as a request enters it, so a socket inside a
     mounted application sees that application, not the outer one (vault BACKLOG #2846). A mount of
-    bare routes has no app of its own, so its sockets still see ``outer``. Middleware a mount wraps
-    around its app is unwrapped through each layer's ``app``, up to a fixed depth."""
-    target: object = mount.app
-    for _ in range(32):
-        if isinstance(target, Starlette):
-            return target
-        target = getattr(target, "app", None)
-        if target is None:
-            break
-    return outer
+    bare routes has no app of its own, so its sockets still see ``outer``. The app is read from the
+    same object ``Mount.routes`` reads, beneath any middleware the mount wraps around it."""
+    base = getattr(mount, "_base_app", mount.app)
+    return base if isinstance(base, Starlette) else outer
 
 
 def _walk(routes: Sequence[BaseRoute], prefix: str, app: Starlette) -> Iterator[RouteRow]:
