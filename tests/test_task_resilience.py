@@ -166,6 +166,7 @@ async def test_file_poller_survives_scan_error(tmp_path: Path) -> None:
 
 async def test_session_reaper_survives_purge_error(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(api_app, "_SESSION_REAP_INTERVAL", 0.01)
+    monkeypatch.setattr(api_app, "_SESSION_REAP_FIRST_DELAY", 0.01)
     calls = {"n": 0}
 
     class _Store:

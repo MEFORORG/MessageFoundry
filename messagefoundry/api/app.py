@@ -7770,9 +7770,13 @@ async def _assert_security_notice_is_deliverable(
 
 
 _SESSION_REAP_INTERVAL = 3600.0  # purge expired/idle sessions hourly to bound the sessions table
-# How far the wall clock may run ahead of the monotonic clock between two reaper passes before the
-# later pass is skipped as a clock step. Clock discipline slews by far less than this in an hour.
-_SESSION_REAP_STEP_TOLERANCE = 60.0
+# How long the reaper waits after start before its first pass, so time sync has run and an engine
+# that restarts often still purges.
+_SESSION_REAP_FIRST_DELAY = 300.0
+# How far the wall clock may run ahead of the monotonic clock between two readings before the
+# reaper skips the pass as a clock step. Above what clock discipline slews in an hour (chrony's
+# default ceiling is about 300 s), below the default 30-minute idle window.
+_SESSION_REAP_STEP_TOLERANCE = 600.0
 
 
 async def _session_reaper(
@@ -7782,23 +7786,26 @@ async def _session_reaper(
     wall: Callable[[], float] | None = None,
     mono: Callable[[], float] | None = None,
 ) -> None:
-    """Drop expired session rows, one interval after start and then on that interval, until the
-    task is cancelled. With ``idle_seconds`` given, idle-expired rows go too (BACKLOG #2096); the
-    lifespan passes the idle timeout the validator uses.
+    """Drop expired session rows, first ``_SESSION_REAP_FIRST_DELAY`` after start and then every
+    ``_SESSION_REAP_INTERVAL``, until the task is cancelled. With ``idle_seconds`` given,
+    idle-expired rows go too (BACKLOG #2096); the lifespan passes the idle timeout the validator
+    uses.
 
-    **A pass that sees the wall clock jump forward is skipped (BACKLOG #2283).** The purge judges
-    expiry and idleness by the wall clock, and its deletes cannot be undone. Run just after a
-    forward step, it would delete every session as idle, though setting the clock right would have
-    made them valid again. So each pass compares how far the wall clock moved since the previous
-    reading with how far the monotonic clock moved. When the wall clock ran ahead by more than
-    ``_SESSION_REAP_STEP_TOLERANCE``, the pass deletes nothing and logs a warning. The next pass
-    compares against this one, so a step that persists for a whole interval is then trusted and
-    purged by. A host that slept can also trip it, which costs one skipped pass.
+    **The reaper skips a pass when the wall clock has jumped forward (BACKLOG #2283).** The purge
+    judges expiry and idleness by the wall clock, and its deletes cannot be undone. Run just after
+    a forward step, it would delete every session as idle, though setting the clock right would
+    have made them valid again. So each pass compares how far the wall clock moved since the
+    previous reading with how far the monotonic clock moved. When the wall clock ran ahead by more
+    than ``_SESSION_REAP_STEP_TOLERANCE``, the pass deletes nothing and logs a warning. The next
+    pass compares against this one, so a step that persists for a whole interval is then trusted
+    and purged by. A host that slept can also trip it, which costs one skipped pass. A host whose
+    clock steps forward by more than the tolerance every interval never purges, and the warning
+    each pass is what says so.
 
     **The first reading is a baseline, not a pass.** A wrong clock is likeliest at start-up, before
     time sync has run, and a first pass would have nothing to compare it with. So the reaper reads
-    both clocks, waits one interval, and only then purges. Rows that expired before a restart wait
-    one interval longer; the validator refuses them meanwhile.
+    both clocks and waits ``_SESSION_REAP_FIRST_DELAY`` before it purges. Rows that expired before
+    a restart wait that much longer; the validator refuses them meanwhile.
 
     This guards only the purge. The validator revokes a session it refuses on presentation, by the
     same wall clock, so a forward step still ends every session that is USED during it.
@@ -7814,8 +7821,10 @@ async def _session_reaper(
         return (wall or time.time)(), (mono or time.monotonic)()
 
     previous = _clocks()
+    delay = _SESSION_REAP_FIRST_DELAY
     while True:
-        await asyncio.sleep(_SESSION_REAP_INTERVAL)
+        await asyncio.sleep(delay)
+        delay = _SESSION_REAP_INTERVAL
         now, ticks = _clocks()
         ahead = (now - previous[0]) - (ticks - previous[1])
         previous = (now, ticks)

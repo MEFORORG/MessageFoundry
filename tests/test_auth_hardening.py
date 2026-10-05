@@ -758,8 +758,9 @@ async def test_session_reaper_purges_expired_sessions(
 ) -> None:
     from messagefoundry.api import app as api_app
 
-    # The reaper waits one interval before its first pass (BACKLOG #2283), so shorten it.
+    # The reaper waits before its first pass (BACKLOG #2283), so shorten both waits.
     monkeypatch.setattr(api_app, "_SESSION_REAP_INTERVAL", 0.01)
+    monkeypatch.setattr(api_app, "_SESSION_REAP_FIRST_DELAY", 0.01)
     await engine.store.create_user(
         user_id="u",
         username="reaper",
@@ -805,6 +806,7 @@ async def test_session_reaper_skips_a_pass_after_a_forward_clock_step(
     from messagefoundry.api import app as api_app
 
     monkeypatch.setattr(api_app, "_SESSION_REAP_INTERVAL", 0)
+    monkeypatch.setattr(api_app, "_SESSION_REAP_FIRST_DELAY", 0)
     hour = 3600.0
     tolerance = api_app._SESSION_REAP_STEP_TOLERANCE
     # (wall, monotonic) per reading. Reading 0 is the start-up baseline. Pass 1 drifts inside the
