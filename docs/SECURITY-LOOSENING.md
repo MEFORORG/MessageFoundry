@@ -977,7 +977,7 @@ This section is kept rather than deleted, because the claim it used to make is t
 ### `tls_revocation_attested = true` on a connection — revocation checked outside the engine
 > **Connection-scoped**, both directions: an `inbound()`/`outbound()` keyword, or a **top-level**
 > `connections.toml` key (not under `[settings]`), always paired with a mandatory
-> `tls_revocation_attested_reason`.
+> `tls_revocation_attested_reason`. A `FhirLookup()` takes the same keyword pair.
 > [ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)
 > §1.5 item 4.
 - **What you lose:** the engine's refusal of a *verifying* TLS hop that checks no certificate
@@ -985,6 +985,9 @@ This section is kept rather than deleted, because the claim it used to make is t
   OCSP or CRL). On an mTLS listener it is the `check_inbound_revocation` refusal of a listener with
   `tls_ca_file` and no `tls_crl_file`. With the attestation set, a revoked but unexpired certificate on
   that hop is accepted **unless your PKI or terminator stops it**, because the engine will not.
+  **On a `FhirLookup`, one declaration lifts two refusals** (BACKLOG #2193): the https read to the
+  FHIR server, and the SMART token endpoint the lookup signs in to. Those are often two hosts, so
+  the reason has to hold for both.
 - **When acceptable:** a revocation-checking PKI or terminator really does cover this hop, and you can
   name it. That name belongs in the reason. On a listener, prefer `tls_crl_file`, which checks
   revocation in the engine and needs no attestation.

@@ -84,6 +84,7 @@ from messagefoundry.config.settings import (
     weakened_tls_escape_permitted_here,
 )
 from messagefoundry.config.tls_policy import (
+    RevocationHopGuard,
     TrustAnchorPolicy,
     build_verifying_client_context,
     harden_cipher_suites,
@@ -410,6 +411,13 @@ class _RemoteClient(abc.ABC):
     """Connect-per-operation remote-file client. Implementations are **synchronous** (blocking I/O);
     the connector calls them via :func:`asyncio.to_thread`. Each method opens its own connection, does
     the operation, and closes — nothing is held across calls."""
+
+    @property
+    def tls_context(self) -> ssl.SSLContext | None:
+        """The TLS context this client dials with, or ``None`` for a client that uses none (SFTP,
+        plain FTP). The destination's revocation guard reads it (BACKLOG #2193), so a client that
+        gains TLS must return its context here to be guarded."""
+        return None
 
     @abc.abstractmethod
     def list_dir(self, remote_dir: str) -> list[tuple[str, int]]:
@@ -778,6 +786,10 @@ class _FtpClient(_RemoteClient):
             if tls
             else None
         )
+
+    @property
+    def tls_context(self) -> ssl.SSLContext | None:
+        return self._context
 
     def _connect(self) -> ftplib.FTP:
         """Connect, secure the control channel (FTPS), log in and secure the data channel (FTPS), or
@@ -1865,6 +1877,24 @@ class RemoteFileDestination(DestinationConnector):
         self._client = _make_client(
             s, trust_anchor_policy=config.trust_anchor_policy, name=config.name
         )
+        # BACKLOG #2193 (ADR 0173): a verifying FTPS upload validates the server certificate, but
+        # stdlib ssl checks no OCSP or CRL, so a revoked certificate would still be accepted on a hop
+        # that carries message files and the FTP login. Taken AFTER the client is built and handed
+        # the context that client will really dial with, so a [tls].crl_file that reached this hop
+        # relaxes the refusal and a hop it never reached keeps it. Keyed on the context, as MLLP's
+        # is: sftp and plain ftp build none, and a tls_verify=false context verifies nothing, so
+        # the refusals that own those hops stay the only gate on them.
+        ftps_context = self._client.tls_context
+        if ftps_context is not None and ftps_context.verify_mode is not ssl.CERT_NONE:
+            RevocationHopGuard.capture(
+                host=str(s["host"]),
+                cell="REMOTEFILE ftps destination",
+                description="verified FTPS upload (no revocation check)",
+                attested=config.tls_revocation_attested,
+                attested_reason=config.tls_revocation_attested_reason,
+                connection=config.name,
+                context=ftps_context,
+            ).enforce_construction()
         self._settings = s
         self._host = str(s["host"])
         self._remote_dir = str(s["remote_dir"])

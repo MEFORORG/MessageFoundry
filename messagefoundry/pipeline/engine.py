@@ -2058,6 +2058,7 @@ class Engine:
             # provider wraps its own read and names the value file; this covers an embedder-supplied
             # provider, and it covers every caller that reaches reload_detail (the route, the
             # dual-control release executor, the cluster convergence loop, the DR-threshold re-apply).
+            refusal: str | None = None
             try:
                 self._env_values = dict(self._env_values_provider())
             except WiringError:
@@ -2078,10 +2079,15 @@ class Engine:
                 # the host application rather than a bad value file, and a 500 is the honest signal
                 # for it -- widening to Exception would relabel the host's bug as the operator's
                 # config being invalid.
+                refusal = safe_exc(exc)
+            if refusal is not None:
+                # Raised AFTER the handler, so the caught error rides neither __cause__ nor
+                # __context__ (BACKLOG #2307): a TOMLDecodeError keeps the whole value file on .doc,
+                # credentials included. `from None` would still leave it on __context__.
                 raise WiringError(
                     "could not re-read this environment's values for the reload, so the live graph "
-                    f"is unchanged: {safe_exc(exc)}"
-                ) from exc
+                    f"is unchanged: {refusal}"
+                )
             if self._registry_runner is not None:
                 self._registry_runner.set_env_values(self._env_values)
         # Off the event loop: load_config executes user config modules (arbitrary, potentially heavy

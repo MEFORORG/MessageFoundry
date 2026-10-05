@@ -85,10 +85,10 @@ def test_the_floor_step_sits_between_the_smoke_and_the_first_publish() -> None:
     names = [str(s.get("name") or "") for s in steps]
     smoke = next(i for i, n in enumerate(names) if n.startswith("Smoke-check the console wheel"))
     release = next(i for i, n in enumerate(names) if n.startswith("Create or update the console"))
-    publish = next(
-        i for i, n in enumerate(names) if n.startswith("Publish messagefoundry-webconsole")
-    )
-    assert smoke < idx < release < publish
+    # The PyPI publish runs in its own job since vault BACKLOG #2631; the files leave this job by
+    # the hand-over, so that is the last point this step must precede.
+    handover = next(i for i, n in enumerate(names) if n.startswith("Hand the PyPI files"))
+    assert smoke < idx < release < handover
     # Not "Smoke-check...": tests/test_release_pipeline.py requires exactly one such step per job.
     assert not str(step.get("name")).startswith("Smoke-check")
     # Unconditional, so a dispatch dry run on a release branch fails here before a tag does.

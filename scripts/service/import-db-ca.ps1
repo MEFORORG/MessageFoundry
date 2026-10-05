@@ -63,7 +63,7 @@ $StoreLocation = "Cert:\LocalMachine\Root"
 # (Cc) and every format character (Cf: the bidi overrides and isolates, zero-width marks) prints
 # as a visible \uXXXX before it reaches the console (ASVS 1.1.2). Line and paragraph separators,
 # private-use and unassigned code points go the same way -- the same categories as
-# CONTROL_CATEGORIES in messagefoundry/terminal_text.py, since this .NET runtime's tables cannot
+# CONTROL_CATEGORIES in messagefoundry/controlchars.py, since this .NET runtime's tables cannot
 # vouch for an unassigned one. So does every surrogate: PowerShell walks UTF-16 code units, so a
 # character past the BMP prints as its escaped pair rather than being judged half at a time.
 # A run of backslashes is doubled whole where it stands before 'u' and four hex digits or before a

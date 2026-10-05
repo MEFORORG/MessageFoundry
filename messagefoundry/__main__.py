@@ -4015,9 +4015,12 @@ def _serve(args: argparse.Namespace) -> int:
             # gate exists to prevent. No TypeError here, unlike the engine-side guard: that one wraps
             # an embedder's arbitrary callable, while this one wraps our own call into a function that
             # returns a dict or raises.
-            raise WiringError(
-                f"could not read environment values from {env_file}: {safe_exc(exc)}"
-            ) from exc
+            refusal = safe_exc(exc)
+        # Raised AFTER the handler, so neither __cause__ nor __context__ is set (BACKLOG #2307). A
+        # TOMLDecodeError keeps the whole document on .doc and a UnicodeDecodeError keeps the file's
+        # bytes on .object, so chaining either would carry every credential the file holds. `from None`
+        # would not do: it leaves __context__ set.
+        raise WiringError(f"could not read environment values from {env_file}: {refusal}")
 
     # ADR 0050 anchoring diagnostics. Emitted ONCE here at startup (NOT inside env_values(), which is
     # re-invoked on every reload), and they log resolved file PATHS only — never env() values or
@@ -6596,7 +6599,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
     from messagefoundry.config.tls_policy import InsecureHopRefused
     from messagefoundry.secrets_dpapi import DpapiError, DpapiUnavailable
     from messagefoundry.store.base import StoreNotFoundError, build_store_cipher
-    from messagefoundry.store.crypto import StoreKeylessError
+    from messagefoundry.store.crypto import CipherError, StoreKeylessError
     from messagefoundry.store.keyprovider import KeyProviderError
 
     store_slot = _ProvisionStore()
@@ -6648,7 +6651,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
             # resolves it again, which costs a second Vault round trip. Nothing is created. A
             # server backend resolved it inside the open, before it found no store.
             build_store_cipher(settings.store)
-    except StoreKeylessError as exc:
+    except (StoreKeylessError, CipherError) as exc:
+        # CipherError: a keyed open met a row it cannot read, or one that decrypted to something
+        # that is not JSON (BACKLOG #2308). Its text names the table or key id, never the value.
         return _emit_error(f"{exc}. Nothing was written", as_json=args.json)
     except KeylessAuditChainRefused as exc:  # #1916: could not start, as the write below exits
         _emit_error(str(exc), as_json=args.json)
@@ -6944,7 +6949,7 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
         open_store,
         store_driver_errors,
     )
-    from messagefoundry.store.crypto import StoreKeylessError
+    from messagefoundry.store.crypto import CipherError, StoreKeylessError
 
     settings = _host_gated_store_settings(args)
     if isinstance(settings, int):
@@ -6979,9 +6984,10 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
                 settings.store,
                 keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
             )
-        except StoreKeylessError as exc:
+        except (StoreKeylessError, CipherError) as exc:
             # A keyed store with encrypted rows, opened from a shell without its key, refuses at
-            # open. Nothing has been read or written.
+            # open. So does a keyed open that meets a row it cannot read or that is not JSON once
+            # decrypted (BACKLOG #2308). Nothing has been read or written.
             return ("open-refused", wanted, str(exc))
         try:
             user = await store.get_user_by_username(wanted)
@@ -7532,6 +7538,8 @@ def _rotate_key(args: argparse.Namespace) -> int:
         # the uploaded-file store), so a failure in the second leaves the FIRST already committed
         # and the ASVS 13.3.4 rotation stamp unwritten. That is safe precisely because both passes
         # skip what is already under the active key — it is a resumable rotation, not a rollback.
+        # One case no key finishes: a row whose tag verified but which is not UTF-8, or not JSON at
+        # the open's cache warm-up, is corrupt, and its message says so (BACKLOG #2308).
         print(f"error: rotation aborted — {exc}", file=sys.stderr)
         return 1
     except (NotImplementedError, StoreNotFoundError) as exc:  # #1780: no store there

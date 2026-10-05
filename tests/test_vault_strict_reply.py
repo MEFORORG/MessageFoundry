@@ -416,7 +416,8 @@ def test_control_the_stock_response_class_reads_a_bare_cr_head_as_an_answer(
         assert response.status_code == 200
         assert response.content == _BODY
 
-    monkeypatch.setattr(StrictHTTPResponse, "begin", http.client.HTTPResponse.begin)
+    # The guard goes on when the response is built (vault BACKLOG #2170), so that is what is undone.
+    monkeypatch.setattr(StrictHTTPResponse, "__init__", http.client.HTTPResponse.__init__)
     with _ScriptedVault([(reply, True)]) as server:
         assert _get(_client(server.port))["data"]["data"]["value"] == "synthetic"
 

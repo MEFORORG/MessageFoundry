@@ -62,7 +62,8 @@ param(
     # and add lock either way. The worktree gate's rule 3b prints it for a reader whose own worktree is
     # nested (BACKLOG #1038); which mechanism makes which layout is stated once, in the "WHICH
     # MECHANISM MADE THIS WORKTREE" block of scripts\hooks\worktree_gate.ps1. There is NO scripted
-    # teardown for it: the cleanup it prints is a plain `git worktree remove` (see Show-NextSteps).
+    # teardown for it, remove.ps1 -Path included: the cleanup it prints is a plain `git worktree
+    # remove` (see Show-NextSteps).
     [switch]$Nested
 )
 
@@ -235,11 +236,16 @@ function Show-NextSteps {
     # verbatim; "  # " (hash, one space) is prose. tests/test_worktree_new_cleanup_advice.py extracts
     # the former and EXECUTES it against a synthetic repo, because advice that is only read is advice
     # nothing checks. Keep the two shapes distinct.
-    # A NESTED TREE HAS NO SCRIPTED TEARDOWN, ON PURPOSE (BACKLOG #1038, Manager decision batch 184).
-    # remove.ps1 had a -Nested route for one round, and it was withdrawn: its occupancy fence cannot see
-    # an `isolation: worktree` subagent, whose session record carries its PARENT's cwd (measured: 0
-    # occupants for a live subagent's tree, 1 for its parent's), and a deletion tool whose fence fails
-    # open is worse than none. So the advice is plain git, and says what git does and does not check.
+    # A TREE UNDER .claude\worktrees HAS NO SCRIPTED TEARDOWN, ON PURPOSE (BACKLOG #1038, Manager
+    # decision batch 184). remove.ps1 had a -Nested route for one round, and it was withdrawn: its
+    # occupancy fence cannot see an `isolation: worktree` subagent, whose session record carries its
+    # PARENT's cwd (measured: 0 occupants for a live subagent's tree, 1 for its parent's), and a
+    # deletion tool whose fence fails open is worse than none. So the advice is plain git, and says
+    # what git does and does not check.
+    # THAT STILL HOLDS AFTER remove.ps1 GAINED -Path (vault BACKLOG #1017). -Path is the checked route
+    # for every OTHER registered worktree, and it refuses this population for the reason above. The
+    # one exception is not a nested tree at all: a SIBLING this script makes beside a linked worktree
+    # also sits under .claude\worktrees, and the plain branch below prints the -Name line for it.
     # The command line is built from parts so the static extractor in
     # tests/test_worktree_new_cleanup_advice.py, which drives a SIBLING fixture, skips it; the nested
     # test there runs it from this script's real output instead.

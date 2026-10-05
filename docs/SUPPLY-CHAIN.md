@@ -49,14 +49,20 @@ flowchart TB
     SIGN["Sigstore keyless signing<br/>sdist, wheels, both SBOMs, VEX"]:::build
     SLSA["SLSA build provenance attestation"]:::build
     GHREL["Create the GitHub release as a draft<br/>artifacts with their Sigstore bundles"]:::build
+  end
+
+  subgraph PUBJOB["release.yml: the publish-pypi job, environment pypi"]
+    CHECK["Fetch the gated files<br/>check each against the release job's digests"]:::build
     PUBTK["Publish the toolkit wheel"]:::build
     PUBENG["Publish the engine sdist and wheel"]:::build
   end
 
   HARN["release-harness job<br/>build wheel, member gate, smoke test"]:::build
+  PUBHARN["publish-pypi-harness job, environment pypi<br/>check the digests, publish the harness wheel"]:::build
   GHPUB["publish-github-release job<br/>publish the draft once every asset is on it"]:::build
   TAGW(["Console tag webconsole-vX.Y.Z pushed"]):::ext
   WEB["release-webconsole job<br/>build wheel, member gate, smoke test, engine floor gate"]:::build
+  PUBWEB["publish-pypi-webconsole job, environment pypi<br/>check the digests, publish the console wheel"]:::build
 
   GH(["GitHub release assets"]):::ext
   PYPI(["PyPI<br/>Trusted Publishing by OIDC, PEP 740 attestations"]):::ext
@@ -83,21 +89,26 @@ flowchart TB
   SBOMIN --> SIGN
   SIGN --> SLSA
   SLSA --> GHREL
-  GHREL --> PUBTK
+  GHREL -->|"hand over files and digests"| CHECK
+  CHECK --> PUBTK
   PUBTK --> PUBENG
   GHREL -->|"draft"| GH
   PUBTK --> PYPI
   PUBENG --> PYPI
-  PUBENG -->|"then"| HARN
+  GHREL -->|"then"| HARN
   HARN -->|"attach wheel to the draft"| GH
-  HARN -.->|"publish"| PYPI
+  HARN -->|"hand over files and digests"| PUBHARN
+  PUBENG -->|"then"| PUBHARN
+  PUBHARN -.->|"publish"| PYPI
   HARN --> GHPUB
+  PUBENG --> GHPUB
   GHPUB -->|"publish the release"| GH
   MAIN -->|"a maintainer tags a console release"| TAGW
   TAGW --> PROV
   PROV --> WEB
   WEB -->|"create release"| GH
-  WEB -.->|"publish"| PYPI
+  WEB -->|"hand over files and digests"| PUBWEB
+  PUBWEB -.->|"publish"| PYPI
 ```
 
 **Legend.** Rounded boxes are events and outside services. The cylinder is the `main` branch. Each
@@ -105,7 +116,7 @@ group's title names the workflow its boxes belong to. The job boxes outside a gr
 `release.yml` too. The merge checks group shows at least the checks that bear on the package. A
 dotted arrow is a publish step that runs when its repository variable is set.
 
-Four facts the labels leave out:
+Facts the labels leave out:
 
 - **The locks.** `uv.lock` is the resolver's record of `pyproject.toml`. `requirements.lock` is its
   hashed export with every extra. The lock sync check fails when `uv.lock` is out of step with
@@ -113,15 +124,24 @@ Four facts the labels leave out:
 - **The merge queue.** `ci.yml` and `security.yml` also trigger on the merge-queue commit. Branch
   protection reads the required checks there. The checked-in list of those checks is
   [`.github/required-contexts.txt`](../.github/required-contexts.txt).
-- **One identity.** In the release job, signing, attestation and publishing all use that job's
-  GitHub OIDC identity. Every PyPI publish in `release.yml` is Trusted Publishing, with no API
-  token.
-- **The order.** A PyPI upload cannot be replaced, so the two publish steps come last in the
-  release job. A blocking step that fails before them stops the job. The SBOM quality score reports
-  and does not block. The toolkit uploads before the engine
+- **Publishing has its own jobs.** The release job signs and attests with its GitHub OIDC
+  identity. Every PyPI publish runs in a separate job that only publishes, names the `pypi`
+  environment and holds nothing but that identity. It downloads the files the build job gated and
+  checks each one against the digests that job recorded. Every PyPI publish is Trusted Publishing,
+  with no API token. A publish job runs only on a tag push, so a manual dry-run never asks for the
+  environment.
+- **The `pypi` environment.** It exists, and it admits only tags matching `v*` or `webconsole-v*`.
+  Each publish waits for a named reviewer to approve it, and an admin cannot skip that approval.
+  One step remains for the owner, once these publish jobs are on `main`: name `pypi` as the
+  environment in each PyPI Trusted Publisher. Until then a publisher with a blank environment would
+  accept a token from any job in `release.yml`, so the approval would not bind.
+- **The order.** A PyPI upload cannot be replaced, so a publish job runs only after the whole job
+  that built its files has passed. A blocking step that fails there stops the publish. The SBOM
+  quality score reports and does not block. The toolkit uploads before the engine
   ([ADR 0201](adr/0201-a-messagefoundry-toolkit-distribution-carries-the-authoring-and-development-tooling-out-of-the-engine-wheel.md)).
 - **The draft.** The engine's GitHub release stays a draft until the harness wheel is on it
-  too. A separate job publishes it last, so no job adds an asset to a published release.
+  too, and until the engine is on PyPI. A separate job publishes it last, so no job adds an asset
+  to a published release.
 - **The provenance gate.** The tagged commit must be on `main`, and each required check's latest
   run on it must have passed. A red run after the merge blocks the tag even if the merge-queue run
   passed. To clear it, re-run the failed job on that commit, then re-run the release. A check

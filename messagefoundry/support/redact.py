@@ -343,11 +343,11 @@ def split_log_lines(text: str) -> list[str]:
     """``text`` split into log lines at LF, CR and CRLF, and nowhere else (vault BACKLOG #2563).
 
     ``str.splitlines`` also ends a line at VT, FF, U+001C to U+001E, U+0085, U+2028 and U+2029. The
-    write-time scrub (:func:`~messagefoundry.controlchars.scrub_control_chars`) escapes the C0 ones but
-    deliberately not the last three, so a logged value holding one of them would read back as two
-    records. The three endings kept are the ones a universal-newline file read recognises, so on those
-    the result equals ``text.splitlines()`` exactly. At least both log tail readers split here, the
-    web console viewer and the support bundle; a new reader should too."""
+    write-time scrub (:func:`~messagefoundry.controlchars.scrub_control_chars`) has escaped all of them
+    since vault BACKLOG #2815, but a line written before that, or by another tool, can still hold one,
+    and would read back as two records. The three endings kept are the ones a universal-newline file
+    read recognises, so on those the result equals ``text.splitlines()`` exactly. At least both log
+    tail readers split here, the web console viewer and the support bundle; a new reader should too."""
     lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     if lines[-1] == "":
         lines.pop()  # a final line ending closes the last line; it does not open an empty one
