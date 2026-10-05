@@ -812,7 +812,9 @@ bind-guard ladder above:
   `[logging]` TLS syslog forwarder**. Since BACKLOG #2193 four more are refused the same way:
   **an https `FhirLookup` read, the DICOM C-STORE SCU with `tls = true`, an FTPS upload, and a
   Direct destination that sets a `username`** (a Direct hop with no SMTP credential is not
-  gated: its body is S/MIME-protected and it sends no login). **The OIDC token and JWKS legs** are refused on the same terms,
+  gated: its body is S/MIME-protected and it sends no login). On a first `serve` start a refused
+  outbound is recorded failed and the rest of the graph starts, while a refused `FhirLookup` stops
+  the start (measured for BACKLOG #2193; `check`, dry-run and reload fail as a whole). **The OIDC token and JWKS legs** are refused on the same terms,
   each leg on its own host, when `serve` builds the auth service; `messagefoundry check` does not
   build it, so it does not reach them. A non-enforcing instance **warns** instead, and that is the only
   dial left: declaring the instance synthetic used to exempt it and
