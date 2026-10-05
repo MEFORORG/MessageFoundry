@@ -6,6 +6,7 @@ in-process fake SMTP (no real server is ever contacted)."""
 
 from __future__ import annotations
 
+import email.policy
 import smtplib
 import socket
 import ssl
@@ -813,6 +814,30 @@ def test_a_control_character_in_a_header_setting_is_refused_at_load(
         EmailDestination(dest)
 
 
+@pytest.mark.parametrize("code", [0xD800, 0xDC80])
+def test_a_lone_surrogate_in_the_subject_is_refused_at_load(code: int) -> None:
+    # It passes the control-character check. Before vault BACKLOG #2842 a U+D800 subject then raised
+    # UnicodeEncodeError in _build_message at every send, which _send does not convert, and a U+DC80
+    # one went out garbled. The refusal names the setting and never quotes its value.
+    dest = _wire_dest(2525, ["a@hospital.example"])
+    subject = f"Referral {chr(code)} note"
+    dest.settings["subject"] = subject
+    with pytest.raises(ValueError, match="'subject' holds a lone surrogate") as caught:
+        EmailDestination(dest)
+    assert subject not in str(caught.value)
+
+
+def test_a_non_ascii_subject_that_can_be_encoded_is_written_as_utf8() -> None:
+    # The control for the test above: only the unencodable shape is refused. Serialized, because a
+    # U+DC80 subject also builds and reads back equal, and goes wrong only when written.
+    dest = _wire_dest(2525, ["a@hospital.example"])
+    dest.settings["subject"] = "Référence – 患者"
+    msg = EmailDestination(dest)._build_message("PID|1|synthetic")
+    wire = msg.as_bytes(policy=email.policy.SMTP)
+    assert b"Subject: =?utf-8?" in wire
+    assert b"unknown-8bit" not in wire
+
+
 @pytest.mark.parametrize("value", _NON_ROUND_TRIP, ids=["parameter-after-mailbox", "stray-angle"])
 async def test_a_value_that_does_not_read_back_is_refused_before_any_rcpt(
     wire: _WireCapture, value: str
@@ -884,6 +909,9 @@ def _sender_shapes() -> dict[str, str]:
         "shape-g": _quote() + "engine" + "@" + _quote() + "@" + "hospital.example",
         "shape-h": own + ", " + other,
         "shape-i": "Ops <" + own + ">",
+        # A non-ASCII sender would fail every send on a relay without SMTPUTF8 (vault BACKLOG #2842).
+        "non-ascii-local": "zoë" + "@" + "hospital.example",
+        "non-ascii-domain": "engine" + "@" + "höspital.example",
     }
     # Every line break policy.default refuses, the three Unicode ones included.
     for code in (13, 10, 0x85, 0x2028, 0x2029):
@@ -1023,6 +1051,23 @@ def test_a_domain_of_host_characters_in_the_wrong_shape_is_refused(address: str,
 @pytest.mark.parametrize("address", _DOMAIN_CONTROLS)
 def test_a_plain_domain_still_passes_the_address_rule(address: str) -> None:
     assert envelope_address_problem(address) is None
+
+
+@pytest.mark.parametrize(
+    ("key", "why"),
+    [
+        ("non-ascii-local", "the sender has a local part outside plain mailbox characters"),
+        ("non-ascii-domain", "the sender has a non-ASCII domain"),
+    ],
+)
+def test_a_non_ascii_sender_is_refused_at_construction_by_the_address_rule(
+    key: str, why: str
+) -> None:
+    # vault BACKLOG #2842: pins WHICH rule refuses, the address rule applied to the sender in
+    # 07e87db5e6 (PR 1978, #2841). The shared table carries both shapes to Direct and alert mail.
+    dest = _wire_dest(2525, ["a@hospital.example"], sender=_SENDER_SHAPES[key])
+    with pytest.raises(ValueError, match=why):
+        EmailDestination(dest)
 
 
 def test_a_trailing_dot_recipient_never_matched_the_recipient_domain_list() -> None:
