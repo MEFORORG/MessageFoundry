@@ -759,7 +759,7 @@ per tier which of those its code provides, and an operator carries the rest
 | `messages.error`, `queue.last_error` | `safe_exc()` chokepoint | `messages:view_summary`; a holder gets a fixed `****` mask on at least the message open, the message list and search, and the dead-letter list, until the per-message `reveal_errors` act on `GET /messages/{id}` (`messages:view_raw`), which the `message_view` audit row records (BACKLOG #2436) | nulled by `purge_message_bodies` / `purge_dead_letters` |
 | `message_events.detail` | `safe_text()` | `GET /messages/{id}` (`messages:view_raw` + `require_phi_read`); the read itself writes a `viewed` event and a `message_view` audit row. `EventInfo.detail` is **additionally** nulled by `redact_unauthorized` for a caller lacking `messages:view_summary`, so a view_raw-without-view_summary role cannot read it; a holder gets it as a fixed `****` mask for every event kind until the `reveal_errors` act (BACKLOG #2436) | set to `NULL` by `purge_message_bodies` (inherits the body window) |
 | `response.detail` | on an `ack_sent` row, `safe_text(detail, limit=200)` (the bound below); on an outbound reply row, none at the store | `GET /messages/{id}/responses` under `messages:read` + `require_phi_read`; nulled by `redact_unauthorized` for a caller lacking `messages:view_summary`; every read writes a `response.read` audit row | set to `NULL` in place by `purge_message_bodies` |
-| `response.resp_headers` | none at the store: the connector keeps allow-listed header names only, and the store JSON-encodes the values as captured (BACKLOG #154) | **no API surface** — it is not a field of `CapturedResponseInfo` and is never returned by `GET /messages/{id}/responses`; reachable only from a Handler via `response_get(destination)` (ADR 0013/0084) | set to `NULL` in place by `purge_message_bodies` |
+| `response.resp_headers` | none at the store: it JSON-encodes the map the connector captured (BACKLOG #154), and what each connector captures, and from where, is that connector's own | **no API surface** — it is not a field of `CapturedResponseInfo` and is never returned by `GET /messages/{id}/responses`; reachable only from a Handler via `response_get(destination)` (ADR 0013/0084) | set to `NULL` in place by `purge_message_bodies` |
 | `state.value` | none (Handler-authored JSON) | **no read API** — Handler-only via `state_get` | age purge on `[retention].state_max_age_days` (DELETE) |
 | `reference.value` | none | **no read API** — Handler-only via `reference()` | **none** — a snapshot is replaced only by the next sync's build-new-then-flip |
 | `search_presets.criteria` | none (the operator's own needle) | **never returned by the API.** `GET /search/presets` returns names + timestamps only; create is `require_step_up(messages:read)` and audits the needle *shape* only; the needle is loaded **server-side** by `GET /search/layered` and never round-trips. Owner-scoped on every read | **`[retention].search_preset_days`** on every backend — whole-row `DELETE` by last-**used** (the later of `updated_at` and `last_used_at`, #306); `0` = keep forever (the default), so an owner `DELETE` remains the only removal until a window is set |
@@ -780,8 +780,10 @@ per tier which of those its code provides, and an operator carries the rest
   `[redaction bound: dropped N more chars unscanned]` marker. So a stored value can be longer than
   200 characters, by the length of those notes. Each column is `TEXT` on SQLite and Postgres and
   `NVARCHAR(MAX)` on SQL Server, so no declared width can overflow. The count is per call. Text an
-  earlier call already bounded, such as an emit site's `safe_exc()`, is cut again here, and that
-  earlier note or marker can be kept in part, cut away, or counted inside N. Other `safe_text()`
+  earlier call already bounded, such as an emit site's `safe_exc()`, is cut again here. An earlier
+  note or marker is then kept whole when the cut falls before it, or dropped whole and counted inside
+  N, so a stored value ends in one count. A note the scrubber itself rewrote, the BACKLOG #2079 case
+  `safe_text` names, is not recognised and can still be kept in part. Other `safe_text()`
   columns, such as `message_events.detail`, get the same default limit of 200; these three pass it
   explicitly. Until BACKLOG #1797 the store sliced `safe_text(x)[:200]` instead. Once `safe_text`
   began cutting at a token boundary, that slice could cut into the note, and a cut inside its number
@@ -791,8 +793,8 @@ per tier which of those its code provides, and an operator carries the rest
   scrubs both before the cipher and holds them to the 200-character bound above, and
   `connection_event.reason` is scrubbed at its source too. It is also why the tables are documented
   **metadata-only** — a frame, body or HL7 field value must never be written to either.
-- **Logging.** Every tier above passes a `safe_exc()` / `safe_text()` chokepoint **before** it is
-  logged or stored, and the two `reason` columns are held to the 200-character bound above, so what
+- **Logging.** Every tier above whose row names a `safe_exc()` / `safe_text()` chokepoint passes it
+  **before** it is logged or stored, and the two `reason` columns are held to the 200-character bound above, so what
   reaches the rotating log is the same scrubbed value the store holds — never a body.
   [§7](#7-logging--phi-redaction).
 

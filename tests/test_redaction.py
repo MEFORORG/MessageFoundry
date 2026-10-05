@@ -2728,14 +2728,17 @@ def _plain_words(length: int) -> str:
     ("text", "kept"),
     [
         (_plain_words(190) + "…(+150 chars)", 190),
-        (_plain_words(170) + " [redaction bound: dropped 5_000 more chars unscanned]", 170),
+        (_plain_words(170) + " " + redaction._clamp_marker(5_000), 170),
+        # The cut falls in the bound note, and moving back before it would end on a whole count.
+        (_plain_words(150) + "…(+65000 chars) " + redaction._clamp_marker(1_234_567), 150),
     ],
-    ids=["count-note", "bound-note"],
+    ids=["count-note", "bound-note", "count-then-bound-note"],
 )
 def test_a_further_call_does_not_split_a_note_an_earlier_call_wrote(text: str, kept: int) -> None:
     """The store calls ``safe_text`` again on a value an emit site already bounded. The cut must not
-    keep half of the earlier note and glue its own after it, as in ``…(+150…(+7 chars)``. THE
-    CONTROL: the plain whole-token cut does fall inside the note on both texts."""
+    keep half of the earlier note and glue its own after it, as in ``…(+150…(+7 chars)``, nor end on
+    a whole earlier count and add a second. THE CONTROL: the plain whole-token cut does fall inside
+    a note on every text."""
     assert redact(text) == text
     plain = redaction._whole_token_prefix(text, 200)
     fragment = text[kept:plain].strip()
@@ -2743,20 +2746,26 @@ def test_a_further_call_does_not_split_a_note_an_earlier_call_wrote(text: str, k
     assert safe_text(text, limit=200) == f"{text[:kept]}…(+{len(text) - kept} chars)"
 
 
-def test_the_store_pass_over_a_bounded_exception_writes_one_note() -> None:
-    """The path the store takes: ``safe_exc`` at the emit site, then ``safe_text`` at the store,
-    over token widths and message lengths near the bound. The stored text ends in exactly one note,
-    whole. THE CONTROL: on some of these the plain whole-token cut falls inside the first note."""
+def test_the_store_pass_over_a_bounded_exception_keeps_the_most_it_can() -> None:
+    """The path the store takes: ``safe_exc`` at the emit site, then ``safe_text`` at the store, over
+    token widths and message lengths near the bound. The stored head is the plain whole-token cut,
+    or ends just before the first call's note when that cut would fall inside it, and the count is
+    every character held back. THE CONTROL: the cut does fall inside the note on some of these."""
     split = 0
     for width in range(5, 60):
-        for length in range(150, 260):
+        for length in range(189, 260):
             words = ("a" * (width - 1) + " ") * (length // width + 1)
             first = safe_exc(ValueError(words[: length - 1] + "j"))
-            plain = first[: redaction._whole_token_prefix(first, 200)]
-            split += len(first) > 200 and "…(+" in plain and not plain.endswith(" chars)")
+            assert redact(first) == first
             stored = safe_text(first, limit=200)
-            assert stored.count("…(+") <= 1, stored
-            assert "…(+" not in stored or stored.endswith(" chars)"), stored
+            if len(first) <= 200:
+                assert stored == first
+                continue
+            plain = redaction._whole_token_prefix(first, 200)
+            note = first.find("…(+")
+            kept = plain if note == -1 or plain < note else note
+            split += kept != plain
+            assert stored == f"{first[:kept]}…(+{len(first) - kept} chars)", (width, length)
     assert split > 0, "the control does not hold"
 
 

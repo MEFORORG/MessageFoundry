@@ -1786,29 +1786,38 @@ def _whole_token_prefix(text: str, limit: int) -> int:
     return len(text[:end].rstrip(_CUT_CHARS))
 
 
-#: The notes :func:`safe_text` writes, as opener and closer, in the reverse of the order it writes
-#: them. Each note holds a space, so the whole-token cut of a further call can fall inside one. No
-#: opener holds whitespace, so a cut, which falls on whitespace, never splits an opener itself.
-_OWN_NOTES = (("[redaction", " unscanned]"), ("…(+", " chars)"))
+#: The count note :func:`safe_text` writes, as the text before and after its number. One spelling, so
+#: :func:`_clear_of_own_notes` reads the note the code writes.
+_COUNT_OPENER = "…(+"
+_COUNT_CLOSER = " chars)"
+#: The first and last words of :func:`_clamp_marker`'s note, derived from it for the same reason.
+_BOUND_OPENER = _clamp_marker(0).split(" ")[0]
+_BOUND_CLOSER = " " + _clamp_marker(0).rsplit(" ", 1)[1]
 
 
 def _clear_of_own_notes(text: str, kept: int) -> int:
-    """``kept`` moved back to before a note of this module that a cut at ``kept`` would split.
+    """``kept`` moved back so the kept head ends before this module's own notes, never inside one.
 
     The store calls :func:`safe_text` again on a value an emit site already bounded, so the input can
-    end in this module's own notes. The whole-token cut sees the space inside a note as a boundary,
-    so it kept ``…(+150`` and then wrote its own note after it: ``…(+150…(+7 chars)``, two counts
-    glued together. So a note the cut would split goes whole, and the token it is glued to stays. The
-    new note's count still covers every character held back.
+    end in this module's notes. The whole-token cut sees the space inside a note as a boundary, so it
+    kept ``…(+150`` and then wrote its own note after it: ``…(+150…(+7 chars)``, two counts glued
+    together. So a bound note the cut would split goes whole. Then a count note the cut would split,
+    or that the head would end on, goes whole too, so the result ends in one count. That count still
+    covers every character held back. No opener holds whitespace, so a cut never splits an opener.
 
-    One pass, last note first: moving back before a split bound note lands just after a whole count
-    note, if there is one. Only the last opener of each kind before the cut is read. One a peer wrote
-    can only move the cut back, which drops more and never keeps more. Linear in ``kept``: each search
-    is bounded by it."""
-    for opener, closer in _OWN_NOTES:
-        start = text.rfind(opener, 0, kept)
-        if start != -1 and text.find(closer, start, kept) == -1:
-            kept = len(text[:start].rstrip(_CUT_CHARS))
+    Residuals, at least these. Only the last opener of each kind before the cut is read. One a peer
+    wrote, with no closer after it, moves the cut back as far as itself, possibly to nothing. That
+    drops more and never keeps more. A count note the scrubber already rewrote (the BACKLOG #2079 case
+    :func:`safe_text` names) no longer holds its opener, so it is not recognised. Linear in ``kept``:
+    each search is bounded by it."""
+    start = text.rfind(_BOUND_OPENER, 0, kept)
+    if start != -1 and text.find(_BOUND_CLOSER, start, kept) == -1:
+        kept = len(text[:start].rstrip(_CUT_CHARS))
+    start = text.rfind(_COUNT_OPENER, 0, kept)
+    if start != -1 and (
+        text.find(_COUNT_CLOSER, start, kept) == -1 or text.endswith(_COUNT_CLOSER, start, kept)
+    ):
+        kept = len(text[:start].rstrip(_CUT_CHARS))
     return kept
 
 
@@ -1849,7 +1858,7 @@ def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
     message = redact(head).strip()
     if len(message) > limit:
         kept = _clear_of_own_notes(message, _whole_token_prefix(message, limit))
-        message = f"{message[:kept]}…(+{len(message) - kept} chars)"
+        message = f"{message[:kept]}{_COUNT_OPENER}{len(message) - kept}{_COUNT_CLOSER}"
     if dropped:
         message = f"{message} {_clamp_marker(dropped)}"
     return message

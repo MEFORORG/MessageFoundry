@@ -125,8 +125,9 @@ async def test_a_short_value_is_stored_unchanged(tmp_path: Path, write: Writer) 
     assert stored == "connect refused"
 
 
-#: An outer slice on a ``safe_text`` result, the shape #1797 removed.
-_SLICED = re.compile(r"safe_text\([^()]*\)\[:")
+#: A slice on the same line as a ``safe_text`` call, the shape #1797 removed. At least the spellings
+#: the control below names; a slice taken on a later line is not seen.
+_SLICED = re.compile(r"safe_text\(.*\)\)?\s*\[[^\]\n]*:")
 #: The shape each of the three writers uses now.
 _BOUNDED = re.compile(r"safe_text\((?:detail|reason), limit=200\)")
 
@@ -134,8 +135,14 @@ _BOUNDED = re.compile(r"safe_text\((?:detail|reason), limit=200\)")
 @pytest.mark.parametrize("module", ["store.py", "postgres.py", "sqlserver.py"])
 def test_every_backend_passes_the_bound_instead_of_slicing(module: str) -> None:
     """Postgres and SQL Server have no server here, so their three writers are held by source. THE
-    CONTROL: the slice pattern does match the old spelling."""
-    assert _SLICED.search("safe_text(reason)[:200]"), "the control does not hold"
+    CONTROL: the slice pattern does match the old spelling and its near variants."""
+    for old in (
+        "safe_text(reason)[:200]",
+        "safe_text(str(reason))[:200]",
+        "(safe_text(reason))[:200]",
+        "safe_text(reason)[0:200]",
+    ):
+        assert _SLICED.search(old), f"the control does not hold: {old}"
     source = (Path(store_package.__file__).parent / module).read_text(encoding="utf-8")
     assert _SLICED.search(source) is None
     assert len(_BOUNDED.findall(source)) == 3
