@@ -5091,8 +5091,10 @@ class AuthService:
             # Deliberately WITHOUT the idle timeout (BACKLOG #2283). An idle row can come back: a
             # backward clock step or a raised idle setting makes the validator accept it again. So
             # an account holding only idle rows is still probed, and a disabled one keeps accruing
-            # strikes. Filtered, a forward clock step would also make every account look idle,
-            # empty the candidate list, and let the prunes below drop every strike and the hold.
+            # strikes. An idle filter would also let a forward step of more than the idle window
+            # empty the candidates, and the prunes below would drop every strike and the hold. The
+            # read still filters on absolute expiry, so a step past the absolute lifetime does
+            # that today. That predates BACKLOG #2283, and #2283 leaves it open.
             if not await self._store.list_sessions(user.id):
                 continue
             if is_unkeyed:
@@ -9535,8 +9537,9 @@ class AuthService:
         mapping and an added one change an outcome, so the affected set is not derivable from the
         entries alone. Local accounts read neither map and are left alone.
 
-        Enumerates the way the reconciler does -- ``list_users`` filtered on provider and disabled,
-        then ``list_sessions`` -- so this needs no schema change on any backend. Unlike the
+        Enumerates with ``list_users`` filtered on provider and disabled, then revokes each
+        account's unrevoked rows, so this needs no schema change on any backend. The count it
+        returns includes rows already past their limits, which the revoke ends too. Unlike the
         reconciler this is NOT counted against the mass-revoke breaker: that breaker exists to catch
         a directory the engine cannot read, and this is an administrator's own step-up-gated edit.
         """
@@ -9544,11 +9547,11 @@ class AuthService:
         for user in await self._store.list_users():
             if user.auth_provider != AuthProvider.AD.value or user.disabled:
                 continue
-            # No idle timeout here either, as in the reconciler (BACKLOG #2283): an idle row left
-            # unrevoked would come back on the old mapping after a backward clock step or a raised
-            # idle setting.
-            if not await self._store.list_sessions(user.id):
-                continue
+            # Unconditional (BACKLOG #2283). It used to revoke only when ``list_sessions`` found a
+            # row, and that read filters on the wall clock: after a forward clock step past the
+            # absolute lifetime it found none, and those rows would come back on the old mapping
+            # once the clock was set right. ``revoke_user_sessions`` matches every unrevoked row,
+            # whatever the clock says, and costs one statement where the read cost one too.
             revoked += await self._store.revoke_user_sessions(user.id)
         return revoked
 

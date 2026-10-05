@@ -690,6 +690,36 @@ async def test_local_sessions_and_signed_out_users_are_never_probed() -> None:
         await store.close()
 
 
+async def test_a_map_edit_revokes_rows_the_clock_calls_expired() -> None:
+    """BACKLOG #2283: an AD map edit revokes directory sessions so it applies at once. It used to
+    revoke only an account that ``list_sessions`` found a row for, and that read filters on the
+    wall clock, so after a forward step past the absolute lifetime it revoked nothing. Those rows
+    would validate again on the OLD mapping once the clock was set right. Here the row is past its
+    expiry by the clock and still unrevoked; the edit must revoke it."""
+    import time
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, _ad_settings(), ldap=_FakeLdap())  # type: ignore[arg-type]
+        await service.initialize()
+        now = time.time()
+        await store.create_user(
+            user_id="stepped", username="stepped", auth_provider="ad", password_generated=False
+        )
+        await store.create_session(
+            token_hash="stepped-hash", user_id="stepped", expires_at=now - 60, now=now - 120
+        )
+
+        await service.set_ad_group_map([("cn=ops", Role.OPERATOR.value)], actor="test")
+
+        row = await store.get_session("stepped-hash")
+        assert row is not None and row.revoked_at is not None, (
+            "a map edit left a row unrevoked because the clock said it had expired"
+        )
+    finally:
+        await store.close()
+
+
 async def test_a_user_whose_only_session_is_idle_is_still_probed() -> None:
     """BACKLOG #2283: an idle session can come back, after a backward clock step or a raised idle
     setting, so the reconciler keeps probing its account. Skipping it would let a disabled account
