@@ -7826,8 +7826,11 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     alert. A whole-directory outage aborts too, but it is audited as ``auth.ad_reconcile_skipped``
     and pages nothing: the accounts are fine, the directory is not, and the pass is fail-open.
 
-    Reads the RETURNED plan, so it sees only a pass that finished. A pass that raised part-way has
-    already audited the revocations it applied; those rows stand, and no alert is raised for them."""
+    Reads the RETURNED plan, so it sees only a pass that finished. A failed write of the pass's own
+    held, aborted, skipped or unkeyed-binding row no longer ends the pass (BACKLOG #2137): the
+    service logs it at ERROR and returns the plan, so these alerts still fire. A pass that raised
+    part-way for another reason, such as inside one revocation, has already audited the revocations
+    it applied before that point; those rows stand, and no alert is raised for them."""
     if plan.directory_outage:
         return
     if plan.aborted is not None:

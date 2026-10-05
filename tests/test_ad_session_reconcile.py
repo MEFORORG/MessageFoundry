@@ -18,6 +18,7 @@ All directory data here is synthetic.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import uuid
 from dataclasses import replace
@@ -1087,13 +1088,18 @@ async def test_an_unkeyed_binding_is_reported_once_per_process_across_sign_ins()
 
 
 async def test_a_failed_skip_report_neither_stops_the_pass_nor_is_forgotten(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The skip report runs after the pass's work, and is marked only once written (BACKLOG #2027).
 
     One failed audit write must not stop the probes of every other account, which is what a report
     made before probing would do on every pass while the write kept failing. And the failed report
     must be retried, not recorded as done.
+
+    **Changed on purpose by BACKLOG #2137.** This test used to assert that the pass RAISED on the
+    failed write. A pass that raises returns no plan, so the lifespan task raised no alert for the
+    revocations it had already applied. The failure is now logged at ERROR, naming the action, and
+    the pass returns. The retry half is unchanged.
     """
     store = await MessageStore.open(":memory:")
     try:
@@ -1126,9 +1132,14 @@ async def test_a_failed_skip_report_neither_stops_the_pass_nor_is_forgotten(
 
         monkeypatch.setattr(store, "record_audit", failing)
         ldap.probe_keys.clear()
-        with pytest.raises(sqlite3.OperationalError):
-            await service.reconcile_directory_sessions()
+        with caplog.at_level(logging.ERROR, logger="messagefoundry.auth.service"):
+            plan = await service.reconcile_directory_sessions()
+        assert plan.aborted is None, "the failed report ended the pass"
         assert ldap.probe_keys == [("object_id", _object_id_for("jdoe"))], "the pass never probed"
+        assert any(
+            r.levelno == logging.ERROR and "auth.ad_reconcile_binding_unkeyed" in r.getMessage()
+            for r in caplog.records
+        ), "the failed write was not logged at ERROR with its action name"
 
         monkeypatch.setattr(store, "record_audit", real_record)
         await service.reconcile_directory_sessions()

@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sqlite3
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
@@ -561,6 +562,93 @@ async def test_a_pass_the_breaker_also_aborts_still_writes_the_held_row_and_aler
         assert await _alive(service, tokens) == set(names)
         assert service.directory_reconcile_hold is not None
         assert service.directory_reconcile_alert is not None
+
+
+# --- BACKLOG #2137: a failed write of the pass's own row does not end the pass -------------------
+
+
+def _refuse_audit(monkeypatch: pytest.MonkeyPatch, store: MessageStore, action: str) -> None:
+    """Make the store refuse every audit write of ``action``, as a full or failing disk would."""
+    real = store.record_audit
+
+    async def refusing(name: str, **kwargs: Any) -> None:
+        if name == action:
+            raise sqlite3.OperationalError("synthetic: disk I/O error")
+        await real(name, **kwargs)
+
+    monkeypatch.setattr(store, "record_audit", refusing)
+
+
+def _logged_at_error(caplog: pytest.LogCaptureFixture, action: str) -> bool:
+    return any(r.levelno == logging.ERROR and action in r.getMessage() for r in caplog.records)
+
+
+async def test_a_failed_held_row_write_still_alerts_each_revocation_and_the_hold(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The held row is written after the pass's revocations. When that write failed, the pass
+    raised and returned no plan, so the lifespan task raised no alert for the revocations it had
+    already applied, nor for the hold. Now the failure is logged at ERROR and the pass returns."""
+    names = ["u1", "u2", "u3", "gone", "off", "ok1", "ok2", "ok3", "ok4", "ok5"]
+    async with _signed_in_estate(monkeypatch, names) as (directory, service, store, tokens):
+        directory.uac.update({"u1": ABSENT, "u2": NON_NUMERIC, "u3": None, "off": DISABLED})
+        directory.delete("gone")
+        assert (await _pass(service)).hold  # strike 1 for "gone" and "off"
+        _refuse_audit(monkeypatch, store, "auth.ad_reconcile_held")
+        sink = _Sink()
+        with caplog.at_level(logging.ERROR, logger="messagefoundry.auth.service"):
+            plan = await _pass(service, sink)
+        assert plan.hold and plan.aborted is None
+        assert [e[0] for e in sink.events] == [
+            "ad_session_revoked",
+            "ad_session_revoked",
+            "ad_reconcile_held",
+        ]
+        assert await _alive(service, tokens) == set(names) - {"gone", "off"}
+        assert len(await _audited(store, "auth.ad_session_revoked")) == 2
+        assert len(await _audited(store, "auth.ad_reconcile_held")) == 1  # pass 1's row only
+        assert service.directory_reconcile_hold is not None  # latched before the write
+        assert _logged_at_error(caplog, "auth.ad_reconcile_held")
+
+
+async def test_a_failed_aborted_row_write_still_alerts_the_breaker_and_the_hold(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The breaker's own row gets the same answer as the held row: its failed write is logged at
+    ERROR, and the pass still returns its plan, so both alerts fire and the latch still shows."""
+    names = ["u1", "u2"] + [f"gone{i}" for i in range(10)]
+    async with _signed_in_estate(monkeypatch, names) as (directory, service, store, tokens):
+        directory.uac.update({"u1": ABSENT, "u2": ABSENT})
+        for name in names[2:]:
+            directory.delete(name)
+        await _pass(service)
+        _refuse_audit(monkeypatch, store, "auth.ad_reconcile_aborted")
+        sink = _Sink()
+        with caplog.at_level(logging.ERROR, logger="messagefoundry.auth.service"):
+            plan = await _pass(service, sink)
+        assert plan.aborted == "mass_revoke_breaker" and plan.hold
+        assert [e[0] for e in sink.events] == ["ad_reconcile_aborted", "ad_reconcile_held"]
+        assert await _audited(store, "auth.ad_reconcile_aborted") == []
+        assert len(await _audited(store, "auth.ad_reconcile_held")) == 2
+        assert await _alive(service, tokens) == set(names)
+        assert service.directory_reconcile_alert is not None  # latched before the write
+        assert _logged_at_error(caplog, "auth.ad_reconcile_aborted")
+
+
+async def test_a_failed_skipped_row_write_does_not_end_an_outage_pass(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The outage's own row is routed the same way, so an outage pass returns its plan too."""
+    async with _signed_in_estate(monkeypatch, ["jdoe", "asmith"]) as estate:
+        directory, service, store, tokens = estate
+        directory.down = True
+        _refuse_audit(monkeypatch, store, "auth.ad_reconcile_skipped")
+        sink = _Sink()
+        with caplog.at_level(logging.ERROR, logger="messagefoundry.auth.service"):
+            plan = await _pass(service, sink)
+        assert plan.directory_outage and sink.events == []
+        assert await _alive(service, tokens) == {"jdoe", "asmith"}
+        assert _logged_at_error(caplog, "auth.ad_reconcile_skipped")
 
 
 # --- AC-7: the count spans the probe rotation -----------------------------------------------------

@@ -28,6 +28,7 @@ from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from enum import Enum
+from functools import cache
 from types import MappingProxyType
 from typing import Any, Final, Literal, TypeVar
 from uuid import uuid4
@@ -111,7 +112,7 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.credential import constant_time_equal
-from messagefoundry.store.base import AdminStore
+from messagefoundry.store.base import AdminStore, store_driver_errors
 from messagefoundry.store.crypto import MARKER_PREFIX, CipherError
 from messagefoundry.store.store import (
     SCOPE_SOURCE_AD,
@@ -140,6 +141,17 @@ _log = logging.getLogger(__name__)
 _FACTOR_CEREMONIES: Final = frozenset(
     {"mfa_enroll_confirm", "mfa_verify", "webauthn_enroll", "webauthn_assert"}
 )
+
+
+@cache
+def _audit_write_errors() -> tuple[type[Exception], ...]:
+    """What a refused audit write raises, on every store backend (BACKLOG #2137).
+
+    The drivers' own errors, plus the two that :func:`~messagefoundry.store.base.store_driver_errors`
+    asks a caller to add: ``RuntimeError`` for the engine's own refusals (the acquire timeout, a
+    keyless audit append) and ``OSError`` for a connection lost at the socket. Built on first use,
+    because naming a server driver imports it."""
+    return (RuntimeError, OSError, *store_driver_errors())
 
 
 def _warn_if_corpus_unreadable(path: str | None) -> None:
@@ -5234,10 +5246,13 @@ class AuthService:
                 held=await self._store.get_user_by_username(refresh.new_username),
             )
         # ADR 0195. After the revocations, so a held-row audit write that fails cannot stop a
-        # genuine disable or demotion in the same pass from being applied.
+        # genuine disable or demotion in the same pass from being applied. And that failure is
+        # logged rather than raised (BACKLOG #2137), so the pass still returns its plan and the
+        # lifespan task still raises an alert for each revocation above and for the hold.
         await self._record_reconcile_hold(plan)
         # BACKLOG #2027. Reported LAST, on every exit, so an audit write that keeps failing costs
-        # only this report and never stops the probes and revocations above from running.
+        # only this report and never stops the probes and revocations above from running. A
+        # failed write is logged, not raised (BACKLOG #2137), for the same reason as the hold's.
         await self._report_unkeyed_bindings(unkeyed, still_unkeyed=still_unkeyed)
         # What the pass DID, which is what the caller alerts on: a scope revocation skipped at apply
         # time (ADR 0198) was audited as nothing, so it must page as nothing too.
@@ -5497,9 +5512,8 @@ class AuthService:
                 user.username,
                 user.id,
             )
-            await self._audit(
+            written = await self._audit_reconciler_row(
                 "auth.ad_reconcile_binding_unkeyed",
-                actor="<reconciler>",
                 detail=_json(
                     {
                         "reason": DIRECTORY_OBJECT_ID_MISSING,
@@ -5509,7 +5523,8 @@ class AuthService:
                 ),
             )
             # Marked only once the audit row is written, so a failed write is retried next pass.
-            self._reconcile_unkeyed_reported.add(user.id)
+            if written:
+                self._reconcile_unkeyed_reported.add(user.id)
 
     async def _record_reconcile_hold(self, plan: reconcile.ReconcilePlan) -> None:
         """Latch, log and audit an engaged undetermined-wave hold, or release a latched one.
@@ -5523,7 +5538,8 @@ class AuthService:
         Written once per pass that holds, like the breaker's row, so the audit log shows how long it
         lasted. The counts are all it carries: the held accounts' own sign-ins are refused and
         audited on their own rows. The message is latched before the row is written, so a failing
-        audit write still leaves the operator-visible condition set.
+        audit write still leaves the operator-visible condition set. That failure is logged and not
+        raised (BACKLOG #2137; see :meth:`_audit_reconciler_row`).
         """
         if not plan.hold:
             if self._reconcile_hold_alert is not None:
@@ -5541,9 +5557,8 @@ class AuthService:
             f"account can read userAccountControl on every account in [auth].ad_user_search_base."
         )
         _log.error("directory reconcile: %s", self._reconcile_hold_alert)
-        await self._audit(
+        await self._audit_reconciler_row(
             "auth.ad_reconcile_held",
-            actor="<reconciler>",
             detail=_json(
                 {
                     "reason": reconcile.HOLD_REASON,
@@ -5564,9 +5579,8 @@ class AuthService:
                 "session was revoked (fail-open).",
                 plan.probed,
             )
-            await self._audit(
+            await self._audit_reconciler_row(
                 "auth.ad_reconcile_skipped",
-                actor="<reconciler>",
                 detail=_json({"reason": plan.aborted, "probed": plan.probed}),
             )
             return
@@ -5585,9 +5599,10 @@ class AuthService:
             f"ad_bind_dn service account's read rights."
         )
         _log.error("directory reconcile: %s", self._reconcile_alert)
-        await self._audit(
+        # Latched above, before the write, as the hold's message is: a failed write is logged and
+        # not raised, so the breaker's alert still fires and its status still shows (BACKLOG #2137).
+        await self._audit_reconciler_row(
             "auth.ad_reconcile_aborted",
-            actor="<reconciler>",
             detail=_json(
                 {
                     "reason": plan.aborted,
@@ -5597,6 +5612,29 @@ class AuthService:
                 }
             ),
         )
+
+    async def _audit_reconciler_row(self, action: str, *, detail: str) -> bool:
+        """Write one of the reconcile pass's own rows, and say whether it was written.
+
+        BACKLOG #2137. These rows are the held row, the breaker's aborted row, the outage's skipped
+        row and the unkeyed-binding report. Each is written after the pass's revocations, or on a
+        pass that applies none. **A failed write here does not end the pass.** If
+        it raised, the pass would return no plan, and the lifespan task would raise no alert for
+        the revocations already applied, nor for the hold or the breaker. So a store refusal is
+        logged at ERROR, naming the action, and the pass goes on. The log line is then the only
+        record of that row. A per-revocation audit write is not routed through here: that one
+        still raises.
+        """
+        try:
+            await self._audit(action, actor="<reconciler>", detail=detail)
+        except _audit_write_errors():
+            _log.exception(
+                "directory reconcile: the %s audit row could not be written; the pass goes on, "
+                "so its alerts still fire",
+                action,
+            )
+            return False
+        return True
 
     async def _apply_reconcile_revocation(self, revocation: reconcile.SessionRevocation) -> bool:
         """Apply one planned revocation: persist a role re-diff (when that is why), drop the user's
