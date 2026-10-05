@@ -193,6 +193,15 @@ class FrameCodec:
         return FrameDecoder(self, max_frame_bytes=max_frame_bytes)
 
 
+#: Line-end bytes a sender may put after a frame's end byte, such as MLLP's CR trailer or CR LF.
+#: Up to :data:`_FRAME_TAIL_MAX` of them, or of the codec's own ``trailer`` byte, directly after a
+#: completed frame count as that frame's ending, however reads split them (vault BACKLOG #2847).
+#: The cap is what keeps a peer from trickling them to hold a listener's frame deadline off: past
+#: it, they are inter-frame noise like any byte.
+_FRAME_TAIL_BYTES = frozenset(b"\r\n")
+_FRAME_TAIL_MAX = 2
+
+
 class FrameDecoder:
     """Stateful frame reassembler for a :class:`FrameCodec`.
 
@@ -210,6 +219,14 @@ class FrameDecoder:
         self._buf = bytearray()
         self._in_block = False
         self.max_frame_bytes = max_frame_bytes
+        #: Line-end bytes the last completed frame may still take as its ending; 0 once any other
+        #: byte has followed it. See :data:`_FRAME_TAIL_BYTES`.
+        self._tail_left = 0
+        #: Whether the most recent :meth:`feed` held nothing but line-end bytes ending the frame
+        #: before it. Such a read finishes that frame rather than starting anything, which is how a
+        #: listener's frame deadline tells it from inter-frame noise (vault BACKLOG #2847). Set when
+        #: :meth:`feed` is called, before its generator is iterated.
+        self.trailer_only = False
 
     @property
     def in_frame(self) -> bool:
@@ -225,13 +242,36 @@ class FrameDecoder:
         read costs two C-level scans per frame rather than one Python loop iteration per byte.
         Still a lazy generator: a listener that awaits between frames sees each payload as its end
         delimiter is reached, and an over-cap frame later in the same read cannot retract one
-        already yielded.
+        already yielded. :attr:`trailer_only` is decided here, eagerly, so it never describes an
+        earlier read.
         """
+        pos = 0
+        if not self._in_block and self._tail_left:
+            pos = self._skip_tail(data, 0)
+        self.trailer_only = 0 < pos == len(data)
+        return self._frames(data, pos)
+
+    def _skip_tail(self, data: bytes, pos: int) -> int:
+        """Step over the line-end bytes still owed to the last completed frame, from ``pos``."""
+        start, trailer = self._codec.start, self._codec.trailer
+        size, left = len(data), self._tail_left
+        while (
+            left
+            and pos < size
+            and (data[pos] in _FRAME_TAIL_BYTES or data[pos] == trailer)
+            and data[pos] != start
+        ):
+            pos += 1
+            left -= 1
+        # Any other byte ends the allowance: what follows it is not this frame's ending.
+        self._tail_left = left if pos == size else 0
+        return pos
+
+    def _frames(self, data: bytes, pos: int) -> Iterator[bytes]:
         start, end = self._codec.start, self._codec.end
         cap = self.max_frame_bytes
         view = memoryview(data)
         size = len(data)
-        pos = 0
         while True:
             if not self._in_block:
                 opened = data.find(start, pos)
@@ -260,10 +300,12 @@ class FrameDecoder:
                 self._buf.clear()
             else:
                 payload = bytes(view[pos:closed])  # whole frame in this read: no staging copy
-            # End of block. Any trailer that follows is left to be discarded as inter-frame
-            # noise, so a missing/extra trailer is tolerated.
+            # End of block. The line-end bytes that follow are stepped over as this frame's ending,
+            # and anything else is discarded as inter-frame noise, so a missing or extra trailer is
+            # tolerated.
             self._in_block = False
-            pos = closed + 1
+            self._tail_left = _FRAME_TAIL_MAX
+            pos = self._skip_tail(data, closed + 1)
             yield payload
 
 

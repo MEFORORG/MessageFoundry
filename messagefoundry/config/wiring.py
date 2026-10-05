@@ -1614,7 +1614,7 @@ def MLLP(
     max_connections_per_host: int | None = 32,  # cap concurrent clients from ONE peer address
     receive_timeout: float | None = 60.0,  # close a client idle this many seconds (slowloris)
     max_frame_bytes: int | None = 16 * 1024 * 1024,  # cap one frame's bytes (OOM guard); both dirs
-    max_frame_seconds: float | None = 60.0,  # cap one frame's life, start byte to end byte
+    max_frame_seconds: float | None = 60.0,  # cap one frame's life, from its first byte of any kind
     max_inflight_frames: int
     | None = 32,  # inbound: cap frames in the pre-ACK handling path at once, per listener
     # INBOUND message-RATE pacing. Unlike the caps above these default to OFF, and that is ruled
@@ -1676,8 +1676,9 @@ def MLLP(
     the listener and ``max_connections_per_host`` (32) bounds concurrent sockets from ONE peer
     address, which is the term ``max_connections`` does not carry since it counts sockets rather than
     hosts. ``receive_timeout`` (60 s) bounds SILENCE between reads and **resets on every byte
-    received**, so ``max_frame_seconds`` (60 s) bounds one frame's life from its start byte to its
-    end byte — that is what reaches a peer trickling a byte at a time, which is never idle.
+    received**, so ``max_frame_seconds`` (60 s) bounds one frame's life from the first byte of any
+    kind after the last completed frame — that is what reaches a peer trickling a byte at a time,
+    which is never idle (vault BACKLOG #2847 moved the start off the start byte).
     ``max_frame_bytes`` (16 MiB) bounds the same frame's size. ``max_inflight_frames`` (32, inbound
     only) bounds how many complete frames the listener hands to its handler at once; a frame over
     it waits for a slot and is never refused. Each is disabled by ``None``/``0``.
@@ -1861,7 +1862,7 @@ def Tcp(
     max_frame_bytes: int | None = 16 * 1024 * 1024,  # cap one frame's bytes (OOM guard); both dirs
     max_connections_per_host: int
     | None = 32,  # inbound: cap concurrent clients from ONE peer address
-    max_frame_seconds: float | None = 60.0,  # inbound: cap one frame's life, start byte to end byte
+    max_frame_seconds: float | None = 60.0,  # inbound: cap one frame's life, from its first byte
     # INBOUND message-RATE pacing (BACKLOG #1114) — the MLLP pacer, ported. Unlike the caps above
     # these default to OFF, and that is ruled rather than accidental: a rate on a clinical interface
     # is only safe at a number taken from a real feed profile. Over budget the listener PAUSES
@@ -1900,8 +1901,8 @@ def Tcp(
     **Inbound connection bounds (vault BACKLOG #2606)** are MLLP's, at MLLP's defaults:
     ``max_connections_per_host`` (32) caps concurrent sockets from ONE peer address, so set it to
     ``None``/``0`` behind a source-NAT proxy where every partner shares one address; and
-    ``max_frame_seconds`` (60 s) bounds one frame from its start byte to its end byte, which is what
-    reaches a peer that trickles bytes and so is never idle. Raise it with ``max_frame_bytes``.
+    ``max_frame_seconds`` (60 s) bounds one frame from the first byte of any kind after the last
+    completed frame, which is what reaches a peer that trickles bytes and so is never idle. Raise it with ``max_frame_bytes``.
 
     **Inbound message-rate pacing (BACKLOG #1114).** ``max_messages_per_second`` bounds how fast one
     accepted connection may feed messages in; ``message_burst`` is how large a burst passes before the

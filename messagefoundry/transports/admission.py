@@ -13,7 +13,7 @@ refusal (vault BACKLOG #2606). This module holds those controls once.
 * :class:`RefusalLog` is the per-address, windowed log throttle the DICOM server introduced, moved here
   so the four socket listeners and the DICOM server share one.
 * :class:`FrameClock` is the frame deadline: the bound on one frame from its first byte to its last.
-  The MLLP read loop keeps its own copy of the logic and reads its arithmetic from here.
+  The MLLP, raw-TCP and X12 read loops all run it (vault BACKLOG #2847 moved MLLP onto it).
 
 Everything here runs before ingress, so no message is read, persisted or acknowledged by it. The
 ACK-on-receipt and count-and-log invariants are untouched: a refused connection has delivered
@@ -41,8 +41,6 @@ __all__ = [
     "ListenerAdmission",
     "Refusal",
     "RefusalLog",
-    "frame_seconds_left",
-    "read_budget",
 ]
 
 logger = logging.getLogger(__name__)
@@ -248,7 +246,7 @@ class ListenerAdmission:
         )
 
 
-def frame_seconds_left(opened_at: float | None, max_frame_seconds: float | None) -> float | None:
+def _frame_seconds_left(opened_at: float | None, max_frame_seconds: float | None) -> float | None:
     """Seconds left on the open frame's deadline, or ``None`` when no deadline is running.
 
     ``None`` means the bound has nothing to say: it is off, or no frame is open. The result may be
@@ -259,7 +257,7 @@ def frame_seconds_left(opened_at: float | None, max_frame_seconds: float | None)
     return max_frame_seconds - (time.monotonic() - opened_at)
 
 
-def read_budget(receive_timeout: float | None, frame_left: float | None) -> float | None:
+def _read_budget(receive_timeout: float | None, frame_left: float | None) -> float | None:
     """How long the next read may block: the idle bound, the open frame's remaining life, or the
     smaller of the two. ``None`` only when neither bound is configured."""
     if frame_left is None:
@@ -290,6 +288,9 @@ class FrameClock:
         self.receive_timeout = receive_timeout
         #: Monotonic stamp of the read that carried the current frame's first byte, or None.
         self.opened_at: float | None = None
+        #: True while the running clock was started by bytes outside any frame and no frame has
+        #: opened since, so the drop line can say that rather than "a frame did not complete".
+        self._noise_only = False
 
     def withhold(self, since: float) -> None:
         """Push the open frame's start forward by the time the engine declined to read since
@@ -307,12 +308,12 @@ class FrameClock:
         decided before it, never re-measured after a timeout: at the boundary a re-measure would read
         a small positive remainder and misname a frame deadline as an idle timeout.
         """
-        left = frame_seconds_left(self.opened_at, self.max_frame_seconds)
+        left = _frame_seconds_left(self.opened_at, self.max_frame_seconds)
         if left is not None and left <= 0.0:
             # Spent while we were not waiting on the socket: bytes arrived at or past the deadline.
             self._log_frame_deadline(writer)
             return b"", "frame_deadline"
-        budget = read_budget(self.receive_timeout, left)
+        budget = _read_budget(self.receive_timeout, left)
         if budget is None:
             return await reader.read(4096), None
         try:
@@ -328,6 +329,15 @@ class FrameClock:
         Socket metadata only, never frame bytes. One line per dropped connection, like
         `frame_oversize`: reaching it costs the peer a connection held for `max_frame_seconds`, so
         the connection caps bound its rate."""
+        if self._noise_only:
+            logger.warning(
+                "%s peer %s sent bytes outside any frame and completed no frame within "
+                "max_frame_seconds (%.1fs); dropping the connection",
+                self.transport,
+                writer.get_extra_info("peername"),
+                self.max_frame_seconds,
+            )
+            return
         logger.warning(
             "%s frame from %s did not complete within max_frame_seconds (%.1fs); "
             "dropping the connection",
@@ -336,7 +346,7 @@ class FrameClock:
             self.max_frame_seconds,
         )
 
-    def after_read(self, *, in_frame: bool, decoded: int) -> None:
+    def after_read(self, *, in_frame: bool, decoded: int, trailer_only: bool) -> None:
         """Restamp after the decoder consumed a non-empty read.
 
         A read that completed a frame restarts the clock: a NEW frame if one is open after it, none
@@ -345,9 +355,18 @@ class FrameClock:
         running, WHETHER OR NOT the decoder counts a frame as open: bytes the decoder discards
         outside a frame reset the idle bound just as frame bytes do, so a deadline that waited for
         ``in_frame`` would never reach a peer trickling them. So any bytes must lead to a completed
-        frame within ``max_frame_seconds``.
+        frame within ``max_frame_seconds`` of read time; the engine's own waits are withheld.
+
+        ``trailer_only`` (:attr:`~messagefoundry.framing.FrameDecoder.trailer_only`) is the one
+        exception: a read holding only the line-end bytes that end the frame before it, such as
+        MLLP's CR arriving after its FS, belongs to that completed frame and starts nothing (vault
+        BACKLOG #2847). Without it a healthy peer that went quiet after such a read would be cut
+        here. It is required, so a new caller cannot leave it out by accident.
         """
         if decoded:
             self.opened_at = time.monotonic() if in_frame else None
-        elif self.opened_at is None:
+        elif self.opened_at is None and not trailer_only:
             self.opened_at = time.monotonic()
+            self._noise_only = True
+        if in_frame:
+            self._noise_only = False

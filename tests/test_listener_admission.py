@@ -11,6 +11,9 @@ they hold whichever way the admission code is arranged inside the listener.
 Each refusal test carries its own control: the same drive with the bound switched off, or the same
 listener admitting a peer that is within its budget. A refusal that a broken harness produced would
 read as a working cap without one.
+
+Vault BACKLOG #2847 moved the MLLP listener onto the same frame clock, so MLLP joins most of the
+frame-deadline tests here, and it put the MLLP stop()'s per-host reset in a ``finally``.
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Source
+from messagefoundry.framing import MLLP_CODEC, STX_ETX_CODEC, FrameCodec
 from messagefoundry.parsing.x12.interchange import X12FrameReader
 from messagefoundry.transports import admission
 from messagefoundry.transports.admission import ListenerAdmission, RefusalLog
@@ -191,9 +195,20 @@ async def test_the_http_listener_applies_a_per_host_cap_an_operator_sets() -> No
 
 def _frame_start(kind: str) -> tuple[bytes, bytes]:
     """The bytes that open a frame, and a byte to trickle inside it."""
+    if kind == "mllp":
+        return b"\x0b", b"A"
     if kind == "tcp":
         return b"\x02", b"A"
     return EDI.encode("ascii")[:120], b"*"
+
+
+def _whole_frame(kind: str, payload: str = "PAYLOAD") -> bytes:
+    """One complete frame for ``kind``. X12 always sends the synthetic interchange."""
+    if kind == "mllp":
+        return MLLP_CODEC.frame(payload)
+    if kind == "tcp":
+        return STX_ETX_CODEC.frame(payload)
+    return EDI.encode("ascii")
 
 
 async def _trickle(port: int, kind: str, seconds: float) -> bool:
@@ -224,7 +239,7 @@ async def _trickle(port: int, kind: str, seconds: float) -> bool:
         await _close(writer)
 
 
-@pytest.mark.parametrize("kind", ["tcp", "x12"])
+@pytest.mark.parametrize("kind", ["mllp", "tcp", "x12"])
 async def test_the_frame_deadline_closes_a_peer_trickling_inside_a_frame(kind: str) -> None:
     events = _Events()
     source = _build(kind, max_frame_seconds=0.5, receive_timeout=5.0)
@@ -238,10 +253,12 @@ async def test_the_frame_deadline_closes_a_peer_trickling_inside_a_frame(kind: s
     await _run(source, body)
 
 
-@pytest.mark.parametrize("kind", ["tcp", "x12"])
+@pytest.mark.parametrize("kind", ["mllp", "tcp", "x12"])
 async def test_the_frame_deadline_also_closes_a_peer_trickling_outside_any_frame(kind: str) -> None:
     """Bytes the decoder discards outside a frame reset the idle bound too, so the deadline must
-    start on them as well, or such a peer would hold its slot for as long as it kept sending."""
+    start on them as well, or such a peer would hold its slot for as long as it kept sending.
+
+    On MLLP this is vault BACKLOG #2847: its clock used to start only on a start byte."""
     events = _Events()
     source = _build(kind, max_frame_seconds=0.5, receive_timeout=5.0)
     source.on_connection_event = events
@@ -283,7 +300,7 @@ def test_a_late_stop_does_not_wipe_a_restarted_listeners_counts() -> None:
     assert gate.per_host == {}
 
 
-@pytest.mark.parametrize("kind", ["tcp", "x12"])
+@pytest.mark.parametrize("kind", ["mllp", "tcp", "x12"])
 async def test_with_the_frame_deadline_off_the_trickling_peer_stays(kind: str) -> None:
     """CONTROL for the test above: the same drive, with only the deadline switched off."""
     source = _build(kind, max_frame_seconds=0, receive_timeout=5.0)
@@ -315,7 +332,7 @@ async def test_a_pipelined_sender_is_not_cut_off_by_the_frame_deadline(kind: str
 
     source = _build(kind, max_frame_seconds=0.4, receive_timeout=5.0)
     source.on_connection_event = events
-    frame = b"\x02" + b"PAYLOAD" + b"\x03" if kind == "tcp" else EDI.encode("ascii")
+    frame = _whole_frame(kind)
 
     async def body(port: int) -> None:
         _reader, writer = await asyncio.open_connection("127.0.0.1", port)
@@ -333,6 +350,134 @@ async def test_a_pipelined_sender_is_not_cut_off_by_the_frame_deadline(kind: str
 
     await _run(source, body, handler)
     assert "frame_deadline" not in events.reasons("closed")
+
+
+@pytest.mark.parametrize("kind", ["mllp", "tcp", "x12"])
+async def test_whole_frames_with_quiet_gaps_longer_than_the_deadline_are_not_cut_off(
+    kind: str,
+) -> None:
+    """CONTROL for the any-byte clock: a completed frame STOPS the clock, so a peer that sends whole
+    frames at a normal pace, quiet for longer than the deadline between them, is never dropped. A
+    clock that kept running after a completed frame would cut this feed at the first gap."""
+    events = _Events()
+    received: list[bytes] = []
+
+    async def handler(raw: bytes) -> str | None:
+        received.append(raw)
+        return None
+
+    source = _build(kind, max_frame_seconds=0.3, receive_timeout=5.0)
+    source.on_connection_event = events
+
+    async def body(port: int) -> None:
+        _reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        for _ in range(3):
+            writer.write(_whole_frame(kind))
+            await writer.drain()
+            await asyncio.sleep(0.5)  # quiet, for longer than max_frame_seconds
+        assert await _until(lambda: len(received) == 3)
+        assert events.count("closed") == 0, events.events
+        await _close(writer)
+
+    await _run(source, body, handler)
+    assert "frame_deadline" not in events.reasons("closed")
+
+
+@pytest.mark.parametrize(
+    ("kind", "after", "cut"),
+    [
+        ("mllp", b"\r", False),
+        (
+            "mllp",
+            b"\n",
+            False,
+        ),  # after a trailer that arrived with the FS: CR LF split as FS CR | LF
+        ("tcp", b"\r", False),
+        ("mllp", b"Z", True),  # CONTROL: any other byte after a completed frame starts the clock
+        ("mllp", b"\r\n\r", True),  # CONTROL: line ends past the two-byte allowance are noise
+    ],
+)
+async def test_line_end_bytes_ending_a_frame_do_not_start_the_frame_deadline(
+    kind: str, after: bytes, cut: bool
+) -> None:
+    """Up to two line-end bytes after a frame's end byte belong to that frame. When they reach the
+    listener in a read of their own (a TCP segment or a 4096-byte read boundary after the FS), they
+    must start nothing, or a healthy peer that then goes quiet is cut as `frame_deadline` (vault
+    BACKLOG #2847 review). The raw-TCP case runs the MLLP codec through `framing="mllp"`."""
+    events = _Events()
+    received: list[bytes] = []
+
+    async def handler(raw: bytes) -> str | None:
+        received.append(raw)
+        return None
+
+    framing = {"framing": "mllp"} if kind == "tcp" else {}
+    source = _build(kind, max_frame_seconds=0.3, receive_timeout=5.0, **framing)
+    source.on_connection_event = events
+    whole = _whole_frame("mllp")
+    # The `\n` row sends the CR with the frame, so the LF is the second line-end byte.
+    first = whole if after == b"\n" else whole[:-1]
+
+    async def body(port: int) -> None:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        closed = asyncio.ensure_future(reader.read())
+        try:
+            writer.write(first)
+            await writer.drain()
+            assert await _until(lambda: len(received) == 1)
+            writer.write(after)
+            await writer.drain()
+            await asyncio.wait({closed}, timeout=0.9)  # quiet, for three times max_frame_seconds
+        finally:
+            closed.cancel()
+            with contextlib.suppress(BaseException):
+                await closed
+            await _close(writer)
+
+    await _run(source, body, handler)
+    assert ("frame_deadline" in events.reasons("closed")) is cut, events.events
+
+
+def test_the_decoder_marks_only_a_frames_own_line_ends_as_trailer_only() -> None:
+    decoder = MLLP_CODEC.decoder()
+    whole = MLLP_CODEC.frame("PAYLOAD")
+    assert list(decoder.feed(whole[:-1])) == [b"PAYLOAD"]
+    assert not decoder.trailer_only
+    assert list(decoder.feed(b"\r")) == []
+    assert decoder.trailer_only, "the CR ending the frame"
+    assert list(decoder.feed(b"\n")) == []
+    assert decoder.trailer_only, "the LF of a CR LF ending"
+    # CONTROL: a third line-end byte is past the allowance, so it is noise like any other byte.
+    assert list(decoder.feed(b"\r")) == []
+    assert not decoder.trailer_only
+    # CONTROL: a byte that is not a line end ends the allowance for what follows it too.
+    assert list(decoder.feed(whole[:-1])) == [b"PAYLOAD"]
+    assert list(decoder.feed(b"Z")) == []
+    assert not decoder.trailer_only
+    assert list(decoder.feed(b"\r")) == []
+    assert not decoder.trailer_only
+    # A whole frame with its CR leaves one byte of allowance, for an LF.
+    assert list(decoder.feed(whole)) == [b"PAYLOAD"]
+    assert list(decoder.feed(b"\n")) == []
+    assert decoder.trailer_only
+    # Decided when feed() is called, before its generator runs, so it never describes a past read.
+    assert list(decoder.feed(whole)) == [b"PAYLOAD"]
+    decoder.feed(b"Z")  # not iterated
+    assert not decoder.trailer_only
+    # STX/ETX framing takes the same line-end allowance.
+    plain = STX_ETX_CODEC.decoder()
+    assert list(plain.feed(STX_ETX_CODEC.frame("P"))) == [b"P"]
+    assert list(plain.feed(b"\r\n")) == []
+    assert plain.trailer_only
+    # A configured trailer that is not a line end is part of the allowance too.
+    eot = FrameCodec(start=0x02, end=0x03, trailer=0x04).decoder()
+    assert list(eot.feed(b"\x02P\x03")) == [b"P"]
+    assert list(eot.feed(b"\x04")) == []
+    assert eot.trailer_only
+    # CONTROL: the same byte on a codec without that trailer is noise.
+    assert list(plain.feed(STX_ETX_CODEC.frame("P"))) == [b"P"]
+    assert list(plain.feed(b"\x04")) == []
+    assert not plain.trailer_only
 
 
 def test_the_x12_reader_reports_an_open_interchange() -> None:
@@ -463,6 +608,65 @@ async def test_a_connection_reaching_a_stopping_listener_is_refused_unread(kind:
     assert calls == []
 
 
+@pytest.mark.parametrize("how", ["cancelled", "raises"])
+@pytest.mark.parametrize("kind", ["mllp", "tcp", "x12"])
+async def test_a_stop_cut_short_in_its_wait_still_clears_the_per_host_count(
+    kind: str, how: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """stop()'s per-host reset runs in a ``finally``; vault BACKLOG #2847 added it on MLLP, and the
+    other two already had it. A client held inside its handler keeps stop() in its grace wait; the
+    wait is then cancelled, or raises. Without the ``finally`` the count survives, and a restarted
+    listener would refuse that address early."""
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(raw: bytes) -> str:
+        entered.set()
+        await release.wait()
+        return build_ack(raw, code="AA")
+
+    source = _build(kind)
+    await source.start(handler)
+    gate = source._admission  # type: ignore[attr-defined]
+    client_tasks = source._client_tasks  # type: ignore[attr-defined]
+    writer: asyncio.StreamWriter | None = None
+    try:
+        _reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)  # type: ignore[attr-defined]
+        writer.write(_whole_frame(kind, HL7))
+        await writer.drain()
+        await asyncio.wait_for(entered.wait(), 3.0)
+        # CONTROL: the count the stop must clear is really there before it runs.
+        assert gate.per_host == {"127.0.0.1": 1}
+        if how == "cancelled":
+            stopping = asyncio.ensure_future(source.stop())
+            await asyncio.sleep(0.1)  # inside the 5 s client-task grace wait
+            assert not stopping.done(), "stop() did not wait on the held client"
+            stopping.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await stopping
+        else:
+            real_wait = asyncio.wait
+
+            async def failing_wait(fs: Any, *args: Any, **kwargs: Any) -> Any:
+                # Fail only the listener's own client-task wait; any other task on the shared loop
+                # that calls asyncio.wait meanwhile gets the real one.
+                fs = list(fs)
+                if any(task in client_tasks for task in fs):
+                    raise RuntimeError("synthetic failure in stop()'s client-task wait")
+                return await real_wait(fs, *args, **kwargs)
+
+            with monkeypatch.context() as patch:
+                patch.setattr(asyncio, "wait", failing_wait)
+                with pytest.raises(RuntimeError, match="synthetic failure"):
+                    await source.stop()
+        assert gate.per_host == {}, "a stop() cut short left a stale per-host count behind"
+    finally:
+        release.set()
+        if writer is not None:
+            await _close(writer)
+        await asyncio.wait_for(source.stop(), timeout=10.0)
+
+
 # --- A normal frame still flows, and is answered, with every new bound at its default -------------
 
 
@@ -471,7 +675,7 @@ async def test_mllp_still_acks_a_normal_frame() -> None:
 
     async def body(port: int) -> None:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
-        writer.write(b"\x0b" + HL7.encode("ascii") + b"\x1c\r")
+        writer.write(_whole_frame("mllp", HL7))
         await writer.drain()
         ack = await asyncio.wait_for(reader.readuntil(b"\x1c\r"), 5.0)
         assert b"MSA|AA|MSG0001" in ack
@@ -489,7 +693,7 @@ async def test_raw_tcp_and_x12_still_hand_over_a_normal_frame_and_reply(kind: st
         return "OK"
 
     source = _build(kind)
-    frame = b"\x02" + HL7.encode("ascii") + b"\x03" if kind == "tcp" else EDI.encode("ascii")
+    frame = _whole_frame(kind, HL7)
 
     async def body(port: int) -> None:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
