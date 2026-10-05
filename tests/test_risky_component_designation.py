@@ -1170,12 +1170,45 @@ _HIGHLIGHTED = "**Highlighted as risky on what it carries:**"
 _READ = "**Read from the carried project's own advisories:**"
 
 
+#: The forms the survey answers for, with the words the page uses for each. Compiled code is the
+#: wheel's own top-level answer in the record; the other two are entries under these keys.
+_FORMS = {"compiled": "compiled code", "source": "source code", "data": "data"}
+#: What the page must say about its own rule, once. Held here in this module's own words, so a
+#: renderer that drops or reverses the rule cannot pass by agreeing with itself.
+_CRITERION = (
+    "A wheel that is not designated is owed a route when it carries another project's code, "
+    "compiled or source.",
+    "A wheel that carries only another project's data is listed below with what it carries.",
+    "It is owed no route, because data is read and not run.",
+    "A wheel whose answer is not established, for any form, is treated as carrying code.",
+)
+
+
+def _said(wheel: dict[str, Any], form: str) -> object:
+    """The record's answer for one form, or ``None`` where the wheel has no entry for it."""
+    answer = wheel if form == "compiled" else wheel.get(form)
+    return answer.get("carries") if isinstance(answer, dict) else None
+
+
+def _counts_as_code(wheel: dict[str, Any]) -> bool:
+    """Whether the wheel counts as carrying another project's code, by this module's own rule.
+
+    Code in either form counts, and so does any answer that was not established: a wheel nobody
+    listed cannot be called data only.
+    """
+    return (
+        _said(wheel, "compiled") != "no"
+        or _said(wheel, "source") != "no"
+        or _said(wheel, "data") not in ("yes", "no")
+    )
+
+
 def _owed_a_route(survey: dict[str, Any]) -> set[str]:
-    """The not-designated names the survey did not show to carry nothing.
+    """The not-designated names that count as carrying another project's code.
 
     This module's own reading of the tiers and of the record, not the generator's rule.
     """
-    return {w["name"] for w in survey["wheels"] if w["carries"] != "no"} - _designated()
+    return {w["name"] for w in survey["wheels"] if _counts_as_code(w)} - _designated()
 
 
 def _survey_page_drift(page: str, survey: dict[str, Any]) -> list[str]:
@@ -1186,21 +1219,46 @@ def _survey_page_drift(page: str, survey: dict[str, Any]) -> list[str]:
     head, _, read = section.partition(f"\n{_READ}\n")
     found, _, highlighted = head.partition(f"\n{_HIGHLIGHTED}\n")
     wheels = survey["wheels"]
-    counts = {a: sum(w["carries"] == a for w in wheels) for a in component_readings.CARRIES}
     size = len(wheels)
-    sentence = (
-        f"**Carries another project's compiled code: {counts['yes']} of {size}. Does not: "
-        f"{counts['no']}. Not established: {counts['not established']}. {counts['yes']} plus "
-        f"{counts['no']} plus {counts['not established']} is {size}.**"
-    )
+    flat = " ".join(section.split())
     problems = []
-    if sentence not in " ".join(section.split()):
-        problems.append(f"the page does not state {sentence!r}")
-    carrying = {w["name"] for w in wheels if w["carries"] != "no"}
+    for form, words in _FORMS.items():
+        said = [_said(w, form) for w in wheels]
+        yes, no, unknown = (said.count(a) for a in component_readings.CARRIES)
+        sentence = (
+            f"**Carries another project's {words}: {yes} of {size}. Does not: {no}. "
+            f"Not established: {unknown}. {yes} plus {no} plus {unknown} is {size}.**"
+        )
+        if sentence not in flat:
+            problems.append(f"the page does not state {sentence!r}")
+    for sentence in _CRITERION:
+        if flat.count(sentence) != 1:
+            problems.append(f"criterion: the page does not state once {sentence!r}")
+    carrying = {w["name"] for w in wheels if any(_said(w, f) != "no" for f in _FORMS)}
     if _table_names(found) != carrying:
         problems.append(
             f"found: page names {sorted(_table_names(found))}, the survey {sorted(carrying)}"
         )
+    # One row per wheel and form that is not a plain "no", so a wheel cannot be listed for its
+    # compiled code while what it carries in another form goes unsaid.
+    rows = found.splitlines()
+    for wheel in wheels:
+        for form, words in _FORMS.items():
+            start = f"| `{wheel['name']}` | {wheel['pinned']} | {words} |"
+            if (_said(wheel, form) != "no") != any(row.startswith(start) for row in rows):
+                problems.append(f"row: the page and the survey differ on {wheel['name']}, {form}")
+    data_only = sorted(
+        w["name"] for w in wheels if not _counts_as_code(w) and _said(w, "data") == "yes"
+    )
+    if data_only:
+        listed = ", ".join(f"`{name}`" for name in data_only)
+        if f"another project's data and none of its code: {listed}." not in flat:
+            problems.append(f"data only: the page does not list {data_only}")
+        loose = sorted(set(data_only) - _designated())
+        if loose and (
+            f"Not designated among them: {', '.join(f'`{name}`' for name in loose)}." not in flat
+        ):
+            problems.append(f"data only: the page does not name the not-designated {loose}")
     for label, table, route in (("highlighted", highlighted, "highlight"), ("read", read, "read")):
         want = {w["name"] for w in wheels if w.get("route") == route}
         if _table_names(table) != want:
@@ -1212,8 +1270,9 @@ def _survey_page_drift(page: str, survey: dict[str, Any]) -> list[str]:
 
 def test_every_assessed_wheel_has_a_survey_answer_and_every_owed_route_is_recorded() -> None:
     """RED when: a name in an assessed closure has no survey answer, the survey answers for a name
-    no closure carries, or a not-designated wheel that carries another project's compiled code,
-    or whose answer is not established, has no route.
+    no closure carries, a wheel lacks an answer for one of the three forms, or a not-designated
+    wheel that carries another project's code, compiled or source, has no route. An answer that
+    is not established counts as code. A wheel that carries only data must have no route.
 
     The names are held to the closure files here, not to the snapshot, so a dependency that enters
     a closure needs a survey answer in the same pull request. A version bump alone does not turn
@@ -1239,7 +1298,9 @@ def test_every_assessed_wheel_has_a_survey_answer_and_every_owed_route_is_record
 
 
 def test_the_page_states_what_the_survey_found_and_the_route_each_wheel_took() -> None:
-    """RED when: the page's survey tables or counts disagree with the record.
+    """RED when: the page's survey tables or counts disagree with the record, for any of the
+    three forms; a wheel and form that is not a plain "no" has no row; the wheels that carry only
+    data are not listed; or the page does not state its criterion once.
 
     Independent of the renderer: see ``_survey_page_drift``. The exact text is held by
     ``test_the_rendered_section_is_the_tracked_one``.
@@ -1262,8 +1323,14 @@ def test_the_survey_checks_can_fail() -> None:
     labels = component_readings.designation_labels(page)
     wheels = survey["wheels"]
     carried = [{"name": "another project", "version": "1.0"}]
-    plain = next(w for w in wheels if w["name"] not in labels and w["carries"] == "no")
+    plain = next(
+        w
+        for w in wheels
+        if w["name"] not in labels and all(_said(w, form) == "no" for form in _FORMS)
+    )
     ranked = next(w for w in wheels if w["name"] in labels)
+    # A metadata answer lists no wheel, so its source and data answers cannot be established.
+    unknown = {"carries": "not established", "projects": [], "evidence": "the wheel was not read"}
     # The same two wheels in a known shape: one routed and highlighted, one designated and carrying.
     routed = {
         **plain,
@@ -1271,6 +1338,8 @@ def test_the_survey_checks_can_fail() -> None:
         "projects": carried,
         "evidence_kind": component_readings.METADATA_ONLY,
         "files_read": [],
+        "source": unknown,
+        "data": unknown,
         "route": "highlight",
         "route_reason": "a reason",
     }
@@ -1280,6 +1349,8 @@ def test_the_survey_checks_can_fail() -> None:
         "projects": carried,
         "evidence_kind": component_readings.METADATA_ONLY,
         "files_read": [],
+        "source": unknown,
+        "data": unknown,
         "route": None,
     }
     base = [routed if w is plain else designated if w is ranked else w for w in wheels]
@@ -1363,6 +1434,49 @@ def test_the_survey_checks_can_fail() -> None:
     assert name in _owed_a_route({**survey, "wheels": base})
     assert name not in _owed_a_route(survey)
 
+    # The three forms, on the tracked record. ``plain`` is not designated and carries nothing, so
+    # each change below is the only thing wrong with it.
+    yes = {"carries": "yes", "projects": carried, "evidence": "a file list"}
+    reason = {"route": "highlight", "route_reason": "a reason"}
+
+    def one(change: dict[str, Any], record: dict[str, Any] = survey) -> list[str]:
+        changed = [{**w, **change} if w is plain else w for w in wheels]
+        return component_readings.survey_problems({**record, "wheels": changed}, data, labels)
+
+    # Data alone owes no route and takes none. Code in source form owes one, and takes it.
+    assert one({"data": yes}) == []
+    assert one({"source": yes, **reason}) == []
+    for change, problem in (
+        ({"source": None}, f"{name}: no answer for source"),
+        ({"data": {**yes, "carries": "maybe"}}, f"{name}: no answer for data"),
+        ({"source": {**yes, "projects": []}}, f"{name}: the source answer 'yes' does not match"),
+        ({"data": {**unknown, "projects": carried}}, f"{name}: the data answer 'not established'"),
+        ({"data": {**yes, "evidence": " "}}, f"{name}: no evidence is recorded for data"),
+        ({"forms_surveyed": "not a date"}, f"{name}: no date is recorded for the source and data"),
+        # Another project's source with no route, and an answer nobody established with none.
+        ({"source": yes}, f"{name}: not designated"),
+        ({"source": unknown}, f"{name}: not designated"),
+        ({"data": unknown}, f"{name}: not designated"),
+        # A route on a wheel that carries only data.
+        ({"data": yes, **reason}, f"{name}: a route is recorded"),
+    ):
+        found = one(change)
+        assert any(line.startswith(problem) for line in found), (problem, found)
+    # A guessed "no" for a form, on a wheel nobody listed.
+    guessed = problems(swap(routed, source={**unknown, "carries": "no"}))
+    assert any(
+        line.startswith(f"{name}: a source answer of 'no' names no wheel") for line in guessed
+    )
+    # A search with no control that fired: missing, and with a field blank.
+    for control in ({}, {"control": {**survey["control"], "fired_on": " "}}):
+        without = {k: v for k, v in survey.items() if k != "control"} | control
+        found = one({}, without)
+        assert found == ["the survey names no control that its source and data search fired on"]
+    # This module's own rule follows the forms too: source code is owed a route, data is not.
+    assert name in _owed_a_route({**survey, "wheels": [{**plain, "source": yes}]})
+    assert name in _owed_a_route({**survey, "wheels": [{**plain, "data": unknown}]})
+    assert name not in _owed_a_route({**survey, "wheels": [{**plain, "data": yes}]})
+
     # The page side. Each mutated survey is rendered into a copy of the page, which then agrees
     # with that survey and disagrees with every other one.
     assert _survey_page_drift(page, survey) == []
@@ -1375,11 +1489,37 @@ def test_the_survey_checks_can_fail() -> None:
         drift = _survey_page_drift(page, mutated)
         assert any(line.startswith(table) for line in drift), (table, drift)
         assert component_readings.section_of(rendered) != component_readings.section_of(page)
-    # A row dropped from the first table moves no count, so only the names check can see it.
+    # A wheel that carries only data, and one that carries source: each is rendered into a copy of
+    # the page, and the tracked page then lacks its row, its count and its place in the data list.
+    for change, wanted in (
+        ({"data": yes}, {"the page does not state", "found", "row", "data only"}),
+        ({"source": yes, **reason}, {"the page does not state", "found", "row", "highlighted"}),
+    ):
+        mutated = {**survey, "wheels": [{**w, **change} if w is plain else w for w in wheels]}
+        rendered = component_readings.render_page(page, data, mutated)
+        assert _survey_page_drift(rendered, mutated) == []
+        drift = _survey_page_drift(page, mutated)
+        for prefix in wanted:
+            assert any(line.startswith(prefix) for line in drift), (prefix, drift)
+    # A row dropped from the first table moves no count, so only the table checks can see it.
     section = _region(_SURVEY_HEADING, _EXTRA_NAMES, page)
-    row = next(ln for ln in section.splitlines() if ln.startswith("| `"))
-    drift = _survey_page_drift(page.replace(row + "\n", "", 1), survey)
-    assert [line.partition(":")[0] for line in drift] == ["found"], drift
+    rows = [
+        ln for ln in section.partition(f"\n{_HIGHLIGHTED}\n")[0].splitlines() if ln[:3] == "| `"
+    ]
+    drift = _survey_page_drift(page.replace(rows[0] + "\n", "", 1), survey)
+    assert {line.partition(":")[0] for line in drift} <= {"found", "row"} and drift, drift
+    # A wheel with more than one row keeps its name when one row goes, so only the row check sees.
+    names = [row.split("`")[1] for row in rows]
+    twice = next(row for row in rows if names.count(row.split("`")[1]) > 1)
+    drift = _survey_page_drift(page.replace(twice + "\n", "", 1), survey)
+    assert [line.partition(":")[0] for line in drift] == ["row"], drift
+    # The criterion, stated once: dropped, and reversed.
+    assert _CRITERION[2] in " ".join(section.split())
+    for edit in ("", "It is owed a route all the same."):
+        drift = _survey_page_drift(
+            page.replace("because data is read and not run.", edit, 1), survey
+        )
+        assert [line.partition(":")[0] for line in drift] == ["criterion"], drift
 
 
 def test_the_generator_reads_a_component_from_fake_replies() -> None:

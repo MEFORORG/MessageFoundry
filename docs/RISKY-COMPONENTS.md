@@ -149,9 +149,10 @@ looked at.
 That is 11, and 23 plus 11 is 34. The arithmetic is stated so a reader can check the set is closed
 rather than trusting that it is.
 
-Not designated is a statement about the tiers only. A wheel in this table can still carry another
-project's compiled code. *What each wheel carries inside it*, in the ASVS reading further down,
-says which wheels do, and the route this page takes for each one that is not designated.
+Not designated is a statement about the tiers only. A wheel in this table can still carry a bundled
+copy of another project, as compiled code, source code or data. *What each wheel carries inside
+it*, in the ASVS reading further down, says which wheels do and in what form. It also states the
+route this page takes for a not-designated wheel that carries another project's code.
 
 ## The `sqlserver` extra
 
@@ -270,10 +271,10 @@ they carry. A name in that reading's *Not risky on any of the three* table is un
 
 That is a limit of the instrument. The same generated reading narrows it, under *What each wheel
 carries inside it*, and does not by itself close it. That survey says, for every wheel this page
-assesses, whether the pinned wheel carries another project's compiled code, and on what evidence.
-The designated wheels here are already highlighted by the table above. A wheel that is not
-designated, and that the survey did not show to carry nothing, takes one of the two routes stated
-there.
+assesses, whether the pinned wheel carries a bundled copy of another project, and on what evidence.
+It answers for three forms: compiled code, source code and data. The designated wheels here are
+already highlighted by the table above. A wheel that is not designated, and that the survey did not
+show to carry no code from another project, takes one of the two routes stated there.
 
 That subsection says whether any advisory for Qt was read, and what the survey could not establish.
 Where it read none, a reader who needs the Qt side still has to check Qt's own security notices
@@ -324,10 +325,11 @@ record's CVSS 3 vector and rates it on that system's scale. CVSS is the Common V
 System. An advisory with neither does not count. The ones in the window are named below so a reader
 can judge them.
 
-OSV matches an advisory to a component by its PyPI name. A flaw in code a wheel carries inside it,
-such as a compiled library, shows up here only when an advisory names the PyPI package. So nothing
-below shows that the code inside a wheel is free of known flaws. *What each wheel carries inside
-it*, further down, says which wheels carry such code and what this page does about each.
+OSV matches an advisory to a component by its PyPI name. A flaw in something a wheel carries inside
+it from another project shows up here only when an advisory names the PyPI package. That holds for a
+compiled library, for a copy of another project's source, and for its data. So nothing below shows
+that what a wheel carries is free of known flaws. *What each wheel carries inside it*, further down,
+says which wheels carry another project in any of those forms, and what this page does about each.
 
 These tests are mechanical. A small library that is finished can trip the first one without being
 neglected. The reading says where to look; it does not say the library is broken.
@@ -405,39 +407,68 @@ names them so that choice stays visible, and a reviewer can revisit it.
 ### What each wheel carries inside it
 
 The vulnerability-history test reads advisories by PyPI name. This survey asks what that test
-cannot: whether each of the 40 pinned wheels carries compiled code from another project. It was made
-by hand between 2026-10-04 and 2026-10-05, against the pins the snapshot reads. Its evidence, the
-files read and their hashes are recorded in
+cannot: whether each of the 40 pinned wheels carries a bundled copy of another separately
+distributed project, and in what form. The forms are compiled code, source code and data. Lines
+copied into a wheel's own module do not count. The compiled-code answers were made by hand between
+2026-10-04 and 2026-10-05, and the source and data answers on 2026-10-05, against the pins the
+snapshot reads. The evidence, the files read and their hashes are recorded in
 [`security/bundled-code-survey.json`](../security/bundled-code-survey.json). A run of the script
 does not repeat it.
+
+**This page's criterion.** A wheel that is not designated is owed a route when it carries another
+project's code, compiled or source. A wheel that carries only another project's data is listed below
+with what it carries. It is owed no route, because data is read and not run. That line is this
+page's choice, and a reader can draw it elsewhere: data still decides things, as a list of root
+certificates decides what is trusted. A wheel whose answer is not established, for any form, is
+treated as carrying code.
 
 **Carries another project's compiled code: 9 of 40. Does not: 31. Not established: 0. 9 plus 31 plus
 0 is 40.**
 
-A wheel whose answer is not established is treated as carrying.
+**Carries another project's source code: 1 of 40. Does not: 37. Not established: 2. 1 plus 37 plus 2
+is 40.**
 
-| Component | Pinned | Carries | Evidence | Route |
-|---|---|---|---|---|
-| `argon2-cffi-bindings` | 26.1.0 | Argon2 reference implementation (phc-winner-argon2), version not established | wheel file list and source tree | designated, tier 2 |
-| `cffi` | 2.1.1 | libffi, version not established | wheel file list and source tree | designated, tier 2 |
-| `cryptography` | 50.0.1 | OpenSSL 4.0.2; Rust crates, the 40 entries of the source distribution's `Cargo.lock` | wheel file list and source tree | designated, tier 2 |
-| `httptools` | 0.8.0 | llhttp 9.4.1; http-parser 2.9.4 | wheel file list and source tree | designated, tier 3 |
-| `pydantic-core` | 2.46.5 | Rust crates, the 104 entries of the source distribution's `Cargo.lock` | wheel file list and source tree | designated, tier 1 |
-| `pyside6-addons` | 6.11.2 | Qt, version not established | project metadata | highlighted below |
-| `pyside6-essentials` | 6.11.2 | Qt, version not established | project metadata | designated, the `harness` extra |
-| `shiboken6` | 6.11.2 | Microsoft Visual C++ runtime libraries (Windows wheel) 14.44.35211.0, with two files at 14.24.28127.4 | wheel file list | designated, the `harness` extra |
-| `uvloop` | 0.22.1 | libuv 1.48.0 | wheel file list and source tree | highlighted below |
+**Carries another project's data: 5 of 40. Does not: 33. Not established: 2. 5 plus 33 plus 2 is
+40.**
 
-26 wheels were found to carry none, on the evidence of the wheel tag and file list: `aioodbc`,
-`aiosqlite`, `annotated-doc`, `annotated-types`, `anyio`, `argon2-cffi`, `certifi`, `click`,
-`fastapi`, `h11`, `hl7apy`, `httpcore`, `httpx`, `idna`, `ldap3`, `pyasn1`, `pycparser`, `pydantic`,
-`pyspnego`, `starlette`, `tomlkit`, `truststore`, `typing-extensions`, `typing-inspection`,
-`tzdata`, `uvicorn`.
+The table has one row for each wheel and form where the answer is not a plain no.
 
-4 wheels were found to carry none, on the evidence of the wheel file list and source tree: `psutil`,
-`pyodbc`, `sspilib`, `websockets`.
+| Component | Pinned | Form | Carries | Evidence | Route |
+|---|---|---|---|---|---|
+| `argon2-cffi-bindings` | 26.1.0 | compiled code | Argon2 reference implementation (phc-winner-argon2), version not established | wheel file list and source tree | designated, tier 2 |
+| `certifi` | 2026.7.22 | data | Mozilla's list of trusted root certificates, version not established | wheel file list | designated, tier 2 |
+| `cffi` | 2.1.1 | compiled code | libffi, version not established | wheel file list and source tree | designated, tier 2 |
+| `cryptography` | 50.0.1 | compiled code | OpenSSL 4.0.2; Rust crates, the 40 entries of the source distribution's `Cargo.lock` | wheel file list and source tree | designated, tier 2 |
+| `hl7apy` | 1.3.5 | data | HL7 v2 definitions of messages, segments, fields and data types, versions 2.1 to 2.8.2, twelve versions | wheel file list | designated, tier 1 |
+| `httptools` | 0.8.0 | compiled code | llhttp 9.4.1; http-parser 2.9.4 | wheel file list and source tree | designated, tier 3 |
+| `idna` | 3.20 | data | IDNA and UTS 46 mapping tables, Unicode 18.0.0 | wheel file list | designated, tier 3 |
+| `ldap3` | 2.9.1 | data | Directory server schemas (Active Directory 2012 R2, 389 Directory Server, eDirectory 8.8.8 and 9.1.4, OpenLDAP slapd 2.4), versions as the file names give them | wheel file list | designated, tier 2 |
+| `pydantic` | 2.13.5 | source code | The project's own 1.x line, pydantic 1.10.26 | wheel file list | designated, tier 1 |
+| `pydantic-core` | 2.46.5 | compiled code | Rust crates, the 104 entries of the source distribution's `Cargo.lock` | wheel file list and source tree | designated, tier 1 |
+| `pyside6-addons` | 6.11.2 | compiled code | Qt, version not established | project metadata | highlighted below |
+| `pyside6-addons` | 6.11.2 | source code | not established | wheel not fetched | highlighted below |
+| `pyside6-addons` | 6.11.2 | data | not established | wheel not fetched | highlighted below |
+| `pyside6-essentials` | 6.11.2 | compiled code | Qt, version not established | project metadata | designated, the `harness` extra |
+| `pyside6-essentials` | 6.11.2 | source code | not established | wheel not fetched | designated, the `harness` extra |
+| `pyside6-essentials` | 6.11.2 | data | not established | wheel not fetched | designated, the `harness` extra |
+| `shiboken6` | 6.11.2 | compiled code | Microsoft Visual C++ runtime libraries (Windows wheel) 14.44.35211.0, with two files at 14.24.28127.4 | wheel file list | designated, the `harness` extra |
+| `tzdata` | 2026.4 | data | IANA Time Zone Database 2026d | wheel file list | none owed: data only |
+| `uvloop` | 0.22.1 | compiled code | libuv 1.48.0 | wheel file list and source tree | highlighted below |
 
-1 wheel was found to carry none, on the evidence of the wheel file list: `pyside6`.
+20 wheels were found to carry none, in any form. The compiled answer rests on the wheel tag and file
+list: `aioodbc`, `aiosqlite`, `annotated-doc`, `annotated-types`, `anyio`, `argon2-cffi`, `click`,
+`fastapi`, `h11`, `httpcore`, `httpx`, `pyasn1`, `pycparser`, `pyspnego`, `starlette`, `tomlkit`,
+`truststore`, `typing-extensions`, `typing-inspection`, `uvicorn`.
+
+4 wheels were found to carry none, in any form. The compiled answer rests on the wheel file list and
+source tree: `psutil`, `pyodbc`, `sspilib`, `websockets`.
+
+1 wheel was found to carry none, in any form. The compiled answer rests on the wheel file list:
+`pyside6`.
+
+5 wheels carry another project's data and none of its code: `certifi`, `hl7apy`, `idna`, `ldap3`,
+`tzdata`. Not designated among them: `tzdata`. Under the criterion above, that owes no route. No
+notice about any of that data was read.
 
 Each answer rests on the evidence the record names. A wheel tagged `none-any` had its file list read
 as well as its tag. For any other wheel that was fetched, one Linux x86_64 wheel and the Windows
@@ -446,17 +477,24 @@ show code linked into an extension, so the pinned source distribution was read t
 record does not name was not read, and can carry something else. That holds for another platform,
 and for a second Linux x86_64 wheel where the lock carries more than one.
 
-No source distribution was read for `pyside6` or `shiboken6`. Their answers rest on wheel file lists
-alone, which cannot show what is linked into a compiled file.
+The source and data answers rest on the file lists of the same wheels, read again. The search looked
+for a vendoring directory, a top-level name beyond the project's own, a licence file named for
+another project, and large data files. It reads names, sizes and marked text. So it can miss a copy
+kept under an ordinary name inside a wheel's own package. As a control, the same search was run over
+`pip-26.2.1-py3-none-any.whl`, a wheel known to vendor source. It fired on `pip/_vendor`.
 
-No wheel was fetched for `pyside6-addons` or `pyside6-essentials`. Their answers rest on PyPI
-project metadata, which lists no file. What the table names for such a wheel is the least it
-carries: nothing else was looked for.
+No source distribution was read for `pyside6` or `shiboken6`. Their compiled answers rest on wheel
+file lists alone, which cannot show what is linked into a compiled file.
+
+No wheel was fetched for `pyside6-addons` or `pyside6-essentials`. Their compiled answers rest on
+PyPI project metadata, which lists no file. What the table names for such a wheel is the least it
+carries: nothing else was looked for. For the same reason, no source or data answer is established
+for such a wheel.
 
 A designated wheel is already highlighted, by its tier. No carried project's advisories were read
-for a designated wheel. 2 wheels are not designated and not shown to carry nothing. Each takes one
-of two routes: this page highlights it as risky on what it carries, or reads the carried project's
-own advisories.
+for a designated wheel. 2 wheels are not designated and counted as carrying another project's code.
+Each takes one of two routes: this page highlights it as risky on what it carries, or reads the
+carried project's own advisories.
 
 **Highlighted as risky on what it carries:**
 
@@ -534,10 +572,12 @@ the markers must be exactly what the snapshot and the tiers above render, so a t
 `python scripts/security/component_readings.py --render-only`.
 
 The same test holds the survey of what each wheel carries,
-[`security/bundled-code-survey.json`](../security/bundled-code-survey.json), three ways (BACKLOG
+[`security/bundled-code-survey.json`](../security/bundled-code-survey.json), four ways (BACKLOG
 #2935). Every name in an assessed closure must have a survey answer, so a new dependency needs one
-in the same pull request. A wheel that is not designated, and not shown to carry nothing, must have
-a recorded route. And the page's survey tables must say what the record says.
+in the same pull request. Each answer must cover compiled code, source code and data. A wheel that
+is not designated, and not shown to carry no code from another project, must have a recorded route.
+A wheel that carries only data must have none. And the page's survey tables, its counts and its
+stated criterion must say what the record says.
 
 The survey is made by hand, and no script repeats it. It is dated to the pins the snapshot reads, so
 a version bump alone does not turn the test red. A re-read that moves a pin does: the script then

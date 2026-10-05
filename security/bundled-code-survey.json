@@ -1,5 +1,5 @@
 {
-  "subject": "Survey of which pinned wheels carry another project's compiled code (BACKLOG #2935, ASVS 15.1.4)",
+  "subject": "Survey of which pinned wheels carry a bundled copy of another project, as compiled code, source code or data (BACKLOG #2935, ASVS 15.1.4)",
   "readings": "security/risky-component-readings.json",
   "method": [
     "The population and the pins are those of the readings snapshot named above.",
@@ -9,7 +9,16 @@
     "The `pyside6-addons` and `pyside6-essentials` wheels were not fetched. Their answers rest on PyPI project metadata.",
     "The `pyside6` and `shiboken6` wheels were fetched on 2026-10-05, hash-checked against the harness lock, and their contents listed. PyPI offers no source distribution for either, so those two answers rest on the wheel file lists alone.",
     "Where an answer could not be established, it is recorded as not established and the wheel is treated as carrying.",
-    "Each answer carries the date it was made. A wheel surveyed again later carries its own date."
+    "Each answer carries the date it was made. A wheel surveyed again later carries its own date.",
+    "The unit is a bundled copy of a separately distributed project. Lines copied into a wheel's own module do not count.",
+    "Each wheel's top-level `carries` and `projects` answer for compiled code. Its `source` and `data` entries answer for the other two forms, and `forms_surveyed` dates them.",
+    "For source code and data, every wheel named under `files_read` was fetched again on 2026-10-05, its sha256 checked against the recorded hash and the lock, and its file list read. Nothing was installed or run.",
+    "What was looked for: a directory named `_vendor`, `vendor`, `vendored`, `_vendored`, `third_party`, `thirdparty`, `3rdparty`, `extern`, `external`, `_bundled`, `bundled`, `contrib`, `packages`, `ext` or `deps`; a top-level name beyond the project's own, from the file list and `top_level.txt`; a licence or notice file named for another project; a non-Python file over 20 KB; and the largest Python modules, opened where a name or a size suggested a generated table.",
+    "The text files of each wheel were also searched for words such as `vendored`, `copied from`, `taken from` and `backported from`. Each hit was read. A hit inside a project's own module is lines copied, which the unit does not count.",
+    "Data means another project's or body's published tables, held in the wheel as files or as generated modules: a time zone database, a list of root certificates, Unicode tables, a standard's definitions, a server's schema.",
+    "This search reads names, sizes and marked text. It can miss a copy kept under an ordinary name inside a wheel's own package, with no marker.",
+    "A search that finds nothing proves nothing unless it can fire. The `control` entry names a wheel known to vendor source. The same search was run over it and fired.",
+    "The `pyside6-addons` and `pyside6-essentials` wheels were not fetched for this either. Their source and data answers are recorded as not established."
   ],
   "sources": {
     "pypi_release": "https://pypi.org/pypi/<name>/<version>/json",
@@ -17,6 +26,12 @@
       "requirements.lock",
       "security/locks/requirements-harness.lock"
     ]
+  },
+  "control": {
+    "file": "pip-26.2.1-py3-none-any.whl",
+    "sha256": "71138adf1f4ca900cdb7d289c21b7494329f2332b6d85f0e1c42108c0384ed3e",
+    "fired_on": "pip/_vendor",
+    "note": "pip vendors its dependencies in source form. The directory search fired on `pip/_vendor`, and on the licence files filed under `licenses/src/pip/_vendor`. The sha256 is the one PyPI states for the file: pip is in no lock here."
   },
   "wheels": [
     {
@@ -32,9 +47,20 @@
           "sha256": "bcaf16f007855fa4bf0ce6754b1f72c6c5a3d544188849577ddd55c5dc42985e"
         }
       ],
+      "source": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "The wheel's 12 files were listed again. The top-level name is `aioodbc`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+      },
+      "data": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "No non-Python file is over 20 KB, and no Python module was found to be a table from another project."
+      },
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-04"
+      "surveyed": "2026-10-04",
+      "forms_surveyed": "2026-10-05"
     },
     {
       "name": "aiosqlite",
@@ -49,9 +75,20 @@
           "sha256": "21c002eb13823fad740196c5a2e9d8e62f6243bd9e7e4a1f87fb5e44ecb4fceb"
         }
       ],
+      "source": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "The wheel's 15 files were listed again. The top-level name is `aiosqlite`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+      },
+      "data": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "No non-Python file is over 20 KB, and no Python module was found to be a table from another project."
+      },
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-04"
+      "surveyed": "2026-10-04",
+      "forms_surveyed": "2026-10-05"
     },
     {
       "name": "annotated-doc",
@@ -66,9 +103,20 @@
           "sha256": "117bac03a25ede5df5440e855b32d556049ca169ead221505badf432fed4b101"
         }
       ],
+      "source": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "The wheel's 8 files were listed again. The top-level name is `annotated_doc`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+      },
+      "data": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "No non-Python file is over 20 KB, and no Python module was found to be a table from another project."
+      },
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-04"
+      "surveyed": "2026-10-04",
+      "forms_surveyed": "2026-10-05"
     },
     {
       "name": "annotated-types",
@@ -83,9 +131,20 @@
           "sha256": "f072f4d804ea359e4eaf198b1af7a8b0943881a87f31bb764f8bf219bb9419e0"
         }
       ],
+      "source": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "The wheel's 7 files were listed again. The top-level name is `annotated_types`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+      },
+      "data": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "No non-Python file is over 20 KB, and no Python module was found to be a table from another project."
+      },
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-04"
+      "surveyed": "2026-10-04",
+      "forms_surveyed": "2026-10-05"
     },
     {
       "name": "anyio",
@@ -100,9 +159,20 @@
           "sha256": "6152fdbbf9a77fdec97731721bebf7c4c44f7c29b424b0065826173efc7ed101"
         }
       ],
+      "source": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "The wheel's 53 files were listed again. The top-level name is `anyio`, the project's own. No directory has a vendoring name, and no licence file is named for another project. A few functions are marked as copied from CPython, as lines in the project's own modules."
+      },
+      "data": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "No non-Python file is over 20 KB, and no Python module was found to be a table from another project."
+      },
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-04"
+      "surveyed": "2026-10-04",
+      "forms_surveyed": "2026-10-05"
     },
     {
       "name": "argon2-cffi",
@@ -117,9 +187,20 @@
           "sha256": "fdc8b074db390fccb6eb4a3604ae7231f219aa669a2652e0f20e16ba513d5741"
         }
       ],
+      "source": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "The wheel's 13 files were listed again. The top-level name is `argon2`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+      },
+      "data": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "No non-Python file is over 20 KB, and no Python module was found to be a table from another project."
+      },
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-04"
+      "surveyed": "2026-10-04",
+      "forms_surveyed": "2026-10-05"
     },
     {
       "name": "argon2-cffi-bindings",
@@ -147,9 +228,20 @@
           "sha256": "63505c71542a44b68b1e38060450fb006404170da375feb31af153e7f9c6205d"
         }
       ],
+      "source": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "Both wheels read were listed again, 6 files. The top-level name is `_argon2_cffi_bindings`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+      },
+      "data": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "The only non-Python files over 20 KB are the wheel's own compiled files, and no Python module was found to be a table from another project."
+      },
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-04"
+      "surveyed": "2026-10-04",
+      "forms_surveyed": "2026-10-05"
     },
     {
       "name": "certifi",
@@ -164,9 +256,25 @@
           "sha256": "62f22742b58a1a33014a2b6b706588a8d7e2a88ae7bd1a6ebe8c992928483775"
         }
       ],
+      "source": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "The wheel's 12 files were listed again. The top-level name is `certifi`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+      },
+      "data": {
+        "carries": "yes",
+        "projects": [
+          {
+            "name": "Mozilla's list of trusted root certificates",
+            "version": "not established"
+          }
+        ],
+        "evidence": "The wheel's 12 files were listed again. `certifi/cacert.pem`, about 240 KB, is the bundle of root certificates. The wheel's own metadata calls it Mozilla's collection of root certificates. The file states no version of that list. The wheel's own version, 2026.07.22, dates the copy."
+      },
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-04"
+      "surveyed": "2026-10-04",
+      "forms_surveyed": "2026-10-05"
     },
     {
       "name": "cffi",
@@ -194,9 +302,20 @@
           "sha256": "dd31f52ea1086513bb9df30f8fcee9b8918323ae067a3d5b78bc826a000712be"
         }
       ],
+      "source": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "Both wheels read were listed again, 31 files. The top-level names are `_cffi_backend` and `cffi`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The four `.h` files are the project's own headers."
+      },
+      "data": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "The only non-Python files over 20 KB are the wheel's own compiled files, and no Python module was found to be a table from another project."
+      },
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-04"
+      "surveyed": "2026-10-04",
+      "forms_surveyed": "2026-10-05"
     },
     {
       "name": "click",
@@ -211,9 +330,20 @@
           "sha256": "255bc9599cf7748b4b1a446ccc735421bd08a2ae529a8b88597d3de5664ee360"
         }
       ],
+      "source": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "The wheel's 22 files were listed again. The top-level name is `click`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+      },
+      "data": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "No non-Python file is over 20 KB, and no Python module was found to be a table from another project."
+      },
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-04"
+      "surveyed": "2026-10-04",
+      "forms_surveyed": "2026-10-05"
     },
     {
       "name": "cryptography",
@@ -245,9 +375,20 @@
           "sha256": "5dd9bda1c12b4162f6ff568eeb5e0ff956c28d14406e875cfe8a63a2d414ff20"
         }
       ],
+      "source": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "Both wheels read were listed again, 120 files. The top-level name is `cryptography`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+      },
+      "data": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "The only non-Python files over 20 KB are the wheel's own compiled files, and no Python module was found to be a table from another project."
+      },
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-04"
+      "surveyed": "2026-10-04",
+      "forms_surveyed": "2026-10-05"
     },
     {
       "name": "fastapi",
@@ -262,9 +403,20 @@
           "sha256": "bfb91aa2d334c61cb35ba9a116fc123b3d3df31640b801cf57a7a78ec3f603b3"
         }
       ],
+      "source": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "The wheel's 61 files were listed again. The top-level name is `fastapi`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The seven `.md` files under `fastapi/.agents` are the project's own notes."
+      },
+      "data": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "No non-Python file is over 20 KB, and no Python module was found to be a table from another project."
+      },
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-04"
+      "surveyed": "2026-10-04",
+      "forms_surveyed": "2026-10-05"
     },
     {
       "name": "h11",
@@ -279,9 +431,20 @@
           "sha256": "63cf8bbe7522de3bf65932fda1d9c2772064ffb3dae62d55932da54b31cb6c86"
         }
       ],
+      "source": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "The wheel's 17 files were listed again. The top-level name is `h11`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+      },
+      "data": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "No non-Python file is over 20 KB, and no Python module was found to be a table from another project."
+      },
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-04"
+      "surveyed": "2026-10-04",
+      "forms_surveyed": "2026-10-05"
     },
     {
       "name": "hl7apy",
@@ -296,9 +459,25 @@
           "sha256": "c8b80ff5ad020bf9c1e68a6395cf45cb78db621f65569d1798c46eb1b657e27b"
         }
       ],
+      "source": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "The wheel's 100 files were listed again. The top-level name is `hl7apy`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+      },
+      "data": {
+        "carries": "yes",
+        "projects": [
+          {
+            "name": "HL7 v2 definitions of messages, segments, fields and data types, versions",
+            "version": "2.1 to 2.8.2, twelve versions"
+          }
+        ],
+        "evidence": "The wheel's 100 files were listed again. Twelve directories, `hl7apy/v2_1` to `hl7apy/v2_8_2`, hold the definitions of each HL7 v2 version as Python modules. The largest, `v2_8_2/groups.py`, is about 302 KB. They are tables from the HL7 standard, held as Python modules."
+      },
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-04"
+      "surveyed": "2026-10-04",
+      "forms_surveyed": "2026-10-05"
     },
     {
       "name": "httpcore",
@@ -313,9 +492,20 @@
           "sha256": "2d400746a40668fc9dec9810239072b40b4484b640a8c38fd654a024c7a1bf55"
         }
       ],
+      "source": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "The wheel's 36 files were listed again. The top-level name is `httpcore`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+      },
+      "data": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "No non-Python file is over 20 KB, and no Python module was found to be a table from another project."
+      },
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-04"
+      "surveyed": "2026-10-04",
+      "forms_surveyed": "2026-10-05"
     },
     {
       "name": "httptools",
@@ -347,9 +537,20 @@
           "sha256": "6b2a32f18d97e16e90827d7a819ffa8dbd8cc245fc4e1fa9d1095b54ef4bd999"
         }
       ],
+      "source": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "Both wheels read were listed again, 22 files. The top-level name is `httptools`, the project's own. The `.pyx` and `.pxd` files are the project's own Cython sources. The licence files under `licenses/vendor` are for llhttp and http-parser, which are compiled in, as the compiled answer records. Their source is not in the wheel."
+      },
+      "data": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "The only non-Python files over 20 KB are the wheel's own compiled files, and no Python module was found to be a table from another project."
+      },
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-04"
+      "surveyed": "2026-10-04",
+      "forms_surveyed": "2026-10-05"
     },
     {
       "name": "httpx",
@@ -364,9 +565,20 @@
           "sha256": "d909fcccc110f8c7faf814ca82a9a4d816bc5a6dbfea25d6591d6985b8ba59ad"
         }
       ],
+      "source": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "The wheel's 29 files were listed again. The top-level name is `httpx`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+      },
+      "data": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "No non-Python file is over 20 KB, and no Python module was found to be a table from another project."
+      },
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-04"
+      "surveyed": "2026-10-04",
+      "forms_surveyed": "2026-10-05"
     },
     {
       "name": "idna",
@@ -381,9 +593,25 @@
           "sha256": "ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c"
         }
       ],
+      "source": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "The wheel's 16 files were listed again. The top-level name is `idna`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+      },
+      "data": {
+        "carries": "yes",
+        "projects": [
+          {
+            "name": "IDNA and UTS 46 mapping tables, Unicode",
+            "version": "18.0.0"
+          }
+        ],
+        "evidence": "The wheel's 16 files were listed again. `idna/uts46data.py`, about 237 KB, and `idna/idnadata.py`, about 46 KB, each say they are generated by the project's `tools/idna-data`, and each gives `__version__` as 18.0.0, the Unicode version. They are tables, held as Python modules."
+      },
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-04"
+      "surveyed": "2026-10-04",
+      "forms_surveyed": "2026-10-05"
     },
     {
       "name": "ldap3",
@@ -398,9 +626,25 @@
           "sha256": "5869596fc4948797020d3f03b7939da938778a0f9e2009f7a072ccf92b8e8d70"
         }
       ],
+      "source": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "The wheel's 118 files were listed again. The top-level name is `ldap3`, the project's own. No directory has a vendoring name, and no licence file is named for another project. `ldap3/utils/tls_backport.py` holds two functions backported from the Python standard library, as lines in the project's own module."
+      },
+      "data": {
+        "carries": "yes",
+        "projects": [
+          {
+            "name": "Directory server schemas (Active Directory 2012 R2, 389 Directory Server, eDirectory 8.8.8 and 9.1.4, OpenLDAP slapd 2.4),",
+            "version": "versions as the file names give them"
+          }
+        ],
+        "evidence": "The wheel's 118 files were listed again. `ldap3/protocol/schemas` holds five modules, each a recorded schema of one directory server: `ad2012R2.py` (about 334 KB), `ds389.py`, `edir888.py`, `edir914.py` and `slapd24.py`. The versions are read from the file names. They are data from those servers, held as Python modules."
+      },
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-04"
+      "surveyed": "2026-10-04",
+      "forms_surveyed": "2026-10-05"
     },
     {
       "name": "psutil",
@@ -423,9 +667,20 @@
           "sha256": "0746f5f8d406af344fd547f1c8daa5f5c33dbc293bb8d6a16d80b4bb88f59372"
         }
       ],
+      "source": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "Both wheels read were listed again, 16 files. The top-level name is `psutil`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+      },
+      "data": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "The only non-Python files over 20 KB are the wheel's own compiled files, and no Python module was found to be a table from another project."
+      },
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-04"
+      "surveyed": "2026-10-04",
+      "forms_surveyed": "2026-10-05"
     },
     {
       "name": "pyasn1",
@@ -440,9 +695,20 @@
           "sha256": "deda9277cfd454080ec40b207fb6df82206a3a2688735233cdcd8d3d565f088b"
         }
       ],
+      "source": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "The wheel's 38 files were listed again. The top-level name is `pyasn1`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+      },
+      "data": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "No non-Python file is over 20 KB, and no Python module was found to be a table from another project."
+      },
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-04"
+      "surveyed": "2026-10-04",
+      "forms_surveyed": "2026-10-05"
     },
     {
       "name": "pycparser",
@@ -457,9 +723,20 @@
           "sha256": "b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992"
         }
       ],
+      "source": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "The wheel's 13 files were listed again. The top-level name is `pycparser`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The 13 files hold no `ply` directory and no parser generator from another project."
+      },
+      "data": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "No non-Python file is over 20 KB, and no Python module was found to be a table from another project."
+      },
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-04"
+      "surveyed": "2026-10-04",
+      "forms_surveyed": "2026-10-05"
     },
     {
       "name": "pydantic",
@@ -474,9 +751,25 @@
           "sha256": "346a034f080da3755d8e9cb5e00e8b07de1d39e4f6e2c87d8ab7cafa0b269a73"
         }
       ],
+      "source": {
+        "carries": "yes",
+        "projects": [
+          {
+            "name": "The project's own 1.x line, pydantic",
+            "version": "1.10.26"
+          }
+        ],
+        "evidence": "The wheel's 111 files were listed again. The directory `pydantic/v1` holds 27 files, a copy of the project's own 1.x line, and its `version.py` gives 1.10.26. That line is released separately on PyPI under the same name. An advisory against it would be filed under version numbers below 2, which the pinned 2.13.5 is not. One file in that copy, `datetime_parse.py`, says it was taken from Django. The one top-level name is `pydantic`, no other directory has a vendoring name, and no licence file is named for another project."
+      },
+      "data": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "No non-Python file is over 20 KB, and no Python module was found to be a table from another project."
+      },
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-04"
+      "surveyed": "2026-10-04",
+      "forms_surveyed": "2026-10-05"
     },
     {
       "name": "pydantic-core",
@@ -504,9 +797,20 @@
           "sha256": "10416c15b8839ecc4ef4d0885da76da6fd0f67333a0eb8aff6d93c4b8f2910fc"
         }
       ],
+      "source": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "Both wheels read were listed again, 10 files. The top-level name is `pydantic_core`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+      },
+      "data": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "The only non-Python files over 20 KB are the wheel's own compiled files, and no Python module was found to be a table from another project."
+      },
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-04"
+      "surveyed": "2026-10-04",
+      "forms_surveyed": "2026-10-05"
     },
     {
       "name": "pyodbc",
@@ -529,9 +833,20 @@
           "sha256": "2fe0e063d8fb66efd0ac6dc39236c4de1a45f17c33eaded0d553d21c199f4d05"
         }
       ],
+      "source": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "Both wheels read were listed again, 7 files. The top-level name is `pyodbc`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+      },
+      "data": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "The only non-Python files over 20 KB are the wheel's own compiled files, and no Python module was found to be a table from another project."
+      },
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-04"
+      "surveyed": "2026-10-04",
+      "forms_surveyed": "2026-10-05"
     },
     {
       "name": "pyside6",
@@ -550,9 +865,20 @@
           "sha256": "3201d67e3c10be2eaedd3910ff0f02351eca7e88c95a291cde5e7f2f55ef207f"
         }
       ],
+      "source": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "Both wheels read were listed again, 67 and 69 files. The top-level name is `PySide6`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The wheel holds typing stubs and three small modules, all the project's own."
+      },
+      "data": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "Neither wheel holds a non-Python file over 20 KB beside its typing stubs, which are the project's own."
+      },
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-05"
+      "surveyed": "2026-10-05",
+      "forms_surveyed": "2026-10-05"
     },
     {
       "name": "pyside6-addons",
@@ -567,9 +893,20 @@
       "evidence_kind": "project metadata",
       "evidence": "The wheel was not fetched or listed. Its PyPI description says it includes Qt modules, and PyPI lists the Linux wheel at about 175 MB. The Qt version inside was not read, and nothing else the wheel bundles was looked for. A lead, not evidence: a copy of this version installed in a Windows development environment, not hash-checked here, lists FFmpeg libraries (`avcodec`, `avformat`, `avutil`, `swresample`, `swscale`), `QtWebEngineProcess.exe` and a V8 snapshot. A listing of the pinned wheel would settle what it carries beyond Qt.",
       "files_read": [],
+      "source": {
+        "carries": "not established",
+        "projects": [],
+        "evidence": "The wheel was not fetched or listed, so this form was not looked for. That changes no route: this page already highlights the wheel on the compiled Qt it carries."
+      },
+      "data": {
+        "carries": "not established",
+        "projects": [],
+        "evidence": "The wheel was not fetched or listed, so this form was not looked for. That changes no route: this page already highlights the wheel on the compiled Qt it carries."
+      },
       "route": "highlight",
       "route_reason": "It holds compiled Qt modules, among them the web engine, multimedia and PDF modules. The harness imports none of them, but an install puts them on disk. A flaw filed against Qt names Qt, not `pyside6-addons`, so the vulnerability-history reading would not show it.",
-      "surveyed": "2026-10-04"
+      "surveyed": "2026-10-04",
+      "forms_surveyed": "2026-10-05"
     },
     {
       "name": "pyside6-essentials",
@@ -584,9 +921,20 @@
       "evidence_kind": "project metadata",
       "evidence": "The wheel was not fetched or listed. Its PyPI description says it includes the essential Qt modules, and PyPI lists the Linux wheel at about 80 MB. The Qt version inside was not read, and nothing else the wheel bundles was looked for. A lead, not evidence: a copy of this version installed in a Windows development environment, not hash-checked here, lists `opengl32sw.dll` and Microsoft Visual C++ runtime libraries. A listing of the pinned wheel would settle what it carries beyond Qt.",
       "files_read": [],
+      "source": {
+        "carries": "not established",
+        "projects": [],
+        "evidence": "The wheel was not fetched or listed, so this form was not looked for. That changes no route: the wheel is designated."
+      },
+      "data": {
+        "carries": "not established",
+        "projects": [],
+        "evidence": "The wheel was not fetched or listed, so this form was not looked for. That changes no route: the wheel is designated."
+      },
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-04"
+      "surveyed": "2026-10-04",
+      "forms_surveyed": "2026-10-05"
     },
     {
       "name": "pyspnego",
@@ -601,9 +949,20 @@
           "sha256": "04e7c9260ced15197b3f42b891ffa30fa98c37bb09372c5c2bf927bcdfe30b53"
         }
       ],
+      "source": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "The wheel's 38 files were listed again. The top-level name is `spnego`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+      },
+      "data": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "No non-Python file is over 20 KB, and no Python module was found to be a table from another project."
+      },
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-04"
+      "surveyed": "2026-10-04",
+      "forms_surveyed": "2026-10-05"
     },
     {
       "name": "shiboken6",
@@ -627,9 +986,20 @@
           "sha256": "6ab0eba1c904455df621f9a6df3ca2bb896bab8670572d2bc4e37804ae91f19a"
         }
       ],
+      "source": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "Both wheels read were listed again, 58 and 70 files. The top-level name is `shiboken6`, the project's own. The 41 `.h` files and six `.cmake` files are the project's own. No directory has a vendoring name. The Windows wheel's one licence file is Qt's own commercial licence text."
+      },
+      "data": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "The non-Python files over 20 KB are compiled files, the project's own headers and one of its own `.cmake` files. None is another project's data."
+      },
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-05"
+      "surveyed": "2026-10-05",
+      "forms_surveyed": "2026-10-05"
     },
     {
       "name": "sspilib",
@@ -648,9 +1018,20 @@
           "sha256": "b4d4e3402230f14cd93999f3953619163075bcaca3e13dcf2ab5942c269627f4"
         }
       ],
+      "source": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "The wheel's 29 files were listed again. The top-level name is `sspilib`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+      },
+      "data": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "The only non-Python files over 20 KB are the wheel's own compiled files. `sspilib/raw/_winerror.py` is a table of Windows error codes in the project's own module."
+      },
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-04"
+      "surveyed": "2026-10-04",
+      "forms_surveyed": "2026-10-05"
     },
     {
       "name": "starlette",
@@ -665,9 +1046,20 @@
           "sha256": "67f8e99895493dd2911a03f11314af6ceebeae4e704bb9f43dfc6a9db151c93e"
         }
       ],
+      "source": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "The wheel's 41 files were listed again. The top-level name is `starlette`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+      },
+      "data": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "No non-Python file is over 20 KB, and no Python module was found to be a table from another project."
+      },
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-04"
+      "surveyed": "2026-10-04",
+      "forms_surveyed": "2026-10-05"
     },
     {
       "name": "tomlkit",
@@ -682,9 +1074,20 @@
           "sha256": "177a05aece5a8ca5266fd3c448abb47b8d352f09d477d3ca8332db4d89b24304"
         }
       ],
+      "source": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "The wheel's 17 files were listed again. The top-level name is `tomlkit`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+      },
+      "data": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "No non-Python file is over 20 KB, and no Python module was found to be a table from another project."
+      },
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-04"
+      "surveyed": "2026-10-04",
+      "forms_surveyed": "2026-10-05"
     },
     {
       "name": "truststore",
@@ -699,9 +1102,20 @@
           "sha256": "adaeaecf1cbb5f4de3b1959b42d41f6fab57b2b1666adb59e89cb0b53361d981"
         }
       ],
+      "source": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "The wheel's 11 files were listed again. The top-level name is `truststore`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+      },
+      "data": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "No non-Python file is over 20 KB, and no Python module was found to be a table from another project."
+      },
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-04"
+      "surveyed": "2026-10-04",
+      "forms_surveyed": "2026-10-05"
     },
     {
       "name": "typing-extensions",
@@ -716,9 +1130,20 @@
           "sha256": "481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8"
         }
       ],
+      "source": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "The wheel's 5 files were listed again. The top-level name is `typing_extensions`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The wheel is one module. Parts of it follow CPython's `typing`, as lines in the project's own module."
+      },
+      "data": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "No non-Python file is over 20 KB, and no Python module was found to be a table from another project."
+      },
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-04"
+      "surveyed": "2026-10-04",
+      "forms_surveyed": "2026-10-05"
     },
     {
       "name": "typing-inspection",
@@ -733,9 +1158,20 @@
           "sha256": "65b8397ba37ccbce054456aaccddfc91e6e3083c92824df348d96ca832f3f147"
         }
       ],
+      "source": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "The wheel's 9 files were listed again. The top-level name is `typing_inspection`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+      },
+      "data": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "No non-Python file is over 20 KB, and no Python module was found to be a table from another project."
+      },
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-04"
+      "surveyed": "2026-10-04",
+      "forms_surveyed": "2026-10-05"
     },
     {
       "name": "tzdata",
@@ -750,9 +1186,25 @@
           "sha256": "c2169a8b0a7a5e9674da5a135ccdfb2b3e671b333ed9fed17b41f73c34476e81"
         }
       ],
+      "source": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "The wheel's 633 files were listed again. The top-level name is `tzdata`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+      },
+      "data": {
+        "carries": "yes",
+        "projects": [
+          {
+            "name": "IANA Time Zone Database",
+            "version": "2026d"
+          }
+        ],
+        "evidence": "The wheel's 633 files were listed again. 605 of them are compiled time zone files under `tzdata/zoneinfo`, beside `tzdata.zi` and four `.tab` tables. `tzdata/__init__.py` gives `IANA_VERSION` as 2026d, and `tzdata.zi` opens with the same version."
+      },
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-04"
+      "surveyed": "2026-10-04",
+      "forms_surveyed": "2026-10-05"
     },
     {
       "name": "uvicorn",
@@ -767,9 +1219,20 @@
           "sha256": "ba3d14c3ee7e41c6c654c46c9eb489d33213cdd30aa1696eab1374337c13f68f"
         }
       ],
+      "source": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "The wheel's 46 files were listed again. The top-level name is `uvicorn`, the project's own. No directory has a vendoring name, and no licence file is named for another project."
+      },
+      "data": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "No non-Python file is over 20 KB, and no Python module was found to be a table from another project."
+      },
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-04"
+      "surveyed": "2026-10-04",
+      "forms_surveyed": "2026-10-05"
     },
     {
       "name": "uvloop",
@@ -793,9 +1256,20 @@
           "sha256": "6c84bae345b9147082b17371e3dd5d42775bddce91f885499017f4607fdaf39f"
         }
       ],
+      "source": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "The wheel's 63 files were listed again. The top-level name is `uvloop`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The `.pyx`, `.pxd` and `.pxi` files are the project's own Cython sources. libuv's source is not in the wheel: it is compiled in, as the compiled answer records."
+      },
+      "data": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "The non-Python files over 20 KB are the wheel's compiled file and the project's own Cython sources. None is another project's data."
+      },
       "route": "highlight",
       "route_reason": "libuv is the event loop's I/O layer, so the socket reads and writes of an engine that runs on `uvloop` go through it. An advisory against libuv names libuv, not `uvloop`, so the vulnerability-history reading would not show it.",
-      "surveyed": "2026-10-04"
+      "surveyed": "2026-10-04",
+      "forms_surveyed": "2026-10-05"
     },
     {
       "name": "websockets",
@@ -818,9 +1292,20 @@
           "sha256": "acfea4c20bf54384883ea33b1240fc1db4f52e190823a4e2b334bc3e8bfca96a"
         }
       ],
+      "source": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "Both wheels read were listed again, 62 files. The top-level name is `websockets`, the project's own. No directory has a vendoring name, and no licence file is named for another project. The one `.c` file, `speedups.c`, is the project's own."
+      },
+      "data": {
+        "carries": "no",
+        "projects": [],
+        "evidence": "The only non-Python files over 20 KB are the wheel's own compiled files, and no Python module was found to be a table from another project."
+      },
       "route": null,
       "route_reason": null,
-      "surveyed": "2026-10-04"
+      "surveyed": "2026-10-04",
+      "forms_surveyed": "2026-10-05"
     }
   ]
 }
