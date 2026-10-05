@@ -328,11 +328,36 @@ def test_the_leak_check_skips_only_a_value_the_date_kind_wrote(
 
 @_SURROGATES
 def test_the_exemption_never_reaches_an_msh_line(module: Any, century_site_prefix: str) -> None:
-    """The tee applies no rule to an MSH field, so a DATE rule there proves nothing about it."""
+    """Both adapters apply a DATE rule to an MSH field (BACKLOG #2265), but the exemption does not
+    number MSH fields the MSH way, so it never reaches an MSH line: the value is still checked
+    and scrubbed."""
     rules = tuple(engine_rules.FieldRule(f"MSH-{n}", SurrogateKind.DATE) for n in (12, 13, 14))
     text = _HEADER + "|" + _FILLED  # one field after the version, whichever way MSH is numbered
     assert module.message_has_site_code(text, rules)
     assert _FILLED not in module.scrub_message_site_codes(text, engine_keying.Keyer(_SALT), rules)
+
+
+def test_a_date_rule_on_an_msh_field_is_applied_and_still_not_exempt(
+    century_site_prefix: str,
+) -> None:
+    """The whole route, both adapters: the DATE rule on MSH-13 runs (BACKLOG #2265), then the
+    site-code pass rewrites the ``YYYYMM`` it left, because the exemption stops at an MSH line.
+    So the two sides give the same bytes and neither keeps the filled date. The control is the
+    same value in a segment the exemption does reach."""
+    rules = (
+        *DEFAULT_RULES,
+        engine_rules.FieldRule("MSH-13", SurrogateKind.DATE),
+        engine_rules.FieldRule("ZPD-1", SurrogateKind.DATE),
+    )
+    msg = _msg(
+        _HEADER + "|" + _YEAR_MONTH, "PID|1||12345^^^HOSP^MR||DOE^JOHN", "ZPD|" + _YEAR_MONTH
+    )
+    engine = engine_anonymize(msg, salt=_SALT, rules=rules)
+    tee = tee_anonymize(msg, salt=_SALT, rules=rules)
+    assert engine == tee
+    header, _pid, zpd = tee.split("\r")
+    assert header.split("|")[12] not in (_YEAR_MONTH, _FILLED)  # MSH-13 sits at split index 12
+    assert zpd == "ZPD|" + _FILLED
 
 
 @_SURROGATES
