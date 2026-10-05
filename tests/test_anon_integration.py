@@ -203,8 +203,8 @@ def test_corpus_from_file_rejects_empty_and_malformed(tmp_path) -> None:
 
 # --- tee anonymize-captures: PHI-safety guards (ANON-9) --------------------------------------------
 
-# A forbidden token (a routable IP) in a KEPT field (MSH-4, sending facility). MSH is never scrubbed
-# by the rule pass, so the IP survives anonymization and trips the leak_check -> LeakError. The tee's
+# A forbidden token (a routable IP) in a KEPT field (MSH-4, sending facility). No default rule names
+# an MSH field, so the IP survives anonymization and trips the leak_check -> LeakError. The tee's
 # vendored IP detector keeps a literal default even without the publish guard, so this runs on the OSS
 # mirror too.
 #

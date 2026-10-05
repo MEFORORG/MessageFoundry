@@ -1802,6 +1802,26 @@ it. A bare `MSH`, `FHS` or `BHS` line is refused; a header segment carries the s
 
 A second MSH line in capitals is checked, and its fields are numbered as MSH fields.
 
+**A rule for an MSH field is applied to every MSH line, the header included.** The engine and
+the tee both do this (BACKLOG #2265). Before, the tee skipped the rule while the leak-check
+counted its field as scrubbed. No default rule names an MSH field, so the header is kept unless
+an overlay maps one.
+
+A rule that would rewrite `MSH-1` or `MSH-2` is refused, because those two fields hold the
+message's delimiters. So is a rule for field 0 of any segment, which is the segment id. A `keep`
+is allowed, because it rewrites nothing. A later MSH line that carries data where `MSH-2` belongs
+cannot be scrubbed by a rule. Repair or remove that line.
+
+**The two anonymizers still differ on some inputs, at least these:**
+
+- A `BHS` or `FHS` line. The engine numbers it the HL7 way, where `BHS-1` is the separator. The
+  tee and the leak-check number it as an ordinary segment. So an engine rule lands one field to
+  the left of the field the check counts as scrubbed, and that field can still hold its value.
+  A tee rule written with the HL7 number scrubs the next field along.
+- A later `MSH`, `BHS` or `FHS` line with fewer than two field separators. The engine writes it
+  back out of shape, and a rule can then land on the wrong text.
+- A header not in capitals, such as `Msh`. The engine refuses the message. The tee emits it.
+
 **The coverage report is the record of those fields.** It lists the address of every present
 field that no rule mapped, never its value. A caller gets it through `on_report` on the clean path
 and on a leak-check refusal, and inside the `LeakError`. A message the anonymizer refuses with
@@ -1928,8 +1948,8 @@ which HIPAA Safe Harbor counts as an identifier; a default rule now scrubs it.
   `anon.toml`, where a reviewer can see it.
 - A short value in a fixed-list field passes. A two-letter code in `PID-8` could still be
   initials.
-- The tee applies no rule to an MSH field. A rule for a second MSH line's field counts as decided
-  there, but the tee leaves that field as it was and does not scan it.
+- The `BHS`, `FHS` and short header line gaps listed above, under "The two anonymizers still
+  differ", apply with the switch on too.
 
 Note: encryption-at-rest (§3) and log redaction (§7) are **not** de-identification — do not conflate
 "we encrypt" or "we redact logs" with "we de-identify."

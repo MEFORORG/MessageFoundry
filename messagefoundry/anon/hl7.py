@@ -6,8 +6,9 @@ Drives the rule map over a message using the engine's battle-tested mutable mode
 (:class:`messagefoundry.parsing.message.Message`). The standalone ``tee/anon/hl7.py`` does the *same
 thing* through a pure stdlib splitter (it cannot import ``messagefoundry``); the two share the
 ``normalized_message`` / ``read_message_seps`` / ``scrub_message_site_codes`` / ``preserve_obx5_value``
-helpers and a single **fail-closed contract** so they agree on every input (the golden-corpus +
-adversarial parity tests pin them):
+helpers and a single **fail-closed contract**. The golden-corpus + adversarial parity tests pin the
+two equal on the inputs they hold; the two do NOT agree on every input, and ``docs/PHI.md`` section 9
+names at least the cases known to differ. The contract:
 
 * normalize first (strip MLLP framing, drop empty segments, ``\\r`` line endings);
 * a message with **no parseable MSH / encoding characters** is **refused** — :class:`AnonError`, a
@@ -42,12 +43,50 @@ def _segment_id(path: str) -> str:
     return path.split("-", 1)[0]
 
 
+#: The lowest field number a rule may rewrite: 1 in any segment, because field 0 is the segment
+#: id, and 3 in MSH, because MSH-1 and MSH-2 hold the message's own delimiters. With either of
+#: those rewritten the output has no readable header, and the leak-check has no separators to
+#: walk it with.
+_FIRST_REWRITABLE_FIELD = 1
+_FIRST_REWRITABLE_MSH_FIELD = 3
+
+
+def _refuse_unwritable_rules(rules: tuple[FieldRule, ...]) -> None:
+    """Refuse a rule set that would rewrite a segment id, MSH-1 or MSH-2 (a body-free
+    :class:`AnonError`).
+
+    The field number is read with ``int()``, the way the adapters read it, so ``MSH-02`` and a
+    path with a stray space or newline are refused like ``MSH-2``. A path whose number ``int()``
+    cannot read is not a whole-field address; ``load_rules`` refuses those, and one built in code
+    is left to the adapter as before. A ``KEEP`` rewrites nothing, so it is allowed. The same
+    check runs in both adapters (BACKLOG #2265)."""
+    named: set[str] = set()
+    for rule in rules:
+        if rule.kind == SurrogateKind.KEEP:
+            continue
+        segment, _, number = rule.path.partition("-")
+        try:
+            field = int(number)
+        except ValueError:
+            continue
+        is_msh = segment.upper() == "MSH"
+        if field < (_FIRST_REWRITABLE_MSH_FIELD if is_msh else _FIRST_REWRITABLE_FIELD):
+            named.add(f"{segment}-{field}")
+    if named:
+        raise AnonError(
+            f"a rule names {', '.join(sorted(named))}, which no rule can rewrite: field 0 is the "
+            "segment id, and MSH-1 and MSH-2 hold the message's delimiters. Repair or remove a "
+            "later MSH line that carries data there. Refusing to emit"
+        )
+
+
 def anonymize_message(raw: str, keyer: Keyer, rules: tuple[FieldRule, ...]) -> str:
     """De-identify one HL7 v2 message: apply ``rules`` field-by-field, then the site-code pass.
 
     Pure + deterministic for a given ``keyer`` (same message + salt → same fixture). Raises
     :class:`AnonError` (carrying no body) when the message cannot be safely anonymized — fail closed.
     """
+    _refuse_unwritable_rules(rules)
     text = normalized_message(raw, tuple(rule.path for rule in rules))
     parsed = read_message_seps(text)
     if parsed is None:
