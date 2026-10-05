@@ -57,6 +57,14 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
    the DICOM SCP) gets the same checks. The connector loads its CA through
    :func:`inbound_ca_cadata` when it builds its context, and :func:`registry_anchor_specs` feeds the
    audited preflight each time a graph is loaded.
+8. **A changed settings anchor takes a restart, and a reload says so** (BACKLOG #2185). The three
+   settings anchors above are loaded once, when their consumer is built, and no reload rebuilds
+   one. A reload still re-checks each file. :func:`verified_anchor_cadata` records the fingerprint
+   of the bytes it hands each consumer. When the bytes on disk differ from those, the settings
+   preflight logs a WARNING and audits a ``restart_required`` row. It does so on every reload whose
+   anchor check passes, until the engine restarts. Item 3's ``changed`` row cannot do this job. It
+   compares with the last AUDITED fingerprint, so it goes quiet after one reload while the
+   consumers still trust the start-time bytes.
 """
 
 from __future__ import annotations
@@ -97,7 +105,9 @@ log = logging.getLogger(__name__)
 #: ``acl_indeterminate`` (the ACL could not be determined, BACKLOG #1142), ``path_insecure`` and
 #: ``path_indeterminate`` (the path check, BACKLOG #1142 directory arm), and ``pem_refused`` (the
 #: file is not text the TLS library loads as trust anchors: no PEM block or a TRUSTED CERTIFICATE
-#: block since BACKLOG #1142 slice 3, and anything its ``cadata=`` load refuses since #2025).
+#: block since BACKLOG #1142 slice 3, and anything its ``cadata=`` load refuses since #2025), and
+#: ``restart_required`` (a reload found a settings anchor whose bytes differ from the ones its
+#: consumer loaded, BACKLOG #2185).
 AUDIT_ACTION = "auth.trust_anchor"
 
 
@@ -882,10 +892,29 @@ def verified_anchor_cadata(spec: AnchorSpec, *, enforcing: bool) -> str:
     ``cadata=`` loads no CRL from the anchor file. A CRL file is loaded separately, by
     :func:`~messagefoundry.config.tls_policy.harden_crl_check`, which refuses a load that would add a
     certificate to the trust store (BACKLOG #1890). The CRL file carries no pin or ACL check:
-    whoever can write it can change what is revoked, but not what is trusted."""
+    whoever can write it can change what is revoked, but not what is trusted.
+
+    It records the fingerprint of the bytes it returns, for :func:`loaded_fingerprint`."""
     verdict = evaluate_anchor(spec)
     _enforce_verdict(spec, verdict, enforcing=enforcing)
-    return anchor_cadata(verdict.data, spec)
+    text = anchor_cadata(verdict.data, spec)
+    _LOADED[(spec.label, spec.path)] = verdict.fingerprint
+    return text
+
+
+#: The fingerprint of the bytes :func:`verified_anchor_cadata` last handed a consumer in this
+#: process, keyed by the anchor's label and path (BACKLOG #2185). Every consumer of a settings
+#: anchor loads through that function: the API's client-CA context, the AD authenticator and the
+#: OIDC opener. So this holds the bytes each one trusts, and an anchor no consumer loaded has no
+#: entry. The path is in the key so two configurations in one process, such as two tests, never
+#: read each other's entry.
+_LOADED: dict[tuple[str, str], str] = {}
+
+
+def loaded_fingerprint(spec: AnchorSpec) -> str | None:
+    """The fingerprint of the bytes a consumer in this process last loaded for ``spec``, or ``None``
+    when no consumer loaded it. See :data:`_LOADED`."""
+    return _LOADED.get((spec.label, spec.path))
 
 
 # --- spec collection ----------------------------------------------------------------------------
@@ -1113,10 +1142,10 @@ async def _record(store: Store, spec: AnchorSpec, event: str, **extra: object) -
     await store.record_audit(AUDIT_ACTION, actor=None, detail=json.dumps(detail))
 
 
-async def _preflight_one(store: Store, spec: AnchorSpec, *, enforcing: bool) -> None:
+async def _preflight_one(store: Store, spec: AnchorSpec, *, enforcing: bool) -> str:
     """Preflight one anchor: audit the observation (baseline / changed) FIRST so a change is durably
     recorded even when the anchor then fails its pin/ACL, record any violation, then enforce (which may
-    raise).
+    raise). Returns the fingerprint of the bytes it read and passed.
 
     **It applies every check a consumer applies**, the PEM shape of :func:`anchor_cadata` included
     (BACKLOG #1142, slice 3). The reload route runs this and builds no context to verify a peer
@@ -1182,11 +1211,12 @@ async def _preflight_one(store: Store, spec: AnchorSpec, *, enforcing: bool) -> 
     _enforce_verdict(spec, verdict, enforcing=enforcing)
     if shape_error is not None:
         raise shape_error
+    return verdict.fingerprint
 
 
 async def run_anchor_preflight(
     specs: Sequence[AnchorSpec], store: Store, *, enforcing: bool
-) -> None:
+) -> dict[str, str]:
     """The central load/reload preflight over every configured anchor. Called at serve startup (before
     any listener binds) and on a config reload (re-reading the on-disk PEMs, so a swapped anchor is
     caught). **Dormant when ``specs`` is empty** — it makes no store call and writes no audit row, so an
@@ -1195,9 +1225,35 @@ async def run_anchor_preflight(
     On a fatal violation (a pin mismatch, a file with no loadable PEM block, or under ``enforce`` an
     anchor another principal can replace or whose ACL or path could not be read, with no matching pin)
     it raises :class:`TrustAnchorError` after auditing it, so the caller refuses to start / refuses
-    the reload."""
+    the reload. Otherwise it returns each anchor's fingerprint, keyed by its label."""
+    return {spec.label: await _preflight_one(store, spec, enforcing=enforcing) for spec in specs}
+
+
+async def _report_restart_required(
+    specs: Sequence[AnchorSpec], store: Store, *, seen: Mapping[str, str]
+) -> None:
+    """Log and audit each settings anchor whose bytes on disk differ from the bytes its consumer
+    loaded (:func:`loaded_fingerprint`). An anchor no consumer loaded is skipped: a restart would
+    apply nothing there.
+
+    The compare is never against the audit chain. The last audited fingerprint moves to the new
+    bytes at the first reload that sees them, while the consumers still trust the old bytes. A
+    compare with it would go quiet from the second reload on (BACKLOG #2185)."""
     for spec in specs:
-        await _preflight_one(store, spec, enforcing=enforcing)
+        in_use = loaded_fingerprint(spec)
+        now = seen[spec.label]
+        if in_use is None or in_use == now:
+            continue
+        log.warning(
+            "%s: the trust anchor '%s' changed on disk since the engine loaded it (sha256 %s, was "
+            "%s). This reload checked the new file but does not apply it. The engine keeps "
+            "trusting the CA it loaded until it restarts. Restart the engine to apply the new CA",
+            spec.setting,
+            spec.path,
+            now,
+            in_use,
+        )
+        await _record(store, spec, "restart_required", fingerprint=now, in_use=in_use)
 
 
 def make_settings_anchor_preflight(
@@ -1213,7 +1269,14 @@ def make_settings_anchor_preflight(
     row. A refusal is re-raised as ``WiringError`` caused by a :class:`TrustAnchorError`, so the reload
     route answers 422 and audits ``reason="trust_anchor"``, as it did when it ran this itself. An
     unreadable anchor (``OSError``, or ``ValueError`` from a NUL in its path) counts as a refused
-    anchor, as it did there."""
+    anchor, as it did there.
+
+    **A reload that passes does not apply a changed anchor** (BACKLOG #2185). No reload rebuilds the
+    consumers that loaded these files, so each keeps the bytes it read at start. When this
+    preflight passes, it warns and audits ``restart_required`` for each anchor whose bytes on disk
+    differ from its consumer's (:func:`loaded_fingerprint`). That repeats on every reload until a
+    restart. The specs are frozen here, pins included, so a reload re-reads the paths and pins the
+    engine started with."""
     if not specs:
         return None
     from messagefoundry.config.wiring import WiringError
@@ -1222,7 +1285,7 @@ def make_settings_anchor_preflight(
 
     async def preflight() -> None:
         try:
-            await run_anchor_preflight(frozen, store, enforcing=enforcing)
+            seen = await run_anchor_preflight(frozen, store, enforcing=enforcing)
         except TrustAnchorError as exc:
             raise WiringError(f"a settings trust anchor was refused: {exc}") from exc
         except (OSError, ValueError) as exc:
@@ -1230,6 +1293,7 @@ def make_settings_anchor_preflight(
             unreadable = TrustAnchorError(f"a trust anchor could not be read: {exc}")
             unreadable.__cause__ = exc
             raise WiringError(f"a settings trust anchor was refused: {unreadable}") from unreadable
+        await _report_restart_required(frozen, store, seen=seen)
 
     return preflight
 
