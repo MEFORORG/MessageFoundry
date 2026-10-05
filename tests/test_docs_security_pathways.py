@@ -2855,3 +2855,114 @@ def test_the_twelfth_sweep_browser_support_does_not_say_a_passkey_is_never_alone
         "docs/BROWSER-SUPPORT.md says a passkey is never the only factor again; a directory account "
         "and a local account outside the requirement can hold one alone."
     )
+
+
+# The twelfth sweep's second round. The first round removed MFA from sentences that also called
+# off-box log forwarding and the de-identification framework missing, called at-rest encryption
+# opt-in, called mTLS and off-box logs delegated, and named a removed key. Each was checked against
+# the code before it was changed; the probe below pins what was checked.
+
+
+def test_the_twelfth_sweep_second_round_probes_what_is_built() -> None:
+    """The code facts the second round's sentences now state."""
+    from messagefoundry import anon
+    from messagefoundry.config import ai_policy
+    from messagefoundry.config import settings as settings_module
+    from messagefoundry.config.wiring import X12, Tcp
+    from messagefoundry.logging_setup import SyslogForward
+
+    # 1. Off-box log forwarding is built and wired: serve builds a SyslogForward handler.
+    main_tree = ast.parse((_ROOT / "messagefoundry" / "__main__.py").read_text(encoding="utf-8"))
+    assert inspect.isclass(SyslogForward) and _called(main_tree, "SyslogForward"), (
+        "serve no longer builds the SyslogForward handler; README and the early-adopter guide say "
+        "off-box log forwarding is built."
+    )
+    # 2. The de-identification framework is built; only the AI-assist path lacks it, and the guide's
+    #    row says that path's scope falls back to code_only.
+    assert callable(getattr(anon, "anonymize_checked", None)), "messagefoundry.anon lost its entry"
+    deid = ai_policy.resolve_effective_policy(
+        mode=ai_policy.AiMode.MANAGED_CLAUDE_BAA,
+        data_scope=ai_policy.AiDataScope.DEIDENTIFIED,
+        production=True,
+    )
+    assert deid.data_scope is ai_policy.AiDataScope.CODE_ONLY, (
+        "the AI deidentified scope is live now; restate the early-adopter guide's de-identification row."
+    )
+    # 3. At-rest encryption is required by default: with no key and no opt-out the gate refuses.
+    assert (
+        settings_module.keyless_opt_out_refusal(
+            settings_module.StoreSettings(), settings_module.SecuritySettings()
+        )
+        == settings_module.KEYLESS_REFUSED_BY_NO_OPT_OUT
+    ), "a keyless store opens by default now; the guide says encryption is required by default."
+    # 4. Raw TCP and X12 take no TLS setting, so they are the remaining transport gap.
+    for factory in (Tcp, X12):
+        tls = [p for p in inspect.signature(factory).parameters if "tls" in p.lower()]
+        assert not tls, (
+            f"{factory.__name__}() takes {tls} now; the guide names raw TCP and X12 as the "
+            "remaining transport gap."
+        )
+    # 5. `[auth].enabled` is a removed key, refused at load.
+    assert ("auth", "enabled") in settings_module._REMOVED_KEYS, (
+        "[auth].enabled is no longer refused as removed; restate docs/SECURITY-LOOSENING.md."
+    )
+
+
+#: Off-box logs and the de-identification framework, under the names the docs give them.
+_BUILT_ELSEWHERE = re.compile(
+    r"off-box log|log shipping|log forwarding|de-identification framework|\bde-identification\)",
+    re.IGNORECASE,
+)
+
+
+@pytest.mark.parametrize("name", ["README.md", "docs/EARLY-ADOPTER-GUIDE.md"])
+def test_the_twelfth_sweep_no_doc_says_offbox_logs_or_deid_are_missing(name: str) -> None:
+    """README said off-box log shipping "remains on the roadmap", and the early-adopter guide said
+    off-box logs and the de-identification framework are not there yet, not built, or the remaining
+    transport gap. Both are built (the probe above)."""
+    clauses = _clauses(_doc(name))
+    subject = [c for c in clauses if _BUILT_ELSEWHERE.search(c)]
+    assert subject, (
+        f"{name} no longer names off-box logs or de-identification, so this reads nothing"
+    )
+    stale = [c for c in subject if _ABSENT.search(c)]
+    assert not stale, f"{name} says a built control is missing again: {stale} (BACKLOG #1133)."
+
+
+def test_the_twelfth_sweep_guide_names_the_real_transport_gap_and_encryption_default() -> None:
+    """The guide named off-box log shipping as the remaining transport gap (raw TCP and X12 are),
+    and twice called at-rest encryption opt-in (a keyless store is refused by default)."""
+    clauses = _clauses(_doc("docs/EARLY-ADOPTER-GUIDE.md"))
+    gap = [c for c in clauses if re.search(r"\bremaining transport gap\b", c, re.IGNORECASE)]
+    assert gap and all("raw TCP and X12" in c for c in gap), (
+        f"the guide's remaining-transport-gap sentence must name raw TCP and X12: {gap}"
+    )
+    opt_in = [
+        c
+        for c in clauses
+        if re.search(r"at-rest (?:body )?encryption", c, re.IGNORECASE)
+        and re.search(r"\bopt-in\b", c, re.IGNORECASE)
+    ]
+    assert not opt_in, f"the guide calls at-rest encryption opt-in again: {opt_in}"
+
+
+def test_the_twelfth_sweep_phi_does_not_delegate_built_controls() -> None:
+    """docs/PHI.md said mTLS, certificate revocation and off-box logs are "delegated to the org's
+    environment". The engine builds each; the org supplies the PKI and the SIEM."""
+    delegated = [
+        c
+        for c in _clauses(_doc("docs/PHI.md"))
+        if re.search(r"delegated to the org", c) and re.search(r"mTLS|off-box log", c)
+    ]
+    assert not delegated, f"docs/PHI.md delegates built controls again: {delegated}"
+
+
+def test_the_twelfth_sweep_loosening_note_does_not_gate_a_removed_key() -> None:
+    """docs/SECURITY-LOOSENING.md listed `[auth].enabled` among switches gated by their own
+    serve-time refusals. The key is gone: it is refused at load (the probe above)."""
+    gated = [
+        c
+        for c in _clauses(_doc("docs/SECURITY-LOOSENING.md"))
+        if "`[auth].enabled`" in c and "serve-time refusal" in c
+    ]
+    assert not gated, f"docs/SECURITY-LOOSENING.md gates the removed [auth].enabled again: {gated}"
