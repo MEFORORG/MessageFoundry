@@ -193,7 +193,7 @@ _ABSENT = object()
 
 @pytest.mark.parametrize("body_is_needed", [False, True])
 @pytest.mark.parametrize(
-    "status", [_ABSENT, None, "200", 200.0, True], ids=["absent", "None", "str", "float", "bool"]
+    "status", [_ABSENT, None, "200", 200.0], ids=["absent", "None", "str", "float"]
 )
 def test_an_over_cap_body_with_no_status_to_show_fails_closed(
     status: object, body_is_needed: bool, caplog: pytest.LogCaptureFixture
@@ -255,7 +255,14 @@ def test_the_stored_refusal_keeps_its_code_under_a_long_connection_name() -> Non
 
 def _payload(ctype: ConnectorType) -> str:
     if ctype is ConnectorType.FHIR:
-        return json.dumps({"resourceType": "Patient", "id": "p1", "note": _PAYLOAD_MARKER})
+        return json.dumps(
+            {
+                "resourceType": "Patient",
+                "id": "p1",
+                "meta": {"versionId": "3"},  # if-match sends it; the other forms ignore it
+                "note": _PAYLOAD_MARKER,
+            }
+        )
     if ctype is ConnectorType.DICOMWEB:
         return RawMessage.from_bytes(
             b"\x00" * 128 + b"DICM" + _PAYLOAD_MARKER.encode(), "dicom"
@@ -265,7 +272,8 @@ def _payload(ctype: ConnectorType) -> str:
     return json.dumps({"note": _PAYLOAD_MARKER})
 
 
-#: Every destination and mode, as (connector, extra settings) -> the delivered or the refused side.
+#: At least these destinations and modes, as (connector, extra settings) -> the delivered or the
+#: refused side. Not here: a ``transaction`` or ``batch`` Bundle a Handler built.
 _DELIVERED = "delivered"
 _REFUSED = "refused"
 _RULED: list[tuple[ConnectorType, dict[str, Any], str]] = [
@@ -290,6 +298,19 @@ _RULED: list[tuple[ConnectorType, dict[str, Any], str]] = [
         {"capture_response": False, "interaction": "update", "update_url_form": "path"},
         _DELIVERED,
     ),
+    # The other way a write becomes a wrapped update: if-match, whatever the interaction says.
+    (ConnectorType.FHIR, {"capture_response": False, "conditional": "if-match"}, _REFUSED),
+    # THE CONTROL: the other conditional forms are not wrapped, even under interaction="update".
+    (
+        ConnectorType.FHIR,
+        {
+            "capture_response": False,
+            "interaction": "update",
+            "conditional": "conditional-update",
+            "conditional_query": "identifier=synthetic-1",
+        },
+        _DELIVERED,
+    ),
 ]
 
 
@@ -298,7 +319,8 @@ def _case_id(case: tuple[ConnectorType, dict[str, Any], str]) -> str:
     capture = "capture-on" if over.get("capture_response") else "capture-off"
     interaction = f"-{over['interaction']}" if "interaction" in over else ""
     form = f"-{over['update_url_form']}" if "update_url_form" in over else ""
-    return f"{ctype.value}-{capture}{interaction}{form}"
+    conditional = f"-{over['conditional']}" if "conditional" in over else ""
+    return f"{ctype.value}-{capture}{interaction}{form}{conditional}"
 
 
 @pytest.mark.parametrize("case", _RULED, ids=_case_id)

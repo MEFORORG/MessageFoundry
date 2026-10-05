@@ -1395,13 +1395,14 @@ the four HTTP destinations, and their own sections point here.
 
 The two FHIR refusals are the batch 191 Manager's reading of the owner ruling of 2026-10-05, which
 names the principle and not these two cases. "An update the engine sends as a transaction" is
-`interaction="update"` or `conditional="if-match"` with the default `update_url_form`. Every other
-FHIR write is in the last two rows: a create, the other conditional forms, an update in the path
-form, and a `transaction` or `batch` `Bundle` a Handler built.
+`conditional="if-match"`, or `interaction="update"` with no `conditional`, each with the default
+`update_url_form`. Every other FHIR write is in the last two rows. That is at least a create,
+`conditional="conditional-update"` or `"if-none-exist"` under any `interaction`, an update in the
+path form, and a `transaction` or `batch` `Bundle` a Handler built.
 
 A message that dead-letters this way got a 2xx, but the engine could not read the reply. The partner
-may have applied it, and on SOAP or DICOMweb the unread body may have held a rejection. Its stored
-error carries the code `reply-too-large`. Check the partner's own record before you replay it. A
+may have applied it. On SOAP, on DICOMweb, and on a FHIR update sent as a transaction, the unread
+body may instead have held a rejection. Its stored error carries the code `reply-too-large`. Check the partner's own record before you replay it. A
 reply that is cut short or misframed after a 2xx is a separate case, and the lane still retries it.
 
 **Security.** Redirects are **refused** (a 3xx can't divert PHI to another host — ASVS 15.3.2), the URL

@@ -17,12 +17,13 @@ uses at ``auth/oidc_http.py`` and ``auth/oidc/flow.py``.
 received messages: nothing here can drop one, because nothing here reads one. What these bounds
 refuse is a *reply* to a request the engine made.
 
-**An over-cap reply is retried, except after a 2xx on a delivery.** :class:`ResponseTooLargeError`
-subclasses :class:`~messagefoundry.transports.base.DeliveryError`, so an over-cap reply lands on
-the retry-then-dead-letter path an unreadable reply has always taken (a timeout mid-read, a reset
-socket). A token endpoint's over-cap reply still takes that path: the mint fails inside a delivery,
-before the message is sent, and the worker retries the delivery. A probe and the alert webhook
-raise the error to their own caller instead, and nothing retries those.
+**An over-cap reply is a transient error, except after a 2xx on a delivery.**
+:class:`ResponseTooLargeError` subclasses :class:`~messagefoundry.transports.base.DeliveryError`.
+Where it surfaces inside a delivery, the worker retries the delivery and then dead-letters it,
+as it does for any reply the engine could not read (a timeout mid-read, a reset socket). A token
+endpoint's over-cap reply is one such case, when a delivery mints its bearer before it sends. At
+least a probe, the alert webhook and a ``fhir_lookup`` raise the error to their own caller
+instead, and nothing retries those.
 
 A delivery that already holds a 2xx status is different, because a retry would send again a
 request the partner answered 2xx (vault BACKLOG #2180, owner ruling 2026-10-05).
@@ -1217,8 +1218,9 @@ def read_2xx_reply_text(
     Call it where the status is already known to be 2xx. In a destination's ``_post`` that is
     inside ``with opener.open(...)``, because urllib raises every other status as an ``HTTPError``.
     The helper checks this itself, and fails closed: unless ``reader.status`` is an integer from
-    200 to 299, an over-cap body raises as :func:`read_bounded_text` raises it. So a reader with
-    another status, or with none it can show, is never recorded as delivered here.
+    200 to 299, an over-cap body raises as :func:`read_bounded_text` raises it. So an over-cap
+    body from a reader with another status, or with none it can show, is never recorded as
+    delivered here. An in-cap body is returned whatever the status: that is the caller's to judge.
 
     The partner answered 2xx, so an over-cap body must not cause a re-send (vault BACKLOG #2180).
     What it does cause depends on ``body_is_needed`` (owner ruling 2026-10-05). This is the one
@@ -1250,7 +1252,8 @@ def read_2xx_reply_text(
     if body_is_needed:
         # The stored error is cut at 200 characters, so the code and "not sent again" come first
         # and the advice last. It does not say the partner accepted the request: the body that
-        # could not be read is where a Fault or a failed-instance list would be.
+        # could not be read is where a Fault, a failed-instance list or a failed entry status
+        # would be.
         raise NegativeAckError(
             f"{connector}: {REPLY_TOO_LARGE_CODE}, not sent again. A 2xx reply body is over the "
             f"{limit}-byte bound and is needed here. Check the partner before a replay",
