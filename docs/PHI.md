@@ -1741,7 +1741,8 @@ Properties of the anonymizer:
 - **Field-anchored site-code scrub** — the site-code scrub is anchored to the field, not matched by
   loose string search.
 - **Fail-closed contract.** A message with **no parseable MSH / malformed** is **REFUSED** (raises
-  `AnonError`) — it never emits an un-scrubbed body.
+  `AnonError`) — it never emits an un-scrubbed body. So is a message holding a line no rule can
+  reach. Plain `anonymize` and `anonymize_checked` both refuse it, on the engine and on the tee.
 
 Surfaces: the **`python -m tee anonymize-captures`** subcommand and the test-harness
 `CaptureSink`/corpus hooks. [`scripts/security/scan_forbidden.py`](../scripts/security/scan_forbidden.py)
@@ -1761,7 +1762,7 @@ these cases:
 | A dashed SSN (`NNN-NN-NNNN`) appears | Fields no rule maps |
 | A punctuated US phone number (`NNN-NNN-NNNN` or `(NNN) NNN-NNNN`) appears | Fields no rule maps |
 | A CX identifier typed `MR` or `MRN` appears | Fields no rule maps |
-| A line no rule can reach: its first field is not a segment id (a lowercase second `msh` line included), or it has no field separator (a wrapped `LEE`, but also a legal empty segment such as `PV2`) | Every line after the MSH header |
+| A line no rule can reach (`AnonError`, raised by the anonymizer before the leak-check runs): its first field is not a segment id (a lowercase second `msh` line included), or it has no field separator and is not a segment id that the message's HL7 version defines or that a rule names (a wrapped `LEE` or `ZOE`). A bare `PV2` is a legal empty segment and passes | Every line after the MSH header |
 | The denylist tables did not load, and the caller passed `require_live_denylist=True` | The token source |
 
 **Everything else in a field no rule maps passes.** That includes a name, a date, an undashed SSN,
@@ -1780,13 +1781,57 @@ names it. Any other id is shown as `(unknown segment)`, so `KIM|F` appears as
   starts with `Z`, such as `ZOE`, is still printed.
 - With no readable version in MSH-12, any id that some HL7 version defines is printed.
 - `LEE|` with only empty fields passes and is not reported at all.
+- A bare fragment that is a real segment id for the message's version, such as `ROL` or `CON`,
+  passes as an empty segment. With no readable version in MSH-12, any id that some HL7 version
+  defines does.
+
+A bare Z-segment id, such as `ZPD` with no field separator, is refused unless a rule that
+rewrites a field names that segment. Nothing else tells it apart from a wrapped `ZOE`. A `keep`
+does not count, because it rewrites nothing. To get such a line through, map a field of the
+segment in an `anon.toml` overlay, or add the trailing separator (`ZPD|`), then run again. The
+anonymizer and the leak-check apply this to the same rules, so they accept and refuse the same
+lines.
+
+A bare id from a later HL7 version than MSH-12 names is refused too: `SFT` came in with 2.5, so a
+bare `SFT` in a 2.3 message is not an empty segment.
+
+A line holding only whitespace or control characters is dropped before anything else runs. The
+engine and the tee used to disagree on one at the start or end of a message. They still differ on
+whitespace after the last field of the last line: the engine's parser trims it and the tee keeps
+it. A bare `MSH`, `FHS` or `BHS` line is refused; a header segment carries the separators.
 
 A second MSH line in capitals is checked, and its fields are numbered as MSH fields.
 
+**A rule for an MSH field is applied to every MSH line, the header included.** The engine and
+the tee both do this (BACKLOG #2265). Before, the tee skipped the rule while the leak-check
+counted its field as scrubbed. No default rule names an MSH field, so the header is kept unless
+an overlay maps one.
+
+A rule that would rewrite `MSH-1` or `MSH-2` is refused, because those two fields hold the
+message's delimiters. A `keep` on either is allowed, because it rewrites nothing. A rule for
+field 0 of any segment, which is the segment id, is refused whatever its kind: `PID-0` is not a
+whole-field address, so the rule is refused when it is built or loaded (BACKLOG #2330). A later
+MSH line that carries data where `MSH-2` belongs cannot be scrubbed by a rule. Repair or remove
+that line.
+
+**The two anonymizers still differ on some inputs, at least these:**
+
+- A `BHS` or `FHS` line. The engine numbers it the HL7 way, where `BHS-1` is the separator. The
+  tee and the leak-check number it as an ordinary segment. So an engine rule lands one field to
+  the left of the field the check counts as scrubbed, and that field can still hold its value.
+  A tee rule written with the HL7 number scrubs the next field along.
+- A later `MSH`, `BHS` or `FHS` line with fewer than two field separators. The engine writes it
+  back out of shape, and a rule can then land on the wrong text.
+- A header not in capitals, such as `Msh`. The engine refuses the message. The tee emits it.
+
 **The coverage report is the record of those fields.** It lists the address of every present
-field that no rule mapped, never its value. A caller gets it through `on_report` on both paths, and
-inside the `LeakError` on a refusal. `python -m tee anonymize-captures` logs it at INFO once per
-run, after it has checked the captures, with a count per address. Read that list before you share
+field that no rule mapped, never its value. A caller gets it through `on_report` on the clean path
+and on a leak-check refusal, and inside the `LeakError`. A message the anonymizer refuses with
+`AnonError` (no parseable MSH, or a line no rule can reach) gets no report, and the
+`anonymize-captures` coverage line does not count it. `python -m tee anonymize-captures` logs it at INFO once per
+run, after it has checked the captures, with a count per address. A quieter `--log-level` does not
+hide it: the line is then printed plain to stderr. It says the denylist tables were live only when
+they loaded and passed the floor check on every message. Read that list before you share
 a dataset. Map any field that carries PHI in an `anon.toml` overlay, then run again.
 
 ### Dates and locations: mapped, and still NOT Safe Harbor de-identified
@@ -1803,6 +1848,8 @@ and fills the rest of the value at the same width. BACKLOG #2248 added it.
 | `PV1-44`, `PV1-45` | Admit and discharge times | `date` |
 | `ORC-9` | Order transaction time | `date` |
 | `OBR-7`, `OBX-14` | Observation times | `date` |
+| `AIS-4`, `RXA-3`, `RXA-4`, `PR1-5`, `FT1-4` | Appointment, administration, procedure and transaction times | `date` |
+| `GT1-8`, `IN1-18`, `NK1-16` | Dates of birth of the guarantor, the insured and a contact | `dob`, a fabricated date, like `PID-7`. A time after the eight date digits is kept. Anything else after them is dropped |
 | `PID-12` | County code | `freetext`, the whole field becomes `[REDACTED]` |
 | `PV1-3` | Assigned patient location | `freetext`, the whole field becomes `[REDACTED]` |
 
@@ -1819,10 +1866,15 @@ What the `date` kind does to a value:
 - It keeps a TS precision code such as `^S` in the second component.
 - It scrubs a value that is not a valid HL7 timestamp to empty. Every group must be in range and
   in ASCII digits, and the year must fall in 1850 to 2199. So a US `03152026` is scrubbed rather
-  than kept as the year `0315`. A date field that carries text is never passed through. Nothing
-  records that a field was emptied.
-- A six-digit `YYMMDD` whose first four digits happen to read as a year and a month, such as
-  `201107`, still passes as `YYYYMM`. Its output keeps those four digits.
+  than kept as the year `0315`. A date field that carries text is never passed through.
+- It records each field it emptied that way, by address and never by value. `anonymize_checked`
+  puts the addresses in the coverage report as `blanked_fields`, and
+  `python -m tee anonymize-captures` adds a count per address to its run summary. It is a record
+  and not a refusal. A caller of plain `anonymize` gets the list only by passing `blanked`.
+- It scrubs a six-digit value to empty when the value reads two ways. `201107` is July 2011 as
+  `YYYYMM`, and 7 November 2020 as `YYMMDD`. Kept as a year and a month, it would show the real
+  month of the second reading. The cost: a true `YYYYMM` whose year ends in `01` to `12`, such as
+  `200803`, is emptied as well. Both are recorded as emptied.
 - It keeps the HL7 null `""` as it is.
 
 **These gaps keep the output short of Safe Harbor, at least:**
@@ -1832,13 +1884,25 @@ What the `date` kind does to a value:
   not hide the day.
 - The order and accession numbers `ORC-2`, `ORC-3`, `OBR-2` and `OBR-3` are not mapped. Safe
   Harbor counts an accession number as an identifier.
-- Other date fields are not mapped. Over the generated corpus, full dates still come through in
-  `AIS-4`, `RXA-3`, `RXA-4`, `PR1-5` and `FT1-4`. A date-typed `OBX-5` result, such as a last
-  menstrual period, is kept whole by the `OBX-5` allowlist. `GT1-8`, `IN1-18` and `NK1-16` are
-  dates of birth with no rule.
-- When a site-code prefix of `19` or `20` is configured, the site-code pass rewrites a six-digit
-  `YYYYMM` output with a salted code. That value then differs between datasets and is no longer a
-  valid date.
+- A date field outside the table above has no rule. BACKLOG #2330 mapped the eight that were
+  known to come through whole. Nobody has checked every HL7 date field, so read the coverage
+  report for others.
+- A `FT1-4` that holds a date range with an end date is scrubbed to empty. The `date` kind reads
+  one timestamp, and a second one after the component separator is not a precision code.
+- An `OBX-5` result whose `OBX-2` type is `DT` or `TS`, such as a last menstrual period, takes the
+  `date` kind too: the year stays, and a value that is not a valid timestamp is scrubbed to
+  empty. A date under any other type gets that type's treatment. So a date sent as `NM` is still
+  kept whole, and one sent as `DTM` or `ST` is redacted whole.
+- When a site-code prefix of `19` or `20` is configured, a six-digit `YYYYMM` has the shape of a
+  site code. The site-code pass and the leak-check's site-code test skip a field that the `date`
+  kind filled, so the filled date stays a date. Two things follow. A site code that reads as a
+  year and a month, sitting in a date field, leaves as its first four digits and `01`. And a
+  `dob` field is not skipped, so a fabricated `YYYYMM` date of birth is still rewritten into a
+  number that is not a date. A site code that is itself a year followed by `01` leaves whole.
+  The skip needs the rules: `leak_check` called with no rules, and the publish gate's own scan
+  of a committed file, still flag a kept `YYYYMM` date under such a prefix. The skip never
+  reaches an MSH line. A `date` rule on an MSH field is applied, and a `YYYYMM` it leaves there
+  is still treated as a site code.
 
 Do not shift the dates to fix the `MSH-7` gap. The kept `MSH-7` minus a shifted `EVN-2` gives back
 the shift.
@@ -1882,7 +1946,8 @@ or one that breaks the schema, refuses the whole run with one `error:` line and 
 came from `messagefoundry generate --count 2 --seed 1710`, run for every type: 186 messages. With
 the switch on, all 186 refused. Mapping the dates and locations above did not change that count.
 It removed 6 of the 72 undecided field addresses, and 553 of the 2,115 undecided fields across the
-corpus. Every message still carries at least one coded field that needs a rule or a `keep`:
+corpus. These counts predate the rules BACKLOG #2330 and #2645 added, and nobody has measured them
+again. Every message still carries at least one coded field that needs a rule or a `keep`:
 
 | Undecided field | Messages |
 | --- | --- |
@@ -1905,8 +1970,8 @@ which HIPAA Safe Harbor counts as an identifier; a default rule now scrubs it.
   `anon.toml`, where a reviewer can see it.
 - A short value in a fixed-list field passes. A two-letter code in `PID-8` could still be
   initials.
-- The tee applies no rule to an MSH field. A rule for a second MSH line's field counts as decided
-  there, but the tee leaves that field as it was and does not scan it.
+- The `BHS`, `FHS` and short header line gaps listed above, under "The two anonymizers still
+  differ", apply with the switch on too.
 
 Note: encryption-at-rest (§3) and log redaction (§7) are **not** de-identification — do not conflate
 "we encrypt" or "we redact logs" with "we de-identify."

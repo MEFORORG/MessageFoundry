@@ -33,8 +33,10 @@ from pathlib import Path
 
 #: A whole-FIELD HL7 address: a 3-char segment id then ``-`` then a 1-based field number
 #: (``PID-5``, ``MRG-1``). Component paths (``PID-5.1``) are rejected — surrogates compose a whole
-#: field's value (ADR 0030 §3), so rules address whole fields only.
-_FIELD_PATH_RE = re.compile(r"^[A-Z][A-Z0-9]{2}-\d+$")
+#: field's value (ADR 0030 §3), so rules address whole fields only. The number is ASCII digits with
+#: no leading zero: ``PID-0`` is the segment id itself, which the tee would overwrite, and ``PID-05``
+#: or a non-ASCII digit names a field the two adapters and the leak-check would read differently.
+_FIELD_PATH_RE = re.compile(r"[A-Z][A-Z0-9]{2}-[1-9][0-9]*")
 
 
 class SurrogateKind(StrEnum):
@@ -57,7 +59,7 @@ class SurrogateKind(StrEnum):
 class RuleError(ValueError):
     """A rule the data layer refuses: a malformed ``anon.toml`` overlay, one that tries to express
     something the data layer deliberately cannot (ADR 0030 §2 — selection only, never logic), or
-    a :class:`FieldRule` built in code with an unknown kind."""
+    a :class:`FieldRule` built in code with an unknown kind or a path that is not a whole field."""
 
 
 def _coerce_kind(path: str, raw: object) -> SurrogateKind:
@@ -73,13 +75,26 @@ def _coerce_kind(path: str, raw: object) -> SurrogateKind:
         ) from None
 
 
+def _check_field_path(path: object) -> None:
+    """Refuse a path that is not a whole-field address. ``fullmatch``, so a trailing newline, a
+    lower-case segment id and a component path all fail here, for a rule built in code and for an
+    overlay key alike."""
+    if not isinstance(path, str) or _FIELD_PATH_RE.fullmatch(path) is None:
+        raise RuleError(
+            f"rule path {path!r} is not a whole-field HL7 address like 'PID-5' "
+            "(component paths and free text are rejected — selection is field-level only)"
+        )
+
+
 @dataclass(frozen=True)
 class FieldRule:
     """One rule: scrub the whole field at ``path`` with surrogate ``kind``.
 
     ``kind`` is normalized to THIS package's :class:`SurrogateKind` on construction, so a plain
     ``"drop"`` string, or the other package's member, becomes the member here. An unknown kind
-    raises :class:`RuleError` at construction, not at the first message. A rule built by the other
+    raises :class:`RuleError` at construction, not at the first message. So does a ``path`` that is
+    not a whole-field address: ``pid-29`` would match no segment and scrub nothing, and ``PID-29.1``
+    would fail inside the tee on the first message (BACKLOG #2330). A rule built by the other
     package still carries that package's member, which is why the adapters and the leak-check
     compare a kind by value rather than by identity.
     """
@@ -88,16 +103,19 @@ class FieldRule:
     kind: SurrogateKind
 
     def __post_init__(self) -> None:
+        _check_field_path(self.path)
         object.__setattr__(self, "kind", _coerce_kind(self.path, self.kind))
 
 
 # The recommended default scrub map (ADR 0030 §3). Anything NOT listed is left intact — so the
-# routing/coded fields (MSH-7/9/10/12, NK1-3 relationship, IN1-2/3/4 plan codes, DG1/AL1/PR1,
-# OBR-4 service) survive untouched and correlation + parity-diff (#14) still work.
+# routing/coded fields (MSH-7/9/10/12, NK1-3 relationship, IN1-2/3/4 plan codes, DG1/AL1, the PR1
+# codes, OBR-4 service) survive untouched and correlation + parity-diff (#14) still work.
 #
 # The DATE and location rules map these Safe Harbor date and location fields, and that is NOT Safe
 # Harbor de-identification: MSH-7 keeps the full message time, the order and accession numbers
-# (ORC-2/3, OBR-2/3) are left unmapped, and so are other date fields (BACKLOG #2248).
+# (ORC-2/3, OBR-2/3) are left unmapped (BACKLOG #2248). The date fields BACKLOG #2330 listed are
+# mapped: an event date takes DATE, and a date of birth takes DOB like PID-7. A date field outside
+# that list still has no rule, and only the coverage report names it.
 #
 # MRG fields are scrubbed with the SAME kinds as their PID counterparts (MRG-1 with PID-3, MRG-4
 # with PID-5) and keyed on the same value, so an A40 merge's old-to-new linkage is preserved across
@@ -131,16 +149,28 @@ DEFAULT_RULES: tuple[FieldRule, ...] = (
     FieldRule("NK1-5", SurrogateKind.PHONE),
     FieldRule("NK1-6", SurrogateKind.PHONE),
     FieldRule("NK1-7", SurrogateKind.PHONE),
+    FieldRule("NK1-16", SurrogateKind.DOB),  # contact's date of birth
     # GT1 — guarantor
     FieldRule("GT1-3", SurrogateKind.NAME),
     FieldRule("GT1-5", SurrogateKind.ADDRESS),
     FieldRule("GT1-6", SurrogateKind.PHONE),
     FieldRule("GT1-7", SurrogateKind.PHONE),
+    FieldRule("GT1-8", SurrogateKind.DOB),  # guarantor's date of birth
     FieldRule("GT1-12", SurrogateKind.SSN),
-    # IN1/IN2 — insurance (plan/company codes IN1-2/3/4 are KEPT by omission)
+    FieldRule("GT1-16", SurrogateKind.NAME),  # guarantor's employer, an XPN
+    FieldRule("GT1-17", SurrogateKind.ADDRESS),  # guarantor's employer address
+    FieldRule("GT1-18", SurrogateKind.PHONE),  # guarantor's employer phone
+    # IN1/IN2 — insurance (plan/company codes IN1-2/3/4 are KEPT by omission). The company's
+    # address, contact and phone, and the insured's employer, are mapped (BACKLOG #2645).
+    FieldRule("IN1-5", SurrogateKind.ADDRESS),  # insurance company address
+    FieldRule("IN1-6", SurrogateKind.NAME),  # insurance company contact person
+    FieldRule("IN1-7", SurrogateKind.PHONE),  # insurance company phone
+    FieldRule("IN1-11", SurrogateKind.NAME),  # insured's group employer name
     FieldRule("IN1-16", SurrogateKind.NAME),
+    FieldRule("IN1-18", SurrogateKind.DOB),  # insured's date of birth
     FieldRule("IN1-19", SurrogateKind.ADDRESS),
     FieldRule("IN1-36", SurrogateKind.ID),
+    FieldRule("IN1-44", SurrogateKind.ADDRESS),  # insured's employer address
     FieldRule("IN1-49", SurrogateKind.ID),
     FieldRule("IN2-2", SurrogateKind.SSN),
     FieldRule("IN2-3", SurrogateKind.FREETEXT),
@@ -163,11 +193,18 @@ DEFAULT_RULES: tuple[FieldRule, ...] = (
     FieldRule("OBR-7", SurrogateKind.DATE),  # observation date/time
     FieldRule("OBR-16", SurrogateKind.PROVIDER),
     FieldRule("OBR-32", SurrogateKind.PROVIDER),
+    FieldRule("OBR-35", SurrogateKind.PROVIDER),  # transcriptionist
     FieldRule("OBX-5", SurrogateKind.FREETEXT),
     FieldRule("OBX-14", SurrogateKind.DATE),  # observation date/time
     FieldRule("OBX-16", SurrogateKind.PROVIDER),
     # NTE — notes / comments
     FieldRule("NTE-3", SurrogateKind.FREETEXT),
+    # Event dates in the scheduling, pharmacy, procedure and financial segments (BACKLOG #2330)
+    FieldRule("AIS-4", SurrogateKind.DATE),  # appointment start date/time
+    FieldRule("RXA-3", SurrogateKind.DATE),  # administration start date/time
+    FieldRule("RXA-4", SurrogateKind.DATE),  # administration end date/time
+    FieldRule("PR1-5", SurrogateKind.DATE),  # procedure date/time
+    FieldRule("FT1-4", SurrogateKind.DATE),  # transaction date
 )
 
 
@@ -182,11 +219,7 @@ _LOG = logging.getLogger(__name__)
 
 
 def _validate_path(path: str) -> str:
-    if not _FIELD_PATH_RE.match(path):
-        raise RuleError(
-            f"rule path {path!r} is not a whole-field HL7 address like 'PID-5' "
-            "(component paths and free text are rejected — selection is field-level only)"
-        )
+    _check_field_path(path)
     return path
 
 

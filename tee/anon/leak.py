@@ -25,6 +25,7 @@ from __future__ import annotations
 import importlib.util
 import re
 from collections import Counter
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -121,6 +122,8 @@ _SEGMENT_ID: re.Pattern[str] = re.compile(r"[A-Z][A-Z0-9]{2}")
 MALFORMED_SEGMENT = "(malformed segment)"
 #: The address a malformed line's first field always gets. :func:`structural_phi_hits` refuses on it.
 _MALFORMED_LINE = f"{MALFORMED_SEGMENT}-0"
+#: The hit a malformed line raises. Named so :func:`refusal_advice` can tell it from a PHI shape.
+MALFORMED_LINE_HIT = "line with a malformed segment id, which no rule can reach"
 #: The stand-in segment id for a well-formed id that the message's HL7 version does not define and
 #: that is not a Z-segment. A segment id is untrusted text too -- a wrapped ``KIM|F`` looks like a
 #: segment -- so only a defined id, a Z-segment or an id a rule names is ever printed in an address.
@@ -211,7 +214,9 @@ _SEGMENT_TABLE_CHANGES: tuple[tuple[str, str, str], ...] = (
 
 def _version_key(version: str) -> tuple[int, ...] | None:
     parts = version.strip().split(".")
-    if not all(part.isdigit() for part in parts):
+    # ASCII digits only: a superscript two passes str.isdigit() and then int() raises on it,
+    # and MSH-12 is untrusted text that must not reach an error message (BACKLOG #2246).
+    if not all(part.isascii() and part.isdigit() for part in parts):
         return None
     return tuple(int(part) for part in parts)
 
@@ -242,6 +247,26 @@ def known_segments(version: str) -> frozenset[str]:
     return chosen if chosen is not None else _ANY_VERSION_SEGMENTS
 
 
+#: Header segments. Each carries its own separators, so none is ever a legal bare line.
+_HEADER_SEGMENTS: frozenset[str] = frozenset({"MSH", "FHS", "BHS"})
+
+
+def _line_is_malformed(fields: list[str], defined: frozenset[str] | set[str]) -> bool:
+    """True if no rule can reach this line. Either its first field is not a well-formed segment
+    id, or the line has no field separator and its text is not an id in ``defined``.
+
+    A segment with no fields is legal HL7, so a bare ``PV2`` is an empty segment and is left
+    alone. A bare ``LEE`` or ``ZOE`` is three letters of untrusted text that no rule can address,
+    so it is malformed. ``defined`` is the ids the message's HL7 version defines plus the ids a
+    rule names, so a bare ``ZPD`` is an empty segment only when a rule names ``ZPD``. A Z-prefix
+    alone does not count (BACKLOG #2247). A header id (``MSH``, ``FHS``, ``BHS``) never stands
+    bare: it carries the separators, and the engine's parser refuses one that the tee would emit."""
+    seg_id = fields[0]
+    if not _SEGMENT_ID.fullmatch(seg_id):
+        return True
+    return len(fields) == 1 and (seg_id not in defined or seg_id in _HEADER_SEGMENTS)
+
+
 def unmapped_field_values(text: str, mapped_paths: set[str]) -> list[tuple[str, str]]:
     """Every ``(address, value)`` in ``text`` whose whole-field ``SEG-i`` address is **not** in
     ``mapped_paths`` and whose value is non-empty — the fields the rule map never touched.
@@ -252,8 +277,9 @@ def unmapped_field_values(text: str, mapped_paths: set[str]) -> list[tuple[str, 
     occurrence of its segment), so the address is the bare ``SEG-i``. Returns ``[]`` when the message
     has no parseable MSH (there is no field separator to split on).
 
-    A line whose first field is not a well-formed segment id, or that has no field separator at
-    all (a wrapped ``LEE`` looks like a segment id), is reported under :data:`MALFORMED_SEGMENT`,
+    A line whose first field is not a well-formed segment id, or that has no field separator and
+    is not an id the message's HL7 version defines or a rule names (a wrapped ``LEE`` looks like a
+    segment id; a bare ``PV2`` is a legal empty segment), is reported under :data:`MALFORMED_SEGMENT`,
     first field included as index 0, so its text reaches the detectors but never an address.
     :func:`structural_phi_hits` refuses such a line outright. A line holding only whitespace or
     control characters (NUL padding, a trailing SUB) carries nothing and is skipped.
@@ -279,7 +305,7 @@ def unmapped_field_values(text: str, mapped_paths: set[str]) -> list[tuple[str, 
             nameable = known_segments(version) | {p.split("-", 1)[0] for p in mapped_paths}
             continue
         seg_id = fields[0]
-        if len(fields) == 1 or not _SEGMENT_ID.fullmatch(seg_id):
+        if _line_is_malformed(fields, nameable):
             out.append((_MALFORMED_LINE, seg_id))  # always present, even when empty
             out.extend((f"{MALFORMED_SEGMENT}-{i}", v) for i, v in enumerate(fields) if i and v)
             continue
@@ -318,7 +344,7 @@ def _structural_reasons(value: str, seps: Seps) -> list[str]:
 
 def structural_phi_hits(text: str, mapped_paths: set[str]) -> list[str]:
     """Structural PHI-shape hits over the fields no rule matched — reasons name the shape + field
-    ADDRESS only (e.g. ``"unmapped SSN-shaped value in GT1-16"``), never the offending value, so the
+    ADDRESS only (e.g. ``"unmapped SSN-shaped value in ZPD-4"``), never the offending value, so the
     result is safe to raise/log. Empty when the message has no parseable MSH.
 
     A line with a malformed segment id is a hit by itself, whatever it holds: no rule can reach it,
@@ -331,9 +357,21 @@ def structural_phi_hits(text: str, mapped_paths: set[str]) -> list[str]:
     hits: list[str] = []
     for address, value in unmapped_field_values(text, mapped_paths):
         if address == _MALFORMED_LINE:
-            hits.append("line with a malformed segment id, which no rule can reach")
+            hits.append(MALFORMED_LINE_HIT)
         hits.extend(f"{reason} in {address}" for reason in _structural_reasons(value, seps))
     return hits
+
+
+def has_unreachable_line(text: str, mapped_paths: Iterable[str] = ()) -> bool:
+    """True if ``text`` holds a line no rule can reach, by the same walk the leak-check uses.
+    ``normalized_message`` refuses on it, so plain ``anonymize`` and ``anonymize_checked`` agree
+    (BACKLOG #2246). False when the message has no parseable MSH; the adapters refuse that.
+
+    ``mapped_paths`` is the paths of the rules that rewrite a field, the same set
+    :func:`structural_phi_hits` is given. A segment id one of them names may stand bare, so this
+    and the leak-check accept and refuse the same lines for the same rules."""
+    paths = set(mapped_paths)
+    return any(address == _MALFORMED_LINE for address, _ in unmapped_field_values(text, paths))
 
 
 #: Fields ``require_full_coverage`` needs no rule for, but only while the value has the expected
@@ -378,6 +416,9 @@ class LeakReport:
     * ``token_floor_reason`` — why the denylist is not trustworthy, or ``None`` if it is.
     * ``undecided_fields`` — the addresses present that no rule scrubs, no ``keep`` names and
       :data:`ALWAYS_DECIDED` does not excuse; ``require_full_coverage`` refuses on them.
+    * ``blanked_fields`` — the addresses where the ``DATE`` kind scrubbed a value it could
+      not keep to empty. Only ``anonymize_checked`` fills it: this report is built from the
+      output, where an emptied field looks like one that was never sent (BACKLOG #2330).
     """
 
     hits: list[str]
@@ -386,6 +427,7 @@ class LeakReport:
     token_tables_live: bool
     token_floor_reason: str | None
     undecided_fields: tuple[str, ...] = ()
+    blanked_fields: tuple[str, ...] = ()
 
 
 def leak_report(text: str, *, rules: tuple[FieldRule, ...] | None = None) -> LeakReport:
@@ -398,7 +440,8 @@ def leak_report(text: str, *, rules: tuple[FieldRule, ...] | None = None) -> Lea
     when ``rules`` is supplied**; a bare-string call is the legacy token-only behaviour.
     """
     token_hits = scan_text(text, include_estate=True)
-    if message_has_site_code(text):
+    # The rules scope this check too: a field the DATE kind filled is not a site code (#2330).
+    if message_has_site_code(text, rules or ()):
         token_hits.append("site-code pattern")
     undecided: tuple[str, ...] = ()
     if rules is None:
@@ -454,12 +497,39 @@ def leak_check(text: str, *, rules: tuple[FieldRule, ...] | None = None) -> list
 def coverage_clause(report: LeakReport) -> str:
     """A PHI-safe suffix for a fail-closed message naming what the check reached — the count and
     ADDRESSES of the unmapped fields (never their values) and whether the denylist tables were live."""
-    live = "yes" if report.token_tables_live else "no"
+    live = "yes" if denylist_is_live(report) else "no"
     fields = ", ".join(report.unmapped_fields) if report.unmapped_fields else "none"
     return (
         f" (checked {len(report.unmapped_fields)} unmapped field(s): {fields}; "
         f"denylist tables live: {live})"
     )
+
+
+def denylist_is_live(report: LeakReport) -> bool:
+    """True only if the token tables loaded AND passed the floor check. ``token_tables_live`` alone
+    is true for a source that lost a whole section, which ``token_floor_reason`` then names, so
+    printing "live" from the first field alone overstated the check (BACKLOG #2247)."""
+    return report.token_tables_live and report.token_floor_reason is None
+
+
+def refusal_advice(
+    report: LeakReport, *, denylist_refused: bool = False, coverage_refused: bool = False
+) -> str:
+    """What to do about a refusal: one sentence per KIND of cause that fired, and no others.
+    Every refusal used to suggest repairing a malformed line, even when a token was the cause
+    (BACKLOG #2247). PHI-safe: fixed text, chosen by the kind of hit and never by a value."""
+    steps: list[str] = []
+    token_hit = len(report.hits) > len(report.structural_hits)
+    shape_hit = any(hit != MALFORMED_LINE_HIT for hit in report.structural_hits)
+    if token_hit or shape_hit:
+        steps.append("Extend the rule map so the field that carries it is scrubbed.")
+    if coverage_refused:
+        steps.append("Add a rule for each field named, or a keep for one you reviewed.")
+    if MALFORMED_LINE_HIT in report.structural_hits:
+        steps.append("Repair the line with a malformed segment id.")
+    if denylist_refused:
+        steps.append("Load the denylist token source.")
+    return " ".join(steps)
 
 
 #: What the structural detectors look for in an unmapped field, and what they let through. Stated once
@@ -481,6 +551,7 @@ class CoverageTally:
         self.messages = 0
         self.counts: Counter[str] = Counter()
         self.undecided: Counter[str] = Counter()
+        self.blanked: Counter[str] = Counter()
         self.full_coverage = full_coverage
         self.denylist_live = True
 
@@ -488,7 +559,8 @@ class CoverageTally:
         self.messages += 1
         self.counts.update(report.unmapped_fields)
         self.undecided.update(report.undecided_fields)
-        self.denylist_live = self.denylist_live and report.token_tables_live
+        self.blanked.update(report.blanked_fields)
+        self.denylist_live = self.denylist_live and denylist_is_live(report)
 
     def summary(self) -> str:
         live = "yes" if self.messages and self.denylist_live else "no"
@@ -501,4 +573,9 @@ class CoverageTally:
         if self.full_coverage:
             todo = ", ".join(f"{a} x{n}" for a, n in sorted(self.undecided.items())) or "none"
             text += f" Fields that need a rule or a keep for require_full_coverage: {todo}."
+        if self.blanked:
+            gone = ", ".join(f"{a} x{n}" for a, n in sorted(self.blanked.items()))
+            text += (
+                f" Date fields emptied because the value was not a timestamp it could keep: {gone}."
+            )
         return text
