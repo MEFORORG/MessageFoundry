@@ -40,6 +40,16 @@
   set, `MSH-7` included, is unchanged.** Reasons the result falls short of Safe Harbor, at least:
   `MSH-7` keeps the full message time for tee correlation, the order and accession numbers `ORC-2/3`
   and `OBR-2/3` stay unmapped, and so do other date fields. [PHI.md](../PHI.md) §9 is the long form.
+- **AMENDED 2026-10-05 (BACKLOG #2330): the follow-ups the #2248 change left open.** The default map
+  adds `AIS-4`, `RXA-3`, `RXA-4`, `PR1-5` and `FT1-4` as `DATE`, and `GT1-8`, `IN1-18` and `NK1-16`
+  as `DOB`. **`PR1-5` is the one place this touches the §3 `KEEP` set:** §3 keeps the coded clinical
+  segments, PR1 among them, and the procedure date is not a code, so the PR1 codes stay `KEEP` and
+  only the date is mapped. The `DATE` kind itself gains three behaviours. An `OBX-5` whose `OBX-2`
+  is `DT` or `TS` takes it, where the preserve allowlist used to keep the value whole. A six-digit
+  value that reads both as `YYYYMM` and as `YYMMDD` is scrubbed to empty. And each field it empties
+  is recorded by address in the coverage report. The site-code pass (§5) and its leak-check twin
+  skip a field the `DATE` kind filled. The output is still NOT Safe Harbor de-identified, for the
+  reasons the bullet above gives. [PHI.md](../PHI.md) §9 is the long form.
 - **Decision in one line:** ship a **pure-stdlib, dependency-free `anon` package** that turns real,
   messy HL7 v2 into structurally-faithful **PHI-free** datasets via a **two-layer rule model — a
   declarative field-*selection* map (data) over a code registry of pure surrogate *functions* (logic)** —
@@ -199,7 +209,8 @@ patient-merge does not leak the prior MRN/name; NK1-2 (`NAME`), NK1-4 (`ADDRESS`
 merge linkage survives. **MSH-7/9/10/12 are `KEEP`** so tee correlation + parity-diff (#14) and
 routing/validation realism survive, and the coded clinical segments (DG1/AL1/PR1) are `KEEP`.
 *(AMENDED 2026-09-28, #2248: the event, visit, order and observation dates plus `PID-12` and `PV1-3`
-were added to this list; see the status banner.)*
+were added to this list; see the status banner. AMENDED 2026-10-05, #2330: eight more date fields
+were added, `PR1-5` among them, and the PR1 codes are still `KEEP`.)*
 
 **Free-text default = full redaction.** `OBX-5` and `NTE-3` carry narrative that *commonly embeds
 identifiers* (name/MRN/DOB/phone) which field-level surrogation cannot reach, and the leak-check (§5) only
