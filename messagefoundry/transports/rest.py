@@ -333,6 +333,7 @@ def http_family_trust_anchor(
     *,
     url: str,
     trust_anchor_policy: TrustAnchorPolicy | None,
+    cell: str = "HTTP-family trust anchor",
 ) -> TrustAnchor:
     """Resolve the client trust anchor for an https hop in the HTTP egress family (#1180, ADR 0093).
 
@@ -347,11 +348,13 @@ def http_family_trust_anchor(
 
     A ``url`` that names no host raises ``ValueError`` (:func:`hop_url_host`, BACKLOG #2207). Read as
     ``""`` it took the loopback arm, which drops the instance CA and the CRL from a hop nobody can
-    place."""
+    place. ``cell`` leads that refusal. The two token-endpoint factories resolve the anchor before
+    their provider checks the URL, so they pass the setting's name and the operator learns which
+    URL to fix."""
     ca = settings.get("tls_ca_file")
     return resolve_trust_anchor(
         connection_ca_file=str(ca) if ca else None,
-        host=hop_url_host(url, cell="HTTP-family trust anchor"),
+        host=hop_url_host(url, cell=cell),
         policy=trust_anchor_policy if trust_anchor_policy is not None else TrustAnchorPolicy(),
     )
 

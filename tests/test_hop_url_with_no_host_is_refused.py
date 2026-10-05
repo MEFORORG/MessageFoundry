@@ -45,7 +45,13 @@ from messagefoundry.config.wiring import FHIR, DICOMweb, Rest, Soap
 from messagefoundry.transports import build_destination, rest
 from messagefoundry.transports.base import DeliveryError, DestinationConnector
 from messagefoundry.transports.fhir import FhirLookupExecutor
-from messagefoundry.transports.rest import InsecureHopGuard, http_family_trust_anchor
+from messagefoundry.transports.http_auth import oauth2_cc_provider_from_settings
+from messagefoundry.transports.rest import (
+    HttpAuthError,
+    InsecureHopGuard,
+    http_family_trust_anchor,
+)
+from messagefoundry.transports.smart import SmartAuthError, token_provider_from_settings
 from tests._extras_probe import OPTIONAL_EXTRAS, extra_is_installed
 
 _PROD = HopPosture(enforcing=True)
@@ -399,6 +405,47 @@ def test_the_http_family_anchor_lookup_still_resolves_a_real_host() -> None:
     assert (remote.cafile, remote.crl_file) == ("ca.pem", "crl.pem")
     local = http_family_trust_anchor({}, url="https://127.0.0.1/x", trust_anchor_policy=policy)
     assert (local.cafile, local.crl_file) == (None, None)
+
+
+@pytest.mark.parametrize(
+    "token_url", ["https:///token", "https://:8443/token", "idp.example/token"]
+)
+def test_a_token_endpoint_with_no_host_is_refused_by_name(token_url: str) -> None:
+    """Both token-endpoint factories resolve the trust anchor before their provider checks the URL,
+    so the anchor lookup is where a URL with no host is refused. The refusal leads with the
+    setting's name. A plain ValueError, as BACKLOG #1924 chose for these seams."""
+    with active_hop_posture(_PROD):
+        with pytest.raises(ValueError, match="names no host") as oauth:
+            oauth2_cc_provider_from_settings(
+                {
+                    "oauth2_token_url": token_url,
+                    "oauth2_client_id": "synthetic-client",
+                    "oauth2_client_secret": "synthetic",  # nosec B105 - a made-up test value
+                }
+            )
+        with pytest.raises(ValueError, match="names no host") as smart:
+            token_provider_from_settings(
+                {"smart_token_url": token_url, "smart_client_id": "synthetic-client"}
+            )
+    assert str(oauth.value).startswith("oauth2_token_url: ")
+    assert str(smart.value).startswith("smart_token_url: ")
+
+
+def test_a_token_endpoint_with_a_host_still_gets_its_providers_own_refusal() -> None:
+    """The control: a URL that has a host passes the anchor lookup, and the provider's own check
+    still answers, with its own error type."""
+    with active_hop_posture(_PROD), pytest.raises(HttpAuthError, match="must be http or https"):
+        oauth2_cc_provider_from_settings(
+            {
+                "oauth2_token_url": "ftp://idp.example/token",
+                "oauth2_client_id": "synthetic-client",
+                "oauth2_client_secret": "synthetic",  # nosec B105 - a made-up test value
+            }
+        )
+    with active_hop_posture(_PROD), pytest.raises(SmartAuthError, match="must be http or https"):
+        token_provider_from_settings(
+            {"smart_token_url": "ftp://idp.example/token", "smart_client_id": "synthetic-client"}
+        )
 
 
 def _hosts_the_vault_lookup_resolves(
