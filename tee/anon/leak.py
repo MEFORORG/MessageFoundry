@@ -34,19 +34,21 @@ from .surrogates import Seps, message_has_site_code, read_message_seps
 
 
 def _load_publish_guard(_start: Path | None = None) -> object | None:
-    """Load the owner-managed guard (``scripts/security/scan_forbidden.py``) by path, walking up from
-    this file. It is the SINGLE source for the token tables, so none live literally here. Absent from an
-    installed wheel with no ``scripts/`` → returns ``None`` and the tables load empty. ``_start``
-    overrides the search origin for tests."""
+    """Load the owner-managed guard (``scripts/security/scan_forbidden.py``) by path. It is the SINGLE
+    source for the token tables, so none live literally here. Absent from an installed wheel with no
+    ``scripts/`` → returns ``None`` and the tables load empty. ``_start`` stands in for this file's
+    path in tests."""
     origin = (_start if _start is not None else Path(__file__)).resolve()
-    for parent in origin.parents:
-        candidate = parent / "scripts" / "security" / "scan_forbidden.py"
-        if candidate.exists():
-            spec = importlib.util.spec_from_file_location("tee_anon_publish_guard", candidate)
-            if spec is not None and spec.loader is not None:
-                mod = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(mod)
-                return mod
+    # ONE path, built and never searched for (BACKLOG #2344). parents[2] is the folder that holds the
+    # tee package: the repository root in a checkout. Why that folder is the limit is stated once, for
+    # the engine copy, in docs/DANGEROUS-FUNCTIONALITY.md ("`anon/leak.py` loads one file by path").
+    candidate = origin.parents[2] / "scripts" / "security" / "scan_forbidden.py"
+    if candidate.is_file():
+        spec = importlib.util.spec_from_file_location("tee_anon_publish_guard", candidate)
+        if spec is not None and spec.loader is not None:
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
     return None
 
 

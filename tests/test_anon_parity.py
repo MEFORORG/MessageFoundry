@@ -121,7 +121,9 @@ def test_leak_tables_load_empty_without_the_publish_guard(tmp_path: Path) -> Non
     # Where no guard is reachable (an installed wheel with no scripts/ above it) the token tables
     # must load EMPTY -- never a stale or fragmented copy -- so no customer/vendor token ships in
     # the tee. Exercise the loader against a tree that has no scripts/security above it.
-    assert tee_leak._load_publish_guard(tmp_path / "no-guard-here" / "leak.py") is None
+    # The loader tries one path, under parents[2] of the file it is given (BACKLOG #2344). Shape
+    # the stand-in like the package so that folder is inside tmp_path.
+    assert tee_leak._load_publish_guard(tmp_path / "root" / "tee" / "anon" / "leak.py") is None
 
 
 def test_leak_tables_are_sourced_from_the_guard_when_present() -> None:
