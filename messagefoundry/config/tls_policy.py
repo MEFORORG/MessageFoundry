@@ -124,6 +124,7 @@ __all__ = [
     "APPROVED_TLS12_SUITES",
     "APPROVED_TLS13_SUITES",
     "apply_operator_tls_ciphers",
+    "EngineTlsListRefused",
     "narrow_signature_algorithms",
     "narrow_tls13_suites",
     "narrow_to_approved_suites",
@@ -812,7 +813,8 @@ def validate_tls_ciphers(value: str, *, require_approved_suites: bool = True) ->
     probe = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     # The probe models an engine context, so the string reaches it the way it reaches every engine
     # context: through apply_operator_tls_ciphers, TLS 1.3 narrowing included. An ssl.SSLError here
-    # is the operator's string; the engine's own TLS 1.3 list fails with RuntimeError instead.
+    # is the operator's string; the engine's own lists fail with EngineTlsListRefused instead, which
+    # passes through as the ValueError it is (BACKLOG #2484).
     try:
         apply_operator_tls_ciphers(probe, value)
     except ssl.SSLError as exc:
@@ -1071,13 +1073,16 @@ def apply_connection_tls_ciphers(
     :func:`validate_tls_ciphers` speaks about a generic ``tls_ciphers`` and an operator running
     several connections needs to know WHICH one is at fault."""
     ciphers = settings.get(CONNECTION_TLS_CIPHERS_SETTING)
-    if ciphers is None:
-        narrow_to_approved_suites(ctx)
-        return
-    text = str(ciphers)
     try:
+        if ciphers is None:
+            narrow_to_approved_suites(ctx)
+            return
+        text = str(ciphers)
         validate_tls_ciphers(text)
         apply_operator_tls_ciphers(ctx, text)
+    except EngineTlsListRefused as exc:
+        # The build refused the engine's list, so name the connection without blaming its string.
+        raise EngineTlsListRefused(f"{connector}: {exc}") from exc
     except (ValueError, ssl.SSLError) as exc:
         raise ValueError(f"{connector}: tls_ciphers rejected: {exc}") from exc
 
@@ -1226,8 +1231,34 @@ def narrow_to_approved_suites(ctx: ssl.SSLContext) -> None:
     This narrows and does not assert. Each seam still calls :func:`harden_cipher_suites` itself,
     after this, so the ASVS 12.1.2 call-site guard keeps seeing the assertion by name (ADR 0188)."""
     ctx.set_ciphers(f"@SECLEVEL={ctx.security_level}:" + ":".join(APPROVED_TLS12_SUITES))
-    narrow_tls13_suites(ctx)
-    narrow_signature_algorithms(ctx)
+    _narrow_tls13_and_sigalgs(ctx)
+
+
+class EngineTlsListRefused(ValueError):
+    """The linked OpenSSL refused a list the ENGINE sets on every context, not an operator string.
+
+    A :class:`ValueError`, so every seam surfaces it as a configuration refusal at ``check``,
+    dry-run or ``serve``. Its own class only so :func:`apply_connection_tls_ciphers` can name the
+    connection without prefixing "tls_ciphers rejected", which would blame the operator."""
+
+
+def _narrow_tls13_and_sigalgs(ctx: ssl.SSLContext) -> None:
+    """Narrow the two halves a cipher string cannot reach, and refuse as a config error if the build
+    will not take the engine's list (BACKLOG #2484).
+
+    :func:`narrow_tls13_suites` and :func:`narrow_signature_algorithms` raise :class:`RuntimeError`
+    on such a build. Before #2484 only the ldap3 and hvac seam caught it, so every other seam failed
+    at start with an unhandled error rather than a named refusal. Converting here, in the two
+    wrappers, reaches every seam at once. The narrowers' own message names the list; this adds the
+    linked OpenSSL, because the fault is that build's."""
+    try:
+        narrow_tls13_suites(ctx)
+        narrow_signature_algorithms(ctx)
+    except RuntimeError as exc:
+        raise EngineTlsListRefused(
+            f"{ssl.OPENSSL_VERSION} refused a list the engine sets on every TLS context. This is "
+            f"the engine's own list, not an operator tls_ciphers string: {exc}"
+        ) from exc
 
 
 def narrow_tls13_suites(ctx: ssl.SSLContext) -> bool:
@@ -1255,7 +1286,9 @@ def narrow_tls13_suites(ctx: ssl.SSLContext) -> bool:
 
     **The return value is for callers and tests; no posture field reports it yet.** The seams drop
     it. An OpenSSL build that refuses the approved list raises :class:`RuntimeError` naming the
-    engine's list, so the failure is never reported as a fault in an operator's ``tls_ciphers``."""
+    engine's list, so the failure is never reported as a fault in an operator's ``tls_ciphers``.
+    The two wrappers that call this turn it into :class:`EngineTlsListRefused`, a config refusal
+    (BACKLOG #2484)."""
     target = getattr(ctx, "_ctx", ctx)
     if not hasattr(target, "set_ciphersuites"):
         return False  # the recorded gap described above
@@ -1360,7 +1393,8 @@ def narrow_signature_algorithms(ctx: ssl.SSLContext) -> bool:
     warning once per process and keeps today's behaviour, as 3.14 does (accepted by the Manager on
     BACKLOG #1171). An OpenSSL that refuses the list without ML-DSA, or a catalogue with no scheme
     left once SHA-224 is removed, raises :class:`RuntimeError`, as :func:`narrow_tls13_suites` does,
-    so the failure is never blamed on an operator's ``tls_ciphers``.
+    so the failure is never blamed on an operator's ``tls_ciphers``. The wrappers turn that into
+    :class:`EngineTlsListRefused`, as they do for the TLS 1.3 list (BACKLOG #2484).
 
     **Reach.** Every engine-built context that narrows its suites, through
     :func:`narrow_to_approved_suites` or :func:`apply_operator_tls_ciphers`, the LDAPS hop included
@@ -1426,10 +1460,10 @@ def apply_operator_tls_ciphers(ctx: ssl.SSLContext, ciphers: str) -> None:
     The signature schemes are narrowed here too (:func:`narrow_signature_algorithms`), because a
     cipher string cannot reach them either.
     It does not validate. The seams validate first, at settings load or in
-    :func:`apply_connection_tls_ciphers`; :func:`validate_tls_ciphers` calls this on its own probe."""
+    :func:`apply_connection_tls_ciphers`; :func:`validate_tls_ciphers` calls this on its own probe.
+    A build that refuses the engine's own lists raises :class:`EngineTlsListRefused`."""
     ctx.set_ciphers(ciphers)
-    narrow_tls13_suites(ctx)
-    narrow_signature_algorithms(ctx)
+    _narrow_tls13_and_sigalgs(ctx)
 
 
 def _is_encrypting(cipher: Mapping[str, object]) -> bool:
@@ -1575,7 +1609,7 @@ def _narrow_library_context(ctx: ssl.SSLContext, *, connector: str, hop: str) ->
     after it, so the call-site guards see the assertion at each seam by name."""
     try:
         narrow_to_approved_suites(ctx)  # TLS 1.2, TLS 1.3 and sigalgs (BACKLOG #300, #2494)
-    except (ssl.SSLError, RuntimeError) as exc:
+    except (ssl.SSLError, EngineTlsListRefused) as exc:
         raise ValueError(
             f"{connector}: this OpenSSL build refuses the approved suite list, so {hop} cannot "
             f"be narrowed (BACKLOG #300): {exc}"

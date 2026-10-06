@@ -780,6 +780,73 @@ def test_an_engine_tls13_list_the_build_refuses_is_not_blamed_on_the_operator() 
         narrow_tls13_suites(_Refusing(ssl.PROTOCOL_TLS_CLIENT))
 
 
+class _RefusesTls13(ssl.SSLContext):
+    """A 3.15-shaped context whose OpenSSL refuses the engine's TLS 1.3 list (BACKLOG #2484)."""
+
+    def set_ciphersuites(self, suites: str) -> None:
+        raise ssl.SSLError("no cipher match")
+
+
+_OPERATOR_STRING = APPROVED_TLS12_SUITES[0]
+
+
+@pytest.mark.parametrize("wrapper", ["default", "operator"])
+def test_a_refused_engine_tls13_list_is_a_config_refusal_naming_the_list_and_openssl(
+    wrapper: str,
+) -> None:
+    """Both wrappers turn the narrower's RuntimeError into a ValueError, so every seam reports a
+    named configuration refusal rather than an unhandled error at start (BACKLOG #2484)."""
+    ctx = _RefusesTls13(ssl.PROTOCOL_TLS_SERVER)
+    with pytest.raises(tls_policy.EngineTlsListRefused) as caught:
+        if wrapper == "default":
+            narrow_to_approved_suites(ctx)
+        else:
+            tls_policy.apply_operator_tls_ciphers(ctx, _OPERATOR_STRING)
+    assert isinstance(caught.value, ValueError)
+    message = str(caught.value)
+    assert ssl.OPENSSL_VERSION in message
+    assert all(name in message for name in APPROVED_TLS13_SUITES), message
+    assert isinstance(caught.value.__cause__, RuntimeError)
+
+
+@pytest.mark.parametrize("settings", [{}, {"tls_ciphers": _OPERATOR_STRING}])
+def test_a_refused_engine_list_on_a_connection_names_it_without_blaming_its_string(
+    settings: dict[str, str],
+) -> None:
+    """Set or unset, the refusal names the connection and is never "tls_ciphers rejected"."""
+    with pytest.raises(tls_policy.EngineTlsListRefused) as caught:
+        tls_policy.apply_connection_tls_ciphers(
+            _RefusesTls13(ssl.PROTOCOL_TLS_CLIENT), settings, connector="MLLP destination"
+        )
+    message = str(caught.value)
+    assert message.startswith("MLLP destination: ")
+    assert "tls_ciphers rejected" not in message
+    assert ssl.OPENSSL_VERSION in message
+
+
+def test_a_refused_engine_list_at_settings_load_is_a_validation_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``[api].tls_ciphers`` is validated on a probe the stub cannot reach, so the narrower itself
+    is made to refuse. Settings load must report it as a ValueError, not crash."""
+
+    def refuse(ctx: ssl.SSLContext) -> bool:
+        raise RuntimeError("this OpenSSL build refused the engine's approved TLS 1.3 suites")
+
+    monkeypatch.setattr(tls_policy, "narrow_tls13_suites", refuse)
+    with pytest.raises(ValueError, match=re.escape(ssl.OPENSSL_VERSION)):
+        ApiSettings(tls_ciphers=_OPERATOR_STRING)
+
+
+def test_the_library_seam_still_names_its_connector_on_a_refused_engine_list() -> None:
+    """The ldap3 and hvac seam caught RuntimeError before #2484; it now catches the new class."""
+    with pytest.raises(ValueError, match="^LDAP: this OpenSSL build refuses") as caught:
+        tls_policy._narrow_library_context(
+            _RefusesTls13(ssl.PROTOCOL_TLS_CLIENT), connector="LDAP", hop="the LDAPS hop"
+        )
+    assert isinstance(caught.value.__cause__, tls_policy.EngineTlsListRefused)
+
+
 # --- the call-site count: every engine module that asserts a suite list narrows one -----------------
 
 
