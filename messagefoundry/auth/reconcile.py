@@ -188,7 +188,8 @@ class ReconcilePlan:
     #: Cached usernames to copy down from the directory (BACKLOG #1532). Empty on an aborted pass,
     #: like every other write this plan carries -- an abort leaves the store byte-identical.
     renames: tuple[UsernameRefresh, ...] = ()
-    #: Strikes to record: ``user_id -> consecutive ABSENT, DISABLED or UNDETERMINED count``. A PRESENT
+    #: Strikes to record: ``user_id -> consecutive ABSENT, DISABLED, UNDETERMINED or UNKEYED
+    #: count``. A PRESENT
     #: probe maps to 0 (reset), and so does a HELD one (ADR 0195 rule item 7; ``held`` tells the two
     #: apart). An UNAVAILABLE or REFERRED probe is absent from this mapping, leaving whatever strike
     #: the user already carried untouched. Populated even on a breaker abort — see :func:`plan_pass`.
@@ -368,8 +369,11 @@ def plan_pass(
     probes = list(probes)
     unavailable = [p for p in probes if p.outcome is ProbeOutcome.UNAVAILABLE]
     referred = [p for p in probes if p.outcome is ProbeOutcome.REFERRED]
+    # BACKLOG #2434. An UNKEYED row was never asked, so it says nothing about whether the
+    # directory answered, and must not stop an outage or a referral-only pass being named as one.
+    asked = sum(1 for p in probes if p.outcome is not ProbeOutcome.UNKEYED)
 
-    if referred and len(unavailable) + len(referred) == len(probes):
+    if referred and len(unavailable) + len(referred) == asked:
         # BACKLOG #2538. Nothing in the pass was answered, as on an outage, so it judges nothing and
         # the hold's state carries over. Checked before the outage, so a pass of referrals and
         # failures is not read as a plain outage, which pages nobody. A user search base in another
@@ -382,7 +386,7 @@ def plan_pass(
             latched=latched,
         )
 
-    if probes and len(unavailable) == len(probes):
+    if asked and len(unavailable) == asked:
         # Every probe failed: the directory, not the accounts, is what changed. Belt-and-braces on
         # top of the per-probe fail-open — this is the shape a DC outage takes, and naming it keeps
         # the operator-facing reason honest rather than reporting a silent zero-revocation pass.

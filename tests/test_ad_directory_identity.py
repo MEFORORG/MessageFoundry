@@ -1524,7 +1524,7 @@ class _RebindDirectory:
     so a second directory read would show as a second key."""
 
     def __init__(
-        self, bound: AdPrincipal | None, refusal: DirectoryAnswer = DirectoryAnswer.FOUND
+        self, bound: AdPrincipal | None, refusal: DirectoryAnswer | None = DirectoryAnswer.FOUND
     ) -> None:
         self.bound = bound
         self.refusal = refusal
@@ -1744,11 +1744,13 @@ async def test_the_reauth_route_says_the_directory_could_not_confirm_the_account
         (DirectoryAnswer.NOT_FOUND, "not_in_directory"),
         (DirectoryAnswer.DISABLED, "directory_disabled"),
         (DirectoryAnswer.UNDETERMINED, "directory_undetermined"),
+        # No lookup ran for a non-empty password: never read as empty_password, never counted.
+        (None, "directory_unavailable"),
     ],
-    ids=["absent", "disabled", "undetermined"],
+    ids=["absent", "disabled", "undetermined", "no-lookup"],
 )
 async def test_an_unjudged_re_bind_names_its_cause_on_the_audit_row(
-    answer: DirectoryAnswer, reason: str
+    answer: DirectoryAnswer | None, reason: str
 ) -> None:
     """Every refusal that judged no password says why on ``auth.reauth``, so the row never reads
     as a wrong guess. RED when any arm drops or swaps its slug. A disabled account is told apart

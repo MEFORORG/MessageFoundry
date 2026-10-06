@@ -542,6 +542,34 @@ def test_the_outcome_record_caps_undetermined_entries_last() -> None:
     assert ledger == {"u1": U}
 
 
+def test_an_unkeyed_probe_strikes_like_an_absent_one_and_never_moves_the_hold() -> None:
+    """BACKLOG #2434, the pure layer. UNKEYED strikes and revokes at the threshold as
+    ``directory_object_id_missing``. Two of them are not a wave: no hold, nothing held, no latch."""
+    k = reconcile.ProbeOutcome.UNKEYED
+    probes = [reconcile.Probe("k1", "k1", k), reconcile.Probe("k2", "k2", k)]
+    first = _plan(probes)
+    assert first.revocations == () and first.strikes == {"k1": 1, "k2": 1}
+    second = _plan(probes, prior_strikes=dict(first.strikes), prior_outcomes=dict(first.outcomes))
+    assert sorted((r.user_id, r.reason) for r in second.revocations) == [
+        ("k1", "directory_object_id_missing"),
+        ("k2", "directory_object_id_missing"),
+    ]
+    assert not (first.hold or second.hold or first.latched or second.latched)
+    assert first.undetermined == 0 and first.readable == 0
+
+
+def test_an_unkeyed_probe_does_not_hide_an_outage_or_a_referral_only_pass() -> None:
+    """BACKLOG #2434. An UNKEYED row was never asked, so it says nothing about the directory: a
+    pass whose every ASKED probe failed is still an outage, and one of referrals is still that."""
+    unkeyed = reconcile.Probe("k", "k", reconcile.ProbeOutcome.UNKEYED)
+    down = reconcile.Probe("a", "a", reconcile.ProbeOutcome.UNAVAILABLE)
+    referred = reconcile.Probe("r", "r", reconcile.ProbeOutcome.REFERRED)
+    assert _plan([down, unkeyed]).aborted == "directory_unavailable"
+    assert _plan([referred, unkeyed]).aborted == reconcile.REFERRAL_ABORT
+    # CONTROL: a pass of UNKEYED rows alone is judged, not read as an outage.
+    assert _plan([unkeyed]).aborted is None
+
+
 def test_breaker_ceiling_reports_the_larger_of_the_two_thresholds() -> None:
     assert reconcile.breaker_ceiling(probed=10, max_absolute=5, max_fraction=0.34) == 5
     assert reconcile.breaker_ceiling(probed=300, max_absolute=5, max_fraction=0.34) == 102
@@ -1391,8 +1419,37 @@ async def test_a_row_with_no_immutable_id_is_never_probed_by_name() -> None:
         ]
         assert not any(plan.hold or plan.held or plan.latched for plan in plans)
         assert service.directory_reconcile_hold is None
+        assert service._reconcile_hold_standing != "forfeit"
         for token in tokens:
             assert token is not None and await service.identity_for_token(token) is None
+    finally:
+        await store.close()
+
+
+async def test_a_referral_does_not_mark_an_id_less_row_it_can_never_confirm() -> None:
+    """BACKLOG #2434. A referral marks every candidate until a pass reads it PRESENT. An id-less
+    row is never probed, so it could never be confirmed, and its UNKEYED revocation would forfeit
+    the referral's clear. It is left unmarked; the id-bearing accounts are marked as before."""
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap(
+            {
+                "alice": _principal("alice"),
+                "bob": _principal("bob"),
+                "jdoe": replace(_principal("jdoe"), directory_object_id=None),
+            }
+        )
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        for name in ("alice", "bob", "jdoe"):
+            assert await _signed_in_ad_user(service, store, name) is not None
+        ids = {n: (await store.get_user_by_username(n)).id for n in ("alice", "bob", "jdoe")}  # type: ignore[union-attr]
+        ldap.referring.add("alice")
+
+        plan = await service.reconcile_directory_sessions()
+
+        assert plan.referred == (ids["alice"],)
+        assert service._reconcile_referred == {ids["alice"], ids["bob"]}
     finally:
         await store.close()
 

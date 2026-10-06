@@ -5415,8 +5415,8 @@ class AuthService:
         * a probe that could not reach the directory contributes nothing (fail-open);
         * a probe the directory referred contributes nothing either, and the pass alerts, while
           every other account is still judged (BACKLOG #2538);
-        * a principal must come back absent, disabled or undetermined ``ad_session_recheck_strikes``
-          passes running;
+        * a principal must come back absent, disabled, undetermined or unkeyed
+          ``ad_session_recheck_strikes`` passes running;
         * a PRESENT principal whose directory groups would change its roles, or withdraw or narrow
           its channel scope, is revoked on one pass, and the scope itself is left for the next login
           to write (ADR 0198);
@@ -5572,19 +5572,22 @@ class AuthService:
         # dropped from the set (`_forfeit_clears_on_attrition`). Kept as it stood before this pass,
         # for the revocation loop below.
         unconfirmed = frozenset(self._reconcile_unconfirmed)
+        # BACKLOG #2434. An id-less row is never probed, so no pass can read it PRESENT. Marked, it
+        # would stay unconfirmed until its UNKEYED revocation forfeits the clear, every time.
+        keyed = {uid for uid, user in users.items() if user.directory_object_id}
         if plan.aborted is None:
             present = reconcile.ProbeOutcome.PRESENT
             self._reconcile_unconfirmed.difference_update(
                 uid for uid, outcome in plan.outcomes.items() if outcome is present
             )
         elif not plan.judged_nothing:
-            self._reconcile_unconfirmed = set(users)
+            self._reconcile_unconfirmed = set(keyed)
             self._advance_breaker_standing("tripped")
         # BACKLOG #2538. The same for a referral, on its own record and its own standing.
         # `_mark_reconcile_clears` states why every candidate is marked and why only PRESENT
         # confirms; `_forfeit_clears_on_attrition` states the forfeit.
         if plan.referred:
-            self._reconcile_referred = set(users)
+            self._reconcile_referred = set(keyed)
             self._advance_referral_standing("referred")
         else:
             present = reconcile.ProbeOutcome.PRESENT
@@ -6245,7 +6248,8 @@ class AuthService:
                 "directory reconcile: %s carries a federated binding but no directory object id, "
                 "so it is not probed by name and a directory disable will not end its sessions "
                 "before they expire. Unbind it (DELETE /users/%s/federated-identity) so the "
-                "reconciler ends its sessions.",
+                "reconciler ends its sessions; it cannot sign in again until it is removed and "
+                "re-created with a directory id.",
                 user.username,
                 user.id,
             )
