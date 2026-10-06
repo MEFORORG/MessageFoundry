@@ -1677,6 +1677,18 @@ the same permission set on the same method reds CI until it is listed here.
 > `POST /connections/{name}/flag` has no per-channel check.
 > `tests/test_channel_rbac.py` pins the six routes, not that list.
 
+> **Every API route has a channel-scope class, and a new route fails the build until it gets one
+> (BACKLOG #2627).** `tests/test_route_channel_scope_classification.py` holds the table: scoped,
+> not channel-bearing, administrator-only, or unscoped. It runs each scoped list read as a scoped
+> caller and as an all-channels caller, and aims each by-id message route at another channel's
+> message, which must answer 404. Those routes all open the message through one helper,
+> `messagefoundry/api/message_scope.py`, and a test fails if any other API module reads a message
+> by id itself. The store reads that take `allowed_channels` require it, so a caller cannot read
+> every channel by leaving it out. The table also lists at least three unscoped routes that no
+> backlog item tracks yet: `GET /security/posture` names connections, `GET /users` returns every
+> account's channel scope to a `users:read` holder, and `POST /config/reload` acts on every
+> connection.
+
 > **`/config/reload` executes Python** from the target directory in-process, so it is constrained
 > beyond the `config:deploy` permission: the directory must resolve **within** an allowed root —
 > the server's startup `--config` dir or an entry in `[api].config_reload_roots` — otherwise it is
