@@ -2608,30 +2608,96 @@ _NESTED_LABELS = (
     *("password", "client_secret", "token", "api_key", "authorization"),
     *("private_key", "encryption_keys_retired", "MEFOR_A_PW"),
 )
-_NESTED_INNER_ASSIGNMENTS = ("=", ": ", "'=", "=Bearer ")
-_NESTED_INNER_VALUES = ("vq1", "'vq1'", '"vq1"', "{vq1}", "'vq1 vq3'", '"vq1 vq3"', "{vq1 vq3}")
+_NESTED_INNER_ASSIGNMENTS = ("=", ": ")
+#: The empty quotes and the spaced brace are the second review round's shapes: an empty quote that a
+#: pattern newly took, and a spaced brace whose trailing quote it newly ate.
+_NESTED_INNER_VALUES = (
+    *("vq1", "'vq1'", '"vq1"', "{vq1}", "'vq1 vq3'", '"vq1 vq3"', "{vq1 vq3}"),
+    *("''", '""'),
+)
 
 
 def _nested_label_lines() -> list[str]:
     """Every outer label, with a single-quoted, double-quoted or braced value holding ``vq0``, a
-    separator and a whole inner label of every family, then a tail with or without a stray quote."""
+    separator, sometimes a second value word, and a whole inner label of every family. Then the
+    outer closer and a tail with or without a stray quote, or no outer closer at all, so the inner
+    value's own quote is the last one. ONE inner label only: the second review round found that two
+    inner labels reach the open defects ``secretscrub``'s RESIDUALS list, which this arm cannot pass
+    until they are fixed."""
     lines: list[str] = []
     for outer in _NESTED_LABELS:
-        for outer_assign in ("=", ": "):
-            for opener, closer in (("'", "'"), ('"', '"'), ("{", "}")):
-                tails = sorted(
-                    {"", f" vq2{closer}", f"vq2{closer}", " vq2'", ' vq2"', f"{closer} vq2"}
-                )
-                for inner in _NESTED_LABELS:
-                    for inner_assign in _NESTED_INNER_ASSIGNMENTS:
-                        for value in _NESTED_INNER_VALUES:
-                            for sep in (" ", ";"):
-                                head = (
-                                    f"{outer}{outer_assign}{opener}vq0{sep}"
-                                    f"{inner}{inner_assign}{value}{closer}"
+        for opener, closer in (("'", "'"), ('"', '"'), ("{", "}")):
+            ends = {
+                closer: sorted(
+                    {"", " vq2", f" vq2{closer}", f"vq2{closer}", " vq2'", ' vq2"', f"{closer} vq2"}
+                ),
+                "": ["", " vq2"],
+            }
+            for inner in _NESTED_LABELS:
+                for inner_assign in _NESTED_INNER_ASSIGNMENTS:
+                    for value in _NESTED_INNER_VALUES:
+                        for sep in (" ", ";", ","):
+                            for word in ("", "vq4 "):
+                                head = f"{outer}={opener}vq0{sep}{word}{inner}{inner_assign}{value}"
+                                lines.extend(
+                                    head + end + tail
+                                    for end, tails in ends.items()
+                                    for tail in tails
                                 )
-                                lines.extend(head + tail for tail in tails)
     return lines
+
+
+#: The second review round's lines, each of which printed a value on this branch that origin/main
+#: hid, and the atoms that must not print. Each is fixed now; the empty-quote and line-break shapes
+#: came from walks that accepted no token at all.
+_ROUND_TWO_SHAPES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ('cfg password="hunter;two MEFOR_DB={x y}" mode', ("hunter", "two")),
+    ('cfg password="hunter,two MEFOR_STORE_PW=""', ("hunter", "two")),
+    ("cfg password='hunter;two MEFOR_ENV='' mode", ("hunter", "two")),
+    ("secret='pk-A1|bearer_token=\n\"\" and private_key'='pk-B1 pk-B2'", ("pk-A1", "pk-B1")),
+)
+
+
+@pytest.mark.parametrize(
+    "case", _ROUND_TWO_SHAPES, ids=("spaced-brace", "empty-double", "empty-single", "line-break")
+)
+def test_the_second_review_rounds_shapes_print_nothing_new(
+    case: tuple[str, tuple[str, ...]],
+) -> None:
+    """No listed atom prints on any surface."""
+    line, atoms = case
+    for surface, apply in _SWALLOW_SURFACES:
+        out = apply(line)
+        printed = [atom for atom in atoms if atom in out]
+        assert not printed, f"{surface}: {printed} printed -- got {out!r}"
+
+
+#: OPEN DEFECTS, NOT TRADES. Each line prints a value on this branch that origin/main hid, on both
+#: copies and every surface, and ``secretscrub``'s RESIDUALS lists them under that name. Pinned as
+#: still printing so the list cannot go stale: a fix turns this red, and must update both.
+_OPEN_CASCADE_DEFECTS: tuple[tuple[str, str], ...] = (
+    ("cfg password='pw-A1 MEFOR_A=x;private_key='pké-B1 pk-B2'", "pk-B2"),
+    ("cfg password='pw-A1 pw-A2;MEFOR_A=x;MEFOR_B='pw-B1'", "pw-A2"),
+    ("secret=pw-A0@MEFOR_B_PW=pw-A2;MEFOR_X = 'pw-A4'@x.password='pw-A6", "pw-A6"),
+)
+
+
+@pytest.mark.parametrize(
+    "case", _OPEN_CASCADE_DEFECTS, ids=("refused-run-on", "swallowed-mefor", "split-mefor")
+)
+def test_the_open_cascade_defects_still_print(case: tuple[str, str]) -> None:
+    """TWO-SIDED. Each defect still prints on every surface, and origin/main's patterns hid it."""
+    line, atom = case
+    for surface, apply in _SWALLOW_SURFACES:
+        assert atom in apply(line), (
+            f"{surface}: {atom!r} no longer prints in {line!r}. Good news -- remove it here and from "
+            "secretscrub's OPEN DEFECTS list."
+        )
+    old = _pre_change_patterns()
+    text = line
+    for name in ("_MEFOR_SECRET", "_BEARER", "_AUTH_SCHEME", "_CREDENTIAL_KV", "_KEY_MATERIAL"):
+        text = old[name].sub(lambda m: f"{m.group(1)}=x", text)
+    assert atom not in text, f"origin/main's patterns print {atom!r} too, so it is not new"
 
 
 @pytest.mark.parametrize("surface", _SWALLOW_SURFACES, ids=lambda surface: surface[0])
@@ -2678,6 +2744,42 @@ def test_the_nested_arm_finds_the_braced_closer_leak(monkeypatch: pytest.MonkeyP
     assert any(repr(line) in row for row in newly), (
         f"the arm missed {line!r}; it found {len(newly)} others, first {newly[:2]}"
     )
+
+
+def _accepting_an_empty_quote(module: ModuleType, source: str) -> str:
+    """``source`` with both empty-quote refusals undone: the guarded walk's ``++`` and
+    ``_MEFOR_SECRET``'s no-space quoted branch. Each alone is masked by the other."""
+    guarded = module._GUARDED_QUOTED_VALUE
+    assert guarded.count("++(?=") == 2, f"{module.__name__}._GUARDED_QUOTED_VALUE changed"
+    source = source.replace(guarded, guarded.replace("++(?=", "*+(?="))
+    return source.replace(r"['\"][^\s'\"]++['\"]", r"['\"][^\s'\"]*+['\"]")
+
+
+def _taking_a_quote_after_a_spaced_brace(module: ModuleType, source: str) -> str:
+    """``source`` with ``_MEFOR_SECRET``'s spaced braced value taking a trailing quote again."""
+    spaced = module._GUARDED_BRACED_VALUE + _BRACED_CLOSER_GUARD + "|"
+    return source.replace(spaced, module._GUARDED_BRACED_VALUE + _BRACED_CLOSER_QUOTE + "|")
+
+
+@pytest.mark.parametrize(
+    "undo",
+    (_accepting_an_empty_quote, _taking_a_quote_after_a_spaced_brace),
+    ids=("empty-quote", "spaced-brace-quote"),
+)
+def test_the_nested_arm_finds_each_second_round_fix_undone(
+    undo: Callable[[ModuleType, str], str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE POSITIVE CONTROLS for the second review round's fixes: each, undone in both copies, must
+    make the nested arm find a newly printed value. Each undo must change ``_MEFOR_SECRET``, or it
+    proves nothing."""
+    mutated = _shipped()
+    for module in (scrub_mod, redact_mod):
+        for name, pattern in mutated[module].items():
+            mutated[module][name] = re.compile(undo(module, pattern.pattern), pattern.flags)
+        before = module._MEFOR_SECRET.pattern
+        assert mutated[module]["_MEFOR_SECRET"].pattern != before, f"{module.__name__}: no change"
+    newly, _hidden_now = _newly_printed_atoms(monkeypatch, mutated, _nested_label_lines())
+    assert newly, "with the fix undone the nested arm found nothing, so it cannot see that fix"
 
 
 #: Lines where ``_CREDENTIAL_KV``'s quoted value must run on past a later label's opening quote, and
@@ -2782,6 +2884,18 @@ def test_every_keyword_passes_the_stops_first_letter_gate() -> None:
                 assert label.match(f'{spelling}="v w"'), (
                     f"{module.__name__}: {spelling} misses the gate"
                 )
+
+
+def test_every_keyword_is_a_run_on_label_in_both_copies() -> None:
+    """``_RUN_ON_LABEL`` restates the keyword alternation and its first-letter gate by hand in the
+    bundle copy. A word added to the vocabulary tuples but not there would silently stop the run-on
+    for that label in the support bundle. Driven by the tuples, so the drift reds here."""
+    words = scrub_mod._CREDENTIAL_WORDS + scrub_mod._KEY_MATERIAL_WORDS + scrub_mod._TOKEN_WORDS
+    for module in (scrub_mod, redact_mod):
+        label = re.compile(module._RUN_ON_LABEL)
+        for word in (*words, "MEFOR_A_PW"):
+            for spelling in {word, word.upper()}:
+                assert label.match(f"{spelling}= "), f"{module.__name__}: {spelling} is no label"
 
 
 #: The input the growth arm runs: a long MEFOR_MEFOR_... name inside a token value, ending on a quote

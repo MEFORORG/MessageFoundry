@@ -103,10 +103,11 @@ _LABEL_PREFIX = r"(?:[A-Za-z0-9]+[._-]){0,6}"
 _ODBC_BRACED = r"\{(?:[^}]|\}\})*+\}(?!\})"
 _ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
 _GUARDED_QUOTED_VALUE = (
-    "'(?:[^'\"{\\s:=]++|(?::(?!//)|=|[^\\S\r\n])++(?!'))*+(?='(?!\\s*+[:=]))"
-    '|"(?:[^\'"{\\s:=]++|(?::(?!//)|=|[^\\S\r\n])++(?!"))*+(?="(?!\\s*+[:=]))'
+    "'(?:[^'\"{\\s:=]++|(?::(?!//)|=|[^\\S\r\n])++(?!'))++(?='(?!\\s*+[:=]))"
+    '|"(?:[^\'"{\\s:=]++|(?::(?!//)|=|[^\\S\r\n])++(?!"))++(?="(?!\\s*+[:=]))'
 )
 _GUARDED_BRACED_VALUE = r"\{(?:[^}'\"\r\n]|\}\})*+\}(?!\})"
+_GUARDED_BRACED_NO_SPACE = r"\{(?:[^}'\"\s]|\}\})*+\}(?!\})"
 
 # Where an UNQUOTED value stops early: just before a credential label whose value is a closed, guarded
 # quote. Without it a plain value ran on across a separator into a LATER label and ended at that
@@ -296,19 +297,21 @@ _AUTH_SCHEME = re.compile(r"(?i)\b(bearer)\s+(?=['\"]?[^\s'\",;]{4})" + _PLAIN_S
 # A MEFOR_* secret echoed as "MEFOR_FOO=value" or "MEFOR_FOO: value": never carry the value. The
 # optional quotes match the shape an error string produces — "(env 'MEFOR_VALUE_PW'='<value>')" — which
 # the unquoted form missed entirely. A quoted value is taken whole, and so is a braced one when its
-# closer ends the value, both through the guarded forms (explained at ``_CREDENTIAL_KV``). The braced
-# value takes one quote after its closer, as the old plain class did; why is on the same pattern in
-# ``messagefoundry/secretscrub.py``.
+# closer ends the value, both through the guarded forms (explained at ``_CREDENTIAL_KV``). A braced
+# value with no space in it takes one quote after its closer, as the old plain class did, and one with
+# a space does not; why is on the same pattern in ``messagefoundry/secretscrub.py``.
 _MEFOR_SECRET = re.compile(
     r"\b(MEFOR_[A-Z0-9_]+)\b['\"]?\s*[:=]\s*"
     r"(?:"
+    + _GUARDED_BRACED_NO_SPACE
+    + rf"(?![^{_PLAIN_TERMINATORS}])"
+    + r"['\"]?|"
     + _GUARDED_BRACED_VALUE
     + rf"(?![^{_PLAIN_TERMINATORS}])"
-    # The braced value's one trailing quote, then a quoted value with no space in it, closer and
-    # all: the span the old plain class took.
-    + r"['\"]?|(?="
+    # A non-empty quoted value with no space in it, closer and all: the span the old plain class took.
+    + r"|(?="
     + _GUARDED_QUOTED_VALUE
-    + r")['\"][^\s'\"]*+['\"]|"
+    + r")['\"][^\s'\"]++['\"]|"
     + _GUARDED_QUOTED_VALUE
     + r"|"
     + _PLAIN_VALUE

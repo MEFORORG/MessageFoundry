@@ -112,9 +112,9 @@ now redacts the second password. The costliest shape measured that day was a 6 K
 ends on a quote, which forces the token walk: 24 against 764 us, linear at 7.6x to 8.0x for 8x the
 length over four adversarial shapes, a quoted run of spaces among them. IT IS NOT THE CEILING. A
 review on 2026-10-05 measured costlier ones, because the underscored-prefix check walks at every run
-start: ``token=x`` then ``;a_a_a_a_a_a_a`` repeated, ending on a quote, cost 1.2 ms at 6 KB and
-3.4 ms at 16 KB, 7.9x for 8x the length. That is linear and under this module's 21 ms ceiling above,
-and under the 33 ms the PHI pass spends on such a line.
+start: ``token=x`` then ``;a_a_a_a_a_a_a`` repeated, ending on a quote, cost 0.41 ms at 2 KB,
+1.2 ms at 6 KB and 3.3 ms at 16 KB, about 8x for the 8x from 2 KB to 16 KB. That is linear and
+under this module's 21 ms ceiling above, and under the 33 ms the PHI pass spends on such a line.
 
 WHAT :data:`_KV_QUOTED_VALUE` COSTS, measured 2026-10-05 the same way, against the plain quoted form in
 the same pattern. The paragraph above predates it. An ordinary quoted credential line is level, 4.05
@@ -375,6 +375,25 @@ _ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
 # ``label=value``: in ``MEFOR_B_PW = vq0:vq1_session = 'vq2:vq3'`` it is "vq1" that prints, and the
 # quoted "vq2:vq3" that no longer does. Taken because the quoted value is the one a label names for
 # certain; the run in front of the keyword is a value only by one of two readings.
+#
+# OPEN DEFECTS, NOT TRADES: VALUES THIS CHANGE PRINTS THAT THE PATTERNS BEFORE IT HID. Found by the
+# second code-review round of 2026-10-05, on both copies and every surface, and not fixed here. Each
+# is a ``MEFOR_`` label inside an earlier label's quoted value. There the old ``_MEFOR_SECRET`` class
+# ate a quote, and the earlier value closed on a later one. Now the stop, or a guarded quoted value
+# under ``_MEFOR_SECRET``, leaves that quote or consumes a different one, and the earlier value
+# closes somewhere else. At least these shapes:
+#
+# * a stop before a later quoted label whose value the run-on refuses, for a non-ASCII character or a
+#   label in it: ``password='pw-A1 MEFOR_A=x;private_key='pk<e-acute>-B1 pk-B2'`` prints both pk
+#   values;
+# * a later ``MEFOR_`` label the old class swallowed now matching, and taking its own closer:
+#   ``password='pw-A1 pw-A2;MEFOR_A=x;MEFOR_B='pw-B1'`` prints " pw-A2";
+# * a stop that splits one ``MEFOR_`` value, so a later ``MEFOR_`` label eats the space that ended an
+#   earlier plain value: ``secret=pw-A0@MEFOR_B_PW=pw-A2;MEFOR_X = 'pw-A4'@x.password='pw-A6``
+#   prints "pw-A6".
+#
+# ``tests/test_log_redaction_secret_domain.py`` pins each one as still printing, so a fix must
+# update that pin and this list together.
 
 # A quoted value for the patterns that only took a plain one before BACKLOG #1685's remainder:
 # ``_MEFOR_SECRET``, ``_BEARER`` and ``_KEY_MATERIAL``. ``_CREDENTIAL_KV`` keeps the plain quoted
@@ -408,14 +427,21 @@ _ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
 # stopped AT a quote, so a later pass found it there: as the closer of an earlier value it had opened
 # (``password='a b token='c'`` hid all of "a b" only because "'" was still after "c"), and as the
 # terminator of a plain value running up to it. Consuming the closer took both away and printed
-# values the old patterns hid. ``_MEFOR_SECRET`` alone consumes it, and only where its old trailing
-# quote did, on a value with no space in it.
+# values the old patterns hid. ``_MEFOR_SECRET`` alone consumes it, and only on a non-empty value with
+# no space in it, where its old trailing quote did. That holds only where the old pattern matched the
+# label at all. Where an earlier old value had swallowed the label, consuming the closer can print a
+# value; the residuals at ``_NOT_BEFORE_QUOTED_LABEL`` give the measured shapes.
+#
+# THE WALK TAKES AT LEAST ONE TOKEN, so an empty ``''`` or ``""`` is refused, as the old plain class
+# refused it. Accepting it let ``token=`` take a line break and an empty quote on the next line, and
+# an earlier quoted credential then ran on past where the old line ended. Found by the second review
+# round of 2026-10-05.
 #
 # DETERMINISTIC AND POSSESSIVE, so linear: the two branches of the walk cannot match the same
 # character, and each takes a whole run, so a long run of spaces is walked once.
 _GUARDED_QUOTED_VALUE = (
-    "'(?:[^'\"{\\s:=]++|(?::(?!//)|=|[^\\S\r\n])++(?!'))*+(?='(?!\\s*+[:=]))"
-    '|"(?:[^\'"{\\s:=]++|(?::(?!//)|=|[^\\S\r\n])++(?!"))*+(?="(?!\\s*+[:=]))'
+    "'(?:[^'\"{\\s:=]++|(?::(?!//)|=|[^\\S\r\n])++(?!'))++(?='(?!\\s*+[:=]))"
+    '|"(?:[^\'"{\\s:=]++|(?::(?!//)|=|[^\\S\r\n])++(?!"))++(?="(?!\\s*+[:=]))'
 )
 
 # The braced value for ``_MEFOR_SECRET`` and ``_KEY_MATERIAL``, guarded the same way and for the same
@@ -424,6 +450,8 @@ _GUARDED_QUOTED_VALUE = (
 # crossed. Each user adds its own guard after the closer: the closer must END the value, at a
 # character the pattern's plain class stops at, or ``MEFOR_X={a}bc`` would print "bc".
 _GUARDED_BRACED_VALUE = r"\{(?:[^}'\"\r\n]|\}\})*+\}(?!\})"
+#: The same, holding no whitespace at all: the one braced shape the old plain class took whole.
+_GUARDED_BRACED_NO_SPACE = r"\{(?:[^}'\"\s]|\}\})*+\}(?!\})"
 
 #: The first letters of every label keyword. A one-character gate in front of the keyword alternation:
 #: a case-folded alternation is tried branch by branch, and most runs start with none of these.
@@ -484,10 +512,14 @@ _RUN_ON_INNER = (
 # would close it OPENS A LATER LABEL'S VALUE. There it takes that label and its value as well, through
 # the value's own closer. The plain form closed on the later label's opening quote, so that label was
 # eaten and its value printed. ``password='abc, private_key='p w q'`` printed "p w q'" on both copies
-# at the merge base, and still does under the plain form. A stop then made it worse in one shape: in
-# ``pass='a b+MEFOR_B_PW: c,private_key='pk1 pk2'`` the old ``_MEFOR_SECRET`` class ate the inner
-# opening quote, so the outer value closed at the end of the line and hid everything. With the stop
-# that quote stayed, the outer value closed on it, and "pk1 pk2" printed.
+# at the merge base, and still does under the plain form. A stop then made it worse, in a whole
+# family of shapes and not one: in ``pass='a b+MEFOR_B_PW: c,private_key='pk1 pk2'`` the old
+# ``_MEFOR_SECRET`` class ate the inner opening quote, so the outer value closed at the end of the
+# line and hid everything. With the stop that quote stayed, the outer value closed on it, and
+# "pk1 pk2" printed. The run-on below closes that only when the later value is plain ASCII with no
+# label in it. WHEN IT FALLS BACK AFTER A STOP, IT DOES NOT REPEAT THE OLD BEHAVIOUR: the quote it
+# closes on is one the old ``_MEFOR_SECRET`` class had eaten, so the value after it prints where the
+# old patterns hid it. The residuals at ``_NOT_BEFORE_QUOTED_LABEL`` give the measured shapes.
 #
 # WHEN IT RUNS ON, AND WHEN IT FALLS BACK. Where no label opens with the closing quote, it takes the
 # same span as the plain form. Where one does, it runs on to the later value's closer only when
@@ -608,22 +640,28 @@ _AUTH_SCHEME = re.compile(r"(?i)\b(bearer)\s+(?=['\"]?[^\s'\",;]{4})" + _PLAIN_S
 # A quoted value is taken whole, and so is a braced one when its closer ends the value; the guard is
 # on ``_CREDENTIAL_KV``'s residuals.
 #
-# THE BRACED VALUE TAKES ONE QUOTE AFTER ITS CLOSER, as the old plain class's trailing ``['\"]?`` did.
-# Without it ``password='vq0 MEFOR_X={vq1}' vq2'`` printed " vq2'": the old class ate the quote after
-# "}", so the password's quoted value closed on the last quote and hid the line, but the braced form
-# left that quote behind and the password closed on it. On a braced value with no space in it this
-# takes exactly the span the old class took.
+# A BRACED VALUE WITH NO SPACE IN IT TAKES ONE QUOTE AFTER ITS CLOSER, as the old plain class's
+# trailing ``['\"]?`` did. Without it ``password='vq0 MEFOR_X={vq1}' vq2'`` printed " vq2'": the old
+# class ate the quote after "}", so the password's quoted value closed on the last quote and hid the
+# line, but the braced form left that quote behind and the password closed on it. A braced value WITH
+# a space leaves the quote, because the old class stopped at the space and left it too: taking it
+# there made ``password="hunter;two MEFOR_DB={x y}" mode`` print ";two", found by the second review
+# round of 2026-10-05.
 _MEFOR_SECRET = re.compile(
     r"\b(" + re.escape(_ENV_PREFIX) + r"[A-Z0-9_]+)\b['\"]?\s*[:=]\s*"
     r"(?:"
+    + _GUARDED_BRACED_NO_SPACE
+    + rf"(?![^{_PLAIN_TERMINATORS}])"
+    + r"['\"]?|"
     + _GUARDED_BRACED_VALUE
     + rf"(?![^{_PLAIN_TERMINATORS}])"
-    # The braced value's one trailing quote, then the next branch: a quoted value with no space in
-    # it, closer and all. On a value with no space in it, each takes exactly the span the old plain
-    # class and its trailing quote took, so later passes see the same text they always did.
-    + r"['\"]?|(?="
+    # A quoted value with no space in it and at least one character, closer and all. With the braced
+    # branch above, it takes exactly the span the old plain class and its trailing quote took, so later
+    # passes see the same text they always did, wherever the old pattern matched this label at all.
+    # An empty value is refused, as the old class refused it.
+    + r"|(?="
     + _GUARDED_QUOTED_VALUE
-    + r")['\"][^\s'\"]*+['\"]|"
+    + r")['\"][^\s'\"]++['\"]|"
     + _GUARDED_QUOTED_VALUE
     + r"|"
     + _PLAIN_VALUE
