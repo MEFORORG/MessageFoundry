@@ -291,12 +291,14 @@ _ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
 # the label and its ":" or "=". The stop also requires :data:`_GUARDED_QUOTED_VALUE` to match the
 # whole quoted value, so the label's own pattern is sure to take it, and to take it past where the old
 # value ended. So, WITHIN ONE PASS, a stop newly prints label text, and a value only in the one trade
-# written down at the end of this comment. ACROSS PASSES
+# written down further down this comment. ACROSS PASSES
 # IT CAN, and the differential test measures how often: the text a stop leaves behind is not the text
 # the old class left, so a later pass over it can end somewhere else. A stray quote or a later label
-# used to cut a later pass short, and now does not. It is rare, and most such lines also hide a value
-# the old patterns printed, but not all of them; the count and the shapes are on
-# ``test_the_change_prints_no_value_the_pre_change_patterns_hid``. With only an OPENING quote
+# used to cut a later pass short, and now does not. It is rare. Four of the eight shapes on the OPEN
+# DEFECTS list below also hide a value the old patterns printed, and four do not. The differential
+# measures the count on its corpus, in
+# ``test_the_change_prints_no_value_the_pre_change_patterns_hid``, and the known shapes are pinned in
+# ``test_the_open_cascade_defects_still_print``. With only an OPENING quote
 # required, ``token=x;password="private_key: pk`` printed "pk": the exposed label's plain class then
 # swallowed the next label instead. A label followed by a BRACE or a plain value gets no stop, because
 # the class used to run on past those, and stopping there would print what it used to hide.
@@ -384,9 +386,10 @@ _ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
 # already rewrote. A stop, a guarded quoted value or a braced one leaves a quote, or takes one, where
 # the old classes did the other. So a later pass reads different text, and its value closes or stops
 # somewhere else. A ``MEFOR_`` label inside an earlier label's quoted value is one way in, and it is
-# not the only one: the same cascade lands in ``_KEY_MATERIAL`` and ``_CREDENTIAL_KV`` on lines with
-# no ``MEFOR_`` label at all. Some of these lines also hide a value the old patterns printed, but by
-# accident, so they belong here and not with the trade above. At least these shapes:
+# not the only one: the same cascade lands in ``_KEY_MATERIAL`` on lines with no ``MEFOR_`` label at
+# all, after ``_CREDENTIAL_KV`` rewrote them. Four of these lines also hide a value the old patterns
+# printed, each named below. That is by accident, so they belong here and not with the trade above.
+# At least these shapes:
 #
 # * a stop before a later quoted label whose value the run-on refuses, for a non-ASCII character or a
 #   label in it: ``password='pw-A1 MEFOR_A=x;private_key='pk<e-acute>-B1 pk-B2'`` prints both pk
@@ -395,22 +398,24 @@ _ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
 #   ``password='pw-A1 pw-A2;MEFOR_A=x;MEFOR_B='pw-B1'`` prints " pw-A2";
 # * a stop that splits one ``MEFOR_`` value, so a later ``MEFOR_`` label eats the space that ended an
 #   earlier plain value: ``secret=pw-A0@MEFOR_B_PW=pw-A2;MEFOR_X = 'pw-A4'@x.password='pw-A6``
-#   prints "pw-A6";
+#   prints "pw-A6", and hides "pw-A4", which the old patterns printed;
 # * ``_KEY_MATERIAL`` running over a later key label, with no ``MEFOR_`` label on the line.
 #   ``_CREDENTIAL_KV`` now takes a quoted value whole, closer and all, where an old pass left a quote
 #   that ended ``_KEY_MATERIAL``'s plain value. That value now runs on over the later key label, which
 #   gets no stop because its own value is not a closed, guarded quote.
 #   ``connect failed encryption_key=token=password='hunter2',private_key='abc def=='`` prints
-#   "abc def==", where the old patterns printed " def==";
-#   ``cfg private_key=pass=credential="c1"|private_key'=pk-SECRET-9`` prints "pk-SECRET-9"; and
+#   "abc def==". The old patterns printed "hunter2" and " def==", so "abc" is new and "hunter2" is
+#   now hidden. ``cfg private_key=pass=credential="c1"|private_key'=pk-SECRET-9`` prints
+#   "pk-SECRET-9" and hides "c1", which the old patterns printed. And
 #   ``private_key=password='vq0 token=''|encryption_key='vq2`` prints "vq2";
 # * a stop that takes a ``MEFOR_`` match away: ``pass='MEFOR_1:pass'="vq4"'`` prints "vq4". The old
 #   ``_MEFOR_SECRET`` ate ``pass'``, so the outer quoted value closed on the last quote. Now that
 #   value's first run is a quoted label, ``_MEFOR_SECRET`` does not match, and the outer value closes
 #   on the quote it left;
 # * ``_MEFOR_SECRET``'s guarded quoted value matching where the old class did not:
-#   ``pass=",pw-IN-3 MEFOR_A"=' mv-4'`` prints ",pw-IN-3". The label takes the double quote that
-#   closed the outer value, so that value has no closer and nothing matches it.
+#   ``pass=",pw-IN-3 MEFOR_A"=' mv-4'`` prints ",pw-IN-3" and hides " mv-4", which the old patterns
+#   printed. The label takes the double quote that closed the outer value, so that value has no
+#   closer and nothing matches it.
 #
 # ``tests/test_log_redaction_secret_domain.py`` pins each one as still printing, so a fix must
 # update that pin and this list together.
@@ -450,7 +455,7 @@ _ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
 # values the old patterns hid. ``_MEFOR_SECRET`` alone consumes it, and only on a non-empty value with
 # no space in it, where its old trailing quote did. That holds only where the old pattern matched the
 # label at all. Where an earlier old value had swallowed the label, consuming the closer can print a
-# value; the residuals at ``_NOT_BEFORE_QUOTED_LABEL`` give the measured shapes.
+# value; the OPEN DEFECTS list, in the comment on the stop above, gives the measured shapes.
 #
 # THE WALK TAKES AT LEAST ONE TOKEN, so an empty ``''`` or ``""`` is refused, as the old plain class
 # refused it. Accepting it let ``token=`` take a line break and an empty quote on the next line, and
@@ -539,7 +544,8 @@ _RUN_ON_INNER = (
 # "pk1 pk2" printed. The run-on below closes that only when the later value is plain ASCII with no
 # label in it. WHEN IT FALLS BACK AFTER A STOP, IT DOES NOT REPEAT THE OLD BEHAVIOUR: the quote it
 # closes on is one the old ``_MEFOR_SECRET`` class had eaten, so the value after it prints where the
-# old patterns hid it. The residuals at ``_NOT_BEFORE_QUOTED_LABEL`` give the measured shapes.
+# old patterns hid it. The OPEN DEFECTS list, in the comment on the stop above, gives the measured
+# shapes.
 #
 # WHEN IT RUNS ON, AND WHEN IT FALLS BACK. Where no label opens with the closing quote, it takes the
 # same span as the plain form. Where one does, it runs on to the later value's closer only when

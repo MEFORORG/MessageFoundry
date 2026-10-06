@@ -2665,8 +2665,8 @@ def _nested_label_lines() -> list[str]:
     return lines
 
 
-#: The second review round's lines, each of which printed a value on this branch that origin/main
-#: hid, and the atoms that must not print. Each is fixed now; the empty-quote and line-break shapes
+#: The second review round's lines, each of which printed a value on this branch that the pre-change
+#: patterns hid, and the atoms that must not print. Each is fixed now; the empty-quote and line-break shapes
 #: came from walks that accepted no token at all.
 _ROUND_TWO_SHAPES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ('cfg password="hunter;two MEFOR_DB={x y}" mode', ("hunter", "two")),
@@ -2692,17 +2692,17 @@ def test_the_second_review_rounds_shapes_print_nothing_new(
 
 #: OPEN DEFECTS, NOT TRADES. Each line prints a value on this branch that the pre-change patterns
 #: hid, on both copies and every surface, and ``secretscrub``'s OPEN DEFECTS comment lists them under
-#: that name. Three of the last five carry no ``MEFOR_`` label at all. Pinned as still printing so the
-#: list cannot go stale: a fix turns this red, and must update both.
-_OPEN_CASCADE_DEFECTS: tuple[tuple[str, str], ...] = (
-    ("cfg password='pw-A1 MEFOR_A=x;private_key='pké-B1 pk-B2'", "pk-B2"),
-    ("cfg password='pw-A1 pw-A2;MEFOR_A=x;MEFOR_B='pw-B1'", "pw-A2"),
-    ("secret=pw-A0@MEFOR_B_PW=pw-A2;MEFOR_X = 'pw-A4'@x.password='pw-A6", "pw-A6"),
-    ("connect failed encryption_key=token=password='hunter2',private_key='abc def=='", "abc"),
-    ('cfg private_key=pass=credential="c1"|private_key\'=pk-SECRET-9', "pk-SECRET-9"),
-    ("private_key=password='vq0 token=''|encryption_key='vq2", "vq2"),
-    ("pass=\",pw-IN-3 MEFOR_A\"=' mv-4'", "pw-IN-3"),
-    ("pass='MEFOR_1:pass'=\"vq4\"'", "vq4"),
+#: that name. Three of the last five carry no ``MEFOR_`` label at all. Each row names every value the
+#: line newly prints. Pinned as still printing, so a fix turns this red and must update both.
+_OPEN_CASCADE_DEFECTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("cfg password='pw-A1 MEFOR_A=x;private_key='pké-B1 pk-B2'", ("pké-B1", "pk-B2")),
+    ("cfg password='pw-A1 pw-A2;MEFOR_A=x;MEFOR_B='pw-B1'", ("pw-A2",)),
+    ("secret=pw-A0@MEFOR_B_PW=pw-A2;MEFOR_X = 'pw-A4'@x.password='pw-A6", ("pw-A6",)),
+    ("connect failed encryption_key=token=password='hunter2',private_key='abc def=='", ("abc",)),
+    ('cfg private_key=pass=credential="c1"|private_key\'=pk-SECRET-9', ("pk-SECRET-9",)),
+    ("private_key=password='vq0 token=''|encryption_key='vq2", ("vq2",)),
+    ("pass=\",pw-IN-3 MEFOR_A\"=' mv-4'", ("pw-IN-3",)),
+    ("pass='MEFOR_1:pass'=\"vq4\"'", ("vq4",)),
 )
 
 
@@ -2716,23 +2716,27 @@ _OPEN_CASCADE_DEFECTS: tuple[tuple[str, str], ...] = (
     ),
 )
 def test_the_open_cascade_defects_still_print(
-    case: tuple[str, str], monkeypatch: pytest.MonkeyPatch
+    case: tuple[str, tuple[str, ...]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """TWO-SIDED. Each defect still prints on every surface, and the pre-change patterns hid it.
+    """TWO-SIDED. Each value still prints on every surface, and the pre-change patterns hid it.
 
-    The second half is the differential's own baseline: :func:`_pre_change_patterns` patched into
-    both real modules and run through the real surfaces, with the same passes taken out as the
-    differential takes out. So this pin judges "hid it" the way the differential does, and cannot
-    drift from it the way a hand-built replay of the passes could."""
-    line, atom = case
+    The second half uses the differential's own baseline. :func:`_pre_change_patterns` is patched
+    into both real modules and run through the real pass order. The same passes are taken out as the
+    differential takes out. That replaces a hand-built replay of the passes, which could drift from
+    what the modules do. Values are matched as substrings here, not as ``vq`` atoms."""
+    line, atoms = case
     for surface, apply in _SWALLOW_SURFACES:
-        assert atom in apply(line), (
-            f"{surface}: {atom!r} no longer prints in {line!r}. Good news -- remove it here and from "
-            "secretscrub's OPEN DEFECTS list."
+        out = apply(line)
+        hidden = [atom for atom in atoms if atom not in out]
+        assert not hidden, (
+            f"{surface}: {hidden} no longer print in {line!r}, got {out!r}. Re-measure the line on "
+            "every surface. Drop it here and from secretscrub's OPEN DEFECTS list only when it "
+            "prints no value the pre-change patterns hid."
         )
     _secret_passes_only(monkeypatch)
     for surface, (before,) in _surface_outputs(monkeypatch, _pre_change(), [line]).items():
-        assert atom not in before, f"{surface}: the pre-change patterns print {atom!r} too"
+        printed = [atom for atom in atoms if atom in before]
+        assert not printed, f"{surface}: the pre-change patterns print {printed} too"
 
 
 @pytest.mark.parametrize("surface", _SWALLOW_SURFACES, ids=lambda surface: surface[0])
