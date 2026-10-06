@@ -24,6 +24,8 @@ from __future__ import annotations
 
 from urllib.parse import urlsplit
 
+from messagefoundry.domainshape import is_canonical_ipv4
+
 #: Schemes we will render an interstitial for. Anything else (``javascript:``, ``data:``, ``file:``)
 #: is not a navigation we should be helping the operator complete, so callers treat it as a hard
 #: refusal rather than as an external link to warn about.
@@ -66,10 +68,14 @@ def _matches_domain(host: str, domain: str) -> bool:
     """``host`` is ``domain`` or a subdomain of it — matched on a LABEL boundary.
 
     ``evilhospital.example`` must not match ``hospital.example``. A plain ``endswith`` says it does.
+    An IPv4 entry, which ``[security]`` accepts in its canonical form, matches only that address:
+    an address has no subdomains (vault BACKLOG #2843).
     """
     domain = domain.strip().lower().lstrip(".")
     if not domain or not host:
         return False
+    if is_canonical_ipv4(domain):
+        return host == domain
     return host == domain or host.endswith("." + domain)
 
 
