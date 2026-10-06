@@ -16,11 +16,16 @@ a fresh step-up and is not built here; the page says where to do it instead.
 the key the self-approval refusal uses (BACKLOG #1540: names are mutable, user ids are not). Hiding
 the button by name would be wrong in both directions, so the engine refuses and this page shows why.
 
-Every value goes through the escaping ``el`` builder. Operation labels, user names, ids and the
-engine's refusal text are dual-control metadata, never PHI.
+**Each row shows the parameters its hold captured** (BACKLOG #2458), so an approver sees what a
+release would do: which connection a replay or purge names, its scope, a reload's config directory.
+
+Every value goes through the escaping ``el`` builder. Operation labels, captured parameters, user
+names, ids and the engine's refusal text are dual-control metadata, never PHI.
 """
 
 from __future__ import annotations
+
+import json
 
 from messagefoundry.api.models import ApprovalDecisionResult, ApprovalList, PendingApprovalInfo
 
@@ -98,6 +103,25 @@ def _when(value: float | None) -> str:
     return "—" if value is None else _ts(value)
 
 
+def _param_value(value: object) -> str:
+    if value is None:
+        return "not set"
+    return value if isinstance(value, str) else json.dumps(value)
+
+
+def _params(a: PendingApprovalInfo) -> Markup:
+    """What a release would re-run, one ``name: value`` line per captured parameter (BACKLOG
+    #2458). These are operation metadata such as connection names, never a message body."""
+    if a.params is None:
+        return el("span", "unreadable", class_="muted")
+    if not a.params:
+        return el("span", "none", class_="muted")
+    return el(
+        "div",
+        *(el("div", f"{key}: {_param_value(a.params[key])}") for key in sorted(a.params)),
+    )
+
+
 def _pending_row(a: PendingApprovalInfo) -> list[object]:
     base = f"{_PAGE}/{_seg(a.id)}"
     actions = el(
@@ -109,6 +133,7 @@ def _pending_row(a: PendingApprovalInfo) -> list[object]:
     return [
         _ts(a.requested_at),
         a.label,
+        _params(a),
         a.requester,
         _when(a.expires_at),
         el("code", a.id),
@@ -120,6 +145,7 @@ def _interrupted_row(a: PendingApprovalInfo) -> list[object]:
     return [
         _ts(a.requested_at),
         a.label,
+        _params(a),
         a.requester,
         a.approver or "—",
         _when(a.decided_at),
@@ -140,7 +166,7 @@ def approvals_page(listing: ApprovalList, *, notice: str = "") -> Markup:
     if pending:
         parts.append(
             rows_table(
-                ["Requested", "Operation", "Requester", "Expires", "Id", "Actions"],
+                ["Requested", "Operation", "Parameters", "Requester", "Expires", "Id", "Actions"],
                 [_pending_row(a) for a in pending],
             )
         )
@@ -151,7 +177,15 @@ def approvals_page(listing: ApprovalList, *, notice: str = "") -> Markup:
         parts.append(el("p", _INTERRUPTED_NOTE, class_="muted"))
         parts.append(
             rows_table(
-                ["Requested", "Operation", "Requester", "Released by", "Cut off", "Id"],
+                [
+                    "Requested",
+                    "Operation",
+                    "Parameters",
+                    "Requester",
+                    "Released by",
+                    "Cut off",
+                    "Id",
+                ],
                 [_interrupted_row(a) for a in interrupted],
             )
         )

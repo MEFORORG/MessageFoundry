@@ -75,6 +75,10 @@ async def test_the_page_lists_a_hold_with_both_buttons(engine: Engine) -> None:
     assert "Replay dead-lettered deliveries" in r.text
     assert f'action="/ui/approvals/{approval_id}/approve"' in r.text
     assert f'action="/ui/approvals/{approval_id}/reject"' in r.text
+    # BACKLOG #2458: the row shows what the release would re-run, read from the hold itself.
+    assert "Parameters" in r.text
+    assert "channel_id: ch1" in r.text
+    assert "destination_name: not set" in r.text
     # The nav carries the page under Admin.
     assert 'href="/ui/approvals"' in r.text
 
@@ -263,11 +267,30 @@ def test_the_page_escapes_what_it_renders() -> None:
         label="<script>alert(1)</script>",
         requester="<b>maker</b>",
         requested_at=0.0,
+        params={"config_dir": "<i>dir</i>", "scope": ["<u>all</u>"]},
     )
     html = str(pages.approvals_page(ApprovalList(approvals=[row])))
     assert "<script>alert(1)</script>" not in html
     assert "<b>maker</b>" not in html
     assert "&lt;b&gt;maker&lt;/b&gt;" in html
+    # Captured params are escaped like every other value (BACKLOG #2458).
+    assert "<i>dir</i>" not in html and "config_dir: &lt;i&gt;dir&lt;/i&gt;" in html
+    assert "<u>all</u>" not in html
+
+
+def test_params_that_did_not_parse_or_are_empty_say_so() -> None:
+    def _row(params: dict[str, object] | None) -> PendingApprovalInfo:
+        return PendingApprovalInfo(
+            id="b" * 32,
+            operation="dead_letter_replay",
+            label="replay",
+            requester="maker",
+            requested_at=0.0,
+            params=params,
+        )
+
+    assert ">unreadable<" in str(pages.approvals_page(ApprovalList(approvals=[_row(None)])))
+    assert ">none<" in str(pages.approvals_page(ApprovalList(approvals=[_row({})])))
 
 
 def test_a_notice_code_selects_a_sentence_and_never_supplies_one() -> None:

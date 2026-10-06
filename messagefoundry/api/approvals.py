@@ -86,6 +86,20 @@ RESOLVE_OUTCOMES: Mapping[str, str] = {
 DRAIN_TIMEOUT_SECONDS = 3.0
 
 
+def _queued_params(approval_id: str, raw: Any) -> dict[str, Any] | None:
+    """The captured params as the approver's queue shows them (BACKLOG #2458), or ``None`` when the
+    stored value is not a JSON object. One unreadable row must not take the whole queue down, so it
+    is logged by id only and listed without its params; approving it still fails on the same parse."""
+    try:
+        params = json.loads(str(raw))
+    except ValueError:
+        params = None
+    if not isinstance(params, dict):
+        log.warning("approval %s: its stored params are not a JSON object", approval_id)
+        return None
+    return params
+
+
 def _log_orphaned_write(task: asyncio.Future[Any], approval_id: str) -> None:
     """Log a shielded write whose caller was cancelled, since nothing else will read its error.
 
@@ -258,7 +272,11 @@ class ApprovalGate:
         return ``None`` — the endpoint executes inline exactly as before.
 
         ``requester_user_id`` is the requester's immutable ``users.id`` and is what
-        :meth:`approve` compares; ``requester`` is the display/audit label (BACKLOG #1540)."""
+        :meth:`approve` compares; ``requester`` is the display/audit label (BACKLOG #1540).
+
+        Every holder of ``approvals:approve`` sees ``params`` in the queue, because an approver has
+        to see what a release will do (BACKLOG #2458). So they must stay operation metadata, such
+        as connection names, a scope or a config directory, and never carry a message body."""
         if not self._gated(operation):
             return None
         # Enforce the write half of the invariant here, matching `create_upload`'s guard on
@@ -306,6 +324,7 @@ class ApprovalGate:
             "id": str(r["id"]),
             "operation": str(r["operation"]),
             "label": self._label(str(r["operation"])),
+            "params": _queued_params(str(r["id"]), r["params"]),
             "requester": str(r["requester"]),
             "requested_at": float(r["requested_at"]),
             "expires_at": (None if r["expires_at"] is None else float(r["expires_at"])),

@@ -1701,6 +1701,10 @@ server-side, not a client confirmation). On release the captured operation is **
 a request older than `[approvals].expiry_hours` can no longer be approved. Approvers see the open queue
 at `GET /approvals`, or on the console's **Approvals** page (`/ui/approvals`, BACKLOG #1982), which
 offers Approve and Reject on each pending request and lists `interrupted` releases read-only.
+Each queued request carries the `params` its hold captured (BACKLOG #2458), so an approver sees
+what a release would re-run: a replay's connection names, a purge's connection and scope, a
+reload's config directory. They are operation metadata and never a message body; only an
+Administrator holds `approvals:approve`, so no channel scope masks them.
 
 **The audit log must accept a release before the operation runs.** Before it claims a request, the
 gate writes an `approval.release_attempted` row against the approver, naming the requester. If the

@@ -138,6 +138,53 @@ async def test_high_value_action_is_held_pending(engine: Engine) -> None:
         assert any(a["id"] == body["approval_id"] and a["requester"] == "op" for a in pending)
 
 
+async def test_the_queue_shows_the_params_a_hold_captured(engine: Engine) -> None:
+    """BACKLOG #2458: the approver sees what a release would re-run, not only the operation name."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await _add(service, "approver", Role.ADMINISTRATOR)
+    async with _client(engine, service, ON) as c:
+        held = await c.post(
+            "/dead-letters/replay",
+            headers=await _token(c, "op"),
+            json={"channel_id": "IB_ACME_ADT", "destination_name": "OB_LAB_ORU"},
+        )
+        assert held.status_code == 202
+        approval_id = held.json()["approval_id"]
+        listed = (await c.get("/approvals", headers=await _token(c, "approver"))).json()
+    row = next(a for a in listed["approvals"] if a["id"] == approval_id)
+    # Exactly the mapping the release hands the executor, read back from the stored row.
+    stored = await engine.store.get_pending_approval(approval_id)
+    assert stored is not None
+    assert row["params"] == json.loads(str(stored["params"]))
+    assert row["params"] == {
+        "channel_id": "IB_ACME_ADT",
+        "destination_name": "OB_LAB_ORU",
+        "requester": "op",
+    }
+
+
+async def test_a_row_whose_params_do_not_parse_is_listed_without_them(engine: Engine) -> None:
+    """One damaged row must not take the queue down; it is listed with ``params`` None."""
+    service = await _service(engine)
+    op_id = await _add(service, "op", Role.OPERATOR)
+    await _add(service, "approver", Role.ADMINISTRATOR)
+    damaged = uuid4().hex
+    await engine.store.create_pending_approval(
+        approval_id=damaged,
+        operation="dead_letter_replay",
+        params="not json",
+        requester="op",
+        requester_user_id=op_id,
+        requested_at=time.time(),
+        expires_at=None,
+    )
+    async with _client(engine, service, ON) as c:
+        r = await c.get("/approvals", headers=await _token(c, "approver"))
+    assert r.status_code == 200
+    assert [a["params"] for a in r.json()["approvals"] if a["id"] == damaged] == [None]
+
+
 async def test_requester_cannot_approve_their_own_request(engine: Engine) -> None:
     service = await _service(engine)
     await _add(service, "admin1", Role.ADMINISTRATOR)  # admins can both request and approve

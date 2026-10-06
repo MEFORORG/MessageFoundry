@@ -504,11 +504,16 @@ class PendingApprovalResponse(BaseModel):
 class PendingApprovalInfo(BaseModel):
     """One open request in the approver's queue: ``pending`` (awaiting a second approver, unexpired)
     or ``interrupted`` (released, cut off mid-run, awaiting a resolve; BACKLOG #1562). For an
-    interrupted row, ``approver`` released it and ``decided_at`` is when it was cut off."""
+    interrupted row, ``approver`` released it and ``decided_at`` is when it was cut off.
+
+    ``params`` are the parameters the hold captured, which a release re-runs (BACKLOG #2458), so an
+    approver sees what it releases. They are operation metadata, never a message body; ``None``
+    means the stored row could not be read as a JSON object."""
 
     id: str
     operation: str
     label: str
+    params: dict[str, Any] | None = None
     requester: str
     requested_at: float
     expires_at: float | None = None
