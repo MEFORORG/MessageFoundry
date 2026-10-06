@@ -449,8 +449,8 @@ class BackupRunner:
             raise BackupError(
                 "encrypt",
                 "no store encryption key is configured; refusing to write an UNENCRYPTED .mfbak archive "
-                "(set [backup].allow_unencrypted=true for a synthetic/no-PHI box, or configure "
-                "MEFOR_STORE_ENCRYPTION_KEY)",
+                "(configure MEFOR_STORE_ENCRYPTION_KEY, or set [backup].allow_unencrypted=true to "
+                "accept a cleartext archive, which holds the store's PHI)",
             )
         key_id = key_fingerprint(key) if key is not None else None
         # ADR 0196: seal the frames under the live store's data sub-key (the header records the salt,
@@ -925,7 +925,8 @@ class BackupRunner:
                     salt=salt,
                 )
             else:
-                # No key + allow_unencrypted: write the plaintext tar verbatim (synthetic/no-PHI box).
+                # No key + allow_unencrypted: write the plaintext tar verbatim. No synthetic box is
+                # exempt: every instance carries patient data (BACKLOG #1279, ADR 0186).
                 while True:
                     buf = src.read(1024 * 1024)
                     if not buf:
@@ -1293,7 +1294,7 @@ def _verify_archive_blocking(
     when no key is configured unless ``[backup].allow_unencrypted`` is set; symmetrically, when a store key
     IS configured a **plaintext** archive is a downgrade signal (an attacker swapping the AEAD-sealed
     archive for an unauthenticated one) and is refused here as ``KEY_MISMATCH`` — unless ``allow_unencrypted``
-    is set for a synthetic/no-PHI box.
+    is set. That flag reads no synthetic or non-PHI condition (BACKLOG #1279, ADR 0186).
 
     ``store_settings`` is this instance's live :class:`StoreSettings`. It is what a ``full`` verify opens
     the snapshot with, so the snapshot is read under the real cipher, keyring and key provider; without
@@ -1320,7 +1321,7 @@ def _verify_archive_blocking(
         encrypted = _looks_encrypted(archive_path)
         if not encrypted and keys and not allow_unencrypted and Path(archive_path).is_file():
             # A store key is configured but the archive is plaintext — refuse (possible downgrade/tamper),
-            # symmetric to the write-side fail-closed. allow_unencrypted opts a synthetic/no-PHI box back in.
+            # symmetric to the write-side fail-closed. allow_unencrypted opts any box back in.
             # is_file() gates this to a real plaintext archive (a MISSING file also has no MAGIC, but that
             # is a plain FAIL, not a downgrade).
             return VerifyResult(

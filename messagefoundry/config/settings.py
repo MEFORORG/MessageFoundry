@@ -1329,12 +1329,12 @@ class ApiSettings(_Section):
     # operator ATTESTATIONS made FAIL-CLOSED (mirroring MEFOR_TLS_REVOCATION_ATTESTED): the serve gate
     # REFUSES an off-loopback Posture-B bind under [security].enforcement=enforce unless both are
     # affirmatively declared, and WARNS on a loopback bind or under enforcement = warn. No instance
-    # stays quiet: every instance carries patient data since BACKLOG #1279 (ADR 0186), so the gate reads
-    # no synthetic condition. They are NOT runtime enforcement (see the honest docs).
+    # stays quiet: every instance carries patient data since BACKLOG #1279 (ADR 0186), so the gate
+    # reads no synthetic condition. They are NOT runtime enforcement (see the honest docs).
     #
     # proxy_intra_service_auth — HOW the proxy→engine hop is authenticated so a rogue peer on the internal
-    #   segment cannot impersonate the proxy. "none" (default) is undeclared → refuse off-loopback. Declare
-    #   "mtls" (the proxy presents a client cert), "network" (an isolated proxy↔engine segment / host
+    #   segment cannot impersonate the proxy. "none" (default) is undeclared → refuse off-loopback.
+    #   Declare "mtls" (the proxy presents a client cert), "network" (an isolated proxy↔engine segment / host
     #   firewall allow-list), or "shared_secret" (a pre-shared header the proxy injects). Attestation only.
     proxy_intra_service_auth: Literal["none", "mtls", "network", "shared_secret"] = "none"
     # proxy_tls_min_version — the operator-DECLARED TLS version floor the reverse proxy negotiates with
@@ -1387,13 +1387,15 @@ class ApiSettings(_Section):
     @property
     def proxy_intra_service_declared(self) -> bool:
         """Whether the Posture-B proxy→engine intra-service-auth posture is affirmatively declared
-        (#200). ``"none"`` (the default) is undeclared → a prod-PHI Posture-B bind refuses."""
+        (#200). ``"none"`` (the default) is undeclared → an off-loopback Posture-B bind refuses under
+        ``[security].enforcement = enforce``, whatever the tier."""
         return self.proxy_intra_service_auth != "none"
 
     @property
     def proxy_tls_floor_declared(self) -> bool:
         """Whether the Posture-B proxy TLS/KEX floor is declared (#200): a ``proxy_tls_min_version`` is
-        set. Undeclared → a prod-PHI Posture-B bind refuses (the engine cannot observe the proxy's TLS)."""
+        set. Undeclared → an off-loopback Posture-B bind refuses under
+        ``[security].enforcement = enforce`` (the engine cannot observe the proxy's TLS)."""
         return self.proxy_tls_min_version is not None
 
     @property
@@ -2299,9 +2301,10 @@ class LoggingSettings(_Section):
     # message ids, connection names, IPs, the audit chain) on the wire in the clear, and it was the ONE
     # egress path with no posture gate at all. It is now decided by the same shared authority the
     # transports use (see `forward_hop_disposition`): a plaintext / unverified-TLS collector hop is
-    # REFUSED on an enforcing production-PHI instance unless the operator ATTESTS it — the acknowledged
-    # opt-out, replacing a silent default. Loopback is always allowed, so the ADR 0080 "point tcp/udp at
-    # 127.0.0.1 and let a local rsyslog/Vector agent add TLS" deployment is untouched.
+    # REFUSED under [security].enforcement = enforce, on any tier, unless the operator ATTESTS it —
+    # the acknowledged opt-out, replacing a silent default. Loopback is always allowed, so the ADR
+    # 0080 "point tcp/udp at 127.0.0.1 and let a local rsyslog/Vector agent add TLS" deployment is
+    # untouched.
     forward_hop_attested: bool = False
     forward_hop_attested_reason: str | None = None
     # --- On-disk spool behind the forwarder (BACKLOG #1966, ADR 0200) ----------
@@ -2609,13 +2612,15 @@ class RetentionSettings(_Section):
     # a write lock on the whole DB while it runs, so it is off by default and meant for a quiet window.
     vacuum_at: str = ""
     # Secure-by-default opt-out (#186a, ASVS 14.2.4): `serve` refuses to start under
-    # [security].enforcement=enforce (warns under enforcement = warn) unless BOTH PHI-body retention
-    # windows are bounded — the inbound-body window (`messages_days`) and the dead-letter-body window
-    # (`dead_letter_days`), each of which keeps FULL raw PHI until purged — so PHI bodies do not
+    # [security].enforcement=enforce (warns under enforcement = warn) when an auto-bounded PHI window
+    # is unbounded — `messages_days`, `dead_letter_days` and `reference_snapshot_days`, each of which
+    # keeps FULL raw PHI until purged (`auto_bounded_windows()` is the list) — so PHI does not
     # accumulate without bound. Unless this override is set, an UNSET window is auto-bounded to 30
-    # days, so only an explicit 0 trips the gate. Setting this true is the explicit, audited override that lets an instance run with
-    # unbounded (keep-forever) retention. Off by default. No instance is exempt: every instance
-    # carries patient data since BACKLOG #1279 (ADR 0186). See messagefoundry/__main__.py.
+    # days, so only an explicit 0 trips the gate. Setting this true is the explicit, audited override
+    # that lets an instance run with unbounded (keep-forever) retention. Operators write it as
+    # [security].allow_keeping_phi_indefinitely; the [retention] spelling is refused at load. Off by
+    # default. No instance is exempt: every instance carries patient data since BACKLOG #1279
+    # (ADR 0186). See messagefoundry/__main__.py.
     allow_unbounded_phi: bool = False
 
     @field_validator(
@@ -4620,13 +4625,14 @@ class AlertsSettings(_Section):
 
     # Secure-by-default (#188, ASVS 6.3.5/6.3.7): out-of-band security-event notifications are required
     # by default. `serve` refuses to start under [security].enforcement=enforce (warns under
-    # enforcement = warn) when no effective security-notification channel exists — SMTP transport (the settings above) configured AND the
-    # [auth].notify_security_events kill-switch on (both are what api/app.py needs to wire the notifier)
-    # — so account-security events (lockout, password/roles change, new-IP admin action) always have a
-    # push channel, not just the pull-only /me/security-events feed. That feed carries the user's own
-    # events, not an administrator's change to their account (auth/notifications.py states the rule).
-    # Set false to accept the pull-only feed in writing (the explicit, audited opt-out). No instance is
-    # exempt: every instance carries patient data since BACKLOG #1279 (ADR 0186). See
+    # enforcement = warn) when no effective security-notification channel exists — SMTP transport
+    # (the settings above) configured AND the [auth].notify_security_events kill-switch on (both are
+    # what api/app.py needs to wire the notifier) — so account-security events (lockout,
+    # password/roles change, new-IP admin action) always have a push channel, not just the pull-only
+    # /me/security-events feed. That feed carries the user's own events, not an administrator's
+    # change to their account (auth/notifications.py states the rule). Set false to accept the
+    # pull-only feed in writing (the explicit, audited opt-out). No instance is exempt: every
+    # instance carries patient data since BACKLOG #1279 (ADR 0186). See
     # messagefoundry/__main__.py. BACKLOG #2008 (ASVS 6.4.5): the same gate also requires a credential-
     # reminder RECIPIENT (webhook_url, or email_to beside host + sender), and false waives that too.
     security_notifications_required: bool = True
@@ -5608,11 +5614,12 @@ class BackupSettings(_Section):
     # On a server-DB store (postgres/sqlserver) the DB backup is DBA-delegated (#52); back up the config
     # bundle ONLY. False = skip the backup entirely on a server-DB store (no config-only archive either).
     config_only_on_server_db: bool = True
-    # Audited escape: permit a CLEARTEXT archive when no store key is configured (parallel to
+    # Escape: permit a CLEARTEXT archive when no store key is configured (parallel to
     # [store].allow_unencrypted_phi). With no key and this flag off, the BackupRunner's key check
     # REFUSES to write an unencrypted archive (fail-closed). With it on, any keyless instance writes
     # one: the check reads no synthetic or non-PHI condition, and every instance carries patient data
-    # since BACKLOG #1279 (ADR 0186), so the cleartext archive holds PHI.
+    # since BACKLOG #1279 (ADR 0186), so the cleartext archive holds PHI. Each backup's `dr_backup`
+    # audit row carries `encrypted: false`; security_loosenings() does not name this flag.
     allow_unencrypted: bool = False
 
     @field_validator("schedule_at")
@@ -6661,9 +6668,11 @@ def _desugar_security(data: dict[str, dict[str, Any]]) -> None:
         origin = sec.web_console_public_address.strip()
         _set("api", "public_origin", origin or None)
 
-    # At-rest encryption: encrypt_stored_data=false OR allow_unencrypted_phi=true both suppress the
-    # keyless-PHI refusal (the audited opt-out). [store].require_encryption (which refuses a keyless
-    # start even past that opt-out) is plumbing that stays put and still wins.
+    # At-rest encryption: encrypt_stored_data=false OR allow_unencrypted_phi=true both set the
+    # audited opt-out from the keyless-PHI refusal. Under [security].enforcement = enforce the opt-out
+    # also needs allow_unencrypted_phi_under_strict_enforcement (ADR 0140; keyless_opt_out_refusal).
+    # [store].require_encryption (which refuses a keyless start even past that opt-out) is plumbing
+    # that stays put and still wins.
     if "encrypt_stored_data" in provided or "allow_unencrypted_phi" in provided:
         _set(
             "store",
