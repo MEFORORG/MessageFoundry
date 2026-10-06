@@ -1697,7 +1697,8 @@ class RegistryRunner:
         (ADR 0061).
 
         Sharded (ADR 0073): a wake for a lane ANOTHER shard owns is dropped here — the single choke
-        point for every producer wake (transform handoffs, retry re-wakes, response captures).
+        point for every producer wake (transform handoffs, retry re-wakes, response captures,
+        pass-through re-ingress).
         ``mark_ready`` is create-or-stick, so an ungated cross-shard wake would register the lane on
         THIS shard's dispatcher and make it a second concurrent claimer — the exact per-lane FIFO
         hazard the single-consumer invariant closes. The owning shard discovers cross-shard produce
@@ -1708,10 +1709,15 @@ class RegistryRunner:
         OUTBOUND dispatcher (create-or-stick) and make that dispatcher a SECOND claimer of a lane a
         worker already drains — the single-consumer hazard :meth:`_per_lane_delivery` exists to close."""
         if self.registry.shard_id is not None:
-            if stage is Stage.OUTBOUND and not self._owns_destination(key):
+            if stage is Stage.OUTBOUND:
+                if not self._owns_destination(key):
+                    return
+            elif key not in self.registry.inbound:
+                # INGRESS / ROUTED / RESPONSE lanes are keyed by an inbound name, and each is drained
+                # only by the shard that owns that inbound. Reached by a RESPONSE wake for a
+                # reingress_to loopback on another shard, and by an INGRESS wake after a Send into a
+                # pass-through another shard owns (vault BACKLOG #2755).
                 return
-            if stage is Stage.RESPONSE and key not in self.registry.inbound:
-                return  # the reingress_to loopback lives on (and is drained by) another shard
         if self._claim_mode == "pooled" and not (
             stage is Stage.OUTBOUND and self._per_lane_delivery(key)
         ):
@@ -3984,7 +3990,11 @@ class RegistryRunner:
                         "%s. The pooled OUTBOUND dispatcher's <=%.2fs sweep covers every OTHER lane",
                         _PER_LANE_IDLE_BACKSTOP_SECONDS,
                         self._claim_mode,
-                        "every outbound lane"
+                        # A per_lane router/re-ingress worker has no sweep either, so a pass-through
+                        # or reingress_to loopback another shard sends into waits the same way
+                        # (vault BACKLOG #2755).
+                        "every outbound lane, and every pass-through or loopback inbound another "
+                        "shard sends into"
                         if self._claim_mode != "pooled"
                         else "any ordering=unordered outbound (ADR 0066 D4)",
                         self._pooled_sweep_interval,
@@ -9289,9 +9299,9 @@ def check_pt_backend_supported(registry: Registry, store: QueueStore) -> None:
     so the path on today's three backends is byte-identical."""
     if getattr(store, "supports_pt_reingress", False):
         return  # backend opted in (SQLite/Postgres/SQL Server) — PT is permitted, nothing to gate
-    pt_inbounds = sorted(
-        name for name, ic in registry.inbound.items() if ic.spec.type is ConnectorType.PT
-    )
+    # The whole config's PT inbounds, not only this engine shard's: a shard that owns no PT but Sends
+    # into a sibling's still writes PT children to the shared store (vault BACKLOG #2755).
+    pt_inbounds = sorted(registry.passthrough_inbounds())
     if not pt_inbounds:
         return  # no PT connector in the graph — any backend is fine
     backend = getattr(store, "backend", None)
