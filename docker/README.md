@@ -58,7 +58,7 @@ interpreter it starts.
 - **The virtual environment is owned by root, and the engine runs as uid 10001.** So the engine's
   own account cannot add a file to `site-packages`, even where the root file system is left
   writable. Code planted there would run at every interpreter start. Uid 10001 owns only
-  `/var/lib/mefor` and `/config`.
+  `/var/lib/mefor`; `/config` is root-owned too.
 
 Two things undo this, and the engine reports both:
 
@@ -76,25 +76,38 @@ reads it off a running container and tries the write. What each entry means is i
 ## Configuration — bake it in (recommended) or mount it carefully
 
 The engine **executes your config `*.py` as its service account**, so `_assert_safe_config_source`
-refuses a config dir that is **group/world-writable** *or* **owned by a different uid** than the engine
-(uid 10001). Two ways to satisfy it:
+refuses a config dir or module that is **group/world-writable** *or* **owned by any uid other than
+root or the engine's own** (uid 10001). **Root-owned is the safer of the two owners**: the engine's own
+account then cannot rewrite the code it executes. Two ways to satisfy it:
 
 **1. Bake config into a derived image (recommended; immutable, matches ADR 0017).**
 ```dockerfile
 FROM messagefoundry:<version>
-COPY --chown=10001:10001 config /config
+COPY config /config
 ```
-Deploy that image. This is the only clean path on Kubernetes — a ConfigMap/projected volume mounts
-**root-owned**, which the guard rejects.
+`COPY` writes the files root-owned by default and keeps their modes, so clear any group/world write
+bit and make everything readable by the engine in the build context first
+(`chmod -R a+rX,go-w config`): a root-owned file the engine cannot read stops the start, and the
+engine's own config editors write theirs at 0600. The base image's `/config` directory is
+root-owned as well. Deploy that image. It is the recommended path on Kubernetes because it is
+immutable and byte-identical across replicas. A ConfigMap or projected volume has not been verified
+against the guard: its root owner is accepted, but its directory mode may still be refused.
 
-**2. Mount config read-only (Docker single-host).** The mount must be owned by uid 10001 and not
-group/world-writable:
+**2. Mount config read-only (Docker single-host).** The mount must be owned by root or uid 10001 and
+not group/world-writable. Root-owned is the safer choice:
 ```sh
-chown -R 10001:10001 ./config && chmod -R go-w ./config
+chmod -R a+rX,go-w ./config && sudo chown -R root:root ./config
 docker run --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges:true \
   -v "$PWD/config:/config:ro" -v mefor-store:/var/lib/mefor ... messagefoundry:<version> serve --config /config --env prod
 ```
 A **Docker-Desktop-on-Windows** bind mount surfaces as `0o777` and **will be refused** — bake instead.
+Under **rootless Docker or Podman, or userns-remap**, a host root owner appears inside the container
+as an unprivileged uid and is refused; leave the files owned by your own user there, which maps to
+root inside.
+
+**What a root-owned config gives up.** The engine's own config editors (the web console's connection
+toggle, code-set and alert edits) write into the config directory, so they cannot write a root-owned
+one, just as they cannot write a read-only mount.
 
 **Pass `--read-only` on a plain `docker run`.** [`compose.yaml`](compose.yaml) and both Kubernetes
 manifests set a read-only root file system; a bare `docker run` does not. The engine writes only

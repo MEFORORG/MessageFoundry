@@ -27,6 +27,7 @@ import errno
 import functools
 import json
 import logging
+import math
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import CancelledError as FutureCancelledError
@@ -219,6 +220,10 @@ is keyed by ``(Direction, name)`` rather than by the bare name."""
 
 type _LaneFault = Literal["credential", "configuration"]
 """A connection fault that STOPs an outbound lane and keeps its queue (#109, BACKLOG #2083)."""
+
+type _RefusedMember = tuple[str, str, NegativeAckError]
+"""A batch member its frame refused: its outbox row id, the content-free error the store keeps, and
+the refusal, with no traceback, whose class name and code the log line reads (BACKLOG #3043)."""
 
 
 log = logging.getLogger(__name__)
@@ -472,6 +477,115 @@ class _WorkerFaultLog:
                 count_label=_WORKER_RUN_COUNT,
                 stacklevel=3,
             )
+
+
+# BACKLOG #3043: how long one (connection, refusal code) pair stays quiet after it writes its
+# permanent-refusal WARNING. See _RefusalLog.
+_REFUSAL_LOG_WINDOW_SECONDS = 60.0
+# Most lines all pairs together write in one window. Some codes come from the peer (an HTTP status, a
+# SQLSTATE, a DICOM status), so a peer that varies its code would otherwise get one line per code.
+_REFUSAL_LOG_MAX_LINES_PER_WINDOW = 100
+# Past this many (connection, code) pairs, a written line first forgets the pairs whose window has
+# closed and that hold no count. The next forget waits until the table doubles, so the cost stays
+# amortized when nothing can be forgotten.
+_REFUSAL_LOG_MAX_PAIRS = 4096
+
+
+class _RefusalLog:
+    """The WARNING a permanent refusal writes after the delivery worker dead-letters it, throttled per
+    (connection, refusal code) (BACKLOG #3043).
+
+    **What the line may carry.** The connection, the outbox row id (and the message id where the
+    caller has it), the exception's class name and its ``code``. Never ``str(exc)`` or
+    ``safe_exc(exc)``: a partner's reject text (MSA-3, an HTTP body) can echo the message, and
+    ``safe_exc`` scrubs HL7 shapes, not every connector's content. The full detail already goes to
+    the secured store's ``last_error`` and the dead event.
+
+    **Why throttle (a Manager decision on the item).** A lane whose charset or frame refuses every
+    message would write one line per message. The first refusal of a pair always logs, and says
+    that more like it in the window are counted rather than logged. Later ones inside
+    :data:`_REFUSAL_LOG_WINDOW_SECONDS` are counted by ROW, and the next line the pair writes
+    reports that count. This throttles only the log line. Every refused row is still dead-lettered
+    with its own event, status and count. The count-and-log invariant (CLAUDE.md section 2) is about
+    that store record and its disposition, not one log line per message: a delivered message writes
+    no per-message log line either. So the store stays the complete record. A count still held when
+    the runner tears down is not written; teardown starts a fresh log, so the first refusal after a
+    restart or a promotion logs again. Nothing flushes a held count when a burst simply ends: it is
+    written only by the pair's next line. The first line's "counted, not logged" says so.
+
+    All pairs together write at most :data:`_REFUSAL_LOG_MAX_LINES_PER_WINDOW` lines a window. A
+    pair over that cap is counted as held, so a peer cycling its code cannot turn the throttle off.
+
+    Not :class:`messagefoundry.transports.admission.RefusalLog`: that one reports one running total
+    across every key, counts one per call, and keeps no per-key count. This line has to say how many
+    ROWS of one pair went unlogged, and a refused batch is many rows.
+
+    Mutable, shared by every delivery worker of one runner. Safe without a lock: :meth:`warning`
+    reads and writes the state with no ``await`` between."""
+
+    __slots__ = (
+        "_clock",
+        "_lines",
+        "_lines_since",
+        "_max_lines",
+        "_prune_at",
+        "_state",
+        "_window",
+    )
+
+    def __init__(
+        self,
+        *,
+        window: float = _REFUSAL_LOG_WINDOW_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+        max_lines: int = _REFUSAL_LOG_MAX_LINES_PER_WINDOW,
+        max_pairs: int = _REFUSAL_LOG_MAX_PAIRS,
+    ) -> None:
+        self._window = window
+        self._clock = clock
+        self._max_lines = max_lines
+        self._prune_at = max_pairs
+        # (connection, code) -> (when its last line was written, rows held back since then)
+        self._state: dict[tuple[str, str], tuple[float, int]] = {}
+        self._lines = 0  # lines written, across all pairs, since _lines_since
+        self._lines_since = -math.inf
+
+    def warning(
+        self, name: str, exc: NegativeAckError, rows: int, message: str, *args: object
+    ) -> None:
+        """Log ``message % args`` at WARNING, followed by ``exc``'s class name and code, unless the
+        pair ``(name, code)`` logged inside the window, in which case count its ``rows``. Call it
+        AFTER the dead-letter write, so a line never claims a dead-letter that did not happen."""
+        # getattr: a connector may raise a subclass that never set `code` (see _lane_stopping_fault).
+        # A missing code must not turn the fail-fast dead-letter into an AttributeError loop.
+        code = str(getattr(exc, "code", "?"))
+        key = (name, code)
+        now = self._clock()
+        last, held = self._state.get(key, (-math.inf, 0))
+        if now - self._lines_since >= self._window:
+            self._lines, self._lines_since = 0, now
+        if now - last < self._window or self._lines >= self._max_lines:
+            # A pair held by the cross-pair cap keeps `last`, so its next line is not delayed.
+            self._state[key] = (last, held + rows)
+            return
+        if len(self._state) >= self._prune_at:
+            # Forget only what carries nothing: a closed window AND no held count.
+            self._state = {
+                k: v for k, v in self._state.items() if v[1] or now - v[0] < self._window
+            }
+            self._prune_at = max(self._prune_at, 2 * len(self._state))
+        self._lines += 1
+        self._state[key] = (now, 0)
+        message += " (%s, code %r)"
+        args = (*args, type(exc).__name__, code)
+        if held:
+            message += (
+                " (%d more row(s) refused with this code on this connection since its last line)"
+            )
+            args = (*args, held)
+        message += "; more with this code in the next %.0f s are counted, not logged"
+        args = (*args, self._window)
+        log.warning(message, *args, stacklevel=2)
 
 
 # A queue_buildup alert re-fires at most this often per connection while the lane stays over threshold,
@@ -1301,6 +1415,8 @@ class RegistryRunner:
         # so a bad value fails loud at construction, mirroring the infra_fault_policy assert above.
         assert credential_fault_policy in ("stop", "dead_letter")
         self._credential_fault_policy = credential_fault_policy
+        # BACKLOG #3043: the content-free WARNING a permanent refusal writes when it dead-letters.
+        self._refusal_log = _RefusalLog()
         # #147 (ADR 0095): per-connection active-window scheduler. `_schedule_clock` is injectable for
         # deterministic tests (returns an AWARE UTC datetime); `_schedule_tick` is the reconcile
         # granularity. `_schedule_workers` holds one cooperatively-cancellable task per SCHEDULED
@@ -4417,6 +4533,8 @@ class RegistryRunner:
         self._lane_healthy.clear()
         self._next_buildup_alert.clear()
         self._next_stall_alert.clear()
+        # BACKLOG #3043: a fresh refusal log, so the first refusal after a restart or promotion logs.
+        self._refusal_log = _RefusalLog()
         # #93: drop the per-lane saturation depth-sample history + re-alert throttle so a start()-after-
         # stop() (or a full reload teardown) begins sampling a fresh backlog curve, not a stale one.
         self._saturation_detectors.clear()
@@ -6693,6 +6811,18 @@ class RegistryRunner:
                 return _ItemOutcome.STOPPED, None
             if exc.permanent:
                 await self.store.dead_letter_now(item.id, safe_exc(exc))
+                # BACKLOG #3043: this arm used to dead-letter with no log line at all. Class name
+                # and code only, never the text: see _RefusalLog for why, and for the throttle.
+                self._refusal_log.warning(
+                    name,
+                    exc,
+                    1,
+                    "delivery worker %r: outbox row %s (message %s) refused permanently; "
+                    "dead-lettered",
+                    name,
+                    item.id,
+                    item.message_id,
+                )
             else:
                 retry_until = await self._mark_failed_and_arm(name, item.id, safe_exc(exc), retry)
                 await self._maybe_alert_buildup(name)
@@ -6938,7 +7068,7 @@ class RegistryRunner:
         # policy below (dead-letter / STOP) instead of stranding every claimed row INFLIGHT forever with
         # no send and no disposition. Members are carried VERBATIM (the head too — never re-encoded); only
         # the head is PARSED, for the BHS separators + the BHS-11 control id.
-        refused: list[tuple[str, str]] = []
+        refused: list[_RefusedMember] = []
         try:
             # #149 (ADR 0105 Phase 1b): re-attach each member's detached document VERBATIM before framing
             # the envelope, so a batched streaming feed delivers full inline documents (never a raw
@@ -6950,9 +7080,7 @@ class RegistryRunner:
             # shadow branch below, so a simulate outbound records the same dispositions. The split
             # writes nothing; the refused members are dead-lettered after this try, on every path.
             if _frames(connector):
-                kept, members, refused = self._split_unframeable_members(
-                    name, connector, items, hydrated
-                )
+                kept, members, refused = self._split_unframeable_members(connector, items, hydrated)
             else:
                 kept, members = list(items), list[Message | str](hydrated)
             ids = [it.id for it in kept]
@@ -6978,11 +7106,23 @@ class RegistryRunner:
             if fault is not None:
                 # Refused members first: a store fault here then escapes before the stop, not
                 # after a stop and alert are already recorded, so #109 cannot loop on re-auth.
-                await self._dead_letter_refused(refused)
+                await self._dead_letter_refused(name, refused)
                 await self._stop_lane_retaining(name, ids, exc, fault)
                 return _ItemOutcome.STOPPED, None
             if exc.permanent:
                 await self.store.dead_letter_batch(ids, safe_exc(exc))
+                # BACKLOG #3043, the batch twin of the single-row line. `ids` is never empty here:
+                # a send only happens with a member kept, and an earlier refusal keeps every id.
+                self._refusal_log.warning(
+                    name,
+                    exc,
+                    len(ids),
+                    "delivery worker %r: a batch of %d (head outbox row %s) refused permanently; "
+                    "dead-lettered",
+                    name,
+                    len(ids),
+                    ids[0],
+                )
             else:
                 retry_until = await self._mark_batch_failed_and_arm(name, ids, safe_exc(exc), retry)
                 await self._maybe_alert_buildup(name)
@@ -7001,7 +7141,7 @@ class RegistryRunner:
                 self._internal_error.get(name, self._internal_error_default)
                 is InternalErrorPolicy.STOP
             ):
-                await self._dead_letter_refused(refused)  # before the stop, as above
+                await self._dead_letter_refused(name, refused)  # before the stop, as above
                 log.error(
                     "delivery worker %r: framing/internal error delivering a batch of %d (%s); STOPPING "
                     "connection (operator must fix + reload/restart to resume)",
@@ -7028,48 +7168,55 @@ class RegistryRunner:
             if ids:  # nothing was sent when every member was refused
                 self._note_lane_healthy(name)
                 await self.store.mark_batch_done(ids)
-        await self._dead_letter_refused(refused)
+        await self._dead_letter_refused(name, refused)
         return _ItemOutcome.PROCESSED, retry_until
 
     def _split_unframeable_members(
         self,
-        name: str,
         connector: DestinationConnector,
         items: Sequence[OutboxItem],
         payloads: Sequence[str],
-    ) -> tuple[list[OutboxItem], list[Message | str], list[tuple[str, str]]]:
+    ) -> tuple[list[OutboxItem], list[Message | str], list[_RefusedMember]]:
         """Split the batch into the members ``connector``'s frame can carry, with their hydrated
-        payloads, and the ``(id, error)`` of each member it refuses permanently (ADR 0205 rule 1).
-        Pure: it writes nothing, so a store fault cannot strike between a refusal and the send, and
-        the caller dead-letters the refused members once the rest are resolved. A refusal that is
-        not permanent, or one that must stop the lane, is re-raised for the whole batch, as a send
-        would raise it. The error text names a byte and an offset in that member, never content."""
+        payloads, and the ``(id, error, refusal)`` of each member it refuses permanently (ADR 0205
+        rule 1). Pure: it writes and logs nothing, so a store fault cannot strike between a refusal
+        and the send, and the caller dead-letters and logs the refused members once the rest are
+        resolved. A refusal that is not permanent, or one that must stop the lane, is re-raised for
+        the whole batch, as a send would raise it. The error text names a byte and an offset in that
+        member, never content."""
         kept: list[OutboxItem] = []
         kept_payloads: list[Message | str] = []
-        refused: list[tuple[str, str]] = []
+        refused: list[_RefusedMember] = []
         for item, payload in zip(items, payloads, strict=True):
             try:
                 connector.check_frame(payload, rewrite=False)
             except NegativeAckError as exc:
                 if not exc.permanent or self._lane_stopping_fault(exc) is not None:
                     raise
-                log.warning(
-                    "delivery worker %r: batch member %s cannot be framed (%s); dead-lettered "
-                    "alone, the rest of the batch goes on",
-                    name,
-                    item.id,
-                    exc.code,
-                )
-                refused.append((item.id, safe_exc(exc)))
+                # No traceback: it would hold this frame, and with it every hydrated payload of
+                # the batch, in a cycle until the collector ran.
+                refused.append((item.id, safe_exc(exc), exc.with_traceback(None)))
             else:
                 kept.append(item)
                 kept_payloads.append(payload)
         return kept, kept_payloads, refused
 
-    async def _dead_letter_refused(self, refused: Sequence[tuple[str, str]]) -> None:
-        """Dead-letter each batch member :meth:`_split_unframeable_members` refused, alone."""
-        for outbox_id, error in refused:
+    async def _dead_letter_refused(self, name: str, refused: Sequence[_RefusedMember]) -> None:
+        """Dead-letter each batch member :meth:`_split_unframeable_members` refused, alone, then log
+        it. The line used to be written in the split, before any write, so a member a later
+        refusal sent back with the whole batch was logged as dead-lettered when it was not. It goes
+        through the same throttle as the other permanent-refusal lines (BACKLOG #3043)."""
+        for outbox_id, error, exc in refused:
             await self.store.dead_letter_now(outbox_id, error)
+            self._refusal_log.warning(
+                name,
+                exc,
+                1,
+                "delivery worker %r: batch member %s refused permanently, its frame cannot "
+                "carry it; dead-lettered alone, apart from the rest of its batch",
+                name,
+                outbox_id,
+            )
 
     def _lane_stopping_fault(self, exc: NegativeAckError) -> _LaneFault | None:
         """Which connection fault ``exc`` is, when it must STOP the lane and keep the queue:

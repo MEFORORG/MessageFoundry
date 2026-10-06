@@ -231,9 +231,9 @@ Container-specific essentials (all detailed in [`../docker/README.md`](../docker
 
 - **Two variants:** slim default (core + SQLite) and `-sqlserver` (adds the OS-level MS ODBC Driver 18
   for the SQL Server store / `db_lookup`). Non-root uid 10001; read-only root fs; per-profile hash-locked deps.
-- **Config is executed code:** mount it owned by **uid 10001** and not group/world-writable, or — the
-  robust path, and the only clean one on Kubernetes — **bake it into a derived image**
-  (`FROM messagefoundry; COPY --chown=10001:10001 config /config`).
+- **Config is executed code:** mount it owned by **root** (safest) or **uid 10001** and not
+  group/world-writable, or -- the robust path, and the recommended one on Kubernetes -- **bake it into
+  a derived image** (`FROM messagefoundry; COPY config /config`, which writes root-owned files).
 - **Store volume must persist** (named volume / PVC, never the ephemeral layer) or the at-least-once
   invariant is void across a restart; enable the at-rest cipher (`MEFOR_STORE_ENCRYPTION_KEY` +
   `MEFOR_STORE_REQUIRE_ENCRYPTION=true`).
