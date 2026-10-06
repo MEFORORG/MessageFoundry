@@ -233,8 +233,9 @@ class ApprovalGate:
         caller was cancelled, such as by a request timeout, then lands instead of meeting a closed
         store. Returns the approval ids of any writes still running at the deadline, and logs them
         at ERROR. Nothing is cancelled: a write that outlives the drain meets the closing store, and
-        its own failure is logged. An app that owns its engine some other way than the managed
-        lifespan calls this itself, before it stops the engine.
+        its own failure is logged. ``create_app(engine=...)`` gives its app a lifespan that calls
+        this at shutdown; a caller that passes its own lifespan calls it itself, before it stops
+        the engine.
 
         It re-reads the set until it is empty, so a write started while it waits is drained too."""
         deadline = asyncio.get_running_loop().time() + timeout

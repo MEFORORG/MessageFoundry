@@ -1982,3 +1982,72 @@ async def test_a_reconcile_that_cannot_move_a_row_leaves_it_for_the_next_start(
     later = await ApprovalGate(engine.store, ON).reconcile_after_restart()
     assert later.interrupted == (mine,)
     assert await _status_of(engine, mine) == "interrupted"
+
+
+# --- BACKLOG #2087: the teardown always stops the engine, and the embedded app drains ------------
+
+
+async def test_a_lifespan_cancelled_mid_drain_still_stops_the_engine(tmp_path: Path) -> None:
+    """A cancel delivered to the lifespan while the drain waits used to skip engine.stop(), and the
+    store's non-daemon worker then kept the process alive. The cancel still propagates."""
+    app = _managed(tmp_path / "cancelled.db")
+    calls: list[str] = []
+    real_stop: list[Any] = []
+    entered, leave, draining = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def _run() -> None:
+        async with app.router.lifespan_context(app):
+            engine = app.state.engine
+            real_stop.append(engine.stop)
+            gate: ApprovalGate = app.state.approval_gate
+
+            async def _hangs(timeout: float = 0.0) -> list[str]:
+                calls.append("drain")
+                draining.set()
+                await asyncio.Event().wait()
+                return []
+
+            async def _spy_stop() -> None:
+                calls.append("stop")
+                await real_stop[0]()
+
+            gate.drain = _hangs  # type: ignore[method-assign]
+            engine.stop = _spy_stop
+            entered.set()
+            await leave.wait()
+
+    task = asyncio.create_task(_run())
+    try:
+        await asyncio.wait_for(entered.wait(), _WAIT_S)
+        leave.set()
+        await asyncio.wait_for(draining.wait(), _WAIT_S)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, _WAIT_S)
+    finally:
+        if real_stop and "stop" not in calls:
+            await real_stop[0]()
+    assert calls == ["drain", "stop"]
+
+
+async def test_the_embedded_app_drains_an_orphaned_write_at_shutdown(engine: Engine) -> None:
+    """create_app(engine=...) has no engine to stop, so it drains in its own lifespan: the write
+    lands before the app's shutdown returns, and so before the caller stops its engine."""
+    app = create_app(engine, approvals=ON)
+    finished = asyncio.Event()
+    async with app.router.lifespan_context(app):
+        gate: ApprovalGate = app.state.approval_gate
+
+        async def _slow_write() -> None:
+            await asyncio.sleep(0.3)
+            await engine.store.record_audit("approval.drain_probe", actor="checker")
+            finished.set()
+
+        caller = asyncio.create_task(gate._shielded(_slow_write(), "probe-id"))
+        await asyncio.sleep(0)
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        assert not finished.is_set()
+    assert finished.is_set(), "the shutdown returned before the orphaned write landed"
+    assert len(await engine.store.list_audit(action="approval.drain_probe")) == 1

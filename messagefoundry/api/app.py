@@ -806,18 +806,38 @@ async def _reconcile_approvals_after_restart(gate: ApprovalGate) -> None:
         )
 
 
+async def _drain_approval_gate(app: FastAPI) -> None:
+    """Let approval outcome writes still running land before the store closes (BACKLOG #2087).
+
+    A write whose caller was cancelled, such as by a request timeout, finishes on its own, and would
+    otherwise meet a closed store. ``drain()`` is bounded, and a failure is logged rather than
+    raised, so the teardown still reaches ``engine.stop()``. The gate is read through getattr
+    because a startup that failed early may not have built one."""
+    gate: ApprovalGate | None = getattr(app.state, "approval_gate", None)
+    if gate is None:
+        return
+    try:
+        await gate.drain()
+    except Exception:
+        _log.exception("approval gate: the shutdown drain failed; continuing the teardown")
+
+
 @asynccontextmanager
 async def _embedded_approvals_lifespan(app: FastAPI) -> AsyncIterator[None]:
     """The lifespan :func:`create_app` gives an app built around a caller's engine.
 
     The caller starts and stops the engine; this runs only the approval gate's own steps, which the
     managed lifespan runs too. At start, :meth:`ApprovalGate.reconcile_after_restart`, before the
-    app serves an approval. A caller that passes its own ``lifespan`` replaces this one and runs
-    these steps itself, with the engine's store open."""
+    app serves an approval. At shutdown, :meth:`ApprovalGate.drain` (BACKLOG #2087), so a caller
+    that stops its engine after the app has shut down loses no outcome write. A caller that passes
+    its own ``lifespan`` replaces this one and runs these steps itself, with the store open."""
     gate: ApprovalGate | None = getattr(app.state, "approval_gate", None)
     if gate is not None:
         await _reconcile_approvals_after_restart(gate)
-    yield
+    try:
+        yield
+    finally:
+        await _drain_approval_gate(app)
 
 
 def _build_approval_gate(
@@ -9227,65 +9247,59 @@ def create_managed_app(
                     )
             yield
         finally:
-            if upload_retention_runner is not None:
-                await upload_retention_runner.stop()
-            if reconciler is not None:
-                reconciler.cancel()
-                await asyncio.gather(reconciler, return_exceptions=True)
-            if reaper is not None:
-                reaper.cancel()
-                # gather(return_exceptions): absorbs both our cancellation AND any exception a
-                # previously-died reaper stored, so it can't propagate here and skip engine.stop()
-                # (review M-33).
-                await asyncio.gather(reaper, return_exceptions=True)
-            if credential_reminder is not None:
-                credential_reminder.cancel()
-                await asyncio.gather(credential_reminder, return_exceptions=True)
-            # BACKLOG #2087: let approval outcome writes still running land before the store closes.
-            # A write whose caller was cancelled, such as by a request timeout, finishes on its own,
-            # and would otherwise meet a closed store. drain() is bounded, and it is guarded like the
-            # flush below, so neither a failure nor the deadline skips engine.stop(). The gate is
-            # read through getattr because a startup that failed early may not have built one.
-            approval_gate = getattr(app.state, "approval_gate", None)
-            if approval_gate is not None:
+            # BACKLOG #2087: every step before engine.stop() sits in this try, so a cancel delivered
+            # to the lifespan mid-teardown, or a step that raises, still stops the engine. Without
+            # it the store's non-daemon worker keeps the process alive.
+            try:
+                if upload_retention_runner is not None:
+                    await upload_retention_runner.stop()
+                if reconciler is not None:
+                    reconciler.cancel()
+                    await asyncio.gather(reconciler, return_exceptions=True)
+                if reaper is not None:
+                    reaper.cancel()
+                    # gather(return_exceptions): absorbs both our cancellation AND any exception a
+                    # previously-died reaper stored, so it can't propagate here and skip engine.stop()
+                    # (review M-33).
+                    await asyncio.gather(reaper, return_exceptions=True)
+                if credential_reminder is not None:
+                    credential_reminder.cancel()
+                    await asyncio.gather(credential_reminder, return_exceptions=True)
+                # BACKLOG #2087: let approval outcome writes still running land before the store closes.
+                await _drain_approval_gate(app)
+                # M-5 (BACKLOG #1640): flush the open summary-access window before the store closes.
+                # `_SummaryAuditCoalescer.flush` documents itself as the engine-shutdown path and NOTHING
+                # called it, so every clean restart dropped the open hour's PHI-summary access audit --
+                # the rows the control exists to produce, lost exactly when an operator restarts after a
+                # bulk census fetch.
+                #
+                # BEFORE engine.stop(), because that ends in store.close() and the emit needs the store.
+                # Guarded like the reaper above: a store error here must not skip engine.stop(), or the
+                # non-daemon aiosqlite worker keeps the process alive and a lost audit row becomes a hung
+                # service. Read directly, not through getattr: create_app always sets the auditor, so a
+                # rename should fail loudly inside this guard rather than silently skip the flush.
                 try:
-                    await approval_gate.drain()
+                    await app.state.summary_auditor.flush(store)
                 except Exception:
                     _log.exception(
-                        "approval gate: the shutdown drain failed; continuing the teardown"
+                        "summary-access coalescer: the shutdown flush failed, so at least one open "
+                        "window's audit row is lost; continuing the teardown"
                     )
-            # M-5 (BACKLOG #1640): flush the open summary-access window before the store closes.
-            # `_SummaryAuditCoalescer.flush` documents itself as the engine-shutdown path and NOTHING
-            # called it, so every clean restart dropped the open hour's PHI-summary access audit --
-            # the rows the control exists to produce, lost exactly when an operator restarts after a
-            # bulk census fetch.
-            #
-            # BEFORE engine.stop(), because that ends in store.close() and the emit needs the store.
-            # Guarded like the reaper above: a store error here must not skip engine.stop(), or the
-            # non-daemon aiosqlite worker keeps the process alive and a lost audit row becomes a hung
-            # service. Read directly, not through getattr: create_app always sets the auditor, so a
-            # rename should fail loudly inside this guard rather than silently skip the flush.
-            try:
-                await app.state.summary_auditor.flush(store)
-            except Exception:
-                _log.exception(
-                    "summary-access coalescer: the shutdown flush failed, so at least one open "
-                    "window's audit row is lost; continuing the teardown"
-                )
-            await engine.stop()
-            # B11: shut down the harness-only instrumented executor (None in production / other tests).
-            # The engine is stopped (no more to_thread work), so a non-blocking shutdown is clean.
-            shim_executor = getattr(app.state, "connscale_executor", None)
-            if shim_executor is not None:
-                shim_executor.shutdown(wait=False)
-            if security_notifier is not None:
-                await (
-                    security_notifier.aclose()
-                )  # drain queued user emails, bounded by SMTP timeout
-            if notifier is not None:
-                # Stop accepting alerts last (after the engine quiesces) so any final
-                # connection_stopped/queue_buildup still drains; bounded by the transport timeouts.
-                await notifier.aclose()
+            finally:
+                await engine.stop()
+                # B11: shut down the harness-only instrumented executor (None in production / other tests).
+                # The engine is stopped (no more to_thread work), so a non-blocking shutdown is clean.
+                shim_executor = getattr(app.state, "connscale_executor", None)
+                if shim_executor is not None:
+                    shim_executor.shutdown(wait=False)
+                if security_notifier is not None:
+                    await (
+                        security_notifier.aclose()
+                    )  # drain queued user emails, bounded by SMTP timeout
+                if notifier is not None:
+                    # Stop accepting alerts last (after the engine quiesces) so any final
+                    # connection_stopped/queue_buildup still drains; bounded by the transport timeouts.
+                    await notifier.aclose()
 
     # Settings never select the open mode: only the caller's opt-in, checked at the top, does
     # (vault BACKLOG #2611, #2825).
