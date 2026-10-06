@@ -151,11 +151,16 @@ def test_a_force_import_that_fails_while_staging_changes_nothing(tmp_path: Path)
     import_corepoint(export, out)
     (out / "IB_ALPHA.py").write_text(_HAND_FINISHED, encoding="utf-8")
     # Occupy IB_BETA's staging name, so staging the second module fails after the first is staged.
-    (out / f".IB_BETA.py.{os.getpid()}.tmp").mkdir()
+    # A regular FILE, never a directory: an exclusive create over an existing directory is EEXIST
+    # on POSIX but ERROR_ACCESS_DENIED (PermissionError) on Windows, while over an existing file it
+    # is FileExistsError on both.
+    occupied = out / f".IB_BETA.py.{os.getpid()}.tmp"
+    occupied.write_text("occupied", encoding="utf-8")
 
     with pytest.raises(FileExistsError):
         import_corepoint(export, out, force=True)
 
+    assert occupied.read_text(encoding="utf-8") == "occupied"  # not ours, so never discarded
     assert (out / "IB_ALPHA.py").read_text(encoding="utf-8") == _HAND_FINISHED
     assert sorted(p.name for p in out.iterdir()) == [
         f".IB_BETA.py.{os.getpid()}.tmp",  # the planted one; IB_ALPHA's staged copy is gone
