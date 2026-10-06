@@ -4292,11 +4292,10 @@ class AuthService:
         matches; it is a step-up flow; the code exchange and the whole claims ladder pass (the nonce,
         the pinned issuer, ``auth_time`` present and within ``oidc_max_age_seconds``, and the MFA
         claim when that gate is on); the session is still live by every test
-        :meth:`identity_for_token` applies, and still an OIDC session; ``auth_time`` is fresh by our
-        clock (see the inline note); the account is enabled and still a directory account; the
-        token's verified ``(issuer, sub)`` is byte-for-byte the pair bound to the account;
-        ``auth_time`` is later than the IdP ``auth_time`` the session holds; the directory still
-        has the account; and every role stored on the account is among the roles its current
+        :meth:`identity_for_token` applies, and still an OIDC session; the account is enabled and
+        still a directory account; the token's verified ``(issuer, sub)`` is byte-for-byte the pair
+        bound to the account; ``auth_time`` is fresh by our clock (see the inline note), and later
+        than the IdP ``auth_time`` the session holds; the directory still has the account; and every role stored on the account is among the roles its current
         groups map to (BACKLOG #2154). Then it elevates through :meth:`_elevated_hash`, so
         rotation, the MFA carry and the single-use grant follow the password leg's rules exactly.
 
@@ -4371,16 +4370,6 @@ class AuthService:
             return await self._step_up_refused(
                 "session_gone", actor=actor, client=client, return_to=return_to, lost=True
             )
-        # FRESHNESS, two tests, and both must pass. max_age=0 and prompt=login ask the IdP to
-        # authenticate the user afresh, so a conforming IdP's auth_time postdates this request.
-        # (a) Against our clock: auth_time is IdP clock and issued_at is ours, so the floor allows
-        # the configured skew for an IdP clock that runs behind.
-        skew = self._settings.oidc_clock_skew_seconds
-        if flow.issued_at <= 0 or principal_claims.auth_time < flow.issued_at - skew:
-            return await self._step_up_refused(
-                STEP_UP_NOT_FRESH, actor=actor, client=client, return_to=return_to
-            )
-        # Test (b) runs after the subject check below, not here.
         user = await self._store.get_user(session.user_id)
         if user is None or user.disabled or user.auth_provider != AuthProvider.AD.value:
             return await self._step_up_refused(
@@ -4395,22 +4384,32 @@ class AuthService:
             # shared browser, or another person's IdP session. Nothing is elevated. The session is
             # left as it was rather than revoked, because whoever holds this flow cookie already
             # holds the session cookie in the same browser.
+            # BEFORE both freshness tests (BACKLOG #2143), so another person's answer that passed
+            # the claims ladder is filed as a subject mismatch whatever its auth_time. Both tests
+            # below judge this session's identity, so neither is the right name for someone else.
             return await self._step_up_refused(
                 STEP_UP_SUBJECT_MISMATCH, actor=actor, client=client, return_to=return_to
+            )
+        # FRESHNESS, two tests, and both must pass. max_age=0 and prompt=login ask the IdP to
+        # authenticate the user afresh, so a conforming IdP's auth_time postdates this request.
+        # (a) Against our clock: auth_time is IdP clock and issued_at is ours, so the floor allows
+        # the configured skew for an IdP clock that runs behind.
+        skew = self._settings.oidc_clock_skew_seconds
+        if flow.issued_at <= 0 or principal_claims.auth_time < flow.issued_at - skew:
+            return await self._step_up_refused(
+                STEP_UP_NOT_FRESH, actor=actor, client=client, return_to=return_to
             )
         # (b) Against the IdP's own clock (BACKLOG #2143): auth_time must be LATER than the one the
         # session holds, which is the sign-in's or the last step-up's. No skew applies, because
         # both values come from the IdP. This closes most of what (a) alone left: an IdP that
         # ignores max_age=0 and answers from the sign-in, or from the last step-up, within the skew.
         # A NULL (an oidc row written before the column existed) cannot be compared, so it refuses.
-        # AFTER the subject check, so another person's IdP answer is filed as a subject mismatch
-        # whatever its auth_time: the held value belongs to this session's identity, not theirs.
         # RESIDUAL, stated exactly: an IdP that ignores max_age=0 still passes when its last
         # sign-in for this user is later than the value the session holds and within
         # oidc_clock_skew_seconds of this request. The cost of (b): an IdP clock that steps back, or
         # IdP nodes whose clocks disagree, refuse a real re-authentication until it passes the value.
-        # Each arm has its own closed-set reason, apart from (a)'s STEP_UP_NOT_FRESH, because
-        # neither clears on a retry and the operator is told to sign in again instead.
+        # Each arm has its own closed-set reason, apart from (a)'s STEP_UP_NOT_FRESH, so the audit
+        # row and the operator's text say which one refused.
         held_auth_time = session.idp_auth_time
         if held_auth_time is None:
             return await self._step_up_refused(

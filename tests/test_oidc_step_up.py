@@ -691,15 +691,18 @@ async def test_a_different_idp_subject_is_refused(
         await store.close()
 
 
+@pytest.mark.parametrize("which", ["engine-clock-stale", "idp-clock-not-later"])
 async def test_another_persons_older_idp_answer_is_a_subject_mismatch_not_stale(
-    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch, which: str
 ) -> None:
-    """BACKLOG #2143. RED when: the IdP-clock freshness test runs before the subject check again.
+    """BACKLOG #2143. RED when: either freshness test runs before the subject check again.
 
-    Another person's IdP session answers, with an ``auth_time`` inside the engine-clock skew but
-    not later than the one this session holds. Both the subject test and the IdP-clock test would
-    refuse it. The audit row must say subject mismatch, which is the signal that another person's
-    IdP session answered; "not fresh" would hide it."""
+    Another person's IdP session answers with an ``auth_time`` that one freshness test refuses on
+    its own. ``engine-clock-stale`` is older than the staged moment less the skew, which only the
+    engine-clock test catches first. ``idp-clock-not-later`` is inside the skew but equal to the
+    value this session holds, which only the IdP-clock test catches. The subject test refuses both.
+    The audit row must say subject mismatch, which is the signal that another person's IdP session
+    answered; a freshness reason would hide it. Both answers pass the claims ladder."""
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store, rsa_key)
@@ -708,7 +711,12 @@ async def test_another_persons_older_idp_answer_is_a_subject_mismatch_not_stale(
         assert held is not None
         flow_id, _url = await _begin(service, token)
         skew = service._settings.oidc_clock_skew_seconds
-        assert held >= _staged(service, flow_id).issued_at - skew, "the engine-clock test refuses"
+        floor = _staged(service, flow_id).issued_at - skew
+        if which == "engine-clock-stale":
+            answered_at = floor - skew - 1
+        else:
+            answered_at = held
+            assert answered_at >= floor, "the engine-clock test would refuse this arm first"
 
         out = await _return_from_idp(
             service,
@@ -716,7 +724,7 @@ async def test_another_persons_older_idp_answer_is_a_subject_mismatch_not_stale(
             rsa_key,
             flow_id,
             sub=DEFAULT_SUB + "-someone-else",
-            auth_time=held,
+            auth_time=answered_at,
         )
 
         assert not out.ok and out.reason == STEP_UP_SUBJECT_MISMATCH

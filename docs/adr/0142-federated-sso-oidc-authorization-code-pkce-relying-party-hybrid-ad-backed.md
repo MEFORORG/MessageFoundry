@@ -526,8 +526,10 @@ B.1 left the verification of what comes back to the build. These are its criteri
   IdP again after the stored value, inside that skew.
 - **AC-16 (identity)** — IF the verified `(iss, sub)` is not byte-for-byte the pair bound to the
   session's account, THEN THE SYSTEM SHALL refuse with `step_up_subject_mismatch` and leave the session
-  as it was. IF the directory no longer returns the account by its immutable id, THEN THE SYSTEM SHALL
-  refuse with `not_in_directory`, and a row with no immutable id SHALL be refused with
+  as it was. This test SHALL run before both AC-15 freshness tests, so an answer that fails it and
+  either of them is refused as `step_up_subject_mismatch` (BACKLOG #2143). IF the directory no
+  longer returns the account by its immutable id, THEN THE SYSTEM SHALL refuse with
+  `not_in_directory`, and a row with no immutable id SHALL be refused with
   `directory_object_id_missing` rather than looked up by name. IF a role stored on the account is
   not among the roles its current directory groups map to, THEN THE SYSTEM SHALL refuse with
   `directory_roles_demoted`, write no roles, and leave the session as it was (BACKLOG #2154). Only a
