@@ -150,8 +150,18 @@ def _audit_write_errors() -> tuple[type[Exception], ...]:
     The drivers' own errors, plus the two that :func:`~messagefoundry.store.base.store_driver_errors`
     asks a caller to add: ``RuntimeError`` for the engine's own refusals (the acquire timeout, a
     keyless audit append) and ``OSError`` for a connection lost at the socket. Built on first use,
-    because naming a server driver imports it."""
+    because naming a server driver imports it; ``AuthService`` builds it once at construction, so
+    that import never runs on the event loop in the middle of a store incident."""
     return (RuntimeError, OSError, *store_driver_errors())
+
+
+#: The classes inside :func:`_audit_write_errors` that a reconciler audit write raises rather than
+#: passes over (the Lander's finding 4 on PR 2036). ``RuntimeError`` has to stay in that catch,
+#: because the store raises it for its own refusals; these two subclasses never mean a refusal.
+#: A DB-API ``ProgrammingError`` stays caught although it usually means a bad statement: SQLite
+#: and pyodbc also raise it for a closed database or connection, and raising that would cost the
+#: pass's alerts, which is the harm BACKLOG #2137 removed.
+_AUDIT_WRITE_DEFECTS: Final = (NotImplementedError, RecursionError)
 
 
 def _warn_if_corpus_unreadable(path: str | None) -> None:
@@ -2090,6 +2100,9 @@ class AuthService:
         #: user_ids of bound id-less rows the reconciler has already reported as skipped (BACKLOG
         #: #2027), so each is logged and audited once per process rather than once per pass.
         self._reconcile_unkeyed_reported: set[str] = set()
+        # Built now, at startup, so a reconciler's first refused audit write does not import the
+        # server drivers on the event loop (see `_audit_write_errors`).
+        _audit_write_errors()
         # Advisory, NON-STICKY federated-IdP health (ADR 0142 AC-8) — see the oidc_available docstring.
         self._oidc_unavailable_reason: str | None = None
         self._oidc_client_auth: oidc.ClientAuthentication | None = None
@@ -5301,17 +5314,15 @@ class AuthService:
 
         ``users`` is this pass's candidate set, and a clear rests on reading every one of them.
 
-        **This is one process's evidence, and the instances are the store's.** Every ``[cluster]``
-        node and every engine shard runs its own reconciler, with its own records and possibly its
-        own view of the directory, so one can read clear while another's breaker or hold stands.
-        The lifespan task therefore raises no inverse in either topology
-        (``api/app.py::_without_clears``).
+        **This is one process's evidence, and the instances are the store's.** Where another
+        reconciler may share the store, the lifespan task raises no inverse; the reason is stated
+        once, at ``api/app.py::_without_clears``.
 
         **The cost is a missed clear, never a false one, with one reconciler on the store.** An
         account that never answers keeps both instances open while it is signed in. So does a
-        reconciler that is switched off, and so does every cluster or sharded engine. An operator
-        resolves those by hand. One case is not covered: two plain ``serve`` processes on one
-        store, declaring neither a cluster nor engine shards, each clear on their own evidence.
+        reconciler that is switched off, and so does every cluster or multi-shard engine. An
+        operator resolves those by hand. One case is not covered: two plain ``serve`` processes on
+        one store, declaring neither a cluster nor engine shards, each clear on their own evidence.
         Neither can see the other, and ``serve`` records that topology as unguarded (the engine
         shard guard's comment in ``__main__.py``).
         """
@@ -5573,6 +5584,7 @@ class AuthService:
         and this loop has no administrator behind it.
         """
         self._reconcile_unkeyed_reported &= still_unkeyed
+        failed = False
         for user in unkeyed:
             if user.id in self._reconcile_unkeyed_reported:
                 continue
@@ -5593,13 +5605,15 @@ class AuthService:
                         "username": user.username,
                     }
                 ),
+                # One ERROR per pass, not one per account; later refusals go to DEBUG. Every
+                # account is still tried, so a row the store refuses cannot starve the rest.
+                log_failure=not failed,
             )
             # Marked only once the audit row is written, so a failed write is retried next pass.
-            if not written:
-                # One ERROR per pass, not one per account: a store that refused this append will
-                # refuse the next, and every account left unmarked is tried again next pass.
-                break
-            self._reconcile_unkeyed_reported.add(user.id)
+            if written:
+                self._reconcile_unkeyed_reported.add(user.id)
+            else:
+                failed = True
 
     async def _record_reconcile_hold(self, plan: reconcile.ReconcilePlan) -> None:
         """Latch, log and audit an engaged undetermined-wave hold, or release a latched one.
@@ -5688,7 +5702,9 @@ class AuthService:
             ),
         )
 
-    async def _audit_reconciler_row(self, action: str, *, detail: str) -> bool:
+    async def _audit_reconciler_row(
+        self, action: str, *, detail: str, log_failure: bool = True
+    ) -> bool:
         """Write one of the reconcile pass's own rows, and say whether it was written.
 
         BACKLOG #2137. These rows are the held row, the breaker's aborted row, the outage's skipped
@@ -5698,21 +5714,22 @@ class AuthService:
         the revocations already applied, nor for the hold or the breaker. So a store refusal is
         logged at ERROR, naming the action, and the pass goes on. The log line is then the only
         record of that row. A per-revocation audit write is not routed through here: that one
-        still raises.
+        still raises. ``log_failure=False`` logs a refusal at DEBUG instead, for a caller that has
+        already logged one at ERROR this pass.
 
-        ``RuntimeError`` stays in the catch because the store raises it for its own refusals,
-        such as the acquire timeout and the keyless audit append. Its two subclasses that mean a
-        defect rather than a refusal, ``NotImplementedError`` and ``RecursionError``, are raised.
+        A defect is raised, not passed over (:data:`_AUDIT_WRITE_DEFECTS`).
         """
         try:
             await self._audit(action, actor="<reconciler>", detail=detail)
-        except (NotImplementedError, RecursionError):
+        except _AUDIT_WRITE_DEFECTS:
             raise
         except _audit_write_errors():
-            _log.exception(
+            _log.log(
+                logging.ERROR if log_failure else logging.DEBUG,
                 "directory reconcile: the %s audit row could not be written; the pass goes on, "
                 "so its alerts still fire",
                 action,
+                exc_info=True,
             )
             return False
         return True

@@ -7877,9 +7877,8 @@ async def _directory_reconciler(
     Each finished pass is turned into alerts here, by :func:`_alert_reconcile_plan`. The alerting
     lives in this task and never in ``auth/``, which does not import the pipeline's sinks.
 
-    ``sole_reconciler`` is False when other processes may run this same task over this store: every
-    ``[cluster]`` node and every engine shard runs its own, ungated. Then no inverse is raised (see
-    :func:`_without_clears`). Required, so a new caller has to decide it.
+    With ``sole_reconciler`` False no inverse is raised; :func:`_without_clears` says why, and
+    :func:`_is_sole_reconciler` decides it. Required, so a new caller has to decide it.
 
     A transient failure must not kill the loop for the process lifetime (that would silently disable
     the control until restart) — log and retry next interval, the session-reaper precedent."""
@@ -7971,13 +7970,23 @@ def _without_clears(plan: ReconcilePlan) -> ReconcilePlan:
     return replace(plan, **cleared)
 
 
-def _is_sole_reconciler(coordinator: ClusterCoordinator, registry_filter: object | None) -> bool:
+def _is_sole_reconciler(
+    coordinator: ClusterCoordinator,
+    registry_filter: object | None,
+    runner: RegistryRunner | None,
+) -> bool:
     """Whether this process can be the only directory reconciler on its store (BACKLOG #2136).
 
-    Not on a ``[cluster]`` node, and not on an engine shard, which `serve --shard` marks by passing
-    a registry filter. A lone shard of a one-shard config reads as sharded too, which costs only a
-    missed clear."""
-    return not coordinator.is_clustered() and registry_filter is None
+    Not on a ``[cluster]`` node. A ``serve --shard`` process, which passes a registry filter, is
+    alone only when its loaded graph pins no shard universe: ``all_shard_ids`` is set when the
+    config names two or more shards, and a reload cannot change it (ADR 0073). So ``supervise``
+    over an untagged config, which runs one ``--shard`` child, still resolves. A shard with no
+    graph loaded is not presumed alone."""
+    if coordinator.is_clustered():
+        return False
+    if registry_filter is None:
+        return True
+    return runner is not None and runner.registry.all_shard_ids is None
 
 
 _INITIAL_CREDENTIAL_MAX_LEAD = 24 * 3600.0  # warn at most this long before the deadline
@@ -8818,9 +8827,10 @@ def create_managed_app(
                             auth,
                             auth_settings.ad_session_recheck_seconds,
                             notifier or LoggingAlertSink(),
-                            # BACKLOG #2136: on a [cluster] node or an engine shard, another
-                            # reconciler shares this store, so no pass may resolve its alerts.
-                            sole_reconciler=_is_sole_reconciler(coordinator, registry_filter),
+                            # BACKLOG #2136. After engine.start(), so the graph is loaded.
+                            sole_reconciler=_is_sole_reconciler(
+                                coordinator, registry_filter, engine.registry_runner
+                            ),
                         )
                     )
             yield

@@ -53,6 +53,7 @@ from messagefoundry.config.settings import _ALERT_EVENT_TYPES, AuthSettings
 from messagefoundry.pipeline.alert_sinks import _AUTO_RESOLVE, NotifierAlertSink
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
+from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store.store import MessageStore, UserRecord
 from tests.test_alert_sinks import _drain, _RecordingTransport
 from tests.test_approval_requester_recheck import _Sink
@@ -1177,11 +1178,21 @@ def test_without_clears_sets_every_clear_flag_false_and_nothing_else() -> None:
     assert stripped == ReconcilePlan(probed=3, hold=True, undetermined=2, held=("a", "b"))
 
 
-def test_only_an_unclustered_unsharded_process_is_the_sole_reconciler() -> None:
+def _runner(all_shard_ids: tuple[str, ...] | None) -> RegistryRunner:
+    return cast(
+        RegistryRunner, SimpleNamespace(registry=SimpleNamespace(all_shard_ids=all_shard_ids))
+    )
+
+
+def test_only_a_process_alone_on_its_store_is_the_sole_reconciler() -> None:
+    single = NullCoordinator()
     clustered = cast(ClusterCoordinator, SimpleNamespace(is_clustered=lambda: True))
-    assert _is_sole_reconciler(NullCoordinator(), None)
-    assert not _is_sole_reconciler(NullCoordinator(), lambda registry: registry)  # engine shard
-    assert not _is_sole_reconciler(clustered, None)  # a [cluster] node
+    shard_filter = object()  # `serve --shard` passes a filter; only its presence is read
+    assert _is_sole_reconciler(single, None, None)  # plain serve
+    assert _is_sole_reconciler(single, shard_filter, _runner(None))  # supervise, one shard
+    assert not _is_sole_reconciler(single, shard_filter, _runner(("a", "b")))  # two shards
+    assert not _is_sole_reconciler(single, shard_filter, None)  # a shard with no graph
+    assert not _is_sole_reconciler(clustered, None, _runner(None))  # a [cluster] node
 
 
 class _PlanAuth:

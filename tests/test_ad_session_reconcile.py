@@ -1271,7 +1271,9 @@ async def test_a_refused_skip_report_logs_one_error_per_pass_not_one_per_account
                 and "auth.ad_reconcile_binding_unkeyed" in r.getMessage()
             ]
             assert len(errors) == 1, "one ERROR per pass while the write keeps failing"
-        assert len(attempts) == 2, "a pass kept writing after the store refused the first row"
+        # Every account is still tried on every pass, so one row the store refuses cannot starve
+        # the reports behind it.
+        assert len(attempts) == 4, "a pass stopped writing after the store refused one row"
 
         monkeypatch.setattr(store, "record_audit", real_record)
         await service.reconcile_directory_sessions()
