@@ -65,6 +65,18 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
    anchor check passes, until the engine restarts. Item 3's ``changed`` row cannot do this job. It
    compares with the last AUDITED fingerprint, so it goes quiet after one reload while the
    consumers still trust the start-time bytes.
+9. **The per-connection outbound CAs** (vault BACKLOG #2371). A connection that dials out reads its
+   ``tls_ca_file`` to verify the server: every outbound that takes the key, and a ``FhirLookup``.
+   :func:`registry_anchor_specs` hands each one to the same preflight, at the first load and at
+   every reload, under the label ``outbound:<name>`` or ``fhir_lookup:<name>``. So the ACL and
+   path checks, the optional ``tls_ca_pin`` and the change audit all apply, on the inbound dial:
+   a pin mismatch always refuses, and an exposed or unjudged CA refuses at ``enforce``.
+   **Not covered: the checked bytes are not the loaded bytes here.** These consumers still build
+   their context from the path, with ``cafile=``, after the preflight passes. So a file swapped
+   between the preflight and the build would be trusted unchecked until the next reload re-checks
+   it. For that reason the spec carries ``loads_verified_bytes=False``: a matching pin is NOT the
+   item 6 escape for an unjudged outbound CA, and the PEM shape checks are skipped, since
+   ``cafile=`` loads what ``cadata=`` refuses. Item 5 closed the same gap for the inbound CAs.
 """
 
 from __future__ import annotations
@@ -89,7 +101,7 @@ from messagefoundry.auth.anchor_path import (
     PathVerdict,
     anchor_path_verdict,
 )
-from messagefoundry.connection_names import inbound_record_name
+from messagefoundry.connection_names import fhir_lookup_record_name, inbound_record_name
 from messagefoundry.service_status import _system_exe
 
 if TYPE_CHECKING:
@@ -124,20 +136,27 @@ class AnchorSpec:
     """One operator-supplied trust anchor to preflight.
 
     ``label`` is the stable, PHI-free audit key (``"oidc"`` / ``"ad"`` / ``"api_client"`` /
-    ``"inbound:<connection>"``); ``setting`` is the human-facing config key for messages; ``path`` is
+    ``"inbound:<connection>"`` / ``"outbound:<connection>"`` / ``"fhir_lookup:<name>"``); ``setting`` is the human-facing config key for messages; ``path`` is
     the configured PEM; ``pin`` is the optional configured SHA-256 pin (any case, optional ``:``
     separators); ``pin_setting`` names where that pin is set, so a refusal can name the escape.
 
     Every consumer loads the bytes the check read (slice 2's ``cadata=``), never the file again. That
     is what lets a matching pin stand in for an unreadable ACL or path, and why every anchor takes
     the PEM shape checks of :func:`anchor_cadata`. The AD anchor was the one exception, read by path
-    on every bind, until BACKLOG #2034; a consumer that reads by path again must not reuse this."""
+    on every bind, until BACKLOG #2034.
+
+    ``loads_verified_bytes`` is ``False`` for an anchor whose consumer reads the file again by path:
+    the outbound and ``FhirLookup`` CAs since vault BACKLOG #2371 (item 9 of the module text). It
+    restores the switch the AD anchor had before #2034. A pin cannot stand in for an unreadable ACL
+    or path there, and the PEM shape checks (:func:`anchor_cadata`) do not apply, because
+    ``cafile=`` reads what ``cadata=`` refuses."""
 
     label: str
     setting: str
     path: str
     pin: str | None = None
     pin_setting: str | None = None
+    loads_verified_bytes: bool = True
 
 
 @dataclass(frozen=True)
@@ -855,6 +874,12 @@ def _indeterminate_fix(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
         if windows
         else "a root-owned 755 folder like /etc/messagefoundry/"
     )
+    if not spec.loads_verified_bytes:
+        return (
+            f"Fix: move the anchor into a folder whose permissions the engine can read, such as "
+            f"{folder}. A pin does not help here: this anchor is read again by path when it is "
+            "used, so a pin cannot vouch for the bytes loaded."
+        )
     pin = f"set {spec.pin_setting} to" if spec.pin_setting else "pin it to"
     return (
         f"Fix: move the anchor into a folder whose permissions the engine can read, such as "
@@ -873,7 +898,9 @@ def _enforce_verdict(spec: AnchorSpec, verdict: AnchorVerdict, *, enforcing: boo
       replace is a finding, not an unknown.
     * An ACL or path that could not be read refuses at ``enforce`` and warns at ``warn`` (BACKLOG
       #1142, slice 3). **A configured pin that matches is the escape**: it warns and loads, at either
-      dial, because the bytes it matched are the bytes the context loads."""
+      dial, because the bytes it matched are the bytes the context loads. Not for an anchor whose
+      consumer reads the file again (``loads_verified_bytes`` False, the outbound CAs, vault
+      BACKLOG #2371): there the pin matched bytes the consumer does not load."""
     if verdict.pin_ok is False:
         raise TrustAnchorError(_pin_mismatch_message(spec, verdict))
     if verdict.acl_ok is False:
@@ -895,7 +922,7 @@ def _enforce_verdict(spec: AnchorSpec, verdict: AnchorVerdict, *, enforcing: boo
     # BACKLOG #1142, slice 3. Slice 2 made the checked bytes the loaded bytes, which is what lets a
     # pin stand in for a read the file system would not give.
     unknown = _indeterminate_message(spec, verdict)
-    if verdict.pin_ok is True:
+    if verdict.pin_ok is True and spec.loads_verified_bytes:
         log.warning(
             "%s\n%s matches the bytes read, and those are the bytes loaded, so it is loaded anyway",
             unknown,
@@ -1046,25 +1073,70 @@ def connection_anchor_spec(name: str, settings: Mapping[str, Any]) -> AnchorSpec
     )
 
 
+#: How an outbound connection's CA is labelled in its ``auth.trust_anchor`` rows (vault BACKLOG
+#: #2371). Prefixed, unlike how a record names an outbound elsewhere (bare, see
+#: :func:`~messagefoundry.connection_names.inbound_record_name`), because the label keys the
+#: fingerprint baseline :func:`_last_fingerprint` reads. A connection may be named ``ad`` or
+#: ``oidc``, and a bare label would then share a baseline with that settings anchor.
+_OUTBOUND_LABEL = "outbound:{}"
+
+
+def outbound_anchor_spec(
+    name: str,
+    settings: Mapping[str, Any],
+    *,
+    kind: str = "outbound connection",
+    label: str | None = None,
+) -> AnchorSpec | None:
+    """The CA a dialling connection verifies its server with, or ``None`` (vault BACKLOG #2371).
+
+    A connection that dials out reads ``tls_ca_file`` to verify the server: every outbound that
+    takes the key, and a ``FhirLookup``, which passes ``kind="fhir lookup"`` and its own label. The
+    test is ``tls_ca_file`` set and ``tls`` not turned off. Connectors with no ``tls`` key (the HTTP
+    family, Email, Direct) read the file whenever it is set. ``MLLP``, ``DICOM`` and ``Ftp`` read
+    it only with ``tls`` on. A CA a hop would not read is not checked here; ``Ftp`` refuses one at
+    load, and ``tls_ca_pin`` beside one is refused by :func:`refuse_an_unread_ca_pin`.
+
+    ``settings`` must already have its ``env()`` references resolved, as for
+    :func:`connection_anchor_spec`. A ``tls_ca_pin`` that is blank or not text raises
+    ``ValueError`` (:func:`connection_ca_pin`)."""
+    ca = settings.get("tls_ca_file")
+    if isinstance(ca, os.PathLike):
+        ca = os.fspath(ca)
+    if not isinstance(ca, str) or not ca:
+        return None
+    if "tls" in settings and not settings["tls"]:
+        return None
+    pin = connection_ca_pin(settings, f"{kind} '{name}' tls_ca_pin")
+    return AnchorSpec(
+        label or _OUTBOUND_LABEL.format(name),
+        f"{kind} '{name}' tls_ca_file",
+        ca,
+        pin,
+        f"{kind} '{name}' tls_ca_pin",
+        loads_verified_bytes=False,  # the hop's context reads cafile= after the preflight
+    )
+
+
 def refuse_an_unread_ca_pin(settings: Mapping[str, Any], *, inbound: bool, connector: str) -> None:
-    """Refuse a ``tls_ca_pin`` that nothing reads. It pins the CA an INBOUND listener verifies
-    client certificates with, so it means something only with ``tls`` and ``tls_ca_file`` on an
-    inbound connection. Anywhere else the config would read as pinned while nothing checks it, which
-    is worse than no pin. Raises ``ValueError``, which a connector build reports as a config error.
-    A blank pin refuses here too, on every connection, whatever else it sets."""
+    """Refuse a ``tls_ca_pin`` that nothing reads. It pins the connection's ``tls_ca_file``, so it
+    means something only where that file is checked: on an inbound connection with ``tls`` and
+    ``tls_ca_file`` (:func:`connection_anchor_spec`), and on an outbound one with ``tls_ca_file``
+    and ``tls`` not off (:func:`outbound_anchor_spec`, vault BACKLOG #2371). Anywhere else the
+    config would read as pinned while nothing checks it, which is worse than no pin. Raises
+    ``ValueError``, which a connector build reports as a config error. A blank pin refuses here too,
+    on every connection, whatever else it sets."""
     if connection_ca_pin(settings, f"{connector}: tls_ca_pin") is None:
         return
     if inbound and connection_anchor_spec("", settings) is not None:
         return
-    where = (
-        "an inbound connection without tls=True and a tls_ca_file"
-        if inbound
-        else "an outbound connection, whose tls_ca_file it does not pin"
-    )
+    if not inbound and outbound_anchor_spec("", settings) is not None:
+        return
+    direction = "an inbound" if inbound else "an outbound"
     raise ValueError(
-        f"{connector}: tls_ca_pin is set on {where}, so nothing would check it. It pins the CA an "
-        "inbound listener verifies client certificates with. Remove it, or turn on tls with a "
-        "tls_ca_file on the inbound listener"
+        f"{connector}: tls_ca_pin is set on {direction} connection without tls=True and a "
+        "tls_ca_file, so nothing would check it. It pins the connection's tls_ca_file. Remove it, "
+        "or turn on tls with a tls_ca_file"
     )
 
 
@@ -1104,23 +1176,40 @@ _CONNECTION_ANCHOR_KEYS = ("tls", "tls_ca_file", "tls_ca_pin")
 
 
 def registry_anchor_specs(registry: Registry, env_values: Mapping[str, Any]) -> list[AnchorSpec]:
-    """The inbound CAs of every deployed inbound connection in ``registry`` that requires a peer
-    certificate, with ``env()`` references resolved against ``env_values``.
+    """Every per-connection CA in ``registry`` the preflight checks, with ``env()`` references
+    resolved against ``env_values``: the CA of each deployed inbound that requires a peer
+    certificate (:func:`connection_anchor_spec`), then, since vault BACKLOG #2371, the CA each
+    deployed outbound and each ``FhirLookup`` verifies its server with (:func:`outbound_anchor_spec`).
 
     A connection whose anchor settings do not resolve is skipped: its own build refuses it, and
     that error names the missing value."""
     from messagefoundry.config.wiring import WiringError, resolve_env_settings
 
+    def resolved(settings: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        raw = {k: settings[k] for k in _CONNECTION_ANCHOR_KEYS if k in settings}
+        try:
+            return resolve_env_settings(raw, env_values)
+        except WiringError:
+            return None
+
     pairs: list[tuple[str, Mapping[str, Any]]] = []
     for ic in registry.inbound.values():
-        if not ic.deployed:
-            continue
-        raw = {k: ic.spec.settings[k] for k in _CONNECTION_ANCHOR_KEYS if k in ic.spec.settings}
-        try:
-            pairs.append((ic.name, resolve_env_settings(raw, env_values)))
-        except WiringError:
-            continue
-    return connection_anchor_specs(pairs)
+        if ic.deployed and (st := resolved(ic.spec.settings)) is not None:
+            pairs.append((ic.name, st))
+    specs = connection_anchor_specs(pairs)
+    dialling: list[tuple[str, Mapping[str, Any] | None, str, str | None]] = [
+        (oc.name, resolved(oc.spec.settings) if oc.deployed else None, "outbound connection", None)
+        for oc in registry.outbound.values()
+    ]
+    dialling += [
+        (fl.name, resolved(fl.settings), "fhir lookup", fhir_lookup_record_name(fl.name))
+        for fl in registry.fhir_lookups.values()
+    ]
+    for name, st, kind, label in dialling:
+        spec = outbound_anchor_spec(name, st, kind=kind, label=label) if st is not None else None
+        if spec is not None:
+            specs.append(spec)
+    return specs
 
 
 def collect_anchor_specs(auth: AuthSettings, api: ApiSettings) -> list[AnchorSpec]:
@@ -1201,10 +1290,14 @@ async def _preflight_one(store: Store, spec: AnchorSpec, *, enforcing: bool) -> 
 
     That load is OpenSSL parsing the file, so it runs off the event loop, and it is skipped when the
     pin does not match: those bytes are refused anyway, and a consumer never parses bytes whose pin
-    failed, because :func:`verified_anchor_cadata` enforces first."""
+    failed, because :func:`verified_anchor_cadata` enforces first.
+
+    An anchor whose consumer reads ``cafile=`` (``loads_verified_bytes`` False, the outbound CAs,
+    vault BACKLOG #2371) skips the shape check. ``cafile=`` loads a ``TRUSTED CERTIFICATE`` block,
+    for one, so refusing it here would refuse what the build accepts."""
     verdict = await asyncio.to_thread(evaluate_anchor, spec)
     shape_error: TrustAnchorError | None = None
-    if verdict.pin_ok is not False:
+    if verdict.pin_ok is not False and spec.loads_verified_bytes:
         try:
             await asyncio.to_thread(anchor_cadata, verdict.data, spec)
         except TrustAnchorError as exc:
@@ -1346,9 +1439,10 @@ def make_registry_anchor_preflight(
     store: Store, *, enforcing: bool
 ) -> Callable[[Registry, Mapping[str, Any]], Awaitable[None]]:
     """The engine's ``registry_preflight`` for ``serve``: :func:`run_anchor_preflight` over a graph's
-    per-connection inbound CAs (:func:`registry_anchor_specs`), at the first load and at every real
-    reload. A refusal is re-raised as ``WiringError``, which the reload route answers with 422 and
-    the first load with a refused start. Dormant when no inbound names a CA.
+    per-connection CAs (:func:`registry_anchor_specs`), inbound and, since vault BACKLOG #2371,
+    outbound and ``FhirLookup``, at the first load and at every real reload. A refusal is re-raised
+    as ``WiringError``, which the reload route answers with 422 and the first load with a refused
+    start. Dormant when no connection names a CA it checks.
 
     The ``WiringError`` is always caused by a :class:`TrustAnchorError`, as the settings preflight's
     is (:func:`make_settings_anchor_preflight`), so the reload routes audit ``reason="trust_anchor"``
@@ -1365,13 +1459,13 @@ def make_registry_anchor_preflight(
                 return
             await run_anchor_preflight(specs, store, enforcing=enforcing)
         except TrustAnchorError as exc:
-            raise WiringError(f"an inbound trust anchor was refused: {exc}") from exc
+            raise WiringError(f"a connection trust anchor was refused: {exc}") from exc
         except (OSError, ValueError) as exc:
             # ValueError too: an env()-supplied path with a NUL in it raises one from the read, and
             # a blank tls_ca_pin raises one, and each must reach the route as a refused anchor, not
             # an unaudited 500. Wrapped as the settings preflight wraps it, with the text unchanged.
             refused = TrustAnchorError(str(exc))
             refused.__cause__ = exc
-            raise WiringError(f"an inbound trust anchor was refused: {refused}") from refused
+            raise WiringError(f"a connection trust anchor was refused: {refused}") from refused
 
     return preflight

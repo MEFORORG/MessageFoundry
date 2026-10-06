@@ -403,6 +403,27 @@ def _check_tls_ca_file(factory: str, value: Any, *, unread: str | None = None) -
         raise ValueError(f"{factory} tls_ca_file would never be read: {unread}.")
 
 
+def _check_tls_ca_pin(factory: str, pin: Any, ca: Any) -> None:
+    """Refuse a ``tls_ca_pin`` that nothing would check (vault BACKLOG #2371).
+
+    The pin is the SHA-256 of ``tls_ca_file``, checked by the graph preflight at load and at every
+    reload (``auth/trust_anchors.py``, ``registry_anchor_specs``). With no ``tls_ca_file`` there is
+    nothing to check, so the config would read as pinned while nothing is. A blank literal is
+    refused as the inbound pin's is; a blank ``env()`` value is refused by that preflight once it
+    resolves. Raises ``ValueError`` for the reason :func:`_check_tls_ca_file` does."""
+    if pin is None:
+        return
+    if isinstance(pin, str):
+        from messagefoundry.config.settings import refuse_a_blank_anchor_pin
+
+        refuse_a_blank_anchor_pin(pin, f"{factory} tls_ca_pin")
+    if ca is None:
+        raise ValueError(
+            f"{factory} tls_ca_pin is set without a tls_ca_file, so nothing would check it. It "
+            "pins the connection's tls_ca_file. Remove it, or set tls_ca_file"
+        )
+
+
 def _reject_envref_headers(factory: str, headers: Any) -> None:
     """Refuse an ``env()`` reference inside a ``headers`` table (BACKLOG #1649).
 
@@ -945,6 +966,7 @@ def FhirLookup(
     timeout_seconds: float = 30.0,
     verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
+    tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     encoding: str = "utf-8",
     # ADR 0153 decision 2 — the same per-connection cleartext declaration an outbound carries. It must
     # be authorable HERE: the read executor honours the pair, so leaving it to a hand-mutated
@@ -1015,6 +1037,7 @@ def FhirLookup(
     # does for an outbound, so the declaration cannot reach the read executor unvalidated.
     try:
         _check_tls_ca_file("FhirLookup", tls_ca_file)
+        _check_tls_ca_pin("FhirLookup", tls_ca_pin, tls_ca_file)
         _check_cleartext_acceptance(cleartext_accepted, cleartext_reason)
         _check_revocation_attestation(tls_revocation_attested, tls_revocation_attested_reason)
     except ValueError as exc:
@@ -1029,6 +1052,7 @@ def FhirLookup(
         "timeout_seconds": timeout_seconds,
         "verify_tls": verify_tls,
         "tls_ca_file": tls_ca_file,
+        "tls_ca_pin": tls_ca_pin,
         "encoding": encoding,
     }
     # The cleartext and revocation declarations are NOT written into `settings`: they are the spec's
@@ -1680,7 +1704,7 @@ def MLLP(
     tls_ca_file: str
     | None = None,  # trust anchor — inbound: verify client certs (mTLS); outbound: verify server
     tls_ca_pin: str
-    | None = None,  # INBOUND: SHA-256 of tls_ca_file; a mismatch refuses (BACKLOG #1142)
+    | None = None,  # BOTH: SHA-256 of tls_ca_file; a mismatch refuses (BACKLOG #1142, #2371)
     tls_crl_file: str
     | None = None,  # INBOUND: opt-in CRL for mTLS client certs (#1005): a bare PEM CRL (#1890)
     tls_verify: bool = True,  # OUTBOUND: verify the server cert (false is MITM-able → needs MEFOR_ALLOW_INSECURE_TLS)
@@ -2683,6 +2707,7 @@ def Rest(
     verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
     tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain+hostname still verified; #129)
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
+    tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     encoding: str = "utf-8",
     capture_response: bool = False,  # capture the HTTP response body as a reply (ADR 0013)
     capture_response_headers: list[str]
@@ -2718,6 +2743,7 @@ def Rest(
     not, is stated once in ``docs/CONNECTIONS.md``, "Pinning a private CA per connection"."""
     _reject_envref_headers("Rest", headers)
     _check_tls_ca_file("Rest", tls_ca_file)
+    _check_tls_ca_pin("Rest", tls_ca_pin, tls_ca_file)
     _reject_envref_in_lists(
         "Rest",
         capture_response_headers=capture_response_headers,
@@ -2737,6 +2763,7 @@ def Rest(
             "verify_tls": verify_tls,
             "tls_allow_expired": tls_allow_expired,
             "tls_ca_file": tls_ca_file,
+            "tls_ca_pin": tls_ca_pin,
             "encoding": encoding,
             "capture_response": capture_response,
             "capture_response_headers": capture_response_headers,
@@ -2779,6 +2806,7 @@ def FHIR(
     verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
     tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain+hostname still verified; #129)
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
+    tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     encoding: str = "utf-8",
     capture_response: bool = False,  # capture the server reply / OperationOutcome (ADR 0013)
     capture_response_headers: list[str]
@@ -2832,6 +2860,7 @@ def FHIR(
         )
     _reject_envref_headers("FHIR", headers)
     _check_tls_ca_file("FHIR", tls_ca_file)
+    _check_tls_ca_pin("FHIR", tls_ca_pin, tls_ca_file)
     _reject_envref_in_lists(
         "FHIR",
         capture_response_headers=capture_response_headers,
@@ -2855,6 +2884,7 @@ def FHIR(
             "verify_tls": verify_tls,
             "tls_allow_expired": tls_allow_expired,
             "tls_ca_file": tls_ca_file,
+            "tls_ca_pin": tls_ca_pin,
             "encoding": encoding,
             "capture_response": capture_response,
             "capture_response_headers": capture_response_headers,
@@ -2881,6 +2911,7 @@ def Email(
     use_tls: bool = True,  # STARTTLS by default; False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
     tls_verify: bool = True,  # verify the server cert (#323); False (dev only) needs the escape
     tls_ca_file: str | EnvRef | None = None,  # PEM to verify the SMTP server against (not a secret)
+    tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     tls_check_hostname: bool = True,  # match the cert against `host` (leave on)
     timeout_seconds: float = 30.0,
     encoding: str = "utf-8",
@@ -2907,6 +2938,7 @@ def Email(
     re-sends the email — a mailbox has no idempotency key, so a rare duplicate is possible and accepted
     (a duplicate beats a drop). ADR 0029."""
     _reject_envref_in_lists("Email", recipients=recipients)
+    _check_tls_ca_pin("Email", tls_ca_pin, tls_ca_file)
     return ConnectionSpec(
         ConnectorType.EMAIL,
         {
@@ -2920,6 +2952,7 @@ def Email(
             "use_tls": use_tls,
             "tls_verify": tls_verify,
             "tls_ca_file": tls_ca_file,
+            "tls_ca_pin": tls_ca_pin,
             "tls_check_hostname": tls_check_hostname,
             "timeout_seconds": timeout_seconds,
             "encoding": encoding,
@@ -2950,6 +2983,7 @@ def Direct(
     use_tls: bool = True,  # STARTTLS by default; False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
     tls_verify: bool = True,  # verify the relay's cert (#323); False (dev only) needs the escape
     tls_ca_file: str | EnvRef | None = None,  # PEM to verify the SMTP/HISP relay against
+    tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     tls_check_hostname: bool = True,  # match the cert against `host` (leave on)
     timeout_seconds: float = 30.0,
     encoding: str = "utf-8",
@@ -2982,6 +3016,7 @@ def Direct(
     the pinned ``cryptography`` exposes no OAEP alternative on ``PKCS7EnvelopeBuilder``, so this
     setting does not make the whole message OAEP-clean."""
     _reject_envref_in_lists("Direct", recipients=recipients)
+    _check_tls_ca_pin("Direct", tls_ca_pin, tls_ca_file)
     return ConnectionSpec(
         ConnectorType.DIRECT,
         {
@@ -3001,6 +3036,7 @@ def Direct(
             "use_tls": use_tls,
             "tls_verify": tls_verify,
             "tls_ca_file": tls_ca_file,
+            "tls_ca_pin": tls_ca_pin,
             "tls_check_hostname": tls_check_hostname,
             "timeout_seconds": timeout_seconds,
             "encoding": encoding,
@@ -3034,7 +3070,7 @@ def DICOM(
     | None = None,  # opt-in mTLS: require + verify a calling peer's client cert
     tls_ca_pin: str
     | EnvRef
-    | None = None,  # SCP: SHA-256 of tls_ca_file; a mismatch refuses (BACKLOG #1142)
+    | None = None,  # SCP and SCU: SHA-256 of tls_ca_file; a mismatch refuses (#1142, #2371)
     tls_crl_file: str
     | EnvRef
     | None = None,  # opt-in CRL for mTLS client certs (#1005): a bare PEM CRL (#1890)
@@ -3155,6 +3191,7 @@ def DICOMweb(
     timeout_seconds: float = 30.0,
     verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
+    tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     encoding: str = "utf-8",
     capture_response: bool = False,  # capture the STOW-RS dicom+json response as a reply (ADR 0013)
     reingress_to: str
@@ -3196,6 +3233,7 @@ def DICOMweb(
         if verify_tls
         else "verify_tls=False verifies nothing, and DICOMweb has no token hop",
     )
+    _check_tls_ca_pin("DICOMweb", tls_ca_pin, tls_ca_file)
     _reject_envref_in_lists("DICOMweb", proxy_no_proxy=proxy_no_proxy)
     return ConnectionSpec(
         ConnectorType.DICOMWEB,
@@ -3209,6 +3247,7 @@ def DICOMweb(
             "timeout_seconds": timeout_seconds,
             "verify_tls": verify_tls,
             "tls_ca_file": tls_ca_file,
+            "tls_ca_pin": tls_ca_pin,
             "encoding": encoding,
             "capture_response": capture_response,
             "reingress_to": reingress_to,
@@ -3556,6 +3595,7 @@ def Soap(
     verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
     tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain+hostname still verified; #129)
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
+    tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     encoding: str = "utf-8",
     capture_response: bool = False,  # capture the SOAP response envelope as a reply (ADR 0013)
     capture_response_headers: list[str]
@@ -3619,6 +3659,7 @@ def Soap(
     not, is stated once in ``docs/CONNECTIONS.md``, "Pinning a private CA per connection"."""
     _reject_envref_headers("Soap", headers)
     _check_tls_ca_file("Soap", tls_ca_file)
+    _check_tls_ca_pin("Soap", tls_ca_pin, tls_ca_file)
     _reject_envref_in_lists(
         "Soap",
         capture_response_headers=capture_response_headers,
@@ -3638,6 +3679,7 @@ def Soap(
             "verify_tls": verify_tls,
             "tls_allow_expired": tls_allow_expired,
             "tls_ca_file": tls_ca_file,
+            "tls_ca_pin": tls_ca_pin,
             "encoding": encoding,
             "capture_response": capture_response,
             "capture_response_headers": capture_response_headers,
@@ -3746,6 +3788,7 @@ def Ftp(
     # unless a hand-built spec sets tls_check_hostname=False.
     tls_allow_expired: bool = False,
     tls_ca_file: str | EnvRef | None = None,  # FTPS: PEM, trust ONLY this CA for the server (#1180)
+    tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     username: str | EnvRef | None = None,
     password: str | EnvRef | None = None,  # secret — use env()
     remote_dir: str | EnvRef,
@@ -3780,6 +3823,7 @@ def Ftp(
     _check_tls_ca_file(
         "Ftp", tls_ca_file, unread=None if tls else "plain FTP (tls=False) builds no TLS context"
     )
+    _check_tls_ca_pin("Ftp", tls_ca_pin, tls_ca_file)
     return ConnectionSpec(
         ConnectorType.REMOTEFILE,
         {
@@ -3788,6 +3832,7 @@ def Ftp(
             "port": port,
             "tls_allow_expired": tls_allow_expired,
             "tls_ca_file": tls_ca_file,
+            "tls_ca_pin": tls_ca_pin,
             "username": username,
             "password": password,
             "remote_dir": remote_dir,
