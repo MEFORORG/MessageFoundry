@@ -173,9 +173,13 @@ async def _assert_totp_contract(store: Any) -> None:
 
     # Enable + recovery codes: single-use consumption is atomic (the double-spend guard).
     await store.set_totp_secret("totp-u1", secret="JBSWY3DPEHPK3PXP", now=4.0)
-    await store.enable_totp("totp-u1", recovery_code_hashes=["rc1", "rc2"], now=5.0)
+    assert await store.enable_totp("totp-u1", recovery_code_hashes=["rc1", "rc2"], now=5.0) is True
     user = await store.get_user("totp-u1")
     assert user is not None and user.totp_enabled is True
+    assert set(await store.get_recovery_code_hashes("totp-u1")) == {"rc1", "rc2"}
+    # The enable is conditional (BACKLOG #2224): a second confirm that lands once TOTP is on matches
+    # no row, so it cannot replace the recovery codes the first one handed out.
+    assert await store.enable_totp("totp-u1", recovery_code_hashes=["loser"], now=5.5) is False
     assert set(await store.get_recovery_code_hashes("totp-u1")) == {"rc1", "rc2"}
     assert await store.consume_recovery_code_hash("totp-u1", "rc1", now=6.0) is True
     assert await store.consume_recovery_code_hash("totp-u1", "rc1", now=7.0) is False
@@ -194,5 +198,14 @@ async def _assert_totp_contract(store: Any) -> None:
     assert user is not None and user.totp_enabled is False
     assert await store.get_totp_secret("totp-u1") is None
     assert await store.get_recovery_code_hashes("totp-u1") == []
+
+    # The reset race (BACKLOG #2224): an enable that lands after a factor reset cleared the staged
+    # secret matches no row, so TOTP is never flagged on over a NULL secret.
+    assert await store.enable_totp("totp-u1", recovery_code_hashes=["late"], now=9.0) is False
+    user = await store.get_user("totp-u1")
+    assert user is not None and user.totp_enabled is False
+    assert await store.get_totp_secret("totp-u1") is None
+    assert await store.get_recovery_code_hashes("totp-u1") == []
+    assert await store.enable_totp("missing-user", recovery_code_hashes=[], now=9.0) is False
 
     await store.delete_user("totp-u1")

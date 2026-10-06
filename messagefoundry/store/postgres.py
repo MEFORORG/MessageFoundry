@@ -224,6 +224,7 @@ from messagefoundry.store.store import (
     roll_audit_key_range,
     rotation_factor_term,
     should_record_event,
+    totp_enable_term,
     verify_audit_rows,
 )
 from messagefoundry.support.redact import redact_log_line
@@ -6600,20 +6601,32 @@ class PostgresStore:
     ) -> int:
         """Soft-cancel **pending** deliveries for a destination: mark them ``cancelled``, log a
         ``cancelled`` event each, and finalize any message whose deliveries are now all terminal.
-        ``channel_id=None`` cancels across all producers; ``top_only`` cancels just the head. Returns
-        the number cancelled."""
+        ``channel_id=None`` cancels across all producers; ``top_only`` cancels just the FIFO head --
+        the oldest pending row by ``seq``, the lane predicate and key :meth:`claim_next_fifo` uses --
+        even while it is backing off and not yet due (ADR 0059). With a ``channel_id`` it is the
+        oldest row from that producer, the lane head only when no other inbound feeds the
+        destination. Returns the number cancelled."""
         now = time.time() if now is None else now
-        # `top_only` cancels the true FIFO head, so the tiebreak after next_attempt_at must match the
-        # claim's seq-only order, NOT created_at (no longer the ordering key; ADR 0059).
+        # `top_only` cancels the true FIFO head, so it orders by the claim's seq-only key alone (ADR
+        # 0059). Not next_attempt_at first: mark_failed pushes a failed head's next_attempt_at past the
+        # younger rows behind it, so that key would pick a healthy younger row and leave the
+        # backing-off head blocking the lane (vault BACKLOG #2754).
         query = (
             "SELECT id, message_id FROM queue"
-            " WHERE destination_name=$1 AND status=$2 AND ($3::text IS NULL OR channel_id=$3)"
-            " ORDER BY next_attempt_at, seq"
+            " WHERE stage=$4 AND destination_name=$1 AND status=$2"
+            " AND ($3::text IS NULL OR channel_id=$3)"
+            " ORDER BY seq"
         )
         if top_only:
             query += " LIMIT 1"
         async with self._timed_acquire() as conn, conn.transaction():
-            rows = await conn.fetch(query, destination_name, OutboxStatus.PENDING.value, channel_id)
+            rows = await conn.fetch(
+                query,
+                destination_name,
+                OutboxStatus.PENDING.value,
+                channel_id,
+                Stage.OUTBOUND.value,
+            )
             if not rows:
                 return 0
             ids = [r["id"] for r in rows]
@@ -7615,15 +7628,17 @@ class PostgresStore:
 
     async def enable_totp(
         self, user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
-    ) -> None:
+    ) -> bool:
         now = time.time() if now is None else now
-        await self._execute(
+        # Conditional, and the count says whether it wrote: see ``totp_enable_term`` (#2224).
+        written = await self._execute(
             "UPDATE users SET totp_enabled=TRUE, totp_enrolled_at=$1, totp_recovery_codes=$2,"
-            " updated_at=$1 WHERE id=$3",
+            f" updated_at=$1 WHERE id=$3{totp_enable_term('FALSE')}",
             now,
             json.dumps(recovery_code_hashes),
             user_id,
         )
+        return written > 0
 
     async def disable_totp(self, user_id: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now

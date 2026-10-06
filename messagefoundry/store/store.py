@@ -2519,8 +2519,8 @@ class AuditVerdict(tuple[bool, str | None]):
 
     ``keyless_walk`` says a clean verdict came from a process that holds no key, over a chain whose
     first row names none: a plain SHA-256 walk, which anyone who can write the log can recompute.
-    It is set only with ``ok`` true. A caller whose settings require a key uses it to say the chain
-    it just passed is keyless, before any tamper makes that matter.
+    It is set only with ``ok`` true. A caller whose settings require a key must not report it as a
+    pass: ``audit-verify`` exits 5, "not checked", on it (vault BACKLOG #3054).
 
     ``==`` and ``hash`` are the tuple's and ignore both flags; ``__reduce__`` keeps them through a
     copy."""
@@ -4109,10 +4109,22 @@ def check_password_generated(*, password_generated: bool, password_hash: str | N
 #: service's read and this write makes the write match no row, and the caller refuses. Backend
 #: truth literals differ, so each backend passes its own.
 def rotation_factor_term(true_literal: str) -> str:
-    # ``totp_secret IS NOT NULL`` too: an enrolment confirm that raced an administrator's factor
-    # reset can leave ``totp_enabled`` set over a NULL secret, and TOTP with no secret is no way
-    # past the lock.
+    # ``totp_secret IS NOT NULL`` too, because TOTP with no secret is no way past the lock. Since
+    # BACKLOG #2224 ``enable_totp`` no longer writes that state (see ``totp_enable_term``), but at
+    # least ``set_totp_secret(secret=None)`` still can, so the second guard stays.
     return f" AND totp_enabled={true_literal} AND totp_secret IS NOT NULL"
+
+
+#: The WHERE term that makes ``enable_totp`` conditional (BACKLOG #2224). The enrolment confirm
+#: rotates the session BEFORE it enables TOTP (BACKLOG #1902), so an ``admin_reset_mfa`` can clear
+#: the staged secret inside that window, and a second confirm can enable first. Unconditional, the
+#: enable would then set ``totp_enabled`` over a NULL secret, or replace the first confirm's
+#: recovery codes. With this term the write matches no row in either case, and the caller refuses.
+#: It checks that SOME secret is staged, not that it is the one the caller verified: a second
+#: ``set_totp_secret`` landing in the window is not caught here. Backend false literals differ, so
+#: each backend passes its own.
+def totp_enable_term(false_literal: str) -> str:
+    return f" AND totp_secret IS NOT NULL AND totp_enabled={false_literal}"
 
 
 #: Which lockout counter one failed attempt feeds (ADR 0197, BACKLOG #1131). ``"sign_in"`` is the
@@ -10056,21 +10068,31 @@ class MessageStore:
         a ``cancelled`` audit event each, and finalize any message whose deliveries are now all
         terminal. ``channel_id=None`` cancels across all producers (a code-first outbound
         connection fed by several inbounds); pass an id to scope to one. ``top_only`` cancels just
-        the head of the queue (next due). Inflight/dead rows are left untouched (dead uses
-        :meth:`replay`). Returns the number cancelled."""
+        the FIFO head -- the oldest pending row by ``rowid``, the lane predicate and key
+        :meth:`claim_next_fifo` uses -- even while it is backing off and not yet due, since a
+        backing-off head blocking the lane is the case "purge top" exists to clear (ADR 0059). With a
+        ``channel_id`` it is the oldest row from that producer, which is the lane head only when no
+        other inbound feeds the destination; the API passes ``None``. On an unordered lane there is no
+        blocking head, and this still cancels the oldest row. Inflight/dead rows are left untouched
+        (dead uses :meth:`replay`). Returns the number cancelled."""
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
-            where = ["destination_name=?", "status=?"]
-            params: list[object] = [destination_name, OutboxStatus.PENDING.value]
+            # The claim's own lane predicate (stage, destination_name, status), so the head query seeks
+            # ix_queue_fifo_out_seq in rowid order; only outbound rows carry a destination_name anyway.
+            where = ["stage=?", "destination_name=?", "status=?"]
+            params: list[object] = [
+                Stage.OUTBOUND.value,
+                destination_name,
+                OutboxStatus.PENDING.value,
+            ]
             if channel_id is not None:
-                where.insert(0, "channel_id=?")
-                params.insert(0, channel_id)
-            # `top_only` cancels the true FIFO head, so the tiebreak after next_attempt_at must match the
-            # claim's seq-only order (rowid = SQLite seq), NOT created_at (no longer the ordering key; ADR 0059).
-            query = (
-                "SELECT id, message_id FROM queue"
-                f" WHERE {' AND '.join(where)} ORDER BY next_attempt_at, rowid"
-            )
+                where.insert(1, "channel_id=?")
+                params.insert(1, channel_id)
+            # `top_only` cancels the true FIFO head, so it orders by the claim's seq-only key alone
+            # (rowid = SQLite seq; ADR 0059). Not next_attempt_at first: mark_failed pushes a failed
+            # head's next_attempt_at past the younger rows behind it, so that key would pick a healthy
+            # younger row and leave the backing-off head blocking the lane (vault BACKLOG #2754).
+            query = f"SELECT id, message_id FROM queue WHERE {' AND '.join(where)} ORDER BY rowid"
             if top_only:
                 query += " LIMIT 1"
             cur = await self._db.execute(query, tuple(params))
@@ -11637,17 +11659,20 @@ class MessageStore:
 
     async def enable_totp(
         self, user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
-    ) -> None:
+    ) -> bool:
         """Activate TOTP for a user (post-confirm), storing the argon2id hashes of their one-time
-        recovery codes."""
+        recovery codes. Writes only where a secret is staged and TOTP is still off, and returns
+        whether it wrote (BACKLOG #2224, see :func:`totp_enable_term`)."""
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
-            await self._db.execute(
+            cur = await self._db.execute(
                 "UPDATE users SET totp_enabled=1, totp_enrolled_at=?, totp_recovery_codes=?,"
-                " updated_at=? WHERE id=?",
+                f" updated_at=? WHERE id=?{totp_enable_term('0')}",
                 (now, json.dumps(recovery_code_hashes), now, user_id),
             )
+            written = cur.rowcount > 0
             await self._commit()
+        return written
 
     async def disable_totp(self, user_id: str, *, now: float | None = None) -> None:
         """Clear a user's TOTP enrollment entirely (secret, enabled flag, recovery codes)."""

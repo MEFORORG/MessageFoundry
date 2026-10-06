@@ -29,6 +29,15 @@ this line.**
 
 ### Security
 
+- **The step-up re-auth page names the action, and auto-submits only a continuation the server
+  issued to this session.** `/ui/reauth` used to auto-submit whichever registered action its `next`
+  named, so a typed, bookmarked or clicked link to it could turn a routine re-authentication into a
+  destructive action. A step-up gate now records the continuation it hands out, bound to the
+  session, single use and short-lived. Any other `next` still re-authenticates, says nothing will
+  run, and ends on a page saying nothing ran. The per-connection purge POST is no longer a registered
+  continuation; its re-auth returns to the purge confirm page. No seam change. (vault BACKLOG
+  #2764, ADR 0065 amendment of 2026-10-06)
+
 - **An IPv4 entry in `organization_domains` or `external_link_allowlist` matches only that
   address.** The interstitial check matched every entry on a label boundary. So a host that merely
   ended in a listed address would have counted as covered. The engine still accepts a canonical

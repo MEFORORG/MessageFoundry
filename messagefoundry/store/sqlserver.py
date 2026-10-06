@@ -210,6 +210,7 @@ from messagefoundry.store.store import (
     roll_audit_key_range,
     rotation_factor_term,
     should_record_event,
+    totp_enable_term,
     verify_audit_rows,
 )
 from messagefoundry.support.redact import redact_log_line
@@ -10305,11 +10306,14 @@ class SqlServerStore:
         top = "TOP (1) " if top_only else ""
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
-                # `top_only` cancels the true FIFO head, so the tiebreak after next_attempt_at must match
-                # the claim's seq-only order, NOT created_at (no longer the ordering key; ADR 0059).
+                # `top_only` cancels the true FIFO head, so it orders by the claim's seq-only key alone
+                # (ADR 0059), even while that head is backing off. Not next_attempt_at first: mark_failed
+                # pushes a failed head's next_attempt_at past the younger rows behind it, so that key
+                # would pick a healthy younger row and leave the head blocking the lane (vault BACKLOG
+                # #2754).
                 await cur.execute(
                     f"SELECT {top}id, message_id FROM queue WHERE {' AND '.join(where)}"
-                    " ORDER BY next_attempt_at, seq",
+                    " ORDER BY seq",
                     tuple(params),
                 )
                 rows = [(r[0], r[1]) for r in await cur.fetchall()]
@@ -11352,13 +11356,16 @@ class SqlServerStore:
 
     async def enable_totp(
         self, user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
-    ) -> None:
+    ) -> bool:
         now = time.time() if now is None else now
-        await self._execute(
+        # Conditional (see ``totp_enable_term``, #2224). The OUTPUT rowset, never the row count,
+        # says whether it wrote, for the reason ``_execute_output`` gives.
+        rows = await self._execute_output(
             "UPDATE users SET totp_enabled=1, totp_enrolled_at=?, totp_recovery_codes=?,"
-            " updated_at=? WHERE id=?",
+            f" updated_at=? OUTPUT inserted.id WHERE id=?{totp_enable_term('0')}",
             (now, json.dumps(recovery_code_hashes), now, user_id),
         )
+        return bool(rows)
 
     async def disable_totp(self, user_id: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now

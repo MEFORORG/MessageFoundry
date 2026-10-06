@@ -1007,6 +1007,28 @@ def test_a_build_refusing_every_list_raises_runtime_error(
     assert tls_policy._SIGALGS_MLDSA_WARNED is False
 
 
+@pytest.mark.usefixtures("catalogue")
+@pytest.mark.parametrize("wrapper", ["default", "operator"])
+def test_a_refused_sigalg_list_is_a_config_refusal_naming_openssl(wrapper: str) -> None:
+    """Both wrappers turn the pin's RuntimeError into a ValueError naming the list and the linked
+    OpenSSL, so a seam reports a configuration refusal and not an unhandled error (BACKLOG #2484)."""
+
+    class _Refusing(_SigalgCapableContext):
+        def refuse(self, sigalgs: str) -> bool:
+            return True
+
+    ctx = _Refusing(ssl.PROTOCOL_TLS_SERVER)
+    with pytest.raises(tls_policy.EngineTlsListRefused) as caught:
+        if wrapper == "default":
+            tls_policy.narrow_to_approved_suites(ctx)
+        else:
+            tls_policy.apply_operator_tls_ciphers(ctx, "ECDHE-ECDSA-AES256-GCM-SHA384")
+    assert isinstance(caught.value, ValueError)
+    message = str(caught.value)
+    assert "without SHA-224" in message
+    assert ssl.OPENSSL_VERSION in message
+
+
 def test_a_catalogue_of_only_sha224_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     """Nothing left once SHA-224 is gone is a refusal, not the "cannot list" no-op."""
     monkeypatch.setattr(ssl, "get_sigalgs", lambda: ["rsa_pkcs1_sha224"], raising=False)

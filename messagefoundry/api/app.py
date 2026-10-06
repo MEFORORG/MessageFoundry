@@ -205,6 +205,7 @@ from messagefoundry.api.multipart import (
     MultipartTooLargeError,
     parse_single_file_upload,
 )
+from messagefoundry.api.outlive import OutlivingOperations
 from messagefoundry.api.request_timeout import RequestTimeoutMiddleware
 from messagefoundry.api.security import (
     AuthenticatedBeforeBodyRoute,
@@ -251,7 +252,7 @@ from messagefoundry.api.validation import (
 # app.state.ui_ws_authorize, app.state.ui_connections_render (read by the always-on middleware/routes).
 from messagefoundry.auth import Identity, Permission, Role
 from messagefoundry.auth.audit_visibility import reads_audit_copies_in_the_log
-from messagefoundry.auth.reconcile import HOLD_REASON, ReconcilePlan
+from messagefoundry.auth.reconcile import HOLD_REASON, REFERRAL_ABORT, ReconcilePlan
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.trust_anchors import (
     AnchorSpec,
@@ -344,7 +345,7 @@ from messagefoundry.last_resort import install_loop_exception_handler
 from messagefoundry.logging_guard import active_guard as active_log_guard
 from messagefoundry.logging_setup import LOG_LEVELS, current_log_level, set_runtime_level
 from messagefoundry.parsing.sniff import attachment_mime_agrees, nontext_upload_reason
-from messagefoundry.pipeline import ConfigReloadDenied, Engine
+from messagefoundry.pipeline import ConfigReloadDenied, Engine, ReloadOutcome
 from messagefoundry.pipeline.alert_sinks import EmailTransport, notifier_from_settings
 from messagefoundry.pipeline.alerts import (
     AlertSink,
@@ -748,8 +749,8 @@ def _purge_in_scope(identity: Identity) -> bool:
 def _requester_identity_resolver(app: FastAPI) -> IdentityResolver:
     """The approval gate's way to re-read a requester's CURRENT identity at release (ASVS 8.3.2).
 
-    Late-bound through ``app.state`` on purpose: the managed lifespan builds the gate before it
-    attaches the auth service, so capturing the service at build time would capture ``None``. With no
+    Late-bound through ``app.state`` on purpose: ``create_app`` builds the gate before it attaches
+    the auth service, so capturing the service at build time would capture ``None``. With no
     auth service bound it answers ``None``, and the gate then refuses the release (fail closed)."""
 
     async def _resolve(user_id: str) -> Identity | None:
@@ -767,6 +768,7 @@ def _build_approval_gate(
     *,
     resolve_identity: IdentityResolver | None = None,
     alert_sink: AlertSink | None = None,
+    outliving: OutlivingOperations,
 ) -> ApprovalGate:
     """Build the approval gate and register the high-value operations dual-control can hold. Each
     executor re-runs its captured operation on approval (params are JSON, persisted at request time).
@@ -778,6 +780,8 @@ def _build_approval_gate(
     gate = ApprovalGate(
         engine.store, settings, resolve_identity=resolve_identity, alert_sink=alert_sink
     )
+    # A released reload runs inside the approve request, so it outlives that request's deadline the
+    # way the inline route's does (vault BACKLOG #2753). Required, so the lifespan's drain sees it.
 
     async def _replay(p: Mapping[str, Any]) -> dict[str, Any]:
         # BACKLOG #1646: write the same dead_letter_replay row the inline route writes, so an
@@ -853,37 +857,45 @@ def _build_approval_gate(
         # reload_detail for parity with the inline route (BACKLOG #1111): a released reload that
         # swapped the graph and then failed a follow-on step must report the same degraded outcome
         # the inline path reports, or dual control would be the quieter of the two.
-        try:
-            outcome = await engine.reload_detail(config_dir, dry_run=False, propagate=True)
-        except WiringError as exc:
-            # BACKLOG #2034: a release the engine refuses (a settings or inbound trust anchor, or a
-            # bad config) answers 422 and records the row the inline route records, rather than
-            # escaping the approve route as a 500. The gate still marks the approval failed.
-            anchor_refused = isinstance(exc.__cause__, TrustAnchorError)
-            _log.warning("released config reload refused: %s", exc)
-            await engine.store.record_audit(
-                "config_reload_failed",
-                actor=actor,
-                detail=json.dumps(
-                    {
-                        "requested": config_dir,
-                        "dry_run": False,
-                        "reason": "trust_anchor" if anchor_refused else "invalid_config",
-                    }
-                ),
+
+        async def _apply() -> dict[str, Any]:
+            try:
+                outcome = await _reload_or_record_interruption(
+                    engine, config_dir, actor=actor, client=None
+                )
+            except WiringError as exc:
+                # BACKLOG #2034: a release the engine refuses (a settings or inbound trust anchor,
+                # or a bad config) answers 422 and records the row the inline route records, rather
+                # than escaping the approve route as a 500. The gate still marks the approval failed.
+                anchor_refused = isinstance(exc.__cause__, TrustAnchorError)
+                _log.warning("released config reload refused: %s", exc)
+                await engine.store.record_audit(
+                    "config_reload_failed",
+                    actor=actor,
+                    detail=json.dumps(
+                        {
+                            "requested": config_dir,
+                            "dry_run": False,
+                            "reason": "trust_anchor" if anchor_refused else "invalid_config",
+                        }
+                    ),
+                )
+                raise ApprovalError(422, "invalid configuration") from exc
+            registry = outcome.registry
+            # BACKLOG #1940: never raises after the swap; see _record_reload_audit.
+            failures = await _record_reload_audit(
+                engine, actor=actor, failed_steps=[f.step for f in outcome.failures]
             )
-            raise ApprovalError(422, "invalid configuration") from exc
-        registry = outcome.registry
-        # BACKLOG #1940: never raises after the swap; see _record_reload_audit.
-        failures = await _record_reload_audit(
-            engine, actor=actor, failed_steps=[f.step for f in outcome.failures]
-        )
-        return {
-            "inbound": len(registry.inbound),
-            "outbound": len(registry.outbound),
-            "degraded": outcome.applied and bool(failures),
-            "failures": failures,
-        }
+            return {
+                "inbound": len(registry.inbound),
+                "outbound": len(registry.outbound),
+                "degraded": outcome.applied and bool(failures),
+                "failures": failures,
+            }
+
+        # A cancelled approve records 'interrupted' in the gate (#1562), and this reload goes on to
+        # write its own config_reload row rather than stopping with intake half swapped.
+        return await outliving.run(_apply(), "released config reload")
 
     def _replay_params_in_scope(identity: Identity, p: Mapping[str, Any]) -> bool:
         channel_id = p.get("channel_id")
@@ -1020,6 +1032,13 @@ def _posture_loosenings(
 # audit row failed (BACKLOG #1940). It sits beside the engine's own labels in ReloadResult.failures.
 _RELOAD_AUDIT_STEP = "audit"
 
+#: The actor on a cluster convergence reload's ``config_reload`` row (vault BACKLOG #3076). No user
+#: asked for that reload, so the row names the system in the ``system:<task>`` form the key rotation
+#: uses. Its ``initiator`` key says the same thing, and a user cannot set that key by naming an
+#: account to match.
+_CONVERGENCE_ACTOR = "system:cluster-convergence"
+_CONVERGENCE_INITIATOR = "cluster_convergence"
+
 
 @dataclass(frozen=True, slots=True)
 class _LoadedConfig:
@@ -1071,6 +1090,36 @@ _UNKNOWN_LOADED = _LoadedConfig(
 )
 
 
+async def _reload_or_record_interruption(
+    engine: Engine, config_dir: str | None, *, actor: str, client: str | None
+) -> ReloadOutcome:
+    """A real (non-dry-run) reload with ``propagate=True``, which records its own cancellation.
+
+    The routes run a reload so that a request deadline does not cancel it (``api/outlive.py``),
+    which leaves at least a shutdown that still can. ``RegistryRunner.reload`` then rolls intake back
+    to the previous graph, and this writes a ``config_reload_interrupted`` row before the
+    cancellation goes on (vault BACKLOG #2753), so the attempt is not missing from the audit log.
+    Its detail does not claim either graph is live: a cancellation after the swap committed, in a
+    follow-on step, leaves the new graph serving. ``GET /config/provenance`` says which one is."""
+    try:
+        return await engine.reload_detail(config_dir, dry_run=False, propagate=True)
+    except asyncio.CancelledError:
+        try:
+            await engine.store.record_audit(
+                "config_reload_interrupted",
+                actor=actor,
+                detail=json.dumps({"requested": config_dir, "dry_run": False}),
+                client=client,
+            )
+        except Exception as exc:
+            _log.warning(
+                "config reload: cancelled, and the config_reload_interrupted audit row could not "
+                "be written: %s",
+                safe_exc(exc),
+            )
+        raise
+
+
 async def _record_reload_audit(
     engine: Engine,
     *,
@@ -1088,9 +1137,11 @@ async def _record_reload_audit(
     shard and cluster node, since each engine-shard process loads the graph.
 
     Shared by the inline reload endpoint and the dual-control executor so a held-then-approved reload
-    records the same fingerprint-bearing row as an ungated one. The fingerprint is the engine's
-    :attr:`~Engine.loaded_config_fingerprint`, the digest it took of the bytes it loaded, so a reload's
-    row and ``GET /config/provenance`` name one digest. A start row a reload superseded names the
+    records the same fingerprint-bearing row as an ungated one. A cluster convergence reload writes
+    its row through here too, as :data:`_CONVERGENCE_ACTOR` (vault BACKLOG #3076).
+
+    The fingerprint is the engine's :attr:`~Engine.loaded_config_fingerprint`, the digest it took
+    of the bytes it loaded, so a reload's row and ``GET /config/provenance`` name one digest. A start row a reload superseded names the
     start's digest instead (vault BACKLOG #2838). When the engine could not take one, the row is
     written without it.
 
@@ -2196,6 +2247,12 @@ def create_app(
     # says what it does not cover; a route reached through ``include_router`` is one. The engine
     # includes no router; refuse_undeclared_route refuses a route whose gate only an include adds.
     app.router.route_class = AuthenticatedBeforeBodyRoute
+    # DR activate, DR release and config reload outlive a caller the request deadline cancels, and
+    # the managed lifespan drains what is still running before engine.stop() (vault BACKLOG #2751,
+    # #2752, #2753). One per app; the handlers below close over it, so /ui gets it too, and so does
+    # the approval gate's released reload.
+    outliving = OutlivingOperations()
+    app.state.outliving_operations = outliving
     if engine is not None:
         app.state.engine = engine
         # No notifier exists on this direct-construction path, so the gate's alerts log (its default).
@@ -2203,6 +2260,7 @@ def create_app(
             engine,
             approvals or ApprovalsSettings(),
             resolve_identity=_requester_identity_resolver(app),
+            outliving=outliving,
         )
     if auth is not None:
         app.state.auth = auth
@@ -4451,6 +4509,19 @@ def create_app(
         # reload, so a swapped or newly exposed anchor refuses the deploy (422, audited as
         # reason="trust_anchor" below). It moved there from this route in BACKLOG #2034, so a held,
         # convergence or DR reload runs it too.
+        #
+        # The reload and its audit rows run as one operation that outlives this request: a request
+        # deadline ends the response, never the swap, so the reload finishes or rolls back and
+        # writes its own row either way (vault BACKLOG #2753). Every exit of
+        # _reload_config_apply, refusals included, is inside that operation.
+        return await outliving.run(
+            _reload_config_apply(req, request, engine, user), "config reload"
+        )
+
+    async def _reload_config_apply(
+        req: ReloadRequest, request: Request, engine: Engine, user: Identity
+    ) -> ReloadResult:
+        """The body of :func:`reload_config` past its dual-control hold, run by ``outliving``."""
         try:
             # propagate=True on the real apply so an operator reload on one node bumps the cluster-wide
             # config version and every other node converges (Track B Step 6); a dry_run never propagates
@@ -4459,9 +4530,12 @@ def create_app(
             # provenance fingerprint, the reference-set reconcile, the cluster version bump) fails,
             # and reload() projects that away to a Registry. Reporting it is the whole point of
             # BACKLOG #1111 -- without this the route answers a degraded apply as clean success.
-            outcome = await engine.reload_detail(
-                req.config_dir, dry_run=req.dry_run, propagate=not req.dry_run
-            )
+            if req.dry_run:
+                outcome = await engine.reload_detail(req.config_dir, dry_run=True, propagate=False)
+            else:
+                outcome = await _reload_or_record_interruption(
+                    engine, req.config_dir, actor=user.username, client=client_ip(request)
+                )
             registry = outcome.registry
         except ConfigReloadDenied as exc:
             await engine.store.record_audit(
@@ -7396,16 +7470,25 @@ def create_app(
         archive = body.archive if body is not None else None
         dba_attests_restored = body.dba_attests_restored if body is not None else False
         try:
-            result = await coord.activate(
-                archive=archive,
-                dba_attests_restored=dba_attests_restored,
-                actor=identity.username,
+            # Outlives this request (vault BACKLOG #2751): a request deadline ends the response and
+            # never cuts an activation between its steps. A retry waits on the coordinator's lock,
+            # then reads the activation's real outcome.
+            result = await outliving.run(
+                coord.activate(
+                    archive=archive,
+                    dba_attests_restored=dba_attests_restored,
+                    actor=identity.username,
+                ),
+                "DR activation",
             )
         except DrActivationError as exc:
-            # The coordinator already recorded a dr_activation_aborted audit row. Map the failing phase
-            # to an HTTP status: a missing/unverified seed or a not-this-box state is the client's input
-            # (409/422); a key-unavailable / VIP-not-acquired / profile failure is an environment
-            # condition (503 — retry once the cause is fixed). Never echo a body (the message is scrubbed).
+            # For an abort, the coordinator already recorded a dr_activation_aborted audit row. Map the
+            # failing phase to an HTTP status: a missing/unverified seed or a not-this-box state is the
+            # client's input (409/422); a key-unavailable / VIP-not-acquired / profile failure is an
+            # environment condition (503 — retry once the cause is fixed). Kind "audit" is not an
+            # abort: an earlier activate or release changed the box's posture and its audit row could
+            # not be written, so it too is a 503 to retry, and the message says which posture holds
+            # (vault BACKLOG #2751, #2752). Never echo a body (the message is scrubbed).
             status_code = {"state": 409, "seed": 422}.get(exc.kind, 503)
             raise HTTPException(status_code, str(exc)) from exc
         return DrActionResult(
@@ -7435,7 +7518,9 @@ def create_app(
         if coord is None:
             raise HTTPException(503, "this deployment is not a DR standby ([dr].enabled is false)")
         try:
-            result = await coord.release(actor=identity.username)
+            # Outlives this request (vault BACKLOG #2752): the drain can run longer than the request
+            # deadline, and a release cut off there left intake unbound with the box still active.
+            result = await outliving.run(coord.release(actor=identity.username), "DR release")
         except DrActivationError as exc:
             raise HTTPException(503, str(exc)) from exc
         return DrActionResult(
@@ -7445,6 +7530,7 @@ def create_app(
             vip_hook_ran=result.vip_hook_ran,
             drained=result.drained,
             held_on_parked_outbounds=result.held_on_parked_outbounds,
+            depth_left=result.depth_left,
         )
 
     @app.post("/status/integrity-check", response_model=IntegrityResult)
@@ -8036,6 +8122,12 @@ async def _directory_reconciler(
             _log.exception("directory reconcile: pass failed; will retry next interval")
 
 
+#: The source label of the referral's own ``ad_reconcile_aborted`` instance (BACKLOG #2538). Apart
+#: from the breaker's ``directory-reconciler``, so each has its own instance, throttle and detail,
+#: and an alert rule can match one source without the other.
+_REFERRAL_ALERT_SOURCE = "directory-reconciler-referral"
+
+
 def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSink) -> None:
     """Raise the alert that matches each audit row the pass wrote (ASVS 8.3.2).
 
@@ -8046,35 +8138,52 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     alert. A whole-directory outage aborts too, but it is audited as ``auth.ad_reconcile_skipped``
     and pages nothing: the accounts are fine, the directory is not, and the pass is fail-open.
 
+    A referral (BACKLOG #2538) is NOT an outage: it recurs until a search base is fixed. Any pass
+    with a referred probe is ``auth.ad_reconcile_referred`` and becomes one ``ad_reconcile_aborted``
+    alert with reason ``directory_referral``, under its own source label
+    (:data:`_REFERRAL_ALERT_SOURCE`), beside whatever else the pass raised. The type is reused, not
+    new. Its own source keeps it apart from the breaker's instance: acknowledging or suspending a
+    standing referral must not silence a later breaker trip, and each keeps its own detail. An
+    ``[alerts]`` rule keyed on the event type alone still matches both.
+
     Reads the RETURNED plan, so it sees only a pass that finished. A failed write of the pass's own
-    held, aborted, skipped or unkeyed-binding row no longer ends the pass (BACKLOG #2137): the
-    service logs it at ERROR and returns the plan, so these alerts still fire. A pass that raised
+    held, aborted, skipped, referred or unkeyed-binding row no longer ends the pass (BACKLOG #2137):
+    the service logs it at ERROR and returns the plan, so these alerts still fire. A pass that raised
     part-way for another reason, such as inside one revocation, has already audited the revocations
     it applied before that point; those rows stand, and no alert is raised for them.
 
     Each standing alert also gets its inverse, which pages nobody and resolves the open instance
-    (BACKLOG #2136): ``ad_reconcile_breaker_cleared`` and ``ad_reconcile_hold_released``. The auth
-    service decides when a pass is evidence of a clear (``plan.breaker_clear``, ``plan.hold_clear``;
-    see ``AuthService._mark_reconcile_clears``), so the alert and the service read one predicate.
-    An outage or a pass with no signed-in account sets neither. The inverse is raised on EVERY pass
-    that sets its flag, not once per clear: resolving is an idempotent update, and a resolve the
-    notifier failed to write is retried that way. A process clears only what it watched open, so a
-    fresh process resolves neither alert an earlier run left open (:func:`_without_inherited_clears`
-    drops that clear); ``_mark_reconcile_clears`` states that rule once."""
+    (BACKLOG #2136): ``ad_reconcile_breaker_cleared`` and ``ad_reconcile_hold_released``, and
+    ``ad_reconcile_breaker_cleared`` under the referral's source for the referral's instance. The
+    auth service decides when a pass is evidence of a clear (``plan.breaker_clear``,
+    ``plan.hold_clear``, ``plan.referral_clear``; see ``AuthService._mark_reconcile_clears``), so
+    the alert and the service read one predicate. An outage or a pass with no signed-in account
+    sets none. The inverse is raised on EVERY pass that sets its flag, not once per clear:
+    resolving is an idempotent update, and a resolve the notifier failed to write is retried that
+    way. A process clears only what it watched open, so a fresh process resolves no alert an
+    earlier run left open (:func:`_without_inherited_clears` drops that clear);
+    ``_mark_reconcile_clears`` states that rule once."""
     if plan.directory_outage:
         return
-    if plan.aborted is not None:
-        # Every other abort is audited as auth.ad_reconcile_aborted (ReconcilePlan.directory_outage
-        # is the one predicate both sides read), so every such abort alerts.
+    if plan.aborted is not None and not plan.directory_referral:
+        # A breaker trip. A pass of referrals only is not one: its one alert is the referral's below.
         sink.ad_reconcile_aborted(
             "directory-reconciler",
             reason=plan.aborted,
             probed=plan.probed,
             detail=auth.directory_reconcile_alert or plan.aborted,
         )
-    else:
+    elif plan.aborted is None:
         for revocation in plan.revocations:
             sink.ad_session_revoked(revocation.username, reason=revocation.reason)
+    if plan.referred:
+        # BACKLOG #2538. After the breaker and the revocations, matching the service's order.
+        sink.ad_reconcile_aborted(
+            _REFERRAL_ALERT_SOURCE,
+            reason=REFERRAL_ABORT,
+            probed=plan.probed,
+            detail=auth.directory_reconcile_referral or REFERRAL_ABORT,
+        )
     if plan.hold:
         # After the breaker and the revocations, matching the auth service's order: a sink that
         # raises here cannot suppress the breaker's or a revocation's alert for the same pass.
@@ -8089,6 +8198,8 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
         sink.ad_reconcile_breaker_cleared("directory-reconciler")
     if plan.hold_clear:
         sink.ad_reconcile_hold_released("directory-reconciler")
+    if plan.referral_clear:
+        sink.ad_reconcile_breaker_cleared(_REFERRAL_ALERT_SOURCE)
 
 
 def _without_clears(plan: ReconcilePlan) -> ReconcilePlan:
@@ -8113,16 +8224,19 @@ def _without_clears(plan: ReconcilePlan) -> ReconcilePlan:
     return replace(plan, **cleared)
 
 
-#: Each ``*_clear`` flag on a plan, and the alert instance its inverse resolves (BACKLOG #2136).
-_RECONCILE_CLEAR_RESOLVES: Final[Mapping[str, str]] = {
-    "breaker_clear": "ad_reconcile_aborted",
-    "hold_clear": "ad_reconcile_held",
+#: Each ``*_clear`` flag on a plan, and the alert instance its inverse resolves, as the instance's
+#: ``(connection, event_type)`` key (BACKLOG #2136). The referral's instance shares the breaker's
+#: event type under its own source (BACKLOG #2538), so the source is part of the key.
+_RECONCILE_CLEAR_RESOLVES: Final[Mapping[str, tuple[str, str]]] = {
+    "breaker_clear": ("directory-reconciler", "ad_reconcile_aborted"),
+    "hold_clear": ("directory-reconciler", "ad_reconcile_held"),
+    "referral_clear": (_REFERRAL_ALERT_SOURCE, "ad_reconcile_aborted"),
 }
 
 
-async def _open_reconcile_instances(store: Store) -> dict[int, str] | None:
-    """``id -> event_type`` of the open or acknowledged reconcile alert instances, or None when the
-    read failed, which is logged.
+async def _open_reconcile_instances(store: Store) -> dict[int, tuple[str, str]] | None:
+    """``id -> (connection, event_type)`` of the open or acknowledged reconcile alert instances, or
+    None when the read failed, which is logged.
 
     Catches ``Exception``, on purpose and only around this one read. Its failures are no closed
     family: each backend's driver errors, the engine's own ``RuntimeError``, aiosqlite's
@@ -8130,7 +8244,9 @@ async def _open_reconcile_instances(store: Store) -> dict[int, str] | None:
     that escaped would cost the pass's pages, or the whole pass, through the loop's own catch. Any
     failure here only drops a clear, which is a missed clear, never a false one."""
     try:
-        rows = await store.list_active_alert_instances(allowed_channels=["directory-reconciler"])
+        rows = await store.list_active_alert_instances(
+            allowed_channels=sorted({source for source, _ in _RECONCILE_CLEAR_RESOLVES.values()})
+        )
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -8141,7 +8257,11 @@ async def _open_reconcile_instances(store: Store) -> dict[int, str] | None:
         )
         return None
     resolvable = set(_RECONCILE_CLEAR_RESOLVES.values())
-    return {row.id: row.event_type for row in rows if row.event_type in resolvable}
+    return {
+        row.id: (row.connection, row.event_type)
+        for row in rows
+        if (row.connection, row.event_type) in resolvable
+    }
 
 
 async def _without_inherited_clears(
@@ -8153,13 +8273,14 @@ async def _without_inherited_clears(
     #2136).
 
     ``inherited`` holds the instances already open before this process's first pass. Each alert has
-    one instance row, so a trip or a hold of this process's own folds into an earlier run's open
-    row, and the auth service's evidence covers only the accounts this process saw. The earlier
-    run's accounts may have left across the restart. So while an inherited row is still open, its
-    clear is dropped and an operator resolves it. Once an operator has, the next trip or hold opens
-    a new row, and that one is this process's own. ``AuthService._mark_reconcile_clears`` states
-    the rule this keeps. A flag this map does not name is dropped too, and so is every flag when
-    the read fails: a missed clear, never a false one."""
+    one instance row, so a trip, a hold or a referral (BACKLOG #2538) of this process's own folds
+    into an earlier run's open row, and the auth service's evidence covers only the accounts this
+    process saw. The earlier run's accounts may have left across the restart. So while an
+    inherited row is still open, its clear is dropped and an operator resolves it. Once an operator
+    has, the next trip, hold or referral opens a new row, and that one is this process's own.
+    ``AuthService._mark_reconcile_clears`` states the rule this keeps. A flag this map does not
+    name is dropped too, and so is every flag when the read fails: a missed clear, never a false
+    one."""
     named = set(_RECONCILE_CLEAR_RESOLVES)
     flags = {f.name: getattr(plan, f.name) for f in fields(plan) if f.name.endswith("_clear")}
     if not any(flags.values()):
@@ -8167,7 +8288,7 @@ async def _without_inherited_clears(
     now_open = await _open_reconcile_instances(store)
     if now_open is None:
         return _without_clears(plan)
-    stale = {event for row_id, event in now_open.items() if row_id in inherited}
+    stale = {key for row_id, key in now_open.items() if row_id in inherited}
     kept: dict[str, Any] = {
         flag: value and flag in named and _RECONCILE_CLEAR_RESOLVES[flag] not in stale
         for flag, value in flags.items()
@@ -8718,6 +8839,26 @@ def create_managed_app(
                 trust_anchor_specs, store, enforcing=trust_anchors_enforcing
             ),
         )
+
+        # vault BACKLOG #3076: a convergence reload writes the same config_reload row an operator
+        # reload does, so the store's newest baseline names the graph this node now runs.
+        async def _audit_convergence_reload(outcome: ReloadOutcome) -> None:
+            failed = [f.step for f in outcome.failures]
+            # A row with no digest would be the newest baseline and leave the next start nothing
+            # to compare against. Unlike an operator's row, one lands per follower per cluster
+            # reload, so it is marked and a later start passes over it to a digest-bearing row.
+            no_digest = "config_fingerprint" in failed
+            await _record_reload_audit(
+                engine,
+                actor=_CONVERGENCE_ACTOR,
+                failed_steps=failed,
+                extra={
+                    "initiator": _CONVERGENCE_INITIATOR,
+                    **({_BASELINE_UNCHECKED: True} if no_digest else {}),
+                },
+            )
+
+        engine.convergence_reload_audit = _audit_convergence_reload
         # Bound before the branch so no later read can meet an unbound name (the #1257 lesson below).
         start_fingerprint_failure: str | None = None
         start_outcome: _StartOutcome | None = None
@@ -8730,6 +8871,9 @@ def create_managed_app(
             # tears them down, so they are closed here. Left open, aiosqlite's non-daemon worker keeps
             # the process from exiting (#1257).
             try:
+                # Before the load reads the directory, so a sibling's reload that lands after it is
+                # still converged on (vault BACKLOG #3076). Never raises; a no-op on a single node.
+                await engine.seed_config_version()
                 loaded = load_config(config_dir)
                 # Before the shard filter, as the reload path does inside the engine: the guard judges
                 # the whole graph.
@@ -8795,8 +8939,8 @@ def create_managed_app(
         # exit: uvicorn refused correctly, printed 'Exiting.', and then hung forever.
         try:
             # BACKLOG #1923: CONSTRUCTED before engine.start(), so a refusal its constructor raises
-            # (the OIDC revocation guard, #1887) stops startup before any connection starts. Only
-            # construction is here; initialize() and every use of the service stay below the start.
+            # (the OIDC revocation guard, #1887) stops startup before any connection starts.
+            # BACKLOG #2131 moved initialize() and the notice gate up here too, below.
             auth: AuthService | None = None
             if auth_settings is not None:
                 # Out-of-band security-event push (#188, ASVS 6.3.5/6.3.7) — reuses the [alerts] SMTP
@@ -8834,6 +8978,20 @@ def create_managed_app(
                 # Started only once the service is built, so a constructor refusal starts no task.
                 if security_notifier is not None:
                     security_notifier.start()
+                # BACKLOG #2131: before engine.start() for #1923's reason. On a first run no
+                # enabled Administrator exists yet, and the gate's refusal must stop startup before
+                # any connection starts rather than after. Both touch only the store: initialize()
+                # seeds the built-in roles and the gate reads the users. A refusal here also comes
+                # before the start's opt-in audit-chain walk, so that walk cannot alert on such a
+                # start. Everything else that uses the service stays below the start.
+                await auth.initialize()
+                app.state.auth = auth
+                await _assert_security_notice_is_deliverable(
+                    store,
+                    auth_settings=auth_settings,
+                    alerts_settings=alerts_settings,
+                    security_settings=security_settings,
+                )
             await engine.start()
             # #144 (ADR 0128): inject the connection-control callback INTO the notifier (the sink never imports
             # RegistryRunner). A rule's control_action then auto-remediates via restart_inbound/restart_outbound;
@@ -8880,9 +9038,10 @@ def create_managed_app(
             app.state.approval_gate = _build_approval_gate(
                 engine,
                 approvals_settings or ApprovalsSettings(),
-                # ASVS 8.3.2: late-bound, because the auth service is attached further down.
+                # ASVS 8.3.2: late-bound through app.state, as create_app's own gate must be.
                 resolve_identity=_requester_identity_resolver(app),
                 alert_sink=notifier,  # None -> the gate's own LoggingAlertSink default
+                outliving=app.state.outliving_operations,
             )
             # ASVS 5.2.4: age-based retention prune for the uploaded-logs surface. Owned by this lifespan
             # (started here, stopped in the finally) — the runner pattern of cert_expiry, but wired where the
@@ -8929,6 +9088,9 @@ def create_managed_app(
             # The start's config_loaded row (vault BACKLOG #2597), as early as its readers allow: the
             # last stash the loosenings reader needs is the one above, and the graph is already
             # serving, so a later startup step that aborts must not leave the start unrecorded.
+            # It stays after engine.start() (BACKLOG #2131): its superseded check exists for the
+            # reload the start may run. So a start the notice gate refuses writes no row; it served
+            # no graph.
             if config_dir is not None:
                 await _record_start_audit(
                     app,
@@ -8940,14 +9102,6 @@ def create_managed_app(
                 )
             # The auth_settings test adds nothing at runtime; it narrows the type for the reads below.
             if auth is not None and auth_settings is not None:
-                await auth.initialize()
-                app.state.auth = auth
-                await _assert_security_notice_is_deliverable(
-                    store,
-                    auth_settings=auth_settings,
-                    alerts_settings=alerts_settings,
-                    security_settings=security_settings,
-                )
                 # ADR 0197 Amendment A, AC-A9: name every account still lockable with no way past a
                 # sign-in lock. It warns and audits and NEVER refuses to start: an account-level fact
                 # must not get a site-wide veto, so even a failure of the census itself is logged
@@ -9067,6 +9221,16 @@ def create_managed_app(
             if credential_reminder is not None:
                 credential_reminder.cancel()
                 await asyncio.gather(credential_reminder, return_exceptions=True)
+            # vault BACKLOG #2751-#2753: a DR activate or release, or a config reload, whose caller
+            # was cancelled is still running on its own. Let it finish, or cancel it so its own
+            # rollback arm restores state and records 'interrupted', while the store is open.
+            # Before the approval drain: a released reload's outcome write follows it.
+            try:
+                await app.state.outliving_operations.drain()
+            except Exception:
+                _log.exception(
+                    "long operations: the shutdown drain failed; continuing the teardown"
+                )
             # BACKLOG #2087: let approval outcome writes still running land before the store closes.
             # A write whose caller was cancelled, such as by a request timeout, finishes on its own,
             # and would otherwise meet a closed store. drain() is bounded, and it is guarded like the

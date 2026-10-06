@@ -397,7 +397,7 @@ async def test_a_release_drain_that_times_out_is_not_recorded_as_drained(
     )
     real_drain = engine._drain_pipeline
 
-    async def short_drain() -> tuple[bool, int]:
+    async def short_drain() -> tuple[int, int]:
         return await real_drain(timeout=0.3)
 
     monkeypatch.setattr(engine, "_drain_pipeline", short_drain)

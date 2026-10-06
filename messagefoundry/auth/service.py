@@ -47,6 +47,7 @@ from messagefoundry.auth.ldap import (
     DirectoryAnswer,
     LdapAuthenticator,
     LdapError,
+    LdapReferralError,
     kerberos_principal,
     normalise_object_guid,
 )
@@ -55,6 +56,7 @@ from messagefoundry.auth.notifications import (
     ACCOUNT_DISABLED,
     ACCOUNT_LOCKED,
     ADMIN_NEW_IP,
+    DIRECTORY_SESSIONS_ENDED,
     EMAIL_CHANGED,
     FEDERATED_IDENTITY_BOUND,
     FEDERATED_IDENTITY_UNBOUND,
@@ -245,6 +247,44 @@ _DUMMY_PASSWORD_HASH = hash_password("mf-login-timing-equalizer")
 #: thread-pool executor (and starve all login/AD/password work). Argon2 is deliberately CPU-heavy.
 _ARGON2_MAX_CONCURRENCY = max(2, min(8, os.cpu_count() or 2))
 
+#: Cap on concurrent directory probes from the mTLS certificate path (BACKLOG #2316). Each probe
+#: holds a worker thread for up to the LDAP connect and receive timeouts, so a burst of certificate
+#: requests during a slow directory must not drain the thread pool every other leg shares.
+_CERT_PROBE_MAX_CONCURRENCY = 8
+#: How long a certificate request waits for a probe slot before it is refused. Short on purpose: a
+#: full cap means the directory is slow, and a service caller retries, so queueing without a bound
+#: would only stack requests behind a stalled directory. A refusal fails closed.
+_CERT_PROBE_SLOT_WAIT_SECONDS = 2.0
+#: The refusal reason when no probe slot freed in time. Not a directory answer.
+CERT_PROBE_SATURATED = "probe_capacity_saturated"
+#: Refusals that say the directory could not be asked, not what it said about the account. The
+#: certificate path logs these once per outage rather than once per request.
+_CERT_DIRECTORY_OUTAGES = frozenset(
+    {
+        reconcile.ProbeOutcome.UNAVAILABLE.value,
+        reconcile.ProbeOutcome.REFERRED.value,
+        CERT_PROBE_SATURATED,
+    }
+)
+#: The least time between two certificate-path outage WARNINGs, so a flapping outage cannot log
+#: one WARNING and INFO pair per request.
+_CERT_OUTAGE_LOG_INTERVAL_SECONDS = 60.0
+#: The level ``_probe_principal`` logs an unexpected directory fault at. WARNING for the reconciler
+#: and step-up; the certificate path sets DEBUG in its probe task's own context (BACKLOG #2316).
+_PROBE_FAULT_LOG_LEVEL: ContextVar[int] = ContextVar(
+    "_PROBE_FAULT_LOG_LEVEL", default=logging.WARNING
+)
+#: Outcomes the directory itself gave. Any of them ends a logged outage.
+_CERT_DIRECTORY_ANSWERS = frozenset(
+    outcome.value
+    for outcome in (
+        reconcile.ProbeOutcome.PRESENT,
+        reconcile.ProbeOutcome.ABSENT,
+        reconcile.ProbeOutcome.DISABLED,
+        reconcile.ProbeOutcome.UNDETERMINED,
+    )
+)
+
 # Bound on the per-process new-client-IP dedup cache (WP-L3-13). It only debounces the audit/notify
 # side effects of the 8.4.2 signal; the step-up decision never depends on it, so eviction is harmless.
 _NEW_IP_DEDUP_MAX = 4096
@@ -331,6 +371,9 @@ _HOLD_RELEASABLE: Final[frozenset[_HoldStanding]] = frozenset({"held", "settled"
 #: `AuthService._reconcile_breaker_standing`: whether this process may resolve a trip (BACKLOG
 #: #2136). Only ``"tripped"`` may.
 _BreakerStanding = Literal["fresh", "tripped", "forfeit"]
+#: `AuthService._reconcile_referral_standing`, the same rule for the referral's own instance
+#: (BACKLOG #2538). Only ``"referred"`` may resolve it.
+_ReferralStanding = Literal["fresh", "referred", "forfeit"]
 
 
 # Bounds on the per-session re-proof failure counts (BACKLOG #1138). A count is NEVER evicted while
@@ -670,8 +713,10 @@ class Elevation:
       (password re-auth only, BACKLOG #1138) the session is revoked because it spent its re-proof
       budget, in which case the proof was wrong or never checked; or (any ceremony, BACKLOG #2298)
       the session was ended because its temporary password lapsed, with the proof checked or not,
-      as that ``auth.temp_password_expired`` row records. Fails CLOSED: no token is handed
-      back. Held apart from a wrong proof so a route answers 401 rather than re-prompting on a
+      as that ``auth.temp_password_expired`` row records; or (``confirm_mfa_enrollment`` only,
+      BACKLOG #2224) the proof was good but turning TOTP on matched no row, so the confirm ended
+      the session it had just rotated, as its ``auth.mfa_enroll_refused`` row records. Fails
+      CLOSED: no token is handed back. Held apart from a wrong proof so a route answers 401 rather than re-prompting on a
       session that no longer exists. The ``auth.reauth`` row's ``session_revoked`` says which.
 
     ``recovery_codes`` is populated only by :meth:`AuthService.confirm_mfa_enrollment` (shown once).
@@ -1001,6 +1046,20 @@ class _DirectoryLoginRefused(Exception):
     and the refusal has to land BEFORE the resolver's profile, name and role writes. A resolver that
     reported the condition in its ``UserRecord`` return value would have done those writes already,
     which is the half of BACKLOG #1637 a check on the returned value cannot close.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class _DirectoryAccountConflict(Exception):
+    """A directory login lost the first-sight create race to a row it may not adopt (BACKLOG #2697).
+
+    Raised by :meth:`AuthService._upsert_ad_user` when its INSERT met the username index and the row
+    that won is LOCAL, or carries a different immutable id. Caught by
+    :meth:`AuthService._complete_ad_login`, which renders it as the conflict refusals it already
+    makes before the resolver runs: an ``account conflict`` outcome, audited with ``reason``.
     """
 
     def __init__(self, reason: str) -> None:
@@ -1806,6 +1865,34 @@ def _allowed_channels(user: UserRecord, roles: frozenset[Role]) -> frozenset[str
     return channel_scope.scope_channels(user.channel_scope)
 
 
+def _cert_narrowed_scope(
+    user: UserRecord, mapped: frozenset[str], *, administrator: bool
+) -> UserRecord:
+    """``user`` with the channel scope its current directory groups leave it, for one certificate
+    request (BACKLOG #2316). Writes nothing.
+
+    The rule is :func:`~messagefoundry.auth.channel_scope.decide_ad_channel_scope`, the one login
+    and the reconciler share. Only a narrowing applies, and only as far as the stored scope reaches:
+    the result is the stored channels intersected with what the groups now map to. A scope the groups
+    would widen stays as stored, because this path must not grant, so a widening still waits for a
+    sign-in to write it."""
+    decision = channel_scope.decide_ad_channel_scope(
+        channel_scope.ScopeInput(
+            stored_scope=user.channel_scope,
+            stored_source=user.channel_scope_source,
+            mapped=mapped,
+            administrator=administrator,
+        )
+    )
+    if not decision.narrows:
+        return user
+    before = channel_scope.scope_channels(user.channel_scope)
+    # A narrowing always has a bounded target: an empty set for a withdrawal, else the channels.
+    after = channel_scope.scope_channels(decision.scope_json) or frozenset()
+    reach = after if before is None else before & after
+    return replace(user, channel_scope=json.dumps(sorted(reach)))
+
+
 #: The IdP legs' OWN way across. The connection-shaped default cannot reach this opener, which
 #: resolves no trust anchor; see :attr:`~messagefoundry.config.tls_policy.RevocationHopGuard.ways_across`.
 _IDP_WAYS_ACROSS = (
@@ -1893,9 +1980,10 @@ def _refuse_idp_revocation(
     ``[auth]`` key for one, and borrowing another hop's claim is how a flag silently widens.
 
     The API lifespan builds ``AuthService`` before ``engine.start()`` (BACKLOG #1923), so this refusal
-    comes before any connection starts. ``messagefoundry check`` still does not reach it; ADR 0173
-    AC-4 records that limit. Two more are recorded only here: when both legs refuse, only the token
-    leg is named, because it is checked first; and the WARN arm logs with no audit sink after
+    comes before any connection starts. ``messagefoundry check`` reports it in its required
+    ``oidc-revocation`` leg, through the same :func:`idp_revocation_guards` (BACKLOG #2131, ADR 0173
+    AC-4). Two limits are recorded only here: when both legs refuse, only the token leg is named,
+    because it is checked first; and the WARN arm logs with no audit sink after
     ``configure_logging`` has set the root level, so a level above WARNING would likely filter it, as
     ``logging_setup._refuse_forward_revocation`` measured for its hop."""
     for guard in idp_revocation_guards(settings, opener, posture):
@@ -2044,6 +2132,20 @@ class AuthService:
             self._ldap = None
         # Instance-scoped (one event loop per AuthService) so it never crosses loops in tests.
         self._argon2_sem = asyncio.Semaphore(_ARGON2_MAX_CONCURRENCY)
+        # BACKLOG #2316: the certificate path's directory probes, capped like argon2 above.
+        # Bounded, so a release with no matching acquire raises instead of widening the cap.
+        self._cert_probe_slots = asyncio.BoundedSemaphore(_CERT_PROBE_MAX_CONCURRENCY)
+        #: Probe tasks still running, held so none is collected while its caller has gone.
+        self._cert_probe_tasks: set[asyncio.Task[reconcile.Probe | str]] = set()
+        #: The certificate path's current outage reason, or None (`_note_cert_directory_answer`).
+        self._cert_directory_outage: str | None = None
+        #: Monotonic time of its last outage WARNING, and whether the current outage logged one.
+        self._cert_outage_warned_at: float | None = None
+        self._cert_outage_announced = False
+        #: Monotonic time of the last INFO saying the current outage changed its reason.
+        self._cert_outage_kind_noted_at: float | None = None
+        #: Configuration refusals already logged by this process.
+        self._cert_config_refusals_logged: set[str] = set()
         self._login_limiter: SlidingWindowRateLimiter | None = (
             SlidingWindowRateLimiter(
                 per_key=settings.login_rate_limit_per_ip,
@@ -2142,6 +2244,18 @@ class AuthService:
         self._reconcile_last_probed: dict[str, float] = {}
         #: Latched mass-revoke circuit-breaker trip, cleared by the next clean pass.
         self._reconcile_alert: str | None = None
+        #: Latched LDAP referral (BACKLOG #2538). Its own latch, like the hold's, because a pass with
+        #: a referral beside other answers is not aborted and so clears `_reconcile_alert`. Set on a
+        #: pass with a referral. Cleared by `_mark_reconcile_clears` on the referral clear's test.
+        self._reconcile_referral_alert: str | None = None
+        #: user_ids signed in at the last pass with a referral and not read PRESENT since (BACKLOG
+        #: #2538). `_mark_reconcile_clears` states the test that reads it.
+        self._reconcile_referred: set[str] = set()
+        #: Whether THIS process may resolve the referral's durable ``ad_reconcile_aborted``
+        #: instance (BACKLOG #2538), on the breaker's rule (`_reconcile_breaker_standing`).
+        #: ``"fresh"``: no pass here saw a referral. ``"referred"``: one did. ``"forfeit"``: see
+        #: `_forfeit_clears_on_attrition`. Only `_advance_referral_standing` moves it.
+        self._reconcile_referral_standing: _ReferralStanding = "fresh"
         #: user_ids a breaker trip has not yet seen read PRESENT on a pass that was not aborted
         #: (BACKLOG #2136). `_mark_reconcile_clears` reports no breaker clear while one is signed in.
         self._reconcile_unconfirmed: set[str] = set()
@@ -2559,21 +2673,38 @@ class AuthService:
             await self._store.revoke_user_sessions(user_id)
         else:
             user_id = uuid4().hex
-            await self._store.create_user(
-                user_id=user_id,
-                username=username,
-                auth_provider=AuthProvider.LOCAL.value,
-                display_name=display_name,
-                # Seeds `notify_email` too (see `store.seed_notify_email`), which is the column the
-                # PHI security-notice start gate reads.
-                email=notify_email,
-                # No hash yet, deliberately: an account with no credential cannot be signed into, so
-                # the window before `set_password` below admits nobody. The flag is therefore
-                # unobservable until that write, which is what actually decides it.
-                password_hash=None,
-                must_change_password=True,
-                password_generated=False,
-            )
+            try:
+                await self._store.create_user(
+                    user_id=user_id,
+                    username=username,
+                    auth_provider=AuthProvider.LOCAL.value,
+                    display_name=display_name,
+                    # Seeds `notify_email` too (see `store.seed_notify_email`), which is the column
+                    # the PHI security-notice start gate reads.
+                    email=notify_email,
+                    # No hash yet, deliberately: an account with no credential cannot be signed into,
+                    # so the window before `set_password` below admits nobody. The flag is therefore
+                    # unobservable until that write, which is what actually decides it.
+                    password_hash=None,
+                    must_change_password=True,
+                    password_generated=False,
+                )
+            except Exception as exc:
+                if not _is_integrity_refusal(exc):
+                    raise
+                # BACKLOG #2697: another run, or a directory sign-in, took the name after the read
+                # above. Refused rather than repaired in place: a re-run reads the row and takes the
+                # repair branch, so `_existing_row_refusal`'s rules (#2288) stay in one place. This
+                # INSERT was the run's first account write, so no account row was written. A
+                # refusal with no row holding the name is some other fault and re-raises untouched.
+                if await self._store.get_user_by_username(username) is None:
+                    raise
+                raise FirstAdministratorRefused(
+                    "an account with that username was created while this command ran, so this run "
+                    "wrote no account; remove any authenticator entry it showed. If another "
+                    "provision-admin run is in progress, let it finish. Then run the command again: "
+                    "it reads that account and either completes it or says why it cannot"
+                ) from exc
         await self._seed_roles()
         # ADR 0197 Amendment A (N-A): the step is consumed FIRST, before the credential or the
         # secret is written, so a code this row already spent (an interrupted earlier run in the
@@ -2601,7 +2732,17 @@ class AuthService:
                 totp.generate_recovery_codes(self._settings.mfa_recovery_code_count)
             )
             hashes = [await self._argon2(hash_password, c) for c in plain_codes]
-            await self._store.enable_totp(user_id, recovery_code_hashes=hashes)
+            # Conditional (BACKLOG #2224): a factor clear by another run's repair branch, or another
+            # run that enabled TOTP first, since the secret was staged above makes it match no row.
+            # Refused before the role, so the row stays roleless and a re-run completes it.
+            if not await self._store.enable_totp(user_id, recovery_code_hashes=hashes):
+                raise FirstAdministratorRefused(
+                    "the authenticator enrolment was changed while this command ran, so this run "
+                    "did not turn TOTP on and granted no role; remove the authenticator entry it "
+                    "showed. "
+                    "If another provision-admin run is in progress, let it finish. Then run the "
+                    "command again"
+                )
         if notify_email is not None:
             # Unconditional rather than fresh-path-only, because the invariant "the supplied address
             # always lands" is simpler than the case analysis. On the fresh path `create_user` already
@@ -4133,6 +4274,13 @@ class AuthService:
         Refusals are audited under the staged session's account wherever the flow names one, so they
         appear in that person's security events rather than under an anonymous actor.
 
+        The session is re-anchored to the callback's address when the callback has one. The
+        ``auth.reauth`` row a completed step-up writes, including one whose rotation lost the
+        session, also records the start leg's address as ``start_client`` and whether the two are
+        different hosts as ``client_moved`` (BACKLOG #2160). The refusal rows above carry neither.
+        A move is recorded, never refused. Behind a proxy the engine does not trust, both legs carry
+        the proxy's address, so ``client_moved`` reads false there.
+
         Not padded to a deadline, unlike the sign-in callback: the caller already holds a session,
         and the step-up leg does not choose between accounts.
         """
@@ -4271,6 +4419,15 @@ class AuthService:
             # (3) The purpose-bound grant, against the NEW hash.
             self._grant_action_step_up(hash_token(elevation.token), purpose)
         self.clear_oidc_unavailable()
+        # BACKLOG #2160: the start leg staged its caller's address, and the session is re-anchored
+        # to the callback's above. Record whether the address moved mid-ceremony, compared as the
+        # new-address signal compares. Recorded only: refusing a move, or anchoring to the start
+        # address, would change ADR 0142 Amendment B and needs a ruling first. None when either
+        # address is unknown, since an empty string matches nothing and proves no move.
+        start_client = flow.client_ip or None
+        client_moved = (
+            not self._same_host(start_client, client) if start_client and client else None
+        )
         await self._audit(
             "auth.reauth",
             actor=user.username,
@@ -4283,6 +4440,8 @@ class AuthService:
                     "session_lost": elevation.session_lost,
                     "grant_refused": grant_refused,
                     "session_revoked": False,
+                    "start_client": start_client,
+                    "client_moved": client_moved,
                 }
             ),
             client=client,
@@ -4500,6 +4659,18 @@ class AuthService:
             user = await self._upsert_ad_user(
                 principal, by_name=existing, federated=federated, client=client
             )
+        except _DirectoryAccountConflict as exc:
+            # BACKLOG #2697: a concurrent create took the name, and the row that won is not this
+            # principal's. Audited as the two conflict branches above audit. The outcome names the
+            # reason in both cases, as the federated leg's local conflict does; the local branch
+            # above names none.
+            await self._audit(
+                "auth.login_failed",
+                actor=principal.username,
+                detail=_json({"provider": "ad", "reason": exc.reason}),
+                client=client,
+            )
+            return LoginOutcome(ok=False, error="account conflict", reason=exc.reason)
         except _DirectoryLoginRefused as exc:
             # The resolver refused before it wrote anything. Rendered here rather than there so the
             # audit row carries the caller's ``client`` and every directory refusal in this method
@@ -4813,6 +4984,11 @@ class AuthService:
         one (vault BACKLOG #2609, which is what ``federated`` is for), before any write. See the gate
         below the id-keyed lookup for why the condition is signalled from here rather than checked
         on the returned record.
+
+        A first sign-in that loses the create race to a concurrent one adopts the row that won
+        (BACKLOG #2697), after the same conflict and eligibility checks the caller makes on a row it
+        read. Raises :class:`_DirectoryAccountConflict` when that row is LOCAL or carries a different
+        immutable id.
         """
         if by_name is not None and by_name.directory_object_id != principal.directory_object_id:
             # Defensive, and deliberately a RAISE rather than a silent re-read. The caller's check is
@@ -4843,8 +5019,40 @@ class AuthService:
             if refusal is not None:
                 raise _DirectoryLoginRefused(refusal)
         if existing is None:
-            user_id = await self._create_directory_row(principal, client=client)
-        else:
+            try:
+                user_id = await self._create_directory_row(principal, client=client)
+            except Exception as exc:
+                if not _is_integrity_refusal(exc):
+                    raise
+                # BACKLOG #2697. A CONCURRENT FIRST SIGN-IN TOOK THE NAME BETWEEN THE READS ABOVE AND
+                # THIS INSERT. Two sign-ins of one person at once is ordinary, so the loser adopts the
+                # winner's row rather than failing. The username index is the only one that can fire
+                # here: `directory_object_id` carries no UNIQUE index on any backend. So the name is
+                # what is re-read, and a refusal with no row holding it is some other fault.
+                winner = await self._store.get_user_by_username(principal.username)
+                if winner is None:
+                    raise
+                # The checks `_complete_ad_login` makes on a row it read by name, in its order. That
+                # read ran before the winner existed, so nothing has asked them of this row yet. A
+                # check added there belongs here too.
+                #
+                # NOT CLOSED HERE: both sign-ins then run the caller's role resync on one new row.
+                # When the groups map to a role, each can read no prior roles and revoke the
+                # account's sessions, which can end the other's new session. On the server backends
+                # the two `set_user_roles` transactions can also meet the `user_roles` key, by
+                # reading (not measured), and the second would raise. Two concurrent sign-ins of an
+                # existing account meet both races too, so they belong to the resync.
+                if winner.auth_provider != AuthProvider.AD.value:
+                    raise _DirectoryAccountConflict("local_account_conflict") from exc
+                if winner.directory_object_id != principal.directory_object_id:
+                    raise _DirectoryAccountConflict(DIRECTORY_IDENTITY_CONFLICT) from exc
+                # BACKLOG #1637 / #1638: the eligibility gate stays before the first write, for the
+                # adopted row as for one the reads found. The winner may already be disabled.
+                refusal = _directory_login_refusal(winner, time.time(), federated=federated)
+                if refusal is not None:
+                    raise _DirectoryLoginRefused(refusal) from exc
+                existing = winner
+        if existing is not None:
             user_id = existing.id
             if principal.username != existing.username:
                 # BACKLOG #1532. Reachable only through the id-keyed lookup above: a name-keyed hit
@@ -5166,6 +5374,13 @@ class AuthService:
         return self._reconcile_alert
 
     @property
+    def directory_reconcile_referral(self) -> str | None:
+        """The standing LDAP referral's operator message, or ``None`` (BACKLOG #2538). Latches until
+        a pass marks ``referral_clear``, the test the referral's alert resolves on, which
+        ``_mark_reconcile_clears`` states."""
+        return self._reconcile_referral_alert
+
+    @property
     def directory_reconcile_hold(self) -> str | None:
         """The engaged undetermined-wave hold's operator message, or ``None`` (ADR 0195). Latches
         while the hold is engaged, so an operator who missed the log line still sees it."""
@@ -5207,11 +5422,25 @@ class AuthService:
         ``userAccountControl`` UNDETERMINED (ADR 0195 rule items 1 and 2). An unreadable attribute
         must never come back as UNAVAILABLE, which never revokes; that would reopen BACKLOG #1639.
         """
-        # Guarded by directory_reconcile_enabled, and by _directory_step_up_refusal (BACKLOG #2023).
+        # Guarded by directory_reconcile_enabled, and by _directory_presence (BACKLOG #2023, #2316).
         assert self._ldap is not None
         try:
             probe = await asyncio.to_thread(
                 self._ldap.probe_principal, user.username, object_id=user.directory_object_id
+            )
+        except LdapReferralError as exc:
+            # BACKLOG #2538. Ahead of LdapError, which it subclasses. A referral is not an outage:
+            # it recurs on every pass until the search base is fixed, so read as UNAVAILABLE it
+            # would stop revocation for the referred accounts without a page. REFERRED never
+            # strikes or revokes this account, the rest of the pass is still judged, the pass
+            # alerts, and verify_mfa refuses on it like any other non-PRESENT answer. DEBUG here: a
+            # referring base refers every account on every pass, so the reconciler logs one ERROR
+            # per pass carrying the first referral's text instead, and verify_mfa audits its own
+            # refusal. ldap.py warns once per process too. The text names the operation and the
+            # referred hosts only (BACKLOG #2530), which is what makes it safe to carry and log.
+            _log.debug("directory probe of %s was referred: %s", user.username, exc)
+            return reconcile.Probe(
+                user.id, user.username, reconcile.ProbeOutcome.REFERRED, detail=str(exc)
             )
         except LdapError as exc:
             # FAIL OPEN, for the reconciler. verify_mfa reads the same UNAVAILABLE as a refusal and
@@ -5222,6 +5451,33 @@ class AuthService:
             # need the console. Debug-level — a flapping DC must not flood the log at one line per
             # user per pass; the pass-level summary below reports the count at WARNING.
             _log.debug("directory probe failed for %s: %s", user.username, exc)
+            return reconcile.Probe(user.id, user.username, reconcile.ProbeOutcome.UNAVAILABLE)
+        except Exception as exc:
+            # BACKLOG #2241. Anything else the directory layer raised: a KeyError or ValueError on a
+            # malformed entry, an OSError, a fault in a test double. Uncaught, it was a 500 from
+            # verify_mfa instead of an audited refusal, and it ended the WHOLE reconcile pass, so one
+            # account that always raised stopped revocation for every account. Read as UNAVAILABLE:
+            # verify_mfa refuses on it (fail closed), and the reconciler skips this one account.
+            #
+            # NOT LIKE #1639, AND THE COST IS NAMED. An unreadable userAccountControl is an answer
+            # the directory gave, so it strikes as UNDETERMINED. This is the engine failing to read
+            # whatever came back, which says nothing about the account, so it must not strike; and
+            # UNDETERMINED would move the ADR 0195 hold. The price is that an account whose entry
+            # raises every time is never revoked by the reconciler while that lasts. So this logs
+            # at WARNING on every probe, unlike the debug-level outage above: a repeat here is a
+            # standing gap for one named account, not a blip. CancelledError is not an Exception.
+            # The WARNING names the type only: the message can quote a directory value, which
+            # ldap.py never logs. The traceback, with the message, goes to DEBUG for diagnosis.
+            # The certificate path lowers this to DEBUG in its own task's context (BACKLOG #2316):
+            # it probes per request, not per pass, and reports the fault once as an outage.
+            _log.log(
+                _PROBE_FAULT_LOG_LEVEL.get(),
+                "directory probe of %s raised %s; read as unavailable, so this account's "
+                "sessions are not revoked and its step-up is refused while this repeats",
+                user.username,
+                type(exc).__name__,
+            )
+            _log.debug("directory probe of %s raised", user.username, exc_info=True)
             return reconcile.Probe(user.id, user.username, reconcile.ProbeOutcome.UNAVAILABLE)
         principal = probe.principal
         if principal is None:
@@ -5258,6 +5514,8 @@ class AuthService:
         within one interval instead of at the 12-hour absolute cap. Safe by construction:
 
         * a probe that could not reach the directory contributes nothing (fail-open);
+        * a probe the directory referred contributes nothing either, and the pass alerts, while
+          every other account is still judged (BACKLOG #2538);
         * a principal must come back absent, disabled or undetermined ``ad_session_recheck_strikes``
           passes running;
         * a PRESENT principal whose directory groups would change its roles, or withdraw or narrow
@@ -5329,6 +5587,8 @@ class AuthService:
         )
         now = time.monotonic()
         probes: list[reconcile.Probe] = []
+        # No early stop on a referral (BACKLOG #2538): a referral leaves only its own account
+        # unjudged, so every other account in the sample is still probed and judged.
         for user_id, _username in selected:
             probes.append(await self._probe_principal(users[user_id]))
             self._reconcile_last_probed[user_id] = now
@@ -5404,14 +5664,31 @@ class AuthService:
             self._reconcile_unconfirmed.difference_update(
                 uid for uid, outcome in plan.outcomes.items() if outcome is present
             )
-        elif not plan.directory_outage:
+        elif not plan.judged_nothing:
             self._reconcile_unconfirmed = set(users)
             self._advance_breaker_standing("tripped")
+        # BACKLOG #2538. The same for a referral, on its own record and its own standing.
+        # `_mark_reconcile_clears` states why every candidate is marked and why only PRESENT
+        # confirms; `_forfeit_clears_on_attrition` states the forfeit.
+        if plan.referred:
+            self._reconcile_referred = set(users)
+            self._advance_referral_standing("referred")
+        else:
+            present = reconcile.ProbeOutcome.PRESENT
+            self._reconcile_referred.difference_update(
+                uid for uid, outcome in plan.outcomes.items() if outcome is present
+            )
+        referral = next((p for p in probes if p.outcome is reconcile.ProbeOutcome.REFERRED), None)
         if plan.aborted is not None:
-            await self._abort_reconcile_pass(plan)
+            if not plan.directory_referral:
+                await self._abort_reconcile_pass(plan)
             if not plan.directory_outage:
+                # A pass of referrals only is recorded as a referral and nothing else (#2538).
+                await self._record_reconcile_referral(plan, first=referral)
+            if not plan.judged_nothing:
                 # A held pass writes its own row even when the breaker also aborts it (ADR 0195 rule
-                # item 9). An outage judged nothing, so it leaves the hold's message alone.
+                # item 9). An outage or a pass of referrals only judged nothing, so it leaves the
+                # hold's message alone and marks no clear (BACKLOG #2538).
                 await self._record_reconcile_hold(plan)
                 plan = self._mark_reconcile_clears(plan, users)
             await self._report_unkeyed_bindings(unkeyed, still_unkeyed=still_unkeyed)
@@ -5421,7 +5698,8 @@ class AuthService:
         if plan.unavailable:
             _log.warning(
                 "directory reconcile: %d of %d principals could not be resolved (directory "
-                "unreachable) — those sessions were left alone (fail-open)",
+                "unreachable, or a probe raised, which is warned per account) — those sessions "
+                "were left alone (fail-open)",
                 plan.unavailable,
                 plan.probed,
             )
@@ -5438,6 +5716,9 @@ class AuthService:
                 # The same, for the breaker. The account was signed in at the trip and has not read
                 # clean since. It is about to leave, so nothing will read it clean again.
                 self._advance_breaker_standing("forfeit")
+            if revocation.user_id in self._reconcile_referred:
+                # The same, for the referral (BACKLOG #2538; `_forfeit_clears_on_attrition`).
+                self._advance_referral_standing("forfeit")
             if await self._apply_reconcile_revocation(revocation):
                 applied.append(revocation)
         for refresh in plan.renames:
@@ -5456,6 +5737,9 @@ class AuthService:
                 new_username=refresh.new_username,
                 held=await self._store.get_user_by_username(refresh.new_username),
             )
+        # BACKLOG #2538. After the revocations, like the hold below: the referred accounts were left
+        # unjudged, and every other account's revocation above has already been applied.
+        await self._record_reconcile_referral(plan, first=referral)
         # ADR 0195. After the revocations, so a held-row audit write that fails cannot stop a
         # genuine disable or demotion in the same pass from being applied. And that failure is
         # logged rather than raised (BACKLOG #2137), so the pass still returns its plan and the
@@ -5476,31 +5760,45 @@ class AuthService:
         """Say on the plan whether this pass is EVIDENCE that each standing condition has cleared.
 
         BACKLOG #2136. The lifespan task resolves the durable ``ad_reconcile_aborted`` and
-        ``ad_reconcile_held`` alert instances on these, on every pass that sets them. Those
-        instances outlive the process, and the strike and outcome records and the hold's latch
-        here do not. So "not aborted" or "not held" is not enough: after a restart, or before the
-        probe budget has reached every account, a pass can read clear while the condition stands.
+        ``ad_reconcile_held`` alert instances on these, on every pass that sets them, and the
+        referral's own ``ad_reconcile_aborted`` instance (BACKLOG #2538). Those instances outlive
+        the process, and the strike and outcome records and the hold's latch here do not. So "not
+        aborted" or "not held" is not enough: after a restart, or before the probe budget has
+        reached every account, a pass can read clear while the condition stands.
 
-        **The rule for both alerts, and the one statement of it: a process clears only what it
-        watched open.** A restart forgets which accounts were behind a trip or a hold, and an
-        account that leaves across it is not seen to leave. Two layers keep the rule.
+        **The rule for every alert, and the one statement of it: a process clears only what it
+        watched open.** A restart forgets which accounts were behind a trip, a hold or a referral,
+        and an account that leaves across it is not seen to leave. Two layers keep the rule.
 
-        * Here: a pass marks a trip clear only after a pass of this process tripped, and a hold
-          clear only after one held (``_reconcile_breaker_standing``,
-          ``_reconcile_hold_standing``), and then only on a pass that passes the tests below.
+        * Here: a pass marks a trip clear only after a pass of this process tripped, a hold clear
+          only after one held, and a referral clear only after one saw a referral
+          (``_reconcile_breaker_standing``, ``_reconcile_hold_standing``,
+          ``_reconcile_referral_standing``), and then only on a pass that passes the tests below.
         * In the lifespan task: ``api/app.py::_without_inherited_clears`` drops a clear while the
           instance it would resolve is one that was already open when the task first read alert
-          state. Each alert has one instance row, so a trip or hold of this process's own folds
-          into an earlier run's open instance, and resolving that would rest on accounts the
-          earlier run saw and this process never did.
+          state. Each alert has one instance row, so a trip, hold or referral of this process's
+          own folds into an earlier run's open instance, and resolving that would rest on
+          accounts the earlier run saw and this process never did.
 
         So a fresh process never resolves an instance an earlier run left open, however clean its
         estate reads, and that instance stays open for an operator. Within one process, an account
-        behind either alert that leaves before it reads clean forfeits that clear until a restart
-        (`_forfeit_clears_on_attrition`).
+        behind any of the alerts that leaves before it reads clean forfeits that clear until a
+        restart (`_forfeit_clears_on_attrition`).
 
-        * Both need an answer on record, from this process, for every signed-in account the pass
-          did not just revoke. A probe that could not reach the directory leaves none.
+        * All three need an answer on record, from this process, for every signed-in account the
+          pass did not just revoke. A probe that could not reach the directory leaves none.
+        * A pass in which any probe was referred marks none of the three (BACKLOG #2538). A
+          referred account has no answer from this pass, and an older one on record may predate
+          the referral.
+        * The referral's own instance is clear when, on top of the first test, every account signed
+          in at the last referral has since read PRESENT on a pass with no referral
+          (``_reconcile_referred``), and ``_reconcile_referral_standing`` is ``"referred"``: a
+          pass here saw a referral, and has not forfeited. Any referral marks every candidate, not
+          only the referred ones, because a probe sample can miss accounts that would also be
+          referred. Only a PRESENT answer confirms: it alone ran every search a referral can come
+          from. A pass of referrals only, or an outage, is never evidence. The latched message is
+          released on this same test, so on a sole reconciler the log and the instance agree.
+          Where the lifespan task drops the flag, the latch is released and the instance stays.
         * The hold is clear when, on top of that, the pass did not hold and these tests pass.
           None of those answers is undetermined; this is the record, across the rotation. No
           account the pass just revoked read undetermined either. At least one probe of THIS pass
@@ -5536,7 +5834,7 @@ class AuthService:
         the other code sites point here; ``docs/CONFIGURATION.md`` tells operators.
 
         **The usual cost is a missed clear, with one reconciler on the store.** An account that
-        never answers keeps both instances open while it is signed in. So does a hold, for the
+        never answers keeps every instance open while it is signed in. So does a hold, for the
         breaker's instance. So does a reconciler that is switched off, and so does every cluster
         or multi-shard engine. A fresh process keeps both instances an earlier run left open, and
         a forfeited one keeps the instance it forfeited (`_forfeit_clears_on_attrition` says
@@ -5552,7 +5850,20 @@ class AuthService:
         revoked_undetermined = undetermined in (self._reconcile_outcomes.get(u) for u in revoked)
         ids = [uid for uid in users if uid not in revoked]
         outcomes = [self._reconcile_outcomes.get(uid) for uid in ids]
-        settled = bool(ids) and None not in outcomes and undetermined not in outcomes
+        covered = bool(ids) and None not in outcomes and not plan.referred
+        settled = covered and undetermined not in outcomes
+        # Called only on a pass that judged something, so a pass of referrals only never gets here.
+        referral_clear = (
+            covered
+            and self._reconcile_referral_standing == "referred"
+            and self._reconcile_referred.isdisjoint(ids)
+        )
+        if referral_clear and self._reconcile_referral_alert is not None:
+            self._reconcile_referral_alert = None
+            _log.warning(
+                "directory reconcile: every account signed in at the last LDAP referral has since "
+                "been read without one; the referral cleared"
+            )
         hold_clear = (
             settled
             and not plan.hold
@@ -5569,7 +5880,12 @@ class AuthService:
             and all(self._reconcile_strikes.get(uid, 0) == 0 for uid in ids)
             and self._reconcile_unconfirmed.isdisjoint(ids)
         )
-        return replace(plan, breaker_clear=breaker_clear, hold_clear=hold_clear)
+        return replace(
+            plan,
+            breaker_clear=breaker_clear,
+            hold_clear=hold_clear,
+            referral_clear=referral_clear,
+        )
 
     def _forfeit_clears_on_attrition(self, users: Mapping[str, UserRecord]) -> None:
         """Give up a clear when an account behind it leaves the candidate set (BACKLOG #2136).
@@ -5585,18 +5901,25 @@ class AuthService:
           its sessions go.
         * An account whose last answer was undetermined forfeits the hold's release, on the same
           rule as revoking one: unless this process has settled and has not held since.
+        * An account signed in at a referral that has not since read PRESENT on a pass with no
+          referral forfeits the referral's clear until a restart (BACKLOG #2538). The revocation
+          loop forfeits for an account the reconciler revokes, as for the breaker. A pass with a
+          referral marks every candidate, so an account that pass itself revokes forfeits too.
 
         At least these take an account out: it signs out or reaches the session cap, the reconciler
         revokes it, an operator disables it locally, or its row is deleted. The cost is a missed
         clear when an account leaves for an ordinary reason while the evidence is pending. A trip
-        marks every candidate unconfirmed, healthy ones too, so a sign-out during a long trip
-        forfeits its clear. This is one process's memory: what leaves across a restart is not seen
-        here. The rule in `_mark_reconcile_clears` covers that case, because a fresh process
-        resolves nothing an earlier run left open.
+        or a referral marks every candidate unconfirmed, healthy ones too, so a sign-out during a
+        long trip or referral forfeits its clear. This is one process's memory: what leaves across
+        a restart is not seen here. The rule in `_mark_reconcile_clears` covers that case, because
+        a fresh process resolves nothing an earlier run left open.
         """
         if not self._reconcile_unconfirmed <= users.keys():
             self._advance_breaker_standing("forfeit")
         self._reconcile_unconfirmed.intersection_update(users)
+        if not self._reconcile_referred <= users.keys():
+            self._advance_referral_standing("forfeit")
+        self._reconcile_referred.intersection_update(users)
         undetermined = reconcile.ProbeOutcome.UNDETERMINED
         if any(
             outcome is undetermined
@@ -5624,6 +5947,28 @@ class AuthService:
                 "directory reconcile: an account signed in at the last breaker trip left before a "
                 "pass read it clean, so this process will not resolve ad_reconcile_aborted itself "
                 "until it restarts; an operator resolves it once the directory reads clean"
+            )
+
+    def _advance_referral_standing(self, event: _ReferralStanding) -> None:
+        """Move ``_reconcile_referral_standing`` on ``event`` (BACKLOG #2538), the only place it
+        moves. The breaker's rule (:meth:`_advance_breaker_standing`), for the referral's instance.
+
+        ``"referred"``: a pass here saw a referral, so this process watched one open. It moves a
+        fresh process to ``"referred"``. ``"forfeit"``: an account signed in at a referral is about
+        to be revoked, or has left, before a pass with no referral read it PRESENT; see
+        :meth:`_forfeit_clears_on_attrition`. ``"forfeit"`` is never left. The latched referral
+        message is then kept until a restart too, because the test that releases it is the clear's.
+        """
+        current = self._reconcile_referral_standing
+        if event == "referred" and current == "fresh":
+            self._reconcile_referral_standing = "referred"
+        elif event == "forfeit" and current != "forfeit":
+            self._reconcile_referral_standing = "forfeit"
+            _log.warning(
+                "directory reconcile: an account signed in at the last LDAP referral left before a "
+                "pass read it without one, so this process will not resolve the referral's "
+                "ad_reconcile_aborted instance itself until it restarts; an operator resolves it "
+                "once the search bases are fixed"
             )
 
     def _advance_hold_standing(self, event: _HoldStanding) -> None:
@@ -6069,7 +6414,8 @@ class AuthService:
             )
             return
         # Held probes were left out of the breaker's denominator (ADR 0195 rule item 7), so the
-        # ceiling it quotes is taken over the same count. `probed` keeps its meaning in the row.
+        # ceiling it quotes is taken over the same count. `probed` keeps its meaning in the row. A
+        # pass of referrals only never reaches here: it is not a trip (BACKLOG #2538).
         ceiling = reconcile.breaker_ceiling(
             probed=plan.judged,
             max_absolute=self._settings.ad_session_revoke_max,
@@ -6097,16 +6443,86 @@ class AuthService:
             ),
         )
 
+    async def _record_reconcile_referral(
+        self, plan: reconcile.ReconcilePlan, *, first: reconcile.Probe | None
+    ) -> None:
+        """Latch, log and audit a pass in which the directory referred probes.
+
+        BACKLOG #2538. Called on every pass that judged something, and on a pass of referrals
+        only; an outage pass does not call it. On one with a referral,
+        whatever else the pass did, it latches the message, logs it at ERROR with the first
+        referral's search and hosts, and writes an ``auth.ad_reconcile_referred`` row. Its own audit
+        action, because a pass with a referral beside other answers is not an aborted one, and an
+        ``auth.ad_reconcile_aborted`` row is read as "nothing was revoked". The row's ``aborted``
+        field says what else the pass did. On a pass with no referral it does nothing:
+        ``_mark_reconcile_clears`` releases the latched message on the referral clear's test.
+
+        **Its own latch and its own alert instance**, apart from the breaker's: the lifespan task
+        raises it as ``ad_reconcile_aborted`` under its own source label. A shared instance would
+        let an operator who acknowledges or suspends a standing referral also silence a later
+        breaker trip, and would let one detail hide the other. An ``[alerts]`` rule keyed on the
+        event type alone still matches both; only a rule naming the exact source keeps them apart.
+
+        The message is the alert's detail, so it names the settings to change FIRST: the store
+        keeps only the first 200 characters of an alert instance's reason. It carries counts and
+        no username. It is latched before the row is written, so a failed write leaves it set.
+        """
+        if not plan.referred:
+            # The latch is released in `_mark_reconcile_clears`, on the referral clear's own test.
+            return
+        others = (
+            "The pass revoked nothing."
+            if plan.aborted is not None
+            else "Accounts that answered without a referral were judged as usual."
+        )
+        if plan.unavailable:
+            # A pass of referrals and failures is recorded here and not as an outage, so the
+            # failures are counted here, or a near-total outage would read as a search-base fault.
+            others = (
+                f"{plan.unavailable} could not be read (the directory was unreachable, or the "
+                f"probe raised). {others}"
+            )
+        self._reconcile_referral_alert = (
+            "LDAP referral: check [auth].ad_user_search_base and, for nested groups, "
+            "[auth].ad_group_search_base; one names a base in another domain of the forest. "
+            f"{len(plan.referred)} of {plan.probed} signed-in directory account(s) probed were "
+            f"referred and left unjudged. {others} A referred account is never revoked while it "
+            "is referred, because the engine does not follow referrals. Use a base in the bound "
+            "domain controller's own domain, or a global catalog. The ERROR log line for each such "
+            "pass names the first referred search and its hosts."
+        )
+        # The username and the refusal's text go to the log only: the refusal names the search
+        # and the referred hosts and nothing else (BACKLOG #2530). One line per pass, not one per
+        # referred account, because a referring base refers every account on every pass.
+        _log.error(
+            "directory reconcile: %s First referral: %s: %s",
+            self._reconcile_referral_alert,
+            first.username if first is not None else "?",
+            first.detail if first is not None else "?",
+        )
+        await self._audit_reconciler_row(
+            "auth.ad_reconcile_referred",
+            detail=_json(
+                {
+                    "reason": reconcile.REFERRAL_ABORT,
+                    "referred": len(plan.referred),
+                    "unavailable": plan.unavailable,
+                    "probed": plan.probed,
+                    "aborted": plan.aborted,
+                }
+            ),
+        )
+
     async def _audit_reconciler_row(self, action: str, *, detail: str) -> bool:
         """Write one of the reconcile pass's own rows, and say whether it was written.
 
         BACKLOG #2137. These rows are the held row, the breaker's aborted row, the outage's skipped
-        row and the unkeyed-binding report. Each is written after the pass's revocations, or on a
-        pass that applies none. **A failed write here does not end the pass.** If
-        it raised, the pass would return no plan, and the lifespan task would raise no alert for
-        the revocations already applied, nor for the hold or the breaker. So a store refusal is
-        logged at ERROR, naming the action, and the pass goes on. The log line is then the only
-        record of that row. A per-revocation audit write is not routed through here: that one
+        row, the referral's row (BACKLOG #2538) and the unkeyed-binding report. Each is written
+        after the pass's revocations, or on a pass that applies none. **A failed write here does
+        not end the pass.** If it raised, the pass would return no plan, and the lifespan task
+        would raise no alert for the revocations already applied, nor for the hold, the breaker or
+        the referral. So a store refusal is logged at ERROR, naming the action, and the pass goes
+        on. The log line is then the only record of that row. A per-revocation audit write is not routed through here: that one
         still raises.
 
         A defect is raised, not passed over (:data:`_AUDIT_WRITE_DEFECTS`).
@@ -6188,9 +6604,20 @@ class AuthService:
         # ``account_disabled`` would be a false statement in a security notice, and the login-path
         # scope re-sync this mirrors sends no notice either. The audit row and the
         # ``ad_session_revoked`` alert record it.
+        #
+        # ACCOUNT_DISABLED only when the pass READ the disabled bit (vault BACKLOG #2140). That
+        # notice says an administrator disabled the account, which an absent account or an unreadable
+        # attribute does not establish, so every other whole-account reason, including any added
+        # later, gets the neutral DIRECTORY_SESSIONS_ENDED.
+        if revocation.role_ids is not None:
+            kind = ROLES_CHANGED
+        elif revocation.reason == reconcile.REVOKE_REASONS[reconcile.ProbeOutcome.DISABLED]:
+            kind = ACCOUNT_DISABLED
+        else:
+            kind = DIRECTORY_SESSIONS_ENDED
         if user is not None and revocation.reason != reconcile.SCOPE_CHANGED:
             await self._notify_security(
-                ACCOUNT_DISABLED if revocation.role_ids is None else ROLES_CHANGED,
+                kind,
                 username=user.username,
                 email=user.notify_email,
                 detail={"reason": revocation.reason},
@@ -6551,7 +6978,8 @@ class AuthService:
 
     async def identity_for_cert_user_id(self, user_id: str) -> Identity | None:
         """Resolve the users-row id a verified client cert maps to, or ``None`` when that account is
-        unknown or disabled — WITHOUT a bearer session (BACKLOG #2238, ADR 0083).
+        unknown, disabled, or a directory account the directory does not confirm — WITHOUT a bearer
+        session (BACKLOG #2238, #2316, ADR 0083).
 
         The mTLS map targets the row id, not the username, because a username can be released by a
         rename and taken by another row: a map keyed by name would then hand the cert to that other
@@ -6560,13 +6988,188 @@ class AuthService:
         treats it (:meth:`identity_for_token`); unlike :meth:`identity_for_user_id`, which the
         permission inspector uses and which resolves a disabled account on purpose.
 
-        No directory check, the same as the name-keyed path before it: the engine row's ``disabled``
-        flag is the one this path has always read. Asking the directory per request is a separate
-        control change, not this key change."""
+        **A DIRECTORY ACCOUNT IS ASKED ABOUT ON EVERY REQUEST, AND FAILS CLOSED (BACKLOG #2316).**
+        The engine row's ``disabled`` flag and roles are not enough for an AD row: the reconciler
+        probes only accounts holding a live session, and a certificate caller holds none, so nothing
+        ever refreshed them and a directory-side disable or group removal never reached this path.
+        So an AD row gets the same probe and the same refusals as directory step-up
+        (:meth:`_directory_presence`): anything short of a present, enabled account in the directory
+        returns ``None``. That includes an unreachable or referring directory, no directory wired,
+        and a row with no ``directory_object_id``. A local row is never probed.
+
+        **Roles NARROW rather than refuse.** The identity carries the stored roles that the
+        account's current groups still map to: never more than the row holds, because this path
+        writes nothing and must not grant, and never more than the directory now grants. So an
+        account removed from one of two mapped groups keeps the other role on its next request,
+        where step-up refuses outright. An empty result returns ``None``. The channel scope narrows
+        on the same groups, by the rule sign-in uses (:func:`_cert_narrowed_scope`), so a scope an
+        administrator set is kept when no scope-mapped group matches. Nothing is written: only a
+        sign-in, or a reconciler pass while the account holds a session, re-syncs the row.
+
+        **No cache, and a bounded wait.** A cached answer would bring back the staleness this
+        closes. Concurrent probes are capped at :data:`_CERT_PROBE_MAX_CONCURRENCY`; a request that
+        cannot get a slot within :data:`_CERT_PROBE_SLOT_WAIT_SECONDS` is refused. Refusals do not
+        log one line per request; :meth:`_note_cert_directory_answer` says what they log."""
         user = await self._store.get_user(user_id)
         if user is None or user.disabled:
             return None
-        return await self._build_identity(user)
+        if user.auth_provider != AuthProvider.AD.value:
+            return await self._build_identity(user)
+        answer = await self._cert_directory_presence(user)
+        self._note_cert_directory_answer(answer)
+        if not isinstance(answer, reconcile.Probe):
+            return None
+        # Everything below is read after the probe, as step-up does: the round trip can be seconds,
+        # and a local disable, a scope edit or a sign-in's role re-sync may have landed meanwhile.
+        # The answer vouches only for the account it asked about, so a row whose immutable id or
+        # provider moved during the round trip is refused rather than judged on another's answer.
+        asked = user
+        user = await self._store.get_user(user_id)
+        if (
+            user is None
+            or user.disabled
+            or user.auth_provider != asked.auth_provider
+            or user.directory_object_id != asked.directory_object_id
+        ):
+            return None
+        granted = await self._store.roles_for_ad_groups(answer.groups)
+        held = await self._store.get_user_role_ids(user.id)
+        kept = [role_id for role_id in held if role_id in granted]
+        if not kept:
+            return None
+        # The scope narrows on the same groups, by the rule login and the reconciler share. Its
+        # TARGET roles decide the Administrator short-circuit there; here that is the kept set.
+        administrator = Role.ADMINISTRATOR.value in kept
+        mapped = (
+            frozenset()
+            if administrator
+            else frozenset(await self._store.channels_for_ad_groups(answer.groups))
+        )
+        return await self._build_identity(
+            _cert_narrowed_scope(user, mapped, administrator=administrator), role_ids=kept
+        )
+
+    async def _cert_directory_presence(self, user: UserRecord) -> reconcile.Probe | str:
+        """:meth:`_directory_presence` under the certificate path's probe cap (BACKLOG #2316), or
+        :data:`CERT_PROBE_SATURATED` when no slot frees within the wait bound.
+
+        The slot is held until the probe itself ends, not until this caller stops waiting. The
+        probe's worker thread cannot be cancelled, so releasing on a cancelled request would let
+        the threads outnumber the cap. The probe therefore runs as its own task, shielded, and
+        releases its slot when it finishes."""
+        try:
+            async with asyncio.timeout(_CERT_PROBE_SLOT_WAIT_SECONDS):
+                await self._cert_probe_slots.acquire()
+        except TimeoutError:
+            return CERT_PROBE_SATURATED
+        try:
+            task = asyncio.create_task(self._cert_probe(user))
+        except BaseException:
+            self._cert_probe_slots.release()
+            raise
+        self._cert_probe_tasks.add(task)
+        task.add_done_callback(self._cert_probe_done)
+        return await asyncio.shield(task)
+
+    async def _cert_probe(self, user: UserRecord) -> reconcile.Probe | str:
+        # This task's own context, so the DEBUG level never reaches the reconciler or step-up. A
+        # fault on one account's entry would otherwise log a WARNING naming it on every request;
+        # the outage line below reports it once instead.
+        token = _PROBE_FAULT_LOG_LEVEL.set(logging.DEBUG)
+        try:
+            return await self._directory_presence(user)
+        except Exception:
+            # Returned, never raised: a raise from a probe whose caller was cancelled would reach
+            # the loop's exception handler through the shield, one ERROR per orphaned request.
+            # Read as an outage, which fails closed and logs by the outage rules. The traceback can
+            # quote a directory value, so it goes to DEBUG and names no account.
+            _log.debug("certificate-path directory probe raised", exc_info=True)
+            return reconcile.ProbeOutcome.UNAVAILABLE.value
+        finally:
+            _PROBE_FAULT_LOG_LEVEL.reset(token)
+
+    def _cert_probe_done(self, task: asyncio.Task[reconcile.Probe | str]) -> None:
+        self._cert_probe_slots.release()
+        self._cert_probe_tasks.discard(task)
+        if not task.cancelled():
+            # Only a BaseException that is not an Exception can end here; _cert_probe returns
+            # everything else. Retrieved so it is not also reported as never retrieved.
+            task.exception()
+
+    def _note_cert_directory_answer(self, answer: reconcile.Probe | str) -> None:
+        """Log the certificate path's directory refusals without logging one line per request.
+
+        An outage is a refusal that says the directory could not be asked: unreachable, referring,
+        a fault reading the entry, or the probe cap full. It logs one WARNING per outage and, if that
+        WARNING was logged, one INFO on the next answer the directory actually gave, whatever it
+        said about the account. WARNINGs are at least :data:`_CERT_OUTAGE_LOG_INTERVAL_SECONDS`
+        apart, so an outage that flaps (a full cap turning over, or one referring account beside a
+        healthy one) still logs about once a minute. An outage that starts inside that interval
+        logs its WARNING on its first refusal after the interval ends, so a long one is never
+        silent. A logged outage whose reason changes logs the change at INFO, at most once per
+        interval, and the closing INFO names the latest reason.
+
+        A configuration refusal (no directory wired, a row with no immutable id) asks nothing and
+        moves neither way. It logs one WARNING per reason per process instead.
+
+        The lines name no account. Every service request during an outage is refused the same way,
+        and the username is not the useful fact."""
+        outcome = answer.outcome.value if isinstance(answer, reconcile.Probe) else answer
+        if outcome in _CERT_DIRECTORY_OUTAGES:
+            now = time.monotonic()
+            latched = self._cert_directory_outage
+            self._cert_directory_outage = outcome
+            if latched is not None and self._cert_outage_announced:
+                if outcome != latched:
+                    self._note_cert_outage_kind_change(latched, outcome, now)
+                return
+            last = self._cert_outage_warned_at
+            if last is not None and now - last < _CERT_OUTAGE_LOG_INTERVAL_SECONDS:
+                if latched is None:
+                    _log.debug("certificate-path directory check returned %s again", outcome)
+                return
+            self._cert_outage_announced = True
+            self._cert_outage_warned_at = now
+            self._cert_outage_kind_noted_at = None
+            _log.warning(
+                "mTLS certificate identities for directory accounts are refused: the directory "
+                "check returned %s. Logged once until a check reaches the directory again",
+                outcome,
+            )
+        elif outcome in _CERT_DIRECTORY_ANSWERS:
+            if self._cert_directory_outage is None:
+                return
+            if self._cert_outage_announced:
+                _log.info(
+                    "mTLS certificate identities for directory accounts: the directory check "
+                    "reaches the directory again (it last returned %s)",
+                    self._cert_directory_outage,
+                )
+            self._cert_directory_outage = None
+            self._cert_outage_announced = False
+        elif outcome not in self._cert_config_refusals_logged:
+            self._cert_config_refusals_logged.add(outcome)
+            _log.warning(
+                "an mTLS certificate identity for a directory account was refused: %s. Logged "
+                "once per process for this reason",
+                outcome,
+            )
+
+    def _note_cert_outage_kind_change(self, before: str, after: str, now: float) -> None:
+        """Log that a logged certificate-path outage changed its reason, at INFO at most once per
+        :data:`_CERT_OUTAGE_LOG_INTERVAL_SECONDS` and otherwise at DEBUG. A full cap and an
+        unreachable directory can alternate request by request, and must not log a line each."""
+        last = self._cert_outage_kind_noted_at
+        if last is not None and now - last < _CERT_OUTAGE_LOG_INTERVAL_SECONDS:
+            _log.debug("certificate-path directory check now returns %s (was %s)", after, before)
+            return
+        self._cert_outage_kind_noted_at = now
+        _log.info(
+            "mTLS certificate identities for directory accounts are still refused: the directory "
+            "check now returns %s (it had returned %s)",
+            after,
+            before,
+        )
 
     async def identity_for_user_id(self, user_id: str) -> Identity | None:
         """Resolve a user id directly to its :class:`Identity` (roles + custom-role overlay), or
@@ -6710,8 +7313,15 @@ class AuthService:
             granted |= decode_custom_role_permissions(row["permissions"])
         return frozenset(granted)
 
-    async def _build_identity(self, user: UserRecord) -> Identity:
-        role_ids = await self._store.get_user_role_ids(user.id)
+    async def _build_identity(
+        self, user: UserRecord, *, role_ids: Iterable[str] | None = None
+    ) -> Identity:
+        """The account's :class:`Identity`. ``role_ids`` replaces the stored role ids when given, so
+        a caller that narrowed them (:meth:`identity_for_cert_user_id`) gets the same built-in,
+        custom-role and channel treatment as every other path."""
+        if role_ids is None:
+            role_ids = await self._store.get_user_role_ids(user.id)
+        role_ids = list(role_ids)
         roles = _roles_from_ids(role_ids)
         custom_permissions = await self._custom_permissions_for_ids(role_ids)
         provider = (
@@ -8194,7 +8804,10 @@ class AuthService:
         Returns an :class:`Elevation` whose ``recovery_codes`` carry the plaintext codes; a wrong code
         (or a time-step already consumed -- single-use, BACKLOG #1021) elevates nothing and carries
         none. A good code on a session revoked before the rotation returns ``session_lost`` with MFA
-        still OFF (BACKLOG #1902), so a lost session never leaves MFA on with codes nobody saw.
+        still OFF (BACKLOG #1902), so a lost session never leaves MFA on with codes nobody saw. So
+        does a good code whose activation matches no row, because a reset cleared the staged secret
+        or a second confirm enabled first (BACKLOG #2224). That confirm ends the session it rotated,
+        hands back no codes, and audits ``auth.mfa_enroll_refused``.
 
         This is one of the two legs that turn an MFA-pending session into an MFA-satisfied one for a
         FIRST enrolment, so it rotates for the same reason ``verify_mfa`` does: without it a pre-MFA
@@ -8246,9 +8859,36 @@ class AuthService:
             client=client,
             recovery_codes=tuple(plain),
         )
-        if not elevation.ok:
+        if elevation.token is None:  # not ``ok``, spelled so mypy narrows the token below
             return elevation
-        await self._store.enable_totp(identity.user_id, recovery_code_hashes=hashes)
+        if not await self._store.enable_totp(identity.user_id, recovery_code_hashes=hashes):
+            # BACKLOG #2224: the conditional enable matched no row, because an administrator's
+            # reset cleared the staged secret inside the rotation window, or a second confirm
+            # enabled TOTP first. This confirm turns nothing on and its codes are dropped. The
+            # rotated session was stamped MFA-verified against a factor that is gone or not this
+            # ceremony's, so it is ended rather than handed back: ``session_lost``, the same
+            # fail-closed answer as a session revoked before the rotation.
+            #
+            # Known cost: ``_elevated`` already ran the session cap for the rotated session, so
+            # at the cap that run may have ended the account's oldest full session, and it stays
+            # ended. The order is #1902's, rotate first and enable last, and is kept.
+            await self._store.revoke_session(hash_token(elevation.token))
+            # The reason is the row's state read AFTER the refusal, not the write's own verdict,
+            # so a later write can blur it; it is a pointer for an operator, not a proof.
+            after = await self._store.get_user(identity.user_id)
+            if after is None:
+                reason = "account_gone"
+            elif after.totp_enabled:
+                reason = "already_enabled"
+            else:
+                reason = "secret_cleared"
+            await self._audit(
+                "auth.mfa_enroll_refused",
+                actor=identity.username,
+                detail=_json({"reason": reason, "session_ended": True}),
+                client=client,
+            )
+            return Elevation(session_lost=True)
         await self._audit("auth.mfa_enrolled", actor=identity.username, client=client)
         # ADR 0197 Amendment A: enrolment now comes BEFORE the first rotation, so whoever intercepts
         # an issued credential can enrol their own authenticator without rotating. The notice to a
@@ -8502,8 +9142,8 @@ class AuthService:
 
         **FAILS CLOSED, UNLIKE THE RECONCILER.** The reconciler REVOKES, so it fails open on an
         unreachable directory and wants two strikes for an ambiguous answer. This GRANTS, so any
-        answer short of a present, enabled account refuses: absent, disabled, undetermined and
-        unavailable alike. The directory step-up legs already refuse this way: ``_reauth_ad`` on a
+        answer short of a present, enabled account refuses: absent, disabled, undetermined,
+        unavailable and referred (BACKLOG #2538) alike. The directory step-up legs already refuse this way: ``_reauth_ad`` on a
         failed bind, and the federated step-up on ``directory_unavailable``. A refusal revokes
         nothing, so the next attempt asks again. An AD row on an engine with no directory
         configured is refused as ``not_configured``, because nothing can confirm it.
@@ -8523,6 +9163,26 @@ class AuthService:
         refuses even when the new role grants more. This refuses and writes nothing; the reconciler
         or the next sign-in re-syncs the roles. Channel scope is not compared here.
         """
+        answer = await self._directory_presence(user)
+        if not isinstance(answer, reconcile.Probe):
+            return answer
+        # The groups came back with the probe, so this costs store reads only. Read after the probe,
+        # so a sign-in that re-synced the roles during the round trip is judged on what it wrote.
+        held = set(await self._store.get_user_role_ids(user.id))
+        if not held <= await self._store.roles_for_ad_groups(answer.groups):
+            return DIRECTORY_ROLES_DEMOTED
+        return None
+
+    async def _directory_presence(self, user: UserRecord) -> reconcile.Probe | str:
+        """Ask the directory whether AD row ``user`` is a present, enabled account. Returns the
+        PRESENT probe, which carries the account's current groups, or the refusal reason string.
+
+        The fail-closed half :meth:`_directory_step_up_refusal` and
+        :meth:`identity_for_cert_user_id` share. Every answer short of PRESENT is a reason:
+        ``not_configured`` with no directory wired, :data:`DIRECTORY_OBJECT_ID_MISSING` for a row
+        with no immutable id (asked nothing, see the step-up docstring), and otherwise the probe's
+        own outcome value.
+        """
         if self._ldap is None:
             return "not_configured"
         if not user.directory_object_id:
@@ -8533,12 +9193,7 @@ class AuthService:
         probe = await self._probe_principal(user)
         if probe.outcome is not reconcile.ProbeOutcome.PRESENT:
             return str(probe.outcome.value)
-        # The groups came back with the probe, so this costs store reads only. Read after the probe,
-        # so a sign-in that re-synced the roles during the round trip is judged on what it wrote.
-        held = set(await self._store.get_user_role_ids(user.id))
-        if not held <= await self._store.roles_for_ad_groups(probe.groups):
-            return DIRECTORY_ROLES_DEMOTED
-        return None
+        return probe
 
     async def _verify_second_factor(
         self,

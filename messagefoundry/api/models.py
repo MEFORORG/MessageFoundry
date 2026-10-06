@@ -1257,8 +1257,12 @@ class DrActionResult(BaseModel):
     verify_status: str | None = None
     seed_segment: str | None = None
     vip_hook_ran: bool = False
-    # Release only (vault BACKLOG #3067): whether every drainable row drained, and how many rows
-    # stay held on outbounds the engine parks. A release that did not drain says so here.
+    #: Release only: the staged-queue depth left when the drain ended, held rows included. More
+    #: than ``held_on_parked_outbounds`` means the drain gave up at its bound and those rows stay
+    #: queued (vault BACKLOG #2752).
+    depth_left: int | None = None
+    #: Release only (vault BACKLOG #3067): whether every drainable row drained, and how many rows
+    #: stay held on outbounds the engine parks. A release that did not drain says so here.
     drained: bool | None = None
     held_on_parked_outbounds: int | None = None
 

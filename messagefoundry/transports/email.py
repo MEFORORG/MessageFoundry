@@ -412,9 +412,9 @@ class EmailDestination(DestinationConnector):
                     f"the SMTP hop to {self.host} — the session is encrypted but UNAUTHENTICATED, so "
                     "an on-path attacker presenting any certificate reads the message body (PHI) and "
                     "any SMTP authentication credential. Use a trusted CA (tls_ca_file, or [tls].internal_ca_file "
-                    f"for the instance), or set {INSECURE_TLS_ESCAPE_ENV}=1 to allow it on a "
-                    "trusted-network bind (refused on a production-PHI instance even with the escape, "
-                    "#200)."
+                    f"for the instance), or set {INSECURE_TLS_ESCAPE_ENV}=1 on an instance at "
+                    "[security].enforcement = warn to allow it on a trusted-network bind (the escape "
+                    "has no effect while enforcing, the default, or with no posture)."
                 )
             # Credentials over an unauthenticated channel are refused for the same reason they are
             # refused over cleartext: an on-path attacker who can present any cert can capture the

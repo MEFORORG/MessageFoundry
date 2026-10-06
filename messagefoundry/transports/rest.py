@@ -386,10 +386,12 @@ def http_family_trust_anchor(
     their provider checks the URL, so they pass the setting's name and the operator learns which
     URL to fix."""
     ca = settings.get("tls_ca_file")
+    connection = settings.get(MIRRORED_CONNECTION_SETTING)
     return resolve_trust_anchor(
         connection_ca_file=str(ca) if ca else None,
         host=hop_url_host(url, cell=cell),
         policy=trust_anchor_policy if trust_anchor_policy is not None else TrustAnchorPolicy(),
+        connection=None if connection is None else str(connection),
     )
 
 

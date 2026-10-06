@@ -504,7 +504,7 @@ def _server_ssl_context(s: dict[str, Any], *, name: str = "") -> ssl.SSLContext 
         # An HTTP proxy can terminate neither DIMSE nor MLLP, so for this listener the documented
         # out-of-engine delegation does not reach and there is no workaround.
         if crl := s.get("tls_crl_file"):
-            harden_crl_check(ctx, str(crl))
+            harden_crl_check(ctx, str(crl), setting=f"inbound connection '{name}' tls_crl_file")
     harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
     # Narrow first, assert last, both spelled here -- do NOT fold them into one call; see
     # apply_connection_tls_ciphers. Unset (the default) narrows to the approved AEAD suites
@@ -1188,7 +1188,7 @@ class DicomScpSource(SourceConnector):
 
 
 def _client_ssl_context(
-    s: dict[str, Any], *, trust_anchor_policy: TrustAnchorPolicy | None = None
+    s: dict[str, Any], *, trust_anchor_policy: TrustAnchorPolicy | None = None, name: str = ""
 ) -> ssl.SSLContext | None:
     """Build the SCU's **client** ``SSLContext`` for DICOM-over-TLS dialing a downstream PACS, or
     ``None`` when ``tls`` is off. Built via :func:`ssl.create_default_context` (like MLLP/REST) so it
@@ -1198,7 +1198,8 @@ def _client_ssl_context(
     ``tls_key_file`` opt into mTLS. Verification is never disabled (a downstream is a PHI egress). TLS
     1.2+ floor. Built once at construction so a bad cert/key fails at build (dry-run/``check``), not at
     the first delivery — the client mirror of :func:`_server_ssl_context`. ``tls_key_password`` decrypts
-    a passphrase-encrypted mTLS client key (``env()``-sourced, mirroring MLLP).
+    a passphrase-encrypted mTLS client key (``env()``-sourced, mirroring MLLP). ``name`` is the
+    connection's, for a refusal of an unreadable ``tls_ca_file`` to name (vault BACKLOG #2370).
 
     ``trust_anchor_policy`` (#190, ADR 0093) supplies the instance ``[tls]`` internal-CA fallback when
     the connection names no ``tls_ca_file`` of its own: an internal hop verifies against the org internal
@@ -1215,6 +1216,7 @@ def _client_ssl_context(
             connection_ca_file=str(ca) if ca else None,
             host=str(s.get("host", "")),
             policy=trust_anchor_policy,
+            connection=name or None,
         )
         ctx = build_verifying_client_context(anchor)
     else:
@@ -1288,7 +1290,9 @@ class DicomScuDestination(DestinationConnector):
         # at the first delivery (like the SCP / MLLP / REST). #190 (ADR 0093): thread the instance [tls]
         # internal-CA trust-anchor policy so an internal hop that names no tls_ca_file of its own verifies
         # against the org internal CA.
-        self._ssl = _client_ssl_context(s, trust_anchor_policy=config.trust_anchor_policy)
+        self._ssl = _client_ssl_context(
+            s, trust_anchor_policy=config.trust_anchor_policy, name=config.name
+        )
         # #200 (ADR 0092): a plaintext DIMSE association (DICOM-over-TLS off) is a cleartext PHI hop —
         # guard it on the posture gradient (a production-PHI hop off-loopback is refused at the enforced
         # construction gate). None when TLS is on: a verified association needs no cleartext guard.

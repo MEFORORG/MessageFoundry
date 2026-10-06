@@ -340,7 +340,8 @@ The one row that *does* vary:
 ### `[tls]` — outbound client trust anchors
 Instance-wide **client trust-anchor policy** (#190, [ADR 0093](adr/0093-pinned-internal-ca-trust-anchor.md)) —
 a small shared fallback for the outbound connectors that verify a downstream *server* certificate (MLLP,
-DICOM, FTPS today). By default the OS trust store roots verify the peer; a hospital estate whose internal
+DICOM, FTPS today). The inbound FTPS poller dials out and verifies its server too, so it reads this block
+as well (vault BACKLOG #2370): a `pinned` mode or a `crl_file` must suit its partner. By default the OS trust store roots verify the peer; a hospital estate whose internal
 endpoints present a private/internal-CA certificate can pin that CA **once** here instead of installing it
 box-globally or repeating a per-connection `tls_ca_file`. This selects **which** roots verify the peer — it
 **never disables verification** — so it composes with (never weakens) the connectors' fail-closed no-CA /
@@ -715,7 +716,8 @@ document ([SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md)).
 #### When the reconciler's two alerts resolve themselves
 
 The session reconciler's `ad_reconcile_aborted` (the breaker) and `ad_reconcile_held` (the hold)
-alerts resolve on their own when a pass is evidence the condition has gone (BACKLOG #2136). This
+alerts resolve on their own when a pass is evidence the condition has gone (BACKLOG #2136). So
+does the referral's own `ad_reconcile_aborted` instance, under a separate source (below). This
 needs alert state ([ADR 0044](adr/0044-operator-alert-state.md)). The pass must have an answer, from
 this engine process, for every signed-in directory account it did not just revoke.
 
@@ -739,11 +741,25 @@ engine resolves the next trip or hold on its own.
   it reads clean. Reading clean means a pass that did not abort found the account present and
   enabled. A held read, or one that adds a strike, does not count. The reconciler revoking the
   account counts as leaving. The engine then resolves no trip until its
-  next restart. The engine logs a warning when it gives up either resolve.
+  next restart. The engine logs a warning when it gives up any resolve.
+- An LDAP referral opens its own `ad_reconcile_aborted` instance, with reason `directory_referral`
+  and source `directory-reconciler-referral` (BACKLOG #2538). It follows the same rule: the engine
+  resolves it only after a pass of its own saw a referral. It resolves once every account signed
+  in at the last referral has since been read in full, present and enabled, on a pass with no
+  referral. A pass with any referral resolves none of these alerts.
+- So an account that never reads in full keeps the referral's alert open while it is signed in. A
+  held account, a disabled one awaiting its strikes, and one that never answers all do this.
+- An engine gives up resolving the referral when an account signed in at the last referral leaves
+  before it reads in full. The reconciler revoking the account counts as leaving, including on the
+  pass that saw the referral. The engine then resolves no referral until its next restart.
+- A search base changes only on a restart, and a restarted engine resolves no alert its last run
+  left open. So once you fix a referring base and restart, you resolve the referral's alert
+  yourself. The engine resolves a referral on its own only when it clears without a restart, such
+  as a directory-side change.
 
 A pass judges only accounts that hold a session, and nothing reads an account again once it has
 left. An account leaves at least when it signs out, reaches the session cap, is revoked by the
-reconciler, is disabled locally, or is deleted. The two give-up rules above stop an alert resolving
+reconciler, is disabled locally, or is deleted. The give-up rules above stop an alert resolving
 on the accounts that remain. The cost is a missed resolve when an account leaves for an ordinary
 reason, such as a sign-out, while the evidence is still pending.
 
@@ -1290,10 +1306,15 @@ started together, can each raise it; the alert list folds them into one instance
   `loosenings` is `null`, since the loosenings reader sees only the reloaded graph. A later start
   passes over it to the reload's own row.
 - A start that could not take that snapshot still starts, with comparison `no_start_digest`. Its
-  row is degraded with the `start_snapshot` step, and its `dir`, counts, digest and `loosenings`
-  are `null`. A start that could not tell whether a reload swapped its graph names its own graph,
-  degraded with the `start_swap_check` step and `loosenings` `null`. A later start passes over
-  both rows.
+  row is degraded with the `start_snapshot` step. Its `dir`, counts and `loosenings` are `null`,
+  and it has no `fingerprint` key at all. A start that could not tell whether a reload swapped its
+  graph names its own graph, degraded with the `start_swap_check` step and `loosenings` `null`. A
+  later start passes over both rows.
+- A convergence reload writes its own `config_reload` row, in the shape an operator reload writes
+  (vault BACKLOG #3076). Its actor is `system:cluster-convergence` and its `initiator` is
+  `cluster_convergence`. So the store's newest baseline names the graph the node converged on,
+  whether the reload lands before or after the start's row. A convergence row that could not take
+  a fingerprint is marked `baseline_unchecked`, so a later start passes over it.
 - The pass-over looks through the newest 50 config rows at most. If none is usable, the start
   begins a new baseline and says at WARNING that a change made before those rows is not reported.
 

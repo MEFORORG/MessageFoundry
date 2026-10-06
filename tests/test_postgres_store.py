@@ -796,6 +796,31 @@ async def test_cancel_queued(store) -> None:
     assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
 
 
+async def test_cancel_queued_top_only_cancels_a_backing_off_head(store) -> None:
+    # vault BACKLOG #2754: a backed-off head is later-due than the row behind it; "purge top" must
+    # still cancel the FIFO head (seq order, as claim_next_fifo), not the earliest-due row.
+    m1 = await store.enqueue_message(
+        channel_id="IB", raw=RAW, deliveries=[("OB1", "p1")], now=100.0
+    )
+    m2 = await store.enqueue_message(
+        channel_id="IB", raw=RAW, deliveries=[("OB1", "p2")], now=101.0
+    )
+    head = await store.claim_next_fifo("OB1", now=102.0)
+    assert head is not None and head.message_id == m1
+    await store.mark_failed(
+        head.id, "boom", RetryPolicy(max_attempts=None, backoff_seconds=60.0), now=102.0
+    )
+    assert (await store.outbox_for(m1))[0]["next_attempt_at"] > (await store.outbox_for(m2))[0][
+        "next_attempt_at"
+    ]
+    assert await store.claim_next_fifo("OB1", now=103.0) is None  # the head blocks the lane
+    assert await store.cancel_queued(None, "OB1", top_only=True, now=103.0) == 1
+    assert (await store.outbox_for(m1))[0]["status"] == OutboxStatus.CANCELLED.value
+    assert (await store.outbox_for(m2))[0]["status"] == OutboxStatus.PENDING.value
+    nxt = await store.claim_next_fifo("OB1", now=103.0)
+    assert nxt is not None and nxt.message_id == m2
+
+
 async def test_dead_letter_missing_destinations(store) -> None:
     mid = await store.enqueue_message(
         channel_id="IB", raw=RAW, deliveries=[("GONE", "p")], now=100.0
@@ -4410,7 +4435,7 @@ async def test_store_once_deliver_many_body_ref_inert(store) -> None:
         assert item is not None and item.payload == body
 
 
-async def test_audit_verify_cli_server(store, capsys) -> None:
+async def test_audit_verify_cli_server(store, capsys, monkeypatch) -> None:
     """CLI-22 (Postgres mirror): the ``audit-verify`` CLI wrapper reaches the live Postgres store via
     ``MEFOR_STORE_*`` env (no ``--db``; the M-31 missing-DB guard is SQLite-only, so it's inert and the
     CLI goes straight to ``open_store`` on the env-configured backend). Seed a keyless audit chain
@@ -4418,7 +4443,11 @@ async def test_audit_verify_cli_server(store, capsys) -> None:
     it), then run the CLI OFF the event loop — ``_audit_verify`` calls ``asyncio.run`` internally, which
     raises inside a running loop, so ``asyncio.to_thread`` gives it a fresh loop + its own pool."""
     from messagefoundry.__main__ import main
+    from tests._phi_gate_provisions import setenv_at_rest_opt_out
 
+    # The chain is keyless, so verify it under the opt-out a keyless engine runs with: in a shell
+    # whose settings require a key, a clean keyless walk exits 5 (vault BACKLOG #3054).
+    setenv_at_rest_opt_out(monkeypatch)
     await store.record_audit("message_view", actor="alice", detail="v1")
     await store.record_audit("export", actor="bob", detail="e1")
     rc = await asyncio.to_thread(main, ["audit-verify"])  # backend from env; NO --db
@@ -4427,7 +4456,7 @@ async def test_audit_verify_cli_server(store, capsys) -> None:
     assert "OK:" in out and "verified 2" in out
 
 
-async def test_audit_anchor_cli_server(store, capsys) -> None:
+async def test_audit_anchor_cli_server(store, capsys, monkeypatch) -> None:
     """BACKLOG #328 (Postgres mirror): ``audit-anchor`` + ``audit-verify --expected-anchor``.
 
     ``audit_anchor()`` is implemented separately per backend (``store.py`` / ``sqlserver.py`` /
@@ -4439,6 +4468,9 @@ async def test_audit_anchor_cli_server(store, capsys) -> None:
     guard is SQLite-only and inert here), driven through ``asyncio.to_thread`` because ``_audit_anchor``
     calls ``asyncio.run`` internally. The anchor is captured at RUNTIME, never a literal."""
     from messagefoundry.__main__ import main
+    from tests._phi_gate_provisions import setenv_at_rest_opt_out
+
+    setenv_at_rest_opt_out(monkeypatch)  # a keyless chain, as above (vault BACKLOG #3054)
 
     await store.record_audit("message_view", actor="alice", detail="v1")
     await store.record_audit("export", actor="bob", detail="e1")

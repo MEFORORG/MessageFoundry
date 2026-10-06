@@ -83,14 +83,15 @@ RUN apt-get update \
 # writable DIRECTORY (a single writable file mount is not enough). /config is the read-only config-repo
 # mount. Everything else stays read-only; /tmp is provided as a tmpfs at run time.
 #
-# THESE TWO PATHS ARE ALL THE RUNTIME UID OWNS (vault BACKLOG #2701). /var/lib/mefor because the
-# engine writes it. /config because the config-source guard refuses a config dir owned by another
-# uid. The venv is NOT in that list: the final stages copy it root-owned, so the engine's own
+# THIS STEP GIVES THE RUNTIME UID /var/lib/mefor ONLY (vault BACKLOG #2701): the engine writes it.
+# /config stays root-owned: the config-source guard trusts root as an owner (vault BACKLOG #2759),
+# and a root-owned config directory is one the engine's own account cannot add a module to. The
+# venv is NOT owned by the runtime uid either: the final stages copy it root-owned, so the engine's own
 # account cannot add a .pth file or a sitecustomize module to site-packages even where the root
 # file system is left writable (a plain `docker run` with no --read-only).
 RUN useradd --uid 10001 --create-home --shell /usr/sbin/nologin mefor \
  && mkdir -p /var/lib/mefor /config \
- && chown -R 10001:10001 /var/lib/mefor /config
+ && chown -R 10001:10001 /var/lib/mefor
 # PYTHONUNBUFFERED and PYTHONDONTWRITEBYTECODE are for the Python CHILDREN the engine starts (an
 # engine shard under `supervise`, the sandbox worker). The engine itself is started in isolated
 # mode by the ENTRYPOINT below, which ignores every PYTHON* variable, so it gets the same two

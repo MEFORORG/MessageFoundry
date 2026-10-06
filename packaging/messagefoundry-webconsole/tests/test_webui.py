@@ -19,7 +19,7 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
 import httpx
 import pytest
-from _ui_clients import create_local_user_chosen
+from _ui_clients import create_local_user_chosen, issue_continuation
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
@@ -113,7 +113,11 @@ async def _mint_action(
     """7.5.1 (ADR 0077): POST /ui/reauth to mint the single-use ACTION grant bound to ``next_path``;
     the caller then re-POSTs the action to consume it. The login window no longer unlocks a /ui factor
     bind, so every factor lane needs its own fresh grant. Pass ``code`` for a full-step-up (enrolled)
-    reauth (e.g. disable-MFA on an enrolled session)."""
+    reauth (e.g. disable-MFA on an enrolled session).
+
+    The continuation is issued first, as the step-up gate's refusal would issue it (vault BACKLOG
+    #2764): /ui/reauth mints the grant only for a continuation the console issued to this session."""
+    issue_continuation(c, next_path)
     data = {"next": next_path, "password": PW}
     if code is not None:
         data["code"] = code
@@ -2592,16 +2596,18 @@ def test_register_ui_action_extends_the_stepup_allowlist() -> None:
     # A not-yet-registered path is not auto-retryable.
     pat = r"^/ui/alerts/[^/?#]+/ack$"
     assert not is_safe_ui_action("/ui/alerts/7/ack")
-    register_ui_action(pat, Permission.MONITORING_DIAGNOSE)
+    register_ui_action(pat, Permission.MONITORING_DIAGNOSE, label="Acknowledge an alert")
     assert is_safe_ui_action("/ui/alerts/7/ack")  # now allowed
     assert not is_safe_ui_action("/ui/alerts/7/../ack")  # .. still rejected
 
     # A body-carrying action (auto_retry=False) never rides the URL auto-retry.
-    register_ui_action(r"^/ui/users/create$", Permission.USERS_MANAGE, auto_retry=False)
+    register_ui_action(
+        r"^/ui/users/create$", Permission.USERS_MANAGE, auto_retry=False, label="Create a user"
+    )
     assert not is_safe_ui_action("/ui/users/create")
 
     # Idempotent by pattern.
-    register_ui_action(pat, Permission.MONITORING_DIAGNOSE)
+    register_ui_action(pat, Permission.MONITORING_DIAGNOSE, label="Acknowledge an alert")
     assert sum(1 for a in _UI_WRITE_ACTIONS if a.path_re.pattern == pat) == 1
 
 
@@ -2840,17 +2846,20 @@ async def test_purge_after_login_stepup_reaches_handler(engine: Engine) -> None:
         assert "reauth" not in r.headers.get("location", "")
 
 
-async def test_purge_action_registered_in_stepup_allowlist(engine: Engine) -> None:
-    # Creating the /ui app registers the purge action, so the re-auth flow may auto-retry it (path-based,
-    # body-less). A non-purge or query-bearing path is not accepted.
-    from messagefoundry_webconsole import is_safe_ui_action
+async def test_purge_action_not_registered_in_stepup_allowlist(engine: Engine) -> None:
+    # Vault BACKLOG #2764: the per-name purge was once an auto-retry continuation, but no page renders
+    # a form to it, so the re-auth auto-submit had become its only browser entry point. Even with the
+    # /ui app mounted (every registration fired), the re-auth flow may not continue to it.
+    from messagefoundry_webconsole import is_safe_ui_action, lookup_ui_action
 
     service = await _service(engine)
     create_app(engine, auth=service, serve_ui=True)
-    assert is_safe_ui_action("/ui/connections/OB_X/purge/all")
-    assert is_safe_ui_action("/ui/connections/OB_X/purge/top")
-    assert not is_safe_ui_action("/ui/connections/OB_X/purge/some")  # bad scope
-    assert not is_safe_ui_action("/ui/connections/OB_X/purge/all?x=1")  # query rejected
+    for scope in ("all", "top"):
+        assert not is_safe_ui_action(f"/ui/connections/OB_X/purge/{scope}")
+        assert lookup_ui_action(f"/ui/connections/OB_X/purge/{scope}") is None
+    # The confirm page the console actually purges through stays an unlock continuation.
+    confirm = lookup_ui_action("/ui/connections/purge-confirm")
+    assert confirm is not None and confirm.unlock
 
 
 async def test_purge_stale_stepup_redirects_to_reauth(engine: Engine) -> None:
@@ -2897,10 +2906,11 @@ async def test_purge_stale_stepup_redirects_to_reauth(engine: Engine) -> None:
         )
         # The LOCATION is the assertion that carries the property: a SUCCESSFUL purge also answers
         # 303 (RedirectResponse("/ui")), so the status alone would not say the gate refused. The
-        # exact continuation, not just the /ui/reauth prefix: the purge is registered auto_retry, so
-        # the operator must land back on the action they clicked, not on a bare re-auth page.
-        assert r.headers.get("location") == "/ui/reauth?next=/ui/connections/OB_X/purge/all", (
-            "a stale step-up was not sent to re-auth carrying the purge it interrupted"
+        # exact continuation, not just the /ui/reauth prefix: the purge is NOT a registered
+        # continuation (vault BACKLOG #2764), so the operator lands back on the confirm page the
+        # console purges through, never on an auto-submitted purge.
+        assert r.headers.get("location") == "/ui/reauth?next=/ui/connections/purge-confirm", (
+            "a stale step-up was not sent to re-auth carrying the purge confirm page"
         )
         assert r.status_code == 303
 
@@ -3111,6 +3121,7 @@ async def test_write_action_method_matches_its_continuation(engine: Engine) -> N
 # (PR1); the L4a admin pages that register real unlock actions land in PR2.
 
 _UNLOCK_PAT = r"^/ui/testunlock/[^/?#]+$"  # a synthetic unlock form path, namespaced to the tests
+_UNLOCK_LABEL = "Open the test unlock form"
 
 
 def test_is_unlock_action_gate() -> None:
@@ -3124,7 +3135,9 @@ def test_is_unlock_action_gate() -> None:
     )
 
     assert not is_unlock_action("/ui/testunlock/new")  # not yet registered
-    register_ui_action(_UNLOCK_PAT, Permission.USERS_MANAGE, auto_retry=False, unlock=True)
+    register_ui_action(
+        _UNLOCK_PAT, Permission.USERS_MANAGE, auto_retry=False, unlock=True, label=_UNLOCK_LABEL
+    )
     assert is_unlock_action("/ui/testunlock/new")  # now an unlock target
     assert not is_safe_ui_action("/ui/testunlock/new")  # but NOT an auto-retry (POST) target
     assert not is_unlock_action("/ui/testunlock/../new")  # .. still rejected
@@ -3144,10 +3157,14 @@ def test_register_ui_action_rejects_auto_retry_and_unlock() -> None:
     from messagefoundry_webconsole import register_ui_action
     from messagefoundry_webconsole._auth import UiWriteAction
 
-    with pytest.raises(ValueError):
-        register_ui_action(r"^/ui/bad$", Permission.USERS_MANAGE, auto_retry=True, unlock=True)
-    with pytest.raises(ValueError):
-        UiWriteAction(re.compile(r"^/ui/bad$"), Permission.USERS_MANAGE, True, True, True)
+    with pytest.raises(ValueError, match="auto_retry"):
+        register_ui_action(
+            r"^/ui/bad$", Permission.USERS_MANAGE, auto_retry=True, unlock=True, label="Bad"
+        )
+    with pytest.raises(ValueError, match="auto_retry"):
+        UiWriteAction(
+            re.compile(r"^/ui/bad$"), Permission.USERS_MANAGE, True, True, True, label="Bad"
+        )
 
 
 async def test_reauth_form_renders_for_unlock_next(engine: Engine) -> None:
@@ -3155,7 +3172,9 @@ async def test_reauth_form_renders_for_unlock_next(engine: Engine) -> None:
     from messagefoundry.auth import Permission
     from messagefoundry_webconsole import register_ui_action
 
-    register_ui_action(_UNLOCK_PAT, Permission.USERS_MANAGE, auto_retry=False, unlock=True)
+    register_ui_action(
+        _UNLOCK_PAT, Permission.USERS_MANAGE, auto_retry=False, unlock=True, label=_UNLOCK_LABEL
+    )
     service = await _service(engine)
     await _add(service, "boss", Role.ADMINISTRATOR)
     async with _client(engine, service) as c:
@@ -3172,7 +3191,9 @@ async def test_reauth_get_unlock_redirects_after_stepup(engine: Engine) -> None:
     from messagefoundry.auth import Permission
     from messagefoundry_webconsole import register_ui_action
 
-    register_ui_action(_UNLOCK_PAT, Permission.USERS_MANAGE, auto_retry=False, unlock=True)
+    register_ui_action(
+        _UNLOCK_PAT, Permission.USERS_MANAGE, auto_retry=False, unlock=True, label=_UNLOCK_LABEL
+    )
     service = await _service(engine)
     await _add(service, "boss", Role.ADMINISTRATOR)
     async with _client(engine, service) as c:
@@ -3211,7 +3232,9 @@ async def test_reauth_failed_stepup_rerenders_form_not_redirect(engine: Engine) 
     from messagefoundry.auth import Permission
     from messagefoundry_webconsole import register_ui_action
 
-    register_ui_action(_UNLOCK_PAT, Permission.USERS_MANAGE, auto_retry=False, unlock=True)
+    register_ui_action(
+        _UNLOCK_PAT, Permission.USERS_MANAGE, auto_retry=False, unlock=True, label=_UNLOCK_LABEL
+    )
     service = await _service(engine)
     await _add(service, "boss", Role.ADMINISTRATOR)
     async with _client(engine, service) as c:
@@ -3226,21 +3249,216 @@ async def test_reauth_failed_stepup_rerenders_form_not_redirect(engine: Engine) 
         assert 'name="next"' in r.text and "/ui/testunlock/new" in r.text
 
 
-async def test_reauth_post_auto_retry_still_renders_continue(engine: Engine) -> None:
-    # Regression: a body-less POST action (replay) still gets the auto-submit continue page after
-    # step-up — the unlock branch must not have changed the existing auto-retry continuation.
+async def _stale_window_service(engine: Engine) -> AuthService:
+    """A service whose step-up window is always stale, so every step-up POST is refused and its
+    gate issues the continuation. -1 rather than 0 for the reason the purge test below gives."""
+    service = AuthService(
+        engine.store,
+        AuthSettings(
+            require_mfa=False,
+            admin_new_ip_step_up=False,
+            step_up_max_age_seconds=-1,
+            admin_write_min_interval_seconds=0,
+        ),
+    )
+    await service.initialize()
+    return service
+
+
+_REPLAY_ALL = "/ui/dead-letters/replay-all"
+_REPLAY_ONE = "/ui/messages/abc/replay"
+_SFS_SAME = {"Sec-Fetch-Site": "same-origin"}
+
+
+async def _reauth(c: httpx.AsyncClient, next_path: str) -> httpx.Response:
+    return await c.post("/ui/reauth", data={"next": next_path, "password": PW}, headers=_SFS_SAME)
+
+
+def _nothing_ran(r: httpx.Response, label: str) -> bool:
+    """The re-auth succeeded and said, by name, that the action did not run (no auto-submit)."""
+    return (
+        r.status_code == 200
+        and "Nothing ran" in r.text
+        and label in r.text
+        and "data-autosubmit" not in r.text
+        and '<a href="/ui">Return to the console</a>' in r.text
+    )
+
+
+async def test_reauth_auto_submits_an_issued_continuation_once(engine: Engine) -> None:
+    """Vault BACKLOG #2764: the continuation the step-up gate issued auto-submits ONCE.
+
+    RED when POST /ui/reauth auto-submits without consuming the record (the second POST would
+    auto-submit again), or when the gate stops recording what it hands out (the first would not)."""
+    service = await _stale_window_service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        refused = await c.post(_REPLAY_ALL, headers=_SFS_SAME)
+        assert refused.status_code == 303
+        assert refused.headers["location"] == f"/ui/reauth?next={_REPLAY_ALL}"
+        form = await c.get(refused.headers["location"])
+        assert "you to: " in form.text
+        assert "Replay all dead letters" in form.text  # the page NAMES the action
+        assert "nothing will run" not in form.text
+        first = await _reauth(c, _REPLAY_ALL)
+        assert first.status_code == 200
+        assert "data-autosubmit" in first.text  # the same-origin auto-submit POST form
+        assert f'action="{_REPLAY_ALL}"' in first.text
+        assert "Replay all dead letters" in first.text  # the continuation names it too
+        second = await _reauth(c, _REPLAY_ALL)
+        assert _nothing_ran(second, "Replay all dead letters")
+
+
+async def test_reauth_does_not_auto_submit_a_next_the_server_did_not_issue(engine: Engine) -> None:
+    """Vault BACKLOG #2764, the finding itself: a typed, bookmarked or clicked
+    ``/ui/reauth?next=<registered destructive action>`` (Sec-Fetch-Site: none) still lets the operator
+    re-authenticate, says nothing will run, and ends on a page saying nothing ran, with no
+    auto-submit."""
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")
-        r = await c.post(
-            "/ui/reauth",
-            data={"next": "/ui/messages/abc/replay", "password": PW},
-            headers={"Sec-Fetch-Site": "same-origin"},
+        form = await c.get(
+            "/ui/reauth", params={"next": _REPLAY_ALL}, headers={"Sec-Fetch-Site": "none"}
         )
-        assert r.status_code == 200
-        assert "data-autosubmit" in r.text  # the same-origin auto-submit POST form
-        assert 'action="/ui/messages/abc/replay"' in r.text
+        assert form.status_code == 200
+        assert "Replay all dead letters" in form.text
+        assert "nothing will run" in form.text
+        assert "data-autosubmit" not in form.text
+        assert _nothing_ran(await _reauth(c, _REPLAY_ALL), "Replay all dead letters")
+
+
+async def test_reauth_no_purpose_grant_for_an_unissued_factor_next(engine: Engine) -> None:
+    """A forged ``next`` naming an ADR 0077 action-bound lane mints NO grant for it (#2764): the
+    grant's purpose comes from ``next``, so it would otherwise attach to the forged action."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        r = await _reauth(c, "/ui/account/sessions/revoke-others")
+        assert _nothing_ran(r, "Sign out all your other sessions")
+        tok = c.cookies.get("mf_session")
+        assert tok is not None
+        assert await service.has_action_step_up(tok, "session_terminate") is False
+
+
+async def test_another_session_cannot_consume_an_issued_continuation(engine: Engine) -> None:
+    """The record is keyed by the session that was refused, so a second session of the SAME user
+    presenting the same ``next`` gets no auto-submit, and the first session's record survives."""
+    service = await _stale_window_service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service) as a, _client(engine, service) as b:
+        await _cookie_login(a, "op")
+        await _cookie_login(b, "op")
+        refused = await a.post(_REPLAY_ALL, headers=_SFS_SAME)
+        assert refused.status_code == 303
+        assert _nothing_ran(await _reauth(b, _REPLAY_ALL), "Replay all dead letters")
+        own = await _reauth(a, _REPLAY_ALL)
+        assert own.status_code == 200 and "data-autosubmit" in own.text
+
+
+async def test_a_sessions_other_continuations_follow_its_rotation(engine: Engine) -> None:
+    """Two tabs of one session, each refused for its own action, share one cookie. The first tab's
+    re-auth rotates the token, so the second tab's issued entry must move with it, or its
+    re-auth would end with nothing run after a page that said it would continue."""
+    service = await _stale_window_service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        assert (await c.post(_REPLAY_ALL, headers=_SFS_SAME)).status_code == 303
+        assert (await c.post(_REPLAY_ONE, headers=_SFS_SAME)).status_code == 303
+        before = c.cookies.get("mf_session")
+        tab_a = await _reauth(c, _REPLAY_ALL)
+        assert tab_a.status_code == 200 and "data-autosubmit" in tab_a.text
+        assert c.cookies.get("mf_session") != before  # the password leg rotated the session
+        tab_b = await _reauth(c, _REPLAY_ONE)
+        assert tab_b.status_code == 200 and f'action="{_REPLAY_ONE}"' in tab_b.text
+
+
+async def test_an_unlock_reauth_in_one_tab_does_not_strand_another_tabs_action(
+    engine: Engine,
+) -> None:
+    """The unlock branch returns its 303 too, and the password leg rotated the session on the way.
+    The other tab's issued action must have followed that rotation before the branch returned."""
+    service = await _stale_window_service(engine)
+    await _add(service, "boss", Role.ADMINISTRATOR)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "boss")
+        assert (await c.post(_REPLAY_ALL, headers=_SFS_SAME)).status_code == 303
+        unlock = await _reauth(c, "/ui/users/new")
+        assert unlock.status_code == 303 and unlock.headers["location"] == "/ui/users/new"
+        tab_a = await _reauth(c, _REPLAY_ALL)
+        assert tab_a.status_code == 200 and "data-autosubmit" in tab_a.text
+
+
+def test_the_issued_table_prunes_lapsed_sessions_and_evicts_the_least_recent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prune drops a session whose newest entry lapsed even when a re-key moved it behind a live
+    one, and the session cap drops the least recently issued session, not the newest."""
+    from messagefoundry_webconsole import _auth
+
+    clock = [1000.0]
+    monkeypatch.setattr(_auth.time, "monotonic", lambda: clock[0])
+    table = _auth._IssuedContinuations()
+    table.issue("a", "/ui/x")  # deadline 1300
+    clock[0] = 1100.0
+    table.issue("b", "/ui/x")  # deadline 1400
+    clock[0] = 1150.0
+    table.rekey("a", "a2")  # a2 now sits BEHIND b, still with deadline 1300
+    clock[0] = 1350.0
+    table.issue("c", "/ui/x")  # prunes: a2 lapsed although it is not at the front
+    assert hash_token("a2") not in table._sessions
+    assert table.issued("b", "/ui/x")
+    cap = _auth._REAUTH_CONTINUATION_SESSIONS_MAX
+    for n in range(cap):
+        table.issue(f"s{n}", "/ui/x")
+    assert not table.issued("b", "/ui/x")  # the least recently issued went first
+    assert table.issued(f"s{cap - 1}", "/ui/x")
+
+
+async def test_a_same_site_refusal_issues_no_continuation(engine: Engine) -> None:
+    """A sibling host's POST carries the SameSite=Strict cookie, so a gate can see it. A browser that
+    sends fetch metadata is refused by the /ui fetch-metadata middleware before any route runs; one
+    that sends only ``Origin`` (an older browser) reaches the route. On an MFA-PENDING session the
+    factor gate refuses it before ``require_ui`` asserts provenance, so the origin check inside the
+    issuing itself is what keeps that page from minting the record that authorises an auto-submit.
+    The same-origin control shows the instrument can see an issue."""
+    from messagefoundry_webconsole._auth import continuation_issued
+
+    service = AuthService(engine.store, AuthSettings(require_mfa=True, admin_new_ip_step_up=False))
+    await service.initialize()
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        tok = c.cookies.get("mf_session")
+        assert tok is not None and await service.mfa_satisfied(tok) is False  # pending
+        fetch_metadata = await c.post(_REPLAY_ALL, headers={"Sec-Fetch-Site": "same-site"})
+        assert fetch_metadata.status_code == 403  # the middleware, before any route
+        assert continuation_issued(tok, _REPLAY_ALL) is False
+        cross = await c.post(_REPLAY_ALL, headers={"Origin": "http://sibling.t"})
+        assert cross.status_code == 303
+        assert cross.headers["location"] == f"/ui/reauth?next={_REPLAY_ALL}"  # the MFA refusal
+        assert continuation_issued(tok, _REPLAY_ALL) is False
+        own = await c.post(_REPLAY_ALL, headers=_SFS_SAME)
+        assert own.status_code == 303
+        assert continuation_issued(tok, _REPLAY_ALL) is True
+
+
+def test_the_issued_table_bounds_each_session() -> None:
+    """A session that keeps getting refused holds at most the per-session cap, oldest dropped, so
+    it cannot crowd out another session's entries."""
+    from messagefoundry_webconsole import _auth
+
+    table = _auth._IssuedContinuations()
+    cap = _auth._REAUTH_CONTINUATIONS_PER_SESSION
+    table.issue("other-session", "/ui/messages/keep/replay")
+    for n in range(cap + 5):
+        table.issue("noisy-session", f"/ui/messages/{n}/replay")
+    assert not table.issued("noisy-session", "/ui/messages/0/replay")
+    assert table.issued("noisy-session", f"/ui/messages/{cap + 4}/replay")
+    assert table.issued("other-session", "/ui/messages/keep/replay")
 
 
 # --- L4a: users/RBAC admin (/ui/users, /ui/roles, /ui/ad-groups), #75 phase 4 ----------------------
@@ -5113,7 +5331,10 @@ async def test_reauth_never_demands_code_from_unenrolled_user(engine: Engine) ->
     await _add(service, "boss", Role.ADMINISTRATOR)
     async with _client(engine, service) as c:
         await _cookie_login(c, "boss")
-        # Stale window → enroll bounces to reauth; the form must NOT demand a TOTP code.
+        # Stale window → enroll bounces to reauth (issuing the continuation, vault BACKLOG #2764);
+        # the form must NOT demand a TOTP code.
+        r = await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
+        assert r.headers["location"] == "/ui/reauth?next=/ui/account/mfa/enroll"
         r = await c.get("/ui/reauth", params={"next": "/ui/account/mfa/enroll"})
         assert r.status_code == 200
         assert 'name="password"' in r.text
@@ -6361,6 +6582,9 @@ async def test_sso_session_not_reauth_seeded(
         # is the second-factor grant.
         assert sessions[0].mfa_verified_at is None
 
+        # The step_up action 303s to /ui/reauth, issuing its continuation (vault BACKLOG #2764).
+        r = await c.post("/ui/account/webauthn/enroll", headers=_SFS)
+        assert r.headers["location"] == "/ui/reauth?next=/ui/account/webauthn/enroll"
         # The directory-password step-up completes at /ui/reauth (auth.reauth live-rebinds AD).
         r = await c.post(
             "/ui/reauth",

@@ -386,7 +386,8 @@ def _check_tls_ca_file(factory: str, value: Any, *, unread: str | None = None) -
 
     Every connector that reads the key treats a blank value as unset, so a blank literal would look
     pinned in review while the hop falls back to the instance ``[tls]`` anchor or the OS store. An
-    ``env()`` reference resolves later, so a blank RESOLVED value is not caught here. ``unread`` names
+    ``env()`` reference resolves later, so :func:`resolve_env_settings` refuses a blank RESOLVED
+    value (vault BACKLOG #2370). ``unread`` names
     why this connection would never read the CA at all, such as plain FTP.
 
     Raises ``ValueError`` rather than :class:`WiringError`, so ``connections_file._build_spec`` adds
@@ -1049,8 +1050,19 @@ def FhirLookup(
     return spec
 
 
-def resolve_env_settings(settings: Mapping[str, Any], values: Mapping[str, Any]) -> dict[str, Any]:
+#: Settings an ``env()`` reference must not resolve blank (vault BACKLOG #2370). A blank
+#: ``tls_ca_file`` reads as unset, so the hop would quietly trust what it trusts with no pin. A blank
+#: literal is refused at load by ``_check_tls_ca_file``; this is the same refusal once the value is in.
+_NON_BLANK_ENV_SETTINGS = frozenset({"tls_ca_file"})
+
+
+def resolve_env_settings(
+    settings: Mapping[str, Any], values: Mapping[str, Any], *, connection: str | None = None
+) -> dict[str, Any]:
     """Return a copy of ``settings`` with every :class:`EnvRef` resolved against ``values``.
+
+    A setting in :data:`_NON_BLANK_ENV_SETTINGS` whose reference resolves to a blank string is
+    refused in the same error, naming the setting, the key and ``connection`` when given.
 
     Resolution order per ref: the environment value (cast if a ``cast`` was given), else its
     ``default``, else it's *missing*. Raises a single :class:`WiringError` listing **all** problems
@@ -1063,6 +1075,7 @@ def resolve_env_settings(settings: Mapping[str, Any], values: Mapping[str, Any])
     resolved: dict[str, Any] = {}
     missing: list[str] = []
     bad: list[str] = []
+    blank: list[str] = []
     for name, value in settings.items():
         if isinstance(value, EnvRef):
             if value.key in values:
@@ -1108,6 +1121,11 @@ def resolve_env_settings(settings: Mapping[str, Any], values: Mapping[str, Any])
                 resolved[name] = value.default
             else:
                 missing.append(value.key)
+            got = resolved.get(name)
+            if name in _NON_BLANK_ENV_SETTINGS and isinstance(got, str) and not got.strip():
+                # No ":" or "=" after the name: the log scrubber reads "LABEL: value" as a secret.
+                owner = f" of connection {connection!r}" if connection else ""
+                blank.append(f"setting {name!r}{owner} (env {value.key!r}) pins nothing")
         else:
             resolved[name] = value
     problems: list[str] = []
@@ -1115,6 +1133,8 @@ def resolve_env_settings(settings: Mapping[str, Any], values: Mapping[str, Any])
         problems.append("missing: " + ", ".join(sorted(set(missing))))
     if bad:
         problems.append("uncastable: " + "; ".join(bad))
+    if blank:
+        problems.append("blank: " + "; ".join(blank))
     if problems:
         raise WiringError(
             "environment value(s) unusable — "
@@ -7523,7 +7543,13 @@ def _assert_safe_config_source(directory: Path) -> None:
     Because :func:`_exec_module` runs arbitrary Python as the engine's service account, a
     lower-privileged user who can write into the config dir (or a module file) could execute
     code as that account on the next reload. On POSIX we hard-fail on a group/world-writable
-    directory or module, **and on one owned by another unprivileged uid**. On Windows the equivalent
+    directory or module, **and on one owned by any uid other than root or the engine's effective
+    uid; when the engine runs as root, only a root owner is trusted** -- the owner rule
+    :func:`messagefoundry.auth.anchor_path.posix_path_verdict` applies to a trust anchor. A
+    root-owned, read-only config is therefore accepted under a service-account engine. This check
+    reads only the directory and its ``*.py`` (following links), not the directories above it, as
+    that function does; docs/SERVICE.md states what the layout then still depends on. On Windows the
+    equivalent
     NTFS-DACL check now runs in-process
     (:func:`_assert_safe_config_source_windows`, SEC-003): the directory and each ``*.py``
     owner/DACL is parsed via ctypes and a source is refused when its DACL grants a broad/low-privilege
@@ -7537,9 +7563,14 @@ def _assert_safe_config_source(directory: Path) -> None:
         return
     if os.name != "posix":
         return
-    # getattr keeps mypy happy on win32 (os.getuid is POSIX-only); we already returned on non-posix.
-    _getuid = getattr(os, "getuid", None)
-    self_uid: int | None = _getuid() if _getuid is not None else None
+    # The EFFECTIVE uid is the account the executed code runs as, so it is the one to compare. Called
+    # directly: os.geteuid exists on every POSIX platform, and a missing one must fail loudly rather
+    # than switch the owner check off.
+    euid = os.geteuid()
+    # Root can rewrite anything, so a root owner adds no writer the engine does not already trust. A
+    # root engine trusts only root (the set collapses to {0}): any other owner could rewrite code
+    # that then runs as root.
+    trusted_uids = frozenset({0, euid})
     # Include _*.py: the loader skips them as top-level modules, but a sibling can import them, so a
     # writable/foreign-owned helper is just as much an injection vector (review M-21).
     candidates = [directory, *directory.glob("*.py")]
@@ -7554,12 +7585,14 @@ def _assert_safe_config_source(directory: Path) -> None:
                 f"(mode {oct(st.st_mode & 0o777)}); see docs/SERVICE.md for required permissions"
             )
             continue
-        # Code here runs as the engine's account, so a file owned by a *different* unprivileged user
-        # is an escalation vector even at 0644 — that user can rewrite it (CONFIG-2 / review M-21).
-        if self_uid is not None and self_uid != 0 and st.st_uid != self_uid:
+        # Code here runs as the engine's account, so a file owned by any other non-root user is an
+        # escalation vector even at 0644 -- that user can rewrite it (CONFIG-2 / review M-21).
+        if st.st_uid not in trusted_uids:
+            trusted = "root" if euid == 0 else f"root or uid {euid}"
             _refuse_unsafe_config_source(
-                f"refusing to load config from {path} owned by uid {st.st_uid} — the engine runs as "
-                f"uid {self_uid}; that owner could rewrite the executed code (see docs/SERVICE.md)"
+                f"refusing to load config from {path} owned by uid {st.st_uid} -- the engine runs as "
+                f"uid {euid} and trusts only an owner that is {trusted}; that owner could rewrite "
+                "the executed code (see docs/SERVICE.md)"
             )
 
 

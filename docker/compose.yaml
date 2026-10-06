@@ -111,9 +111,10 @@ services:
       # PHI store — a NAMED VOLUME (never the ephemeral layer) so at-least-once survives restarts. WAL
       # writes -wal/-shm siblings, so this must be the writable DIRECTORY that holds messagefoundry.db.
       - mefor-store:/var/lib/mefor
-      # Adopter config repo, READ-ONLY. It must be owned by uid 10001 and NOT group/world-writable, or the
-      # engine refuses to load it (it executes the *.py as the service account). On Linux:
-      #   chown -R 10001:10001 ./config && chmod -R go-w ./config
+      # Adopter config repo, READ-ONLY. It must be owned by root or uid 10001 and NOT group/world-writable,
+      # or the engine refuses to load it (it executes the *.py as the service account). Root-owned is the
+      # safer choice, since the engine's own account cannot rewrite it. On Linux:
+      #   chmod -R a+rX,go-w ./config && sudo chown -R root:root ./config
       # The robust production alternative is to BAKE config into a derived image (see docker/README.md);
       # a Docker-Desktop-on-Windows bind mount surfaces as 0o777 and will be refused.
       - ./config:/config:ro

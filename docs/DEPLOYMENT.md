@@ -231,9 +231,9 @@ Container-specific essentials (all detailed in [`../docker/README.md`](../docker
 
 - **Two variants:** slim default (core + SQLite) and `-sqlserver` (adds the OS-level MS ODBC Driver 18
   for the SQL Server store / `db_lookup`). Non-root uid 10001; read-only root fs; per-profile hash-locked deps.
-- **Config is executed code:** mount it owned by **uid 10001** and not group/world-writable, or — the
-  robust path, and the only clean one on Kubernetes — **bake it into a derived image**
-  (`FROM messagefoundry; COPY --chown=10001:10001 config /config`).
+- **Config is executed code:** mount it owned by **root** (safest) or **uid 10001** and not
+  group/world-writable, or -- the robust path, and the recommended one on Kubernetes -- **bake it into
+  a derived image** (`FROM messagefoundry; COPY config /config`, which writes root-owned files).
 - **Store volume must persist** (named volume / PVC, never the ephemeral layer) or the at-least-once
   invariant is void across a restart; enable the at-rest cipher (`MEFOR_STORE_ENCRYPTION_KEY` +
   `MEFOR_STORE_REQUIRE_ENCRYPTION=true`).
@@ -871,7 +871,7 @@ on the shipped posture.
 | Ungated verifying TLS hop | Why it is a verifying hop |
 |---|---|
 | **SQL Server store hop** | `[store].encrypt` defaults **true** and `[store].trust_server_certificate` defaults **false** — and SQL Server is a documented production store. The PostgreSQL store hop *is* gated; its SQL Server twin is not |
-| **RemoteFile FTPS inbound poll** | explicit TLS, verifying by default. The FTPS *upload* is gated since BACKLOG #2193; the poll is not, and `[tls].crl_file` does not reach it |
+| **RemoteFile FTPS inbound poll** | explicit TLS, verifying by default. The FTPS *upload* is gated since BACKLOG #2193; the poll is not. Since vault BACKLOG #2370 the poll reads the `[tls]` block, so a set `[tls].crl_file` is checked there, but nothing refuses the poll without one |
 | **`dialect='sqlserver'` DATABASE destination** | `Encrypt=yes` / `TrustServerCertificate=false` defaults |
 | **LDAPS** (`[auth].ad_tls_verify`, default true) | verifying directory bind |
 | **Webhook alert sink** and the **AI-broker endpoint** | verifying https openers |

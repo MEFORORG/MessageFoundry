@@ -524,8 +524,9 @@ def _ftps_ssl_context(
     if not verify and not weakened_tls_escape_permitted_here():
         raise ValueError(
             "REMOTEFILE ftps tls_verify=false disables server-certificate verification (MITM risk). "
-            f"Use a trusted CA (tls_ca_file), or set {INSECURE_TLS_ESCAPE_ENV}=1 to allow it on a "
-            "trusted-network bind (refused on a production-PHI instance even with the escape, #200)."
+            f"Use a trusted CA (tls_ca_file), or set {INSECURE_TLS_ESCAPE_ENV}=1 on an instance at "
+            "[security].enforcement = warn to allow it on a trusted-network bind (the escape has no "
+            "effect while enforcing, the default, or with no posture)."
         )
     ca = settings.get("tls_ca_file")
     if verify and trust_anchor_policy is not None:
@@ -535,6 +536,7 @@ def _ftps_ssl_context(
             connection_ca_file=str(ca) if ca else None,
             host=str(settings.get("host", "")),
             policy=trust_anchor_policy,
+            connection=name or None,
         )
         ctx = build_verifying_client_context(anchor)
     else:
@@ -551,7 +553,8 @@ def _ftps_ssl_context(
     else:
         logger.warning(
             "REMOTEFILE ftps TLS certificate verification is DISABLED (tls_verify=false, permitted "
-            "by %s) — MITM-able; for a trusted-network dev/test bind only.",
+            "by %s at [security].enforcement = warn) — MITM-able; for a trusted-network dev/test "
+            "bind only.",
             INSECURE_TLS_ESCAPE_ENV,
         )
         ctx.check_hostname = False
@@ -1436,7 +1439,8 @@ class _SftpClient(_RemoteClient):
         if self._accept_unknown:
             logger.warning(
                 "REMOTEFILE sftp %s accepts UNKNOWN host keys (AutoAddPolicy) because %s is set "
-                "— MITM-able; for a trusted-network dev/test bind only",
+                "on an instance at [security].enforcement = warn — MITM-able; for a trusted-network "
+                "dev/test bind only",
                 self._host,
                 INSECURE_TLS_ESCAPE_ENV,
             )
@@ -1751,8 +1755,9 @@ def _make_client(
 ) -> _RemoteClient:
     """Build the protocol-appropriate client. Tests monkeypatch this (or the client classes) so no
     real server/SSH is needed; both connectors call it per operation-batch. ``trust_anchor_policy``
-    (#190, ADR 0093) is the outbound FTPS verify-path internal-CA fallback; the source passes ``None``
-    (byte-identical) and SFTP/plain-FTP ignore it (no server-cert verify)."""
+    (#190, ADR 0093) is the FTPS verify-path internal-CA fallback. Both connectors pass their
+    config's policy (the source since vault BACKLOG #2370); SFTP/plain-FTP ignore it (no server-cert
+    verify)."""
     protocol = remote_file_protocol(settings)
     if protocol == "sftp":
         return _SftpClient(settings)
@@ -1830,8 +1835,9 @@ def _validate_common(
             raise ValueError(
                 f"{hop_name_prefix(connection)}REMOTEFILE plain ftp transmits credentials in "
                 "CLEARTEXT; refused unless "
-                f"{INSECURE_TLS_ESCAPE_ENV} is set — use ftps (tls=True) or sftp (refused on a "
-                "production-PHI instance even with the escape, #200)"
+                f"{INSECURE_TLS_ESCAPE_ENV} is set on an instance at [security].enforcement = warn "
+                "(the escape has no effect while enforcing, the default, or with no posture) — use "
+                "ftps (tls=True) or sftp"
             )
         logger.warning(
             "%sREMOTEFILE %s sends credentials over CLEARTEXT ftp (no TLS)",
@@ -2135,7 +2141,13 @@ class RemoteFileSource(SourceConnector):
         _validate_common(
             s, connection=None if config.name is None else inbound_record_name(config.name)
         )
-        self._client = _make_client(s, name=config.name or "")
+        # Vault BACKLOG #2370: the poller verifies its FTPS server under [tls], as the outbound does,
+        # and its warnings and refusals spell it inbound:<name>, as _validate_common above does.
+        self._client = _make_client(
+            s,
+            trust_anchor_policy=config.trust_anchor_policy,
+            name="" if config.name is None else inbound_record_name(config.name),
+        )
         self._host = str(s["host"])
         self._remote_dir = str(s["remote_dir"])
         self._pattern: str = s.get("pattern", "*.hl7")
