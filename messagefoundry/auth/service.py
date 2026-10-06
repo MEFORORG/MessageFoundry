@@ -627,6 +627,11 @@ DIRECTORY_ROLES_DEMOTED = "directory_roles_demoted"
 #: ``auth.reauth`` audit row and on :class:`OidcStepUp`. A claims-ladder slug can also appear there.
 STEP_UP_NOT_FRESH = "step_up_not_fresh"
 STEP_UP_SUBJECT_MISMATCH = "step_up_subject_mismatch"
+#: The IdP-clock freshness test's two refusals (BACKLOG #2143), kept apart from the engine-clock
+#: :data:`STEP_UP_NOT_FRESH`. Neither clears on a retry against the same session: the session holds
+#: no IdP ``auth_time`` to compare, or the IdP answered with one no later than the one it holds.
+STEP_UP_IDP_AUTH_TIME_MISSING = "step_up_idp_auth_time_missing"
+STEP_UP_IDP_AUTH_TIME_NOT_LATER = "step_up_idp_auth_time_not_later"
 FLOW_PURPOSE_MISMATCH = "flow_purpose_mismatch"
 
 #: The audit reason for a second step refused under its ASVS 2.4.2 minimum-elapsed floor (BACKLOG
@@ -645,6 +650,17 @@ _STEP_UP_ERRORS: Final[Mapping[str, str]] = MappingProxyType(
         STEP_UP_SUBJECT_MISMATCH: (
             "The identity provider signed in a different account from the one this session belongs"
             " to. Sign in at the provider as yourself, then try again."
+        ),
+        # No "try again" on the two below: a retry on this session cannot pass. A new sign-in
+        # stores a new IdP auth_time, which is what the next step-up is compared with.
+        STEP_UP_IDP_AUTH_TIME_MISSING: (
+            "This session holds no sign-in time from the identity provider, so the provider cannot"
+            " confirm it's you here. Sign out, then sign in again."
+        ),
+        STEP_UP_IDP_AUTH_TIME_NOT_LATER: (
+            "The identity provider's answer is no newer than this session's last confirmation, so"
+            " it could not confirm it's you. Sign out, then sign in again. If this repeats, the"
+            " provider is ignoring max_age=0 and prompt=login."
         ),
         "session_gone": "Your session ended. Sign in again.",
         "state_unknown": "The confirmation expired. Try again.",
@@ -4391,10 +4407,16 @@ class AuthService:
         # sign-in for this user is later than the value the session holds and within
         # oidc_clock_skew_seconds of this request. The cost of (b): an IdP clock that steps back, or
         # IdP nodes whose clocks disagree, refuse a real re-authentication until it passes the value.
+        # Each arm has its own closed-set reason, apart from (a)'s STEP_UP_NOT_FRESH, because
+        # neither clears on a retry and the operator is told to sign in again instead.
         held_auth_time = session.idp_auth_time
-        if held_auth_time is None or principal_claims.auth_time <= held_auth_time:
+        if held_auth_time is None:
             return await self._step_up_refused(
-                STEP_UP_NOT_FRESH, actor=actor, client=client, return_to=return_to
+                STEP_UP_IDP_AUTH_TIME_MISSING, actor=actor, client=client, return_to=return_to
+            )
+        if principal_claims.auth_time <= held_auth_time:
+            return await self._step_up_refused(
+                STEP_UP_IDP_AUTH_TIME_NOT_LATER, actor=actor, client=client, return_to=return_to
             )
         # The DIRECTORY still has the account. The password re-bind this leg replaces failed for a
         # disabled or deleted AD object, and the sign-in leg refuses one as not_in_directory. An IdP

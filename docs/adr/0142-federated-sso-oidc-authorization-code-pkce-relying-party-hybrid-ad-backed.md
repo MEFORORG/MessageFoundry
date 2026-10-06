@@ -515,11 +515,12 @@ B.1 left the verification of what comes back to the build. These are its criteri
   was staged, less `[auth].oidc_clock_skew_seconds`, THEN THE SYSTEM SHALL refuse with
   `step_up_not_fresh` and elevate nothing. The full claims ladder, the MFA-claim gate included, SHALL
   also pass. IF that `auth_time` is not later than the IdP `auth_time` the session holds, THEN THE
-  SYSTEM SHALL also refuse with `step_up_not_fresh`, with no skew, because both values are IdP clock
-  (BACKLOG #2143). The session SHALL store the sign-in's verified `auth_time` as the IdP stated it,
-  rotation SHALL carry it, and a step-up that passes every check SHALL replace it with its own in the
-  statement that stamps `reauth_at`. An `oidc` session holding none SHALL be refused. *Amended
-  2026-10-06:* this criterion's residual read "an IdP that ignores `max_age=0` still passes when its
+  SYSTEM SHALL refuse with `step_up_idp_auth_time_not_later`, with no skew, because both values are
+  IdP clock (BACKLOG #2143). The session SHALL store the sign-in's verified `auth_time` as the IdP
+  stated it, rotation SHALL carry it, and a step-up that passes every check SHALL replace it with
+  its own in the statement that stamps `reauth_at`. An `oidc` session holding none SHALL be refused
+  with `step_up_idp_auth_time_missing`. Neither of those two refusals SHALL tell the operator to
+  try again, because a retry on the same session cannot pass. *Amended 2026-10-06:* this criterion's residual read "an IdP that ignores `max_age=0` still passes when its
   last sign-in for the user is within that skew of the request", with storing the sign-in's IdP
   `auth_time` named as the fix and not built. It would now pass only when the user signed in at the
   IdP again after the stored value, inside that skew.

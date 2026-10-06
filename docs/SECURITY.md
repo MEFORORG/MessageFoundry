@@ -3124,9 +3124,11 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
     each step-up that passes every check replaces it with its own in the statement that stamps
     `reauth_at`.
     Both values are IdP clock, so no skew applies. An IdP that ignores `max_age=0` and answers from
-    the sign-in, or replays the last step-up's answer, is then refused even inside the skew. An
-    `oidc` session with no stored value, which is a row written before the column existed, is
-    refused, so its holder would sign in again. **Residual:** an IdP that ignores `max_age=0` still
+    the sign-in, or replays the last step-up's answer, is then refused even inside the skew, as
+    `step_up_idp_auth_time_not_later`. An `oidc` session with no stored value, which is a row
+    written before the column existed, is refused as `step_up_idp_auth_time_missing`. Neither
+    clears on a retry against the same session, so both refusals tell the operator to sign in
+    again; `step_up_not_fresh` stays the engine-clock test's reason. **Residual:** an IdP that ignores `max_age=0` still
     passes in one case. The user signed in at the IdP again after the session's stored `auth_time`,
     and that sign-in is within the skew of the request. **Cost:** an IdP clock that
     steps back, or IdP nodes whose clocks disagree, would refuse a real re-authentication until
@@ -3143,7 +3145,7 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   as on the password leg). Every outcome
   that `complete_oidc_step_up` or `abandon_oidc_step_up` decides writes an `auth.reauth` row with
   `mech=oidc`, and a refusal carries a closed-set `reason` (`step_up_not_fresh`,
-  `step_up_subject_mismatch`, `flow_purpose_mismatch`, a claims-ladder slug, and others). Some
+  `step_up_idp_auth_time_not_later`, `step_up_idp_auth_time_missing`, `step_up_subject_mismatch`, `flow_purpose_mismatch`, a claims-ladder slug, and others). Some
   refusals come earlier and write no such row: a return the sign-in window throttles (a 303 to
   `/ui/login?e=rate_limited` and a WARNING log), a return the `Sec-Fetch-Mode` check refuses
   (audited `auth.login_failed`), and any refusal at the start leg `POST /ui/reauth/oidc`. A refusal those two methods decide changes nothing and re-renders the
@@ -3854,7 +3856,7 @@ code at engine commit `3345056505`, and the Where column names the code that doe
 | **AD bind, step-up only** | Whether the bind as the user succeeded. Nothing about the directory's own MFA | Not a sign-in since BACKLOG #1137. It re-proves the password behind a Kerberos session and stamps the step-up window. It grants no second factor: `reauth` stamps the window and never marks the factor. The directory's MFA is not delegated (BACKLOG #1144) | `AuthService.reauth` |
 | **OIDC sign-in, recency** | `auth_time` in the signed `id_token`. The engine asks for it by sending `max_age` on every authorization request | Refused, with no time assumed. A missing `auth_time` fails as `auth_time_missing`, and one older than `[auth].oidc_max_age_seconds` as `auth_time_stale`. An accepted session also ends at `auth_time + oidc_max_age_seconds` when that is sooner than its other caps | `_check_auth_time` in `auth/oidc/claims.py`; `AuthService._authenticate_oidc` |
 | **OIDC sign-in, strength** | `amr` and `acr` in the signed `id_token` | With `[auth].oidc_require_mfa_claim` on (the default), a token with no `amr` value in `oidc_mfa_amr_values` and no `acr` in `oidc_required_acr_values` is refused as `mfa_claim_missing`. With it off, the session is minted `mfa_verified=False`, the same minimum as Kerberos. Either way, no step-up window | `_check_mfa_gate` in `auth/oidc/claims.py`; `AuthService._authenticate_oidc`, which passes `oidc_require_mfa_claim` as the grant |
-| **OIDC step-up** | A fresh `auth_time`, asked for with `max_age=0` and `prompt=login` | Refused when `auth_time` is missing (`auth_time_missing`, from the same claims check as sign-in). Also refused when it is earlier than the moment the flow was staged, less `oidc_clock_skew_seconds` (`step_up_not_fresh`). Also refused, with the same reason, when it is not later than the IdP `auth_time` the session holds, or the session holds none (BACKLOG #2143). A pass stamps the step-up window and leaves the session's second-factor state as it was | `AuthService.begin_oidc_step_up` sends the request; `AuthService.complete_oidc_step_up` checks the answer |
+| **OIDC step-up** | A fresh `auth_time`, asked for with `max_age=0` and `prompt=login` | Refused when `auth_time` is missing (`auth_time_missing`, from the same claims check as sign-in). Also refused when it is earlier than the moment the flow was staged, less `oidc_clock_skew_seconds` (`step_up_not_fresh`). Also refused when it is not later than the IdP `auth_time` the session holds (`step_up_idp_auth_time_not_later`), or the session holds none (`step_up_idp_auth_time_missing`) (BACKLOG #2143). A pass stamps the step-up window and leaves the session's second-factor state as it was | `AuthService.begin_oidc_step_up` sends the request; `AuthService.complete_oidc_step_up` checks the answer |
 
 **So no directory sign-in opens the step-up window.** Kerberos by either route and the OIDC callback
 all mint without one. At sign-in, only a local sign-in that owes no factor, or a combined sign-in, can

@@ -33,6 +33,8 @@ from messagefoundry.auth.service import (
     FLOW_PURPOSE_MISMATCH,
     IDP_STEP_UP_REQUIRED,
     STEP_UP_ACTION_SESSION_TERMINATE,
+    STEP_UP_IDP_AUTH_TIME_MISSING,
+    STEP_UP_IDP_AUTH_TIME_NOT_LATER,
     STEP_UP_NOT_FRESH,
     STEP_UP_SUBJECT_MISMATCH,
     AuthService,
@@ -485,7 +487,9 @@ async def test_an_idp_answering_from_the_sign_in_within_the_skew_is_refused(
 
         out = await _return_from_idp(service, monkeypatch, rsa_key, flow_id, auth_time=signed_in_at)
 
-        assert not out.ok and out.reason == STEP_UP_NOT_FRESH
+        assert not out.ok and out.reason == STEP_UP_IDP_AUTH_TIME_NOT_LATER
+        rows = [json.loads(str(r["detail"])) for r in await _audit_rows(store, "auth.reauth")]
+        assert rows and rows[-1]["reason"] == STEP_UP_IDP_AUTH_TIME_NOT_LATER, rows
         await _assert_untouched(service, token)
         assert await _held_auth_time(store, token) == signed_in_at, "a refusal moved the value"
 
@@ -519,7 +523,7 @@ async def test_a_replayed_step_up_answer_is_refused_the_second_time(
         flow_id, _url = await _begin(service, rotated)
         replay = await _return_from_idp(service, monkeypatch, rsa_key, flow_id, auth_time=first_at)
 
-        assert not replay.ok and replay.reason == STEP_UP_NOT_FRESH
+        assert not replay.ok and replay.reason == STEP_UP_IDP_AUTH_TIME_NOT_LATER
         assert await service.identity_for_token(rotated) is not None
         assert await _held_auth_time(store, rotated) == first_at
     finally:
@@ -534,8 +538,9 @@ async def test_an_oidc_session_with_no_stored_auth_time_is_refused(
     elevates: bool,
 ) -> None:
     """RED when: an ``oidc`` session with no stored IdP ``auth_time`` (a row written before the
-    column existed) steps up at all. Nothing can be compared, so it is refused as not fresh. The
-    control arm is the same row holding a value, which elevates on the same answer."""
+    column existed) steps up at all. Nothing can be compared, so it is refused with its own reason,
+    not the engine-clock ``step_up_not_fresh``. The control arm is the same row holding a value,
+    which elevates on the same answer."""
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store, rsa_key)
@@ -558,10 +563,29 @@ async def test_an_oidc_session_with_no_stored_auth_time_is_refused(
         if elevates:
             assert out.ok, out
         else:
-            assert not out.ok and out.reason == STEP_UP_NOT_FRESH
+            assert not out.ok and out.reason == STEP_UP_IDP_AUTH_TIME_MISSING
+            rows = [json.loads(str(r["detail"])) for r in await _audit_rows(store, "auth.reauth")]
+            assert rows and rows[-1]["reason"] == STEP_UP_IDP_AUTH_TIME_MISSING, rows
             await _assert_untouched(service, token)
     finally:
         await store.close()
+
+
+def test_the_idp_clock_refusals_have_their_own_reasons_and_say_sign_in_again() -> None:
+    """BACKLOG #2143. RED when: the IdP-clock refusals fold back into ``step_up_not_fresh``, or
+    their text says to try again. A retry on the same session cannot pass either of them, so the
+    text sends the operator to sign in again. The engine-clock refusal keeps its own text."""
+    from messagefoundry.auth.service import _STEP_UP_ERRORS
+
+    reasons = {STEP_UP_NOT_FRESH, STEP_UP_IDP_AUTH_TIME_MISSING, STEP_UP_IDP_AUTH_TIME_NOT_LATER}
+    assert len(reasons) == 3, reasons
+    assert STEP_UP_IDP_AUTH_TIME_MISSING == "step_up_idp_auth_time_missing"
+    assert STEP_UP_IDP_AUTH_TIME_NOT_LATER == "step_up_idp_auth_time_not_later"
+    for reason in (STEP_UP_IDP_AUTH_TIME_MISSING, STEP_UP_IDP_AUTH_TIME_NOT_LATER):
+        text = _STEP_UP_ERRORS[reason]
+        assert "sign in again" in text.lower(), text
+        assert "try again" not in text.lower(), text
+    assert "Try again" in _STEP_UP_ERRORS[STEP_UP_NOT_FRESH]
 
 
 async def test_an_account_gone_from_the_directory_is_refused(
