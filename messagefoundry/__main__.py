@@ -392,8 +392,9 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "sub-check previews under [pipeline].snapshot_on_send (copy-on-Send, ADR 0104) resolved "
         "best-effort from the settings the posture check reads: this instance's "
         "messagefoundry.toml, or with no file, the MEFOR_* environment when MEFOR_AI_ENVIRONMENT "
-        "names the instance. Under --project-root, a messagefoundry.toml in the working directory "
-        "is not read and stops the environment read. When no settings load it falls back to the "
+        "names the instance. Under --project-root, a messagefoundry.toml in a working directory "
+        "other than the project root is not read and stops the environment read. When no "
+        "settings load it falls back to the "
         "setting's own default (ON) — matching the default engine, never a silent OFF (#230).",
     )
     check.add_argument("--config", default="samples/config", help="config modules directory")

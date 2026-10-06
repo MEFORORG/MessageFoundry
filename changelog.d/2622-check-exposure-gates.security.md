@@ -10,7 +10,8 @@
   when the window opens. A listener left unbound meets the same gates when it is started. **One
   exposed listener the engine would bind refuses the whole config at build check**, where engine
   start isolates only that listener. While it stands, a reload, dry-run reload, promote, connection
-  edit, connection-flag toggle and DR activation are all refused. The refusal names the listener.
+  edit, connection-flag toggle, DR activation and a cluster follower's convergence reload are all
+  refused. The refusal names the listener.
   It says that `deployed = false`, or `auto_start = false` with the listener stopped, leaves it
   unbound. The HTTP intake-authentication start gate (ADR 0154 D7) is not filtered this way. It
   still runs on every deployed HTTP listener. A reload, a dry-run reload and a flag toggle pass the

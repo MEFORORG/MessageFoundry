@@ -248,11 +248,13 @@ request through it fails. Setting the acknowledgement without `tls_terminated_up
 load. `messagefoundry check` runs the same test as a required check, `upstream-hop-ack`, against the
 `messagefoundry.toml` it finds, so the commit/CI gate catches the refusal before `serve` does. With
 no file and no `--service-config`, it reads the environment instead. That needs
-`MEFOR_AI_ENVIRONMENT` to name the instance, and the line says so. Two cases keep the skip. A
-`--service-config` naming a missing file is one, because `serve` refuses that file. The other is
-`--project-root` with a `messagefoundry.toml` in the working directory, which the line names. A terminator set through `MEFOR_API_*` variables with no file and no
-`MEFOR_AI_ENVIRONMENT`, for example on a site that names its environment only with `serve --env`,
-still reaches `serve` and not the check.
+`MEFOR_AI_ENVIRONMENT` to name the instance, and the line says so. At least these cases keep the
+skip. A `--service-config` naming a missing file is one, because `serve` refuses that file.
+Another is `--project-root` with no `--service-config`, no file under the root or the config
+directory, and a `messagefoundry.toml` in a working directory that is not the root. The line
+names that file. A third is no file and no `MEFOR_AI_ENVIRONMENT`. So a terminator set through
+`MEFOR_API_*` variables alone, for example on a site that names its environment only with
+`serve --env`, still reaches `serve` and not the check.
 
 **A trusted proxy must be declared, or the engine must hold your certificate (BACKLOG #2055).** The
 pairing runs both ways. A non-empty `[api].trusted_proxies` without `tls_terminated_upstream` is
@@ -2680,14 +2682,19 @@ slack.
 BACKLOG #2622 item 1).** The MLLP, DICOM, raw TCP and HTTP listener exposure gates run in two places. At
 listener start, a refusal isolates that one listener and the rest of the graph comes up (ADR 0031).
 At build check, the same refusal fails the whole config. That covers `messagefoundry check`, a
-reload or dry-run reload, promote, a connection edit, a connection-flag toggle and a DR activation.
+reload or dry-run reload, promote, a connection edit, a connection-flag toggle, a DR activation
+and a cluster follower's convergence reload. A follower whose own settings refuse the graph would
+keep its old graph, log the refusal and retry each interval.
 The build check runs the gates only on a listener the engine would bind: deployed and `auto_start`.
 On a running engine it also skips one the DR run-profile parks, and it gates one an operator
 started. It gates a listener outside its schedule window, because the scheduler binds it when the
 window opens. So `deployed = false`, or `auto_start = false` with the listener stopped, lets those
-paths through while the listener stays unbound. A later start of it meets the same refusal. The
-refusal text names the listener and both settings. The HTTP intake-authentication start gate (ADR
-0154 D7) is not filtered this way: it still runs at build check on every deployed HTTP listener.
+paths through while the listener stays unbound. An operator start of an `auto_start = false`
+listener meets the same refusal. A `deployed = false` listener cannot be started: that start
+raises `NotDeployedError`. The reload that deploys it meets the refusal if the engine would then
+bind it. Otherwise its first start does. The refusal text names the listener and both settings.
+The HTTP intake-authentication start gate (ADR 0154 D7) is not filtered this way: it still runs
+at build check on every deployed HTTP listener.
 
 The per-connection `source_ip_allowlist` is enforced on **five** listener types, all at **accept**: the four
 stream listeners (MLLP, TCP, X12, HTTP) and the DICOM C-STORE SCP. The SCP closes a non-allowlisted
