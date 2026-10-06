@@ -332,8 +332,8 @@ engine writes, such as a File connection's, to `NT SERVICE\MessageFoundry` by na
 
 Auth is **enabled by default**, and **the engine creates no account on its own**. Until you create the
 first Administrator, nobody can manage the engine. At the shipped posture a start with no Administrator
-is refused. If a start goes ahead without one, a Windows sign-in (Kerberos) can still create a
-directory account, but that account holds no role. Create the
+is refused. If a start goes ahead without one, a Windows sign-in (Kerberos), where configured, can
+still create a directory account, but that account holds no role. Create the
 Administrator once per store, at the host:
 
 1. Set the store key in your shell, the same `MEFOR_STORE_ENCRYPTION_KEY` the service runs with,

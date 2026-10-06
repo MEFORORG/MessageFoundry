@@ -1,16 +1,17 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Off-box audit tee — the single PHI-redaction path shared by every store backend (sec-offbox-log).
+"""Off-box audit tee — the single redaction path shared by every store backend (sec-offbox-log).
 
 Each store backend's ``record_audit`` (``SqliteStore``, ``PostgresStore``, ``SqlServerStore``) calls
 :func:`emit_audit_tee` immediately after the row is durably committed. So does a write that
 commits an audit row in its own transaction, through ``AuditAppend.tee`` (BACKLOG #2100). At least
-those paths reach it. So a **PHI-safe metadata** copy
-of the audit record is shipped off-box via the ``messagefoundry.audit`` logger — which propagates to
+those paths reach it. So a **metadata** copy of the audit record, with HL7-shaped spans scrubbed
+from its ``detail``, is shipped off-box. That scrub is best-effort and does not make the copy
+PHI-free (BACKLOG #1133). The copy goes via the ``messagefoundry.audit`` logger — which propagates to
 the root stdout + optional syslog/SIEM forwarder configured by :mod:`messagefoundry.logging_setup`.
 So the audit trail survives a host/DB compromise (ASVS 16.x).
 
-One helper means there is exactly **one** place the off-box PHI-redaction guarantee lives, identical
+One helper means there is exactly **one** place the off-box redaction lives, identical
 across all three backends — not three copies that could drift.
 
 **Propagation is only half the guarantee.** A record reaches that forwarder only if the process

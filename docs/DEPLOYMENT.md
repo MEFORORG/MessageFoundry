@@ -352,7 +352,8 @@ the management API, and it does not inherit the API's auth: harden it deliberate
   `warn` it only logs a warning. The listener then accepts a POST from any peer that can reach it, so
   configure a control anyway. What counts depends on `intake_auth`. With `api_key` or `bearer` it is
   the key, and with `mtls_subject` it is a CA plus a subject list. Once `intake_auth` names a mode,
-  only that mode is judged, and the allow-list is not consulted. With `intake_auth = none`, the
+  this gate judges only that mode, and the allow-list is not consulted here. The listener still
+  refuses a peer outside `source_ip_allowlist` on every connection. With `intake_auth = none`, the
   default, a `source_ip_allowlist` counts when every entry is /8 or narrower for IPv4, or /32 or
   narrower for IPv6. `tls_ca_file` alone does not count, because it accepts any certificate that CA
   ever signed.

@@ -106,7 +106,7 @@ messagefoundry serve --config config --env dev
 The engine creates no account on its own, so nobody can manage a new instance until `provision-admin`
 has run once at the host. Run it against the same store and service config `serve` uses. At the shipped
 posture a start with no Administrator is refused. If a start goes ahead without one, a Windows sign-in
-(Kerberos) can still create a directory account, but that account holds no role. `provision-admin` asks for the password at the terminal. It needs the same store key as `serve`; see
+(Kerberos), where configured, can still create a directory account, but that account holds no role. `provision-admin` asks for the password at the terminal. It needs the same store key as `serve`; see
 [Provisioning the first administrator](https://github.com/MEFORORG/MessageFoundry/blob/main/docs/SECURITY.md#provisioning-the-first-administrator-asvs-632).
 
 MessageFoundry is in **Early Access**. Always **pin the exact version** so upgrades stay

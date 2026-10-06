@@ -40,7 +40,14 @@ from messagefoundry.api import security as api_security
 from messagefoundry.api.security import _PHI_VIEW_PERMISSIONS, require_service_cert
 from messagefoundry.auth import service as service_module
 from messagefoundry.auth.identity import AuthProvider
-from messagefoundry.auth.permissions import BUILTIN_ROLE_PERMISSIONS, Permission, Role
+from messagefoundry.auth.permissions import (
+    BUILTIN_ROLE_PERMISSIONS,
+    CUSTOM_ROLE_FORBIDDEN_PERMISSIONS,
+    CustomRoleError,
+    Permission,
+    Role,
+    validate_custom_role_permissions,
+)
 from messagefoundry.auth.policy import PasswordPolicy
 from messagefoundry.auth.service import AuthService, _directory_login_refusal
 from messagefoundry.config.models import ConnectorType, Source
@@ -49,7 +56,7 @@ from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.config.wiring import Http, WiringError
 from messagefoundry.pipeline.wiring_runner import check_inbound_revocation
 from messagefoundry.store.store import LockoutCounter, UserRecord, lockout_escalates
-from tests._sign_in_claim import SIGN_IN_CLAIM, SIGN_IN_VERB
+from tests._sign_in_claim import SIGN_IN_ANY_TENSE, SIGN_IN_CLAIM
 
 _ROOT = Path(__file__).resolve().parent.parent
 _DOC = _ROOT / "docs" / "SECURITY.md"
@@ -3111,8 +3118,12 @@ def test_the_thirteenth_sweep_probes_the_code_the_docs_now_state(
     gate(True, source_ip_allowlist=["10.0.0.0/8", "2001:db8::/32"])
     # Once intake_auth names a mode, only that mode is judged: a narrow allow-list does not rescue
     # a key mode with no key (docs/DEPLOYMENT.md says the allow-list is then not consulted).
-    with pytest.raises(WiringError):
-        gate(True, intake_auth="bearer", intake_api_key="", source_ip_allowlist=["10.0.0.0/24"])
+    for incomplete in (
+        {"intake_auth": "bearer", "intake_api_key": ""},
+        {"intake_auth": "mtls_subject", "tls_ca_file": "ca.pem", "intake_client_subjects": []},
+    ):
+        with pytest.raises(WiringError):
+            gate(True, source_ip_allowlist=["10.0.0.0/24"], **incomplete)
     assert (
         "allow_insecure_bind"
         not in inspect.signature(wiring_runner.check_http_intake_auth).parameters
@@ -3235,11 +3246,9 @@ def test_the_thirteenth_sweep_probes_the_code_the_docs_now_state(
         r.value for r, p in BUILTIN_ROLE_PERMISSIONS.items() if Permission.USERS_MANAGE in p
     ] == [Role.ADMINISTRATOR.value]
     # ...and no custom role can hold it either: the write-time validator refuses it.
-    from messagefoundry.auth import permissions as permissions_module
-
-    assert Permission.USERS_MANAGE in permissions_module.CUSTOM_ROLE_FORBIDDEN_PERMISSIONS
-    with pytest.raises(permissions_module.CustomRoleError, match="not assignable"):
-        permissions_module.validate_custom_role_permissions([Permission.USERS_MANAGE.value])
+    assert Permission.USERS_MANAGE in CUSTOM_ROLE_FORBIDDEN_PERMISSIONS
+    with pytest.raises(CustomRoleError, match="not assignable"):
+        validate_custom_role_permissions([Permission.USERS_MANAGE.value])
     assert "FEDERATED_SUBJECT_NOT_BOUND" in {
         n.id for n in ast.walk(_service_func("_authenticate_oidc")) if isinstance(n, ast.Name)
     }, "_authenticate_oidc no longer refuses a federated identity bound to no account"
@@ -3337,8 +3346,8 @@ def test_the_thirteenth_sweep_loosening_note_binds_no_user_at_sign_in() -> None:
     section = doc[start : doc.index("\n### ", start + 1)]
     clauses = [c for c in _clauses(section) if "password" in c]
     assert clauses, "the cleartext-LDAP section names no password, so this check reads nothing"
-    # The shared verb pattern, so "sign-in", "signin" and "login" are read too.
-    at_sign_in = [c for c in clauses if SIGN_IN_VERB.search(c)]
+    # The shared pattern in every tense, so "sign-in", "login", "signed in" and "logged on" are read.
+    at_sign_in = [c for c in clauses if SIGN_IN_ANY_TENSE.search(c)]
     assert not at_sign_in, (
         f"docs/SECURITY-LOOSENING.md says a user's sign-in binds a password again: {at_sign_in}"
     )
@@ -3406,17 +3415,25 @@ def test_the_thirteenth_sweep_no_doc_says_nobody_can_sign_in_before_provisioning
         "before then holds no role"
     )
     # The Kerberos note must not read as the default path. At the shipped posture a start with no
-    # Administrator is refused, so a sign-in "before then" happens only if a start goes ahead.
-    unconditional = [c for c in clauses if "Kerberos" in c and re.search(r"\bbefore then\b", c)]
+    # Administrator is refused, so a sign-in ahead of provisioning happens only if a start goes
+    # ahead. A clause placing it ahead of provisioning must carry that condition itself.
+    unconditional = [
+        c
+        for c in clauses
+        if "Kerberos" in c
+        and re.search(r"\b(?:before|until) (?:then|provisioning)\b", c)
+        and not re.search(r"\bgoes ahead\b|\bwarn\b|\bwaive", c)
+    ]
     assert not unconditional, (
         f"{name} says a Windows sign-in can come before provisioning with no condition: "
         f"{unconditional}"
     )
 
 
-#: Dated records keep what they said on the day: the released changelog, its fragments, ADRs and
-#: the archive. Everything else tracked as Markdown is a shipped page and is scanned.
-_DATED_RECORDS = ("CHANGELOG.md", "changelog.d/", "docs/adr/", "docs/archive/")
+#: Dated records keep what they said on the day: the released changelog and its fragments, each
+#: numbered ADR (the ADR index, docs/adr/README.md, is a maintained page and IS scanned), and the
+#: dated benchmark and status records. Everything else tracked as Markdown is a shipped page.
+_DATED_RECORDS = ("CHANGELOG.md", "changelog.d/", "docs/adr/0", "docs/benchmarks/")
 
 
 def test_the_thirteenth_sweep_no_shipped_page_says_nobody_can_sign_in() -> None:
@@ -3430,10 +3447,13 @@ def test_the_thirteenth_sweep_no_shipped_page_says_nobody_can_sign_in() -> None:
     assert len(pages) >= 150, (
         f"only {len(pages)} tracked pages found, floor 150; re-derive the list"
     )
-    assert set(_PROVISIONING_DOCS) <= set(pages), "control: the six named docs are in the scan"
+    assert set(_PROVISIONING_DOCS) <= set(pages), "control: the six named docs are in the listing"
+    assert "docs/adr/README.md" in pages, "control: the ADR index is a page, not a dated record"
     hits = [
         f"{rel}: {c[:120]}"
+        # The six named docs are read by the parametrized test above with the same pattern.
         for rel in pages
+        if rel not in _PROVISIONING_DOCS
         # Through _doc, the reader every prose check in this file uses: this is a claim about
         # pages, not about source, so it is not a source probe.
         for c in _clauses(_doc(rel))

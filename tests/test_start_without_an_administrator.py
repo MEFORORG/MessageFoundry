@@ -198,6 +198,11 @@ def test_a_posture_that_starts_logs_one_warning_naming_provision_admin(
     assert not SIGN_IN_CLAIM.search(lines[0]), f"the line says nobody can sign in again: {lines[0]}"
     # One fact, said once: the prefix must not repeat the detail (BACKLOG #1133 review).
     assert lines[0].count("no enabled Administrator") == 1, lines[0]
+    if "enforcement" not in posture:
+        # The skipped-gate line, whose prefix changelog.d/1133-first-sign-in.changed.md quotes.
+        assert lines[0].startswith("the engine is starting with the notice gate skipped: "), lines[
+            0
+        ]
 
 
 def test_with_sign_in_not_required_no_administrator_is_needed_and_nothing_is_logged(
@@ -303,8 +308,15 @@ def test_the_help_reader_survives_a_hyphen_wrap() -> None:
     assert SIGN_IN_CLAIM.search(rejoin_wrapped_hyphens(wrapped))
     assert not SIGN_IN_CLAIM.search(" ".join(wrapped.split())), "control: a bare join misses it"
     # The pattern's two edges: ADR 0197's lock is a noun, and a state is not an ability.
-    assert not SIGN_IN_CLAIM.search("Accounts with no way past a sign-in lock")
-    assert not SIGN_IN_CLAIM.search("nobody is signed in at the moment")
+    for not_the_claim in (
+        "Accounts with no way past a sign-in lock",
+        "nobody can get past the sign-in lockout",
+        "nobody is signed in at the moment",
+        "no one-time password is written, so sign in with the directory",
+    ):
+        assert not SIGN_IN_CLAIM.search(not_the_claim), not_the_claim
+    # Only a hyphen that ends a line is rejoined; spaced prose is left as written.
+    assert rejoin_wrapped_hyphens("pre- and post-processing") == "pre- and post-processing"
     for claim in (
         "nobody can log in",
         "no one can sign into it",
