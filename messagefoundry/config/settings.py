@@ -6316,6 +6316,19 @@ def _env_overrides(environ: Mapping[str, str]) -> dict[str, dict[str, Any]]:
     return out
 
 
+def environment_named_by_env(environ: Mapping[str, str] | None = None) -> str | None:
+    """The active environment ``MEFOR_AI_ENVIRONMENT`` names, or ``None`` when it is unset or blank.
+
+    Read the way :func:`load_settings` reads it, through :func:`_env_overrides`, so a spelling the
+    loader accepts is a spelling this accepts. ``messagefoundry check`` uses it to tell an instance
+    declared in the environment from a dev shell that merely exports a store key (vault BACKLOG
+    #2355): ``serve`` refuses to start with no active environment, so a set of ``MEFOR_*`` variables
+    with none is not an instance ``serve`` would run."""
+    environ = os.environ if environ is None else environ
+    value = _env_overrides(environ).get("ai", {}).get("environment")
+    return value if isinstance(value, str) and value.strip() else None
+
+
 def _warn_file_secrets(file_data: Mapping[str, Any], path: Path) -> None:
     """Warn when a secret is supplied via the config file instead of the environment."""
     for section, key in _FILE_SECRET_KEYS:
@@ -7859,12 +7872,18 @@ def load_settings(
     config_path: str | Path | None = None,
     cli: Mapping[str, Mapping[str, Any]] | None = None,
     environ: Mapping[str, str] | None = None,
+    default_file: bool = True,
 ) -> ServiceSettings:
     """Resolve settings with CLI > env > file > default precedence.
 
     ``config_path`` reads that TOML file (error if it's missing); when ``None``, ``./messagefoundry.toml``
     is used **only if it exists**. ``cli`` is a nested ``{section: {key: value}}`` of explicitly-provided
     CLI overrides (omit a key to fall through). ``environ`` defaults to ``os.environ``.
+
+    ``default_file=False`` with no ``config_path`` reads no file at all: settings come from the
+    environment, ``cli`` and the defaults. ``messagefoundry check`` needs that for an instance declared
+    in the environment alone, whose settings must not pick up a stray ``messagefoundry.toml`` in
+    whatever directory the gate runs from (vault BACKLOG #2355).
     """
     environ = os.environ if environ is None else environ
     data: dict[str, dict[str, Any]] = {}
@@ -7873,7 +7892,7 @@ def load_settings(
     path = Path(config_path) if config_path is not None else Path(_DEFAULT_FILE)
     if config_path is not None and not path.exists():
         raise FileNotFoundError(f"service config not found: {path}")
-    if path.exists():
+    if (config_path is not None or default_file) and path.exists():
         with path.open("rb") as fh:
             file_data = tomllib.load(fh)
         _warn_file_secrets(file_data, path)

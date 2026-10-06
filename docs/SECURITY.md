@@ -246,9 +246,11 @@ loosening, and [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) says how each star
 not required. The proxy must then speak https to the engine and trust that certificate, or every
 request through it fails. Setting the acknowledgement without `tls_terminated_upstream` is refused at
 load. `messagefoundry check` runs the same test as a required check, `upstream-hop-ack`, against the
-`messagefoundry.toml` it finds, so the commit/CI gate catches the refusal before `serve` does. It
-reads that file only: a terminator set through `MEFOR_API_*` environment variables alone reaches
-`serve` and not the check.
+`messagefoundry.toml` it finds, so the commit/CI gate catches the refusal before `serve` does. With
+no file it reads the environment instead, when `MEFOR_AI_ENVIRONMENT` names the instance, and its
+line says so. A terminator set through `MEFOR_API_*` variables with no file and no
+`MEFOR_AI_ENVIRONMENT`, for example on a site that names its environment only with `serve --env`,
+still reaches `serve` and not the check.
 
 **A trusted proxy must be declared, or the engine must hold your certificate (BACKLOG #2055).** The
 pairing runs both ways. A non-empty `[api].trusted_proxies` without `tls_terminated_upstream` is

@@ -11,6 +11,7 @@ and confirms the ``checks.py`` commit/CI mirror fails-closed on an unresolved po
 
 from __future__ import annotations
 
+import os
 import tomllib
 from pathlib import Path
 
@@ -537,6 +538,174 @@ def test_build_check_runs_the_inbound_exposure_gates(
     assert result.ok is ok, f"{arm}: {result.detail}"
     if not ok:
         assert "IB_EXPOSED" in result.detail and "without TLS" in result.detail
+
+
+# --- vault BACKLOG #2355: an instance declared in MEFOR_* variables alone is checked, not skipped --
+# Before this every settings leg returned SKIP "no messagefoundry.toml" before reading a variable, so
+# a site configured by environment alone got a green gate that read nothing. The trigger is
+# MEFOR_AI_ENVIRONMENT, because serve refuses to start without an active environment; any other
+# MEFOR_<SECTION>_* variable alone, a store key in a dev shell, keeps the bare-dir SKIP.
+
+_ENV_ONLY_NOTE = "settings from environment only"
+_MLLP_CONFIG = (
+    "from messagefoundry import inbound, router, MLLP\n"
+    "inbound('IB_ENV', MLLP(port=2601), router='r')\n"
+    "@router('r')\n"
+    "def r(m): return []\n"
+)
+
+
+def _bare_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str = _MLLP_CONFIG) -> Path:
+    """A config dir with no messagefoundry.toml, and an environment holding no MEFOR_* variable
+    but the ones the test sets. The scrub matters: a CI job or this file's own fixtures can export
+    settings variables, and a test of the environment-only path must not read them by accident."""
+    for name in list(os.environ):
+        if name.upper().startswith("MEFOR_"):
+            monkeypatch.delenv(name)
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "c.py").write_text(body, encoding="utf-8")
+    return cfg
+
+
+def _leg(cfg: Path, name: str) -> CheckResult:
+    # suppress_service_toml_search confines the look to cfg, so no file anywhere above tmp_path or in
+    # the working directory can stand in for the environment.
+    report = run_checks(cfg, run_lint=False, suppress_service_toml_search=True)
+    return next(r for r in report.results if r.name == name)
+
+
+_SETTINGS_LEGS = (
+    "posture",
+    "build-check",
+    "reference-backend",
+    "upstream-hop-ack",
+    "oidc-auth-params",
+    "static-credentials",
+    "alert-smtp-tls",
+)
+
+
+@pytest.mark.parametrize("name", _SETTINGS_LEGS)
+def test_every_settings_leg_reads_an_environment_only_instance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    cfg = _bare_config(tmp_path, monkeypatch)
+    monkeypatch.setenv("MEFOR_AI_ENVIRONMENT", "dev")
+    result = _leg(cfg, name)
+    assert _ENV_ONLY_NOTE in result.detail, f"{name}: {result.detail}"
+    assert "graph only" not in result.detail  # static-credentials read the settings half too
+    if name != "static-credentials":  # that leg reads the graph either way, so never skipped
+        assert not result.skipped, f"{name}: {result.detail}"
+
+
+@pytest.mark.parametrize("name", _SETTINGS_LEGS)
+def test_a_store_key_alone_keeps_the_bare_dir_skip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    # Trap 2 of the item: a dev shell exporting settings variables but naming no environment is
+    # not an instance serve would run, so nothing changes for it.
+    cfg = _bare_config(tmp_path, monkeypatch)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)
+    monkeypatch.setenv("MEFOR_INBOUND_BIND_HOST", "0.0.0.0")
+    result = _leg(cfg, name)
+    assert _ENV_ONLY_NOTE not in result.detail
+    if name == "static-credentials":
+        assert "graph only" in result.detail
+    else:
+        assert result.skipped and result.detail == "no messagefoundry.toml", result.detail
+
+
+def test_posture_refuses_an_environment_only_custom_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _bare_config(tmp_path, monkeypatch)
+    monkeypatch.setenv("MEFOR_AI_ENVIRONMENT", "poc")
+    fail = _leg(cfg, "posture")
+    assert fail.required and not fail.ok and not fail.skipped
+    assert "production_instance" in fail.detail
+    monkeypatch.setenv("MEFOR_SECURITY_PRODUCTION_INSTANCE", "false")
+    ok = _leg(cfg, "posture")
+    assert ok.ok and not ok.skipped, ok.detail
+
+
+def test_build_check_refuses_an_environment_only_exposed_listener(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The two items meet here: the bind host comes from the environment, and the exposure gate it
+    # trips now runs at check.
+    cfg = _bare_config(tmp_path, monkeypatch)
+    monkeypatch.setenv("MEFOR_AI_ENVIRONMENT", "dev")
+    monkeypatch.setenv("MEFOR_INBOUND_BIND_HOST", "0.0.0.0")
+    result = _leg(cfg, "build-check")
+    assert result.required and not result.ok and not result.skipped
+    assert "IB_ENV" in result.detail and "without TLS" in result.detail
+    assert _ENV_ONLY_NOTE in result.detail
+
+
+def test_hop_ack_refuses_an_environment_only_terminator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #1179's recorded gap: a terminator set only through MEFOR_API_* reached serve and not
+    # the check.
+    cfg = _bare_config(tmp_path, monkeypatch)
+    monkeypatch.setenv("MEFOR_AI_ENVIRONMENT", "dev")
+    monkeypatch.setenv("MEFOR_API_TLS_TERMINATED_UPSTREAM", "true")
+    monkeypatch.setenv("MEFOR_API_TRUSTED_PROXIES", "10.0.0.1")
+    result = _leg(cfg, "upstream-hop-ack")
+    assert result.required and not result.ok and not result.skipped
+    assert "plaintext_upstream_hop_acknowledged" in result.detail
+
+
+def test_reference_backend_reads_an_environment_only_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The SQL Server flag stands in for a future backend with no snapshot store, as in
+    # tests/test_checks.py. The backend is declared only in MEFOR_STORE_*.
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    monkeypatch.setattr(SqlServerStore, "supports_reference_sets", False)
+    csv = tmp_path / "npi.csv"
+    csv.write_text("key,value\nMED1,9991\n", encoding="utf-8")
+    cfg = _bare_config(
+        tmp_path,
+        monkeypatch,
+        "from messagefoundry import inbound, router, File, Reference, FileRef\n"
+        "inbound('IB_X', File(directory='in'), router='r')\n"
+        f"Reference('provider_npi', source=FileRef(path={str(csv)!r}))\n"
+        "@router('r')\n"
+        "def r(m): return []\n",
+    )
+    monkeypatch.setenv("MEFOR_AI_ENVIRONMENT", "dev")
+    for key, value in (
+        ("BACKEND", "sqlserver"),
+        ("SERVER", "db.example.invalid"),
+        ("DATABASE", "mefor"),
+        ("USERNAME", "mefor_svc"),
+    ):
+        monkeypatch.setenv(f"MEFOR_STORE_{key}", value)
+    result = _leg(cfg, "reference-backend")
+    assert result.required and not result.ok and not result.skipped
+    assert "provider_npi" in result.detail and "sqlserver" in result.detail
+
+
+def test_an_environment_only_load_ignores_a_stray_file_in_the_working_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Trap 1 of the item: load_settings with no path reads ./messagefoundry.toml. A file the gate
+    # did not resolve must not leak into an environment-only read. This stray one declares a
+    # terminator with no acknowledgement, which the leg would refuse if it read it.
+    cfg = _bare_config(tmp_path, monkeypatch)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "messagefoundry.toml").write_text(
+        '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.1"]\n', encoding="utf-8"
+    )
+    monkeypatch.chdir(elsewhere)
+    monkeypatch.setenv("MEFOR_AI_ENVIRONMENT", "dev")
+    result = _leg(cfg, "upstream-hop-ack")
+    assert result.ok and not result.skipped, result.detail
+    assert _ENV_ONLY_NOTE in result.detail
 
 
 # BACKLOG #1967: this file's serve fixtures test other gates, so they bound the two warn-only
