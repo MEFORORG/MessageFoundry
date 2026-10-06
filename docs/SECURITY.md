@@ -1975,8 +1975,22 @@ the lockout. It is audited as `auth.webauthn_failed` with
 `POST /ui/reauth/webauthn` answers **400** with the same words the other legs use. A session or
 account gone after the lookup answers **401**.
 
-**The password re-bind says the same when the directory could not judge the password (BACKLOG
-#2027).** That covers at least a row with no directory object id, no enabled entry for the row's
+**Both legs also refuse a present account that lost a role in the directory (BACKLOG #2240).** The
+lookup returns the account's groups, and the engine maps them to roles as the reconciliation pass
+does. If any role stored on the account is not among those, the leg refuses. Without this, an
+operator demoted in the directory since sign-in would renew its window or clear the MFA gate with
+the old roles until the reconciliation pass revoked it. An added role is not refused, because the
+account then holds fewer roles than the directory grants. The check compares the roles themselves,
+not the permissions they grant. So a move from one role to another refuses, even when the new role
+grants more. A lookup whose groups map to no role refuses every directory account that holds a
+role. The refusal writes no roles; the next reconciliation pass, when it runs, or the next sign-in
+re-syncs them. Otherwise it behaves as the refusals above, audited with the outcome
+`directory_roles_demoted`. Channel scope is not compared on these legs. At least the password
+re-bind (`POST /me/reauth` and the `/ui/reauth` password leg), the IdP step-up leg and the
+enrolment legs do not compare roles yet.
+
+**The password re-bind gives the code and passkey legs' answer when the directory could not judge
+the password (BACKLOG #2027).** That covers at least a row with no directory object id, no enabled entry for the row's
 id (an entry that is not provably the row's own counts as none), an unreachable directory, and no
 directory configured. None of these checks the password or counts toward the lockout.
 `POST /me/reauth` answers **403** saying the directory could not confirm the account, rather than
