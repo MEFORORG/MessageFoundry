@@ -55,6 +55,7 @@ from messagefoundry.auth.identity import Identity
 from messagefoundry.auth.permissions import Permission
 from messagefoundry.config.settings import ApprovalsSettings
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
+from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.store.base import Store
 from messagefoundry.store.store import AuditAppend
 
@@ -98,13 +99,14 @@ def _stored_params(approval_id: str, raw: Any) -> dict[str, Any] | None:
     """A row's captured params, or ``None`` when the stored value is not a JSON object. The one
     decoder for the queue (BACKLOG #2458) and for :meth:`ApprovalGate.approve`, so the two agree on
     what is readable: the queue lists such a row as unreadable, and approve refuses it with a 409.
-    Logged by id only, because the value may be anything."""
-    try:
-        params = json.loads(str(raw))
-    except (ValueError, RecursionError):  # RecursionError: a deeply nested stored value
-        params = None
-    if not isinstance(params, dict):
-        log.warning("approval %s: its stored params are not a JSON object", approval_id)
+    Logged by id and a content-free hint only, because the value may be anything."""
+    params, refusal = json_loads_or_refusal(str(raw))
+    if refusal is not None or not isinstance(params, dict):
+        log.warning(
+            "approval %s: its stored params are not a JSON object (%s)",
+            approval_id,
+            refusal or "not an object",
+        )
         return None
     return params
 
@@ -388,6 +390,7 @@ class ApprovalGate:
         return [self._queue_entry(r, caller_user_id) for r in rows]
 
     def _queue_entry(self, r: Any, caller_user_id: str | None) -> dict[str, Any]:
+        operation = str(r["operation"])
         return {
             # BACKLOG #2460: keyed on the immutable id, like the refusals it predicts (#1540), so a
             # page can hide Approve from the requester. A row with no id never matches; approve
@@ -395,8 +398,8 @@ class ApprovalGate:
             "caller_is_requester": bool(caller_user_id)
             and str(r["requester_user_id"] or "") == caller_user_id,
             "id": str(r["id"]),
-            "operation": str(r["operation"]),
-            "label": self._label(str(r["operation"])),
+            "operation": operation,
+            "label": self._label(operation),
             "params": _stored_params(str(r["id"]), r["params"]),
             "requester": str(r["requester"]),
             "requested_at": float(r["requested_at"]),
@@ -406,7 +409,7 @@ class ApprovalGate:
             "decided_at": (None if r["decided_at"] is None else float(r["decided_at"])),
             # The same test approve() refuses on (approval.no_longer_gated), so a page can stop
             # offering a release the gate would refuse. Read now, like the refusal it predicts.
-            "gated": self._gated(str(r["operation"])),
+            "gated": self._gated(operation),
         }
 
     async def approve(

@@ -87,6 +87,8 @@ _INTERRUPTED_NOTE = (
 
 _OWN_REQUEST = "Your request. A different approver decides it."
 
+_UNREADABLE = "Unreadable; reject it."
+
 # Mirrors the engine's approval.no_longer_gated refusal, so the advice is the same either way.
 _NOT_GATED = (
     "Dual control no longer applies to this operation, so it cannot be approved. Reject it; if it "
@@ -188,26 +190,21 @@ def _pending_row(a: PendingApprovalInfo) -> list[object]:
     base = f"{_PAGE}/{_seg(a.id)}"
     # BACKLOG #2460: Approve is not offered where the gate would refuse it: to the requester, on a
     # row whose operation dual control no longer gates, and on a row whose params are unreadable.
+    # Each such row gets the reject and a note saying why, in the order approve() refuses them.
     if a.caller_is_requester:
-        controls = [
-            _post_button(f"{base}/reject", "Withdraw"),
-            el("span", _OWN_REQUEST, class_="muted"),
-        ]
+        note: str | None = _OWN_REQUEST
     elif not a.gated:
-        controls = [
-            _post_button(f"{base}/reject", "Reject"),
-            el("span", _NOT_GATED, class_="muted"),
-        ]
+        note = _NOT_GATED
     elif a.params is None:
-        controls = [
-            _post_button(f"{base}/reject", "Reject"),
-            el("span", "Unreadable; reject it.", class_="muted"),
-        ]
+        note = _UNREADABLE
     else:
-        controls = [
-            _post_button(f"{base}/approve", "Approve"),
-            _post_button(f"{base}/reject", "Reject"),
-        ]
+        note = None
+    reject = _post_button(f"{base}/reject", "Withdraw" if a.caller_is_requester else "Reject")
+    controls = (
+        [_post_button(f"{base}/approve", "Approve"), reject]
+        if note is None
+        else [reject, el("span", note, class_="muted")]
+    )
     actions = el("div", *controls, class_="ctls")
     return [
         _ts(a.requested_at),

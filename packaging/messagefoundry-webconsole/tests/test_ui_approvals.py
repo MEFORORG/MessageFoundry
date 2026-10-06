@@ -138,8 +138,9 @@ async def test_a_hold_dual_control_no_longer_gates_offers_only_reject(engine: En
 
 def test_an_ungated_row_offers_no_approve() -> None:
     """The page reads ``gated`` alone; a gated row of the same shape still offers Approve."""
+    aid = "b" * 32
     row = PendingApprovalInfo(
-        id="b" * 32,
+        id=aid,
         operation="dead_letter_replay",
         label="Replay",
         params={"channel_id": "ch1"},
@@ -150,9 +151,9 @@ def test_an_ungated_row_offers_no_approve() -> None:
     ungated = str(
         pages.approvals_page(ApprovalList(approvals=[row.model_copy(update={"gated": False})]))
     )
-    assert f'action="/ui/approvals/{"b" * 32}/approve"' in gated
-    assert f'action="/ui/approvals/{"b" * 32}/approve"' not in ungated
-    assert f'action="/ui/approvals/{"b" * 32}/reject"' in ungated
+    assert f'action="/ui/approvals/{aid}/approve"' in gated
+    assert f'action="/ui/approvals/{aid}/approve"' not in ungated
+    assert f'action="/ui/approvals/{aid}/reject"' in ungated
     assert "Dual control no longer applies" in ungated and "Dual control no longer" not in gated
 
 
