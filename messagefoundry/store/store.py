@@ -4109,10 +4109,22 @@ def check_password_generated(*, password_generated: bool, password_hash: str | N
 #: service's read and this write makes the write match no row, and the caller refuses. Backend
 #: truth literals differ, so each backend passes its own.
 def rotation_factor_term(true_literal: str) -> str:
-    # ``totp_secret IS NOT NULL`` too: an enrolment confirm that raced an administrator's factor
-    # reset can leave ``totp_enabled`` set over a NULL secret, and TOTP with no secret is no way
-    # past the lock.
+    # ``totp_secret IS NOT NULL`` too, because TOTP with no secret is no way past the lock. Since
+    # BACKLOG #2224 ``enable_totp`` no longer writes that state (see ``totp_enable_term``), but at
+    # least ``set_totp_secret(secret=None)`` still can, so the second guard stays.
     return f" AND totp_enabled={true_literal} AND totp_secret IS NOT NULL"
+
+
+#: The WHERE term that makes ``enable_totp`` conditional (BACKLOG #2224). The enrolment confirm
+#: rotates the session BEFORE it enables TOTP (BACKLOG #1902), so an ``admin_reset_mfa`` can clear
+#: the staged secret inside that window, and a second confirm can enable first. Unconditional, the
+#: enable would then set ``totp_enabled`` over a NULL secret, or replace the first confirm's
+#: recovery codes. With this term the write matches no row in either case, and the caller refuses.
+#: It checks that SOME secret is staged, not that it is the one the caller verified: a second
+#: ``set_totp_secret`` landing in the window is not caught here. Backend false literals differ, so
+#: each backend passes its own.
+def totp_enable_term(false_literal: str) -> str:
+    return f" AND totp_secret IS NOT NULL AND totp_enabled={false_literal}"
 
 
 #: Which lockout counter one failed attempt feeds (ADR 0197, BACKLOG #1131). ``"sign_in"`` is the
@@ -11637,17 +11649,20 @@ class MessageStore:
 
     async def enable_totp(
         self, user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
-    ) -> None:
+    ) -> bool:
         """Activate TOTP for a user (post-confirm), storing the argon2id hashes of their one-time
-        recovery codes."""
+        recovery codes. Writes only where a secret is staged and TOTP is still off, and returns
+        whether it wrote (BACKLOG #2224, see :func:`totp_enable_term`)."""
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
-            await self._db.execute(
+            cur = await self._db.execute(
                 "UPDATE users SET totp_enabled=1, totp_enrolled_at=?, totp_recovery_codes=?,"
-                " updated_at=? WHERE id=?",
+                f" updated_at=? WHERE id=?{totp_enable_term('0')}",
                 (now, json.dumps(recovery_code_hashes), now, user_id),
             )
+            written = cur.rowcount > 0
             await self._commit()
+        return written
 
     async def disable_totp(self, user_id: str, *, now: float | None = None) -> None:
         """Clear a user's TOTP enrollment entirely (secret, enabled flag, recovery codes)."""

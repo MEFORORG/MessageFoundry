@@ -427,6 +427,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # A correct code on a session revoked mid-enrolment: the rotation failed before MFA was
             # enabled, so MFA stays OFF (BACKLOG #1902) and no codes exist to show. This browser's
             # cookie is dead; land on login, and the operator enrols again from the account page.
+            # The same answer when a reset or a second confirm beat this one to the enable
+            # (BACKLOG #2224): this confirm turned nothing on and its session was ended. After a
+            # second confirm TOTP is already on, so the operator signs in with it, not enrols.
             return login_redirect_response()
         if elevation.token is None:
             return HTMLResponse(pages.mfa_confirm_page(error="Invalid code."), status_code=400)
