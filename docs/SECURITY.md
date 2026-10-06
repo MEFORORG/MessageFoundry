@@ -4030,6 +4030,29 @@ as long as an attacker sustains a lock that sign-in cannot pass: the second-step
 lock on any account except a local one with TOTP enrolled. Only the host-gated `admin-unlock`
 remains, which needs access to the engine host itself.
 
+**Replace a sole administrator's authenticator seed from the host.** If you suspect the TOTP seed
+has leaked, or the device holding it is lost, run `messagefoundry admin-reset-totp --username
+<name>` with the engine stopped ([ADR
+0171](adr/0171-offline-administrator-unlock-a-host-gated-cli-recovery-path-for-a-sole-administrator-lockout.md)
+Amendment B, BACKLOG #2226, owner ruling 2026-10-06). It is the only route for a sole administrator
+whose one factor is TOTP. The administrator reset refuses a self-target, and self-service removal
+refuses the last factor. It uses the same host gate as `admin-unlock`.
+
+1. The command refuses, before showing anything, at least: an unknown account, a non-Administrator,
+   a disabled account and an account with no TOTP enrolled.
+2. It shows a new key and its `otpauth://` URI on the console only, never on stdout or stderr. Add
+   it to the app as a new entry and type the code it shows.
+3. Only after a good code does it write. One write swaps the seed and the recovery codes and leaves
+   TOTP on, so the account never has no factor. A wrong code or a lost console writes nothing, and
+   the old entry keeps working.
+4. It ends every session of the account and shows the new recovery codes on the console once. The
+   old entry and the old codes stop working. Delete the old entry from the app.
+
+It writes an `auth.admin_totp_reset` audit row naming the OS user, and sends the account an
+`mfa_enabled` notice where a relay is configured. It leaves passkeys alone and does not clear a
+lockout; run `admin-unlock` for that. Another account's authenticator is reset from the web console
+(Reset MFA), because a host-run replacement would leave the new seed with whoever ran it.
+
 > **Binding conditionality — controls 2 and 3 are one switch, not two.**
 > `[auth].login_rate_limit_enabled = false` constructs **neither** limiter: `_login_limiter` and
 > `_reauth_limiter` are both `None` and both accessors then return `True` unconditionally. They share
