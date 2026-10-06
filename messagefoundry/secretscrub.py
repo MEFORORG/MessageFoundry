@@ -108,16 +108,19 @@ names is level: the plain line 0.58 against 0.57 us, the credential line 3.37 ag
 credential line 3.21 against 3.21, and each 6 KB run ending at the end of the line within 3 percent.
 That is :data:`_NO_QUOTED_LABEL_AFTER`'s fast path; without it the credential line cost 41 percent
 more. A line where the stop actually runs pays for it: a two-label line 5.70 against 7.12 us, and it
-now redacts the second password. THE NEW CEILING is a 6 KB value whose run ends on a quote, which
-forces the token walk: 24 against 764 us, linear at 7.6x to 8.0x for 8x the length over four
-adversarial shapes, a quoted run of spaces among them. That is well under this module's 21 ms ceiling
-above, and under the 33 ms the PHI pass spends on such a line.
+now redacts the second password. The costliest shape measured that day was a 6 KB value whose run
+ends on a quote, which forces the token walk: 24 against 764 us, linear at 7.6x to 8.0x for 8x the
+length over four adversarial shapes, a quoted run of spaces among them. IT IS NOT THE CEILING. A
+review on 2026-10-05 measured costlier ones, because the underscored-prefix check walks at every run
+start: ``token=x`` then ``;a_a_a_a_a_a_a`` repeated, ending on a quote, cost 1.2 ms at 6 KB and
+3.4 ms at 16 KB, 7.9x for 8x the length. That is linear and under this module's 21 ms ceiling above,
+and under the 33 ms the PHI pass spends on such a line.
 
 WHAT :data:`_KV_QUOTED_VALUE` COSTS, measured 2026-10-05 the same way, against the plain quoted form in
 the same pattern. The paragraph above predates it. An ordinary quoted credential line is level, 4.05
-against 4.04 us, because its fast path is the plain form. A quoted value whose last character is "=" or
-a space takes the walk: 3.95 against 4.54 us, and 44 against 572 us for a 6 KB one. Linear, and under
-the ceiling above.
+against 4.04 us, because its fast path is the plain form. A quoted value whose last character is ":",
+"=" or a space takes the walk. Measured on "=" and a space: 3.95 against 4.54 us, and 44 against
+572 us for a 6 KB one. Linear, and under the ceiling above.
 """
 
 from __future__ import annotations
@@ -366,7 +369,9 @@ _ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
 # hard separator, an underscored run in front of a keyword is read as the later label's prefix, so in
 # ``token=a;b_password="v w"`` the "b" prints as part of the label ``b_password`` and "v w" no longer
 # does. That is how ``_CREDENTIAL_KV`` already reads the same text, since its own value stops at ";".
-# ":" and "=" count as hard separators too, so the printed run can be the TAIL OF A VALUE written as
+# Every character outside letters, digits, ".", "-" and "_" is a hard separator, "+", "@", "/" and "("
+# among them. So the run that prints can be the tail of a value such as ``token=abc+def_password='x y'``,
+# where "def" prints. ":" and "=" count too, so the printed run can be the TAIL OF A VALUE written as
 # ``label=value``: in ``MEFOR_B_PW = vq0:vq1_session = 'vq2:vq3'`` it is "vq1" that prints, and the
 # quoted "vq2:vq3" that no longer does. Taken because the quoted value is the one a label names for
 # certain; the run in front of the keyword is a value only by one of two readings.
@@ -651,9 +656,10 @@ _MEFOR_SECRET = re.compile(
 #   unclosed "{" under ``_MEFOR_SECRET`` or ``_KEY_MATERIAL`` falls back to the plain class too.
 # * A list under ``_KEY_MATERIAL`` written with a SPACE after each comma still prints its later
 #   elements; the reason is on that pattern.
-# * A quoted value the guard refuses still prints its tail under the three guarded patterns: one that
-#   holds the other quote, holds a "{", or ends in "=" or a space. ``MEFOR_STORE_PW="it's a secret"``
-#   prints "s a secret"" and ``private_key='ab cd=='`` prints " cd=='". The guard is what stops a value
+# * A quoted value the guard refuses still prints its tail under the three guarded patterns. At least
+#   these: one that holds the other quote, a "{" or a "://", one that ends in ":", "=" or a space, and
+#   one whose closer is followed by ":" or "=". ``MEFOR_STORE_PW="it's a secret"`` prints
+#   "s a secret"" and ``private_key='ab cd=='`` prints " cd=='". The guard is what stops a value
 #   closing on a later label's quote, so loosening it is a trade to measure, not a free edit.
 # * A ``MEFOR_*`` value holding a connection string with a braced password, as in
 #   ``MEFOR_STORE_DSN=Server=h;PWD={p w}``, still prints " w}". The stop does not fire before a

@@ -240,7 +240,7 @@ _PLAIN_SCHEME_VALUE = (
 # ``_AUTH_SCHEME`` was worth ZERO while its only case-bearing part was the scheme word. It is NOT a
 # free edit any more: the pattern now splices ``_PLAIN_SCHEME_VALUE``, whose run class and stop sit
 # under the global fold, so scoping it would change what it matches and stop its run class folding
-# U+017F, U+0130 and U+0131. Leave it global. ``_DSN_PASSWORD`` would pay --
+# U+017F, U+0130, U+0131 and U+212A. Leave it global. ``_DSN_PASSWORD`` would pay --
 # it scans two classes under its fold -- but its ``[a-z]`` classes depend on the global fold, so
 # scoping it means rewriting them, and that is still a separate change from the one it needed first.
 #

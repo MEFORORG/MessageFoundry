@@ -691,15 +691,27 @@ def test_the_quoted_value_repetitions_stay_non_backtracking() -> None:
     Structural rather than a stopwatch, for the reason the sibling guard already gives: a timing
     assertion on a shared runner flakes, and the property that matters is that the mitigation is
     there."""
-    for name in ("_ODBC_BRACED", "_KV_QUOTED_VALUE"):
-        fragment = getattr(redact_mod, name)
-        assert "*+" in fragment, (
-            f"{name} is {fragment!r} -- its repetition must stay POSSESSIVE. A plain '*' re-walks a "
-            "value whose closer never arrives, on attacker-influenceable log text."
-        )
-        assert "*" not in fragment.replace("*+", ""), (
-            f"{name} is {fragment!r} -- it grew a repetition that is neither possessive nor bounded."
-        )
+    # Both copies, and the guarded forms too: a review measured ``_GUARDED_QUOTED_VALUE`` going
+    # exponential with its ``++`` and ``*+`` made greedy, and nothing structural failed. Every "+"
+    # must be possessive as well as every "*", for the same reason.
+    for module in (redact_mod, scrub_mod):
+        for name in (
+            "_ODBC_BRACED",
+            "_KV_QUOTED_VALUE",
+            "_GUARDED_QUOTED_VALUE",
+            "_GUARDED_BRACED_VALUE",
+        ):
+            fragment = getattr(module, name)
+            assert "*+" in fragment, (
+                f"{module.__name__}.{name} is {fragment!r} -- its repetition must stay POSSESSIVE. "
+                "A plain '*' re-walks a value whose closer never arrives, on attacker-influenceable "
+                "log text."
+            )
+            rest = fragment.replace("*+", "").replace("++", "").replace("?+", "")
+            assert "*" not in rest and "+" not in rest, (
+                f"{module.__name__}.{name} is {fragment!r} -- it grew a repetition that is neither "
+                "possessive nor bounded."
+            )
 
     # Anti-vacuity: every fragment must still be REACHED, or the assertions above pin dead strings.
     # Taken from the table rather than written fresh, so this cannot go green over a shape the suite
@@ -2073,8 +2085,9 @@ def test_the_old_gate_fails_the_fold_character_test(monkeypatch: pytest.MonkeyPa
 #: The patterns whose plain value class carries the stop, in both modules.
 _STOPPED_PATTERNS = ("_MEFOR_SECRET", "_BEARER", "_AUTH_SCHEME", "_CREDENTIAL_KV", "_KEY_MATERIAL")
 
-#: The three shapes the finding was filed with: the line, every value piece that must not print, and
-#: the labels that must stay visible so a reader can tell which credentials were there.
+#: The three shapes the finding was filed with, and a fourth for ``_AUTH_SCHEME``: the line, every
+#: value piece that must not print, and the labels that must stay visible so a reader can tell which
+#: credentials were there.
 SWALLOW_EXAMPLES: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
     (
         'connect failed api_token=tk-Sw_A-61;password="pw-Sw_B-62 pw-Sw_C-63" for svc',

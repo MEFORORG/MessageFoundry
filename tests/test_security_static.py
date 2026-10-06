@@ -598,7 +598,10 @@ _UNSCANNABLE_RE_PATTERNS = {
     # literals would restore static scannability and lose that property. The shapes are bounded and
     # non-catastrophic by inspection: one BOUNDED prefix repetition ``{0,6}`` (deliberately bounded --
     # unbounded it is quadratic on attacker-influenceable log text), then a literal alternation, then
-    # a negated character class. No nested quantifier and no overlapping alternation.
+    # a negated character class. That was the whole shape when this entry was written, with no nested
+    # quantifier and no overlapping alternation. IT IS NOT THE SHAPE NOW: the fragments spliced in
+    # since nest quantifiers and start several branches on the same quote. What keeps them linear is
+    # argued below, fragment by fragment, and not by this sentence.
     #
     # ``_CREDENTIAL_KV`` gained three spliced value fragments under BACKLOG #1685, and the clause above
     # covers them all. Every repetition they add is DETERMINISTIC -- there is exactly one parse of any
