@@ -794,7 +794,7 @@ def test_open_egress_gate_counts_smtp_and_direct_when_deny_by_default_is_unset(
 ) -> None:
     """[egress] declares EIGHT allowed_* DESTINATION lists; the gate used to count six.
 
-    (`allowed_proxy` is a ninth allowed_* key and is not one of them — it gates a transport
+    (`allowed_proxy` is another allowed_* key, and it is not one of them — it gates a transport
     intermediary, not a destination, so it must never satisfy this gate. BACKLOG #1659.)
 
 
