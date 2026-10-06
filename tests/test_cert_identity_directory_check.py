@@ -12,19 +12,22 @@ directory data here is synthetic.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import threading
 from collections.abc import AsyncIterator
 from dataclasses import replace
 
 import pytest
 
+from messagefoundry.auth import reconcile
 from messagefoundry.auth import service as service_module
 from messagefoundry.auth.identity import AuthProvider
-from messagefoundry.auth.ldap import DirectoryAnswer, LdapReferralError
-from messagefoundry.auth.permissions import Role
+from messagefoundry.auth.ldap import DirectoryAnswer, DirectoryProbe, LdapReferralError
+from messagefoundry.auth.permissions import Permission, Role
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
-from messagefoundry.store.store import MessageStore
+from messagefoundry.store.store import MessageStore, UserRecord
 from tests._admin_account import login_admin
 from tests.test_mfa_directory_recheck import _OPERATORS, _PRINCIPAL, _VIEWERS, _Directory, _settings
 
@@ -40,13 +43,13 @@ async def store() -> AsyncIterator[MessageStore]:
 
 
 async def _directory_account(
-    store: MessageStore, *groups: str
+    store: MessageStore, *groups: str, role_map: list[tuple[str, str]] | None = None
 ) -> tuple[AuthService, _Directory, str]:
     """A directory account whose roles a sign-in wrote from ``groups`` under the synthetic map.
 
     The sign-in is only how the row is born. The certificate path holds no session."""
     await AuthService(store, _settings()).initialize()  # the map's role ids need the seeded roles
-    await store.set_ad_group_role_map([(_OPERATORS, "operator"), (_VIEWERS, "viewer")])
+    await store.set_ad_group_role_map(role_map or [(_OPERATORS, "operator"), (_VIEWERS, "viewer")])
     principal = replace(_PRINCIPAL, groups=frozenset(groups))
     directory = _Directory(principal)
     service = AuthService(store, _settings(), ldap=directory)  # type: ignore[arg-type]
@@ -210,6 +213,159 @@ async def test_a_full_probe_cap_refuses_after_the_bounded_wait(
     assert len(directory.probes) == 1
 
 
+async def test_more_requests_than_the_cap_all_reach_the_directory_in_turn(
+    store: MessageStore,
+) -> None:
+    """RED when: a finished probe does not give its slot back, so the cap fills and stays full."""
+    service, directory, user_id = await _directory_account(store, _VIEWERS)
+    calls = service_module._CERT_PROBE_MAX_CONCURRENCY * 2 + 1
+
+    for _ in range(calls):
+        assert await service.identity_for_cert_user_id(user_id) is not None
+
+    assert len(directory.probes) == calls
+
+
+async def test_a_cancelled_request_holds_its_slot_until_the_probe_thread_ends(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The probe's worker thread cannot be cancelled. Releasing the slot when the caller gives up
+    would let the threads outnumber the cap; the slot comes back when the thread is done."""
+    service, directory, user_id = await _directory_account(store, _VIEWERS)
+    entered, gate = threading.Event(), threading.Event()
+    real_probe = directory.probe_principal
+
+    def _gated(username: str, *, object_id: str | None = None) -> DirectoryProbe:
+        entered.set()
+        gate.wait(10)
+        return real_probe(username, object_id=object_id)
+
+    monkeypatch.setattr(directory, "probe_principal", _gated)
+    request = asyncio.create_task(service.identity_for_cert_user_id(user_id))
+    try:
+        assert await asyncio.to_thread(entered.wait, 10)
+        request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+        assert len(service._cert_probe_tasks) == 1  # the probe still runs, and holds its slot
+    finally:
+        gate.set()
+    async with asyncio.timeout(10):
+        while service._cert_probe_tasks:
+            await asyncio.sleep(0.01)
+
+    # Every slot is free again: all of them can be taken without waiting.
+    for _ in range(service_module._CERT_PROBE_MAX_CONCURRENCY):
+        assert not service._cert_probe_slots.locked()
+        await service._cert_probe_slots.acquire()
+    assert service._cert_probe_slots.locked()
+
+
+async def test_a_local_disable_during_the_probe_is_honoured(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The probe is a round trip of up to seconds, so the row is read again after it."""
+    service, _directory, user_id = await _directory_account(store, _VIEWERS)
+    real_probe = service._probe_principal
+
+    async def _probe(user: UserRecord) -> reconcile.Probe:
+        probe = await real_probe(user)
+        await store._db.execute("UPDATE users SET disabled = 1 WHERE id = ?", (user_id,))
+        await store._db.commit()
+        return probe
+
+    monkeypatch.setattr(service, "_probe_principal", _probe)
+
+    assert await service.identity_for_cert_user_id(user_id) is None
+
+
+_ADMINS = "CN=MF-Admins,OU=Groups,DC=test,DC=invalid"
+_CUSTOM = "CN=MF-Validators,OU=Groups,DC=test,DC=invalid"
+_CHANNEL_A = "CN=MF-Channel-A,OU=Groups,DC=test,DC=invalid"
+_CHANNEL_B = "CN=MF-Channel-B,OU=Groups,DC=test,DC=invalid"
+
+
+async def test_an_administrator_removed_from_the_admin_group_loses_every_channel_grant(
+    store: MessageStore,
+) -> None:
+    """Administrator reaches every channel by role. Narrowed away, the identity falls back to the
+    stored scope, which for this account grants none."""
+    service, directory, user_id = await _directory_account(
+        store, _ADMINS, _VIEWERS, role_map=[(_ADMINS, "administrator"), (_VIEWERS, "viewer")]
+    )
+
+    full = await service.identity_for_cert_user_id(user_id)
+    assert full is not None and Role.ADMINISTRATOR in full.roles
+    assert full.allowed_channels is None
+
+    directory.principal = replace(_PRINCIPAL, groups=frozenset({_VIEWERS}))
+    narrowed = await service.identity_for_cert_user_id(user_id)
+
+    assert narrowed is not None and narrowed.roles == {Role.VIEWER}
+    assert narrowed.allowed_channels == frozenset()
+
+
+async def test_a_custom_role_narrows_away_with_its_group(store: MessageStore) -> None:
+    """A custom role's permission overlay goes the same way as a built-in role."""
+    seed = AuthService(store, _settings())
+    await seed.initialize()
+    custom = await seed.create_custom_role(
+        display_name="cert-validators",
+        description=None,
+        permissions=["config:validate"],
+        actor="test",
+    )
+    service, directory, user_id = await _directory_account(
+        store, _CUSTOM, _VIEWERS, role_map=[(_CUSTOM, custom.id), (_VIEWERS, "viewer")]
+    )
+    assert set(await store.get_user_role_ids(user_id)) == {custom.id, "viewer"}
+    validate = Permission("config:validate")
+
+    with_custom = await service.identity_for_cert_user_id(user_id)
+    assert with_custom is not None and validate in with_custom.permissions
+
+    directory.principal = replace(_PRINCIPAL, groups=frozenset({_VIEWERS}))
+    narrowed = await service.identity_for_cert_user_id(user_id)
+
+    assert narrowed is not None and validate not in narrowed.permissions
+
+
+async def test_a_channel_group_removal_narrows_the_scope_and_writes_nothing(
+    store: MessageStore,
+) -> None:
+    """The scope narrows on the same groups as the roles, by the rule login and the reconciler
+    share. A cert-only account never signs in, so nothing else would ever apply it."""
+    await AuthService(store, _settings()).initialize()
+    await store.set_ad_group_scope_map([(_CHANNEL_A, "IB_A"), (_CHANNEL_B, "IB_B")])
+    service, directory, user_id = await _directory_account(store, _VIEWERS, _CHANNEL_A, _CHANNEL_B)
+    stored = (await store.get_user(user_id)).channel_scope  # type: ignore[union-attr]
+
+    full = await service.identity_for_cert_user_id(user_id)
+    assert full is not None and full.allowed_channels == frozenset({"IB_A", "IB_B"})
+
+    directory.principal = replace(_PRINCIPAL, groups=frozenset({_VIEWERS, _CHANNEL_A}))
+    one = await service.identity_for_cert_user_id(user_id)
+    assert one is not None and one.allowed_channels == frozenset({"IB_A"})
+
+    directory.principal = replace(_PRINCIPAL, groups=frozenset({_VIEWERS}))
+    none = await service.identity_for_cert_user_id(user_id)
+    assert none is not None and none.allowed_channels == frozenset()
+
+    assert (await store.get_user(user_id)).channel_scope == stored  # type: ignore[union-attr]
+
+
+async def test_a_scope_the_groups_would_widen_is_not_widened(store: MessageStore) -> None:
+    """Never more than the row holds: a widening waits for a sign-in to write it."""
+    await AuthService(store, _settings()).initialize()
+    await store.set_ad_group_scope_map([(_CHANNEL_A, "IB_A"), (_CHANNEL_B, "IB_B")])
+    service, directory, user_id = await _directory_account(store, _VIEWERS, _CHANNEL_A)
+    directory.principal = replace(_PRINCIPAL, groups=frozenset({_VIEWERS, _CHANNEL_A, _CHANNEL_B}))
+
+    identity = await service.identity_for_cert_user_id(user_id)
+
+    assert identity is not None and identity.allowed_channels == frozenset({"IB_A"})
+
+
 def _outage_records(caplog: pytest.LogCaptureFixture, level: int) -> list[logging.LogRecord]:
     return [
         r
@@ -240,10 +396,86 @@ async def test_one_outage_logs_one_warning_and_its_end_one_info(
         assert await service.identity_for_cert_user_id(user_id) is not None
     assert len(_outage_records(caplog, logging.INFO)) == 1
 
-    # A second outage is a new one, and logs again.
+    # An outage that returns within the interval logs nothing more at WARNING, so a flapping one
+    # cannot log a pair per request.
     directory.unreachable = True
     assert await service.identity_for_cert_user_id(user_id) is None
+    directory.unreachable = False
+    assert await service.identity_for_cert_user_id(user_id) is not None
+    assert len(_outage_records(caplog, logging.WARNING)) == 1
+    assert len(_outage_records(caplog, logging.INFO)) == 1
+
+
+async def test_a_new_outage_past_the_interval_logs_again(
+    store: MessageStore, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, directory, user_id = await _directory_account(store, _VIEWERS)
+    monkeypatch.setattr(service_module, "_CERT_OUTAGE_LOG_INTERVAL_SECONDS", 0.0)
+    caplog.set_level(logging.INFO, logger=_SERVICE_LOGGER)
+    for _ in range(2):
+        directory.unreachable = True
+        assert await service.identity_for_cert_user_id(user_id) is None
+        directory.unreachable = False
+        assert await service.identity_for_cert_user_id(user_id) is not None
+
     assert len(_outage_records(caplog, logging.WARNING)) == 2
+    assert len(_outage_records(caplog, logging.INFO)) == 2
+
+
+async def test_a_fault_reading_the_entry_does_not_warn_per_request_by_name(
+    store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The probe's own per-fault WARNING names the account. It suits a per-pass reconciler, not a
+    per-request path, so here it goes to DEBUG and the outage line reports the fault once."""
+    service, directory, user_id = await _directory_account(store, _VIEWERS)
+    caplog.set_level(logging.DEBUG, logger=_SERVICE_LOGGER)
+    directory.raises = KeyError("userAccountControl")
+    caplog.clear()  # the sign-in that made the row logs its own lines
+
+    for _ in range(4):
+        assert await service.identity_for_cert_user_id(user_id) is None
+
+    warnings = [
+        r for r in caplog.records if r.name == _SERVICE_LOGGER and r.levelno >= logging.WARNING
+    ]
+    assert len(warnings) == 1 and _OUTAGE_LINE in warnings[0].getMessage()
+    assert "jdoe" not in warnings[0].getMessage()
+
+
+async def test_the_reconciler_and_step_up_still_warn_on_a_fault(
+    store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The control: the DEBUG level is the certificate task's alone and leaks nowhere else."""
+    service, directory, _user_id = await _directory_account(store, _VIEWERS)
+    caplog.set_level(logging.DEBUG, logger=_SERVICE_LOGGER)
+    directory.raises = KeyError("userAccountControl")
+    user = await store.get_user(_user_id)
+    assert user is not None
+
+    await service.identity_for_cert_user_id(_user_id)
+    assert await service._directory_step_up_refusal(user) == "unavailable"
+
+    raised = [r for r in caplog.records if "raised KeyError" in r.getMessage()]
+    assert [r.levelno for r in raised] == [logging.DEBUG, logging.WARNING]
+
+
+async def test_a_configuration_refusal_logs_once_per_process(
+    store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    """No directory wired: an operator would otherwise see a bare 401, like an unmapped cert."""
+    _service, _directory, user_id = await _directory_account(store, _VIEWERS)
+    unwired = AuthService(store, AuthSettings(mfa_verify_min_elapsed_seconds=0))
+    caplog.set_level(logging.INFO, logger=_SERVICE_LOGGER)
+
+    for _ in range(3):
+        assert await unwired.identity_for_cert_user_id(user_id) is None
+
+    refused = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "not_configured" in r.getMessage()
+    ]
+    assert len(refused) == 1 and "jdoe" not in refused[0].getMessage()
 
 
 async def test_an_answer_about_the_account_ends_an_outage(

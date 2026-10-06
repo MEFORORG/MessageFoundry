@@ -189,14 +189,24 @@ or group removal never reached the certificate path at all.
   nothing, and never more than the directory now grants. An account removed from one of two mapped
   groups keeps the other role on its next request. Step-up refuses that case outright instead,
   because it renews a window rather than serving one request. An empty set returns no identity.
+- **Channel scope narrows the same way.** The groups are already in hand, so the scope goes through
+  `decide_ad_channel_scope`, the rule login and the reconciler share. Only a narrowing applies, and
+  only within the stored scope. A cert-only account never signs in, so nothing else would apply it.
+  A widening still waits for a sign-in to write it.
+- **The row is read again after the probe.** The round trip can take seconds, and a local disable
+  or scope edit may land meanwhile.
 - **No cache.** A cached answer would bring back the staleness this closes.
 - **A cap and a bounded wait.** At most 8 certificate-path probes run at once. A request that gets no
-  slot within 2 seconds is refused. A directory outage or a full cap logs one WARNING going in and one
-  INFO coming out, naming no account, rather than a line per request.
+  slot within 2 seconds is refused. A slot is held until the probe's worker thread ends, even when
+  the request was cancelled, so the threads cannot outnumber the cap.
+- **Refusals do not log one line per request.** An outage (unreachable, referring, a fault reading
+  the entry, or a full cap) logs one WARNING going in and one INFO coming out, naming no account,
+  and at most one WARNING a minute while it flaps. A configuration refusal (no directory wired, no
+  `directory_object_id`) logs one WARNING per reason per process.
 
 **What this does not close.**
 
-- Channel scope is still the row's. A scope the directory's groups would narrow reaches a
-  certificate identity only when the account next signs in, as on step-up.
 - Every certificate request for a directory account now costs a directory round trip, and a
   directory outage refuses every such request. That is the price of failing closed.
+- A route that resolves the identity twice in one request, once before the body and once at the
+  gate, probes twice. No shipped certificate route takes a body.
