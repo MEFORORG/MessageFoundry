@@ -219,6 +219,7 @@ from messagefoundry.api.security import (
     optional_identity,
     pending_credential_deadline,
     public_route,
+    refuse_from_new_address,
     refuse_undeclared_route,
     require,
     require_paced,
@@ -3608,8 +3609,9 @@ def create_app(
         ``GET /connections/{name}/metadata``. A caller without that permission is refused,
         and the refusal is audited as
         ``auth.permission_denied`` like every other one (ASVS 16.3.2). Over HTTP the reveal is
-        also a PHI read: it takes the serve-hop refusal and the per-actor PHI budget. The web
-        console's reveal routes already charged both through ``require_ui(..., phi=True)`` before
+        also a PHI read: it takes the serve-hop refusal, the new-address refusal (vault BACKLOG
+        #2620) and the per-actor PHI budget. The web console's reveal routes already took all three
+        through ``require_ui(..., phi=True)`` before
         calling in-process, so a ``/ui`` route is not charged twice. That skip reads the matched
         route, so a future ``/ui`` route passing ``reveal`` must carry ``phi=True`` itself."""
         if reveal is None:
@@ -3626,6 +3628,9 @@ def create_app(
             raise HTTPException(403, "a reveal needs messages:view_summary")
         if not (_matched_route_path(request) or "").startswith("/ui/"):
             enforce_phi_read_hop(request)
+            # Vault BACKLOG #2620: a PHI read, so it refuses a new address as require_phi_read
+            # does, before the budget. The /ui twins asked in require_ui's phi=True arm.
+            await refuse_from_new_address(request)
             enforce_phi_read_pacing(request, identity)
 
     async def _redact_reasons(

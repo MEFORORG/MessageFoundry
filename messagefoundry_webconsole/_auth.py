@@ -356,10 +356,12 @@ def require_ui(
 
     **A PHI read (``phi=True``) or a write (any non-GET) from a host the session has not verified
     from is sent to ``/ui/reauth``** (vault BACKLOG #2620), the cookie twin of the refusal
-    ``require_phi_read`` and ``require_paced`` give. A PHI page continues back to itself, so each is
-    registered as an unlock continuation beside its route; a write lands on ``/ui`` afterwards,
-    because a write's body cannot be carried through the re-auth. A re-auth from the new address
-    re-anchors the session. Each runs before the budget it would charge. The step-up factories pass
+    ``require_phi_read`` and ``require_paced`` give. A PHI page continues back to its own path (a
+    filter query is not carried), so each is registered as an unlock continuation beside its route;
+    a write lands on ``/ui`` afterwards, because a write's body cannot be carried through the
+    re-auth. A re-auth from the new address re-anchors the session. The check runs once, before
+    both budgets. The password page (``allow_must_change``) is not asked: ``/ui/reauth`` sends a
+    must-change session back to it, so a refusal there would loop. The step-up factories pass
     ``new_address_check=False``: they ask the same question themselves, with the continuation their
     route needs, and asking here first would send the operator to ``/ui`` instead.
 
@@ -500,40 +502,46 @@ def require_ui(
             # posture, where a browser has to get its login redirect instead. Above the budget: a
             # read that will not be served must not spend the actor's PHI-read quota.
             enforce_phi_read_hop(request)
-            # Vault BACKLOG #2620: the JSON plane's require_phi_read refuses a new address here
-            # too, and it is the same ordering rule: a read not served spends no quota.
-            if new_address_check and request.method == "GET":
-                await _refuse_from_new_address(auth, request, next_path=None)
-            if not auth.allow_phi_read(identity.user_id):
-                raise HTTPException(
-                    status.HTTP_429_TOO_MANY_REQUESTS,
-                    "too many requests; please slow down",
-                    headers={"Retry-After": "10"},
-                )
-        # BACKLOG #287: the console reaches the handlers IN-PROCESS -- it holds no HTTP client -- so
-        # a /ui write never passes through the engine's `_enforce_admin_write_pacing`. Without this
-        # the product's only pacing floor was absent on the one surface a human actually uses. Same
-        # NON-GET rule as the engine: a GET must stay free because the console's nav polls on a timer,
-        # and charging those would throttle an idle operator. This is a separate budget from the PHI
-        # one above by design -- that quota measures PHI reads, and administration must not spend it.
-        if request.method != "GET":
+        write = request.method != "GET"
+        if write:
             # PROVENANCE BEFORE SPEND, and the order is the security property. The routes call
             # assert_same_origin inline, which runs AFTER this dependency -- so charging first would
             # let an attacker's page spend a victim's budget using the victim's SameSite cookie, and
             # throttle their console from off-origin. Re-asserting here is idempotent (the inline
             # call still stands) and makes a cross-site write cost the attacker nothing.
             assert_same_origin(request)
-            # Vault BACKLOG #2620, require_paced's refusal on this plane. After provenance, so a
-            # cross-site page cannot make the engine write an audit row or send a notice; before the
-            # charge, so a refused write spends nothing.
-            if new_address_check:
-                await _refuse_from_new_address(auth, request, next_path=WRITE_REAUTH_LANDING)
-            if not auth.allow_admin_write(identity.user_id):
-                raise HTTPException(
-                    status.HTTP_429_TOO_MANY_REQUESTS,
-                    "too many requests; please slow down",
-                    headers={"Retry-After": "10"},
-                )
+        # Vault BACKLOG #2620: require_phi_read's and require_paced's new-address refusal on this
+        # plane, asked once for a PHI read or a write. After provenance, so a cross-site page cannot
+        # make the engine write an audit row or send a notice; before both charges below, so a
+        # refused request spends nothing. Not on the password page (allow_must_change): /ui/reauth
+        # sends a must-change session back to that page, so a refusal there would loop, and its
+        # JSON twin /me/password is neither paced nor asked.
+        if new_address_check and not allow_must_change and (phi or write):
+            await _refuse_from_new_address(
+                auth, request, next_path=WRITE_REAUTH_LANDING if write else None
+            )
+        if phi and not auth.allow_phi_read(identity.user_id):
+            raise HTTPException(
+                status.HTTP_429_TOO_MANY_REQUESTS,
+                "too many requests; please slow down",
+                headers={"Retry-After": "10"},
+            )
+        # BACKLOG #287: the console reaches the handlers IN-PROCESS -- it holds no HTTP client -- so
+        # a /ui write never passes through the engine's `_enforce_admin_write_pacing`. Without this
+        # the product's only pacing floor was absent on the one surface a human actually uses. Same
+        # NON-GET rule as the engine: a GET must stay free because the console's nav polls on a timer,
+        # and charging those would throttle an idle operator. This is a separate budget from the PHI
+        # one above by design -- that quota measures PHI reads, and administration must not spend it.
+        if not write:
+            return identity
+        # Its own `if`, not `write and ...`: tests/test_security_doc_rate_limits.py reads this exact
+        # test line to plant its mutations.
+        if not auth.allow_admin_write(identity.user_id):
+            raise HTTPException(
+                status.HTTP_429_TOO_MANY_REQUESTS,
+                "too many requests; please slow down",
+                headers={"Retry-After": "10"},
+            )
         return identity
 
     return mark_route_gate(dependency)

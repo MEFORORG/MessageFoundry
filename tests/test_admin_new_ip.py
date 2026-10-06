@@ -771,3 +771,21 @@ async def test_the_phi_and_paced_gates_ask_nothing_with_the_signal_off(engine: E
         assert r.status_code == 200
     assert isinstance(engine.store, MessageStore)
     assert await _new_ip_rows(engine.store) == []
+
+
+async def test_an_http_reveal_from_a_second_address_is_refused(engine: Engine) -> None:
+    """RED when: a ``reveal`` on a monitoring list route, a PHI read admitted by ``_admit_reveal``
+    rather than ``require_phi_read``, answers a token replayed from a new address (vault BACKLOG
+    #2620, review round 1). The same list without ``reveal`` still answers: it rides the base gate."""
+    service = _new_ip_service(engine)
+    await service.initialize()
+    await _add_admin(service, "boss")
+    async with _client_at(engine, service, "10.0.0.1") as a:
+        token = await _login_token(a)
+        control = await a.get("/events", params={"reveal": 1}, headers=_auth(token))
+        assert control.headers.get("X-Step-Up-Required") is None, control.status_code
+    async with _client_at(engine, service, "10.9.9.9") as b:
+        for path in ("/events", "/alerts/active"):
+            r = await b.get(path, params={"reveal": 1}, headers=_auth(token))
+            assert (r.status_code, r.headers.get("X-Step-Up-Required")) == (403, "1"), path
+        assert (await b.get("/events", headers=_auth(token))).status_code == 200

@@ -8222,3 +8222,70 @@ async def test_a_refused_new_address_spends_no_budget(engine: Engine) -> None:
         assert (await a.get(f"/ui/messages/{mid}")).status_code == 200
         r = await a.post("/ui/statistics/reset", headers=same)
         assert (r.status_code, r.headers["location"]) == (303, "/ui/status")
+
+
+async def test_every_phi_page_has_a_reauth_continuation(engine: Engine) -> None:
+    """RED when: a ``require_ui(..., phi=True)`` GET page is added without registering it as an
+    unlock continuation (vault BACKLOG #2620). Its new-address refusal sends the browser to
+    ``/ui/reauth?next=<path>``, and an unregistered ``next`` bounces to ``/ui`` with the session
+    still anchored elsewhere, so the operator could never reach the page from the new address.
+
+    Walks the mounted routes and reads ``phi`` and ``new_address_check`` from each ``require_ui``
+    dependency's closure, so the set is derived and not a list kept by hand."""
+    from fastapi.routing import APIRoute
+
+    from messagefoundry_webconsole._auth import is_unlock_action
+
+    service = await _service(engine)
+    app = create_app(engine, auth=service, serve_ui=True)
+    checked: list[str] = []
+    for route in app.routes:
+        if not isinstance(route, APIRoute) or not route.path.startswith("/ui"):
+            continue
+        if "GET" not in route.methods:
+            continue
+        for dep in route.dependant.dependencies:
+            call = dep.call
+            code = getattr(call, "__code__", None)
+            if (
+                code is None
+                or getattr(call, "__qualname__", "") != "require_ui.<locals>.dependency"
+            ):
+                continue
+            closure = getattr(call, "__closure__", None) or ()
+            cells = dict(zip(code.co_freevars, (c.cell_contents for c in closure), strict=True))
+            if cells.get("phi") and cells.get("new_address_check"):
+                concrete = re.sub(r"\{[^}]+\}", "x1", route.path)
+                assert is_unlock_action(concrete), f"{route.path} has no unlock continuation"
+                checked.append(route.path)
+    # The control: the walk found the PHI pages it exists for, so a zero is not a pass.
+    assert "/ui/messages/{message_id}" in checked and "/ui/dead-letters" in checked, checked
+
+
+async def test_the_password_page_is_not_refused_for_a_new_address(engine: Engine) -> None:
+    """RED when: a must-change session's password POST from a new address is sent to
+    ``/ui/reauth``. That page sends a must-change session straight back to the password page, so
+    the refusal would loop with no message (vault BACKLOG #2620, review round 1). A mismatched
+    pair proves the handler ran: it answers 400 in place."""
+    service = await _service(engine)
+    await _add(service, "fresh", Role.OPERATOR)
+    user = await service.store.get_user_by_username("fresh")
+    assert user is not None and user.password_hash is not None
+    await service.store.set_password(
+        user.id,
+        password_hash=user.password_hash,
+        must_change_password=True,
+        password_generated=False,
+    )
+    async with _client_from(engine, service, "10.0.0.1") as a:
+        await _cookie_login(a, "fresh")
+        tok = a.cookies.get("mf_session")
+        assert tok is not None
+    async with _client_from(engine, service, "10.9.9.9") as b:
+        b.cookies.set("mf_session", tok)
+        r = await b.post(
+            "/ui/account/password",
+            data={"current_password": PW, "new_password": "a" * 20, "new_password2": "b" * 20},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 400, r.headers.get("location")
