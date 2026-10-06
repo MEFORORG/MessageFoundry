@@ -14,7 +14,7 @@ import socket
 from collections.abc import Callable
 from datetime import UTC, datetime, time
 from pathlib import Path
-from typing import Literal
+from typing import Literal, TypedDict
 
 import pytest
 
@@ -74,12 +74,50 @@ def _free_port() -> int:
         s.close()
 
 
-async def _wait_until(predicate, timeout: float = 2.0) -> None:
+# A positive wait's bound. It was 2.0 s, and three waits in this file timed out at it on loaded CI
+# runners, on pull requests that touched no scheduler code (vault BACKLOG #2590 and #3086, and the
+# per_lane rig's first wait in a windows-2022 merge-group run on 2026-10-06). Measured that day on a
+# 4-core Linux box, every wait in the STOP section finished in at most 0.03 s idle, 0.45 s beside 12
+# busy processes, and 2.48 s with each SQLite commit delayed by 0.3 s: a wait scales with the store,
+# so 2.0 s is a bound a slow runner exceeds with nothing lost. Widening it hides no lost wakeup: the
+# "wake_only" variants below run with no poll or sweep backstop inside the bound, so a lost wake or a
+# lost re-arm fails the wait at any bound instead of being rescued. It stays under the per-test
+# pytest-timeout (60 s on ubuntu, 120 s on Windows), so a real hang still fails here, in this frame.
+_WAIT_BOUND_SECONDS = 30.0
+
+
+async def _wait_until(predicate, timeout: float = _WAIT_BOUND_SECONDS) -> None:
     async def _poll() -> None:
         while not predicate():
             await asyncio.sleep(0.01)
 
     await asyncio.wait_for(_poll(), timeout)
+
+
+# A poll and sweep interval far past _WAIT_BOUND_SECONDS. Inside a wait no PERIODIC poll or sweep can
+# then move a lane (an explicit sweep request and the park timers still run), so a lost wakeup or a
+# lost re-arm fails the wait rather than being rescued by the 20 ms per_lane poll or the 0.25 s pooled
+# sweep the "polled" variant runs with. Measured 2026-10-06 by deleting the wake and the sweep request
+# in StageDispatcher.resume_lane: the two operator restarts that resume a pooled lane still passed
+# polled, rescued by the periodic sweep, and failed wake_only. The polled variant stays because its
+# periodic poll or sweep is what would find a lane a wrong re-arm had left claimable.
+_WAKE_ONLY_BACKSTOP_SECONDS = 3600.0
+_Mode = Literal["polled", "wake_only"]
+_BACKSTOPS = pytest.mark.parametrize("backstop", ["polled", "wake_only"])
+
+
+class _Backstop(TypedDict, total=False):
+    poll_interval: float
+    pooled_sweep_interval: float
+
+
+def _backstop(mode: _Mode) -> _Backstop:
+    if mode == "wake_only":
+        return {
+            "poll_interval": _WAKE_ONLY_BACKSTOP_SECONDS,
+            "pooled_sweep_interval": _WAKE_ONLY_BACKSTOP_SECONDS,
+        }
+    return {"poll_interval": 0.02}
 
 
 @pytest.fixture
@@ -386,7 +424,12 @@ class _CollectingDestination:
 
 
 async def _start_credential_fault_rig(
-    store: MessageStore, tmp_path: Path, claim_mode: str, clock: _Clock, schedule: Schedule
+    store: MessageStore,
+    tmp_path: Path,
+    claim_mode: str,
+    clock: _Clock,
+    schedule: Schedule,
+    backstop: _Mode = "polled",
 ) -> tuple[RegistryRunner, _CredentialFaultDestination]:
     """A running runner whose scheduled outbound has just STOPPED on a credential fault, in window."""
     reg = Registry()
@@ -404,7 +447,7 @@ async def _start_credential_fault_rig(
     runner = RegistryRunner(
         reg,
         store,
-        poll_interval=0.02,
+        **_backstop(backstop),
         schedule_clock=clock.now,
         claim_mode=claim_mode,
         alert_sink=sink,
@@ -431,13 +474,16 @@ async def _start_credential_fault_rig(
     return runner, faulty
 
 
+@_BACKSTOPS
 @pytest.mark.parametrize("claim_mode", ["per_lane", "pooled"])
 async def test_credential_fault_stop_is_not_resumed_by_the_next_window(
-    store: MessageStore, tmp_path: Path, claim_mode: str
+    store: MessageStore, tmp_path: Path, claim_mode: str, backstop: _Mode
 ) -> None:
     schedule = _weekday_window()
     clock = _Clock(_IN_WINDOW)
-    runner, faulty = await _start_credential_fault_rig(store, tmp_path, claim_mode, clock, schedule)
+    runner, faulty = await _start_credential_fault_rig(
+        store, tmp_path, claim_mode, clock, schedule, backstop
+    )
     try:
         clock.set(_OUT_OF_WINDOW)  # the window closes...
         await runner._reconcile_schedule("OB_SCHED", "outbound", schedule)
@@ -485,15 +531,18 @@ async def test_the_window_open_does_not_start_a_paused_lane_a_stop_holds(
         await runner.stop()
 
 
+@_BACKSTOPS
 async def test_a_pooled_broadcast_that_re_arms_a_stopped_lane_ends_its_hold(
-    store: MessageStore, tmp_path: Path
+    store: MessageStore, tmp_path: Path, backstop: _Mode
 ) -> None:
     # A pooled notify_work broadcast (replay, DR failback) re-arms every STOPPED lane by design. The
     # hold must end with it: a hold that outlived the re-arm would skip the next window close, and
     # the running lane would then deliver outside its window.
     schedule = _weekday_window()
     clock = _Clock(_IN_WINDOW)
-    runner, faulty = await _start_credential_fault_rig(store, tmp_path, "pooled", clock, schedule)
+    runner, faulty = await _start_credential_fault_rig(
+        store, tmp_path, "pooled", clock, schedule, backstop
+    )
     try:
         assert ("outbound", "OB_SCHED") in runner._stop_held  # the rig waited for STOPPED
         runner.notify_work()
@@ -503,8 +552,9 @@ async def test_a_pooled_broadcast_that_re_arms_a_stopped_lane_ends_its_hold(
         await runner.stop()
 
 
+@_BACKSTOPS
 async def test_infra_fault_stop_is_not_resumed_by_the_next_window(
-    store: MessageStore, tmp_path: Path
+    store: MessageStore, tmp_path: Path, backstop: _Mode
 ) -> None:
     # BACKLOG #2072. The pooled ADR 0070 T17 bound STOPs a lane whose dispatch keeps raising, and it
     # decides that inside the dispatcher, so no runner STOP site recorded a hold. The window close
@@ -527,7 +577,7 @@ async def test_infra_fault_stop_is_not_resumed_by_the_next_window(
     runner = RegistryRunner(
         reg,
         store,
-        poll_interval=0.02,
+        **_backstop(backstop),
         schedule_clock=clock.now,
         claim_mode="pooled",
         alert_sink=sink,
@@ -573,8 +623,9 @@ async def test_infra_fault_stop_is_not_resumed_by_the_next_window(
         await runner.stop()
 
 
+@_BACKSTOPS
 async def test_a_response_lane_infra_fault_stop_is_not_resumed_by_the_next_window(
-    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backstop: _Mode
 ) -> None:
     # PR 1811 review, on BACKLOG #2072. The T17 bound can STOP a pooled RESPONSE lane (a loopback's
     # re-ingress), and _HOLD_DIRECTION had no entry for RESPONSE, so that STOP was not held. A window
@@ -590,7 +641,7 @@ async def test_a_response_lane_infra_fault_stop_is_not_resumed_by_the_next_windo
     runner = RegistryRunner(
         reg,
         store,
-        poll_interval=0.02,
+        **_backstop(backstop),
         schedule_clock=clock.now,
         claim_mode="pooled",
         alert_sink=_LogPageSink(),
