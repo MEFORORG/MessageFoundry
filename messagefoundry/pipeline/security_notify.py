@@ -23,6 +23,7 @@ from messagefoundry.auth.notifications import (
     ACCOUNT_DISABLED,
     ACCOUNT_LOCKED,
     ADMIN_NEW_IP,
+    DIRECTORY_SESSIONS_ENDED,
     EMAIL_CHANGED,
     FEDERATED_IDENTITY_BOUND,
     FEDERATED_IDENTITY_UNBOUND,
@@ -72,6 +73,7 @@ _SUBJECTS = {
     FEDERATED_IDENTITY_UNBOUND: "An external sign-in identity was removed from your MessageFoundry account",
     FIRST_ADMINISTRATOR_TAKEOVER: "Your MessageFoundry account was made an Administrator from the host",
     ACCOUNT_DISABLED: "Your MessageFoundry account was disabled",
+    DIRECTORY_SESSIONS_ENDED: "Your MessageFoundry sessions were ended by a directory check",
     MFA_ENABLED: "Two-factor authentication was enabled on your MessageFoundry account",
     MFA_DISABLED: "Two-factor authentication was disabled on your MessageFoundry account",
     MFA_CREDENTIAL_REMOVED: "A second factor was removed from your MessageFoundry account",
@@ -107,6 +109,11 @@ _DESCRIPTIONS = {
         "no longer works."
     ),
     ACCOUNT_DISABLED: "Your account was disabled by an administrator.",
+    # vault BACKLOG #2140. Says only what the engine did. The directory either did not find the
+    # account or did not answer whether it is disabled, so this must not say disabled or deleted.
+    DIRECTORY_SESSIONS_ENDED: (
+        "A check against your organization's directory ended your MessageFoundry sessions."
+    ),
     MFA_ENABLED: "A two-factor authenticator (TOTP) was enrolled on your account.",
     MFA_DISABLED: "Two-factor authentication was removed from your account.",
     # BACKLOG #1139: this arm reports WHAT CHANGED and states what still stands. It must not borrow
@@ -448,6 +455,10 @@ def _build_body(event: SecurityEvent) -> str:
         # The takeover runs only when the install has no enabled Administrator, so "contact your
         # administrator" would name nobody, or the person who ran it.
         closing = "If you did not expect this, tell whoever operates the MessageFoundry host."
+    elif event.event_type == DIRECTORY_SESSIONS_ENDED:
+        # vault BACKLOG #2140. The engine did this on a directory answer, so "if this was you" cannot
+        # apply.
+        closing = "If you did not expect this, contact your MessageFoundry administrator."
     elif (
         moved_by_admin
         or set_by_admin
