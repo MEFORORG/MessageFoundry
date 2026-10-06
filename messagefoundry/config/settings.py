@@ -7928,11 +7928,18 @@ def settings_error_detail(exc: Exception) -> str:
     SINCE BACKLOG #296 THE SETTINGS MODELS STRIP THE INPUT THEMSELVES. Every ``_Section`` and
     :class:`ServiceSettings` re-raises each error with its input replaced by :data:`HIDDEN_INPUT`
     (``_InputHidingModel``), so ``str(exc)``, ``exc.errors()`` and ``exc.json()`` carry the
-    placeholder, never the refused mapping. That covers
-    the ``__main__.py`` arms that still print ``str(exc)`` (at least ``rotate-key`` and the store
-    commands behind ``_host_gated_store_settings``). At least ``serve``, ``supervise``,
-    ``audit-anchor`` and, since vault BACKLOG #3054, ``audit-verify`` render through this function,
-    by way of ``_load_service_settings``.
+    placeholder, never the refused mapping.
+
+    THE CLI ARMS THAT PRINT A WHOLE-FILE LOAD FAILURE ARE MEANT TO RENDER IT HERE TOO (vault
+    BACKLOG #2760), so neither layer rests on the other: a model added later outside
+    ``_InputHidingModel`` still prints no input through them. Most reach it through
+    ``__main__._load_service_settings``, including the post-write ``validate`` callback of
+    ``security set`` and ``alert add``/``remove``, whose reload is the whole file plus the
+    environment layer and not the JSON the operator typed. ``tests/test_cli_settings_error_render.py``
+    holds at least the arms it lists to this; a new arm belongs there. Some arms print ``str(exc)``
+    on purpose, at least the operator-input prechecks (``invalid [security] value``, ``invalid alert
+    rule``) and ``security show``'s read of the file's own ``[security]`` table: none of those
+    reads the environment.
 
     THE MESSAGE IS NOT HIDDEN, AND THIS FUNCTION PRINTS IT. A validator that quotes the value it
     refused still shows it, here and in ``str(exc)``: at least the ``[backup]`` and ``[dr]``
