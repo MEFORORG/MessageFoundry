@@ -126,9 +126,20 @@ def host_of(url: str) -> str:
     return _host_of_normalised(_as_browser_reads(url))
 
 
-#: A host this module will compare: dot-separated labels of letters, digits, ``-`` and ``_``. Run
+#: What a host label this module will compare may hold: letters, digits, ``-`` and ``_``. Checked
 #: on the IDNA-encoded form, so an internationalised name has already become ``xn--`` labels.
-_HOST_RE = re.compile(r"[a-z0-9_-]+(?:\.[a-z0-9_-]+)*\.?")
+_HOST_LABEL_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-_")
+
+
+def _is_plain_host(ascii_host: str) -> bool:
+    """Dot-separated non-empty labels of :data:`_HOST_LABEL_CHARS`, with at most one trailing dot.
+
+    A loop over labels rather than one regex: the regex form needs a nested quantifier, which the
+    ReDoS lint refuses whatever the input. An empty label (a leading dot, ``..``) is refused.
+    """
+    labels = ascii_host.removesuffix(".").split(".")
+    return all(label and _HOST_LABEL_CHARS.issuperset(label) for label in labels)
+
 
 #: IDNA 2003 deviation characters: sharp s (both cases), final sigma, ZWNJ and ZWJ. Python's
 #: ``idna`` codec maps them away (sharp s becomes ``ss``), and a browser's UTS 46 non-transitional
@@ -154,7 +165,7 @@ def _host_of_normalised(normalised: str) -> str:
         ascii_host = host.encode("idna").decode("ascii").lower()
     except UnicodeError:
         return ""
-    if _HOST_RE.fullmatch(ascii_host):
+    if _is_plain_host(ascii_host):
         # A trailing dot names the same host fully qualified; dropped so it matches its domain.
         return ascii_host.removesuffix(".")
     if _is_ipv6(ascii_host):

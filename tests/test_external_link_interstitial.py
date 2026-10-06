@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import pytest
 
+from messagefoundry_webconsole import _external
 from messagefoundry_webconsole._external import (
     display_host,
     host_of,
@@ -195,6 +196,20 @@ def test_a_fully_qualified_host_matches_its_domain() -> None:
     """A trailing dot names the same host. Reach control: the grammar must not make it external."""
     assert is_external("https://adfs.hospital.example./", ORG) is False
     assert is_allowlisted("https://docs.vendor.example./", ["vendor.example"]) is True
+
+
+@pytest.mark.parametrize("host", ["a..b", ".a", ".", "a.b..", "", "a b", "a%2fb"])
+def test_the_host_grammar_refuses_an_empty_label_and_stray_characters(host: str) -> None:
+    """Pinned on the grammar itself: the IDNA codec usually refuses an empty label first, so a test
+    through ``host_of`` alone would pass with the grammar's own refusal deleted."""
+    assert _external._is_plain_host(host) is False
+    assert host_of(f"https://{host}/") == ""
+
+
+@pytest.mark.parametrize("host", ["a", "a.b", "a.b.", "x_y-1.example"])
+def test_the_host_grammar_accepts_plain_labels(host: str) -> None:
+    """Reach control for the refusals above."""
+    assert _external._is_plain_host(host) is True
 
 
 def test_an_ipv6_literal_still_has_a_host() -> None:
