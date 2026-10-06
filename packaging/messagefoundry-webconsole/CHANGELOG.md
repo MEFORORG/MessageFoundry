@@ -52,11 +52,11 @@ this line.**
   directory the engine could not check is counted apart. They come from the new
   `interpreter` block of the engine's security posture, which moves the supported engine UI seam.
   The file names are in `GET /security/posture`. (vault BACKLOG #2701, #2700)
-- **The passkey leg says when the directory could not confirm the account.** A directory
-  account's passkey assertion at `POST /ui/reauth/webauthn` is now refused when the directory does
-  not confirm the account. The route answers with the same words the code and password legs use,
-  not "passkey verification failed", because the passkey was never checked. No seam change. (vault
-  BACKLOG #2239)
+- **The passkey leg says when the directory could not confirm the account.** The engine refuses
+  a directory account's passkey assertion when the directory does not confirm the account. The
+  console's `POST /ui/reauth/webauthn` now shows the directory message for that refusal, in the
+  same words the code and password legs use, not "passkey verification failed", because the
+  passkey was never checked. No seam change. (vault BACKLOG #2239)
 
 ## [0.4.0] — 2026-10-01 — Early Access
 
