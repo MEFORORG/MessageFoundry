@@ -230,20 +230,25 @@ def run_checks(
     connections, and there are none. The skip line they print says "config did not load", which is
     inexact for this one cause; threading the keyword further was left out of scope.
 
-    With no ``messagefoundry.toml``, the seven legs that read service settings read them from the
-    environment when ``MEFOR_AI_ENVIRONMENT`` names the instance (vault BACKLOG #2355), and each
-    of their lines says so. :func:`_settings_source` says why that variable is the trigger.
+    With no ``messagefoundry.toml``, the seven legs that read service settings, and the dry-run
+    preview's ``snapshot_on_send``, read them from the environment when ``MEFOR_AI_ENVIRONMENT``
+    names the instance (vault BACKLOG #2355), and each line that ran says so.
+    :func:`_settings_source` says why that variable is the trigger.
     """
     _toml, env_only = _settings_source(
         config_dir, service_config=service_config, suppress_search=suppress_service_toml_search
     )
     results = [
         _check_validate(config_dir, allow_empty=allow_empty_config),
-        _check_dryrun(
-            config_dir,
-            messages_dir,
-            service_config=service_config,
-            suppress_search=suppress_service_toml_search,
+        # Tagged too: its preview runs under the snapshot_on_send it resolved the same way.
+        _with_source(
+            _check_dryrun(
+                config_dir,
+                messages_dir,
+                service_config=service_config,
+                suppress_search=suppress_service_toml_search,
+            ),
+            env_only,
         ),
         _with_source(
             _check_posture(
@@ -1902,13 +1907,17 @@ def _settings_source(
       Server connection, beside a bare config dir. Triggering on any of them would end the documented
       fail-safe SKIP for a bare dir and run every leg against an instance nobody declared.
 
+    An explicit ``--service-config`` naming a file that does not exist never falls through to the
+    environment. ``serve`` refuses that file outright, so reading defaults plus the environment in its
+    place would pass a config ``serve`` will not start. It keeps the SKIP it always had.
+
     ``(None, False)`` is the SKIP the legs have always given a bare dir."""
     from messagefoundry.config.settings import environment_named_by_env
 
     toml = _resolve_service_toml(
         config_dir, service_config=service_config, suppress_search=suppress_search
     )
-    if toml is not None:
+    if toml is not None or service_config is not None:
         return toml, False
     return None, environment_named_by_env() is not None
 
@@ -1928,8 +1937,12 @@ def _load_check_settings(
 
 def _with_source(result: CheckResult, env_only: bool) -> CheckResult:
     """``result`` with :data:`_ENV_ONLY_SOURCE` on its line when the settings came from the
-    environment alone, so the source shares a line with the verdict."""
-    if not env_only:
+    environment alone, so the source shares a line with the verdict.
+
+    A SKIP is left alone. Under an environment declaration no settings leg skips for a settings
+    reason, so a skip there is about the graph (``config did not load``) or the fixtures, and the
+    tag would name the wrong cause."""
+    if not env_only or result.skipped:
         return result
     return replace(result, detail=f"{result.detail} [{_ENV_ONLY_SOURCE}]")
 

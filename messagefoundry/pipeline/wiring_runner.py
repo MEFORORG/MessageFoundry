@@ -3087,25 +3087,7 @@ class RegistryRunner:
         # #200: thread the derived instance posture so --allow-insecure-bind is CLAMPED — a
         # production-PHI listener refuses cleartext even with the flag (a per-connection
         # tls_hop_attested is the surgical per-hop opt-in).
-        check_mllp_tls_exposure(
-            source_cfg,
-            ic.name,
-            allow_insecure_bind=self._allow_insecure_bind,
-            posture=self._hop_posture,
-        )
-        check_dimse_tls_exposure(
-            source_cfg,
-            ic.name,
-            allow_insecure_bind=self._allow_insecure_bind,
-            posture=self._hop_posture,
-        )
-        check_tcp_tls_exposure(
-            source_cfg,
-            ic.name,
-            allow_insecure_bind=self._allow_insecure_bind,
-            posture=self._hop_posture,
-        )
-        check_http_tls_exposure(
+        check_inbound_tls_exposure(
             source_cfg,
             ic.name,
             allow_insecure_bind=self._allow_insecure_bind,
@@ -8974,22 +8956,17 @@ def _build_check_connectors(
         # ADR 0154 D4's cross-registry arm: reply_from's target must exist, be deployed, capture
         # responses, and resolve to a lane that can actually serve concurrent callers.
         check_http_sync_reply(ic, registry, delivery=delivery)
-        # Vault BACKLOG #2622 item 1: the four inbound exposure gates, the offline twin of the block
-        # in _start_inbound_unsafe. Before this they ran only at start, so `messagefoundry check`
-        # passed a cleartext off-loopback listener that serve then refused. Same gates, same order,
-        # same posture (the one active_hop_posture stamped), and the caller's own escape value.
-        for gate in (
-            check_mllp_tls_exposure,
-            check_dimse_tls_exposure,
-            check_tcp_tls_exposure,
-            check_http_tls_exposure,
-        ):
-            gate(
-                source_cfg,
-                ic.name,
-                allow_insecure_bind=allow_insecure_bind,
-                posture=current_hop_posture(),
-            )
+        # Vault BACKLOG #2622 item 1: the four inbound exposure gates, through the one function
+        # _start_inbound_unsafe also calls. Before this they ran only at start, so
+        # `messagefoundry check` passed a cleartext off-loopback listener that serve then refused.
+        # Same posture (the one active_hop_posture stamped) and the caller's own escape value. The
+        # revocation gate that follows them at start, check_inbound_revocation, is NOT run here.
+        check_inbound_tls_exposure(
+            source_cfg,
+            ic.name,
+            allow_insecure_bind=allow_insecure_bind,
+            posture=current_hop_posture(),
+        )
         # ADR 0154 D7's parallel offline arm. The runner-side call in _start_inbound_unsafe does NOT
         # fire at `messagefoundry check`, so without this a config that refuses to start would pass
         # the commit/CI gate and only fail at serve. Same predicate, and posture-keyed the same way:
@@ -9308,6 +9285,22 @@ def check_inbound_revocation(
         "terminate neither MLLP nor DIMSE, so for those listeners the proxy-based OCSP delegation "
         "does not reach."
     )
+
+
+def check_inbound_tls_exposure(
+    source: Source, name: str, *, allow_insecure_bind: bool, posture: HopPosture | None
+) -> None:
+    """Run the four inbound exposure gates, MLLP, DIMSE, raw TCP and HTTP, in that order. Each
+    no-ops for a type that is not its own. The one list both listener start and the offline build
+    check run (vault BACKLOG #2622 item 1), so a gate added here reaches both and the two cannot
+    drift apart."""
+    for gate in (
+        check_mllp_tls_exposure,
+        check_dimse_tls_exposure,
+        check_tcp_tls_exposure,
+        check_http_tls_exposure,
+    ):
+        gate(source, name, allow_insecure_bind=allow_insecure_bind, posture=posture)
 
 
 def check_mllp_tls_exposure(

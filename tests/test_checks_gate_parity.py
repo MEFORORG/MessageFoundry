@@ -512,12 +512,27 @@ _EXPOSURE_ARMS = [
 ]
 
 
+def _scrub_mefor_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Remove every MEFOR_* variable for this test. A CI job or this file's own fixtures can export
+    settings variables, and these tests must read only what they set."""
+    for name in list(os.environ):
+        if name.upper().startswith("MEFOR_"):
+            monkeypatch.delenv(name)
+
+
 @pytest.mark.parametrize(
     "arm,security,exposed,ok", _EXPOSURE_ARMS, ids=[a[0] for a in _EXPOSURE_ARMS]
 )
 def test_build_check_runs_the_inbound_exposure_gates(
-    tmp_path: Path, arm: str, security: str, exposed: bool, ok: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    arm: str,
+    security: str,
+    exposed: bool,
+    ok: bool,
 ) -> None:
+    # An exported MEFOR_INBOUND_BIND_HOST or MEFOR_SECURITY_* would beat the file below.
+    _scrub_mefor_env(monkeypatch)
     repo = tmp_path / "repo"
     cfg = repo / "config"
     cfg.mkdir(parents=True)
@@ -530,10 +545,11 @@ def test_build_check_runs_the_inbound_exposure_gates(
     )
     # The dotted [security] keys come first, or TOML files them under the last table header.
     bind = '[inbound]\nbind_host = "0.0.0.0"\n' if exposed else ""
-    (repo / "messagefoundry.toml").write_text(
-        security + '[ai]\nenvironment = "dev"\n' + bind, encoding="utf-8"
-    )
-    result = next(r for r in run_checks(cfg, run_lint=False).results if r.name == "build-check")
+    toml = repo / "messagefoundry.toml"
+    toml.write_text(security + '[ai]\nenvironment = "dev"\n' + bind, encoding="utf-8")
+    # Named explicitly, so no messagefoundry.toml above tmp_path can stand in for it.
+    report = run_checks(cfg, run_lint=False, service_config=toml)
+    result = next(r for r in report.results if r.name == "build-check")
     assert result.required and not result.skipped, f"{arm}: {result.detail}"
     assert result.ok is ok, f"{arm}: {result.detail}"
     if not ok:
@@ -557,11 +573,8 @@ _MLLP_CONFIG = (
 
 def _bare_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str = _MLLP_CONFIG) -> Path:
     """A config dir with no messagefoundry.toml, and an environment holding no MEFOR_* variable
-    but the ones the test sets. The scrub matters: a CI job or this file's own fixtures can export
-    settings variables, and a test of the environment-only path must not read them by accident."""
-    for name in list(os.environ):
-        if name.upper().startswith("MEFOR_"):
-            monkeypatch.delenv(name)
+    but the ones the test sets."""
+    _scrub_mefor_env(monkeypatch)
     cfg = tmp_path / "config"
     cfg.mkdir()
     (cfg / "c.py").write_text(body, encoding="utf-8")
@@ -614,6 +627,39 @@ def test_a_store_key_alone_keeps_the_bare_dir_skip(
         assert "graph only" in result.detail
     else:
         assert result.skipped and result.detail == "no messagefoundry.toml", result.detail
+
+
+@pytest.mark.parametrize("name", _SETTINGS_LEGS)
+def test_a_missing_named_service_config_never_falls_through_to_the_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    # serve refuses a --service-config that does not exist. Reading defaults plus the environment
+    # in its place would pass a config serve will not start, so the leg keeps its old answer.
+    cfg = _bare_config(tmp_path, monkeypatch)
+    monkeypatch.setenv("MEFOR_AI_ENVIRONMENT", "dev")
+    report = run_checks(cfg, run_lint=False, service_config=tmp_path / "typo.toml")
+    result = next(r for r in report.results if r.name == name)
+    assert _ENV_ONLY_NOTE not in result.detail, f"{name}: {result.detail}"
+    if name == "static-credentials":
+        assert "graph only" in result.detail
+    else:
+        assert result.skipped, f"{name}: {result.detail}"
+
+
+def test_a_graph_skip_is_not_tagged_as_an_environment_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A config that will not load skips for a graph reason. The environment-only tag would name the
+    # wrong cause, so it goes only on a line that ran.
+    cfg = _bare_config(tmp_path, monkeypatch, "this is not python\n")
+    monkeypatch.setenv("MEFOR_AI_ENVIRONMENT", "dev")
+    report = run_checks(cfg, run_lint=False, suppress_service_toml_search=True)
+    for name in ("build-check", "reference-backend", "static-credentials"):
+        result = next(r for r in report.results if r.name == name)
+        assert result.skipped and "config did not load" in result.detail, result.detail
+        assert _ENV_ONLY_NOTE not in result.detail
+    # The settings-only legs still ran, and say where they read from.
+    assert _ENV_ONLY_NOTE in next(r for r in report.results if r.name == "posture").detail
 
 
 def test_posture_refuses_an_environment_only_custom_name(
