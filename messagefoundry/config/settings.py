@@ -1791,9 +1791,12 @@ class DeliverySettings(_Section):
     # remains a deliberate internal idiom for a permanent, no-retry failure (store `mark_failed`), and
     # constraining that instead would delete a used mechanism while claiming to add a guard.
     retry_max_attempts: int | None = Field(default=100, ge=1)
-    retry_backoff_seconds: float = 5.0
-    retry_backoff_multiplier: float = 2.0
-    retry_max_backoff_seconds: float = 300.0
+    # Vault BACKLOG #2761: the same bounds RetryPolicy carries, so a bad value fails here, at load,
+    # naming the [delivery] key, rather than later at retry_policy(). Positive finite base and cap, a
+    # finite multiplier of at least 1.
+    retry_backoff_seconds: float = Field(default=5.0, gt=0, allow_inf_nan=False)
+    retry_backoff_multiplier: float = Field(default=2.0, ge=1, allow_inf_nan=False)
+    retry_max_backoff_seconds: float = Field(default=300.0, gt=0, allow_inf_nan=False)
 
     # BACKLOG #1217 half 2. TOML has no null literal and an env var is always a string, so `None`
     # (retry-forever) was reachable from code-first Python only. The string spelling "forever"
