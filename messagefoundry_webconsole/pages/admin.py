@@ -134,10 +134,10 @@ def ticked_scope_expected_source(user: UserSummary) -> Literal["ad"] | None:
     """The ``expected_source`` a TICKED scope save sends (BACKLOG #2098): ``"ad"`` when the directory
     owns the stored scope, which the save handler requires before it makes that scope manual.
 
-    ``None`` for any other source, so a ticked save on such a scope works as it did before; the
+    "Owns" is :func:`needs_manual_scope_confirm`, which the engine's save agrees with (BACKLOG
+    #2252). ``None`` for any other scope, so a ticked save there works as it did before; the
     handler then compares against the source it reads itself."""
-    source = user.channel_scope_source
-    return _SCOPE_SOURCE_DIRECTORY if source == _SCOPE_SOURCE_DIRECTORY else None
+    return _SCOPE_SOURCE_DIRECTORY if needs_manual_scope_confirm(user) else None
 
 
 def _scope_source_text(user: UserSummary) -> str:

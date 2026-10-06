@@ -206,7 +206,9 @@ class ChannelScope(RequestModel):
     #: last wrote the stored scope, as ``UserSummary.channel_scope_source`` reports it. REQUIRED as
     #: ``"ad"`` to save over a directory scope, because the save makes it manual and the login sync
     #: then never withdraws it; when sent, a stored source that differs answers 409. Omitted, it
-    #: changes nothing for a scope the directory does not own. ``exclude=True`` keeps it out of the
+    #: changes nothing for a scope the directory does not own. ONE EXCEPTION to "as it reports it"
+    #: (BACKLOG #2252): where it reports null on an AD account with a stored scope, send ``"ad"``;
+    #: ``AuthService.set_channel_scope`` says why. ``exclude=True`` keeps it out of the
     #: GET payload: this class is also the reader an older client validates that payload with, and it
     #: forbids a key it does not know.
     expected_source: Literal["ad", "manual"] | None = Field(default=None, exclude=True)

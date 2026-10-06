@@ -1030,7 +1030,34 @@ class ChannelScopeSourceConflict(RuntimeError):
     Three causes. The stored scope is the directory's and the caller did not send
     ``expected_source="ad"``, so the write would make it manual without anyone saying so. The
     caller's ``expected_source`` does not match the stored one. Or an AD sign-in changed the source
-    between this write's read and its compare-and-set."""
+    between this write's read and its compare-and-set. "The directory's" and "the stored one" both
+    mean :func:`_effective_scope_source`, not the raw column (BACKLOG #2252)."""
+
+
+def _effective_scope_source(user: UserRecord) -> ChannelScopeSource | None:
+    """Who owns ``user``'s stored channel scope, for the save's intent check (BACKLOG #2252).
+
+    **This is the one statement of the rule; other comments point here.** The stored source,
+    except on an AD account whose scope was stored before the source column existed (#1927): there
+    it is NULL, and nothing backfilled it. The login sync manages such a scope as it manages a
+    directory one: with no mapped group, :func:`channel_scope.decide_ad_channel_scope` withdraws
+    any grant that is not manual. So a save, which makes the scope manual and takes it out of the
+    sync's hands, needs the same ``expected_source="ad"``. That holds for a stored scope that
+    already denies, too: the sync keeps it only because withdrawing it changes nothing, and the
+    save's new value is what gets pinned. A local account never meets the sync, and a NULL scope
+    has nothing stored, so both keep their NULL.
+
+    The web console's ``needs_manual_scope_confirm`` asks the same three questions through
+    ``UserSummary``, because the console cannot import this module. A test in the console's suite
+    compares the two."""
+    stored = user.channel_scope_source
+    if (
+        stored is None
+        and user.channel_scope is not None
+        and user.auth_provider == AuthProvider.AD.value
+    ):
+        return SCOPE_SOURCE_AD
+    return stored
 
 
 #: The ONE detail every refusal of ADR 0197 Amendment A's first-sign-in order carries (N-B2 part 4):
@@ -9758,20 +9785,26 @@ class AuthService:
         write lands raises the same error instead of being overwritten. A caller that leaves
         ``expected_source`` unset on a scope the directory does not own is unaffected.
 
+        "The stored source" in both checks is :func:`_effective_scope_source`, which counts an AD
+        account's stored scope with no recorded writer as the directory's (BACKLOG #2252). The
+        compare-and-set still expects the raw stored value, which is what the row holds.
+
         Raises ``ValueError("no such user")`` when the account does not exist."""
         user = await self._store.get_user(user_id)
         if user is None:
             raise ValueError("no such user")
         stored = user.channel_scope_source
-        if expected_source is None and stored == SCOPE_SOURCE_AD:
+        owner = _effective_scope_source(user)
+        if expected_source is None and owner == SCOPE_SOURCE_AD:
             raise ChannelScopeSourceConflict(
                 "the directory owns this channel scope; send expected_source='ad' to confirm "
                 "that saving it makes it manual"
             )
-        if expected_source is not None and expected_source != stored:
+        if expected_source is not None and expected_source != owner:
             raise ChannelScopeSourceConflict(
-                "expected_source does not match who last wrote this channel scope; re-read the "
-                "user and retry, and omit expected_source where no writer is recorded"
+                "expected_source does not match who owns this channel scope; re-read the user and "
+                "retry. Where no writer is recorded, a directory account's stored scope needs "
+                "'ad'; omit expected_source when no scope is stored or the account is local"
             )
         scope_json = None if channels is None else _json(sorted(set(channels)))
         if not await self._store.set_user_channel_scope_if_source(
