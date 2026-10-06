@@ -1853,6 +1853,9 @@ class Engine:
                     reserved_bindings=self._reserved_bindings,
                     posture=self._hop_posture,
                     trust_anchor_policy=self._trust_anchor_policy,
+                    # The running engine's own escape, so the toggle never refuses a cleartext
+                    # listener this engine already accepted (vault BACKLOG #2622 item 1).
+                    allow_insecure_bind=self._allow_insecure_bind,
                 )
 
             connections_edit.upsert_connection(cfg_dir, match, validate=validate)
@@ -2148,6 +2151,10 @@ class Engine:
                 fifo_claim_batch=self._fifo_claim_batch,
                 inbound_bind_host=self._inbound_bind_host,
                 reserved_bindings=self._reserved_bindings,
+                # build_check now runs the inbound exposure gates (vault BACKLOG #2622 item 1), so
+                # the throwaway checker needs the engine's escape or a dry run refuses what a real
+                # reload accepts.
+                allow_insecure_bind=self._allow_insecure_bind,
                 delivery_defaults=self._delivery_defaults,
                 ordering_default=self._ordering_default,
                 internal_error_default=self._internal_error_default,

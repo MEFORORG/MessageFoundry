@@ -2064,6 +2064,10 @@ def _check_build(
             # [delivery] defaults. Without them that arm is skipped rather than guessed, and the
             # misconfiguration would surface only at serve rather than at commit/CI.
             delivery=settings.delivery,
+            # Vault BACKLOG #2622 item 1: the inbound exposure gates now run here, so pass serve's
+            # cleartext escape. `check` has no --allow-insecure-bind, so this is the settings half of
+            # serve's fold alone; a site that relies on the flag sees check refuse what serve admits.
+            allow_insecure_bind=not settings.security.require_encryption_for_remote,
         )
     except WiringError as exc:
         return CheckResult("build-check", ok=False, required=True, detail=str(exc))

@@ -490,6 +490,55 @@ def test_hop_ack_check_load_failure_echoes_no_secret(
     assert "SUPERSECRET123" not in result.detail
 
 
+# --- vault BACKLOG #2622 item 1: the inbound exposure gates run at check, as at start -------------
+# serve refuses a cleartext off-loopback listener when it starts it. The build-check leg now runs
+# the same four gates, keyed on the same posture and the same escape, so the gate fails the config
+# rather than passing it to a serve that refuses. The runner-level parity, the same message from
+# both arms, is pinned in tests/test_wiring_engine.py.
+
+_ESCAPE = "security.require_encryption_for_remote = false\n"
+
+#: (arm, [security] lines, bind off loopback?, expected build-check ok). The loopback control shows
+#: the refusal is about exposure and not about MLLP.
+_EXPOSURE_ARMS = [
+    ("off-loopback-cleartext-refused", "", True, False),
+    ("loopback-control-passes", "", False, True),
+    # serve folds [security].require_encryption_for_remote=false into its cleartext escape, and
+    # under enforcement=warn the escape crosses with a warning. check must agree.
+    ("escape-under-warn-passes", 'security.enforcement = "warn"\n' + _ESCAPE, True, True),
+    # Under enforce the escape is clamped, at start and at check alike.
+    ("escape-under-enforce-refused", _ESCAPE, True, False),
+]
+
+
+@pytest.mark.parametrize(
+    "arm,security,exposed,ok", _EXPOSURE_ARMS, ids=[a[0] for a in _EXPOSURE_ARMS]
+)
+def test_build_check_runs_the_inbound_exposure_gates(
+    tmp_path: Path, arm: str, security: str, exposed: bool, ok: bool
+) -> None:
+    repo = tmp_path / "repo"
+    cfg = repo / "config"
+    cfg.mkdir(parents=True)
+    (cfg / "c.py").write_text(
+        "from messagefoundry import inbound, router, MLLP\n"
+        "inbound('IB_EXPOSED', MLLP(port=2600), router='r')\n"
+        "@router('r')\n"
+        "def r(m): return []\n",
+        encoding="utf-8",
+    )
+    # The dotted [security] keys come first, or TOML files them under the last table header.
+    bind = '[inbound]\nbind_host = "0.0.0.0"\n' if exposed else ""
+    (repo / "messagefoundry.toml").write_text(
+        security + '[ai]\nenvironment = "dev"\n' + bind, encoding="utf-8"
+    )
+    result = next(r for r in run_checks(cfg, run_lint=False).results if r.name == "build-check")
+    assert result.required and not result.skipped, f"{arm}: {result.detail}"
+    assert result.ok is ok, f"{arm}: {result.detail}"
+    if not ok:
+        assert "IB_EXPOSED" in result.detail and "without TLS" in result.detail
+
+
 # BACKLOG #1967: this file's serve fixtures test other gates, so they bound the two warn-only
 # retention tiers that ship with no window (tests/conftest.py, bounded_warn_only_retention).
 pytestmark = pytest.mark.usefixtures("bounded_warn_only_retention", "verified_log_forwarding")

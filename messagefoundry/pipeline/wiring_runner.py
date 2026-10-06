@@ -4942,6 +4942,7 @@ class RegistryRunner:
             reserved_bindings=self._reserved_bindings,
             posture=self._hop_posture,
             trust_anchor_policy=self._trust_anchor_policy,
+            allow_insecure_bind=self._allow_insecure_bind,
         )
         # PT-backend allow-list — folded in here (vs only at Engine.start) so EVERY reload + dry-run
         # path that build-checks the new registry also rejects a PT-on-non-SQLite graph before any
@@ -8865,6 +8866,7 @@ def build_check_registry(
     posture: HopPosture | None = None,
     trust_anchor_policy: TrustAnchorPolicy | None = None,
     delivery: DeliverySettings | None = None,
+    allow_insecure_bind: bool = False,
 ) -> None:
     """Construct (and discard) every **deployed** connector in ``registry`` + run the fail-closed
     connect/egress allowlists, so a bad connector spec or a non-allowlisted host fails as a
@@ -8884,7 +8886,14 @@ def build_check_registry(
 
     ``trust_anchor_policy`` (#190, ADR 0093) is the instance ``[tls]`` client trust-anchor policy the
     internal-outbound TLS context builders resolve their org internal-CA fallback against. ``None`` → the
-    default system/no-op policy (byte-identical — the OS trust store verifies the peer)."""
+    default system/no-op policy (byte-identical — the OS trust store verifies the peer).
+
+    ``allow_insecure_bind`` is the cleartext-listener escape the four inbound exposure gates read
+    (vault BACKLOG #2622 item 1): ``serve --allow-insecure-bind`` folded with
+    ``[security].require_encryption_for_remote = false``, exactly as ``serve`` folds them. Pass the
+    value the caller really has. A running engine passes its own, so a reload or flag toggle accepts
+    the listener the engine already accepted; ``messagefoundry check`` has no such flag and passes the
+    setting half alone. The default ``False`` is the strict side: it refuses, never admits."""
     # Port-conflict pre-flight (env-resolved + reserved-port aware): a listener stealing a sibling's or
     # the API's (host, port) fails the whole reload here, before quiescing, naming both ends — rather
     # than half-applying and surfacing as a bare bind OSError. PortConflictError is a WiringError → 422.
@@ -8913,7 +8922,13 @@ def build_check_registry(
         # so it need not run inside the scope.
         with active_hop_posture(posture):
             _build_check_connectors(
-                registry, inbound_bind_host, env_values, egress, trust_anchor_policy, delivery
+                registry,
+                inbound_bind_host,
+                env_values,
+                egress,
+                trust_anchor_policy,
+                delivery,
+                allow_insecure_bind=allow_insecure_bind,
             )
     except WiringError:
         raise
@@ -8928,6 +8943,8 @@ def _build_check_connectors(
     egress: EgressSettings,
     trust_anchor_policy: TrustAnchorPolicy | None = None,
     delivery: DeliverySettings | None = None,
+    *,
+    allow_insecure_bind: bool = False,
 ) -> None:
     """Construct-and-discard every DEPLOYED connector + run the connect/egress allowlists (the body of
     :func:`build_check_registry`, split out so the whole block runs inside the ``active_hop_posture``
@@ -8957,6 +8974,22 @@ def _build_check_connectors(
         # ADR 0154 D4's cross-registry arm: reply_from's target must exist, be deployed, capture
         # responses, and resolve to a lane that can actually serve concurrent callers.
         check_http_sync_reply(ic, registry, delivery=delivery)
+        # Vault BACKLOG #2622 item 1: the four inbound exposure gates, the offline twin of the block
+        # in _start_inbound_unsafe. Before this they ran only at start, so `messagefoundry check`
+        # passed a cleartext off-loopback listener that serve then refused. Same gates, same order,
+        # same posture (the one active_hop_posture stamped), and the caller's own escape value.
+        for gate in (
+            check_mllp_tls_exposure,
+            check_dimse_tls_exposure,
+            check_tcp_tls_exposure,
+            check_http_tls_exposure,
+        ):
+            gate(
+                source_cfg,
+                ic.name,
+                allow_insecure_bind=allow_insecure_bind,
+                posture=current_hop_posture(),
+            )
         # ADR 0154 D7's parallel offline arm. The runner-side call in _start_inbound_unsafe does NOT
         # fire at `messagefoundry check`, so without this a config that refuses to start would pass
         # the commit/CI gate and only fail at serve. Same predicate, and posture-keyed the same way:

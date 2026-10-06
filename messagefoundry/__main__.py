@@ -8100,6 +8100,9 @@ def _connection(args: argparse.Namespace) -> int:
             # #190 (ADR 0093): resolve internal-outbound TLS hops against the [tls] internal-CA anchor at
             # edit-time build-check exactly as at reload (None-safe: default system policy = no-op).
             trust_anchor_policy=settings.tls.policy(),
+            # Vault BACKLOG #2622 item 1: the inbound exposure gates read serve's cleartext escape.
+            # This command has no --allow-insecure-bind, so pass the settings half serve folds in.
+            allow_insecure_bind=not settings.security.require_encryption_for_remote,
         )
 
     try:
