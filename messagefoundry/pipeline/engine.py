@@ -543,9 +543,10 @@ class Engine:
         # and so the engine's own reloads, which pass the resolved startup dir, always pass.
         configured = [*config_reload_roots, *([config_dir] if config_dir else [])]
         self._reload_roots_lexical = lexical_roots([*configured, *self._reload_roots])
-        # The directory the most recent APPLIED reload loaded from (resolved). The provenance drift
-        # check and set_connection_flag both trust it to name where the running graph came from, so
-        # a dry run or a failed reload never moves it (vault BACKLOG #2598).
+        # The directory the most recent APPLIED reload loaded from (resolved). At least the provenance
+        # drift check, set_connection_flag and a DR activation (vault BACKLOG #2840) trust it to name
+        # where the running graph came from, so a dry run or a failed reload never moves it (vault
+        # BACKLOG #2598).
         self.last_reload_dir: Path | None = None
         # ADR 0041 D1 (config provenance, item C): the content fingerprint + best-effort git commit of
         # the graph currently loaded, captured at the start's first load (capture_start_provenance,
@@ -708,29 +709,41 @@ class Engine:
         """The manual DR promotion/fail-back coordinator (#61, ADR 0048), or ``None`` when this is not a
         DR box (``[dr].enabled`` is false) or the store settings were not supplied (embedding/tests with
         no KeyProvider seam — the cold seed can't be verified). Built lazily on first access; the API
-        ``POST /dr/activate`` / ``/dr/release`` endpoints drive it."""
+        ``POST /dr/activate`` / ``/dr/release`` endpoints drive it. Building it reads no file; see
+        :meth:`_dr_config_fingerprint`."""
         if self._dr_coordinator is None:
             if not self._dr_settings.enabled or self._store_settings is None:
                 return None
-            cfg_fp: str | None = None
-            if self.config_dir is not None:
-                from messagefoundry.config.fingerprint import config_fingerprint
-
-                try:
-                    cfg_fp = config_fingerprint(self.config_dir)
-                except OSError:
-                    cfg_fp = None
             self._dr_coordinator = DrCoordinator(
                 self.store,
                 self._dr_settings,
                 store_settings=self._store_settings,
                 activate_profile=self._dr_activate_profile,
                 deactivate_profile=self._dr_release_drain,
-                config_fingerprint=cfg_fp,
+                config_fingerprint_provider=self._dr_config_fingerprint,
                 alert_sink=self._alert_sink,
                 owned_lanes=self._owned_lanes,  # ADR 0073: scoped activation recovery when sharded
             )
         return self._dr_coordinator
+
+    async def _dr_config_fingerprint(self) -> str | None:
+        """The config digest a DR activation's seed marker records, or ``None`` when there is none.
+
+        The coordinator awaits it when it writes the marker, so building the coordinator reads no
+        file. It fingerprints :attr:`running_config_dir`, the directory :meth:`_dr_activate_profile`
+        then reloads. The marker is written a step before that reload, and the VIP takeover hook
+        runs between them, so an edit to the directory, or an operator reload from another root,
+        in that window makes the two differ. It goes through :meth:`fingerprint_bundle`, the one
+        best-effort rule, off the event loop. Where that rule takes no digest, such as for a file
+        name that is not UTF-8, this gives ``None`` rather than failing the activation (vault
+        BACKLOG #2839). That rule skips an unreadable file, and a missing directory digests as an
+        empty bundle, so a digest here is not proof that every file was read."""
+        directory = self.running_config_dir
+        if directory is None:
+            return None
+        bundle, _reason = await self.fingerprint_bundle(directory)
+        digest = (bundle or {}).get("fingerprint")
+        return digest if isinstance(digest, str) else None
 
     async def _dr_activate_profile(self) -> None:
         """Engine callback the DR coordinator runs to BEGIN serving under the DR run-profile (#61, ADR
@@ -744,13 +757,20 @@ class Engine:
         if rr is None:
             return
         # Re-apply the (now-active) threshold over the SAME graph so the runner parks the below-threshold
-        # feeds. Prefer a full engine reload (re-reads the config dir, picks up any priority edits) when a
-        # config dir is configured; otherwise (embedding) re-run the runner over its current registry,
-        # which re-evaluates the DR filter in place. propagate=False — a local DR decision, never a
-        # cluster-wide config bump.
+        # feeds. Prefer a full engine reload (re-reads the config dir, picks up any priority edits) when
+        # running_config_dir names one; otherwise (embedding, never reloaded from a dir) re-run the
+        # runner over its current registry, which re-evaluates the DR filter in place. propagate=False
+        # — a local DR decision, never a cluster-wide config bump.
+        # The directory is running_config_dir, the one the running graph came from, and not the
+        # startup dir: an operator who reloaded from another allowed root chose that graph, and a DR
+        # activation must not swap the older one back in without telling anyone (vault BACKLOG
+        # #2840). If that directory has gone, the reload raises and the activation aborts with the
+        # reason, rather than falling back to the startup dir. _converge_reload keeps the startup dir
+        # on purpose: each node converges on its own, identically deployed, config dir.
+        cfg_dir = self.running_config_dir
         try:
-            if self.config_dir is not None:
-                await self.reload(self.config_dir, propagate=False)
+            if cfg_dir is not None:
+                await self.reload(cfg_dir, propagate=False)
             else:
                 await self.preflight_settings()  # reload_detail runs it on the branch above (#2034)
                 await rr.reload(rr.registry)
@@ -1911,7 +1931,9 @@ class Engine:
     @property
     def running_config_dir(self) -> Path | None:
         """The directory the running graph came from: the last applied reload's, else the startup
-        ``--config`` dir. The provenance drift check and :meth:`set_connection_flag` read it."""
+        ``--config`` dir. Readers include at least the provenance drift check,
+        :meth:`set_connection_flag` and a DR activation's reload and seed marker (vault BACKLOG
+        #2840, #2839)."""
         return self.last_reload_dir or self.config_dir
 
     async def fingerprint_bundle(self, path: Path) -> tuple[dict[str, object] | None, str | None]:

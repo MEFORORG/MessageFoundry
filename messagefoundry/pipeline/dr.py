@@ -127,7 +127,7 @@ class DrCoordinator:
         store_settings: object,
         activate_profile: Callable[[], Awaitable[None]],
         deactivate_profile: Callable[[], Awaitable[None]],
-        config_fingerprint: str | None = None,
+        config_fingerprint_provider: Callable[[], Awaitable[str | None]] | None = None,
         alert_sink: AlertSink | None = None,
         clock: Callable[[], float] = time.time,
         owned_lanes: Callable[[], OwnedLanes | None] | None = None,
@@ -139,7 +139,8 @@ class DrCoordinator:
         self._store_settings = store_settings
         self._activate_profile = activate_profile
         self._deactivate_profile = deactivate_profile
-        self._config_fingerprint = config_fingerprint
+        # Awaited per activation, so building the coordinator reads no file (vault BACKLOG #2839).
+        self._config_fingerprint_provider = config_fingerprint_provider
         self._alert_sink: AlertSink = alert_sink or LoggingAlertSink()
         # #145: the DR box label carried in dr_activated / dr_released alerts (also the throttle /
         # auto-resolve key). The hostname is stable across an activate/release pair (same box), so the
@@ -741,6 +742,10 @@ class DrCoordinator:
         chain's tip hash** (read via :meth:`Store.audit_anchor`). Each side then stays independently
         verifiable and the fork is explicit/attributable, rather than blindly extending the restored chain
         (ADR 0049/0041 audit-chain-fork handling). Returns the marker row's own hash digest (PHI-free)."""
+        # Before the anchor read, so the hash of the config dir does not widen the window in which
+        # another audit row could land between the anchor and this marker.
+        provider = self._config_fingerprint_provider
+        config_fp = await provider() if provider is not None else None
         restored_seq, restored_tip = await self._store.audit_anchor()
         cipher = self._store.cipher_info()
         marker = {
@@ -753,7 +758,7 @@ class DrCoordinator:
             # an anchor names, so the marker and an out-of-band anchor can be compared directly.
             "restored_audit_seq": restored_seq,
             "restored_audit_tip": restored_tip,
-            "config_fingerprint": self._config_fingerprint,
+            "config_fingerprint": config_fp,
             "dek_fingerprint": cipher.active_key_id,  # one-way fingerprint, NEVER key bytes
         }
         detail = json.dumps(marker, sort_keys=True)

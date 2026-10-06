@@ -1197,7 +1197,10 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             # Vault BACKLOG #2597: set_connection_flag compares two public config digests with
             # fingerprint_matches (constant time), as the provenance route in api/app.py does.
             "compare:via messagefoundry.config.fingerprint",
-            "hash:via messagefoundry.config.fingerprint",
+            # No hash token since vault BACKLOG #2839: the DR coordinator's direct
+            # config_fingerprint call left, and every config digest the engine takes now goes
+            # through fingerprint_bundle's asyncio.to_thread, a reference this scanner does not
+            # follow as a call. The SHA-256 fold still runs; the instrument cannot see it here.
             "mac:via messagefoundry.pipeline.secret_rotation",
         }
     ),
