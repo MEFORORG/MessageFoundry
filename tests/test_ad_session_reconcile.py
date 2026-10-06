@@ -1214,6 +1214,101 @@ async def test_a_failed_skip_report_neither_stops_the_pass_nor_is_forgotten(
         await store.close()
 
 
+async def _two_unkeyed_bindings(store: MessageStore) -> AuthService:
+    """Two signed-in accounts bound to a federated subject with no directory object id, beside one
+    ordinary account, so a pass has two skip reports to write."""
+    ldap = _FakeLdap(
+        {
+            "jdoe": _principal("jdoe"),
+            "legacy1": replace(_principal("legacy1"), directory_object_id=None),
+            "legacy2": replace(_principal("legacy2"), directory_object_id=None),
+        }
+    )
+    service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+    await service.initialize()
+    await _signed_in_ad_user(service, store, "jdoe")
+    for name in ("legacy1", "legacy2"):
+        await _signed_in_ad_user(service, store, name)
+        user = await store.get_user_by_username(name)
+        assert user is not None
+        bound = await store.set_user_federated_subject(
+            user.id, "https://idp.test.invalid", f"S-1-{name}"
+        )
+        assert bound is not None
+        # The bind ended the session above, so the bound row signs in again.
+        assert await _signed_in_ad_user(service, store, name) is not None
+    return service
+
+
+async def test_a_refused_skip_report_logs_one_error_per_pass_not_one_per_account(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The Lander's finding 6 on PR 2036. While the write keeps failing, ``main`` logged one ERROR
+    per pass, because the first failure ended the pass. Logging it and going on must not turn that
+    into one traceback per unkeyed account on every pass. Both accounts are still reported once the
+    store accepts the write again."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _two_unkeyed_bindings(store)
+        real_record = store.record_audit
+        attempts: list[str] = []
+
+        async def failing(action: str, **kwargs: Any) -> None:
+            if action == "auth.ad_reconcile_binding_unkeyed":
+                attempts.append(action)
+                raise sqlite3.OperationalError("synthetic: disk I/O error")
+            await real_record(action, **kwargs)
+
+        monkeypatch.setattr(store, "record_audit", failing)
+        for _ in range(2):
+            caplog.clear()
+            with caplog.at_level(logging.ERROR, logger="messagefoundry.auth.service"):
+                assert (await service.reconcile_directory_sessions()).aborted is None
+            errors = [
+                r
+                for r in caplog.records
+                if r.levelno == logging.ERROR
+                and "auth.ad_reconcile_binding_unkeyed" in r.getMessage()
+            ]
+            assert len(errors) == 1, "one ERROR per pass while the write keeps failing"
+        assert len(attempts) == 2, "a pass kept writing after the store refused the first row"
+
+        monkeypatch.setattr(store, "record_audit", real_record)
+        await service.reconcile_directory_sessions()
+        reported = [
+            json.loads(a["detail"])["username"]
+            for a in await store.list_audit()
+            if a["action"] == "auth.ad_reconcile_binding_unkeyed"
+        ]
+        assert sorted(reported) == ["legacy1", "legacy2"]
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("defect", [NotImplementedError, RecursionError])
+async def test_a_defect_in_a_reconciler_audit_write_is_raised_not_passed_over(
+    monkeypatch: pytest.MonkeyPatch, defect: type[RuntimeError]
+) -> None:
+    """The Lander's finding 4 on PR 2036. The catch keeps ``RuntimeError`` because the store raises
+    it for its own refusals. Its two subclasses that mean a defect in the code, not a refused write,
+    still end the pass."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _two_unkeyed_bindings(store)
+        real_record = store.record_audit
+
+        async def broken(action: str, **kwargs: Any) -> None:
+            if action == "auth.ad_reconcile_binding_unkeyed":
+                raise defect("synthetic defect")
+            await real_record(action, **kwargs)
+
+        monkeypatch.setattr(store, "record_audit", broken)
+        with pytest.raises(defect):
+            await service.reconcile_directory_sessions()
+    finally:
+        await store.close()
+
+
 async def test_a_genuinely_absent_account_is_still_revoked_under_the_id_keyed_probe() -> None:
     """THE CONTROL ON THE FIX. Re-keying the probe must not disarm the security control it sits in.
 

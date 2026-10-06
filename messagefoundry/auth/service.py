@@ -5299,13 +5299,21 @@ class AuthService:
           held accounts only cannot trip the breaker at all. And a trip on role or scope changes
           leaves no strike, so a later probe sample that missed those accounts proves nothing.
 
-        ``users`` is this pass's candidate set. Every node on a store runs its own reconciler over
-        the same signed-in accounts and the same alert instance, so a clear rests on reading every
-        one of them.
+        ``users`` is this pass's candidate set, and a clear rests on reading every one of them.
 
-        **The cost is a missed clear, never a false one.** An account that never answers keeps
-        both instances open while it is signed in, and so does a reconciler that is switched off.
-        An operator resolves those by hand.
+        **This is one process's evidence, and the instances are the store's.** Every ``[cluster]``
+        node and every engine shard runs its own reconciler, with its own records and possibly its
+        own view of the directory, so one can read clear while another's breaker or hold stands.
+        The lifespan task therefore raises no inverse in either topology
+        (``api/app.py::_without_clears``).
+
+        **The cost is a missed clear, never a false one, with one reconciler on the store.** An
+        account that never answers keeps both instances open while it is signed in. So does a
+        reconciler that is switched off, and so does every cluster or sharded engine. An operator
+        resolves those by hand. One case is not covered: two plain ``serve`` processes on one
+        store, declaring neither a cluster nor engine shards, each clear on their own evidence.
+        Neither can see the other, and ``serve`` records that topology as unguarded (the engine
+        shard guard's comment in ``__main__.py``).
         """
         undetermined = reconcile.ProbeOutcome.UNDETERMINED
         revoked = {r.user_id for r in plan.revocations}
@@ -5587,8 +5595,11 @@ class AuthService:
                 ),
             )
             # Marked only once the audit row is written, so a failed write is retried next pass.
-            if written:
-                self._reconcile_unkeyed_reported.add(user.id)
+            if not written:
+                # One ERROR per pass, not one per account: a store that refused this append will
+                # refuse the next, and every account left unmarked is tried again next pass.
+                break
+            self._reconcile_unkeyed_reported.add(user.id)
 
     async def _record_reconcile_hold(self, plan: reconcile.ReconcilePlan) -> None:
         """Latch, log and audit an engaged undetermined-wave hold, or release a latched one.
@@ -5688,9 +5699,15 @@ class AuthService:
         logged at ERROR, naming the action, and the pass goes on. The log line is then the only
         record of that row. A per-revocation audit write is not routed through here: that one
         still raises.
+
+        ``RuntimeError`` stays in the catch because the store raises it for its own refusals,
+        such as the acquire timeout and the keyless audit append. Its two subclasses that mean a
+        defect rather than a refusal, ``NotImplementedError`` and ``RecursionError``, are raised.
         """
         try:
             await self._audit(action, actor="<reconciler>", detail=detail)
+        except (NotImplementedError, RecursionError):
+            raise
         except _audit_write_errors():
             _log.exception(
                 "directory reconcile: the %s audit row could not be written; the pass goes on, "

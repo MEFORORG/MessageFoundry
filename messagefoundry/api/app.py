@@ -42,7 +42,7 @@ import shutil
 import time
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
@@ -352,6 +352,7 @@ from messagefoundry.pipeline.alerts import (
 )
 from messagefoundry.pipeline.cert_expiry import MonitoredCert
 from messagefoundry.pipeline.cluster import (
+    ClusterCoordinator,
     StepdownLockTimeout,
     StepdownReleaseUnconfirmed,
     build_coordinator,
@@ -7862,7 +7863,9 @@ async def _session_reaper(
             _log.exception("session reaper: purge failed; will retry next interval")
 
 
-async def _directory_reconciler(auth: AuthService, interval: float, sink: AlertSink) -> None:
+async def _directory_reconciler(
+    auth: AuthService, interval: float, sink: AlertSink, *, sole_reconciler: bool
+) -> None:
     """Re-resolve directory principals holding live sessions, revoking those AD has disabled or
     deleted (ADR 0079 mechanism 2). Created only when AD is wired and
     ``[auth].ad_session_recheck_seconds`` is non-zero (it defaults to 300).
@@ -7874,12 +7877,18 @@ async def _directory_reconciler(auth: AuthService, interval: float, sink: AlertS
     Each finished pass is turned into alerts here, by :func:`_alert_reconcile_plan`. The alerting
     lives in this task and never in ``auth/``, which does not import the pipeline's sinks.
 
+    ``sole_reconciler`` is False when other processes may run this same task over this store: every
+    ``[cluster]`` node and every engine shard runs its own, ungated. Then no inverse is raised (see
+    :func:`_without_clears`). Required, so a new caller has to decide it.
+
     A transient failure must not kill the loop for the process lifetime (that would silently disable
     the control until restart) — log and retry next interval, the session-reaper precedent."""
     while True:
         await asyncio.sleep(interval)
         try:
             plan = await auth.reconcile_directory_sessions()
+            if not sole_reconciler:
+                plan = _without_clears(plan)
             # Inside the try: a sink that breaks its never-raise contract must not kill the loop.
             _alert_reconcile_plan(plan, auth, sink)
         except asyncio.CancelledError:
@@ -7940,6 +7949,35 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
         sink.ad_reconcile_breaker_cleared("directory-reconciler")
     if plan.hold_clear:
         sink.ad_reconcile_hold_released("directory-reconciler")
+
+
+def _without_clears(plan: ReconcilePlan) -> ReconcilePlan:
+    """The plan with every ``*_clear`` flag set False, so it resolves no alert instance.
+
+    BACKLOG #2136, the Lander's finding 1 on PR 2036. The evidence for a clear is this process's
+    own: its strike and outcome records, and its own view of the directory. The instance it would
+    resolve is shared by every process on the store. Where more than one reconciler runs, one
+    process can read clean while another's condition still stands, and resolving on that would
+    clear a breaker or a hold that is still in force. There is no shared state to decide it from:
+    the strike and outcome records are process-local by design, and the instance row carries no
+    node. A leader gate does not reach it either. An engine shard runs no ``[cluster]`` lease, so
+    each one reads as leader, and a ``[cluster]`` standby still runs its own reconciler and can
+    open the instance a leader would then clear.
+
+    So there, a clear is missed instead. The trip and the hold still page, from each process that
+    sees them, and an operator resolves the instance by hand. Matched by field name, so a flag a
+    later item adds is covered without an edit here."""
+    cleared: dict[str, Any] = {f.name: False for f in fields(plan) if f.name.endswith("_clear")}
+    return replace(plan, **cleared)
+
+
+def _is_sole_reconciler(coordinator: ClusterCoordinator, registry_filter: object | None) -> bool:
+    """Whether this process can be the only directory reconciler on its store (BACKLOG #2136).
+
+    Not on a ``[cluster]`` node, and not on an engine shard, which `serve --shard` marks by passing
+    a registry filter. A lone shard of a one-shard config reads as sharded too, which costs only a
+    missed clear."""
+    return not coordinator.is_clustered() and registry_filter is None
 
 
 _INITIAL_CREDENTIAL_MAX_LEAD = 24 * 3600.0  # warn at most this long before the deadline
@@ -8780,6 +8818,9 @@ def create_managed_app(
                             auth,
                             auth_settings.ad_session_recheck_seconds,
                             notifier or LoggingAlertSink(),
+                            # BACKLOG #2136: on a [cluster] node or an engine shard, another
+                            # reconciler shares this store, so no pass may resolve its alerts.
+                            sole_reconciler=_is_sole_reconciler(coordinator, registry_filter),
                         )
                     )
             yield

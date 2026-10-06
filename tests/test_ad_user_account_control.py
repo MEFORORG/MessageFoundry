@@ -24,23 +24,36 @@ import logging
 import re
 import sqlite3
 import uuid
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Mapping
 from contextlib import asynccontextmanager
+from dataclasses import fields as dataclass_fields
+from dataclasses import replace
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
-from messagefoundry.api.app import _alert_reconcile_plan
+from messagefoundry.api.app import (
+    _alert_reconcile_plan,
+    _directory_reconciler,
+    _is_sole_reconciler,
+    _without_clears,
+)
 from messagefoundry.auth import ldap as ldap_module
 from messagefoundry.auth.ldap import DirectoryAnswer, LdapAuthenticator, _account_enabled
 from messagefoundry.auth.permissions import Role
-from messagefoundry.auth.reconcile import HOLD_REASON, ReconcilePlan
+from messagefoundry.auth.reconcile import (
+    HOLD_REASON,
+    ProbeOutcome,
+    ReconcilePlan,
+    SessionRevocation,
+)
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import _ALERT_EVENT_TYPES, AuthSettings
 from messagefoundry.pipeline.alert_sinks import _AUTO_RESOLVE, NotifierAlertSink
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
-from messagefoundry.store.store import MessageStore
+from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
+from messagefoundry.store.store import MessageStore, UserRecord
 from tests.test_alert_sinks import _drain, _RecordingTransport
 from tests.test_approval_requester_recheck import _Sink
 
@@ -1060,3 +1073,161 @@ async def test_a_fresh_process_does_not_release_a_hold_its_budget_has_not_reache
         second = await _alerted_pass(service, sink)
         assert second.hold and not second.hold_clear
         assert HELD in await _open_alerts(store)
+
+
+# --- the Lander's review of PR 2036 --------------------------------------------------------------
+#
+# Finding 3: each clause of the clear predicate is pinned by a test that turns red when it goes.
+# Finding 1: a process that may share its store with another reconciler resolves nothing.
+
+PRESENT, ABSENT_OUTCOME, UNDETERMINED = (
+    ProbeOutcome.PRESENT,
+    ProbeOutcome.ABSENT,
+    ProbeOutcome.UNDETERMINED,
+)
+
+
+async def _marked(
+    plan: ReconcilePlan,
+    outcomes: dict[str, ProbeOutcome],
+    *,
+    strikes: dict[str, int] | None = None,
+) -> tuple[bool, bool]:
+    """``(breaker_clear, hold_clear)`` for ``plan``, with these records on file for exactly these
+    signed-in accounts and nothing unconfirmed. Every other input is held clean, so a test changes
+    the one input whose clause it pins."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _fresh_process(store)
+        service._reconcile_outcomes = dict(outcomes)
+        service._reconcile_strikes = dict.fromkeys(outcomes, 0) | (strikes or {})
+        service._reconcile_unconfirmed = set()
+        # The predicate reads only the candidate ids, so the records behind them are not built.
+        users = cast(Mapping[str, UserRecord], dict.fromkeys(outcomes))
+        marked = service._mark_reconcile_clears(plan, users)
+        return marked.breaker_clear, marked.hold_clear
+    finally:
+        await store.close()
+
+
+async def test_the_clear_predicate_control_reads_both_clear() -> None:
+    """The control for the four tests below: on these inputs both clears hold, so each red there is
+    the one clause that test changes."""
+    assert await _marked(ReconcilePlan(probed=2), {"a": PRESENT, "b": PRESENT}) == (True, True)
+
+
+async def test_an_estate_that_reads_only_undetermined_is_no_breaker_clear() -> None:
+    """``any(o is not undetermined ...)``: a pass of held accounts only cannot trip the breaker at
+    all, so it says nothing about whether the breaker is still tripped."""
+    plan = ReconcilePlan(probed=2)
+    assert await _marked(plan, {"a": UNDETERMINED, "b": UNDETERMINED}) == (False, False)
+
+
+async def test_an_undetermined_answer_on_record_is_no_hold_clear_even_when_the_pass_held_none() -> (
+    None
+):
+    """``undetermined not in outcomes``: this node's pass did not hold, but an undetermined answer
+    on record is the hold's own condition, which another node's latch may still be holding on."""
+    plan = ReconcilePlan(probed=2)
+    assert await _marked(plan, {"a": PRESENT, "b": UNDETERMINED}) == (True, False)
+
+
+async def test_an_account_this_pass_revoked_does_not_hold_the_breaker_open() -> None:
+    """The ``revoked`` exclusion: the account the pass just revoked still carries its strikes on
+    record, and it has left the estate. Counting it would keep the breaker open after every pass
+    that revokes anyone."""
+    plan = ReconcilePlan(
+        probed=2, revocations=(SessionRevocation("a", "alice", reason="directory_absent"),)
+    )
+    outcomes = {"a": ABSENT_OUTCOME, "b": PRESENT}
+    assert await _marked(plan, outcomes, strikes={"a": 2}) == (True, True)
+
+
+async def test_a_breaker_trip_still_resolves_a_hold_that_has_gone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The aborted branch marks the clears too. A held pass writes its own row on a pass the
+    breaker aborts (ADR 0195 rule item 9), and so a trip with no undetermined account on record is
+    evidence the hold has gone. The breaker's own instance stays open."""
+    names = ["ok1", "ok2"] + [f"gone{i}" for i in range(10)]
+    async with _signed_in_estate(monkeypatch, names) as (directory, service, store, _tokens):
+        sink = NotifierAlertSink([], store=store)
+        for name in names[2:]:
+            directory.delete(name)
+        await _alerted_pass(service, sink)  # strike 1: no trip yet
+        last_run = NotifierAlertSink([], store=store)
+        last_run.ad_reconcile_held(
+            "directory-reconciler", reason=HOLD_REASON, undetermined=2, detail="held"
+        )
+        await _settle(last_run)
+        tripped = await _alerted_pass(service, sink)
+        assert tripped.aborted == "mass_revoke_breaker" and tripped.hold_clear
+        assert await _open_alerts(store) == {ABORTED}
+
+
+def test_without_clears_sets_every_clear_flag_false_and_nothing_else() -> None:
+    names = {f.name for f in dataclass_fields(ReconcilePlan) if f.name.endswith("_clear")}
+    assert {"breaker_clear", "hold_clear"} <= names  # the suffix match is armed
+    every_clear: dict[str, Any] = dict.fromkeys(names, True)
+    plan = replace(
+        ReconcilePlan(probed=3, hold=True, undetermined=2, held=("a", "b")), **every_clear
+    )
+    stripped = _without_clears(plan)
+    assert not any(getattr(stripped, name) for name in names)
+    assert stripped == ReconcilePlan(probed=3, hold=True, undetermined=2, held=("a", "b"))
+
+
+def test_only_an_unclustered_unsharded_process_is_the_sole_reconciler() -> None:
+    clustered = cast(ClusterCoordinator, SimpleNamespace(is_clustered=lambda: True))
+    assert _is_sole_reconciler(NullCoordinator(), None)
+    assert not _is_sole_reconciler(NullCoordinator(), lambda registry: registry)  # engine shard
+    assert not _is_sole_reconciler(clustered, None)  # a [cluster] node
+
+
+class _PlanAuth:
+    """Stands in for the auth service in the lifespan loop: every pass returns one plan."""
+
+    directory_reconcile_alert: str | None = None
+    directory_reconcile_hold = "held"
+
+    def __init__(self, plan: ReconcilePlan) -> None:
+        self.plan = plan
+        self.passes = 0
+
+    async def reconcile_directory_sessions(self) -> ReconcilePlan:
+        self.passes += 1
+        return self.plan
+
+
+@pytest.mark.parametrize(
+    ("sole", "expected"),
+    [
+        (True, {"ad_reconcile_held", "ad_reconcile_breaker_cleared"}),
+        (False, {"ad_reconcile_held"}),
+    ],
+    ids=["sole-reconciler", "shared-store"],
+)
+async def test_a_process_that_may_share_its_store_pages_but_resolves_nothing(
+    sole: bool, expected: set[str]
+) -> None:
+    """Finding 1. One node's clear rests on its own records and its own view of the directory,
+    while the instance it would resolve is the store's. So a cluster node or an engine shard still
+    pages a hold, and raises no inverse."""
+    plan = ReconcilePlan(
+        probed=3, hold=True, undetermined=2, held=("a", "b"), breaker_clear=True, hold_clear=False
+    )
+    auth = _PlanAuth(plan)
+    sink = _InverseSink()
+    task = asyncio.create_task(
+        _directory_reconciler(auth, 0.001, sink, sole_reconciler=sole)  # type: ignore[arg-type]
+    )
+    try:
+        for _ in range(500):
+            if auth.passes >= 3:
+                break
+            await asyncio.sleep(0.005)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert auth.passes >= 3
+    assert {event[0] for event in sink.events} == expected
