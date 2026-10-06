@@ -95,12 +95,17 @@ def parse_tree(
     # Before the size checks, so a large non-HL7 body reads as "not HL7" rather than "too large".
     if not text.startswith("MSH"):
         raise HL7PeekError("message does not start with an MSH segment")
+    # Keep only the refusal's text (limits and counts, never content) and raise after the handler
+    # ends, so the new error carries no __cause__ or __context__ holding the body.
+    too_large: str | None = None
     try:
         enforce_size_limits(
             text, max_bytes=DEFAULT_MAX_MESSAGE_BYTES, max_segments=DEFAULT_MAX_SEGMENTS
         )
     except HL7PeekError as exc:
-        raise ParseTreeTooLargeError(str(exc)) from exc
+        too_large = str(exc)
+    if too_large is not None:
+        raise ParseTreeTooLargeError(too_large)
     segments = [s for s in text.split("\r") if s]
 
     builder = _TreeBuilder(_separators(segments[0]), max_nodes, max_value_chars)
