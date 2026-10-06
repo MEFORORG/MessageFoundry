@@ -5271,7 +5271,9 @@ class AuthService:
         # reads it again, so a probe sample that missed the accounts behind the trip is no clear. A
         # held account is not read again: its probe judged neither its roles nor its scope, and its
         # strike went back to 0, so it stays unconfirmed. An account that left has already been
-        # dropped from the set, and has forfeited the breaker's clear (`_forfeit_clears_on_attrition`).
+        # dropped from the set (`_forfeit_clears_on_attrition`). Kept as it stood before this pass,
+        # for the revocation loop below.
+        unconfirmed = frozenset(self._reconcile_unconfirmed)
         if plan.aborted is None:
             held = set(plan.held)
             self._reconcile_unconfirmed.difference_update(
@@ -5306,6 +5308,10 @@ class AuthService:
                 # BEFORE the sessions go, so a pass that raises part-way cannot lose it (BACKLOG
                 # #2136): the next pass no longer sees this account.
                 self._advance_hold_standing("forfeit")
+            if revocation.user_id in unconfirmed:
+                # The same, for the breaker. The account was signed in at the trip and has not read
+                # clean since. It is about to leave, so nothing will read it clean again.
+                self._forfeit_breaker_clear()
             if await self._apply_reconcile_revocation(revocation):
                 applied.append(revocation)
         for refresh in plan.renames:
@@ -5364,8 +5370,8 @@ class AuthService:
           its own holds. Until then, an earlier run's instance stays open for an operator.
         * Revoking an undetermined account first forfeits the release until a restart, because
           nothing re-reads the account. The forfeit is recorded before the sessions go, so a pass
-          that raises part-way keeps it. An undetermined account that leaves the candidate set any
-          other way forfeits on the same rule (`_forfeit_clears_on_attrition`). Once a pass here has
+          that raises part-way keeps it. Leaving any other way forfeits on the same rule
+          (`_forfeit_clears_on_attrition`). Once a pass here has
           found the hold gone, every signed-in account had an answer from this process. Its latch
           then covers what an earlier run held, and a later lone revocation is ADR 0195's own,
           until a pass here holds again. The standing gate on its own is not what stops a false
@@ -5378,8 +5384,7 @@ class AuthService:
           either way. A held account's probe judged neither its roles nor its scope, and a trip
           on role or scope changes leaves no strike, so a probe sample that missed or held the
           accounts behind a trip proves nothing. The undetermined test covers that after a
-          restart too, when this process has no record of the trip. An account the trip left
-          unconfirmed that leaves the candidate set forfeits the clear until a restart
+          restart too, when this process has no record of the trip. And it is not forfeited
           (`_forfeit_clears_on_attrition`). The breaker has no latch to lose: every pass judges
           its revocations afresh, so a fresh process may resolve a trip.
 
@@ -5395,21 +5400,18 @@ class AuthService:
         **The usual cost is a missed clear, with one reconciler on the store.** An account that
         never answers keeps both instances open while it is signed in. So does a hold, for the
         breaker's instance. So does a reconciler that is switched off, and so does every cluster
-        or multi-shard engine. A fresh or forfeited process keeps the hold's instance open. An
-        operator resolves those by hand. **At least two cases can still clear falsely.** Any
+        or multi-shard engine. A fresh or forfeited process keeps the hold's instance open, and a
+        process that forfeited the breaker keeps its instance open (`_forfeit_clears_on_attrition`
+        says when). An operator resolves those by hand. **At least two cases can still clear
+        falsely.** Any
         engine that declares neither ``[cluster]`` nor more than one shard clears on its own
         evidence, whatever else shares its store: two plain ``serve`` processes, two one-shard
         ``supervise`` fleets, or a plain engine beside a cluster node or a multi-shard engine on
         the same store. It cannot see the others, and ``serve`` records a second engine on one
-        store as unguarded (the engine shard guard's comment in ``__main__.py``). And the
-        attrition forfeit is one process's memory: a trip's accounts that leave across a restart
-        are not seen to leave. The restarted process may then resolve that trip on the accounts
-        that remain. The hold's standing gate keeps the hold from this.
-
-        A pass judges only accounts that hold a session. Within one process, a trip or hold whose
-        accounts leave the candidate set is forfeited, not cleared on the rest
-        (`_forfeit_clears_on_attrition`). That costs a missed clear wherever an account leaves
-        while the evidence is still pending, including an ordinary sign-out.
+        store as unguarded (the engine shard guard's comment in ``__main__.py``). And a trip's
+        accounts that leave across a restart are not seen to leave, so the restarted process may
+        resolve that trip on the accounts that remain. The hold's standing gate keeps the hold
+        from this.
         """
         undetermined = reconcile.ProbeOutcome.UNDETERMINED
         revoked = {r.user_id for r in plan.revocations}
@@ -5438,22 +5440,26 @@ class AuthService:
     def _forfeit_clears_on_attrition(self, users: Mapping[str, UserRecord]) -> None:
         """Give up a clear when an account behind it leaves the candidate set (BACKLOG #2136).
 
-        A pass judges only accounts that hold a session, and nothing re-reads one that has left. So
-        when the accounts behind a trip or a hold leave, the next pass would read clear on the
-        rest while the fault stands. Every account a wrong search base strikes is one that cannot
-        sign back in, so its sessions only drain. This turns that false clear into a missed one.
+        **The one statement of the attrition forfeit; the other sites point here.** A pass judges
+        only accounts that hold a session, and nothing reads one again once it has left. So when
+        the accounts behind a trip or a hold leave, the next pass would read clear on the rest
+        while the fault stands. Every account a wrong search base strikes is one that cannot sign
+        back in, so its sessions only drain. This turns that false clear into a missed one.
 
-        * An account a trip left unconfirmed forfeits the breaker's clear until a restart.
+        * An account a trip left unconfirmed forfeits the breaker's clear until a restart. The
+          reconciler revoking such an account forfeits it too, in the pass's revocation loop, before
+          its sessions go.
         * An account whose last answer was undetermined forfeits the hold's release, on the same
           rule as revoking one: unless this process has settled and has not held since.
 
         At least these take an account out: it signs out or reaches the session cap, the reconciler
-        revokes it, an operator disables it locally, or its row is deleted. The reconciler's own
-        revocation of an unconfirmed account cannot forfeit the breaker: it revokes only on a pass
-        that was not aborted, and that pass has already read the account again.
+        revokes it, an operator disables it locally, or its row is deleted. The cost is a missed
+        clear when an account leaves for an ordinary reason while the evidence is pending. A trip
+        marks every candidate unconfirmed, healthy ones too, so a sign-out during a long trip
+        forfeits its clear. This is one process's memory: what leaves across a restart is not seen.
         """
         if not self._reconcile_unconfirmed <= users.keys():
-            self._reconcile_breaker_forfeit = True
+            self._forfeit_breaker_clear()
         self._reconcile_unconfirmed.intersection_update(users)
         undetermined = reconcile.ProbeOutcome.UNDETERMINED
         if any(
@@ -5463,20 +5469,38 @@ class AuthService:
         ):
             self._advance_hold_standing("forfeit")
 
+    def _forfeit_breaker_clear(self) -> None:
+        """Set ``_reconcile_breaker_forfeit``, logging the first time (BACKLOG #2136). Said aloud,
+        because the in-process breaker message still clears on the next pass that is not aborted,
+        while the durable instance stays open for an operator."""
+        if not self._reconcile_breaker_forfeit:
+            self._reconcile_breaker_forfeit = True
+            _log.warning(
+                "directory reconcile: an account signed in at the last breaker trip left before a "
+                "pass read it clean, so this process will not resolve ad_reconcile_aborted itself "
+                "until it restarts; an operator resolves it once the directory reads clean"
+            )
+
     def _advance_hold_standing(self, event: _HoldStanding) -> None:
         """Move ``_reconcile_hold_standing`` on ``event`` (BACKLOG #2136), the only place it moves.
 
         ``"held"``: a pass here held. That moves a fresh process to ``"held"``, and a settled one
-        back to it, because the accounts this hold covers can still leave before it releases.
-        ``"forfeit"``: an undetermined account is about to be revoked, or has left the candidate
-        set. That forfeits unless this process has settled. ``"settled"``: a pass here found the
-        hold gone. ``"forfeit"`` is never left.
+        back to it, because this hold's accounts can still leave before it releases.
+        ``"forfeit"``: an undetermined account is about to be revoked, or has left; see
+        :meth:`_forfeit_clears_on_attrition`. It forfeits unless this process has settled.
+        ``"settled"``: a pass here found the hold gone. ``"forfeit"`` is never left.
         """
         current = self._reconcile_hold_standing
         if event == "held" and current in ("fresh", "settled"):
             self._reconcile_hold_standing = "held"
-        elif event == "forfeit" and current != "settled":
+        elif event == "forfeit" and current not in ("settled", "forfeit"):
             self._reconcile_hold_standing = "forfeit"
+            _log.warning(
+                "directory reconcile: an account whose userAccountControl read undetermined left "
+                "before this process released a hold, so it will not resolve ad_reconcile_held "
+                "itself "
+                "until it restarts; an operator resolves it once the attribute reads clean"
+            )
         elif event == "settled" and current in _HOLD_RELEASABLE:
             self._reconcile_hold_standing = "settled"
 

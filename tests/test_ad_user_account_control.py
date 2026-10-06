@@ -979,6 +979,61 @@ async def test_a_trip_does_not_resolve_when_the_accounts_behind_it_leave(
             assert await _open_alerts(store) == {ABORTED}
 
 
+async def _sign_in(service: AuthService, names: list[str]) -> None:
+    """A fresh AD session for each of ``names``, minted the way ``_signed_in_estate`` mints one."""
+    auth = LdapAuthenticator(_settings())
+    for name in names:
+        principal = auth.resolve_principal(name)
+        assert principal is not None
+        assert (await service._complete_ad_login(principal, None, mfa_verified=True)).token
+
+
+async def test_a_trip_does_not_resolve_when_the_reconciler_revokes_the_accounts_behind_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reconciler's own revocation is a way out too. Six of twelve read absent and the breaker
+    trips. Twelve more users sign in, so the next pass's six revocations are a quarter of the
+    probed population, under the fraction, and they go through. Nothing was fixed. The pass that
+    revoked them, and the pass after it, must not resolve the trip on the eighteen that remain."""
+    names = [f"ok{i}" for i in range(6)] + [f"gone{i}" for i in range(6)]
+    later = [f"late{i}" for i in range(12)]
+    async with _signed_in_estate(monkeypatch, names + later) as estate:
+        directory, service, store, _tokens = estate
+        await _expire(store, later)
+        sink = NotifierAlertSink([], store=store)
+        for name in names[6:]:
+            directory.delete(name)
+        assert not (await _alerted_pass(service, sink)).breaker_clear  # strike 1
+        assert (await _alerted_pass(service, sink)).aborted == "mass_revoke_breaker"
+        await _sign_in(service, later)
+        revoked = await _alerted_pass(service, sink)
+        assert revoked.aborted is None and len(revoked.revocations) == 6
+        assert not revoked.breaker_clear, "the trip resolved on the pass that revoked its accounts"
+        assert not (await _alerted_pass(service, sink)).breaker_clear
+        assert ABORTED in await _open_alerts(store)
+
+
+async def test_a_hold_whose_accounts_leave_on_a_pass_with_nobody_signed_in_still_forfeits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The attrition check runs before the prunes and before the early return for a pass with no
+    candidates. Everyone signs out while a hold stands, a pass finds nobody, and then one readable
+    account signs back in. Its clean read must not release the hold the departed accounts were
+    behind."""
+    names = ["u1", "u2", "ok1"]
+    async with _signed_in_estate(monkeypatch, names) as (directory, service, store, _tokens):
+        sink = NotifierAlertSink([], store=store)
+        directory.uac.update({"u1": ABSENT, "u2": ABSENT})
+        assert (await _alerted_pass(service, sink)).hold
+        await _expire(store, names)
+        assert (await _alerted_pass(service, sink)).probed == 0
+        await _sign_in(service, ["ok1"])
+        plan = await _alerted_pass(service, sink)
+        assert plan.aborted is None and not plan.hold and plan.readable == 1
+        assert not plan.hold_clear, "the hold released after a pass with nobody signed in"
+        assert HELD in await _open_alerts(store)
+
+
 async def test_an_account_that_leaves_after_it_was_read_again_does_not_forfeit_the_trip(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

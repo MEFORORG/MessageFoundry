@@ -731,7 +731,9 @@ this engine process, for every signed-in directory account it did not just revok
   strike, and every account still signed in since the last trip has been read again, and not held.
   So the breaker's alert stays open while a hold stands.
 - An engine gives up resolving the breaker when an account signed in at the last trip leaves before
-  a pass has read it again. It then resolves no trip until its next restart.
+  it reads clean. Reading clean means a pass that did not abort read it, and did not hold it. The
+  reconciler revoking the account counts as leaving. The engine then resolves no trip until its
+  next restart. The engine logs a warning when it gives up either resolve.
 
 A pass judges only accounts that hold a session, and nothing reads an account again once it has
 left. An account leaves at least when it signs out, reaches the session cap, is revoked by the

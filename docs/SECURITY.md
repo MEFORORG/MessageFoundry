@@ -3197,9 +3197,10 @@ found" for *deleted*, *moved out of the search base* and *the search base was ne
   `auth.ad_reconcile_held` and raises the `ad_reconcile_held` alert. Once more than one has been seen, the hold stays until no
   signed-in account reads undetermined. So within one engine process, attrition cannot release the
   last one. The hold's latch does not survive a restart, though. If sessions end until one held
-  account is left, and the engine then restarts, the restarted engine knows only that one. Where a
-  pass also reads the attribute on another account, it strikes that account, and revokes it once
-  the strikes reach `ad_session_recheck_strikes` (2 at the default). Held accounts are left out of
+  account is left, and the engine then restarts, the restarted engine knows only that one. It
+  treats it as a lone undetermined account. So when a pass also reads the attribute on another
+  account, the engine strikes the formerly held account. It revokes that account once its strikes
+  reach `ad_session_recheck_strikes` (2 at the default). Held accounts are left out of
   the population the breaker below judges, and a pass it aborts still writes the held row. The rule is fixed, with no setting
   and no floor. **The cost:**
   two genuinely disabled accounts whose attribute the bind account cannot read keep their sessions to
