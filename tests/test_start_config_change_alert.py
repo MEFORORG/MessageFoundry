@@ -568,8 +568,10 @@ async def test_a_convergence_reload_after_capture_leaves_the_start_row_naming_th
     """vault BACKLOG #2838: a sibling node reloads a changed directory, and this node's convergence
     reload lands between its start's capture and its config_loaded row. The row names the graph
     this start loaded: its digest and counts, and the comparison it made against them. It marks
-    itself superseded, so the next start on the reloaded bytes compares against the sibling's
-    row and raises no false config_changed."""
+    itself superseded, so the next start on the reloaded bytes compares against the convergence
+    reload's own row and raises no false config_changed. No sibling row is needed for that: the
+    initiator's row may be missing, and this node's row still names the bytes it converged on
+    (vault BACKLOG #3076)."""
     start_digest = config_fingerprint(cfg)
     await _start(tmp_path, cfg)  # the baseline, so this start makes a real comparison
     seen: dict[str, Any] = {}
@@ -579,8 +581,9 @@ async def test_a_convergence_reload_after_capture_leaves_the_start_row_naming_th
         await real_start(self)
         _add_a_connection_pair(cfg, tmp_path)  # the sibling's change, on the shared directory
         await self._converge_reload()  # what ConfigConvergenceRunner calls on a version bump
-        # The sibling's own reload row, which its reload route writes for the same bytes.
-        assert await app_module._record_reload_audit(self, actor="sibling") == []
+        # This node's own row for the reload, written by the lifespan's hook (vault BACKLOG #3076).
+        reload_rows = await self.store.list_audit(action="config_reload")
+        seen["actors"] = [r["actor"] for r in reload_rows]
         rr = self.registry_runner
         assert rr is not None
         seen["fingerprint"] = (self.loaded_config_fingerprint or {}).get("fingerprint")
@@ -591,7 +594,11 @@ async def test_a_convergence_reload_after_capture_leaves_the_start_row_naming_th
     # Control: the reload did swap the graph before the row was written.
     reloaded_digest = config_fingerprint(cfg)
     assert reloaded_digest != start_digest
-    assert seen == {"fingerprint": reloaded_digest, "counts": (2, 2)}
+    assert seen == {
+        "fingerprint": reloaded_digest,
+        "counts": (2, 2),
+        "actors": ["system:cluster-convergence"],
+    }
     row = rows[-1]
     assert row["fingerprint"] == start_digest
     assert (row["inbound"], row["outbound"]) == (1, 1)
@@ -603,7 +610,7 @@ async def test_a_convergence_reload_after_capture_leaves_the_start_row_naming_th
 
     monkeypatch.setattr(Engine, "start", real_start)
     rows = await _start(tmp_path, cfg)
-    assert alerts == [], "the superseded row is passed over for the sibling's reload row"
+    assert alerts == [], "the superseded row is passed over for the convergence row"
     assert rows[-1]["comparison"] == "compared"
     assert rows[-1]["previous_fingerprint"] == reloaded_digest
     assert "superseded" not in rows[-1], "control: an undisturbed start is not marked"
@@ -635,6 +642,57 @@ async def test_the_reload_route_row_still_names_the_reloaded_graph(
     # Control: the start's own row, written before the reload, names the start's graph.
     assert start["fingerprint"] == start_digest
     assert (start["inbound"], start["outbound"]) == (1, 1)
+
+
+@pytest.mark.parametrize("reverted", [True, False], ids=["reverted", "kept"])
+async def test_a_convergence_reload_writes_the_row_the_next_start_compares_against(
+    tmp_path: Path, cfg: Path, alerts: list[dict[str, Any]], reverted: bool
+) -> None:
+    """vault BACKLOG #3076 item 1: a convergence reload that lands after the start's row writes its
+    own config_reload row, so the store's newest baseline names the graph the node converged on.
+
+    Without that row the newest baseline was the start's, naming the old digest. ``kept`` restarts
+    on the converged bytes and must raise nothing; it alerted falsely before. ``reverted`` puts the
+    old bytes back, and the next start must see that; it compared equal to the stale start row
+    before, so the revert went unreported."""
+    original = (cfg / "cfg.py").read_bytes()
+    start_digest = config_fingerprint(cfg)
+    await _start(tmp_path, cfg)  # the baseline
+    app = _app(tmp_path, cfg)
+    async with app.router.lifespan_context(app):
+        engine: Engine = app.state.engine
+        _add_a_connection_pair(cfg, tmp_path)  # a sibling's change, on the shared directory
+        await engine._converge_reload()  # what ConfigConvergenceRunner calls on a version bump
+        reload_rows = await engine.store.list_audit(action="config_reload")
+        node = engine.coordinator.node_id
+    converged_digest = config_fingerprint(cfg)
+    assert converged_digest != start_digest, "control: the change moved the digest"
+    assert alerts == []
+    assert len(reload_rows) == 1
+    assert reload_rows[0]["actor"] == "system:cluster-convergence"
+    row = json.loads(reload_rows[0]["detail"])
+    assert list(row)[:6] == ["dir", "shard", "node", "inbound", "outbound", "dry_run"]
+    assert row["initiator"] == "cluster_convergence" and row["node"] == node
+    assert row["fingerprint"] == converged_digest and (row["inbound"], row["outbound"]) == (2, 2)
+    assert "baseline_unchecked" not in row and "degraded" not in row
+
+    if reverted:
+        (cfg / "cfg.py").write_bytes(original)
+        assert config_fingerprint(cfg) == start_digest, "control: the revert restored the bytes"
+    rows = await _start(tmp_path, cfg)
+    assert rows[-1]["comparison"] == "compared"
+    assert rows[-1]["previous_fingerprint"] == converged_digest
+    if reverted:
+        assert len(alerts) == 1, "the revert to the old graph is reported"
+        alert = alerts[0]
+        assert (alert["fingerprint"], alert["previous_fingerprint"]) == (
+            start_digest,
+            converged_digest,
+        )
+        assert alert["baseline_action"] == "config_reload"
+        assert alert["baseline_actor"] == "system:cluster-convergence"
+    else:
+        assert alerts == [], "a start on the converged bytes matches the convergence row"
 
 
 # --- the flag toggle -----------------------------------------------------------------------------

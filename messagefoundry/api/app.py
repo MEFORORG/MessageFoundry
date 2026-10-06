@@ -344,7 +344,7 @@ from messagefoundry.last_resort import install_loop_exception_handler
 from messagefoundry.logging_guard import active_guard as active_log_guard
 from messagefoundry.logging_setup import LOG_LEVELS, current_log_level, set_runtime_level
 from messagefoundry.parsing.sniff import attachment_mime_agrees, nontext_upload_reason
-from messagefoundry.pipeline import ConfigReloadDenied, Engine
+from messagefoundry.pipeline import ConfigReloadDenied, Engine, ReloadOutcome
 from messagefoundry.pipeline.alert_sinks import EmailTransport, notifier_from_settings
 from messagefoundry.pipeline.alerts import (
     AlertSink,
@@ -1019,6 +1019,13 @@ def _posture_loosenings(
 # The degraded-step label _record_reload_audit adds when the graph swapped and its config_reload
 # audit row failed (BACKLOG #1940). It sits beside the engine's own labels in ReloadResult.failures.
 _RELOAD_AUDIT_STEP = "audit"
+
+#: The actor on a cluster convergence reload's ``config_reload`` row (vault BACKLOG #3076). No user
+#: asked for that reload, so the row names the system in the ``system:<task>`` form the key rotation
+#: uses. Its ``initiator`` key says the same thing, and a user cannot set that key by naming an
+#: account to match.
+_CONVERGENCE_ACTOR = "system:cluster-convergence"
+_CONVERGENCE_INITIATOR = "cluster_convergence"
 
 
 @dataclass(frozen=True, slots=True)
@@ -8716,6 +8723,18 @@ def create_managed_app(
                 trust_anchor_specs, store, enforcing=trust_anchors_enforcing
             ),
         )
+
+        # vault BACKLOG #3076: a convergence reload writes the same config_reload row an operator
+        # reload does, so the store's newest baseline names the graph this node now runs.
+        async def _audit_convergence_reload(outcome: ReloadOutcome) -> None:
+            await _record_reload_audit(
+                engine,
+                actor=_CONVERGENCE_ACTOR,
+                failed_steps=[f.step for f in outcome.failures],
+                extra={"initiator": _CONVERGENCE_INITIATOR},
+            )
+
+        engine.convergence_reload_audit = _audit_convergence_reload
         # Bound before the branch so no later read can meet an unbound name (the #1257 lesson below).
         start_fingerprint_failure: str | None = None
         start_outcome: _StartOutcome | None = None
@@ -8728,6 +8747,9 @@ def create_managed_app(
             # tears them down, so they are closed here. Left open, aiosqlite's non-daemon worker keeps
             # the process from exiting (#1257).
             try:
+                # Before the load reads the directory, so a sibling's reload that lands after it is
+                # still converged on (vault BACKLOG #3076). Never raises; a no-op on a single node.
+                await engine.seed_config_version()
                 loaded = load_config(config_dir)
                 # Before the shard filter, as the reload path does inside the engine: the guard judges
                 # the whole graph.

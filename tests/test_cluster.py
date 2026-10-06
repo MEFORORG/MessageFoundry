@@ -1219,6 +1219,102 @@ async def test_engine_convergence_reload_does_not_propagate(tmp_path: Path) -> N
         await eng.stop()
 
 
+class _SiblingBumpCoordinator(_BumpRecordingCoordinator):
+    """The bump-recording stand-in whose cached read answers the live version too, so a test that
+    moves ``_version`` acts as a sibling's operator reload the convergence loop can see."""
+
+    def config_version_cached(self) -> int:
+        return self._version
+
+
+@pytest.mark.parametrize("seed_first", [True, False], ids=["seeded_before_load", "seeded_at_start"])
+async def test_a_sibling_reload_between_the_first_load_and_start_is_converged_on(
+    tmp_path: Path, seed_first: bool
+) -> None:
+    """vault BACKLOG #3076 item 2: a sibling changes the shared directory and bumps the version
+    after this node's first load read it, and before ``start()`` seeds the version. Seeded before
+    the load, the bump is ahead of the seed and the node converges on the sibling's graph. The
+    ``seeded_at_start`` arm is the old order, and the control: it reads the bump as applied, so the
+    node keeps the graph it loaded before the sibling's reload."""
+    coord = _SiblingBumpCoordinator()
+    cfgdir = tmp_path / "cfg"
+    _minimal_config(cfgdir, tmp_path)
+    eng = await Engine.create(
+        tmp_path / "seed.db",
+        poll_interval=0.05,
+        config_dir=cfgdir,
+        coordinator=coord,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    if seed_first:
+        await eng.seed_config_version()  # what the API lifespan runs before its first load
+    eng.add_registry(load_config(cfgdir))
+    # The sibling's change, in the window: a second inbound on disk, and the version bump.
+    inbox2 = tmp_path / "in-2"
+    inbox2.mkdir()
+    with (cfgdir / "c.py").open("a", encoding="utf-8") as fh:
+        fh.write(
+            f"inbound('in2', File(directory={str(inbox2)!r}, pattern='*.hl7', poll_seconds=0.05), "
+            "router='r')\n"
+        )
+    coord._version = 1  # the sibling's bump
+    await eng.start()
+    try:
+        runner = eng._config_convergence
+        assert runner is not None
+        # The loop's first pass runs at once; settle it, then run one more to be sure.
+        for _ in range(100):
+            if eng._applied_config_version == 1:
+                break
+            await asyncio.sleep(0.02)
+        await runner.converge_once()
+        rr = eng.registry_runner
+        assert rr is not None
+        assert eng._applied_config_version == 1, "control: both arms end at the shared version"
+        inbounds = sorted(rr.registry.inbound)
+        if seed_first:
+            assert inbounds == ["in", "in2"], "the node converged on the sibling's graph"
+            assert eng.last_reload_dir == cfgdir.resolve()
+        else:
+            assert inbounds == ["in"], "control: seeded late, the bump read as already applied"
+            assert eng.last_reload_dir is None
+    finally:
+        await eng.stop()
+
+
+async def test_a_failed_early_seed_falls_back_to_the_start_seed(tmp_path: Path) -> None:
+    """vault BACKLOG #3076 item 2: the early seed never refuses a start. A read that fails leaves
+    ``start()`` to seed, as it did before."""
+
+    class _FailsOnce(_SiblingBumpCoordinator):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        async def config_version(self) -> int:
+            self.calls += 1
+            if self.calls == 1:
+                raise ConnectionError("synthetic: the store is not answering yet")
+            return self._version
+
+    coord = _FailsOnce()
+    coord._version = 3
+    eng = await Engine.create(
+        tmp_path / "fallback.db",
+        poll_interval=0.05,
+        coordinator=coord,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    await eng.seed_config_version()  # logs and returns
+    assert coord.calls == 1 and eng._applied_config_version == 0
+    await eng.start()
+    try:
+        assert coord.calls == 2, "start() read the version itself"
+        assert eng._applied_config_version == 3
+    finally:
+        await eng.stop()
+
+
 # --- Step 6b: StateConvergenceRunner read-throughs newer transform-state (no DB) ----
 
 
