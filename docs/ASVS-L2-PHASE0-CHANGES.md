@@ -289,11 +289,13 @@ have their own rows in the inventory table above.) The engine mints at least the
 - The **store DEK**, on request. `messagefoundry gen-key` prints 32 bytes from `os.urandom`,
   base64-encoded, to stdout and does not persist them (`generate_key` in
   [`store/crypto.py`](../messagefoundry/store/crypto.py)).
-- A **non-production** self-signed EC P-256 certificate and key, on request (`messagefoundry cert
+- A self-signed EC P-256 certificate and key, on request (`messagefoundry cert
   self-signed`, `make_self_signed` in [`pki.py`](../messagefoundry/pki.py)). The key PEM is
   unencrypted PKCS#8, written `O_EXCL` with mode `0o600` and a tightened Windows DACL, and the command
-  refuses to overwrite an existing file. A self-signed certificate has no chain of trust and must
-  never front production PHI.
+  refuses to overwrite an existing key file. It does not guard `cert.pem` the same way: an existing
+  one in `--out-dir` is replaced. A self-signed certificate has no chain of trust. It is
+  better than cleartext and worse than an operator-supplied chain, so it is a placeholder to
+  replace, not an endorsed production terminator.
 - The **API TLS placeholder key**, unasked, on the first `serve` that has no `[api].tls_cert_file`
   and no declared upstream TLS terminator
   ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)).
@@ -320,7 +322,7 @@ it had there, as an **unencrypted** `key.pem` (`pki.key_to_pem`), and the `.pfx`
 | **Outbound mTLS client key** — `tls_key_file` (+ `tls_key_password`) beside `tls_cert_file` on an MLLP outbound, a DICOM SCU or an FTPS remote-file connection; `client_key_file` (+ `client_key_password`) beside `client_cert_file` on a SOAP outbound ([ADR 0015](adr/0015-ws-soap-outbound-mtls-wssecurity.md)) | a PEM file path read when the connection builds its client context. It is optional, and present only when the partner requires mutual TLS | the operator's file system, read by the process account; the partner holds only the certificate | re-issuing the certificate and enrolling it with the partner again |
 | **Off-box log-forward client key** — inside `[logging].forward_tls_client_cert` ([ADR 0080](adr/0080-offbox-forwarding-tls-defaults.md)) | one combined PEM file that holds the certificate **and** its private key, loaded by `load_cert_chain(certfile=...)` in [`logging_setup.py`](../messagefoundry/logging_setup.py). There is no separate key setting and no passphrase setting, so the file's permissions are its only protection | the operator's file system, read by the process account; the collector holds only the certificate | re-issuing from the collector's CA; forwarding with that client identity fails until a usable PEM is present |
 | **Native API client key** — the `tls_client_key` argument of `EngineClient` in [`apiclient/client.py`](../messagefoundry/apiclient/client.py), for mutual TLS to the engine API (today the test harness) | a PEM file path handed to `load_cert_chain` when the client builds its context, or embedded in the certificate PEM. It lives in the **client** process, never the engine | the operator of that client machine; the engine holds no copy of it | re-issuing the client certificate from a CA the engine trusts |
-| **Non-production self-signed key** — from `messagefoundry cert self-signed`, and the per-run pair the load-test harness mints (`harness/load/tlsmat.py`) | minted locally by `make_self_signed` in [`pki.py`](../messagefoundry/pki.py): an EC P-256 key with a SHA-256 self-signed certificate. The CLI writes the key through `_write_private_key`; the harness writes its pair into a per-run temp directory with a plain write and `chmod 0o600`, not through that writer | the account that ran the command. The harness passes the pair's file paths through the environment to each engine node it spawns (`MEFOR_API_TLS_CERT_FILE` / `MEFOR_API_TLS_KEY_FILE`) and to a child harness process | nothing: mint another. It has no chain of trust and must never front production PHI |
+| **Non-production self-signed key** — from `messagefoundry cert self-signed`, and the per-run pair the load-test harness mints (`harness/load/tlsmat.py`) | minted locally by `make_self_signed` in [`pki.py`](../messagefoundry/pki.py): an EC P-256 key with a SHA-256 self-signed certificate. The CLI writes the key through `_write_private_key`; the harness writes its pair into a per-run temp directory with a plain write and `chmod 0o600`, not through that writer | the account that ran the command. The harness passes the pair's file paths through the environment to each engine node it spawns (`MEFOR_API_TLS_CERT_FILE` / `MEFOR_API_TLS_KEY_FILE`) and to a child harness process | nothing: mint another. It has no chain of trust, so it is a placeholder to replace with an operator-supplied chain, not an endorsed production terminator |
 
 **Secret keys the engine holds or feeds.** Neither of these is an asymmetric key, and neither fits
 the table above. The TOTP secret is the only shared secret the engine mints and uses as key material,

@@ -730,7 +730,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     cert = sub.add_parser(
         "cert",
         help="certificate tooling (BACKLOG #71/#72): import a PKCS#12/.pfx bundle to the PEM files the "
-        "TLS loaders read, list cert facts (read-only inventory), or mint a self-signed dev cert",
+        "TLS loaders read, list cert facts (read-only inventory), or mint a self-signed placeholder "
+        "cert",
     )
     cert_sub = cert.add_subparsers(dest="cert_command", required=True)
 
@@ -781,8 +782,9 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
 
     cert_self_signed = cert_sub.add_parser(
         "self-signed",
-        help="mint a self-signed EC P-256 cert+key (cert.pem / key.pem) for NON-PROD TLS bring-up ONLY; "
-        "key.pem is written 0600 and refuses to overwrite an existing key",
+        help="mint a self-signed EC P-256 cert+key (cert.pem / key.pem) as a TLS PLACEHOLDER (no "
+        "chain of trust: better than cleartext, worse than an operator-supplied chain, so replace "
+        "it); key.pem is written 0600 and refuses to overwrite an existing key",
     )
     cert_self_signed.add_argument(
         "--cn", required=True, help="certificate common name (also added as a DNS SAN)"
@@ -2064,7 +2066,8 @@ def _serve(args: argparse.Namespace) -> int:
     # below reads `enforcing`, and `enforce` is the shipped default on dev and staging as much as on
     # prod, so all three REFUSE on stock defaults. It downgrades to an advisory warning only under
     # enforcement = warn. No instance is exempt and none stays quiet: a dev or loopback instance is
-    # a PHI instance too, and this gate reads no synthetic or dev condition. Lock it down with
+    # a PHI instance too, since every instance carries patient data (BACKLOG #1279, ADR 0186), and
+    # this gate reads no synthetic or dev condition. Lock it down with
     # [security].block_unlisted_outbound or per-transport [egress].allowed_* lists.
     #
     # [egress] declares EIGHT allowed_* DESTINATION lists and every one is enforced downstream by
@@ -2154,7 +2157,8 @@ def _serve(args: argparse.Namespace) -> int:
     # partially-configured instance that the gate above lets start. This used to be an in-place flip of a false model
     # default; since vault BACKLOG #2605 the model default is true, so every entry point gets deny
     # and this block only announces the posture, or audits the explicit opt-out. No instance is
-    # exempt: a dev, loopback or staging instance is held to it exactly as a production one is.
+    # exempt: every instance carries patient data (BACKLOG #1279, ADR 0186), so a dev, loopback or
+    # staging instance is held to it exactly as a production one is.
     if not deny_written:
         # configure_logging has not run yet (root lastResort drops < WARNING), so announce on stderr
         # like the sibling posture gates rather than logging.info.
@@ -2231,8 +2235,8 @@ def _serve(args: argparse.Namespace) -> int:
     # plaintext-UDP default shipped the (best-effort redacted, still sensitive) log + audit evidence stream
     # off-box in the clear, silently. Decide it with the SAME shared authority the transports use, and
     # BEFORE configure_logging installs the handler, so a refused hop never emits a single record.
-    # Loopback (the ADR 0080 local-agent deployment) is untouched; no instance is exempt as
-    # synthetic or dev. Any other hop that is not verified TLS and not attested REFUSES under
+    # Loopback (the ADR 0080 local-agent deployment) passes THIS hop check, though the BACKLOG #1966
+    # forwarding gate below refuses it under enforce; no instance is exempt as synthetic or dev. Any other hop that is not verified TLS and not attested REFUSES under
     # [security].enforcement=enforce and WARNS under enforcement = warn. The acknowledged opt-out is
     # [logging].forward_hop_attested, which lets the hop through silently under either dial.
     if log_forward is not None:
@@ -5427,12 +5431,21 @@ def _cert_inventory(args: argparse.Namespace) -> int:
     return 1 if had_error else 0
 
 
+#: What `cert self-signed` says its pair is, in the console note and the --json `note` alike, so
+#: those two cannot drift. The parser help is worded separately. BACKLOG #1276, owner override
+#: 2026-08-16; the substance of api/tls.py's PLACEHOLDER docstring, not a copy of it.
+_SELF_SIGNED_PLACEHOLDER_NOTE = (
+    "self-signed, so no chain of trust: better than cleartext, worse than an operator-supplied "
+    "chain. A placeholder to replace, not an endorsed production terminator"
+)
+
+
 def _cert_self_signed(args: argparse.Namespace) -> int:
-    """`cert self-signed` — mint a self-signed EC P-256 cert+key for NON-PROD TLS bring-up.
+    """`cert self-signed` — mint a self-signed EC P-256 cert+key, a TLS PLACEHOLDER.
 
     Writes cert.pem + key.pem to ``--out-dir``; key.pem is written by :func:`_write_private_key`,
-    which refuses to overwrite. Prints a clear DEV/non-prod note (a self-signed cert has no chain of
-    trust)."""
+    which refuses to overwrite it (cert.pem has no such guard). Prints
+    :data:`_SELF_SIGNED_PLACEHOLDER_NOTE` (ADR 0172)."""
     from messagefoundry import pki
 
     if args.days <= 0:
@@ -5466,20 +5479,16 @@ def _cert_self_signed(args: argparse.Namespace) -> int:
         "cn": args.cn,
         "sans": dns,
         "days": args.days,
-        "note": "DEV/non-prod only — self-signed, no chain of trust",
+        "note": _SELF_SIGNED_PLACEHOLDER_NOTE,
     }
     if args.json:
         _print_json(result, compact=True)
     else:
-        _safe_print(
-            f"Wrote a self-signed DEV certificate (non-prod TLS bring-up ONLY) to {out_dir}:"
-        )
+        _safe_print(f"Wrote a self-signed PLACEHOLDER certificate to {out_dir}:")
         _safe_print(f"  cert: {cert_path}")
         _safe_print(f"  key:  {key_path} (private; 0600)")
         _safe_print(f"  CN={args.cn}  SAN(DNS)={', '.join(dns)}  valid {args.days} day(s)")
-        _safe_print(
-            "  NOTE: self-signed — no chain of trust; never front production PHI with this."
-        )
+        _safe_print(f"  NOTE: {_SELF_SIGNED_PLACEHOLDER_NOTE}.")
     return 0
 
 
