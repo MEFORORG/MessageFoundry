@@ -738,18 +738,21 @@ engine resolves the next trip or hold on its own.
   it reads clean. Reading clean means a pass that did not abort found the account present and
   enabled. A held read, or one that adds a strike, does not count. The reconciler revoking the
   account counts as leaving. The engine then resolves no trip until its
-  next restart. The engine logs a warning when it gives up either resolve.
+  next restart. The engine logs a warning when it gives up any resolve.
 - An LDAP referral opens its own `ad_reconcile_aborted` instance, with reason `directory_referral`
-  and source `directory-reconciler-referral` (BACKLOG #2538). It resolves once every account signed
-  in at the last referral has since been read in full, with no referral. At least one account
-  must have been read that way since. A restart counts as a referral here, so a restarted engine
-  first reads every account again. A pass with any referral resolves none of these alerts.
+  and source `directory-reconciler-referral` (BACKLOG #2538). It follows the same rule: the engine
+  resolves it only after a pass of its own saw a referral. It resolves once every account signed
+  in at the last referral has since been read in full, present and enabled, on a pass with no
+  referral. A pass with any referral resolves none of these alerts.
 - So an account that never reads in full keeps the referral's alert open while it is signed in. A
   held account, a disabled one awaiting its strikes, and one that never answers all do this.
+- An engine gives up resolving the referral when an account signed in at the last referral leaves
+  before it reads in full. The reconciler revoking the account counts as leaving, including on the
+  pass that saw the referral. The engine then resolves no referral until its next restart.
 
 A pass judges only accounts that hold a session, and nothing reads an account again once it has
 left. An account leaves at least when it signs out, reaches the session cap, is revoked by the
-reconciler, is disabled locally, or is deleted. The two give-up rules above stop an alert resolving
+reconciler, is disabled locally, or is deleted. The give-up rules above stop an alert resolving
 on the accounts that remain. The cost is a missed resolve when an account leaves for an ordinary
 reason, such as a sign-out, while the evidence is still pending.
 

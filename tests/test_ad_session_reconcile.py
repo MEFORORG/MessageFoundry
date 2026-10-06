@@ -845,10 +845,12 @@ async def test_a_referral_beside_other_answers_still_revokes_them_and_pages() ->
 
         ldap.referring.clear()
         clean = await service.reconcile_directory_sessions()
-        assert clean.referred == () and service.directory_reconcile_referral is None
-        # jdoe has now been read without a referral, so the referral's instance may resolve. No
-        # pass here has tripped or held, so this process marks neither of those (BACKLOG #2136).
-        assert clean.referral_clear and not clean.breaker_clear and not clean.hold_clear
+        # asmith was signed in at the referral and left, revoked, before a pass read it PRESENT.
+        # So this process forfeits the referral's clear, and keeps its message, until it restarts
+        # (`_forfeit_clears_on_attrition`). It never tripped or held, so it marks neither of those
+        # clears either (BACKLOG #2136).
+        assert clean.referred == () and service.directory_reconcile_referral is not None
+        assert not clean.referral_clear and not clean.breaker_clear and not clean.hold_clear
     finally:
         await store.close()
 
@@ -859,7 +861,9 @@ async def test_a_referral_is_not_cleared_by_a_sample_that_missed_an_account_it_s
     """BACKLOG #2538. A referral that starts mid-process marks EVERY candidate, not only the one
     the sample happened to probe. With one probe per pass, the referred account signs out, and the
     next sample reads only a clean account. Another account the same base still refers was last
-    read before the referral began, so its answer on record says nothing about it.
+    read before the referral began, so its answer on record says nothing about it. And the
+    referred account left before a pass read it PRESENT, so the process forfeits the clear: even
+    a pass that later reads every remaining account PRESENT resolves nothing.
 
     RED when: only referred ids are tracked, so that pass marks ``referral_clear`` and releases the
     message while the base still refers an account no pass has read since."""
@@ -887,6 +891,9 @@ async def test_a_referral_is_not_cleared_by_a_sample_that_missed_an_account_it_s
         ldap.referring = {first, third}  # a referring base that refers two of the three
         referral = await service.reconcile_directory_sessions()
         assert _probed() == first and referral.referred and not referral.referral_clear
+        everyone = {u.id for u in await store.list_users() if u.username in names}
+        assert len(everyone) == 3
+        assert service._reconcile_referred == everyone, "only the probed account was marked"
         row = await store.get_user_by_username(first)
         assert row is not None
         await store.revoke_user_sessions(row.id)  # it signs out, and leaves the candidate set
@@ -903,18 +910,21 @@ async def test_a_referral_is_not_cleared_by_a_sample_that_missed_an_account_it_s
         partial = await service.reconcile_directory_sessions()
         assert _probed() == second and not partial.referral_clear
         fixed = await service.reconcile_directory_sessions()
-        assert _probed() == third and fixed.referral_clear
-        assert service.directory_reconcile_referral is None
+        assert _probed() == third and not fixed.referral_clear  # forfeit: `first` left unread
+        assert service.directory_reconcile_referral is not None
     finally:
         await store.close()
 
 
-async def test_a_referral_whose_accounts_all_left_is_not_cleared_by_an_absent_answer() -> None:
-    """BACKLOG #2538. Every account signed in at the referral signs out. The one account left reads
-    ABSENT, which returns before the group search, so nothing has run every search since. That is
-    no clear. A later PRESENT read is.
+async def test_a_referral_whose_accounts_all_left_is_not_cleared_by_the_accounts_that_remain() -> (
+    None
+):
+    """BACKLOG #2538. Every account signed in at the referral signs out before a pass reads it
+    PRESENT, so the process forfeits the referral's clear until it restarts. A newcomer that reads
+    ABSENT, and then PRESENT, resolves nothing: neither says anything about the accounts that left.
 
-    RED when: a referral clear needs only that no marked account is still signed in."""
+    RED when: a referral clear needs only that no marked account is still signed in, or that one
+    account has read PRESENT since."""
     store = await MessageStore.open(":memory:")
     try:
         ldap = _FakeLdap({n: _principal(n) for n in ("jdoe", "asmith", "bwong")})
@@ -940,7 +950,8 @@ async def test_a_referral_whose_accounts_all_left_is_not_cleared_by_an_absent_an
 
         ldap.present["bwong"] = _principal("bwong")
         present = await service.reconcile_directory_sessions()
-        assert present.referral_clear and service.directory_reconcile_referral is None
+        assert present.readable == 1 and not present.referral_clear
+        assert service.directory_reconcile_referral is not None
     finally:
         await store.close()
 

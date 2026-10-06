@@ -8015,16 +8015,19 @@ def _without_clears(plan: ReconcilePlan) -> ReconcilePlan:
     return replace(plan, **cleared)
 
 
-#: Each ``*_clear`` flag on a plan, and the alert instance its inverse resolves (BACKLOG #2136).
-_RECONCILE_CLEAR_RESOLVES: Final[Mapping[str, str]] = {
-    "breaker_clear": "ad_reconcile_aborted",
-    "hold_clear": "ad_reconcile_held",
+#: Each ``*_clear`` flag on a plan, and the alert instance its inverse resolves, as the instance's
+#: ``(connection, event_type)`` key (BACKLOG #2136). The referral's instance shares the breaker's
+#: event type under its own source (BACKLOG #2538), so the source is part of the key.
+_RECONCILE_CLEAR_RESOLVES: Final[Mapping[str, tuple[str, str]]] = {
+    "breaker_clear": ("directory-reconciler", "ad_reconcile_aborted"),
+    "hold_clear": ("directory-reconciler", "ad_reconcile_held"),
+    "referral_clear": (_REFERRAL_ALERT_SOURCE, "ad_reconcile_aborted"),
 }
 
 
-async def _open_reconcile_instances(store: Store) -> dict[int, str] | None:
-    """``id -> event_type`` of the open or acknowledged reconcile alert instances, or None when the
-    read failed, which is logged.
+async def _open_reconcile_instances(store: Store) -> dict[int, tuple[str, str]] | None:
+    """``id -> (connection, event_type)`` of the open or acknowledged reconcile alert instances, or
+    None when the read failed, which is logged.
 
     Catches ``Exception``, on purpose and only around this one read. Its failures are no closed
     family: each backend's driver errors, the engine's own ``RuntimeError``, aiosqlite's
@@ -8032,7 +8035,9 @@ async def _open_reconcile_instances(store: Store) -> dict[int, str] | None:
     that escaped would cost the pass's pages, or the whole pass, through the loop's own catch. Any
     failure here only drops a clear, which is a missed clear, never a false one."""
     try:
-        rows = await store.list_active_alert_instances(allowed_channels=["directory-reconciler"])
+        rows = await store.list_active_alert_instances(
+            allowed_channels=sorted({source for source, _ in _RECONCILE_CLEAR_RESOLVES.values()})
+        )
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -8043,7 +8048,11 @@ async def _open_reconcile_instances(store: Store) -> dict[int, str] | None:
         )
         return None
     resolvable = set(_RECONCILE_CLEAR_RESOLVES.values())
-    return {row.id: row.event_type for row in rows if row.event_type in resolvable}
+    return {
+        row.id: (row.connection, row.event_type)
+        for row in rows
+        if (row.connection, row.event_type) in resolvable
+    }
 
 
 async def _without_inherited_clears(
@@ -8055,13 +8064,14 @@ async def _without_inherited_clears(
     #2136).
 
     ``inherited`` holds the instances already open before this process's first pass. Each alert has
-    one instance row, so a trip or a hold of this process's own folds into an earlier run's open
-    row, and the auth service's evidence covers only the accounts this process saw. The earlier
-    run's accounts may have left across the restart. So while an inherited row is still open, its
-    clear is dropped and an operator resolves it. Once an operator has, the next trip or hold opens
-    a new row, and that one is this process's own. ``AuthService._mark_reconcile_clears`` states
-    the rule this keeps. A flag this map does not name is dropped too, and so is every flag when
-    the read fails: a missed clear, never a false one."""
+    one instance row, so a trip, a hold or a referral (BACKLOG #2538) of this process's own folds
+    into an earlier run's open row, and the auth service's evidence covers only the accounts this
+    process saw. The earlier run's accounts may have left across the restart. So while an
+    inherited row is still open, its clear is dropped and an operator resolves it. Once an operator
+    has, the next trip, hold or referral opens a new row, and that one is this process's own.
+    ``AuthService._mark_reconcile_clears`` states the rule this keeps. A flag this map does not
+    name is dropped too, and so is every flag when the read fails: a missed clear, never a false
+    one."""
     named = set(_RECONCILE_CLEAR_RESOLVES)
     flags = {f.name: getattr(plan, f.name) for f in fields(plan) if f.name.endswith("_clear")}
     if not any(flags.values()):
@@ -8069,7 +8079,7 @@ async def _without_inherited_clears(
     now_open = await _open_reconcile_instances(store)
     if now_open is None:
         return _without_clears(plan)
-    stale = {event for row_id, event in now_open.items() if row_id in inherited}
+    stale = {key for row_id, key in now_open.items() if row_id in inherited}
     kept: dict[str, Any] = {
         flag: value and flag in named and _RECONCILE_CLEAR_RESOLVES[flag] not in stale
         for flag, value in flags.items()

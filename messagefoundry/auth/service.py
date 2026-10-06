@@ -332,6 +332,9 @@ _HOLD_RELEASABLE: Final[frozenset[_HoldStanding]] = frozenset({"held", "settled"
 #: `AuthService._reconcile_breaker_standing`: whether this process may resolve a trip (BACKLOG
 #: #2136). Only ``"tripped"`` may.
 _BreakerStanding = Literal["fresh", "tripped", "forfeit"]
+#: `AuthService._reconcile_referral_standing`, the same rule for the referral's own instance
+#: (BACKLOG #2538). Only ``"referred"`` may resolve it.
+_ReferralStanding = Literal["fresh", "referred", "forfeit"]
 
 
 # Bounds on the per-session re-proof failure counts (BACKLOG #1138). A count is NEVER evicted while
@@ -2102,13 +2105,15 @@ class AuthService:
         #: user_ids signed in at the last pass with a referral and not read PRESENT since (BACKLOG
         #: #2538). Every candidate, not only the referred ones, because a probe sample can miss
         #: accounts the same base would refer. `_mark_reconcile_clears` reports no referral clear
-        #: while one is signed in. A process's first pass with candidates fills it the same way.
+        #: while one is signed in, and one that leaves forfeits it (`_forfeit_clears_on_attrition`).
         self._reconcile_referred: set[str] = set()
-        #: Whether that first pass has run (BACKLOG #2538).
-        self._reconcile_referral_seeded = False
-        #: Whether a pass has read some account PRESENT since the last referral, or since that
-        #: first pass (BACKLOG #2538). A referral clear needs it.
-        self._reconcile_referral_read = False
+        #: Whether THIS process may resolve the referral's durable ``ad_reconcile_aborted``
+        #: instance (BACKLOG #2538), on the breaker's rule (`_reconcile_breaker_standing`): a
+        #: process clears only what it watched open. ``"fresh"``: no pass here saw a referral, so it
+        #: resolves none. ``"referred"``: a pass here saw one. ``"forfeit"``: an account signed in at
+        #: a referral left before a pass here read it PRESENT, so it resolves no referral until it
+        #: restarts. Only `_advance_referral_standing` moves it.
+        self._reconcile_referral_standing: _ReferralStanding = "fresh"
         #: user_ids a breaker trip has not yet seen read PRESENT on a pass that was not aborted
         #: (BACKLOG #2136). `_mark_reconcile_clears` reports no breaker clear while one is signed in.
         self._reconcile_unconfirmed: set[str] = set()
@@ -5355,28 +5360,22 @@ class AuthService:
         elif not plan.judged_nothing:
             self._reconcile_unconfirmed = set(users)
             self._advance_breaker_standing("tripped")
-        # BACKLOG #2538. The same for a referral, on its own record. Any referral marks EVERY
-        # candidate unconfirmed, as a trip does: a probe sample can miss accounts that the same
-        # search base would also refer, so tracking only the referred ones would let a later
-        # sample that never reached them clear the referral. An account counts as unconfirmed
-        # until a later probe reads it PRESENT. Only that answer ran every search a referral can
-        # come from; a DISABLED or ABSENT one returns before the group search, so it says nothing
-        # about a referring group base. A revoked account leaves with the candidate set.
-        #
-        # A process's first pass counts as a referral too. The instance outlives the process, and a
-        # fresh one cannot tell whether its last run saw a referral, so it reads every account
-        # again first. And a clear needs at least one PRESENT read since: if every marked account
-        # leaves, the DISABLED or ABSENT answers of the rest say nothing about the search base.
-        present = reconcile.ProbeOutcome.PRESENT
-        if plan.referred or not self._reconcile_referral_seeded:
+        # BACKLOG #2538. The same for a referral, on its own record and its own standing. Any
+        # referral marks EVERY candidate unconfirmed, as a trip does: a probe sample can miss
+        # accounts that the same search base would also refer, so tracking only the referred ones
+        # would let a later sample that never reached them clear the referral. An account counts as
+        # unconfirmed until a pass with no referral reads it PRESENT. Only that answer ran every
+        # search a referral can come from; a DISABLED or ABSENT one returns before the group search,
+        # so it says nothing about a referring group base. An account that leaves first forfeits
+        # the clear (`_forfeit_clears_on_attrition`, and the revocation loop below).
+        if plan.referred:
             self._reconcile_referred = set(users)
-            self._reconcile_referral_seeded = True
-            self._reconcile_referral_read = False
-        if not plan.referred:
-            read = {uid for uid, outcome in plan.outcomes.items() if outcome is present}
-            self._reconcile_referred.intersection_update(users)
-            self._reconcile_referred.difference_update(read)
-            self._reconcile_referral_read = self._reconcile_referral_read or bool(read)
+            self._advance_referral_standing("referred")
+        else:
+            present = reconcile.ProbeOutcome.PRESENT
+            self._reconcile_referred.difference_update(
+                uid for uid, outcome in plan.outcomes.items() if outcome is present
+            )
         referral = next((p for p in probes if p.outcome is reconcile.ProbeOutcome.REFERRED), None)
         if plan.aborted is not None:
             if not plan.directory_referral:
@@ -5415,6 +5414,10 @@ class AuthService:
                 # The same, for the breaker. The account was signed in at the trip and has not read
                 # clean since. It is about to leave, so nothing will read it clean again.
                 self._advance_breaker_standing("forfeit")
+            if revocation.user_id in self._reconcile_referred:
+                # The same, for the referral (BACKLOG #2538). The account was signed in at a
+                # referral and has not read PRESENT on a pass without one since, this pass included.
+                self._advance_referral_standing("forfeit")
             if await self._apply_reconcile_revocation(revocation):
                 applied.append(revocation)
         for refresh in plan.renames:
@@ -5462,23 +5465,24 @@ class AuthService:
         aborted" or "not held" is not enough: after a restart, or before the probe budget has
         reached every account, a pass can read clear while the condition stands.
 
-        **The rule for both alerts, and the one statement of it: a process clears only what it
-        watched open.** A restart forgets which accounts were behind a trip or a hold, and an
-        account that leaves across it is not seen to leave. Two layers keep the rule.
+        **The rule for every alert, and the one statement of it: a process clears only what it
+        watched open.** A restart forgets which accounts were behind a trip, a hold or a referral,
+        and an account that leaves across it is not seen to leave. Two layers keep the rule.
 
-        * Here: a pass marks a trip clear only after a pass of this process tripped, and a hold
-          clear only after one held (``_reconcile_breaker_standing``,
-          ``_reconcile_hold_standing``), and then only on a pass that passes the tests below.
+        * Here: a pass marks a trip clear only after a pass of this process tripped, a hold clear
+          only after one held, and a referral clear only after one saw a referral
+          (``_reconcile_breaker_standing``, ``_reconcile_hold_standing``,
+          ``_reconcile_referral_standing``), and then only on a pass that passes the tests below.
         * In the lifespan task: ``api/app.py::_without_inherited_clears`` drops a clear while the
           instance it would resolve is one that was already open when the task first read alert
-          state. Each alert has one instance row, so a trip or hold of this process's own folds
-          into an earlier run's open instance, and resolving that would rest on accounts the
-          earlier run saw and this process never did.
+          state. Each alert has one instance row, so a trip, hold or referral of this process's
+          own folds into an earlier run's open instance, and resolving that would rest on
+          accounts the earlier run saw and this process never did.
 
         So a fresh process never resolves an instance an earlier run left open, however clean its
         estate reads, and that instance stays open for an operator. Within one process, an account
-        behind either alert that leaves before it reads clean forfeits that clear until a restart
-        (`_forfeit_clears_on_attrition`).
+        behind any of the alerts that leaves before it reads clean forfeits that clear until a
+        restart (`_forfeit_clears_on_attrition`).
 
         * All three need an answer on record, from this process, for every signed-in account the
           pass did not just revoke. A probe that could not reach the directory leaves none.
@@ -5486,14 +5490,14 @@ class AuthService:
           referred account has no answer from this pass, and an older one on record may predate
           the referral.
         * The referral's own instance is clear when, on top of the first test, every account signed
-          in at the last referral has been read PRESENT since (``_reconcile_referred``), and at
-          least one account has. Any referral marks every candidate, not only the referred ones,
-          because a probe sample can miss accounts that would also be referred. Only a PRESENT
-          answer ran every search a referral can come from. A process's first pass marks every
-          candidate the same way, because a fresh process cannot tell whether its last run saw a
-          referral. A pass of referrals only, or an outage, is never evidence. The latched message
-          is released on this same test, so on a sole reconciler the log and the instance agree.
-          Where ``_without_clears`` drops the flag, the latch is released and the instance stays.
+          in at the last referral has since read PRESENT on a pass with no referral
+          (``_reconcile_referred``), and ``_reconcile_referral_standing`` is ``"referred"``: a
+          pass here saw a referral, and has not forfeited. Any referral marks every candidate, not
+          only the referred ones, because a probe sample can miss accounts that would also be
+          referred. Only a PRESENT answer confirms: it alone ran every search a referral can come
+          from. A pass of referrals only, or an outage, is never evidence. The latched message is
+          released on this same test, so on a sole reconciler the log and the instance agree.
+          Where the lifespan task drops the flag, the latch is released and the instance stays.
         * The hold is clear when, on top of that, the pass did not hold and these tests pass.
           None of those answers is undetermined; this is the record, across the rotation. No
           account the pass just revoked read undetermined either. At least one probe of THIS pass
@@ -5549,7 +5553,9 @@ class AuthService:
         settled = covered and undetermined not in outcomes
         # Called only on a pass that judged something, so a pass of referrals only never gets here.
         referral_clear = (
-            covered and self._reconcile_referral_read and self._reconcile_referred.isdisjoint(ids)
+            covered
+            and self._reconcile_referral_standing == "referred"
+            and self._reconcile_referred.isdisjoint(ids)
         )
         if referral_clear and self._reconcile_referral_alert is not None:
             self._reconcile_referral_alert = None
@@ -5594,18 +5600,27 @@ class AuthService:
           its sessions go.
         * An account whose last answer was undetermined forfeits the hold's release, on the same
           rule as revoking one: unless this process has settled and has not held since.
+        * An account signed in at a referral that has not since read PRESENT on a pass with no
+          referral forfeits the referral's clear until a restart (BACKLOG #2538). A referred
+          account cannot be judged, so it is never revoked for what it is, and it leaves only by
+          draining. The revocation loop forfeits for an account the reconciler revokes, as for the
+          breaker. A pass with a referral marks every candidate, so an account that pass itself
+          revokes forfeits too.
 
         At least these take an account out: it signs out or reaches the session cap, the reconciler
         revokes it, an operator disables it locally, or its row is deleted. The cost is a missed
         clear when an account leaves for an ordinary reason while the evidence is pending. A trip
-        marks every candidate unconfirmed, healthy ones too, so a sign-out during a long trip
-        forfeits its clear. This is one process's memory: what leaves across a restart is not seen
-        here. The rule in `_mark_reconcile_clears` covers that case, because a fresh process
-        resolves nothing an earlier run left open.
+        or a referral marks every candidate unconfirmed, healthy ones too, so a sign-out during a
+        long trip or referral forfeits its clear. This is one process's memory: what leaves across
+        a restart is not seen here. The rule in `_mark_reconcile_clears` covers that case, because
+        a fresh process resolves nothing an earlier run left open.
         """
         if not self._reconcile_unconfirmed <= users.keys():
             self._advance_breaker_standing("forfeit")
         self._reconcile_unconfirmed.intersection_update(users)
+        if not self._reconcile_referred <= users.keys():
+            self._advance_referral_standing("forfeit")
+        self._reconcile_referred.intersection_update(users)
         undetermined = reconcile.ProbeOutcome.UNDETERMINED
         if any(
             outcome is undetermined
@@ -5633,6 +5648,28 @@ class AuthService:
                 "directory reconcile: an account signed in at the last breaker trip left before a "
                 "pass read it clean, so this process will not resolve ad_reconcile_aborted itself "
                 "until it restarts; an operator resolves it once the directory reads clean"
+            )
+
+    def _advance_referral_standing(self, event: _ReferralStanding) -> None:
+        """Move ``_reconcile_referral_standing`` on ``event`` (BACKLOG #2538), the only place it
+        moves. The breaker's rule (:meth:`_advance_breaker_standing`), for the referral's instance.
+
+        ``"referred"``: a pass here saw a referral, so this process watched one open. It moves a
+        fresh process to ``"referred"``. ``"forfeit"``: an account signed in at a referral is about
+        to be revoked, or has left, before a pass with no referral read it PRESENT; see
+        :meth:`_forfeit_clears_on_attrition`. ``"forfeit"`` is never left. The latched referral
+        message is then kept until a restart too, because the test that releases it is the clear's.
+        """
+        current = self._reconcile_referral_standing
+        if event == "referred" and current == "fresh":
+            self._reconcile_referral_standing = "referred"
+        elif event == "forfeit" and current != "forfeit":
+            self._reconcile_referral_standing = "forfeit"
+            _log.warning(
+                "directory reconcile: an account signed in at the last LDAP referral left before a "
+                "pass read it without one, so this process will not resolve the referral's "
+                "ad_reconcile_aborted instance itself until it restarts; an operator resolves it "
+                "once the search bases are fixed"
             )
 
     def _advance_hold_standing(self, event: _HoldStanding) -> None:
