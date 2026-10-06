@@ -623,12 +623,18 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                 raise HTTPException(status.HTTP_401_UNAUTHORIZED, "session ended; sign in again")
             if elevation.idp_step_up_required:
                 # BACKLOG #296, ADR 0142 Amendment B: a session the federated login minted steps up
-                # at the IdP, which needs a browser redirect this JSON route cannot perform. Nothing
-                # was checked or charged, so the message names the leg that works.
+                # at the IdP, which needs a browser redirect this JSON route cannot perform. No
+                # credential was checked, though the per-actor ceremony budget above was drawn, so
+                # the message names the leg that works. The header is the one the step-up gates
+                # send such a session (BACKLOG #2158), so a client branches on it here too rather
+                # than parsing the detail. No X-Step-Up-Required: this is the step-up itself.
+                # Typed out because api/security.py keeps its constant private; a test pins the
+                # name and the value to what the gates send.
                 raise HTTPException(
                     status.HTTP_403_FORBIDDEN,
                     "this session was signed in through the identity provider; re-authenticate"
                     " there through the web console at /ui/reauth, not with a password",
+                    headers={"X-Step-Up-Via": "idp"},
                 )
             if elevation.directory_unconfirmed:
                 # BACKLOG #2027: the directory could not judge the password, so "failed" would

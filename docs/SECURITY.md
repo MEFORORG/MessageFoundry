@@ -2071,10 +2071,11 @@ step-up gate's 403 for such a session names `/ui/reauth` instead of `POST /me/re
 `X-Step-Up-Via: idp`. `X-Step-Up-Required` and any `X-Step-Up-Action` stay as they are. At least these raise it:
 `require_step_up`, `require_step_up_action`, `require_reauth_only`, `require_reauth_only_action`
 and `refuse_from_new_address` (so `require_phi_read`, `require_paced` and the `reveal` reads too).
-Every other session's detail and headers are unchanged. `POST /me/reauth`'s own refusal of an
-`oidc` session does not carry the header. The hint never names `POST /auth/mfa-verify`, whose use
-here is BACKLOG #2142's open question. The engine client raises `IdpStepUpRequired` on the header
-and does not call its step-up handler. Before this, a bearer client holding an `oidc` session
+Every other session's detail and headers are unchanged. The hint never names
+`POST /auth/mfa-verify`, whose use here is BACKLOG #2142's open question. `POST /me/reauth`'s own
+refusal of an `oidc` session carries `X-Step-Up-Via: idp` too, without `X-Step-Up-Required`. The
+engine client raises `IdpStepUpRequired` on the header, from a gate or from `reauth()`, and does
+not call its step-up handler. Before this, a bearer client holding an `oidc` session
 would have followed the hint and met a second 403 on a first deployment. A bearer client still
 cannot finish the IdP step-up. It runs in a browser and re-keys the session it steps up.
 [Session inventory](#session-inventory--targeted-revocation-wp-10) says what that costs on the
