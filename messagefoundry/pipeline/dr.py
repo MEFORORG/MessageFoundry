@@ -57,6 +57,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
 
+from messagefoundry import proctree
 from messagefoundry.childenv import hook_environment
 from messagefoundry.config.settings import DrSettings, StoreBackend
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
@@ -772,8 +773,12 @@ class DrCoordinator:
         if not command:
             return False
         try:
+            # Only a takeover hook is killed when it overruns: an aborted activation must not be
+            # left taking the address. A release hook is left to finish late, as before, since
+            # killing it partway could strand the address on this box (vault BACKLOG #2622).
             ok = await asyncio.wait_for(
-                _run_command(command), timeout=self._settings.takeover_timeout_seconds
+                _run_command(command, stop_kills=phase == "takeover"),
+                timeout=self._settings.takeover_timeout_seconds,
             )
         except TimeoutError:
             ok = False
@@ -838,22 +843,123 @@ class DrCoordinator:
             log.warning("DR: %s alert failed", event, exc_info=True)
 
 
-async def _run_command(command: str) -> bool:
+async def _run_command(command: str, *, stop_kills: bool = True) -> bool:
     """Run an operator-supplied shell command OFF the event loop and return whether it exited 0. Uses the
     asyncio subprocess API (never blocks the loop). The command is operator-configured (``[dr]``), not
     request-derived, so it is run via the shell exactly as the operator wrote it (parity with the way the
     backup destination / other operator-configured paths are trusted).
 
     Its environment is :func:`messagefoundry.childenv.hook_environment`: the operator's ordinary
-    variables, without the engine's own (vault BACKLOG #2587)."""
-    proc = await asyncio.create_subprocess_shell(
-        command,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
-        env=hook_environment(),
+    variables, without the engine's own (vault BACKLOG #2587).
+
+    **Stopping it stops the whole hook, when** ``stop_kills`` (vault BACKLOG #2622). The caller
+    bounds this with ``wait_for``, which stops it by cancelling it. Cancelling only the wait would
+    leave the shell and whatever it started running, so an activation recorded as aborted could
+    still be taking the address. So the shell starts as the root of a tree
+    :mod:`messagefoundry.proctree` can kill, and a cancel kills that tree before it propagates.
+    With ``stop_kills=False`` the hook starts as it did before, in no tree of its own, and a
+    cancel leaves it running. On Windows that also keeps it out of a kill-on-close job, which
+    would end it when the engine exits. Anything outside this code that stops the engine's
+    processes, such as a service wrapper's tree kill or a signal to the engine's process group,
+    can still end it. A hook that finishes on its own is left alone either way, including
+    anything it left running."""
+    spawn = asyncio.ensure_future(
+        asyncio.create_subprocess_shell(
+            command,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=hook_environment(),
+            creationflags=proctree.ADOPT_CREATIONFLAGS if stop_kills else 0,
+            start_new_session=proctree.ADOPT_NEW_SESSION and stop_kills,
+        )
     )
-    await proc.wait()
+    try:
+        # Shielded so a stop that lands mid-start cannot lose the process: the callback kills it.
+        # On Windows a hook this may kill is still suspended then, so it has done nothing yet.
+        proc = await asyncio.shield(spawn)
+    except (asyncio.CancelledError, GeneratorExit):
+        spawn.add_done_callback(_kill_late_start if stop_kills else _leave_late_start)
+        raise
+    job: int | None = None
+    try:
+        if stop_kills:
+            job = proctree.resume_into_job(proc.pid, who="DR takeover hook")
+        await proc.wait()
+    except GeneratorExit:
+        if stop_kills:
+            _kill_hook(proc, job)  # a closing coroutine may not await, so no reap
+        raise
+    except BaseException:
+        if stop_kills:
+            _kill_hook(proc, job)
+            await _reap_hook(proc)
+        raise
+    if job is not None:
+        proctree.release_job(job)
     return proc.returncode == 0
+
+
+#: How long a killed hook gets to be reaped before the abort carries on without it. This adds to
+#: ``[dr].takeover_timeout_seconds`` in the worst case. docs/CONFIGURATION.md quotes it, and
+#: tests/test_dr_activation.py pins that quote.
+_HOOK_REAP_SECONDS = 5.0
+
+#: Reaps started from a done-callback, held so the loop does not drop them mid-wait.
+_LATE_REAPS: set[asyncio.Task[None]] = set()
+
+
+def _kill_hook(proc: asyncio.subprocess.Process, job: int | None) -> None:
+    """Kill the hook's shell and what it started.
+
+    Windows ends the job. POSIX signals the group the shell was started to lead. That group outlives
+    the shell, so it is signalled even when the shell has already exited: its children may not have.
+    POSIX does not reuse a group's id while the group has members, so the signal cannot reach an
+    unrelated group then. Once the group is empty its id can be reused, which is the same narrow
+    risk any kill by process id carries. The single-process kill is the fallback for a job that
+    could not be set up, and it never raises: the stop that called it must carry on."""
+    if job is not None:
+        proctree.terminate_job(job)
+        return
+    if proctree.kill_process_group(proc.pid, started_as_leader=proctree.ADOPT_NEW_SESSION):
+        return
+    if proc.returncode is None:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass  # it exited on its own in the meantime
+        except OSError as exc:
+            log.warning("DR hook (pid %d) could not be killed: %s", proc.pid, safe_exc(exc))
+
+
+async def _reap_hook(proc: asyncio.subprocess.Process) -> None:
+    """Wait for the killed shell to exit, bounded, and say so when it has not."""
+    try:
+        await asyncio.wait_for(proc.wait(), _HOOK_REAP_SECONDS)
+    except TimeoutError:
+        log.warning(
+            "DR hook (pid %d) was killed but had not exited %gs later; it may still be running",
+            proc.pid,
+            _HOOK_REAP_SECONDS,
+        )
+
+
+def _kill_late_start(spawn: asyncio.Future[asyncio.subprocess.Process]) -> None:
+    """Kill a hook whose start finished after its caller was stopped, then reap it. On Windows it
+    is still suspended, so it has started nothing and killing the one process is enough."""
+    if spawn.cancelled() or spawn.exception() is not None:
+        return
+    proc = spawn.result()
+    _kill_hook(proc, None)
+    reap = spawn.get_loop().create_task(_reap_hook(proc))
+    _LATE_REAPS.add(reap)
+    reap.add_done_callback(_LATE_REAPS.discard)
+
+
+def _leave_late_start(spawn: asyncio.Future[asyncio.subprocess.Process]) -> None:
+    """Let a release hook whose start finished after its caller was stopped run on. A failed
+    start is read here, so asyncio does not log it as an exception nobody retrieved."""
+    if not spawn.cancelled():
+        spawn.exception()
 
 
 def _confined_archive(archive: str, seed_dir: str) -> Path | None:

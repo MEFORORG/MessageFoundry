@@ -194,6 +194,63 @@ def test_nonloopback_scp_with_source_ip_allowlist_ok() -> None:
     _scp("0.0.0.0", source_ip_allowlist=["10.0.0.0/8"])  # no raise
 
 
+# Vault BACKLOG #2622 item 2: the allow-list is weighed, not counted. Each refused list is set, so
+# a presence test passes it; each is wider than the floor somewhere, so it restricts nobody it can
+# be shown to. RED on the code before #2622, which built every one of these.
+_TOO_WIDE = (
+    ["0.0.0.0/0"],
+    ["::/0"],
+    ["10.0.0.0/7"],
+    ["2001:db8::/31"],
+    ["10.0.0.0/8", "0.0.0.0/0"],  # ONE wide entry defeats the list
+)
+# The controls, one prefix inside each floor, so the refusal is the floor and not the presence.
+_NARROW_ENOUGH = (["10.0.0.0/8"], ["2001:db8::/32"], ["192.0.2.7"], ["10.0.0.0/8", "2001:db8::/48"])
+
+
+@pytest.mark.parametrize("allowlist", _TOO_WIDE)
+def test_nonloopback_scp_with_a_too_wide_allowlist_fails_closed(allowlist: list[str]) -> None:
+    with pytest.raises(ValueError) as exc:
+        _scp("0.0.0.0", source_ip_allowlist=allowlist)
+    msg = str(exc.value)
+    # It says why the list the operator did set does not count, with the floors it is held to.
+    assert "wider than /8 (IPv4) or /32 (IPv6)" in msg
+    assert "Narrow every entry" in msg
+
+
+@pytest.mark.parametrize("allowlist", _NARROW_ENOUGH)
+def test_nonloopback_scp_with_an_allowlist_at_the_floor_ok(allowlist: list[str]) -> None:
+    _scp("0.0.0.0", source_ip_allowlist=allowlist)  # no raise
+
+
+def test_a_too_wide_allowlist_still_passes_with_mtls(tmp_path: Path) -> None:
+    # The width rule only stops the list counting as a control. mTLS is the other control, and it
+    # still satisfies the gate by presence: the subject-binding half of #2622 item 2 is not built.
+    cert, key = _cert(tmp_path, encrypt=None)
+    _scp(
+        "0.0.0.0",
+        source_ip_allowlist=["0.0.0.0/0"],
+        tls=True,
+        tls_cert_file=cert,
+        tls_key_file=key,
+        tls_ca_file=cert,
+    )  # no raise
+
+
+@pytest.mark.parametrize("allowlist", [*_TOO_WIDE, *_NARROW_ENOUGH])
+def test_the_dicom_and_http_gates_weigh_an_allowlist_the_same(allowlist: list[str]) -> None:
+    # One rule for both listeners: an allow-list the HTTP intake gate refuses, the SCP refuses.
+    from messagefoundry.pipeline.wiring_runner import _has_effective_peer_control
+
+    http_counts = _has_effective_peer_control({"source_ip_allowlist": allowlist})
+    try:
+        _scp("0.0.0.0", source_ip_allowlist=allowlist)
+        dicom_counts = True
+    except ValueError:
+        dicom_counts = False
+    assert dicom_counts is http_counts
+
+
 def test_nonloopback_scp_with_mtls_ok(tmp_path: Path) -> None:
     # tls + tls_ca_file → CERT_REQUIRED (real peer authentication); the cert is built on disk because
     # _server_ssl_context runs at __init__.
