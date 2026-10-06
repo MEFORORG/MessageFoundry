@@ -43,6 +43,14 @@ this line.**
   ended in a listed address would have counted as covered. The engine still accepts a canonical
   dotted-quad address in either list. It now refuses a partial or non-canonical one, and any other
   entry not shaped like a host name. No seam change. (vault BACKLOG #2843)
+- **The interstitial check reads a link the way a browser does.** It called anything starting
+  with `/` local, so `//evil.example` and `/\evil.example` would have skipped the "you are
+  leaving" page although a browser takes both to another host. Only a path on this origin is now
+  local, after the clean-up a browser applies, every percent-decoding of the path, and with no
+  `.` or `..` segment. The host check reads `https://evil.example\@hospital.example/` as
+  `evil.example`, refuses a host a browser would read differently, and the allowlist never exempts
+  a scheme other than http(s). The OIDC interstitial shows the host it judged, an IPv6 one
+  included. No seam change. (vault BACKLOG #2790)
 
 - **A cookie replayed from a second address is sent to re-authenticate before a PHI page or a
   write.** The message pages, the dead-letter list and the three reason reveals (every
