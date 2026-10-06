@@ -2485,6 +2485,32 @@ def _secret_passes_only(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(redact_mod, "_LONG_B64", NEVER_MATCHES)
 
 
+#: The two surfaces the differential compares. ``CredentialScrubFilter`` is left out because it runs
+#: ``scrub_credentials`` and reads the same module patterns.
+_DIFFERENTIAL_SURFACES = (
+    ("scrub_credentials", scrub_credentials),
+    ("redact_log_line", redact_log_line),
+)
+
+
+def _surface_outputs(
+    monkeypatch: pytest.MonkeyPatch,
+    patterns: dict[ModuleType, dict[str, re.Pattern[str]]],
+    corpus: list[str],
+) -> dict[str, list[str]]:
+    """Each differential surface's output over ``corpus``, with ``patterns`` patched into the real
+    modules, so the real pass order and placeholders run and only the five patterns differ."""
+    for module, by_name in patterns.items():
+        for name, pattern in by_name.items():
+            monkeypatch.setattr(module, name, pattern)
+    return {surface: [apply(line) for line in corpus] for surface, apply in _DIFFERENTIAL_SURFACES}
+
+
+def _pre_change() -> dict[ModuleType, dict[str, re.Pattern[str]]]:
+    """:func:`_pre_change_patterns` for both copies, ready for :func:`_surface_outputs`."""
+    return {scrub_mod: _pre_change_patterns(), redact_mod: _pre_change_patterns()}
+
+
 def _newly_printed_atoms(
     monkeypatch: pytest.MonkeyPatch,
     shipped_patterns: dict[ModuleType, dict[str, re.Pattern[str]]],
@@ -2497,19 +2523,11 @@ def _newly_printed_atoms(
     _secret_passes_only(monkeypatch)
     if corpus is None:
         corpus = [*_REVIEW_SHAPES, *_fuzz_lines(4000), *_structured_lines(4000)]
-    surfaces = (("scrub_credentials", scrub_credentials), ("redact_log_line", redact_log_line))
-
-    def outputs(patterns: dict[ModuleType, dict[str, re.Pattern[str]]]) -> dict[str, list[str]]:
-        for module, by_name in patterns.items():
-            for name, pattern in by_name.items():
-                monkeypatch.setattr(module, name, pattern)
-        return {surface: [apply(line) for line in corpus] for surface, apply in surfaces}
-
-    new = outputs(shipped_patterns)
-    old = outputs({scrub_mod: _pre_change_patterns(), redact_mod: _pre_change_patterns()})
+    new = _surface_outputs(monkeypatch, shipped_patterns, corpus)
+    old = _surface_outputs(monkeypatch, _pre_change(), corpus)
     newly: list[str] = []
     hidden_now = 0
-    for surface, _apply in surfaces:
+    for surface, _apply in _DIFFERENTIAL_SURFACES:
         for line, before, after in zip(corpus, old[surface], new[surface], strict=True):
             for atom in set(_ATOM.findall(line)):
                 printed_before = re.search(re.escape(atom) + r"(?!\d)", before) is not None
@@ -2622,7 +2640,7 @@ def _nested_label_lines() -> list[str]:
     separator, sometimes a second value word, and a whole inner label of every family. Then the
     outer closer and a tail with or without a stray quote, or no outer closer at all, so the inner
     value's own quote is the last one. ONE inner label only: the second review round found that two
-    inner labels reach the open defects ``secretscrub``'s RESIDUALS list, which this arm cannot pass
+    inner labels reach shapes on ``secretscrub``'s OPEN DEFECTS list, which this arm cannot pass
     until they are fixed."""
     lines: list[str] = []
     for outer in _NESTED_LABELS:
@@ -2672,32 +2690,49 @@ def test_the_second_review_rounds_shapes_print_nothing_new(
         assert not printed, f"{surface}: {printed} printed -- got {out!r}"
 
 
-#: OPEN DEFECTS, NOT TRADES. Each line prints a value on this branch that origin/main hid, on both
-#: copies and every surface, and ``secretscrub``'s RESIDUALS lists them under that name. Pinned as
-#: still printing so the list cannot go stale: a fix turns this red, and must update both.
+#: OPEN DEFECTS, NOT TRADES. Each line prints a value on this branch that the pre-change patterns
+#: hid, on both copies and every surface, and ``secretscrub``'s OPEN DEFECTS comment lists them under
+#: that name. Three of the last five carry no ``MEFOR_`` label at all. Pinned as still printing so the
+#: list cannot go stale: a fix turns this red, and must update both.
 _OPEN_CASCADE_DEFECTS: tuple[tuple[str, str], ...] = (
     ("cfg password='pw-A1 MEFOR_A=x;private_key='pké-B1 pk-B2'", "pk-B2"),
     ("cfg password='pw-A1 pw-A2;MEFOR_A=x;MEFOR_B='pw-B1'", "pw-A2"),
     ("secret=pw-A0@MEFOR_B_PW=pw-A2;MEFOR_X = 'pw-A4'@x.password='pw-A6", "pw-A6"),
+    ("connect failed encryption_key=token=password='hunter2',private_key='abc def=='", "abc"),
+    ('cfg private_key=pass=credential="c1"|private_key\'=pk-SECRET-9', "pk-SECRET-9"),
+    ("private_key=password='vq0 token=''|encryption_key='vq2", "vq2"),
+    ("pass=\",pw-IN-3 MEFOR_A\"=' mv-4'", "pw-IN-3"),
+    ("pass='MEFOR_1:pass'=\"vq4\"'", "vq4"),
 )
 
 
 @pytest.mark.parametrize(
-    "case", _OPEN_CASCADE_DEFECTS, ids=("refused-run-on", "swallowed-mefor", "split-mefor")
+    "case",
+    _OPEN_CASCADE_DEFECTS,
+    ids=(
+        *("refused-run-on", "swallowed-mefor", "split-mefor"),
+        *("key-material-run-on", "key-material-echo", "key-material-unclosed"),
+        *("mefor-takes-outer-closer", "mefor-match-taken-away"),
+    ),
 )
-def test_the_open_cascade_defects_still_print(case: tuple[str, str]) -> None:
-    """TWO-SIDED. Each defect still prints on every surface, and origin/main's patterns hid it."""
+def test_the_open_cascade_defects_still_print(
+    case: tuple[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TWO-SIDED. Each defect still prints on every surface, and the pre-change patterns hid it.
+
+    The second half is the differential's own baseline: :func:`_pre_change_patterns` patched into
+    both real modules and run through the real surfaces, with the same passes taken out as the
+    differential takes out. So this pin judges "hid it" the way the differential does, and cannot
+    drift from it the way a hand-built replay of the passes could."""
     line, atom = case
     for surface, apply in _SWALLOW_SURFACES:
         assert atom in apply(line), (
             f"{surface}: {atom!r} no longer prints in {line!r}. Good news -- remove it here and from "
             "secretscrub's OPEN DEFECTS list."
         )
-    old = _pre_change_patterns()
-    text = line
-    for name in ("_MEFOR_SECRET", "_BEARER", "_AUTH_SCHEME", "_CREDENTIAL_KV", "_KEY_MATERIAL"):
-        text = old[name].sub(lambda m: f"{m.group(1)}=x", text)
-    assert atom not in text, f"origin/main's patterns print {atom!r} too, so it is not new"
+    _secret_passes_only(monkeypatch)
+    for surface, (before,) in _surface_outputs(monkeypatch, _pre_change(), [line]).items():
+        assert atom not in before, f"{surface}: the pre-change patterns print {atom!r} too"
 
 
 @pytest.mark.parametrize("surface", _SWALLOW_SURFACES, ids=lambda surface: surface[0])

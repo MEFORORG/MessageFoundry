@@ -116,9 +116,11 @@ _GUARDED_BRACED_NO_SPACE = r"\{(?:[^}'\"\s]|\}\})*+\}(?!\})"
 # ``api_token=[REDACTED]"v w"``. Why it stops only there (so one pass newly prints label text, and a
 # value only in one recorded trade, though a later pass over the changed text can print more), where
 # in the label it stops (at the keyword, or at an underscored prefix right after a hard separator),
-# why the MEFOR_ branch keeps ``\b``, why it stays linear, and the residuals, are stated once, on the
-# same fragments in ``messagefoundry/secretscrub.py``. This copy spells the keywords the
-# way this module's own patterns do, and folds case on them alone, for the reason given at ``_BEARER``.
+# why the MEFOR_ branch keeps ``\b``, why it stays linear, the residuals, and the OPEN DEFECTS this
+# copy shares (values a later pass newly prints, on lines with or without a ``MEFOR_`` label), are
+# stated once, on the same fragments in ``messagefoundry/secretscrub.py``. This copy spells the
+# keywords the way this module's own patterns do, and folds case on them alone, for the reason given
+# at ``_BEARER``.
 _LABEL_HEAD = (
     r"(?=(?i:[abceipst]))"
     r"(?:(?i:pass(?:word|wd|phrase)?|pwd|secret|credential|encryption_key(?:s_retired)?|private_key"

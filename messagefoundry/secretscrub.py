@@ -301,7 +301,9 @@ _ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
 # swallowed the next label instead. A label followed by a BRACE or a plain value gets no stop, because
 # the class used to run on past those, and stopping there would print what it used to hide.
 #
-# NOT BEFORE A LABEL WHOSE HEAD HOLDS WHITESPACE EITHER, though that looks safe and was tried. In
+# NOT BEFORE A LABEL WHOSE VALUE IS UNQUOTED, EVEN WHERE THE OLD CLASS ENDED INSIDE THAT LABEL'S HEAD,
+# though that looks safe and was tried. A label head may hold whitespace and still get a stop, as in
+# ``token=x;password= 'v w'``; what decides it is the quote. In
 # ``token=x;password= hunter2`` the old class ends at the space, so a stop there would print only
 # label text, and "hunter2" would be hidden. Within one pass that holds. Across passes it does not:
 # the later label's own plain class then runs on over a label after it, which the old text had cut
@@ -376,12 +378,15 @@ _ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
 # quoted "vq2:vq3" that no longer does. Taken because the quoted value is the one a label names for
 # certain; the run in front of the keyword is a value only by one of two readings.
 #
-# OPEN DEFECTS, NOT TRADES: VALUES THIS CHANGE PRINTS THAT THE PATTERNS BEFORE IT HID. Found by the
-# second code-review round of 2026-10-05, on both copies and every surface, and not fixed here. Each
-# is a ``MEFOR_`` label inside an earlier label's quoted value. There the old ``_MEFOR_SECRET`` class
-# ate a quote, and the earlier value closed on a later one. Now the stop, or a guarded quoted value
-# under ``_MEFOR_SECRET``, leaves that quote or consumes a different one, and the earlier value
-# closes somewhere else. At least these shapes:
+# OPEN DEFECTS, NOT TRADES: VALUES THIS CHANGE PRINTS THAT THE PATTERNS BEFORE IT HID. Found by code
+# review on 2026-10-05, on both copies and every surface, and not fixed here. THE MECHANISM: the
+# passes run one after another, and each judges where its value stops on text that earlier passes
+# already rewrote. A stop, a guarded quoted value or a braced one leaves a quote, or takes one, where
+# the old classes did the other. So a later pass reads different text, and its value closes or stops
+# somewhere else. A ``MEFOR_`` label inside an earlier label's quoted value is one way in, and it is
+# not the only one: the same cascade lands in ``_KEY_MATERIAL`` and ``_CREDENTIAL_KV`` on lines with
+# no ``MEFOR_`` label at all. Some of these lines also hide a value the old patterns printed, but by
+# accident, so they belong here and not with the trade above. At least these shapes:
 #
 # * a stop before a later quoted label whose value the run-on refuses, for a non-ASCII character or a
 #   label in it: ``password='pw-A1 MEFOR_A=x;private_key='pk<e-acute>-B1 pk-B2'`` prints both pk
@@ -390,7 +395,22 @@ _ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
 #   ``password='pw-A1 pw-A2;MEFOR_A=x;MEFOR_B='pw-B1'`` prints " pw-A2";
 # * a stop that splits one ``MEFOR_`` value, so a later ``MEFOR_`` label eats the space that ended an
 #   earlier plain value: ``secret=pw-A0@MEFOR_B_PW=pw-A2;MEFOR_X = 'pw-A4'@x.password='pw-A6``
-#   prints "pw-A6".
+#   prints "pw-A6";
+# * ``_KEY_MATERIAL`` running over a later key label, with no ``MEFOR_`` label on the line.
+#   ``_CREDENTIAL_KV`` now takes a quoted value whole, closer and all, where an old pass left a quote
+#   that ended ``_KEY_MATERIAL``'s plain value. That value now runs on over the later key label, which
+#   gets no stop because its own value is not a closed, guarded quote.
+#   ``connect failed encryption_key=token=password='hunter2',private_key='abc def=='`` prints
+#   "abc def==", where the old patterns printed " def==";
+#   ``cfg private_key=pass=credential="c1"|private_key'=pk-SECRET-9`` prints "pk-SECRET-9"; and
+#   ``private_key=password='vq0 token=''|encryption_key='vq2`` prints "vq2";
+# * a stop that takes a ``MEFOR_`` match away: ``pass='MEFOR_1:pass'="vq4"'`` prints "vq4". The old
+#   ``_MEFOR_SECRET`` ate ``pass'``, so the outer quoted value closed on the last quote. Now that
+#   value's first run is a quoted label, ``_MEFOR_SECRET`` does not match, and the outer value closes
+#   on the quote it left;
+# * ``_MEFOR_SECRET``'s guarded quoted value matching where the old class did not:
+#   ``pass=",pw-IN-3 MEFOR_A"=' mv-4'`` prints ",pw-IN-3". The label takes the double quote that
+#   closed the outer value, so that value has no closer and nothing matches it.
 #
 # ``tests/test_log_redaction_secret_domain.py`` pins each one as still printing, so a fix must
 # update that pin and this list together.
