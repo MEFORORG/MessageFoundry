@@ -1263,10 +1263,10 @@ tuple: they act only on the caller's own account.
 > `verify_mfa`'s check and the reconciler read it as absent, so none of them takes another
 > account's entry as this row's. The engine warns once per distinct cause -- the attribute absent,
 > present in a shape it cannot read, or another object's -- so a site on that path learns why its
-> sign-ins fail. **At least one reader
-> still asks about an id-less row by its name:** the session reconciler, on a row with no federated
-> binding. A directory that reissued the name answers for its new holder there. `verify_mfa` asked
-> such a row by name too, until the rest of BACKLOG #2027 refused it.
+> sign-ins fail. The session reconciler asked about an id-less row with no federated binding by its
+> name until BACKLOG #2434, so a directory that reissued the name answered for its new holder there.
+> It now reads that row as undetermined without a lookup. `verify_mfa` asked such a row by name too,
+> until the rest of BACKLOG #2027 refused it.
 >
 > **Owner-only** is the whole rule: list, browse, resend and delete reach the caller's own files.
 > `files:access_any` is the explicit cross-operator override, granted to **Administrator** only (it is
@@ -1999,14 +1999,22 @@ directory configured. None of these checks the password or counts toward the loc
 `re-verification failed`, and the `/ui/reauth` password leg says it rather than "Incorrect
 password." A password the directory refused still reads as wrong. The words name no directory
 internals. The `auth.reauth` audit row carries the cause as `reason`: at least
-`directory_object_id_missing`, `not_in_directory` (no enabled entry for the row's id, disabled
-included), `directory_unavailable` or `not_configured`.
+`directory_object_id_missing`, `not_in_directory` (no entry for the row's id, or one not provably
+its own), `directory_disabled`, `directory_undetermined` (the account state could not be read),
+`directory_unavailable` or `not_configured`. Since BACKLOG #2434 the bind's own lookup tells a
+disabled account from an absent one, with no second directory read.
+
+An empty password is refused before the directory is asked, and is not counted either (BACKLOG
+#2434): an empty simple bind is anonymous, so the directory never judges it. It reads as a refused
+password rather than as a directory that could not confirm the account, and its `auth.reauth` row
+carries `empty_password`. A local account's empty re-auth password is still checked against the
+stored hash and counted like any wrong password.
 
 Without this, an account disabled in the directory would keep renewing its window with a code
 until the reconciliation pass revoked its sessions. The engine row's `disabled` flag is only as
 fresh as that pass, which runs every `[auth].ad_session_recheck_seconds` (300 s by default) and
 revokes after `[auth].ad_session_recheck_strikes` refusals in a row (2 by default). An id-less row
-with no binding used to be looked up by name here, as the reconciler still looks it up. Since the
+with no binding used to be looked up by name here, as the reconciler did until BACKLOG #2434. Since the
 rest of BACKLOG #2027 this check refuses it, as the Windows SSO sign-in and the password step-up do.
 
 **This check fails closed, which is the opposite of the reconciler, and the cost is availability.**
@@ -3282,8 +3290,13 @@ fails part-way keeps the audit rows for what it already revoked, but raises no a
 **The probe is keyed on the directory's immutable `objectGUID`**, the same identifier a directory login
 is identified by, and a renamed account's stored username is refreshed from the directory on the same
 pass. That is why *renamed* is absent from the ambiguity list below: it used to sit there, and reading a
-rename as an absence revoked the renamed person's sessions on every interval. A directory that returns
-no readable `objectGUID` still probes by name and keeps that ambiguity (BACKLOG #1471, #1532). Such a
+rename as an absence revoked the renamed person's sessions on every interval. A row with no
+`objectGUID` is **never probed by name** (BACKLOG #2434), because a name probe can read another
+account's entry and write its roles onto the row. No sign-in or step-up admits such a row (BACKLOG
+#2027), so a session it holds is anomalous. The pass reads it as undetermined without a lookup: it
+writes no roles, and it strikes and revokes like any undetermined answer. **The cost:** the ADR 0195
+hold applies to it too, so two such rows at once, or one with no readable answer beside it, are held
+and alert as a lost read right rather than revoked. Such a
 row cannot take a federated binding: the bind refuses it, so every binding the bind has made since
 BACKLOG #1143 slice C sits on a row probed by its id (ADR 0184 AC-5). A binding already on an id-less
 row, made before that refusal, is **never probed by name** (BACKLOG #2027). The pass skips the row and

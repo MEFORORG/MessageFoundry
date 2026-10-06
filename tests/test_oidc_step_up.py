@@ -24,7 +24,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 
 from messagefoundry.auth import oidc
 from messagefoundry.auth.identity import SessionMechanism
-from messagefoundry.auth.ldap import AdPrincipal
+from messagefoundry.auth.ldap import AdPrincipal, DirectoryBind
 from messagefoundry.auth.service import (
     FLOW_PURPOSE_MISMATCH,
     IDP_STEP_UP_REQUIRED,
@@ -82,7 +82,7 @@ class _CountingLdap(_FakeLdap):
         super().__init__(principal)
         self.binds: list[str] = []
 
-    def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
+    def authenticate(self, username: str, password: str, **_: object) -> DirectoryBind:
         self.binds.append(username)
         return super().authenticate(username, password)
 

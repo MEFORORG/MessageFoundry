@@ -9,6 +9,13 @@
   > the owner to accept. No code until Accepted."*
   <!-- Proposed (no code yet) -> Accepted (build may start) -> Superseded by NNNN / Rejected -->
 - **Date:** 2026-09-26
+- **Amendment 2026-10-06 (BACKLOG #2434).** Rule item 2's *"Every other caller keeps its `None`.
+  That includes at least `LdapAuthenticator.authenticate`"* no longer holds for that method; it is
+  kept as the record. `authenticate` now returns a `DirectoryBind` carrying the lookup's
+  `DirectoryAnswer`, so the step-up re-bind audits a disabled or undetermined account apart from an
+  absent one without a second read. No client sees the difference. The reconciler also feeds this
+  rule's hold a new source of UNDETERMINED: an id-less row, read so without a lookup (ADR 0184
+  amendment 2026-10-06).
 - **Related:** [ADR 0079](0079-kerberos-idp-session-coordination.md) (mechanism 2, the directory
   session reconciler, and its mass-revoke breaker) · [CLAUDE.md](../../CLAUDE.md) section 0 (not
   deployed) and section 11 (SDS-3.6, SDS-3.7) · BACKLOG #1639 (the fail-closed read this follows) ·

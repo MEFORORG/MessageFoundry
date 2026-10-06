@@ -34,6 +34,7 @@ from messagefoundry.auth.identity import AuthProvider, Identity
 from messagefoundry.auth.ldap import (
     AdPrincipal,
     DirectoryAnswer,
+    DirectoryBind,
     LdapAuthenticator,
     LdapError,
     _object_guid,
@@ -42,6 +43,7 @@ from messagefoundry.auth.ldap import (
 )
 from messagefoundry.auth.notifications import USERNAME_CHANGED, SecurityEvent
 from messagefoundry.auth.service import DIRECTORY_OBJECT_ID_MISSING, AuthService
+from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore
@@ -358,7 +360,7 @@ def _drive(name: str, auth: LdapAuthenticator) -> AdPrincipal | None:
     """Call one entry point by name. Both take a username; only one takes a password, which is why
     this exists rather than a bare ``getattr``."""
     if name == "authenticate":
-        return auth.authenticate("jsmith", "synthetic-user-pw")
+        return auth.authenticate("jsmith", "synthetic-user-pw").principal
     return auth.resolve_principal("jsmith")
 
 
@@ -418,8 +420,8 @@ class _FakeLdap:
     """Stands in for the directory. These tests drive ``_complete_ad_login`` with a principal
     directly -- the LDAP lookup itself is covered above, against the entry double."""
 
-    def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
-        return None
+    def authenticate(self, username: str, password: str, **_: object) -> DirectoryBind:
+        return DirectoryBind(DirectoryAnswer.NOT_FOUND)
 
     def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
         return None
@@ -1022,13 +1024,16 @@ def test_authenticate_by_id_never_binds_the_password_as_an_entry_that_is_not_the
     control binds as the entry and returns it."""
     binds: list[str] = []
     _install_directory(monkeypatch, _directory_entry(guid), binds)
-    principal = _authenticator().authenticate("jsmith", "synthetic-user-pw", object_id=GUID_A_TEXT)
+    bind = _authenticator().authenticate("jsmith", "synthetic-user-pw", object_id=GUID_A_TEXT)
+    principal = bind.principal
     # The service connection auto-binds and never calls bind(), so these are the password binds.
     if found:
         assert principal is not None and principal.directory_object_id == GUID_A_TEXT
         assert binds == ["CN=jsmith,DC=x"]
     else:
         assert principal is None
+        # BACKLOG #2434: the answer says no entry is this account, so no password was judged.
+        assert bind.answer is DirectoryAnswer.NOT_FOUND
         # Exactly the equalizing bind: the refusal costs the same round trips, and the typed
         # password goes to no real entry.
         assert binds == ["CN=mf-nonexistent-timing-equalizer,DC=x"]
@@ -1047,6 +1052,75 @@ def test_probe_by_id_answers_no_match_for_another_objects_entry(
     assert auth.resolve_principal("jsmith", object_id=GUID_A_TEXT) is None
     # A name-keyed probe is a different question and is not checked against any id.
     assert auth.probe_principal("jsmith").answer is DirectoryAnswer.FOUND
+
+
+@pytest.mark.parametrize(
+    ("read_back", "foreign"),
+    [(_FakeAttr(GUID_B_TEXT), True), (_FakeAttr(GUID_A_BRACED, raw=GUID_A_BYTES), False)],
+    ids=["foreign-id", "own-id-control"],
+)
+async def test_a_reconcile_pass_never_takes_roles_from_an_entry_reading_back_a_foreign_id(
+    monkeypatch: pytest.MonkeyPatch, read_back: _FakeAttr, foreign: bool
+) -> None:
+    """BACKLOG #2434, limb 4: the whole pass, through the REAL ``LdapAuthenticator``.
+
+    The row is keyed to ``GUID_A``. The directory's id-keyed search returns an entry in an
+    Administrator-mapped group that reads back another object's id. ``_lookup_by_object_id``
+    answers that as no match, so the pass reads the account as ABSENT: no role is written from the
+    foreign entry, and its sessions end at the strike threshold as ``directory_absent``. The control
+    entry reads back the row's own id, and the same pass rewrites the roles at once, so the
+    instrument can see a rewrite.
+    """
+    admin_group = "CN=MF-Admins,DC=x"
+    entry = _FakeEntry(
+        {
+            "sAMAccountName": _FakeAttr("jsmith"),
+            "objectGUID": read_back,
+            "displayName": _FakeAttr("J Smith"),
+            "mail": _FakeAttr("jsmith@example.org"),
+            "memberOf": _FakeAttr([admin_group]),
+            "userAccountControl": _FakeAttr("512"),
+        },
+        dn="CN=jsmith,DC=x",
+    )
+    _install_directory(monkeypatch, entry)
+    store = await MessageStore.open(":memory:")
+    try:
+        settings = AuthSettings(
+            ad_enabled=True,
+            ad_server="ldaps://x",
+            ad_user_search_base="DC=x",
+            ad_bind_dn="CN=svc,DC=x",
+            ad_bind_password="x",
+        )
+        service = AuthService(store, settings, ldap=_authenticator())
+        await service.initialize()
+        await service.set_ad_group_map(
+            [("CN=MF-Ops,DC=x", "operator"), (admin_group, Role.ADMINISTRATOR.value)],
+            actor="admin",
+        )
+        out = await service._complete_ad_login(
+            _principal("jsmith", GUID_A_TEXT), None, mfa_verified=True
+        )
+        assert out.ok and out.identity is not None and out.token is not None, out.error
+        user_id = out.identity.user_id
+        assert await store.get_user_role_ids(user_id) == ["operator"]
+
+        plans = [await service.reconcile_directory_sessions() for _ in range(2)]
+
+        reasons = [[r.reason for r in plan.revocations] for plan in plans]
+        if foreign:
+            assert await store.get_user_role_ids(user_id) == ["operator"], (
+                "the pass wrote roles read from another directory object's entry"
+            )
+            assert reasons == [[], ["directory_absent"]]
+            assert plans[1].revocations[0].role_ids is None  # no role write planned
+        else:
+            assert reasons[0] == ["roles_changed"]
+            assert await store.get_user_role_ids(user_id) == [Role.ADMINISTRATOR.value]
+        assert await service.identity_for_token(out.token) is None
+    finally:
+        await store.close()
 
 
 class _RecordingConn:
@@ -1352,8 +1426,8 @@ class _ResolvingLdap:
     def __init__(self, principal: AdPrincipal) -> None:
         self._principal = principal
 
-    def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
-        return None
+    def authenticate(self, username: str, password: str, **_: object) -> DirectoryBind:
+        return DirectoryBind(DirectoryAnswer.NOT_FOUND)
 
     def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
         return self._principal if username == self._principal.username else None
@@ -1444,27 +1518,34 @@ async def test_a_locked_mirror_row_does_not_complete_a_kerberos_login(
 
 class _RebindDirectory:
     """A directory whose re-bind answer the test sets. ``bound`` is who a good password binds as;
-    ``named`` is who the lookup answers after a refusal. ``binds`` counts password binds, and
-    ``keys`` records the ``object_id`` each call was keyed on."""
+    ``refusal`` is what the bind's own lookup found when it did not bind: ``FOUND`` for an enabled
+    entry that refused the password, any other answer for no enabled entry (BACKLOG #2434).
+    ``binds`` counts password binds, and ``keys`` records the ``object_id`` each call was keyed on,
+    so a second directory read would show as a second key."""
 
-    def __init__(self, bound: AdPrincipal | None, named: AdPrincipal | None) -> None:
+    def __init__(
+        self, bound: AdPrincipal | None, refusal: DirectoryAnswer = DirectoryAnswer.FOUND
+    ) -> None:
         self.bound = bound
-        self.named = named
+        self.refusal = refusal
         self.binds = 0
         self.keys: list[object] = []
 
     def authenticate(
         self, username: str, password: str, *, object_id: str | None = None
-    ) -> AdPrincipal | None:
+    ) -> DirectoryBind:
         self.binds += 1
         self.keys.append(object_id)
-        return self.bound if password == "synthetic-good" else None
+        if password == "synthetic-good" and self.bound is not None:
+            return DirectoryBind(DirectoryAnswer.FOUND, self.bound)
+        return DirectoryBind(self.refusal)
 
     def resolve_principal(
         self, username: str, *, object_id: str | None = None
     ) -> AdPrincipal | None:
+        # The re-bind no longer reads this (BACKLOG #2434); a call would show as a second key.
         self.keys.append(object_id)
-        return self.named
+        return self.bound if self.refusal is DirectoryAnswer.FOUND else None
 
 
 async def _reauth_session(
@@ -1504,7 +1585,7 @@ async def test_a_re_bind_on_a_row_with_no_directory_id_is_refused_unasked() -> N
     the caller did not guess wrong."""
     store = await MessageStore.open(":memory:")
     try:
-        directory = _RebindDirectory(_principal("jsmith", GUID_A_TEXT), None)
+        directory = _RebindDirectory(_principal("jsmith", GUID_A_TEXT), DirectoryAnswer.NOT_FOUND)
         service, identity, token = await _reauth_session(store, directory, keep_id=False)
         elevation = await service.reauth(identity, "synthetic-good", token=token)
         assert not elevation.ok and elevation.token is None
@@ -1528,7 +1609,7 @@ async def test_a_re_bind_that_binds_another_directory_object_is_refused(
     that entry proves nothing about this row's holder. Refused, and not counted."""
     store = await MessageStore.open(":memory:")
     try:
-        directory = _RebindDirectory(_principal("jsmith", bound_id), None)
+        directory = _RebindDirectory(_principal("jsmith", bound_id), DirectoryAnswer.NOT_FOUND)
         service, identity, token = await _reauth_session(store, directory)
         elevation = await service.reauth(identity, "synthetic-good", token=token)
         assert not elevation.ok and elevation.token is None
@@ -1543,19 +1624,19 @@ async def test_a_re_bind_that_binds_another_directory_object_is_refused(
 
 
 async def test_a_refused_re_bind_keyed_on_the_rows_id_is_counted() -> None:
-    """The failed bind was keyed on the row's own id, so it was a guess at THIS account and counts,
-    even when the entry the lookup finds reads back another id. Not counting it would let a held
-    session send the directory unlimited guesses past the per-session cap."""
+    """The failed bind was keyed on the row's own id and its lookup found the entry, so it was a
+    guess at THIS account and counts. Not counting it would let a held session send the directory
+    unlimited guesses past the per-session cap. One directory call, not two (BACKLOG #2434)."""
     store = await MessageStore.open(":memory:")
     try:
-        directory = _RebindDirectory(None, _principal("jsmith", GUID_B_TEXT))
+        directory = _RebindDirectory(None, DirectoryAnswer.FOUND)
         service, identity, token = await _reauth_session(store, directory)
         elevation = await service.reauth(identity, "synthetic-wrong", token=token)
         assert not elevation.ok
         assert elevation.directory_unconfirmed is False  # judged and wrong, so "wrong" is true
         row = await store.get_user(identity.user_id)
         assert row is not None and row.failed_attempts == 1
-        assert directory.keys == [GUID_A_TEXT, GUID_A_TEXT]
+        assert directory.keys == [GUID_A_TEXT]
     finally:
         await store.close()
 
@@ -1566,7 +1647,7 @@ async def test_a_renamed_account_still_steps_up_by_its_object_id() -> None:
     store = await MessageStore.open(":memory:")
     try:
         renamed = _principal("jsmith-married", GUID_A_TEXT)
-        directory = _RebindDirectory(renamed, renamed)
+        directory = _RebindDirectory(renamed)
         service, identity, token = await _reauth_session(store, directory)
         good = await service.reauth(identity, "synthetic-good", token=token)
         assert good.ok and directory.keys == [GUID_A_TEXT]
@@ -1581,7 +1662,7 @@ async def test_a_re_bind_of_the_rows_own_object_still_elevates_and_still_counts(
     store = await MessageStore.open(":memory:")
     try:
         own = _principal("jsmith", GUID_A_TEXT)
-        directory = _RebindDirectory(own, own)
+        directory = _RebindDirectory(own)
         service, identity, token = await _reauth_session(store, directory)
         wrong = await service.reauth(identity, "synthetic-wrong", token=token)
         assert not wrong.ok and wrong.directory_unconfirmed is False
@@ -1591,7 +1672,7 @@ async def test_a_re_bind_of_the_rows_own_object_still_elevates_and_still_counts(
         assert good.ok and good.token is not None
         assert not any('"reason"' in d for d in await _reauth_rows(store))
         # Every directory call was keyed on the row's own id, never on the recyclable name alone.
-        assert directory.keys == [GUID_A_TEXT, GUID_A_TEXT, GUID_A_TEXT]
+        assert directory.keys == [GUID_A_TEXT, GUID_A_TEXT]
     finally:
         await store.close()
 
@@ -1601,7 +1682,7 @@ class _UnreachableRebindDirectory(_RebindDirectory):
 
     def authenticate(
         self, username: str, password: str, *, object_id: str | None = None
-    ) -> AdPrincipal | None:
+    ) -> DirectoryBind:
         self.binds += 1
         raise LdapError("synthetic: LDAP socket closed")
 
@@ -1611,7 +1692,7 @@ async def test_an_unreachable_directory_re_bind_is_unconfirmed_and_uncounted() -
     nothing counts (BACKLOG #1138's outage rule)."""
     store = await MessageStore.open(":memory:")
     try:
-        directory = _UnreachableRebindDirectory(None, None)
+        directory = _UnreachableRebindDirectory(None)
         service, identity, token = await _reauth_session(store, directory)
         elevation = await service.reauth(identity, "synthetic-good", token=token)
         assert not elevation.ok and elevation.directory_unconfirmed is True
@@ -1639,7 +1720,7 @@ async def test_the_reauth_route_says_the_directory_could_not_confirm_the_account
     try:
         assert isinstance(engine.store, MessageStore)
         own = _principal("jsmith", GUID_A_TEXT)
-        directory = _RebindDirectory(own, own)
+        directory = _RebindDirectory(own)
         service, _identity, token = await _reauth_session(engine.store, directory, keep_id=keep_id)
         transport = httpx.ASGITransport(
             app=create_app(engine, auth=service), client=("127.0.0.1", 123)
@@ -1657,35 +1738,56 @@ async def test_the_reauth_route_says_the_directory_could_not_confirm_the_account
         await engine.stop()
 
 
-class _LookupFailsRebindDirectory(_RebindDirectory):
-    """The bind is refused, then the lookup that would judge it cannot reach the directory."""
-
-    def resolve_principal(
-        self, username: str, *, object_id: str | None = None
-    ) -> AdPrincipal | None:
-        raise LdapError("synthetic: LDAP socket closed")
-
-
 @pytest.mark.parametrize(
-    ("directory", "reason"),
+    ("answer", "reason"),
     [
-        (_RebindDirectory(None, None), "not_in_directory"),
-        (_LookupFailsRebindDirectory(None, None), "directory_unavailable"),
+        (DirectoryAnswer.NOT_FOUND, "not_in_directory"),
+        (DirectoryAnswer.DISABLED, "directory_disabled"),
+        (DirectoryAnswer.UNDETERMINED, "directory_undetermined"),
     ],
-    ids=["no-enabled-entry", "lookup-unreachable"],
+    ids=["absent", "disabled", "undetermined"],
 )
 async def test_an_unjudged_re_bind_names_its_cause_on_the_audit_row(
-    directory: _RebindDirectory, reason: str
+    answer: DirectoryAnswer, reason: str
 ) -> None:
     """Every refusal that judged no password says why on ``auth.reauth``, so the row never reads
-    as a wrong guess. RED when either arm drops or swaps its slug."""
+    as a wrong guess. RED when any arm drops or swaps its slug. A disabled account is told apart
+    from an absent one by the bind's own lookup, with no second directory read (BACKLOG #2434)."""
     store = await MessageStore.open(":memory:")
     try:
+        directory = _RebindDirectory(None, answer)
         service, identity, token = await _reauth_session(store, directory)
         elevation = await service.reauth(identity, "synthetic-good", token=token)
         assert not elevation.ok and elevation.directory_unconfirmed is True
         row = await store.get_user(identity.user_id)
         assert row is not None and row.failed_attempts == 0
         assert any(f'"reason": "{reason}"' in d for d in await _reauth_rows(store))
+        assert directory.keys == [GUID_A_TEXT], "the re-bind made a second directory read"
+    finally:
+        await store.close()
+
+
+async def test_an_empty_re_bind_password_is_refused_unasked_and_uncharged() -> None:
+    """BACKLOG #2434. The directory never judges an empty password, so it is no guess: refused
+    before any directory call, charged to neither the account nor the session, and audited as
+    ``empty_password``. The caller sees a refused password, not a directory that could not confirm
+    the account. Past the lockout threshold, so one charge per attempt would have locked the row."""
+    store = await MessageStore.open(":memory:")
+    try:
+        directory = _RebindDirectory(_principal("jsmith", GUID_A_TEXT))
+        service, identity, token = await _reauth_session(store, directory)
+        for _ in range(6):
+            elevation = await service.reauth(identity, "", token=token)
+            assert not elevation.ok and elevation.token is None
+            assert elevation.directory_unconfirmed is False
+            assert not elevation.session_lost
+        assert directory.binds == 0, "an empty password reached the directory"
+        row = await store.get_user(identity.user_id)
+        assert row is not None and row.failed_attempts == 0 and row.locked_until is None
+        assert service._session_reproof_failures(hash_token(token)) == 0
+        rows = await _reauth_rows(store)
+        assert len(rows) == 6 and all('"reason": "empty_password"' in d for d in rows)
+        # CONTROL: the same session still steps up, so the refusals were the empty password.
+        assert (await service.reauth(identity, "synthetic-good", token=token)).ok
     finally:
         await store.close()

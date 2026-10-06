@@ -1170,7 +1170,11 @@ async def test_a_user_whose_only_session_is_idle_is_still_probed() -> None:
         now = time.time()
         for username, last_used in (("idler", now - idle - 60), ("active", now - idle + 60)):
             await store.create_user(
-                user_id=username, username=username, auth_provider="ad", password_generated=False
+                user_id=username,
+                username=username,
+                auth_provider="ad",
+                password_generated=False,
+                directory_object_id=_object_id_for(username),
             )
             await store.create_session(
                 token_hash=f"{username}-hash",
@@ -1334,27 +1338,52 @@ async def test_the_probe_is_keyed_on_the_immutable_id_when_the_row_carries_one()
         await store.close()
 
 
-async def test_a_row_with_no_immutable_id_still_probes_by_name() -> None:
-    """The residual path, and it is a DIRECTORY's property rather than a choice here.
+async def test_a_row_with_no_immutable_id_is_never_probed_by_name() -> None:
+    """BACKLOG #2434. A row with no ``objectGUID`` is read as UNDETERMINED without a lookup.
 
-    A row with no ``objectGUID`` gives the engine no identifier to key on. No sign-in mints such a
-    row since BACKLOG #2027, which refuses a principal with no id, so this is a row made before that
-    or planted in the store (the fixture plants it). The pass keeps the pre-#1471 behaviour for it,
-    rename wart included. Asserted so the fallback is a stated arm rather than something a later
-    change silently deletes.
+    No sign-in or step-up admits such a row since BACKLOG #2027, so this is a row made before that
+    or planted in the store (the fixture plants it). A name probe would ask a question another
+    account can answer: here the name now resolves to an entry whose groups map to Administrator.
+    The pass must not ask, must not write that entry's roles onto the row, and must end the row's
+    sessions by the undetermined strike rule. ``alice`` is an id-bearing control, probed by her id,
+    whose readable answer lets a lone undetermined account strike (ADR 0195).
     """
+    admin_group = "CN=mf-admins,OU=Groups,DC=test,DC=invalid"
     store = await MessageStore.open(":memory:")
     try:
-        ldap = _FakeLdap({"jdoe": replace(_principal("jdoe"), directory_object_id=None)})
+        ldap = _FakeLdap(
+            {
+                "jdoe": replace(_principal("jdoe"), directory_object_id=None),
+                "alice": _principal("alice"),
+            }
+        )
         service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
         await service.initialize()
-        await _signed_in_ad_user(service, store, "jdoe")
+        await service.set_ad_group_map([(admin_group, Role.ADMINISTRATOR.value)], actor="test")
+        token = await _signed_in_ad_user(service, store, "jdoe")
+        assert await _signed_in_ad_user(service, store, "alice") is not None
         row = await store.get_user_by_username("jdoe")
-        assert row is not None and row.directory_object_id is None
+        assert row is not None and row.directory_object_id is None and token is not None
+        roles_before = await store.get_user_role_ids(row.id)
+        # What a name probe would now read: another account's entry, in the Administrator group.
+        ldap.present["jdoe"] = replace(
+            _principal("jdoe", admin_group, object_id=_object_id_for("mallory")),
+            directory_object_id=None,
+        )
         ldap.probe_keys.clear()
 
-        await service.reconcile_directory_sessions()
-        assert ldap.probe_keys == [("username", "jdoe")]
+        plans = [await service.reconcile_directory_sessions() for _ in range(2)]
+
+        assert ("username", "jdoe") not in ldap.probe_keys, "an id-less row was probed by name"
+        assert ldap.probe_keys == [("object_id", _object_id_for("alice"))] * 2
+        assert await store.get_user_role_ids(row.id) == roles_before, (
+            "roles were written onto an id-less row"
+        )
+        assert plans[0].revocations == ()
+        assert [(r.user_id, r.reason) for r in plans[1].revocations] == [
+            (row.id, "directory_undetermined")
+        ]
+        assert await service.identity_for_token(token) is None
     finally:
         await store.close()
 
@@ -1408,14 +1437,10 @@ async def test_ac5_a_federated_binding_only_lands_on_a_row_the_probe_keys_by_id(
         await service.reconcile_directory_sessions()
 
         bound = {u.username for u in await store.list_users() if u.oidc_subject is not None}
-        # AC-5 ITSELF: no bound row was asked about by name.
-        assert [key for key in ldap.probe_keys if key[0] == "username" and key[1] in bound] == []
-        # CONTROL: the pass did probe by name -- the unbound id-less row -- so the check above had
-        # a name-keyed probe to find, and the bound row was probed by its id.
-        assert sorted(ldap.probe_keys) == [
-            ("object_id", _object_id_for("jdoe")),
-            ("username", "nobody"),
-        ]
+        # AC-5 ITSELF, and since BACKLOG #2434 more: no row at all was asked about by name. The
+        # unbound id-less row is read as undetermined unasked, and the bound row by its id.
+        assert [key for key in ldap.probe_keys if key[0] == "username"] == []
+        assert ldap.probe_keys == [("object_id", _object_id_for("jdoe"))]
         assert refused and bound == {"jdoe"}
     finally:
         await store.close()
@@ -1429,9 +1454,9 @@ async def test_ac5_a_bound_row_with_no_id_is_skipped_not_probed_by_name() -> Non
     name, so the pass must not ask about it at all. It is skipped the way an account the pass cannot
     ask about is skipped: its session is left alone, not revoked, and the skip is audited once.
 
-    Two controls share the pass. An id-bearing bound row is still probed by its id, and an UNBOUND
-    id-less row is still probed by name, so the name-keyed arm is narrowed to exactly the bound
-    rows rather than switched off.
+    Two controls share the pass. An id-bearing bound row is still probed by its id. An UNBOUND
+    id-less row is not probed either, but unlike the bound one it is judged: it reads as
+    undetermined, strikes and is revoked (BACKLOG #2434), so the skip is the binding's alone.
     """
     store = await MessageStore.open(":memory:")
     try:
@@ -1470,15 +1495,17 @@ async def test_ac5_a_bound_row_with_no_id_is_skipped_not_probed_by_name() -> Non
         ldap.present.pop("legacy")  # gone from the directory: a name probe would strike it
 
         ldap.probe_keys.clear()
+        nobody = await store.get_user_by_username("nobody")
+        assert nobody is not None
+        revoked: list[str] = []
         for _ in range(3):  # past the strike threshold, so a name probe would have revoked
             plan = await service.reconcile_directory_sessions()
-            assert plan.aborted is None and plan.revocations == ()
+            assert plan.aborted is None
+            revoked += [r.user_id for r in plan.revocations]
 
+        assert revoked == [nobody.id], "the bound id-less row was revoked, or the unbound one not"
         assert ("username", "legacy") not in ldap.probe_keys
-        assert sorted(set(ldap.probe_keys)) == [
-            ("object_id", _object_id_for("jdoe")),
-            ("username", "nobody"),
-        ]
+        assert sorted(set(ldap.probe_keys)) == [("object_id", _object_id_for("jdoe"))]
         assert token is not None and await service.identity_for_token(token) is not None
         skipped = [
             json.loads(a["detail"])
@@ -1536,7 +1563,8 @@ async def test_an_unkeyed_binding_is_reported_once_per_process_across_sign_ins()
 
     A mark kept only for signed-in rows would drop whenever the sessions lapse, and the account
     would be reported again on its next sign-in. After the unbind the row is ordinary again, so its
-    mark goes, and the pass probes it by name like any unbound id-less row.
+    mark goes, and the pass reads it as undetermined unasked like any unbound id-less row (BACKLOG
+    #2434).
     """
     store = await MessageStore.open(":memory:")
     try:
@@ -1576,8 +1604,9 @@ async def test_an_unkeyed_binding_is_reported_once_per_process_across_sign_ins()
         )
         await _signed_in_ad_user(service, store, "legacy")
         ldap.probe_keys.clear()
-        await service.reconcile_directory_sessions()
-        assert ldap.probe_keys == [("username", "legacy")]
+        plan = await service.reconcile_directory_sessions()
+        assert ldap.probe_keys == []
+        assert plan.held == (legacy.id,)  # a lone undetermined answer with nothing readable
         assert await reported() == 1
     finally:
         await store.close()

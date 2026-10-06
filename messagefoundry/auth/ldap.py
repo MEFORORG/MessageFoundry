@@ -104,10 +104,11 @@ class LdapReferralError(LdapError):
 class DirectoryAnswer(Enum):
     """What one password-free lookup of one account established (ADR 0195 rule item 2).
 
-    Two callers read this: the session reconciler, and ``verify_mfa``'s directory check (BACKLOG
-    #2023), which fails closed on anything but :attr:`FOUND` and writes the answer only to the audit
-    row. Every sign-in caller keeps its plain ``None`` for anything but :attr:`FOUND`, so the reason
-    an account was refused never reaches a client.
+    At least three callers read this: the session reconciler, ``verify_mfa``'s directory check
+    (BACKLOG #2023), which fails closed on anything but :attr:`FOUND`, and the step-up re-bind
+    through :class:`DirectoryBind` (BACKLOG #2434). Each writes the answer only to the audit row, and
+    every sign-in caller keeps its plain ``None`` for anything but :attr:`FOUND`, so the reason an
+    account was refused never reaches a client.
     """
 
     #: The entry was found and ``userAccountControl`` proved it enabled.
@@ -121,6 +122,27 @@ class DirectoryAnswer(Enum):
     #: like a disabled account on every sign-in path (BACKLOG #1639); told apart here so the
     #: reconciler can hold a wave of them (ADR 0195) instead of revoking it.
     UNDETERMINED = "undetermined"
+
+
+@dataclass(frozen=True)
+class DirectoryBind:
+    """One password bind: what its lookup found, and the principal when the bind succeeded.
+
+    :meth:`LdapAuthenticator.authenticate` returns this (BACKLOG #2434), so the step-up re-bind can
+    tell a refused password from an absent or disabled account without a second directory read.
+    ``answer`` is ``None`` when no lookup ran, which only an empty password causes. ``FOUND`` with
+    no principal means the entry was found enabled and the directory refused the bind, so the
+    password was judged against that account. Any other answer means no bind was judged. None of
+    this may reach a client: a sign-in caller must refuse every answer alike.
+    """
+
+    answer: DirectoryAnswer | None
+    principal: AdPrincipal | None = None
+
+    def __post_init__(self) -> None:
+        # A principal only for FOUND: a bind that succeeded found its entry first.
+        if self.principal is not None and self.answer is not DirectoryAnswer.FOUND:
+            raise ValueError(f"DirectoryBind({self.answer}) with principal={self.principal!r}")
 
 
 @dataclass(frozen=True)
@@ -947,9 +969,14 @@ class LdapAuthenticator:
 
     def authenticate(
         self, username: str, password: str, *, object_id: str | None = None
-    ) -> AdPrincipal | None:
-        """Verify ``username``/``password`` against AD and return the principal, or ``None`` if the
-        credentials are rejected. Raises :class:`LdapError` on a connectivity/config failure.
+    ) -> DirectoryBind:
+        """Verify ``username``/``password`` against AD. Raises :class:`LdapError` on a
+        connectivity/config failure.
+
+        The answer carries the principal on success, and otherwise says what the lookup found
+        (:class:`DirectoryBind`, BACKLOG #2434). Before that it returned ``None`` for a wrong
+        password and for an absent or disabled account alike, so the step-up re-bind made a second
+        lookup to tell them apart and still could not tell absent from disabled.
 
         ``object_id`` picks the entry to bind as by its ``objectGUID`` rather than by the name, the
         same key rule as :meth:`resolve_principal` (BACKLOG #2027). The step-up re-bind passes the
@@ -958,14 +985,15 @@ class LdapAuthenticator:
         import ldap3
 
         if not password:  # never allow an empty password (it triggers an anonymous bind)
-            return None
+            return DirectoryBind(None)
         try:
             with self._service_conn() as svc:
-                info = (
-                    self._lookup_by_object_id(svc, object_id, fallback_username=username).info
+                found = (
+                    self._lookup_by_object_id(svc, object_id, fallback_username=username)
                     if object_id is not None
-                    else self._find_user(svc, username)
+                    else self._lookup_by_name(svc, username)
                 )
+                info = found.info
                 if info is None:
                     # ASVS 6.3.8 (BACKLOG #1140): an absent or disabled principal used to return
                     # HERE, skipping the whole second Server build, TCP connect and bind round trip
@@ -984,7 +1012,7 @@ class LdapAuthenticator:
                     # apart. That method's docstring says what this does not settle.
                     with _socket_faults_as_ldap_error():
                         self._equalizing_bind(password)
-                    return None
+                    return DirectoryBind(found.answer)
                 user_dn = str(info["dn"])
                 # The password-verifying bind — a SECOND connection (and a second Server, built by
                 # _server() with its own connect_timeout). It carries the same finite receive_timeout
@@ -1008,13 +1036,14 @@ class LdapAuthenticator:
                         bound = user_conn.bind()
                     if not bound:
                         _refuse_referral(user_conn, "user bind")
-                        return None
+                        # The entry was found enabled, so the refusal judged this account.
+                        return DirectoryBind(DirectoryAnswer.FOUND)
                 finally:
                     user_conn.unbind()
                 groups = self._resolve_groups(svc, user_dn, info["memberOf"])
         except ldap3.core.exceptions.LDAPException as exc:
             raise LdapError(str(exc)) from exc
-        return _principal_from(info, user_dn, groups)
+        return DirectoryBind(DirectoryAnswer.FOUND, _principal_from(info, user_dn, groups))
 
     def resolve_principal(
         self, username: str, *, object_id: str | None = None

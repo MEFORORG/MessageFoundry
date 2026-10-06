@@ -578,6 +578,10 @@ IDP_STEP_UP_REQUIRED = "idp_step_up_required"
 #: charged.
 DIRECTORY_UNCONFIRMED = "directory_unconfirmed"
 
+#: The ``auth.reauth`` reason for a directory step-up re-bind sent with an empty password (BACKLOG
+#: #2434). The directory is never asked and nothing is charged; the caller sees a refused password.
+EMPTY_PASSWORD = "empty_password"  # nosec B105 -- an audit reason slug, not a credential
+
 #: The outcome :meth:`AuthService._directory_step_up_refusal` gives a present, enabled directory
 #: account whose stored roles are not all among the roles its current groups map to (BACKLOG #2240).
 #: Audited beside :data:`DIRECTORY_UNCONFIRMED`, like the probe's own outcomes.
@@ -1366,6 +1370,18 @@ _REFUSED_OUTCOMES: dict[DirectoryAnswer, reconcile.ProbeOutcome] = {
     DirectoryAnswer.UNDETERMINED: reconcile.ProbeOutcome.UNDETERMINED,
 }
 
+#: The ``auth.reauth`` reason for each step-up re-bind whose lookup judged no password (BACKLOG
+#: #2434). None is counted toward the lockout. ``None`` is an empty password, which ``_reauth_ad``
+#: refuses before it asks the directory. The disabled and undetermined slugs are the reconciler's.
+_REBIND_REFUSALS: Final[Mapping[DirectoryAnswer | None, str]] = MappingProxyType(
+    {
+        None: EMPTY_PASSWORD,
+        DirectoryAnswer.NOT_FOUND: "not_in_directory",
+        DirectoryAnswer.DISABLED: reconcile.REVOKE_REASONS[reconcile.ProbeOutcome.DISABLED],
+        DirectoryAnswer.UNDETERMINED: reconcile.REVOKE_REASONS[reconcile.ProbeOutcome.UNDETERMINED],
+    }
+)
+
 
 #: The pair a session insert requires of a row that must hold NO federated binding (vault BACKLOG
 #: #2609). Passed as ``require_federated_subject`` by the Windows SSO mint.
@@ -1462,13 +1478,13 @@ class _DirectoryRebind:
 
     ``verdict`` keeps the three answers that method documents. ``reason`` is a closed-set slug set
     whenever ``verdict`` is ``None``, naming why the directory could not judge the password
-    (BACKLOG #2027): ``not_configured``, ``directory_unavailable`` or ``not_in_directory``, and,
-    from a directory implementation that does not check the id itself,
-    ``directory_object_id_missing`` or ``directory_identity_conflict`` (``None`` whether or not
-    the bind succeeded). ``not_in_directory`` means what the IdP step-up's same slug means: no
-    ENABLED entry for the row's id, so absent, disabled, an unreadable account state, or an entry
-    that does not read the id back. The TOTP leg's audit ``outcome`` tells those apart; this leg's
-    second lookup does not."""
+    (BACKLOG #2027): ``empty_password``, ``not_configured``, ``directory_unavailable``,
+    ``not_in_directory``, ``directory_disabled`` or ``directory_undetermined``, and, from a
+    directory implementation that does not check the id itself, ``directory_object_id_missing`` or
+    ``directory_identity_conflict`` (``None`` whether or not the bind succeeded).
+    ``not_in_directory`` means no entry for the row's id, or an entry that does not read the id
+    back. Since BACKLOG #2434 a disabled entry and an unreadable account state have their own
+    slugs, read from the bind's own lookup."""
 
     verdict: bool | None
     reason: str | None = None
@@ -5295,13 +5311,10 @@ class AuthService:
         write ``users.username``. The fix is to stop asking a question whose answer has stopped
         meaning what the caller reads it as.
 
-        A row whose ``directory_object_id`` is NULL still probes by name. That is a **directory's**
-        property rather than a choice here: one that returns no readable ``objectGUID`` leaves every
-        row unbound, and the engine cannot key on an identifier it is never given. Such a site keeps
-        the old behaviour, rename wart included; ``auth/ldap.py`` warns once per distinct shape so an
-        operator can find out. **Except a row that carries a federated binding** (ADR 0184 AC-5,
-        BACKLOG #2027): :meth:`reconcile_directory_sessions` never hands one here, and
-        :meth:`_report_unkeyed_bindings` says why and what it costs.
+        No caller hands this a row whose ``directory_object_id`` is NULL (BACKLOG #2434). Such a row
+        would probe by name, and a name probe can read another account's entry. The step-up legs
+        refuse it first, and :meth:`reconcile_directory_sessions` reads it as UNDETERMINED unasked,
+        or skips it when it carries a federated binding (:meth:`_report_unkeyed_bindings`).
 
         ``probe_principal`` is the password-free service-account lookup the Kerberos path uses, with
         the reason kept. It returns the group set, so the role re-diff below costs no extra round
@@ -5407,6 +5420,8 @@ class AuthService:
           its channel scope, is revoked on one pass, and the scope itself is left for the next login
           to write (ADR 0198);
         * a wave of undetermined answers is held, not revoked, and alerts (ADR 0195);
+        * a row with no directory id is never asked about by name: it reads as undetermined without
+          a lookup, so it strikes and writes no roles (BACKLOG #2434);
         * a pass that would revoke too many at once aborts wholesale and alerts.
 
         The pass is **planned in full before anything is written**, so an abort leaves the store
@@ -5475,7 +5490,18 @@ class AuthService:
         # No early stop on a referral (BACKLOG #2538): a referral leaves only its own account
         # unjudged, so every other account in the sample is still probed and judged.
         for user_id, _username in selected:
-            probes.append(await self._probe_principal(users[user_id]))
+            user = users[user_id]
+            if user.directory_object_id:
+                probes.append(await self._probe_principal(user))
+            else:
+                # BACKLOG #2434, ADR 0184 amendment 2026-10-06. An id-less row is never asked about
+                # by name. A name probe could read another account's entry and write that
+                # account's roles onto this row, and no sign-in or step-up admits such a row any
+                # more, so a session it holds is anomalous. UNDETERMINED, unasked, writes no roles
+                # and strikes like any other undetermined answer, including under the ADR 0195 hold.
+                probes.append(
+                    reconcile.Probe(user.id, user.username, reconcile.ProbeOutcome.UNDETERMINED)
+                )
             self._reconcile_last_probed[user_id] = now
 
         # Resolve the role sets for the role re-diff, and the scope inputs for the scope re-diff (ADR
@@ -7370,8 +7396,12 @@ class AuthService:
                 verify_password, user.password_hash, password
             )
         if verdict is None:
-            # Only the directory leg answers None: it could not judge the password at all.
-            return _Reproof(ok=False, user=user, reason=reason, directory_unconfirmed=True)
+            # Only the directory leg answers None: it could not judge the password at all. An empty
+            # password is the caller's malformed submission, not a directory that could not confirm
+            # the account, so it reads as a refused password (BACKLOG #2434). Neither is charged.
+            return _Reproof(
+                ok=False, user=user, reason=reason, directory_unconfirmed=reason != EMPTY_PASSWORD
+            )
         charged = self._charge_reproof_failure(token_hash, user.id) if not verdict else 0
         # A fresh read and a fresh clock: the verify may have taken seconds, and another leg may have
         # set a lock meanwhile.
@@ -7766,13 +7796,23 @@ class AuthService:
 
         Three verdicts, because only one of the two refusals is a guess (BACKLOG #1138): ``True`` =
         bound; ``False`` = the directory REJECTED the password, which :meth:`_reproof` counts toward
-        the engine lockout; ``None`` = it could not be asked (no directory, an :class:`LdapError`)
-        or it has no such principal. Both refusals fail closed; only ``False`` is counted.
+        the engine lockout; ``None`` = it could not be asked (no directory, an :class:`LdapError`),
+        it has no enabled entry for the row, or the password was empty. Every refusal fails closed;
+        only ``False`` is counted.
 
-        The principal check matters because ``authenticate`` answers ``None`` for a missing, renamed
-        or disabled principal as well as for a wrong password. Counting that would lock the engine
-        row of a user whose every re-bind fails whatever they type, and the lock is then enforced at
-        their Kerberos and OIDC sign-in. The extra lookup runs only after a refusal. A correct
+        **AN EMPTY PASSWORD IS REFUSED FIRST, AND IS NOT A GUESS (BACKLOG #2434).** The directory
+        never judges one, since an empty simple bind is an anonymous bind. Counting it would charge
+        the account for a malformed submission. It is refused before any directory call as
+        ``empty_password``, which :meth:`_reproof_serialized` refuses like a wrong password but
+        does not charge.
+
+        **``authenticate`` says what its lookup found (BACKLOG #2434).** Its :class:`DirectoryBind`
+        tells a refused bind on an enabled entry (``False``, counted) from an absent entry
+        (``not_in_directory``), a disabled one (``directory_disabled``) and an unreadable account
+        state (``directory_undetermined``), none of them counted. Counting those would lock the
+        engine row of a user whose every re-bind fails whatever they type, and the lock is then
+        enforced at their Kerberos and OIDC sign-in. Before #2434 a second lookup after every
+        refusal told absent from present, and could not tell absent from disabled. A correct
         password the DC refuses as expired still counts, which nothing here can tell apart.
 
         **THE BIND IS KEYED BY THE ROW'S OWN OBJECT, NOT BY ITS NAME (BACKLOG #2027).** ``username``
@@ -7790,37 +7830,29 @@ class AuthService:
         Each answer is still checked against ``object_id``, for any other directory implementation:
         an answer carrying no readable id is ``None`` with reason ``directory_object_id_missing``,
         and one about another object is ``None`` with ``directory_identity_conflict``. Neither is
-        counted. A refused bind is counted once the id-keyed lookup finds the entry, because that
-        bind was judged against this account. ``object_id`` is required, so no caller can re-bind a
-        row that has none; :meth:`_reproof_serialized` refuses that row first."""
+        counted. A refused bind on an entry the id-keyed lookup found is counted, because that bind
+        was judged against this account. ``object_id`` is required, so no caller can re-bind a row
+        that has none; :meth:`_reproof_serialized` refuses that row first."""
+        if not password:
+            return _DirectoryRebind(None, EMPTY_PASSWORD)
         if self._ldap is None:
             return _DirectoryRebind(None, "not_configured")
         try:
-            principal = await asyncio.to_thread(
+            bind = await asyncio.to_thread(
                 self._ldap.authenticate, username, password, object_id=object_id
             )
         except LdapError:
             return _DirectoryRebind(None, "directory_unavailable")
-        if principal is not None:
-            mismatch = _directory_answer_mismatch(principal, object_id)
+        if bind.principal is not None:
+            mismatch = _directory_answer_mismatch(bind.principal, object_id)
             return _DirectoryRebind(None, mismatch) if mismatch else _DirectoryRebind(True)
-        try:
-            known = await asyncio.to_thread(
-                self._ldap.resolve_principal, username, object_id=object_id
-            )
-        except LdapError:
-            # ``authenticate`` also answers None where no real bind was judged (an empty password, an
-            # unfound principal's equalizing bind, a DC too busy to answer the bind), so a lookup
-            # that then fails cannot show the password was checked. Not counted, like an outage.
-            return _DirectoryRebind(None, "directory_unavailable")
-        # Found by the row's own id, so the bind that failed was judged against this account: it
-        # counts, whatever id the entry reads back. Not counting an unreadable one would let a
-        # held session send the DC unlimited guesses past the per-session cap. (LdapAuthenticator
-        # never binds such an entry, and answers None for it here, so it reaches this only through
-        # another directory implementation.)
-        return (
-            _DirectoryRebind(None, "not_in_directory") if known is None else _DirectoryRebind(False)
-        )
+        if bind.answer is DirectoryAnswer.FOUND:
+            # Found by the row's own id, so the bind that failed was judged against this account:
+            # it counts. That includes a DC too busy to answer the bind, which nothing here can
+            # tell from a wrong password.
+            return _DirectoryRebind(False)
+        # No bind was judged, so nothing is counted.
+        return _DirectoryRebind(None, _REBIND_REFUSALS[bind.answer])
 
     async def has_recent_step_up(self, token: str | None) -> bool:
         """Whether the caller's session re-verified its credential within
