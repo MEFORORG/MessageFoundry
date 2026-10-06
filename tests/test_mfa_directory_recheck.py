@@ -18,7 +18,7 @@ import asyncio
 import json
 import time
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -350,6 +350,96 @@ async def test_a_directory_accounts_sign_in_lock_alone_does_not_refuse_the_secon
 
     assert verified.ok is True and verified.locked is False
     assert e.directory.probes == [("jdoe", _PRINCIPAL.directory_object_id)]
+
+
+# BACKLOG #2240: a present account's stored roles must all be among the roles its current groups
+# map to. Synthetic groups; the map gives each one role.
+_OPERATORS = "CN=MF-Operators,OU=Groups,DC=test,DC=invalid"
+_VIEWERS = "CN=MF-Viewers,OU=Groups,DC=test,DC=invalid"
+
+
+async def _mapped_session(store: Store, monkeypatch: pytest.MonkeyPatch, *groups: str) -> _Enrolled:
+    """A directory session whose roles the sign-in wrote from ``groups``, under the synthetic map."""
+    await AuthService(store, _settings()).initialize()  # the map's role ids need the seeded roles
+    await store.set_ad_group_role_map([(_OPERATORS, "operator"), (_VIEWERS, "viewer")])
+    return await _enrolled_directory_session(
+        store, monkeypatch, replace(_PRINCIPAL, groups=frozenset(groups))
+    )
+
+
+@pytest.mark.parametrize("now_in", [(_VIEWERS,), ()], ids=["one-role-lost", "every-role-lost"])
+async def test_a_directory_account_demoted_since_sign_in_is_refused_the_renewal(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, now_in: tuple[str, ...]
+) -> None:
+    """RED when: ``verify_mfa`` renews the window of an account the directory has since demoted, so
+    it steps up with roles it no longer holds until the reconciler's role pass. The refusal must
+    spend no code, charge nothing, and leave the stored roles for the reconciler to re-sync."""
+    e = await _mapped_session(store, monkeypatch, _OPERATORS, _VIEWERS)
+    assert set(await store.get_user_role_ids(e.user_id)) == {"operator", "viewer"}
+    e.directory.principal = replace(_PRINCIPAL, groups=frozenset(now_in))
+    code = totp.totp(e.secret, now=_T1)
+
+    refused = await e.service.verify_mfa(e.token, code)
+
+    assert refused.ok is False and refused.directory_unconfirmed is True
+    assert refused.session_lost is False
+    session = await store.get_session(hash_token(e.token))
+    assert session is not None and session.revoked_at is None
+    assert session.reauth_at is None and session.mfa_verified_at is None
+    user = await store.get_user(e.user_id)
+    assert user is not None and user.failed_attempts == 0
+    assert user.second_step_failed_attempts == 0
+    assert {
+        "reason": DIRECTORY_UNCONFIRMED,
+        "outcome": "directory_roles_demoted",
+    } in await _audited_mfa_failures(store)
+    assert set(await store.get_user_role_ids(e.user_id)) == {"operator", "viewer"}  # wrote nothing
+
+    # The code was never checked: once the directory gives the groups back, the same code verifies.
+    e.directory.principal = replace(_PRINCIPAL, groups=frozenset({_OPERATORS, _VIEWERS}))
+    assert (await e.service.verify_mfa(e.token, code)).ok is True
+
+
+@pytest.mark.parametrize(
+    "now_in", [(_VIEWERS,), (_OPERATORS, _VIEWERS)], ids=["unchanged", "promoted"]
+)
+async def test_a_directory_account_not_demoted_still_renews(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, now_in: tuple[str, ...]
+) -> None:
+    """The control: an unchanged account renews, and so does a promoted one, whose token holds fewer
+    roles than the directory grants rather than more."""
+    e = await _mapped_session(store, monkeypatch, _VIEWERS)
+    e.directory.principal = replace(_PRINCIPAL, groups=frozenset(now_in))
+
+    verified = await e.service.verify_mfa(e.token, totp.totp(e.secret, now=_T1))
+
+    assert verified.ok is True and verified.token is not None
+    assert await e.service.has_recent_step_up(verified.token) is True
+
+
+async def test_a_local_account_is_never_role_checked(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A local account reads no group map: its roles are never compared with a directory's."""
+    directory = _Directory(_PRINCIPAL)
+    service = AuthService(store, _settings(), ldap=directory)  # type: ignore[arg-type]
+    identity, token, _ = await login_admin(service)
+    await store.set_ad_group_role_map([(_OPERATORS, "operator")])
+    enroll = await service.begin_mfa_enrollment(identity)
+    confirmed = await service.confirm_mfa_enrollment(
+        identity, fresh_totp(enroll.secret), token=token
+    )
+    assert confirmed.ok and confirmed.recovery_codes
+
+    async def _never(groups: object) -> set[str]:
+        raise AssertionError("a local account was compared with the directory group map")
+
+    monkeypatch.setattr(store, "roles_for_ad_groups", _never)
+
+    verified = await service.verify_mfa(confirmed.token, confirmed.recovery_codes[0])
+
+    assert verified.ok is True
+    assert directory.probes == []
 
 
 async def test_a_lock_set_during_the_lookup_is_honoured(

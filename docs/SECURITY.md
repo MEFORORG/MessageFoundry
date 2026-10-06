@@ -1636,8 +1636,10 @@ the same permission set on the same method reds CI until it is listed here.
 > lands also gets a 409 rather than being silently overwritten. The compare is on the source only:
 > a write that sent `expected_source: "ad"` replaces a directory scope a sign-in rewrote meanwhile,
 > which is the takeover it asked for. A client that omits the field on a
-> scope the directory does not own is unaffected. The 409 detail names the conflict, never the
-> scope. The web console sends `expected_source` when the administrator ticks "Make this scope
+> scope the directory does not own is unaffected. **An AD account's stored scope with a null
+> source counts as `ad` here (BACKLOG #2252):** it predates the source column, the sync withdraws
+> it like a directory scope, and the GET still reports it as null. The 409 detail names the
+> conflict, never the scope. The web console sends `expected_source` when the administrator ticks "Make this scope
 > manual", and shows a race as a refused save with the edits kept.
 >
 > **The monitoring plane is narrowed too, and this used to say the opposite.** For a channel-scoped
@@ -1975,8 +1977,22 @@ the lockout. It is audited as `auth.webauthn_failed` with
 `POST /ui/reauth/webauthn` answers **400** with the same words the other legs use. A session or
 account gone after the lookup answers **401**.
 
-**The password re-bind says the same when the directory could not judge the password (BACKLOG
-#2027).** That covers at least a row with no directory object id, no enabled entry for the row's
+**Both legs also refuse a present account that lost a role in the directory (BACKLOG #2240).** The
+lookup returns the account's groups, and the engine maps them to roles as the reconciliation pass
+does. If any role stored on the account is not among those, the leg refuses. Without this, an
+operator demoted in the directory since sign-in would renew its window or clear the MFA gate with
+the old roles until the reconciliation pass revoked it. An added role is not refused, because the
+account then holds fewer roles than the directory grants. The check compares the roles themselves,
+not the permissions they grant. So a move from one role to another refuses, even when the new role
+grants more. A lookup whose groups map to no role refuses every directory account that holds a
+role. The refusal writes no roles; the next reconciliation pass, when it runs, or the next sign-in
+re-syncs them. Otherwise it behaves as the refusals above, audited with the outcome
+`directory_roles_demoted`. Channel scope is not compared on these legs. At least the password
+re-bind (`POST /me/reauth` and the `/ui/reauth` password leg), the IdP step-up leg and the
+enrolment legs do not compare roles yet.
+
+**The password re-bind gives the code and passkey legs' answer when the directory could not judge
+the password (BACKLOG #2027).** That covers at least a row with no directory object id, no enabled entry for the row's
 id (an entry that is not provably the row's own counts as none), an unreachable directory, and no
 directory configured. None of these checks the password or counts toward the lockout.
 `POST /me/reauth` answers **403** saying the directory could not confirm the account, rather than
@@ -2739,7 +2755,7 @@ listen source. The refusal action differs materially per listener, so each has i
 | **HTTP** — peer-control start gate, not enforcing | as the row above | the same listener shape, with `[security].enforcement` at any level other than `enforce` | **LOG** — the listener starts and a WARNING names the missing control |
 | **DICOM** — calling AE | the requesting AE's Calling AE Title, at **association negotiation** | `calling_ae_allowlist` set and the title is not in it | **DENY** — the association is rejected by pynetdicom before any C-STORE callback runs (`ae.require_calling_aet`). `None` = any AE the peer-IP allow-list admits |
 | **DICOM** — called AE | the AE Title the peer addressed the association to | not this engine's own `ae_title` | **DENY** at negotiation (`ae.require_called_aet`); **default `require_called_ae_title = true`** |
-| **DICOM** — peer-control construction gate | the SCP's bind host × the presence of a **verifiable** peer control | non-loopback bind with **neither** `source_ip_allowlist` (an `inbound(...)` keyword — for a DICOM SCP the ONLY surface, since `DICOM()` is not authorable in `connections.toml`) **nor** mTLS (`tls` + `tls_ca_file` → `CERT_REQUIRED`). **NOTE:** `calling_ae_allowlist` does **not** satisfy this gate alone (BACKLOG #316): an AE Title is caller-asserted with no cryptographic binding, so it is still enforced as a filter but must be **paired** with one of the two above | **DENY at construction** (ValueError). The connection degrades per ADR 0031 startup fault isolation and the fault surfaces under `messagefoundry check` / dry-run. Loopback hosts are exempt |
+| **DICOM** — peer-control construction gate | the SCP's bind host × the presence of a **verifiable** peer control | non-loopback bind with **neither** `source_ip_allowlist` (an `inbound(...)` keyword — for a DICOM SCP the ONLY surface, since `DICOM()` is not authorable in `connections.toml`) **nor** mTLS (`tls` + `tls_ca_file` → `CERT_REQUIRED`). **NOTE:** `calling_ae_allowlist` does **not** satisfy this gate alone (BACKLOG #316): an AE Title is caller-asserted with no cryptographic binding, so it is still enforced as a filter but must be **paired** with one of the two above. `source_ip_allowlist` counts only when every entry meets the HTTP row's floors above, so `0.0.0.0/0` does not count (vault BACKLOG #2622). mTLS still counts by presence, with no client-subject binding | **DENY at construction** (ValueError). The connection degrades per ADR 0031 startup fault isolation and the fault surfaces under `messagefoundry check` / dry-run. Loopback hosts are exempt |
 
 > **Telemetry honesty.** The `peer_not_allowlisted` connection event is durable when the connection's
 > `capture_connection_errors` is `true`, **or is unset (`None`, the default) and the

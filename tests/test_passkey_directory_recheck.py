@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pytest
 
@@ -34,6 +34,7 @@ from messagefoundry.auth.ldap import (  # noqa: E402
 )
 from messagefoundry.auth.service import (  # noqa: E402
     DIRECTORY_OBJECT_ID_MISSING,
+    DIRECTORY_ROLES_DEMOTED,
     DIRECTORY_UNCONFIRMED,
     AuthService,
     Elevation,
@@ -126,21 +127,23 @@ async def _staged_assertion(service: AuthService, token: str, key: SoftAuthentic
     return key.get_response(base64url_to_bytes(json.loads(challenge)["challenge"]))
 
 
-async def _directory_session_owing_a_passkey(store: MessageStore) -> _Pending:
+async def _directory_session_owing_a_passkey(
+    store: MessageStore, principal: AdPrincipal = _PRINCIPAL
+) -> _Pending:
     """A directory account holding a passkey, a new session owing it, and a staged assertion.
 
     Mints through ``_complete_ad_login``, the shared tail Kerberos and OIDC both reach, because the
     subject is the second-factor leg and not the sign-in mechanism. The authenticator's counter
     starts above zero, so a counter that moved is visible.
     """
-    directory = _Directory(_PRINCIPAL)
+    directory = _Directory(principal)
     service = AuthService(store, _settings(), ldap=directory)  # type: ignore[arg-type]
     await service.initialize()
-    first = await service._complete_ad_login(_PRINCIPAL, None, mfa_verified=False)
+    first = await service._complete_ad_login(principal, None, mfa_verified=False)
     assert first.token is not None and first.identity is not None
     key = SoftAuthenticator(rp_id=_RP, origin=_ORIGIN, sign_count=5)
     await _register_passkey(service, first.identity, first.token, key)
-    second = await service._complete_ad_login(_PRINCIPAL, None, mfa_verified=False)
+    second = await service._complete_ad_login(principal, None, mfa_verified=False)
     assert second.token is not None and second.identity is not None
     assert await service.mfa_satisfied(second.token) is False
     response = await _staged_assertion(service, second.token, key)
@@ -265,6 +268,56 @@ async def test_a_present_enabled_directory_account_still_clears_the_gate(
 
     assert verified.ok is True
     assert p.directory.probes == [("kpark", _PRINCIPAL.directory_object_id)]
+    assert await p.service.mfa_satisfied(verified.token) is True
+
+
+# BACKLOG #2240: a present account's stored roles must all be among the roles its current groups
+# map to. Synthetic groups; the map gives each one role.
+_OPERATORS = "CN=MF-Operators,OU=Groups,DC=test,DC=invalid"
+_VIEWERS = "CN=MF-Viewers,OU=Groups,DC=test,DC=invalid"
+
+
+async def _mapped_session(store: MessageStore, *groups: str) -> _Pending:
+    """A directory session owing a passkey, whose roles the sign-in wrote from ``groups``."""
+    await AuthService(store, _settings()).initialize()  # the map's role ids need the seeded roles
+    await store.set_ad_group_role_map([(_OPERATORS, "operator"), (_VIEWERS, "viewer")])
+    return await _directory_session_owing_a_passkey(
+        store, replace(_PRINCIPAL, groups=frozenset(groups))
+    )
+
+
+@pytest.mark.parametrize("now_in", [(_VIEWERS,), ()], ids=["one-role-lost", "every-role-lost"])
+async def test_a_directory_account_demoted_since_sign_in_is_refused_the_passkey(
+    store: MessageStore, now_in: tuple[str, ...]
+) -> None:
+    """RED when: the passkey leg clears the MFA gate for an account the directory has since demoted,
+    or the refusal takes the challenge, moves the counter, charges the lockout or writes roles."""
+    p = await _mapped_session(store, _OPERATORS, _VIEWERS)
+    before = await _sign_count(store, p.user_id)
+    p.directory.principal = replace(_PRINCIPAL, groups=frozenset(now_in))
+
+    await _assert_refused_and_uncharged(p, DIRECTORY_ROLES_DEMOTED, before)
+    assert set(await store.get_user_role_ids(p.user_id)) == {"operator", "viewer"}
+
+    # The challenge is still in flight, so the SAME assertion verifies once the groups are back.
+    p.directory.principal = replace(_PRINCIPAL, groups=frozenset({_OPERATORS, _VIEWERS}))
+    served = await _finish(p)
+    assert served.ok is True and served.token is not None
+
+
+@pytest.mark.parametrize(
+    "now_in", [(_VIEWERS,), (_OPERATORS, _VIEWERS)], ids=["unchanged", "promoted"]
+)
+async def test_a_directory_account_not_demoted_still_clears_the_gate(
+    store: MessageStore, now_in: tuple[str, ...]
+) -> None:
+    """The control: an unchanged or a promoted account clears the gate with its passkey."""
+    p = await _mapped_session(store, _VIEWERS)
+    p.directory.principal = replace(_PRINCIPAL, groups=frozenset(now_in))
+
+    verified = await _finish(p)
+
+    assert verified.ok is True
     assert await p.service.mfa_satisfied(verified.token) is True
 
 
