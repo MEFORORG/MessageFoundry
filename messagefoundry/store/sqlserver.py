@@ -9102,10 +9102,8 @@ class SqlServerStore:
                 if retry.max_attempts is not None and attempts >= retry.max_attempts:
                     status, next_at, event = OutboxStatus.DEAD.value, now, "dead"
                 else:
-                    backoff = min(
-                        retry.max_backoff_seconds,
-                        retry.backoff_seconds * (retry.backoff_multiplier ** max(attempts - 1, 0)),
-                    )
+                    # vault BACKLOG #2761: never overflows, so attempt 1025+ keeps the cap's pace.
+                    backoff = retry.backoff_for(attempts)
                     status, next_at, event = OutboxStatus.PENDING.value, now + backoff, "failed"
                 # ADR 0157 C1: the epoch fence guards the DEAD branch ONLY. The retry branch returns
                 # the row to PENDING; fencing THAT would leave it INFLIGHT, turning a permitted
@@ -9203,11 +9201,8 @@ class SqlServerStore:
                 if retry.max_attempts is not None and head_attempts >= retry.max_attempts:
                     status, next_at, event = OutboxStatus.DEAD.value, now, "dead"
                 else:
-                    backoff = min(
-                        retry.max_backoff_seconds,
-                        retry.backoff_seconds
-                        * (retry.backoff_multiplier ** max(head_attempts - 1, 0)),
-                    )
+                    # vault BACKLOG #2761: never overflows, so attempt 1025+ keeps the cap's pace.
+                    backoff = retry.backoff_for(head_attempts)
                     status, next_at, event = OutboxStatus.PENDING.value, now + backoff, "failed"
                 # ADR 0157 C1: the same DEAD-branch-only split as mark_failed, decided ONCE from
                 # head_attempts and rendered ONCE for the loop: a fence on any member raises out and
