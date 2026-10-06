@@ -416,6 +416,8 @@ def test_a_real_bool_or_none_written_after_the_factory_passes_the_raw_check(
     for value in (True, False, None):
         for key in FLAGS:
             settings[key] = value
+        # The attestation pair is checked too, so a set flag carries its reason.
+        settings["tls_hop_attested_reason"] = REASON if value else None
         refuse_unresolved_hop_flags(settings, "database lookup 'clar'")
 
 
@@ -461,6 +463,26 @@ def test_a_directly_built_fhir_lookup_spec_checks_the_reason_like_the_factory(
 ) -> None:
     with pytest.raises(WiringError, match=rf"fhir lookup 'LK': .*{refusal}"):
         FhirLookupSpec("LK", {"tls_hop_attested": True, "tls_hop_attested_reason": reason})
+
+
+@pytest.mark.parametrize("carrier", ["database lookup 'clar'", "reference set 'codes'"])
+def test_build_check_holds_a_db_carrier_reason_to_the_factory_rule(
+    tmp_path: Path, carrier: str
+) -> None:
+    # The DB carriers' own reader str()s the reason, so a control character written after the
+    # factory would reach `check` output and the posture report. The load check refuses it, as it
+    # does on a FhirLookup.
+    reg = _carriers(tmp_path)
+    settings = _carrier_settings(reg, carrier)
+    settings["tls_hop_attested"] = True
+    settings["tls_hop_attested_reason"] = "ok\nWARNING forged"
+    with pytest.raises(WiringError, match=rf"{carrier}: .*must not contain control characters"):
+        build_check_registry(
+            reg,
+            inbound_bind_host="127.0.0.1",
+            env_values={},
+            egress=EgressSettings(deny_by_default=False),
+        )
 
 
 def test_the_lookup_settings_builder_refuses_a_flag_with_no_reason() -> None:

@@ -614,8 +614,7 @@ def _hop_attestation_entries(where: str, attested: bool, reason: str | None) -> 
 def settings_hop_attestation(settings: Mapping[str, Any], where: str) -> bool:
     """Validate the attestation pair a settings carrier holds, by the factory's own rule.
 
-    For ``FhirLookupSpec`` and the lookup settings builder, whose ``settings`` stay mutable after
-    the factory ran. The pair is checked together, with the same string-type and control-character
+    For ``FhirLookupSpec`` and :func:`refuse_unresolved_hop_flags`, since a carrier's ``settings`` stay mutable after the factory ran. The pair is checked together, with the same string-type and control-character
     rules as :func:`_hop_attestation_entries`, because it IS that function. Absent or ``None`` reads
     as not attested."""
     attested = settings.get("tls_hop_attested")
@@ -630,20 +629,30 @@ def settings_hop_attestation(settings: Mapping[str, Any], where: str) -> bool:
 HOP_POLICY_FLAGS = ("tls_hop_attested", "cleartext_accepted", "tls_revocation_attested")
 
 
-def refuse_unresolved_hop_flags(settings: Mapping[str, Any], where: str) -> None:
-    """Refuse a hop-policy flag in a settings carrier that is not ``None`` or a real ``bool``.
+def refuse_unresolved_hop_flags(settings: Mapping[str, Any], where: str) -> bool:
+    """Refuse a hop-policy flag in a settings carrier that is not ``None`` or a real ``bool``, and an
+    attestation pair the factory would refuse. Returns whether the carrier attests its hop; resolving
+    ``env()`` cannot change that, since the flag it read is already a literal.
 
     Runs on the RAW settings, before ``env()`` resolves (vault BACKLOG #2232). The factories already
     refuse an ``env()`` flag. A reference written into the dict after them would resolve through its
     own cast, and ``env(..., cast=bool)`` turns the string ``"false"`` into ``True``. So the flag is
-    refused while it is still an :class:`EnvRef`, at every place a carrier is read at load."""
+    refused while it is still an :class:`EnvRef`. The attestation pair then goes through
+    :func:`settings_hop_attestation`, so a ``DatabaseLookup`` or ``DatabaseRef`` reason is held to
+    the same type and control-character rules as a ``FhirLookup`` one.
+
+    It runs at least where check, start, reload and each reference sync read a carrier: the
+    ``FhirLookup`` settings builder, the ``db_lookup`` executor build, ``build_check_registry`` and
+    the reference sync. ``load_config`` alone does not run it."""
     for key in HOP_POLICY_FLAGS:
         try:
             flag_from_settings(settings, key)
         except ValueError as exc:
             raise WiringError(
-                f"{where}: {exc} (an env() reference is not accepted on a hop-policy flag)"
+                f"{where}: {exc} (write a literal True or False; an env() reference is not "
+                "accepted on a hop-policy flag)"
             ) from exc
+    return settings_hop_attestation(settings, where)
 
 
 def _refuse_attested_and_accepted(where: str, attested: bool, accepted: bool) -> None:

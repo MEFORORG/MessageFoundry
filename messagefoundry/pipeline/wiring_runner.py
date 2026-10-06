@@ -97,7 +97,6 @@ from messagefoundry.config.wiring import (
     resolve_env_settings,
     resolve_listener_binding,
     resolved_encoding_problems,
-    settings_hop_attestation,
 )
 from messagefoundry.connection_names import fhir_lookup_record_name, inbound_record_name
 from messagefoundry.fhirsearch import FhirSearchParams
@@ -8804,8 +8803,9 @@ def _fhir_lookup_settings(
     the live executor and the check build, so the two cannot differ. The egress allowlist check runs
     in :class:`~messagefoundry.transports.fhir.FhirLookupExecutor` itself."""
     where = f"fhir lookup {spec.name!r}"
-    # Before env() resolves, so a post-factory env() flag cannot resolve "false" to True (#2232).
-    refuse_unresolved_hop_flags(spec.settings, where)
+    # Before env() resolves, so a post-factory env() flag cannot resolve "false" to True (#2232). It
+    # checks the attestation pair as FhirLookupSpec does, so a raw flag with no reason is refused too.
+    attested = refuse_unresolved_hop_flags(spec.settings, where)
     settings = resolve_env_settings(
         spec.settings, env_values, connection=fhir_lookup_record_name(spec.name)
     )
@@ -8821,9 +8821,7 @@ def _fhir_lookup_settings(
     # A lookup's hop attestation still lives in its settings, so a raw one written after the factory
     # ran could pair with the typed acceptance. The attestation wins in the disposition, so the hop
     # would cross with no WARN or audit record while the report listed it as accepted. Refuse it here,
-    # as the factory does, since this is the one builder both executor paths use. The pair is checked
-    # together, as FhirLookupSpec does, so a raw flag with no reason is refused here too.
-    attested = settings_hop_attestation(settings, where)
+    # as the factory does, since this is the one builder both executor paths use.
     _refuse_attested_and_accepted(where, attested, spec.cleartext_accepted)
     return settings
 
