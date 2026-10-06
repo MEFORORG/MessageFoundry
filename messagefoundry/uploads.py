@@ -92,7 +92,8 @@ _ORPHAN_MIN_AGE_SECONDS = 3600.0
 # finish (BACKLOG #2263). It is per call, so a save cancelled during a slow reserve can wait up to
 # two bounds. A healthy statement takes well under a second. The bound exists so a stuck store
 # cannot hold ``_quota_lock``, and the request's cancellation, indefinitely. Past it the call is
-# logged and left running (UploadStore._leave_running).
+# logged and left running (UploadStore._leave_running). The save-time prune reuses the same bound for
+# its audit rows after a cancelled upload (UploadStore._run_to_completion, BACKLOG #2261).
 _LEDGER_CANCEL_WAIT_SECONDS = 5.0
 
 # Every filename a write in THIS process is currently holding: an atomic write's temp from the moment
@@ -503,8 +504,9 @@ class UploadStore:
         # cross-process half: one atomic row on the ONE unified store every shard already shares.
         self._quota_lock = asyncio.Lock()
         self._ledger = store
-        # Ledger calls a cancelled save stopped waiting for (BACKLOG #2263), held until they finish:
-        # the loop holds a Task only weakly. See _leave_running.
+        # Ledger calls a cancelled save stopped waiting for (BACKLOG #2263), and save-time sweeps a
+        # cancelled upload stopped waiting for (#2261), held until they finish: the loop holds a
+        # Task only weakly. See _hold.
         self._stragglers: set[asyncio.Future[Any]] = set()
 
     @property
@@ -1396,9 +1398,8 @@ class UploadStore:
             try:
                 orphans = self._sweep_orphans_sync(now=at)
             except Exception:
-                _log.warning(
-                    "uploaded-logs orphan sweep failed; will retry next pass", exc_info=True
-                )
+                # ERROR, as the runner logged this before the catch moved here.
+                _log.exception("uploaded-logs orphan sweep failed; will retry next pass")
                 orphans = 0
             return PruneResult(pruned=pruned, orphans_removed=orphans)
 
@@ -1421,8 +1422,11 @@ class UploadStore:
                 try:
                     await audit(meta)
                 except Exception:
-                    _log.warning(
-                        "uploaded-logs prune audit failed for %s", meta.file_id, exc_info=True
+                    # ERROR: the file is gone and this was its only record, the level every other
+                    # upload.prune audit gap logs at.
+                    _log.exception(
+                        "uploaded-logs prune audit failed for %s; it has no upload.prune audit row",
+                        meta.file_id,
                     )
         return result
 
@@ -1436,29 +1440,35 @@ class UploadStore:
         what the sweep's thread had deleted, so no ``upload.prune`` row was written for those files.
         The thread kept deleting with nobody left to audit it. This is the retention runner's
         treatment (#2065): a cancel sets the sweep's ``abort``, so it stops at its next file, and
-        the rows for what it removed are still written. See :meth:`run_to_completion` for the wait."""
+        the rows for what it removed are still written. See :meth:`_run_to_completion` for the wait."""
         abort = threading.Event()
-        return await self.run_to_completion(
+        return await self._run_to_completion(
             self.prune_and_audit(audit, abort=abort), on_cancel=abort.set
         )
 
-    async def run_to_completion[T](
+    async def _run_to_completion[T](
         self, coro: Coroutine[Any, Any, T], *, on_cancel: Callable[[], None] | None = None
     ) -> T:
         """Run ``coro`` as its own task, so a cancellation of the caller does not cut it short.
 
-        For the API's save-time sweep, whose deletions must each get an audit row (BACKLOG #2261). The task is outside the caller's cancel scope, so the
-        request deadline does not reach its awaits. A cancelled caller calls ``on_cancel`` first,
-        then waits up to ``_LEDGER_CANCEL_WAIT_SECONDS`` for the task, then the cancellation
-        propagates. A task still running at that bound is held until it finishes. A failure of the
-        task after the cancellation is logged rather than raised, because the cancellation is what
-        propagates. Without one, the task's result or exception is the caller's."""
+        The task is outside the caller's cancel scope, so the request deadline does not reach its
+        awaits. A cancelled caller calls ``on_cancel`` first, then waits up to
+        ``_LEDGER_CANCEL_WAIT_SECONDS`` for the task, then the cancellation propagates. A task
+        still running at that bound is logged and held until it finishes. A failure of the task
+        after the cancellation is logged at ERROR rather than raised, because the cancellation is
+        what propagates. Without one, the task's result or exception is the caller's."""
         task = asyncio.create_task(coro)
         try:
             return await _wait_to_completion(
                 task, cancel_bound=_LEDGER_CANCEL_WAIT_SECONDS, on_cancel=on_cancel
             )
         except asyncio.CancelledError:
+            if not task.done():
+                _log.warning(
+                    "the save-time upload prune did not finish within %gs of its request's "
+                    "cancellation; it was left running",
+                    _LEDGER_CANCEL_WAIT_SECONDS,
+                )
             self._hold(task, _log_late_failure)
             raise
 
@@ -1690,10 +1700,20 @@ async def _to_thread_to_completion[T, A](func: Callable[[A], T], arg: A) -> T:
 
 
 def _log_late_failure(task: asyncio.Future[Any]) -> None:
-    """Log the failure of a :meth:`UploadStore.run_to_completion` task whose caller was cancelled,
-    since nothing else will read it."""
-    if not task.cancelled() and (exc := task.exception()) is not None:
-        _log.warning("an upload write outlived its cancelled request and failed", exc_info=exc)
+    """Log the failure of a :meth:`UploadStore._run_to_completion` task whose caller was cancelled,
+    since nothing else will read it. A cancelled task (shutdown) is a failure too: a file it had
+    deleted and not yet audited has no row, the gap the retention runner's stop logs at ERROR."""
+    if task.cancelled():
+        _log.error(
+            "the save-time upload prune was cancelled before it finished; a file it deleted "
+            "may have no upload.prune audit row"
+        )
+    elif (exc := task.exception()) is not None:
+        _log.error(
+            "the save-time upload prune failed after its request was cancelled; a file it "
+            "deleted may have no upload.prune audit row",
+            exc_info=exc,
+        )
 
 
 async def _wait_to_completion[T](
@@ -1729,6 +1749,8 @@ async def _wait_to_completion[T](
     already = task is not None and task.cancelling() > 0
     cancelled = False
     deadline = None if not already or cancel_bound is None else loop.time() + cancel_bound
+    if already and on_cancel is not None:
+        on_cancel()  # the caller is already on its way out, so ask the work to stop now
     while not fut.done():
         remaining = None if deadline is None else deadline - loop.time()
         if remaining is not None and remaining <= 0:
@@ -1738,7 +1760,7 @@ async def _wait_to_completion[T](
         except asyncio.CancelledError:
             if not (cancelled or already) and cancel_bound is not None:
                 deadline = loop.time() + cancel_bound
-            if not cancelled and on_cancel is not None:
+            if not (cancelled or already) and on_cancel is not None:
                 on_cancel()  # once, at the first cancellation: a sweep's abort (BACKLOG #2261)
             cancelled = True
     if cancelled:

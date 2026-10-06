@@ -1227,11 +1227,11 @@ async def test_a_plain_cancel_of_the_save_time_sweep_also_audits_what_it_deleted
     assert sorted(audited) == sorted(deleted) and len(deleted) == 2
 
 
-async def test_a_write_run_to_completion_lands_after_its_caller_is_cancelled(
+async def test_a_task_run_to_completion_lands_after_its_caller_is_cancelled(
     tmp_path: Path,
 ) -> None:
     """BACKLOG #2261, the primitive. Under an anyio scope, which cancels again at every await, a
-    write run through ``run_to_completion`` still lands before the cancellation propagates."""
+    write run through ``_run_to_completion`` still lands before the cancellation propagates."""
     import anyio
 
     store = _store(tmp_path, key=True)
@@ -1245,7 +1245,7 @@ async def test_a_write_run_to_completion_lands_after_its_caller_is_cancelled(
 
     async def _caller() -> None:
         started.set()
-        await store.run_to_completion(_write())
+        await store._run_to_completion(_write())
 
     async with anyio.create_task_group() as tg:
         tg.start_soon(_caller)
@@ -1269,7 +1269,7 @@ async def test_a_write_stuck_past_the_bound_is_left_to_finish(
         await release.wait()
         raise RuntimeError("store unreachable")
 
-    caller = asyncio.create_task(store.run_to_completion(_write()))
+    caller = asyncio.create_task(store._run_to_completion(_write()))
     await asyncio.sleep(0)
     caller.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -1279,7 +1279,7 @@ async def test_a_write_stuck_past_the_bound_is_left_to_finish(
         release.set()
         await _drain_stragglers(store)
         await asyncio.sleep(0)  # the done callback runs one loop pass after the task ends
-    assert "outlived its cancelled request and failed" in caplog.text, caplog.text
+    assert "no upload.prune audit row" in caplog.text, caplog.text
 
 
 async def test_an_orphan_sweep_failure_keeps_the_pruned_pairs_reported(tmp_path: Path) -> None:
