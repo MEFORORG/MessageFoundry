@@ -6574,9 +6574,10 @@ class RegistryRunner:
                         await self._pace_outbound(name)
                     if not self._lane_may_deliver(name):
                         if not self._coordinator.is_leader():
-                            # As a STOPPED item does on leadership loss: the unfenced release is not
-                            # this node's to make (the rows are the successor's promotion recovery),
-                            # and parking at the pause gate would signal quiescence over them.
+                            # As _process_delivery_item's leadership check does: hand back only this
+                            # item and stop. The tail is the successor's promotion recovery, and
+                            # parking at the pause gate would signal quiescence over it.
+                            await self.store.release_claimed([item.id])
                             return
                         # Unsent, so release_claimed (no attempt spent, seq kept), and then the loop
                         # top signals quiescence and parks or returns. Not _release_tail_on_stop,

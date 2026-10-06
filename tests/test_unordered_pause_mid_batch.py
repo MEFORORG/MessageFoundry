@@ -305,3 +305,33 @@ async def test_a_failed_release_takes_the_fault_repend_and_not_a_quiescence_sign
     finally:
         release.set()
         await runner.stop()
+
+
+async def test_a_pause_during_the_pacing_wait_stops_the_row_being_paced(
+    store: MessageStore,
+    rig: tuple[list[str], asyncio.Event, asyncio.Event],
+    tmp_path: Path,
+) -> None:
+    """A paced lane spends most of its time waiting to send its NEXT row, which has already passed
+    the before-pacing check. The pause lands in that wait, so only the after-pacing check stops it."""
+    sink, started, release = rig
+    runner = RegistryRunner(
+        _registry(tmp_path / "in"),
+        store,
+        poll_interval=0.02,
+        fifo_claim_batch=8,
+        egress=EgressSettings(deny_by_default=False),
+    )
+    await runner.start()
+    try:
+        # Set directly rather than through config: the pacing knob itself is pinned elsewhere.
+        runner._send_pace[_LANE] = 0.6
+        await _claim_whole_batch(runner, store, started)
+        release.set()  # the first send returns; the worker passes the gate and waits 0.6 s
+        await asyncio.sleep(0.2)
+        assert len(sink) == 1  # still pacing, nothing more sent yet
+        await runner.stop_outbound(_LANE)
+        await _assert_tail_released(store, sink)
+    finally:
+        release.set()
+        await runner.stop()

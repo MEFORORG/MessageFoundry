@@ -598,7 +598,7 @@ async def test_stop_during_the_backoff_ends_the_watcher_without_a_relaunch() -> 
 
 async def test_a_launch_that_raises_counts_as_a_fast_exit() -> None:
     """A spawn that raises OSError backs off and trips the breaker like a child that exits at once.
-    The breaker then stops the whole supervisor, and the healthy sibling is drained, not orphaned."""
+    The breaker is per shard: the healthy sibling keeps running until a clean stop drains it."""
     time_ = _FakeTime()
     attempts: list[str] = []
     healthy: list[_FakeProcess] = []
@@ -618,11 +618,24 @@ async def test_a_launch_that_raises_counts_as_a_fast_exit() -> None:
         clock=time_.clock,
         sleep=time_.sleep,
     )
-    await asyncio.wait_for(sup.run(), timeout=5.0)  # ends on its own: the breaker stopped it
-    assert sup.crash_looped == {"a"}
-    assert len(attempts) == 3
-    assert time_.delays == [1.0, 2.0]
-    assert len(healthy) == 1 and healthy[0].terminated  # the sibling was drained
+    run = asyncio.create_task(sup.run())
+    try:
+        for _ in range(200):
+            if sup.crash_looped:
+                break
+            await asyncio.sleep(0)
+        assert sup.crash_looped == {"a"}
+        assert len(attempts) == 3
+        assert time_.delays == [1.0, 2.0]
+        for _ in range(20):  # a few more turns: nothing relaunches a, nothing stops b
+            await asyncio.sleep(0)
+        assert len(attempts) == 3
+        assert not run.done()
+        assert len(healthy) == 1 and not healthy[0].terminated
+    finally:
+        sup.stop()
+        await asyncio.wait_for(run, timeout=2.0)
+    assert healthy[0].terminated  # the clean stop still drains the sibling
 
 
 async def test_a_watcher_that_raises_still_drains_the_other_shards() -> None:
@@ -648,8 +661,11 @@ async def test_a_watcher_that_raises_still_drains_the_other_shards() -> None:
     ("knob", "value"),
     [
         ("crash_loop_limit", 0),
+        ("crash_loop_limit", float("inf")),
+        ("stable_uptime", 0.0),
         ("stable_uptime", -1.0),
         ("stable_uptime", float("nan")),
+        ("restart_backoff_initial", 0.0),
         ("restart_backoff_initial", -1.0),
         ("restart_backoff_max", float("nan")),
     ],
@@ -660,7 +676,7 @@ def test_a_setting_that_would_switch_the_protection_off_is_refused(knob: str, va
 
 
 async def test_supervise_exits_nonzero_when_every_shard_crash_loops(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A fleet whose every shard tripped the breaker is not a clean shutdown, so supervise must not
     return the clean-shutdown 0 for it."""
@@ -684,11 +700,75 @@ async def test_supervise_exits_nonzero_when_every_shard_crash_loops(
     monkeypatch.setattr(supervisor_mod, "preflight_shard_config", _loads)
     monkeypatch.setattr(supervisor_mod, "Supervisor", _supervisor)
 
-    code = await asyncio.wait_for(
-        supervise("cfg", install_signal_handlers=False, **_DISCOVERY), timeout=5.0
-    )
+    with caplog.at_level(logging.ERROR, logger=supervisor_mod.__name__):
+        code = await asyncio.wait_for(
+            supervise("cfg", install_signal_handlers=False, **_DISCOVERY), timeout=5.0
+        )
     assert code == 1
     assert len(spawned) == 2
+    assert "whole fleet is down" in caplog.text
+
+
+async def test_supervise_keeps_running_while_any_shard_is_alive(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Shard a crash-loops and trips; shard b is healthy. supervise does not return, and a later
+    shutdown is a clean one (0) whose last ERROR line still names a as down."""
+    time_ = _FakeTime()
+    healthy: list[_FakeProcess] = []
+    built: list[Supervisor] = []
+    real = Supervisor
+
+    async def spawn(spec: ShardSpec) -> _FakeProcess:
+        p = _FakeProcess()
+        if spec.shard == "a":
+            p.finish(3)
+        else:
+            healthy.append(p)
+        return p
+
+    def _supervisor(specs: list[ShardSpec]) -> Supervisor:
+        sup = real(
+            specs, spawn=_spawner(spawn), crash_loop_limit=2, clock=time_.clock, sleep=time_.sleep
+        )
+        built.append(sup)
+        return sup
+
+    async def _loads(config: str) -> None:
+        return None
+
+    monkeypatch.setattr(
+        supervisor_mod, "discover_shard_specs", lambda *a, **k: [_spec("a"), _spec("b", 8766)]
+    )
+    monkeypatch.setattr(supervisor_mod, "preflight_shard_config", _loads)
+    monkeypatch.setattr(supervisor_mod, "Supervisor", _supervisor)
+
+    with caplog.at_level(logging.ERROR, logger=supervisor_mod.__name__):
+        task = asyncio.create_task(supervise("cfg", install_signal_handlers=False, **_DISCOVERY))
+        try:
+            for _ in range(200):
+                if built and built[0].crash_looped:
+                    break
+                await asyncio.sleep(0)
+            assert built[0].crash_looped == {"a"}
+            for _ in range(20):
+                await asyncio.sleep(0)
+            assert not task.done()  # b is alive, so the supervisor runs on
+            assert len(healthy) == 1 and not healthy[0].terminated
+        finally:
+            # Stands in for the signal handler, which cancels the inner runner; supervise handles
+            # both cancellations through the same except arm.
+            task.cancel()
+            code = await asyncio.wait_for(task, timeout=2.0)
+    assert code == 0
+    assert healthy[0].terminated
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 2
+    assert (
+        "'a'" in errors[0] and "rc=3" in errors[0] and "1 other shard(s) still running" in errors[0]
+    )
+    assert "a down after a crash loop" in errors[1]
+    assert not any("whole fleet" in e for e in errors)
 
 
 # --- the pre-flight: a config must load the way an engine shard will load it (vault BACKLOG #2587) -------

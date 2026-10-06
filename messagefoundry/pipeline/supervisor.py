@@ -15,9 +15,12 @@ running.
 Restarts back off (vault BACKLOG #2773). A child that exits within ``stable_uptime`` seconds of its
 start is a FAST exit: each one in a row doubles the delay before the next launch, from
 ``restart_backoff_initial`` up to ``restart_backoff_max``, and ``crash_loop_limit`` of them in a row
-trip the crash-loop breaker: it logs at ERROR and stops every shard, and ``supervise`` exits 1 so the
-service manager sees the failure (see :meth:`Supervisor._watch` for why all of them). A child that
-ran for ``stable_uptime`` resets both. Without this a start-up failure neither config load reproduces (a
+trip the crash-loop breaker for THAT shard: it is not relaunched again, the ERROR line names it and
+its exit history, and it stays listed in :attr:`Supervisor.crash_looped`. The other shards keep
+running, so one shard's start-up failure is not a fleet outage (a crash in one supervised task stays
+isolated). Only when every shard has tripped does ``supervise`` return non-zero. The supervisor has
+no store and so no AlertSink; the ERROR log is its alert. A child that ran for ``stable_uptime``
+resets both. Without this a start-up failure neither config load reproduces (a
 store that cannot be reached, a port in use, a ``serve`` gate refusing) would relaunch in a tight
 loop, each pass a full interpreter start and config load.
 
@@ -304,19 +307,21 @@ class Supervisor:
     _stopping: asyncio.Event = field(default_factory=asyncio.Event, init=False)
     #: Per-shard restart counters, exposed for tests and observability.
     restarts: dict[str, int] = field(default_factory=dict, init=False)
-    #: Shards that tripped the crash-loop breaker in the current :meth:`run`, which then stopped.
+    #: Shards that tripped the crash-loop breaker in the current :meth:`run`: down, and not relaunched.
     crash_looped: set[str] = field(default_factory=set, init=False)
 
     def __post_init__(self) -> None:
         # Each of these would switch the protection off quietly: a limit of 0 trips on the first
-        # exit even after a long stable run, a negative or NaN stable_uptime never counts an exit as
-        # fast, and a negative or NaN delay relaunches at once.
-        if self.crash_loop_limit < 1:
-            raise ValueError(f"crash_loop_limit must be at least 1, got {self.crash_loop_limit}")
+        # exit even after a long stable run, a NaN or infinite limit never trips, a stable_uptime of
+        # 0 or less (or NaN) never counts an exit as fast, and a delay of 0 or less relaunches at once.
+        if not (isinstance(self.crash_loop_limit, int) and self.crash_loop_limit >= 1):
+            raise ValueError(
+                f"crash_loop_limit must be an integer >= 1, got {self.crash_loop_limit!r}"
+            )
         for knob in ("restart_backoff_initial", "restart_backoff_max", "stable_uptime"):
             value = getattr(self, knob)
-            if not (math.isfinite(value) and value >= 0):
-                raise ValueError(f"{knob} must be a finite number of seconds >= 0, got {value!r}")
+            if not (math.isfinite(value) and value > 0):
+                raise ValueError(f"{knob} must be a finite number of seconds > 0, got {value!r}")
 
     async def run(self) -> None:
         """Spawn every shard, then watch them until cancelled or :meth:`stop` is called.
@@ -358,12 +363,13 @@ class Supervisor:
         handles, the interpreter missing mid-upgrade) counts as a fast exit, so it backs off and trips
         the breaker like any other start-up failure rather than ending the whole supervisor.
 
-        A tripped breaker stops the WHOLE supervisor, not just this shard, so :func:`supervise`
-        exits 1 and the service manager sees the failure. Each engine shard owns a share of the
-        outbound lanes, so a fleet with one shard missing would keep accepting rows that nothing
-        drains while still reading as up.
+        A tripped breaker ends THIS watcher only; the sibling shards keep running, so one shard's
+        bad start-up is not a fleet outage. The cost is accepted: the outbound lanes that shard owns
+        (ADR 0073, one static owner per lane) have no consumer, and their rows queue durably until
+        the supervisor is restarted. The ERROR line is what says so.
         """
-        fast_exits = 0  # consecutive exits within stable_uptime of their start
+        # The exits in the current run of fast ones, as "rc after Ns", for the ERROR line.
+        history: list[str] = []
         while not self._stopping.is_set():
             started = self.clock()
             try:
@@ -387,18 +393,24 @@ class Supervisor:
             if self._stopping.is_set():
                 return  # a launch that failed during shutdown is not a crash
             uptime = self.clock() - started
-            fast_exits = fast_exits + 1 if uptime < self.stable_uptime else 0
+            if uptime < self.stable_uptime:
+                history.append(f"rc={rc} after {uptime:.1f}s")
+            else:
+                history.clear()
+            fast_exits = len(history)
             if fast_exits >= self.crash_loop_limit:
                 self.crash_looped.add(spec.shard)
+                alive = len(self.specs) - len(self.crash_looped)
                 logger.error(
-                    "shard %r exited rc=%s %d times in a row, each within %gs of starting: "
-                    "crash loop, stopping every engine shard. Fix the cause and restart the supervisor.",
+                    "shard %r exited %d times in a row, each within %gs of starting (%s): crash "
+                    "loop, not restarting this shard again; %d other shard(s) still running, and "
+                    "the outbound lanes it owns queue until the supervisor is restarted.",
                     spec.shard,
-                    rc,
                     fast_exits,
                     self.stable_uptime,
+                    "; ".join(history),
+                    alive,
                 )
-                self.stop()
                 return
             # The exponent is capped so a very large crash_loop_limit cannot overflow the float
             # before min() caps the delay; 2**32 seconds is past any restart_backoff_max anyway.
@@ -507,8 +519,8 @@ async def supervise(
     """Discover shards from ``config`` and run a :class:`Supervisor` until interrupted.
 
     Installs SIGINT/SIGTERM handlers (when ``install_signal_handlers``) that trigger a clean drain.
-    Returns 0 on a clean shutdown, 1 when an engine shard tripped the crash-loop breaker (which stops
-    them all), and 2 on a config/discovery error.
+    Runs while any engine shard is alive. Returns 0 on a clean shutdown, 1 when every engine shard
+    tripped the crash-loop breaker, and 2 on a config/discovery error.
     """
     from messagefoundry.config.wiring import WiringError
 
@@ -556,13 +568,20 @@ async def supervise(
     except KeyboardInterrupt:  # pragma: no cover - interactive Ctrl-C on Windows
         runner.cancel()
         await asyncio.gather(runner, return_exceptions=True)
-    # A tripped crash-loop breaker stopped the fleet; that is not a clean shutdown.
-    if supervisor.crash_looped:
+    # run() returns on its own only once every watcher has. With every shard tripped, the whole
+    # fleet is down, which is not a clean shutdown.
+    if len(supervisor.crash_looped) == len(specs):
         logger.error(
-            "supervise: engine shard(s) %s stopped by the crash-loop breaker",
+            "supervise: every engine shard tripped the crash-loop breaker (%s); the whole fleet is "
+            "down",
             ", ".join(sorted(supervisor.crash_looped)),
         )
         return 1
+    if supervisor.crash_looped:
+        logger.error(
+            "supervise: stopped with engine shard(s) %s down after a crash loop",
+            ", ".join(sorted(supervisor.crash_looped)),
+        )
     return 0
 
 
