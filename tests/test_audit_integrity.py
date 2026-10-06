@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import hmac
 import json
@@ -1503,6 +1504,33 @@ async def test_startup_chain_break_keeps_its_own_alert_subject(tmp_path: Path) -
     assert subject == "audit-chain", "a chain break was filed under the truncation subject"
     assert "broken at seq=2, row id=2" in reason
     assert "chain break" in cap.text, cap.records
+
+
+async def test_startup_check_with_no_key_still_alerts_on_a_chain_that_names_a_key(
+    tmp_path: Path,
+) -> None:
+    """Vault BACKLOG #2725 gave `audit-verify` an exit 4 for a keyed chain checked with no key. The
+    engine deliberately does not take that path. It holds no key only under the keyless opt-out,
+    where a chain whose first row names a key is the anomaly, and a forged genesis row must not
+    silence this alert for the edits beside it. So it still fires the `audit-chain` alert. The second
+    half is a row deleted from the middle, which the walk with no key reports as a break."""
+    db = tmp_path / "keyed.db"
+    keyed = await _keyed_store(db)
+    for i in range(3):
+        await keyed.record_audit(f"act{i}", actor="x")
+    await keyed.close()
+
+    sink, _cap = await _verify_on_start(db, None)  # `_verify_on_start` opens with no key
+    assert [s for s, _, _ in sink.events] == ["audit-chain"], sink.events
+    reason = sink.events[0][1]
+    assert "first row names a store key" in reason and "not a finding" not in reason, reason
+
+    with contextlib.closing(sqlite3.connect(db)) as conn:
+        conn.execute("DELETE FROM audit_log WHERE seq = 2")
+        conn.commit()
+    sink, _cap = await _verify_on_start(db, None)
+    assert [s for s, _, _ in sink.events] == ["audit-chain"], sink.events
+    assert "broken at seq=2" in sink.events[0][1]
 
 
 async def test_startup_anchor_absent_file_warns_and_never_blocks(tmp_path: Path) -> None:

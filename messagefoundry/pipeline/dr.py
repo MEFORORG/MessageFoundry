@@ -20,7 +20,9 @@ owns the **priority-feed startup** half (the DR run-profile in
    same fail-closed abort (AC-14), distinct from the in-archive decrypt failure (AC-9). Verifying the
    archive is not loading it — the restore is the operator's separate ``messagefoundry restore`` step —
    so activation then **also** refuses when the DR store does not carry the verified seed
-   (:meth:`DrCoordinator._verify_seeded_store`), rather than promoting onto an empty store.
+   (:meth:`DrCoordinator._verify_seeded_store`), rather than promoting onto an empty store. Last
+   in this step, the optional ``profile_preflight`` callback refuses a run-profile step 4 is already
+   bound to fail, such as one whose config dir has gone, so the VIP never moves for it.
 2. **Recover the cold-restored store + start a NEW audit-chain segment.** ``reset_stale_inflight``
    recovers in-flight rows of every stage carried in the backup (AC-15), then a ``dr_seed`` marker
    (seed-marker genesis = source-snapshot SHA-256 + config/DEK fingerprints + the restored chain's tip
@@ -57,6 +59,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
 
+from messagefoundry import proctree
 from messagefoundry.childenv import hook_environment
 from messagefoundry.config.settings import DrSettings, StoreBackend
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
@@ -115,7 +118,8 @@ class DrCoordinator:
     """Manual, audited DR promotion/fail-back (ADR 0048). Construct with the open store + ``[dr]``
     settings + the store settings (the KeyProvider seam for restore-verify) + two engine callbacks that
     flip the DR run-profile (``activate_profile`` reloads the graph with the run-profile ON;
-    ``deactivate_profile`` unbinds intake + drains, then turns it OFF). Single-writer: the API serializes
+    ``deactivate_profile`` unbinds intake + drains, then turns it OFF), and optional callbacks for
+    the seed marker's config digest and a run-profile preflight. Single-writer: the API serializes
     activate/release behind ``[approvals]``-style RBAC; this object additionally guards against a
     concurrent activate/release with its own lock."""
 
@@ -127,10 +131,11 @@ class DrCoordinator:
         store_settings: object,
         activate_profile: Callable[[], Awaitable[None]],
         deactivate_profile: Callable[[], Awaitable[None]],
-        config_fingerprint: str | None = None,
+        config_fingerprint_provider: Callable[[], Awaitable[str | None]] | None = None,
         alert_sink: AlertSink | None = None,
         clock: Callable[[], float] = time.time,
         owned_lanes: Callable[[], OwnedLanes | None] | None = None,
+        profile_preflight: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self._store = store
         self._settings = settings
@@ -139,7 +144,11 @@ class DrCoordinator:
         self._store_settings = store_settings
         self._activate_profile = activate_profile
         self._deactivate_profile = deactivate_profile
-        self._config_fingerprint = config_fingerprint
+        # Awaited per activation, so building the coordinator reads no file (vault BACKLOG #2839).
+        self._config_fingerprint_provider = config_fingerprint_provider
+        # Raises OSError when activate_profile is already bound to fail, such as when the config dir
+        # it would reload has gone. Run before any store change or VIP step (vault BACKLOG #2840).
+        self._profile_preflight = profile_preflight
         self._alert_sink: AlertSink = alert_sink or LoggingAlertSink()
         # #145: the DR box label carried in dr_activated / dr_released alerts (also the throttle /
         # auto-resolve key). The hostname is stable across an activate/release pair (same box), so the
@@ -166,6 +175,18 @@ class DrCoordinator:
     @property
     def settings(self) -> DrSettings:
         return self._settings
+
+    @staticmethod
+    def _profile_failure(exc: BaseException, *, before_vip: bool) -> str:
+        """The abort reason for a run-profile that cannot be applied. The preflight and the profile
+        step share it, and it says which one refused, because only the second runs after the
+        takeover hook: an operator must know whether the VIP may have moved."""
+        where = (
+            "refused before the VIP step; the takeover hook did not run"
+            if before_vip
+            else "the engine could not bind the priority feeds"
+        )
+        return f"DR run-profile activation failed ({where}): {safe_exc(exc)}"
 
     # --- activate ------------------------------------------------------------
 
@@ -235,6 +256,18 @@ class DrCoordinator:
             # the server-DB gate above.
             await self._verify_seeded_store(verify, actor, now)
 
+            # (1d) RUN-PROFILE PREFLIGHT (fail-closed, BEFORE any store mutation or VIP step). Step (4)
+            # reloads the config dir the running graph came from; if that dir has gone or cannot be
+            # read, step (4) would abort AFTER the takeover hook moved the VIP, leaving it on a box
+            # that is NOT running the DR run-profile. Step (4) keeps its own check: the dir can
+            # still go in between.
+            if self._profile_preflight is not None:
+                try:
+                    await self._profile_preflight()
+                except OSError as exc:
+                    reason = self._profile_failure(exc, before_vip=True)
+                    await self._record_aborted("profile", reason, actor, now)
+
             # (2) Recover the cold-restored store (every stage, AC-15) + open a NEW audit-chain segment
             # (the seed-marker genesis; do NOT blindly extend the restored chain — ADR 0049/0041).
             # Ownership-scoped when sharded (ADR 0073) — see _owned_lanes in __init__.
@@ -267,13 +300,8 @@ class DrCoordinator:
                 await self._activate_profile()
             except Exception as exc:
                 self._active = False
-                await self._record_aborted(
-                    "profile",
-                    f"DR run-profile activation failed (the engine could not bind the priority feeds): "
-                    f"{safe_exc(exc)}",
-                    actor,
-                    now,
-                )
+                reason = self._profile_failure(exc, before_vip=False)
+                await self._record_aborted("profile", reason, actor, now)
 
             await self._store.record_audit(
                 _ACTION_ACTIVATE,
@@ -741,6 +769,10 @@ class DrCoordinator:
         chain's tip hash** (read via :meth:`Store.audit_anchor`). Each side then stays independently
         verifiable and the fork is explicit/attributable, rather than blindly extending the restored chain
         (ADR 0049/0041 audit-chain-fork handling). Returns the marker row's own hash digest (PHI-free)."""
+        # Before the anchor read, so the hash of the config dir does not widen the window in which
+        # another audit row could land between the anchor and this marker.
+        provider = self._config_fingerprint_provider
+        config_fp = await provider() if provider is not None else None
         restored_seq, restored_tip = await self._store.audit_anchor()
         cipher = self._store.cipher_info()
         marker = {
@@ -753,7 +785,7 @@ class DrCoordinator:
             # an anchor names, so the marker and an out-of-band anchor can be compared directly.
             "restored_audit_seq": restored_seq,
             "restored_audit_tip": restored_tip,
-            "config_fingerprint": self._config_fingerprint,
+            "config_fingerprint": config_fp,
             "dek_fingerprint": cipher.active_key_id,  # one-way fingerprint, NEVER key bytes
         }
         detail = json.dumps(marker, sort_keys=True)
@@ -772,8 +804,12 @@ class DrCoordinator:
         if not command:
             return False
         try:
+            # Only a takeover hook is killed when it overruns: an aborted activation must not be
+            # left taking the address. A release hook is left to finish late, as before, since
+            # killing it partway could strand the address on this box (vault BACKLOG #2622).
             ok = await asyncio.wait_for(
-                _run_command(command), timeout=self._settings.takeover_timeout_seconds
+                _run_command(command, stop_kills=phase == "takeover"),
+                timeout=self._settings.takeover_timeout_seconds,
             )
         except TimeoutError:
             ok = False
@@ -838,22 +874,123 @@ class DrCoordinator:
             log.warning("DR: %s alert failed", event, exc_info=True)
 
 
-async def _run_command(command: str) -> bool:
+async def _run_command(command: str, *, stop_kills: bool = True) -> bool:
     """Run an operator-supplied shell command OFF the event loop and return whether it exited 0. Uses the
     asyncio subprocess API (never blocks the loop). The command is operator-configured (``[dr]``), not
     request-derived, so it is run via the shell exactly as the operator wrote it (parity with the way the
     backup destination / other operator-configured paths are trusted).
 
     Its environment is :func:`messagefoundry.childenv.hook_environment`: the operator's ordinary
-    variables, without the engine's own (vault BACKLOG #2587)."""
-    proc = await asyncio.create_subprocess_shell(
-        command,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
-        env=hook_environment(),
+    variables, without the engine's own (vault BACKLOG #2587).
+
+    **Stopping it stops the whole hook, when** ``stop_kills`` (vault BACKLOG #2622). The caller
+    bounds this with ``wait_for``, which stops it by cancelling it. Cancelling only the wait would
+    leave the shell and whatever it started running, so an activation recorded as aborted could
+    still be taking the address. So the shell starts as the root of a tree
+    :mod:`messagefoundry.proctree` can kill, and a cancel kills that tree before it propagates.
+    With ``stop_kills=False`` the hook starts as it did before, in no tree of its own, and a
+    cancel leaves it running. On Windows that also keeps it out of a kill-on-close job, which
+    would end it when the engine exits. Anything outside this code that stops the engine's
+    processes, such as a service wrapper's tree kill or a signal to the engine's process group,
+    can still end it. A hook that finishes on its own is left alone either way, including
+    anything it left running."""
+    spawn = asyncio.ensure_future(
+        asyncio.create_subprocess_shell(
+            command,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=hook_environment(),
+            creationflags=proctree.ADOPT_CREATIONFLAGS if stop_kills else 0,
+            start_new_session=proctree.ADOPT_NEW_SESSION and stop_kills,
+        )
     )
-    await proc.wait()
+    try:
+        # Shielded so a stop that lands mid-start cannot lose the process: the callback kills it.
+        # On Windows a hook this may kill is still suspended then, so it has done nothing yet.
+        proc = await asyncio.shield(spawn)
+    except (asyncio.CancelledError, GeneratorExit):
+        spawn.add_done_callback(_kill_late_start if stop_kills else _leave_late_start)
+        raise
+    job: int | None = None
+    try:
+        if stop_kills:
+            job = proctree.resume_into_job(proc.pid, who="DR takeover hook")
+        await proc.wait()
+    except GeneratorExit:
+        if stop_kills:
+            _kill_hook(proc, job)  # a closing coroutine may not await, so no reap
+        raise
+    except BaseException:
+        if stop_kills:
+            _kill_hook(proc, job)
+            await _reap_hook(proc)
+        raise
+    if job is not None:
+        proctree.release_job(job)
     return proc.returncode == 0
+
+
+#: How long a killed hook gets to be reaped before the abort carries on without it. This adds to
+#: ``[dr].takeover_timeout_seconds`` in the worst case. docs/CONFIGURATION.md quotes it, and
+#: tests/test_dr_activation.py pins that quote.
+_HOOK_REAP_SECONDS = 5.0
+
+#: Reaps started from a done-callback, held so the loop does not drop them mid-wait.
+_LATE_REAPS: set[asyncio.Task[None]] = set()
+
+
+def _kill_hook(proc: asyncio.subprocess.Process, job: int | None) -> None:
+    """Kill the hook's shell and what it started.
+
+    Windows ends the job. POSIX signals the group the shell was started to lead. That group outlives
+    the shell, so it is signalled even when the shell has already exited: its children may not have.
+    POSIX does not reuse a group's id while the group has members, so the signal cannot reach an
+    unrelated group then. Once the group is empty its id can be reused, which is the same narrow
+    risk any kill by process id carries. The single-process kill is the fallback for a job that
+    could not be set up, and it never raises: the stop that called it must carry on."""
+    if job is not None:
+        proctree.terminate_job(job)
+        return
+    if proctree.kill_process_group(proc.pid, started_as_leader=proctree.ADOPT_NEW_SESSION):
+        return
+    if proc.returncode is None:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass  # it exited on its own in the meantime
+        except OSError as exc:
+            log.warning("DR hook (pid %d) could not be killed: %s", proc.pid, safe_exc(exc))
+
+
+async def _reap_hook(proc: asyncio.subprocess.Process) -> None:
+    """Wait for the killed shell to exit, bounded, and say so when it has not."""
+    try:
+        await asyncio.wait_for(proc.wait(), _HOOK_REAP_SECONDS)
+    except TimeoutError:
+        log.warning(
+            "DR hook (pid %d) was killed but had not exited %gs later; it may still be running",
+            proc.pid,
+            _HOOK_REAP_SECONDS,
+        )
+
+
+def _kill_late_start(spawn: asyncio.Future[asyncio.subprocess.Process]) -> None:
+    """Kill a hook whose start finished after its caller was stopped, then reap it. On Windows it
+    is still suspended, so it has started nothing and killing the one process is enough."""
+    if spawn.cancelled() or spawn.exception() is not None:
+        return
+    proc = spawn.result()
+    _kill_hook(proc, None)
+    reap = spawn.get_loop().create_task(_reap_hook(proc))
+    _LATE_REAPS.add(reap)
+    reap.add_done_callback(_LATE_REAPS.discard)
+
+
+def _leave_late_start(spawn: asyncio.Future[asyncio.subprocess.Process]) -> None:
+    """Let a release hook whose start finished after its caller was stopped run on. A failed
+    start is read here, so asyncio does not log it as an exception nobody retrieved."""
+    if not spawn.cancelled():
+        spawn.exception()
 
 
 def _confined_archive(archive: str, seed_dir: str) -> Path | None:

@@ -343,7 +343,32 @@ class AlertSink(Protocol):
         ``reason`` is the closed-set slug ``user_account_control_undetermined``; ``undetermined`` is
         how many signed-in accounts read undetermined; ``detail`` is the operator-facing explanation
         the auth service latches. No PHI. Emitted by the API-lifespan reconciler task, never from
+        ``auth/``. :meth:`ad_reconcile_hold_released` is its auto-resolving inverse."""
+        ...
+
+    def ad_reconcile_breaker_cleared(self, name: str) -> None:
+        """The INVERSE of :meth:`ad_reconcile_aborted` (BACKLOG #2136): a pass that is evidence the
+        mass-revoke breaker is not tripped, as the auth service judges it
+        (``AuthService._mark_reconcile_clears`` states the test). Emits **no** notification; when
+        alert-state is wired (ADR 0044) it auto-resolves the open ``ad_reconcile_aborted`` instance
+        for the same ``name`` (``"directory-reconciler"``). Raised on every such pass, except where
+        ``api/app.py::_is_sole_reconciler`` says another reconciler may run, at least on a
+        ``[cluster]`` node or in an engine that runs more than one engine shard
+        (``api/app.py::_without_clears`` says why), and while the open instance is one an earlier
+        run left open (``api/app.py::_without_inherited_clears``). The sole-reconciler gate does
+        not see every engine on the store; ``AuthService._mark_reconcile_clears`` names at least
+        the cases that can still resolve falsely. No PHI. Emitted by the API-lifespan reconciler task, never from
         ``auth/``."""
+        ...
+
+    def ad_reconcile_hold_released(self, name: str) -> None:
+        """The INVERSE of :meth:`ad_reconcile_held` (BACKLOG #2136): a pass that is evidence no
+        undetermined-wave hold stands, as the auth service judges it
+        (``AuthService._mark_reconcile_clears`` states the test, which is not the breaker's).
+        Emits **no** notification; when alert-state is wired
+        (ADR 0044) it auto-resolves the open ``ad_reconcile_held`` instance for the same ``name``
+        (``"directory-reconciler"``). Raised as :meth:`ad_reconcile_breaker_cleared` is. No PHI.
+        Emitted by the API-lifespan reconciler task, never from ``auth/``."""
         ...
 
     def ad_session_revoked(self, name: str, *, reason: str) -> None:
@@ -742,6 +767,15 @@ class LoggingAlertSink:
             reason,
             detail,
         )
+
+    def ad_reconcile_breaker_cleared(self, name: str) -> None:
+        # The inverse (auto-resolve) event, raised on every clear pass; no page, so DEBUG.
+        log.debug("ALERT ad_reconcile_breaker_cleared: %r found the breaker not tripped", name)
+
+    def ad_reconcile_hold_released(self, name: str) -> None:
+        # The inverse (auto-resolve) event, raised on every clear pass; no page, so DEBUG. A hold
+        # the auth service releases while its message is set is logged there at WARNING.
+        log.debug("ALERT ad_reconcile_hold_released: %r found no hold standing", name)
 
     def ad_session_revoked(self, name: str, *, reason: str) -> None:
         log.warning(

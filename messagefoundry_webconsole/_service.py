@@ -4,7 +4,7 @@
 
 A trivial re-implementation of ``api.auth_routes._service`` (get + enabled-check reading
 ``app.state``) so the package never imports ``auth_routes`` — which would form a
-package → auth_routes → package cycle. Identical semantics: absent/disabled auth → 503.
+package → auth_routes → package cycle. Identical semantics: no auth service answers 503.
 """
 
 from __future__ import annotations

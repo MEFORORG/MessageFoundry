@@ -95,8 +95,9 @@ CLI_TIERS: Final[Mapping[str, Tier]] = MappingProxyType(
         "cert inventory": "production",  # owner-ruled production 2026-09-28
         # Owner-ruled production on 2026-09-29: R5 of vault
         # docs/security/ASVS-OWNER-RULINGS-2026-09-28-BATCH175.md, "Keep production". Its own help
-        # still says "for NON-PROD TLS bring-up ONLY". The owner kept it anyway, because a first box
+        # said "for NON-PROD TLS bring-up ONLY" then. The owner kept it anyway, because a first box
         # may need a self-signed cert before a real one exists, and the `cert` group stays whole.
+        # BACKLOG #1276 has since rewritten that help to call the pair a placeholder to replace.
         "cert self-signed": "production",
         # Accounts.
         "admin-unlock": "production",

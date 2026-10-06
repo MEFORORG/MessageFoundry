@@ -183,6 +183,12 @@ class ReconcilePlan:
     undetermined: int = 0
     #: ``r``: probes in THIS pass that read the attribute (PRESENT or DISABLED).
     readable: int = 0
+    #: Set by the auth service after the pass, never by :func:`plan_pass` (BACKLOG #2136): whether
+    #: this pass is EVIDENCE that the breaker is not tripped, or that no hold stands. Not merely
+    #: "not aborted" or "not held". The caller resolves the matching durable alert on it, so a pass
+    #: that could not have tripped or held must leave these False.
+    breaker_clear: bool = False
+    hold_clear: bool = False
 
     @property
     def directory_outage(self) -> bool:

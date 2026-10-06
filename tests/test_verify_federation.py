@@ -470,15 +470,6 @@ def test_an_off_box_idp_with_no_crl_fails_as_the_engine_would_refuse() -> None:
     assert "[auth].oidc_tls_crl_file" in row.detail
 
 
-def test_auth_disabled_skips_because_the_engine_runs_no_guard() -> None:
-    """The guard lives in the auth service, which settings built in code with [auth].enabled off do
-    not have (`serve` refuses that, vault BACKLOG #2719). A FAIL here would report a refusal the
-    engine never makes."""
-    row = _revocation_result(_settings(enabled=False))
-    assert row.status is Status.SKIP
-    assert "[auth].enabled is false" in row.detail
-
-
 def test_on_box_legs_pass_because_the_engine_lets_them_cross() -> None:
     row = _revocation_result(_settings(**_LOOPBACK_LEGS))
     assert row.status is Status.PASS

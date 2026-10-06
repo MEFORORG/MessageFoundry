@@ -51,7 +51,7 @@ import logging  # noqa: E402
 import sqlite3  # noqa: E402  # stdlib; the exception the store-opening subcommands translate (#1670) + the ro probe (#1669)
 import sys  # noqa: E402
 import tomllib  # noqa: E402  # stdlib; classifies a malformed SERVICE-config TOML (_env_dir_name + `security show`)
-from collections.abc import Mapping, Sequence  # noqa: E402
+from collections.abc import Awaitable, Mapping, Sequence  # noqa: E402
 from pathlib import (  # noqa: E402
     Path,
 )  # stdlib, imported at interpreter startup — no cost to the fast subcommands
@@ -390,9 +390,12 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         help="run validate + dryrun (+ advisory ruff/mypy) as a commit/CI gate",
         description="Run validate + dryrun (+ advisory ruff/mypy) as a commit/CI gate. The dryrun "
         "sub-check previews under [pipeline].snapshot_on_send (copy-on-Send, ADR 0104) resolved "
-        "best-effort from this instance's messagefoundry.toml (same resolution as the posture "
-        "check); when no settings load it falls back to the setting's own default (ON) — matching "
-        "the default engine, never a silent OFF (#230).",
+        "best-effort from the settings the posture check reads: this instance's "
+        "messagefoundry.toml, or with no file, the MEFOR_* environment when MEFOR_AI_ENVIRONMENT "
+        "names the instance. Under --project-root, a messagefoundry.toml in a working directory "
+        "other than the project root is not read and stops the environment read. When no "
+        "settings load it falls back to the "
+        "setting's own default (ON) — matching the default engine, never a silent OFF (#230).",
     )
     check.add_argument("--config", default="samples/config", help="config modules directory")
     _add_anchor_flags(check)
@@ -727,7 +730,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     cert = sub.add_parser(
         "cert",
         help="certificate tooling (BACKLOG #71/#72): import a PKCS#12/.pfx bundle to the PEM files the "
-        "TLS loaders read, list cert facts (read-only inventory), or mint a self-signed dev cert",
+        "TLS loaders read, list cert facts (read-only inventory), or mint a self-signed placeholder "
+        "cert",
     )
     cert_sub = cert.add_subparsers(dest="cert_command", required=True)
 
@@ -778,8 +782,9 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
 
     cert_self_signed = cert_sub.add_parser(
         "self-signed",
-        help="mint a self-signed EC P-256 cert+key (cert.pem / key.pem) for NON-PROD TLS bring-up ONLY; "
-        "key.pem is written 0600 and refuses to overwrite an existing key",
+        help="mint a self-signed EC P-256 cert+key (cert.pem / key.pem) as a TLS PLACEHOLDER (no "
+        "chain of trust: better than cleartext, worse than an operator-supplied chain, so replace "
+        "it); key.pem is written 0600 and refuses to overwrite an existing key",
     )
     cert_self_signed.add_argument(
         "--cn", required=True, help="certificate common name (also added as a DNS SAN)"
@@ -830,7 +835,7 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "provision-admin",
         help="create the first administrator offline (the engine creates no account on its own)",
         description="Create the first Administrator from the host, against the store the service "
-        "uses. The engine creates no account on its own, so an install has no way to sign in until "
+        "uses. The engine creates no account on its own, so nobody can manage a new install until "
         "this runs. It refuses, before asking for a password, when an enabled Administrator already "
         "exists or an argument is out of range, and it creates the store only once the password "
         "has passed the policy, so a refusal leaves no new SQLite store file behind. Run it with the "
@@ -906,7 +911,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         action="store_true",
         help="exit 0 instead of 3 when the audit log verifies clean but holds no rows. Without it "
         "an empty log is a distinct exit code, so a scheduled job cannot read 'there was nothing "
-        "to verify' as a pass (exit 1 stays a BROKEN CHAIN, exit 2 'could not open the store')",
+        "to verify' as a pass (exit 1 stays a BROKEN CHAIN, exit 2 'could not open the store', "
+        "exit 4 'the chain is keyed and this shell holds no key, so it was not checked')",
     )
     # ONE mutually-exclusive group: the two flags carry the same value in two transports, and argparse
     # refusing both is better than silently letting one win.
@@ -1742,6 +1748,7 @@ def _serve(args: argparse.Namespace) -> int:
         SyslogProtocol,
         forward_hop_disposition,
         hop_posture_from_ai,
+        insecure_bind_escape,
         oidc_second_factor_claim_exception,
         security_loosenings,
     )
@@ -1837,24 +1844,6 @@ def _serve(args: argparse.Namespace) -> int:
     # is exactly how the ASVS 11.7.1 and 6.3.3 arms once disagreed about the same boot (#326).
     instance_exposed = not settings.api.host_is_browser_origin
 
-    # Fail closed: `serve` always requires sign-in, on every bind (vault BACKLOG #2719). With auth
-    # disabled the API would answer every request as a full-privilege system identity. This arm used
-    # to refuse only an EXPOSED instance (BACKLOG #1013) and let a bare loopback bind run with no
-    # sign-in. That loopback mode was removed: it named no person in the audit trail, and it could not
-    # repair an account either, since with no auth service the account and audit routes answer 503.
-    # No config key turns sign-in off any more ([security].require_sign_in and [auth].enabled are
-    # both refused at load), so this arm is the backstop for a caller that builds Settings in code.
-    # The app factory's allow_no_auth=True stays for embedders and tests; `serve` never passes it.
-    if not settings.auth.enabled:
-        print(
-            "error: refusing to serve with authentication disabled; the API would answer every "
-            "request as a full-privilege system identity with no sign-in. `serve` always requires "
-            "sign-in, on every bind (vault BACKLOG #2719): build the settings with "
-            "[auth].enabled on.",
-            file=sys.stderr,
-        )
-        return 2
-
     if settings.store.backend is StoreBackend.SQLSERVER:
         import importlib.util
 
@@ -1912,9 +1901,7 @@ def _serve(args: argparse.Namespace) -> int:
     # cleartext inbound listener; BACKLOG #1672). It rides the SAME exposed-bind gate + the SAME
     # ADR 0092 clamp below, keyed on [security].enforcement — it cannot relax either bind under
     # enforcement=enforce. Fold both escapes into one flag the exposed-gate + create_managed_app read.
-    insecure_bind_ok = (
-        args.allow_insecure_bind or not settings.security.require_encryption_for_remote
-    )
+    insecure_bind_ok = insecure_bind_escape(settings, flag=args.allow_insecure_bind)
 
     # Delegated-identity precondition (#203, ASVS 13.2.1/13.3.2): when the operator declares
     # [store].require_managed_identity, refuse to start if the store authenticates with a static
@@ -2079,14 +2066,16 @@ def _serve(args: argparse.Namespace) -> int:
     # below reads `enforcing`, and `enforce` is the shipped default on dev and staging as much as on
     # prod, so all three REFUSE on stock defaults. It downgrades to an advisory warning only under
     # enforcement = warn. No instance is exempt and none stays quiet: a dev or loopback instance is
-    # a PHI instance too, and this gate reads no synthetic or dev condition. Lock it down with
+    # a PHI instance too, since every instance carries patient data (BACKLOG #1279, ADR 0186), and
+    # this gate reads no synthetic or dev condition. Lock it down with
     # [security].block_unlisted_outbound or per-transport [egress].allowed_* lists.
     #
     # [egress] declares EIGHT allowed_* DESTINATION lists and every one is enforced downstream by
-    # _allowlist_for (transports/egress.py). ([egress].allowed_proxy is a ninth allowed_* key and
-    # is deliberately NOT one of them: it gates a transport INTERMEDIARY rather than a destination, is
-    # not in _allowlist_for, and is deny-by-default on its own terms — BACKLOG #1659 — so listing a
-    # proxy says nothing about where PHI may be sent and must not satisfy this gate.)
+    # _allowlist_for (transports/egress.py). ([egress].allowed_proxy is another allowed_* key, and
+    # it is deliberately NOT one of them: it gates a transport INTERMEDIARY rather than a
+    # destination, is not in _allowlist_for, and is deny-by-default on its own terms — BACKLOG
+    # #1659 — so listing a proxy says nothing about where PHI may be sent and must not satisfy this
+    # gate.)
     #
     # Counting only six here meant a mail-only or Direct-only instance could enumerate every
     # destination it actually uses and still be refused, with nothing in the refusal naming the two
@@ -2169,7 +2158,8 @@ def _serve(args: argparse.Namespace) -> int:
     # partially-configured instance that the gate above lets start. This used to be an in-place flip of a false model
     # default; since vault BACKLOG #2605 the model default is true, so every entry point gets deny
     # and this block only announces the posture, or audits the explicit opt-out. No instance is
-    # exempt: a dev, loopback or staging instance is held to it exactly as a production one is.
+    # exempt: every instance carries patient data (BACKLOG #1279, ADR 0186), so a dev, loopback or
+    # staging instance is held to it exactly as a production one is.
     if not deny_written:
         # configure_logging has not run yet (root lastResort drops < WARNING), so announce on stderr
         # like the sibling posture gates rather than logging.info.
@@ -2243,11 +2233,11 @@ def _serve(args: argparse.Namespace) -> int:
         else None
     )
     # #200 (ADR 0092) residual: the forwarder was the ONE egress path with no posture gate — its
-    # plaintext-UDP default shipped the (PHI-redacted, but still sensitive) log + audit evidence stream
+    # plaintext-UDP default shipped the (best-effort redacted, still sensitive) log + audit evidence stream
     # off-box in the clear, silently. Decide it with the SAME shared authority the transports use, and
     # BEFORE configure_logging installs the handler, so a refused hop never emits a single record.
-    # Loopback (the ADR 0080 local-agent deployment) is untouched; no instance is exempt as
-    # synthetic or dev. Any other hop that is not verified TLS and not attested REFUSES under
+    # Loopback (the ADR 0080 local-agent deployment) passes THIS hop check, though the BACKLOG #1966
+    # forwarding gate below refuses it under enforce; no instance is exempt as synthetic or dev. Any other hop that is not verified TLS and not attested REFUSES under
     # [security].enforcement=enforce and WARNS under enforcement = warn. The acknowledged opt-out is
     # [logging].forward_hop_attested, which lets the hop through silently under either dial.
     if log_forward is not None:
@@ -2552,9 +2542,8 @@ def _serve(args: argparse.Namespace) -> int:
     )
     # A non-loopback API bind puts bearer tokens + PHI on the wire. The exposed-gate (ADR 0002 §0):
     # an operator certificate → the first-class secure path (allow); none but --allow-insecure-bind →
-    # a loud dev override (warn); otherwise → refuse fail-closed. The auth-disabled case is refused
-    # above regardless of this flag — serving full-privilege admin to the network is never one "I
-    # accept the risk" away.
+    # a loud dev override (warn); otherwise it refuses, fail-closed. `serve` always requires sign-in
+    # (vault BACKLOG #2719, #2825), so no flag here serves full-privilege admin to the network.
     #
     # BACKLOG #1672: WITHOUT AN OPERATOR CERTIFICATE THE HOP IS NOT CLEARTEXT. The unconditional
     # ensure_api_tls_material call further down (ADR 0172) mints a self-signed pair and serves
@@ -5443,12 +5432,21 @@ def _cert_inventory(args: argparse.Namespace) -> int:
     return 1 if had_error else 0
 
 
+#: What `cert self-signed` says its pair is, in the console note and the --json `note` alike, so
+#: those two cannot drift. The parser help is worded separately. BACKLOG #1276, owner override
+#: 2026-08-16; the substance of api/tls.py's PLACEHOLDER docstring, not a copy of it.
+_SELF_SIGNED_PLACEHOLDER_NOTE = (
+    "self-signed, so no chain of trust: better than cleartext, worse than an operator-supplied "
+    "chain. A placeholder to replace, not an endorsed production terminator"
+)
+
+
 def _cert_self_signed(args: argparse.Namespace) -> int:
-    """`cert self-signed` — mint a self-signed EC P-256 cert+key for NON-PROD TLS bring-up.
+    """`cert self-signed` — mint a self-signed EC P-256 cert+key, a TLS PLACEHOLDER.
 
     Writes cert.pem + key.pem to ``--out-dir``; key.pem is written by :func:`_write_private_key`,
-    which refuses to overwrite. Prints a clear DEV/non-prod note (a self-signed cert has no chain of
-    trust)."""
+    which refuses to overwrite it (cert.pem has no such guard). Prints
+    :data:`_SELF_SIGNED_PLACEHOLDER_NOTE` (ADR 0172)."""
     from messagefoundry import pki
 
     if args.days <= 0:
@@ -5482,20 +5480,16 @@ def _cert_self_signed(args: argparse.Namespace) -> int:
         "cn": args.cn,
         "sans": dns,
         "days": args.days,
-        "note": "DEV/non-prod only — self-signed, no chain of trust",
+        "note": _SELF_SIGNED_PLACEHOLDER_NOTE,
     }
     if args.json:
         _print_json(result, compact=True)
     else:
-        _safe_print(
-            f"Wrote a self-signed DEV certificate (non-prod TLS bring-up ONLY) to {out_dir}:"
-        )
+        _safe_print(f"Wrote a self-signed PLACEHOLDER certificate to {out_dir}:")
         _safe_print(f"  cert: {cert_path}")
         _safe_print(f"  key:  {key_path} (private; 0600)")
         _safe_print(f"  CN={args.cn}  SAN(DNS)={', '.join(dns)}  valid {args.days} day(s)")
-        _safe_print(
-            "  NOTE: self-signed — no chain of trust; never front production PHI with this."
-        )
+        _safe_print(f"  NOTE: {_SELF_SIGNED_PLACEHOLDER_NOTE}.")
     return 0
 
 
@@ -6263,10 +6257,10 @@ def _keyless_store_gate(settings: ServiceSettings) -> str | None:
 def _offline_security_notifier(settings: ServiceSettings) -> SecurityEventNotifier | None:
     """The per-user security notifier ``serve`` would wire, built for an offline command (#2019).
 
-    Same conditions as the API lifespan: ``[auth].enabled`` and ``[auth].notify_security_events``
-    on, and an ``[alerts]`` SMTP host and sender. ``None`` otherwise, and the caller's notice is then
-    dropped with the WARNING ``AuthService`` logs for every notice with no channel. The host and
-    sender are checked first, so a site with no relay never resolves a secret provider.
+    Same conditions as the API lifespan: ``[auth].notify_security_events`` on, and an ``[alerts]``
+    SMTP host and sender. ``None`` otherwise, and the caller's notice is then dropped with the
+    WARNING ``AuthService`` logs for every notice with no channel. The host and sender are checked
+    first, so a site with no relay never resolves a secret provider.
 
     **An SMTP hop that does not authenticate the relay is refused unless acknowledged**, whatever the
     instance's posture. ``serve`` refuses that hop only on a PHI instance under ``enforce``, and that
@@ -6282,12 +6276,7 @@ def _offline_security_notifier(settings: ServiceSettings) -> SecurityEventNotifi
     from messagefoundry.pipeline.security_notify import security_notifier_from_settings
 
     alerts = settings.alerts
-    if not (
-        settings.auth.enabled
-        and settings.auth.notify_security_events
-        and alerts.email_smtp_host
-        and alerts.email_from
-    ):
+    if not (settings.auth.notify_security_events and alerts.email_smtp_host and alerts.email_from):
         return None
     unauthenticated = not alerts.email_use_tls or not alerts.email_tls_verify
     if unauthenticated and not settings.security.allow_unverified_alert_smtp_tls:
@@ -6412,8 +6401,6 @@ def _build_provision_auth_service(
     warning twice; and only the enforcement dial was passed, so a secret held by a ``[secrets]``
     provider failed here although ``serve`` resolved it. Now it gets the ``[secrets]`` provider,
     the ``[security].enforcement`` dial and the instance hop ``posture``, as ``serve`` passes them.
-    One difference is older than this item: ``serve`` builds the service only when
-    ``[auth].enabled``, and this command always builds one, because it needs one to write.
 
     No security notifier is passed. Whether the command owes a takeover notice is decided at the
     write, against the store it writes to, and attached there.
@@ -6597,10 +6584,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
     from messagefoundry.auth.trust_anchors import TrustAnchorError
     from messagefoundry.config.settings import StoreBackend, hop_posture_from_ai
     from messagefoundry.config.tls_policy import InsecureHopRefused
-    from messagefoundry.secrets_dpapi import DpapiError, DpapiUnavailable
     from messagefoundry.store.base import StoreNotFoundError, build_store_cipher
     from messagefoundry.store.crypto import CipherError, StoreKeylessError
-    from messagefoundry.store.keyprovider import KeyProviderError
 
     store_slot = _ProvisionStore()
     # The instance hop posture, as `serve` derives it: the auth build takes it, and both store opens
@@ -6639,7 +6624,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
     # variables and files, never a key (see store/keyprovider.py, secrets_dpapi.py). Exit 2, as
     # `rotate-key` exits on the same three: the store could not be opened, so the command could not
     # start. Before BACKLOG #2081 they escaped to the dispatch floor.
-    key_unresolved = (KeyProviderError, DpapiError, DpapiUnavailable)
+    key_unresolved = _key_unresolved()
 
     try:
         service = _build_provision_auth_service(settings, store_slot, posture=posture)
@@ -6803,7 +6788,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # #1905, #1916: could not start -- exit 2 whichever of the three keyless checks caught it
         _emit_error(str(exc), as_json=args.json)
         return 2
-    except (*key_unresolved, InsecureHopRefused) as exc:
+    except key_unresolved + (InsecureHopRefused,) as exc:
         # Refused before the prompt already; one that changed since is refused the same way.
         _emit_error(f"{_sentence(exc)} {_NOTHING_PROVISIONED}", as_json=args.json)
         return 2
@@ -7147,6 +7132,7 @@ def _audit_verify(args: argparse.Namespace) -> int:
         StoreNotFoundError,
         open_store,
     )
+    from messagefoundry.store.store import AuditVerdict
 
     # Resolve the anchor FIRST: it is a pure argv/file error, so it should not depend on a config load
     # succeeding, and refusing it early keeps a typo from costing a store open.
@@ -7160,7 +7146,10 @@ def _audit_verify(args: argparse.Namespace) -> int:
         cli.setdefault("store", {})["path"] = args.db
     try:
         settings = load_settings(config_path=args.service_config, cli=cli)
-    except (FileNotFoundError, ValueError, ValidationError) as exc:
+    except (OSError, ValueError, ValidationError) as exc:
+        # OSError, not only FileNotFoundError (vault BACKLOG #2725): a directory or an unreadable
+        # file named by --service-config reached the dispatch floor and exited 1, a broken chain's
+        # code. Its text names the path, not the file's content.
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
@@ -7177,32 +7166,38 @@ def _audit_verify(args: argparse.Namespace) -> int:
     )
     if refused is not None:
         return refused
+    # Decides exit 4 against exit 1 below. The open computes the same verdict inline, because the
+    # #1916 source guard reads that call's argument, so the two cannot be one expression.
+    keyless_refusal = keyless_opt_out_refusal(settings.store, settings.security)
 
-    async def run() -> tuple[bool, str | None, int]:
+    async def run() -> tuple[AuditVerdict, int]:
         # Read-only (BACKLOG #1780, #2101): the evidence is neither migrated nor refused for a schema
         # this build does not match, so a store an incompatible version wrote can still be verified.
-        store = await open_store(
-            settings.store,
-            read_only=True,
-            keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+        store = await _open_store_or_refuse_the_key(
+            open_store(
+                settings.store,
+                read_only=True,
+                keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+            )
         )
         try:
-            ok, message = await store.verify_audit_chain(expected_anchor=expected_anchor)
-            if not ok:
-                return ok, message, -1  # a FAIL exits 1 whatever the count; don't query for it
+            verdict = await store.verify_audit_chain(expected_anchor=expected_anchor)
+            if not verdict[0]:
+                return verdict, -1  # a FAIL exits 1 or 4 whatever the count; don't query for it
             # The row count decides the empty-log exit below. Ask the store for an integer rather
             # than pattern-matching "verified 0 " out of a human-readable message.
             count, _head = await store.audit_anchor()
-            return ok, message, count
+            return verdict, count
         finally:
             await store.close()
 
     try:
-        ok, message, count = run_guarded(run())
+        verdict, count = run_guarded(run())
     except (
         KeylessAuditChainRefused,
         StoreNotFoundError,
-    ) as exc:  # #1916; #1780: a server database with no store. Could not start.
+        _StoreKeyUnresolved,
+    ) as exc:  # #1916; #1780: a server database with no store; #2725: no key. Could not start.
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
@@ -7210,9 +7205,42 @@ def _audit_verify(args: argparse.Namespace) -> int:
         # ONLY SQLite; this catch is what a server backend and any error raised after the open
         # still land in, so both guards stay live.
         return _emit_store_open_error(exc, settings.store.path, as_json=False)
+    ok, message = verdict
+    if verdict.key_unavailable:
+        if keyless_refusal is not None:
+            # EXIT 4, NOT 1 (vault BACKLOG #2725). The chain is keyed, and this shell holds no key
+            # while its settings do not run the store keyless, so it is a shell missing the key. No
+            # row MAC was checked, and 1 would tell a job that reads only the code the chain is
+            # broken. The flag decides, never the message, and only a process with no key sets it.
+            print("NOT CHECKED: " + (message or ""))
+            return 4
+        # Under the audited keyless opt-out the store may run with no key, and then a chain whose
+        # first row names one is the anomaly. Reading it as "not checked" would let a forged genesis
+        # row turn every other edit into a 4, so it stays a broken chain. The cost: a store keyed
+        # under the opt-out, verified from a shell missing its key, also exits 1, and the line says
+        # that is the other explanation.
+        message = (
+            "audit chain broken: its first row names a store key, this shell holds no key, and its "
+            "settings allow the store to run keyless (the audited opt-out), where a chain never "
+            "names one. Either the chain was altered, or this shell lacks the key the store runs "
+            "with"
+        )
     print(("OK: " if ok else "FAIL: ") + (message or ""))
     if not ok:
         return 1
+    if verdict.keyless_walk and keyless_refusal is not None:
+        # Vault BACKLOG #2725. A keyless chain passed, in a shell whose settings require a key. That
+        # is the setup where a rewritten first row turns later tampering into exit 4, so it is said
+        # now, while the chain is clean. The exit stays 0: the chain did verify. Content-free.
+        print(
+            "WARNING: the audit chain is keyless (its first row names no key, and it was checked "
+            "as plain SHA-256), but this shell's settings require a store key. Causes include at "
+            "least: the store runs keyless under other settings, the key is missing here, or the "
+            "chain was rewritten as keyless, which a keyless check cannot see. Run this check with "
+            "the settings and key the engine runs with; if the engine holds a key, that run "
+            "decides it.",
+            file=sys.stderr,
+        )
     if count:
         return 0
 
@@ -7282,10 +7310,12 @@ def _audit_anchor(args: argparse.Namespace) -> int:
 
     async def run() -> tuple[int, str]:
         # Read-only, as audit-verify opens it (BACKLOG #1780, #2101).
-        store = await open_store(
-            settings.store,
-            read_only=True,
-            keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+        store = await _open_store_or_refuse_the_key(
+            open_store(
+                settings.store,
+                read_only=True,
+                keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+            )
         )
         try:
             return await store.audit_anchor()
@@ -7294,7 +7324,11 @@ def _audit_anchor(args: argparse.Namespace) -> int:
 
     try:
         count, head = run_guarded(run())
-    except (KeylessAuditChainRefused, StoreNotFoundError) as exc:  # #1916, #1780, as audit-verify
+    except (
+        KeylessAuditChainRefused,
+        StoreNotFoundError,
+        _StoreKeyUnresolved,
+    ) as exc:  # #1916, #1780, #2725, as audit-verify
         _emit_error(str(exc), as_json=args.json)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
@@ -7409,10 +7443,8 @@ def _rotate_key(args: argparse.Namespace) -> int:
 
     from messagefoundry.config.settings import StoreBackend, load_settings
     from messagefoundry.last_resort import run_guarded
-    from messagefoundry.secrets_dpapi import DpapiError, DpapiUnavailable
     from messagefoundry.store.base import StoreNotFoundError, open_store, resolve_active_key
     from messagefoundry.store.crypto import CipherError
-    from messagefoundry.store.keyprovider import KeyProviderError
     from messagefoundry.uploads import ResealResult, UploadStore
 
     cli: dict[str, dict[str, object]] = {}
@@ -7426,7 +7458,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
 
     try:
         active_key = resolve_active_key(settings.store)
-    except (DpapiError, DpapiUnavailable, KeyProviderError) as exc:
+    except _key_unresolved() as exc:
         # KeyProviderError: a non-default [store].key_provider that is unknown or not-yet-built (an
         # external HSM/KMS/Vault provider) — fail closed with a clean exit-2, not a traceback (ADR 0019).
         print(f"error: cannot load the active key for rotation: {exc}", file=sys.stderr)
@@ -8035,6 +8067,7 @@ def _connection(args: argparse.Namespace) -> int:
     from messagefoundry.config.settings import (
         BLOCK_UNLISTED_OUTBOUND_IN_FORCE,
         hop_posture_from_ai,
+        insecure_bind_escape,
         load_settings,
     )
     from messagefoundry.config.wiring import API_LISTENER_LABEL, WiringError, load_config
@@ -8100,6 +8133,9 @@ def _connection(args: argparse.Namespace) -> int:
             # #190 (ADR 0093): resolve internal-outbound TLS hops against the [tls] internal-CA anchor at
             # edit-time build-check exactly as at reload (None-safe: default system policy = no-op).
             trust_anchor_policy=settings.tls.policy(),
+            # Vault BACKLOG #2622 item 1: the inbound exposure gates read serve's cleartext escape.
+            # This command has no --allow-insecure-bind, so pass the settings half serve folds in.
+            allow_insecure_bind=insecure_bind_escape(settings),
         )
 
     try:
@@ -8695,6 +8731,38 @@ def _paste_safe_option(option: str, value: str) -> str | None:
         or value.startswith("/")
     )
     return None if unsafe else f'{option}="{value}"'
+
+
+def _key_unresolved() -> tuple[type[Exception], ...]:
+    """What ``open_store`` raises when the store key the settings name cannot be resolved: an
+    unreadable key file, or a key provider (Vault, Transit) that refuses or cannot be reached.
+
+    Each is raised while the key is resolved, before the store reads a row, so nothing a database
+    holds can cause one. Their texts name settings, environment variables and files, never a key.
+    Imported here, not at module level, so the CLI's import cost stays where it is."""
+    from messagefoundry.secrets_dpapi import DpapiError, DpapiUnavailable
+    from messagefoundry.store.keyprovider import KeyProviderError
+
+    return (KeyProviderError, DpapiError, DpapiUnavailable)
+
+
+class _StoreKeyUnresolved(RuntimeError):
+    """The store key the settings name could not be resolved while the store opened (vault BACKLOG
+    #2725). Its text is the resolution error's, which names settings, variables and files."""
+
+
+async def _open_store_or_refuse_the_key(opening: Awaitable[Store]) -> Store:
+    """Await a store open, turning a key that cannot be resolved into :class:`_StoreKeyUnresolved`.
+
+    For ``audit-verify`` and ``audit-anchor``, where the dispatch floor's exit 1 is a broken chain's
+    code. Only the OPEN is wrapped: ``open_store`` resolves the key before the backend reads a row,
+    so nothing a database holds can turn a finding into "could not start". A malformed key raises
+    ``ValueError``, which is not caught, because the open raises ``ValueError`` for other reasons too.
+    """
+    try:
+        return await opening
+    except _key_unresolved() as exc:
+        raise _StoreKeyUnresolved(str(exc)) from exc
 
 
 def _emit_store_open_error(exc: sqlite3.DatabaseError, path: str, *, as_json: bool) -> int:

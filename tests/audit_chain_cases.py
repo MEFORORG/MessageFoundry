@@ -373,8 +373,12 @@ async def a_handle_with_no_key_refuses_to_append_to_a_keyed_chain(b: ChainBacken
             assert "refusing to append a keyless audit row" in str(exc), f"{b.name}: {exc}"
         else:
             raise AssertionError(f"{b.name}: a handle with no key appended to a keyed chain")
-        ok, message = await keyless.verify_audit_chain()
+        verdict = await keyless.verify_audit_chain()
+        ok, message = verdict
         assert not ok and "no store encryption key/MAC" in (message or ""), f"{b.name}: {message}"
+        # vault BACKLOG #2725: an intact keyed chain with no key is "not checked", flagged as such,
+        # which is what lets audit-verify exit 4 rather than the broken-chain 1.
+        assert verdict.key_unavailable, f"{b.name}: {message}"
     finally:
         await keyless.close()
     assert await _chain(b) == before, f"{b.name}: the refused append wrote a row"
@@ -493,8 +497,12 @@ async def a_row_added_below_the_genesis_row_does_not_change_what_the_chain_is(
     try:
         refusal = keyless.audit_append_refusal()
         assert refusal is not None, f"{b.name}: a handle with no key read the chain as keyless"
-        ok, message = await keyless.verify_audit_chain()
-        assert not ok and "no store encryption key/MAC" in (message or ""), f"{b.name}: {message}"
+        # A row out of sequence needs no key to see, so a handle with no key reports it as the break
+        # it is, and not as a chain it could not check (vault BACKLOG #2725).
+        verdict = await keyless.verify_audit_chain()
+        ok, message = verdict
+        assert not ok and "broken at seq=1" in (message or ""), f"{b.name}: {message}"
+        assert not verdict.key_unavailable, f"{b.name}: {message}"
     finally:
         await keyless.close()
 

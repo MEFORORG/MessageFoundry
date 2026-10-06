@@ -226,7 +226,7 @@ def _phi_app(tmp_path: Path, *, security: SecuritySettings) -> FastAPI:
         # itself enforce whenever security_settings is passed, as serve always passes it.
         store_settings=StoreSettings(path=str(tmp_path / "phi.db"), allow_unencrypted_phi=True),
         poll_interval=0.05,
-        auth_settings=AuthSettings(enabled=True, notify_security_events=True),
+        auth_settings=AuthSettings(notify_security_events=True),
         alerts_settings=AlertsSettings(
             security_notifications_required=True,
             email_smtp_host="smtp.example.test",

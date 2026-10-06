@@ -620,6 +620,109 @@ async def test_a_scope_the_directory_does_not_own_saves_without_expected_source(
         assert (await c.put(missing, json={"channels": ["IB_A"]}, headers=h)).status_code == 404
 
 
+async def _legacy_scoped_user(engine: Engine, provider: str, scope_json: str | None) -> str:
+    """An account whose scope was stored before BACKLOG #1927 added the source column, so its
+    source is NULL. Every writer now records a source, so the row is written with ``None``
+    directly; nothing else can produce it."""
+    user_id = uuid.uuid4().hex  # hex, because the JSON route takes a ResourceId in its path
+    await engine.store.create_user(
+        user_id=user_id,
+        username=f"u{user_id[:8]}",
+        auth_provider=provider,
+        password_generated=False,
+    )
+    await engine.store.set_user_channel_scope(
+        user_id,
+        scope_json,
+        source=None,  # type: ignore[arg-type]  # the legacy row's NULL, which no writer now makes
+    )
+    assert await _scope_row(engine, user_id) == (scope_json, None)  # positive control on the setup
+    return user_id
+
+
+async def test_a_legacy_directory_scope_needs_expected_source(engine: Engine) -> None:
+    """BACKLOG #2252. An AD account's stored scope with no recorded writer is the directory's: the
+    login sync withdraws it like an ``"ad"`` one. So the bare PUT is refused 409 instead of pinning
+    it manual, and ``expected_source: "ad"`` saves it. Fails on the tree before #2252, where the
+    bare PUT answered 200 and wrote ``manual``, and the ``"ad"`` PUT answered 409."""
+    service = await _admin_service(engine)
+    ada_id = await _legacy_scoped_user(engine, "ad", '["IB_A"]')
+    transport = httpx.ASGITransport(app=create_app(engine, auth=service))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _boss_headers(c)
+        url = f"/users/{ada_id}/channel-scope"
+        # The GET still reports the raw NULL; the save's rule is the one that changed.
+        users = (await c.get("/users", headers=h)).json()
+        assert [u["channel_scope_source"] for u in users if u["id"] == ada_id] == [None]
+
+        r = await c.put(url, json={"channels": ["IB_Z"]}, headers=h)
+        assert r.status_code == 409
+        assert "expected_source='ad'" in r.json()["detail"]
+        assert "IB_A" not in r.text and "IB_Z" not in r.text
+        assert await _scope_row(engine, ada_id) == ('["IB_A"]', None)  # untouched
+
+        r = await c.put(url, json={"channels": ["IB_Z"], "expected_source": "manual"}, headers=h)
+        assert r.status_code == 409
+        assert await _scope_row(engine, ada_id) == ('["IB_A"]', None)
+
+        # The control: the same body with the intent saves, and the compare-and-set still matched
+        # the raw NULL the row holds.
+        r = await c.put(url, json={"channels": ["IB_Z"], "expected_source": "ad"}, headers=h)
+        assert r.status_code == 200
+        assert await _scope_row(engine, ada_id) == ('["IB_Z"]', SCOPE_SOURCE_MANUAL)
+
+
+async def test_a_sign_in_that_takes_over_a_legacy_scope_mid_save_is_a_conflict(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2252: the intent check reads the legacy NULL as the directory's, but the
+    compare-and-set still expects the NULL the row holds. A sign-in that writes the scope between
+    the two leaves its grant, and the confirmed save answers 409 rather than overwriting it."""
+    service = await _admin_service(engine)
+    ada_id = await _legacy_scoped_user(engine, "ad", '["IB_A"]')
+    store = engine.store
+    real = store.set_user_channel_scope_if_source
+
+    async def sign_in_lands_first(*args: object, **kwargs: object) -> bool:
+        await store.set_user_channel_scope(ada_id, '["IB_B"]', source=SCOPE_SOURCE_AD)
+        return await real(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(store, "set_user_channel_scope_if_source", sign_in_lands_first)
+    transport = httpx.ASGITransport(app=create_app(engine, auth=service))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _boss_headers(c)
+        body = {"channels": ["IB_Z"], "expected_source": "ad"}
+        r = await c.put(f"/users/{ada_id}/channel-scope", json=body, headers=h)
+    assert r.status_code == 409
+    assert "changed hands" in r.json()["detail"]
+    assert await _scope_row(engine, ada_id) == ('["IB_B"]', SCOPE_SOURCE_AD)  # the sign-in's
+
+
+@pytest.mark.parametrize(
+    ("provider", "scope_json"),
+    [
+        ("local", '["IB_A"]'),  # a local account never meets the login sync
+        ("ad", None),  # nothing stored, so nothing for the sync to withdraw
+    ],
+)
+async def test_a_null_source_the_directory_does_not_own_saves_without_expected_source(
+    engine: Engine, provider: str, scope_json: str | None
+) -> None:
+    """BACKLOG #2252 is scoped to the AD account with a stored scope. A NULL source anywhere else
+    still saves with the body an older client sends, and ``"ad"`` there is still the mismatch."""
+    service = await _admin_service(engine)
+    user_id = await _legacy_scoped_user(engine, provider, scope_json)
+    transport = httpx.ASGITransport(app=create_app(engine, auth=service))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _boss_headers(c)
+        url = f"/users/{user_id}/channel-scope"
+        r = await c.put(url, json={"channels": ["IB_Z"], "expected_source": "ad"}, headers=h)
+        assert r.status_code == 409
+        assert await _scope_row(engine, user_id) == (scope_json, None)
+        assert (await c.put(url, json={"channels": ["IB_Z"]}, headers=h)).status_code == 200
+        assert await _scope_row(engine, user_id) == ('["IB_Z"]', SCOPE_SOURCE_MANUAL)
+
+
 @pytest.mark.parametrize("expected_source", [None, "manual"])
 async def test_a_sign_in_between_the_read_and_the_write_is_a_conflict(
     engine: Engine, monkeypatch: pytest.MonkeyPatch, expected_source: str | None

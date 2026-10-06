@@ -29,6 +29,20 @@ this line.**
 
 ### Security
 
+- **An IPv4 entry in `organization_domains` or `external_link_allowlist` matches only that
+  address.** The interstitial check matched every entry on a label boundary. So a host that merely
+  ended in a listed address would have counted as covered. The engine still accepts a canonical
+  dotted-quad address in either list. It now refuses a partial or non-canonical one, and any other
+  entry not shaped like a host name. No seam change. (vault BACKLOG #2843)
+
+- **A cookie replayed from a second address is sent to re-authenticate before a PHI page or a
+  write.** The message pages, the dead-letter list and the three reason reveals (every
+  `require_ui(..., phi=True)` page), and every write on `require_ui`, now send a session presented
+  from a host it has not verified from to `/ui/reauth`. A must-change session is not asked. A PHI
+  page comes back to itself after the re-auth, query included, so those pages are now registered
+  continuations. A write lands on `/ui`, or on `/ui/account` for a session without
+  `monitoring:read`, and the operator presses the button again. The step-up routes already did this. Pages that are neither,
+  the dashboard included, still load. No seam change. (vault BACKLOG #2620)
 - **Every console route declares its authorization.** Each `require_ui*` gate carries the engine's
   gate mark, and each sign-in and re-authentication route is marked `public_route` with a reason.
   The engine now refuses a route that declares neither. The supported engine seam moved because the
@@ -52,6 +66,15 @@ this line.**
   directory the engine could not check is counted apart. They come from the new
   `interpreter` block of the engine's security posture, which moves the supported engine UI seam.
   The file names are in `GET /security/posture`. (vault BACKLOG #2701, #2700)
+- **An attached auth service can no longer be turned off.** The engine's `AuthService.enabled` is
+  now a read-only property that is always true, so the console's sign-in checks hold whenever a
+  service is attached. The console code is unchanged; the supported engine UI seam moved because
+  the property is now part of the contract the seam digest reads. (vault BACKLOG #2825)
+- **The passkey leg says when the directory could not confirm the account.** The engine refuses
+  a directory account's passkey assertion when the directory does not confirm the account. The
+  console's `POST /ui/reauth/webauthn` now shows the directory message for that refusal, in the
+  same words the code and password legs use, not "passkey verification failed", because the
+  passkey was never checked. No seam change. (vault BACKLOG #2239)
 
 ## [0.4.0] — 2026-10-01 — Early Access
 
