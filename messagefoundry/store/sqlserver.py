@@ -9409,23 +9409,31 @@ class SqlServerStore:
         sha256 of the VERBATIM concatenated plaintext). Each chunk is AES-GCM-sealed independently (a
         bounded plaintext window per seal). Identical content **dedups** to one copy (a re-put returns the
         same ref and writes nothing). The fresh attachment sits at ``refcount=0`` until increffed."""
-        hasher = hashlib.sha256()
-        total = 0
-        # Cell-bound AAD (ASVS 11.3.3) binds each chunk to (attachment_id, seq), and the attachment_id is
-        # the content hash — known only after the full plaintext is hashed. Buffer the verbatim slices,
-        # hash, then seal each under (ref, seq); the source is an already-materialized OBX-5.5 value, so
-        # this adds no order-of-magnitude memory and each seal still consumes one chunk. Mirrors SQLite.
-        plaintext_chunks: list[str] = []
-        for chunk in chunks:
-            data = chunk.encode("utf-8")
-            hasher.update(data)
-            total += len(data)
-            plaintext_chunks.append(chunk)
-        ref = hasher.hexdigest()
-        sealed: list[str] = [
-            self._cipher.encrypt(c, aad=cell_aad("attachment_chunk", "ciphertext", ref, seq))
-            for seq, c in enumerate(plaintext_chunks)
-        ]
+
+        def _seal() -> tuple[str, int, list[str]]:
+            # Off the event loop (vault BACKLOG #2757): hashing and sealing a large document is CPU
+            # work in proportion to its size, and nothing else would run meanwhile.
+            hasher = hashlib.sha256()
+            total = 0
+            # Cell-bound AAD (ASVS 11.3.3) binds each chunk to (attachment_id, seq), and the
+            # attachment_id is the content hash — known only after the full plaintext is hashed.
+            # Buffer the verbatim slices, hash, then seal each under (ref, seq); the source is an
+            # already-materialized OBX-5.5 value, so this adds no order-of-magnitude memory and each
+            # seal still consumes one chunk. Mirrors SQLite.
+            plaintext_chunks: list[str] = []
+            for chunk in chunks:
+                data = chunk.encode("utf-8")
+                hasher.update(data)
+                total += len(data)
+                plaintext_chunks.append(chunk)
+            ref = hasher.hexdigest()
+            sealed: list[str] = [
+                self._cipher.encrypt(c, aad=cell_aad("attachment_chunk", "ciphertext", ref, seq))
+                for seq, c in enumerate(plaintext_chunks)
+            ]
+            return ref, total, sealed
+
+        ref, total, sealed = await asyncio.to_thread(_seal)
         now = time.time()
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
