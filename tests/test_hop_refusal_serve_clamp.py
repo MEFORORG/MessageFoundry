@@ -2,9 +2,10 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """#200 (ADR 0092) apply-findings coverage: the LIVE serve/reload connector-build sites stamp the derived
 posture (so the raw/MLLP/HTTP hop guards actually decide against the real posture on ``serve`` — not the
-unstamped fail-closed/no-op default), and the strict verify-off cells (MLLP/FTPS ``tls_verify=false``,
-credentialed plain-ftp, engine<->store TLS) CLAMP the ``MEFOR_ALLOW_INSECURE_TLS`` escape so it can never
-relax a production-PHI hop (decision 2).
+unstamped fail-closed/no-op default), and the strict verify-off cells (MLLP/anonymous FTPS
+``tls_verify=false``, engine<->store TLS) CLAMP the ``MEFOR_ALLOW_INSECURE_TLS`` escape so it can never
+relax a production-PHI hop (decision 2). Credentialed plain-ftp was such a cell until vault BACKLOG
+#2636 made it absolute.
 
 These guard the exact regressions the review found: ``engine.start()`` never calls ``build_check``, so the
 guards no-op / fail-closed on the primary serve path unless the build sites stamp the posture themselves.
@@ -218,7 +219,7 @@ def test_ftps_verify_off_refuses_prod_phi_even_with_escape(monkeypatch: pytest.M
         RemoteFileDestination(cfg)  # crosses with the escape on non-prod
 
 
-def test_credentialed_ftp_refuses_prod_phi_even_with_escape(
+def test_credentialed_ftp_refuses_every_posture_even_with_escape(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from messagefoundry.transports.remotefile import RemoteFileDestination

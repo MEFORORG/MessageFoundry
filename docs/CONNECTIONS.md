@@ -1225,7 +1225,7 @@ poll/write shape against a remote server, selected by an internal `protocol` set
 | `host` | both | — (required) | the remote server — the `[egress].allowed_remote` key. Use `env()` for a DEV/PROD-specific host. |
 | `port` | both | `22` (`Sftp`) / `21` (`Ftp`) | server port |
 | `remote_dir` | both | — (required) | remote directory to poll / upload into |
-| `username` | both | — (unset) | login user (unset = anonymous, FTP only) |
+| `username` | both | — (unset) | login user (unset = anonymous, FTP only). Refused over plain `ftp`, alone or with a password. |
 | `password` | both | — (unset) | login password — a **secret**, via `env()`. Refused over plain `ftp`. |
 | `private_key` | both | — | **`Sftp` only** — the **text** of an **RSA** private key, not a path; a **secret**, via `env()`. See *RSA key text only* below the table. |
 | `key_password` | both | — | **`Sftp` only** — **refused** (BACKLOG #1352): an encrypted SFTP key cannot meet the [wrap floor](#encrypted-private-keys-must-meet-the-wrap-floor), so supply `private_key` unencrypted through `env()`. Setting this fails at `check` |

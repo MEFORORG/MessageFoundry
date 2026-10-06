@@ -342,8 +342,8 @@ class EmailDestination(DestinationConnector):
         # mechanism — but it is now read through the CLAMPED weakened_tls_escape_permitted_here()
         # (#200, ADR 0092 decision 2) rather than the raw insecure_tls_allowed(): the blunt global
         # escape must not silence a cleartext hop on an ENFORCING production-PHI instance, exactly as
-        # it no longer does for MLLP/FTPS tls_verify=false or credentialed plain-ftp. A per-connection
-        # `tls_hop_attested` also satisfies this opt-in gate, so an operator who has attested the hop
+        # it no longer does for MLLP/anonymous-FTPS tls_verify=false (credentialed FTP is refused
+        # outright since vault BACKLOG #2636). A per-connection `tls_hop_attested` also satisfies this opt-in gate, so an operator who has attested the hop
         # is legitimately secure (a trusted segment / on-box relay) is not forced to ALSO set a blunt
         # process-wide env var — without this, attestation would be dead config on EMAIL alone.
         self._hop_guard: InsecureHopGuard | None = None

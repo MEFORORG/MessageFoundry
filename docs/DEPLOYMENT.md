@@ -628,8 +628,10 @@ every posture, with no escape (it puts the credential itself on the wire; vault 
 
 ## The `MEFOR_ALLOW_INSECURE_TLS` escape hatch
 
-Several connectors **fail closed** on a weakened-TLS or cleartext-credential configuration unless the
-environment variable `MEFOR_ALLOW_INSECURE_TLS` is set. It exists for **dev / trusted-lab** use only.
+Several connectors **fail closed** on a weakened-TLS or cleartext configuration unless the
+environment variable `MEFOR_ALLOW_INSECURE_TLS` is set. A credential over cleartext or over an
+unverified TLS session is not on this list: SMTP AUTH and FTP logins there are refused outright,
+whatever the escape says. It exists for **dev / trusted-lab** use only.
 With it set, these otherwise-refused settings become permitted (each logs a loud warning):
 
 - REST/SOAP `verify_tls = false`. *(Clamped.)*

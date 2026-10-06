@@ -341,7 +341,9 @@ The console stays a **host-side process**; only its target URL changes.
 - **External SQL Server / Postgres store.** The store connection is TLS by default
   (`[store].encrypt = true`, `[store].trust_server_certificate = false`). **`MEFOR_ALLOW_INSECURE_TLS`
   must NOT be set in a real deployment** — it is the single switch that downgrades store TLS (and
-  MLLP-outbound verify, REST/SOAP verify, SFTP host-key, plain-FTP creds) to best-effort. Note CI sets
+  MLLP-outbound verify, REST/SOAP verify, SFTP host-key) to best-effort. It no longer releases a
+  credential over plain FTP or over an unverified FTPS session: those are refused outright (vault
+  BACKLOG #2636). Note CI sets
   it deliberately for the self-signed SQL Server container; that is a **CI-only** posture and must
   never leak into a production image/compose. Give the production DB a CA-trusted cert instead.
 - **Logs.** Keep the service at INFO (never raise to DEBUG in a PHI container — full-body logging risk
