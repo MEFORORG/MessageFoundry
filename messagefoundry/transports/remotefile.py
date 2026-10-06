@@ -524,8 +524,9 @@ def _ftps_ssl_context(
     if not verify and not weakened_tls_escape_permitted_here():
         raise ValueError(
             "REMOTEFILE ftps tls_verify=false disables server-certificate verification (MITM risk). "
-            f"Use a trusted CA (tls_ca_file), or set {INSECURE_TLS_ESCAPE_ENV}=1 to allow it on a "
-            "trusted-network bind (refused on a production-PHI instance even with the escape, #200)."
+            f"Use a trusted CA (tls_ca_file), or set {INSECURE_TLS_ESCAPE_ENV}=1 on an instance at "
+            "[security].enforcement = warn to allow it on a trusted-network bind (the escape has no "
+            "effect while enforcing, the default, or with no posture)."
         )
     ca = settings.get("tls_ca_file")
     if verify and trust_anchor_policy is not None:
@@ -552,7 +553,8 @@ def _ftps_ssl_context(
     else:
         logger.warning(
             "REMOTEFILE ftps TLS certificate verification is DISABLED (tls_verify=false, permitted "
-            "by %s) — MITM-able; for a trusted-network dev/test bind only.",
+            "by %s at [security].enforcement = warn) — MITM-able; for a trusted-network dev/test "
+            "bind only.",
             INSECURE_TLS_ESCAPE_ENV,
         )
         ctx.check_hostname = False
@@ -1437,7 +1439,8 @@ class _SftpClient(_RemoteClient):
         if self._accept_unknown:
             logger.warning(
                 "REMOTEFILE sftp %s accepts UNKNOWN host keys (AutoAddPolicy) because %s is set "
-                "— MITM-able; for a trusted-network dev/test bind only",
+                "on an instance at [security].enforcement = warn — MITM-able; for a trusted-network "
+                "dev/test bind only",
                 self._host,
                 INSECURE_TLS_ESCAPE_ENV,
             )
@@ -1832,8 +1835,9 @@ def _validate_common(
             raise ValueError(
                 f"{hop_name_prefix(connection)}REMOTEFILE plain ftp transmits credentials in "
                 "CLEARTEXT; refused unless "
-                f"{INSECURE_TLS_ESCAPE_ENV} is set — use ftps (tls=True) or sftp (refused on a "
-                "production-PHI instance even with the escape, #200)"
+                f"{INSECURE_TLS_ESCAPE_ENV} is set on an instance at [security].enforcement = warn "
+                "(the escape has no effect while enforcing, the default, or with no posture) — use "
+                "ftps (tls=True) or sftp"
             )
         logger.warning(
             "%sREMOTEFILE %s sends credentials over CLEARTEXT ftp (no TLS)",

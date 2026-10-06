@@ -673,14 +673,15 @@ class LdapAuthenticator:
             if not weakened_tls_escape_permitted(self._posture):
                 raise LdapError(
                     "ad_tls_verify=false disables LDAPS certificate verification (MITM risk). Use a "
-                    f"trusted CA via ad_tls_ca_cert_file, or set {INSECURE_TLS_ESCAPE_ENV}=1 to "
-                    "explicitly allow it for a trusted-network dev/test bind (refused on an enforcing "
-                    "PHI instance even with that override set, #329)."
+                    f"trusted CA via ad_tls_ca_cert_file, or set {INSECURE_TLS_ESCAPE_ENV}=1 on an "
+                    "instance at [security].enforcement = warn to explicitly allow it for a "
+                    "trusted-network dev/test bind (the override has no effect while enforcing, the "
+                    "default, or with no posture)."
                 )
             logger.warning(
                 "LDAPS certificate verification for AD is DISABLED (ad_tls_verify=false, permitted by "
-                "%s) — the service-account and user binds are exposed to MITM; do not use in "
-                "production.",
+                "%s at [security].enforcement = warn) — the service-account and user binds are "
+                "exposed to MITM; do not use in production.",
                 INSECURE_TLS_ESCAPE_ENV,
             )
         # BACKLOG #1317, #2494. The engine builds this hop's TLS context (ASVS 12.1.2): narrowed to the
