@@ -309,17 +309,6 @@ async def test_an_inbound_ftps_pollers_ca_takes_the_checks(
         await _preflight(store, cfg)
 
 
-@pytest.mark.parametrize("factory", ["Email", "Direct"])
-def test_a_ca_the_mail_hop_never_reads_is_not_checked(tmp_path: Path, factory: str) -> None:
-    """With use_tls off the SMTP hop builds no TLS context, so its CA is never read. A missing or
-    exposed file there must not refuse the whole load. The control: use_tls on collects it."""
-    gone = str(tmp_path / "gone.pem")
-    off = _FACTORIES[factory](tls_ca_file=gone, use_tls=False)
-    on = _FACTORIES[factory](tls_ca_file=gone)
-    assert ta.outbound_anchor_spec("OB_MAIL", off.settings) is None
-    assert ta.outbound_anchor_spec("OB_MAIL", on.settings) is not None
-
-
 # --- the change audit ----------------------------------------------------------------------------
 
 
@@ -458,3 +447,242 @@ def test_an_mllp_and_a_dicom_destination_build_with_a_pin(tmp_path: Path) -> Non
     pinned["tls_ca_pin"] = _sha(ca)
     assert _mllp_ssl_context(dict(pinned), server=False) is not None
     assert _client_ssl_context(dict(pinned)) is not None
+
+
+# --- review round 2: where a refusal lands (ADR 0031, as amended 2026-10-06) ----------------------
+
+_PIN_MISMATCH = "does not match its configured SHA-256 pin"
+#: How a lane failed by its CA reads in its status. ``safe_exc`` shortens the rest of the reason,
+#: so the audit row is what proves it was the pin.
+_REFUSED_OUT = "TrustAnchorError: outbound connection 'OUT' tls_ca_file: the trust anchor"
+
+
+def _engine(store: MessageStore) -> Any:
+    """An engine with the two checks ``serve`` hands it, and nothing else."""
+    from messagefoundry.pipeline import Engine
+
+    return Engine(
+        store,
+        registry_preflight=ta.make_registry_anchor_preflight(store, enforcing=True),
+        lane_anchor_check=ta.make_lane_anchor_check(store, enforcing=True),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+
+
+async def _start_like_serve(engine: Any, cfg: Path) -> Any:
+    """The managed app's first load: the start-scoped preflight, then the start."""
+    reg = load_config(cfg)
+    await engine.preflight_registry(reg, at_start=True)
+    engine.add_registry(reg)
+    await engine.start()
+    return engine.registry_runner
+
+
+def _two_outbound_graph(cfg: Path, out: str) -> None:
+    """``OUT`` as given, beside a plain File outbound ``OB_OK`` that must come up regardless."""
+    cfg.mkdir()
+    for d in ("in", "ok"):
+        (cfg.parent / d).mkdir(exist_ok=True)
+    (cfg / "feed.py").write_text(
+        "from messagefoundry import File, Rest, Send, handler, inbound, outbound, router\n"
+        f"inbound('IB_IN', File(directory={str(cfg.parent / 'in')!r}, poll_seconds=1.0), "
+        "router='r')\n"
+        f"outbound('OUT', {out})\n"
+        f"outbound('OB_OK', File(directory={str(cfg.parent / 'ok')!r}))\n" + _GRAPH_TAIL,
+        encoding="utf-8",
+    )
+
+
+async def test_a_refused_outbound_ca_fails_its_lane_at_start_and_a_reload_refuses(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """ADR 0031: the start comes up with ``OUT`` failed and named, ``OB_OK`` and the inbound live,
+    and the audit row written. A reload checks every CA first, so it is refused whole. Red under:
+    the lane check removed from the start build, or the start preflight checking lanes again."""
+    ca = _ca(tmp_path)
+    cfg = tmp_path / "cfg"
+    _two_outbound_graph(cfg, _dest("rest", ca, pin="00" * 32))
+    engine = _engine(store)
+    try:
+        runner = await _start_like_serve(engine, cfg)
+        degraded = runner.degraded_outbound()
+        assert set(degraded) == {"OUT"}, degraded
+        assert degraded["OUT"].startswith(_REFUSED_OUT), degraded
+        assert not runner.degraded_inbound()
+        assert "pin_mismatch" in {r["event"] for r in await _rows(store, "outbound:OUT")}
+        with pytest.raises(WiringError, match=_PIN_MISMATCH):
+            await engine.reload_detail(cfg)
+    finally:
+        await engine.stop()
+
+
+async def test_an_operator_start_checks_a_lane_the_boot_gate_left_unbuilt(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """Review R1: an ``auto_start=False`` lane is built at its operator start, and the CA is
+    checked then. The start itself reads nothing for it. Red under: the check removed from
+    ``_ensure_destination_built``."""
+    ca = _ca(tmp_path)
+    cfg = tmp_path / "cfg"
+    _two_outbound_graph(cfg, _dest("rest", ca, pin="00" * 32) + ", auto_start=False")
+    engine = _engine(store)
+    try:
+        runner = await _start_like_serve(engine, cfg)
+        assert not runner.degraded_outbound()
+        assert await _rows(store, "outbound:OUT") == []
+        await runner.start_outbound("OUT")
+        assert runner.degraded_outbound()["OUT"].startswith(_REFUSED_OUT)
+        assert "pin_mismatch" in {r["event"] for r in await _rows(store, "outbound:OUT")}
+    finally:
+        await engine.stop()
+
+
+async def test_a_refused_ftps_poller_ca_fails_that_inbound_at_start(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """The inbound twin: an ``Ftp`` poller is checked before it binds, at start and at an operator
+    start, and only it fails. Red under: either call removed from the runner."""
+    ca = _ca(tmp_path)
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    (cfg / "feed.py").write_text(
+        "from messagefoundry import File, Ftp, Send, handler, inbound, outbound, router\n"
+        "inbound('IB_FTPS', Ftp(host='127.0.0.1', port=9, tls=True, remote_dir='/out', "
+        f"tls_ca_file={str(ca)!r}, tls_ca_pin={'00' * 32!r}), router='r')\n"
+        f"outbound('OUT', File(directory={str(tmp_path / 'out')!r}))\n" + _GRAPH_TAIL,
+        encoding="utf-8",
+    )
+    engine = _engine(store)
+    try:
+        runner = await _start_like_serve(engine, cfg)
+        refused = "TrustAnchorError: inbound connection 'IB_FTPS' tls_ca_file: the trust anchor"
+        assert runner.degraded_inbound()["IB_FTPS"].startswith(refused)
+        assert not runner.degraded_outbound()
+        assert "pin_mismatch" in {r["event"] for r in await _rows(store, "inbound:IB_FTPS")}
+        with pytest.raises(TrustAnchorError, match=_PIN_MISMATCH):
+            await runner.start_inbound("IB_FTPS")
+    finally:
+        await engine.stop()
+
+
+async def test_the_start_preflight_keeps_the_lookup_and_leaves_the_lanes(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """A ``FhirLookup`` has no lane to fail, so its refused CA still refuses the start. An outbound's
+    does not: the lane check owns it. The reload scope checks both."""
+    ca = _ca(tmp_path)
+    cfg = tmp_path / "cfg"
+    _two_outbound_graph(cfg, _dest("rest", ca, pin="00" * 32))
+    reg = load_config(cfg)
+    preflight = ta.make_registry_anchor_preflight(store, enforcing=True)
+    await preflight(reg, {}, at_start=True)
+    with pytest.raises(WiringError, match="outbound connection 'OUT'"):
+        await preflight(reg, {})
+
+    wiring._active = Registry()
+    lookup = tmp_path / "lookup"
+    _graph(lookup, _dest("rest", ca))
+    (lookup / "lookup.py").write_text(
+        "from messagefoundry import FhirLookup\n"
+        f"FhirLookup('EPIC', url='https://fhir.example.org/fhir', tls_ca_file={str(ca)!r}, "
+        f"tls_ca_pin={'00' * 32!r})\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(WiringError, match="fhir lookup 'EPIC' tls_ca_file"):
+        await preflight(load_config(lookup), {}, at_start=True)
+
+
+async def test_a_missing_outbound_ca_names_the_connection(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    """Review D2: the refusal names the connection, at the lane and at a reload. Red under: the
+    ``OSError`` reaching the caller unwrapped."""
+    gone = str(tmp_path / "gone.pem")
+    check = ta.make_lane_anchor_check(store, enforcing=True)
+    with pytest.raises(TrustAnchorError, match="outbound connection 'OUT' tls_ca_file: could not"):
+        await check("outbound", "OUT", {"tls_ca_file": gone})
+    cfg = tmp_path / "cfg"
+    _graph(cfg, _dest("rest", gone))
+    with pytest.raises(WiringError, match="outbound connection 'OUT' tls_ca_file: could not"):
+        await _preflight(store, cfg)
+
+
+# --- review round 2: a CA the hop never reads, and the pin's format --------------------------------
+
+_MAIL_KW = "host='smtp.example.org', sender='a@example.org', recipients=['b@example.org']"
+_DIRECT_KW = (
+    "host='hisp.example.org', sender='a@direct.example.org', "
+    "recipients=['b@direct.example.org'], signing_cert='s.pem', signing_key='k.pem', "
+    "recipient_cert='r.pem', trust_anchor='t.pem'"
+)
+
+#: Each hop builds no context that verifies a server against ``tls_ca_file``.
+_UNREAD: dict[str, str] = {
+    "email-no-tls": "Email(" + _MAIL_KW + ", use_tls=False{kw})",
+    "direct-no-tls": "Direct(" + _DIRECT_KW + ", use_tls=False{kw})",
+    "email-no-verify": "Email(" + _MAIL_KW + ", tls_verify=False{kw})",
+    "rest-http": "Rest(url='http://partner.example.org/api'{kw})",
+    "rest-verify-off": "Rest(url='https://partner.example.org/api', verify_tls=False{kw})",
+    "mllp-verify-off": "MLLP(host='partner.example.org', port=2575, tls=True, tls_verify=False{kw})",
+}
+
+
+def _unread_graph(cfg: Path, dest: str) -> None:
+    cfg.mkdir()
+    (cfg.parent / "in").mkdir(exist_ok=True)
+    (cfg / "feed.py").write_text(
+        "from messagefoundry import MLLP, Direct, Email, File, Rest, Send, env, handler\n"
+        "from messagefoundry import inbound, outbound, router\n"
+        "from messagefoundry.transports.http_auth import with_oauth2_client_credentials\n"
+        f"inbound('IB_IN', File(directory={str(cfg.parent / 'in')!r}, poll_seconds=1.0), "
+        "router='r')\n"
+        f"outbound('OUT', {dest})\n" + _GRAPH_TAIL,
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize("case", sorted(_UNREAD))
+def test_a_ca_the_hop_never_reads_is_not_checked_and_its_pin_is_refused(
+    tmp_path: Path, case: str
+) -> None:
+    """Reviews D3 and R5, through a loaded graph. With no pin the CA is not collected, so a missing
+    file refuses nothing. With a pin the load refuses, naming the reason. Red under: ``use_tls`` or
+    ``tls_verify`` dropped from ``_CONNECTION_ANCHOR_KEYS``, or the unread rule removed."""
+    gone = str(tmp_path / "gone.pem")
+    bare = tmp_path / "bare"
+    _unread_graph(bare, _UNREAD[case].format(kw=f", tls_ca_file={gone!r}"))
+    assert ta.registry_anchor_specs(load_config(bare), {}) == []
+    wiring._active = Registry()
+    pinned = tmp_path / "pinned"
+    kw = f", tls_ca_file={gone!r}, tls_ca_pin={'ab' * 32!r}"
+    _unread_graph(pinned, _UNREAD[case].format(kw=kw))
+    with pytest.raises(WiringError, match="tls_ca_pin is set, but the hop never reads"):
+        load_config(pinned)
+
+
+def test_a_token_hop_reads_the_ca_on_an_http_url(tmp_path: Path) -> None:
+    """The control for the case above: an OAuth2 token hop reads ``tls_ca_file`` whatever the data
+    url says, so the CA is collected and its pin is not refused."""
+    gone = str(tmp_path / "gone.pem")
+    cfg = tmp_path / "cfg"
+    rest = (
+        f"Rest(url='http://partner.example.org/api', tls_ca_file={gone!r}, "
+        f"tls_ca_pin={'ab' * 32!r})"
+    )
+    _unread_graph(
+        cfg,
+        f"with_oauth2_client_credentials({rest}, token_url='https://auth.example.org/token', "
+        "client_id='c', client_secret=env('secret'))",
+    )
+    (spec,) = ta.registry_anchor_specs(load_config(cfg), {"secret": "s"})
+    assert (spec.label, spec.pin) == ("outbound:OUT", "ab" * 32)
+
+
+@pytest.mark.parametrize("factory", sorted(_FACTORIES))
+@pytest.mark.parametrize("pin", ["ab" * 31, "zz" * 32])
+def test_a_malformed_pin_is_refused_at_load(factory: str, pin: str) -> None:
+    """Review R3: a pin of the wrong length or not hex is refused by the factory, so ``check`` and a
+    dry run catch it, not only a real reload. An ``env()`` pin is checked once it resolves."""
+    with pytest.raises((ValueError, WiringError), match="must be a SHA-256 hex digest"):
+        _FACTORIES[factory](tls_ca_file="/org/ca.pem", tls_ca_pin=pin)
+    _FACTORIES[factory](tls_ca_file="/org/ca.pem", tls_ca_pin=env("ca_pin"))
