@@ -68,8 +68,7 @@ from dataclasses import dataclass
 from typing import Any, Final, Literal
 
 from fastapi import FastAPI
-from fastapi import routing as fastapi_routing
-from fastapi.routing import APIRoute, APIWebSocketRoute
+from fastapi.routing import APIRoute, APIWebSocketRoute, iter_route_contexts
 from starlette.applications import Starlette
 from starlette.routing import BaseRoute, Mount
 
@@ -427,18 +426,16 @@ def websocket_gates(
 def _effective_routes(routes: Sequence[BaseRoute]) -> Iterator[tuple[BaseRoute, Any]]:
     """``(route, effective)`` for each route, with every ``include_router`` call unpacked.
 
-    FastAPI 0.139 and later keep an included router as one opaque object on the app, and serve its
-    routes through an effective context that carries the include's prefix and dependencies.
-    ``effective`` is that context, read through FastAPI's ``iter_route_contexts``, or the route itself
-    where there is no include. The walk takes the PATH and methods from it, and the gate from the
-    route's own dependencies. An older FastAPI copied included routes onto the app, so there the
-    plain list is already complete."""
-    iterate = getattr(fastapi_routing, "iter_route_contexts", None)
-    if iterate is None:  # pragma: no cover - only an older FastAPI than the lock pins
-        for route in routes:
-            yield route, route
-        return
-    for context in iterate(routes):
+    FastAPI keeps an included router as one opaque object on the app, and serves its routes
+    through an effective context that carries the include's prefix and dependencies.
+    ``iter_route_contexts`` reads those contexts. For an API route, ``effective`` is the context;
+    for any other route, it is the rebuilt copy FastAPI serves, or the route itself. The walk takes
+    the PATH and methods from it. An HTTP route's gate comes from the route's own dependencies.
+
+    The import is direct on purpose. On a FastAPI that hides included routes without this call, the
+    walk once showed each include as one bare MOUNT row and lost its routes from the gated view.
+    The floor in pyproject.toml says which releases those are."""
+    for context in iter_route_contexts(routes):
         original: BaseRoute = context.original_route
         if isinstance(original, APIRoute):
             yield original, context
