@@ -363,3 +363,22 @@ def test_the_cli_reports_an_unnamed_integrity_refusal_as_a_refused_write(
     assert rc == 1
     assert error.startswith("the store refused one of this command's writes")
     assert "cannot open the store" not in error
+
+
+class UniqueViolationError(Exception):
+    """Stands in for asyncpg's class of that name, which shares no base with sqlite3's errors."""
+
+
+def test_the_cli_reports_a_server_backends_integrity_refusal_as_a_refused_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    db = _cli_ready(tmp_path, monkeypatch)
+
+    async def refused(self: MessageStore, **_kwargs: object) -> None:
+        raise UniqueViolationError("duplicate key value violates unique constraint")
+
+    monkeypatch.setattr(MessageStore, "create_user", refused)
+    rc = main(["provision-admin", "--username", "site-admin", "--db", str(db), "--json"])
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert rc == 1
+    assert error.startswith("the store refused one of this command's writes")

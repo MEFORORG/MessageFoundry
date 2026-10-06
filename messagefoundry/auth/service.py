@@ -2493,15 +2493,15 @@ class AuthService:
                 # BACKLOG #2697: another run, or a directory sign-in, took the name after the read
                 # above. Refused rather than repaired in place: a re-run reads the row and takes the
                 # repair branch, so `_existing_row_refusal`'s rules (#2288) stay in one place. This
-                # INSERT was the run's first write, so nothing was written. A refusal with no row
-                # holding the name is some other fault and re-raises untouched.
+                # INSERT was the run's first account write, so no account row was written. A
+                # refusal with no row holding the name is some other fault and re-raises untouched.
                 if await self._store.get_user_by_username(username) is None:
                     raise
                 raise FirstAdministratorRefused(
                     "an account with that username was created while this command ran, so this run "
-                    "wrote nothing. If another provision-admin run is in progress, let it finish. "
-                    "Then run the command again: it reads that account and either completes it or "
-                    "says why it cannot"
+                    "wrote no account; remove any authenticator entry it showed. If another "
+                    "provision-admin run is in progress, let it finish. Then run the command again: "
+                    "it reads that account and either completes it or says why it cannot"
                 ) from exc
         await self._seed_roles()
         # ADR 0197 Amendment A (N-A): the step is consumed FIRST, before the credential or the
@@ -4808,8 +4808,10 @@ class AuthService:
                 #
                 # NOT CLOSED HERE: both sign-ins then run the caller's role resync on one new row.
                 # When the groups map to a role, each can read no prior roles and revoke the
-                # account's sessions, which can end the other's new session. That fails closed, and
-                # two sign-ins of an existing account after a group change meet the same race.
+                # account's sessions, which can end the other's new session. On the server backends
+                # the two `set_user_roles` transactions can also meet the `user_roles` key, by
+                # reading (not measured), and the second would raise. Two concurrent sign-ins of an
+                # existing account meet both races too, so they belong to the resync.
                 if winner.auth_provider != AuthProvider.AD.value:
                     raise _DirectoryAccountConflict("local_account_conflict") from exc
                 if winner.directory_object_id != principal.directory_object_id:

@@ -6484,6 +6484,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
         FirstAdministratorRefused,
         InvalidNotifyEmail,
         ProvisionedAdministrator,
+        _is_integrity_refusal,
         _require_single_mailbox,
     )
     from messagefoundry.config.settings import (
@@ -6767,6 +6768,17 @@ def _provision_admin(args: argparse.Namespace) -> int:
             store_slot.current = None
             await store.close()
 
+    def refused_write(exc: Exception) -> int:
+        """An integrity refusal the service did not name (BACKLOG #2697). Exit 1, this command's
+        refusal. Any write can raise one, so the text does not say how far the run got."""
+        return _emit_error(
+            f"the store refused one of this command's writes ({exc}), so the Administrator may be "
+            "missing or incomplete. Once no other provision-admin run is in progress, run the "
+            "command again: it completes a partly written account, or says why it cannot. If it "
+            "is refused the same way again, the store has a fault this command cannot repair",
+            as_json=args.json,
+        )
+
     # No TrustAnchorError arm: the anchors are checked at the build, before the prompt (#2081).
     try:
         outcome, store_path = run_guarded(run())
@@ -6782,17 +6794,16 @@ def _provision_admin(args: argparse.Namespace) -> int:
         return 2
     except sqlite3.IntegrityError as exc:
         # BACKLOG #2697. Ahead of the arm below, which it subclasses: a write the store refused is
-        # not a path that is not a database. A lost username race arrives as the refusal above; this
-        # is a SQLite integrity refusal the service did not name. Exit 1, this command's refusal.
-        # Any write can raise it, so the text does not say how far the run got.
-        return _emit_error(
-            f"the store refused one of this command's writes ({exc}), so the Administrator may be "
-            "missing or incomplete. Once no other provision-admin run is in progress, run the "
-            "command again: it completes a partly written account, or says why it cannot",
-            as_json=args.json,
-        )
+        # not a path that is not a database. A lost username race arrives as the refusal above.
+        return refused_write(exc)
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
+    except Exception as exc:
+        # The server backends' integrity refusals, which share no class with sqlite3's. Matched by
+        # MRO name as the service matches them; anything else propagates as it did before.
+        if not _is_integrity_refusal(exc):
+            raise
+        return refused_write(exc)
 
     codes_shown = False  # true only once issued codes actually reached the console
     if outcome.recovery_codes:
