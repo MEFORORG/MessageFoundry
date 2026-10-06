@@ -221,3 +221,34 @@ determines whether `/ui` is mounted, and nothing else. `ui_exposed` remains, sco
 console being served. This ADR mentioned neither `require_mfa` nor `admin_exposed`, which is how the
 interaction came to exist without ever being adjudicated; recording it here is what puts it on the
 record.
+
+## Cross-reference (2026-10-05) -- the console exposure flags count `[api].trusted_proxies` (BACKLOG #2218)
+
+Section 3's "Exposed bind" bullet names three exposed cases. Engine PR 1717 (merged 2026-09-27
+Central) added a fourth: a non-empty `[api].trusted_proxies` on a loopback bind. `serve` reads it in
+both console flags. `console_exposed` drives the auto-degrade. `ui_exposed` drives the ASVS 8.4.2
+pointer and the `[auth].admin_new_ip_step_up` advisory. Both now read
+`not settings.api.host_is_browser_origin`.
+
+**Why the console flags count it.** Settings accept `trusted_proxies` on a loopback bind only with
+`tls_terminated_upstream` or an operator `tls_cert_file` (BACKLOG #2055). So a set list declares a
+proxy in front of the engine, and the browser reaches the console through it, from off the box.
+Section 3 makes the default-on console a local-loopback convenience, so off the box it must be asked
+for by name. The two advisories are written for an off-box console, so they apply here too.
+
+**It refuses nothing new.** The auto-degrade serves JSON-only with a warning and exits 0, and the
+advisories never refuse. So counting this posture turns no config into a start failure, which is the
+property section 3 exists to keep.
+
+**ADR 0068 gives a second, separate reason for the same rule.** Behind a proxy the request `Host` may
+be forwarded and client-controlled, so it cannot anchor the passkey rp_id (its 2026-09-28
+amendment, BACKLOG #2220). Both ADRs use one predicate, `request_host_is_browser_origin` in
+`messagefoundry/config/settings.py`, so the two cannot drift apart.
+
+**What this note does not change.** The refusing arms read `instance_exposed`, and the 2026-08-04
+cross-reference above still describes it: an off-loopback bind or `tls_terminated_upstream`. It does
+not count `trusted_proxies`. So a site that deployed a loopback bind behind a re-encrypting proxy (an
+operator certificate and no declared terminator) would get the console degrade and both advisories.
+It would not get the MFA-at-exposure refusal, the dual-control warning or the in-use-memory
+declaration gate. Counting that posture there is vault BACKLOG #2251, still open. Section 3 is left
+as written and dated by this note.
