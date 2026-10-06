@@ -8165,10 +8165,11 @@ class AuthService:
         **A present account that lost a role in the directory is refused too (BACKLOG #2240).** Its
         stored roles must all be among the roles its current groups map to, the same pair the
         reconciler diffs. Otherwise a demoted operator would renew its window, or clear the MFA
-        gate, with roles it no longer holds until the reconciler's role pass. Only a demotion
-        refuses: a promotion leaves the token under-privileged, not over. This refuses and writes
-        nothing; the reconciler or the next sign-in re-syncs the roles. Channel scope is not
-        compared here.
+        gate, with roles it no longer holds until the reconciler's role pass. Only a lost role
+        refuses: an added role leaves the account holding fewer roles than the directory grants, not
+        more. Roles are compared by id, not by permission, so a move from one role to another
+        refuses even when the new role grants more. This refuses and writes nothing; the reconciler
+        or the next sign-in re-syncs the roles. Channel scope is not compared here.
         """
         if self._ldap is None:
             return "not_configured"
