@@ -325,7 +325,9 @@ def _host_key(address: str) -> str:
 #: repeat or the cap was already reached.
 _NewIpFlag = Literal["audit", "audit_cap_reached", "repeat", "over_cap"]
 #: `AuthService._reconcile_hold_standing`: whether this process may resolve a hold (BACKLOG #2136).
-_HoldStanding = Literal["fresh", "latched", "forfeit", "settled"]
+_HoldStanding = Literal["fresh", "held", "forfeit", "settled"]
+#: The standings under which a pass may resolve the durable hold instance.
+_HOLD_RELEASABLE: Final[frozenset[_HoldStanding]] = frozenset({"held", "settled"})
 
 
 # Bounds on the per-session re-proof failure counts (BACKLOG #1138). A count is NEVER evicted while
@@ -2108,12 +2110,11 @@ class AuthService:
         #: Whether THIS process may resolve the durable ``ad_reconcile_held`` instance (BACKLOG
         #: #2136). The instance outlives the process and the latch does not, so a fresh process
         #: cannot tell whether an earlier run's latch was still holding an account.
-        #: ``"fresh"``: no pass here has latched a hold, so it resolves none. ``"latched"``: a pass
-        #: here latched one, so a lift it then sees is its own. ``"forfeit"``: it revoked an
-        #: undetermined account first, which a lost latch may have held, so it resolves no hold
-        #: until it restarts. ``"settled"``: it resolved one on a pass that read every signed-in
-        #: account, so its records now cover what an earlier run held. Set in
-        #: `_mark_reconcile_clears`, and to ``"latched"`` where the latch is kept.
+        #: ``"fresh"``: no pass here has held, so it resolves no hold. ``"held"``: a pass here held,
+        #: so a release it then sees is its own. ``"forfeit"``: it revoked an undetermined account
+        #: first, which a lost latch may have held, so it resolves no hold until it restarts.
+        #: ``"settled"``: a pass here read every signed-in account and found the hold gone, so its
+        #: records now cover what an earlier run held. Only `_advance_hold_standing` moves it.
         self._reconcile_hold_standing: _HoldStanding = "fresh"
         #: user_ids of bound id-less rows the reconciler has already reported as skipped (BACKLOG
         #: #2027), so each is logged and audited once per process rather than once per pass.
@@ -5255,8 +5256,8 @@ class AuthService:
         self._reconcile_strikes.update(plan.strikes)
         self._reconcile_outcomes.update(plan.outcomes)
         self._reconcile_hold_latched = plan.latched
-        if plan.latched and self._reconcile_hold_standing == "fresh":
-            self._reconcile_hold_standing = "latched"  # BACKLOG #2136: this hold is this process's
+        if plan.hold:
+            self._advance_hold_standing("held")
         # BACKLOG #2136. A trip makes every candidate unconfirmed until a pass that is not aborted
         # reads it again, so a probe sample that missed the accounts behind the trip is no clear. A
         # held account is not read again: its probe judged neither its roles nor its scope, and its
@@ -5289,6 +5290,13 @@ class AuthService:
             )
         applied: list[reconcile.SessionRevocation] = []
         for revocation in plan.revocations:
+            if (
+                self._reconcile_outcomes.get(revocation.user_id)
+                is reconcile.ProbeOutcome.UNDETERMINED
+            ):
+                # BEFORE the sessions go, so a pass that raises part-way cannot lose it (BACKLOG
+                # #2136): the next pass no longer sees this account.
+                self._advance_hold_standing("forfeit")
             if await self._apply_reconcile_revocation(revocation):
                 applied.append(revocation)
         for refresh in plan.renames:
@@ -5334,22 +5342,24 @@ class AuthService:
 
         * Both need an answer on record, from this process, for every signed-in account the pass
           did not just revoke. A probe that could not reach the directory leaves none.
-        * The hold is clear when, on top of that, the pass did not hold and four tests pass.
+        * The hold is clear when, on top of that, the pass did not hold and these tests pass.
           None of those answers is undetermined; this is the record, across the rotation. No
           account the pass just revoked read undetermined either. At least one probe of THIS pass
           read the attribute (PRESENT or DISABLED, ADR 0195's readable answer, ``plan.readable``):
           an answer from an earlier pass, or one that found no entry (ABSENT), says nothing about
-          whether it is readable now. And this process may vouch for the hold
-          (``_reconcile_hold_standing``): a pass here latched a hold, or this process already
-          resolved one.
+          whether it is readable now. And ``_reconcile_hold_standing`` lets this process release
+          a hold: a pass here held, or one already found the hold gone.
         * That last test is the restart's. A lone undetermined account beside readable ones
-          revokes only because no hold engaged, and a fresh process lacks the latch under which an
-          earlier run may still have held it. So a fresh process resolves no hold until its own pass
-          latches one, and the instance an earlier run left open stays open for an operator. A
-          process that revokes an undetermined account before it has resolved a hold forfeits:
-          it resolves none until it restarts, because nothing re-reads the account it revoked.
-          Once it has resolved one, every signed-in account has an answer from it, so its latch
-          covers what an earlier run held, and a later lone revocation is ADR 0195's own.
+          revokes only because no hold engaged. A fresh process lacks the latch under which an
+          earlier run may still have held it. So a fresh process releases no hold until a pass of
+          its own holds. Until then, an earlier run's instance stays open for an operator.
+        * Revoking an undetermined account first forfeits the release until a restart, because
+          nothing re-reads the account. The forfeit is recorded before the sessions go, so a pass
+          that raises part-way keeps it. Once a pass here has found the hold gone, every signed-in
+          account had an answer from this process. Its latch then covers what an earlier run held,
+          and a later lone revocation is ADR 0195's own. The standing gate on its own is not what
+          stops a false release: the forfeit does that. The gate keeps an earlier run's instance
+          for an operator, at the cost of a missed release on every restart.
         * The breaker is clear when the pass was not aborted, none of those answers is undetermined,
           every one of those accounts carries no strike, and every account still signed in since
           the last trip has been read again by a pass that was not aborted, and was not held there.
@@ -5386,8 +5396,6 @@ class AuthService:
         undetermined = reconcile.ProbeOutcome.UNDETERMINED
         revoked = {r.user_id for r in plan.revocations}
         revoked_undetermined = undetermined in (self._reconcile_outcomes.get(u) for u in revoked)
-        if revoked_undetermined and self._reconcile_hold_standing != "settled":
-            self._reconcile_hold_standing = "forfeit"
         ids = [uid for uid in users if uid not in revoked]
         outcomes = [self._reconcile_outcomes.get(uid) for uid in ids]
         settled = bool(ids) and None not in outcomes and undetermined not in outcomes
@@ -5396,10 +5404,10 @@ class AuthService:
             and not plan.hold
             and not revoked_undetermined
             and plan.readable > 0
-            and self._reconcile_hold_standing in ("latched", "settled")
+            and self._reconcile_hold_standing in _HOLD_RELEASABLE
         )
         if hold_clear:
-            self._reconcile_hold_standing = "settled"
+            self._advance_hold_standing("settled")
         breaker_clear = (
             settled
             and plan.aborted is None
@@ -5407,6 +5415,21 @@ class AuthService:
             and self._reconcile_unconfirmed.isdisjoint(ids)
         )
         return replace(plan, breaker_clear=breaker_clear, hold_clear=hold_clear)
+
+    def _advance_hold_standing(self, event: _HoldStanding) -> None:
+        """Move ``_reconcile_hold_standing`` on ``event`` (BACKLOG #2136), the only place it moves.
+
+        ``"held"``: a pass here held, which counts only for a fresh process. ``"forfeit"``: the pass
+        is about to revoke an undetermined account, which forfeits unless this process has already
+        settled. ``"settled"``: a pass here found the hold gone. ``"forfeit"`` is never left.
+        """
+        current = self._reconcile_hold_standing
+        if event == "held" and current == "fresh":
+            self._reconcile_hold_standing = "held"
+        elif event == "forfeit" and current != "settled":
+            self._reconcile_hold_standing = "forfeit"
+        elif event == "settled" and current in _HOLD_RELEASABLE:
+            self._reconcile_hold_standing = "settled"
 
     async def _refresh_cached_username(
         self,

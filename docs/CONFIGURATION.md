@@ -720,11 +720,11 @@ this engine process, for every signed-in directory account it did not just revok
 
 - The hold resolves when no answer is undetermined and this pass read `userAccountControl` at
   least once. An account the pass just revoked still counts as an answer here.
-- The hold also needs this engine process to have held two or more undetermined accounts at
-  once itself. A restart forgets that, so a restarted engine leaves a hold its last run left open
-  for an operator to resolve, until it holds and releases a wave of its own. An engine that
-  revokes an undetermined account before it has resolved a hold resolves no hold until it
-  restarts.
+- The hold also needs this engine process to have held accounts itself since it started. A
+  restart forgets which accounts a hold covered. So a restarted engine leaves its last run's hold
+  open until it holds and releases accounts of its own. Until then, an operator resolves it.
+- An engine can also give up resolving the hold. That happens when it revokes an undetermined
+  account before it has released a hold. It then resolves no hold until its next restart.
 - The breaker resolves when the pass did not abort, no answer is undetermined, no account carries a
   strike, and every account still signed in since the last trip has been read again, and not held.
   So the breaker's alert stays open while a hold stands.
