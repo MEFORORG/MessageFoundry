@@ -665,7 +665,7 @@ class LdapAuthenticator:
                     "ad_tls_verify=false disables LDAPS certificate verification (MITM risk). Use a "
                     f"trusted CA via ad_tls_ca_cert_file, or set {INSECURE_TLS_ESCAPE_ENV}=1 on an "
                     "instance at [security].enforcement = warn to explicitly allow it for a "
-                    "trusted-network dev/test bind (the escape has no effect while enforcing, the "
+                    "trusted-network dev/test bind (the override has no effect while enforcing, the "
                     "default, or with no posture)."
                 )
             logger.warning(
