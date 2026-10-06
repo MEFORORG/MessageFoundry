@@ -1,15 +1,23 @@
-- **The off-box audit record stays valid JSON after the log scrub in more cases, and redaction
-  still sees it.** The scrub spelled some characters as `\x7f` or `\U000e0001`, which JSON does
-  not allow. A DEL, a C1 control, a soft hyphen or an astral format code point in `actor` or
-  `detail` then left the collector unable to parse the record. A failed sign-in sets `actor` to
-  the typed name, so a client could have caused this on a first deployment. The scrub now writes
-  every escape in a form JSON accepts inside a string. So the audit tee keeps plain `json.dumps`,
-  and the first handler's redaction and credential filters see the raw characters. An earlier
-  draft of this fix escaped those characters before the filters instead. A name or a
-  `password=` value written just after one then reached the log unredacted. At least two
-  residuals remain, and the `emit_audit_tee` docstring names both. A filter can still take a
-  closing quote. And a later handler, the forwarder included, re-runs the filters over the first
-  handler's escaped text. (vault `BACKLOG #3012`)
+- **The off-box audit record stays valid JSON after the log scrub in more cases, and the tee adds
+  no escaping before redaction.** The scrub spelled some characters as `\x7f` or `\U000e0001`,
+  which JSON does not allow. At least a DEL, a C1 control, a soft hyphen or an escaped astral
+  code point then left the collector unable to parse the record. The astral ones include at
+  least format, unassigned and private-use code points. The field could be at least `action`,
+  `actor`, `channel_id`, `client` or `detail`. A failed sign-in sets `actor` to the typed name,
+  so a client could have caused this on a first deployment. The scrub now writes every escape
+  in a form JSON accepts inside a string. So the audit tee keeps plain `json.dumps` and adds no
+  escaping of its own. The first handler's redaction and credential filters see each character
+  unescaped, except the quote, the backslash and the 32 C0 controls. `json.dumps` escapes those
+  itself. Escaping more characters before the filters would hide a name or a `password=` value
+  from them. At least three residuals remain, and the `emit_audit_tee` docstring names them. A
+  filter can still take a closing quote, so the record fails to parse. With two
+  attacker-influenced fields, the record can instead parse with fields missing, or with one
+  field's text under another key. A later handler, the forwarder included, re-runs the filters
+  over the first handler's escaped text. So a record that parses on stdout can fail there. And
+  the filters can still miss text beside a C0 control, on either side. Measured cases include a
+  name, a date, a bearer token and a `password=` value, which then reach the tee line
+  unredacted. That third residual is not new: the code before this fix did the same. (vault
+  `BACKLOG #3012`)
 - **Many escaped characters in engine log lines are spelled differently.** An escaped code
   point up to U+00FF now takes JSON's form: DEL is `\u007f` where it was `\x7f`. This covers
   the C0 and C1 controls and the soft hyphen too. An escaped code point past U+FFFF is a

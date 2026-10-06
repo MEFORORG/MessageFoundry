@@ -1487,6 +1487,14 @@ handlers, across all three store backends
 audit evidence is emitted even when `[logging].level` is `WARNING`. **Not used:** structlog (stdlib
 `logging` only).
 
+**A collector should not assume every tee record parses or is whole.** Each record leaves as one
+JSON object, but the handler filters can rewrite it as text afterwards. On a first deployment, a
+collector could receive a record that fails to parse. It could also receive one that parses with
+fields missing, or with one field's text under another key. And a C0 control in a field, such as a
+typed sign-in name, could let text beside it reach the tee unredacted. The `emit_audit_tee`
+docstring in [`store/audit_tee.py`](../messagefoundry/store/audit_tee.py) names at least three
+residuals that cause these.
+
 ### Logging inventory (16.1.1 / 16.2.3)
 
 Every log/event stream the product emits, with the facts ASVS 16.1.1 asks for: **what events are

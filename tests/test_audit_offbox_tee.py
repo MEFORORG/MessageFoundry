@@ -417,12 +417,66 @@ def test_a_clean_or_plain_non_ascii_actor_round_trips(
 def test_the_redaction_filters_fire_across_an_escaped_character(
     fmt: str, actor: str, needle: str | None, capsys
 ) -> None:
-    """The filters run before the scrub and see the raw character, so they redact what follows it
-    exactly as they redact the same text with nothing in front. Synthetic values; the helper's
-    ``json.loads`` is the parse check."""
+    """The filters run before the scrub and see these characters unescaped, so they redact what
+    follows each exactly as they redact the same text with nothing in front. A C0 control is the
+    exception, because ``json.dumps`` escapes it first; the test below pins that. Synthetic values;
+    the helper's ``json.loads`` is the parse check."""
     line, _inner, _record = _teed_through_configured_stdout(fmt, actor, "ok", capsys)
     if needle is not None:
         assert needle not in line, line
+
+
+class _C0Leak(Exception):
+    """The one failure the C0 xfail below expects, so a helper assert cannot satisfy it."""
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=_C0Leak,
+    reason="KNOWN RESIDUAL, not built here and older than vault BACKLOG #3012: json.dumps escapes a "
+    "C0 control before any filter runs, so a pattern that needs a word boundary or whitespace "
+    "misses the text beside it. See emit_audit_tee's docstring.",
+)
+@pytest.mark.parametrize("fmt", ["text", "json"])
+@pytest.mark.parametrize(
+    ("actor", "needle"),
+    [
+        (f"{chr(0x01)}DOE JANE", "DOE"),
+        (f"{chr(0x01)}password=hunter2", "hunter2"),
+        (f"{chr(0x09)}password=hunter2", "hunter2"),
+        (f"{chr(0x01)}05/05/1980", "1980"),
+        (f"DOE{chr(0x09)}JANE", "DOE"),
+        (f"Bearer{chr(0x09)}abcdefgh", "abcdefgh"),
+        (f"MRN{chr(0x09)}12345678", "12345678"),
+    ],
+)
+def test_a_c0_control_still_hides_text_from_the_filters(
+    fmt: str, actor: str, needle: str, capsys
+) -> None:
+    """Each case leaks only because of the C0 control: the control test asserts the same text
+    is redacted without it. When a case flips to a pass, take the marker off for it."""
+    line, _inner, _record = _teed_through_configured_stdout(fmt, actor, "ok", capsys)
+    if needle in line:
+        raise _C0Leak(line)
+
+
+@pytest.mark.parametrize("fmt", ["text", "json"])
+@pytest.mark.parametrize(
+    ("actor", "needle"),
+    [
+        ("05/05/1980", "1980"),
+        ("DOE JANE", "DOE"),
+        ("Bearer abcdefgh", "abcdefgh"),
+        ("MRN 12345678", "12345678"),
+    ],
+)
+def test_the_c0_cases_are_redacted_without_the_control(
+    fmt: str, actor: str, needle: str, capsys
+) -> None:
+    """The control for the xfail above: the same text with a space, or nothing, in place of the
+    C0 control is redacted, so the xfail measures the control and not the pattern."""
+    line, _inner, _record = _teed_through_configured_stdout(fmt, actor, "ok", capsys)
+    assert needle not in line, line
 
 
 def _tee_line(text: str) -> str:

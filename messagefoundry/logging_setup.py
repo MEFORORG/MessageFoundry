@@ -212,6 +212,9 @@ class RedactionFilter(logging.Filter):
     through to both the stdout handler and the off-box forwarder by construction. The remaining residual
     is an adversarially-crafted *single-token* or non-name-shaped identifier, for which the "never put
     PHI in an exception message" convention remains the control (see :mod:`messagefoundry.redaction`).
+    A message escaped before it reaches this filter is another residual: the audit tee's
+    ``json.dumps`` escapes the C0 controls first, and a name or date beside one can pass. See
+    :func:`~messagefoundry.store.audit_tee.emit_audit_tee`.
 
     **EVERY FIELD IS BOUNDED BEFORE IT IS SCANNED (BACKLOG #1576).** This filter had no ceiling at all,
     and it is the worst place in the engine not to have one: a ``logging.Filter`` is synchronous by the

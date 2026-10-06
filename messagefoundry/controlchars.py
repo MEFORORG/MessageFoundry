@@ -186,8 +186,12 @@ def _log_escape(code: int) -> str:
     CR and LF are ``\\r`` and ``\\n``. A lone surrogate is ``\\\\udc80``, a doubled backslash and
     the hex (see below). Every other code point is :func:`json_unicode_escape`: ``\\u007f``,
     ``\\u0085``, ``\\u2028``, and a surrogate pair past U+FFFF. So a document from ``json.dumps``
-    without ``indent``, such as the off-box audit record, still parses after the scrub. And the
-    redaction filters that run before the scrub see the raw characters (vault BACKLOG #3012).
+    without ``indent``, such as the off-box audit record, still parses after the scrub. So the
+    audit tee need not escape early (vault BACKLOG #3012). On the first handler, the redaction
+    filters run before its scrub. They see a character unescaped unless something escaped it
+    before logging, as ``json.dumps`` does to the C0 controls in the audit record. A later
+    handler re-runs them over text the first scrub escaped. ``emit_audit_tee`` lists both as
+    residuals.
     Python's ``ascii`` spelling, used until then, wrote ``\\x7f`` and ``\\U000e0001``, which JSON
     does not define.
 
