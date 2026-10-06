@@ -27,6 +27,7 @@ import pytest
 from messagefoundry.config import fingerprint as fp
 from messagefoundry.config.settings import DrSettings, EgressSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry.pipeline.dr import DrActivationError
 from tests.test_dr_activation import _seed
 
 # A name that cannot be encoded as UTF-8: a lone surrogate. NTFS stores it as UTF-16, and on a
@@ -127,18 +128,24 @@ async def test_convergence_still_reloads_the_startup_dir(box: _Box) -> None:
     assert _inbound_names(engine) == {"IB_LIVE_ADT"}
 
 
-async def test_a_removed_reload_dir_aborts_the_profile_and_drops_the_latch(box: _Box) -> None:
-    """With the operator's directory gone, the DR reload raises rather than falling back to the
-    startup dir, and the run-profile latch goes back off."""
+async def test_a_removed_reload_dir_aborts_the_activation(box: _Box) -> None:
+    """With the operator's directory gone, the activation aborts at the profile step with a
+    recorded reason rather than falling back to the startup dir. The latch goes back off, and the
+    seed marker records no digest rather than the digest of an empty bundle."""
     engine = box.engine
     await engine.reload_detail(box.staging)
     shutil.rmtree(box.staging)
+    coord = engine.dr_coordinator
+    assert coord is not None
 
-    with pytest.raises(FileNotFoundError):
-        await engine._dr_activate_profile()
+    with pytest.raises(DrActivationError) as caught:
+        await coord.activate(actor="alice")
 
-    assert engine.dr_active is False
+    assert caught.value.kind == "profile"
+    assert coord.active is False and engine.dr_active is False
     assert _inbound_names(engine) == {"IB_STAGING_ADT"}  # the running graph was not swapped
+    assert len(await engine.store.list_audit(action="dr_activation_aborted")) == 1
+    assert (await _seed_marker(engine))["config_fingerprint"] is None
 
 
 async def test_the_seed_marker_fingerprints_the_directory_the_activation_reloads(
@@ -215,5 +222,7 @@ async def test_the_dr_fingerprint_is_not_taken_on_the_event_loop(
     await coord.activate(actor="alice")
 
     assert seen_before_activation == []  # building the coordinator read no file
-    assert seen, "control: the activation took a fingerprint"
+    # Control: the marker carries a digest, which only the provider supplies, so the provider ran
+    # and its fold is among the calls checked below (the reload's own fold is there too).
+    assert isinstance((await _seed_marker(engine))["config_fingerprint"], str)
     assert all(thread != loop_thread for _name, thread in seen), seen

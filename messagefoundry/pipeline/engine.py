@@ -731,15 +731,16 @@ class Engine:
 
         The coordinator awaits it when it writes the marker, so building the coordinator reads no
         file. It fingerprints :attr:`running_config_dir`, the directory :meth:`_dr_activate_profile`
-        then reloads. The marker is written a step before that reload, and the VIP takeover hook
-        runs between them, so an edit to the directory, or an operator reload from another root,
-        in that window makes the two differ. It goes through :meth:`fingerprint_bundle`, the one
-        best-effort rule, off the event loop. Where that rule takes no digest, such as for a file
-        name that is not UTF-8, this gives ``None`` rather than failing the activation (vault
-        BACKLOG #2839). That rule skips an unreadable file, and a missing directory digests as an
-        empty bundle, so a digest here is not proof that every file was read."""
+        then reloads when a graph is running. The marker is written a step before that reload, and
+        the VIP takeover hook runs between them, so an edit to the directory, or an operator
+        reload from another root, in that window makes the two differ. It goes through
+        :meth:`fingerprint_bundle`, the one best-effort rule, off the event loop. Where that rule
+        takes no digest, such as for a file name that is not UTF-8, this gives ``None`` rather than
+        failing the activation (vault BACKLOG #2839). A directory that has gone also gives
+        ``None``, where the rule would digest an empty bundle. The rule skips an unreadable file,
+        so a digest here is not proof that every file was read."""
         directory = self.running_config_dir
-        if directory is None:
+        if directory is None or not await asyncio.to_thread(directory.is_dir):
             return None
         bundle, _reason = await self.fingerprint_bundle(directory)
         digest = (bundle or {}).get("fingerprint")
