@@ -1257,9 +1257,9 @@ async def _reported(store: MessageStore) -> list[str]:
 async def test_a_refused_skip_report_logs_once_per_pass_and_tries_the_next_account_next(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, refusal: Exception
 ) -> None:
-    """The Lander's finding 6 on PR 2036. While the store refuses every write, ``main`` logged one
-    ERROR per pass, because the first failure ended the pass. So does this: the report stops at the
-    first refusal, which also keeps a pool that times out each write to one timeout per pass. The
+    """While the store refuses every write, the pass logs one ERROR per pass. Before BACKLOG #2137
+    the first failure ended the pass; now the report stops at the first refusal, which also keeps
+    a pool that times out each write to one timeout per pass. The
     account it refused goes last next pass, so the next account is tried. Both are reported once the
     store accepts the write. A Transit outage refuses like a driver error (ADR 0138)."""
     store = await MessageStore.open(":memory:")
@@ -1351,7 +1351,7 @@ async def test_two_skip_reports_the_store_keeps_refusing_take_turns(
 async def test_a_defect_in_a_reconciler_audit_write_is_raised_not_passed_over(
     monkeypatch: pytest.MonkeyPatch, defect: type[Exception]
 ) -> None:
-    """The Lander's finding 4 on PR 2036. The catch keeps ``RuntimeError`` because the store raises
+    """BACKLOG #2137. The catch keeps ``RuntimeError`` because the store raises
     it for its own refusals. Its two subclasses that mean a defect in the code, not a refused write,
     still end the pass, and so does a bad statement on SQLite."""
     store = await MessageStore.open(":memory:")

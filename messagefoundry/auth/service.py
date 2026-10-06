@@ -160,7 +160,7 @@ def _audit_write_errors() -> tuple[type[Exception], ...]:
 
 
 #: The classes inside :func:`_audit_write_errors` that a reconciler audit write raises rather than
-#: passes over (the Lander's finding 4 on PR 2036). ``RuntimeError`` has to stay in that catch,
+#: passes over (BACKLOG #2137). ``RuntimeError`` has to stay in that catch,
 #: because the store raises it for its own refusals; ``NotImplementedError`` and ``RecursionError``
 #: are its subclasses that never mean one. ``sqlite3.ProgrammingError`` is a bad statement or bind:
 #: the SQLite store reaches sqlite3 through aiosqlite, which refuses a closed connection with its
@@ -5320,11 +5320,14 @@ class AuthService:
 
         * Both need an answer on record, from this process, for every signed-in account the pass
           did not just revoke. A probe that could not reach the directory leaves none.
-        * The hold is clear when, on top of that, the pass did not hold, none of those answers is
-          undetermined, and at least one of them read the attribute (PRESENT or DISABLED, ADR
-          0195's readable answer). The undetermined test does not rest on this node's hysteresis
-          latch, which another node on the store may not share. An estate that reads only ABSENT
-          found no entry, so it says nothing about whether the attribute is readable now.
+        * The hold is clear when, on top of that, the pass did not hold, no answer it got is
+          undetermined, and at least one answer it got read the attribute (PRESENT or DISABLED, ADR
+          0195's readable answer, counted in ``plan.readable``). Both read THIS pass: an answer on
+          record from an earlier pass, or one that found no entry (ABSENT), says nothing about
+          whether the attribute is readable now. An account the pass just revoked counts too. A
+          lone undetermined answer revokes only because no hold engaged, and a restarted process
+          has lost the latch that may still have held it. The undetermined test does not rest on
+          this node's hysteresis latch, which another node on the store may not share.
         * The breaker is clear when the pass was not aborted, none of those answers is undetermined,
           every one of those accounts carries no strike, and every account still signed in since
           the last trip has been read again by a pass that was not aborted, and was not held there.
@@ -5336,9 +5339,11 @@ class AuthService:
 
         ``users`` is this pass's candidate set, and a clear rests on reading every one of them.
 
-        **This is one process's evidence, and the instances are the store's.** Where another
-        reconciler may share the store, the lifespan task raises no inverse; the reason is stated
-        once, at ``api/app.py::_without_clears``.
+        **This is one process's evidence, and the instances are the store's.** On a ``[cluster]``
+        node, or in an engine that runs more than one engine shard, the lifespan task raises no
+        inverse; ``api/app.py::_without_clears`` says why. That gate does not see every reconciler
+        on the store. The cases it misses are stated once, in the next paragraph, and the other
+        sites point here.
 
         **The usual cost is a missed clear, with one reconciler on the store.** An account that
         never answers keeps both instances open while it is signed in. So does a hold, for the
@@ -5353,12 +5358,16 @@ class AuthService:
         whose accounts have all signed out, or reached the session cap, clears on the rest.
         """
         undetermined = reconcile.ProbeOutcome.UNDETERMINED
-        readable = (reconcile.ProbeOutcome.PRESENT, reconcile.ProbeOutcome.DISABLED)
         revoked = {r.user_id for r in plan.revocations}
         ids = [uid for uid in users if uid not in revoked]
         outcomes = [self._reconcile_outcomes.get(uid) for uid in ids]
         settled = bool(ids) and None not in outcomes and undetermined not in outcomes
-        hold_clear = settled and not plan.hold and any(o in readable for o in outcomes)
+        hold_clear = (
+            settled
+            and not plan.hold
+            and plan.readable > 0
+            and undetermined not in plan.outcomes.values()
+        )
         breaker_clear = (
             settled
             and plan.aborted is None
@@ -5642,8 +5651,8 @@ class AuthService:
             )
             # Marked only once the audit row is written, so a failed write is retried next pass.
             if not written:
-                # Stop at the first refusal: one ERROR and one WARNING per pass, as `main` logged,
-                # and no second acquire timeout behind a store that is refusing every write.
+                # Stop at the first refusal: one ERROR and one WARNING per pass, and no second
+                # acquire timeout behind a store that is refusing every write.
                 refused.pop(user.id, None)  # re-inserted at the end: refused most recently
                 refused[user.id] = None
                 break

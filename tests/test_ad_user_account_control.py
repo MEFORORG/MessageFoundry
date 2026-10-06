@@ -1134,10 +1134,59 @@ async def test_a_fresh_process_does_not_clear_a_trip_on_a_pass_that_held_account
         assert ABORTED in await _open_alerts(store)
 
 
-# --- the Lander's review of PR 2036 --------------------------------------------------------------
+async def test_a_fresh_process_does_not_release_a_hold_on_a_pass_that_read_nothing_readable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With a budget of one, the first pass reads the enabled account and the second reads only
+    the deleted one. The record still holds the first pass's PRESENT answer, but the second pass
+    read nothing that says ``userAccountControl`` is readable now, so it releases no hold."""
+    names = ["n1", "n2"]
+    async with _signed_in_estate(monkeypatch, names, ad_session_recheck_max_users=1) as estate:
+        directory, _service, store, _tokens = estate
+        by_id = sorted([(u.id, u.username) for u in await store.list_users()])
+        order = [name for _id, name in by_id if name in names]
+        await _left_open_by_an_earlier_run(store)
+        directory.delete(order[1])  # the second sample only
+        service = _fresh_process(store, ad_session_recheck_max_users=1)
+        await service.initialize()
+        sink = NotifierAlertSink([], store=store)
+        first = await _alerted_pass(service, sink)
+        assert first.readable == 1 and not first.hold_clear  # the other account has no answer yet
+        second = await _alerted_pass(service, sink)
+        assert second.aborted is None and not second.hold and second.readable == 0
+        assert not second.hold_clear, "an earlier pass's readable answer released the hold"
+        assert HELD in await _open_alerts(store)
+
+
+async def test_a_fresh_process_does_not_release_a_hold_on_a_pass_that_revoked_an_undetermined(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A restart loses the hysteresis latch. A lone undetermined account beside readable ones is
+    then not held, and at the strike threshold the pass revokes it. Its answer is the hold's own
+    condition, which the lost latch may still have been holding, so that pass releases no hold.
+    The breaker judged the revocation, so the trip resolves."""
+    names = ["u1", "ok1", "ok2"]
+    async with _signed_in_estate(monkeypatch, names) as (directory, _service, store, _tokens):
+        await _left_open_by_an_earlier_run(store)
+        directory.uac["u1"] = ABSENT
+        service = _fresh_process(store)
+        await service.initialize()
+        sink = NotifierAlertSink([], store=store)
+        first = await _alerted_pass(service, sink)
+        assert not first.hold and first.revocations == () and not first.hold_clear  # strike 1
+        second = await _alerted_pass(service, sink)
+        assert second.aborted is None and not second.hold
+        assert [r.reason for r in second.revocations] == ["directory_undetermined"]
+        assert second.breaker_clear and not second.hold_clear
+        open_now = await _open_alerts(store)
+        assert HELD in open_now and ABORTED not in open_now
+
+
+# --- the clear predicate, clause by clause, and the sole-reconciler gate --------------------------
 #
-# Finding 3: each clause of the clear predicate is pinned by a test that turns red when it goes.
-# Finding 1: a process that may share its store with another reconciler resolves nothing.
+# Each clause of the clear predicate is pinned by a test that turns red when it goes. A [cluster]
+# node or a multi-shard engine resolves nothing; what that gate misses is stated once, in
+# AuthService._mark_reconcile_clears.
 
 PRESENT, ABSENT_OUTCOME, UNDETERMINED = (
     ProbeOutcome.PRESENT,
@@ -1172,7 +1221,8 @@ async def _marked(
 async def test_the_clear_predicate_control_reads_both_clear() -> None:
     """The control for the four tests below: on these inputs both clears hold, so each red there is
     the one clause that test changes."""
-    assert await _marked(ReconcilePlan(probed=2), {"a": PRESENT, "b": PRESENT}) == (True, True)
+    plan = ReconcilePlan(probed=2, readable=2, outcomes={"a": PRESENT, "b": PRESENT})
+    assert await _marked(plan, {"a": PRESENT, "b": PRESENT}) == (True, True)
 
 
 async def test_an_estate_that_reads_only_undetermined_is_no_breaker_clear() -> None:
@@ -1188,28 +1238,57 @@ async def test_an_undetermined_answer_on_record_is_no_hold_clear_even_when_the_p
     """``undetermined not in outcomes``: this node's pass did not hold, but an undetermined answer
     on record is the hold's own condition, which another node's latch may still be holding on. It
     keeps the breaker open too: that account's roles and scope were not judged."""
-    plan = ReconcilePlan(probed=2)
+    plan = ReconcilePlan(probed=1, readable=1, outcomes={"a": PRESENT})
     assert await _marked(plan, {"a": PRESENT, "b": UNDETERMINED}) == (False, False)
 
 
 async def test_a_hold_clear_needs_one_answer_that_read_the_attribute() -> None:
-    """``any(o in readable ...)``: ABSENT answers alone found no entry, so they say nothing about
-    the attribute the hold is about. A DISABLED answer did read it, so it counts."""
-    plan = ReconcilePlan(probed=2)
+    """``plan.readable > 0``: ABSENT answers alone found no entry, so they say nothing about the
+    attribute the hold is about. A DISABLED answer did read it, so it counts."""
     gone = {"a": ABSENT_OUTCOME, "b": ABSENT_OUTCOME}
+    plan = ReconcilePlan(probed=2, outcomes=gone)
     assert await _marked(plan, gone, strikes={"a": 1, "b": 1}) == (False, False)
     disabled = {"a": ProbeOutcome.DISABLED, "b": ABSENT_OUTCOME}
+    plan = ReconcilePlan(probed=2, readable=1, outcomes=disabled)
     assert await _marked(plan, disabled, strikes={"a": 1, "b": 1}) == (False, True)
+
+
+async def test_a_readable_answer_from_an_earlier_pass_is_no_hold_clear() -> None:
+    """The readable answer must come from THIS pass. The record still says ``a`` read PRESENT on
+    an earlier pass, but this pass read only ``b``, and found no entry. Nothing this pass read says
+    the attribute is readable now, so the hold stays open."""
+    plan = ReconcilePlan(probed=1, outcomes={"b": ABSENT_OUTCOME})
+    for earlier in (PRESENT, ProbeOutcome.DISABLED):  # neither stands in for a readable answer now
+        record = {"a": earlier, "b": ABSENT_OUTCOME}
+        assert await _marked(plan, record, strikes={"b": 1}) == (False, False), earlier.value
+
+
+async def test_an_undetermined_answer_this_pass_revoked_still_blocks_the_hold_clear() -> None:
+    """The revoked exclusion does not reach the hold. ``a`` read undetermined and was revoked,
+    because no hold engaged on this process. A restarted process has lost the latch that may still
+    have held it, so its answer is the hold's own condition. The breaker judged the revocation, so
+    its clear stands."""
+    outcomes = {"a": UNDETERMINED, "b": PRESENT}
+    plan = ReconcilePlan(
+        probed=2,
+        readable=1,
+        outcomes=outcomes,
+        revocations=(SessionRevocation("a", "alice", reason="directory_undetermined"),),
+    )
+    assert await _marked(plan, outcomes, strikes={"a": 2}) == (True, False)
 
 
 async def test_an_account_this_pass_revoked_does_not_hold_the_breaker_open() -> None:
     """The ``revoked`` exclusion: the account the pass just revoked still carries its strikes on
     record, and it has left the estate. Counting it would keep the breaker open after every pass
     that revokes anyone."""
-    plan = ReconcilePlan(
-        probed=2, revocations=(SessionRevocation("a", "alice", reason="directory_absent"),)
-    )
     outcomes = {"a": ABSENT_OUTCOME, "b": PRESENT}
+    plan = ReconcilePlan(
+        probed=2,
+        readable=1,
+        outcomes=outcomes,
+        revocations=(SessionRevocation("a", "alice", reason="directory_absent"),),
+    )
     assert await _marked(plan, outcomes, strikes={"a": 2}) == (True, True)
 
 

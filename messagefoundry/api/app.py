@@ -7953,7 +7953,7 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
 def _without_clears(plan: ReconcilePlan) -> ReconcilePlan:
     """The plan with every ``*_clear`` flag set False, so it resolves no alert instance.
 
-    BACKLOG #2136, the Lander's finding 1 on PR 2036. The evidence for a clear is this process's
+    BACKLOG #2136. The evidence for a clear is this process's
     own: its strike and outcome records, and its own view of the directory. The instance it would
     resolve is shared by every process on the store. Where more than one reconciler runs, one
     process can read clean while another's condition still stands, and resolving on that would
@@ -7963,8 +7963,10 @@ def _without_clears(plan: ReconcilePlan) -> ReconcilePlan:
     each one reads as leader, and a ``[cluster]`` standby still runs its own reconciler and can
     open the instance a leader would then clear.
 
-    So there, a clear is missed instead. The trip and the hold still page, from each process that
-    sees them, and an operator resolves the instance by hand. Matched by field name, so a flag a
+    So where :func:`_is_sole_reconciler` sees another reconciler, a clear is missed instead. The
+    trip and the hold still page, from each process that sees them, and an operator resolves the
+    instance by hand. That test does not see every reconciler on the store; the cases it misses
+    are stated once, in ``AuthService._mark_reconcile_clears``. Matched by field name, so a flag a
     later item adds is covered without an edit here."""
     cleared: dict[str, Any] = {f.name: False for f in fields(plan) if f.name.endswith("_clear")}
     return replace(plan, **cleared)

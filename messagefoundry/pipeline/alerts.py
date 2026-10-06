@@ -351,9 +351,11 @@ class AlertSink(Protocol):
         mass-revoke breaker is not tripped, as the auth service judges it
         (``AuthService._mark_reconcile_clears`` states the test). Emits **no** notification; when
         alert-state is wired (ADR 0044) it auto-resolves the open ``ad_reconcile_aborted`` instance
-        for the same ``name`` (``"directory-reconciler"``). Raised on every such pass, and never
-        where another reconciler may share the store (``api/app.py::_without_clears``). No PHI.
-        Emitted by the API-lifespan reconciler task, never from ``auth/``."""
+        for the same ``name`` (``"directory-reconciler"``). Raised on every such pass, except on a
+        ``[cluster]`` node or in an engine that runs more than one engine shard
+        (``api/app.py::_without_clears``). That does not cover every engine that shares the store;
+        ``AuthService._mark_reconcile_clears`` names at least the cases that can still resolve
+        falsely. No PHI. Emitted by the API-lifespan reconciler task, never from ``auth/``."""
         ...
 
     def ad_reconcile_hold_released(self, name: str) -> None:

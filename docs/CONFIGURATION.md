@@ -718,7 +718,8 @@ alerts resolve on their own when a pass is evidence the condition has gone (BACK
 needs alert state ([ADR 0044](adr/0044-operator-alert-state.md)). The pass must have an answer, from
 this engine process, for every signed-in directory account it did not just revoke.
 
-- The hold resolves when no answer is undetermined and at least one read `userAccountControl`.
+- The hold resolves when no answer is undetermined, including one from an account the pass just
+  revoked, and at least one answer this pass got read `userAccountControl`.
 - The breaker resolves when the pass did not abort, no answer is undetermined, no account carries a
   strike, and every account still signed in since the last trip has been read again, and not held.
   So the breaker's alert stays open while a hold stands.
