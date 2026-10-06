@@ -2121,3 +2121,80 @@ async def test_the_reload_route_audits_an_unreadable_inbound_ca_as_trust_anchor(
         assert reasons == {str(cfg): "trust_anchor", str(empty): "invalid_config"}
     finally:
         await engine.stop()
+
+
+# --- BACKLOG #2269: a set anchor path that nothing loads still refuses when it cannot load ---------
+#
+# Owner-side decision, recorded in docs/CONFIGURATION.md: keep the refusal. The preflight checks every
+# anchor path that is set, whether or not a consumer uses it, as refuse_an_unread_ca_pin already
+# refuses a pin nothing reads. It fails closed, and unsetting the path is the way out.
+
+
+def _ad_off(ca: str) -> dict[str, Any]:
+    return {"ad_tls_ca_cert_file": ca}
+
+
+def _ad_on_plain_ldap(ca: str) -> dict[str, Any]:
+    return {
+        "ad_enabled": True,
+        "ad_server": "ldap://dc1.example.com",
+        "ad_allow_insecure_ldap": True,
+        "ad_domain": "example.com",
+        "ad_user_search_base": "DC=example,DC=com",
+        "ad_bind_dn": "CN=svc,DC=example,DC=com",
+        "ad_bind_password": "not-a-real-password",
+        "ad_tls_ca_cert_file": ca,
+    }
+
+
+def _oidc_off(ca: str) -> dict[str, Any]:
+    return {"oidc_tls_ca_cert_file": ca}
+
+
+@pytest.mark.parametrize(
+    "unused",
+    [
+        pytest.param(_ad_off, id="AD off"),
+        pytest.param(_ad_on_plain_ldap, id="AD on plain ldap"),
+        pytest.param(_oidc_off, id="OIDC off"),
+    ],
+)
+async def test_a_set_anchor_nothing_loads_refuses_at_start_and_reload(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unused: Any
+) -> None:
+    """Red under: the preflight skipping an anchor no consumer loads. The start refuses through the
+    managed app's lifespan, and a reload through the engine's settings preflight, for a file that
+    cannot load (a CRL alone) and for a file that is missing. The control: the same settings with
+    the path unset collect no anchor, so nothing is checked."""
+    from messagefoundry.api.app import create_managed_app
+    from messagefoundry.config.wiring import WiringError
+
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    crl = tmp_path / "crl-only.pem"
+    crl.write_bytes(_crl_only())
+    specs = collect_anchor_specs(AuthSettings(**unused(str(crl))), ApiSettings())
+    assert len(specs) == 1
+    cfg = tmp_path / "cfg"
+    _file_graph(cfg)
+    app = create_managed_app(
+        db_path=tmp_path / "m.db",
+        config_dir=cfg,
+        trust_anchor_specs=specs,
+        allow_no_auth=True,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    with pytest.raises(TrustAnchorError, match="the TLS library cannot load the trust anchor"):
+        async with app.router.lifespan_context(app):
+            pass
+
+    for path in (crl, tmp_path / "gone.pem"):
+        (spec,) = collect_anchor_specs(AuthSettings(**unused(str(path))), ApiSettings())
+        preflight = ta.make_settings_anchor_preflight([spec], store, enforcing=True)
+        assert preflight is not None
+        with pytest.raises(WiringError, match="a settings trust anchor was refused") as err:
+            await preflight()
+        assert isinstance(err.value.__cause__, TrustAnchorError)
+
+    unset = {k: v for k, v in unused(str(crl)).items() if not k.endswith("_tls_ca_cert_file")}
+    assert collect_anchor_specs(AuthSettings(**unset), ApiSettings()) == []
