@@ -30,10 +30,10 @@ this line.**
 ### Security
 
 - **An IPv4 entry in `organization_domains` or `external_link_allowlist` matches only that
-  address.** The engine now accepts a canonical dotted-quad address in either list and refuses
-  every other entry that is not shaped like a host name. The interstitial check matched every
-  entry on a label boundary, so a host that merely ended in a listed address would have counted as
-  covered. No seam change. (vault BACKLOG #2843)
+  address.** The interstitial check matched every entry on a label boundary. So a host that merely
+  ended in a listed address would have counted as covered. The engine still accepts a canonical
+  dotted-quad address in either list. It now refuses a partial or non-canonical one, and any other
+  entry not shaped like a host name. No seam change. (vault BACKLOG #2843)
 
 - **A cookie replayed from a second address is sent to re-authenticate before a PHI page or a
   write.** The message pages, the dead-letter list and the three reason reveals (every

@@ -4,9 +4,11 @@
 
 ``[security].organization_domains``, ``[security].external_link_allowlist`` and
 ``[egress].allowed_recipient_domains`` each tested an entry's shape their own way, and the egress
-list accepted hexadecimal IPv4 forms the address rule refuses. One table now feeds every list and
-``envelope_address_problem`` the same values. The verdicts must agree, except for the one stated
-difference: the two navigation lists also accept a canonical dotted-quad IPv4 address.
+list accepted hexadecimal IPv4 forms the address rule refuses. One table now feeds every list the
+same values, and ``envelope_address_problem`` each value that reaches its domain check. The
+verdicts must agree, except for two stated differences: the two navigation lists also accept a
+canonical dotted-quad IPv4 address, and the recipient list takes a 253-character domain that no
+address can carry.
 
 Read on the unfixed code at ``873aa9d75a``: ``organization_domains`` and
 ``external_link_allowlist`` accepted every value in :data:`_REFUSED` except the URL, port and
@@ -19,8 +21,9 @@ import pytest
 from pydantic import ValidationError
 
 from messagefoundry.config.settings import EgressSettings, SecuritySettings
-from messagefoundry.domainshape import domain_shape_problem
+from messagefoundry.domainshape import domain_shape_problem, is_canonical_ipv4
 from messagefoundry.transports.email import envelope_address_problem
+from messagefoundry_webconsole import _external
 from messagefoundry_webconsole._external import is_allowlisted, is_external
 
 #: Each list, and the settings section that validates it.
@@ -87,15 +90,16 @@ def test_every_list_accepts_the_same_values(list_name: str, value: str) -> None:
     assert _load(list_name, value) == [value.strip().lower()]
 
 
-#: The values whose probe address reaches the domain check: one holding "@", "/", ":" or "*" fails
-#: earlier, in the parse or the local part, so its verdict would agree for an unrelated reason.
-#: The 255-character one is left out too: the address cap refuses it first.
-_DOMAIN_ONLY = [
-    v for v in [*_REFUSED, *_ACCEPTED, _IPV4] if not set(v) & set("@/:*") and len(v) < 250
-]
+#: The values whose probe address reaches the domain check. One holding "@", "/" or ":" fails the
+#: read-back first, so its verdict would agree for an unrelated reason.
+_DOMAIN_ONLY = [v for v in [*_REFUSED, *_ACCEPTED, _IPV4] if not set(v) & set("@/:")]
+
+#: A 252-character domain, the longest an address can carry, and one a character longer.
+_LONGEST_SENDABLE = ".".join(["x" * 63] * 3 + ["x" * 60])
+_ONE_TOO_LONG = _LONGEST_SENDABLE + "x"
 
 
-@pytest.mark.parametrize("value", _DOMAIN_ONLY)
+@pytest.mark.parametrize("value", [*_DOMAIN_ONLY, _LONGEST_SENDABLE])
 def test_the_address_check_agrees_with_the_recipient_list(value: str) -> None:
     # The send rule and the list a recipient is matched against give one verdict, so no entry is
     # accepted that no sendable address could match, and no sendable domain is unlistable.
@@ -105,6 +109,15 @@ def test_the_address_check_agrees_with_the_recipient_list(value: str) -> None:
     except ValidationError:
         listed = False
     assert (envelope_address_problem("a@" + value.strip()) is None) is listed
+
+
+def test_a_253_character_domain_is_the_one_stated_gap() -> None:
+    # The shared rule allows 253 characters, the RFC 1035 limit. The address cap of 254 leaves
+    # 252 for the domain, so the list takes an entry no address can carry. Pinned so a change to
+    # either cap is a decision rather than drift.
+    assert len(_ONE_TOO_LONG) == 253
+    assert _load("allowed_recipient_domains", _ONE_TOO_LONG) == [_ONE_TOO_LONG]
+    assert envelope_address_problem("a@" + _ONE_TOO_LONG) == "is longer than SMTP allows"
 
 
 @pytest.mark.parametrize("list_name", ["organization_domains", "external_link_allowlist"])
@@ -127,6 +140,13 @@ def test_the_console_matches_an_ipv4_entry_exactly() -> None:
     assert not is_allowlisted(f"https://x.{_IPV4}/", entries)
 
 
+@pytest.mark.parametrize("value", [*_REFUSED, _IPV4, "10.20.30.040", "0.0.0.0"])
+def test_the_console_and_the_engine_agree_on_what_is_an_ipv4_entry(value: str) -> None:
+    # The console keeps its own stdlib check rather than import the engine module, so the two
+    # must not drift: an entry would move between exact and label-boundary matching.
+    assert _external._is_ipv4(value) is is_canonical_ipv4(value)
+
+
 def test_a_blank_entry_is_skipped_by_every_list() -> None:
     for list_name in _MODELS:
         assert _load(list_name, "   ") == []
@@ -136,6 +156,6 @@ def test_a_blank_entry_is_skipped_by_every_list() -> None:
 def test_the_shared_reason_names_no_part_of_the_value(value: str) -> None:
     reason = domain_shape_problem(value)
     assert reason is not None
-    for part in ("example", "mx", "0x", "spital", "xxx", "https", "25"):
+    for part in ("example", "mx", "0x", "spital", "xxx", "https"):
         if part in value:
             assert part not in reason

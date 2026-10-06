@@ -4189,8 +4189,9 @@ class EgressSettings(_Section):
         ``[security].organization_domains``, subdomains are NOT matched: each needs its own entry.
 
         Each entry must pass the shape rule the send path applies to a recipient's domain, so an
-        entry shaped like no sendable domain is refused here, not at the gate. The send path also
-        caps the whole address at 254 characters, which this list does not. Normalisation, in
+        entry shaped like no sendable domain is refused here, not at the gate. One gap remains: a
+        domain of exactly 253 characters passes here, but the send path's 254-character address cap
+        refuses every address in it. Normalisation, in
         :func:`_bare_domain_entries`: whitespace stripped, blanks skipped, no dot stripped, and
         lowercased after the check. No IP address is accepted (vault BACKLOG #2843)."""
         return _bare_domain_entries(
@@ -6041,7 +6042,8 @@ class SecuritySettings(_Section):
     # is sent somewhere "outside the application's CONTROL", and control is organisational rather than
     # topological — an operator's own AD FS is a different host, a different origin, and squarely
     # theirs. Matched on a LABEL boundary, so "hospital.example" covers "adfs.hospital.example" and
-    # NOT "evilhospital.example"; a bare endswith would admit the lookalike.
+    # NOT "evilhospital.example"; a bare endswith would admit the lookalike. An IPv4 entry matches
+    # only that address (vault BACKLOG #2843).
     #
     # EMPTY (the default) is deliberately the strict position, not the lax one: with nothing declared,
     # every absolute http(s) destination is treated as external and gets the interstitial. An operator
@@ -6053,7 +6055,7 @@ class SecuritySettings(_Section):
     # WARNING: THE AUDITED ESCAPE, and it LOWERS SECURITY. Destinations here are navigated to with no
     # notification and no cancel — precisely what 3.7.3 asks for. It exists because operators have
     # legitimate high-volume external destinations they do not want to declare as their own domain.
-    # Same label-boundary matching. Non-empty produces a startup warning naming every entry; the
+    # Same matching, an IPv4 entry exactly. Non-empty produces a startup warning naming every entry; the
     # method's rule is that a signed relaxation is never a Pass, so this is the delta, not the default.
     external_link_allowlist: list[str] = Field(default_factory=list)
 

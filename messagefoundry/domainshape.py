@@ -22,8 +22,9 @@ __all__ = ["domain_shape_problem", "is_canonical_ipv4"]
 
 #: The characters a hostname-shaped domain may hold, in either case.
 _DOMAIN_TEXT = frozenset(string.ascii_letters + string.digits + "-.")
-#: The RFC 1035 limits on one label of a domain, and on the whole domain written without a final dot.
+#: The RFC 1035 limit on one label of a domain.
 _MAX_LABEL = 63
+#: The RFC 1035 limit on a whole domain, written without a final dot.
 _MAX_DOMAIN = 253
 
 
@@ -31,8 +32,8 @@ def domain_shape_problem(domain: str) -> str | None:
     """Why ``domain`` is not a hostname-shaped domain, or ``None`` when it is.
 
     Hostname-shaped means ASCII labels of letters, digits and hyphens, 1 to 63 characters each,
-    none starting or ending with a hyphen, and 253 characters in all. So an empty domain, an empty label, and a leading,
-    trailing or doubled dot, are refused. The last label must start with a letter. That refuses a
+    none starting or ending with a hyphen, and at most 253 characters in all. So an empty domain,
+    an empty label, and a leading, trailing or doubled dot, are refused. The last label must start with a letter. That refuses a
     dotted quad, and also the forms ``inet_aton`` reads as IPv4, such as ``10.0.0.0x1`` and
     ``0x7f000001``, which an all-digits test would pass. No public top-level domain starts with a
     digit, so this refuses no public domain. A private DNS name whose last label starts with a

@@ -148,8 +148,8 @@ _LOCAL_ATEXT = frozenset(string.ascii_letters + string.digits + "#$&'*+-^_`{}~")
 #: SEPARATOR). ``policy.default`` refuses a header value holding one, so a subject or sender with
 #: one would fail every send. The shared ``controlchars`` alphabet is deliberately blind to them.
 _UNICODE_LINE_BREAKS = frozenset("\u0085\u2028\u2029")
-#: The RFC 5321 size limits: a local part of 64 octets, and 254 for the whole address. The domain
-#: needs no limit of its own: this holds it to 252 characters, under the 253 RFC 1035 allows.
+#: The RFC 5321 size limits: a local part of 64 octets, and 254 for the whole address. The address
+#: limit holds the domain to 252 characters, so the shared rule's 253 never binds here.
 _MAX_LOCAL = 64
 _MAX_ADDRESS = 254
 
