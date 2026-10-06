@@ -46,7 +46,12 @@ import urllib.request
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, ClassVar
 
-from messagefoundry.config.models import ConnectorType, Destination, SignatureAlgorithm
+from messagefoundry.config.models import (
+    ConnectorType,
+    Destination,
+    SignatureAlgorithm,
+    flag_from_settings,
+)
 from messagefoundry.config.tls_policy import (
     CREDENTIAL_HOP_WAYS_ACROSS,
     MIRRORED_CONNECTION_SETTING,
@@ -642,7 +647,7 @@ def revocation_attestation_from_settings(
     reason = s.get("tls_revocation_attested_reason")
     connection = s.get(MIRRORED_CONNECTION_SETTING)
     return (
-        bool(s.get("tls_revocation_attested", False)),
+        flag_from_settings(s, "tls_revocation_attested"),
         None if reason is None else str(reason),
         None if connection is None else str(connection),
     )
@@ -709,7 +714,7 @@ def token_provider_from_settings(
         timeout_seconds=float(s.get("smart_timeout_seconds", _DEFAULT_TOKEN_TIMEOUT)),
         # #200: the per-connection insecure-hop attestation keys the posture-keyed cleartext refusal in
         # __init__ (read from settings exactly as _dest_config / the OAuth2 provider do).
-        attested=bool(s.get("tls_hop_attested", False)),
+        attested=flag_from_settings(s, "tls_hop_attested"),
         # #1498 (ADR 0173 §4.3): the revocation attestation `_dest_config` mirrors from the connection's
         # top-level declaration. A DIFFERENT claim from `attested` above, so it gets its own key.
         revocation_attested=revocation[0],

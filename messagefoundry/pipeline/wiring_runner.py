@@ -63,6 +63,7 @@ from messagefoundry.config.models import (
     Schedule,
     Source,
     StallThreshold,
+    flag_from_settings,
 )
 from messagefoundry.config.run_context import RunContext, run_contexts
 from messagefoundry.config.settings import (
@@ -8818,7 +8819,7 @@ def _fhir_lookup_settings(
     # as the factory does, since this is the one builder both executor paths use.
     _refuse_attested_and_accepted(
         f"fhir lookup {spec.name!r}",
-        bool(settings.get("tls_hop_attested", False)),
+        flag_from_settings(settings, "tls_hop_attested"),
         spec.cleartext_accepted,
     )
     return settings

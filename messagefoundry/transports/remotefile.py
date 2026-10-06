@@ -77,6 +77,7 @@ from messagefoundry.config.models import (
     ContentType,
     Destination,
     Source,
+    flag_from_settings,
     remote_file_protocol,
 )
 from messagefoundry.config.settings import (
@@ -1794,7 +1795,7 @@ def _anon_ftp_guard(
         port=int(s.get("port", 21)),
         cell="REMOTEFILE ftp",
         description="cleartext anonymous FTP egress",
-        attested=bool(s.get("tls_hop_attested", False)),
+        attested=flag_from_settings(s, "tls_hop_attested"),
         attested_reason=None if reason is None else str(reason),
         cleartext_accepted=cleartext_accepted,
         cleartext_reason=cleartext_reason,

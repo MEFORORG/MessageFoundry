@@ -76,6 +76,7 @@ from messagefoundry.config.models import (
     _check_hop_attestation,
     _check_revocation_attestation,
     check_db_connect_timeout,
+    flag_from_settings,
 )
 from messagefoundry.config.send_snapshot import snapshot_on_send_active
 from messagefoundry.connection_names import (
@@ -917,14 +918,13 @@ class FhirLookupSpec:
                 self.tls_revocation_attested, self.tls_revocation_attested_reason
             )
             _check_cleartext_acceptance(self.cleartext_accepted, self.cleartext_reason)
+            attested = flag_from_settings(self.settings, "tls_hop_attested")
         except ValueError as exc:
             raise WiringError(f"fhir lookup {self.name!r}: {exc}") from exc
         # The factory refuses both claims at once, and a spec built directly must not hold them either.
         # `wiring_runner._fhir_lookup_settings` checks again, since `settings` is mutable (ADR 0092).
         _refuse_attested_and_accepted(
-            f"fhir lookup {self.name!r}",
-            bool(self.settings.get("tls_hop_attested")),
-            self.cleartext_accepted,
+            f"fhir lookup {self.name!r}", attested, self.cleartext_accepted
         )
 
 

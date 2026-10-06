@@ -180,12 +180,39 @@ class InternalErrorPolicy(str, Enum):  # noqa: UP042
     STOP = "stop"
 
 
+def require_flag(value: object, key: str) -> bool:
+    """Return ``value`` if it is a real ``bool``; refuse anything else, naming ``key`` (BACKLOG #2232).
+
+    For the hop-policy flags (``tls_hop_attested``, ``tls_revocation_attested``,
+    ``cleartext_accepted``). ``bool("false")`` is ``True``, so a lax read would honour the string
+    ``"false"`` as the flag SET; an ``env()`` reference is truthy too. ``connections.toml`` already
+    refuses both (``connections_file._require_bool``); this is the same rule for every other path."""
+    if not isinstance(value, bool):
+        raise ValueError(f"{key} must be true or false, not {type(value).__name__}")
+    return value
+
+
+def flag_from_settings(settings: Mapping[str, Any], key: str) -> bool:
+    """The one reader of a hop-policy flag out of a raw settings mapping (BACKLOG #2232).
+
+    Absent, or ``None``, means ``False``. A real ``bool`` is returned as is. Anything else raises
+    :class:`ValueError` naming ``key`` (:func:`require_flag`), so a mapping that was written past
+    every factory cannot cross a refusal on a truthy string."""
+    value = settings.get(key)
+    return False if value is None else require_flag(value, key)
+
+
 def _check_flag_with_reason(
     flag: bool, reason: str | None, *, flag_name: str, reason_name: str, flag_means: str, why: str
 ) -> None:
     """The three fail-loud rules every flag-plus-mandatory-reason pair shares: a reason without the
     flag, the flag without a reason, and a blank reason. One body, so the pairs cannot drift apart;
-    each caller supplies only its names and the sentence saying why the reason is required."""
+    each caller supplies only its names and the sentence saying why the reason is required.
+
+    The flag must be a real ``bool`` (vault BACKLOG #2232). A code-first factory passes the author's
+    value straight here, and the string ``"false"`` is truthy, so it would otherwise pass as a set flag
+    and be mirrored into settings as ``True``."""
+    require_flag(flag, flag_name)
     if reason is not None and not flag:
         raise ValueError(
             f"{reason_name} is set without {flag_name}=true — set the flag to {flag_means}, "
@@ -237,7 +264,7 @@ def hop_attestation_from_settings(settings: Mapping[str, Any]) -> bool:
     pair into it from their own ``tls_hop_attested`` parameters (owner ruling 2026-09-24), and
     ``config.wiring.attested_secure_hops`` reads the same mapping, so the loosening report names every
     attestation this reader honours."""
-    attested = bool(settings.get("tls_hop_attested", False))
+    attested = flag_from_settings(settings, "tls_hop_attested")
     reason = settings.get("tls_hop_attested_reason")
     _check_hop_attestation(attested, None if reason is None else str(reason))
     return attested

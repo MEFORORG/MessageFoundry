@@ -39,7 +39,7 @@ import urllib.request
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
-from messagefoundry.config.models import ConnectorType
+from messagefoundry.config.models import ConnectorType, flag_from_settings
 from messagefoundry.config.tls_policy import (
     CREDENTIAL_HOP_WAYS_ACROSS,
     SYSTEM_TRUST_ANCHOR,
@@ -272,7 +272,7 @@ def oauth2_cc_provider_from_settings(
         # #200: the per-connection insecure-hop attestation keys the posture-keyed cleartext refusal in
         # __init__ (read from settings exactly as _dest_config / FhirLookup do). Default False → the hop
         # decides purely on posture.
-        attested=bool(s.get("tls_hop_attested", False)),
+        attested=flag_from_settings(s, "tls_hop_attested"),
         # BACKLOG #2112 (ADR 0173 section 4.3): the revocation attestation `_dest_config` mirrors from
         # the connection's top-level declaration, through the reader the SMART sibling uses.
         revocation_attested=revocation[0],
@@ -359,7 +359,7 @@ def digest_handler_from_settings(
     # ``InsecureHopRefused`` on REFUSE; re-raise as ``HttpAuthError`` to keep this seam's error contract
     # (both are ``ValueError``s → the loader surfaces either identically). Runs at connector construction
     # under the gate's stamped posture (fail-closing to prod-PHI when unstamped).
-    attested = bool(s.get("tls_hop_attested", False))
+    attested = flag_from_settings(s, "tls_hop_attested")
     # ADR 0153: the sibling cleartext-acceptance declaration, mirrored into these resolved settings by
     # the runner's _dest_config for exactly this kind of settings-driven seam.
     accepted, accept_reason, accept_conn = cleartext_acceptance_from_settings(s)
