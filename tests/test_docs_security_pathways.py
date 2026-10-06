@@ -3449,7 +3449,20 @@ def test_the_thirteenth_sweep_second_round_probes_reply_logging_and_opt_in() -> 
     assert asyncio.run(committed("accepted")).outcome is ReplyOutcome.REPLY
     # The caveat's example and its "most": a capturing SOAP send returns a 2xx <Fault> as a
     # rejected reply, and REST retries exactly two 4xx statuses and dead-letters the rest.
-    assert 'outcome="rejected"' in inspect.getsource(soap.SoapDestination.send)
+    # Read from the code, not the text: some DeliveryResponse(...) call in send passes the literal
+    # outcome="rejected", so a comment or docstring naming it cannot keep this green.
+    send_tree = ast.parse(textwrap.dedent(inspect.getsource(soap.SoapDestination.send)))
+    assert any(
+        isinstance(n, ast.Call)
+        and ast.unparse(n.func).split(".")[-1] == "DeliveryResponse"
+        and any(
+            kw.arg == "outcome"
+            and isinstance(kw.value, ast.Constant)
+            and kw.value.value == "rejected"
+            for kw in n.keywords
+        )
+        for n in ast.walk(send_tree)
+    ), "SoapDestination.send no longer returns a captured <Fault> as a rejected reply"
     retried_4xx = rest._RETRYABLE_4XX
     assert retried_4xx == frozenset({408, 429})
 
