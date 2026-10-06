@@ -644,6 +644,12 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     import_corepoint.add_argument(
         "--out", required=True, help="config directory to write the generated modules into"
     )
+    import_corepoint.add_argument(
+        "--force",
+        action="store_true",
+        help="replace modules already in --out under the names this import writes (without it, an "
+        "existing module is refused and nothing is written)",
+    )
     import_corepoint.add_argument("--json", action="store_true", help="emit a JSON import summary")
 
     init = sub.add_parser(
@@ -4998,11 +5004,12 @@ def _import(args: argparse.Namespace) -> int:
 
     Writes one ``@router``/``@handler`` module per channel into ``--out`` and reports the count-and-log
     summary (mapped vs. unmapped actions). The export is untrusted data — a malformed export is a clean
-    error + exit 1, never a traceback."""
+    error + exit 1, never a traceback. A module already in ``--out`` under a name this import writes
+    is refused (exit 1, naming each file, nothing written) unless ``--force`` is given."""
     from messagefoundry.corepoint_import import CorepointImportError, import_corepoint
 
     try:
-        result = import_corepoint(args.export, args.out)
+        result = import_corepoint(args.export, args.out, force=args.force)
     except (CorepointImportError, OSError, RecursionError) as exc:
         return _emit_error(str(exc), as_json=args.json)
 

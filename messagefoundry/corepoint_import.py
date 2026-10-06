@@ -84,9 +84,11 @@ vendored ``defusedxml`` copy (``messagefoundry/_vendor/defusedxml/``) and its ow
 
 from __future__ import annotations
 
+import builtins
 import html
 import json
 import keyword
+import os
 import re
 from dataclasses import dataclass, field, replace
 from math import isfinite
@@ -96,6 +98,8 @@ from xml.etree.ElementTree import (  # nosec B405 — exception type only; every
     ParseError,
 )
 
+import messagefoundry
+import messagefoundry.actions as _actions
 from messagefoundry._vendor.defusedxml.common import DefusedXmlException
 from messagefoundry._vendor.defusedxml.ElementTree import fromstring as _xml_fromstring
 from messagefoundry.connection_names import CONNECTION_NAME_MAX_LENGTH, is_connection_name
@@ -525,10 +529,11 @@ def _parse_channel(ch: dict[str, Any], index: int) -> Channel:
         raise CorepointImportError(f"channel {name!r} requires a non-empty 'handlers' array")
     all_dest_names = tuple(d.name for d in destinations)
     handlers: list[Handler] = []
+    taken = set(_BOUND_NAMES)
     for k, h in enumerate(handlers_raw):
         if not isinstance(h, dict):
             raise CorepointImportError(f"channel {name!r} handler #{k} must be an object")
-        handlers.append(_parse_handler(h, k, name, all_dest_names))
+        handlers.append(_parse_handler(h, k, name, all_dest_names, taken))
 
     router_name = _opt_str(ch, "router") or f"{ident.lower()}_router"
     return Channel(
@@ -543,10 +548,10 @@ def _default_outbound(ident: str, index: int) -> str:
 
 
 def _parse_handler(
-    h: dict[str, Any], index: int, channel: str, all_dests: tuple[str, ...]
+    h: dict[str, Any], index: int, channel: str, all_dests: tuple[str, ...], taken: set[str]
 ) -> Handler:
     raw_name = _opt_str(h, "name") or f"handler_{index + 1}"
-    name = _sanitize(raw_name)
+    name = _unique_def_name(_sanitize(raw_name), taken)
     actions_raw = h.get("actions", [])
     if not isinstance(actions_raw, list):
         raise CorepointImportError(
@@ -2289,19 +2294,13 @@ def parse_package(text: str, *, source_name: str = "package") -> tuple[Channel, 
     calls = any(map(_may_call, root.iter()))
 
     handlers: list[Handler] = []
-    taken: set[str] = {"route"}
+    taken = set(_BOUND_NAMES)
     destinations: list[str] = []
     for i, action_list in enumerate(lists):
         raw_name = _attr(action_list, "Name") or f"transform_{i + 1}"
         # Lower-case BEFORE sanitizing so the keyword guard sees the final identifier ("Class" →
         # "class" → "class_"): the name is both the ``@handler`` id and the emitted ``def``.
-        name = _sanitize(raw_name.lower())
-        if name in taken:
-            n = 2
-            while f"{name}_{n}" in taken:
-                n += 1
-            name = f"{name}_{n}"
-        taken.add(name)
+        name = _unique_def_name(_sanitize(raw_name.lower()), taken)
         scope = _disabled_scope(action_list, parents)
         # The whole-list gate (BACKLOG #313 step 2, ADR 0086): decided ONCE, for the whole list. A
         # list it does not fully understand takes the step 1 path below untouched, so its output is
@@ -2877,13 +2876,20 @@ def _verify_compilable(source: str, target: Path) -> None:
         ) from exc
 
 
-def import_corepoint(export_path: str | Path, out_dir: str | Path) -> ImportResult:
+def import_corepoint(
+    export_path: str | Path, out_dir: str | Path, *, force: bool = False
+) -> ImportResult:
     """Parse the export at ``export_path`` and write one config module per channel into ``out_dir``.
 
     Returns the :class:`ImportResult` count-and-log summary. Raises :class:`CorepointImportError` on a
     malformed export -- including one that is not valid UTF-8, and one whose generated module CPython
     cannot parse -- and :class:`OSError` on a filesystem failure (the CLI maps both to a clean
-    error)."""
+    error).
+
+    A module already in ``out_dir`` under a name this import would write is refused, naming every
+    such file, and nothing is written -- unless ``force`` is true (vault BACKLOG #2786). The import's
+    own summary tells the operator to hand-finish the generated modules in place, so a second run into
+    the same directory would otherwise replace that work with fresh stubs and report success."""
     epath = Path(export_path)
     unreadable: str | None = None
     try:
@@ -2903,6 +2909,7 @@ def import_corepoint(export_path: str | Path, out_dir: str | Path) -> ImportResu
 
     results: list[ChannelResult] = []
     assigned: set[str] = set()
+    targets: list[Path] = []
     for ch in channels:
         # Two channels can resolve to the same ``module_name`` — either from equal source names or
         # because ``_sanitize`` folds distinct names ("DEMO ADT" vs "DEMO-ADT") onto one stem. Since the
@@ -2933,10 +2940,10 @@ def import_corepoint(export_path: str | Path, out_dir: str | Path) -> ImportResu
             disabled += h_disabled
         filename = f"{module_name}.py"
         target = out / filename
-        # Raising here leaves an earlier channel's file in place, as an ``OSError`` from the write
-        # already would; the error names the module that failed and the command exits non-zero.
+        # Every module is generated and compiled before any is written, so a refusal here, or the
+        # overwrite refusal below, leaves the directory exactly as it was.
         _verify_compilable(source, target)
-        target.write_text(source, encoding="utf-8")
+        targets.append(target)
         results.append(
             ChannelResult(
                 module_name,
@@ -2949,6 +2956,27 @@ def import_corepoint(export_path: str | Path, out_dir: str | Path) -> ImportResu
                 disabled,
             )
         )
+
+    if not force:
+        # ``lexists``: a dangling symlink is a name in the directory too, and ``exists`` reads it as
+        # absent. The ``"x"`` open below is what holds against a file that appears after this check.
+        present = sorted(t.name for t in targets if os.path.lexists(t))
+        if present:
+            raise CorepointImportError(
+                f"refusing to overwrite {len(present)} existing module(s) in {out}: "
+                f"{', '.join(present)}; pass --force to replace them, or import into another "
+                "directory"
+            )
+    mode = "w" if force else "x"
+    for target, result in zip(targets, results, strict=True):
+        try:
+            with target.open(mode, encoding="utf-8") as handle:
+                handle.write(result.source)
+        except FileExistsError as exc:
+            raise CorepointImportError(
+                f"refusing to overwrite {target.name} in {out}: it appeared during the import; "
+                "pass --force to replace it"
+            ) from exc
     return ImportResult(tuple(results))
 
 
@@ -3209,6 +3237,33 @@ _NON_CONNECTION = re.compile(r"[^A-Za-z0-9_-]+")
 # Headroom under the rule's ceiling for the writer's ``_<n>`` de-duplication suffix, and, where the
 # name is also a file stem, for ``.py`` inside a 255-character filename.
 _CONNECTION_NAME_BUDGET = CONNECTION_NAME_MAX_LENGTH - 16
+
+
+# Every module-level name a generated module reaches besides its own handler ``def``s (vault BACKLOG
+# #2788). A ``def`` rebinds the module global of its name, and ``@handler`` returns the function, so a
+# list named ``set_field`` would replace the vocabulary helper for every other handler in the module,
+# and one named ``handler`` or ``router`` would replace the decorator. So the set is deliberately the
+# whole of what such a module could import or call, not only what this import happened to emit: the
+# public surface (the ``from messagefoundry import`` line), the vocabulary (``from
+# messagefoundry.actions import``), the builtins (the emitted code calls ``NotImplementedError`` and
+# ``Exception``, and an author finishing the module reaches for others), the router's ``route``, and
+# the inline ``sends`` list. A name a hand-finisher adds later then still means what it says.
+_BOUND_NAMES = frozenset(
+    {*messagefoundry.__all__, *_actions.__all__, *dir(builtins), "route", "sends"}
+)
+
+
+def _unique_def_name(name: str, taken: set[str]) -> str:
+    """``name``, or ``name_2``, ``name_3``, ... -- the first not in ``taken``, which it then joins.
+
+    Deterministic: the same export always yields the same names, in list order."""
+    if name in taken:
+        n = 2
+        while f"{name}_{n}" in taken:
+            n += 1
+        name = f"{name}_{n}"
+    taken.add(name)
+    return name
 
 
 def _connection_name(name: str) -> str:
