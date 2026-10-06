@@ -7838,7 +7838,6 @@ def _managed_oidc_app(tmp_path: object, *, oidc_enabled: bool) -> object:
             "oidc_allowed_endpoints": ["idp.example"],
         }
     settings = AuthSettings(
-        enabled=True,
         ad_enabled=True,
         ad_server="ldaps://x",
         ad_user_search_base="DC=x",

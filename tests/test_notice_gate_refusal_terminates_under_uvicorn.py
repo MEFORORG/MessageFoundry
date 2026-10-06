@@ -104,7 +104,7 @@ app = create_managed_app(
     store_settings=StoreSettings(path=str(Path(_TMP) / "phi.db"), allow_unencrypted_phi=True),
     poll_interval=0.05,
     egress_settings=EgressSettings(),
-    auth_settings=AuthSettings(enabled=True, notify_security_events=True),
+    auth_settings=AuthSettings(notify_security_events=True),
     alerts_settings=AlertsSettings(
         security_notifications_required=True,
         email_smtp_host="smtp.example.test",

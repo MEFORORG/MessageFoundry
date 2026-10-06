@@ -2,7 +2,7 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """FastAPI authentication + authorization dependencies (deny-by-default).
 
-``require(*permissions)`` is a dependency factory applied to every protected route. Once an enabled
+``require(*permissions)`` is a dependency factory applied to every protected route. Once an
 :class:`AuthService` is wired (the ``serve`` path) it enforces the bearer token plus the listed
 permissions. When **no** AuthService is attached the behaviour is **fail-closed**: the route is
 denied unless the app was explicitly built with ``allow_no_auth=True`` (the in-process embedding /
@@ -1428,8 +1428,8 @@ async def optional_identity(request: Request) -> Identity | None:
     ``GET /ai/policy``) that must answer even to a tokenless client, while still reporting the
     caller's RBAC when a valid token is present.
 
-    Returns the full-access system identity when auth is disabled-with-``allow_no_auth`` (embedding/
-    dev); ``None`` when auth is unconfigured/fail-closed or the token is missing/invalid. The
+    Returns the full-access system identity when no service is attached and ``allow_no_auth`` is
+    set (embedding/dev); ``None`` when auth is unconfigured/fail-closed or the token is missing/invalid. The
     ``must_change_password`` gate is intentionally *not* applied — this surfaces non-sensitive policy,
     not PHI. The ASVS 6.3.3 **MFA access gate is excluded for the same reason, deliberately**: this
     resolver answers tokenless callers by contract, so a second-factor gate here could only ever

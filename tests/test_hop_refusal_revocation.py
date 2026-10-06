@@ -1558,9 +1558,7 @@ def _oidc_managed_app(tmp_path: Path, *, host: str) -> FastAPI:
     """A serve-shaped managed app with OIDC on and both legs on ``host``. ``ai_settings`` is what
     makes the lifespan derive a posture at all, and the default enforcement is enforce. The AD
     server is on loopback so the directory's own hop cannot be the thing that refuses."""
-    settings = _oidc_leg_settings(
-        token_host=host, jwks_host=host, enabled=True, ad_server=f"ldaps://{LOOPBACK}"
-    )
+    settings = _oidc_leg_settings(token_host=host, jwks_host=host, ad_server=f"ldaps://{LOOPBACK}")
     return create_managed_app(
         db_path=tmp_path / "oidc1923.db",
         poll_interval=0.05,

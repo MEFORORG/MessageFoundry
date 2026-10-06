@@ -2734,10 +2734,28 @@ _AD_TIMEOUT_MAX_SECONDS = 3600.0
 
 
 class AuthSettings(_Section):
-    """Authentication + RBAC knobs. Secrets (the AD bind password) come from env, never the file."""
+    """Authentication + RBAC knobs. Secrets (the AD bind password) come from env, never the file.
 
-    # Authentication is required by default; this flag exists only for the embedding/test path.
-    enabled: bool = True
+    There is no sign-in switch here (vault BACKLOG #2825). Settings that exist build an auth service,
+    and a service always requires sign-in. The open mode is the app factories' ``allow_no_auth=True``
+    with no settings at all."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _refuse_the_removed_sign_in_switch(cls, data: Any) -> Any:
+        """Refuse ``enabled`` loudly rather than drop it (vault BACKLOG #2825).
+
+        ``extra="ignore"`` would drop it, so settings built in code with ``enabled=False`` would
+        silently require sign-in after all. The loader already refuses the key from a file or the
+        environment as REMOVED (``_REMOVED_KEYS``), before any model is built."""
+        if isinstance(data, Mapping) and "enabled" in data:
+            raise ValueError(
+                "AuthSettings has no `enabled` field: sign-in cannot be turned off (vault BACKLOG "
+                "#2825). For an app with no sign-in, pass the app factory allow_no_auth=True and no "
+                "auth settings"
+            )
+        return data
+
     session_idle_timeout_minutes: int = 30
     session_absolute_hours: int = 12
     # Cap concurrent sessions per user (ASVS 7.1.2); a login beyond the cap revokes the user's oldest
@@ -2856,7 +2874,7 @@ class AuthSettings(_Section):
     # DEFAULT ON since BACKLOG #288 (owner ruling 2026-09-26, ASVS 8.2.4). It used to default off,
     # with an exposure-time advisory asking an off-loopback operator to turn it on; the hardened path
     # is now the shipped path. Setting it false is a LOOSENING -- `security_loosenings()` names it
-    # whenever auth is on -- because it removes the only mid-session address signal.
+    # -- because it removes the only mid-session address signal.
     admin_new_ip_step_up: bool = True
 
     # Local-password policy — ASVS 5.0-aligned (WP-3): length-first, no mandatory composition.
@@ -3129,7 +3147,7 @@ class AuthSettings(_Section):
     # lockout: bounds password-spray + argon2 CPU-burn. In-process only; an exposed/multi-host
     # deployment must also front the API with a proxy/WAF limiter. 0 disables a limit, and a window
     # of 0 or less disables both. A count above its default, a window below it, and each off value is
-    # a LOOSENING that `security_loosenings()` names while auth is on (BACKLOG #1131); so are the
+    # a LOOSENING that `security_loosenings()` names (BACKLOG #1131); so are the
     # PHI-read, admin-write, session-cap and OIDC flow-cache limits below.
     login_rate_limit_enabled: bool = True
     login_rate_limit_per_ip: int = 10  # max attempts per client IP per window
@@ -5981,8 +5999,8 @@ class SecuritySettings(_Section):
     # ── Sign-in & identity ───────────────────────────────────────────
     # There is no sign-in switch here. `serve` always requires sign-in (vault BACKLOG #2719): the
     # loopback no-auth mode it once offered was removed, not relocated, so `require_sign_in` is
-    # refused at load as a REMOVED key (_REMOVED_KEYS). AuthSettings.enabled survives only for
-    # embedders and tests that build the app themselves with allow_no_auth=True.
+    # refused at load as a REMOVED key (_REMOVED_KEYS). AuthSettings has no such field either (vault
+    # BACKLOG #2825); only an app built in code with allow_no_auth=True runs without sign-in.
     require_mfa: bool = True  # second factor, enforced as an ACCESS gate (ASVS 6.3.3)
     # Who must enroll one when require_mfa is on. Default widens the gate past the Administrator role
     # to every local account (ASVS 6.3.3); "administrators" restores the pre-6.3.3 posture.
@@ -6235,8 +6253,6 @@ class ServiceSettings(_InputHidingModel):
         it at build for a caller that hands it an ``AuthSettings`` alone. Under ``warn`` the opt-in is
         honoured, warned at build and named by :func:`security_loosenings`.
 
-        Not keyed on ``[auth].enabled``: with sign-in off nothing dials the directory, but turning
-        sign-in on would make the bind live with no second check, so the config is refused either way.
         A loopback ``ldap://`` (an on-box LDAPS proxy) is refused too; the cleartext-hop gradient's
         loopback ALLOW was not extended to this hop."""
         if self.auth.plain_ldap_bind and self.security.enforcement is SecurityEnforcement.ENFORCE:
@@ -7235,10 +7251,9 @@ def security_loosenings(
     interpreter (vault BACKLOG #2701), and
     ``[store].schema_management = auto`` on a server backend (#305). It is NOT yet
     an exhaustive registry of every security-relevant switch in every section; ``[store]``/``[auth]``
-    carry others (``encrypt``, ``trust_server_certificate``, ``enabled``, ``ad_tls_verify``,
+    carry others (``encrypt``, ``trust_server_certificate``, ``ad_tls_verify``,
     ``oidc_require_mfa_claim``, ``password_check_breached``) that are not reported here. Most are
-    gated elsewhere. ``enabled`` has no config key: ``serve`` always requires sign-in (vault BACKLOG
-    #2719). ``oidc_require_mfa_claim`` has no serve-time refusal of its own: turned off, it mints
+    gated elsewhere. ``oidc_require_mfa_claim`` has no serve-time refusal of its own: turned off, it mints
     every OIDC session with no factor met, and while ``require_mfa`` is on that session owes an
     engine factor. The parenthetical list above is enumerated in the floor test's exemption set so
     the gap is a written decision that a new switch cannot silently join. That set also holds at
@@ -7570,10 +7585,8 @@ def security_loosenings(
         )
     # Vault BACKLOG #2354: a plain ldap:// AD bind. ServiceSettings refuses it at load under enforce, so a
     # loaded config reaches this only at warn. Conditional on the bind being live: the flag beside an
-    # ldaps:// address, with AD off, or with sign-in off (nothing builds the authenticator) changes
-    # nothing and is not named. Sign-in is off only on an app an embedder or a test built itself;
-    # `serve` always requires it (vault BACKLOG #2719).
-    if auth.enabled and auth.plain_ldap_bind:
+    # ldaps:// address, or with AD off, changes nothing and is not named.
+    if auth.plain_ldap_bind:
         out.append(
             (
                 "ad_allow_insecure_ldap",
@@ -7582,9 +7595,8 @@ def security_loosenings(
                 "domain controller",
             )
         )
-    # BACKLOG #288: the new-client-IP step-up defaults ON. Conditional on auth, like the entry above is
-    # on the directory: with sign-in off there is no session for the signal to guard.
-    if auth.enabled and not auth.admin_new_ip_step_up:
+    # BACKLOG #288: the new-client-IP step-up defaults ON.
+    if not auth.admin_new_ip_step_up:
         out.append(
             (
                 "admin_new_ip_step_up",
@@ -7596,10 +7608,7 @@ def security_loosenings(
     # BACKLOG #1131, owner ruling 2026-09-27 (#2006): a silent weakening of an anti-automation control
     # keeps its ASVS cell at partial. Every such limit LOOSER THAN ITS SHIPPED DEFAULT is named, not
     # only an off value; _auth_limit_loosenings says why and how each direction was read.
-    # Gated on [auth].enabled. A loaded config always has it on: `serve` requires sign-in and no key
-    # turns it off (vault BACKLOG #2719). Only an app an embedder or a test built itself has it off.
-    if auth.enabled:
-        out.extend(_auth_limit_loosenings(auth))
+    out.extend(_auth_limit_loosenings(auth))
     # BACKLOG #1131: trusted_proxies ranges covering every peer of a family (0.0.0.0/0, ::/0, or
     # ranges whose union is that) make uvicorn trust X-Forwarded-For from all of them, which is what
     # the refused "*" does. The load still accepts them; naming them is the fix. Parsed STRICTLY, as

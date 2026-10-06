@@ -1838,24 +1838,6 @@ def _serve(args: argparse.Namespace) -> int:
     # is exactly how the ASVS 11.7.1 and 6.3.3 arms once disagreed about the same boot (#326).
     instance_exposed = not settings.api.is_loopback or settings.api.tls_terminated_upstream
 
-    # Fail closed: `serve` always requires sign-in, on every bind (vault BACKLOG #2719). With auth
-    # disabled the API would answer every request as a full-privilege system identity. This arm used
-    # to refuse only an EXPOSED instance (BACKLOG #1013) and let a bare loopback bind run with no
-    # sign-in. That loopback mode was removed: it named no person in the audit trail, and it could not
-    # repair an account either, since with no auth service the account and audit routes answer 503.
-    # No config key turns sign-in off any more ([security].require_sign_in and [auth].enabled are
-    # both refused at load), so this arm is the backstop for a caller that builds Settings in code.
-    # The app factory's allow_no_auth=True stays for embedders and tests; `serve` never passes it.
-    if not settings.auth.enabled:
-        print(
-            "error: refusing to serve with authentication disabled; the API would answer every "
-            "request as a full-privilege system identity with no sign-in. `serve` always requires "
-            "sign-in, on every bind (vault BACKLOG #2719): build the settings with "
-            "[auth].enabled on.",
-            file=sys.stderr,
-        )
-        return 2
-
     if settings.store.backend is StoreBackend.SQLSERVER:
         import importlib.util
 
@@ -2553,9 +2535,8 @@ def _serve(args: argparse.Namespace) -> int:
     )
     # A non-loopback API bind puts bearer tokens + PHI on the wire. The exposed-gate (ADR 0002 §0):
     # an operator certificate → the first-class secure path (allow); none but --allow-insecure-bind →
-    # a loud dev override (warn); otherwise → refuse fail-closed. The auth-disabled case is refused
-    # above regardless of this flag — serving full-privilege admin to the network is never one "I
-    # accept the risk" away.
+    # a loud dev override (warn); otherwise it refuses, fail-closed. `serve` always requires sign-in
+    # (vault BACKLOG #2719, #2825), so no flag here serves full-privilege admin to the network.
     #
     # BACKLOG #1672: WITHOUT AN OPERATOR CERTIFICATE THE HOP IS NOT CLEARTEXT. The unconditional
     # ensure_api_tls_material call further down (ADR 0172) mints a self-signed pair and serves
@@ -6264,10 +6245,10 @@ def _keyless_store_gate(settings: ServiceSettings) -> str | None:
 def _offline_security_notifier(settings: ServiceSettings) -> SecurityEventNotifier | None:
     """The per-user security notifier ``serve`` would wire, built for an offline command (#2019).
 
-    Same conditions as the API lifespan: ``[auth].enabled`` and ``[auth].notify_security_events``
-    on, and an ``[alerts]`` SMTP host and sender. ``None`` otherwise, and the caller's notice is then
-    dropped with the WARNING ``AuthService`` logs for every notice with no channel. The host and
-    sender are checked first, so a site with no relay never resolves a secret provider.
+    Same conditions as the API lifespan: ``[auth].notify_security_events`` on, and an ``[alerts]``
+    SMTP host and sender. ``None`` otherwise, and the caller's notice is then dropped with the
+    WARNING ``AuthService`` logs for every notice with no channel. The host and sender are checked
+    first, so a site with no relay never resolves a secret provider.
 
     **An SMTP hop that does not authenticate the relay is refused unless acknowledged**, whatever the
     instance's posture. ``serve`` refuses that hop only on a PHI instance under ``enforce``, and that
@@ -6283,12 +6264,7 @@ def _offline_security_notifier(settings: ServiceSettings) -> SecurityEventNotifi
     from messagefoundry.pipeline.security_notify import security_notifier_from_settings
 
     alerts = settings.alerts
-    if not (
-        settings.auth.enabled
-        and settings.auth.notify_security_events
-        and alerts.email_smtp_host
-        and alerts.email_from
-    ):
+    if not (settings.auth.notify_security_events and alerts.email_smtp_host and alerts.email_from):
         return None
     unauthenticated = not alerts.email_use_tls or not alerts.email_tls_verify
     if unauthenticated and not settings.security.allow_unverified_alert_smtp_tls:
@@ -6413,8 +6389,6 @@ def _build_provision_auth_service(
     warning twice; and only the enforcement dial was passed, so a secret held by a ``[secrets]``
     provider failed here although ``serve`` resolved it. Now it gets the ``[secrets]`` provider,
     the ``[security].enforcement`` dial and the instance hop ``posture``, as ``serve`` passes them.
-    One difference is older than this item: ``serve`` builds the service only when
-    ``[auth].enabled``, and this command always builds one, because it needs one to write.
 
     No security notifier is passed. Whether the command owes a takeover notice is decided at the
     write, against the store it writes to, and attached there.
