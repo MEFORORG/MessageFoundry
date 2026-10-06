@@ -856,15 +856,20 @@ def _build_approval_gate(
         try:
             outcome = await engine.reload_detail(config_dir, dry_run=False, propagate=True)
         except _RELOAD_REFUSALS as exc:
-            # BACKLOG #2034 / vault BACKLOG #2459: a release the engine refuses answers the code the
-            # inline route answers and records the row it records, rather than escaping the approve
-            # route as a 500. That covers a bad config or trust anchor (422), and a directory that
-            # vanished (404) or left the reload roots (403) between the hold and the release. The
-            # gate still marks the approval failed. No `client`: see _record_reload_audit.
-            status, answer = await _audit_refused_reload(
+            # BACKLOG #2034 / vault BACKLOG #2459: a release the engine refuses records the row the
+            # inline route records, with the inline route's detail text, rather than escaping the
+            # approve route as a 500. That covers a bad config or trust anchor, and a directory
+            # that vanished or left the reload roots between the hold and the release. The gate
+            # still marks the approval failed. No `client`: see _record_reload_audit.
+            #
+            # Always 422 here, never the inline 403 or 404: on the approve route those two already
+            # mean "you cannot approve your own request" and "no such approval request", and the
+            # web console words them that way. 422 is the approve route's "the released operation
+            # was refused".
+            _status, answer = await _audit_refused_reload(
                 engine, exc, actor=actor, requested=config_dir, dry_run=False
             )
-            raise ApprovalError(status, answer) from exc
+            raise ApprovalError(422, answer) from exc
         registry = outcome.registry
         # BACKLOG #1940: never raises after the swap; see _record_reload_audit.
         failures = await _record_reload_audit(
@@ -1184,18 +1189,18 @@ async def _audit_refused_reload(
     is generic on purpose: the real error is logged here, never returned, so a ``config:deploy``
     holder cannot probe the filesystem through it.
 
-    ``client`` follows :func:`_record_reload_audit`'s rule (ADR 0150): the executor passes none."""
+    ``client`` follows :func:`_record_reload_audit`'s rule (ADR 0150): the executor passes none.
+
+    **The row's write never raises.** A refusal changed nothing, so its answer stands whether or
+    not the row lands, and a store fault here would otherwise turn it into a raw 500 (vault BACKLOG
+    #2255). A failed write is logged at ERROR with the row's detail."""
+    detail: dict[str, object] = {"requested": requested, "dry_run": dry_run}
     if isinstance(exc, ConfigReloadDenied):
-        await engine.store.record_audit(
-            "config_reload_denied",
-            actor=actor,
-            detail=json.dumps({"requested": requested, "dry_run": dry_run}),
-            client=client,
-        )
-        return 403, "config directory is not an allowed reload root"
-    if isinstance(exc, FileNotFoundError):
+        action = "config_reload_denied"
+        status, answer = 403, "config directory is not an allowed reload root"
+    elif isinstance(exc, FileNotFoundError):
         _log.warning("config reload failed (missing dir): %s", exc)
-        reason = "not_found"
+        action, detail["reason"] = "config_reload_failed", "not_found"
         status, answer = 404, "config directory not found"
     else:
         anchor_refused = isinstance(exc.__cause__, TrustAnchorError)
@@ -1204,14 +1209,19 @@ async def _audit_refused_reload(
             "refused (trust anchor)" if anchor_refused else "failed (invalid config)",
             exc,
         )
-        reason = "trust_anchor" if anchor_refused else "invalid_config"
+        action = "config_reload_failed"
+        detail["reason"] = "trust_anchor" if anchor_refused else "invalid_config"
         status, answer = 422, "invalid configuration"
-    await engine.store.record_audit(
-        "config_reload_failed",
-        actor=actor,
-        detail=json.dumps({"requested": requested, "dry_run": dry_run, "reason": reason}),
-        client=client,
-    )
+    row = json.dumps(detail)
+    try:
+        await engine.store.record_audit(action, actor=actor, detail=row, client=client)
+    except Exception:  # noqa: BLE001 - every store backend raises its own type; see the docstring
+        _log.exception(
+            "a refused config reload's %s audit row failed. Lost row: actor=%s detail=%s",
+            action,
+            actor,
+            row,
+        )
     return status, answer
 
 

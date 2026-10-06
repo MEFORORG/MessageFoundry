@@ -267,18 +267,72 @@ async def test_a_refused_release_row_pages_as_well_as_answering_503(store: Messa
 
 async def test_a_failed_compensation_still_writes_its_audit_row(store: MessageStore) -> None:
     """The compensation's status write and audit row used to share one try, so a failed status
-    write also dropped the approval.failed row. It is now attempted on its own, and says the row
-    did not move."""
+    write also dropped the approval.failed row. It is now attempted on its own. Its
+    ``compensated`` is null, not false: false says another caller moved the row first."""
     gate = _gate(_Faulty(store, decide_fails=("failed",)), _Sink(), raises=True)
     approval_id = await _request(gate)
     with pytest.raises(RuntimeError, match="executor exploded"):
         await gate.approve(approval_id, approver="checker", approver_user_id=_APPROVER_ID)
     rows = await store.list_audit(action="approval.failed")
     assert len(rows) == 1
-    assert json.loads(str(rows[0]["detail"]))["compensated"] is False
+    assert json.loads(str(rows[0]["detail"]))["compensated"] is None
 
 
-async def test_the_audit_write_failed_alert_is_routable_and_phi_free() -> None:
+async def test_an_unaudited_request_is_withdrawn_paged_and_still_raised(
+    store: MessageStore,
+) -> None:
+    """The guard used to leave a releasable pending row with no approval.requested row. The caller
+    got an error and no id, so a retry left two releasable copies of one operation."""
+    sink = _Sink()
+    gate = _gate(_Faulty(store, audit_fails=("approval.requested",)), sink)
+    with pytest.raises(sqlite3.OperationalError):
+        await gate.guard(
+            "dead_letter_replay", {}, requester="maker", requester_user_id=_REQUESTER_ID
+        )
+    assert len(sink.lost) == 1 and sink.lost[0][1] == "approval.requested"
+    approval_id = sink.lost[0][0].removeprefix("approval:")
+    assert await _status(store, approval_id) == "failed"
+    assert await store.list_pending_approvals(now=0.0) == []
+
+
+async def test_a_cut_off_release_whose_status_write_fails_still_audits_it(
+    store: MessageStore,
+) -> None:
+    """The interrupted record's status write and audit row used to share one try."""
+    import asyncio
+
+    sink = _Sink()
+    started = asyncio.Event()
+    settings = ApprovalsSettings(
+        enabled=True, operations=["dead_letter_replay"], min_dwell_seconds=0.0
+    )
+    gate = ApprovalGate(
+        _Faulty(store, decide_fails=("interrupted",)),
+        settings,
+        resolve_identity=_resolve,
+        alert_sink=sink,
+    )
+
+    async def _hangs(_p: Mapping[str, Any]) -> dict[str, Any]:
+        started.set()
+        await asyncio.Event().wait()
+        return {}
+
+    gate.register("dead_letter_replay", "op", _hangs, permission=Permission.MESSAGES_REPLAY)
+    approval_id = await _request(gate)
+    task = asyncio.create_task(
+        gate.approve(approval_id, approver="checker", approver_user_id=_APPROVER_ID)
+    )
+    await asyncio.wait_for(started.wait(), 10.0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    rows = await store.list_audit(action="approval.interrupted")
+    assert len(rows) == 1
+    assert json.loads(str(rows[0]["detail"]))["recorded"] is None
+
+
+async def test_the_audit_write_failed_alert_is_rule_routable() -> None:
     """A name a sink emits but the settings registry lacks is silently un-targetable by a rule."""
     assert "audit_write_failed" in _ALERT_EVENT_TYPES
     assert "audit_write_failed" not in _ALERT_CONTROL_EVENT_TYPES
