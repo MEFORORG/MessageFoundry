@@ -875,6 +875,10 @@ def _build_approval_gate(
                 # already mean "you cannot approve your own request" and "no such approval request",
                 # and the web console words them that way. 422 is the approve route's "the released
                 # operation was refused".
+                #
+                # The row alone cannot say the release ran it (actor is the requester either way),
+                # so this line marks it. The type name only: _audit_refused_reload logs the rest.
+                _log.warning("released config reload refused: %s", type(exc).__name__)
                 _status, answer = await _audit_refused_reload(
                     engine, exc, actor=actor, requested=config_dir, dry_run=False
                 )
@@ -893,7 +897,8 @@ def _build_approval_gate(
 
         # A cancelled approve records 'interrupted' in the gate (#1562), and this reload goes on to
         # write its own config_reload row rather than stopping with intake half swapped. A refusal
-        # raised inside _apply is part of that operation too, so its row is written either way.
+        # raised inside _apply is part of that operation too, so a timed-out approve does not cut
+        # its row short. A shutdown drain that cancels the operation still can.
         return await outliving.run(_apply(), "released config reload")
 
     def _replay_params_in_scope(identity: Identity, p: Mapping[str, Any]) -> bool:

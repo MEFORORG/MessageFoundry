@@ -505,6 +505,53 @@ async def test_a_refused_release_whose_audit_row_fails_still_answers_422(
     )
 
 
+async def test_a_refused_release_is_refused_and_recorded_inside_the_outliving_operation(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Vault BACKLOG #2753 made a released reload outlive the approve request; vault BACKLOG #2459
+    gave its refusal the inline route's row and answer. Batch 197 merged the two, so pin that the
+    refusal is handled INSIDE the outliving operation: a timed-out approve must not cut off the
+    refusal's row. The operation itself must end in the 422, not in the raw FileNotFoundError."""
+    import shutil
+
+    from messagefoundry.api.approvals import ApprovalError
+    from messagefoundry.api.outlive import OutlivingOperations
+
+    ended: list[tuple[str, BaseException | None]] = []
+    real_run = OutlivingOperations.run
+
+    async def _spy(self: OutlivingOperations, coro: Any, label: str) -> Any:
+        async def _watched() -> Any:
+            try:
+                result = await coro
+            except BaseException as exc:
+                ended.append((label, exc))
+                raise
+            ended.append((label, None))
+            return result
+
+        return await real_run(self, _watched(), label)
+
+    monkeypatch.setattr(OutlivingOperations, "run", _spy)
+    service = await _service(engine)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.app"):
+        _approval_id, r = await _hold_then_release(
+            engine, service, {}, between=lambda: shutil.rmtree(tmp_path / "cfg")
+        )
+    assert r.status_code == 422, r.text
+    released = [exc for label, exc in ended if label == "released config reload"]
+    assert len(released) == 1
+    assert isinstance(released[0], ApprovalError) and released[0].status == 422
+    assert len(await engine.store.list_audit(action="config_reload_failed")) == 1
+    assert any(
+        "released config reload refused: FileNotFoundError" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
 # --- BACKLOG #2183: a released reload audits an unreadable inbound CA as trust_anchor -------------
 
 
