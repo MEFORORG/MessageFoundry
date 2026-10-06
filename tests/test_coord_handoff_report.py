@@ -302,6 +302,10 @@ class TestWriteCopiesOneDocumentIn:
             "doc.md:stream.md",
             ".hidden.md",
             "a..b.md",
+            "a.md\n",
+            "CON.md",
+            "nul.txt",
+            "com1.notes.md",
         ],
     )
     def test_write_refuses_a_name_that_is_not_a_plain_document(
