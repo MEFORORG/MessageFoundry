@@ -95,6 +95,7 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.connection_names import is_connection_name
 from messagefoundry.controlchars import has_lone_surrogate
+from messagefoundry.domainshape import domain_shape_problem, is_canonical_ipv4
 from messagefoundry.logging_setup import LOG_LEVELS
 from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.remotedebug import RemoteDebugPosture, remote_debug_loosening
@@ -4045,8 +4046,26 @@ def forward_hop_disposition(log: LoggingSettings, posture: HopPosture) -> HopDis
     )
 
 
-#: The characters a ``[egress].allowed_recipient_domains`` entry may hold, after lowercasing.
-_DOMAIN_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-.")
+def _bare_domain_entries(value: list[str], *, allow_ipv4: bool, refusal: str) -> list[str]:
+    """One domain list's entries, normalised, or a ``ValueError`` for the first that can never match.
+
+    Shared by ``[egress].allowed_recipient_domains`` and the two ``[security]`` navigation lists
+    (vault BACKLOG #2843). Surrounding whitespace is stripped and a blank entry is skipped. Each
+    entry must pass :func:`~messagefoundry.domainshape.domain_shape_problem`, or with
+    ``allow_ipv4`` be a canonical IPv4 address. No dot is stripped, so a leading or trailing dot is
+    refused rather than silently dropped. An entry is lowercased only after the check, because
+    ``str.lower()`` turns some non-ASCII letters, such as the Kelvin sign, into ASCII ones, which
+    would accept a value that differs from the one written. ``refusal`` ends the error message."""
+    cleaned: list[str] = []
+    for raw in value:
+        item = raw.strip()
+        if not item:
+            continue
+        problem = domain_shape_problem(item)
+        if problem is not None and not (allow_ipv4 and is_canonical_ipv4(item)):
+            raise ValueError(f"{item!r} is {problem}. {refusal}")
+        cleaned.append(item.lower())
+    return cleaned
 
 
 class EgressSettings(_Section):
@@ -4167,31 +4186,21 @@ class EgressSettings(_Section):
         A recipient domain is compared exactly against the part of an address after its last ``@``.
         So an address, a URL, a port or a wildcard looks plausible and matches nothing, and an
         operator would believe they had listed a domain they had not. Unlike
-        ``[security].organization_domains``, subdomains are NOT matched: each needs its own entry."""
-        cleaned: list[str] = []
-        for raw in value:
-            if not raw.strip():
-                continue
-            item = raw.strip().lower().rstrip(".")
-            labels = item.split(".")
-            # A hostname-shaped domain: letters, digits and hyphens in labels of 1 to 63 characters,
-            # no label starting or ending with a hyphen, and a final label that is not all digits.
-            # This refuses an address, URL, port, wildcard, leading-dot suffix, IP address and a
-            # comma-joined pair, none of which names a mail domain the exact match should accept.
-            if (
-                not item
-                or set(item) - _DOMAIN_CHARS
-                or any(not 0 < len(label) <= 63 for label in labels)
-                or any(label[0] == "-" or label[-1] == "-" for label in labels)
-                or labels[-1].isdigit()
-            ):
-                raise ValueError(
-                    f"[egress].allowed_recipient_domains: {item!r} must be a bare domain such as "
-                    "'hospital.example', not an address, URL, port, wildcard or suffix; list each "
-                    "subdomain as its own entry"
-                )
-            cleaned.append(item)
-        return cleaned
+        ``[security].organization_domains``, subdomains are NOT matched: each needs its own entry.
+
+        Each entry must pass the shape rule the send path applies to a recipient's domain, so an
+        entry shaped like no sendable domain is refused here, not at the gate. One gap remains: a
+        domain of exactly 253 characters passes here, but the send path's 254-character address cap
+        refuses every address in it. Normalisation, in
+        :func:`_bare_domain_entries`: whitespace stripped, blanks skipped, no dot stripped, and
+        lowercased after the check. No IP address is accepted (vault BACKLOG #2843)."""
+        return _bare_domain_entries(
+            value,
+            allow_ipv4=False,
+            refusal="[egress].allowed_recipient_domains needs a bare domain such as "
+            "'hospital.example', not an address, URL, port, wildcard or suffix; list each "
+            "subdomain as its own entry",
+        )
 
 
 #: How an operator-facing refusal says ``EgressSettings.deny_by_default`` is on (BACKLOG #1361).
@@ -6033,7 +6042,8 @@ class SecuritySettings(_Section):
     # is sent somewhere "outside the application's CONTROL", and control is organisational rather than
     # topological — an operator's own AD FS is a different host, a different origin, and squarely
     # theirs. Matched on a LABEL boundary, so "hospital.example" covers "adfs.hospital.example" and
-    # NOT "evilhospital.example"; a bare endswith would admit the lookalike.
+    # NOT "evilhospital.example"; a bare endswith would admit the lookalike. An IPv4 entry matches
+    # only that address (vault BACKLOG #2843).
     #
     # EMPTY (the default) is deliberately the strict position, not the lax one: with nothing declared,
     # every absolute http(s) destination is treated as external and gets the interstitial. An operator
@@ -6045,7 +6055,7 @@ class SecuritySettings(_Section):
     # WARNING: THE AUDITED ESCAPE, and it LOWERS SECURITY. Destinations here are navigated to with no
     # notification and no cancel — precisely what 3.7.3 asks for. It exists because operators have
     # legitimate high-volume external destinations they do not want to declare as their own domain.
-    # Same label-boundary matching. Non-empty produces a startup warning naming every entry; the
+    # Same matching, an IPv4 entry exactly. Non-empty produces a startup warning naming every entry; the
     # method's rule is that a signed relaxation is never a Pass, so this is the delta, not the default.
     external_link_allowlist: list[str] = Field(default_factory=list)
 
@@ -6068,19 +6078,29 @@ class SecuritySettings(_Section):
         an internal domain and get an interstitial on every internal link, or worse, believe they had
         allowlisted something that is still being warned about. Failing at config load is the only
         place this is cheap to notice.
+
+        Each entry must pass the shape rule ``[egress].allowed_recipient_domains`` and the mail
+        address check apply, which also refuses a URL, a port and a wildcard. Normalisation, in
+        :func:`_bare_domain_entries`: whitespace stripped, blanks skipped, no dot stripped, and
+        lowercased after the check. A leading dot is refused rather than dropped: label-boundary
+        matching already covers every subdomain, which is all it could have meant (vault BACKLOG
+        #2843).
+
+        ONE DIFFERENCE FROM THE EGRESS LIST, AND WHY. A canonical dotted-quad IPv4 address, such as
+        ``10.20.30.40``, is accepted here and refused there. These lists are matched against the
+        host of a URL the browser navigates to, and an identity provider on a private network can
+        be reached by address; a mail domain is never an IP address. A short, octal or hexadecimal
+        form is still refused, and so is a partial quad such as ``0.1``, which label-boundary
+        matching would let cover every address that ends in it. The console matches an IPv4 entry
+        exactly. IPv6 stays refused.
         """
-        cleaned: list[str] = []
-        for raw in value:
-            item = raw.strip().lower().lstrip(".")
-            if not item:
-                continue
-            if "/" in item or ":" in item or "*" in item:
-                raise ValueError(
-                    f"{item!r} must be a bare domain such as 'hospital.example', not a URL, scheme "
-                    "or wildcard — subdomains are matched automatically on a label boundary"
-                )
-            cleaned.append(item)
-        return cleaned
+        return _bare_domain_entries(
+            value,
+            allow_ipv4=True,
+            refusal="Write a bare domain such as 'hospital.example', not a URL, scheme or "
+            "wildcard, and with no leading dot: subdomains are matched automatically on a label "
+            "boundary",
+        )
 
     @field_validator("static_credential_accepted", mode="after")
     @classmethod

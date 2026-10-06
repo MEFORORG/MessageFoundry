@@ -1082,12 +1082,12 @@ def test_a_non_ascii_sender_is_refused_at_construction_by_the_address_rule(
         EmailDestination(dest)
 
 
-def test_a_trailing_dot_recipient_never_matched_the_recipient_domain_list() -> None:
-    # The list drops a trailing dot from each entry at load, and the gate compares the recipient's
-    # domain as written. So "example.org." never matched "example.org", and the gate refused it
-    # before vault BACKLOG #2911 too, naming the domain as unlisted. It now refuses the shape first.
-    e = _relay_listed(["example.org."])
-    assert e.allowed_recipient_domains == ["example.org"]
+def test_a_trailing_dot_is_refused_in_the_list_and_in_the_recipient() -> None:
+    # The list used to drop a trailing dot from each entry at load. Since vault BACKLOG #2843 it
+    # applies the address rule's domain shape, so the entry is refused, and so is the recipient.
+    with pytest.raises(ValidationError, match="empty label"):
+        _relay_listed(["example.org."])
+    e = _relay_listed(["example.org"])
     dest = _email_dest("smtp.hospital.example", recipients=["a@example.org."])
     with pytest.raises(WiringError, match="empty label") as refused:
         check_egress_allowed(dest, e)
@@ -1096,14 +1096,15 @@ def test_a_trailing_dot_recipient_never_matched_the_recipient_domain_list() -> N
     check_egress_allowed(_email_dest("smtp.hospital.example", recipients=["a@example.org"]), e)
 
 
-def test_a_listed_hex_ip_domain_is_refused_by_the_shape_rule_at_the_gate() -> None:
-    # The list's own validator accepts this entry, so before vault BACKLOG #2911 the recipient
-    # matched it and passed the gate. Only the shape rule refuses it, which the reason pins.
+def test_a_hex_ip_domain_is_refused_by_the_list_and_by_the_gate() -> None:
+    # Before vault BACKLOG #2843 the list's own validator accepted this entry, and only the send
+    # rule (vault BACKLOG #2911) refused the recipient. Both now apply the one shape rule.
     address = _DOMAIN_SHAPES["domain-hex-last-part"][0]
-    e = _relay_listed([address.rpartition("@")[2]])
+    with pytest.raises(ValidationError, match="start with a letter"):
+        _relay_listed([address.rpartition("@")[2]])
     dest = _email_dest("smtp.hospital.example", recipients=[address])
     with pytest.raises(WiringError, match="start with a letter"):
-        check_egress_allowed(dest, e)
+        check_egress_allowed(dest, _relay_listed(["example.org"]))
 
 
 def test_recipient_domains_do_not_gate_direct() -> None:
@@ -1119,7 +1120,7 @@ def test_recipient_domains_do_not_gate_direct() -> None:
 def test_recipient_domains_load_from_the_environment(tmp_path: Path) -> None:
     empty = tmp_path / "settings.toml"
     empty.write_text("", encoding="utf-8")
-    environ = {"MEFOR_EGRESS_ALLOWED_RECIPIENT_DOMAINS": "Hospital.Example., lab.example"}
+    environ = {"MEFOR_EGRESS_ALLOWED_RECIPIENT_DOMAINS": "Hospital.Example, lab.example"}
     loaded = load_settings(config_path=empty, environ=environ).egress
     assert loaded.allowed_recipient_domains == ["hospital.example", "lab.example"]
 
