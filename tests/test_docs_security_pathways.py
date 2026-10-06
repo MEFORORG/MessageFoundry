@@ -3692,3 +3692,45 @@ def test_the_thirteenth_sweep_phi_says_built_is_not_on() -> None:
     assert forward_rows, "docs/PHI.md names [logging].forward_* nowhere, so this reads nothing"
     misdirected = [c for c in forward_rows if re.search(r"§11|#11-hardening", c)]
     assert not misdirected, f"docs/PHI.md sends forward_* to section 11 again: {misdirected}"
+
+
+def test_the_passkey_leg_asks_the_directory_and_the_doc_says_so() -> None:
+    """BACKLOG #2239. The step-up section said "the passkey leg does not ask the directory", which
+    was true until ``finish_webauthn_assertion`` gained the same directory check ``verify_mfa`` has
+    (#2023). This pins the call, then refuses the old sentence and asks for the new citation. The
+    behaviour (refused before the challenge is taken, nothing charged) is pinned in
+    ``tests/test_passkey_directory_recheck.py``, not by this AST read."""
+    assertion = _service_func("finish_webauthn_assertion")
+    assert _called(assertion, "_directory_step_up_refusal"), (
+        "finish_webauthn_assertion no longer asks the directory; the step-up section and the "
+        "passkey row say it does (BACKLOG #2239)."
+    )
+    provider_reads = sum(
+        1 for n in ast.walk(assertion) if isinstance(n, ast.Attribute) and n.attr == "auth_provider"
+    )
+    assert provider_reads == 1, (
+        f"finish_webauthn_assertion reads auth_provider {provider_reads} times; the lockout "
+        "paragraph says each second-factor leg has ONE provider branch, the directory check."
+    )
+    text = " ".join(_doc_text().split())
+    assert "the passkey leg does not ask the directory" not in text, (
+        "docs/SECURITY.md says the passkey leg does not ask the directory again; it does (#2239)."
+    )
+    assert "BACKLOG #2239" in _section(), (
+        "the pathway section no longer names the passkey leg's provider branch (BACKLOG #2239)."
+    )
+    paragraph = next(
+        (
+            " ".join(p.split())
+            for p in re.split(r"\n\s*\n", _doc_text())
+            if p.startswith("**The passkey leg asks the same question")
+        ),
+        None,
+    )
+    assert paragraph is not None, "the step-up section lost the passkey leg's directory paragraph"
+    for token in (
+        "`auth.webauthn_failed`",
+        "`reason=directory_unconfirmed`",
+        "challenge in flight",
+    ):
+        assert token in paragraph, f"the passkey leg's directory paragraph must name {token}"

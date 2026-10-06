@@ -1198,6 +1198,32 @@ async def test_the_reauth_password_leg_says_the_directory_could_not_confirm_the_
         assert ("Incorrect password." in r.text) is not unconfirmed
 
 
+@pytest.mark.parametrize("unconfirmed", [True, False], ids=["directory-refused", "bad-assertion"])
+async def test_the_passkey_leg_says_the_directory_could_not_confirm_the_account(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, unconfirmed: bool
+) -> None:
+    """BACKLOG #2239: the passkey leg asks the directory before it checks a directory account's
+    assertion, so a refusal never judged the passkey and must not say it failed. The service-level
+    refusal is pinned in tests/test_passkey_directory_recheck.py; here the answer is stubbed.
+
+    RED when: /ui/reauth/webauthn drops the directory_unconfirmed branch (the refused arm then reads
+    "passkey verification failed"), or applies it to an ordinary failed assertion (the control)."""
+    service = await _service(engine, require_mfa=False)
+    await _add(service, "op", Role.OPERATOR)
+
+    async def _refused(token: str | None, response_json: str, **_kwargs: object) -> Elevation:
+        return Elevation(directory_unconfirmed=unconfirmed)
+
+    async with _client(engine, service) as c:
+        assert (await _login(c)).status_code == 303
+        monkeypatch.setattr(service, "finish_webauthn_assertion", _refused)
+        r = await c.post("/ui/reauth/webauthn", json={"response": {}}, headers=SAME_ORIGIN)
+        assert r.status_code == 400
+        error = r.json()["error"]
+        assert (_DIRECTORY_UNCONFIRMED_TEXT in error) is unconfirmed
+        assert (error == "passkey verification failed") is not unconfirmed
+
+
 # --- the temporary credential's deadline on the factor and password pages (BACKLOG #2009) ------
 
 
