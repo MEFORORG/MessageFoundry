@@ -2509,7 +2509,9 @@ def _check_hostname_unchecked(config_dir: str | Path) -> CheckResult:
     that chains to the anchor is accepted whatever host it names.
 
     Advisory (``required=False``) on the ``tls_allow_expired`` precedent: a per-connection TLS
-    relaxation is reported, not refused, under any ``[security].enforcement``. SKIPs when the graph
+    relaxation is reported, not refused, under any ``[security].enforcement``. A credentialed SMTP or
+    FTPS hop that declares it is refused at its own construction instead (#1314, vault BACKLOG
+    #2636); this line does not repeat that refusal. SKIPs when the graph
     will not load, the same convention as its siblings."""
     from messagefoundry.config.wiring import WiringError, hostname_unchecked_hops, load_config
 

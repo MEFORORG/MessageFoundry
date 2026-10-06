@@ -14,6 +14,7 @@ passing because every build warns.
 from __future__ import annotations
 
 import logging
+import re
 import ssl
 from typing import Any
 
@@ -156,14 +157,13 @@ def test_ftps_context_with_defaults_is_silent(caplog: pytest.LogCaptureFixture) 
 def test_ftps_destination_and_source_pass_their_names(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The name reaches the line through ``_make_client`` from both directions."""
+    """The name reaches the line through ``_make_client`` from both directions. Credential-less, as
+    a credentialed hop with the name check off is refused (vault BACKLOG #2636)."""
     from messagefoundry.transports.remotefile import RemoteFileDestination, RemoteFileSource
 
     settings: dict[str, Any] = {
         "protocol": "ftps",
         "host": "ftps.partner.example.invalid",
-        "username": "svc",
-        "password": "synthetic",
         "remote_dir": "/in",
         "tls_check_hostname": False,
     }
@@ -178,6 +178,94 @@ def test_ftps_destination_and_source_pass_their_names(
     assert any("'OB_RF'" in ln for ln in lines), lines
     # The inbound namespace is spelt out, as every inbound refusal does (vault BACKLOG #2370).
     assert any("'inbound:IB_RF'" in ln for ln in lines), lines
+
+
+# --- credentialed FTPS with the name check off is REFUSED (vault BACKLOG #2636) ---------------
+#
+# The FTPS twin of the SMTP refusal of #1314: absolute, keyed on no escape, on either half of the
+# credential. The credential-less hop keeps the warning above.
+
+_REFUSAL = re.escape("peer NAME is unverified (tls_check_hostname=false); refused")
+
+
+@pytest.mark.parametrize(
+    "credential", [{"username": "svc"}, {"password": "synthetic"}], ids=["username", "password"]
+)
+def test_ftps_context_refuses_a_credential_with_the_name_check_off(
+    credential: dict[str, str], caplog: pytest.LogCaptureFixture
+) -> None:
+    from messagefoundry.transports.remotefile import _ftps_ssl_context
+
+    settings: dict[str, Any] = {
+        "host": "ftps.partner.example.invalid",
+        "tls_check_hostname": False,
+        **credential,
+    }
+    with caplog.at_level(logging.WARNING), pytest.raises(ValueError, match=_REFUSAL) as info:
+        _ftps_ssl_context(settings, name="OB_FTPS")
+    message = str(info.value)
+    assert "connection 'OB_FTPS'" in message
+    assert "tls_check_hostname on" in message and "sftp" in message  # names the remedy
+    assert "synthetic" not in message  # never echoes the credential
+    assert _hostname_warnings(caplog) == []  # refused, not warned and then refused
+
+
+def test_ftps_refusal_has_no_escape(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Neither the insecure-TLS escape nor a permissive posture unlocks it. A guard against a later
+    edit that makes this arm consult the escape, which the verify-off arm above it does."""
+    from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV
+    from messagefoundry.transports import remotefile
+
+    monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
+    monkeypatch.setattr(remotefile, "weakened_tls_escape_permitted_here", lambda: True)
+    with pytest.raises(ValueError, match=_REFUSAL):
+        remotefile._ftps_ssl_context(
+            {"host": "h.example.invalid", "tls_check_hostname": False, "username": "svc"}
+        )
+
+
+def test_ftps_refusal_fires_from_both_directions() -> None:
+    """The destination upload and the inbound poller both log in, so both are refused at build."""
+    from messagefoundry.transports.remotefile import RemoteFileDestination, RemoteFileSource
+
+    settings: dict[str, Any] = {
+        "protocol": "ftps",
+        "host": "ftps.partner.example.invalid",
+        "username": "svc",
+        "password": "synthetic",
+        "remote_dir": "/in",
+        "tls_check_hostname": False,
+    }
+    with pytest.raises(ValueError, match=_REFUSAL) as out:
+        RemoteFileDestination(
+            Destination(name="OB_RF", type=ConnectorType.REMOTEFILE, settings=dict(settings))
+        )
+    assert "'OB_RF'" in str(out.value)
+    with pytest.raises(ValueError, match=_REFUSAL) as inb:
+        RemoteFileSource(
+            Source(name="IB_RF", type=ConnectorType.REMOTEFILE, settings=dict(settings))
+        )
+    assert "'inbound:IB_RF'" in str(inb.value)
+
+
+@pytest.mark.parametrize("explicit", [True, False], ids=["explicit-true", "absent"])
+def test_ftps_credentials_with_the_name_check_on_are_unaffected(
+    explicit: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Control arm: the same credentials on the shipped posture build silently."""
+    from messagefoundry.transports.remotefile import _ftps_ssl_context
+
+    settings: dict[str, Any] = {
+        "host": "ftps.partner.example.invalid",
+        "username": "svc",
+        "password": "synthetic",
+    }
+    if explicit:
+        settings["tls_check_hostname"] = True
+    with caplog.at_level(logging.WARNING):
+        ctx = _ftps_ssl_context(settings, name="OB_FTPS")
+    assert ctx.check_hostname is True and ctx.verify_mode == ssl.CERT_REQUIRED
+    assert _hostname_warnings(caplog) == []
 
 
 # --- the expiry relaxation states what is actually verified ------------------------------------

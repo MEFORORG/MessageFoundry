@@ -515,7 +515,9 @@ def _ftps_ssl_context(
 
     ``name`` is the connection's, for the ``tls_check_hostname=false`` warning (ASVS 12.3.2). ``Ftp()``
     does not take that key, so ``connections.toml`` cannot set it either, but a hand-built
-    ``ConnectionSpec`` can, and this context honours it, so the warning lives here."""
+    ``ConnectionSpec`` can, and this context honours it, so the warning lives here. With a
+    ``username`` or ``password`` set it is refused outright instead, with no escape (vault BACKLOG
+    #2636, mirroring the SMTP refusal of #1314)."""
     # #200 (ADR 0092 decision 2): the escape is CLAMPED to non production-PHI, so tls_verify=false can no
     # longer be silenced by MEFOR_ALLOW_INSECURE_TLS on a prod-PHI instance (mirrors the MLLP verify-off
     # arm). Off the construction gate (posture unstamped) the escape is refused since vault BACKLOG
@@ -527,6 +529,23 @@ def _ftps_ssl_context(
             f"Use a trusted CA (tls_ca_file), or set {INSECURE_TLS_ESCAPE_ENV}=1 on an instance at "
             "[security].enforcement = warn to allow it on a trusted-network bind (the escape has no "
             "effect while enforcing, the default, or with no posture)."
+        )
+    check_hostname = bool(settings.get("tls_check_hostname", True))
+    # Vault BACKLOG #2636, the FTPS twin of the SMTP refusal #1314 made (email.py, direct.py): the
+    # chain IS verified here, but with the name check off any certificate chaining to the anchor is
+    # accepted whatever host it names -- on the system trust store, any certificate any public CA
+    # issued to anyone -- and login() then hands the credential to a peer whose identity was never
+    # established. ABSOLUTE and keyed on no escape, as #1314's arm is. Keyed on either half, as the
+    # plain-ftp credential guard is. The credential-less hop keeps the warning below. NOT the whole of
+    # #1314: the tls_verify=false arm above still lets a credential through under the clamped escape,
+    # where SMTP refuses it outright; that gap is separate work.
+    if verify and not check_hostname and (settings.get("username") or settings.get("password")):
+        raise ValueError(
+            f"{hop_name_prefix(name)}REMOTEFILE ftps sends FTP login credentials over a TLS session "
+            "whose peer NAME is unverified (tls_check_hostname=false); refused -- credentials "
+            "require a session bound to the host, not merely to the trust anchor. Leave "
+            "tls_check_hostname on (the default) and have the partner's certificate name the host "
+            "you dial, or use sftp."
         )
     ca = settings.get("tls_ca_file")
     if verify and trust_anchor_policy is not None:
@@ -543,8 +562,8 @@ def _ftps_ssl_context(
         ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=ca)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     if verify:
-        ctx.check_hostname = bool(settings.get("tls_check_hostname", True))
-        if not ctx.check_hostname:  # ASVS 12.3.2: a recorded loosening, never a silent one
+        ctx.check_hostname = check_hostname
+        if not check_hostname:  # ASVS 12.3.2: a recorded loosening, never a silent one
             warn_hostname_check_off(
                 connector="remote-file (FTPS) connection",
                 name=name,

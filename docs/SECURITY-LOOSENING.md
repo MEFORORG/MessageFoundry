@@ -953,7 +953,7 @@ This section is kept rather than deleted, because the claim it used to make is t
 > `MLLP` one is also a `connections.toml` `[settings]` key, because `Email` and `Direct` are not
 > `connections.toml` transports. `Ftp()` does not take it, so a `[settings]` table cannot set it on FTPS
 > either, but the FTPS context honours it from a hand-built `ConnectionSpec`, so it is a loosening
-> there too. ASVS 12.3.2.
+> there too, for an anonymous login only. ASVS 12.3.2.
 - **What you lose:** the check that the server certificate names the host the engine dialled. The
   chain is still verified, so the certificate must come from the hop's trust anchor. But any
   certificate from that anchor is accepted, whatever host it was issued to. On the public trust store
@@ -965,7 +965,14 @@ This section is kept rather than deleted, because the claim it used to make is t
   as an IP address, while they reissue it. Prefer a private trust anchor in `tls_ca_file`, which narrows
   "any certificate from the anchor" to the partner's own CA.
 - **Compensating controls:** a private `tls_ca_file` is the one that matters. With credentials it is
-  not available at all: `Email` and `Direct` refuse it outright when they carry an SMTP credential.
+  not available at all: `Email` and `Direct` refuse it outright when they carry an SMTP credential,
+  and FTPS refuses it outright, in both directions, when a `username` or `password` is set (vault
+  BACKLOG #2636). No escape variable or posture unlocks either refusal. CORRECTED 2026-10-06: FTPS
+  was warned and not refused here, so a credentialed FTPS hop with the name check off would have
+  sent its login to any peer holding a certificate from the anchor. **Not yet matched on FTPS:** a
+  credentialed FTPS hop with `tls_verify = false` is still gated only by the clamped
+  `MEFOR_ALLOW_INSECURE_TLS` escape, where `Email` and `Direct` refuse a credential there outright;
+  that gap is unfiled at the time of writing.
 - **It is never silent:** a WARNING at each construction naming the connection and the host; a
   `tls-check-hostname` line in `messagefoundry check` naming every declaring connection and its peer;
   and a `tls_check_hostname` entry in `security_loosenings()`, and so in `GET /security/posture` on a
@@ -976,8 +983,9 @@ This section is kept rather than deleted, because the claim it used to make is t
   Direct without credentials, and on a hand-built FTPS spec, and the posture floor test exempted it as
   "gated by the ADR 0092 hop cell", which was false. **Not** the serve-time loosening warning, which
   fires before the graph is loaded, as for `tls_allow_expired`.
-- **What it cannot do:** it is **advisory only**, on the `tls_allow_expired` precedent. No posture gate
-  keys on it, and `[security].enforcement = enforce` does not refuse it. Where it is NOT reported is the
+- **What it cannot do:** on a hop with no credential it is **advisory only**, on the
+  `tls_allow_expired` precedent. No posture gate keys on it, and `[security].enforcement = enforce`
+  does not refuse it. The credentialed refusals above are absolute and do not depend on enforcement. Where it is NOT reported is the
   same list as `cleartext_accepted` above: `messagefoundry security show` and a graphless
   `GET /security/posture` say so in `loosenings_scope`.
 
