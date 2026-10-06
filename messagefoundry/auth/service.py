@@ -3424,6 +3424,7 @@ class AuthService:
             # session re-authenticated once the code is proved whatever the address (ADR 0197).
             seed_reauth=combined or (not mfa_required and address is not _LoginAddress.NEW),
             mechanism=SessionMechanism.PASSWORD,
+            idp_auth_time=None,
             supersedes_hash=hash_token(supersedes) if supersedes else None,
         )
         await self._record_login_address(
@@ -4127,6 +4128,9 @@ class AuthService:
             },
             max_expires_at=max_expires_at,
             federated_subject=(principal_claims.issuer, principal_claims.subject),
+            # BACKLOG #2143: the RAW verified auth_time, not the clamped value the cap above uses.
+            # The step-up compares the IdP's next auth_time with it, IdP clock against IdP clock.
+            idp_auth_time=principal_claims.auth_time,
             # ASVS 7.2.4: the session the START leg saw (see PendingFlow.prior_session_hash).
             supersedes_hash=flow.prior_session_hash,
         )
@@ -4348,15 +4352,26 @@ class AuthService:
             return await self._step_up_refused(
                 "session_gone", actor=actor, client=client, return_to=return_to, lost=True
             )
-        # FRESHNESS. max_age=0 and prompt=login ask the IdP to authenticate the user afresh, so a
-        # conforming IdP's auth_time postdates this request. auth_time is IdP clock and issued_at
-        # is ours, so the floor allows the configured skew for an IdP clock that runs behind.
-        # RESIDUAL, stated exactly: an IdP that ignores max_age=0 still passes when its last
-        # sign-in for this user is within oidc_clock_skew_seconds of this request. Closing that
-        # needs the sign-in's own IdP auth_time stored on the session, so the comparison is IdP
-        # clock against IdP clock; engine timestamps such as created_at would mix the two clocks.
+        # FRESHNESS, two tests, and both must pass. max_age=0 and prompt=login ask the IdP to
+        # authenticate the user afresh, so a conforming IdP's auth_time postdates this request.
+        # (a) Against our clock: auth_time is IdP clock and issued_at is ours, so the floor allows
+        # the configured skew for an IdP clock that runs behind.
         skew = self._settings.oidc_clock_skew_seconds
         if flow.issued_at <= 0 or principal_claims.auth_time < flow.issued_at - skew:
+            return await self._step_up_refused(
+                STEP_UP_NOT_FRESH, actor=actor, client=client, return_to=return_to
+            )
+        # (b) Against the IdP's own clock (BACKLOG #2143): auth_time must be LATER than the one the
+        # session holds, which is the sign-in's or the last step-up's. No skew applies, because
+        # both values come from the IdP. This closes most of what (a) alone left: an IdP that
+        # ignores max_age=0 and answers from the sign-in, or from the last step-up, within the skew.
+        # A NULL (an oidc row written before the column existed) cannot be compared, so it refuses.
+        # RESIDUAL, stated exactly: an IdP that ignores max_age=0 still passes when its last
+        # sign-in for this user is later than the value the session holds and within
+        # oidc_clock_skew_seconds of this request. The cost of (b): an IdP clock that steps back, or
+        # IdP nodes whose clocks disagree, refuse a real re-authentication until it passes the value.
+        held_auth_time = session.idp_auth_time
+        if held_auth_time is None or principal_claims.auth_time <= held_auth_time:
             return await self._step_up_refused(
                 STEP_UP_NOT_FRESH, actor=actor, client=client, return_to=return_to
             )
@@ -4419,7 +4434,11 @@ class AuthService:
         purpose = flow.step_up_purpose
         # The password leg's three ORDER-CRITICAL steps (see :meth:`reauth`), against the hash.
         # (1) Every stamp against the OLD hash, re-anchoring the session to this client address.
-        await self._store.mark_session_reauthed(token_hash, client=client)
+        # The accepted auth_time is written in the same statement (BACKLOG #2143), so the next
+        # step-up must show a later one: this answer replayed by the IdP is then not fresh.
+        await self._store.mark_session_reauthed(
+            token_hash, client=client, idp_auth_time=principal_claims.auth_time
+        )
         self._restart_new_ip_dedupe(token_hash)
         grant_refused = purpose is not None and await self._factor_binding_is_blocked_hash(
             token_hash, purpose
@@ -4547,6 +4566,9 @@ class AuthService:
         max_expires_at: float | None = None,
         federated_subject: tuple[str, str] | None = None,
         supersedes_hash: str | None = None,
+        # BACKLOG #2143: the federated sign-in's verified auth_time, stored on the session. Only the
+        # federated caller passes it; a Kerberos session has no IdP clock to compare.
+        idp_auth_time: float | None = None,
     ) -> LoginOutcome:
         # ``federated_subject`` is the verified OIDC ``(issuer, sub)`` and is passed ONLY by the
         # federated path (BACKLOG #1015). It defaults to None, so the Kerberos caller's audit row is
@@ -4804,6 +4826,7 @@ class AuthService:
                 # takes. That also covers a rebind's gap, where the row is unbound between the
                 # clear and the write.
                 require_federated_subject=federated_subject if federated else _UNBOUND,
+                idp_auth_time=idp_auth_time,
                 supersedes_hash=supersedes_hash,
             )
         except _BindingChangedMidLogin:
@@ -6650,6 +6673,7 @@ class AuthService:
         mfa_verified: bool,
         seed_reauth: bool,
         mechanism: SessionMechanism,
+        idp_auth_time: float | None,
         max_expires_at: float | None = None,
         require_federated_subject: tuple[str | None, str | None] | None = None,
         supersedes_hash: str | None = None,
@@ -6691,6 +6715,11 @@ class AuthService:
             # ADR 0184 item (iv): REQUIRED, with no default, so a new mint path cannot forget it. The
             # step-up leg reads it (ADR 0142 Amendment B), and rotation carries it forward.
             auth_mechanism=mechanism.value,
+            # BACKLOG #2143: REQUIRED here, with no default, like the mechanism. The IdP step-up
+            # compares the next auth_time with it, and a NULL on an oidc session refuses that
+            # step-up. _complete_ad_login defaults it to None for its Kerberos callers, so nothing
+            # there checks that an oidc mint passed one; the federated caller does.
+            idp_auth_time=idp_auth_time,
         )
         if not issued:
             # Only reachable with a guard requested: an unbind or a bind revoked this account's

@@ -37,7 +37,7 @@ from messagefoundry.auth.service import (
     STEP_UP_SUBJECT_MISMATCH,
     AuthService,
 )
-from messagefoundry.auth.tokens import hash_token
+from messagefoundry.auth.tokens import hash_token, mint_token
 from messagefoundry.store.store import MessageStore
 from tests.test_auth_oidc_service import (
     AUTH_CODE,
@@ -92,9 +92,12 @@ class _CountingLdap(_FakeLdap):
 
 
 async def _oidc_session(
-    service: AuthService, monkeypatch: pytest.MonkeyPatch, rsa_key: rsa.RSAPrivateKey
+    service: AuthService,
+    monkeypatch: pytest.MonkeyPatch,
+    rsa_key: rsa.RSAPrivateKey,
+    **claim_over: Any,
 ) -> str:
-    out = await _oidc_login(service, monkeypatch, rsa_key)
+    out = await _oidc_login(service, monkeypatch, rsa_key, **claim_over)
     assert out.ok and out.token is not None, out
     return out.token
 
@@ -412,14 +415,22 @@ async def test_an_idp_answer_from_before_the_request_is_refused(
     """RED when: the engine trusts an IdP that ignored max_age=0 and answered from its own session.
 
     ``auth_time`` two skew-widths before the flow was staged is still inside
-    ``oidc_max_age_seconds``, so the sign-in ladder accepts it. Only the step-up check refuses it."""
+    ``oidc_max_age_seconds``, so the sign-in ladder accepts it. Only the step-up check refuses it.
+
+    The sign-in is older still, so the stored IdP ``auth_time`` (BACKLOG #2143) does not refuse this
+    answer. What refuses it is the engine-clock test, which that item kept."""
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store, rsa_key)
-        token = await _oidc_session(service, monkeypatch, rsa_key)
-        flow_id, _url = await _begin(service, token)
         skew = service._settings.oidc_clock_skew_seconds
+        token = await _oidc_session(
+            service, monkeypatch, rsa_key, auth_time=time.time() - 10 * skew
+        )
+        flow_id, _url = await _begin(service, token)
         stale = _staged(service, flow_id).issued_at - 2 * skew - 1
+        held = await store.get_session(hash_token(token))
+        assert held is not None and held.idp_auth_time is not None
+        assert stale > held.idp_auth_time, "the stored auth_time would refuse this on its own"
 
         out = await _return_from_idp(service, monkeypatch, rsa_key, flow_id, auth_time=stale)
 
@@ -428,6 +439,127 @@ async def test_an_idp_answer_from_before_the_request_is_refused(
         await _assert_untouched(service, token)
         # Filed under the staged session's account, not an anonymous actor.
         assert (await _audit_rows(store, "auth.reauth"))[-1]["actor"] == "jdoe"
+    finally:
+        await store.close()
+
+
+# --- freshness against the IdP's own clock (BACKLOG #2143, ADR 0142 AC-15) --------------------------
+
+
+async def _held_auth_time(store: MessageStore, token: str) -> float | None:
+    session = await store.get_session(hash_token(token))
+    assert session is not None
+    return session.idp_auth_time
+
+
+async def test_the_sign_in_stores_the_raw_idp_auth_time(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the session stores the clamped ``min(auth_time, now)`` the lifetime cap uses, or
+    nothing. An IdP clock ahead of ours, inside the skew, shows the difference."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key)
+        ahead = time.time() + 30.5
+        token = await _oidc_session(service, monkeypatch, rsa_key, auth_time=ahead)
+        assert await _held_auth_time(store, token) == ahead
+    finally:
+        await store.close()
+
+
+async def test_an_idp_answering_from_the_sign_in_within_the_skew_is_refused(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the residual AC-15 named is open again. An IdP that ignores ``max_age=0`` answers
+    with the sign-in's own ``auth_time``. That is inside the engine-clock skew, so only the stored
+    IdP value can refuse it. A later ``auth_time`` from the same IdP still passes."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key)
+        token = await _oidc_session(service, monkeypatch, rsa_key)
+        signed_in_at = await _held_auth_time(store, token)
+        assert signed_in_at is not None
+        flow_id, _url = await _begin(service, token)
+        skew = service._settings.oidc_clock_skew_seconds
+        assert signed_in_at >= _staged(service, flow_id).issued_at - skew, "not inside the skew"
+
+        out = await _return_from_idp(service, monkeypatch, rsa_key, flow_id, auth_time=signed_in_at)
+
+        assert not out.ok and out.reason == STEP_UP_NOT_FRESH
+        await _assert_untouched(service, token)
+        assert await _held_auth_time(store, token) == signed_in_at, "a refusal moved the value"
+
+        flow_id, _url = await _begin(service, token)
+        later = await _return_from_idp(
+            service, monkeypatch, rsa_key, flow_id, auth_time=signed_in_at + 1
+        )
+        assert later.ok, later
+    finally:
+        await store.close()
+
+
+async def test_a_replayed_step_up_answer_is_refused_the_second_time(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: a successful step-up does not write its ``auth_time`` back. The IdP answers a
+    second step-up with the first one's ``auth_time``, which is still inside the engine-clock skew
+    and later than the sign-in's, so only the write-back refuses it. Rotation carries the value."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key)
+        token = await _oidc_session(service, monkeypatch, rsa_key)
+        flow_id, _url = await _begin(service, token)
+        first_at = time.time()
+        first = await _return_from_idp(service, monkeypatch, rsa_key, flow_id, auth_time=first_at)
+        assert first.ok, first
+        rotated = first.elevation.token
+        assert rotated is not None
+        assert await _held_auth_time(store, rotated) == first_at, "not written back, or not carried"
+
+        flow_id, _url = await _begin(service, rotated)
+        replay = await _return_from_idp(service, monkeypatch, rsa_key, flow_id, auth_time=first_at)
+
+        assert not replay.ok and replay.reason == STEP_UP_NOT_FRESH
+        assert await service.identity_for_token(rotated) is not None
+        assert await _held_auth_time(store, rotated) == first_at
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(("held", "elevates"), [(None, False), (1.0, True)], ids=["null", "held"])
+async def test_an_oidc_session_with_no_stored_auth_time_is_refused(
+    rsa_key: rsa.RSAPrivateKey,
+    monkeypatch: pytest.MonkeyPatch,
+    held: float | None,
+    elevates: bool,
+) -> None:
+    """RED when: an ``oidc`` session with no stored IdP ``auth_time`` (a row written before the
+    column existed) steps up at all. Nothing can be compared, so it is refused as not fresh. The
+    control arm is the same row holding a value, which elevates on the same answer."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key)
+        user = await store.get_user_by_username("jdoe")
+        assert user is not None
+        token = mint_token()
+        assert await store.create_session(
+            token_hash=hash_token(token),
+            user_id=user.id,
+            expires_at=time.time() + 3600,
+            seed_reauth=False,
+            auth_mechanism=SessionMechanism.OIDC.value,
+            idp_auth_time=held,
+        )
+        assert await _held_auth_time(store, token) == held
+        flow_id, _url = await _begin(service, token)
+
+        out = await _return_from_idp(service, monkeypatch, rsa_key, flow_id)
+
+        if elevates:
+            assert out.ok, out
+        else:
+            assert not out.ok and out.reason == STEP_UP_NOT_FRESH
+            await _assert_untouched(service, token)
     finally:
         await store.close()
 

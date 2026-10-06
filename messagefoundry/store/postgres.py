@@ -751,7 +751,8 @@ _SCHEMA: list[str] = [
         client       TEXT,
         reauth_at    DOUBLE PRECISION,
         mfa_verified_at DOUBLE PRECISION,
-        auth_mechanism TEXT
+        auth_mechanism TEXT,
+        idp_auth_time DOUBLE PRECISION
     )""",
     "CREATE INDEX IF NOT EXISTS ix_sessions_user ON sessions(user_id)",
     "CREATE INDEX IF NOT EXISTS ix_sessions_expires ON sessions(expires_at)",
@@ -917,6 +918,11 @@ CLUSTER_SCHEMA: tuple[str, ...] = (
     _gated_add_column("leader_lease", "leader_epoch", "BIGINT NOT NULL DEFAULT 0"),
 )
 _SCHEMA.extend(CLUSTER_SCHEMA)
+# BACKLOG #2143: the IdP auth_time an oidc session's step-up is compared with, for a sessions table
+# created before the column. In _SCHEMA rather than _migrate_lease_columns, so it moves the schema
+# hash itself and its catalog read is scoped to current_schema(). Pre-existing rows get NULL, which
+# the IdP step-up refuses as not fresh.
+_SCHEMA.append(_gated_add_column("sessions", "idp_auth_time", "DOUBLE PRECISION"))
 
 # Bump when _migrate_lease_columns (the open-path migration code OUTSIDE _SCHEMA) changes behavior:
 # unlike _SCHEMA edits — which change _schema_hash automatically — the migration function's Python
@@ -8280,14 +8286,15 @@ class PostgresStore:
         now: float | None = None,
         require_federated_subject: tuple[str | None, str | None] | None = None,
         auth_mechanism: str | None = None,
+        idp_auth_time: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
         # reauth_at ($6) seeds the step-up window from login (ASVS 7.5.3); seed_reauth=False leaves
         # it NULL for an MFA-PENDING session (WP-14) so a stolen pre-MFA token can't enroll/step-up.
         insert = (
             "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at,"
-            " revoked_at, client, reauth_at, auth_mechanism)"
-            " VALUES ($1,$2,$3,$4,$3,NULL,$5,$6,$7)"
+            " revoked_at, client, reauth_at, auth_mechanism, idp_auth_time)"
+            " VALUES ($1,$2,$3,$4,$3,NULL,$5,$6,$7,$8)"
         )
         params = (
             token_hash,
@@ -8297,6 +8304,7 @@ class PostgresStore:
             client,
             now if seed_reauth else None,
             auth_mechanism,
+            None if idp_auth_time is None else float(idp_auth_time),
         )
         if require_federated_subject is None:
             await self._execute(insert, *params)
@@ -8354,15 +8362,24 @@ class PostgresStore:
         )
 
     async def mark_session_reauthed(
-        self, token_hash: str, *, now: float | None = None, client: str | None = None
+        self,
+        token_hash: str,
+        *,
+        now: float | None = None,
+        client: str | None = None,
+        idp_auth_time: float | None = None,
     ) -> None:
         now = time.time() if now is None else now
         # COALESCE keeps the stored client when none is supplied; a re-verify carrying the current
-        # address re-anchors the session to it (WP-L3-13 new-client-IP step-up).
+        # address re-anchors the session to it (WP-L3-13 new-client-IP step-up). The IdP auth_time
+        # only moves forward, and a NULL leaves it (BACKLOG #2143; store.py's
+        # _IDP_AUTH_TIME_FORWARD_SQL says why). GREATEST ignores a NULL argument on Postgres.
         await self._execute(
-            "UPDATE sessions SET reauth_at=$1, client=COALESCE($2, client) WHERE token_hash=$3",
+            "UPDATE sessions SET reauth_at=$1, client=COALESCE($2, client),"
+            " idp_auth_time=GREATEST($3::double precision, idp_auth_time) WHERE token_hash=$4",
             now,
             client,
+            None if idp_auth_time is None else float(idp_auth_time),
             token_hash,
         )
 

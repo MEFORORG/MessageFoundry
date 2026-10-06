@@ -514,9 +514,15 @@ B.1 left the verification of what comes back to the build. These are its criteri
 - **AC-15 (freshness)** — IF the returned `id_token`'s `auth_time` is earlier than the moment the flow
   was staged, less `[auth].oidc_clock_skew_seconds`, THEN THE SYSTEM SHALL refuse with
   `step_up_not_fresh` and elevate nothing. The full claims ladder, the MFA-claim gate included, SHALL
-  also pass. Residual: an IdP that ignores `max_age=0` still passes when its last sign-in for the
-  user is within that skew of the request. Closing it needs the sign-in's IdP `auth_time` stored on
-  the session and compared IdP clock to IdP clock; that is not built.
+  also pass. IF that `auth_time` is not later than the IdP `auth_time` the session holds, THEN THE
+  SYSTEM SHALL also refuse with `step_up_not_fresh`, with no skew, because both values are IdP clock
+  (BACKLOG #2143). The session SHALL store the sign-in's verified `auth_time` as the IdP stated it,
+  rotation SHALL carry it, and a step-up that passes every check SHALL replace it with its own in the
+  statement that stamps `reauth_at`. An `oidc` session holding none SHALL be refused. *Amended
+  2026-10-06:* this criterion's residual read "an IdP that ignores `max_age=0` still passes when its
+  last sign-in for the user is within that skew of the request", with storing the sign-in's IdP
+  `auth_time` named as the fix and not built. It would now pass only when the user signed in at the
+  IdP again after the stored value, inside that skew.
 - **AC-16 (identity)** — IF the verified `(iss, sub)` is not byte-for-byte the pair bound to the
   session's account, THEN THE SYSTEM SHALL refuse with `step_up_subject_mismatch` and leave the session
   as it was. IF the directory no longer returns the account by its immutable id, THEN THE SYSTEM SHALL
