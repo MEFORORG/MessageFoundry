@@ -1893,9 +1893,10 @@ def _refuse_idp_revocation(
     ``[auth]`` key for one, and borrowing another hop's claim is how a flag silently widens.
 
     The API lifespan builds ``AuthService`` before ``engine.start()`` (BACKLOG #1923), so this refusal
-    comes before any connection starts. ``messagefoundry check`` still does not reach it; ADR 0173
-    AC-4 records that limit. Two more are recorded only here: when both legs refuse, only the token
-    leg is named, because it is checked first; and the WARN arm logs with no audit sink after
+    comes before any connection starts. ``messagefoundry check`` reports it in its required
+    ``oidc-revocation`` leg, through the same :func:`idp_revocation_guards` (BACKLOG #2131, ADR 0173
+    AC-4). Two limits are recorded only here: when both legs refuse, only the token leg is named,
+    because it is checked first; and the WARN arm logs with no audit sink after
     ``configure_logging`` has set the root level, so a level above WARNING would likely filter it, as
     ``logging_setup._refuse_forward_revocation`` measured for its hop."""
     for guard in idp_revocation_guards(settings, opener, posture):

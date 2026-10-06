@@ -560,6 +560,18 @@ Do not restate it as one. §6 names what would flip it.
   `tests/test_hop_refusal_revocation.py::test_the_lifespan_refuses_the_oidc_legs_before_engine_start`,
   with `::test_the_lifespan_reaches_engine_start_when_the_oidc_legs_cross` as its control, and by
   the `fed.idp_revocation` arms in `tests/test_verify_federation.py`.
+
+  **THE LAST OF THOSE LIMITS WAS CLOSED UNDER BACKLOG #2131. THE TWO PARAGRAPHS ABOVE ARE KEPT AS
+  THE RECORD.** `messagefoundry check` now carries a required `oidc-revocation` leg. It builds the
+  opener `AuthService` builds and reads the same guards through
+  `verify/federation.py:idp_revocation_result`, so `check` and `verify` share one status mapping.
+  It fails where the engine would refuse, so the gate refuses what `serve` refuses. Where the
+  anchor file is not on the machine running `check`, the leg does not fail on that alone;
+  `idp_revocation_result` says how it decides there. The same item moved `initialize()` and the
+  notice gate before `engine.start()` too. Both rows read `MEFOR_TLS_REVOCATION_ATTESTED` from
+  their own environment; `_revocation_row` records why that cannot move a status, and
+  `tests/test_oidc_revocation_check_leg.py::test_the_attestation_env_never_moves_the_status` pins
+  it. The leg is pinned by the other arms in that file.
 - **AC-5** — THE SYSTEM SHALL NOT assert in code, docstring, error text or documentation that it
   performs certificate revocation checking on either graded direction, and any prose naming the
   shipped client-certificate CRL SHALL state that it is the peer's certificate on a terminating
