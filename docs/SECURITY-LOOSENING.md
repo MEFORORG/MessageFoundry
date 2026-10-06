@@ -969,10 +969,10 @@ This section is kept rather than deleted, because the claim it used to make is t
   and FTPS refuses it outright, in both directions, when a `username` or `password` is set (vault
   BACKLOG #2636). No escape variable or posture unlocks either refusal. CORRECTED 2026-10-06: FTPS
   was warned and not refused here, so a credentialed FTPS hop with the name check off would have
-  sent its login to any peer holding a certificate from the anchor. **Not yet matched on FTPS:** a
-  credentialed FTPS hop with `tls_verify = false` is still gated only by the clamped
-  `MEFOR_ALLOW_INSECURE_TLS` escape, where `Email` and `Direct` refuse a credential there outright;
-  that gap is unfiled at the time of writing.
+  sent its login to any peer holding a certificate from the anchor. The weaker FTPS posture is
+  refused the same way: a credentialed FTPS hop with `tls_verify = false` is refused outright, as
+  `Email` and `Direct` refuse it, and the clamped `MEFOR_ALLOW_INSECURE_TLS` escape governs only an
+  anonymous FTPS hop.
 - **It is never silent:** a WARNING at each construction naming the connection and the host; a
   `tls-check-hostname` line in `messagefoundry check` naming every declaring connection and its peer;
   and a `tls_check_hostname` entry in `security_loosenings()`, and so in `GET /security/posture` on a

@@ -633,7 +633,9 @@ environment variable `MEFOR_ALLOW_INSECURE_TLS` is set. It exists for **dev / tr
 With it set, these otherwise-refused settings become permitted (each logs a loud warning):
 
 - REST/SOAP `verify_tls = false`. *(Clamped.)*
-- MLLP outbound `tls_verify = false`; FTPS `tls_verify = false`. *(Clamped.)*
+- MLLP outbound `tls_verify = false`; FTPS `tls_verify = false` on an **anonymous** hop. *(Clamped.
+  A credentialed FTPS hop with `tls_verify = false` or `tls_check_hostname = false` stays refused
+  outright either way, vault BACKLOG #2636.)*
 - DATABASE destination / store: `Encrypt=false` or `TrustServerCertificate=true` (SQL Server),
   `[store].trust_server_certificate=true` / `[store].encrypt=false`. *(Clamped.)*
 - Plain-FTP credentials. *(Clamped.)*

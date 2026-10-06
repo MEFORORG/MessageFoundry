@@ -515,9 +515,11 @@ def _ftps_ssl_context(
 
     ``name`` is the connection's, for the ``tls_check_hostname=false`` warning (ASVS 12.3.2). ``Ftp()``
     does not take that key, so ``connections.toml`` cannot set it either, but a hand-built
-    ``ConnectionSpec`` can, and this context honours it, so the warning lives here. With a
-    ``username`` or ``password`` set it is refused outright instead, with no escape (vault BACKLOG
-    #2636, mirroring the SMTP refusal of #1314)."""
+    ``ConnectionSpec`` can, and this context honours it, so the warning lives here.
+
+    With a ``username`` or ``password`` set, both ``tls_verify=false`` and ``tls_check_hostname=false``
+    are refused outright, with no escape (vault BACKLOG #2636, mirroring the SMTP credential arms of
+    #323 and #1314). The escape governs only an anonymous hop."""
     # #200 (ADR 0092 decision 2): the escape is CLAMPED to non production-PHI, so tls_verify=false can no
     # longer be silenced by MEFOR_ALLOW_INSECURE_TLS on a prod-PHI instance (mirrors the MLLP verify-off
     # arm). Off the construction gate (posture unstamped) the escape is refused since vault BACKLOG
@@ -530,16 +532,23 @@ def _ftps_ssl_context(
             "[security].enforcement = warn to allow it on a trusted-network bind (the escape has no "
             "effect while enforcing, the default, or with no posture)."
         )
+    # Vault BACKLOG #2636: the FTPS twin of the two SMTP credential arms (#323 and #1314, in email.py
+    # and direct.py). ABSOLUTE and keyed on no escape: the escape above may govern the BODY posture of
+    # an anonymous hop, never the CREDENTIAL, because login() hands the credential to whichever peer
+    # the session reached. Keyed on either half, as the plain-ftp credential guard is.
+    has_credential = bool(settings.get("username") or settings.get("password"))
+    if not verify and has_credential:
+        # No chain and no name: an on-path peer presenting any certificate captures the login.
+        raise ValueError(
+            f"{hop_name_prefix(name)}REMOTEFILE ftps sends FTP login credentials over an unverified "
+            "TLS session (tls_verify=false); refused -- credentials require a verified TLS session. "
+            "Leave tls_verify on (the default) with a trusted CA (tls_ca_file), or use sftp."
+        )
     check_hostname = bool(settings.get("tls_check_hostname", True))
-    # Vault BACKLOG #2636, the FTPS twin of the SMTP refusal #1314 made (email.py, direct.py): the
-    # chain IS verified here, but with the name check off any certificate chaining to the anchor is
-    # accepted whatever host it names -- on the system trust store, any certificate any public CA
-    # issued to anyone -- and login() then hands the credential to a peer whose identity was never
-    # established. ABSOLUTE and keyed on no escape, as #1314's arm is. Keyed on either half, as the
-    # plain-ftp credential guard is. The credential-less hop keeps the warning below. NOT the whole of
-    # #1314: the tls_verify=false arm above still lets a credential through under the clamped escape,
-    # where SMTP refuses it outright; that gap is separate work.
-    if verify and not check_hostname and (settings.get("username") or settings.get("password")):
+    if verify and not check_hostname and has_credential:
+        # The chain IS verified, but with the name check off any certificate chaining to the anchor
+        # is accepted whatever host it names -- on the system trust store, any certificate any public
+        # CA issued to anyone. The credential-less hop keeps the warning below.
         raise ValueError(
             f"{hop_name_prefix(name)}REMOTEFILE ftps sends FTP login credentials over a TLS session "
             "whose peer NAME is unverified (tls_check_hostname=false); refused -- credentials "

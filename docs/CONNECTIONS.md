@@ -1211,6 +1211,10 @@ poll/write shape against a remote server, selected by an internal `protocol` set
 - **`Ftp(...)`** — stdlib `ftplib`, **no extra**: `tls=False` is plain FTP, `tls=True` is **FTPS**
   (explicit TLS + `PROT P`, encrypting the control *and* data channels). FTPS **verifies the server
   certificate and hostname by default** (a verifying `SSLContext`, not ftplib's no-verify fallback).
+  A hand-built spec that turns either check off (`tls_verify = false` or `tls_check_hostname = false`)
+  while a `username` or `password` is set is **refused outright**, with no escape variable or posture
+  to unlock it (vault BACKLOG #2636, as `Email`/`Direct` refuse it); the escape governs only an
+  anonymous FTPS hop.
   Plain FTP is cleartext, so supplying a `username`/`password` over it is **refused** (the credential
   itself would cross in the clear) — use FTPS or `Sftp(...)`; an *anonymous* plain-FTP hop is governed by
   the [`cleartext_accepted`](#declaring-a-cleartext-hop-cleartext_accepted) declaration below.

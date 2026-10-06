@@ -268,6 +268,98 @@ def test_ftps_credentials_with_the_name_check_on_are_unaffected(
     assert _hostname_warnings(caplog) == []
 
 
+# --- credentialed FTPS with tls_verify=false is REFUSED too (vault BACKLOG #2636) -------------
+#
+# The weaker posture, closed in the same change so the hostname refusal above does not leave an
+# inversion behind it. The SMTP twin is #323's credential arm. Every refusal case below permits the
+# escape, so the refusal it reaches is the credential one and not the escape-off one.
+
+_VERIFY_OFF_REFUSAL = re.escape(
+    "over an unverified TLS session (tls_verify=false); refused -- credentials require a verified"
+)
+
+
+@pytest.fixture
+def _escape_permitted(monkeypatch: pytest.MonkeyPatch) -> None:
+    from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV
+    from messagefoundry.transports import remotefile
+
+    monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
+    monkeypatch.setattr(remotefile, "weakened_tls_escape_permitted_here", lambda: True)
+
+
+@pytest.mark.usefixtures("_escape_permitted")
+@pytest.mark.parametrize(
+    "credential", [{"username": "svc"}, {"password": "synthetic"}], ids=["username", "password"]
+)
+def test_ftps_verify_off_refuses_a_credential_under_the_escape(
+    credential: dict[str, str],
+) -> None:
+    from messagefoundry.transports.remotefile import _ftps_ssl_context
+
+    settings: dict[str, Any] = {
+        "host": "ftps.partner.example.invalid",
+        "tls_verify": False,
+        **credential,
+    }
+    with pytest.raises(ValueError, match=_VERIFY_OFF_REFUSAL) as info:
+        _ftps_ssl_context(settings, name="OB_FTPS")
+    message = str(info.value)
+    assert "connection 'OB_FTPS'" in message
+    assert "tls_verify on" in message and "sftp" in message  # names the remedy
+    assert "synthetic" not in message  # never echoes the credential
+
+
+@pytest.mark.usefixtures("_escape_permitted")
+def test_ftps_verify_off_refusal_fires_from_both_directions() -> None:
+    from messagefoundry.transports.remotefile import RemoteFileDestination, RemoteFileSource
+
+    settings: dict[str, Any] = {
+        "protocol": "ftps",
+        "host": "ftps.partner.example.invalid",
+        "username": "svc",
+        "password": "synthetic",
+        "remote_dir": "/in",
+        "tls_verify": False,
+    }
+    with pytest.raises(ValueError, match=_VERIFY_OFF_REFUSAL) as out:
+        RemoteFileDestination(
+            Destination(name="OB_RF", type=ConnectorType.REMOTEFILE, settings=dict(settings))
+        )
+    assert "'OB_RF'" in str(out.value) and "synthetic" not in str(out.value)
+    with pytest.raises(ValueError, match=_VERIFY_OFF_REFUSAL) as inb:
+        RemoteFileSource(
+            Source(name="IB_RF", type=ConnectorType.REMOTEFILE, settings=dict(settings))
+        )
+    assert "'inbound:IB_RF'" in str(inb.value) and "synthetic" not in str(inb.value)
+
+
+@pytest.mark.usefixtures("_escape_permitted")
+def test_ftps_verify_off_without_a_credential_is_unchanged_under_the_escape(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Control arm: the anonymous hop still builds under the escape, CERT_NONE and loudly logged."""
+    from messagefoundry.transports.remotefile import _ftps_ssl_context
+
+    with caplog.at_level(logging.WARNING):
+        ctx = _ftps_ssl_context(
+            {"host": "ftps.partner.example.invalid", "tls_verify": False}, name="OB_FTPS"
+        )
+    assert ctx.verify_mode == ssl.CERT_NONE and ctx.check_hostname is False
+    assert any("verification is DISABLED" in r.getMessage() for r in caplog.records)
+
+
+def test_ftps_anonymous_verify_off_stays_behind_the_escape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without the escape the anonymous verify-off hop is still refused, by the escape arm."""
+    from messagefoundry.transports import remotefile
+
+    monkeypatch.setattr(remotefile, "weakened_tls_escape_permitted_here", lambda: False)
+    with pytest.raises(ValueError, match="disables server-certificate verification"):
+        remotefile._ftps_ssl_context({"host": "h.example.invalid", "tls_verify": False})
+
+
 # --- the expiry relaxation states what is actually verified ------------------------------------
 
 
