@@ -2387,6 +2387,9 @@ class AuthStore(Protocol):
     ) -> list[SessionRecord]:
         """A user's unrevoked sessions not past their absolute expiry, most recently used first.
 
+        A row whose ``expires_at`` equals ``now`` is listed, because the validator still accepts it
+        at that instant (``SessionRecord.is_live``), and the purge keeps it too (BACKLOG #2283).
+
         With ``idle_seconds`` given, sessions idle for longer are hidden too, so the inventory a
         user reads does not list a session the validator refuses for idleness (BACKLOG #2096).
         Callers that only ask "does this user hold any session" pass nothing, and the answer is
@@ -2467,9 +2470,14 @@ class AuthStore(Protocol):
         idle_seconds: float,
         split_mfa_pending: bool,
         now: float | None = None,
-    ) -> None:
+    ) -> int:
         """Keep a user's ``keep`` newest LIVE sessions and revoke the rest, lapsed ones included
         (AUTH-SESS-CAP, BACKLOG #1900).
+
+        Returns how many sessions it revoked, so the caller can audit the revocation (BACKLOG
+        #2283). A ``keep`` of zero or less revokes nothing and returns 0. On SQL Server the count
+        comes from an ``OUTPUT`` rowset, as ``revoke_user_sessions`` counts, so a session-wide
+        ``SET NOCOUNT ON`` cannot turn it into ``-1``.
 
         "Newest" ranks a row from when it completed its second factor (``mfa_verified_at``), or
         from its creation when it has no stamp (BACKLOG #2076). Completing MFA keeps
@@ -2516,7 +2524,13 @@ class AuthStore(Protocol):
     ) -> int:
         """Delete session rows past their absolute expiry, revoked or not, and return the count.
         With ``idle_seconds`` given, rows idle for longer are deleted too (BACKLOG #2096): the
-        validator refuses them on presentation, so keeping them only grows the table."""
+        validator refuses them on presentation, so keeping them only grows the table.
+
+        The idle variant scans the table, because its ``OR`` reaches past the expiry index, and that
+        stands on purpose (BACKLOG #2283). The scan runs once per reaper pass over a table the
+        purge itself keeps small. The alternative is an index on ``last_used_at``, and every
+        authenticated request writes that column, so the index would cost a write on each request
+        to save a scan once an hour."""
         ...
 
 

@@ -6,6 +6,7 @@ reject audit (AUTH-K-AUDIT), and WS token extraction (API-3)."""
 
 from __future__ import annotations
 
+import json
 import time
 
 import pytest
@@ -177,6 +178,39 @@ async def test_login_enforces_per_user_session_cap() -> None:
         await store.close()
 
 
+async def _cap_rows(store: MessageStore) -> list[dict[str, object]]:
+    """Each ``auth.session_revoked`` row with scope ``cap``, as its detail plus the row's actor."""
+    out: list[dict[str, object]] = []
+    for row in await store.list_audit():
+        if row["action"] == "auth.session_revoked" and row["detail"]:
+            detail = json.loads(str(row["detail"]))
+            if detail.get("scope") == "cap":
+                out.append({**detail, "actor": row["actor"], "client": row["client"]})
+    return out
+
+
+async def test_a_cap_revocation_is_audited_under_the_owners_name() -> None:
+    """BACKLOG #2283, row item 9: a sign-in that pushes the user over the cap revokes their oldest
+    session, and that revocation is audited. One row per cap run that revoked anything, with the
+    count, under the name of the user whose session ended, so it reaches their own feed. The first
+    two sign-ins are the control: under the cap they revoke nothing and write no row."""
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings(max_sessions_per_user=2))
+        await service.initialize()
+        await _local_user(service, "dana")
+        for _ in range(2):
+            assert (await service.login("dana", PW)).token is not None
+        assert await _cap_rows(store) == [], "a cap run that revoked nothing wrote an audit row"
+
+        assert (await service.login("dana", PW, client="10.0.0.5")).token is not None
+        assert await _cap_rows(store) == [
+            {"scope": "cap", "count": 1, "cap": 2, "actor": "dana", "client": "10.0.0.5"}
+        ]
+    finally:
+        await store.close()
+
+
 # --- BACKLOG #2076: a sign-in still owing its second factor cannot evict a full session ------
 
 
@@ -259,7 +293,8 @@ async def test_completing_mfa_evicts_the_oldest_full_sibling_not_itself(
         sibling_b = await _full_sign_in(service, password, codes[1])
         assert await _is_full(service, sibling_a) and await _is_full(service, sibling_b)
 
-        done = await service.verify_mfa(waiting, codes[2])
+        before = len(await _cap_rows(store))
+        done = await service.verify_mfa(waiting, codes[2], client="10.0.0.7")
         assert done.ok and done.token is not None
 
         assert await _is_full(service, done.token), (
@@ -269,6 +304,12 @@ async def test_completing_mfa_evicts_the_oldest_full_sibling_not_itself(
         assert await service.identity_for_token(sibling_a) is None, (
             "the cap must hold full sessions to `keep`: the oldest-completed sibling goes"
         )
+        # BACKLOG #2283, row item 9: the cap run after a completed second factor is audited too.
+        rows = await _cap_rows(store)
+        assert len(rows) == before + 1, "the cap run after a completed second factor wrote no row"
+        assert [r for r in rows if r["client"] == "10.0.0.7"] == [
+            {"scope": "cap", "count": 1, "cap": 2, "actor": ADMIN_USERNAME, "client": "10.0.0.7"}
+        ]
     finally:
         await store.close()
 
@@ -300,39 +341,191 @@ async def test_a_password_step_up_never_revokes_the_session_it_hands_back() -> N
         await store.close()
 
 
+_ELEVATE = frozenset({"_elevated", "_elevated_hash"})
+_STAMP = "mark_session_mfa_verified"
+
+
+def _factor_ceremony_scan(source: str) -> tuple[set[str], set[str], list[str]]:
+    """Read ``source`` and sort every elevation's ceremony into ``(stamping, other, refusals)``.
+
+    A ceremony is STAMPING when the function that elevates writes the second-factor stamp BEFORE it
+    elevates, either directly or through a helper that does, at any depth. A helper is matched by
+    the name it is called by, as a method on any receiver or as a bare module-level name. A
+    refusal is an elevation the scan cannot read: a ``ceremony`` that is missing or not a string
+    literal. Refusing it, rather than skipping it, is what closes the old scan's gap (BACKLOG
+    #2283): a ceremony named through a variable used to drop out of both sets and pass.
+
+    Each function is read by its OWN calls: a nested function is a function of its own, so a stamp
+    in an inner function that may never run does not count for the one around it. "Before" is
+    source order, not control flow, so a stamp in a branch that returns early still counts. That
+    errs toward calling a re-proof a factor ceremony, which fails the set comparison loudly rather
+    than passing it quietly.
+
+    It still misses at least one shape, which errs the quiet way: a stamp written by a CALLER of
+    the function that elevates, as when a public method stamps and then hands off to a private
+    one that elevates. Stamps are followed down into helpers, never up into callers. Every shipped
+    ceremony stamps in the function that elevates."""
+    import ast
+
+    tree = ast.parse(source)
+    functions = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)]
+    scopes = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+
+    def _calls(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.Call]:
+        found: list[ast.Call] = []
+        todo: list[ast.AST] = list(fn.body)
+        while todo:
+            node = todo.pop()
+            if isinstance(node, scopes):
+                continue  # its calls are its own
+            if isinstance(node, ast.Call):
+                found.append(node)
+            todo.extend(ast.iter_child_nodes(node))
+        return found
+
+    def _callee(call: ast.Call) -> str | None:
+        if isinstance(call.func, ast.Attribute):
+            return call.func.attr
+        if isinstance(call.func, ast.Name):
+            return call.func.id
+        return None
+
+    # Which functions stamp, directly or through a helper. A fixed point, so a helper of a helper
+    # counts. Keyed by name; a name defined twice counts as stamping if either copy does.
+    stamps = {fn.name for fn in functions if any(_callee(c) == _STAMP for c in _calls(fn))}
+    while True:
+        more = {
+            fn.name
+            for fn in functions
+            if fn.name not in stamps and any(_callee(c) in stamps for c in _calls(fn))
+        }
+        if not more:
+            break
+        stamps |= more
+
+    stamping: set[str] = set()
+    other: set[str] = set()
+    refusals: list[str] = []
+    for fn in functions:
+        if fn.name in _ELEVATE:
+            continue  # the two wrappers pass `ceremony` through by name; they are not ceremonies
+        calls = _calls(fn)
+        stamp_lines = [c.lineno for c in calls if _callee(c) == _STAMP or _callee(c) in stamps]
+        for call in calls:
+            if _callee(call) not in _ELEVATE:
+                continue
+            ceremony = next((kw.value for kw in call.keywords if kw.arg == "ceremony"), None)
+            if not (isinstance(ceremony, ast.Constant) and isinstance(ceremony.value, str)):
+                refusals.append(f"{fn.name}:{call.lineno}")
+                continue
+            # The stamp must come first: rotation carries the stamp forward, and a stamp written
+            # after it lands on the retired hash and writes nothing.
+            stamped_first = any(line < call.lineno for line in stamp_lines)
+            (stamping if stamped_first else other).add(ceremony.value)
+    return stamping, other, refusals
+
+
 def test_the_factor_ceremony_set_matches_the_ceremonies_that_stamp() -> None:
     """``_FACTOR_CEREMONIES`` decides where the cap re-runs after an elevation. Pin it against the
-    code: every service method that stamps ``mark_session_mfa_verified`` and then elevates must name
-    a ceremony in the set, and no method that elevates WITHOUT stamping may. A new factor ceremony
-    that forgot the set would otherwise skip the cap silently."""
-    import ast
+    code: every function that stamps ``mark_session_mfa_verified`` and then elevates must name a
+    ceremony in the set, and no function that elevates WITHOUT stamping first may. A new factor
+    ceremony that forgot the set would otherwise skip the cap silently.
+
+    BACKLOG #2283 closed gaps in the scan. It read only ``AuthService`` and only ``async`` methods;
+    it now reads the whole module. A stamp made through a helper made the ceremony read as a
+    re-proof; helpers now count. A ceremony that was not a string literal was skipped; it is now
+    refused. A stamp after the elevation, or inside a nested function, counted; neither does now."""
     import inspect
-    import textwrap
 
     from messagefoundry.auth import service as service_module
 
-    tree = ast.parse(textwrap.dedent(inspect.getsource(service_module.AuthService)))
-    stamping: set[str] = set()
-    other: set[str] = set()
-    for fn in ast.walk(tree):
-        if not isinstance(fn, ast.AsyncFunctionDef):
-            continue
-        calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call)]
-        names = {c.func.attr for c in calls if isinstance(c.func, ast.Attribute)}
-        for call in calls:
-            if not (
-                isinstance(call.func, ast.Attribute)
-                and call.func.attr in {"_elevated", "_elevated_hash"}
-            ):
-                continue
-            for kw in call.keywords:
-                if kw.arg == "ceremony" and isinstance(kw.value, ast.Constant):
-                    target = stamping if "mark_session_mfa_verified" in names else other
-                    target.add(str(kw.value.value))
+    stamping, other, refusals = _factor_ceremony_scan(inspect.getsource(service_module))
+    assert refusals == [], (
+        f"an elevation names its ceremony in a form the scan cannot read: {refusals}"
+    )
     assert stamping, "found no stamping ceremony -- the scan is broken, not the code"
     assert other, "found no re-proof ceremony -- the scan is broken, not the code"
     assert stamping == service_module._FACTOR_CEREMONIES
     assert not other & service_module._FACTOR_CEREMONIES
+
+
+def test_the_factor_ceremony_scan_sees_each_gap_it_closed() -> None:
+    """The control for the scan above: each shape the old scan missed, fed to the new one."""
+    source = """
+class S:
+    async def _stamp_helper(self, token):
+        await self._store.mark_session_mfa_verified(token)
+
+    async def via_helper(self, token):
+        await self._stamp_helper(token)
+        return await self._elevated(token, ceremony="helper_factor")
+
+    def sync_stamp(self, token):
+        self._store.mark_session_mfa_verified(token)
+        return self._elevated(token, ceremony="sync_factor")
+
+    async def by_variable(self, token):
+        name = "hidden"
+        return await self._elevated(token, ceremony=name)
+
+    async def stamps_too_late(self, token):
+        out = await self._elevated(token, ceremony="late")
+        await self._store.mark_session_mfa_verified(token)
+        return out
+
+    async def via_module_helper(self, token):
+        await _module_stamp(self, token)
+        return await self._elevated(token, ceremony="module_helper_factor")
+
+    async def inner_stamp_never_runs(self, token):
+        async def inner():
+            await self._store.mark_session_mfa_verified(token)
+
+        return await self._elevated(token, ceremony="inner_only")
+
+
+async def _module_stamp(svc, token):
+    await svc._store.mark_session_mfa_verified(token)
+
+
+async def module_level(svc, token):
+    await svc._store.mark_session_mfa_verified(token)
+    return await svc._elevated_hash(token, ceremony="module_factor")
+"""
+    stamping, other, refusals = _factor_ceremony_scan(source)
+    assert stamping == {
+        "helper_factor",
+        "sync_factor",
+        "module_factor",
+        "module_helper_factor",
+    }
+    assert other == {"late", "inner_only"}
+    assert [r.split(":")[0] for r in refusals] == ["by_variable"]
+
+
+def test_only_the_service_module_elevates() -> None:
+    """The scan reads ``auth/service.py``. An elevation written in another module would sit outside
+    it and could skip the cap unseen, so none may exist."""
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[1]
+    service = repo / "messagefoundry" / "auth" / "service.py"
+    # Every first-party package the engine runs in-process: the engine, the web console it mounts
+    # at /ui, and the toolkit.
+    packages = ("messagefoundry", "messagefoundry_webconsole", "messagefoundry_toolkit")
+    files = sorted(path for package in packages for path in (repo / package).rglob("*.py"))
+    # The controls: the walk reached the packages, and the needle finds the elevations that exist.
+    assert len(files) > 100, f"the walk found {len(files)} files under {packages}"
+    assert service in files and "._elevated(" in service.read_text(encoding="utf-8")
+    callers = [
+        str(path.relative_to(repo))
+        for path in files
+        if path != service
+        and any(f".{name}(" in path.read_text(encoding="utf-8") for name in _ELEVATE)
+    ]
+    assert callers == [], (
+        f"an elevation outside auth/service.py escapes the ceremony scan: {callers}"
+    )
 
 
 # --- BACKLOG #2096: one liveness rule, in Python and in SQL ------------------------------------
