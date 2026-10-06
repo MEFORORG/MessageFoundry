@@ -246,6 +246,44 @@ _DUMMY_PASSWORD_HASH = hash_password("mf-login-timing-equalizer")
 #: thread-pool executor (and starve all login/AD/password work). Argon2 is deliberately CPU-heavy.
 _ARGON2_MAX_CONCURRENCY = max(2, min(8, os.cpu_count() or 2))
 
+#: Cap on concurrent directory probes from the mTLS certificate path (BACKLOG #2316). Each probe
+#: holds a worker thread for up to the LDAP connect and receive timeouts, so a burst of certificate
+#: requests during a slow directory must not drain the thread pool every other leg shares.
+_CERT_PROBE_MAX_CONCURRENCY = 8
+#: How long a certificate request waits for a probe slot before it is refused. Short on purpose: a
+#: full cap means the directory is slow, and a service caller retries, so queueing without a bound
+#: would only stack requests behind a stalled directory. A refusal fails closed.
+_CERT_PROBE_SLOT_WAIT_SECONDS = 2.0
+#: The refusal reason when no probe slot freed in time. Not a directory answer.
+CERT_PROBE_SATURATED = "probe_capacity_saturated"
+#: Refusals that say the directory could not be asked, not what it said about the account. The
+#: certificate path logs these once per outage rather than once per request.
+_CERT_DIRECTORY_OUTAGES = frozenset(
+    {
+        reconcile.ProbeOutcome.UNAVAILABLE.value,
+        reconcile.ProbeOutcome.REFERRED.value,
+        CERT_PROBE_SATURATED,
+    }
+)
+#: The least time between two certificate-path outage WARNINGs, so a flapping outage cannot log
+#: one WARNING and INFO pair per request.
+_CERT_OUTAGE_LOG_INTERVAL_SECONDS = 60.0
+#: The level ``_probe_principal`` logs an unexpected directory fault at. WARNING for the reconciler
+#: and step-up; the certificate path sets DEBUG in its probe task's own context (BACKLOG #2316).
+_PROBE_FAULT_LOG_LEVEL: ContextVar[int] = ContextVar(
+    "_PROBE_FAULT_LOG_LEVEL", default=logging.WARNING
+)
+#: Outcomes the directory itself gave. Any of them ends a logged outage.
+_CERT_DIRECTORY_ANSWERS = frozenset(
+    outcome.value
+    for outcome in (
+        reconcile.ProbeOutcome.PRESENT,
+        reconcile.ProbeOutcome.ABSENT,
+        reconcile.ProbeOutcome.DISABLED,
+        reconcile.ProbeOutcome.UNDETERMINED,
+    )
+)
+
 # Bound on the per-process new-client-IP dedup cache (WP-L3-13). It only debounces the audit/notify
 # side effects of the 8.4.2 signal; the step-up decision never depends on it, so eviction is harmless.
 _NEW_IP_DEDUP_MAX = 4096
@@ -1826,6 +1864,34 @@ def _allowed_channels(user: UserRecord, roles: frozenset[Role]) -> frozenset[str
     return channel_scope.scope_channels(user.channel_scope)
 
 
+def _cert_narrowed_scope(
+    user: UserRecord, mapped: frozenset[str], *, administrator: bool
+) -> UserRecord:
+    """``user`` with the channel scope its current directory groups leave it, for one certificate
+    request (BACKLOG #2316). Writes nothing.
+
+    The rule is :func:`~messagefoundry.auth.channel_scope.decide_ad_channel_scope`, the one login
+    and the reconciler share. Only a narrowing applies, and only as far as the stored scope reaches:
+    the result is the stored channels intersected with what the groups now map to. A scope the groups
+    would widen stays as stored, because this path must not grant, so a widening still waits for a
+    sign-in to write it."""
+    decision = channel_scope.decide_ad_channel_scope(
+        channel_scope.ScopeInput(
+            stored_scope=user.channel_scope,
+            stored_source=user.channel_scope_source,
+            mapped=mapped,
+            administrator=administrator,
+        )
+    )
+    if not decision.narrows:
+        return user
+    before = channel_scope.scope_channels(user.channel_scope)
+    # A narrowing always has a bounded target: an empty set for a withdrawal, else the channels.
+    after = channel_scope.scope_channels(decision.scope_json) or frozenset()
+    reach = after if before is None else before & after
+    return replace(user, channel_scope=json.dumps(sorted(reach)))
+
+
 #: The IdP legs' OWN way across. The connection-shaped default cannot reach this opener, which
 #: resolves no trust anchor; see :attr:`~messagefoundry.config.tls_policy.RevocationHopGuard.ways_across`.
 _IDP_WAYS_ACROSS = (
@@ -2064,6 +2130,20 @@ class AuthService:
             self._ldap = None
         # Instance-scoped (one event loop per AuthService) so it never crosses loops in tests.
         self._argon2_sem = asyncio.Semaphore(_ARGON2_MAX_CONCURRENCY)
+        # BACKLOG #2316: the certificate path's directory probes, capped like argon2 above.
+        # Bounded, so a release with no matching acquire raises instead of widening the cap.
+        self._cert_probe_slots = asyncio.BoundedSemaphore(_CERT_PROBE_MAX_CONCURRENCY)
+        #: Probe tasks still running, held so none is collected while its caller has gone.
+        self._cert_probe_tasks: set[asyncio.Task[reconcile.Probe | str]] = set()
+        #: The certificate path's current outage reason, or None (`_note_cert_directory_answer`).
+        self._cert_directory_outage: str | None = None
+        #: Monotonic time of its last outage WARNING, and whether the current outage logged one.
+        self._cert_outage_warned_at: float | None = None
+        self._cert_outage_announced = False
+        #: Monotonic time of the last INFO saying the current outage changed its reason.
+        self._cert_outage_kind_noted_at: float | None = None
+        #: Configuration refusals already logged by this process.
+        self._cert_config_refusals_logged: set[str] = set()
         self._login_limiter: SlidingWindowRateLimiter | None = (
             SlidingWindowRateLimiter(
                 per_key=settings.login_rate_limit_per_ip,
@@ -5322,7 +5402,7 @@ class AuthService:
         ``userAccountControl`` UNDETERMINED (ADR 0195 rule items 1 and 2). An unreadable attribute
         must never come back as UNAVAILABLE, which never revokes; that would reopen BACKLOG #1639.
         """
-        # Guarded by directory_reconcile_enabled, and by _directory_step_up_refusal (BACKLOG #2023).
+        # Guarded by directory_reconcile_enabled, and by _directory_presence (BACKLOG #2023, #2316).
         assert self._ldap is not None
         try:
             probe = await asyncio.to_thread(
@@ -5368,7 +5448,10 @@ class AuthService:
             # standing gap for one named account, not a blip. CancelledError is not an Exception.
             # The WARNING names the type only: the message can quote a directory value, which
             # ldap.py never logs. The traceback, with the message, goes to DEBUG for diagnosis.
-            _log.warning(
+            # The certificate path lowers this to DEBUG in its own task's context (BACKLOG #2316):
+            # it probes per request, not per pass, and reports the fault once as an outage.
+            _log.log(
+                _PROBE_FAULT_LOG_LEVEL.get(),
                 "directory probe of %s raised %s; read as unavailable, so this account's "
                 "sessions are not revoked and its step-up is refused while this repeats",
                 user.username,
@@ -6864,7 +6947,8 @@ class AuthService:
 
     async def identity_for_cert_user_id(self, user_id: str) -> Identity | None:
         """Resolve the users-row id a verified client cert maps to, or ``None`` when that account is
-        unknown or disabled — WITHOUT a bearer session (BACKLOG #2238, ADR 0083).
+        unknown, disabled, or a directory account the directory does not confirm — WITHOUT a bearer
+        session (BACKLOG #2238, #2316, ADR 0083).
 
         The mTLS map targets the row id, not the username, because a username can be released by a
         rename and taken by another row: a map keyed by name would then hand the cert to that other
@@ -6873,13 +6957,188 @@ class AuthService:
         treats it (:meth:`identity_for_token`); unlike :meth:`identity_for_user_id`, which the
         permission inspector uses and which resolves a disabled account on purpose.
 
-        No directory check, the same as the name-keyed path before it: the engine row's ``disabled``
-        flag is the one this path has always read. Asking the directory per request is a separate
-        control change, not this key change."""
+        **A DIRECTORY ACCOUNT IS ASKED ABOUT ON EVERY REQUEST, AND FAILS CLOSED (BACKLOG #2316).**
+        The engine row's ``disabled`` flag and roles are not enough for an AD row: the reconciler
+        probes only accounts holding a live session, and a certificate caller holds none, so nothing
+        ever refreshed them and a directory-side disable or group removal never reached this path.
+        So an AD row gets the same probe and the same refusals as directory step-up
+        (:meth:`_directory_presence`): anything short of a present, enabled account in the directory
+        returns ``None``. That includes an unreachable or referring directory, no directory wired,
+        and a row with no ``directory_object_id``. A local row is never probed.
+
+        **Roles NARROW rather than refuse.** The identity carries the stored roles that the
+        account's current groups still map to: never more than the row holds, because this path
+        writes nothing and must not grant, and never more than the directory now grants. So an
+        account removed from one of two mapped groups keeps the other role on its next request,
+        where step-up refuses outright. An empty result returns ``None``. The channel scope narrows
+        on the same groups, by the rule sign-in uses (:func:`_cert_narrowed_scope`), so a scope an
+        administrator set is kept when no scope-mapped group matches. Nothing is written: only a
+        sign-in, or a reconciler pass while the account holds a session, re-syncs the row.
+
+        **No cache, and a bounded wait.** A cached answer would bring back the staleness this
+        closes. Concurrent probes are capped at :data:`_CERT_PROBE_MAX_CONCURRENCY`; a request that
+        cannot get a slot within :data:`_CERT_PROBE_SLOT_WAIT_SECONDS` is refused. Refusals do not
+        log one line per request; :meth:`_note_cert_directory_answer` says what they log."""
         user = await self._store.get_user(user_id)
         if user is None or user.disabled:
             return None
-        return await self._build_identity(user)
+        if user.auth_provider != AuthProvider.AD.value:
+            return await self._build_identity(user)
+        answer = await self._cert_directory_presence(user)
+        self._note_cert_directory_answer(answer)
+        if not isinstance(answer, reconcile.Probe):
+            return None
+        # Everything below is read after the probe, as step-up does: the round trip can be seconds,
+        # and a local disable, a scope edit or a sign-in's role re-sync may have landed meanwhile.
+        # The answer vouches only for the account it asked about, so a row whose immutable id or
+        # provider moved during the round trip is refused rather than judged on another's answer.
+        asked = user
+        user = await self._store.get_user(user_id)
+        if (
+            user is None
+            or user.disabled
+            or user.auth_provider != asked.auth_provider
+            or user.directory_object_id != asked.directory_object_id
+        ):
+            return None
+        granted = await self._store.roles_for_ad_groups(answer.groups)
+        held = await self._store.get_user_role_ids(user.id)
+        kept = [role_id for role_id in held if role_id in granted]
+        if not kept:
+            return None
+        # The scope narrows on the same groups, by the rule login and the reconciler share. Its
+        # TARGET roles decide the Administrator short-circuit there; here that is the kept set.
+        administrator = Role.ADMINISTRATOR.value in kept
+        mapped = (
+            frozenset()
+            if administrator
+            else frozenset(await self._store.channels_for_ad_groups(answer.groups))
+        )
+        return await self._build_identity(
+            _cert_narrowed_scope(user, mapped, administrator=administrator), role_ids=kept
+        )
+
+    async def _cert_directory_presence(self, user: UserRecord) -> reconcile.Probe | str:
+        """:meth:`_directory_presence` under the certificate path's probe cap (BACKLOG #2316), or
+        :data:`CERT_PROBE_SATURATED` when no slot frees within the wait bound.
+
+        The slot is held until the probe itself ends, not until this caller stops waiting. The
+        probe's worker thread cannot be cancelled, so releasing on a cancelled request would let
+        the threads outnumber the cap. The probe therefore runs as its own task, shielded, and
+        releases its slot when it finishes."""
+        try:
+            async with asyncio.timeout(_CERT_PROBE_SLOT_WAIT_SECONDS):
+                await self._cert_probe_slots.acquire()
+        except TimeoutError:
+            return CERT_PROBE_SATURATED
+        try:
+            task = asyncio.create_task(self._cert_probe(user))
+        except BaseException:
+            self._cert_probe_slots.release()
+            raise
+        self._cert_probe_tasks.add(task)
+        task.add_done_callback(self._cert_probe_done)
+        return await asyncio.shield(task)
+
+    async def _cert_probe(self, user: UserRecord) -> reconcile.Probe | str:
+        # This task's own context, so the DEBUG level never reaches the reconciler or step-up. A
+        # fault on one account's entry would otherwise log a WARNING naming it on every request;
+        # the outage line below reports it once instead.
+        token = _PROBE_FAULT_LOG_LEVEL.set(logging.DEBUG)
+        try:
+            return await self._directory_presence(user)
+        except Exception:
+            # Returned, never raised: a raise from a probe whose caller was cancelled would reach
+            # the loop's exception handler through the shield, one ERROR per orphaned request.
+            # Read as an outage, which fails closed and logs by the outage rules. The traceback can
+            # quote a directory value, so it goes to DEBUG and names no account.
+            _log.debug("certificate-path directory probe raised", exc_info=True)
+            return reconcile.ProbeOutcome.UNAVAILABLE.value
+        finally:
+            _PROBE_FAULT_LOG_LEVEL.reset(token)
+
+    def _cert_probe_done(self, task: asyncio.Task[reconcile.Probe | str]) -> None:
+        self._cert_probe_slots.release()
+        self._cert_probe_tasks.discard(task)
+        if not task.cancelled():
+            # Only a BaseException that is not an Exception can end here; _cert_probe returns
+            # everything else. Retrieved so it is not also reported as never retrieved.
+            task.exception()
+
+    def _note_cert_directory_answer(self, answer: reconcile.Probe | str) -> None:
+        """Log the certificate path's directory refusals without logging one line per request.
+
+        An outage is a refusal that says the directory could not be asked: unreachable, referring,
+        a fault reading the entry, or the probe cap full. It logs one WARNING per outage and, if that
+        WARNING was logged, one INFO on the next answer the directory actually gave, whatever it
+        said about the account. WARNINGs are at least :data:`_CERT_OUTAGE_LOG_INTERVAL_SECONDS`
+        apart, so an outage that flaps (a full cap turning over, or one referring account beside a
+        healthy one) still logs about once a minute. An outage that starts inside that interval
+        logs its WARNING on its first refusal after the interval ends, so a long one is never
+        silent. A logged outage whose reason changes logs the change at INFO, at most once per
+        interval, and the closing INFO names the latest reason.
+
+        A configuration refusal (no directory wired, a row with no immutable id) asks nothing and
+        moves neither way. It logs one WARNING per reason per process instead.
+
+        The lines name no account. Every service request during an outage is refused the same way,
+        and the username is not the useful fact."""
+        outcome = answer.outcome.value if isinstance(answer, reconcile.Probe) else answer
+        if outcome in _CERT_DIRECTORY_OUTAGES:
+            now = time.monotonic()
+            latched = self._cert_directory_outage
+            self._cert_directory_outage = outcome
+            if latched is not None and self._cert_outage_announced:
+                if outcome != latched:
+                    self._note_cert_outage_kind_change(latched, outcome, now)
+                return
+            last = self._cert_outage_warned_at
+            if last is not None and now - last < _CERT_OUTAGE_LOG_INTERVAL_SECONDS:
+                if latched is None:
+                    _log.debug("certificate-path directory check returned %s again", outcome)
+                return
+            self._cert_outage_announced = True
+            self._cert_outage_warned_at = now
+            self._cert_outage_kind_noted_at = None
+            _log.warning(
+                "mTLS certificate identities for directory accounts are refused: the directory "
+                "check returned %s. Logged once until a check reaches the directory again",
+                outcome,
+            )
+        elif outcome in _CERT_DIRECTORY_ANSWERS:
+            if self._cert_directory_outage is None:
+                return
+            if self._cert_outage_announced:
+                _log.info(
+                    "mTLS certificate identities for directory accounts: the directory check "
+                    "reaches the directory again (it last returned %s)",
+                    self._cert_directory_outage,
+                )
+            self._cert_directory_outage = None
+            self._cert_outage_announced = False
+        elif outcome not in self._cert_config_refusals_logged:
+            self._cert_config_refusals_logged.add(outcome)
+            _log.warning(
+                "an mTLS certificate identity for a directory account was refused: %s. Logged "
+                "once per process for this reason",
+                outcome,
+            )
+
+    def _note_cert_outage_kind_change(self, before: str, after: str, now: float) -> None:
+        """Log that a logged certificate-path outage changed its reason, at INFO at most once per
+        :data:`_CERT_OUTAGE_LOG_INTERVAL_SECONDS` and otherwise at DEBUG. A full cap and an
+        unreachable directory can alternate request by request, and must not log a line each."""
+        last = self._cert_outage_kind_noted_at
+        if last is not None and now - last < _CERT_OUTAGE_LOG_INTERVAL_SECONDS:
+            _log.debug("certificate-path directory check now returns %s (was %s)", after, before)
+            return
+        self._cert_outage_kind_noted_at = now
+        _log.info(
+            "mTLS certificate identities for directory accounts are still refused: the directory "
+            "check now returns %s (it had returned %s)",
+            after,
+            before,
+        )
 
     async def identity_for_user_id(self, user_id: str) -> Identity | None:
         """Resolve a user id directly to its :class:`Identity` (roles + custom-role overlay), or
@@ -7023,8 +7282,15 @@ class AuthService:
             granted |= decode_custom_role_permissions(row["permissions"])
         return frozenset(granted)
 
-    async def _build_identity(self, user: UserRecord) -> Identity:
-        role_ids = await self._store.get_user_role_ids(user.id)
+    async def _build_identity(
+        self, user: UserRecord, *, role_ids: Iterable[str] | None = None
+    ) -> Identity:
+        """The account's :class:`Identity`. ``role_ids`` replaces the stored role ids when given, so
+        a caller that narrowed them (:meth:`identity_for_cert_user_id`) gets the same built-in,
+        custom-role and channel treatment as every other path."""
+        if role_ids is None:
+            role_ids = await self._store.get_user_role_ids(user.id)
+        role_ids = list(role_ids)
         roles = _roles_from_ids(role_ids)
         custom_permissions = await self._custom_permissions_for_ids(role_ids)
         provider = (
@@ -8866,6 +9132,26 @@ class AuthService:
         refuses even when the new role grants more. This refuses and writes nothing; the reconciler
         or the next sign-in re-syncs the roles. Channel scope is not compared here.
         """
+        answer = await self._directory_presence(user)
+        if not isinstance(answer, reconcile.Probe):
+            return answer
+        # The groups came back with the probe, so this costs store reads only. Read after the probe,
+        # so a sign-in that re-synced the roles during the round trip is judged on what it wrote.
+        held = set(await self._store.get_user_role_ids(user.id))
+        if not held <= await self._store.roles_for_ad_groups(answer.groups):
+            return DIRECTORY_ROLES_DEMOTED
+        return None
+
+    async def _directory_presence(self, user: UserRecord) -> reconcile.Probe | str:
+        """Ask the directory whether AD row ``user`` is a present, enabled account. Returns the
+        PRESENT probe, which carries the account's current groups, or the refusal reason string.
+
+        The fail-closed half :meth:`_directory_step_up_refusal` and
+        :meth:`identity_for_cert_user_id` share. Every answer short of PRESENT is a reason:
+        ``not_configured`` with no directory wired, :data:`DIRECTORY_OBJECT_ID_MISSING` for a row
+        with no immutable id (asked nothing, see the step-up docstring), and otherwise the probe's
+        own outcome value.
+        """
         if self._ldap is None:
             return "not_configured"
         if not user.directory_object_id:
@@ -8876,12 +9162,7 @@ class AuthService:
         probe = await self._probe_principal(user)
         if probe.outcome is not reconcile.ProbeOutcome.PRESENT:
             return str(probe.outcome.value)
-        # The groups came back with the probe, so this costs store reads only. Read after the probe,
-        # so a sign-in that re-synced the roles during the round trip is judged on what it wrote.
-        held = set(await self._store.get_user_role_ids(user.id))
-        if not held <= await self._store.roles_for_ad_groups(probe.groups):
-            return DIRECTORY_ROLES_DEMOTED
-        return None
+        return probe
 
     async def _verify_second_factor(
         self,
