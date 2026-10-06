@@ -577,8 +577,8 @@ This section is kept rather than deleted, because the claim it used to make is t
 > **Conditional**, and reachable only at `[security].enforcement = warn`. Under `enforce` the switch is
 > inert and the config is refused at load, as `MEFOR_ALLOW_INSECURE_TLS` is inert there (vault BACKLOG
 > #2354). A loopback `ldap://` address is refused too.
-> It is reported only while a plain bind is live, which needs at least `ad_enabled`,
-> sign-in (always on under `serve`) and an `ad_server` that is not `ldaps://`.
+> It is reported only while a plain bind is live, which needs at least `ad_enabled`
+> and an `ad_server` that is not `ldaps://`.
 - **What you lose:** the encryption and the server authentication on the AD hop. Both binds are SIMPLE
   binds, so the service-account password and the password of every user who signs in or steps up cross
   the network in cleartext. Nothing proves the far end is your domain controller, so a host on the path
@@ -592,8 +592,8 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **Reversible:** yes, immediately — point `ad_server` at `ldaps://`, or delete the line, and restart.
 
 ### `[auth].admin_new_ip_step_up = false` — a new client address mid-session goes unchallenged
-> **Conditional** on sign-in. An app an embedder builds with sign-in off has no session for the signal to
-> guard, so it is reported **only** while auth is on, which `serve` always is. The default is `true` since BACKLOG #288
+> Reported whenever it is `false`. No sign-in condition applies, since no setting turns sign-in off
+> (vault BACKLOG #2825). The default is `true` since BACKLOG #288
 > (owner ruling 2026-09-26); before that it shipped off, with an exposure-time advisory.
 - **What you lose:** a session token presented from a **client address it has not verified from**
   can perform a sensitive admin action on the strength of the ordinary step-up window alone. Nothing
