@@ -44,7 +44,7 @@ from messagefoundry.config.settings import (
 from messagefoundry.store.crypto import generate_key
 
 # The retracted "nobody can sign in" claim, one pattern shared with the doc guard that refuses it.
-from tests._sign_in_claim import SIGN_IN_CLAIM
+from tests._sign_in_claim import SIGN_IN_CLAIM, rejoin_wrapped_hyphens
 
 # provision-admin's prompt stub and passphrase, imported rather than copied: that module pins them.
 from tests.test_provision_first_administrator import _PASSWORD, _tty
@@ -196,6 +196,8 @@ def test_a_posture_that_starts_logs_one_warning_naming_provision_admin(
     assert len(lines) == 1, lines
     assert "no enabled Administrator exists" in lines[0]
     assert not SIGN_IN_CLAIM.search(lines[0]), f"the line says nobody can sign in again: {lines[0]}"
+    # One fact, said once: the prefix must not repeat the detail (BACKLOG #1133 review).
+    assert lines[0].count("no enabled Administrator") == 1, lines[0]
 
 
 def test_with_sign_in_not_required_no_administrator_is_needed_and_nothing_is_logged(
@@ -278,15 +280,35 @@ def test_no_engine_code_names_the_bootstrap_credential_file() -> None:
     assert hits == {"messagefoundry/scaffold.py": 1}, hits
 
 
+@pytest.mark.parametrize("columns", ["31", "61", "80", "10000"])
 def test_the_provision_admin_help_does_not_say_nobody_can_sign_in(
-    capsys: pytest.CaptureFixture[str],
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, columns: str
 ) -> None:
     """BACKLOG #1133: ``provision-admin --help`` said an install "has no way to sign in" until it
     runs. A Windows sign-in can still create a directory account first, with no role on a new store.
-    Read from the help the command really prints, wrapped lines joined back into one."""
+    Read from the help the command really prints, at several terminal widths, because argparse wraps
+    on hyphens and a wrapped "sign-in" must still be read as one word."""
+    monkeypatch.setenv("COLUMNS", columns)
     with pytest.raises(SystemExit) as done:
         main([_PROVISION, "--help"])
     assert done.value.code == 0
-    text = " ".join(capsys.readouterr().out.split())
+    text = rejoin_wrapped_hyphens(capsys.readouterr().out)
     assert "creates no account on its own" in text, "control: this is provision-admin's help"
     assert not SIGN_IN_CLAIM.search(text), f"provision-admin's help says nobody can sign in: {text}"
+
+
+def test_the_help_reader_survives_a_hyphen_wrap() -> None:
+    """The control for the test above: a claim wrapped at its hyphen is still caught."""
+    wrapped = "so nobody can sign-\n                 in to a new install until this runs"
+    assert SIGN_IN_CLAIM.search(rejoin_wrapped_hyphens(wrapped))
+    assert not SIGN_IN_CLAIM.search(" ".join(wrapped.split())), "control: a bare join misses it"
+    # The pattern's two edges: ADR 0197's lock is a noun, and a state is not an ability.
+    assert not SIGN_IN_CLAIM.search("Accounts with no way past a sign-in lock")
+    assert not SIGN_IN_CLAIM.search("nobody is signed in at the moment")
+    for claim in (
+        "nobody can log in",
+        "no one can sign into it",
+        "nobody can sign-in",
+        "no way to login",
+    ):
+        assert SIGN_IN_CLAIM.search(claim), claim

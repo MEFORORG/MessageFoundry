@@ -2243,7 +2243,7 @@ def _serve(args: argparse.Namespace) -> int:
         else None
     )
     # #200 (ADR 0092) residual: the forwarder was the ONE egress path with no posture gate — its
-    # plaintext-UDP default shipped the (PHI-redacted, but still sensitive) log + audit evidence stream
+    # plaintext-UDP default shipped the (best-effort redacted, still sensitive) log + audit evidence stream
     # off-box in the clear, silently. Decide it with the SAME shared authority the transports use, and
     # BEFORE configure_logging installs the handler, so a refused hop never emits a single record.
     # Loopback (the ADR 0080 local-agent deployment) is untouched; no instance is exempt as

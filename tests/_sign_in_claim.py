@@ -8,22 +8,38 @@ the old claim, ``tests/test_docs_security_pathways.py`` over the docs and
 ``tests/test_start_without_an_administrator.py`` over the engine's log line and CLI help, so the
 pattern lives here rather than being written twice.
 
-It reads one clause at a time: nobody, no one or no way, then within 40 characters a sign-in verb in
-any of the spellings the tree uses ("sign in", "signs in", "sign into", "sign-in", "log in",
-"log on"). The span is bounded so a clause that says "nobody" and, much later, "signed-in" for an
-unrelated reason does not read as the claim.
+``SIGN_IN_VERB`` is the act of signing in, in the spellings the tree uses: "sign in", "signs in",
+"sign into", "sign-in", "signin", "log in", "login", "log on". It leaves out "signed in" and "logged
+in", which describe a state ("nobody is signed in") rather than who is able to sign in. It also leaves
+out "sign-in lock": ADR 0197's lock is a noun phrase, and "no way past a sign-in lock" is a true
+sentence about lockout, not the retracted claim.
+
+``SIGN_IN_CLAIM`` reads one clause: nobody, no one or no way, then within 40 characters a
+``SIGN_IN_VERB``. The span is bounded so a clause that says "nobody" and, much later, mentions sign-in
+for an unrelated reason does not read as the claim.
 """
 
 from __future__ import annotations
 
 import re
 
-__all__ = ["SIGN_IN_CLAIM"]
+__all__ = ["SIGN_IN_CLAIM", "SIGN_IN_VERB", "rejoin_wrapped_hyphens"]
 
-SIGN_IN_CLAIM = re.compile(
-    r"\b(?:nobody|no one|no way)\b[^.;]{0,40}?"
-    # "signed in" / "logged in" are left out on purpose: "nobody is signed in" describes a state,
-    # true where SECURITY.md uses it, and is not a claim about who is able to sign in.
-    r"\b(?:sign(?:s|ing)?[ -]?in(?:to)?|log(?:s|ging)?[ -]?(?:in|on)(?:to)?)\b",
+SIGN_IN_VERB = re.compile(
+    r"\b(?:sign(?:s|ing)?[ -]?in(?:to)?|log(?:s|ging)?[ -]?(?:in|on)(?:to)?)\b(?![ -]?locks?\b)",
     re.IGNORECASE,
 )
+
+SIGN_IN_CLAIM = re.compile(
+    r"\b(?:nobody|no one|no way)\b[^.;]{0,40}?" + SIGN_IN_VERB.pattern,
+    re.IGNORECASE,
+)
+
+
+def rejoin_wrapped_hyphens(text: str) -> str:
+    """``text`` with its whitespace collapsed and a hyphen split by a line wrap joined again.
+
+    ``argparse`` wraps help with ``break_on_hyphens``, so "sign-in" can come out as "sign-" at the end
+    of one line and "in" at the start of the next. Collapsing whitespace alone leaves "sign- in", which
+    no spelling above matches, so the result would depend on the terminal width the test ran at."""
+    return re.sub(r"(\w-)\s+(?=\w)", r"\1", " ".join(text.split()))
