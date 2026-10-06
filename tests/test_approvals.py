@@ -1035,6 +1035,18 @@ async def test_a_failed_approved_write_still_writes_the_audit_row(
         and "writing the 'approved' status alone failed too" in r.getMessage()
         for r in caplog.records
     )
+    # BACKLOG #2087 limb 4: the row's way out. The same engine process, restarted, moves it to
+    # 'interrupted' with its own row, and an operator resolves it. The trail already holds
+    # approval.approved, which tells the operator the operation ran.
+    restarted = ApprovalGate(engine.store, ON, resolve_identity=_resolve)
+    assert (await restarted.reconcile_after_restart()).interrupted == (approval_id,)
+    assert await _status_of(engine, approval_id) == "interrupted"
+    assert len(await engine.store.list_audit(action="approval.interrupted")) == 1
+    out = await restarted.resolve_interrupted(
+        approval_id, outcome="effects_applied", resolver="checker", resolver_user_id="checker-id"
+    )
+    assert out["status"] == "resolved_applied"
+    assert await _status_of(engine, approval_id) == "resolved_applied"
 
 
 # --- BACKLOG #1540: the self-approval refusal keys on users.id, not on the username --------
