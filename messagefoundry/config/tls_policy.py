@@ -1078,12 +1078,10 @@ def apply_connection_tls_ciphers(
     ciphers = settings.get(CONNECTION_TLS_CIPHERS_SETTING)
     try:
         if ciphers is None:
+            # Raises only EngineTlsListRefused, so the unset hop is never "tls_ciphers rejected".
             narrow_to_approved_suites(ctx)
             return
-    except EngineTlsListRefused as exc:
-        raise EngineTlsListRefused(f"{connector}: {exc}") from exc
-    text = str(ciphers)
-    try:
+        text = str(ciphers)
         validate_tls_ciphers(text)
         apply_operator_tls_ciphers(ctx, text)
     except EngineTlsListRefused as exc:
@@ -1270,8 +1268,9 @@ def _narrow_tls13_and_sigalgs(ctx: ssl.SSLContext) -> None:
     reaches every seam that calls one. The narrowers' own message names the list; this adds the
     linked OpenSSL, because the fault is that build's.
 
-    It does not reach a context built at IMPORT: ``rest._NO_REDIRECT_OPENER`` is one, so on such a
-    build the import itself fails before any seam can report a refusal."""
+    It does not reach a context built at IMPORT. At least ``rest._NO_REDIRECT_OPENER`` and
+    ``alert_sinks._NO_REDIRECT_OPENER`` are, so on such a build the import itself fails before any
+    seam can report a refusal."""
     try:
         narrow_tls13_suites(ctx)
         narrow_signature_algorithms(ctx)
@@ -1630,11 +1629,8 @@ def _narrow_library_context(ctx: ssl.SSLContext, *, connector: str, hop: str) ->
     after it, so the call-site guards see the assertion at each seam by name."""
     try:
         narrow_to_approved_suites(ctx)  # TLS 1.2, TLS 1.3 and sigalgs (BACKLOG #300, #2494)
-    except (ssl.SSLError, EngineTlsListRefused) as exc:
-        raise ValueError(
-            f"{connector}: this OpenSSL build refuses the approved suite list, so {hop} cannot "
-            f"be narrowed (BACKLOG #300): {exc}"
-        ) from exc
+    except EngineTlsListRefused as exc:  # every refusal arrives as this since BACKLOG #2484
+        raise EngineTlsListRefused(f"{connector}: {hop} cannot be narrowed. {exc}") from exc
 
 
 def _hold_to_approved_list(ctx: ssl.SSLContext, *, connector: str, hop: str) -> None:
@@ -2570,7 +2566,7 @@ class TrustAnchorPolicy:
     internal_ca_file: str | None = None
     mode: TrustAnchorMode = "system"
     #: ``[tls].crl_file``: a PEM file of CRLs applied to the OUTBOUND hops this policy
-    #: reaches (BACKLOG #299). Independent of ``mode``: revocation is orthogonal to which roots anchor
+    #: reaches (BACKLOG #299), and to the inbound FTPS poller, which dials out (BACKLOG #2370). Independent of ``mode``: revocation is orthogonal to which roots anchor
     #: the hop, so a ``system``-mode instance can still check a CRL. Loopback hops are exempt, matching
     #: the exemption ``internal_ca_file`` already has and the revocation guard's own on-box ALLOW arm.
     crl_file: str | None = None
@@ -2706,8 +2702,9 @@ def _naming_the_ca_setting(anchor: TrustAnchor) -> Iterator[None]:
     except ssl.SSLError:
         raise
     except OSError as exc:
-        # No path in the text: a connection test returns it to the caller and audits it, and the
-        # bare FileNotFoundError this replaces carried none. The setting tells the operator where.
+        # No path in the text, as the bare FileNotFoundError this replaces carried none: a connection
+        # test returns this text to the caller and audits it. The setting tells the operator where.
+        # It does not make the hop path-free; a [tls].crl_file refusal still names its file.
         setting = anchor.cafile_setting or "the CA file setting"
         raise CaFileUnreadable(
             f"{setting} names a CA file that cannot be read: {exc.strerror or type(exc).__name__}"

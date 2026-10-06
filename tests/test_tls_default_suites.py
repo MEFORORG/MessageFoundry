@@ -883,10 +883,13 @@ def test_a_refused_engine_tls12_list_is_a_config_refusal_too(settings: dict[str,
 
 def test_the_library_seam_still_names_its_connector_on_a_refused_engine_list() -> None:
     """The ldap3 and hvac seam caught RuntimeError before #2484; it now catches the new class."""
-    with pytest.raises(ValueError, match="^LDAP: this OpenSSL build refuses") as caught:
+    with pytest.raises(
+        tls_policy.EngineTlsListRefused, match="^LDAP: the LDAPS hop cannot be narrowed"
+    ) as caught:
         tls_policy._narrow_library_context(
             _RefusesTls13(ssl.PROTOCOL_TLS_CLIENT), connector="LDAP", hop="the LDAPS hop"
         )
+    assert isinstance(caught.value, ValueError)
     assert isinstance(caught.value.__cause__, tls_policy.EngineTlsListRefused)
 
 
