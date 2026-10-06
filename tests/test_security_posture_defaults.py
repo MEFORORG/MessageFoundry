@@ -36,6 +36,7 @@ from messagefoundry.config.settings import (
     SecuritySettings,
     ServiceSettings,
     StoreSettings,
+    _trust_every_peer_entries,
     load_settings,
     security_loosenings,
 )
@@ -885,12 +886,18 @@ def test_a_trust_every_peer_proxy_entry_is_a_named_loosening(entry: str) -> None
         "10.0.0.0/8",
         "::1",
         "fd00::/8",
-        # Host bits set: loads, but uvicorn's strict parse makes it a literal that trusts no peer.
-        "10.1.2.3/0",
     ],
 )
 def test_a_bounded_proxy_entry_is_not_a_loosening(entry: str) -> None:
     assert _names(api=_proxied(entry)) == []
+
+
+def test_the_trust_every_peer_check_skips_a_host_bits_entry() -> None:
+    """A host-bits entry no longer loads (BACKLOG #2488), so this arm moved off ``ApiSettings``. The
+    helper still reads entries as uvicorn does, where ``10.1.2.3/0`` is a literal that trusts no
+    peer, so it must not be named as covering every address."""
+    assert _trust_every_peer_entries(["10.1.2.3/0"]) == []
+    assert _trust_every_peer_entries(["10.1.2.3/0", "0.0.0.0/0"]) == ["0.0.0.0/0"]
 
 
 def _split(network: str, bits: int) -> list[str]:

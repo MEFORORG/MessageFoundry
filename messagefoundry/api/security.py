@@ -864,21 +864,58 @@ def require(
     return _gate(dependency, _authenticate_session_before_body)
 
 
+async def refuse_from_new_address(request: Request) -> None:
+    """Refuse a request whose session was last verified from another host (vault BACKLOG #2620).
+
+    The step-up gates already asked this. The PHI reads and the paced writes did not, so on a
+    first deployment a bearer token replayed from a second address would have read message bodies
+    and started or stopped connections with no signal. Callers: :func:`require_phi_read`,
+    :func:`require_paced` and the HTTP reveal path in ``api/app.py`` (``_admit_reveal``). It gives
+    them the step-up gates' refusal: 403 + ``X-Step-Up-Required: 1``, cleared by a
+    ``POST /me/reauth`` from the new address, which re-anchors the session. A first sighting writes
+    ``auth.admin_action_new_ip`` and a notice, deduped and capped per session as
+    :meth:`AuthService.flag_new_client_ip` says.
+
+    It is NOT in :func:`require`, deliberately: the base gate carries the monitoring polls, and an
+    operator whose address changes behind a NAT pool would be refused on every one until a step-up.
+
+    Costs one session read per request while ``[auth].admin_new_ip_step_up`` is on. The gate has
+    already read the session through :func:`require`, but the identity it returns does not carry
+    the anchor address. A no-op with auth off or absent."""
+    auth = get_auth(request)
+    if auth is None or not auth.enabled:
+        return
+    if await auth.flag_new_client_ip(
+        bearer_token(request), client_ip(request), path=request.url.path
+    ):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "step-up re-verification required; POST /me/reauth then retry",
+            headers={"X-Step-Up-Required": "1"},
+        )
+
+
 def require_paced(*permissions: Permission) -> Callable[[Request], Awaitable[Identity]]:
     """Like :func:`require`, plus per-actor anti-automation PACING on the state-changing admin
-    surface (BACKLOG #193, ASVS 2.4.2) — but WITHOUT the MFA / step-up gates. For the mutating admin
+    surface (BACKLOG #193, ASVS 2.4.2) — but WITHOUT the MFA / step-up window. For the mutating admin
     routes that warrant paced throttling yet not a full step-up re-proof, for example connection
     start/stop/restart and statistics reset. docs/SECURITY.md lists the set. A
     non-GET request from an actor over the per-actor rate is refused early with 429 + Retry-After: 1
     (logged, not silent) before the identity is returned. Reuses the SAME #193 limiter as
     :func:`require_step_up` via :func:`_enforce_admin_write_pacing`, so pacing coverage is uniform
-    across both gates. The embedding/no-auth path is unaffected (no per-actor identity to key on)."""
+    across both gates. The embedding/no-auth path is unaffected (no per-actor identity to key on).
+
+    A request from a host the session has not verified from is refused with the step-up answer
+    (:func:`refuse_from_new_address`, vault BACKLOG #2620). That runs BEFORE the pacing charge, so
+    a refusal here spends none of the holder's write budget (the BACKLOG #1973 rule the console's
+    gate states). The step-up gates still pace before they ask, so a refusal there does."""
     base = require(*permissions)
 
     async def dependency(request: Request) -> Identity:
         identity = await base(request)
         auth = get_auth(request)
         if auth is not None and auth.enabled:
+            await refuse_from_new_address(request)
             _enforce_admin_write_pacing(request, auth, identity)
         return identity
 
@@ -1128,7 +1165,11 @@ def require_phi_read(*permissions: Permission) -> Callable[[Request], Awaitable[
     returns 429. No throttle on the embedding/no-auth path (there's no per-actor identity to key on).
 
     It also enforces the #200 API PHI-read DATA-PATH guard (:func:`enforce_phi_read_hop`) before any
-    identity work, so a production-PHI instance serving over an insecure hop refuses to emit PHI."""
+    identity work, so a production-PHI instance serving over an insecure hop refuses to emit PHI.
+
+    And it refuses a read from a host the session has not verified from, with the step-up answer
+    (:func:`refuse_from_new_address`, vault BACKLOG #2620), before the budget is charged: a read
+    that will not be served must not spend the holder's quota."""
     base = require(*permissions)
     authenticate = _authentication_of(base)
 
@@ -1140,6 +1181,7 @@ def require_phi_read(*permissions: Permission) -> Callable[[Request], Awaitable[
     async def dependency(request: Request) -> Identity:
         enforce_phi_read_hop(request)
         identity = await base(request)
+        await refuse_from_new_address(request)
         enforce_phi_read_pacing(request, identity)
         return identity
 

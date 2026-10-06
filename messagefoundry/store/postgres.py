@@ -166,6 +166,7 @@ from messagefoundry.store.store import (
     AlertSummary,
     AppendedAuditRow,
     AuditAppend,
+    AuditVerdict,
     CapturedResponse,
     ChannelScopeSource,
     ClaimedHeads,
@@ -7391,7 +7392,7 @@ class PostgresStore:
         *,
         expected_anchor: tuple[int, str] | None = None,
         expected_prefix: tuple[int, str] | None = None,
-    ) -> tuple[bool, str | None]:
+    ) -> AuditVerdict:
         """Recompute the audit hash-chain in order; returns ``(ok, message)``. Pass ``expected_anchor``
         from :meth:`audit_anchor` (held out-of-band) to also detect tail-truncation.
 

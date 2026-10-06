@@ -219,6 +219,7 @@ from messagefoundry.api.security import (
     optional_identity,
     pending_credential_deadline,
     public_route,
+    refuse_from_new_address,
     refuse_undeclared_route,
     require,
     require_paced,
@@ -3616,8 +3617,9 @@ def create_app(
         ``GET /connections/{name}/metadata``. A caller without that permission is refused,
         and the refusal is audited as
         ``auth.permission_denied`` like every other one (ASVS 16.3.2). Over HTTP the reveal is
-        also a PHI read: it takes the serve-hop refusal and the per-actor PHI budget. The web
-        console's reveal routes already charged both through ``require_ui(..., phi=True)`` before
+        also a PHI read: it takes the serve-hop refusal, the new-address refusal (vault BACKLOG
+        #2620) and the per-actor PHI budget. The web console's reveal routes already took all three
+        through ``require_ui(..., phi=True)`` before
         calling in-process, so a ``/ui`` route is not charged twice. That skip reads the matched
         route, so a future ``/ui`` route passing ``reveal`` must carry ``phi=True`` itself."""
         if reveal is None:
@@ -3634,6 +3636,9 @@ def create_app(
             raise HTTPException(403, "a reveal needs messages:view_summary")
         if not (_matched_route_path(request) or "").startswith("/ui/"):
             enforce_phi_read_hop(request)
+            # Vault BACKLOG #2620: a PHI read, so it refuses a new address as require_phi_read
+            # does, before the budget. The /ui twins asked in require_ui's phi=True arm.
+            await refuse_from_new_address(request)
             enforce_phi_read_pacing(request, identity)
 
     async def _redact_reasons(
@@ -7707,13 +7712,19 @@ async def _assert_security_notice_is_deliverable(
     store (AC-11). An Administrator with no address is the other half; ``provision-admin`` refuses
     there, so it names the offline setter ``admin-set-notify-email`` and the audited waiver (AC-16).
 
-    **It is also where a skipped gate still says that nobody can sign in (AC-12).** With sign-in
-    required, notices off or waived in writing, and no enabled Administrator, the engine starts and
-    routes HL7 but no one can reach the console. That is logged as ONE WARNING naming
+    **It is also where a skipped gate still says that no enabled Administrator exists (AC-12).** With
+    sign-in required, notices off or waived in writing, and no enabled Administrator, the engine
+    starts and routes HL7, but no enabled account holds the role that manages users and roles. A
+    Windows sign-in can still create a directory account, with no role on a new store (BACKLOG
+    #1133), so the line must not say that nobody can sign in. That is logged as ONE WARNING naming
     ``provision-admin``. Under ``warn`` the refusal's own WARNING already says it, so nothing more is
-    logged. With sign-in not required no Administrator is needed and nothing is logged. It stays a
-    warning rather than a refusal on purpose: NSSM restarts a service at boot with nobody present,
-    and an operator who chose ``warn`` or the waiver chose to keep HL7 flowing.
+    logged. It stays a warning rather than a refusal on purpose: NSSM restarts a service at boot with
+    nobody present, and an operator who chose ``warn`` or the waiver chose to keep HL7 flowing.
+
+    **Sign-in off returns first, and only an embedding reaches that arm.** ``serve`` refuses to start
+    with sign-in off on any bind, and no config key turns it off (vault BACKLOG #2719). So the early
+    return below serves an app an embedder or a test builds in code, which needs no Administrator and
+    logs nothing. It is not a deployable way to start without one.
 
     **Why deliverability rather than "require an email at creation".** A fix resting on an OPERATOR
     ACTION cannot cover the accounts a directory owns; a startup assertion about the state of the
@@ -7755,13 +7766,15 @@ async def _assert_security_notice_is_deliverable(
         # file, and is left as it is.
         where = str(Path(store.path).resolve()) if Path(store.path).is_file() else store.path
         detail = (
-            "no enabled Administrator exists in this store, so nobody can sign in, and every "
-            "out-of-band security notice about the most privileged accounts would reach nobody. The "
-            f"engine creates no account on its own. {_PROVISION_ADMIN_HINT.format(store=where)}."
+            "no enabled Administrator exists in this store, so no enabled account holds the role "
+            "that manages users and roles, and every out-of-band security notice about the most "
+            "privileged accounts would reach nobody. The engine creates no account on its own. "
+            f"{_PROVISION_ADMIN_HINT.format(store=where)}."
         )
         if not gated:
-            # AC-12: the gate is skipped, so this is the one line that says the console is unreachable.
-            _log.warning("the engine is starting with no way to sign in: %s", detail)
+            # AC-12: the gate is skipped, so this is the one line that says no enabled Administrator
+            # exists. The detail states the fact once; the prefix says only why the start goes on.
+            _log.warning("the engine is starting with the notice gate skipped: %s", detail)
             return
     else:
         detail = (

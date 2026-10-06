@@ -579,9 +579,10 @@ This section is kept rather than deleted, because the claim it used to make is t
 > #2354). A loopback `ldap://` address is refused too.
 > It is reported only while a plain bind is live, which needs at least `ad_enabled`
 > and an `ad_server` that is not `ldaps://`.
-- **What you lose:** the encryption and the server authentication on the AD hop. Both binds are SIMPLE
-  binds, so the service-account password and the password of every user who signs in or steps up cross
-  the network in cleartext. Nothing proves the far end is your domain controller, so a host on the path
+- **What you lose:** the encryption and the server authentication on the AD hop. The binds that remain
+  include the service account's and the step-up re-bind a directory user makes to confirm a sensitive
+  action. Each is a SIMPLE bind, so the service-account password and the password of every user who
+  steps up cross the network in cleartext. Nothing proves the far end is your domain controller, so a host on the path
   can read the passwords or answer as the directory.
 - **When acceptable:** a trusted-network dev or test box with a lab directory and throwaway accounts.
   Never with a real domain account.
@@ -596,7 +597,8 @@ This section is kept rather than deleted, because the claim it used to make is t
 > (vault BACKLOG #2825). The default is `true` since BACKLOG #288
 > (owner ruling 2026-09-26); before that it shipped off, with an exposure-time advisory.
 - **What you lose:** a session token presented from a **client address it has not verified from**
-  can perform a sensitive admin action on the strength of the ordinary step-up window alone. Nothing
+  can perform a sensitive admin action on the strength of the ordinary step-up window alone, and can
+  read message bodies and call the paced writes with no step-up at all (vault BACKLOG #2620). Nothing
   writes `auth.admin_action_new_ip`, nothing notifies the account holder, and nothing forces a fresh
   step-up. A stolen token replayed from another host is the case this signal exists for.
 - **When acceptable:** a deployment whose operators reach the console through a pool of egress
@@ -759,8 +761,8 @@ This section is kept rather than deleted, because the claim it used to make is t
 > trail either way. The load refuses `*` for this reason, but an entry of `0.0.0.0/0` or `::/0` loads and
 > does the same thing for its address family, so it is named instead. So are ranges whose union covers a
 > whole family, such as the two `/1` halves of `0.0.0.0/0` listed separately. The check parses each
-> entry the way uvicorn does, strictly. An entry with host bits set, such as `10.1.2.3/0`, loads here but
-> becomes a literal in uvicorn that matches no peer, so it is not this loosening.
+> entry the way uvicorn does, strictly. An entry with host bits set, such as `10.1.2.3/0`, would become a
+> literal in uvicorn that matches no peer, so the load refuses it ([BACKLOG #2488](BACKLOG.md)).
 - **What you lose:** uvicorn trusts `X-Forwarded-For` from every peer the entries cover, so any client can
   declare its own source address. That poisons the audit source address, the per-address sign-in limit and
   the new-client-IP step-up signal. With `[security].allowed_client_networks` set, the load already

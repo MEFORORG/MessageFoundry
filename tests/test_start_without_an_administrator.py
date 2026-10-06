@@ -43,6 +43,9 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.store.crypto import generate_key
 
+# The retracted "nobody can sign in" claim, one pattern shared with the doc guard that refuses it.
+from tests._sign_in_claim import SIGN_IN_CLAIM, rejoin_wrapped_hyphens
+
 # provision-admin's prompt stub and passphrase, imported rather than copied: that module pins them.
 from tests.test_provision_first_administrator import _PASSWORD, _tty
 
@@ -115,6 +118,7 @@ def test_the_gate_refuses_an_empty_store_and_provisioning_it_lets_the_next_start
     message = str(refused.value)
     assert "refusing to start" in message
     assert "no enabled Administrator exists" in message
+    assert not SIGN_IN_CLAIM.search(message), f"the refusal says nobody can sign in: {message}"
     assert f"{_PROVISION} --username" in message
     assert "bootstrap" not in message, "the refusal must not describe an account that is gone"
     assert db.exists(), "control: serve created the store, which is the order under test"
@@ -177,7 +181,10 @@ def test_a_posture_that_starts_logs_one_warning_naming_provision_admin(
     caplog: pytest.LogCaptureFixture,
     posture: dict[str, object],
 ) -> None:
-    """AC-12: it starts (so HL7 keeps flowing) and says, once, that nobody can sign in.
+    """AC-12: it starts (so HL7 keeps flowing) and says, once, that no Administrator exists.
+
+    The line must not say that nobody can sign in: a Windows sign-in can still create a directory
+    account, with no role on a new store (BACKLOG #1133).
 
     Under ``warn`` the ADR 0167 gate itself logs the line. Under the waiver and with notices off the
     gate is skipped, and the skipped-gate WARNING is the one line. Exactly one either way: two lines
@@ -190,6 +197,14 @@ def test_a_posture_that_starts_logs_one_warning_naming_provision_admin(
     lines = _warnings_naming_provision_admin(caplog)
     assert len(lines) == 1, lines
     assert "no enabled Administrator exists" in lines[0]
+    assert not SIGN_IN_CLAIM.search(lines[0]), f"the line says nobody can sign in again: {lines[0]}"
+    # One fact, said once: the prefix must not repeat the detail (BACKLOG #1133 review).
+    assert lines[0].count("no enabled Administrator") == 1, lines[0]
+    if "enforcement" not in posture:
+        # The skipped-gate line, whose prefix changelog.d/1133-first-sign-in.changed.md quotes.
+        assert lines[0].startswith("the engine is starting with the notice gate skipped: "), lines[
+            0
+        ]
 
 
 def test_with_sign_in_not_required_no_administrator_is_needed_and_nothing_is_logged(
@@ -270,3 +285,44 @@ def test_no_engine_code_names_the_bootstrap_credential_file() -> None:
             hits[source.relative_to(_REPO).as_posix()] = count
     assert scanned > 100, f"control: the scan read only {scanned} files"
     assert hits == {"messagefoundry/scaffold.py": 1}, hits
+
+
+@pytest.mark.parametrize("columns", ["31", "61", "80", "10000"])
+def test_the_provision_admin_help_does_not_say_nobody_can_sign_in(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, columns: str
+) -> None:
+    """BACKLOG #1133: ``provision-admin --help`` said an install "has no way to sign in" until it
+    runs. A Windows sign-in can still create a directory account first, with no role on a new store.
+    Read from the help the command really prints, at several terminal widths, because argparse wraps
+    on hyphens and a wrapped "sign-in" must still be read as one word."""
+    monkeypatch.setenv("COLUMNS", columns)
+    with pytest.raises(SystemExit) as done:
+        main([_PROVISION, "--help"])
+    assert done.value.code == 0
+    text = rejoin_wrapped_hyphens(capsys.readouterr().out)
+    assert "creates no account on its own" in text, "control: this is provision-admin's help"
+    assert not SIGN_IN_CLAIM.search(text), f"provision-admin's help says nobody can sign in: {text}"
+
+
+def test_the_help_reader_survives_a_hyphen_wrap() -> None:
+    """The control for the test above: a claim wrapped at its hyphen is still caught."""
+    wrapped = "so nobody can sign-\n                 in to a new install until this runs"
+    assert SIGN_IN_CLAIM.search(rejoin_wrapped_hyphens(wrapped))
+    assert not SIGN_IN_CLAIM.search(" ".join(wrapped.split())), "control: a bare join misses it"
+    # The pattern's two edges: ADR 0197's lock is a noun, and a state is not an ability.
+    for not_the_claim in (
+        "Accounts with no way past a sign-in lock",
+        "nobody can get past the sign-in lockout",
+        "nobody is signed in at the moment",
+        "no one-time password is written, so sign in with the directory",
+    ):
+        assert not SIGN_IN_CLAIM.search(not_the_claim), not_the_claim
+    # Only a hyphen that ends a line is rejoined; spaced prose is left as written.
+    assert rejoin_wrapped_hyphens("pre- and post-processing") == "pre- and post-processing"
+    for claim in (
+        "nobody can log in",
+        "no one can sign into it",
+        "nobody can sign-in",
+        "no way to login",
+    ):
+        assert SIGN_IN_CLAIM.search(claim), claim

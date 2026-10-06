@@ -9499,7 +9499,8 @@ def check_http_sync_reply(
 def check_http_intake_auth(source: Source, name: str, *, posture: HopPosture | None = None) -> None:
     """Peer-control gate (ADR 0154 D7): refuse an **off-loopback HTTP listener with no effective peer
     control** — no sufficiently narrow ``source_ip_allowlist``, no ``intake_auth``, and no
-    ``mtls_subject`` binding. Refuses under an enforcing PHI posture, warns otherwise.
+    ``mtls_subject`` binding. Refuses under an enforcing posture (``HopPosture.enforcing``, which is
+    ``[security].enforcement = enforce``), warns otherwise.
 
     **A separate function, never folded into :func:`check_http_tls_exposure`.** That gate returns early
     the moment ``tls`` is truthy — precisely the case an authentication requirement most needs to

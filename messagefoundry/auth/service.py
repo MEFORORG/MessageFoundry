@@ -7369,8 +7369,13 @@ class AuthService:
         :meth:`reauth` / :meth:`verify_mfa`), so the signal clears and the caller proceeds. An
         ``oidc`` session, which :meth:`reauth` refuses, can re-anchor through the IdP step-up
         (:meth:`complete_oidc_step_up`). It is
-        **advisory + step-up-forcing only** — it never changes an authorization decision and never
-        blocks the non-admin request path.
+        **step-up-forcing only** — it never changes an RBAC allow or deny, and a ``True`` is cleared
+        by a re-verification from the new address. Its callers include at least the step-up gates
+        and, since vault BACKLOG #2620, the PHI reads (``require_phi_read``, the HTTP ``reveal``
+        reads, the console's ``phi=True`` arm) and the paced writes (``require_paced``, the
+        console's write gate), which refuse on ``True``. Not every caller refuses: the console's
+        reauth-only action gate records the signal on a request it is refusing for another reason.
+        The base gate never calls it, so the monitoring polls are not refused.
 
         Disabled (returns ``False`` with no side effects) when ``[auth].admin_new_ip_step_up`` is off.
         It is ON by default since BACKLOG #288, and off is a named loosening. Even on, a single-host
