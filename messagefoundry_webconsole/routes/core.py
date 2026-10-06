@@ -183,25 +183,33 @@ register_ui_action(
 
 # The PHI pages `require_ui(..., phi=True)` gates, as unlock continuations (vault BACKLOG #2620).
 # That gate sends a read from a host the session has not verified from to /ui/reauth, carrying the
-# page's own path, and /ui/reauth acts only on a registered continuation: without these the operator
-# would land on /ui with the session still anchored elsewhere. Path-only, so a filter query is not
-# carried back. Every path here serves GET only; the reveal routes are registered in monitoring.py.
-register_ui_action(r"^/ui/messages$", Permission.MESSAGES_READ, auto_retry=False, unlock=True)
+# page's own target, and /ui/reauth acts only on a registered continuation: without these the
+# operator would land on /ui with the session still anchored elsewhere.
+# QUERY-TOLERANT, for the reason `_auth.is_unlock_action` sets out: a filtered or deferred list must
+# come back filtered or deferred, not as a broader read than the operator asked for. Each route's
+# own Query bounds still judge the query. Every path here serves GET only. The message pattern
+# excludes `search`, which routes/search.py registers with its own flags, so the first-match lookup
+# never depends on import order. The reveal routes are registered in monitoring.py.
 register_ui_action(
-    r"^/ui/messages/[^/?#]+(/(summary|body|errors|parse-tree))?$",
+    r"^/ui/messages(\?[^#]*)?$", Permission.MESSAGES_READ, auto_retry=False, unlock=True
+)
+register_ui_action(
+    r"^/ui/messages/(?!search(?:$|[/?#]))[^/?#]+(/(summary|body|errors|parse-tree))?(\?[^#]*)?$",
     Permission.MESSAGES_VIEW_RAW,
     auto_retry=False,
     unlock=True,
 )
 register_ui_action(
-    r"^/ui/messages/[^/?#]+/attachments/[^/?#]+$",
+    r"^/ui/messages/[^/?#]+/attachments/[^/?#]+(\?[^#]*)?$",
     Permission.MESSAGES_VIEW_RAW,
     auto_retry=False,
     unlock=True,
 )
-register_ui_action(r"^/ui/dead-letters$", Permission.MESSAGES_READ, auto_retry=False, unlock=True)
 register_ui_action(
-    r"^/ui/connection/[^/?#]+/events/[^/?#]+/reason$",
+    r"^/ui/dead-letters(\?[^#]*)?$", Permission.MESSAGES_READ, auto_retry=False, unlock=True
+)
+register_ui_action(
+    r"^/ui/connection/[^/?#]+/events/[^/?#]+/reason(\?[^#]*)?$",
     Permission.MESSAGES_VIEW_SUMMARY,
     auto_retry=False,
     unlock=True,

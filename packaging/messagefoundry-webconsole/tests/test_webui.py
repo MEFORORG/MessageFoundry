@@ -8171,6 +8171,11 @@ async def test_a_cookie_replayed_from_a_second_address_is_sent_to_reauth(engine:
         for page in (f"/ui/messages/{mid}", "/ui/messages", "/ui/dead-letters"):
             r = await b.get(page)
             assert (r.status_code, r.headers.get("location")) == (303, f"/ui/reauth?next={page}")
+        # A filtered or deferred list comes back with its query, never as a broader read.
+        listed = "/ui/messages?channel_id=ch1&defer=1"
+        r = await b.get(listed)
+        assert r.headers.get("location") == "/ui/reauth?next=" + quote(listed, safe="/")
+        assert (await b.get("/ui/reauth", params={"next": listed})).status_code == 200
         r = await b.post("/ui/statistics/reset", headers=same)
         assert (r.status_code, r.headers["location"]) == (303, "/ui/reauth?next=/ui")
         # Not every request: the dashboard is no PHI page and no write.
@@ -8257,6 +8262,8 @@ async def test_every_phi_page_has_a_reauth_continuation(engine: Engine) -> None:
             if cells.get("phi") and cells.get("new_address_check"):
                 concrete = re.sub(r"\{[^}]+\}", "x1", route.path)
                 assert is_unlock_action(concrete), f"{route.path} has no unlock continuation"
+                # Query-tolerant, so a filtered page comes back filtered.
+                assert is_unlock_action(concrete + "?a=1"), f"{route.path} drops its query"
                 checked.append(route.path)
     # The control: the walk found the PHI pages it exists for, so a zero is not a pass.
     assert "/ui/messages/{message_id}" in checked and "/ui/dead-letters" in checked, checked
@@ -8289,3 +8296,34 @@ async def test_the_password_page_is_not_refused_for_a_new_address(engine: Engine
             headers={"Sec-Fetch-Site": "same-origin"},
         )
         assert r.status_code == 400, r.headers.get("location")
+
+
+def test_a_new_address_continuation_never_drops_a_query_or_overflows() -> None:
+    """RED when: a refused GET's continuation drops its query (a broader read after the re-auth)
+    or exceeds ``/ui/reauth``'s 512-character cap on ``next`` (a 422 with no form). Either way the
+    landing is used instead (vault BACKLOG #2620, review round 2)."""
+    from starlette.requests import Request
+
+    from messagefoundry_webconsole._auth import _new_address_continuation
+
+    def req(method: str, path: str, query: str = "") -> Request:
+        scope = {
+            "type": "http",
+            "method": method,
+            "path": path,
+            "raw_path": path.encode(),
+            "query_string": query.encode(),
+            "headers": [],
+        }
+        return Request(scope)
+
+    land = "/ui/account"
+    assert _new_address_continuation(req("GET", "/ui/messages"), landing=land) == "/ui/messages"
+    filtered = req("GET", "/ui/messages", "channel_id=ch1&defer=1")
+    assert (
+        _new_address_continuation(filtered, landing=land) == "/ui/messages?channel_id=ch1&defer=1"
+    )
+    long_name = "/ui/connection/" + "n" * 600 + "/events/1/reason"
+    assert _new_address_continuation(req("GET", long_name), landing=land) == land
+    assert _new_address_continuation(req("GET", "/ui/audit"), landing=land) == land
+    assert _new_address_continuation(req("POST", "/ui/messages"), landing=land) == land

@@ -29,10 +29,16 @@ from ._common import (
 # verified from goes to /ui/reauth and comes back here. Registered for the reason routes/core.py
 # gives beside its own PHI pages (vault BACKLOG #2620).
 register_ui_action(
-    r"^/ui/alerts/[^/?#]+/reason$", Permission.MESSAGES_VIEW_SUMMARY, auto_retry=False, unlock=True
+    r"^/ui/alerts/[^/?#]+/reason(\?[^#]*)?$",
+    Permission.MESSAGES_VIEW_SUMMARY,
+    auto_retry=False,
+    unlock=True,
 )
 register_ui_action(
-    r"^/ui/events/[^/?#]+/reason$", Permission.MESSAGES_VIEW_SUMMARY, auto_retry=False, unlock=True
+    r"^/ui/events/[^/?#]+/reason(\?[^#]*)?$",
+    Permission.MESSAGES_VIEW_SUMMARY,
+    auto_retry=False,
+    unlock=True,
 )
 
 

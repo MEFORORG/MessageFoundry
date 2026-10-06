@@ -356,12 +356,13 @@ def require_ui(
 
     **A PHI read (``phi=True``) or a write (any non-GET) from a host the session has not verified
     from is sent to ``/ui/reauth``** (vault BACKLOG #2620), the cookie twin of the refusal
-    ``require_phi_read`` and ``require_paced`` give. A PHI page continues back to its own path (a
-    filter query is not carried), so each is registered as an unlock continuation beside its route;
-    a write lands on ``/ui`` afterwards, because a write's body cannot be carried through the
-    re-auth. A re-auth from the new address re-anchors the session. The check runs once, before
-    both budgets. The password page (``allow_must_change``) is not asked: ``/ui/reauth`` sends a
-    must-change session back to it, so a refusal there would loop. The step-up factories pass
+    ``require_phi_read`` and ``require_paced`` give. A PHI page continues back to itself, query
+    included, so each is registered as a query-tolerant unlock continuation beside its route; a
+    write lands on ``/ui`` afterwards (``/ui/account`` for a session without ``monitoring:read``),
+    because a write's body cannot be carried through the re-auth. :func:`_new_address_continuation`
+    decides. A re-auth from the new address re-anchors the session. The check runs once, before
+    both budgets. A must-change session is not asked: ``/ui/reauth`` sends it back to its
+    confinement page, so a refusal would loop. The step-up factories pass
     ``new_address_check=False``: they ask the same question themselves, with the continuation their
     route needs, and asking here first would send the operator to ``/ui`` instead.
 
@@ -513,12 +514,17 @@ def require_ui(
         # Vault BACKLOG #2620: require_phi_read's and require_paced's new-address refusal on this
         # plane, asked once for a PHI read or a write. After provenance, so a cross-site page cannot
         # make the engine write an audit row or send a notice; before both charges below, so a
-        # refused request spends nothing. Not on the password page (allow_must_change): /ui/reauth
-        # sends a must-change session back to that page, so a refusal there would loop, and its
-        # JSON twin /me/password is neither paced nor asked.
-        if new_address_check and not allow_must_change and (phi or write):
+        # refused request spends nothing. Not for a must-change session: /ui/reauth sends it back to
+        # its confinement page, so a refusal would loop. Such a session reaches this point only on
+        # the password page, whose JSON twin /me/password is neither paced nor asked.
+        if new_address_check and not identity.must_change_password and (phi or write):
+            landing = (
+                WRITE_REAUTH_LANDING
+                if identity.has(Permission.MONITORING_READ)
+                else ACCOUNT_REAUTH_LANDING
+            )
             await _refuse_from_new_address(
-                auth, request, next_path=WRITE_REAUTH_LANDING if write else None
+                auth, request, next_path=_new_address_continuation(request, landing=landing)
             )
         if phi and not auth.allow_phi_read(identity.user_id):
             raise HTTPException(
@@ -732,6 +738,27 @@ register_ui_action(r"^/ui/dead-letters/replay-all$", Permission.MESSAGES_REPLAY)
 #: an unlock page so ``/ui/reauth`` accepts it; ``/ui`` serves GET only, so this is no POST gadget.
 WRITE_REAUTH_LANDING = "/ui"
 register_ui_action(r"^/ui$", None, auto_retry=False, unlock=True)
+#: The landing for a session without ``monitoring:read``, which ``/ui`` would refuse: a custom role
+#: may hold a write permission without it (ADR 0045). Every signed-in session may load this page.
+ACCOUNT_REAUTH_LANDING = "/ui/account"
+register_ui_action(r"^/ui/account$", None, auto_retry=False, unlock=True)
+#: ``GET /ui/reauth``'s own cap on ``next`` (its ``max_length``). A longer continuation would be
+#: answered 422 there, with no re-auth form.
+_REAUTH_NEXT_MAX = 512
+
+
+def _new_address_continuation(request: Request, *, landing: str) -> str:
+    """The ``next`` for a request refused for a new address (vault BACKLOG #2620).
+
+    A GET comes back to itself, query included, so a filtered or deferred list does not return as
+    a broader read than the operator asked for. A write, or a GET whose whole target ``/ui/reauth``
+    would not take (not a registered unlock page, or past :data:`_REAUTH_NEXT_MAX`), goes to
+    ``landing``. A query is never dropped to make a target fit."""
+    if request.method == "GET":
+        target = request.url.path + (f"?{request.url.query}" if request.url.query else "")
+        if len(target) <= _REAUTH_NEXT_MAX and is_unlock_action(target):
+            return target
+    return landing
 
 
 def is_safe_ui_action(next_path: str | None) -> bool:

@@ -2813,9 +2813,9 @@ class AuthSettings(_Section):
     # on, a step-up (sensitive admin) request arriving from a client IP that differs from the one the
     # session last verified from is treated as higher-risk: it emits an audit + out-of-band notice and
     # FORCES a fresh step-up (a successful re-verify re-anchors the session to the new IP). It is
-    # step-up-forcing only — it NEVER changes an RBAC allow/deny. Since vault BACKLOG #2620 the PHI
-    # reads and the paced writes refuse on it too; the base gate, which the monitoring polls ride,
-    # never asks. A single-host loopback deployment never trips it (loopback addresses
+    # step-up-forcing only — it NEVER changes an RBAC allow/deny. Since vault BACKLOG #2620 at least
+    # the PHI reads and the paced writes refuse on it too, and the base gate never asks;
+    # docs/SECURITY.md (administrative-interface item 6) names the gates. A single-host loopback deployment never trips it (loopback addresses
     # 127.0.0.1 and ::1 are treated as the same host, so a dual-stack box doesn't spuriously fire).
     #
     # DEFAULT ON since BACKLOG #288 (owner ruling 2026-09-26, ASVS 8.2.4). It used to default off,
