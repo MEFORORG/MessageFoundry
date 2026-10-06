@@ -92,7 +92,12 @@ dependencies = [
     "hl7apy>=1.3",          # version-aware validation + profiles
     "pydantic>=2.6",        # channel config models / validation
     "aiosqlite>=0.20",      # async SQLite for the message store/queue
-    "fastapi>=0.137.1",     # localhost engine API
+    # FastAPI floor: the first release where every route-walk test passes (vault BACKLOG #2845).
+    # 0.137.0 and 0.137.1 hide included routes and have no iter_route_contexts.
+    # scripts/security/route_gates.py imports that call, so it fails to import there.
+    # 0.137.2 to 0.139.x lack fastapi.dependencies.models._is_async_gen_callable.
+    # The sync-dependency guard in tests/test_thread_pool_fairness_baseline.py reads it.
+    "fastapi>=0.140.0",     # localhost engine API
     "starlette>=1.3.1",     # explicit floor — fastapi's own pin allows an older Starlette; >=1.3.1 fixes the Host/path + form-DoS CVEs (CVE-2026-48710 @1.0.1, CVE-2026-54282 @1.3.0, CVE-2026-54283 @1.3.1)
     # Ceiling: api/protocol_headers.py overrides uvicorn internals, and serve refuses to start if one
     # moves. Raise it only after re-reading uvicorn's protocol modules (BACKLOG #1120).
