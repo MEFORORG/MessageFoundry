@@ -2103,16 +2103,12 @@ class AuthService:
         #: pass with a referral. Cleared by `_mark_reconcile_clears` on the referral clear's test.
         self._reconcile_referral_alert: str | None = None
         #: user_ids signed in at the last pass with a referral and not read PRESENT since (BACKLOG
-        #: #2538). Every candidate, not only the referred ones, because a probe sample can miss
-        #: accounts the same base would refer. `_mark_reconcile_clears` reports no referral clear
-        #: while one is signed in, and one that leaves forfeits it (`_forfeit_clears_on_attrition`).
+        #: #2538). `_mark_reconcile_clears` states the test that reads it.
         self._reconcile_referred: set[str] = set()
         #: Whether THIS process may resolve the referral's durable ``ad_reconcile_aborted``
-        #: instance (BACKLOG #2538), on the breaker's rule (`_reconcile_breaker_standing`): a
-        #: process clears only what it watched open. ``"fresh"``: no pass here saw a referral, so it
-        #: resolves none. ``"referred"``: a pass here saw one. ``"forfeit"``: an account signed in at
-        #: a referral left before a pass here read it PRESENT, so it resolves no referral until it
-        #: restarts. Only `_advance_referral_standing` moves it.
+        #: instance (BACKLOG #2538), on the breaker's rule (`_reconcile_breaker_standing`).
+        #: ``"fresh"``: no pass here saw a referral. ``"referred"``: one did. ``"forfeit"``: see
+        #: `_forfeit_clears_on_attrition`. Only `_advance_referral_standing` moves it.
         self._reconcile_referral_standing: _ReferralStanding = "fresh"
         #: user_ids a breaker trip has not yet seen read PRESENT on a pass that was not aborted
         #: (BACKLOG #2136). `_mark_reconcile_clears` reports no breaker clear while one is signed in.
@@ -5360,14 +5356,9 @@ class AuthService:
         elif not plan.judged_nothing:
             self._reconcile_unconfirmed = set(users)
             self._advance_breaker_standing("tripped")
-        # BACKLOG #2538. The same for a referral, on its own record and its own standing. Any
-        # referral marks EVERY candidate unconfirmed, as a trip does: a probe sample can miss
-        # accounts that the same search base would also refer, so tracking only the referred ones
-        # would let a later sample that never reached them clear the referral. An account counts as
-        # unconfirmed until a pass with no referral reads it PRESENT. Only that answer ran every
-        # search a referral can come from; a DISABLED or ABSENT one returns before the group search,
-        # so it says nothing about a referring group base. An account that leaves first forfeits
-        # the clear (`_forfeit_clears_on_attrition`, and the revocation loop below).
+        # BACKLOG #2538. The same for a referral, on its own record and its own standing.
+        # `_mark_reconcile_clears` states why every candidate is marked and why only PRESENT
+        # confirms; `_forfeit_clears_on_attrition` states the forfeit.
         if plan.referred:
             self._reconcile_referred = set(users)
             self._advance_referral_standing("referred")
@@ -5415,8 +5406,7 @@ class AuthService:
                 # clean since. It is about to leave, so nothing will read it clean again.
                 self._advance_breaker_standing("forfeit")
             if revocation.user_id in self._reconcile_referred:
-                # The same, for the referral (BACKLOG #2538). The account was signed in at a
-                # referral and has not read PRESENT on a pass without one since, this pass included.
+                # The same, for the referral (BACKLOG #2538; `_forfeit_clears_on_attrition`).
                 self._advance_referral_standing("forfeit")
             if await self._apply_reconcile_revocation(revocation):
                 applied.append(revocation)
@@ -5601,11 +5591,9 @@ class AuthService:
         * An account whose last answer was undetermined forfeits the hold's release, on the same
           rule as revoking one: unless this process has settled and has not held since.
         * An account signed in at a referral that has not since read PRESENT on a pass with no
-          referral forfeits the referral's clear until a restart (BACKLOG #2538). A referred
-          account cannot be judged, so it is never revoked for what it is, and it leaves only by
-          draining. The revocation loop forfeits for an account the reconciler revokes, as for the
-          breaker. A pass with a referral marks every candidate, so an account that pass itself
-          revokes forfeits too.
+          referral forfeits the referral's clear until a restart (BACKLOG #2538). The revocation
+          loop forfeits for an account the reconciler revokes, as for the breaker. A pass with a
+          referral marks every candidate, so an account that pass itself revokes forfeits too.
 
         At least these take an account out: it signs out or reaches the session cap, the reconciler
         revokes it, an operator disables it locally, or its row is deleted. The cost is a missed

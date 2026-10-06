@@ -714,7 +714,8 @@ document ([SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md)).
 #### When the reconciler's two alerts resolve themselves
 
 The session reconciler's `ad_reconcile_aborted` (the breaker) and `ad_reconcile_held` (the hold)
-alerts resolve on their own when a pass is evidence the condition has gone (BACKLOG #2136). This
+alerts resolve on their own when a pass is evidence the condition has gone (BACKLOG #2136). So
+does the referral's own `ad_reconcile_aborted` instance, under a separate source (below). This
 needs alert state ([ADR 0044](adr/0044-operator-alert-state.md)). The pass must have an answer, from
 this engine process, for every signed-in directory account it did not just revoke.
 
@@ -749,6 +750,10 @@ engine resolves the next trip or hold on its own.
 - An engine gives up resolving the referral when an account signed in at the last referral leaves
   before it reads in full. The reconciler revoking the account counts as leaving, including on the
   pass that saw the referral. The engine then resolves no referral until its next restart.
+- A search base changes only on a restart, and a restarted engine resolves no alert its last run
+  left open. So once you fix a referring base and restart, you resolve the referral's alert
+  yourself. The engine resolves a referral on its own only when it clears without a restart, such
+  as a directory-side change.
 
 A pass judges only accounts that hold a session, and nothing reads an account again once it has
 left. An account leaves at least when it signs out, reaches the session cap, is revoked by the
