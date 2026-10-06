@@ -173,8 +173,9 @@ def _json_escaped(match: re.Match[str]) -> str:
     code = ord(match.group())
     if code == 0x0D:
         return "\n"  # in valid JSON a CR is whitespace between tokens, so a newline means the same
-    # A lone surrogate keeps JSON's own ``\udc80`` here, unlike the log's spelling: this function's
-    # promise is the same value back from Python's ``json``, not validity for a strict decoder.
+    # A lone surrogate keeps JSON's own ``\udc80`` here, unlike the log's spelling. The input was
+    # parsed as JSON text, which holds one only after a ``surrogatepass`` decode; an adjacent high
+    # and low pair from such a decode would read back as one astral character.
     return json_unicode_escape(code)
 
 

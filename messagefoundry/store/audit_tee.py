@@ -128,10 +128,13 @@ def emit_audit_tee(
     escape such as ``\\u007f`` ends in a word character, so ``\\b``-anchored patterns no longer
     matched the next word. ``ensure_ascii=True`` is the same mistake, for every non-ASCII character.
 
-    **At least one residual is separate from this.** The redaction and credential filters rewrite
-    spans of this document as text, and a span can take a closing quote with it. An ASCII
-    ``actor`` of ``a%7Cb%7Cc`` breaks the JSON. Serializing after the filters, from structured
-    fields on the record, would close it; that is a larger change than this one.
+    **At least two residuals remain, and both break the JSON.** The redaction and credential
+    filters rewrite spans of this document as text, and a span can take a closing quote with it:
+    an ASCII ``actor`` of ``a%7Cb%7Cc`` does that on every sink. And every handler re-filters the
+    one shared ``LogRecord``, so the file handler and the forwarder run redaction again over the
+    first handler's escaped text. There, ``x%7Cy%7Cz`` followed by U+2028 parses on stdout and not
+    in the file; ``tests/test_audit_offbox_tee.py`` pins that as a strict xfail. Serializing after
+    the filters, from structured fields on the record, would close both.
 
     Best-effort: a logging failure must never fail the audit write (already committed), so it is
     caught and logged, not raised. Callers invoke this **after commit** and **outside any write

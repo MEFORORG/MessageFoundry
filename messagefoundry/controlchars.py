@@ -41,8 +41,9 @@ refusals, that makes three actions built on one predicate:
     the code point as a readable backslash escape, so one record cannot become two. Its alphabet is
     WIDER than the other two arms' (vault BACKLOG #2815); :func:`_escapes_in_a_log_line` states it.
     Every escape it writes is also valid inside a JSON string (:func:`_log_escape`), so a
-    single-line JSON document logged as a message still parses after it (vault BACKLOG #3012). An
-    indented one does not: its line breaks sit between tokens, where ``\\n`` is not JSON.
+    document from ``json.dumps`` without ``indent`` still parses after it (vault BACKLOG #3012):
+    that output holds no character of the alphabet outside a string. A document with a CR or LF
+    between tokens, an indented one for example, does not, because ``\\n`` is not JSON there.
 
 WHY ESCAPE LIVES HERE, WHICH IS THE ONE FACT WORTH STATING ONCE (BACKLOG #1591). It was defined in
 ``logging_setup`` until ``logging_guard`` needed it, and ``logging_setup`` imports
@@ -186,17 +187,22 @@ def _log_escape(code: int) -> str:
     the hex (see below). Every other code point is :func:`json_unicode_escape`: ``\\u007f``,
     ``\\u0085``, ``\\u2028``, and a surrogate pair past U+FFFF. So a JSON document logged as a
     message, such as the off-box audit record, still parses after the scrub, and the redaction
-    filters before the scrub see the raw characters (vault BACKLOG #3012). Python's ``ascii``
-    spelling, used until then, wrote ``\\x7f`` and ``\\U000e0001``, which JSON does not define.
+    filters that run before the scrub see the raw characters (vault BACKLOG #3012). Python's
+    ``ascii`` spelling, used until then, wrote ``\\x7f`` and ``\\U000e0001``, which JSON does not
+    define.
 
     A LONE SURROGATE IS SPELLED AS TEXT, NOT AS A CHARACTER. ``\\udc80`` alone is accepted by
-    Python's ``json`` and refused by a strict decoder, and I-JSON (RFC 7493) forbids it. Worse, a
-    lone high surrogate next to a lone low one would decode as ONE astral character that the text
-    never held. Doubling the backslash makes it six visible characters that every JSON decoder
-    reads as text, so the code point is still shown and nothing is invented.
+    Python's ``json`` and refused by a strict decoder such as jiter. Worse, a lone high surrogate
+    next to a lone low one would decode as ONE astral character that the text never held. With
+    the backslash doubled, the line holds the seven characters ``\\\\udc80``, and every JSON
+    decoder reads them as the six characters of text ``\\udc80``: the code point is still shown,
+    and nothing is invented.
 
-    A backslash in the text is not doubled, as it never was, so peer text that spells an escape
-    reads the same as an escaped character."""
+    At least two ambiguities are accepted. A backslash in the text is not doubled, as it never
+    was, so peer text that spells an escape reads the same as an escaped character; in a decoded
+    JSON document a lone surrogate reads the same as a peer who typed its six characters. And a
+    noncharacter such as U+FFFF is written as its JSON escape, which strict decoders accept and
+    I-JSON (RFC 7493) forbids, so a collector that enforces I-JSON would refuse that record."""
     if code == 0x0A:
         return "\\n"
     if code == 0x0D:
