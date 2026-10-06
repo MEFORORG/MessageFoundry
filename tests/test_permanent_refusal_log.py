@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import traceback
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Iterable, Mapping
 from pathlib import Path
 from typing import cast
 
@@ -218,7 +218,7 @@ async def test_the_warning_is_throttled_per_connection_and_code_and_reports_what
         await _until_dead(store, 3)
         # Every refused row was still dead-lettered: only the log line is throttled.
         (only,) = _refusal_lines(caplog)
-        assert "went unlogged" not in only.getMessage()
+        assert "more row(s) refused" not in only.getMessage()
 
         now[0] += 61.0  # past the window: the next refusal logs and reports the two it held
         (inbox / "4.hl7").write_bytes(_adt(4).encode("utf-8"))
@@ -227,7 +227,7 @@ async def test_the_warning_is_throttled_per_connection_and_code_and_reports_what
         await runner.stop()
 
     _first, second = _refusal_lines(caplog)
-    assert "(2 more with this code on this connection went unlogged" in second.getMessage()
+    assert "(2 more row(s) refused with this code on this connection" in second.getMessage()
     _assert_no_token(caplog.records)
 
 
@@ -235,29 +235,54 @@ def _nak(code: str) -> NegativeAckError:
     return NegativeAckError(f"refused {TOKEN}", code=code, permanent=True)
 
 
-def test_the_throttle_keys_on_connection_and_code(caplog: pytest.LogCaptureFixture) -> None:
+_COUNTED = "; more with this code in the next 60 s are counted, not logged"
+
+
+def test_the_throttle_keys_on_connection_and_code_and_counts_rows(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     caplog.set_level(logging.WARNING, logger=LOGGER)
     now = [0.0]
     refusals = _RefusalLog(window=60.0, clock=lambda: now[0])
     for name, code in [("a", "AR"), ("a", "AR"), ("a", "encoding"), ("b", "AR"), ("a", "AR")]:
-        refusals.warning(name, _nak(code), "refused on %s", name)
+        refusals.warning(name, _nak(code), 1, "refused on %s", name)
     assert [r.getMessage() for r in caplog.records] == [
-        "refused on a (NegativeAckError, code 'AR')",
-        "refused on a (NegativeAckError, code 'encoding')",
-        "refused on b (NegativeAckError, code 'AR')",
+        "refused on a (NegativeAckError, code 'AR')" + _COUNTED,
+        "refused on a (NegativeAckError, code 'encoding')" + _COUNTED,
+        "refused on b (NegativeAckError, code 'AR')" + _COUNTED,
     ]
-    now[0] = 59.9  # still inside ("a", "AR")'s window
-    refusals.warning("a", _nak("AR"), "refused on %s", "a")
+    now[0] = 59.9  # still inside ("a", "AR")'s window: a batch of 20 adds 20 rows, not 1
+    refusals.warning("a", _nak("AR"), 20, "refused on %s", "a")
     assert len(caplog.records) == 3
-    now[0] = 60.0  # the window has closed: logs, with the three held since the first line
-    refusals.warning("a", _nak("AR"), "refused on %s", "a")
+    now[0] = 60.0  # the window has closed: logs, with the 22 rows held since the first line
+    refusals.warning("a", _nak("AR"), 1, "refused on %s", "a")
     assert caplog.records[-1].getMessage() == (
-        "refused on a (NegativeAckError, code 'AR') (3 more with this code on this connection "
-        "went unlogged since its last line)"
+        "refused on a (NegativeAckError, code 'AR') (22 more row(s) refused with this code on "
+        "this connection since its last line)" + _COUNTED
     )
     now[0] = 60.0 + 60.0  # a fresh window, nothing held: no count suffix
-    refusals.warning("a", _nak("AR"), "refused on %s", "a")
-    assert caplog.records[-1].getMessage() == "refused on a (NegativeAckError, code 'AR')"
+    refusals.warning("a", _nak("AR"), 1, "refused on %s", "a")
+    assert (
+        caplog.records[-1].getMessage() == "refused on a (NegativeAckError, code 'AR')" + _COUNTED
+    )
+    _assert_no_token(caplog.records)
+
+
+class _CodelessRefusal(NegativeAckError):
+    """A connector's subclass that never called the base initialiser, so it has no ``code``."""
+
+    def __init__(self) -> None:  # noqa: D107 -- deliberately skips super().__init__
+        Exception.__init__(self, f"refused {TOKEN}")
+        self.permanent = True
+
+
+def test_a_refusal_with_no_code_still_logs(caplog: pytest.LogCaptureFixture) -> None:
+    # _lane_stopping_fault reads its markers with getattr for this case; the log must not raise
+    # either, or the fail-fast dead-letter's caller would see an AttributeError instead.
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    _RefusalLog().warning("a", _CodelessRefusal(), 1, "refused on %s", "a")
+    (record,) = caplog.records
+    assert "(_CodelessRefusal, code '?')" in record.getMessage()
     _assert_no_token(caplog.records)
 
 
@@ -331,3 +356,37 @@ async def test_a_batch_member_the_frame_refuses_logs_the_same_content_free_warni
     assert repr(OUT) in text and "batch member" in text and "dead-lettered alone" in text
     assert "NegativeAckError" in text
     _assert_no_token(caplog.records)
+
+
+class _SplitThenTransient(DestinationConnector):
+    """Frames: refuses member 2 permanently, then member 3 transiently, so the whole batch re-pends."""
+
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    def check_frame(self, payload: str, *, rewrite: bool = True) -> None:
+        if "MSG2" in payload:
+            raise NegativeAckError("frame byte", code="framing", permanent=True)
+        if "MSG3" in payload:
+            raise NegativeAckError("try later", code="AE", permanent=False)
+
+    async def send(self, payload: str, *, metadata: Mapping[str, str] | None = None) -> None:
+        self.sent.append(payload)
+
+    async def aclose(self) -> None:
+        return None
+
+
+async def test_a_refused_member_sent_back_with_its_batch_is_not_logged_as_dead_lettered(
+    store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A later member's transient refusal re-pends the WHOLE batch, member 2 included. The member line
+    # used to be written in the split, before any write, so it claimed a dead-letter that never ran.
+    caplog.set_level(logging.DEBUG, logger="messagefoundry")
+    rec = _SplitThenTransient()
+    runner = _batch_runner(store, rec)
+    await _run_one_batch(store, runner, [_adt(n) for n in (1, 2, 3)])
+
+    assert rec.sent == [] and await store.count_dead() == 0
+    assert (await store.pending_depth(OUT))[0] == 3  # the whole batch went back, member 2 too
+    assert _refusal_lines(caplog) == []
