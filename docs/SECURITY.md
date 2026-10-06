@@ -2000,7 +2000,8 @@ re-syncs them. Otherwise it behaves as the refusals above, audited with the outc
 looks the account up by its directory object id. It now maps the groups that lookup returns to
 roles, and refuses when a stored role is not among them. It refuses only; the session stays as it
 was, with no window and no grant, and no roles are written. The `auth.reauth` row carries
-`reason=directory_roles_demoted`, and the refusal tells the operator to ask an administrator.
+`reason=directory_roles_demoted`, and the refusal tells the operator to sign in again, which
+takes the roles the current groups grant.
 Channel scope is not compared on this leg either. At least the
 password re-bind (`POST /me/reauth` and the `/ui/reauth` password leg) and the enrolment legs do
 not compare roles yet.

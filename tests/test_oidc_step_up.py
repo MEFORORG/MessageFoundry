@@ -656,7 +656,8 @@ async def test_an_account_demoted_in_the_directory_since_sign_in_is_refused(
             assert rows[0]["ok"] is True
         else:
             assert not out.ok and out.reason == DIRECTORY_ROLES_DEMOTED
-            assert out.error and "administrator" in out.error
+            assert out.error and "sign in again" in out.error, out.error
+            assert "administrator" not in out.error, out.error
             assert rows[0] == {
                 "ok": False,
                 "provider": "ad",

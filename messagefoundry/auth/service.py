@@ -673,9 +673,11 @@ _STEP_UP_ERRORS: Final[Mapping[str, str]] = MappingProxyType(
             "Your directory account could not be found or is disabled. Ask an administrator."
         ),
         "directory_unavailable": "The directory is unavailable. Try again later.",
+        # The documented fix is a new sign-in, which takes its roles from the current groups
+        # (BACKLOG #2154). An administrator has nothing to change.
         DIRECTORY_ROLES_DEMOTED: (
-            "Your directory groups no longer grant the roles this session holds. Ask an"
-            " administrator."
+            "Your directory groups no longer grant the roles this session holds. Sign out, then"
+            " sign in again to take the roles your groups grant now."
         ),
     }
 )
