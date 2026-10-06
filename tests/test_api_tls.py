@@ -639,10 +639,17 @@ def test_trusted_proxies_refuses_a_host_bits_cidr(entry: str, address: str, netw
         ApiSettings(trusted_proxies=["10.0.0.7", entry], tls_terminated_upstream=True)
     message = str(exc.value)
     assert f"[api].trusted_proxies entry {entry!r} has host bits set" in message
-    assert f"List the proxy's own address '{address}'" in message
-    assert f"'{network}'" in message
-    # A /0 is named as trusting every peer, never offered as a fix.
-    assert ("as the refused '*' does" in message) == (network.endswith("/0"))
+    named_address = f"List the proxy's own address '{address}'"
+    named_network = f"'{network}'"
+    assert named_address in message
+    assert named_network in message
+    # The address comes first, and the network is named with a caution, never offered as a fix.
+    assert message.index(named_address) < message.index(named_network)
+    assert "write the network" not in message
+    if network.endswith("/0"):
+        assert "as the refused '*' does" in message
+    else:
+        assert "Trust that range only if every host in it is a proxy" in message
     # Both names load.
     ApiSettings(trusted_proxies=[network], tls_terminated_upstream=True)
     ApiSettings(trusted_proxies=[address], tls_terminated_upstream=True)

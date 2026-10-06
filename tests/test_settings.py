@@ -90,7 +90,7 @@ def test_tls_client_cert_files_from_env_splits_on_pathsep() -> None:
 
 def test_trusted_proxies_host_bits_entry_is_refused_from_the_file(tmp_path: Path) -> None:
     """BACKLOG #2488: the TOML form. uvicorn would read ``10.0.0.1/24`` as a literal that matches
-    no peer, so the load refuses it and names the network and the address it may have meant."""
+    no peer, so the load refuses it. It names the single address, then the network it spans."""
     cfg = _write(
         tmp_path / "messagefoundry.toml",
         '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.1/24"]\n',

@@ -1177,8 +1177,8 @@ def _trusted_proxy_refusal(entry: str, exc: ValueError) -> str:
 
     A host-bits CIDR such as ``10.0.0.1/24`` gets its own message naming the single proxy address
     first, then the network it spans (BACKLOG #2488). The address is the host part AS WRITTEN, so
-    an IPv6 zone survives: uvicorn compares a scoped peer with its zone, and ``fe80::1`` never
-    matches ``fe80::1%eth0``. The network is named, never recommended, because every host inside a
+    an IPv6 zone survives: uvicorn compares a scoped peer with a host entry's zone, and ``fe80::1``
+    never matches ``fe80::1%eth0``. A network entry is matched by prefix alone, zone or not. The network is named, never recommended, because every host inside a
     trusted range may set its own source address."""
     try:
         network = ipaddress.ip_network(entry, strict=False)
@@ -1201,7 +1201,7 @@ def _trusted_proxy_refusal(entry: str, exc: ValueError) -> str:
     return (
         f"[api].trusted_proxies entry {entry!r} has host bits set. uvicorn parses a CIDR strictly, "
         "so it would treat this entry as a literal that never matches, collapsing every client "
-        f"source IP to the proxy. List the proxy's own address '{entry.partition('/')[0]}'. {spans}"
+        f"source IP to the proxy. List the proxy's own address {entry.partition('/')[0]!r}. {spans}"
     )
 
 
@@ -1459,9 +1459,9 @@ class ApiSettings(_Section):
         #           still satisfies the tls_terminated_upstream pairing check below while trusting
         #           nothing — quietly collapsing every client to the proxy address and degrading the
         #           audit source IP, the per-IP login limiter, and the new-client-IP step-up signal.
-        # A host-bits CIDR such as 10.0.0.1/24 is the same typo in disguise: uvicorn parses an entry
-        # holding "/" with a STRICT ip_network, so it too becomes a literal that matches no peer.
-        # Parse strictly here for that reason (BACKLOG #2488).
+        # A host-bits CIDR such as 10.0.0.1/24 fails the same way: uvicorn parses an entry holding
+        # "/" with a STRICT ip_network, so it too becomes a literal that matches no peer. Parse
+        # strictly here for that reason (BACKLOG #2488).
         for entry in v:
             if entry == "*":
                 raise ValueError(
