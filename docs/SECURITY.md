@@ -3115,6 +3115,10 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
     expiry, a backward clock step) and still an `oidc` session;
   - `auth_time` is no earlier than the moment the flow was staged, less
     `[auth].oidc_clock_skew_seconds`. That is how the engine checks the IdP honoured `max_age=0`;
+  - the account is enabled and still a directory account;
+  - the verified `(iss, sub)` is byte-for-byte the pair bound to the session's account. The engine
+    checks this before the next test, so another person's IdP answer is refused as
+    `step_up_subject_mismatch` whatever its `auth_time`;
   - `auth_time` is later than the IdP `auth_time` the session holds (BACKLOG #2143). The session
     stores the sign-in's verified `auth_time` as the IdP stated it (`sessions.idp_auth_time`), and
     each step-up that passes every check replaces it with its own in the statement that stamps
@@ -3127,8 +3131,6 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
     and that sign-in is within the skew of the request. **Cost:** an IdP clock that
     steps back, or IdP nodes whose clocks disagree, would refuse a real re-authentication until
     the IdP clock passes the stored value;
-  - the account is enabled and still a directory account;
-  - the verified `(iss, sub)` is byte-for-byte the pair bound to the session's account;
   - the directory still returns the account by its immutable id. A row with no id is refused, as
     at sign-in. The password re-bind this leg replaces would have failed for a deleted account;
   - every role stored on the account is among the roles its current directory groups map to

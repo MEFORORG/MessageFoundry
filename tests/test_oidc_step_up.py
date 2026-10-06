@@ -666,6 +666,43 @@ async def test_a_different_idp_subject_is_refused(
         await store.close()
 
 
+async def test_another_persons_older_idp_answer_is_a_subject_mismatch_not_stale(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2143. RED when: the IdP-clock freshness test runs before the subject check again.
+
+    Another person's IdP session answers, with an ``auth_time`` inside the engine-clock skew but
+    not later than the one this session holds. Both the subject test and the IdP-clock test would
+    refuse it. The audit row must say subject mismatch, which is the signal that another person's
+    IdP session answered; "not fresh" would hide it."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key)
+        token = await _oidc_session(service, monkeypatch, rsa_key)
+        held = await _held_auth_time(store, token)
+        assert held is not None
+        flow_id, _url = await _begin(service, token)
+        skew = service._settings.oidc_clock_skew_seconds
+        assert held >= _staged(service, flow_id).issued_at - skew, "the engine-clock test refuses"
+
+        out = await _return_from_idp(
+            service,
+            monkeypatch,
+            rsa_key,
+            flow_id,
+            sub=DEFAULT_SUB + "-someone-else",
+            auth_time=held,
+        )
+
+        assert not out.ok and out.reason == STEP_UP_SUBJECT_MISMATCH
+        rows = [json.loads(str(r["detail"])) for r in await _audit_rows(store, "auth.reauth")]
+        assert len(rows) == 1, rows
+        assert rows[0]["reason"] == STEP_UP_SUBJECT_MISMATCH
+        await _assert_untouched(service, token)
+    finally:
+        await store.close()
+
+
 async def test_a_session_revoked_mid_flight_is_not_elevated(
     rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
 ) -> None:
