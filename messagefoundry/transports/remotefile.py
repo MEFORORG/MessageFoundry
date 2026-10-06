@@ -520,22 +520,13 @@ def _ftps_ssl_context(
     With a ``username`` or ``password`` set, both ``tls_verify=false`` and ``tls_check_hostname=false``
     are refused outright, with no escape (vault BACKLOG #2636, mirroring the SMTP credential arms of
     #323 and #1314). The escape governs only an anonymous hop."""
-    # #200 (ADR 0092 decision 2): the escape is CLAMPED to non production-PHI, so tls_verify=false can no
-    # longer be silenced by MEFOR_ALLOW_INSECURE_TLS on a prod-PHI instance (mirrors the MLLP verify-off
-    # arm). Off the construction gate (posture unstamped) the escape is refused since vault BACKLOG
-    # #2354; it used to be honoured there unclamped.
     verify = bool(settings.get("tls_verify", True))
-    if not verify and not weakened_tls_escape_permitted_here():
-        raise ValueError(
-            "REMOTEFILE ftps tls_verify=false disables server-certificate verification (MITM risk). "
-            f"Use a trusted CA (tls_ca_file), or set {INSECURE_TLS_ESCAPE_ENV}=1 on an instance at "
-            "[security].enforcement = warn to allow it on a trusted-network bind (the escape has no "
-            "effect while enforcing, the default, or with no posture)."
-        )
     # Vault BACKLOG #2636: the FTPS twin of the two SMTP credential arms (#323 and #1314, in email.py
-    # and direct.py). ABSOLUTE and keyed on no escape: the escape above may govern the BODY posture of
-    # an anonymous hop, never the CREDENTIAL, because login() hands the credential to whichever peer
-    # the session reached. Keyed on either half, as the plain-ftp credential guard is.
+    # and direct.py). ABSOLUTE and keyed on no escape: the escape below may govern the BODY posture
+    # of an anonymous hop, never the CREDENTIAL, because login() hands the credential to whichever
+    # peer the session reached. Keyed on either half, as the plain-ftp credential guard is. Checked
+    # BEFORE the escape arm, unlike SMTP, so a credentialed hop is never told to set an escape that
+    # cannot unlock it.
     has_credential = bool(settings.get("username") or settings.get("password"))
     if not verify and has_credential:
         # No chain and no name: an on-path peer presenting any certificate captures the login.
@@ -545,16 +536,28 @@ def _ftps_ssl_context(
             "Leave tls_verify on (the default) with a trusted CA (tls_ca_file), or use sftp."
         )
     check_hostname = bool(settings.get("tls_check_hostname", True))
-    if verify and not check_hostname and has_credential:
-        # The chain IS verified, but with the name check off any certificate chaining to the anchor
-        # is accepted whatever host it names -- on the system trust store, any certificate any public
-        # CA issued to anyone. The credential-less hop keeps the warning below.
+    if not check_hostname and has_credential:
+        # The chain IS verified (the arm above refused the rest), but with the name check off any
+        # certificate chaining to the anchor is accepted whatever host it names -- on the system
+        # trust store, any certificate any public CA issued to anyone. The credential-less hop keeps
+        # the warning below.
         raise ValueError(
             f"{hop_name_prefix(name)}REMOTEFILE ftps sends FTP login credentials over a TLS session "
             "whose peer NAME is unverified (tls_check_hostname=false); refused -- credentials "
             "require a session bound to the host, not merely to the trust anchor. Leave "
             "tls_check_hostname on (the default) and have the partner's certificate name the host "
             "you dial, or use sftp."
+        )
+    # #200 (ADR 0092 decision 2): the escape is CLAMPED to non production-PHI, so tls_verify=false can no
+    # longer be silenced by MEFOR_ALLOW_INSECURE_TLS on a prod-PHI instance (mirrors the MLLP verify-off
+    # arm). Off the construction gate (posture unstamped) the escape is refused since vault BACKLOG
+    # #2354; it used to be honoured there unclamped. Only an anonymous hop reaches here.
+    if not verify and not weakened_tls_escape_permitted_here():
+        raise ValueError(
+            "REMOTEFILE ftps tls_verify=false disables server-certificate verification (MITM risk). "
+            f"Use a trusted CA (tls_ca_file), or set {INSECURE_TLS_ESCAPE_ENV}=1 on an instance at "
+            "[security].enforcement = warn to allow it on a trusted-network bind (the escape has no "
+            "effect while enforcing, the default, or with no posture)."
         )
     ca = settings.get("tls_ca_file")
     if verify and trust_anchor_policy is not None:

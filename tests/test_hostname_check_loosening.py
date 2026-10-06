@@ -212,7 +212,7 @@ def test_ftps_context_refuses_a_credential_with_the_name_check_off(
 
 def test_ftps_refusal_has_no_escape(monkeypatch: pytest.MonkeyPatch) -> None:
     """Neither the insecure-TLS escape nor a permissive posture unlocks it. A guard against a later
-    edit that makes this arm consult the escape, which the verify-off arm above it does."""
+    edit that makes this arm consult the escape, as the anonymous verify-off arm does."""
     from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV
     from messagefoundry.transports import remotefile
 
@@ -281,6 +281,8 @@ _VERIFY_OFF_REFUSAL = re.escape(
 
 @pytest.fixture
 def _escape_permitted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The escape variable set as an operator would set it, and the clamp patched open, so that no
+    posture can be what refuses. The patch is what decides; the variable documents the scenario."""
     from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV
     from messagefoundry.transports import remotefile
 
@@ -349,15 +351,21 @@ def test_ftps_verify_off_without_a_credential_is_unchanged_under_the_escape(
     assert any("verification is DISABLED" in r.getMessage() for r in caplog.records)
 
 
-def test_ftps_anonymous_verify_off_stays_behind_the_escape(
+def test_ftps_verify_off_credential_without_the_escape_gets_the_credential_remedy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Without the escape the anonymous verify-off hop is still refused, by the escape arm."""
+    """With the escape closed, a credentialed hop is told the remedy that works, not told to set an
+    escape that cannot unlock it. The anonymous escape-off refusal is pinned in
+    test_remotefile_transport.py."""
     from messagefoundry.transports import remotefile
 
     monkeypatch.setattr(remotefile, "weakened_tls_escape_permitted_here", lambda: False)
-    with pytest.raises(ValueError, match="disables server-certificate verification"):
-        remotefile._ftps_ssl_context({"host": "h.example.invalid", "tls_verify": False})
+    with pytest.raises(ValueError, match=_VERIFY_OFF_REFUSAL) as info:
+        remotefile._ftps_ssl_context(
+            {"host": "h.example.invalid", "tls_verify": False, "username": "svc"}, name="OB_FTPS"
+        )
+    assert "MEFOR_ALLOW_INSECURE_TLS" not in str(info.value)
+    assert "connection 'OB_FTPS'" in str(info.value)
 
 
 # --- the expiry relaxation states what is actually verified ------------------------------------
