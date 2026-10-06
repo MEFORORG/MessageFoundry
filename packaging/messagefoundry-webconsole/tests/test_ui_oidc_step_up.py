@@ -20,6 +20,7 @@ from uuid import uuid4
 import httpx
 import pytest
 from _ui_clients import SAME_ORIGIN as _SAME
+from _ui_clients import issue_continuation
 
 from messagefoundry.api import create_app
 from messagefoundry.auth.ldap import AdPrincipal
@@ -226,6 +227,7 @@ async def test_a_fresh_idp_sign_in_steps_the_session_up(
     service = await _service(engine, _FakeLdap())
     async with _client(engine, service) as c:
         old = await _federated_sign_in(service, c, monkeypatch)
+        issue_continuation(c, _NEXT)  # what the step-up gate's refusal of the click records
         start = await _start_step_up(c)
         assert start.status_code == 303
         query = dict(parse_qsl(urlsplit(start.headers["location"]).query))
@@ -235,11 +237,35 @@ async def test_a_fresh_idp_sign_in_steps_the_session_up(
 
         assert r.status_code == 200, r.text
         assert f'action="{_NEXT}"' in r.text  # the auto-retry of the action the operator started
+        assert "data-autosubmit" in r.text and "Reload the engine configuration" in r.text
         new = c.cookies.get("mf_session")
         assert new and new != old
         assert await service.identity_for_token(old) is None
         assert await service.has_recent_step_up(new)
         assert await service.session_steps_up_at_idp(new), "rotation lost the mechanism"
+
+
+async def test_an_unissued_next_steps_up_at_the_idp_and_continues_to_nothing(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #2764 on the federated leg: a ``next`` no step-up gate issued to this session
+    still re-proves at the IdP, but the flow is staged for the console, so the callback lands there
+    with no auto-submit."""
+    service = await _service(engine, _FakeLdap())
+    async with _client(engine, service) as c:
+        await _federated_sign_in(service, c, monkeypatch)
+        page = await c.get("/ui/reauth", params={"next": _NEXT}, follow_redirects=False)
+        assert page.status_code == 200 and "nothing will run" in page.text
+        start = await _start_step_up(c)
+        assert start.status_code == 303
+
+        r = await _callback(c, start.headers["location"])
+
+        assert r.status_code == 200, r.text
+        assert "data-autosubmit" not in r.text
+        assert f'action="{_NEXT}"' not in r.text
+        new = c.cookies.get("mf_session")
+        assert new and await service.has_recent_step_up(new)
 
 
 async def test_a_different_idp_account_is_refused_and_changes_nothing(

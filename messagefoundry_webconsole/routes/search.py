@@ -31,13 +31,21 @@ from ._common import UI_BODY_FILTER_RULES, _form_pairs, blank_to_none, check_fil
 # of /ui/messages/search/run (BACKLOG #1184), which cannot survive a redirect at all, so the operator
 # re-enters it in the fresh window — the same posture as before, now enforced by the shape.
 register_ui_action(
-    r"^/ui/messages/search$", Permission.MESSAGES_READ, auto_retry=False, unlock=True
+    r"^/ui/messages/search$",
+    Permission.MESSAGES_READ,
+    auto_retry=False,
+    unlock=True,
+    label="Search message content",
 )
 # The layered run (ADR 0136) is likewise a step-up-gated GET that composes + decrypts; register it as
 # an UNLOCK form too. Its query carries only preset IDS (never the PHI needle — that's server-composed
 # from the encrypted column), so the deliberate-drop posture is preserved.
 register_ui_action(
-    r"^/ui/messages/search/layered$", Permission.MESSAGES_READ, auto_retry=False, unlock=True
+    r"^/ui/messages/search/layered$",
+    Permission.MESSAGES_READ,
+    auto_retry=False,
+    unlock=True,
+    label="Run a layered message search",
 )
 
 

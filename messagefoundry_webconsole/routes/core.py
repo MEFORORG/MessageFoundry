@@ -49,12 +49,16 @@ from .._auth import (
     assert_same_origin,
     clear_session_cookie,
     confined_before_its_factor,
+    consume_continuation,
+    continues_after_reauth,
     is_unlock_action,
     login_redirect_response,
     lookup_ui_action,
     must_change_target,
     proxied_loopback_host,
+    reauth_landing,
     register_ui_action,
+    rekey_continuations,
     require_ui,
     require_ui_step_up,
     rotation_comes_first,
@@ -179,7 +183,11 @@ class _MsgFilters(TypedDict):
 # `/edit-resend` is deliberately NOT a registered continuation — its `reauth_next` maps a stale-window
 # step-up to this /edit page, so the operator re-submits inside a fresh window (mirrors /ui/users).
 register_ui_action(
-    r"^/ui/messages/[^/?#]+/edit$", Permission.MESSAGES_EDIT, auto_retry=False, unlock=True
+    r"^/ui/messages/[^/?#]+/edit$",
+    Permission.MESSAGES_EDIT,
+    auto_retry=False,
+    unlock=True,
+    label="Open the message edit page",
 )
 
 # The PHI pages `require_ui(..., phi=True)` gates, as unlock continuations (vault BACKLOG #2620).
@@ -192,28 +200,39 @@ register_ui_action(
 # excludes `search`, which routes/search.py registers with its own flags, so the first-match lookup
 # never depends on import order. The reveal routes are registered in monitoring.py.
 register_ui_action(
-    r"^/ui/messages(\?[^#]*)?$", Permission.MESSAGES_READ, auto_retry=False, unlock=True
+    r"^/ui/messages(\?[^#]*)?$",
+    Permission.MESSAGES_READ,
+    auto_retry=False,
+    unlock=True,
+    label="View the message list",
 )
 register_ui_action(
     r"^/ui/messages/(?!search(?:$|[/?#]))[^/?#]+(/(summary|body|errors|parse-tree))?(\?[^#]*)?$",
     Permission.MESSAGES_VIEW_RAW,
     auto_retry=False,
     unlock=True,
+    label="View a message",
 )
 register_ui_action(
     r"^/ui/messages/[^/?#]+/attachments/[^/?#]+(\?[^#]*)?$",
     Permission.MESSAGES_VIEW_RAW,
     auto_retry=False,
     unlock=True,
+    label="View a message attachment",
 )
 register_ui_action(
-    r"^/ui/dead-letters(\?[^#]*)?$", Permission.MESSAGES_READ, auto_retry=False, unlock=True
+    r"^/ui/dead-letters(\?[^#]*)?$",
+    Permission.MESSAGES_READ,
+    auto_retry=False,
+    unlock=True,
+    label="View the dead letters",
 )
 register_ui_action(
     r"^/ui/connection/[^/?#]+/events/[^/?#]+/reason(\?[^#]*)?$",
     Permission.MESSAGES_VIEW_SUMMARY,
     auto_retry=False,
     unlock=True,
+    label="View the reason for a connection event",
 )
 
 # Resend to an ALTERNATE outbound (ADR 0090 §§1-8, BACKLOG #123/#1500). The GET confirm page is the
@@ -232,6 +251,7 @@ register_ui_action(
     Permission.MESSAGES_RESEND,
     auto_retry=False,
     unlock=True,
+    label="Open the message resend confirmation",
 )
 
 #: Fixed text for each refused resend, rendered IN PLACE on the confirm page.
@@ -1266,7 +1286,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         return options, None
 
     async def _reauth_idp_page(
-        auth: AuthService, token: str | None, mfa: MfaStatus, next_: str, step_up: bool
+        auth: AuthService,
+        token: str | None,
+        mfa: MfaStatus,
+        next_: str,
+        step_up: bool,
+        continues: bool,
     ) -> Response:
         """/ui/reauth for a session the federated login minted (BACKLOG #296).
 
@@ -1284,7 +1309,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 # floor can leave a session unsatisfied that the account rule calls exempt, and
                 # the step-up gate asks the session.
                 return RedirectResponse("/ui/account?m=enroll_first", status_code=303)
-        return reauth_idp_response(deps, auth, next_)
+        return reauth_idp_response(deps, auth, next_, continues=continues)
 
     async def _mfa_gate_deadline(auth: AuthService, identity: Identity) -> float | None:
         """The temporary credential's deadline for /ui/mfa, or ``None`` (BACKLOG #2009, ASVS 6.4.5).
@@ -1364,6 +1389,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # must-change session proved its factor first and rotates next (BACKLOG #1954).
             target = "/ui/account/password" if identity.must_change_password else "/ui"
             resp = RedirectResponse(target, status_code=303)
+            rekey_continuations(token, elevation.token)  # vault BACKLOG #2764
             set_session_cookie(resp, elevation.token, request=request)
             return resp
         if elevation.session_lost:
@@ -1405,6 +1431,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return RedirectResponse("/ui", status_code=303)
         auth = get_auth(request)
         token = session_token(request)
+        # Vault BACKLOG #2764: an auto-retry action continues after the confirmation only when a
+        # step-up gate issued it to THIS session. Any other `next` still gets the form, which names
+        # the action and says nothing will run; the POST then ends on a page saying nothing ran.
+        continues = continues_after_reauth(action, token, next_)
         identity = await auth.identity_for_token(token) if auth is not None else None
         if auth is None or identity is None:
             # The session ended under the operator (expiry / revoke) — a post-termination landing
@@ -1421,7 +1451,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # the IdP, so this page renders NO password field at all. Decided by the SESSION's
             # mechanism, not the account: a Kerberos session keeps the password form below.
             # Ahead of the enroll-first bounce; _reauth_idp_page says why.
-            return await _reauth_idp_page(auth, token, mfa, next_, action.step_up)
+            return await _reauth_idp_page(auth, token, mfa, next_, action.step_up, continues)
         if mfa.required and not (mfa.enabled or mfa.webauthn_enrolled) and action.step_up:
             # A full-step-up action a required-but-UNENROLLED session (no factor of EITHER
             # kind — ADR 0068 decision 1(a)) can NEVER satisfy — send it to enroll instead
@@ -1439,6 +1469,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         return HTMLResponse(
             pages.reauth(
                 next_,
+                label=action.label,
+                continues=continues,
                 mfa_needed=mfa_needed,
                 webauthn_options=wa_options,
                 webauthn_notice=wa_notice,
@@ -1471,6 +1503,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # such a session too, and it is the one that audits reason=idp_step_up_required.
             return RedirectResponse("/ui/reauth?" + urlencode({"next": next_}), status_code=303)
         mfa = await auth.mfa_status(identity)
+        # continues_after_reauth is asked of `token` at each use, not once here: the code leg below
+        # rotates it and re-keys the issued continuation onto the new token.
         if mfa.required and not (mfa.enabled or mfa.webauthn_enrolled) and action.step_up:
             # See ui_reauth_form: a full-step-up action this session can never satisfy (no
             # factor of EITHER kind — ADR 0068 decision 1(a)) — send it to enroll rather
@@ -1491,6 +1525,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return HTMLResponse(
                 pages.reauth(
                     next_,
+                    label=action.label,
+                    continues=continues_after_reauth(action, token, next_),
                     mfa_needed=False,
                     webauthn_options=wa_options,
                     webauthn_notice=wa_notice,
@@ -1537,6 +1573,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             if code_elevation.session_lost:
                 return login_redirect_response()  # session ended under a correct code
             if code_elevation.token is not None:
+                rekey_continuations(token, code_elevation.token)
                 token = code_elevation.token  # rotation 1 of 2
             else:
                 wa_options, wa_notice = await _reauth_webauthn_state(
@@ -1546,6 +1583,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 return HTMLResponse(
                     pages.reauth(
                         next_,
+                        label=action.label,
+                        continues=continues_after_reauth(action, token, next_),
                         mfa_needed=True,
                         webauthn_options=wa_options,
                         webauthn_notice=wa_notice,
@@ -1561,8 +1600,16 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # 7.5.1 (ADR 0077): mint the single-use grant bound to this continuation's action. action.action
         # is None for every non-factor continuation (replay/purge/config/create-user), so reauth mints
         # nothing there and those flows stay byte-identical; the factor-binding lanes tag their action.
+        # Vault BACKLOG #2764: only for a continuation that will run. A `next` the console did not
+        # issue to this session takes no grant, because ADR 0077 derives the grant's purpose from
+        # `next` itself, and a forged one would otherwise bind the proof to the forged action.
+        pre_rotation = token
         pw_elevation = await auth.reauth(
-            identity, form.get("password", ""), token=token, client=client, purpose=action.action
+            identity,
+            form.get("password", ""),
+            token=token,
+            client=client,
+            purpose=action.action if continues_after_reauth(action, token, next_) else None,
         )
         if pw_elevation.session_lost:
             return login_redirect_response()
@@ -1584,6 +1631,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 HTMLResponse(
                     pages.reauth(
                         next_,
+                        label=action.label,
+                        continues=continues_after_reauth(action, token, next_),
                         mfa_needed=mfa_enrolled and still_unsatisfied,
                         webauthn_options=wa_options,
                         webauthn_notice=wa_notice,
@@ -1598,13 +1647,25 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             )
         token = pw_elevation.token  # rotation 2 of 2
         # Fully stepped up. Hand control back per the action's continuation style:
-        #  - an unlock target is a GET admin form → 303-GET-redirect so it re-opens inside the now
+        #  - an unlock target is a GET admin form: 303-GET-redirect so it re-opens inside the now
         #    fresh window; the operator then submits the body-carrying POST (incl. a create-user
         #    password) once, never crossing /ui/reauth (the stateless confirm-after-step-up path).
-        #  - otherwise it is a body-less POST action → auto-retry it via the same-origin submit form.
+        #  - a body-less POST action the console issued to this session: auto-retry it via the
+        #    same-origin submit form, spending the issue so it auto-submits once (#2764).
+        #  - any other body-less POST action: a page that says nothing ran, so an operator whose
+        #    entry lapsed (TTL, restart, eviction) does not read the landing as the action done.
+        # The issue is spent under the pre-rotation token, the key it still sits under, and then
+        # the session's OTHER issued entries follow the rotation -- before any branch returns, so
+        # an unlock re-auth in one tab does not strand an action another tab is confirming.
+        issued = not action.unlock and consume_continuation(pre_rotation, next_)
+        rekey_continuations(pre_rotation, token)
         if is_unlock_action(next_):
             return _keep_session(RedirectResponse(next_, status_code=303), token)
-        return _keep_session(HTMLResponse(pages.reauth_continue(next_)), token)
+        if issued:
+            return _keep_session(HTMLResponse(pages.reauth_continue(next_, action.label)), token)
+        return _keep_session(
+            HTMLResponse(pages.reauth_nothing_ran(action.label, reauth_landing(identity))), token
+        )
 
     # ADR 0068 decision 6: the browser passkey leg of step-up. A cookie-authed JSON POST
     # (the sanctioned /ui carve — the cookie stays confined to /ui deps; bearer_token()
@@ -1660,6 +1721,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # The assertion re-keyed the session (ASVS 7.2.4). The new cookie rides this JSON response,
         # because the page's next request is the POST /ui/reauth password leg — it would otherwise
         # present the retired token and be refused on a correct password.
+        # The rotation re-keys the session, so the continuation this page was issued moves with it
+        # (vault BACKLOG #2764); otherwise the password leg would find nothing to continue.
+        rekey_continuations(token, elevation.token)
         resp = JSONResponse({"ok": True})
         set_session_cookie(resp, elevation.token, request=request)
         return resp

@@ -61,9 +61,17 @@ from ._common import _form_pairs
 # that IS registered: filter to the browse GET it was carved out of, upload to the form below, resend
 # to the confirm page below. That is the same shape messages' edit-resend uses.
 register_ui_action(
-    r"^/ui/uploaded-logs/file/[^/?#]+$", Permission.FILES_BROWSE, auto_retry=False, unlock=True
+    r"^/ui/uploaded-logs/file/[^/?#]+$",
+    Permission.FILES_BROWSE,
+    auto_retry=False,
+    unlock=True,
+    label="View an uploaded file",
 )
-register_ui_action(r"^/ui/uploaded-logs/file/[^/?#]+/delete$", Permission.FILES_DELETE)
+register_ui_action(
+    r"^/ui/uploaded-logs/file/[^/?#]+/delete$",
+    Permission.FILES_DELETE,
+    label="Delete an uploaded file",
+)
 # The resend confirm page (BACKLOG #1227). QUERY-TOLERANT ON PURPOSE — see ``_auth.is_unlock_action``
 # for what that trailing group widens and what still bounds it. It has to be:
 # ``reauth_next`` puts ``?index=N&to=NAME`` into ``next``, and ``lookup_ui_action`` /
@@ -79,6 +87,7 @@ register_ui_action(
     Permission.FILES_BROWSE,
     auto_retry=False,
     unlock=True,
+    label="Open the uploaded-message resend confirmation",
 )
 # The upload FORM page (BACKLOG #1739), the unlock continuation for the body-carrying upload POST.
 #
@@ -98,7 +107,11 @@ register_ui_action(
 # whole of the reason. (The doc-drift tests naming this path are substring checks and would have
 # tolerated either spelling — do not cite them as a constraint; the frozenset is the only hard pin.)
 register_ui_action(
-    r"^/ui/uploaded-logs/upload-form$", Permission.FILES_UPLOAD, auto_retry=False, unlock=True
+    r"^/ui/uploaded-logs/upload-form$",
+    Permission.FILES_UPLOAD,
+    auto_retry=False,
+    unlock=True,
+    label="Open the file upload form",
 )
 
 _log = logging.getLogger(__name__)
