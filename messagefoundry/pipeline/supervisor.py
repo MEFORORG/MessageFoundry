@@ -364,9 +364,10 @@ class Supervisor:
         the breaker like any other start-up failure rather than ending the whole supervisor.
 
         A tripped breaker ends THIS watcher only; the sibling shards keep running, so one shard's
-        bad start-up is not a fleet outage. The cost is accepted: the outbound lanes that shard owns
-        (ADR 0073, one static owner per lane) have no consumer, and their rows queue durably until
-        the supervisor is restarted. The ERROR line is what says so.
+        bad start-up is not a fleet outage. The cost is accepted: the lanes that shard owns have no
+        consumer, and their rows queue durably until the supervisor is restarted. That is at least
+        its outbound lanes (ADR 0073, one static owner per lane) and the pass-through and loopback
+        inbounds a sibling shard produces into (vault BACKLOG #2755). The ERROR line is what says so.
         """
         # The exits in the current run of fast ones, as "rc after Ns", for the ERROR line.
         history: list[str] = []
@@ -404,7 +405,7 @@ class Supervisor:
                 logger.error(
                     "shard %r exited %d times in a row, each within %gs of starting (%s): crash "
                     "loop, not restarting this shard again; %d other shard(s) still running, and "
-                    "the outbound lanes it owns queue until the supervisor is restarted.",
+                    "the lanes it owns queue until the supervisor is restarted.",
                     spec.shard,
                     fast_exits,
                     self.stable_uptime,
