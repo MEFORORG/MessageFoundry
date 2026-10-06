@@ -625,6 +625,8 @@ def test_no_fragment_of_a_quoted_credential_value_reaches_the_write_time_scrub(
     ``secretscrub`` keeps its own copy of every pattern, and BACKLOG #1685's remainder was fixed in
     both, so both are pinned on the same rows: ``scrub_credentials`` and the handler filter that
     calls it. The rest of the line must survive here too."""
+    assert case.fragments, f"{case.name}: no fragments to look for, so the scan checks nothing"
+    assert case.survives, f"{case.name}: no context to keep, so the over-redaction scan is empty"
     for surface, out in (
         ("scrub_credentials", scrub_credentials(case.line)),
         ("CredentialScrubFilter", _write_time_filtered(case.line)),
@@ -2213,6 +2215,8 @@ def test_a_plain_value_does_not_swallow_a_later_quoted_label(
 ) -> None:
     """No value piece prints, and both labels stay visible, on every surface."""
     line, values, labels = example
+    assert values, f"no value pieces to look for in {line!r}, so the scan checks nothing"
+    assert labels, f"no labels to keep in {line!r}, so the swallow scan checks nothing"
     for surface, apply in _SWALLOW_SURFACES:
         out = apply(line)
         printed = [value for value in values if value in out]
@@ -2684,6 +2688,7 @@ def test_the_second_review_rounds_shapes_print_nothing_new(
 ) -> None:
     """No listed atom prints on any surface."""
     line, atoms = case
+    assert atoms, f"no atoms to look for in {line!r}, so the scan checks nothing"
     for surface, apply in _SWALLOW_SURFACES:
         out = apply(line)
         printed = [atom for atom in atoms if atom in out]
@@ -2725,6 +2730,7 @@ def test_the_open_cascade_defects_still_print(
     differential takes out. That replaces a hand-built replay of the passes, which could drift from
     what the modules do. Values are matched as substrings here, not as ``vq`` atoms."""
     line, atoms = case
+    assert atoms, f"no atoms to look for in {line!r}, so neither side checks anything"
     for surface, apply in _SWALLOW_SURFACES:
         out = apply(line)
         hidden = [atom for atom in atoms if atom not in out]
@@ -2843,6 +2849,7 @@ def test_a_quoted_credential_runs_on_past_a_later_labels_opening_quote(
 ) -> None:
     """No value piece prints on any surface."""
     line, values = case
+    assert values, f"no value pieces to look for in {line!r}, so the scan checks nothing"
     for surface, apply in _SWALLOW_SURFACES:
         out = apply(line)
         printed = [value for value in values if value in out]
