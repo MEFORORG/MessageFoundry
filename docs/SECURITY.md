@@ -3474,8 +3474,9 @@ Users are notified of security-relevant changes to their account through **two**
   alert distribution list). Fired on: account **lockout** and the **first successful login after ≥3
   failed attempts**, or a step-up re-auth that clears such a run (suspicious-login signals, 6.3.5); and **password change**, **email change**, **role
   change**, **account disable**, and a **directory rename** of the username (credential changes,
-  6.3.7). When the directory session reconciler ends an account's sessions without reading a
-  disabled bit, it sends `directory_sessions_ended`, not `account_disabled` (vault BACKLOG #2140).
+  6.3.7). When the directory session reconciler ends an account's sessions because it could not
+  match the account or could not read its `userAccountControl`, it sends `directory_sessions_ended`,
+  not `account_disabled` (vault BACKLOG #2140).
   The rename notice, `username_changed`, names the old and the new name, and is sent only when
   the new name was written (BACKLOG #2017). An **unreplaced temporary password** near its deadline
   (ASVS 6.4.5, BACKLOG #2007) sends two reminders, beside the operator's `initial_credential_expiring`
