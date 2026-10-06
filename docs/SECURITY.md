@@ -1636,8 +1636,10 @@ the same permission set on the same method reds CI until it is listed here.
 > lands also gets a 409 rather than being silently overwritten. The compare is on the source only:
 > a write that sent `expected_source: "ad"` replaces a directory scope a sign-in rewrote meanwhile,
 > which is the takeover it asked for. A client that omits the field on a
-> scope the directory does not own is unaffected. The 409 detail names the conflict, never the
-> scope. The web console sends `expected_source` when the administrator ticks "Make this scope
+> scope the directory does not own is unaffected. **An AD account's stored scope with a null
+> source counts as `ad` here (BACKLOG #2252):** it predates the source column, the sync withdraws
+> it like a directory scope, and the GET still reports it as null. The 409 detail names the
+> conflict, never the scope. The web console sends `expected_source` when the administrator ticks "Make this scope
 > manual", and shows a race as a refused save with the edits kept.
 >
 > **The monitoring plane is narrowed too, and this used to say the opposite.** For a channel-scoped

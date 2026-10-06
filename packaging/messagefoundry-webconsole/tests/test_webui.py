@@ -4078,24 +4078,121 @@ async def test_the_other_scope_refusals_keep_the_edits_where_they_can(engine: En
 
 def test_only_a_directory_scope_sends_expected_source_on_a_ticked_save() -> None:
     """BACKLOG #2098: the tick becomes ``expected_source="ad"`` only where the directory owns the
-    scope. Any other source sends nothing, so a ticked save there behaves as it did before."""
+    scope. Any other source sends nothing, so a ticked save there behaves as it did before.
+    BACKLOG #2252: an AD account's scope with no recorded writer is the directory's too."""
     from messagefoundry.api.auth_models import UserSummary
     from messagefoundry_webconsole.pages.admin import ticked_scope_expected_source
 
-    def _u(source: str | None) -> UserSummary:
+    def _u(source: str | None, provider: str = "ad", stored: bool = True) -> UserSummary:
         return UserSummary(
             id="u",
             username="u",
-            auth_provider="ad",
+            auth_provider=provider,
             disabled=False,
             roles=["operator"],
-            channel_scope=["IB_A"],
+            channel_scope=["IB_A"] if stored else None,
             channel_scope_source=source,
         )
 
     assert ticked_scope_expected_source(_u("ad")) == "ad"
     assert ticked_scope_expected_source(_u("manual")) is None
-    assert ticked_scope_expected_source(_u(None)) is None
+    assert ticked_scope_expected_source(_u(None)) == "ad"  # legacy AD row: the sync withdraws it
+    assert ticked_scope_expected_source(_u(None, provider="local")) is None  # never synced
+    assert ticked_scope_expected_source(_u(None, stored=False)) is None  # nothing to withdraw
+
+
+async def test_the_console_and_the_engine_agree_on_who_owns_a_scope(engine: Engine) -> None:
+    """BACKLOG #2252: the console asks for the tick, and sends ``"ad"``, exactly where the engine
+    refuses a save without it. The console cannot import the engine's rule, so the two statements
+    are compared here, over every provider, source and stored-scope shape the rule reads."""
+    import dataclasses
+    import itertools
+    import uuid
+
+    from messagefoundry.api.auth_models import UserSummary
+    from messagefoundry.auth.service import _effective_scope_source
+    from messagefoundry.store.store import ChannelScopeSource
+    from messagefoundry_webconsole.pages.admin import (
+        needs_manual_scope_confirm,
+        ticked_scope_expected_source,
+    )
+
+    service = await _service(engine)
+    uid = uuid.uuid4().hex
+    await service.store.create_user(
+        user_id=uid, username="ada", auth_provider="ad", password_generated=False
+    )
+    base = await service.store.get_user(uid)
+    assert base is not None
+    sources: tuple[ChannelScopeSource | None, ...] = (None, "ad", "manual")
+    seen: set[bool] = set()
+    for provider, source, scope in itertools.product(
+        ("ad", "local"), sources, (None, [], ["IB_A"], [ALL_CHANNELS])
+    ):
+        record = dataclasses.replace(
+            base,
+            auth_provider=provider,
+            channel_scope_source=source,
+            channel_scope=None if scope is None else json.dumps(scope),
+        )
+        summary = UserSummary(
+            id=uid,
+            username="ada",
+            auth_provider=provider,
+            disabled=False,
+            roles=["operator"],
+            channel_scope=scope,
+            channel_scope_source=source,
+        )
+        engine_says = _effective_scope_source(record) == "ad"
+        assert needs_manual_scope_confirm(summary) is engine_says, (provider, source, scope)
+        assert ticked_scope_expected_source(summary) == ("ad" if engine_says else None)
+        seen.add(engine_says)
+    assert seen == {True, False}  # both answers occur, so the loop compared something
+
+
+async def test_a_ticked_save_on_a_legacy_directory_scope_saves(engine: Engine) -> None:
+    """BACKLOG #2252: an AD account's scope stored before the source column has a NULL source. The
+    console asks for the tick there, and the ticked save must send ``"ad"``, because the engine now
+    refuses that save without it. Fails before #2252's console change: the ticked save sent nothing
+    and the engine answered with a conflict."""
+    import uuid
+
+    from messagefoundry.store.store import SCOPE_SOURCE_MANUAL
+
+    service = await _service(engine)
+    ada = uuid.uuid4().hex
+    await service.store.create_user(
+        user_id=ada, username="ada", auth_provider="ad", password_generated=False
+    )
+    await service.store.set_user_channel_scope(
+        ada,
+        json.dumps(["IB_A"]),
+        source=None,  # type: ignore[arg-type]  # the legacy row's NULL, which no writer now makes
+    )
+    edit = {"scope_mode": "list", "channels": "IB_B"}
+    same_origin = {"Sec-Fetch-Site": "same-origin"}
+    async with _boss_client(engine, service) as c:
+        detail = (await c.get(f"/ui/users/{ada}")).text
+        assert "Source: not recorded" in detail
+        assert 'name="confirm_manual_scope" value="yes" required' in detail
+
+        r = await c.post(f"/ui/users/{ada}/channel-scope", data=edit, headers=same_origin)
+        assert r.status_code == 400
+        assert "tick the box to confirm" in r.text
+        user = await service.store.get_user(ada)
+        assert user is not None
+        assert (user.channel_scope, user.channel_scope_source) == ('["IB_A"]', None)
+
+        r = await c.post(
+            f"/ui/users/{ada}/channel-scope",
+            data={**edit, "confirm_manual_scope": "yes"},
+            headers=same_origin,
+        )
+        assert r.status_code == 303
+        user = await service.store.get_user(ada)
+        assert user is not None
+        assert (user.channel_scope, user.channel_scope_source) == ('["IB_B"]', SCOPE_SOURCE_MANUAL)
 
 
 async def test_a_sign_in_landing_during_a_console_scope_save_is_refused(
