@@ -360,5 +360,5 @@ absent answers beside them stopped revoking. A referred account is now left unju
 one, and every other probe in the pass is judged and applied. The pass still raises the
 `ad_reconcile_aborted` alert with reason `directory_referral`, now audited as
 `auth.ad_reconcile_referred` and raised under its own source label, so it is not the breaker's
-instance. Nothing resolves it while a referral stands. Only a pass whose every probe is referred or
-unreachable judges nothing, as on an outage, and it pages too.
+instance. This engine process does not resolve it while its own probes are referred. Only a pass
+whose every probe is referred or unreachable judges nothing, as on an outage, and it pages too.
