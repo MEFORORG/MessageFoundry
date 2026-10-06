@@ -847,8 +847,8 @@ async def test_a_referral_beside_other_answers_still_revokes_them_and_pages() ->
         clean = await service.reconcile_directory_sessions()
         assert clean.referred == () and service.directory_reconcile_referral is None
         # jdoe has now been read without a referral, so the referral's instance may resolve. No
-        # pass here has held, so this fresh process releases no hold (BACKLOG #2136).
-        assert clean.referral_clear and clean.breaker_clear and not clean.hold_clear
+        # pass here has tripped or held, so this process marks neither of those (BACKLOG #2136).
+        assert clean.referral_clear and not clean.breaker_clear and not clean.hold_clear
     finally:
         await store.close()
 

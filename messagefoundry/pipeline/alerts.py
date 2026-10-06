@@ -364,9 +364,10 @@ class AlertSink(Protocol):
         ``"directory-reconciler-referral"`` for the referral's. Raised on every such pass, except where
         ``api/app.py::_is_sole_reconciler`` says another reconciler may run, at least on a
         ``[cluster]`` node or in an engine that runs more than one engine shard
-        (``api/app.py::_without_clears`` says why). That gate does not see every engine on the
-        store; ``AuthService._mark_reconcile_clears`` names at least the cases that can still
-        resolve falsely. No PHI. Emitted by the API-lifespan reconciler task, never from
+        (``api/app.py::_without_clears`` says why), and while the open instance is one an earlier
+        run left open (``api/app.py::_without_inherited_clears``). The sole-reconciler gate does
+        not see every engine on the store; ``AuthService._mark_reconcile_clears`` names at least
+        the cases that can still resolve falsely. No PHI. Emitted by the API-lifespan reconciler task, never from
         ``auth/``."""
         ...
 

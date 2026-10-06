@@ -718,16 +718,27 @@ alerts resolve on their own when a pass is evidence the condition has gone (BACK
 needs alert state ([ADR 0044](adr/0044-operator-alert-state.md)). The pass must have an answer, from
 this engine process, for every signed-in directory account it did not just revoke.
 
+**An engine process resolves only an alert it watched open.** It resolves the breaker only after a
+pass of its own tripped, and the hold only after a pass of its own held. It never resolves an
+alert that was already open when it started, even after it trips or holds itself. A restart
+forgets which accounts were behind a trip or a hold, and it cannot see the accounts that sign out
+while the engine is down. So an operator resolves an alert the last run left open. After that, the
+engine resolves the next trip or hold on its own.
+
 - The hold resolves when no answer is undetermined and this pass read `userAccountControl` at
   least once. An account the pass just revoked still counts as an answer here.
-- The hold also needs this engine process to have held accounts itself since it started. A
-  restart forgets which accounts a hold covered. So a restarted engine leaves its last run's hold
-  open until it holds and releases accounts of its own. Until then, an operator resolves it.
-- An engine can also give up resolving the hold. That happens when it revokes an undetermined
-  account before it has released a hold. It then resolves no hold until its next restart.
+- An engine can also give up resolving the hold. That happens when an account whose last answer
+  was undetermined leaves, unless the engine has released a hold and has not held since. The
+  reconciler may revoke it, or its sessions may end some other way. The engine then resolves no
+  hold until its next restart.
 - The breaker resolves when the pass did not abort, no answer is undetermined, no account carries a
-  strike, and every account still signed in since the last trip has been read again, and not held.
+  strike, and every account signed in at the last trip that is still signed in has read clean.
   So the breaker's alert stays open while a hold stands.
+- An engine gives up resolving the breaker when an account signed in at the last trip leaves before
+  it reads clean. Reading clean means a pass that did not abort found the account present and
+  enabled. A held read, or one that adds a strike, does not count. The reconciler revoking the
+  account counts as leaving. The engine then resolves no trip until its
+  next restart. The engine logs a warning when it gives up either resolve.
 - An LDAP referral opens its own `ad_reconcile_aborted` instance, with reason `directory_referral`
   and source `directory-reconciler-referral` (BACKLOG #2538). It resolves once every account signed
   in at the last referral has since been read in full, with no referral. At least one account
@@ -736,18 +747,19 @@ this engine process, for every signed-in directory account it did not just revok
 - So an account that never reads in full keeps the referral's alert open while it is signed in. A
   held account, a disabled one awaiting its strikes, and one that never answers all do this.
 
+A pass judges only accounts that hold a session, and nothing reads an account again once it has
+left. An account leaves at least when it signs out, reaches the session cap, is revoked by the
+reconciler, is disabled locally, or is deleted. The two give-up rules above stop an alert resolving
+on the accounts that remain. The cost is a missed resolve when an account leaves for an ordinary
+reason, such as a sign-out, while the evidence is still pending.
+
 **They never resolve themselves on a `[cluster]` node or in an engine that runs more than one engine
 shard.** Another engine's reconciler may still hold the condition there, so an operator resolves the
 alert. A directory outage, a pass with nobody signed in, an account that never answers, and
 `ad_session_recheck_seconds = 0` resolve nothing either.
 
-At least two cases can still resolve falsely:
-
-- An engine that declares neither `[cluster]` nor more than one engine shard trusts its own
-  evidence, whatever else shares its store.
-- A pass judges only accounts that hold a session. A trip, hold or referral whose accounts have all
-  left resolves on the accounts that remain. An account leaves at least when it signs out, reaches the
-  session cap, is revoked by the reconciler, is disabled locally, or is deleted.
+At least one case can still resolve falsely. An engine that declares neither `[cluster]` nor more
+than one engine shard trusts its own evidence, whatever else shares its store.
 
 ### `[ai]` — AI coding assistance policy
 Implemented (see [AI.md](AI.md)). Controls the IDE AI assistant across the **OFF→PHI-safe** range;

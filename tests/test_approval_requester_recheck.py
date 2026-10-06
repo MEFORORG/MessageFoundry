@@ -319,7 +319,7 @@ async def test_the_lifespan_reconciler_task_raises_the_alerts() -> None:
     )
     auth = _FakeAuth(plan)
     task = asyncio.create_task(
-        _directory_reconciler(auth, 0.001, sink, sole_reconciler=True)  # type: ignore[arg-type]
+        _directory_reconciler(auth, 0.001, sink, sole_reconciler=True, alert_state=None)  # type: ignore[arg-type]
     )
     try:
         for _ in range(500):
@@ -420,7 +420,7 @@ async def test_the_reconciler_loop_survives_a_raising_sink() -> None:
     )
     auth = _FakeAuth(plan)
     task = asyncio.create_task(
-        _directory_reconciler(auth, 0.001, sink, sole_reconciler=True)  # type: ignore[arg-type]
+        _directory_reconciler(auth, 0.001, sink, sole_reconciler=True, alert_state=None)  # type: ignore[arg-type]
     )
     try:
         for _ in range(500):
