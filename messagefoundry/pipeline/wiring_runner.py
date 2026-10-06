@@ -8688,7 +8688,9 @@ def _source_config(
     trust_anchor_policy: TrustAnchorPolicy | None = None,
 ) -> Source:
     # Resolve any env() references first (a missing value raises WiringError here, before bind).
-    settings = resolve_env_settings(ic.spec.settings, env_values, connection=ic.name)
+    settings = resolve_env_settings(
+        ic.spec.settings, env_values, connection=inbound_record_name(ic.name)
+    )
     # Owner ruling 2026-09-24: the hop attestation is the connection's typed field, never a transport
     # setting, so the loosening report and the gate read the same thing. Refuse the raw keys, then
     # mirror a declared pair for the settings-driven seams, as _dest_config does for cleartext_accepted.

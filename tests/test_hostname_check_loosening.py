@@ -176,7 +176,8 @@ def test_ftps_destination_and_source_pass_their_names(
         )
     lines = _hostname_warnings(caplog)
     assert any("'OB_RF'" in ln for ln in lines), lines
-    assert any("'IB_RF'" in ln for ln in lines), lines
+    # The inbound namespace is spelt out, as every inbound refusal does (vault BACKLOG #2370).
+    assert any("'inbound:IB_RF'" in ln for ln in lines), lines
 
 
 # --- the expiry relaxation states what is actually verified ------------------------------------

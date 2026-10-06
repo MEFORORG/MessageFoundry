@@ -340,7 +340,8 @@ The one row that *does* vary:
 ### `[tls]` — outbound client trust anchors
 Instance-wide **client trust-anchor policy** (#190, [ADR 0093](adr/0093-pinned-internal-ca-trust-anchor.md)) —
 a small shared fallback for the outbound connectors that verify a downstream *server* certificate (MLLP,
-DICOM, FTPS today). By default the OS trust store roots verify the peer; a hospital estate whose internal
+DICOM, FTPS today). The inbound FTPS poller dials out and verifies its server too, so it reads this block
+as well (vault BACKLOG #2370): a `pinned` mode or a `crl_file` must suit its partner. By default the OS trust store roots verify the peer; a hospital estate whose internal
 endpoints present a private/internal-CA certificate can pin that CA **once** here instead of installing it
 box-globally or repeating a per-connection `tls_ca_file`. This selects **which** roots verify the peer — it
 **never disables verification** — so it composes with (never weakens) the connectors' fail-closed no-CA /

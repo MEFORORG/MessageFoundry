@@ -871,7 +871,7 @@ on the shipped posture.
 | Ungated verifying TLS hop | Why it is a verifying hop |
 |---|---|
 | **SQL Server store hop** | `[store].encrypt` defaults **true** and `[store].trust_server_certificate` defaults **false** — and SQL Server is a documented production store. The PostgreSQL store hop *is* gated; its SQL Server twin is not |
-| **RemoteFile FTPS inbound poll** | explicit TLS, verifying by default. The FTPS *upload* is gated since BACKLOG #2193; the poll is not, and `[tls].crl_file` does not reach it |
+| **RemoteFile FTPS inbound poll** | explicit TLS, verifying by default. The FTPS *upload* is gated since BACKLOG #2193; the poll is not. Since vault BACKLOG #2370 the poll reads the `[tls]` block, so a set `[tls].crl_file` is checked there, but nothing refuses the poll without one |
 | **`dialect='sqlserver'` DATABASE destination** | `Encrypt=yes` / `TrustServerCertificate=false` defaults |
 | **LDAPS** (`[auth].ad_tls_verify`, default true) | verifying directory bind |
 | **Webhook alert sink** and the **AI-broker endpoint** | verifying https openers |

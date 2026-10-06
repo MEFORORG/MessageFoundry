@@ -32,6 +32,7 @@ from messagefoundry.config.tls_policy import (
     CaFileUnreadable,
     TrustAnchorPolicy,
     build_anchored_https_handler,
+    build_smtp_tls_context,
     build_verifying_client_context,
     resolve_trust_anchor,
 )
@@ -304,7 +305,8 @@ def test_a_blank_env_value_on_another_setting_is_untouched() -> None:
 
 
 def test_a_missing_destination_ca_file_names_the_setting_and_connection(tmp_path: Path) -> None:
-    """It was a bare FileNotFoundError naming only the path. Both bases stay catchable."""
+    """It was a bare FileNotFoundError that named nothing. Both bases stay catchable. The path is
+    left out, because a connection test returns this text to its caller and audits it."""
     gone = str(tmp_path / "gone.pem")
     with pytest.raises(CaFileUnreadable) as caught:
         _destination_opener(Rest(url="https://partner.example.org/api", tls_ca_file=gone))
@@ -312,19 +314,39 @@ def test_a_missing_destination_ca_file_names_the_setting_and_connection(tmp_path
     assert isinstance(caught.value, OSError)
     assert isinstance(caught.value.__cause__, FileNotFoundError)
     message = str(caught.value)
-    assert "tls_ca_file of connection 'OB'" in message
-    assert repr(gone) in message
+    assert "tls_ca_file of connection 'OB' names a CA file that cannot be read" in message
+    assert "gone.pem" not in message
 
 
-def test_a_missing_ftps_ca_file_names_the_poller(tmp_path: Path) -> None:
+def test_a_missing_ftps_ca_file_names_the_poller_in_its_namespace(tmp_path: Path) -> None:
     spec = Ftp(
         host="ftp.internal.example.org",
         tls=True,
         remote_dir="/in",
         tls_ca_file=str(tmp_path / "gone.pem"),
     )
-    with pytest.raises(CaFileUnreadable, match="tls_ca_file of connection 'IB_FTPS'"):
+    with pytest.raises(CaFileUnreadable, match="tls_ca_file of connection 'inbound:IB_FTPS'"):
         _poller_context(spec, TrustAnchorPolicy())
+
+
+def test_a_blank_env_ca_on_an_inbound_names_it_in_its_namespace() -> None:
+    spec = Ftp(host="ftp.internal.example.org", tls=True, remote_dir="/in", tls_ca_file=env("c"))
+    with pytest.raises(WiringError, match="of connection 'inbound:IB_FTPS'"):
+        _source_config(
+            build_inbound_connection("IB_FTPS", spec, router="r"), "127.0.0.1", {"c": ""}
+        )
+
+
+def test_a_missing_alerts_smtp_ca_names_its_own_setting(tmp_path: Path) -> None:
+    """The alerts sink has no connection; it passes its own key, so the operator is not sent
+    looking for a connection's tls_ca_file."""
+    with pytest.raises(CaFileUnreadable, match=r"^\[alerts\]\.email_tls_ca_file names"):
+        build_smtp_tls_context(
+            host="smtp.internal.example.org",
+            cell="alerts SMTP transport",
+            ca_file=str(tmp_path / "gone.pem"),
+            ca_setting="[alerts].email_tls_ca_file",
+        )
 
 
 @pytest.mark.parametrize("mode", ["pinned", "augment"])

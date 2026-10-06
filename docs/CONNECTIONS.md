@@ -3013,7 +3013,7 @@ outbound(
 | What if `verify_tls = false`? | The data hop ignores it, since a verify-off hop trusts nothing. A token hop still reads it, as the row above says. |
 | Does it cover SOAP mutual TLS? | Yes. The client-certificate opener verifies the server against the same file. |
 | Does it apply on a loopback hop? | Yes. Only the instance `[tls]` anchor exempts loopback. A connection's own CA does not. |
-| What if the file is missing? | The build fails with an error that names the setting, the path and, where the build knows it, the connection. `messagefoundry check` and a reload build every connection in one pass, so one missing file fails that whole pass. |
+| What if the file is missing? | The build fails with an error that names the setting and, where the build knows it, the connection. `messagefoundry check` and a reload build every connection in one pass, so one missing file fails that whole pass. |
 | What if it is blank? | On these six factories a blank literal is refused at load. A blank `env()` value is refused when it resolves, naming the setting, the connection and the environment key (vault BACKLOG #2370). |
 | When is it refused as unread? | On `Ftp(tls=False)`, which has no TLS, and on `DICOMweb(verify_tls=False)`, which has no token hop. On the others, a token hop can still read it. |
 | What if it is unset? | The hop is built exactly as before, from the instance `[tls]` block or the OS store. |

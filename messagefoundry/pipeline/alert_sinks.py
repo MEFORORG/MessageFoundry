@@ -522,6 +522,7 @@ def send_plain_email(
             verify=tls_verify,
             ca_file=tls_ca_file,
             trust_anchor_policy=trust_anchor_policy,
+            ca_setting="[alerts].email_tls_ca_file",
         )
         if use_tls
         else None

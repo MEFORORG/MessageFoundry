@@ -76,6 +76,7 @@ from typing import Any, ClassVar, cast
 from messagefoundry.auth.trust_anchors import inbound_ca_cadata, refuse_an_unread_ca_pin
 from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.tls_policy import (
+    MIRRORED_CONNECTION_SETTING,
     RevocationHopGuard,
     TrustAnchorPolicy,
     apply_connection_tls_ciphers,
@@ -1211,10 +1212,12 @@ def _client_ssl_context(
     ca = s.get("tls_ca_file")
     if trust_anchor_policy is not None:
         # #190 (ADR 0093): the connection's own tls_ca_file wins verbatim, else the internal-CA anchor.
+        connection = s.get(MIRRORED_CONNECTION_SETTING)
         anchor = resolve_trust_anchor(
             connection_ca_file=str(ca) if ca else None,
             host=str(s.get("host", "")),
             policy=trust_anchor_policy,
+            connection=None if connection is None else str(connection),
         )
         ctx = build_verifying_client_context(anchor)
     else:

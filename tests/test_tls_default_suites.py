@@ -831,11 +831,54 @@ def test_a_refused_engine_list_at_settings_load_is_a_validation_error(
     is made to refuse. Settings load must report it as a ValueError, not crash."""
 
     def refuse(ctx: ssl.SSLContext) -> bool:
-        raise RuntimeError("this OpenSSL build refused the engine's approved TLS 1.3 suites")
+        raise tls_policy._NarrowerRefused(
+            "this OpenSSL refused the engine's approved TLS 1.3 suites"
+        )
 
     monkeypatch.setattr(tls_policy, "narrow_tls13_suites", refuse)
     with pytest.raises(ValueError, match=re.escape(ssl.OPENSSL_VERSION)):
         ApiSettings(tls_ciphers=_OPERATOR_STRING)
+    # The proxy declaration is not blamed for the engine's list either.
+    with pytest.raises(tls_policy.EngineTlsListRefused) as caught:
+        tls_policy.validate_proxy_tls_posture(min_version=None, ciphers=_OPERATOR_STRING)
+    assert "proxy_tls_ciphers rejected" not in str(caught.value)
+
+
+def test_only_the_narrowers_own_refusal_is_relabelled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Any other RuntimeError, such as a NotImplementedError, is not an OpenSSL list refusal."""
+
+    def broken(ctx: ssl.SSLContext) -> bool:
+        raise NotImplementedError("not this build")
+
+    monkeypatch.setattr(tls_policy, "narrow_tls13_suites", broken)
+    with pytest.raises(NotImplementedError):
+        narrow_to_approved_suites(ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT))
+
+
+class _RefusesTls12(ssl.SSLContext):
+    """A context whose OpenSSL refuses the engine's TLS 1.2 list."""
+
+    def set_ciphers(self, cipherlist: str, /) -> None:
+        raise ssl.SSLError("No cipher can be selected.")
+
+
+@pytest.mark.parametrize("settings", [{}, {"tls_ciphers": _OPERATOR_STRING}])
+def test_a_refused_engine_tls12_list_is_a_config_refusal_too(settings: dict[str, str]) -> None:
+    """With ``tls_ciphers`` unset, the engine's TLS 1.2 list is the one applied, so its refusal is
+    the engine's and must not read as "tls_ciphers rejected". With it set, set_ciphers is the
+    operator's string and the refusal stays theirs."""
+    with pytest.raises(ValueError) as caught:
+        tls_policy.apply_connection_tls_ciphers(
+            _RefusesTls12(ssl.PROTOCOL_TLS_CLIENT), settings, connector="MLLP destination"
+        )
+    message = str(caught.value)
+    assert message.startswith("MLLP destination: ")
+    if settings:
+        assert "tls_ciphers rejected" in message
+    else:
+        assert isinstance(caught.value, tls_policy.EngineTlsListRefused)
+        assert "tls_ciphers rejected" not in message
+        assert all(name in message for name in APPROVED_TLS12_SUITES), message
 
 
 def test_the_library_seam_still_names_its_connector_on_a_refused_engine_list() -> None:

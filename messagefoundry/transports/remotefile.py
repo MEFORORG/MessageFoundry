@@ -2137,9 +2137,12 @@ class RemoteFileSource(SourceConnector):
         _validate_common(
             s, connection=None if config.name is None else inbound_record_name(config.name)
         )
-        # Vault BACKLOG #2370: the poller verifies its FTPS server under [tls], as the outbound does.
+        # Vault BACKLOG #2370: the poller verifies its FTPS server under [tls], as the outbound does,
+        # and its warnings and refusals spell it inbound:<name>, as _validate_common above does.
         self._client = _make_client(
-            s, trust_anchor_policy=config.trust_anchor_policy, name=config.name or ""
+            s,
+            trust_anchor_policy=config.trust_anchor_policy,
+            name="" if config.name is None else inbound_record_name(config.name),
         )
         self._host = str(s["host"])
         self._remote_dir = str(s["remote_dir"])
