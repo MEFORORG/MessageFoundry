@@ -4666,7 +4666,7 @@ async def test_ad_group_maps_roundtrip(engine: Engine) -> None:
             c,
             "/ui/ad-groups/map",
             [
-                ("ad_group", "MEFOR-Admins"),
+                ("ad_group", "CN=MEFOR-Admins,OU=Groups,DC=example,DC=invalid"),
                 ("role", "administrator"),
                 ("ad_group", ""),
                 ("role", ""),
@@ -4675,19 +4675,33 @@ async def test_ad_group_maps_roundtrip(engine: Engine) -> None:
         assert r.status_code == 303
         rows = await service.store.list_ad_group_role_map()
         assert [(x["ad_group"], x["role_id"]) for x in rows] == [
-            ("mefor-admins", "administrator")
+            ("cn=mefor-admins,ou=groups,dc=example,dc=invalid", "administrator")
         ]  # groups are case-normalized
         # Unknown role id: 400, map unchanged.
-        r = await _post_pairs(c, "/ui/ad-groups/map", [("ad_group", "G2"), ("role", "not-a-role")])
+        g2 = "CN=G2,OU=Groups,DC=example,DC=invalid"
+        r = await _post_pairs(c, "/ui/ad-groups/map", [("ad_group", g2), ("role", "not-a-role")])
         assert r.status_code == 400 and "unknown role" in r.text
+        assert len(await service.store.list_ad_group_role_map()) == 1
+        # A short name is refused on both forms, and the page says why (BACKLOG #2610).
+        for path, partner in (
+            ("/ui/ad-groups/map", "role"),
+            ("/ui/ad-groups/scope-map", "channel"),
+        ):
+            value = "administrator" if partner == "role" else "*"
+            r = await _post_pairs(c, path, [("ad_group", "MEFOR-Ops"), (partner, value)])
+            assert r.status_code == 400 and "full distinguished name" in r.text
         assert len(await service.store.list_ad_group_role_map()) == 1
         # Scope map round-trip.
         r = await _post_pairs(
-            c, "/ui/ad-groups/scope-map", [("ad_group", "MEFOR-Ops"), ("channel", "*")]
+            c,
+            "/ui/ad-groups/scope-map",
+            [("ad_group", "CN=MEFOR-Ops,OU=Groups,DC=example,DC=invalid"), ("channel", "*")],
         )
         assert r.status_code == 303
         rows = await service.store.list_ad_group_scope_map()
-        assert [(x["ad_group"], x["channel"]) for x in rows] == [("mefor-ops", "*")]
+        assert [(x["ad_group"], x["channel"]) for x in rows] == [
+            ("cn=mefor-ops,ou=groups,dc=example,dc=invalid", "*")
+        ]
 
 
 async def test_admin_pages_escape_hostile_display_name(engine: Engine) -> None:

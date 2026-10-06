@@ -101,7 +101,7 @@ from messagefoundry.auth import (
     Role,
 )
 from messagefoundry.auth.audit_visibility import audit_exclusion_for
-from messagefoundry.auth.ldap import LdapError
+from messagefoundry.auth.ldap import LdapError, is_group_dn
 from messagefoundry.auth.permissions import CustomRoleError
 from messagefoundry.auth.service import (
     ENROL_AUTHENTICATOR_FIRST,
@@ -357,6 +357,28 @@ async def _validate_roles(service: AuthService, roles: list[str]) -> None:
     if unknown:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST, f"unknown role(s): {', '.join(sorted(unknown))}"
+        )
+
+
+#: How many refused group keys the 400 names before it only counts the rest.
+_GROUPS_NAMED = 3
+
+
+def _validate_group_dns(groups: list[str]) -> None:
+    """Refuse a group map key that is not a full distinguished name (BACKLOG #2610).
+
+    Both ``PUT /ad-group-map`` and ``PUT /ad-group-scope-map`` call this before any write. A short
+    name used to match a same-named group in any unit, so it is refused rather than stored. A blank
+    key is left to the store, which drops it as it always has."""
+    bad = sorted({g.strip() for g in groups if g.strip() and not is_group_dn(g)})
+    if bad:
+        named = ", ".join(bad[:_GROUPS_NAMED])
+        more = len(bad) - _GROUPS_NAMED
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "AD group must be a full distinguished name, such as "
+            f"CN=MF-Admins,OU=Groups,DC=example,DC=com; refused: {named}"
+            + (f" and {more} more" if more > 0 else ""),
         )
 
 
@@ -1468,6 +1490,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
     ) -> SimpleMessage:
+        _validate_group_dns([e.ad_group for e in body.entries])
         await _validate_roles(service, [e.role for e in body.entries])
 
         # BACKLOG #315: mapping a group to Administrator makes every member who signs in an approver,
@@ -1506,6 +1529,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
     ) -> SimpleMessage:
+        _validate_group_dns([e.ad_group for e in body.entries])
         await service.set_ad_group_scope_map(
             [(e.ad_group, e.channel) for e in body.entries], actor=identity.username
         )

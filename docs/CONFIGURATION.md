@@ -710,7 +710,9 @@ document ([SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md)).
 | `oidc_max_age_seconds` | int | `43200` | the most time allowed between the user's sign-in **at the IdP** and the end of the engine session (ASVS 6.8.4 / 7.6.1, BACKLOG #1150). Sent as `max_age` on every authorization request; the `id_token` must return `auth_time`, a missing or stale one is refused, and the session ends at `auth_time + max_age` if that is sooner. `300`..`86400`; **no off switch** (`0` would be `prompt=login`, which ends single sign-on) |
 
 > AD-group→role mappings live in the DB and are managed by an admin (`PUT /ad-group-map` or the
-> console Users page), not in this file. Federated logins reuse the **same** AD-group→role mapping —
+> console Users page), not in this file. Each group is named by its full distinguished name, such as
+> `CN=MF-Admins,OU=Groups,DC=example,DC=com`; a short name is refused (BACKLOG #2610). Federated
+> logins reuse the **same** AD-group→role mapping —
 > the role source is on-prem AD, never a token claim ([ADR 0142](adr/0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md)).
 
 #### When the reconciler's two alerts resolve themselves

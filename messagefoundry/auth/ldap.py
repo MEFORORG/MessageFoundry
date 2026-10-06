@@ -70,8 +70,9 @@ _ACCOUNTDISABLE = 0x2
 class AdPrincipal:
     """An authenticated AD user: identity attributes + the set of groups governing role mapping.
 
-    ``groups`` holds **lower-cased** identifiers — both each group's DN and its ``sAMAccountName`` —
-    so the admin can map roles by whichever form they configured in ``ad_group_role_map``.
+    ``groups`` holds each group's **distinguished name, lower-cased**, and nothing else. The group
+    maps take a full DN only (BACKLOG #2610): a short name is unique in no sense the engine can
+    check, so a same-named group in another unit would grant the mapped roles.
 
     ``directory_object_id`` is the account's **immutable** directory identity (BACKLOG #1471): the
     normalised ``objectGUID``, which is what the engine resolves a MessageFoundry user row by. It
@@ -447,6 +448,34 @@ def _multi(entry: Any, name: str) -> list[str]:
 def _cn_of(dn: str) -> str | None:
     head = dn.split(",", 1)[0]
     return head[3:] if head[:3].upper() == "CN=" else None
+
+
+#: The fewest RDNs a group map key may hold (BACKLOG #2610). One RDN, such as ``CN=Admins``, names a
+#: group in no particular unit, which is the short-name match this rule exists to remove.
+_GROUP_DN_MIN_RDNS = 2
+
+
+def is_group_dn(value: str) -> bool:
+    """Whether ``value`` is a full distinguished name that a group map may key on (BACKLOG #2610).
+
+    Both group maps match a principal's ``groups``, which hold lower-cased DNs only. A key in any
+    other form would match nothing, or, as a short name did before this item, match a same-named
+    group in any unit. So a map write refuses it. The value must parse as an RFC 4514 DN and hold at
+    least :data:`_GROUP_DN_MIN_RDNS` RDNs. ldap3's parser refuses a space after a separator.
+
+    **Accepted is not the same as matching.** Keys and groups are compared as lower-cased strings,
+    so a key must spell each value the way the directory does. A value escaped differently, such as
+    ``\\2C`` where AD writes ``\\,``, passes this check and matches nothing. That fails closed.
+    """
+    from ldap3.core.exceptions import LDAPInvalidDnError  # lazy, like every ldap3 import here
+    from ldap3.utils.dn import parse_dn
+
+    try:
+        parts = parse_dn(value.strip())
+    except LDAPInvalidDnError:
+        return False
+    # parse_dn yields one tuple per attribute. A "+" separator joins two attributes into ONE RDN.
+    return sum(1 for _attr_type, _value, sep in parts if sep != "+") >= _GROUP_DN_MIN_RDNS
 
 
 #: A referred host the refusal may name. Anything else is replaced, because the text comes from the
@@ -922,14 +951,16 @@ class LdapAuthenticator:
         )
 
     def _resolve_groups(self, conn: Any, user_dn: str, member_of: list[str]) -> frozenset[str]:
+        """The user's groups as lower-cased DNs, the one form both group maps key on.
+
+        BACKLOG #2610. This used to add each direct group's first CN and each nested group's
+        ``sAMAccountName`` too, so a map key written as a short name matched a same-named group in
+        any unit. Anyone able to create a group anywhere could then take the roles mapped to it.
+        """
         import ldap3
 
-        groups: set[str] = set()
-        for dn in member_of:  # direct membership from the user's memberOf attribute
-            groups.add(dn.lower())
-            cn = _cn_of(dn)
-            if cn:
-                groups.add(cn.lower())
+        # Direct membership from the user's memberOf attribute.
+        groups: set[str] = {dn.lower() for dn in member_of}
         if self._s.ad_use_nested_groups and self._s.ad_group_search_base:
             _search(
                 conn,
@@ -937,13 +968,9 @@ class LdapAuthenticator:
                 search_base=self._s.ad_group_search_base,
                 search_filter=f"(member:{_MATCHING_RULE_IN_CHAIN}:={_escape_filter(user_dn)})",
                 search_scope=ldap3.SUBTREE,
-                attributes=["distinguishedName", "sAMAccountName"],
+                attributes=["distinguishedName"],
             )
-            for e in conn.entries:
-                groups.add(str(e.entry_dn).lower())
-                sam = _attr(e, "sAMAccountName")
-                if sam:
-                    groups.add(sam.lower())
+            groups.update(str(e.entry_dn).lower() for e in conn.entries)
         return frozenset(groups)
 
     def authenticate(
@@ -1170,6 +1197,34 @@ def _kerberos_acceptor(settings: AuthSettings) -> Any:
     return spnego.server(hostname=hostname, service=service)
 
 
+def _kerberos_context_complete(server: Any) -> bool:
+    """Whether one acceptor step finished the Kerberos context that checked the client's ticket.
+
+    ``server.complete`` answers this for the native SSPI and GSSAPI acceptors. pyspnego's own
+    Negotiate wrapper, used where GSSAPI offers no native SPNEGO, can stay incomplete after a step
+    whose inner Kerberos context did finish. It waits for a ``mechListMIC`` (RFC 4178 section 4.2.2)
+    when the client's first mechanism differs from its own, as a Windows client's does, and this
+    single-leg acceptor never takes a second leg. So for that wrapper the inner context is read, and
+    only a finished KERBEROS context counts. It is a private attribute: if pyspnego moves it, this
+    returns ``False`` and the sign-in is refused.
+    """
+    if server.complete:
+        return True
+    try:
+        from spnego._negotiate import NegotiateProxy  # lazy, like every spnego import here
+
+        if not isinstance(server, NegotiateProxy):
+            return False
+        inner = server._context
+    except (ImportError, AttributeError, KeyError, StopIteration):
+        # The wrapper moved, or it chose no mechanism: nothing finished that can be read.
+        return False
+    return (
+        getattr(inner, "complete", False) is True
+        and getattr(inner, "negotiated_protocol", None) == "kerberos"
+    )
+
+
 def kerberos_principal(token: bytes, settings: AuthSettings) -> str | None:
     """Complete one SPNEGO server step and return the authenticated sAMAccountName, or ``None``.
 
@@ -1178,13 +1233,17 @@ def kerberos_principal(token: bytes, settings: AuthSettings) -> str | None:
     NTLM fallback, no mutual-auth response token, no multi-leg challenge handshake. The server must
     have a usable keytab/credential for ``kerberos_spn`` in its environment; the realm suffix
     (``user@REALM``) is stripped to yield the account name.
+
+    ``None`` unless :func:`_kerberos_context_complete` says the context finished (BACKLOG #2610
+    review point c), so no provider can hand back a principal from a half-done exchange. That is
+    defence in depth: no such provider is known.
     """
     import spnego
 
     try:
         server = _kerberos_acceptor(settings)
         server.step(token)
-        principal = server.client_principal
+        principal = server.client_principal if _kerberos_context_complete(server) else None
     except (spnego.exceptions.SpnegoError, ValueError, struct.error) as exc:
         # SpnegoError is the SSPI/GSSAPI (Windows/Linux-krb5) rejection; the pure-Python provider
         # instead raises a bare ValueError/struct.error while parsing an untrusted token. Both are

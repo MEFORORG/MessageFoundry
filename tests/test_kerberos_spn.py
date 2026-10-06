@@ -112,6 +112,7 @@ def test_settings_refuse_a_malformed_value_at_load(value: str) -> None:
 
 class _FakeServer:
     client_principal = "alice@EXAMPLE.COM"
+    complete = True  # an incomplete context names no client (BACKLOG #2610 review point c)
 
     def step(self, token: bytes) -> None:
         return None
