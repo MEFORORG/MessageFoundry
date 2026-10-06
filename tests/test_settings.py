@@ -720,7 +720,6 @@ def test_auth_defaults_required_with_secure_policy(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     s = load_settings(environ={})
-    assert s.auth.enabled is True  # authentication required by default
     assert s.auth.password_min_length == 15 and s.auth.lockout_threshold == 5  # ASVS-aligned (WP-3)
     assert s.auth.session_idle_timeout_minutes == 30
     assert s.auth.ad_enabled is False and s.auth.kerberos_enabled is False

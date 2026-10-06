@@ -12,12 +12,12 @@ be driven two ways:
 * :func:`create_managed_app(...)` — own the engine via an ASGI lifespan (the CLI server,
   and anything driven by a synchronous test client).
 
-Authentication + RBAC are enforced whenever an enabled :class:`AuthService` is attached. The
-``serve`` path always attaches one: it refuses to start with sign-in off, on every bind (vault
-BACKLOG #2719). With **no** enabled auth attached, both factories are **fail-closed**: every
+Authentication + RBAC are enforced whenever an :class:`AuthService` is attached, and no setting
+turns an attached service off (vault BACKLOG #2825). The ``serve`` path always attaches one, on every
+bind (vault BACKLOG #2719). With **no** auth attached, both factories are **fail-closed**: every
 protected route is refused (503) unless the caller passes ``allow_no_auth=True``, in which case
-requests run as the full-access system identity (SYS-1). Only embedders and tests pass it;
-``serve`` never does.
+requests run as the full-access system identity (SYS-1). Both factories refuse that opt-in beside
+an auth service or auth settings. Only embedders and tests pass it; ``serve`` never does.
 
 The API binds localhost by default and
 always serves TLS (ADR 0172): an operator-supplied certificate wins if configured, otherwise the
@@ -219,6 +219,7 @@ from messagefoundry.api.security import (
     optional_identity,
     pending_credential_deadline,
     public_route,
+    refuse_from_new_address,
     refuse_undeclared_route,
     require,
     require_paced,
@@ -2057,6 +2058,13 @@ def create_app(
     log_dir: str | None = None,
     configured_log_level: str | None = None,
 ) -> FastAPI:
+    # The open mode is the opt-in with no service, and nothing else (vault BACKLOG #2825). Beside a
+    # service the opt-in would leave a live open-mode flag on a signed-in app, so it is refused.
+    if allow_no_auth and auth is not None:
+        raise ValueError(
+            "create_app: allow_no_auth=True was passed beside an auth service; pass the opt-in "
+            "only with no service, since a service always requires sign-in"
+        )
     # The interactive docs (/docs, /redoc) and the OpenAPI schema (/openapi.json) are off by
     # default: they widen the attack surface and disclose the schema, which matters the moment the
     # API binds off-loopback. Opt in with [api] expose_docs = true. See docs/PHI.md §10.
@@ -2411,8 +2419,9 @@ def create_app(
         request: Request, identity: Identity | None = Depends(optional_identity)
     ) -> Health:
         # Liveness is always answerable (tokenless), but the build version is fingerprinting info, so
-        # it is disclosed only to an authenticated caller (WP-L3-07 / ASVS 13.4.6). When auth is
-        # disabled-with-allow_no_auth, optional_identity returns the system identity → version shown.
+        # it is disclosed only to an authenticated caller (WP-L3-07 / ASVS 13.4.6). On an app built
+        # with allow_no_auth=True and no service, optional_identity returns the system identity, so
+        # the version is shown.
         #
         # observed_client is echoed ONLY when [security].allowed_client_networks is in use, so the
         # default deployment's /health payload is byte-identical. This route is EXEMPT from the network
@@ -3608,8 +3617,9 @@ def create_app(
         ``GET /connections/{name}/metadata``. A caller without that permission is refused,
         and the refusal is audited as
         ``auth.permission_denied`` like every other one (ASVS 16.3.2). Over HTTP the reveal is
-        also a PHI read: it takes the serve-hop refusal and the per-actor PHI budget. The web
-        console's reveal routes already charged both through ``require_ui(..., phi=True)`` before
+        also a PHI read: it takes the serve-hop refusal, the new-address refusal (vault BACKLOG
+        #2620) and the per-actor PHI budget. The web console's reveal routes already took all three
+        through ``require_ui(..., phi=True)`` before
         calling in-process, so a ``/ui`` route is not charged twice. That skip reads the matched
         route, so a future ``/ui`` route passing ``reveal`` must carry ``phi=True`` itself."""
         if reveal is None:
@@ -3626,6 +3636,9 @@ def create_app(
             raise HTTPException(403, "a reveal needs messages:view_summary")
         if not (_matched_route_path(request) or "").startswith("/ui/"):
             enforce_phi_read_hop(request)
+            # Vault BACKLOG #2620: a PHI read, so it refuses a new address as require_phi_read
+            # does, before the budget. The /ui twins asked in require_ui's phi=True arm.
+            await refuse_from_new_address(request)
             enforce_phi_read_pacing(request, identity)
 
     async def _redact_reasons(
@@ -7729,8 +7742,6 @@ async def _assert_security_notice_is_deliverable(
     which is a different and much larger change.
     """
     auth_settings = auth_settings or AuthSettings()
-    if not auth_settings.enabled:
-        return  # sign-in is not required, so no Administrator is needed to reach the engine
     alerts = alerts_settings or AlertsSettings()
     # The two preconditions of the deliverability question. Either one false skips the refusal: the
     # transport gate already governs notices off, and the waiver is the audited, in-writing opt-out.
@@ -8123,10 +8134,10 @@ def create_managed_app(
 
     Pass ``store_settings`` for full backend selection (the service path), or ``db_path`` (+optional
     ``synchronous``) as a SQLite shortcut. ``config_dir`` loads the code-first Connection/Router/
-    Handler graph. ``auth_settings`` (when enabled) attaches an :class:`AuthService` and seeds the
-    built-in roles; it creates no account (ADR 0183). With unset or disabled ``auth_settings`` every
-    protected route is refused (503) unless the caller passes ``allow_no_auth=True``, the same opt-in
-    :func:`create_app` takes; beside enabled ``auth_settings`` that opt-in raises ``ValueError``.
+    Handler graph. ``auth_settings`` attaches an :class:`AuthService` and seeds the built-in roles;
+    it creates no account (ADR 0183). With no ``auth_settings`` every protected route is refused
+    (503) unless the caller passes ``allow_no_auth=True``, the same opt-in :func:`create_app` takes;
+    beside ``auth_settings`` that opt-in raises ``ValueError``.
     The store is opened via the
     backend-agnostic :func:`~messagefoundry.store.open_store`. ``api_listener`` is the engine's own
     ``(host, port)`` (from ``[api]``), reserved so no inbound listener can be wired onto the API's port
@@ -8144,13 +8155,12 @@ def create_managed_app(
             raise ValueError("create_managed_app requires either store_settings or db_path")
         store_settings = sqlite_settings(db_path, synchronous=synchronous)
     resolved = store_settings
-    # create_app can ignore the opt-in beside an enabled service, because it is handed the service
-    # already attached. Here the service attaches in the lifespan, so an app that never ran it
-    # would answer as the system identity. The combination is refused instead.
-    if allow_no_auth and auth_settings is not None and auth_settings.enabled:
+    # The open mode is the opt-in with no service (vault BACKLOG #2825), the rule create_app holds.
+    # Checked here and not left to create_app: the service attaches only in the lifespan.
+    if allow_no_auth and auth_settings is not None:
         raise ValueError(
-            "create_managed_app: allow_no_auth=True was passed beside enabled auth_settings; "
-            "pass the opt-in only when sign-in is off"
+            "create_managed_app: allow_no_auth=True was passed beside auth_settings; pass the "
+            "opt-in only with no auth_settings, since settings always require sign-in"
         )
 
     @asynccontextmanager
@@ -8526,7 +8536,7 @@ def create_managed_app(
             # (the OIDC revocation guard, #1887) stops startup before any connection starts. Only
             # construction is here; initialize() and every use of the service stay below the start.
             auth: AuthService | None = None
-            if auth_settings is not None and auth_settings.enabled:
+            if auth_settings is not None:
                 # Out-of-band security-event push (#188, ASVS 6.3.5/6.3.7) — reuses the [alerts] SMTP
                 # transport, sent to each affected user's own address. The notifier is wired only when the
                 # [auth].notify_security_events kill-switch is on AND a transport can be built (SMTP
@@ -8649,10 +8659,9 @@ def create_managed_app(
                 )
                 upload_retention_runner.start()
             # Back the COMPLETE loosening list on GET /security/posture: [auth] carries posture switches
-            # (ad_session_recheck_seconds) that security_loosenings() must see. Stashed here, OUTSIDE the
-            # `enabled` guard below, deliberately — a settings object that exists but is disabled is still
-            # the resolved settings, and stashing it only on the enabled path would make the route silently
-            # fall back to AuthSettings() defaults and report a subset. Mirrors store_settings above.
+            # (ad_session_recheck_seconds) that security_loosenings() must see. Without the stash the
+            # route would fall back to AuthSettings() defaults and report a subset. Mirrors
+            # store_settings above.
             if auth_settings is not None:
                 app.state.auth_settings = auth_settings
             # The start's config_loaded row (vault BACKLOG #2597), as early as its readers allow: the
@@ -8835,8 +8844,8 @@ def create_managed_app(
                 # connection_stopped/queue_buildup still drains; bounded by the transport timeouts.
                 await notifier.aclose()
 
-    # Unset or disabled auth_settings no longer select the open mode: only the caller's opt-in,
-    # checked at the top, does (vault BACKLOG #2611).
+    # Settings never select the open mode: only the caller's opt-in, checked at the top, does
+    # (vault BACKLOG #2611, #2825).
     return create_app(
         lifespan=lifespan,
         # Build the opt-in uploaded-logs store in the SERVE path too (previously only the direct/test

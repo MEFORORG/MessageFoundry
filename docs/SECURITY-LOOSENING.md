@@ -72,14 +72,14 @@ section reference.
 | | `[store].allow_unmarked_ciphertext` | `false` (an unmarked value in an encrypted column is refused) |
 | | `[auth].ad_session_recheck_seconds` | `300` s (*conditional* — a loosening only once `ad_enabled`) |
 | | `[auth].ad_allow_insecure_ldap` | `false` (*conditional* — a loosening only while a plain bind is live; loads only under `enforcement = warn`. See its entry below) |
-| | `[auth].admin_new_ip_step_up` | `true` (*conditional* — a loosening only while auth is on) |
-| | `[auth].login_rate_limit_enabled`, `login_rate_limit_per_ip`, `login_rate_limit_global`, `login_rate_limit_window_seconds` | `true` / `10` / `60` / `60` s (*conditional* — a loosening only while auth is on; `false`, a count of `0` or above its default, or a window below `60` s is named, and `0` or a window of `0` or less turns a limit off) |
-| | `[auth].lockout_minutes`, `lockout_threshold`, `lockout_max_minutes` | `15` / `5` / `1440` (*conditional* — a loosening only while auth is on; minutes below `15` or a ceiling below `1440` is named, and so is a threshold above `5`; minutes of `0` or less means no lock ever holds) |
-| | `[auth].phi_read_rate_limit_enabled`, `phi_read_rate_limit_per_actor`, `phi_read_rate_limit_window_seconds` | `true` / `120` / `60` s (*conditional* — a loosening only while auth is on; `false`, a count of `0` or above `120`, or a window below `60` s) |
-| | `[auth].admin_write_rate_limit_enabled`, `admin_write_rate_limit_per_actor`, `admin_write_rate_limit_window_seconds`, `admin_write_min_interval_seconds` | `true` / `12` / `15` s / `0.15` s (*conditional* — a loosening only while auth is on; `false`, a count of `0` or above `12`, a window below `15` s, or a gap below `0.15` s) |
-| | `[auth].mfa_verify_min_elapsed_seconds`, `oidc_callback_min_elapsed_seconds` | `1.0` s / `1.0` s (*conditional* — a loosening only while auth is on, and the second only with OIDC on; a floor below `1.0` s, and `0` turns it off) |
-| | `[auth].max_sessions_per_user` | `5` (*conditional* — a loosening only while auth is on; `0` or less means unlimited, and so is named, as is any cap above `5`) |
-| | `[auth].oidc_flow_cache_max` | `512` (*conditional* — a loosening only while auth and OIDC are on; a cap above `512`. `0` or less refuses every flow, which is stricter) |
+| | `[auth].admin_new_ip_step_up` | `true` |
+| | `[auth].login_rate_limit_enabled`, `login_rate_limit_per_ip`, `login_rate_limit_global`, `login_rate_limit_window_seconds` | `true` / `10` / `60` / `60` s (`false`, a count of `0` or above its default, or a window below `60` s is named, and `0` or a window of `0` or less turns a limit off) |
+| | `[auth].lockout_minutes`, `lockout_threshold`, `lockout_max_minutes` | `15` / `5` / `1440` (minutes below `15` or a ceiling below `1440` is named, and so is a threshold above `5`; minutes of `0` or less means no lock ever holds) |
+| | `[auth].phi_read_rate_limit_enabled`, `phi_read_rate_limit_per_actor`, `phi_read_rate_limit_window_seconds` | `true` / `120` / `60` s (`false`, a count of `0` or above `120`, or a window below `60` s) |
+| | `[auth].admin_write_rate_limit_enabled`, `admin_write_rate_limit_per_actor`, `admin_write_rate_limit_window_seconds`, `admin_write_min_interval_seconds` | `true` / `12` / `15` s / `0.15` s (`false`, a count of `0` or above `12`, a window below `15` s, or a gap below `0.15` s) |
+| | `[auth].mfa_verify_min_elapsed_seconds`, `oidc_callback_min_elapsed_seconds` | `1.0` s / `1.0` s (*conditional* — the second a loosening only with OIDC on; a floor below `1.0` s, and `0` turns it off) |
+| | `[auth].max_sessions_per_user` | `5` (`0` or less means unlimited, and so is named, as is any cap above `5`) |
+| | `[auth].oidc_flow_cache_max` | `512` (*conditional* — a loosening only while OIDC is on; a cap above `512`. `0` or less refuses every flow, which is stricter) |
 | | `[api].trusted_proxies` | `[]` (entries covering every address, such as `0.0.0.0/0` or `::/0`, trust `X-Forwarded-For` from every peer, as the refused `*` would) |
 | | `[secret_rotation].enforce_store_key_expiry` | `true` (a calendar-overdue store DEK refuses to start) |
 | | `[api].plaintext_upstream_hop_acknowledged` | `false` (*conditional* — a loosening only while `[api].tls_terminated_upstream` is set with no `[api].tls_cert_file`, the one topology where the engine serves the proxy-to-engine hop in plaintext) |
@@ -577,8 +577,8 @@ This section is kept rather than deleted, because the claim it used to make is t
 > **Conditional**, and reachable only at `[security].enforcement = warn`. Under `enforce` the switch is
 > inert and the config is refused at load, as `MEFOR_ALLOW_INSECURE_TLS` is inert there (vault BACKLOG
 > #2354). A loopback `ldap://` address is refused too.
-> It is reported only while a plain bind is live, which needs at least `ad_enabled`,
-> sign-in (always on under `serve`) and an `ad_server` that is not `ldaps://`.
+> It is reported only while a plain bind is live, which needs at least `ad_enabled`
+> and an `ad_server` that is not `ldaps://`.
 - **What you lose:** the encryption and the server authentication on the AD hop. The binds that remain
   include the service account's and the step-up re-bind a directory user makes to confirm a sensitive
   action. Each is a SIMPLE bind, so the service-account password and the password of every user who
@@ -593,11 +593,12 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **Reversible:** yes, immediately — point `ad_server` at `ldaps://`, or delete the line, and restart.
 
 ### `[auth].admin_new_ip_step_up = false` — a new client address mid-session goes unchallenged
-> **Conditional** on sign-in. An app an embedder builds with sign-in off has no session for the signal to
-> guard, so it is reported **only** while auth is on, which `serve` always is. The default is `true` since BACKLOG #288
+> Reported whenever it is `false`. No sign-in condition applies, since no setting turns sign-in off
+> (vault BACKLOG #2825). The default is `true` since BACKLOG #288
 > (owner ruling 2026-09-26); before that it shipped off, with an exposure-time advisory.
 - **What you lose:** a session token presented from a **client address it has not verified from**
-  can perform a sensitive admin action on the strength of the ordinary step-up window alone. Nothing
+  can perform a sensitive admin action on the strength of the ordinary step-up window alone, and can
+  read message bodies and call the paced writes with no step-up at all (vault BACKLOG #2620). Nothing
   writes `auth.admin_action_new_ip`, nothing notifies the account holder, and nothing forces a fresh
   step-up. A stolen token replayed from another host is the case this signal exists for.
 - **When acceptable:** a deployment whose operators reach the console through a pool of egress
@@ -610,8 +611,8 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **Reversible:** yes, immediately — set it back to `true` (or delete the line) and restart.
 
 ### `[auth].login_rate_limit_enabled = false`, or a limit looser than its default — sign-in attempts go less paced
-> **Conditional** on sign-in, like `admin_new_ip_step_up`: an app an embedder builds with sign-in off has
-> no sign-in to limit, and `serve` always requires it. Each of these values is reported under its own key
+> Reported whenever set, since no setting turns sign-in off (vault BACKLOG #2825). Each of these
+> values is reported under its own key
 > ([BACKLOG #1131](BACKLOG.md), ASVS 6.1.1). The owner ruled on 2026-09-27 that a silent weakening here
 > keeps ASVS 6.1.1 at partial.
 >
@@ -649,7 +650,7 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **Reversible:** yes, immediately — restore the default (or delete the line) and restart.
 
 ### `[auth].lockout_minutes`, `lockout_threshold` or `lockout_max_minutes` looser than its default — the account lock protects less
-> **Conditional** on sign-in, as above ([BACKLOG #1131](BACKLOG.md)). Each key is named when it is looser
+> No sign-in condition applies, as above ([BACKLOG #1131](BACKLOG.md)). Each key is named when it is looser
 > than its shipped default, and each says whether it is off or only looser.
 >
 > | Value | What loosens |
@@ -680,7 +681,7 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **Reversible:** yes, immediately — restore `15`, `5` and `1440` (or delete the lines) and restart.
 
 ### `[auth].phi_read_rate_limit_*` looser than its default — PHI reads go less paced
-> **Conditional** on sign-in ([BACKLOG #1131](BACKLOG.md), ASVS 2.4.1). Named: `phi_read_rate_limit_enabled
+> No sign-in condition applies ([BACKLOG #1131](BACKLOG.md), ASVS 2.4.1). Named: `phi_read_rate_limit_enabled
 > = false`; a `phi_read_rate_limit_window_seconds` of `0` or less (off) or below `60` s (looser); a
 > `phi_read_rate_limit_per_actor` of `0` (off) or above `120` (looser). The same parts rule applies as for
 > sign-in: with the limiter off, or its window at `0` or less, its count is not named again.
@@ -696,7 +697,7 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **Reversible:** yes, immediately — restore the default (or delete the line) and restart.
 
 ### `[auth].admin_write_*` looser than its default — state-changing admin actions go less paced
-> **Conditional** on sign-in ([BACKLOG #1131](BACKLOG.md), ASVS 2.4.2). Named:
+> No sign-in condition applies ([BACKLOG #1131](BACKLOG.md), ASVS 2.4.2). Named:
 > `admin_write_rate_limit_enabled = false`; an `admin_write_rate_limit_window_seconds` below `15` s; an
 > `admin_write_rate_limit_per_actor` of `0` (off) or above `12`; an `admin_write_min_interval_seconds` of
 > `0` (off) or below `0.15` s. The window cannot be `0` or less (the load refuses it), but a tiny one,
@@ -713,7 +714,7 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **Reversible:** yes, immediately — restore the default (or delete the line) and restart.
 
 ### `[auth].mfa_verify_min_elapsed_seconds` or `oidc_callback_min_elapsed_seconds` below `1.0` s — a second step may come at machine speed
-> **Conditional** on sign-in ([BACKLOG #1131](BACKLOG.md), ASVS 2.4.2), and the callback floor only while
+> No sign-in condition applies ([BACKLOG #1131](BACKLOG.md), ASVS 2.4.2). The callback floor is named only while
 > `[auth].oidc_enabled` is on. These are the BACKLOG #2301 time floors, beside
 > `admin_write_min_interval_seconds` above. Each refuses an action that comes sooner than the floor and
 > skips the check at `0`, so a floor below its default of `1.0` s is named as looser and `0` as off. A
@@ -732,7 +733,7 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **Reversible:** yes, immediately — restore `1.0` (or delete the line) and restart.
 
 ### `[auth].max_sessions_per_user` of `0` or above `5` — more live sessions per user
-> **Conditional** on sign-in ([BACKLOG #1131](BACKLOG.md), ASVS 7.1.2). `0` or less means unlimited, so it
+> No sign-in condition applies ([BACKLOG #1131](BACKLOG.md), ASVS 7.1.2). `0` or less means unlimited, so it
 > is named as off; any cap above `5` is named as looser.
 - **What you lose:** a new sign-in beyond the cap revokes the user's oldest live session. With a higher
   cap, or none, a stolen or forgotten session stays live beside the owner's for longer.
@@ -743,7 +744,7 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **Reversible:** yes, immediately — restore `5` (or delete the line) and restart.
 
 ### `[auth].oidc_flow_cache_max` above `512` — more pending federated sign-ins held in memory
-> **Conditional** on sign-in and on `[auth].oidc_enabled`, since the cache is built only with federation on
+> **Conditional** on `[auth].oidc_enabled`, since the cache is built only with federation on
 > ([BACKLOG #1131](BACKLOG.md)). The cache refuses a new flow once it holds this many, so a cap of `0` or
 > less refuses **every** federated sign-in. That is stricter, not looser, and it is not named. A cap above
 > `512` is named. A very large one, such as `1e9`, removes the engine-wide bound in practice.

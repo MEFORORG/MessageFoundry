@@ -95,6 +95,7 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.connection_names import is_connection_name
 from messagefoundry.controlchars import has_lone_surrogate
+from messagefoundry.domainshape import domain_shape_problem, is_canonical_ipv4
 from messagefoundry.logging_setup import LOG_LEVELS
 from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.remotedebug import RemoteDebugPosture, remote_debug_loosening
@@ -2733,10 +2734,28 @@ _AD_TIMEOUT_MAX_SECONDS = 3600.0
 
 
 class AuthSettings(_Section):
-    """Authentication + RBAC knobs. Secrets (the AD bind password) come from env, never the file."""
+    """Authentication + RBAC knobs. Secrets (the AD bind password) come from env, never the file.
 
-    # Authentication is required by default; this flag exists only for the embedding/test path.
-    enabled: bool = True
+    There is no sign-in switch here (vault BACKLOG #2825). Settings that exist build an auth service,
+    and a service always requires sign-in. The open mode is the app factories' ``allow_no_auth=True``
+    with no settings at all."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _refuse_the_removed_sign_in_switch(cls, data: Any) -> Any:
+        """Refuse ``enabled`` loudly rather than drop it (vault BACKLOG #2825).
+
+        ``extra="ignore"`` would drop it, so settings built in code with ``enabled=False`` would
+        silently require sign-in after all. The loader already refuses the key from a file or the
+        environment as REMOVED (``_REMOVED_KEYS``), before any model is built."""
+        if isinstance(data, Mapping) and "enabled" in data:
+            raise ValueError(
+                "AuthSettings has no `enabled` field: sign-in cannot be turned off (vault BACKLOG "
+                "#2825). For an app with no sign-in, pass the app factory allow_no_auth=True and no "
+                "auth settings"
+            )
+        return data
+
     session_idle_timeout_minutes: int = 30
     session_absolute_hours: int = 12
     # Cap concurrent sessions per user (ASVS 7.1.2); a login beyond the cap revokes the user's oldest
@@ -2847,14 +2866,15 @@ class AuthSettings(_Section):
     # on, a step-up (sensitive admin) request arriving from a client IP that differs from the one the
     # session last verified from is treated as higher-risk: it emits an audit + out-of-band notice and
     # FORCES a fresh step-up (a successful re-verify re-anchors the session to the new IP). It is
-    # advisory + step-up-forcing only — it NEVER changes an RBAC allow/deny and never blocks the
-    # non-admin request path. A single-host loopback deployment never trips it (loopback addresses
+    # step-up-forcing only — it NEVER changes an RBAC allow/deny. Since vault BACKLOG #2620 at least
+    # the PHI reads and the paced writes refuse on it too, and the base gate never asks;
+    # docs/SECURITY.md (administrative-interface item 6) names the gates. A single-host loopback deployment never trips it (loopback addresses
     # 127.0.0.1 and ::1 are treated as the same host, so a dual-stack box doesn't spuriously fire).
     #
     # DEFAULT ON since BACKLOG #288 (owner ruling 2026-09-26, ASVS 8.2.4). It used to default off,
     # with an exposure-time advisory asking an off-loopback operator to turn it on; the hardened path
     # is now the shipped path. Setting it false is a LOOSENING -- `security_loosenings()` names it
-    # whenever auth is on -- because it removes the only mid-session address signal.
+    # -- because it removes the only mid-session address signal.
     admin_new_ip_step_up: bool = True
 
     # Local-password policy — ASVS 5.0-aligned (WP-3): length-first, no mandatory composition.
@@ -3127,7 +3147,7 @@ class AuthSettings(_Section):
     # lockout: bounds password-spray + argon2 CPU-burn. In-process only; an exposed/multi-host
     # deployment must also front the API with a proxy/WAF limiter. 0 disables a limit, and a window
     # of 0 or less disables both. A count above its default, a window below it, and each off value is
-    # a LOOSENING that `security_loosenings()` names while auth is on (BACKLOG #1131); so are the
+    # a LOOSENING that `security_loosenings()` names (BACKLOG #1131); so are the
     # PHI-read, admin-write, session-cap and OIDC flow-cache limits below.
     login_rate_limit_enabled: bool = True
     login_rate_limit_per_ip: int = 10  # max attempts per client IP per window
@@ -4044,8 +4064,26 @@ def forward_hop_disposition(log: LoggingSettings, posture: HopPosture) -> HopDis
     )
 
 
-#: The characters a ``[egress].allowed_recipient_domains`` entry may hold, after lowercasing.
-_DOMAIN_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-.")
+def _bare_domain_entries(value: list[str], *, allow_ipv4: bool, refusal: str) -> list[str]:
+    """One domain list's entries, normalised, or a ``ValueError`` for the first that can never match.
+
+    Shared by ``[egress].allowed_recipient_domains`` and the two ``[security]`` navigation lists
+    (vault BACKLOG #2843). Surrounding whitespace is stripped and a blank entry is skipped. Each
+    entry must pass :func:`~messagefoundry.domainshape.domain_shape_problem`, or with
+    ``allow_ipv4`` be a canonical IPv4 address. No dot is stripped, so a leading or trailing dot is
+    refused rather than silently dropped. An entry is lowercased only after the check, because
+    ``str.lower()`` turns some non-ASCII letters, such as the Kelvin sign, into ASCII ones, which
+    would accept a value that differs from the one written. ``refusal`` ends the error message."""
+    cleaned: list[str] = []
+    for raw in value:
+        item = raw.strip()
+        if not item:
+            continue
+        problem = domain_shape_problem(item)
+        if problem is not None and not (allow_ipv4 and is_canonical_ipv4(item)):
+            raise ValueError(f"{item!r} is {problem}. {refusal}")
+        cleaned.append(item.lower())
+    return cleaned
 
 
 class EgressSettings(_Section):
@@ -4166,31 +4204,21 @@ class EgressSettings(_Section):
         A recipient domain is compared exactly against the part of an address after its last ``@``.
         So an address, a URL, a port or a wildcard looks plausible and matches nothing, and an
         operator would believe they had listed a domain they had not. Unlike
-        ``[security].organization_domains``, subdomains are NOT matched: each needs its own entry."""
-        cleaned: list[str] = []
-        for raw in value:
-            if not raw.strip():
-                continue
-            item = raw.strip().lower().rstrip(".")
-            labels = item.split(".")
-            # A hostname-shaped domain: letters, digits and hyphens in labels of 1 to 63 characters,
-            # no label starting or ending with a hyphen, and a final label that is not all digits.
-            # This refuses an address, URL, port, wildcard, leading-dot suffix, IP address and a
-            # comma-joined pair, none of which names a mail domain the exact match should accept.
-            if (
-                not item
-                or set(item) - _DOMAIN_CHARS
-                or any(not 0 < len(label) <= 63 for label in labels)
-                or any(label[0] == "-" or label[-1] == "-" for label in labels)
-                or labels[-1].isdigit()
-            ):
-                raise ValueError(
-                    f"[egress].allowed_recipient_domains: {item!r} must be a bare domain such as "
-                    "'hospital.example', not an address, URL, port, wildcard or suffix; list each "
-                    "subdomain as its own entry"
-                )
-            cleaned.append(item)
-        return cleaned
+        ``[security].organization_domains``, subdomains are NOT matched: each needs its own entry.
+
+        Each entry must pass the shape rule the send path applies to a recipient's domain, so an
+        entry shaped like no sendable domain is refused here, not at the gate. One gap remains: a
+        domain of exactly 253 characters passes here, but the send path's 254-character address cap
+        refuses every address in it. Normalisation, in
+        :func:`_bare_domain_entries`: whitespace stripped, blanks skipped, no dot stripped, and
+        lowercased after the check. No IP address is accepted (vault BACKLOG #2843)."""
+        return _bare_domain_entries(
+            value,
+            allow_ipv4=False,
+            refusal="[egress].allowed_recipient_domains needs a bare domain such as "
+            "'hospital.example', not an address, URL, port, wildcard or suffix; list each "
+            "subdomain as its own entry",
+        )
 
 
 #: How an operator-facing refusal says ``EgressSettings.deny_by_default`` is on (BACKLOG #1361).
@@ -5971,8 +5999,8 @@ class SecuritySettings(_Section):
     # ── Sign-in & identity ───────────────────────────────────────────
     # There is no sign-in switch here. `serve` always requires sign-in (vault BACKLOG #2719): the
     # loopback no-auth mode it once offered was removed, not relocated, so `require_sign_in` is
-    # refused at load as a REMOVED key (_REMOVED_KEYS). AuthSettings.enabled survives only for
-    # embedders and tests that build the app themselves with allow_no_auth=True.
+    # refused at load as a REMOVED key (_REMOVED_KEYS). AuthSettings has no such field either (vault
+    # BACKLOG #2825); only an app built in code with allow_no_auth=True runs without sign-in.
     require_mfa: bool = True  # second factor, enforced as an ACCESS gate (ASVS 6.3.3)
     # Who must enroll one when require_mfa is on. Default widens the gate past the Administrator role
     # to every local account (ASVS 6.3.3); "administrators" restores the pre-6.3.3 posture.
@@ -6032,7 +6060,8 @@ class SecuritySettings(_Section):
     # is sent somewhere "outside the application's CONTROL", and control is organisational rather than
     # topological — an operator's own AD FS is a different host, a different origin, and squarely
     # theirs. Matched on a LABEL boundary, so "hospital.example" covers "adfs.hospital.example" and
-    # NOT "evilhospital.example"; a bare endswith would admit the lookalike.
+    # NOT "evilhospital.example"; a bare endswith would admit the lookalike. An IPv4 entry matches
+    # only that address (vault BACKLOG #2843).
     #
     # EMPTY (the default) is deliberately the strict position, not the lax one: with nothing declared,
     # every absolute http(s) destination is treated as external and gets the interstitial. An operator
@@ -6044,7 +6073,7 @@ class SecuritySettings(_Section):
     # WARNING: THE AUDITED ESCAPE, and it LOWERS SECURITY. Destinations here are navigated to with no
     # notification and no cancel — precisely what 3.7.3 asks for. It exists because operators have
     # legitimate high-volume external destinations they do not want to declare as their own domain.
-    # Same label-boundary matching. Non-empty produces a startup warning naming every entry; the
+    # Same matching, an IPv4 entry exactly. Non-empty produces a startup warning naming every entry; the
     # method's rule is that a signed relaxation is never a Pass, so this is the delta, not the default.
     external_link_allowlist: list[str] = Field(default_factory=list)
 
@@ -6067,19 +6096,29 @@ class SecuritySettings(_Section):
         an internal domain and get an interstitial on every internal link, or worse, believe they had
         allowlisted something that is still being warned about. Failing at config load is the only
         place this is cheap to notice.
+
+        Each entry must pass the shape rule ``[egress].allowed_recipient_domains`` and the mail
+        address check apply, which also refuses a URL, a port and a wildcard. Normalisation, in
+        :func:`_bare_domain_entries`: whitespace stripped, blanks skipped, no dot stripped, and
+        lowercased after the check. A leading dot is refused rather than dropped: label-boundary
+        matching already covers every subdomain, which is all it could have meant (vault BACKLOG
+        #2843).
+
+        ONE DIFFERENCE FROM THE EGRESS LIST, AND WHY. A canonical dotted-quad IPv4 address, such as
+        ``10.20.30.40``, is accepted here and refused there. These lists are matched against the
+        host of a URL the browser navigates to, and an identity provider on a private network can
+        be reached by address; a mail domain is never an IP address. A short, octal or hexadecimal
+        form is still refused, and so is a partial quad such as ``0.1``, which label-boundary
+        matching would let cover every address that ends in it. The console matches an IPv4 entry
+        exactly. IPv6 stays refused.
         """
-        cleaned: list[str] = []
-        for raw in value:
-            item = raw.strip().lower().lstrip(".")
-            if not item:
-                continue
-            if "/" in item or ":" in item or "*" in item:
-                raise ValueError(
-                    f"{item!r} must be a bare domain such as 'hospital.example', not a URL, scheme "
-                    "or wildcard — subdomains are matched automatically on a label boundary"
-                )
-            cleaned.append(item)
-        return cleaned
+        return _bare_domain_entries(
+            value,
+            allow_ipv4=True,
+            refusal="Write a bare domain such as 'hospital.example', not a URL, scheme or "
+            "wildcard, and with no leading dot: subdomains are matched automatically on a label "
+            "boundary",
+        )
 
     @field_validator("static_credential_accepted", mode="after")
     @classmethod
@@ -6214,8 +6253,6 @@ class ServiceSettings(_InputHidingModel):
         it at build for a caller that hands it an ``AuthSettings`` alone. Under ``warn`` the opt-in is
         honoured, warned at build and named by :func:`security_loosenings`.
 
-        Not keyed on ``[auth].enabled``: with sign-in off nothing dials the directory, but turning
-        sign-in on would make the bind live with no second check, so the config is refused either way.
         A loopback ``ldap://`` (an on-box LDAPS proxy) is refused too; the cleartext-hop gradient's
         loopback ALLOW was not extended to this hop."""
         if self.auth.plain_ldap_bind and self.security.enforcement is SecurityEnforcement.ENFORCE:
@@ -7214,10 +7251,9 @@ def security_loosenings(
     interpreter (vault BACKLOG #2701), and
     ``[store].schema_management = auto`` on a server backend (#305). It is NOT yet
     an exhaustive registry of every security-relevant switch in every section; ``[store]``/``[auth]``
-    carry others (``encrypt``, ``trust_server_certificate``, ``enabled``, ``ad_tls_verify``,
+    carry others (``encrypt``, ``trust_server_certificate``, ``ad_tls_verify``,
     ``oidc_require_mfa_claim``, ``password_check_breached``) that are not reported here. Most are
-    gated elsewhere. ``enabled`` has no config key: ``serve`` always requires sign-in (vault BACKLOG
-    #2719). ``oidc_require_mfa_claim`` has no serve-time refusal of its own: turned off, it mints
+    gated elsewhere. ``oidc_require_mfa_claim`` has no serve-time refusal of its own: turned off, it mints
     every OIDC session with no factor met, and while ``require_mfa`` is on that session owes an
     engine factor. The parenthetical list above is enumerated in the floor test's exemption set so
     the gap is a written decision that a new switch cannot silently join. That set also holds at
@@ -7549,10 +7585,8 @@ def security_loosenings(
         )
     # Vault BACKLOG #2354: a plain ldap:// AD bind. ServiceSettings refuses it at load under enforce, so a
     # loaded config reaches this only at warn. Conditional on the bind being live: the flag beside an
-    # ldaps:// address, with AD off, or with sign-in off (nothing builds the authenticator) changes
-    # nothing and is not named. Sign-in is off only on an app an embedder or a test built itself;
-    # `serve` always requires it (vault BACKLOG #2719).
-    if auth.enabled and auth.plain_ldap_bind:
+    # ldaps:// address, or with AD off, changes nothing and is not named.
+    if auth.plain_ldap_bind:
         out.append(
             (
                 "ad_allow_insecure_ldap",
@@ -7561,9 +7595,8 @@ def security_loosenings(
                 "domain controller",
             )
         )
-    # BACKLOG #288: the new-client-IP step-up defaults ON. Conditional on auth, like the entry above is
-    # on the directory: with sign-in off there is no session for the signal to guard.
-    if auth.enabled and not auth.admin_new_ip_step_up:
+    # BACKLOG #288: the new-client-IP step-up defaults ON.
+    if not auth.admin_new_ip_step_up:
         out.append(
             (
                 "admin_new_ip_step_up",
@@ -7575,10 +7608,7 @@ def security_loosenings(
     # BACKLOG #1131, owner ruling 2026-09-27 (#2006): a silent weakening of an anti-automation control
     # keeps its ASVS cell at partial. Every such limit LOOSER THAN ITS SHIPPED DEFAULT is named, not
     # only an off value; _auth_limit_loosenings says why and how each direction was read.
-    # Gated on [auth].enabled. A loaded config always has it on: `serve` requires sign-in and no key
-    # turns it off (vault BACKLOG #2719). Only an app an embedder or a test built itself has it off.
-    if auth.enabled:
-        out.extend(_auth_limit_loosenings(auth))
+    out.extend(_auth_limit_loosenings(auth))
     # BACKLOG #1131: trusted_proxies ranges covering every peer of a family (0.0.0.0/0, ::/0, or
     # ranges whose union is that) make uvicorn trust X-Forwarded-For from all of them, which is what
     # the refused "*" does. The load still accepts them; naming them is the fix. Parsed STRICTLY, as

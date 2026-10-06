@@ -579,7 +579,7 @@ async def test_stock_health_reads_as_the_engine_and_a_generic_responder_does_not
     certificate, and one engine build rather than two.
 
     The VALUES below are this app shape's (auth unconfigured, so a tokenless caller gets no
-    version). An engine with ``[auth] enabled = false`` fills ``version`` in for the same tokenless
+    version). An app built with ``allow_no_auth=True`` fills ``version`` in for the same tokenless
     call -- same three KEYS, different values, which is exactly why the tray keys on the names."""
     app = _app(engine, [])
     async with _client(app, "127.0.0.1") as c:

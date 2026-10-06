@@ -90,7 +90,7 @@ async def test_a_fresh_store_gets_no_account(tmp_path: Path) -> None:
     app = create_managed_app(
         db_path=db,
         poll_interval=0.05,
-        auth_settings=AuthSettings(enabled=True, notify_security_events=False),
+        auth_settings=AuthSettings(notify_security_events=False),
         egress_settings=EgressSettings(deny_by_default=False),
     )
     async with app.router.lifespan_context(app):

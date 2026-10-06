@@ -1796,15 +1796,14 @@ async def test_ad_session_maps_groups_and_grants_permission(engine: Engine) -> N
         assert (await c.get("/auth/providers", headers=h)).json()["ad"] is False
 
 
-async def test_disabled_auth_fails_closed_unless_opted_in(engine: Engine) -> None:
-    # SYS-1: disabled auth no longer silently opens routes — it fails closed by default...
-    service = AuthService(engine.store, AuthSettings(enabled=False))
-    transport = httpx.ASGITransport(app=create_app(engine, auth=service))
+async def test_no_auth_fails_closed_unless_opted_in(engine: Engine) -> None:
+    # SYS-1: an app with no auth service does not silently open routes — it fails closed by default...
+    transport = httpx.ASGITransport(app=create_app(engine))
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         assert (await c.get("/stats")).status_code == 503
-    # ...unless the embedding/served path opts in explicitly (`serve` does this when sign-in is
-    # off, after __main__'s start-up refusals; neither factory does it by omission).
-    transport = httpx.ASGITransport(app=create_app(engine, auth=service, allow_no_auth=True))
+    # ...unless an embedder or a test opts in explicitly (`serve` never does; neither factory does it
+    # by omission).
+    transport = httpx.ASGITransport(app=create_app(engine, allow_no_auth=True))
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         assert (await c.get("/stats")).status_code == 200
 

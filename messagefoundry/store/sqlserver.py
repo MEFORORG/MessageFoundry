@@ -148,6 +148,7 @@ from messagefoundry.store.store import (
     AlertSummary,
     AppendedAuditRow,
     AuditAppend,
+    AuditVerdict,
     CapturedResponse,
     ChannelScopeSource,
     ClaimAbortPhase,
@@ -10986,7 +10987,7 @@ class SqlServerStore:
         *,
         expected_anchor: tuple[int, str] | None = None,
         expected_prefix: tuple[int, str] | None = None,
-    ) -> tuple[bool, str | None]:
+    ) -> AuditVerdict:
         """Recompute the audit hash-chain in order; returns (ok, message) — see the SQLite store.
 
         Re-walking can't catch tail-truncation (the surviving prefix still verifies); pass
