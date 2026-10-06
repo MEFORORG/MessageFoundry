@@ -2049,9 +2049,16 @@ class AuthStore(Protocol):
 
     async def get_totp_secret(self, user_id: str) -> str | None: ...
 
+    # CONDITIONAL (BACKLOG #2224): writes only where a secret is staged (``totp_secret IS NOT NULL``)
+    # and TOTP is still off, in the same UPDATE, and returns whether a row was written. An
+    # ``admin_reset_mfa`` that clears the secret, or a second confirm that enables first, between
+    # the caller's checks and this write makes it match no row. A caller must refuse on False and
+    # never treat MFA as on, the way ``set_password(require_totp=...)`` callers do. It does not
+    # check that the staged secret is the one the caller verified; a re-stage in the window is
+    # not caught.
     async def enable_totp(
         self, user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
-    ) -> None: ...
+    ) -> bool: ...
 
     async def disable_totp(self, user_id: str, *, now: float | None = None) -> None: ...
 

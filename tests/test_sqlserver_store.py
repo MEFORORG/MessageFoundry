@@ -31,6 +31,11 @@ from messagefoundry.store import MessageStatus, OutboxStatus, Stage
 from messagefoundry.store.content_search import make_spec
 from messagefoundry.store.crypto import MARKER_PREFIX, cell_aad, generate_key, make_cipher
 from messagefoundry.store.store import load_audit_chain
+from tests._replay_settle_contract import CASES as REPLAY_SETTLE_CASES
+from tests._replay_settle_contract import (
+    assert_replayed_ingress_row_is_received,
+    assert_replayed_routed_row_settles,
+)
 from tests.audit_chain_cases import CASES, ChainBackend, server_chain_backend
 
 # A synthetic ADT carrying a (fake) MRN + name in PID — never real PHI.
@@ -410,7 +415,7 @@ async def test_enqueue_creates_message_and_outbox(store) -> None:
         channel_id="IB", raw=RAW, deliveries=[("OB1", "p1"), ("OB2", "p2")], control_id="MSG1"
     )
     msg = await store.get_message(mid)
-    assert msg is not None and msg["status"] == MessageStatus.RECEIVED.value
+    assert msg is not None and msg["status"] == MessageStatus.ROUTED.value
     assert msg["control_id"] == "MSG1"
     outbox = await store.outbox_for(mid)
     assert {o["destination_name"] for o in outbox} == {"OB1", "OB2"}
@@ -566,7 +571,7 @@ async def test_replay_requeues(store) -> None:
     assert requeued == 1
     outbox = await store.outbox_for(mid)
     assert outbox[0]["status"] == OutboxStatus.PENDING.value and outbox[0]["attempts"] == 0
-    # Outbound-only replay -> ROUTED (no pending ingress/routed row); staged parity with SQLite/PG.
+    # Outbound-only replay -> ROUTED (no pending ingress row); staged parity with SQLite/PG.
     assert (await store.get_message(mid))["status"] == MessageStatus.ROUTED.value
 
 
@@ -1387,6 +1392,17 @@ async def test_all_declined_finalizes_not_deployed(store) -> None:
     assert await store.outbox_for(mid) == []  # AC-2: not one row in the outbound stage
 
 
+@pytest.mark.parametrize(("declined", "expected"), REPLAY_SETTLE_CASES)
+async def test_replayed_routed_row_that_sends_nothing_settles(store, declined, expected) -> None:
+    """Vault BACKLOG #2723 on SQL Server; ``tests/_replay_settle_contract`` carries the property."""
+    await assert_replayed_routed_row_settles(store, declined, expected)
+
+
+async def test_replayed_ingress_row_is_received(store) -> None:
+    """Vault BACKLOG #2723 on SQL Server: the RECEIVED arm of replay's status pick."""
+    await assert_replayed_ingress_row_is_received(store)
+
+
 async def test_declined_sibling_still_processed_event_retained(store) -> None:
     """#233 mixed parity: one deployed delivery + one declined leg → the message finalizes PROCESSED
     once the deployed leg delivers (it DID deliver somewhere — not NOT_DEPLOYED), and the
@@ -2007,6 +2023,27 @@ async def test_cancel_queued_finalizes_via_batch_lock(store) -> None:
     assert await store.cancel_queued(None, "OB", now=200.0) == 1
     assert (await store.outbox_for(mid))[0]["status"] == OutboxStatus.CANCELLED.value
     assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
+
+
+async def test_cancel_queued_top_only_cancels_a_backing_off_head(store) -> None:
+    # vault BACKLOG #2754: a backed-off head is later-due than the row behind it; "purge top" must
+    # still cancel the FIFO head (seq order, as claim_next_fifo), not the earliest-due row.
+    m1 = await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB", "p1")], now=100.0)
+    m2 = await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB", "p2")], now=101.0)
+    head = await store.claim_next_fifo("OB", now=102.0)
+    assert head is not None and head.message_id == m1
+    await store.mark_failed(
+        head.id, "boom", RetryPolicy(max_attempts=None, backoff_seconds=60.0), now=102.0
+    )
+    assert (await store.outbox_for(m1))[0]["next_attempt_at"] > (await store.outbox_for(m2))[0][
+        "next_attempt_at"
+    ]
+    assert await store.claim_next_fifo("OB", now=103.0) is None  # the head blocks the lane
+    assert await store.cancel_queued(None, "OB", top_only=True, now=103.0) == 1
+    assert (await store.outbox_for(m1))[0]["status"] == OutboxStatus.CANCELLED.value
+    assert (await store.outbox_for(m2))[0]["status"] == OutboxStatus.PENDING.value
+    nxt = await store.claim_next_fifo("OB", now=103.0)
+    assert nxt is not None and nxt.message_id == m2
 
 
 # --- query/response (ADR 0013) — capture, correlate, re-ingress on real SQL Server ------------
@@ -4731,7 +4768,7 @@ async def test_store_once_deliver_many_body_ref_inert(store) -> None:
         assert item is not None and item.payload == body
 
 
-async def test_audit_verify_cli_server(store, capsys) -> None:
+async def test_audit_verify_cli_server(store, capsys, monkeypatch) -> None:
     """CLI-22: the ``audit-verify`` CLI wrapper (load_settings + open_store + printed OK/FAIL + exit
     code) has only ever run against SQLite; here it reaches the live SQL Server store via ``MEFOR_STORE_*``
     env (no ``--db`` — that only rewrites the unused SQLite ``[store].path``; the M-31 missing-DB guard is
@@ -4741,7 +4778,11 @@ async def test_audit_verify_cli_server(store, capsys) -> None:
     ``asyncio.run`` internally, which raises inside a running loop, so ``asyncio.to_thread`` gives it a
     fresh loop + its own pool against the same server DB."""
     from messagefoundry.__main__ import main
+    from tests._phi_gate_provisions import setenv_at_rest_opt_out
 
+    # The chain is keyless, so verify it under the opt-out a keyless engine runs with: in a shell
+    # whose settings require a key, a clean keyless walk exits 5 (vault BACKLOG #3054).
+    setenv_at_rest_opt_out(monkeypatch)
     await store.record_audit("message_view", actor="alice", detail="v1")
     await store.record_audit("export", actor="bob", detail="e1")
     rc = await asyncio.to_thread(main, ["audit-verify"])  # backend from env; NO --db
@@ -4750,7 +4791,7 @@ async def test_audit_verify_cli_server(store, capsys) -> None:
     assert "OK:" in out and "verified 2" in out
 
 
-async def test_audit_anchor_cli_server(store, capsys) -> None:
+async def test_audit_anchor_cli_server(store, capsys, monkeypatch) -> None:
     """BACKLOG #328: ``audit-anchor`` + ``audit-verify --expected-anchor`` on the LIVE server store.
 
     ``audit_anchor()`` is implemented separately per backend (``store.py`` / ``sqlserver.py`` /
@@ -4763,6 +4804,9 @@ async def test_audit_anchor_cli_server(store, capsys) -> None:
     calls ``asyncio.run`` internally. The anchor is captured at RUNTIME and never written as a literal:
     DELETE does not reseed SQL Server IDENTITY, so a hard-coded count or head would be wrong."""
     from messagefoundry.__main__ import main
+    from tests._phi_gate_provisions import setenv_at_rest_opt_out
+
+    setenv_at_rest_opt_out(monkeypatch)  # a keyless chain, as above (vault BACKLOG #3054)
 
     await store.record_audit("message_view", actor="alice", detail="v1")
     await store.record_audit("export", actor="bob", detail="e1")

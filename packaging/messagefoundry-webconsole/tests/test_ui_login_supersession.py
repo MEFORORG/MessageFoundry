@@ -86,8 +86,8 @@ def _directory_settings(**over: object) -> AuthSettings:
     return AuthSettings(**base)  # type: ignore[arg-type]
 
 
-async def _service(engine: Engine) -> AuthService:
-    service = AuthService(engine.store, _directory_settings(), ldap=_FakeLdap())  # type: ignore[arg-type]
+async def _service(engine: Engine, **over: object) -> AuthService:
+    service = AuthService(engine.store, _directory_settings(**over), ldap=_FakeLdap())  # type: ignore[arg-type]
     await service.initialize()
     await service.set_ad_group_map([("cn=mf-admins,dc=x", "administrator")], actor="admin")
     await provision(service, "op", [Role.OPERATOR.value])
@@ -292,7 +292,8 @@ async def test_a_failed_ui_oidc_callback_leaves_the_prior_session_alive(
 
 
 async def test_revoking_an_id_that_no_longer_exists_says_so(engine: Engine) -> None:
-    service = await _service(engine)
+    # The refused click below spends the admin-write floor too; zero it so the real POST is not 429.
+    service = await _service(engine, admin_write_min_interval_seconds=0)
     other = await service.login("op", PW)
     assert other.token is not None
     other_id = hash_token(other.token)
@@ -307,6 +308,9 @@ async def test_revoking_an_id_that_no_longer_exists_says_so(engine: Engine) -> N
         r = await c.post("/ui/login", data={"username": "op", "password": PW}, headers=_SAME)
         assert r.status_code == 303
         path = f"/ui/account/sessions/{other_id}/revoke"
+        # The click, refused for want of a fresh proof, issues the continuation (vault BACKLOG #2764).
+        refused = await c.post(path, headers=_SAME)
+        assert refused.headers["location"] == f"/ui/reauth?next={path}"
         minted = await c.post("/ui/reauth", data={"next": path, "password": PW}, headers=_SAME)
         assert minted.status_code in (200, 303), minted.status_code
         r = await c.post(path, headers=_SAME)

@@ -11,10 +11,8 @@
 
 ARG BASE=messagefoundry:ci
 FROM ${BASE}
-# COPY (not mount), owned by the engine's UID and mode 0755. _assert_safe_config_source refuses a
-# config dir/module that is group/world-writable OR owned by a different uid than the engine process
-# (it executes the *.py as the service account) — so the ownership must be 10001, not root. This is
-# also the recommended PRODUCTION pattern: bake the adopter config repo into a derived image rather
-# than bind-mounting (a bind mount must itself be owned by uid 10001 and not group/world-writable).
-COPY --chown=10001:10001 docker/smoke/config /config
+# COPY (not mount), ROOT-owned, so this leg runs the layout docker/README.md recommends: the engine
+# (uid 10001) executes a config its own account cannot rewrite. _assert_safe_config_source trusts an
+# owner that is root or the engine's uid and refuses a group/world-writable one (vault BACKLOG #2759).
+COPY docker/smoke/config /config
 COPY --chown=10001:10001 docker/smoke/send_adt.py /smoke/send_adt.py

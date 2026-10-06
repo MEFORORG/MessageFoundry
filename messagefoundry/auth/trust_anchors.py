@@ -819,7 +819,7 @@ def _path_fix(verdict: AnchorVerdict) -> list[str]:
         return lines
     # Each finding gets only its own command. A mode finding gets the chmod that drops the group and
     # other write bits, never a chown: the object may be the engine's own data folder, such as the
-    # container's /config, and a chown to root would take it away from the engine.
+    # container's /var/lib/mefor, and a chown to root would take it away from the engine.
     #
     # An owner finding gets a chown to root, the owner an anchor's folder wants: the engine only
     # reads an anchor. It names no group, because root:root would also take the group, and with it

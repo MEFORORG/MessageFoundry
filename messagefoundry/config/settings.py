@@ -4319,7 +4319,8 @@ _ALERT_EVENT_TYPES = frozenset(
         "approval_approver_provenance",
         "administrator_granted",
         # ADR 0079 mechanism 2: the directory reconciler's two audited outcomes, each routable apart:
-        # the mass-revoke breaker tripped (nothing revoked), and one principal's sessions were revoked.
+        # a pass left accounts unrevoked (the breaker tripped, or probes were referred, BACKLOG
+        # #2538), and one principal's sessions were revoked.
         "ad_reconcile_aborted",
         "ad_session_revoked",
         # ADR 0195: the reconciler held accounts whose userAccountControl it could not read.
@@ -7400,7 +7401,7 @@ def security_loosenings(
         out.append(
             (
                 "enforcement",
-                "the security REFUSE/WARN dial is at 'warn' — posture weakenings (cleartext/verify-off "
+                "[security].enforcement = warn — posture weakenings (cleartext/verify-off "
                 "hops, keyless PHI, open egress, single-factor sign-in at exposure) are WARNED + audited "
                 "and permitted to continue rather than refused, and MEFOR_ALLOW_INSECURE_TLS / "
                 "--allow-insecure-bind escapes are honored",
@@ -7927,9 +7928,10 @@ def settings_error_detail(exc: Exception) -> str:
     :class:`ServiceSettings` re-raises each error with its input replaced by :data:`HIDDEN_INPUT`
     (``_InputHidingModel``), so ``str(exc)``, ``exc.errors()`` and ``exc.json()`` carry the
     placeholder, never the refused mapping. That covers
-    the ``__main__.py`` arms that still print ``str(exc)`` (at least ``audit-verify``,
-    ``rotate-key`` and the store commands behind ``_host_gated_store_settings``). ``serve`` and
-    ``supervise`` already rendered through this function, by way of ``_load_service_settings``.
+    the ``__main__.py`` arms that still print ``str(exc)`` (at least ``rotate-key`` and the store
+    commands behind ``_host_gated_store_settings``). At least ``serve``, ``supervise``,
+    ``audit-anchor`` and, since vault BACKLOG #3054, ``audit-verify`` render through this function,
+    by way of ``_load_service_settings``.
 
     THE MESSAGE IS NOT HIDDEN, AND THIS FUNCTION PRINTS IT. A validator that quotes the value it
     refused still shows it, here and in ``str(exc)``: at least the ``[backup]`` and ``[dr]``

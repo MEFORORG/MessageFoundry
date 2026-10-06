@@ -1634,6 +1634,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/verify/checks.py": frozenset(
         {"csprng:via messagefoundry.auth.service", "mac:via messagefoundry.auth.service"}
     ),
+    # Vault BACKLOG #2764: the issued step-up continuations are keyed by the session token's SHA-256
+    # (hash_token), so the table never holds a raw token. A lookup key, not a credential check.
+    "messagefoundry_webconsole/_auth.py": frozenset({"hash:via messagefoundry.auth.tokens"}),
     "messagefoundry_webconsole/routes/account.py": frozenset(
         {"hash:via messagefoundry.auth.tokens"}
     ),

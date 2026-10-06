@@ -42,7 +42,13 @@ _BAD_SUSPEND_WINDOW = (
 # status page that holds both buttons (_DR_PAGE), and the operator presses again inside
 # the fresh window. That is the stepdown shape, with the status page standing in for a confirm page.
 _DR_PAGE = "/ui/status"
-register_ui_action(r"^/ui/status$", Permission.DR_OPERATE, auto_retry=False, unlock=True)
+register_ui_action(
+    r"^/ui/status$",
+    Permission.DR_OPERATE,
+    auto_retry=False,
+    unlock=True,
+    label="Open the status page",
+)
 
 
 def register(app: FastAPI, deps: UiDeps) -> None:

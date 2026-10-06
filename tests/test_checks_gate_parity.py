@@ -600,6 +600,7 @@ _SETTINGS_LEGS = (
     "build-check",
     "reference-backend",
     "upstream-hop-ack",
+    "oidc-revocation",
     "oidc-auth-params",
     "static-credentials",
     "alert-smtp-tls",

@@ -1257,6 +1257,9 @@ class DrActionResult(BaseModel):
     verify_status: str | None = None
     seed_segment: str | None = None
     vip_hook_ran: bool = False
+    #: Release only: the staged-queue depth left when the drain ended. ``0`` means it drained; more
+    #: means it gave up at its bound and those rows stay queued (vault BACKLOG #2752).
+    depth_left: int | None = None
 
 
 class DrActivateRequest(RequestModel):

@@ -224,6 +224,7 @@ from messagefoundry.store.store import (
     roll_audit_key_range,
     rotation_factor_term,
     should_record_event,
+    totp_enable_term,
     verify_audit_rows,
 )
 from messagefoundry.support.redact import redact_log_line
@@ -3742,10 +3743,22 @@ class PostgresStore:
         to a skewed-standby clock across failover. This is correct **only because there is exactly ONE
         serial writer per (stage, lane-key)** (the per-inbound listener/router/transform worker; the
         destination_name fan-in is multi-writer but seq is still DB-assigned in commit order, so the
-        first committer gets the lower seq, and ``FOR UPDATE SKIP LOCKED`` never skips the true locked
-        head). With ``created_at`` no longer an ordering backstop, a future second-writer-per-lane or
-        delete+reinsert-on-retry (re-minting seq) would break FIFO. ``FOR UPDATE SKIP LOCKED`` on the
-        head keeps concurrent pollers non-blocking. ``None`` when nothing is pending or the head isn't due.
+        first committer gets the lower seq). With ``created_at`` no longer an ordering backstop, a future
+        second-writer-per-lane or delete+reinsert-on-retry (re-minting seq) would break FIFO. ``FOR
+        UPDATE SKIP LOCKED`` on the head keeps concurrent pollers non-blocking. ``None`` when nothing is
+        pending or the head isn't due.
+
+        **KNOWN HOLE: ``SKIP LOCKED`` CAN skip the true head (ADR 0066 section 3.4).** The serial-writer
+        argument covers a producer's *uncommitted* row, which is invisible to the scan. It does not cover
+        a *visible, committed* head that another transaction holds locked -- for example a message
+        :meth:`replay` re-stamping a backing-off pending head. ``ORDER BY seq LIMIT 1 FOR UPDATE SKIP
+        LOCKED`` passes over that head, and if seq N+1 is due it is claimed first: a per-lane FIFO
+        reorder, not one empty cycle. The pooled default claims each lane's head through
+        :meth:`claim_fifo_heads`, which carries the ADR 0066 head-pin and turns the same schedule into
+        an EMPTY cycle -- but the pooled path does not avoid this method entirely. Every caller of this
+        single-row claim is exposed: at least the ``per_lane`` claim mode's stage workers, and the
+        outbound batch-coalescing window in EITHER claim mode, which tops up a batch with this method.
+        Whether this path should get the head-pin is a separate, open decision (vault BACKLOG #2769).
 
         FAILOVER FIFO SAFETY (active-passive HA): the claim runs in ONE transaction that FIRST reclaims
         this lane's stranded head — a crashed/fenced prior leader's claimed rows are still ``inflight``
@@ -6186,11 +6199,12 @@ class PostgresStore:
             )
             count = _rowcount(result)
             if count:
+                # RECEIVED only for a pending INGRESS row; a re-pended routed row is ROUTED, or the
+                # finalizer could never settle it (vault BACKLOG #2723; MessageStore.replay says why).
                 pre = await conn.fetchrow(
-                    "SELECT 1 FROM queue WHERE message_id=$1 AND stage = ANY($2::text[])"
-                    " AND status=$3 LIMIT 1",
+                    "SELECT 1 FROM queue WHERE message_id=$1 AND stage=$2 AND status=$3 LIMIT 1",
                     message_id,
-                    [Stage.INGRESS.value, Stage.ROUTED.value],
+                    Stage.INGRESS.value,
                     OutboxStatus.PENDING.value,
                 )
                 status = MessageStatus.RECEIVED.value if pre else MessageStatus.ROUTED.value
@@ -6600,20 +6614,32 @@ class PostgresStore:
     ) -> int:
         """Soft-cancel **pending** deliveries for a destination: mark them ``cancelled``, log a
         ``cancelled`` event each, and finalize any message whose deliveries are now all terminal.
-        ``channel_id=None`` cancels across all producers; ``top_only`` cancels just the head. Returns
-        the number cancelled."""
+        ``channel_id=None`` cancels across all producers; ``top_only`` cancels just the FIFO head --
+        the oldest pending row by ``seq``, the lane predicate and key :meth:`claim_next_fifo` uses --
+        even while it is backing off and not yet due (ADR 0059). With a ``channel_id`` it is the
+        oldest row from that producer, the lane head only when no other inbound feeds the
+        destination. Returns the number cancelled."""
         now = time.time() if now is None else now
-        # `top_only` cancels the true FIFO head, so the tiebreak after next_attempt_at must match the
-        # claim's seq-only order, NOT created_at (no longer the ordering key; ADR 0059).
+        # `top_only` cancels the true FIFO head, so it orders by the claim's seq-only key alone (ADR
+        # 0059). Not next_attempt_at first: mark_failed pushes a failed head's next_attempt_at past the
+        # younger rows behind it, so that key would pick a healthy younger row and leave the
+        # backing-off head blocking the lane (vault BACKLOG #2754).
         query = (
             "SELECT id, message_id FROM queue"
-            " WHERE destination_name=$1 AND status=$2 AND ($3::text IS NULL OR channel_id=$3)"
-            " ORDER BY next_attempt_at, seq"
+            " WHERE stage=$4 AND destination_name=$1 AND status=$2"
+            " AND ($3::text IS NULL OR channel_id=$3)"
+            " ORDER BY seq"
         )
         if top_only:
             query += " LIMIT 1"
         async with self._timed_acquire() as conn, conn.transaction():
-            rows = await conn.fetch(query, destination_name, OutboxStatus.PENDING.value, channel_id)
+            rows = await conn.fetch(
+                query,
+                destination_name,
+                OutboxStatus.PENDING.value,
+                channel_id,
+                Stage.OUTBOUND.value,
+            )
             if not rows:
                 return 0
             ids = [r["id"] for r in rows]
@@ -7615,15 +7641,17 @@ class PostgresStore:
 
     async def enable_totp(
         self, user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
-    ) -> None:
+    ) -> bool:
         now = time.time() if now is None else now
-        await self._execute(
+        # Conditional, and the count says whether it wrote: see ``totp_enable_term`` (#2224).
+        written = await self._execute(
             "UPDATE users SET totp_enabled=TRUE, totp_enrolled_at=$1, totp_recovery_codes=$2,"
-            " updated_at=$1 WHERE id=$3",
+            f" updated_at=$1 WHERE id=$3{totp_enable_term('FALSE')}",
             now,
             json.dumps(recovery_code_hashes),
             user_id,
         )
+        return written > 0
 
     async def disable_totp(self, user_id: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now

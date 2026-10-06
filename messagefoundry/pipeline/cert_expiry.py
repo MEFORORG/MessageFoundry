@@ -477,7 +477,7 @@ def _judge_crl(
                     "A reload is pending: the engine applies the file to the running hop within "
                     f"{RELOAD_INTERVAL_SECONDS:g} seconds, unless it refuses the file and logs why",
                 )
-            holders = sorted({copy.setting or "a connection's tls_crl_file" for copy in copies})
+            holders = sorted({copy.setting or "an unnamed setting" for copy in copies})
             log.warning(
                 "cert_expiry: a running TLS hop still holds a copy of %r CRL %s %s (%d load(s), "
                 "from %s). The hop keeps the copy it read when it built its context; the soonest "

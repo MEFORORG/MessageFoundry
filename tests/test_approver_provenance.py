@@ -175,7 +175,7 @@ async def test_totp_enrolled_after_the_request_is_flagged(engine: Engine) -> Non
     gate = _gate(engine, service, sink)
     approval_id = await _request(gate, maker)
     await engine.store.set_totp_secret(checker, secret="JBSWY3DPEHPK3PXP")
-    await engine.store.enable_totp(checker, recovery_code_hashes=[])
+    assert await engine.store.enable_totp(checker, recovery_code_hashes=[])
 
     await _release(gate, approval_id, checker)
 

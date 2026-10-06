@@ -640,9 +640,32 @@ async def test_cancel_queued_top_only_cancels_the_head(store: MessageStore) -> N
     m2 = await store.enqueue_message(channel_id="c1", raw="y", deliveries=[("d1", "p2")], now=101.0)
     n = await store.cancel_queued("c1", "d1", top_only=True, now=102.0)
     assert n == 1
-    # The head (earliest next_attempt_at) is cancelled; the other stays queued.
+    # The FIFO head (lowest rowid) is cancelled; the other stays queued.
     assert (await store.outbox_for(m1))[0]["status"] == OutboxStatus.CANCELLED.value
     assert (await store.outbox_for(m2))[0]["status"] == OutboxStatus.PENDING.value
+
+
+async def test_cancel_queued_top_only_cancels_a_backing_off_head(store: MessageStore) -> None:
+    # vault BACKLOG #2754: the head failed, so mark_failed pushed its next_attempt_at past the younger
+    # row behind it. "Purge top" must still cancel the FIFO head (the claim's rowid key), not the
+    # earliest-due row -- else it cancels a healthy row and the head keeps blocking the lane.
+    m1 = await store.enqueue_message(channel_id="c1", raw="x", deliveries=[("d1", "p1")], now=100.0)
+    m2 = await store.enqueue_message(channel_id="c1", raw="y", deliveries=[("d1", "p2")], now=101.0)
+    head = await store.claim_next_fifo("d1", now=102.0)
+    assert head is not None and head.message_id == m1
+    retry = RetryPolicy(max_attempts=None, backoff_seconds=60, backoff_multiplier=1)
+    await store.mark_failed(head.id, "boom", retry, now=102.0)
+    head_row = (await store.outbox_for(m1))[0]
+    behind_row = (await store.outbox_for(m2))[0]
+    # The discriminating shape: the head is later-due than the row behind it, and blocks the lane.
+    assert head_row["next_attempt_at"] > behind_row["next_attempt_at"]
+    assert await store.claim_next_fifo("d1", now=103.0) is None
+    assert await store.cancel_queued(None, "d1", top_only=True, now=103.0) == 1
+    assert (await store.outbox_for(m1))[0]["status"] == OutboxStatus.CANCELLED.value
+    assert (await store.outbox_for(m2))[0]["status"] == OutboxStatus.PENDING.value
+    # The lane is unblocked: the row behind the purged head is now the claimable head.
+    nxt = await store.claim_next_fifo("d1", now=103.0)
+    assert nxt is not None and nxt.message_id == m2
 
 
 async def test_cancel_queued_leaves_inflight_untouched(store: MessageStore) -> None:

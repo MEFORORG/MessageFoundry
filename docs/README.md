@@ -142,8 +142,8 @@ Security material is decided by a different rule and mostly stays —
 Individually dated documents worth knowing are historical rather than current:
 
 - **[CI-SELFHOSTED-RUNNER.md](CI-SELFHOSTED-RUNNER.md)** — carries its own **RETIRED** banner. The
-  runners are de-registered. It also still contains a "the repo is private" security rationale that the
-  retirement itself invalidates.
+  runners are de-registered. Its security-posture section records the old "the repo is private"
+  rationale and marks it false, since the repository is public.
 - **[CI-QUALITY.md](CI-QUALITY.md)** — a plain-language summary dated **June 20, 2026**, written for a
   non-technical evaluator. Its test counts have since moved; `CI.md` is the accurate technical version.
 - **[REMOTE-CONSOLE.md](REMOTE-CONSOLE.md)** and

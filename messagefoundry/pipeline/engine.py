@@ -112,6 +112,15 @@ __all__ = ["Engine", "ConfigReloadDenied", "ReloadOutcome", "ReloadStepFailure"]
 
 log = logging.getLogger(__name__)
 
+#: How long a DR release waits for the staged queue to drain before it hands back anyway, leaving
+#: the rest queued (vault BACKLOG #2752). Kept well under the API's 120 s request deadline
+#: (``api/request_timeout.py``) with room for the release hook's default 30 s bound and the
+#: listener stops before it, so in the default configuration the caller who asked for the release
+#: is the one told how it ended. The release itself outlives a caller the deadline cuts off
+#: (``api/outlive.py``), so this bound decides what the caller hears, never whether the hand-back
+#: completes. ``tests/test_dr_outlive_deadline.py`` pins the ordering.
+DR_RELEASE_DRAIN_TIMEOUT_SECONDS = 60.0
+
 
 class ConfigReloadDenied(Exception):
     """A /config/reload target lies outside the allowed reload roots (RCE guard).
@@ -301,11 +310,14 @@ class Engine:
         self._leader_maintenance: LeaderMaintenanceRunner | None = None
         # Config-reload convergence (Track B Step 6). Spawned ONLY in clustered mode (is_clustered()),
         # so single-node never pays for it. _applied_config_version is the shared config version this
-        # node has applied; seeded at start() to the coordinator's current version (so a fresh node
-        # doesn't self-reload) and advanced when this node bumps (operator reload) or converges (follower
+        # node has applied; seeded to the coordinator's current version (so a fresh node doesn't
+        # self-reload) and advanced when this node bumps (operator reload) or converges (follower
         # reload). The node that bumps advances it itself, so its own convergence loop sees no change.
+        # The seed is taken before the first load when the caller runs seed_config_version, else at
+        # start(); _config_version_seeded says which (vault BACKLOG #3076).
         self._config_convergence: ConfigConvergenceRunner | None = None
         self._applied_config_version: int = 0
+        self._config_version_seeded = False
         # Transform-state read-through convergence (Track B Step 6b). Spawned ONLY in clustered mode
         # (is_clustered()), so single-node never pays for it. Each tick it read-throughs any namespace a
         # sibling node wrote/purged into this node's local _state_cache (off the hot path, so state_get
@@ -562,9 +574,14 @@ class Engine:
         # and detect on-disk DRIFT. Holds only a one-way hash + a commit sha — never resolved env values.
         self.loaded_config_fingerprint: dict[str, object] | None = None
         # vault BACKLOG #2597: True when this process's start never checked its config against the
-        # store's baseline (the read failed, or the start took no digest). Every config row it writes
-        # is then marked, so a later start passes over it to the last checked baseline.
+        # store's baseline (the read failed, or the start took no digest). Every flag toggle row it
+        # writes is then marked, so a later start passes over it to the last checked baseline. A
+        # reload row, operator or convergence, is not marked: the reload vouches for what it loaded.
         self.config_baseline_unchecked = False
+        # vault BACKLOG #3076: writes the config_reload audit row for a cluster convergence reload,
+        # which has no route to write one. The API sets it, since the row builder lives there and the
+        # engine never imports the API. None (embedding, tests) writes no row.
+        self.convergence_reload_audit: Callable[[ReloadOutcome], Awaitable[None]] | None = None
 
     @classmethod
     async def create(
@@ -802,45 +819,64 @@ class Engine:
             else:
                 await self.preflight_settings()  # reload_detail runs it on the branch above (#2034)
                 await rr.reload(rr.registry)
-        except Exception:
+        except BaseException:
             # A refused reload (BACKLOG #2034: a settings trust anchor, say) applied no DR profile, so
             # the latch goes back too. Left set, the next operator reload would park the feeds below
-            # the threshold on a box the DR coordinator reports as not active.
+            # the threshold on a box the DR coordinator reports as not active. BaseException, not
+            # Exception (vault BACKLOG #2751): a cancelled reload rolls its intake back to the
+            # previous graph (RegistryRunner.reload), so the latch has to follow it there too.
             self._dr_active = was_active
             raise
 
-    async def _dr_release_drain(self) -> None:
+    async def _dr_release_drain(self) -> int | None:
         """Engine callback the DR coordinator runs to FAIL BACK (#61, ADR 0048): unbind all inbound
         listeners (stop accepting new intake), drain the staged queue to completion (every NOT-DONE row
         delivered or dead-lettered), then latch the run-profile OFF. Within the DR store at-least-once +
         idempotency make the drain safe; cross-store reconciliation is operator-verified per the runbook.
-        Returns only once intake is unbound and the pipeline is drained (no dual-accept window)."""
+        Returns only once intake is unbound and the drain has ended (no dual-accept window).
+
+        Returns the staged-queue depth left when the drain ended: ``0`` when it drained, more when
+        it gave up at its bound with rows still queued (vault BACKLOG #2752, finding D-V1). The
+        coordinator records that number on the ``dr.release`` row rather than claiming a drain."""
         rr = self._registry_runner
-        if rr is not None:
+        if rr is None:
+            # No graph, so nothing to unbind and no worker to drain with. Report what is queued.
+            depth: int | None = await self.store.in_pipeline_depth()
+        else:
             for name in list(rr.registry.inbound):
                 await rr.stop_inbound(
                     name
                 )  # unbind every listener — no new intake during fail-back
             rr.notify_work()  # wake every stage so the workers drain the residual backlog promptly
-            await self._drain_pipeline()
+            depth = await self._drain_pipeline()
         self._dr_active = False
+        return depth
 
-    async def _drain_pipeline(self, *, timeout: float = 120.0, poll: float = 0.1) -> None:
+    async def _drain_pipeline(self, *, timeout: float | None = None, poll: float = 0.1) -> int:
         """Wait until the staged queue is fully drained (no NOT-DONE rows across ingress/routed/outbound)
-        — the fail-back hand-back gate (#61, ADR 0048). Bounded by ``timeout`` so a permanently-stuck row
-        (a retry-forever head against a dead peer) doesn't hang the release forever; on timeout it returns
-        (the remaining rows stay queued + replayable, and the runbook reconciliation accounts for them)."""
-        elapsed = 0.0
-        while elapsed < timeout:
-            if await self.store.in_pipeline_depth() == 0:
-                return
+        — the fail-back hand-back gate (#61, ADR 0048). Bounded by ``timeout`` (default
+        :data:`DR_RELEASE_DRAIN_TIMEOUT_SECONDS`, read at call time) so a permanently-stuck row (a
+        retry-forever head against a dead peer) doesn't hang the release forever; on timeout it returns
+        (the remaining rows stay queued + replayable, and the runbook reconciliation accounts for them).
+
+        Returns the depth left, ``0`` when drained. The bound is wall-clock time, measured on the
+        monotonic clock: it used to count only sleep ticks, so each depth query's own time ran past
+        it (vault BACKLOG #2752)."""
+        bound = DR_RELEASE_DRAIN_TIMEOUT_SECONDS if timeout is None else timeout
+        deadline = time.monotonic() + bound
+        while True:
+            depth = await self.store.in_pipeline_depth()
+            if depth == 0 or time.monotonic() >= deadline:
+                break
             await asyncio.sleep(poll)
-            elapsed += poll
-        log.warning(
-            "DR release: staged queue not fully drained within %.0fs; remaining rows stay queued + "
-            "replayable (the fail-back reconciliation runbook accounts for them)",
-            timeout,
-        )
+        if depth:
+            log.warning(
+                "DR release: staged queue not fully drained within %.0fs; %d row(s) stay queued + "
+                "replayable (the fail-back reconciliation runbook accounts for them)",
+                bound,
+                depth,
+            )
+        return depth
 
     def add_registry(self, registry: Registry) -> RegistryRunner:
         """Run a code-first Connection/Router/Handler graph (one runner for the whole graph)."""
@@ -1553,9 +1589,12 @@ class Engine:
         # single-node / SQLite never spawns it. Seed the applied version to the coordinator's CURRENT
         # shared version BEFORE the loop starts, so a fresh node does not immediately self-reload (it is
         # already in sync with whatever reloads happened before it joined); then poll the cached version
-        # each tick and reload this node's own config dir when it falls behind.
+        # each tick and reload this node's own config dir when it falls behind. A seed taken before
+        # the first load (seed_config_version) stands, so a bump that landed after that load is
+        # still ahead of it and converged on (vault BACKLOG #3076).
         if self._coordinator.is_clustered():
-            self._applied_config_version = await self._coordinator.config_version()
+            if not self._config_version_seeded:
+                self._applied_config_version = await self._coordinator.config_version()
             self._config_convergence = ConfigConvergenceRunner(
                 self._coordinator,
                 applied_version=lambda: self._applied_config_version,
@@ -1835,13 +1874,51 @@ class Engine:
         """Setter the convergence runner calls after a successful follower reload (Track B Step 6)."""
         self._applied_config_version = version
 
+    async def seed_config_version(self) -> None:
+        """Seed the applied config version from the shared one, BEFORE the first load reads the
+        config dir (vault BACKLOG #3076). A no-op on a single node.
+
+        Seeded at :meth:`start` instead, after the load, a sibling's bump in between was read as
+        already applied, so this node kept the bytes it loaded before that reload and never
+        converged. Seeded first, such a bump is ahead of the seed, and the convergence loop reloads.
+        A bump that lands between this read and the load costs one redundant reload of the same
+        bytes, which is the safe side. That reload writes its own ``config_reload`` row, and when it
+        lands before the start's ``config_loaded`` row, that row is marked superseded with
+        ``loosenings`` null; the next start then compares against the reload's row.
+        A failed read is logged and leaves :meth:`start` to seed, as it did before; it never refuses
+        a start that the old order allowed."""
+        if not self._coordinator.is_clustered():
+            return
+        try:
+            self._applied_config_version = await self._coordinator.config_version()
+        except Exception as exc:  # noqa: BLE001 - start() retries the read and raises there
+            log.warning(
+                "cluster: the config version could not be read before the first load (%s); it is "
+                "seeded at start instead, so a reload a sibling applies in between is not converged on",
+                safe_exc(exc),
+            )
+            return
+        self._config_version_seeded = True
+
     async def _converge_reload(self) -> None:
         """Re-read THIS node's own startup config dir to converge on a cluster reload (Track B Step 6).
 
         Non-propagating (``propagate=False``): this is convergence, not initiation, so it must NOT bump
         the shared version token again (or nodes would chase each other's reloads). Passing ``None``
-        reloads the startup ``--config`` dir."""
-        await self.reload(propagate=False)
+        reloads the startup ``--config`` dir.
+
+        The swap then writes its own ``config_reload`` row through :attr:`convergence_reload_audit`
+        (vault BACKLOG #3076), as an operator reload does. Without it, the store's newest baseline
+        named the graph this node ran before converging, so a later start compared against the wrong
+        digest. A fault in that writer is logged and goes no further: the graph has swapped, and a
+        raise would make the runner retry a reload that already ran."""
+        outcome = await self.reload_detail(propagate=False)
+        if self.convergence_reload_audit is None:
+            return
+        try:
+            await self.convergence_reload_audit(outcome)
+        except Exception:  # noqa: BLE001 - see the docstring; the API's writer already logs its own
+            log.exception("cluster: the convergence reload swapped the graph, but its audit failed")
 
     async def set_connection_flag(
         self, name: str, *, direction: str, flagged: bool
@@ -2275,6 +2352,9 @@ class Engine:
             except Exception:
                 # Don't leave a half-started runner: a later reload would take the "runner exists"
                 # path and no-op the start, wedging intake. Clear it so a retry re-enters cleanly.
+                # Exception only: RegistryRunner.start() does not tear itself down on a
+                # cancellation, so clearing the reference then would orphan a running runner that
+                # engine.stop() could no longer reach.
                 self._registry_runner = None
                 raise
         else:
