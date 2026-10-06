@@ -2659,6 +2659,18 @@ class RegistryRunner:
             # this (a cleared Event is the gate; setdefault creates it cleared, clear() is for a re-park).
             self._outbound_resume.setdefault(name, asyncio.Event()).clear()
 
+    def _dr_park_outbound(self, name: str) -> None:
+        """Park a lane the DR run-profile leaves without a connector (vault BACKLOG #3067).
+
+        It used to stay unpaused, so its worker claimed each row, found no connector and charged it
+        a failed attempt; under a finite ``max_attempts`` every row queued to a parked feed was
+        dead-lettered within a few backoffs. A park holds them PENDING instead, and the reload that
+        runs with the profile off lifts it through :meth:`_unpark_outbound_lane`, which then builds
+        the connector. A lane an OPERATOR paused is left alone: it already holds its rows, and an
+        engine park would let a later reload undo the operator's pause."""
+        if name not in self._outbound_paused:
+            self._park_outbound_lane(name)
+
     def _unpark_outbound_lane(self, name: str) -> None:
         """Undo a :meth:`_park_outbound_lane` — but ONLY for a lane the ENGINE parked.
 
@@ -3743,15 +3755,14 @@ class RegistryRunner:
             self._park_outbound_lane(name)
             self._spawn_worker(name)
             return
-        # DR run-profile (#61, ADR 0048): a below-threshold outbound is NOT built — but its delivery
-        # worker still spawns (the retry/ordering/etc. above are set regardless), so a row routed to it
-        # sits in the outbound stage and backs off via the retry policy, self-healing on the next full
-        # (non-DR) startup. This is exactly the ADR-0031 degraded-outbound branch (the worker's "no
-        # connector for a claimed row" path), so the count-and-log + at-least-once invariants hold: the
-        # row is queued + retried + buildup-alerted, never silently dropped. status:"filtered" (not
-        # "failed") tells the operator it was deliberately parked.
+        # DR run-profile (#61, ADR 0048): a below-threshold outbound is NOT built, and its lane is
+        # PARKED the way a start-disabled one is (:meth:`_dr_park_outbound`), so a row routed to it is
+        # RETAINED PENDING: never claimed, never charged an attempt, never dead-lettered for being
+        # parked. Its delivery worker still spawns and waits at the pause gate. status:"filtered" (not
+        # "failed" or "stopped") tells the operator it was deliberately parked.
         if self._dr_filters_out(name, oc.priority, kind="outbound"):
             self._destinations.pop(name, None)  # no live connector for a parked lane
+            self._dr_park_outbound(name)
             self._spawn_worker(name)
             return
         self._filtered.pop(
@@ -5169,10 +5180,12 @@ class RegistryRunner:
                     continue
             self._unpark_outbound_lane(name)
             # DR run-profile (#61, ADR 0048): a reload re-evaluates against the threshold. A
-            # below-threshold outbound keeps (or gets) its delivery worker but NO live connector — its
-            # routed rows queue + back off + self-heal on the next full startup, exactly the parked-lane
-            # behavior. Close any live connector from a prior (non-DR) run so it stops delivering.
+            # below-threshold outbound keeps (or gets) its delivery worker but NO live connector, and
+            # its lane is parked, so its rows are held PENDING until a reload with the profile off
+            # lifts the park just above (vault BACKLOG #3067). Close any live connector from a prior
+            # (non-DR) run so it stops delivering.
             if self._dr_filters_out(name, oc.priority, kind="outbound"):
+                self._dr_park_outbound(name)
                 stale = self._destinations.pop(name, None)
                 if stale is not None:
                     await stale.aclose()

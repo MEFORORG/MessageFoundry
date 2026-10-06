@@ -132,7 +132,7 @@ class DrCoordinator:
         *,
         store_settings: object,
         activate_profile: Callable[[], Awaitable[Mapping[str, object] | None]],
-        deactivate_profile: Callable[[], Awaitable[None]],
+        deactivate_profile: Callable[[], Awaitable[Mapping[str, object] | None]],
         config_fingerprint_provider: Callable[[], Awaitable[str | None]] | None = None,
         alert_sink: AlertSink | None = None,
         clock: Callable[[], float] = time.time,
@@ -347,9 +347,9 @@ class DrCoordinator:
                 self._settings.release_hook, phase="release", actor=actor, now=now
             )
             try:
-                await (
-                    self._deactivate_profile()
-                )  # unbind listeners, drain the staged queue to completion
+                # Unbind listeners and drain. Its fields (the drained verdict, and the rows held on
+                # parked outbounds) go on the dr.release row; an embedder's None means drained.
+                drain = await self._deactivate_profile()
             except Exception as exc:
                 # A failed drain leaves the box active (still draining) — report it loudly, do NOT claim a
                 # clean hand-back (a half-drained release would risk cross-store divergence the runbook
@@ -359,16 +359,22 @@ class DrCoordinator:
                     f"DR release drain failed; the box stays active (retry release): {safe_exc(exc)}",
                 ) from exc
             self._active = False
+            outcome = {"drained": True, **(drain or {})}
             await self._store.record_audit(
                 _ACTION_RELEASE,
                 actor=actor,
-                detail=json.dumps({"vip_hook_ran": hook_ran, "drained": True}, sort_keys=True),
+                detail=json.dumps(
+                    {"vip_hook_ran": hook_ran, **outcome}, sort_keys=True, default=str
+                ),
                 now=now,
             )
             log.warning(
-                "DR released by %s: VIP handed back, intake unbound, staged queue drained — the "
-                "recovered primary resumes (cross-store reconciliation is operator-verified per the runbook)",
+                "DR released by %s: VIP handed back, intake unbound, drained=%s, rows held on "
+                "parked outbounds=%s — the recovered primary resumes (cross-store reconciliation is "
+                "operator-verified per the runbook)",
                 actor,
+                outcome["drained"],
+                outcome.get("held_on_parked_outbounds", 0),
             )
             # #145: the inverse — auto-resolves the open dr_activated instance (no page on a clean fail-back).
             self._alert_dr("dr_released")

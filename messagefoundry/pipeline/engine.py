@@ -856,33 +856,49 @@ class Engine:
         )
         return fields
 
-    async def _dr_release_drain(self) -> None:
+    async def _dr_release_drain(self) -> dict[str, object] | None:
         """Engine callback the DR coordinator runs to FAIL BACK (#61, ADR 0048): unbind all inbound
-        listeners (stop accepting new intake), drain the staged queue to completion (every NOT-DONE row
+        listeners (stop accepting new intake), drain the staged queue (every drainable NOT-DONE row
         delivered or dead-lettered), then latch the run-profile OFF and clear the runner's threshold,
         so a later operator reload stops parking feeds (vault BACKLOG #3067). Within the DR store
         at-least-once + idempotency make the drain safe; cross-store reconciliation is
-        operator-verified per the runbook. Returns only once intake is unbound and the pipeline is
-        drained (no dual-accept window)."""
+        operator-verified per the runbook. Returns only once intake is unbound and the drain has
+        finished or timed out (no dual-accept window), with the ``drained`` verdict and the count of
+        rows held on parked outbounds for the ``dr.release`` row. ``None`` when no graph runs."""
         rr = self._registry_runner
-        if rr is not None:
-            for name in list(rr.registry.inbound):
-                await rr.stop_inbound(
-                    name
-                )  # unbind every listener — no new intake during fail-back
-            rr.notify_work()  # wake every stage so the workers drain the residual backlog promptly
-            await self._drain_pipeline()
+        if rr is None:
+            self._set_dr_active(False)
+            return None
+        for name in list(rr.registry.inbound):
+            await rr.stop_inbound(name)  # unbind every listener — no new intake during fail-back
+        rr.notify_work()  # wake every stage so the workers drain the residual backlog promptly
+        drained, held = await self._drain_pipeline()
         self._set_dr_active(False)
+        return {"drained": drained, "held_on_parked_outbounds": held}
 
-    async def _drain_pipeline(self, *, timeout: float = 120.0, poll: float = 0.1) -> None:
-        """Wait until the staged queue is fully drained (no NOT-DONE rows across ingress/routed/outbound)
-        — the fail-back hand-back gate (#61, ADR 0048). Bounded by ``timeout`` so a permanently-stuck row
-        (a retry-forever head against a dead peer) doesn't hang the release forever; on timeout it returns
-        (the remaining rows stay queued + replayable, and the runbook reconciliation accounts for them)."""
+    async def _drain_pipeline(
+        self, *, timeout: float = 120.0, poll: float = 0.1
+    ) -> tuple[bool, int]:
+        """Wait until the staged queue is drained — the fail-back hand-back gate (#61, ADR 0048).
+
+        Returns ``(drained, held)``. ``held`` is the PENDING rows on outbounds the DR run-profile
+        parks: they wait for the profile to come off and cannot drain here, so the wait leaves them
+        out rather than sitting out its whole timeout on them (vault BACKLOG #3067). ``drained`` is
+        True once every other NOT-DONE row, across ingress/routed/outbound, is done. Bounded by
+        ``timeout`` so a permanently-stuck row (a retry-forever head against a dead peer) doesn't
+        hang the release forever; on timeout it returns ``drained=False`` (the remaining rows stay
+        queued + replayable, and the runbook reconciliation accounts for them)."""
+        rr = self._registry_runner
         elapsed = 0.0
-        while elapsed < timeout:
-            if await self.store.in_pipeline_depth() == 0:
-                return
+        while True:
+            held = 0
+            if rr is not None:
+                for name in rr.filtered_outbound():
+                    held += (await self.store.pending_depth(name))[0]
+            if await self.store.in_pipeline_depth() <= held:
+                return True, held
+            if elapsed >= timeout:
+                break
             await asyncio.sleep(poll)
             elapsed += poll
         log.warning(
@@ -890,6 +906,7 @@ class Engine:
             "replayable (the fail-back reconciliation runbook accounts for them)",
             timeout,
         )
+        return False, held
 
     def add_registry(self, registry: Registry) -> RegistryRunner:
         """Run a code-first Connection/Router/Handler graph (one runner for the whole graph)."""

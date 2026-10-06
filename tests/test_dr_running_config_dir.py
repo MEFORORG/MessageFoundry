@@ -18,11 +18,13 @@ name that is not UTF-8 cannot fail an activation or a release, and no digest is 
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import shutil
 import socket
 import threading
+import time
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -41,6 +43,12 @@ from tests.test_dr_activation import _seed
 # POSIX file system Python writes it as the raw byte 0x80. Under environments/ it is fingerprinted
 # (environments/*.toml is in the fold) but never loaded, so the graph still builds.
 _BAD_NAME = "x\udc80.toml"
+
+ADT = (
+    "MSH|^~\\&|S|F|R|RF|20260604||ADT^A01|HOLD1|P|2.5.1\r"
+    "EVN|A01|20260604\r"
+    "PID|1||100^^^H^MR||DOE^JANE\r"
+)
 
 _CRIT = "IB_CRIT_ADT"
 _NORM = "IB_NORM_ADT"
@@ -111,7 +119,7 @@ class _Box(NamedTuple):
 
 
 @pytest.fixture
-async def box(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[_Box]:
+async def box(tmp_path: Path) -> AsyncIterator[_Box]:
     """A passive DR box, with ``live`` as its startup dir and ``staging`` and ``tiered`` as two
     more allowed reload roots. The store is encrypted and carries a cold-seed archive of itself,
     so an activation clears its gates."""
@@ -131,14 +139,10 @@ async def box(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[
         dr_settings=DrSettings(enabled=True, activate=False, seed_archive=archive),
         egress_settings=EgressSettings(deny_by_default=False),
     )
-
-    async def drained() -> None:
-        # The seeded store holds a row for a destination these graphs lack, so a real drain would
-        # wait out its whole timeout. The release paths under test are the coordinator's and the
-        # threshold reset, not the drain.
-        return None
-
-    monkeypatch.setattr(engine, "_drain_pipeline", drained)
+    # The seed holds a row for a destination none of these graphs declares. A started engine
+    # dead-letters it at boot (dead_letter_missing_destinations); these tests never call start(),
+    # so do it here, or every release would wait out its whole drain timeout on that one row.
+    await store.dead_letter_missing_destinations(set())
     try:
         yield _Box(engine, live, staging, tiered)
     finally:
@@ -225,6 +229,102 @@ async def test_a_release_then_a_reload_binds_the_normal_feed_again(box: _Box) ->
     await engine.reload_detail(box.tiered)
     assert rr.inbound_running(_CRIT) and rr.inbound_running(_NORM)
     assert rr.filtered_inbound() == {} and rr.filtered_outbound() == {}
+
+
+async def _norm_row(engine: Engine, message_id: str) -> dict[str, Any]:
+    (row,) = [
+        r
+        for r in await engine.store.outbox_for(message_id)
+        if r["destination_name"] == "OB_NORM_ADT"
+    ]
+    return dict(row)
+
+
+async def _until(predicate: Callable[[], Any], timeout: float = 10.0) -> None:
+    elapsed = 0.0
+    while not await predicate():
+        await asyncio.sleep(0.05)
+        elapsed += 0.05
+        assert elapsed < timeout, "condition not met within timeout"
+
+
+async def test_a_row_on_a_parked_outbound_is_held_and_drains_after_release(box: _Box) -> None:
+    """Red before #3067's hold: the parked lane's worker claimed the row, found no connector and
+    charged it a failed attempt every backoff, so a finite max_attempts dead-lettered it. The
+    release then waited out its whole drain timeout on it and still recorded drained: true."""
+    engine = box.engine
+    await engine.reload_detail(box.tiered)
+    rr = engine.registry_runner
+    assert rr is not None
+    coord = engine.dr_coordinator
+    assert coord is not None
+    await coord.activate(actor="alice")
+    assert "OB_NORM_ADT" in rr.filtered_outbound()
+
+    # The critical feed's handler sends to both tiers, as a received message would.
+    message_id = await engine.store.enqueue_ingress(
+        channel_id=_CRIT,
+        raw=ADT,
+        control_id="HOLD1",
+        message_type="ADT^A01",
+        summary="DOE^JANE",
+        now=time.time(),
+    )
+
+    async def crit_delivered() -> bool:
+        rows = await engine.store.outbox_for(message_id)
+        return any(r["destination_name"] == "OB_CRIT_ADT" and r["status"] == "done" for r in rows)
+
+    await _until(crit_delivered)  # control: the pipeline ran, and the critical tier delivered
+    await asyncio.sleep(0.5)  # ten poll intervals for a worker that would claim the parked row
+    held = await _norm_row(engine, message_id)
+    assert held["status"] == "pending"
+    assert held["attempts"] == 0
+    assert rr.outbound_filtered("OB_NORM_ADT") is not None  # it still reads filtered, not stopped
+
+    started = time.monotonic()
+    await coord.release(actor="alice")
+    assert time.monotonic() - started < 10.0  # the drain did not wait on the held row
+    (row,) = await engine.store.list_audit(action="dr.release")
+    detail = json.loads(row["detail"])
+    assert detail["drained"] is True and detail["held_on_parked_outbounds"] == 1
+
+    await engine.reload_detail(box.tiered)  # the profile is off: the park lifts and it drains
+
+    async def norm_delivered() -> bool:
+        return (await _norm_row(engine, message_id))["status"] == "done"
+
+    await _until(norm_delivered)
+    assert (box.tiered.parent / "out-norm").exists()
+
+
+async def test_a_release_drain_that_times_out_is_not_recorded_as_drained(
+    box: _Box, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``drained`` is true only when the drainable rows drained; a row on a lane that is not
+    parked and cannot deliver keeps it false."""
+    engine = box.engine
+    await engine.reload_detail(box.tiered)
+    rr = engine.registry_runner
+    assert rr is not None
+    await rr.stop_outbound("OB_CRIT_ADT")  # an operator pause: drainable in principle, not now
+    await engine.store.enqueue_message(
+        channel_id=_CRIT, raw=ADT, deliveries=[("OB_CRIT_ADT", ADT)], now=time.time()
+    )
+    real_drain = engine._drain_pipeline
+
+    async def short_drain() -> tuple[bool, int]:
+        return await real_drain(timeout=0.3)
+
+    monkeypatch.setattr(engine, "_drain_pipeline", short_drain)
+    coord = engine.dr_coordinator
+    assert coord is not None
+    await coord.activate(actor="alice")
+    await coord.release(actor="alice")
+
+    (row,) = await engine.store.list_audit(action="dr.release")
+    detail = json.loads(row["detail"])
+    assert detail["drained"] is False and detail["held_on_parked_outbounds"] == 0
 
 
 async def test_a_reload_that_fails_after_the_threshold_is_set_puts_it_back(
