@@ -8817,11 +8817,11 @@ def _fhir_lookup_settings(
     # ran could pair with the typed acceptance. The attestation wins in the disposition, so the hop
     # would cross with no WARN or audit record while the report listed it as accepted. Refuse it here,
     # as the factory does, since this is the one builder both executor paths use.
-    _refuse_attested_and_accepted(
-        f"fhir lookup {spec.name!r}",
-        flag_from_settings(settings, "tls_hop_attested"),
-        spec.cleartext_accepted,
-    )
+    try:
+        attested = flag_from_settings(settings, "tls_hop_attested")
+    except ValueError as exc:
+        raise WiringError(f"fhir lookup {spec.name!r}: {exc}") from exc
+    _refuse_attested_and_accepted(f"fhir lookup {spec.name!r}", attested, spec.cleartext_accepted)
     return settings
 
 

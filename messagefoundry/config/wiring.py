@@ -76,7 +76,7 @@ from messagefoundry.config.models import (
     _check_hop_attestation,
     _check_revocation_attestation,
     check_db_connect_timeout,
-    flag_from_settings,
+    hop_attestation_from_settings,
 )
 from messagefoundry.config.send_snapshot import snapshot_on_send_active
 from messagefoundry.connection_names import (
@@ -917,8 +917,8 @@ class FhirLookupSpec:
             _check_revocation_attestation(
                 self.tls_revocation_attested, self.tls_revocation_attested_reason
             )
-            _check_cleartext_acceptance(self.cleartext_accepted, self.cleartext_reason)
-            attested = flag_from_settings(self.settings, "tls_hop_attested")
+            # The pair, not the flag alone: a spec built directly must not attest without a reason.
+            attested = hop_attestation_from_settings(self.settings)
         except ValueError as exc:
             raise WiringError(f"fhir lookup {self.name!r}: {exc}") from exc
         # The factory refuses both claims at once, and a spec built directly must not hold them either.
@@ -5067,7 +5067,9 @@ def attested_secure_hops(registry: Registry) -> list[tuple[str, str]]:
     out += [
         (name, _reason(settings.get("tls_hop_attested_reason")))
         for name, settings in settings_carriers
-        if settings.get("tls_hop_attested")
+        # `is True`, the value the strict gate reader honours (vault BACKLOG #2232). Not that reader itself:
+        # a report must not raise, and the gate already refuses any other value.
+        if settings.get("tls_hop_attested") is True
     ]
     return sorted(out)
 

@@ -181,19 +181,21 @@ class InternalErrorPolicy(str, Enum):  # noqa: UP042
 
 
 def require_flag(value: object, key: str) -> bool:
-    """Return ``value`` if it is a real ``bool``; refuse anything else, naming ``key`` (BACKLOG #2232).
+    """Return ``value`` if it is a real ``bool``; refuse anything else, naming ``key`` (vault BACKLOG #2232).
 
     For the hop-policy flags (``tls_hop_attested``, ``tls_revocation_attested``,
     ``cleartext_accepted``). ``bool("false")`` is ``True``, so a lax read would honour the string
     ``"false"`` as the flag SET; an ``env()`` reference is truthy too. ``connections.toml`` already
-    refuses both (``connections_file._require_bool``); this is the same rule for every other path."""
+    refuses both (``connections_file._require_bool``); this is the same rule for the code-first
+    factories and the settings-driven seams. A typed pydantic field (``Source``, ``Destination``,
+    ``[logging].forward_hop_attested``) is lax ``bool`` and coerces before this runs."""
     if not isinstance(value, bool):
         raise ValueError(f"{key} must be true or false, not {type(value).__name__}")
     return value
 
 
 def flag_from_settings(settings: Mapping[str, Any], key: str) -> bool:
-    """The one reader of a hop-policy flag out of a raw settings mapping (BACKLOG #2232).
+    """The one reader of a hop-policy flag out of a raw settings mapping (vault BACKLOG #2232).
 
     Absent, or ``None``, means ``False``. A real ``bool`` is returned as is. Anything else raises
     :class:`ValueError` naming ``key`` (:func:`require_flag`), so a mapping that was written past

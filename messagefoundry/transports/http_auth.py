@@ -359,10 +359,15 @@ def digest_handler_from_settings(
     # ``InsecureHopRefused`` on REFUSE; re-raise as ``HttpAuthError`` to keep this seam's error contract
     # (both are ``ValueError``s → the loader surfaces either identically). Runs at connector construction
     # under the gate's stamped posture (fail-closing to prod-PHI when unstamped).
-    attested = flag_from_settings(s, "tls_hop_attested")
-    # ADR 0153: the sibling cleartext-acceptance declaration, mirrored into these resolved settings by
-    # the runner's _dest_config for exactly this kind of settings-driven seam.
-    accepted, accept_reason, accept_conn = cleartext_acceptance_from_settings(s)
+    try:
+        attested = flag_from_settings(s, "tls_hop_attested")
+        # ADR 0153: the sibling cleartext-acceptance declaration, mirrored into these resolved
+        # settings by the runner's _dest_config for exactly this kind of settings-driven seam.
+        accepted, accept_reason, accept_conn = cleartext_acceptance_from_settings(s)
+    except (
+        ValueError
+    ) as exc:  # a non-bool flag (vault BACKLOG #2232), kept inside this seam's contract
+        raise HttpAuthError(str(exc)) from exc
     try:
         refuse_cleartext_credential_hop(
             scheme,
