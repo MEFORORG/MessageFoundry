@@ -297,7 +297,7 @@ are an owner act and remain **pending**.
 | **MFA / multi-layer admin** (6.3.3 / 8.4.2) | your **directory (AD / Entra)** — healthcare orgs are now *required* to enforce MFA there. MEFOR authenticates against it, but counts its MFA only through a checked OIDC claim (see note below) | **a native second factor is built and required by default** (ADR 0002 WP-14) — RFC 6238 TOTP, `[security].require_mfa = true` with `require_mfa_scope = "every_local_account"` + the step-up gate. A WebAuthn passkey (WP-14b) is another factor, for the browser only, and it needs the optional `[webauthn]` extra. The factor reaches directory accounts too, on the rule [SECURITY.md](SECURITY.md#multi-factor-authentication-totp-wp-14) states |
 | **TLS client-cert / mTLS** (12.3.5) | your **PKI**; MF's API mTLS is built (`tls_client_ca_file`, opt-in) | enable mTLS + a console client cert |
 | **Certificate revocation** (12.1.4) | your **proxy / PKI** (OCSP/CRL at the terminator) — **still the control for most hops**, and for a named few the engine also makes you say so | **ENFORCED on the API bind + at least nine outbound hops; delegated everywhere else.** An off-loopback in-process-TLS API bind is refused at `serve`, and **at least nine** verifying outbound TLS hops — MLLP-over-TLS, REST, SOAP, FHIR, DICOMweb https, SMTP/EMAIL, the **PostgreSQL** store hop, the **SMART token endpoint**, the **`[logging]` TLS syslog forwarder**, the **OIDC token and JWKS legs** (those three added by [ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md) §4.3), the **OAuth2 client-credentials token endpoint** (BACKLOG #2112), and the **`fhir_lookup` read hop**, the **DICOM C-STORE SCU over TLS**, the **FTPS upload** and a **credentialed DIRECT relay** (BACKLOG #2193) — are refused at construction on an enforcing PHI instance, unless revocation is **proven in front** (an upstream TLS terminator — API gate only) or **attested** with `MEFOR_TLS_REVOCATION_ATTESTED=1`. **That env no longer clears an outbound hop on an enforcing instance.** There, an outbound hop crosses on loopback or on a CRL loaded on that hop. For the OIDC legs that CRL is `[auth].oidc_tls_crl_file`. **Other verifying hops are NOT gated and stay fully delegated** — the **SQL Server** store hop, the inbound FTPS poll, the `dialect='sqlserver'` DATABASE destination, LDAPS, the webhook + AI-broker endpoints. "Add OCSP/CRL to the TLS contexts" is **not** an available option anywhere: stdlib `ssl` exposes no OCSP/CRL fetch and the engine deliberately attempts none. See [Revocation-guard behavior](#revocation-guard-behavior) |
-| **Off-box log shipping** (16.4.3) | forward the audit + operational logs to your **SIEM/syslog** | **built** — `[logging].forward_*` ships operational logs + PHI-redacted audit rows to a syslog/SIEM collector, over **native TLS** with `forward_protocol = "tls"` (RFC 5425, ADR 0080; port 6514). **Required under the shipped `enforce`**: `serve` refuses to start without verified TLS to a collector on another host, with `forward_tls_ca_file` and `forward_tls_crl_file` set (BACKLOG #1966); `enforcement = "warn"` only warns. A local agent on 127.0.0.1 does not satisfy it. Steps: [SERVICE.md](SERVICE.md#configure-off-box-log-forwarding-before-the-first-start) |
+| **Off-box log shipping** (16.4.3) | forward the audit + operational logs to your **SIEM/syslog** | **built** — `[logging].forward_*` ships operational logs + audit rows, both with only best-effort PHI redaction ([PHI.md §7](PHI.md#7-logging--phi-redaction)), to a syslog/SIEM collector, over **native TLS** with `forward_protocol = "tls"` (RFC 5425, ADR 0080; port 6514). **Required under the shipped `enforce`**: `serve` refuses to start without verified TLS to a collector on another host, with `forward_tls_ca_file` and `forward_tls_crl_file` set (BACKLOG #1966); `enforcement = "warn"` only warns. A local agent on 127.0.0.1 does not satisfy it. Steps: [SERVICE.md](SERVICE.md#configure-off-box-log-forwarding-before-the-first-start) |
 
 **Write the delegation into your deployment runbook.** "We run MEFOR inside our network behind
 \<perimeter / IdP / PKI / SIEM\>" is what turns these from open gaps into *addressed-by-environment* —
@@ -337,8 +337,11 @@ the management API, and it does not inherit the API's auth: harden it deliberate
   listener with an authenticating reverse proxy.
 - **Synchronous reply, built (ADR 0154):** by default the listener answers `202 Accepted` on receipt.
   With `reply_from` naming an outbound that captures its response, the HTTP turn instead waits up to
-  `reply_timeout` for that captured reply and returns it. That holds only when the partner succeeds:
-  a partner error dead-letters and the caller gets a fixed-JSON `502`, not the partner's own body.
+  `reply_timeout` for that captured reply and returns it. A reply the outbound captured as a
+  rejection, at least a SOAP fault in a 2xx body, comes back as a `502` that carries the partner's
+  body. A delivery that dead-letters captures no reply, so a caller still waiting gets a fixed-JSON
+  `502` without the partner's status or body. Most partner `4xx` statuses dead-letter the delivery
+  at once.
   `check_http_sync_reply` refuses a `reply_from` it cannot serve safely, for example one whose outbound
   does not capture its response or would retry forever; see
   [CONNECTIONS.md](CONNECTIONS.md#http-web-service-listener--http-inbound-only-adr-0023).
@@ -451,7 +454,9 @@ HIPAA posture (BAA, KMS, PrivateLink, region pinning), see [`CLOUD-PHI-HIPAA.md`
    `block_unlisted_outbound` not written `true`, **refuses to start**. **`[egress]` is not a boundary around Handler code** — see
    the limit stated under [egress allow-lists](#egress-allow-lists).
 7. **Off-box logs + MFA** — **both are built** and pair with off-loopback exposure: enable
-   `[logging].forward_*` to ship logs + (PHI-redacted) audit to your SIEM. Under the shipped
+   `[logging].forward_*` to ship logs + audit to your SIEM. The redaction on that copy is
+   best-effort, so treat the collector's copy as potential PHI
+   ([PHI.md §7](PHI.md#7-logging--phi-redaction)). Under the shipped
    `enforce` this is required, not optional: set `forward_host` (a collector on another host),
    `forward_port` (usually 6514), `forward_protocol = "tls"`, `forward_tls_ca_file` and
    `forward_tls_crl_file`, or `serve` refuses to start (BACKLOG #1966). A local TLS agent on 127.0.0.1

@@ -782,8 +782,8 @@ Only `baa_attested` is still a forward-compat placeholder (accepted-but-ignored)
 > See [PHI.md §7](PHI.md#7-logging--phi-redaction) and
 > [ADR 0080](adr/0080-offbox-forwarding-tls-defaults.md).
 >
-> **The plaintext default is now gated, not silent (#200, ADR 0092).** The forwarded stream is
-> PHI-redacted but still carries usernames, connection names, message ids, client addresses, and the
+> **The plaintext default is now gated, not silent (#200, ADR 0092).** The forwarded stream gets
+> only best-effort PHI redaction and still carries usernames, connection names, message ids, client addresses, and the
 > tamper-evident audit chain. `serve` therefore decides the forwarding hop with the **same** authority
 > the transports use, *before* the handler is installed: a hop that is not verified TLS is **refused**
 > on an enforcing instance, **warned** on a non-enforcing one, and **allowed** for a loopback

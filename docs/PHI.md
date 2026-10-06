@@ -1469,7 +1469,8 @@ high-volume feed prefer UDP to a collector on another host, which the forwarding
 under `enforcement = "warn"` (BACKLOG #1966).
 
 The tamper-evident **`audit_log`** is **also tee'd off-box** (sec-offbox-log #361/#363): every committed
-audit row is emitted as PHI-redacted metadata through the `messagefoundry.audit` logger to the same
+audit row is emitted as metadata, with only best-effort PHI redaction of its `detail` (stream 3
+below), through the `messagefoundry.audit` logger to the same
 handlers, across all three store backends
 ([`store/audit_tee.py`](../messagefoundry/store/audit_tee.py)). That logger is **pinned to `INFO`**, so
 audit evidence is emitted even when `[logging].level` is `WARNING`. **Not used:** structlog (stdlib

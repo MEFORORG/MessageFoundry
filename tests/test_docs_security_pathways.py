@@ -3402,6 +3402,57 @@ def test_the_thirteenth_sweep_second_round_probes_reply_logging_and_opt_in() -> 
     assert {"reply_from", "reply_timeout"} <= set(inspect.signature(Http).parameters)
     assert callable(wiring_runner.check_http_sync_reply)
 
+    # 1b. What the blocked turn answers (ADR 0154 D5). A reply captured as anything but accepted or
+    #     no-reply resolves `rejected`, and `rejected` is answered 502 WITH the partner's body. Only
+    #     a dead or cancelled delivery row resolves `failed`, which is answered 502 with fixed JSON.
+    from messagefoundry.pipeline import sync_reply
+    from messagefoundry.store.store import OutboxStatus
+    from messagefoundry.transports import rest, soap
+    from messagefoundry.transports.base import InboundReply, ReplyOutcome
+    from messagefoundry.transports.http_listener import HttpSource
+
+    partner = "<soap:Fault>the partner's own words</soap:Fault>"
+    listener: Any = SimpleNamespace(reply_on_empty="204", reply_on_timeout="504")
+    rejected = InboundReply(outcome=ReplyOutcome.REJECTED, body=partner)
+    assert HttpSource._reply_to_wire(listener, rejected, "m1") == (502, partner, None), (
+        "a captured rejection is no longer answered 502 with the partner's body: re-derive the "
+        "intake caveat in docs/DEPLOYMENT.md"
+    )
+    status, fixed, _ = HttpSource._reply_to_wire(
+        listener, InboundReply(outcome=ReplyOutcome.FAILED), "m1"
+    )
+    assert (status, "delivery_failed" in fixed, "partner" in fixed) == (502, True, False)
+    assert {OutboxStatus.DEAD.value} <= sync_reply._TERMINAL_ROW_STATES
+
+    async def committed(outcome: str) -> InboundReply:
+        async def correlate_response(message_id: str) -> list[SimpleNamespace]:
+            return [
+                SimpleNamespace(
+                    kind="response",
+                    destination_name="OB",
+                    response_seq=1,
+                    body=partner,
+                    outcome=outcome,
+                    headers={},
+                )
+            ]
+
+        store: Any = SimpleNamespace(correlate_response=correlate_response)
+        resolver = sync_reply.SyncReplyResolverImpl(
+            store, typing.cast(Any, None), destination="OB", timeout=1.0, content_type="text/xml"
+        )
+        return await resolver._read_committed_reply("m1", 1, 0)
+
+    for outcome in ("rejected", "unparseable"):
+        reply = asyncio.run(committed(outcome))
+        assert (reply.outcome, reply.body) == (ReplyOutcome.REJECTED, partner), outcome
+    assert asyncio.run(committed("accepted")).outcome is ReplyOutcome.REPLY
+    # The caveat's example and its "most": a capturing SOAP send returns a 2xx <Fault> as a
+    # rejected reply, and REST retries exactly two 4xx statuses and dead-letters the rest.
+    assert 'outcome="rejected"' in inspect.getsource(soap.SoapDestination.send)
+    retried_4xx = rest._RETRYABLE_4XX
+    assert retried_4xx == frozenset({408, 429})
+
     # 2. Each sink handler the engine builds gets the one filter chain, read per handler: every name
     #    bound to a handler constructor is passed to `_install_phi_filters` in the same function.
     sinks = {"_ForwardQueueHandler", "GuardedStreamHandler", "GuardedFileHandler", "StreamHandler"}
@@ -3449,35 +3500,79 @@ def test_the_thirteenth_sweep_deployment_does_not_call_the_sync_reply_unbuilt() 
     assert "`reply_from`" in flat, (
         "the intake caveat must name reply_from, the setting that builds the synchronous reply"
     )
-    # ...and must not promise a partner's own body on every answer: a partner error dead-letters.
+    # ...and must not promise a partner's own body on every answer: a dead-lettered delivery is
+    # answered with fixed JSON.
     assert "502" in flat, "the intake caveat must say a partner error reaches the caller as a 502"
+    # Nor may it say the reverse, that every 502 is fixed JSON. The caveat said "That holds only
+    # when the partner succeeds: a partner error dead-letters and the caller gets a fixed-JSON
+    # `502`, not the partner's own body". A reply captured as a rejection is delivered, not
+    # dead-lettered, and its 502 carries the partner's body (the probe above).
+    blanket = [
+        c
+        for c in clauses
+        if re.search(r"only when the partner succeeds|\ba partner error\b", c, re.I)
+        or ("fixed-JSON" in c and not re.search(r"dead-letter", c, re.I))
+    ]
+    assert not blanket, (
+        f"docs/DEPLOYMENT.md says every partner error is answered with fixed JSON again: {blanket}"
+    )
+    with_body = [
+        c
+        for c in clauses
+        if "`502`" in c and re.search(r"\breject", c, re.I) and "carries the partner's body" in c
+    ]
+    assert with_body, (
+        "the intake caveat must say a reply captured as a rejection comes back as a 502 that "
+        "carries the partner's body"
+    )
+
+
+#: The retracted claim, in each phrasing a doc gave it: the forwarded log copy, or the audit rows in
+#: it, called PHI-redacted or PHI-free outright. "PHI-redacted audit rows", "(PHI-redacted) audit"
+#: and "PHI-redacted metadata" are the phrasings the first pattern missed. "PHI-redaction filters"
+#: does not match: naming the filters is true, and calling their output PHI-redacted is the claim.
+_FORWARDED_PHI_FREE = re.compile(
+    r"PHI-(?:redacted|free)\)? (?:stream|copy|audit|metadata|rows?|logs?|evidence)"
+    r"|redacted (?:stream|copy)"
+    r"|(?:copy|stream|rows?|audit) (?:is|are) PHI-(?:redacted|free)",
+    re.IGNORECASE,
+)
+
+#: A clause about the off-box copy, under the names the docs give it.
+_OFF_BOX_COPY = re.compile(r"forward|collector|off-box|\bSIEM\b|syslog", re.IGNORECASE)
 
 
 @pytest.mark.parametrize(
-    ("name", "floor"), [("docs/EARLY-ADOPTER-GUIDE.md", 300), ("docs/PHI.md", 1000)]
+    ("name", "floor", "subject_floor"),
+    [
+        ("docs/EARLY-ADOPTER-GUIDE.md", 300, 5),
+        ("docs/PHI.md", 1000, 30),
+        ("docs/DEPLOYMENT.md", 300, 8),
+        ("docs/CONFIGURATION.md", 2000, 30),
+        ("docs/SECURITY.md", 2000, 25),
+        ("docs/CONTAINER-EXPOSURE-EVALUATION.md", 150, 6),
+    ],
 )
 def test_the_thirteenth_sweep_no_doc_calls_the_forwarded_copy_phi_free(
-    name: str, floor: int
+    name: str, floor: int, subject_floor: int
 ) -> None:
     """docs/EARLY-ADOPTER-GUIDE.md told the reader not to copy the potential-PHI log files off-box
     because forwarding sends "a PHI-redacted stream" instead, and docs/PHI.md's forwarder row said
     "the forwarded copy is PHI-redacted". The forwarded copy passes the same best-effort filters as
-    stdout (the probe above), and docs/PHI.md grades the log files and the spool both "Possibly"."""
+    stdout (the probe above), and docs/PHI.md grades the log files and the spool both "Possibly".
+
+    That correction left the same claim standing as "PHI-redacted audit rows", "(PHI-redacted)
+    audit" and "PHI-redacted metadata", here and in four more documents. The audit tee scrubs only
+    HL7-shaped spans out of a row's ``detail`` (the probe above), so a forwarded audit row is no
+    more PHI-free than a forwarded log line."""
     clauses = _clauses(_doc(name))
     assert len(clauses) >= floor, f"{name} cut into {len(clauses)} clause(s), floor {floor}"
-    forwarded = [c for c in clauses if re.search(r"forward|collector", c, re.I)]
-    assert forwarded, f"{name} names no log forwarding, so this check reads nothing"
-    phi_free = [
-        c
-        for c in forwarded
-        if re.search(
-            r"PHI-(?:redacted|free) (?:stream|copy)|redacted (?:stream|copy)"
-            r"|(?:copy|stream) is PHI-(?:redacted|free)",
-            c,
-            re.I,
-        )
-        and "best-effort" not in c
-    ]
+    forwarded = [c for c in clauses if _OFF_BOX_COPY.search(c)]
+    assert len(forwarded) >= subject_floor, (
+        f"{name} has {len(forwarded)} clause(s) about the off-box copy, floor {subject_floor}: "
+        "this check reads too little to clear it"
+    )
+    phi_free = [c for c in forwarded if _FORWARDED_PHI_FREE.search(c) and "best-effort" not in c]
     assert not phi_free, f"{name} presents the forwarded log copy as PHI-free again: {phi_free}"
     if name == "docs/EARLY-ADOPTER-GUIDE.md":
         assert any("collector" in c and "potential PHI" in c for c in forwarded), (

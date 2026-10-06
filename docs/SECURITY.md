@@ -4231,7 +4231,8 @@ to the forwarded stream as to stdout (see [PHI.md §7](PHI.md#7-logging--phi-red
   gate. A host NAME that resolves to loopback does pass, because the check never resolves DNS; that residual belongs to #1199's collector-separation probe.
 
 The **`audit_log`** rows *themselves* are **also** forwarded off-box (sec-offbox-log #361/#363): every
-committed audit row ships as PHI-redacted metadata through the `messagefoundry.audit` logger to the same
+committed audit row ships as metadata, with only best-effort PHI redaction
+([PHI.md §7](PHI.md#7-logging--phi-redaction)), through the `messagefoundry.audit` logger to the same
 forwarder — so it inherits the TLS transport automatically — across all three store backends, so both the
 operational log and the tamper-evident audit trail survive a host/DB compromise.
 
