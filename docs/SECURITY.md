@@ -4436,6 +4436,14 @@ governed by the posture-keyed cleartext refusal (ADR 0092). It is **not** applie
 context (`build_api_ssl_context`), which verifies **client** certs for opt-in mTLS (ADR 0083) — a
 different trust role. With no `[tls]` block the built SSL context is byte-identical to before.
 
+A connection's own `tls_ca_file` is checked at start and at every reload (vault BACKLOG #2371), as an
+inbound listener's CA is: an optional `tls_ca_pin`, a refusal under `enforce` for a file another
+account could replace, and an `auth.trust_anchor` row when the file changes. One gap remains. The hop
+reads the file again by path when it builds its context, so a file swapped after the check would be
+trusted until the next reload, and a matching pin is no escape for a file whose permissions the
+engine cannot read. [CONNECTIONS.md](CONNECTIONS.md#the-engine-checks-the-file-at-every-start-and-reload-tls_ca_pin)
+states the checks once. `[tls].internal_ca_file` takes none of these checks yet.
+
 ### PHI data-plane integrity residuals — scope-outs (#190, ADR 0093)
 
 BACKLOG #190 bundled three integrity residuals; #190 closes with **one built** and **two scoped out**:
