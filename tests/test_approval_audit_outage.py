@@ -33,9 +33,14 @@ from messagefoundry.config.settings import (
 from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.store.store import MessageStore
-from tests._pending_approval_store_contract import _resolve, _StandingStore
+from tests._pending_approval_store_contract import (
+    _REQUESTER_ID,
+    _request,
+    _resolve,
+    _StandingStore,
+    _status,
+)
 
-_REQUESTER_ID = "outage-requester-id"
 _APPROVER_ID = "outage-approver-id"
 _FAULT = "disk I/O error"
 
@@ -96,7 +101,12 @@ async def store(tmp_path: Path) -> AsyncIterator[MessageStore]:
 
 
 def _gate(
-    store: Any, sink: _Sink, *, min_dwell: float = 0.0, runs: list[str] | None = None
+    store: Any,
+    sink: _Sink,
+    *,
+    min_dwell: float = 0.0,
+    runs: list[str] | None = None,
+    raises: bool = False,
 ) -> ApprovalGate:
     settings = ApprovalsSettings(
         enabled=True, operations=["dead_letter_replay"], min_dwell_seconds=min_dwell
@@ -104,26 +114,14 @@ def _gate(
     gate = ApprovalGate(store, settings, resolve_identity=_resolve, alert_sink=sink)
 
     async def _execute(_p: Mapping[str, Any]) -> dict[str, Any]:
+        if raises:
+            raise RuntimeError("executor exploded")
         if runs is not None:
             runs.append("ran")
         return {"requeued": 0}
 
     gate.register("dead_letter_replay", "op", _execute, permission=Permission.MESSAGES_REPLAY)
     return gate
-
-
-async def _request(gate: ApprovalGate) -> str:
-    approval_id = await gate.guard(
-        "dead_letter_replay", {}, requester="maker", requester_user_id=_REQUESTER_ID
-    )
-    assert approval_id is not None
-    return approval_id
-
-
-async def _status(store: MessageStore, approval_id: str) -> str:
-    row = await store.get_pending_approval(approval_id)
-    assert row is not None
-    return str(row["status"])
 
 
 # --- finding 3: refusals and status writes answer a mapped status, never a raw 500 ---------------
@@ -271,21 +269,7 @@ async def test_a_failed_compensation_still_writes_its_audit_row(store: MessageSt
     """The compensation's status write and audit row used to share one try, so a failed status
     write also dropped the approval.failed row. It is now attempted on its own, and says the row
     did not move."""
-    sink = _Sink()
-    settings = ApprovalsSettings(
-        enabled=True, operations=["dead_letter_replay"], min_dwell_seconds=0.0
-    )
-    gate = ApprovalGate(
-        _Faulty(store, decide_fails=("failed",)),
-        settings,
-        resolve_identity=_resolve,
-        alert_sink=sink,
-    )
-
-    async def _raises(_p: Mapping[str, Any]) -> dict[str, Any]:
-        raise RuntimeError("executor exploded")
-
-    gate.register("dead_letter_replay", "op", _raises, permission=Permission.MESSAGES_REPLAY)
+    gate = _gate(_Faulty(store, decide_fails=("failed",)), _Sink(), raises=True)
     approval_id = await _request(gate)
     with pytest.raises(RuntimeError, match="executor exploded"):
         await gate.approve(approval_id, approver="checker", approver_user_id=_APPROVER_ID)

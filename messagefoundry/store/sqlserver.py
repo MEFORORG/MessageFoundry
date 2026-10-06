@@ -4369,7 +4369,7 @@ class SqlServerStore:
 
         The detach itself is :func:`_detach_connection`, shared with :meth:`_rollback_or_discard`.
         """
-        closer = _detach_connection(conn)  # MUST stay first, and MUST stay await-free
+        closer = _detach_connection(conn)  # first: no await may come before the detach
         if closer is None:  # already detached, handed to a running call, or the executor refused
             return
         try:
