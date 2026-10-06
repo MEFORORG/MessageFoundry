@@ -2030,10 +2030,14 @@ def _with_headers(headers: bytes) -> bytes:
     return _real_ca("crl-test-ca")[0].replace(_BEGIN_CERT, _BEGIN_CERT + headers)
 
 
-def _carriage_return_in_the_begin_line() -> bytes:
-    """A bare CR inside the BEGIN line: bytes.splitlines ends the line there, OpenSSL does not."""
-    return _with_headers(_ENCRYPTED).replace(
-        _BEGIN_CERT, b"-----BEGIN CERTIFICATE-----\r-----END X\n"
+def _begin_past_a_long_line(end_line: bytes) -> Any:
+    """Code review round 2's measured bypasses of a line-based check. The BEGIN sits after 254
+    bytes of one line, where OpenSSL reads it and anchor_cadata's own line loop does not, and the
+    line after it looked like an END line to that check. With the real load, each shape did not
+    return within 15 seconds."""
+    second = _real_ca("second-ca")[0].replace(_BEGIN_CERT, b"")  # the body and its END line
+    return lambda: (
+        _real_ca("crl-test-ca")[0] + b"#" * 254 + _BEGIN_CERT + end_line + _ENCRYPTED + second
     )
 
 
@@ -2070,7 +2074,10 @@ class _NoTlsLoad:
         ),
         pytest.param(lambda: _with_headers(b"proc-type: 4,ENCRYPTED\n\n"), id="lower case"),
         pytest.param(lambda: _with_headers(b"  Proc-Type: 4,ENCRYPTED\n\n"), id="leading space"),
-        pytest.param(_carriage_return_in_the_begin_line, id="bare CR in the BEGIN line"),
+        pytest.param(_begin_past_a_long_line(b"-----END X\xff\n"), id="long line, non-ASCII END"),
+        pytest.param(
+            _begin_past_a_long_line(b"\xef-----END X\n"), id="long line, stray byte before END"
+        ),
         pytest.param(_byte_order_mark_before_the_block, id="byte-order mark"),
         pytest.param(_encrypted_key_beside_the_certificate, id="encrypted key block"),
     ],

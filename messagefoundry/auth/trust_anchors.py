@@ -174,29 +174,26 @@ _PEM_BEGIN = b"-----BEGIN "
 _PEM_END = b"-----END "
 _PEM_TRUSTED = b"-----BEGIN TRUSTED CERTIFICATE-----"
 #: The RFC 1421 headers of an encrypted PEM block, lower-cased (BACKLOG #2270, :func:`anchor_cadata`).
-_PEM_ENCRYPTION_HEADERS = (b"proc-type:", b"dek-info:")
+_PEM_ENCRYPTION_HEADERS = ("proc-type:", "dek-info:")
 #: The source-location tail CPython appends to an ``ssl.SSLError`` message, dropped from a refusal.
 _SSL_WHERE = re.compile(r"\s*\(_ssl\.c:\d+\)$")
 
 
-def _has_encryption_header(data: bytes) -> bool:
-    """Whether a PEM block in ``data`` carries an RFC 1421 encryption header (BACKLOG #2270).
+def _has_encryption_header(text: str) -> bool:
+    """Whether an RFC 1421 encryption header name appears anywhere after the first ``-----BEGIN ``
+    in ``text``, the exact text the TLS load is handed (BACKLOG #2270).
 
-    It splits lines on the line-feed byte alone, as OpenSSL reads them. ``bytes.splitlines`` also
-    splits on a bare carriage return, so one inside a BEGIN line could end a block early there and
-    hand a header behind it to OpenSSL. It errs wide on purpose: a block runs from any line holding ``-----BEGIN ``
-    to a line starting ``-----END ``, and a header name anywhere in such a line counts. A base64
-    body holds no ``:``, so no real certificate line matches."""
-    inside = False
-    for line in data.split(b"\n"):
-        if _PEM_BEGIN in line:
-            inside = True
-        lowered = line.lower()
-        if inside and any(header in lowered for header in _PEM_ENCRYPTION_HEADERS):
-            return True
-        if _PEM_BEGIN not in line and line.lstrip(b" \t\r" + _UTF8_BOM).startswith(_PEM_END):
-            inside = False
-    return False
+    It models no block structure, on purpose. OpenSSL finds a BEGIN in 254-byte pieces of a long
+    line, and ends a block where its own reader says, so a line model here disagrees with it at the
+    edges. A code review measured two such bypasses of an earlier line-based check, each ending in
+    a ``cadata=`` load that did not return. Every header OpenSSL could act on follows a BEGIN it
+    read, and that BEGIN is in the text verbatim. So this errs wide: a header name in a comment
+    between two blocks refuses too. A base64 body holds no ``:``, so no certificate line matches."""
+    begin = text.find("-----BEGIN ")
+    if begin < 0:
+        return False
+    tail = text[begin:].lower()
+    return any(header in tail for header in _PEM_ENCRYPTION_HEADERS)
 
 
 def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
@@ -248,20 +245,13 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
     did not return within 20 seconds and was killed, while ``cafile=`` on the same bytes refused at
     once with ``PEM lib``. So a start or a reload could hang on this file. A CA certificate never
     carries an RFC 1421 encryption header, so ``Proc-Type:`` and ``DEK-Info:`` both refuse, in any
-    case, in a block of any label, and OpenSSL is never handed the text
-    (:func:`_has_encryption_header`). That is wider than the hang: an encrypted private-key block
-    beside a certificate loads through ``cadata=``, and refuses here, because a trust anchor has no
-    use for a key. The same header in a comment outside a block still passes, since OpenSSL skips
-    every line outside a block."""
-    if _has_encryption_header(data):
-        raise TrustAnchorError(
-            f"{spec.setting}: the trust anchor {spec.path!r} holds a PEM block with an encryption "
-            "header (Proc-Type or DEK-Info), such as an encrypted certificate or private key. A "
-            "trust anchor needs only plain CERTIFICATE blocks, and loading an encrypted one can make "
-            "the TLS library wait for a password. Remove the encrypted block, or export the CA "
-            "certificate as a plain CERTIFICATE block"
-        )
+    case, anywhere after the first BEGIN of the text the load would get, and OpenSSL is never
+    handed that text (:func:`_has_encryption_header`). That is wider than the hang: an encrypted
+    private-key block beside a certificate loads through ``cadata=``, and refuses here, because a
+    trust anchor has no use for a key, and so does the header name in a comment between two
+    blocks. The same header in a comment above the first block still passes."""
     kept: list[bytes] = []
+
     inside = False
     blocks = 0
     fresh = True  # the first line, or the line after an END line: where OpenSSL drops a BOM
@@ -295,6 +285,14 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
             f"{spec.setting}: the trust anchor {spec.path!r} has a non-ASCII byte inside a PEM "
             "block, so it is not a readable certificate"
         ) from exc
+    if _has_encryption_header(text):
+        raise TrustAnchorError(
+            f"{spec.setting}: the trust anchor {spec.path!r} holds a PEM block with an encryption "
+            "header (Proc-Type or DEK-Info), such as an encrypted certificate or private key. A "
+            "trust anchor needs only plain CERTIFICATE blocks, and loading an encrypted one can make "
+            "the TLS library wait for a password. Remove the encrypted block, or export the CA "
+            "certificate as a plain CERTIFICATE block"
+        )
     try:
         ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).load_verify_locations(cadata=text)
     except ssl.SSLError as exc:
