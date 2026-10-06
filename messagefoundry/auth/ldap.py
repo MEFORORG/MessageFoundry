@@ -25,8 +25,9 @@ import logging
 import math
 import re
 import ssl
+import struct
 import uuid
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -528,6 +529,64 @@ def _search(conn: Any, operation: str, **kwargs: Any) -> None:
     _refuse_referral(conn, operation)
 
 
+#: What opening an ldap3 socket can raise that is not an ldap3 error (BACKLOG #2566). ldap3's
+#: ``_open_socket`` wraps a ``socket.error`` in its own ``LDAPSocketOpenError``, but not what
+#: ``settimeout`` and ``setsockopt`` raise on a bad value: ``OverflowError``, ``TypeError``, or the
+#: ``struct.error`` BACKLOG #2546 found. With one candidate address, ``open()`` re-raises that fault
+#: bare. ``ValueError`` is a host name that fails IDNA encoding in ``getaddrinfo``, which runs outside
+#: ldap3's per-address try. ``OSError`` covers what else escapes. At least these; others still escape.
+_SOCKET_FAULTS: tuple[type[Exception], ...] = (
+    OSError,
+    OverflowError,
+    TypeError,
+    ValueError,
+    struct.error,
+)
+
+
+@contextlib.contextmanager
+def _socket_faults_as_ldap_error() -> Iterator[None]:
+    """Turn a :data:`_SOCKET_FAULTS` error from the ldap3 call inside into :class:`LdapError`.
+
+    Every caller maps ``LdapError`` to a directory failure, and the sign-in callers write
+    ``auth.login_error``, so an unmapped fault would skip both and surface as an unhandled error.
+
+    **It wraps only the ldap3 calls that OPEN a socket**: the service account's ``auto_bind``
+    construction and the explicit binds. An operation on an open socket needs none, because ldap3
+    already re-raises a ``socket.error`` there as its own ``LDAPSocket*Error``. A wider wrap would
+    catch the engine's own defects, such as a ``TypeError`` from a bad keyword or from parsing an
+    answer. Mapped, that reads as a directory outage, which the session reconciler holds on and logs
+    at debug level, so the defect would hide.
+
+    Two wraps are wider than the open, and each says why. The ``auto_bind`` construction checks its
+    keywords and opens in one call, so a renamed ldap3 keyword there would map; the real-ldap3 arms
+    of ``tests/test_ldap_referrals.py`` build that connection, so one would fail there first. And
+    ``authenticate`` wraps the whole decoy bind, which must neither map nor swallow by itself.
+
+    An ``LDAPException`` passes through untouched, even one that is also an ``OSError``,
+    ``TypeError`` or ``ValueError``, so its own handler keeps its own text. The new text is fixed
+    and names only the type: a fault's message is not the engine's to repeat. **That holds only for
+    a fault that reaches this wrap bare.** With more than one candidate address, ldap3 bundles each
+    address's fault into ``LDAPSocketOpenError``, whose text the ldap3 handler keeps.
+    """
+    import ldap3
+
+    try:
+        yield
+    except ldap3.core.exceptions.LDAPException:
+        raise
+    except _SOCKET_FAULTS as exc:
+        kind = type(exc)
+        # The type alone, never str(exc). struct.error's own name is just "error", so a type from
+        # outside builtins carries its module.
+        name = (
+            kind.__qualname__
+            if kind.__module__ == "builtins"
+            else f"{kind.__module__}.{kind.__qualname__}"
+        )
+        raise LdapError(f"AD directory call failed: {name}") from exc
+
+
 class LdapAuthenticator:
     """Binds against Active Directory over LDAPS and resolves a user's (nested) group membership."""
 
@@ -666,15 +725,20 @@ class LdapAuthenticator:
         # ASVS 13.1.3: receive_timeout bounds every LDAP RESPONSE read on this connection (the bind and
         # each search). ldap3's default is None — an unresponsive DC would otherwise pin the thread-pool
         # worker AuthService dispatches this call on, since that dispatch has no asyncio.wait_for.
-        return ldap3.Connection(
-            self._server(),
-            user=self._s.ad_bind_dn,
-            password=self._bind_password,  # resolved once in __init__ (env or [secrets].provider)
-            authentication=ldap3.SIMPLE,
-            auto_bind=True,
-            receive_timeout=_ldap3_receive_timeout(self._s.ad_receive_timeout),
-            auto_referrals=False,  # BACKLOG #2530: see _refuse_referral
-        )
+        # auto_bind opens the socket here, so a socket fault surfaces here (BACKLOG #2566). The
+        # Server is built outside the wrap to keep engine code out of it. The timeout conversion
+        # stays inline, because tests/test_ldap_timeouts.py checks for that call at this site.
+        server = self._server()
+        with _socket_faults_as_ldap_error():
+            return ldap3.Connection(
+                server,
+                user=self._s.ad_bind_dn,
+                password=self._bind_password,  # resolved once in __init__ (env or a provider)
+                authentication=ldap3.SIMPLE,
+                auto_bind=True,
+                receive_timeout=_ldap3_receive_timeout(self._s.ad_receive_timeout),
+                auto_referrals=False,  # BACKLOG #2530: see _refuse_referral
+            )
 
     def _equalizing_bind(self, password: str) -> None:
         """Do the password-verifying bind's work for a principal that does not exist, and discard it.
@@ -689,6 +753,17 @@ class LdapAuthenticator:
         against a deliberately-bogus DN raise would turn a plain failed login into a *connectivity
         error* — a louder oracle than the timing one this exists to close, and a behaviour change on
         the ordinary wrong-username path.
+
+        **A socket fault that is not an ldap3 error is NOT swallowed (BACKLOG #2566).** It propagates,
+        and ``authenticate`` maps it to :class:`LdapError` exactly as it maps the real bind's. Both
+        branches open a socket to the same directory, so such a fault fails them alike; swallowing
+        it here alone would answer "wrong password" for an absent account and "directory error" for
+        a present one.
+
+        **What #2566 does not settle:** ldap3's OWN socket errors still differ between the branches.
+        This method swallows an ``LDAPSocketOpenError`` while the real bind's handler maps it, so a
+        directory that fails only the second connect answers the two differently. That predates
+        #2566 and is not changed here.
 
         **What this does NOT claim:** that wall-clock is now provably equal. It equalizes the code
         PATH, which is what the item measured; a directory may still answer ``invalidCredentials``
@@ -902,7 +977,13 @@ class LdapAuthenticator:
                     # _find_user. It has TWO callers — this one binds, the Kerberos/SSO one below
                     # does not — so relocating it into the bind path alone would let a DISABLED
                     # ACCOUNT AUTHENTICATE OVER SSO. Equalize the CALLER, never move the check.
-                    self._equalizing_bind(password)
+                    #
+                    # A _SOCKET_FAULTS error in the decoy is mapped HERE, the same way the real
+                    # bind's is below, so for those types an absent and a present account fail
+                    # alike (BACKLOG #2566). Swallowing it inside _equalizing_bind would tell the two
+                    # apart. That method's docstring says what this does not settle.
+                    with _socket_faults_as_ldap_error():
+                        self._equalizing_bind(password)
                     return None
                 user_dn = str(info["dn"])
                 # The password-verifying bind — a SECOND connection (and a second Server, built by
@@ -921,13 +1002,17 @@ class LdapAuthenticator:
                 # returning early without unbinding would leave the connection to GC under exactly
                 # the load that matters (ASVS 13.1.3 — resource release).
                 try:
-                    if not user_conn.bind():
+                    # BACKLOG #2566: the bind opens the socket, so only the bind is wrapped. The
+                    # build above does no I/O, and the release runs on an open socket.
+                    with _socket_faults_as_ldap_error():
+                        bound = user_conn.bind()
+                    if not bound:
                         _refuse_referral(user_conn, "user bind")
                         return None
                 finally:
                     user_conn.unbind()
                 groups = self._resolve_groups(svc, user_dn, info["memberOf"])
-        except ldap3.core.exceptions.LDAPException as exc:  # pragma: no cover - needs real AD
+        except ldap3.core.exceptions.LDAPException as exc:
             raise LdapError(str(exc)) from exc
         return _principal_from(info, user_dn, groups)
 
@@ -982,7 +1067,7 @@ class LdapAuthenticator:
                     return DirectoryProbe(found.answer)
                 user_dn = str(info["dn"])
                 groups = self._resolve_groups(svc, user_dn, info["memberOf"])
-        except ldap3.core.exceptions.LDAPException as exc:  # pragma: no cover - needs real AD
+        except ldap3.core.exceptions.LDAPException as exc:
             raise LdapError(str(exc)) from exc
         return DirectoryProbe(DirectoryAnswer.FOUND, _principal_from(info, user_dn, groups))
 
@@ -1093,8 +1178,6 @@ def kerberos_principal(token: bytes, settings: AuthSettings) -> str | None:
     have a usable keytab/credential for ``kerberos_spn`` in its environment; the realm suffix
     (``user@REALM``) is stripped to yield the account name.
     """
-    import struct
-
     import spnego
 
     try:

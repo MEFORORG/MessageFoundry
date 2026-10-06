@@ -40,6 +40,7 @@ from messagefoundry.auth.notifications import USERNAME_CHANGED
 from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.service import AuthService, DirectoryObjectIdMissing
 from messagefoundry.config.settings import AuthSettings
+from messagefoundry.store.crypto import CipherError
 from messagefoundry.store.store import SCOPE_SOURCE_AD, SCOPE_SOURCE_MANUAL, MessageStore
 from tests._admin_account import create_local_user_chosen
 
@@ -845,8 +846,9 @@ async def test_a_referral_beside_other_answers_still_revokes_them_and_pages() ->
         ldap.referring.clear()
         clean = await service.reconcile_directory_sessions()
         assert clean.referred == () and service.directory_reconcile_referral is None
-        # jdoe has now been read without a referral, so the referral's instance may resolve.
-        assert clean.referral_clear and clean.breaker_clear and clean.hold_clear
+        # jdoe has now been read without a referral, so the referral's instance may resolve. No
+        # pass here has held, so this fresh process releases no hold (BACKLOG #2136).
+        assert clean.referral_clear and clean.breaker_clear and not clean.hold_clear
     finally:
         await store.close()
 
@@ -1010,6 +1012,68 @@ async def test_local_sessions_and_signed_out_users_are_never_probed() -> None:
 
         await service.reconcile_directory_sessions()
         assert ldap.probes == ["jdoe"]  # not alice (local), not dormant (no live session)
+    finally:
+        await store.close()
+
+
+async def test_a_map_edit_revokes_rows_the_clock_calls_expired() -> None:
+    """BACKLOG #2283: an AD map edit revokes directory sessions so it applies at once. It used to
+    revoke only an account that ``list_sessions`` found a row for, and that read filters on the
+    wall clock, so after a forward step past the absolute lifetime it revoked nothing. Those rows
+    would validate again on the OLD mapping once the clock was set right. Here the row is past its
+    expiry by the clock and still unrevoked; the edit must revoke it."""
+    import time
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, _ad_settings(), ldap=_FakeLdap())  # type: ignore[arg-type]
+        await service.initialize()
+        now = time.time()
+        await store.create_user(
+            user_id="stepped", username="stepped", auth_provider="ad", password_generated=False
+        )
+        await store.create_session(
+            token_hash="stepped-hash", user_id="stepped", expires_at=now - 60, now=now - 120
+        )
+
+        await service.set_ad_group_map([("cn=ops", Role.OPERATOR.value)], actor="test")
+
+        row = await store.get_session("stepped-hash")
+        assert row is not None and row.revoked_at is not None, (
+            "a map edit left a row unrevoked because the clock said it had expired"
+        )
+    finally:
+        await store.close()
+
+
+async def test_a_user_whose_only_session_is_idle_is_still_probed() -> None:
+    """BACKLOG #2283: an idle session can come back, after a backward clock step or a raised idle
+    setting, so the reconciler keeps probing its account. Skipping it would let a disabled account
+    escape the strikes until its session revived. A session inside the idle window is the control."""
+    import time
+
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap({"idler": _principal("idler"), "active": _principal("active")})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        idle = service.session_idle_seconds
+        now = time.time()
+        for username, last_used in (("idler", now - idle - 60), ("active", now - idle + 60)):
+            await store.create_user(
+                user_id=username, username=username, auth_provider="ad", password_generated=False
+            )
+            await store.create_session(
+                token_hash=f"{username}-hash",
+                user_id=username,
+                expires_at=now + 3600,
+                now=last_used,
+            )
+
+        await service.reconcile_directory_sessions()
+        assert sorted(ldap.probes) == ["active", "idler"], (
+            "an account holding only an idle session was skipped, though that session can revive"
+        )
     finally:
         await store.close()
 
@@ -1471,6 +1535,162 @@ async def test_a_failed_skip_report_neither_stops_the_pass_nor_is_forgotten(
             for a in await store.list_audit()
             if a["action"] == "auth.ad_reconcile_binding_unkeyed"
         ], "the failed report was marked done and never retried"
+    finally:
+        await store.close()
+
+
+async def _two_unkeyed_bindings(store: MessageStore) -> AuthService:
+    """Two signed-in accounts bound to a federated subject with no directory object id, beside one
+    ordinary account, so a pass has two skip reports to write."""
+    ldap = _FakeLdap(
+        {
+            "jdoe": _principal("jdoe"),
+            "legacy1": replace(_principal("legacy1"), directory_object_id=None),
+            "legacy2": replace(_principal("legacy2"), directory_object_id=None),
+        }
+    )
+    service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+    await service.initialize()
+    await _signed_in_ad_user(service, store, "jdoe")
+    for name in ("legacy1", "legacy2"):
+        await _signed_in_ad_user(service, store, name)
+        user = await store.get_user_by_username(name)
+        assert user is not None
+        bound = await store.set_user_federated_subject(
+            user.id, "https://idp.test.invalid", f"S-1-{name}"
+        )
+        assert bound is not None
+        # The bind ended the session above, so the bound row signs in again.
+        assert await _signed_in_ad_user(service, store, name) is not None
+    return service
+
+
+async def _reported(store: MessageStore) -> list[str]:
+    return sorted(
+        json.loads(a["detail"])["username"]
+        for a in await store.list_audit()
+        if a["action"] == "auth.ad_reconcile_binding_unkeyed"
+    )
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    [sqlite3.OperationalError("synthetic: disk I/O error"), CipherError("synthetic: Transit down")],
+    ids=["driver", "transit-mac"],
+)
+async def test_a_refused_skip_report_logs_once_per_pass_and_tries_the_next_account_next(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, refusal: Exception
+) -> None:
+    """While the store refuses every write, the pass logs one ERROR per pass. Before BACKLOG #2137
+    the first failure ended the pass; now the report stops at the first refusal, which also keeps
+    a pool that times out each write to one timeout per pass. The
+    account it refused goes last next pass, so the next account is tried. Both are reported once the
+    store accepts the write. A Transit outage refuses like a driver error (ADR 0138)."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _two_unkeyed_bindings(store)
+        real_record = store.record_audit
+        attempts: list[str] = []
+
+        async def failing(action: str, **kwargs: Any) -> None:
+            if action == "auth.ad_reconcile_binding_unkeyed":
+                attempts.append(json.loads(kwargs["detail"])["username"])
+                raise refusal
+            await real_record(action, **kwargs)
+
+        monkeypatch.setattr(store, "record_audit", failing)
+        for _ in range(2):
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+                assert (await service.reconcile_directory_sessions()).aborted is None
+            messages = [r.getMessage() for r in caplog.records]
+            assert sum("auth.ad_reconcile_binding_unkeyed" in m for m in messages) == 1
+            assert sum("carries a federated binding" in m for m in messages) == 1
+        assert sorted(attempts) == ["legacy1", "legacy2"], "the refused account was tried first"
+
+        monkeypatch.setattr(store, "record_audit", real_record)
+        await service.reconcile_directory_sessions()
+        assert await _reported(store) == ["legacy1", "legacy2"]
+    finally:
+        await store.close()
+
+
+async def test_one_skip_report_the_store_keeps_refusing_does_not_starve_the_rest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refusal tied to one row: the account behind it goes last, so the others are reported on
+    the next pass and only it is retried after them."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _two_unkeyed_bindings(store)
+        real_record = store.record_audit
+        attempts: list[str] = []
+
+        async def failing(action: str, **kwargs: Any) -> None:
+            if action == "auth.ad_reconcile_binding_unkeyed":
+                name = json.loads(kwargs["detail"])["username"]
+                attempts.append(name)
+                if name == attempts[0]:
+                    raise sqlite3.OperationalError("synthetic: this row is refused")
+            await real_record(action, **kwargs)
+
+        monkeypatch.setattr(store, "record_audit", failing)
+        await service.reconcile_directory_sessions()
+        await service.reconcile_directory_sessions()
+        refused = attempts[0]
+        assert await _reported(store) == sorted({"legacy1", "legacy2"} - {refused})
+        assert attempts == [refused, *sorted({"legacy1", "legacy2"} - {refused}), refused]
+    finally:
+        await store.close()
+
+
+async def test_two_skip_reports_the_store_keeps_refusing_take_turns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both accounts stay refused. Once both have been refused, the one refused longest ago goes
+    first, so neither is starved: list order alone would retry the same account every pass."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _two_unkeyed_bindings(store)
+        real_record = store.record_audit
+        attempts: list[str] = []
+
+        async def failing(action: str, **kwargs: Any) -> None:
+            if action == "auth.ad_reconcile_binding_unkeyed":
+                attempts.append(json.loads(kwargs["detail"])["username"])
+                raise sqlite3.OperationalError("synthetic: these rows are refused")
+            await real_record(action, **kwargs)
+
+        monkeypatch.setattr(store, "record_audit", failing)
+        for _ in range(6):
+            await service.reconcile_directory_sessions()
+        first, second = attempts[:2]
+        assert {first, second} == {"legacy1", "legacy2"}
+        assert attempts == [first, second] * 3, "one refused account starved the other"
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("defect", [NotImplementedError, RecursionError, sqlite3.ProgrammingError])
+async def test_a_defect_in_a_reconciler_audit_write_is_raised_not_passed_over(
+    monkeypatch: pytest.MonkeyPatch, defect: type[Exception]
+) -> None:
+    """BACKLOG #2137. The catch keeps ``RuntimeError`` because the store raises
+    it for its own refusals. Its two subclasses that mean a defect in the code, not a refused write,
+    still end the pass, and so does a bad statement on SQLite."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _two_unkeyed_bindings(store)
+        real_record = store.record_audit
+
+        async def broken(action: str, **kwargs: Any) -> None:
+            if action == "auth.ad_reconcile_binding_unkeyed":
+                raise defect("synthetic defect")
+            await real_record(action, **kwargs)
+
+        monkeypatch.setattr(store, "record_audit", broken)
+        with pytest.raises(defect):
+            await service.reconcile_directory_sessions()
     finally:
         await store.close()
 

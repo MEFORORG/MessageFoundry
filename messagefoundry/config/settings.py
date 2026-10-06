@@ -94,6 +94,7 @@ from messagefoundry.config.tls_policy import (
     validate_tls_ciphers,
 )
 from messagefoundry.connection_names import is_connection_name
+from messagefoundry.controlchars import has_lone_surrogate
 from messagefoundry.logging_setup import LOG_LEVELS
 from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.remotedebug import RemoteDebugPosture, remote_debug_loosening
@@ -3379,8 +3380,9 @@ class AuthSettings(_Section):
                 "negative value would fail every LDAP read or connect)"
             )
         # A huge finite value overflows socket.settimeout / setsockopt (measured from about 3e6 s on
-        # Windows) with OverflowError or TypeError. Those are not ldap3 errors, so they would skip
-        # the LdapError mapping and the auth.login_error audit. The cap sits far below that point.
+        # Windows) with OverflowError or TypeError. auth/ldap.py now maps those to LdapError, so a
+        # sign-in would fail as a directory error and be audited (BACKLOG #2566), but it would fail
+        # every time. The cap refuses the value at load instead, far below that point.
         if value > _AD_TIMEOUT_MAX_SECONDS:
             raise ValueError(
                 f"ad_connect_timeout / ad_receive_timeout must be at most {_AD_TIMEOUT_MAX_SECONDS:g} "
@@ -4320,7 +4322,10 @@ def validate_alert_template(template: str, *, where: str) -> None:
     rejected, closing the ``str.format`` injection surface. Any name outside
     :data:`_ALERT_TEMPLATE_VARS` (e.g. a message-body / HL7 field) raises :class:`ValueError`. ``where``
     labels the offending setting in the error. Escaped braces (``{{`` / ``}}``) are literal text and are
-    fine."""
+    fine. A lone surrogate is refused too, or every alert email built from the template would fail
+    at send or carry a garbled subject (vault BACKLOG #2842)."""
+    if has_lone_surrogate(template):
+        raise ValueError(f"{where}: holds a lone surrogate")
     allowed = ", ".join(sorted(_ALERT_TEMPLATE_VARS))
     for _literal, field, spec, conv in string.Formatter().parse(template):
         if field is None:
@@ -7177,13 +7182,18 @@ def security_loosenings(
     interpreter (vault BACKLOG #2701), and
     ``[store].schema_management = auto`` on a server backend (#305). It is NOT yet
     an exhaustive registry of every security-relevant switch in every section; ``[store]``/``[auth]``
-    carry others (``encrypt``, ``trust_server_certificate``, ``enabled``, ``require_mfa``,
-    ``ad_tls_verify``, ``oidc_require_mfa_claim``,
-    ``password_check_breached``) that are gated elsewhere and are not reported here. That list is
-    enumerated in the floor test's exemption set so the gap is a written decision that a new switch
-    cannot silently join. That set also holds at least one switch this registry DOES report,
-    ``ad_allow_insecure_ldap``, because its entry needs a live ``ldap://`` bind that the floor's lone
-    flip never builds; its own tests pin it.
+    carry others (``encrypt``, ``trust_server_certificate``, ``enabled``, ``ad_tls_verify``,
+    ``oidc_require_mfa_claim``, ``password_check_breached``) that are not reported here. Most are
+    gated elsewhere. ``enabled`` has no config key: ``serve`` always requires sign-in (vault BACKLOG
+    #2719). ``oidc_require_mfa_claim`` has no serve-time refusal of its own: turned off, it mints
+    every OIDC session with no factor met, and while ``require_mfa`` is on that session owes an
+    engine factor. The parenthetical list above is enumerated in the floor test's exemption set so
+    the gap is a written decision that a new switch cannot silently join. That set also holds at
+    least two switches this registry DOES report. One is ``require_mfa``: a loaded config reports it
+    as the ``[security]`` switch below, and its ``[auth]`` field is only the desugared copy (an
+    embedder that builds ``AuthSettings`` itself with it off is not reported). The other is
+    ``ad_allow_insecure_ldap``, because its entry needs a live ``ldap://`` bind that the floor's
+    lone flip never builds; its own tests pin it.
 
     **``[auth].initial_password_expiry_hours`` is also unreported, and BACKLOG #1245 made it
     load-bearing — recorded here as the written decision this paragraph demands, not left implied.**

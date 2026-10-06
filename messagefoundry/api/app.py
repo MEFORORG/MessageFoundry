@@ -42,7 +42,7 @@ import shutil
 import time
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
@@ -352,6 +352,7 @@ from messagefoundry.pipeline.alerts import (
 )
 from messagefoundry.pipeline.cert_expiry import MonitoredCert
 from messagefoundry.pipeline.cluster import (
+    ClusterCoordinator,
     StepdownLockTimeout,
     StepdownReleaseUnconfirmed,
     build_coordinator,
@@ -3115,25 +3116,27 @@ def create_app(
         engine: Engine, identity: Identity, name: str, client: str | None
     ) -> tuple[RegistryRunner, Literal["in", "out"]]:
         """The runner, and which side of its registry holds ``name``, checked against the caller's channel scope
-        BEFORE its existence is (BACKLOG #2551).
+        BEFORE its existence is (BACKLOG #2551, #2640).
 
-        A channel-scoped caller gets one answer, :func:`_deny_connection`, for an inbound outside its
-        scope, for any outbound (an outbound spans channels), and for a name that exists nowhere. Had
-        the 404 come first, on a first deployment such a caller could tell which names exist by
-        probing. An unscoped caller, or a scoped one naming a channel in its own scope, still gets
-        404 for an unknown name. An inbound wins when a name is both, as on the control routes.
-        Raises 503 when the engine has no runner."""
+        A channel-scoped caller reaches only an inbound in its own scope. Every other name gets one
+        answer, :func:`_deny_connection`: an inbound outside its scope, any outbound (an outbound spans
+        channels), and a name that exists nowhere, even one listed in its own scope. Had any of these
+        answered 404, on a first deployment such a caller could tell which names exist by probing.
+        Only an unscoped caller gets 404 for an unknown name. An inbound wins when a name is both, as
+        on the control routes. With no runner the scope is still checked first, so a scoped caller
+        gets the 503 only for a name its scope lists, which tells it nothing it does not know."""
         rr = engine.registry_runner
         if rr is None:
+            await _control_guard(engine, identity, name, client)
             raise HTTPException(503, "engine not started")
         if name in rr.registry.inbound:
             await _control_guard(engine, identity, name, client)  # inbound is per-channel
             return rr, "in"
+        if identity.allowed_channels is not None:
+            # An outbound, or a miss: the answer an out-of-scope inbound gets (BACKLOG #2640).
+            await _deny_connection(engine, identity, name, client)
         if name in rr.registry.outbound:
-            if identity.allowed_channels is not None:
-                await _deny_connection(engine, identity, name, client)
             return rr, "out"
-        await _control_guard(engine, identity, name, client)
         raise HTTPException(404, f"no such connection: {name}")
 
     async def _dual_role_control(
@@ -3150,8 +3153,10 @@ def create_app(
         (stopping an inbound halts intake, its delivery keeps draining). A shared outbound → a
         channel-scoped user is denied (an outbound spans channels; mirrors purge), else
         ``rr.<action>_outbound`` (stopping an outbound PAUSES delivery, retaining the queue). A name that
-        is neither still runs the per-channel guard first, so a scoped user gets a 403 for an out-of-scope
-        name rather than learning it doesn't exist, then 404. Returns ``{"name", "running"}``.
+        is neither gets 404 from an unscoped user. A channel-scoped user gets the audited out-of-scope
+        403 for it, even when its own scope lists the name, so no answer tells it which names exist
+        (BACKLOG #2551, #2640). With no runner no name exists: a scoped user gets the 403 for a name
+        outside its scope, and every other caller gets 404. Returns ``{"name", "running"}``.
 
         ``role`` disambiguates a name declared as BOTH an inbound and an outbound: ``"source"`` targets
         only the inbound, ``"destination"`` only the outbound. ``None`` (the bare-name JSON/legacy
@@ -3178,11 +3183,12 @@ def create_app(
                 engine, identity, name, action, role="source", running=running, client=client
             )
             return {"name": name, "running": running}
+        if rr is not None and identity.allowed_channels is not None:
+            # Past the inbound arm, a channel-scoped user can reach nothing: a shared outbound spans
+            # channels (mirrors purge), and a miss gets the same refusal so that no answer tells an
+            # outbound, an unknown name and an out-of-scope inbound apart (BACKLOG #2551, #2640).
+            await _deny_connection(engine, identity, name, client)
         if rr is not None and want_out and name in rr.registry.outbound:
-            # A shared outbound spans channels, so a channel-scoped user can't control one (mirrors purge).
-            # The refusal is the one an unknown name gets, so it names no outbound (BACKLOG #2551).
-            if identity.allowed_channels is not None:
-                await _deny_connection(engine, identity, name, client)
             try:
                 if action == "start":
                     await rr.start_outbound(name)
@@ -3204,8 +3210,8 @@ def create_app(
                 engine, identity, name, action, role="destination", running=running, client=client
             )
             return {"name": name, "running": running}
-        # Neither an inbound nor an outbound (or no runner). Run the per-channel guard first so a scoped
-        # user is 403'd for a name outside their scope (don't disclose existence), then 404.
+        # With a runner, only an unscoped user reaches here. With none, no name exists, so a 404
+        # after the scope check tells a scoped user nothing its own scope does not.
         await _control_guard(engine, identity, name, client)
         raise HTTPException(404, f"no such connection: {name}")
 
@@ -7770,27 +7776,96 @@ async def _assert_security_notice_is_deliverable(
 
 
 _SESSION_REAP_INTERVAL = 3600.0  # purge expired/idle sessions hourly to bound the sessions table
+# How long the reaper waits after start before its first pass, so time sync has run and an engine
+# that restarts often still purges.
+_SESSION_REAP_FIRST_DELAY = 300.0
+# How far the wall clock may run ahead of the monotonic clock between two readings before the
+# reaper skips the pass as a clock step. Above what clock discipline slews in an hour (chrony's
+# maximum slew rate is about 300 s an hour). Each pass that runs also purges as of this much before
+# its own reading, so a step under it cannot delete a row the validator would still accept.
+_SESSION_REAP_STEP_TOLERANCE = 600.0
 
 
-async def _session_reaper(store: Store, *, idle_seconds: float | None = None) -> None:
-    """Drop expired session rows (immediately, then on an interval) until the task is cancelled.
-    With ``idle_seconds`` given, idle-expired rows go too (BACKLOG #2096); the lifespan passes the
-    idle timeout the validator uses.
+async def _session_reaper(
+    store: Store,
+    *,
+    idle_seconds: float | None = None,
+    wall: Callable[[], float] | None = None,
+    mono: Callable[[], float] | None = None,
+) -> None:
+    """Drop expired session rows, first ``_SESSION_REAP_FIRST_DELAY`` after start and then every
+    ``_SESSION_REAP_INTERVAL``, until the task is cancelled. With ``idle_seconds`` given,
+    idle-expired rows go too (BACKLOG #2096); the lifespan passes the idle timeout the validator
+    uses.
+
+    **The reaper skips a pass when the wall clock has jumped forward (BACKLOG #2283).** The purge
+    judges expiry and idleness by the wall clock, and its deletes cannot be undone. Run just after
+    a forward step, it would delete every session as idle, though setting the clock right would
+    have made them valid again. So each pass compares how far the wall clock moved since the
+    previous reading with how far the monotonic clock moved. When the wall clock ran ahead by more
+    than ``_SESSION_REAP_STEP_TOLERANCE``, the pass deletes nothing and logs a warning. The next
+    pass compares against this one, so a step that persists for a whole interval is then trusted
+    and purged by. A host that slept can also trip it, which costs one skipped pass. A host whose
+    clock steps forward by more than the tolerance every interval never purges, and the warning
+    each pass is what says so.
+
+    **A pass that runs purges as of ``_SESSION_REAP_STEP_TOLERANCE`` before its own reading.** A
+    forward step of ``x`` seconds that the guard lets through would make a purge at the reading
+    delete every row unused for more than ``idle_seconds - x`` real seconds, and every row with
+    less than ``x`` seconds of absolute life left. With an idle window of 10 minutes or less, a step
+    under the tolerance would then delete every session nobody used during it (BACKLOG #2283).
+    Purging as of the earlier instant cancels any ONE step the guard lets through, at any idle
+    setting: a row goes only once the validator would refuse it at the true time. Steps that each
+    pass the guard but add up across passes to more than the tolerance are not cancelled. The cost
+    is that a lapsed row waits up to that much longer for a pass to delete it, and the validator
+    refuses it meanwhile.
+
+    **The first reading is a baseline, not a pass.** A wrong clock is likeliest at start-up, before
+    time sync has run, and a first pass would have nothing to compare it with. So the reaper reads
+    both clocks and waits ``_SESSION_REAP_FIRST_DELAY`` before it purges. Rows that expired before
+    a restart wait that much longer; the validator refuses them meanwhile.
+
+    This guards only the purge. The validator revokes a session it refuses on presentation, by the
+    same wall clock, so a forward step still ends every session that is USED during it.
+
+    ``wall`` and ``mono`` default to ``time.time`` and ``time.monotonic``, read at each pass rather
+    than bound at import, so a test that patches ``time`` reaches the reaper too.
 
     A transient store error must not kill the reaper for the process lifetime (it would let the
     sessions table grow unbounded, and its stored exception could later abort lifespan shutdown) —
     log and retry next interval (review M-33)."""
+
+    def _clocks() -> tuple[float, float]:
+        return (wall or time.time)(), (mono or time.monotonic)()
+
+    previous = _clocks()
+    delay = _SESSION_REAP_FIRST_DELAY
     while True:
+        await asyncio.sleep(delay)
+        delay = _SESSION_REAP_INTERVAL
+        now, ticks = _clocks()
+        ahead = (now - previous[0]) - (ticks - previous[1])
+        previous = (now, ticks)
+        if ahead > _SESSION_REAP_STEP_TOLERANCE:
+            _log.warning(
+                "session reaper: the wall clock ran %.0fs ahead of the monotonic clock since the "
+                "last reading, so this pass deleted nothing; the next pass purges if the clock holds",
+                ahead,
+            )
+            continue
         try:
-            await store.purge_expired_sessions(idle_seconds=idle_seconds)
+            await store.purge_expired_sessions(
+                now=now - _SESSION_REAP_STEP_TOLERANCE, idle_seconds=idle_seconds
+            )
         except asyncio.CancelledError:
             raise
         except Exception:
             _log.exception("session reaper: purge failed; will retry next interval")
-        await asyncio.sleep(_SESSION_REAP_INTERVAL)
 
 
-async def _directory_reconciler(auth: AuthService, interval: float, sink: AlertSink) -> None:
+async def _directory_reconciler(
+    auth: AuthService, interval: float, sink: AlertSink, *, sole_reconciler: bool
+) -> None:
     """Re-resolve directory principals holding live sessions, revoking those AD has disabled or
     deleted (ADR 0079 mechanism 2). Created only when AD is wired and
     ``[auth].ad_session_recheck_seconds`` is non-zero (it defaults to 300).
@@ -7802,12 +7877,17 @@ async def _directory_reconciler(auth: AuthService, interval: float, sink: AlertS
     Each finished pass is turned into alerts here, by :func:`_alert_reconcile_plan`. The alerting
     lives in this task and never in ``auth/``, which does not import the pipeline's sinks.
 
+    With ``sole_reconciler`` False no inverse is raised; :func:`_without_clears` says why, and
+    :func:`_is_sole_reconciler` decides it. Required, so a new caller has to decide it.
+
     A transient failure must not kill the loop for the process lifetime (that would silently disable
     the control until restart) — log and retry next interval, the session-reaper precedent."""
     while True:
         await asyncio.sleep(interval)
         try:
             plan = await auth.reconcile_directory_sessions()
+            if not sole_reconciler:
+                plan = _without_clears(plan)
             # Inside the try: a sink that breaks its never-raise contract must not kill the loop.
             _alert_reconcile_plan(plan, auth, sink)
         except asyncio.CancelledError:
@@ -7853,7 +7933,8 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     the alert and the service read one predicate. An outage or a pass with no signed-in account
     sets none. The inverse is raised on EVERY pass that sets its flag, not once per clear:
     resolving is an idempotent update, a resolve the notifier failed to write is retried that way,
-    and a fresh process resolves an instance its last run left open with no state of its own."""
+    and a fresh process can resolve an instance its last run left open. A hold's release has a
+    further test, stated in ``_mark_reconcile_clears``."""
     if plan.directory_outage:
         return
     if plan.aborted is not None and not plan.directory_referral:
@@ -7891,6 +7972,47 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
         sink.ad_reconcile_hold_released("directory-reconciler")
     if plan.referral_clear:
         sink.ad_reconcile_breaker_cleared(_REFERRAL_ALERT_SOURCE)
+
+
+def _without_clears(plan: ReconcilePlan) -> ReconcilePlan:
+    """The plan with every ``*_clear`` flag set False, so it resolves no alert instance.
+
+    BACKLOG #2136. The evidence for a clear is this process's
+    own: its strike and outcome records, and its own view of the directory. The instance it would
+    resolve is shared by every process on the store. Where more than one reconciler runs, one
+    process can read clean while another's condition still stands, and resolving on that would
+    clear a breaker or a hold that is still in force. There is no shared state to decide it from:
+    the strike and outcome records are process-local by design, and the instance row carries no
+    node. A leader gate does not reach it either. An engine shard runs no ``[cluster]`` lease, so
+    each one reads as leader, and a ``[cluster]`` standby still runs its own reconciler and can
+    open the instance a leader would then clear.
+
+    So where :func:`_is_sole_reconciler` sees another reconciler, a clear is missed instead. The
+    trip and the hold still page, from each process that sees them, and an operator resolves the
+    instance by hand. That test does not see every reconciler on the store; the code names at
+    least the cases it misses in ``AuthService._mark_reconcile_clears``. Matched by field name, so
+    a flag a later item adds is covered without an edit here."""
+    cleared: dict[str, Any] = {f.name: False for f in fields(plan) if f.name.endswith("_clear")}
+    return replace(plan, **cleared)
+
+
+def _is_sole_reconciler(
+    coordinator: ClusterCoordinator,
+    registry_filter: object | None,
+    runner: RegistryRunner | None,
+) -> bool:
+    """Whether this process can be the only directory reconciler on its store (BACKLOG #2136).
+
+    Not on a ``[cluster]`` node. A ``serve --shard`` process, which passes a registry filter, is
+    alone only when its loaded graph pins no shard universe: ``all_shard_ids`` is set when the
+    config names two or more shards, and a reload cannot change it (ADR 0073). So ``supervise``
+    over an untagged config, which runs one ``--shard`` child, still resolves. A shard with no
+    graph loaded is not presumed alone."""
+    if coordinator.is_clustered():
+        return False
+    if registry_filter is None:
+        return True
+    return runner is not None and runner.registry.all_shard_ids is None
 
 
 _INITIAL_CREDENTIAL_MAX_LEAD = 24 * 3600.0  # warn at most this long before the deadline
@@ -8731,6 +8853,10 @@ def create_managed_app(
                             auth,
                             auth_settings.ad_session_recheck_seconds,
                             notifier or LoggingAlertSink(),
+                            # BACKLOG #2136. After engine.start(), so the graph is loaded.
+                            sole_reconciler=_is_sole_reconciler(
+                                coordinator, registry_filter, engine.registry_runner
+                            ),
                         )
                     )
             yield

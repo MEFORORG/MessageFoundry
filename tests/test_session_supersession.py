@@ -197,6 +197,82 @@ async def test_a_lapsed_prior_is_revoked_by_supersession_itself(
     assert await _superseded(store) == [], "a lapsed session was recorded as superseded"
 
 
+async def test_a_rotation_racing_the_supersession_cannot_keep_the_session_live(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #2146. A step-up on the same session re-keys it. The supersession used to read the row
+    # by hash and then revoke by hash, two store calls with an await between them, so a rotation
+    # landing in that gap moved the row to a new hash and the revoke matched nothing. The session
+    # lived on under the rotated token. This drives the rotation in right after the supersession's
+    # FIRST store call that names the presented hash, whichever call that is, so it measures the
+    # gap rather than one method name. Once that call has run, the session must end: the rotation
+    # fails closed, or its new token does not validate. A rotation that commits BEFORE that call is
+    # the stated limit, pinned in tests/_session_rotation_contract.py. If a later change reads the
+    # presented hash earlier in the sign-in, this fires there, and that read must not decide the
+    # revoke, or the gap is back.
+    service = await _service(store)
+    prior = await _token(service)
+    prior_hash = hash_token(prior)
+    rotations: list[str | None] = []
+
+    def _inject(name: str) -> None:
+        real = getattr(store, name)
+
+        async def _then_rotate(*args: object, **kwargs: object) -> object:
+            result = await real(*args, **kwargs)
+            if args and args[0] == prior_hash and not rotations:
+                rotations.append(None)  # claim the one injection before the rotation re-enters
+                rotations[0] = await service._rotate_session_token(prior)
+            return result
+
+        monkeypatch.setattr(store, name, _then_rotate)
+
+    for name in ("get_session", "supersede_session"):
+        _inject(name)
+    new = await _token(service, supersedes=prior)
+
+    assert rotations, "the injection never fired, so this measured nothing"
+    rotated = rotations[0]
+    assert rotated is None or not await _live(service, rotated), (
+        "a rotation between the supersession's read and its revoke kept the session live"
+    )
+    assert not await _live(service, prior)
+    assert await _live(service, new)
+
+
+async def test_a_touch_just_before_the_revoke_still_audits_a_live_session(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Review finding on BACKLOG #2146. A request on the old cookie can touch the session after the
+    # supersession read its clock but before the revoke. That touch must not make a live session
+    # look stamped ahead, or the audit row is lost. The clock STEPS on every read, so the touch is
+    # strictly later than the clock the revoke was stamped with; equal readings could not tell the
+    # two orders apart.
+    service = await _service(store)
+    prior = await _token(service)
+    prior_hash = hash_token(prior)
+    real_supersede = store.supersede_session
+    base, reads = time.time(), [0]
+
+    def _stepping() -> float:
+        reads[0] += 1
+        return base + reads[0] * 0.001
+
+    async def _touched_first(token_hash: str, *, now: float) -> object:
+        touched = time.time()
+        assert touched > now, "the stepping clock did not separate the touch from the revoke stamp"
+        await store.touch_session(token_hash, now=touched)
+        return await real_supersede(token_hash, now=now)
+
+    monkeypatch.setattr(store, "supersede_session", _touched_first)
+    monkeypatch.setattr(time, "time", _stepping)
+    await _token(service, supersedes=prior)
+    assert not await _live(service, prior)
+    assert await _superseded(store) == [
+        {"scope": "superseded", "session": prior_hash[:12], "actor": "op"}
+    ]
+
+
 async def test_a_failed_sign_in_ends_nothing(store: MessageStore) -> None:
     service = await _service(store)
     prior = await _token(service)

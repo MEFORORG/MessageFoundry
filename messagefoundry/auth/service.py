@@ -20,6 +20,7 @@ import logging
 import math
 import os
 import secrets
+import sqlite3
 import time
 import unicodedata
 import urllib.request
@@ -146,13 +147,28 @@ _FACTOR_CEREMONIES: Final = frozenset(
 
 @cache
 def _audit_write_errors() -> tuple[type[Exception], ...]:
-    """What a refused audit write raises, on every store backend (BACKLOG #2137).
+    """What a refused audit write raises, at least on the store backends and key modes named here
+    (BACKLOG #2137).
 
     The drivers' own errors, plus the two that :func:`~messagefoundry.store.base.store_driver_errors`
     asks a caller to add: ``RuntimeError`` for the engine's own refusals (the acquire timeout, a
-    keyless audit append) and ``OSError`` for a connection lost at the socket. Built on first use,
-    because naming a server driver imports it."""
-    return (RuntimeError, OSError, *store_driver_errors())
+    keyless audit append) and ``OSError`` for a connection lost at the socket. And ``CipherError``,
+    which a ``vault_transit`` store raises when Transit cannot compute the audit-chain MAC (ADR
+    0138). Built on first use, because naming a server driver imports it; an ``AuthService`` that
+    runs the reconciler builds it at construction, so that import never runs on the event loop in
+    the middle of a store incident."""
+    return (RuntimeError, OSError, CipherError, *store_driver_errors())
+
+
+#: The classes inside :func:`_audit_write_errors` that a reconciler audit write raises rather than
+#: passes over (BACKLOG #2137). ``RuntimeError`` has to stay in that catch,
+#: because the store raises it for its own refusals; ``NotImplementedError`` and ``RecursionError``
+#: are its subclasses that never mean one. ``sqlite3.ProgrammingError`` is a bad statement or bind:
+#: the SQLite store reaches sqlite3 through aiosqlite, which refuses a closed connection with its
+#: own ``ValueError`` first. pyodbc's ``ProgrammingError`` stays caught, because pyodbc raises it
+#: for a closed connection too, and raising that would cost the pass's alerts, the harm BACKLOG
+#: #2137 removed.
+_AUDIT_WRITE_DEFECTS: Final = (NotImplementedError, RecursionError, sqlite3.ProgrammingError)
 
 
 def _warn_if_corpus_unreadable(path: str | None) -> None:
@@ -309,6 +325,10 @@ def _host_key(address: str) -> str:
 #: the one row that says the session's cap is now reached, or write nothing because the address is a
 #: repeat or the cap was already reached.
 _NewIpFlag = Literal["audit", "audit_cap_reached", "repeat", "over_cap"]
+#: `AuthService._reconcile_hold_standing`: whether this process may resolve a hold (BACKLOG #2136).
+_HoldStanding = Literal["fresh", "held", "forfeit", "settled"]
+#: The standings under which a pass may resolve the durable hold instance.
+_HOLD_RELEASABLE: Final[frozenset[_HoldStanding]] = frozenset({"held", "settled"})
 
 
 # Bounds on the per-session re-proof failure counts (BACKLOG #1138). A count is NEVER evicted while
@@ -2095,9 +2115,28 @@ class AuthService:
         #: message above: it is released as soon as the pruned outcome record holds no UNDETERMINED
         #: entry, including on a pass with no candidates, where the message deliberately stays.
         self._reconcile_hold_latched = False
+        #: Whether THIS process may resolve the durable ``ad_reconcile_held`` instance (BACKLOG
+        #: #2136). The instance outlives the process and the latch does not, so a fresh process
+        #: cannot tell whether an earlier run's latch was still holding an account.
+        #: ``"fresh"``: no pass here has held, so it resolves no hold. ``"held"``: a pass here held,
+        #: so a release it then sees is its own. ``"forfeit"``: it revoked an undetermined account
+        #: first, which a lost latch may have held, so it resolves no hold until it restarts.
+        #: ``"settled"``: a pass here found the hold gone with an answer from this process on record
+        #: for every signed-in account, so its records now cover what an earlier run held. Only
+        #: `_advance_hold_standing` moves it.
+        self._reconcile_hold_standing: _HoldStanding = "fresh"
         #: user_ids of bound id-less rows the reconciler has already reported as skipped (BACKLOG
         #: #2027), so each is logged and audited once per process rather than once per pass.
         self._reconcile_unkeyed_reported: set[str] = set()
+        #: user_ids whose skip report the store refused, in the order of their latest refusal, oldest
+        #: first: a dict used as an ordered set (BACKLOG #2137). Refused accounts go last, the
+        #: longest-refused first, so a row the store keeps refusing starves neither the reports
+        #: behind it nor another refused row.
+        self._reconcile_unkeyed_refused: dict[str, None] = {}
+        if self.directory_reconcile_enabled:
+            # Built now, at startup, so a reconciler's first refused audit write does not import
+            # the server drivers on the event loop (see `_audit_write_errors`).
+            _audit_write_errors()
         # Advisory, NON-STICKY federated-IdP health (ADR 0142 AC-8) — see the oidc_available docstring.
         self._oidc_unavailable_reason: str | None = None
         self._oidc_client_auth: oidc.ClientAuthentication | None = None
@@ -5176,6 +5215,13 @@ class AuthService:
                 # passes keeps its "already reported" mark and is not reported again on its next
                 # sign-in.
                 still_unkeyed.add(user.id)
+            # Deliberately WITHOUT the idle timeout (BACKLOG #2283). An idle row can come back: a
+            # backward clock step or a raised idle setting makes the validator accept it again. So
+            # an account holding only idle rows is still probed, and a disabled one keeps accruing
+            # strikes. An idle filter would also let a forward step of more than the idle window
+            # empty the candidates, and the prunes below would drop every strike and the hold. The
+            # read still filters on absolute expiry, so a step past the absolute lifetime does
+            # that today. That predates BACKLOG #2283, and #2283 leaves it open.
             if not await self._store.list_sessions(user.id):
                 continue
             if is_unkeyed:
@@ -5267,11 +5313,18 @@ class AuthService:
         self._reconcile_strikes.update(plan.strikes)
         self._reconcile_outcomes.update(plan.outcomes)
         self._reconcile_hold_latched = plan.latched
+        if plan.hold:
+            self._advance_hold_standing("held")
         # BACKLOG #2136. A trip makes every candidate unconfirmed until a pass that is not aborted
-        # reads it again, so a probe sample that missed the accounts behind the trip is no clear.
+        # reads it again, so a probe sample that missed the accounts behind the trip is no clear. A
+        # held account is not read again: its probe judged neither its roles nor its scope, and its
+        # strike went back to 0, so it stays unconfirmed.
         self._reconcile_unconfirmed.intersection_update(users)
         if plan.aborted is None:
-            self._reconcile_unconfirmed.difference_update(plan.outcomes)
+            held = set(plan.held)
+            self._reconcile_unconfirmed.difference_update(
+                uid for uid in plan.outcomes if uid not in held
+            )
         elif not plan.judged_nothing:
             self._reconcile_unconfirmed = set(users)
         # BACKLOG #2538. The same for a referral, on its own record: a referred account counts as
@@ -5311,6 +5364,13 @@ class AuthService:
             )
         applied: list[reconcile.SessionRevocation] = []
         for revocation in plan.revocations:
+            if (
+                self._reconcile_outcomes.get(revocation.user_id)
+                is reconcile.ProbeOutcome.UNDETERMINED
+            ):
+                # BEFORE the sessions go, so a pass that raises part-way cannot lose it (BACKLOG
+                # #2136): the next pass no longer sees this account.
+                self._advance_hold_standing("forfeit")
             if await self._apply_reconcile_revocation(revocation):
                 applied.append(revocation)
         for refresh in plan.renames:
@@ -5342,8 +5402,9 @@ class AuthService:
         # failed write is logged, not raised (BACKLOG #2137), for the same reason as the hold's.
         await self._report_unkeyed_bindings(unkeyed, still_unkeyed=still_unkeyed)
         # What the pass DID, which is what the caller alerts on: a scope revocation skipped at apply
-        # time (ADR 0198) was audited as nothing, so it must page as nothing too.
-        return replace(self._mark_reconcile_clears(plan, users), revocations=tuple(applied))
+        # time (ADR 0198) was audited as nothing, so it must page as nothing too. Marked after that,
+        # so the account a skipped revocation left signed in still counts toward the evidence.
+        return self._mark_reconcile_clears(replace(plan, revocations=tuple(applied)), users)
 
     def _mark_reconcile_clears(
         self, plan: reconcile.ReconcilePlan, users: Mapping[str, UserRecord]
@@ -5352,48 +5413,95 @@ class AuthService:
 
         BACKLOG #2136. The lifespan task resolves the durable ``ad_reconcile_aborted`` and
         ``ad_reconcile_held`` alert instances on these, on every pass that sets them, and the
-        referral's own ``ad_reconcile_aborted`` instance (BACKLOG #2538). Those
-        instances outlive the process, and the strike and outcome records here do not. So "not
+        referral's own ``ad_reconcile_aborted`` instance (BACKLOG #2538). Those instances outlive
+        the process, and the strike and outcome records and the hold's latch here do not. So "not
         aborted" or "not held" is not enough: after a restart, or before the probe budget has
-        reached every account, a pass can read clear while the condition still stands.
+        reached every account, a pass can read clear while the condition stands.
 
-        * Both need an answer on record, from this process, for every signed-in account the pass
-          did not just revoke. A probe that could not reach the directory leaves none.
-        * A pass in which any probe was referred marks neither of those two (BACKLOG #2538). A referred account
-          has no answer from this pass, and an older one on record may predate the referral.
-        * The referral's own instance (BACKLOG #2538) is clear when, on top of the first test, the
-          pass saw no referral and every account referred earlier in this process has been read
-          without one since. A pass of referrals only, or an outage, is never evidence.
-        * The hold is clear when, on top of that, the pass did not hold and none of those answers
-          is undetermined. The second test does not rest on this node's hysteresis latch, which
-          another node on the store may not share.
-        * The breaker is clear when the pass was not aborted, every one of those accounts carries no
-          strike, at least one of them did not read undetermined, and every account signed in at
-          the last trip has been read again since by a pass that was not aborted. A pending strike
-          is a revocation the breaker has not judged yet, so it says nothing either way. A pass of
-          held accounts only cannot trip the breaker at all. And a trip on role or scope changes
-          leaves no strike, so a later probe sample that missed those accounts proves nothing.
+        * All three need an answer on record, from this process, for every signed-in account the
+          pass did not just revoke. A probe that could not reach the directory leaves none.
+        * A pass in which any probe was referred marks none of the three (BACKLOG #2538). A
+          referred account has no answer from this pass, and an older one on record may predate
+          the referral.
+        * The referral's own instance is clear when, on top of the first test, every account signed
+          in at the last referral has been read PRESENT since (``_reconcile_referred``). Any
+          referral marks every candidate, not only the referred ones, because a probe sample can
+          miss accounts that would also be referred. Only a PRESENT answer ran every search a
+          referral can come from. A pass of referrals only, or an outage, is never evidence.
+        * The hold is clear when, on top of that, the pass did not hold and these tests pass.
+          None of those answers is undetermined; this is the record, across the rotation. No
+          account the pass just revoked read undetermined either. At least one probe of THIS pass
+          read the attribute (PRESENT or DISABLED, ADR 0195's readable answer, ``plan.readable``):
+          an answer from an earlier pass, or one that found no entry (ABSENT), says nothing about
+          whether it is readable now. And ``_reconcile_hold_standing`` lets this process release
+          a hold: a pass here held, or one already found the hold gone.
+        * That last test is the restart's. A lone undetermined account beside readable ones
+          revokes only because no hold engaged. A fresh process lacks the latch under which an
+          earlier run may still have held it. So a fresh process releases no hold until a pass of
+          its own holds. Until then, an earlier run's instance stays open for an operator.
+        * Revoking an undetermined account first forfeits the release until a restart, because
+          nothing re-reads the account. The forfeit is recorded before the sessions go, so a pass
+          that raises part-way keeps it. Once a pass here has found the hold gone, every signed-in
+          account had an answer from this process. Its latch then covers what an earlier run held,
+          and a later lone revocation is ADR 0195's own. The standing gate on its own is not what
+          stops a false release: the forfeit does that. The gate keeps an earlier run's instance
+          for an operator, at the cost of a missed release on every restart.
+        * The breaker is clear when the pass was not aborted, none of those answers is undetermined,
+          every one of those accounts carries no strike, and every account still signed in since
+          the last trip has been read again by a pass that was not aborted, and was not held there.
+          A pending strike is a revocation the breaker has not judged yet, so it says nothing
+          either way. A held account's probe judged neither its roles nor its scope, and a trip
+          on role or scope changes leaves no strike, so a probe sample that missed or held the
+          accounts behind a trip proves nothing. The undetermined test covers that after a
+          restart too, when this process has no record of the trip. The breaker has no latch to
+          lose: every pass judges its revocations afresh, so a fresh process may resolve a trip.
 
-        ``users`` is this pass's candidate set. Every node on a store runs its own reconciler over
-        the same signed-in accounts and the same alert instance, so a clear rests on reading every
-        one of them.
+        ``users`` is this pass's candidate set, and a clear rests on reading every one of them.
 
-        **The cost is a missed clear, never a false one.** An account that never answers keeps
-        both instances open while it is signed in, and so does a reconciler that is switched off.
-        An operator resolves those by hand.
+        **This is one process's evidence, and the instances are the store's.** Where
+        ``api/app.py::_is_sole_reconciler`` says another reconciler may run, at least on a
+        ``[cluster]`` node or in an engine that runs more than one engine shard, the lifespan task
+        raises no inverse; ``api/app.py::_without_clears`` says why. That gate does not see every
+        reconciler on the store. The code states what it misses here, in the next paragraph, and
+        the other code sites point here; ``docs/CONFIGURATION.md`` tells operators.
+
+        **The usual cost is a missed clear, with one reconciler on the store.** An account that
+        never answers keeps both instances open while it is signed in. So does a hold, for the
+        breaker's instance. So does a reconciler that is switched off, and so does every cluster
+        or multi-shard engine. A fresh or forfeited process keeps the hold's instance open. An
+        operator resolves those by hand. **At least two cases can still clear falsely.** Any
+        engine that declares neither ``[cluster]`` nor more than one shard clears on its own
+        evidence, whatever else shares its store: two plain ``serve`` processes, two one-shard
+        ``supervise`` fleets, or a plain engine beside a cluster node or a multi-shard engine on
+        the same store. It cannot see the others, and ``serve`` records a second engine on one
+        store as unguarded (the engine shard guard's comment in ``__main__.py``). And a pass
+        judges only accounts that hold a session, so a trip or hold whose accounts have all left
+        the candidate set clears on the rest. At least these take an account out: it signs out or
+        reaches the session cap, the reconciler revokes it, an operator disables it locally, or its
+        row is deleted. The forfeit covers only one of those: a hold in a process that has not yet
+        settled, when the reconciler revokes an undetermined account.
         """
         undetermined = reconcile.ProbeOutcome.UNDETERMINED
         revoked = {r.user_id for r in plan.revocations}
+        revoked_undetermined = undetermined in (self._reconcile_outcomes.get(u) for u in revoked)
         ids = [uid for uid in users if uid not in revoked]
         outcomes = [self._reconcile_outcomes.get(uid) for uid in ids]
         covered = bool(ids) and None not in outcomes and not plan.referred
+        settled = covered and undetermined not in outcomes
         # Called only on a pass that judged something, so a pass of referrals only never gets here.
         referral_clear = covered and self._reconcile_referred.isdisjoint(ids)
-        hold_clear = covered and not plan.hold and undetermined not in outcomes
+        hold_clear = (
+            settled
+            and not plan.hold
+            and not revoked_undetermined
+            and plan.readable > 0
+            and self._reconcile_hold_standing in _HOLD_RELEASABLE
+        )
+        if hold_clear:
+            self._advance_hold_standing("settled")
         breaker_clear = (
-            covered
+            settled
             and plan.aborted is None
-            and any(o is not undetermined for o in outcomes)
             and all(self._reconcile_strikes.get(uid, 0) == 0 for uid in ids)
             and self._reconcile_unconfirmed.isdisjoint(ids)
         )
@@ -5403,6 +5511,21 @@ class AuthService:
             hold_clear=hold_clear,
             referral_clear=referral_clear,
         )
+
+    def _advance_hold_standing(self, event: _HoldStanding) -> None:
+        """Move ``_reconcile_hold_standing`` on ``event`` (BACKLOG #2136), the only place it moves.
+
+        ``"held"``: a pass here held, which counts only for a fresh process. ``"forfeit"``: the pass
+        is about to revoke an undetermined account, which forfeits unless this process has already
+        settled. ``"settled"``: a pass here found the hold gone. ``"forfeit"`` is never left.
+        """
+        current = self._reconcile_hold_standing
+        if event == "held" and current == "fresh":
+            self._reconcile_hold_standing = "held"
+        elif event == "forfeit" and current != "settled":
+            self._reconcile_hold_standing = "forfeit"
+        elif event == "settled" and current in _HOLD_RELEASABLE:
+            self._reconcile_hold_standing = "settled"
 
     async def _refresh_cached_username(
         self,
@@ -5647,9 +5770,18 @@ class AuthService:
         and this loop has no administrator behind it.
         """
         self._reconcile_unkeyed_reported &= still_unkeyed
-        for user in unkeyed:
-            if user.id in self._reconcile_unkeyed_reported:
-                continue
+        refused = self._reconcile_unkeyed_refused
+        for user_id in [uid for uid in refused if uid not in still_unkeyed]:
+            del refused[user_id]
+        # An account the store has not refused goes first (-1), so one row it keeps refusing cannot
+        # starve the rest. Refused accounts follow, the longest-refused first, so two rows the store
+        # keeps refusing take turns. sorted() is stable, so the rest keep list_users' order.
+        turn = {uid: i for i, uid in enumerate(refused)}
+        pending = sorted(
+            (u for u in unkeyed if u.id not in self._reconcile_unkeyed_reported),
+            key=lambda u: turn.get(u.id, -1),
+        )
+        for user in pending:
             _log.warning(
                 "directory reconcile: %s carries a federated binding but no directory object id, "
                 "so it is not probed by name and a directory disable will not end its sessions "
@@ -5669,8 +5801,14 @@ class AuthService:
                 ),
             )
             # Marked only once the audit row is written, so a failed write is retried next pass.
-            if written:
-                self._reconcile_unkeyed_reported.add(user.id)
+            if not written:
+                # Stop at the first refusal: one ERROR and one WARNING per pass, and no second
+                # acquire timeout behind a store that is refusing every write.
+                refused.pop(user.id, None)  # re-inserted at the end: refused most recently
+                refused[user.id] = None
+                break
+            refused.pop(user.id, None)
+            self._reconcile_unkeyed_reported.add(user.id)
 
     async def _record_reconcile_hold(self, plan: reconcile.ReconcilePlan) -> None:
         """Latch, log and audit an engaged undetermined-wave hold, or release a latched one.
@@ -5843,9 +5981,13 @@ class AuthService:
         the referral. So a store refusal is logged at ERROR, naming the action, and the pass goes
         on. The log line is then the only record of that row. A per-revocation audit write is not routed through here: that one
         still raises.
+
+        A defect is raised, not passed over (:data:`_AUDIT_WRITE_DEFECTS`).
         """
         try:
             await self._audit(action, actor="<reconciler>", detail=detail)
+        except _AUDIT_WRITE_DEFECTS:
+            raise
         except _audit_write_errors():
             _log.exception(
                 "directory reconcile: the %s audit row could not be written; the pass goes on, "
@@ -5993,10 +6135,10 @@ class AuthService:
             await self._store.mark_session_mfa_verified(token_hash)
         if supersedes_hash is not None:
             await self._supersede_session_hash(supersedes_hash, client=client)
-        await self._enforce_session_cap(user_id)
+        await self._enforce_session_cap(user_id, client=client)
         return token
 
-    async def _enforce_session_cap(self, user_id: str) -> None:
+    async def _enforce_session_cap(self, user_id: str, *, client: str | None = None) -> None:
         """Apply ``[auth].max_sessions_per_user`` to one user (AUTH-SESS-CAP).
 
         Runs after a sign-in mints a row, and again after a ceremony in ``_FACTOR_CEREMONIES``
@@ -6015,9 +6157,21 @@ class AuthService:
         fully signed-in device by signing in over and over (BACKLOG #2076). A pending sign-in gets
         no shorter life: a user who must enrol a factor does it on that session.
 
+        That caller can still push the real user's own pending sign-in out of the pending group,
+        and that stands (BACKLOG #2283). Until the factor is proven the two sign-ins are the same
+        to the engine, so no rank can favour one. The user loses a half-finished sign-in and signs
+        in again, while the caller holding the password gains no access from it.
+
         The price is a bound of twice the cap. If the user later stops owing a factor (MFA turned
         off, the last factor removed, a role change under the administrators scope), the pending
         rows count as full ones until the next cap run, which then keeps the newest ``cap``.
+
+        **A run that revoked anything is audited (BACKLOG #2283):** one ``auth.session_revoked`` row
+        with scope ``cap`` and the count, under the owner's name and with the address of the
+        sign-in or ceremony that ran the cap, as the supersession row is. So it lands in that
+        user's own security-event feed. A count, not hashes, as the other
+        multi-session revocations record it. The count includes lapsed rows the cap ended, which
+        the validator already refused; the store returns one count for both.
         """
         cap = self._settings.max_sessions_per_user
         if not cap or cap <= 0:
@@ -6026,12 +6180,19 @@ class AuthService:
         # A user row that has gone owes nothing more; splitting is then the closed choice, since it
         # can only protect full sessions.
         split = True if user is None else await self._unverified_session_owes_factor(user)
-        await self._store.enforce_session_cap(
+        revoked = await self._store.enforce_session_cap(
             user_id,
             keep=cap,
             idle_seconds=self.session_idle_seconds,
             split_mfa_pending=split,
         )
+        if revoked > 0:
+            await self._audit(
+                "auth.session_revoked",
+                actor=user.username if user is not None else None,
+                detail=_json({"scope": "cap", "count": revoked, "cap": cap}),
+                client=client,
+            )
 
     @property
     def session_idle_seconds(self) -> float:
@@ -6080,9 +6241,9 @@ class AuthService:
 
         **Ordering is the whole control** (see each call site): every store stamp for this elevation
         must already have been written against the OLD hash before this runs, because the re-key
-        carries those columns forward, and every session UPDATE except ``revoke_session`` and
-        ``rotate_session`` is rowcount-blind — a stamp issued *after* the rotation silently writes
-        nothing. Any purpose-bound grant must be minted AFTER, against the NEW hash.
+        carries those columns forward, and every session stamp UPDATE is rowcount-blind (which
+        session writes report what they changed is :meth:`AuthStore.rotate_session`'s docstring to
+        say) — a stamp issued *after* the rotation silently writes nothing. Any purpose-bound grant must be minted AFTER, against the NEW hash.
         """
         return await self._rotate_session_hash(hash_token(token))
 
@@ -6177,23 +6338,35 @@ class AuthService:
             # The session just joined the full ones, so the cap runs again (BACKLOG #2076). With
             # `cap` full sessions already live, the oldest of those goes, never the one just
             # completed: its fresh stamp ranks it newest.
-            await self._enforce_session_cap_after_elevation(rotated)
+            await self._enforce_session_cap_after_elevation(rotated, client=client)
         return Elevation(token=rotated, recovery_codes=recovery_codes)
 
-    async def _enforce_session_cap_after_elevation(self, token: str) -> None:
+    async def _enforce_session_cap_after_elevation(
+        self, token: str, *, client: str | None = None
+    ) -> None:
         """Run the cap for the owner of a session that has ALREADY been rotated.
 
         A failure here is logged, never raised. The old token is gone by now, and the ceremony has
         committed its own writes (an enabled factor, stored recovery codes, a consumed code), so an
         exception would strand the user with neither token and lose recovery codes they never saw.
         Skipping one cap run costs at most one session over the cap until the next sign-in runs it.
+
+        **The catch is broad on purpose (BACKLOG #2283).** Every call inside is a store read or
+        write, and each backend raises its own driver's errors, which ``auth/`` may not import, as
+        the first-seen login-address read says. A cancellation is not an ``Exception``, so it still
+        propagates.
         """
         try:
             session = await self._store.get_session(hash_token(token))
             if session is not None:
-                await self._enforce_session_cap(session.user_id)
-        except Exception:
-            _log.exception("session cap after a completed second factor failed; skipped this run")
+                await self._enforce_session_cap(session.user_id, client=client)
+        except Exception:  # noqa: BLE001 -- driver errors vary by backend; see the docstring
+            # The run may have revoked sessions before its audit write failed, so the log does not
+            # claim the run was skipped (BACKLOG #2283).
+            _log.exception(
+                "session cap after a completed second factor failed; it may not have run, or its"
+                " audit row may be missing"
+            )
 
     async def identity_for_token(
         self, token: str | None, *, activity: bool = True
@@ -6288,23 +6461,31 @@ class AuthService:
         presented token is the whole point, whatever its state. (The per-user cap no longer relies on
         this. Since BACKLOG #1900 it counts only live rows and revokes lapsed ones itself.) Only a
         session that was still LIVE gets an audit row, so the trail does
-        not record the ending of something that had already ended. ``revoke_session`` reports no
-        rowcount, so the row is read back: a rotation that re-keyed it between the read and the
-        revoke leaves the old hash absent, and then no row claims a revoke that never happened.
+        not record the ending of something that had already ended.
+
+        **The read and the revoke are one atomic store operation (BACKLOG #2146).** Why that closes
+        the race with a concurrent rotation is :meth:`AuthStore.supersede_session`'s to say. It holds
+        across engine processes too, because engine shards serve the API from one shared store.
+
+        **A rotation that committed BEFORE that operation is a stated limit, not a race this
+        closes.** The presented hash then names no session, so this ends nothing, and the session
+        lives on under its new token. docs/SECURITY.md (ASVS 7.2.4, the supersession paragraphs)
+        states how wide that window is.
         Returns True when it audited.
         """
-        prior = await self._store.get_session(prior_hash)
-        if prior is None or prior.revoked_at is not None:
+        before = time.time()
+        prior = await self._store.supersede_session(prior_hash, now=before)
+        if prior is None:
             return False
-        now = time.time()
+        after = time.time()
         # The validator's own test, clock-step checks included (BACKLOG #2096): a row stamped ahead
-        # of `now` is one the validator would refuse, so ending it is not the end of a live session.
-        was_live = prior.is_live(now=now, idle_seconds=self.session_idle_seconds)
-        await self._store.revoke_session(prior_hash, now=now)
-        if not was_live:
-            return False
-        after = await self._store.get_session(prior_hash)
-        if after is None or after.revoked_at is None:
+        # of the clock is one the validator would refuse, so ending it is not the end of a live
+        # session. The revoke landed somewhere between `before` and `after`, so the row is judged at
+        # the latest moment it can show to have been used, clamped to that span. A touch that
+        # committed inside the call is then not mistaken for a clock step, a stamp past `after`
+        # still is one, and a session already over at `before` is not judged live by waiting.
+        moment = min(max(before, prior.last_used_at), after)
+        if not prior.is_live(now=moment, idle_seconds=self.session_idle_seconds):
             return False
         owner = await self._store.get_user(prior.user_id)
         await self._audit(
@@ -8015,7 +8196,7 @@ class AuthService:
             if await self._verify_second_factor(user, code, client=client, arrived=arrived):
                 # ORDER-CRITICAL: this whole three-write group lands against the OLD hash, and only
                 # then does the session rotate. Moving any of them after the rotation writes NOTHING
-                # and reports success — every session UPDATE but revoke/rotate is rowcount-blind.
+                # and reports success — every session stamp UPDATE is rowcount-blind.
                 # The 2nd factor is now satisfied; also seed the step-up window (the session has
                 # completed password + MFA) and clear the failure counter. (Initial enrollment has no
                 # factor to verify, so this never fires there — keeping the enrollment step-up gate
@@ -9772,7 +9953,9 @@ class AuthService:
         return False
 
     async def _revoke_ad_sessions(self) -> int:
-        """Revoke every live session held by a directory account. Returns the number revoked.
+        """Revoke every unrevoked session held by an enabled directory account, lapsed ones
+        included. Returns the number revoked, which is the ``sessions_revoked`` the two map audit
+        rows record; it counts rows, not live sessions.
 
         BACKLOG #1154 (ASVS 8.3.2). The two AD map setters below are authorization-value mutators:
         the group maps resolve to role sets and to channel scope, which is exactly what an
@@ -9788,8 +9971,9 @@ class AuthService:
         mapping and an added one change an outcome, so the affected set is not derivable from the
         entries alone. Local accounts read neither map and are left alone.
 
-        Enumerates the way the reconciler does -- ``list_users`` filtered on provider and disabled,
-        then ``list_sessions`` -- so this needs no schema change on any backend. Unlike the
+        Enumerates with ``list_users`` filtered on provider and disabled, then revokes each
+        account's unrevoked rows, so this needs no schema change on any backend. The count it
+        returns includes rows already past their limits, which the revoke ends too. Unlike the
         reconciler this is NOT counted against the mass-revoke breaker: that breaker exists to catch
         a directory the engine cannot read, and this is an administrator's own step-up-gated edit.
         """
@@ -9797,8 +9981,11 @@ class AuthService:
         for user in await self._store.list_users():
             if user.auth_provider != AuthProvider.AD.value or user.disabled:
                 continue
-            if not await self._store.list_sessions(user.id):
-                continue
+            # Unconditional (BACKLOG #2283). It used to revoke only when ``list_sessions`` found a
+            # row, and that read filters on the wall clock: after a forward clock step past the
+            # absolute lifetime it found none, and those rows would come back on the old mapping
+            # once the clock was set right. ``revoke_user_sessions`` matches every unrevoked row,
+            # whatever the clock says, and costs one statement where the read cost one too.
             revoked += await self._store.revoke_user_sessions(user.id)
         return revoked
 

@@ -170,3 +170,16 @@ A burst of `peer_not_allowlisted` / `framing_error` is operationally interesting
 - **(§7) Owner scope call A — alerting in v1 — RESOLVED (owner go, 2026-06-19): ship §7 store-row-only.** The optional `AlertSink.connection_error` emit + realert-throttled notification is a fast-follow once operators want it (the store row + the existing WARNING log cover v1; the lockstep AlertSink change is added then, not now).
 - **(§7) Owner scope call B — deferred read surface — RESOLVED (owner go, 2026-06-19): v1 ships capture + store + purge only** (no API/console "Connection Errors" view yet, matching §5's deferred fleet analytics); the `require_phi_read`-gated route + console view ship with their consumer.
 - **(§7) Build-time, not owner-gated:** add the `\x1f`-in-connection-name wiring guard (not currently enforced — `_add` only dedupes); keep `tls_accept_failed` out of v1 until a proven capture path + an mTLS-rejection test exist; `connection_event` is a brand-new `CREATE TABLE`, so it carries none of §2's NOT-NULL-default rewrite risk.
+
+## Amendment 2026-10-04: the store passes the bound to `safe_text` instead of slicing its output (BACKLOG #1797)
+
+The decision above is unchanged. Only the form of the bound moved. §2 gives `safe_text(reason)[:200]`
+as the example for `response.detail`, §3 slices the runner's `detail` the same way, and §7.3 gives
+`safe_text(str(exc))[:200]` for `connection_event.reason`. Do not build any of these slices. The
+store now writes `safe_text(x, limit=200)` for the `ack_sent` `detail` and for both `reason` columns
+(this one and ADR 0044's `alert_instance.reason`), on all three backends.
+
+Why: under BACKLOG #1797 `safe_text` drops a token that straddles its limit whole, so an outer slice
+could cut into the note it appends. Passing the limit keeps that note whole. The stored value is
+therefore no longer a hard 200 characters. [PHI.md](../PHI.md) states the bound, and this history,
+once, in §3's PL-2 block.

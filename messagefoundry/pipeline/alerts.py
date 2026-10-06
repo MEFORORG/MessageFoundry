@@ -358,19 +358,23 @@ class AlertSink(Protocol):
         stands (BACKLOG #2538), as the auth service judges it
         (``AuthService._mark_reconcile_clears`` states the test). Emits **no** notification; when
         alert-state is wired (ADR 0044) it auto-resolves the open ``ad_reconcile_aborted`` instance
-        for the same ``name`` (``"directory-reconciler"``). Raised on every such pass, so a resolve
-        that failed to write is retried, and an instance left open by an engine that stopped while
-        tripped is resolved by the next run. No PHI. Emitted by the API-lifespan reconciler task,
-        never from ``auth/``."""
+        for the same ``name`` (``"directory-reconciler"``). Raised on every such pass, except where
+        ``api/app.py::_is_sole_reconciler`` says another reconciler may run, at least on a
+        ``[cluster]`` node or in an engine that runs more than one engine shard
+        (``api/app.py::_without_clears`` says why). That gate does not see every engine on the
+        store; ``AuthService._mark_reconcile_clears`` names at least the cases that can still
+        resolve falsely. No PHI. Emitted by the API-lifespan reconciler task, never from
+        ``auth/``."""
         ...
 
     def ad_reconcile_hold_released(self, name: str) -> None:
         """The INVERSE of :meth:`ad_reconcile_held` (BACKLOG #2136): a pass that is evidence no
-        undetermined-wave hold stands, by the same service-side test as
-        :meth:`ad_reconcile_breaker_cleared`. Emits **no** notification; when alert-state is wired
+        undetermined-wave hold stands, as the auth service judges it
+        (``AuthService._mark_reconcile_clears`` states the test, which is not the breaker's).
+        Emits **no** notification; when alert-state is wired
         (ADR 0044) it auto-resolves the open ``ad_reconcile_held`` instance for the same ``name``
-        (``"directory-reconciler"``). Raised on every such pass. No PHI. Emitted by the API-lifespan
-        reconciler task, never from ``auth/``."""
+        (``"directory-reconciler"``). Raised as :meth:`ad_reconcile_breaker_cleared` is. No PHI.
+        Emitted by the API-lifespan reconciler task, never from ``auth/``."""
         ...
 
     def ad_session_revoked(self, name: str, *, reason: str) -> None:

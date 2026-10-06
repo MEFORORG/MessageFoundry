@@ -1,0 +1,28 @@
+# The anon.toml overlay for samples/messages/hapi-hl7v2/batch_18_messages.txt (BACKLOG #2645).
+#
+# That corpus was de-identified with DEFAULT_RULES plus a hand-written overlay. The overlay was
+# never committed, so the next person had to work it out again (BACKLOG #331, Proposed 4). Most of
+# its fields are now default rules in messagefoundry/anon/rules.py. This file holds the ones that
+# are NOT defaults, and says why.
+#
+# These kinds are RE-DERIVED, not recovered. They come from the field list in
+# samples/messages/hapi-hl7v2/README.md and from the shape of each surrogate in the committed
+# corpus. The corpus was scrubbed with a salt nobody recorded, so this file does not reproduce it.
+#
+# Use it with:  anonymize_checked(raw, salt=..., overlay=Path("tests/fixtures/anon/batch_18.anon.toml"))
+
+[hl7.fields]
+# IN1-4 is the insurance company name. ADR 0030 section 3 keeps IN1-2/3/4 by default, because they
+# are plan and company codes that correlation and routing tests rely on. In this corpus the field
+# held a value shaped like a person's name, so this corpus scrubs it. That is a fact about one
+# corpus, and not a reason to change the ratified default.
+"IN1-4" = "name"
+
+# DST is not an HL7 segment. No HL7 version defines it, so its layout is this corpus's own: it
+# mirrors IN1 at a shifted offset. A default rule for it would claim a meaning for DST-2 in every
+# feed, and another feed's DST could hold something else there.
+"DST-2" = "name"
+"DST-7" = "name"
+"DST-9" = "dob"
+"DST-27" = "id"
+"DST-35" = "address"

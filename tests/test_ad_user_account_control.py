@@ -24,28 +24,38 @@ import logging
 import re
 import sqlite3
 import uuid
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Mapping
 from contextlib import asynccontextmanager
+from dataclasses import fields as dataclass_fields
+from dataclasses import replace
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
-from messagefoundry.api.app import _alert_reconcile_plan
+from messagefoundry.api.app import (
+    _alert_reconcile_plan,
+    _directory_reconciler,
+    _is_sole_reconciler,
+    _without_clears,
+)
 from messagefoundry.auth import ldap as ldap_module
 from messagefoundry.auth.ldap import DirectoryAnswer, LdapAuthenticator, _account_enabled
 from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.reconcile import (
     HOLD_REASON,
     REFERRAL_ABORT,
+    ProbeOutcome,
     ReconcilePlan,
     SessionRevocation,
 )
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import AuthService, _HoldStanding
 from messagefoundry.config.settings import _ALERT_EVENT_TYPES, AuthSettings
 from messagefoundry.pipeline.alert_sinks import _AUTO_RESOLVE, NotifierAlertSink
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
-from messagefoundry.store.store import MessageStore
+from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
+from messagefoundry.pipeline.wiring_runner import RegistryRunner
+from messagefoundry.store.store import MessageStore, UserRecord
 from tests.test_alert_sinks import _drain, _RecordingTransport
 from tests.test_approval_requester_recheck import _Sink
 
@@ -1025,6 +1035,45 @@ async def test_a_trip_on_role_changes_is_not_cleared_by_a_sample_that_missed_the
         assert (await _pass(service)).aborted == "mass_revoke_breaker"
 
 
+async def test_a_trip_on_role_changes_is_not_cleared_by_a_pass_that_held_those_accounts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A held probe judged neither roles nor scope, and its strike went back to 0. So the pass
+    after a role-change trip that holds the two accounts behind it, and reads the other two clean,
+    is not aborted and still no evidence the trip has gone. The next readable pass trips again."""
+    names = ["n1", "n2", "n3", "n4"]
+    async with _signed_in_estate(monkeypatch, names, ad_session_revoke_max=0) as estate:
+        directory, service, store, _tokens = estate
+        for name in ("n1", "n2"):  # roles the directory no longer grants
+            await store.set_user_roles(await _id(store, name), [Role.VIEWER.value])
+        assert (await _pass(service)).aborted == "mass_revoke_breaker"
+        directory.uac.update({"n1": ABSENT, "n2": ABSENT})
+        held = await _pass(service)
+        assert held.aborted is None and held.hold and len(held.held) == 2
+        assert not held.breaker_clear, "a held account counted as read again"
+        directory.uac.update({"n1": ENABLED, "n2": ENABLED})
+        assert (await _pass(service)).aborted == "mass_revoke_breaker"
+
+
+async def test_an_estate_that_reads_only_absent_does_not_release_a_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No account read ``userAccountControl``: the searches found no entry at all. That is no
+    evidence the read right the hold is about has come back, so the open hold stays open."""
+    async with _signed_in_estate(monkeypatch, ["jdoe", "asmith"]) as estate:
+        directory, _service, store, _tokens = estate
+        await _left_open_by_an_earlier_run(store)
+        directory.delete("jdoe")
+        directory.delete("asmith")
+        service = _held_before(_fresh_process(store))
+        await service.initialize()
+        sink = NotifierAlertSink([], store=store)
+        plan = await _alerted_pass(service, sink)
+        assert plan.aborted is None and not plan.hold and plan.revocations == ()
+        assert not plan.hold_clear
+        assert await _open_alerts(store) == {ABORTED, HELD}
+
+
 async def test_a_resolve_the_store_failed_to_write_is_retried_on_the_next_pass(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1073,9 +1122,21 @@ def _fresh_process(store: MessageStore, **settings: Any) -> AuthService:
     return AuthService(store, _settings(**settings), ldap=LdapAuthenticator(_settings(**settings)))
 
 
-async def test_a_fresh_process_resolves_what_its_last_run_left_open_but_not_on_an_outage(
+def _held_before(service: AuthService) -> AuthService:
+    """``service`` with its hold standing set as though a pass of its own had held. A fresh
+    process releases no hold at all, so a test that pins some other clause of the release first
+    takes that gate out of the way. Its strike and outcome records stay empty."""
+    service._reconcile_hold_standing = "held"
+    return service
+
+
+async def test_a_fresh_process_resolves_a_trip_its_last_run_left_open_but_not_a_hold(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The breaker has no latch to lose, so a clean pass from a fresh process resolves the trip,
+    though never on an outage. The hold's latch did not survive the restart, and this process has
+    not latched one, so it cannot tell whether the last run's latch still held an account. The
+    hold's instance stays open for an operator."""
     async with _signed_in_estate(monkeypatch, ["jdoe", "asmith"]) as estate:
         directory, _service, store, _tokens = estate
         await _left_open_by_an_earlier_run(store)
@@ -1086,8 +1147,32 @@ async def test_a_fresh_process_resolves_what_its_last_run_left_open_but_not_on_a
         assert (await _alerted_pass(service, sink)).directory_outage
         assert await _open_alerts(store) == {ABORTED, HELD}
         directory.down = False
-        plan = await _alerted_pass(service, sink)
-        assert plan.breaker_clear and plan.hold_clear
+        for _ in range(2):  # not a matter of waiting another pass
+            plan = await _alerted_pass(service, sink)
+            assert plan.breaker_clear and not plan.hold_clear
+            assert await _open_alerts(store) == {HELD}
+
+
+async def test_a_fresh_process_resolves_a_hold_once_it_has_latched_and_released_its_own(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The control for the test above. A fresh process leaves the last run's hold open, then a wave
+    of its own latches, and when that wave reads clean again this process saw the lift itself, so
+    it resolves the instance."""
+    names = ["u1", "u2", "ok1"]
+    async with _signed_in_estate(monkeypatch, names) as (directory, _service, store, _tokens):
+        await _left_open_by_an_earlier_run(store)
+        service = _fresh_process(store)
+        await service.initialize()
+        sink = NotifierAlertSink([], store=store)
+        assert not (await _alerted_pass(service, sink)).hold_clear
+        assert await _open_alerts(store) == {HELD}
+        directory.uac.update({"u1": ABSENT, "u2": ABSENT})
+        held = await _alerted_pass(service, sink)
+        assert held.hold and held.latched and not held.hold_clear
+        directory.uac.update({"u1": ENABLED, "u2": ENABLED})
+        released = await _alerted_pass(service, sink)
+        assert not released.hold and released.hold_clear
         assert await _open_alerts(store) == set()
 
 
@@ -1121,7 +1206,7 @@ async def test_a_fresh_process_does_not_release_a_hold_its_budget_has_not_reache
         order = [name for _id, name in by_id if name in names]
         directory.uac.update(dict.fromkeys(order[2:], ABSENT))  # the second sample only
         await _left_open_by_an_earlier_run(store)
-        service = _fresh_process(store, ad_session_recheck_max_users=2)
+        service = _held_before(_fresh_process(store, ad_session_recheck_max_users=2))
         await service.initialize()
         sink = NotifierAlertSink([], store=store)
         first = await _alerted_pass(service, sink)
@@ -1130,6 +1215,383 @@ async def test_a_fresh_process_does_not_release_a_hold_its_budget_has_not_reache
         second = await _alerted_pass(service, sink)
         assert second.hold and not second.hold_clear
         assert HELD in await _open_alerts(store)
+
+
+async def test_a_fresh_process_does_not_clear_a_trip_on_a_pass_that_held_accounts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A restart forgets which accounts were behind the last trip. A held account's roles and
+    scope were not judged, and its strike went back to 0, so a fresh process's pass that holds two
+    accounts and reads the other two clean is no evidence the trip has gone."""
+    names = ["n1", "n2", "n3", "n4"]
+    async with _signed_in_estate(monkeypatch, names) as (directory, _service, store, _tokens):
+        await _left_open_by_an_earlier_run(store)
+        directory.uac.update({"n1": ABSENT, "n2": ABSENT})
+        service = _fresh_process(store)
+        await service.initialize()
+        sink = NotifierAlertSink([], store=store)
+        plan = await _alerted_pass(service, sink)
+        assert plan.aborted is None and plan.hold and len(plan.held) == 2
+        assert not plan.breaker_clear
+        assert ABORTED in await _open_alerts(store)
+
+
+async def test_a_fresh_process_does_not_release_a_hold_on_a_pass_that_read_nothing_readable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With a budget of one, the first pass reads the enabled account and the second reads only
+    the deleted one. The record still holds the first pass's PRESENT answer, but the second pass
+    read nothing that says ``userAccountControl`` is readable now, so it releases no hold."""
+    names = ["n1", "n2"]
+    async with _signed_in_estate(monkeypatch, names, ad_session_recheck_max_users=1) as estate:
+        directory, _service, store, _tokens = estate
+        by_id = sorted([(u.id, u.username) for u in await store.list_users()])
+        order = [name for _id, name in by_id if name in names]
+        await _left_open_by_an_earlier_run(store)
+        directory.delete(order[1])  # the second sample only
+        service = _held_before(_fresh_process(store, ad_session_recheck_max_users=1))
+        await service.initialize()
+        sink = NotifierAlertSink([], store=store)
+        first = await _alerted_pass(service, sink)
+        assert first.readable == 1 and not first.hold_clear  # the other account has no answer yet
+        second = await _alerted_pass(service, sink)
+        assert second.aborted is None and not second.hold and second.readable == 0
+        assert not second.hold_clear, "an earlier pass's readable answer released the hold"
+        assert HELD in await _open_alerts(store)
+
+
+@pytest.mark.parametrize(
+    ("standing", "released"),
+    [("fresh", False), ("held", False), ("settled", True)],
+    ids=["fresh", "held-forfeits", "settled-keeps"],
+)
+async def test_a_fresh_process_does_not_release_a_hold_on_a_pass_that_revoked_an_undetermined(
+    monkeypatch: pytest.MonkeyPatch, standing: _HoldStanding, released: bool
+) -> None:
+    """A restart loses the hysteresis latch. A lone undetermined account beside readable ones is
+    then not held, and at the strike threshold the pass revokes it. Its answer is the hold's own
+    condition, which the lost latch may still have been holding, so that pass releases no hold.
+    The breaker judged the revocation, so the trip resolves. The next pass no longer sees the
+    revoked account and reads the rest clean, and it still releases no hold: nothing re-read the
+    account the lost latch may have held.
+
+    ``held``: a process whose own pass held before can see its latch lift before every account has
+    an answer from it, so the revocation forfeits the release there too. ``settled``: once a pass
+    here has found the hold gone, its records cover what an earlier run held. The lone revocation
+    is then ADR 0195's own, so the third pass releases."""
+    names = ["u1", "ok1", "ok2"]
+    async with _signed_in_estate(monkeypatch, names) as (directory, _service, store, _tokens):
+        await _left_open_by_an_earlier_run(store)
+        directory.uac["u1"] = ABSENT
+        service = _fresh_process(store)
+        service._reconcile_hold_standing = standing
+        await service.initialize()
+        sink = NotifierAlertSink([], store=store)
+        first = await _alerted_pass(service, sink)
+        assert not first.hold and first.revocations == () and not first.hold_clear  # strike 1
+        second = await _alerted_pass(service, sink)
+        assert second.aborted is None and not second.hold
+        assert [r.reason for r in second.revocations] == ["directory_undetermined"]
+        assert second.breaker_clear and not second.hold_clear
+        open_now = await _open_alerts(store)
+        assert HELD in open_now and ABORTED not in open_now
+        third = await _alerted_pass(service, sink)
+        assert third.aborted is None and not third.hold and third.readable == 2
+        assert third.hold_clear is released, "the release did not follow the standing"
+        assert (HELD in await _open_alerts(store)) is not released
+
+
+# --- the clear predicate, clause by clause, and the sole-reconciler gate --------------------------
+#
+# Each clause of the clear predicate is pinned by a test that turns red when it goes. A [cluster]
+# node or a multi-shard engine resolves nothing; what that gate misses is stated once, in
+# AuthService._mark_reconcile_clears.
+
+PRESENT, ABSENT_OUTCOME, UNDETERMINED = (
+    ProbeOutcome.PRESENT,
+    ProbeOutcome.ABSENT,
+    ProbeOutcome.UNDETERMINED,
+)
+
+
+async def _marked(
+    plan: ReconcilePlan,
+    outcomes: dict[str, ProbeOutcome],
+    *,
+    strikes: dict[str, int] | None = None,
+    standing: _HoldStanding = "held",
+) -> tuple[bool, bool]:
+    """``(breaker_clear, hold_clear)`` for ``plan``, with these records on file for exactly these
+    signed-in accounts and nothing unconfirmed, on a process whose own pass held before. Every
+    other input is held clean, so a test changes the one input whose clause it pins."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _fresh_process(store)
+        service._reconcile_hold_standing = standing
+        service._reconcile_outcomes = dict(outcomes)
+        service._reconcile_strikes = dict.fromkeys(outcomes, 0) | (strikes or {})
+        service._reconcile_unconfirmed = set()
+        # The predicate reads only the candidate ids, so the records behind them are not built.
+        users = cast(Mapping[str, UserRecord], dict.fromkeys(outcomes))
+        marked = service._mark_reconcile_clears(plan, users)
+        return marked.breaker_clear, marked.hold_clear
+    finally:
+        await store.close()
+
+
+async def test_the_clear_predicate_control_reads_both_clear() -> None:
+    """The control for the ``_marked`` tests below: on these inputs both clears hold, so each red
+    there is the one clause that test changes."""
+    plan = ReconcilePlan(probed=2, readable=2, outcomes={"a": PRESENT, "b": PRESENT})
+    assert await _marked(plan, {"a": PRESENT, "b": PRESENT}) == (True, True)
+
+
+async def test_an_estate_that_reads_only_undetermined_is_no_breaker_clear() -> None:
+    """``undetermined not in outcomes``: a pass of held accounts only cannot trip the breaker at
+    all, so it says nothing about whether the breaker is still tripped."""
+    plan = ReconcilePlan(probed=2)
+    assert await _marked(plan, {"a": UNDETERMINED, "b": UNDETERMINED}) == (False, False)
+
+
+async def test_an_undetermined_answer_on_record_is_no_hold_clear_even_when_the_pass_held_none() -> (
+    None
+):
+    """``undetermined not in outcomes``: this node's pass did not hold, but an undetermined answer
+    on record is the hold's own condition, which another node's latch may still be holding on. It
+    keeps the breaker open too: that account's roles and scope were not judged."""
+    plan = ReconcilePlan(probed=1, readable=1, outcomes={"a": PRESENT})
+    assert await _marked(plan, {"a": PRESENT, "b": UNDETERMINED}) == (False, False)
+
+
+async def test_a_hold_clear_needs_one_answer_that_read_the_attribute() -> None:
+    """``plan.readable > 0``: ABSENT answers alone found no entry, so they say nothing about the
+    attribute the hold is about. A DISABLED answer did read it, so it counts."""
+    gone = {"a": ABSENT_OUTCOME, "b": ABSENT_OUTCOME}
+    plan = ReconcilePlan(probed=2, outcomes=gone)
+    assert await _marked(plan, gone, strikes={"a": 1, "b": 1}) == (False, False)
+    disabled = {"a": ProbeOutcome.DISABLED, "b": ABSENT_OUTCOME}
+    plan = ReconcilePlan(probed=2, readable=1, outcomes=disabled)
+    assert await _marked(plan, disabled, strikes={"a": 1, "b": 1}) == (False, True)
+
+
+async def test_a_readable_answer_from_an_earlier_pass_is_no_hold_clear() -> None:
+    """The readable answer must come from THIS pass. The record still says ``a`` read PRESENT on
+    an earlier pass, but this pass read only ``b``, and found no entry. Nothing this pass read says
+    the attribute is readable now, so the hold stays open."""
+    plan = ReconcilePlan(probed=1, outcomes={"b": ABSENT_OUTCOME})
+    for earlier in (PRESENT, ProbeOutcome.DISABLED):  # neither stands in for a readable answer now
+        record = {"a": earlier, "b": ABSENT_OUTCOME}
+        assert await _marked(plan, record, strikes={"b": 1}) == (False, False), earlier.value
+
+
+async def test_an_undetermined_answer_this_pass_revoked_still_blocks_the_hold_clear() -> None:
+    """The revoked exclusion does not reach the hold. ``a`` read undetermined and was revoked,
+    because no hold engaged on this process. A restarted process has lost the latch that may still
+    have held it, so its answer is the hold's own condition. The breaker judged the revocation, so
+    its clear stands."""
+    outcomes = {"a": UNDETERMINED, "b": PRESENT}
+    plan = ReconcilePlan(
+        probed=2,
+        readable=1,
+        outcomes=outcomes,
+        revocations=(SessionRevocation("a", "alice", reason="directory_undetermined"),),
+    )
+    assert await _marked(plan, outcomes, strikes={"a": 2}) == (True, False)
+
+
+async def test_a_process_whose_own_pass_has_not_held_releases_no_hold() -> None:
+    """``_reconcile_hold_standing``: a fresh process cannot tell whether the latch an earlier run
+    kept was still holding an account, and a forfeited one revoked an account such a latch may
+    have held. The control's inputs, and the breaker still clears: it has no latch to lose."""
+    plan = ReconcilePlan(probed=2, readable=2, outcomes={"a": PRESENT, "b": PRESENT})
+    record = {"a": PRESENT, "b": PRESENT}
+    assert await _marked(plan, record, standing="fresh") == (True, False)
+    assert await _marked(plan, record, standing="forfeit") == (True, False)
+    assert await _marked(plan, record, standing="settled") == (True, True)
+
+
+@pytest.mark.parametrize(
+    ("start", "event", "end"),
+    [
+        ("fresh", "held", "held"),
+        ("fresh", "forfeit", "forfeit"),
+        ("fresh", "settled", "fresh"),
+        ("held", "forfeit", "forfeit"),
+        ("held", "settled", "settled"),
+        ("forfeit", "held", "forfeit"),
+        ("forfeit", "settled", "forfeit"),
+        ("settled", "held", "settled"),
+        ("settled", "forfeit", "settled"),
+    ],
+)
+async def test_the_hold_standing_never_leaves_a_forfeit(
+    start: _HoldStanding, event: _HoldStanding, end: _HoldStanding
+) -> None:
+    """A forfeit is never left, and a settled process does not forfeit: its records cover what an
+    earlier run held."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _fresh_process(store)
+        service._reconcile_hold_standing = start
+        service._advance_hold_standing(event)
+        assert service._reconcile_hold_standing == end
+    finally:
+        await store.close()
+
+
+async def test_a_pass_that_raises_after_revoking_an_undetermined_account_still_forfeits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The forfeit is recorded before the revocation lands. Here the revocation's own audit write
+    fails, so the pass raises after the sessions are gone and returns no plan. The next pass no
+    longer sees the account, and must not release the hold on the accounts it left."""
+    names = ["u1", "ok1", "ok2"]
+    async with _signed_in_estate(monkeypatch, names) as (directory, _service, store, _tokens):
+        await _left_open_by_an_earlier_run(store)
+        directory.uac["u1"] = ABSENT
+        service = _held_before(_fresh_process(store))
+        await service.initialize()
+        sink = NotifierAlertSink([], store=store)
+        assert (await _alerted_pass(service, sink)).revocations == ()  # strike 1
+        real = store.record_audit
+        _refuse_audit(monkeypatch, store, "auth.ad_session_revoked")
+        with pytest.raises(sqlite3.OperationalError):
+            await service.reconcile_directory_sessions()
+        monkeypatch.setattr(store, "record_audit", real)
+        after = await _alerted_pass(service, sink)
+        assert after.aborted is None and after.revocations == () and after.readable == 2
+        assert not after.hold_clear, "a pass that raised lost the forfeit"
+        assert HELD in await _open_alerts(store)
+
+
+async def test_a_process_releases_a_hold_it_raised_on_one_account_with_nothing_readable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lone undetermined account with nothing readable beside it is held without the latch. The
+    hold is still this process's own, so when the account reads clean it releases."""
+    async with _signed_in_estate(monkeypatch, ["jdoe"]) as (directory, service, store, _tokens):
+        sink = NotifierAlertSink([], store=store)
+        directory.uac["jdoe"] = ABSENT
+        held = await _alerted_pass(service, sink)
+        assert held.hold and not held.latched and not held.hold_clear
+        assert await _open_alerts(store) == {HELD}
+        directory.uac["jdoe"] = ENABLED
+        assert (await _alerted_pass(service, sink)).hold_clear
+        assert await _open_alerts(store) == set()
+
+
+async def test_an_account_this_pass_revoked_does_not_hold_the_breaker_open() -> None:
+    """The ``revoked`` exclusion: the account the pass just revoked still carries its strikes on
+    record, and it has left the estate. Counting it would keep the breaker open after every pass
+    that revokes anyone."""
+    outcomes = {"a": ABSENT_OUTCOME, "b": PRESENT}
+    plan = ReconcilePlan(
+        probed=2,
+        readable=1,
+        outcomes=outcomes,
+        revocations=(SessionRevocation("a", "alice", reason="directory_absent"),),
+    )
+    assert await _marked(plan, outcomes, strikes={"a": 2}) == (True, True)
+
+
+async def test_a_breaker_trip_still_resolves_a_hold_that_has_gone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The aborted branch marks the clears too. A held pass writes its own row on a pass the
+    breaker aborts (ADR 0195 rule item 9), and so a trip with no undetermined account on record is
+    evidence that the hold this process latched has gone. The breaker's own instance stays open."""
+    names = ["ok1", "ok2", "u1", "u2"] + [f"gone{i}" for i in range(10)]
+    async with _signed_in_estate(monkeypatch, names) as (directory, service, store, _tokens):
+        sink = NotifierAlertSink([], store=store)
+        directory.uac.update({"u1": ABSENT, "u2": ABSENT})
+        for name in names[4:]:
+            directory.delete(name)
+        held = await _alerted_pass(service, sink)  # strike 1 for the gone ten: no trip yet
+        assert held.aborted is None and held.hold and held.latched
+        assert await _open_alerts(store) == {HELD}
+        directory.uac.update({"u1": ENABLED, "u2": ENABLED})
+        tripped = await _alerted_pass(service, sink)
+        assert tripped.aborted == "mass_revoke_breaker" and not tripped.hold
+        assert tripped.hold_clear and not tripped.breaker_clear
+        assert await _open_alerts(store) == {ABORTED}
+
+
+def test_without_clears_sets_every_clear_flag_false_and_nothing_else() -> None:
+    names = {f.name for f in dataclass_fields(ReconcilePlan) if f.name.endswith("_clear")}
+    assert {"breaker_clear", "hold_clear"} <= names  # the suffix match is armed
+    every_clear: dict[str, Any] = dict.fromkeys(names, True)
+    plan = replace(
+        ReconcilePlan(probed=3, hold=True, undetermined=2, held=("a", "b")), **every_clear
+    )
+    stripped = _without_clears(plan)
+    assert not any(getattr(stripped, name) for name in names)
+    assert stripped == ReconcilePlan(probed=3, hold=True, undetermined=2, held=("a", "b"))
+
+
+def _runner(all_shard_ids: tuple[str, ...] | None) -> RegistryRunner:
+    return cast(
+        RegistryRunner, SimpleNamespace(registry=SimpleNamespace(all_shard_ids=all_shard_ids))
+    )
+
+
+def test_only_a_process_alone_on_its_store_is_the_sole_reconciler() -> None:
+    single = NullCoordinator()
+    clustered = cast(ClusterCoordinator, SimpleNamespace(is_clustered=lambda: True))
+    shard_filter = object()  # `serve --shard` passes a filter; only its presence is read
+    assert _is_sole_reconciler(single, None, None)  # plain serve
+    assert _is_sole_reconciler(single, shard_filter, _runner(None))  # supervise, one shard
+    assert not _is_sole_reconciler(single, shard_filter, _runner(("a", "b")))  # two shards
+    assert not _is_sole_reconciler(single, shard_filter, None)  # a shard with no graph
+    assert not _is_sole_reconciler(clustered, None, _runner(None))  # a [cluster] node
+
+
+class _PlanAuth:
+    """Stands in for the auth service in the lifespan loop: every pass returns one plan."""
+
+    directory_reconcile_alert: str | None = None
+    directory_reconcile_hold = "held"
+
+    def __init__(self, plan: ReconcilePlan) -> None:
+        self.plan = plan
+        self.passes = 0
+
+    async def reconcile_directory_sessions(self) -> ReconcilePlan:
+        self.passes += 1
+        return self.plan
+
+
+@pytest.mark.parametrize(
+    ("sole", "expected"),
+    [
+        (True, {"ad_reconcile_held", "ad_reconcile_breaker_cleared"}),
+        (False, {"ad_reconcile_held"}),
+    ],
+    ids=["sole-reconciler", "shared-store"],
+)
+async def test_a_process_that_may_share_its_store_pages_but_resolves_nothing(
+    sole: bool, expected: set[str]
+) -> None:
+    """BACKLOG #2136. One node's clear rests on its own records and its own view of the directory,
+    while the instance it would resolve is the store's. So a cluster node or an engine shard still
+    pages a hold, and raises no inverse."""
+    plan = ReconcilePlan(
+        probed=3, hold=True, undetermined=2, held=("a", "b"), breaker_clear=True, hold_clear=False
+    )
+    auth = _PlanAuth(plan)
+    sink = _InverseSink()
+    task = asyncio.create_task(
+        _directory_reconciler(auth, 0.001, sink, sole_reconciler=sole)  # type: ignore[arg-type]
+    )
+    try:
+        for _ in range(500):
+            if auth.passes >= 3:
+                break
+            await asyncio.sleep(0.005)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert auth.passes >= 3
+    assert {event[0] for event in sink.events} == expected
 
 
 # --- BACKLOG #2538: a referral pages, through the real authenticator and the real notifier ------
