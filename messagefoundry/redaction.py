@@ -1939,13 +1939,65 @@ def safe_exc(
     it, routing a file source's error arm through this function would keep the OS diagnostic and leak
     the name anyway: a control that reports success while the hole stays open. The basename is
     replaced wherever it appears, so a full path is covered; the directory part is operator
-    configuration, not partner-chosen, and stays."""
+    configuration, not partner-chosen, and stays.
+
+    A ``UnicodeError`` never reaches :func:`redact` as text (vault BACKLOG #3033). Its ``str()`` quotes
+    the character or byte it failed on, which is a character of the message, and no pattern can tell
+    that apart from prose. :func:`_unicode_error_text` builds the text from the attributes instead."""
     name = type(exc).__name__
+    if isinstance(exc, UnicodeError):
+        return _unicode_error_text(exc, limit=limit)
     raw = str(exc)
     if file_name and (base := _basename(file_name)):
         raw = raw.replace(base, safe_name(file_name))
     message = safe_text(raw, limit=limit)
     return f"{name}: {message}" if message else name
+
+
+#: A codec name as the codecs module spells one. Anything else in ``.encoding`` is not rendered.
+_CODEC_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,39}")
+_UNICODE_VERBS = {
+    UnicodeEncodeError: "encode",
+    UnicodeDecodeError: "decode",
+    UnicodeTranslateError: "translate",
+}
+
+
+def _unicode_error_text(exc: UnicodeError, *, limit: int) -> str:
+    """``exc`` as its class, codec, position and reason, and never the text it failed on.
+
+    ``str(UnicodeEncodeError)`` reads ``'ascii' codec can't encode character '\\xe9' in position 5``,
+    and a decode error names the byte the same way. Both are message content. ``.object`` holds the
+    whole input, so it is never read here. The position is an index, the same detail
+    ``encode_wire_body`` in transports/base.py already keeps.
+
+    The class name alone is the fallback: a bare ``UnicodeError``, or one whose attributes are missing
+    or not the standard types. A bare one's message is free text this function cannot vouch for.
+    ``.encoding`` is rendered only when it is shaped like a codec name. ``.reason`` is a fixed codec
+    phrase for every stdlib codec, and :func:`safe_text` bounds it in case a third-party one is not."""
+    name = type(exc).__name__
+    verb = next((v for cls, v in _UNICODE_VERBS.items() if isinstance(exc, cls)), None)
+    start = getattr(exc, "start", None)
+    end = getattr(exc, "end", None)
+    reason = getattr(exc, "reason", None)
+    if (
+        verb is None
+        or type(start) is not int
+        or type(end) is not int
+        or not 0 <= start < end
+        or not isinstance(reason, str)
+    ):
+        return name
+    encoding = getattr(exc, "encoding", None)
+    codec = (
+        f"{encoding!r} codec "
+        if isinstance(encoding, str) and _CODEC_NAME.fullmatch(encoding)
+        else ""
+    )
+    where = f"position {start}" if end == start + 1 else f"positions {start}-{end - 1}"
+    detail = safe_text(reason, limit=limit)
+    text = f"{name}: {codec}cannot {verb} at {where}"
+    return f"{text}: {detail}" if detail else text
 
 
 def json_loads_or_refusal(raw: str | bytes) -> tuple[Any, str | None]:

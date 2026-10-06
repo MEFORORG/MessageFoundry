@@ -42,6 +42,7 @@ from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus, Stage
 from messagefoundry.transports import DeliveryError, NegativeAckError, SourceConnector
 from messagefoundry.transports.mllp import MLLPDestination
+from tests.test_encode_wire_body import _escapes
 
 ADT = (
     "MSH|^~\\&|SENDINGAPP|SENDINGFAC|RECV|RFAC|20260604||ADT^A01|MSG1|P|2.5.1\r"
@@ -1206,6 +1207,42 @@ async def test_internal_error_dead_letters_and_continues(
         await runner.stop()
     assert dest.calls == 1  # internal errors are not retried under the default policy
     assert (await store.stats()).get(OutboxStatus.DEAD.value) == 1
+
+
+class _BareEncoder:
+    """Test connector that encodes the payload with a bare ``str.encode`` and no guard."""
+
+    async def send(self, payload: str) -> None:
+        payload.encode("ascii")
+
+    async def aclose(self) -> None:
+        return None
+
+
+async def test_an_unguarded_encode_stores_no_character_of_the_message(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    # vault BACKLOG #3033: a connector that skips encode_wire_body raises a bare UnicodeEncodeError,
+    # whose str() quotes the offending character. The internal-error arm stores it through safe_exc,
+    # which must keep the codec and position and drop the character.
+    inbox, outdir = tmp_path / "in", tmp_path / "out"
+    inbox.mkdir()
+    reg = _retry_registry(inbox, outdir, RetryPolicy())
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
+    await runner.start()
+    runner._destinations["file_out"] = _BareEncoder()
+    (inbox / "a.hl7").write_bytes(ADT.replace("JANE", "JANŘ").encode("utf-8"))
+    try:
+        await _until_stat(store, OutboxStatus.DEAD.value, 1)
+    finally:
+        await runner.stop()
+    cur = await store._db.execute("SELECT last_error FROM queue WHERE last_error IS NOT NULL")
+    errors = " ".join(store._cipher.decrypt(r["last_error"]) for r in await cur.fetchall())
+    assert "UnicodeEncodeError: 'ascii' codec cannot encode at position" in errors
+    for form in (*_escapes("Ř"), "JAN"):
+        assert form not in errors, f"a character of the message reached last_error as {form!r}"
 
 
 class _RecordingAlertSink:

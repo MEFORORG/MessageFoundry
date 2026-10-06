@@ -1,0 +1,127 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
+"""``safe_exc`` renders a ``UnicodeError`` without the character or byte it failed on (vault
+BACKLOG #3033).
+
+``str(UnicodeEncodeError)`` reads ``'ascii' codec can't encode character '\\xe9' in position 5``.
+The character is a character of the message, and :func:`redact` scrubs HL7 shapes, not single
+escaped characters. Any encode or decode site that skips ``encode_wire_body`` put that character
+into a stored ``last_error`` or a log line through ``safe_exc``. All payloads here are synthetic."""
+
+from __future__ import annotations
+
+import pytest
+
+from messagefoundry.redaction import safe_exc
+from tests.test_encode_wire_body import _escapes
+
+#: Synthetic. Distinctive enough that a substring scan of the output cannot miss them.
+_CHAR = "Ř"  # R with caron: not ASCII, not latin-1
+_BYTE = 0xFE  # never valid in UTF-8
+_PREFIX = "PID|1||ZZQ"
+_TEXT = f"{_PREFIX}{_CHAR}X"
+_POSITION = len(_PREFIX)
+
+
+def _byte_forms(byte: int) -> list[str]:
+    return [f"0x{byte:02x}", f"\\x{byte:02x}", f"{byte:02x}", str(byte)]
+
+
+def _encode_error() -> UnicodeEncodeError:
+    with pytest.raises(UnicodeEncodeError) as caught:
+        _TEXT.encode("ascii")
+    return caught.value
+
+
+def _decode_error(data: bytes) -> UnicodeDecodeError:
+    with pytest.raises(UnicodeDecodeError) as caught:
+        data.decode("utf-8")
+    return caught.value
+
+
+def _translate_error() -> UnicodeTranslateError:
+    # No stdlib str method raises this, so build it the way a codec's translate path does.
+    return UnicodeTranslateError(_TEXT, _POSITION, _POSITION + 1, "character maps to <undefined>")
+
+
+def _assert_no_content(text: str) -> None:
+    assert _PREFIX not in text and "ZZQ" not in text, f"payload text leaked: {text!r}"
+    for form in _escapes(_CHAR):
+        assert form not in text, f"the offending character leaked as {form!r}: {text!r}"
+
+
+def test_the_unguarded_text_does_leak() -> None:
+    """POSITIVE CONTROL for the instrument: ``str()`` of each error carries what the scans below
+    look for. A scan that could not find it here proves nothing by finding nothing later."""
+    assert "\\u0158" in str(_encode_error())
+    assert "0xfe" in str(_decode_error(_PREFIX.encode() + bytes([_BYTE])))
+    assert "\\u0158" in str(_translate_error())
+
+
+def test_an_encode_error_names_codec_and_position_and_never_the_character() -> None:
+    text = safe_exc(_encode_error())
+    _assert_no_content(text)
+    assert text.startswith("UnicodeEncodeError: ")
+    assert "'ascii' codec" in text
+    assert f"position {_POSITION}" in text
+    assert "ordinal not in range(128)" in text
+
+
+def test_a_decode_error_names_codec_and_position_and_never_the_byte() -> None:
+    text = safe_exc(_decode_error(_PREFIX.encode() + bytes([_BYTE]) + b"X"))
+    _assert_no_content(text)
+    for form in _byte_forms(_BYTE):
+        assert form not in text, f"the offending byte leaked as {form!r}: {text!r}"
+    assert text.startswith("UnicodeDecodeError: ")
+    assert "'utf-8' codec" in text
+    assert f"position {_POSITION}" in text
+    assert "invalid start byte" in text
+
+
+def test_a_multi_byte_span_is_a_range_and_names_no_byte() -> None:
+    # 0xE2 0x82 then end of data: utf-8 reports the two-byte span, and str() would print both.
+    data = _PREFIX.encode() + b"\xe2\x82"
+    exc = _decode_error(data)
+    assert exc.end - exc.start == 2, "the probe must exercise the multi-byte arm"
+    text = safe_exc(exc)
+    for byte in (0xE2, 0x82):
+        for form in _byte_forms(byte):
+            assert form not in text, f"a byte leaked as {form!r}: {text!r}"
+    assert f"positions {_POSITION}-{_POSITION + 1}" in text
+
+
+def test_a_translate_error_names_position_and_never_the_character() -> None:
+    text = safe_exc(_translate_error())
+    _assert_no_content(text)
+    assert text.startswith("UnicodeTranslateError: ")
+    assert f"position {_POSITION}" in text
+
+
+def test_a_charmap_encode_names_its_codec() -> None:
+    # cp1252 reports itself as "charmap", a real codec name, so it is kept.
+    with pytest.raises(UnicodeEncodeError) as caught:
+        _TEXT.encode("cp1252")
+    text = safe_exc(caught.value)
+    _assert_no_content(text)
+    assert "'charmap' codec" in text and f"position {_POSITION}" in text
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        UnicodeError(f"label too long: {_TEXT}"),
+        UnicodeEncodeError("ascii", _TEXT, _POSITION, _POSITION, "empty span"),
+        UnicodeDecodeError("utf-8", _TEXT.encode(), 5, 2, "backwards"),
+    ],
+    ids=["bare-UnicodeError", "empty-span", "end-before-start"],
+)
+def test_odd_attributes_fall_back_to_the_class_name(exc: UnicodeError) -> None:
+    assert safe_exc(exc) == type(exc).__name__
+
+
+def test_an_encoding_attribute_not_shaped_like_a_codec_is_dropped() -> None:
+    exc = UnicodeEncodeError("ascii", _TEXT, _POSITION, _POSITION + 1, "ordinal not in range(128)")
+    exc.encoding = f"x {_TEXT}"
+    text = safe_exc(exc)
+    _assert_no_content(text)
+    assert "codec" not in text and f"position {_POSITION}" in text

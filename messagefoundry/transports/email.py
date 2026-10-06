@@ -498,14 +498,34 @@ class EmailDestination(DestinationConnector):
     def _build_message(self, payload: str) -> EmailMessage:
         # set_content() below encodes with a bare str.encode(charset), whose UnicodeEncodeError names
         # a character of the message and holds the whole payload on `.object`. The shared helper fails
-        # permanent and content-free instead (see its docstring). _send backs up the second encode.
+        # permanent and content-free instead (see its docstring).
         encode_wire_body(payload, self.encoding, transport=f"Email {self.host}:{self.port}")
         msg = EmailMessage()
         msg["Subject"] = self.subject
         self._envelope.address(msg)
-        # The Handler-produced payload IS the body (content-agnostic — an HL7 string, a JSON/XML report,
-        # plain text); rendering it human-readable is the Handler's job, not the transport's.
-        msg.set_content(payload, charset=self.encoding)
+        # Backstop for set_content()'s own encode, in Direct's shape (see `encode_wire_body`). Python
+        # 3.15 encodes there with the email package's OUTPUT charset (euc-jp and shift_jis become
+        # iso-2022-jp), not the name the guard checked, so a body can pass the guard and still fail.
+        # Keep only the type name and raise outside the handler, so neither chain link holds the
+        # error whose `.object` is the whole payload.
+        #
+        # It wraps set_content() alone, so a header fault is never reported as the body's (vault
+        # BACKLOG #3033). The subject and sender are refused at load if a header could not encode
+        # them; one that got past that escapes as its own error, which safe_exc renders content-free.
+        failure = ""
+        try:
+            # The Handler-produced payload IS the body (content-agnostic — an HL7 string, a JSON/XML
+            # report, plain text); rendering it human-readable is the Handler's job, not the transport's.
+            msg.set_content(payload, charset=self.encoding)
+        except UnicodeError as exc:
+            failure = type(exc).__name__
+        if failure:
+            raise NegativeAckError(
+                f"Email {self.host}:{self.port}: the message could not be encoded for "
+                f"{self.encoding!r} ({failure})",
+                code="encoding",
+                permanent=True,
+            )
         return msg
 
     def _connect(self) -> smtplib.SMTP:
@@ -531,24 +551,7 @@ class EmailDestination(DestinationConnector):
             # Zero-I/O send-time backstop at the byte crossing (the tcp/x12/dicom pattern): re-assert the
             # captured cleartext decision so a reload can't route PHI around the construction-only gate.
             self._hop_guard.assert_send()
-        # Backstop for set_content()'s own encode, in Direct's shape (see `encode_wire_body`). Python
-        # 3.15 encodes there with the email package's OUTPUT charset (euc-jp and shift_jis become
-        # iso-2022-jp), not the name the guard checked, so a body can pass the guard and still fail.
-        # Keep only the type name and raise outside the handler, so neither chain link holds the
-        # error whose `.object` is the whole payload.
-        msg: EmailMessage | None = None
-        failure = ""
-        try:
-            msg = self._build_message(payload)
-        except UnicodeError as exc:
-            failure = type(exc).__name__
-        if msg is None:
-            raise NegativeAckError(
-                f"Email {self.host}:{self.port}: the message could not be encoded for "
-                f"{self.encoding!r} ({failure})",
-                code="encoding",
-                permanent=True,
-            )
+        msg = self._build_message(payload)
         try:
             with self._connect() as smtp:
                 if self.username is not None:
