@@ -982,7 +982,8 @@ async def test_a_ledger_call_stuck_past_the_bound_lets_the_cancellation_through(
 ) -> None:
     """BACKLOG #2263's wait is bounded. A store that never answers must not hold ``_quota_lock``
     and the request's cancellation forever: past the bound the call is left running, a WARNING
-    names it, and the cancellation propagates. A landed file is still removed (#2262)."""
+    names it, and the cancellation propagates. A landed file is still removed (#2262). Once the
+    call does finish, the slot is paid back: a late reserve by a fresh release."""
     from messagefoundry import uploads as uploads_mod
 
     root = tmp_path / "uploads"
@@ -1006,7 +1007,50 @@ async def test_a_ledger_call_stuck_past_the_bound_lets_the_cancellation_through(
             assert not root.exists() or list(root.iterdir()) == []
         finally:
             ledger.gate.set()  # let the abandoned call finish before the store closes
-            await asyncio.sleep(0.1)
+            await _drain_stragglers(store)
+    assert await ledger_db.upload_quota_in_flight("u-op") == (0, 0)
+
+
+async def _drain_stragglers(store: UploadStore) -> None:
+    """Wait for every ledger call a cancelled save left running, a late release included."""
+    for _ in range(100):
+        if not store._stragglers:
+            return
+        await asyncio.wait(set(store._stragglers), timeout=10)
+    raise AssertionError("ledger calls were still running")
+
+
+async def test_a_cancel_absorbed_by_the_write_still_bounds_the_release(
+    tmp_path: Path, ledger_db: MessageStore
+) -> None:
+    """A plain asyncio cancel is used up by the write's wait, so the release in ``save``'s
+    ``finally`` starts with no cancellation pending. It is bounded all the same, because the task
+    is still cancelling. Found in review: without that, the release waited forever."""
+    from messagefoundry import uploads as uploads_mod
+
+    root = tmp_path / "uploads"
+    ledger = _GatedLedger(ledger_db, hold="release")
+    store = UploadStore(root, make_cipher(generate_key()), max_bytes=1024, store=ledger)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(uploads_mod, "_LEDGER_CANCEL_WAIT_SECONDS", 0.2)
+        landed, finish = _hold_after_the_sidecar_lands(mp)
+        save = asyncio.create_task(
+            store.save(data=_ADT.encode(), filename="x.hl7", uploader="op", uploader_id="u-op")
+        )
+        try:
+            assert await asyncio.to_thread(landed.wait, 10), "the sidecar never landed"
+            save.cancel()
+        finally:
+            finish.set()
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(save, 10)
+            assert not store._quota_lock.locked()
+            assert list(root.iterdir()) == []
+        finally:
+            ledger.gate.set()
+            await _drain_stragglers(store)
+    assert await ledger_db.upload_quota_in_flight("u-op") == (0, 0)
 
 
 async def test_a_reserve_that_fails_while_cancelled_is_logged_and_not_blindly_released(
@@ -1050,6 +1094,8 @@ async def test_a_reserve_that_fails_while_cancelled_is_logged_and_not_blindly_re
     ):
         await asyncio.wait_for(save, 10)
     assert "reserve for u-op failed while the upload was being cancelled" in caplog.text
+    # Logged once, by this module. An asyncio.shield wait also handed it to the loop's handler.
+    assert "shielded future" not in caplog.text, caplog.text
     assert await ledger_db.upload_quota_in_flight("u-op") == (1, 2)
 
 
