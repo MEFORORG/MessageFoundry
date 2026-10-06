@@ -256,6 +256,19 @@ in-flight rows stranded.
 > alert, whose contract is a start loading different bytes. The `dr_seed` marker records the running graph's
 > digest too, not a disk digest. The marker is written before the takeover hook, so an operator reload that
 > lands during the hook makes it differ from the `dr.activate` row, which records the graph actually applied.
+>
+> **Decision 3: while the profile parks an outbound, the doors that would change its run state refuse.**
+> Operator start, stop and restart answer `409` with the reason, and an alert rule's automatic restart and
+> the scheduler's resume log the refusal at INFO and do nothing. The engine first tried to defer such a start
+> until release, but each door then turned one kind of pause into another, and each was found on its own.
+> A stop dropped the engine's park, so the lane read `stopping` for good. An alert rule's restart turned an
+> operator's pause into an engine park, so the release brought that lane up. So the lane keeps the state the
+> profile left it in, and the first reload after `POST /dr/release` is the one door that un-parks it. That
+> reload restores the state from before the activation: a lane the engine parked comes up, a lane an operator
+> or the calendar paused first stays paused, and an `auto_start = false` lane takes its gate's answer. A purge
+> of a parked lane is allowed, since the lane is paused and nothing is in flight. An INBOUND is unchanged: an
+> operator start of a parked inbound still overrides the profile, as `tests/test_connection_scheduler.py`
+> pins.
 
 ### Seeding DR state — cold-from-#60 (the owner-locked default)
 
@@ -494,7 +507,10 @@ and listeners are unbound, so there is **no dual-accept window** while the VIP m
    *Amendment (vault BACKLOG #2752, 2026-10-06):* the wait is bounded (60 s of wall-clock time,
    `DR_RELEASE_DRAIN_TIMEOUT_SECONDS` in `pipeline/engine.py`), so a row that cannot drain does not
    hold the release. The hand-back then completes with those rows still queued, and the `dr.release`
-   audit row and the response record `depth_left`, the count left, instead of claiming a drain. The
+   audit row and the response record `depth_left`, the count left, instead of claiming a drain. Rows held on
+   an outbound the profile parks cannot drain on this box, so the wait leaves them out: `depth_left` counts
+   them, `held_on_parked_outbounds` says how many they are, and `drained` is true once every other row has
+   drained (vault BACKLOG #3067). The
    release, like the activation, runs on when the API's request deadline cuts its caller off
    (`api/outlive.py`), and a release cancelled partway stays active and writes `dr_release_failed`.
 3. Primary resumes against the authoritative store. Because the owner-locked seed is **cold**, DR ran on a

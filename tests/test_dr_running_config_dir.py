@@ -31,13 +31,16 @@ from typing import Any, NamedTuple
 
 import pytest
 
+from messagefoundry.api.app import _alert_control_action
 from messagefoundry.config import fingerprint as fp
 from messagefoundry.config.models import Priority
 from messagefoundry.config.settings import DrSettings, EgressSettings
 from messagefoundry.config.wiring import WiringError
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.dr import DrActivationError
+from messagefoundry.pipeline.wiring_runner import DrParkedError
 from tests.test_dr_activation import _seed
+from tests.test_dr_outlive_deadline import _admin_client
 
 # A name that cannot be encoded as UTF-8: a lone surrogate. NTFS stores it as UTF-16, and on a
 # POSIX file system Python writes it as the raw byte 0x80. Under environments/ it is fingerprinted
@@ -95,7 +98,9 @@ _NEVER = (
 )
 
 
-def _write_tiered_graph(cfg: Path, tmp_path: Path, *, norm_schedule: str | None = None) -> None:
+def _write_tiered_graph(
+    cfg: Path, tmp_path: Path, *, norm_schedule: str | None = None, norm_auto_start: bool = True
+) -> None:
     """One critical and one normal MLLP inbound, each with an outbound of the same tier."""
     cfg.mkdir(parents=True, exist_ok=True)
     out_crit, out_norm = tmp_path / "out-crit", tmp_path / "out-norm"
@@ -111,7 +116,8 @@ def _write_tiered_graph(cfg: Path, tmp_path: Path, *, norm_schedule: str | None 
         f"outbound('OB_CRIT_ADT', File(directory={str(out_crit)!r}), "
         "priority=Priority.CRITICAL)\n"
         f"outbound('OB_NORM_ADT', File(directory={str(out_norm)!r}), priority=Priority.NORMAL"
-        f"{f', schedule={norm_schedule}' if norm_schedule else ''})\n"
+        f"{f', schedule={norm_schedule}' if norm_schedule else ''}"
+        f"{'' if norm_auto_start else ', auto_start=False'})\n"
         "@router('r')\n"
         "def route(msg):\n"
         "    return ['h']\n"
@@ -128,6 +134,7 @@ class _Box(NamedTuple):
     staging: Path
     tiered: Path
     scheduled: Path
+    gated: Path
 
 
 @pytest.fixture
@@ -139,16 +146,18 @@ async def box(tmp_path: Path) -> AsyncIterator[_Box]:
     staging = tmp_path / "staging"
     tiered = tmp_path / "tiered"
     scheduled = tmp_path / "scheduled"
+    gated = tmp_path / "gated"
     _write_graph(live, tmp_path, "IB_LIVE_ADT")
     _write_graph(staging, tmp_path, "IB_STAGING_ADT")
     _write_tiered_graph(tiered, tmp_path)
     _write_tiered_graph(scheduled, tmp_path, norm_schedule=_NEVER)
+    _write_tiered_graph(gated, tmp_path, norm_auto_start=False)
     store, archive, ss = await _seed(tmp_path)
     engine = Engine(
         store,
         poll_interval=0.05,
         config_dir=live,
-        config_reload_roots=[str(staging), str(tiered), str(scheduled)],
+        config_reload_roots=[str(staging), str(tiered), str(scheduled), str(gated)],
         store_settings=ss,
         dr_settings=DrSettings(enabled=True, activate=False, seed_archive=archive),
         egress_settings=EgressSettings(deny_by_default=False),
@@ -158,7 +167,7 @@ async def box(tmp_path: Path) -> AsyncIterator[_Box]:
     # so do it here, or every release would wait out its whole drain timeout on that one row.
     await store.dead_letter_missing_destinations(set())
     try:
-        yield _Box(engine, live, staging, tiered, scheduled)
+        yield _Box(engine, live, staging, tiered, scheduled, gated)
     finally:
         await engine.stop()
 
@@ -296,7 +305,8 @@ async def test_a_row_on_a_parked_outbound_is_held_and_drains_after_release(box: 
     assert held["attempts"] == 0
     assert rr.outbound_filtered("OB_NORM_ADT") is not None  # it still reads filtered, not stopped
     # An operator start cannot lift a DR park: there is no connector to deliver through.
-    await rr.start_outbound("OB_NORM_ADT")
+    with pytest.raises(DrParkedError):
+        await rr.start_outbound("OB_NORM_ADT")
     await asyncio.sleep(0.5)
     assert (await _norm_row(engine, message_id))["attempts"] == 0
 
@@ -310,11 +320,15 @@ async def test_a_row_on_a_parked_outbound_is_held_and_drains_after_release(box: 
 
     await engine.reload_detail(box.tiered)  # the profile is off: the park lifts and it drains
 
+    await _until_norm_done(engine, message_id)
+    assert any((box.tiered.parent / "out-norm").iterdir())  # a file reached the target
+
+
+async def _until_norm_done(engine: Engine, message_id: str) -> None:
     async def norm_delivered() -> bool:
         return (await _norm_row(engine, message_id))["status"] == "done"
 
     await _until(norm_delivered)
-    assert any((box.tiered.parent / "out-norm").iterdir())  # a file reached the target
 
 
 async def _assert_delivers_after_release(engine: Engine, box: _Box, message_id: str) -> None:
@@ -325,42 +339,187 @@ async def _assert_delivers_after_release(engine: Engine, box: _Box, message_id: 
     await coord.release(actor="alice")
     await engine.reload_detail(box.tiered)
 
-    async def norm_delivered() -> bool:
-        return (await _norm_row(engine, message_id))["status"] == "done"
-
-    await _until(norm_delivered)
+    await _until_norm_done(engine, message_id)
     assert rr.outbound_status("OB_NORM_ADT") == "running"
 
 
-async def test_a_restarted_dr_parked_outbound_comes_up_after_release(box: _Box) -> None:
-    """Red at 638136f79a: the restart's stop half dropped the engine-park marker and its start
-    half kept the lane parked, so no reload lifted it; it read "stopping" and held its row until
-    an operator started it."""
+async def _activate_with_a_held_row(engine: Engine) -> str:
+    """Activate, then queue one row for the parked normal-tier outbound. Returns its message id."""
+    coord = engine.dr_coordinator
+    assert coord is not None
+    await coord.activate(actor="alice")
+    rr = engine.registry_runner
+    assert rr is not None
+    assert rr.outbound_filtered("OB_NORM_ADT") is not None
+    return await engine.store.enqueue_message(
+        channel_id=_CRIT, raw=ADT, deliveries=[("OB_NORM_ADT", ADT)], now=time.time()
+    )
+
+
+async def _assert_still_parked(engine: Engine, message_id: str) -> None:
+    """The lane is as the profile parked it: filtered, paused and quiesced (never "stopping"), so
+    purge is allowed, and its row is held with no attempt charged."""
+    rr = engine.registry_runner
+    assert rr is not None
+    await asyncio.sleep(0.3)  # several poll intervals for a worker that would claim the row
+    assert rr.outbound_filtered("OB_NORM_ADT") is not None
+    assert rr.outbound_status("OB_NORM_ADT") == "stopped"
+    assert rr.outbound_quiesced("OB_NORM_ADT")
+    row = await _norm_row(engine, message_id)
+    assert row["status"] == "pending" and row["attempts"] == 0
+
+
+@pytest.mark.parametrize("door", ["start", "stop", "restart"])
+async def test_an_operator_door_on_a_dr_parked_outbound_is_refused(box: _Box, door: str) -> None:
+    """Start, stop and restart of a DR-parked outbound refuse, and the lane comes up after release.
+
+    Red at 15d1d9637b for each door in its own way. A start was deferred rather than refused. A
+    stop dropped the engine-park marker, so no reload after release lifted the lane and it read
+    "stopping" for good. A restart had to skip its stop half to avoid that."""
     engine = box.engine
     await engine.reload_detail(box.tiered)
     rr = engine.registry_runner
     assert rr is not None
-    coord = engine.dr_coordinator
-    assert coord is not None
-    await coord.activate(actor="alice")
-    message_id = await engine.store.enqueue_message(
-        channel_id=_CRIT, raw=ADT, deliveries=[("OB_NORM_ADT", ADT)], now=time.time()
-    )
+    message_id = await _activate_with_a_held_row(engine)
 
-    await rr.restart_outbound("OB_NORM_ADT")
-    await asyncio.sleep(0.3)
-    assert rr.outbound_status("OB_NORM_ADT") == "stopped"  # parked, and never "stopping"
-    assert (await _norm_row(engine, message_id))["attempts"] == 0
+    with pytest.raises(DrParkedError, match="release DR first"):
+        await getattr(rr, f"{door}_outbound")("OB_NORM_ADT")
+    await _assert_still_parked(engine, message_id)
 
     await _assert_delivers_after_release(engine, box, message_id)
 
 
-async def test_a_calendar_parked_outbound_unscheduled_under_dr_comes_up_after_release(
+async def test_the_api_answers_409_for_each_door_on_a_dr_parked_outbound(box: _Box) -> None:
+    """The refusal reaches the operator as a 409 with the reason, not a 200 reading running false."""
+    engine = box.engine
+    await engine.reload_detail(box.tiered)
+    message_id = await _activate_with_a_held_row(engine)
+    client, _app = await _admin_client(engine, deadline=30.0)
+    async with client:
+        for door in ("start", "stop", "restart"):
+            r = await client.post(f"/connections/OB_NORM_ADT/{door}")
+            assert r.status_code == 409, (door, r.text)
+            assert "parked by the DR run-profile" in r.json()["detail"]
+    await _assert_still_parked(engine, message_id)
+
+
+async def test_an_alert_rule_restart_on_a_dr_parked_outbound_is_logged_and_does_nothing(
+    box: _Box, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An alert rule's automatic restart is refused like an operator's, logged once at INFO, and
+    raises nothing for the notifier to report as a failure."""
+    engine = box.engine
+    await engine.reload_detail(box.tiered)
+    message_id = await _activate_with_a_held_row(engine)
+
+    with caplog.at_level(logging.INFO, logger="messagefoundry.api.app"):
+        await _alert_control_action(engine, "restart_outbound", "OB_NORM_ADT")
+    refusals = [r for r in caplog.records if "DR run-profile parks it" in r.getMessage()]
+    assert len(refusals) == 1 and refusals[0].levelno == logging.INFO
+    await _assert_still_parked(engine, message_id)
+
+    await _assert_delivers_after_release(engine, box, message_id)
+
+
+async def test_an_operator_pause_from_before_the_activation_survives_the_release(
     box: _Box,
 ) -> None:
-    """A reload under the profile removes the schedule of a lane the calendar parked. Red at
-    638136f79a: the unscheduled resume met the DR park, left the lane paused with no engine-park
-    marker, and no later reload lifted it."""
+    """A lane the operator paused before DR is the operator's after it, even when an alert rule
+    tried to restart it during DR. Red at 15d1d9637b: the alert restart marked the lane as an
+    engine park, so the reload after release brought up a lane the operator had paused."""
+    engine = box.engine
+    await engine.reload_detail(box.tiered)
+    rr = engine.registry_runner
+    assert rr is not None
+    await rr.stop_outbound("OB_NORM_ADT")  # the operator's pause, before any DR
+    message_id = await _activate_with_a_held_row(engine)
+    await _alert_control_action(engine, "restart_outbound", "OB_NORM_ADT")
+
+    coord = engine.dr_coordinator
+    assert coord is not None
+    await coord.release(actor="alice")
+    await engine.reload_detail(box.tiered)
+    await asyncio.sleep(0.3)
+    assert rr.outbound_filtered("OB_NORM_ADT") is None  # no longer the DR's
+    assert rr.outbound_status("OB_NORM_ADT") == "stopped"  # still the operator's pause
+    assert (await _norm_row(engine, message_id))["attempts"] == 0
+
+    await rr.start_outbound("OB_NORM_ADT")  # control: the operator's own start delivers it
+
+    await _until_norm_done(engine, message_id)
+
+
+async def test_a_start_disabled_dr_parked_outbound_follows_its_gate_after_release(
+    box: _Box,
+) -> None:
+    """An ``auto_start=False`` lane: the operator's start under DR is refused out loud, rather than
+    accepted and then lost to the release reload's auto_start gate as at 15d1d9637b."""
+    engine = box.engine
+    await engine.reload_detail(box.gated)
+    rr = engine.registry_runner
+    assert rr is not None
+    assert rr.outbound_status("OB_NORM_ADT") == "stopped"  # control: the gate parked it
+    message_id = await _activate_with_a_held_row(engine)
+    with pytest.raises(DrParkedError):
+        await rr.start_outbound("OB_NORM_ADT")
+
+    coord = engine.dr_coordinator
+    assert coord is not None
+    await coord.release(actor="alice")
+    await engine.reload_detail(box.gated)
+    await asyncio.sleep(0.3)
+    assert rr.outbound_filtered("OB_NORM_ADT") is None
+    assert rr.outbound_status("OB_NORM_ADT") == "stopped"  # its gate's answer
+    assert (await _norm_row(engine, message_id))["attempts"] == 0
+
+    await rr.start_outbound("OB_NORM_ADT")  # the start the gate exists for, now accepted
+
+    await _until_norm_done(engine, message_id)
+
+
+async def test_a_dr_parked_outbound_can_be_purged(box: _Box) -> None:
+    """Purge needs a quiesced lane. A DR-parked lane is one, and a refused stop leaves it so."""
+    engine = box.engine
+    await engine.reload_detail(box.tiered)
+    rr = engine.registry_runner
+    assert rr is not None
+    message_id = await _activate_with_a_held_row(engine)
+    with pytest.raises(DrParkedError):
+        await rr.stop_outbound("OB_NORM_ADT")
+    client, _app = await _admin_client(engine, deadline=30.0)
+    async with client:
+        r = await asyncio.wait_for(client.post("/connections/OB_NORM_ADT/purge"), 10)
+    assert r.status_code == 200, r.text
+    assert r.json()["cancelled"] == 1
+    assert (await _norm_row(engine, message_id))["status"] != "pending"
+
+
+async def test_a_second_stop_of_a_paused_outbound_leaves_it_stopped(box: _Box) -> None:
+    """Not DR: the root of the stuck stop. Red before #3067 round 5: the second stop cleared the
+    lane's quiescence, and the dispatcher's pause of an already-paused lane never set it again, so
+    the lane read "stopping" for good and purge was refused."""
+    engine = box.engine
+    await engine.reload_detail(box.tiered)
+    rr = engine.registry_runner
+    assert rr is not None
+    await rr.stop_outbound("OB_CRIT_ADT")
+
+    async def quiesced() -> bool:
+        return rr.outbound_quiesced("OB_CRIT_ADT")
+
+    await _until(quiesced)  # control: the first stop quiesces
+    await rr.stop_outbound("OB_CRIT_ADT")
+    assert rr.outbound_status("OB_CRIT_ADT") == "stopped"
+    assert rr.outbound_quiesced("OB_CRIT_ADT")
+
+
+async def test_a_calendar_parked_outbound_unscheduled_under_dr_comes_up_after_release(
+    box: _Box, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A reload under the profile removes the schedule of a lane the calendar parked. The
+    scheduler's resume is refused and logged, and the lane stays the calendar's until the reload
+    after release resumes it. Red at 638136f79a: the unscheduled resume met the DR park, left the
+    lane paused with no engine-park marker, and no later reload lifted it."""
     engine = box.engine
     await engine.reload_detail(box.scheduled)
     rr = engine.registry_runner
@@ -376,8 +535,11 @@ async def test_a_calendar_parked_outbound_unscheduled_under_dr_comes_up_after_re
     coord = engine.dr_coordinator
     assert coord is not None
     await coord.activate(actor="alice")
-    await engine.reload_detail(box.tiered)  # the same graph with the schedule gone
-    assert (await _norm_row(engine, message_id))["attempts"] == 0
+    with caplog.at_level(logging.INFO, logger="messagefoundry.pipeline.wiring_runner"):
+        await engine.reload_detail(box.tiered)  # the same graph with the schedule gone
+    refusals = [r for r in caplog.records if "but the DR run-profile parks it" in r.getMessage()]
+    assert len(refusals) == 1
+    await _assert_still_parked(engine, message_id)
 
     await _assert_delivers_after_release(engine, box, message_id)
 
