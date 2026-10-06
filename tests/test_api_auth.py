@@ -1349,9 +1349,9 @@ async def test_connection_test_and_integrity_check_are_paced(engine: Engine) -> 
 
 #: BACKLOG #287 (ASVS 2.4.2): the three state-changing routes that stayed on plain require() after the
 #: #193 sweep. Each entry is (method, path, json body, the status an admitted request gets). None of
-#: them needs a live dependency: the preset id names no row, the log level is set to the value the
-#: root logger already holds (filled in at run time), and the test-email request finds no [alerts]
-#: mail transport configured, so it answers without dialling anything.
+#: them needs a live dependency: the preset id names no row, the log level is set to one the instance
+#: accepts, the current one where it can be (filled in at run time), and the test-email request
+#: finds no [alerts] mail transport configured, so it answers without dialling anything.
 _PACED_BY_287: tuple[tuple[str, str, dict[str, object] | None, int], ...] = (
     ("DELETE", "/search/presets/" + "a" * 32, None, 404),
     ("PATCH", "/logging/level", None, 200),
@@ -1398,9 +1398,14 @@ async def test_backlog_287_routes_are_paced(
     async with _client(engine, service) as c:
         h = _auth((await _login(c, "adm")).json()["token"])
         if path == "/logging/level":
+            # A level this instance ACCEPTS: the client passes no [ai] posture, so it counts as
+            # production and DEBUG is refused (vault BACKLOG #2777). Re-PATCHing the current level
+            # would make this test depend on whatever level the root logger was left at.
             current = await c.get("/logging/level", headers=h)
             assert current.status_code == 200
-            body = {"level": current.json()["level"]}
+            level = current.json()["level"]
+            accepted = current.json()["levels"]
+            body = {"level": level if level in accepted else accepted[0]}
         for _ in range(2):
             admitted = await c.request(method, path, json=body, headers=h)
             assert admitted.status_code == admitted_status, admitted.text

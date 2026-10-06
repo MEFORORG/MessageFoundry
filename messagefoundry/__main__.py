@@ -77,9 +77,11 @@ from messagefoundry.cli_surface import (  # noqa: E402  # pure data, stdlib-only
 from messagefoundry.console_streams import harden_console_streams  # noqa: E402
 from messagefoundry.logging_setup import (  # noqa: E402
     LOG_LEVELS,
+    PRODUCTION_DEBUG_REFUSED,
     LogFile,
     SyslogForward,
     configure_logging,
+    level_refused_on_production,
     query_sntp_offset,
 )
 from messagefoundry.odbc_env import disable_driver_manager_pooling  # noqa: E402
@@ -2198,16 +2200,11 @@ def _serve(args: argparse.Namespace) -> int:
 
     # Gate #1: DEBUG logging can surface PHI (full message bodies / raw field values) into the general
     # log. Refuse it fail-closed on a production instance — real PHI flows there. A non-production
-    # instance may use DEBUG for diagnostics.
-    if production and settings.logging.level.upper() == "DEBUG":
-        print(
-            "error: DEBUG logging is refused on a production instance "
-            "([security].production_instance=true) — it can surface PHI (full message bodies / raw "
-            "field values) into logs. Use INFO or higher in production (set "
-            "[security].production_instance=false on a non-production instance for verbose "
-            "diagnostics).",
-            file=sys.stderr,
-        )
+    # instance may use DEBUG for diagnostics. The predicate is shared with the run-time setter behind
+    # PATCH /logging/level, so a production instance refused DEBUG here is refused it there too
+    # (vault BACKLOG #2777).
+    if level_refused_on_production(settings.logging.level, production=production):
+        print(f"error: {PRODUCTION_DEBUG_REFUSED}", file=sys.stderr)
         return 2
 
     # Off-box log forwarding (sec-offbox-log): ship a copy of every record to a syslog/SIEM collector
