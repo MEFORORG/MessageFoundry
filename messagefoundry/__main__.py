@@ -6598,10 +6598,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
     from messagefoundry.auth.trust_anchors import TrustAnchorError
     from messagefoundry.config.settings import StoreBackend, hop_posture_from_ai
     from messagefoundry.config.tls_policy import InsecureHopRefused
-    from messagefoundry.secrets_dpapi import DpapiError, DpapiUnavailable
     from messagefoundry.store.base import StoreNotFoundError, build_store_cipher
     from messagefoundry.store.crypto import CipherError, StoreKeylessError
-    from messagefoundry.store.keyprovider import KeyProviderError
 
     store_slot = _ProvisionStore()
     # The instance hop posture, as `serve` derives it: the auth build takes it, and both store opens
@@ -6640,7 +6638,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
     # variables and files, never a key (see store/keyprovider.py, secrets_dpapi.py). Exit 2, as
     # `rotate-key` exits on the same three: the store could not be opened, so the command could not
     # start. Before BACKLOG #2081 they escaped to the dispatch floor.
-    key_unresolved = (KeyProviderError, DpapiError, DpapiUnavailable)
+    key_unresolved = _key_unresolved()
 
     try:
         service = _build_provision_auth_service(settings, store_slot, posture=posture)
@@ -6804,7 +6802,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # #1905, #1916: could not start -- exit 2 whichever of the three keyless checks caught it
         _emit_error(str(exc), as_json=args.json)
         return 2
-    except (*key_unresolved, InsecureHopRefused) as exc:
+    except key_unresolved + (InsecureHopRefused,) as exc:
         # Refused before the prompt already; one that changed since is refused the same way.
         _emit_error(f"{_sentence(exc)} {_NOTHING_PROVISIONED}", as_json=args.json)
         return 2
@@ -7144,11 +7142,11 @@ def _audit_verify(args: argparse.Namespace) -> int:
     from messagefoundry.config.settings import StoreBackend, keyless_opt_out_refusal, load_settings
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import (
-        AuditVerdict,
         KeylessAuditChainRefused,
         StoreNotFoundError,
         open_store,
     )
+    from messagefoundry.store.store import AuditVerdict
 
     # Resolve the anchor FIRST: it is a pure argv/file error, so it should not depend on a config load
     # succeeding, and refusing it early keeps a typo from costing a store open.
@@ -7199,13 +7197,15 @@ def _audit_verify(args: argparse.Namespace) -> int:
         finally:
             await store.close()
 
-    try:
-        verdict, count = run_guarded(run())
-    except (
+    # #1916; #1780: a server database with no store; #2725: a key that does not resolve.
+    could_not_start: tuple[type[Exception], ...] = (
         KeylessAuditChainRefused,
         StoreNotFoundError,
         *_key_unresolved(),
-    ) as exc:  # #1916; #1780: a server database with no store; #2725: no key. Could not start.
+    )
+    try:
+        verdict, count = run_guarded(run())
+    except could_not_start as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
@@ -7302,13 +7302,14 @@ def _audit_anchor(args: argparse.Namespace) -> int:
         finally:
             await store.close()
 
-    try:
-        count, head = run_guarded(run())
-    except (
+    could_not_start: tuple[type[Exception], ...] = (
         KeylessAuditChainRefused,
         StoreNotFoundError,
         *_key_unresolved(),
-    ) as exc:  # #1916, #1780, #2725, as audit-verify
+    )
+    try:
+        count, head = run_guarded(run())
+    except could_not_start as exc:  # #1916, #1780, #2725, as audit-verify
         _emit_error(str(exc), as_json=args.json)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
@@ -7423,10 +7424,8 @@ def _rotate_key(args: argparse.Namespace) -> int:
 
     from messagefoundry.config.settings import StoreBackend, load_settings
     from messagefoundry.last_resort import run_guarded
-    from messagefoundry.secrets_dpapi import DpapiError, DpapiUnavailable
     from messagefoundry.store.base import StoreNotFoundError, open_store, resolve_active_key
     from messagefoundry.store.crypto import CipherError
-    from messagefoundry.store.keyprovider import KeyProviderError
     from messagefoundry.uploads import ResealResult, UploadStore
 
     cli: dict[str, dict[str, object]] = {}
@@ -7440,7 +7439,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
 
     try:
         active_key = resolve_active_key(settings.store)
-    except (DpapiError, DpapiUnavailable, KeyProviderError) as exc:
+    except _key_unresolved() as exc:
         # KeyProviderError: a non-default [store].key_provider that is unknown or not-yet-built (an
         # external HSM/KMS/Vault provider) — fail closed with a clean exit-2, not a traceback (ADR 0019).
         print(f"error: cannot load the active key for rotation: {exc}", file=sys.stderr)

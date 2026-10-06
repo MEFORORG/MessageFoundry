@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import hmac
 import json
@@ -1503,6 +1504,31 @@ async def test_startup_chain_break_keeps_its_own_alert_subject(tmp_path: Path) -
     assert subject == "audit-chain", "a chain break was filed under the truncation subject"
     assert "broken at seq=2, row id=2" in reason
     assert "chain break" in cap.text, cap.records
+
+
+async def test_startup_check_of_a_keyed_chain_with_no_key_fires_no_tamper_alert(
+    tmp_path: Path,
+) -> None:
+    """Vault BACKLOG #2725, the startup twin of `audit-verify`'s exit 4. A keyed chain opened by a
+    process with no key was walked, every keyed row read as broken, and the tamper alert fired. Now
+    nothing is checked against the key, so it logs that it could not run and alerts nobody. The
+    control: a row deleted from the middle, which needs no key to see, still alerts as a break."""
+    db = tmp_path / "keyed.db"
+    keyed = await _keyed_store(db)
+    for i in range(3):
+        await keyed.record_audit(f"act{i}", actor="x")
+    await keyed.close()
+
+    sink, cap = await _verify_on_start(db, None)  # `_verify_on_start` opens with no key
+    assert sink.events == [], sink.events
+    assert "could not run" in cap.text and "could not be checked" in cap.text, cap.records
+
+    with contextlib.closing(sqlite3.connect(db)) as conn:
+        conn.execute("DELETE FROM audit_log WHERE seq = 2")
+        conn.commit()
+    sink, cap = await _verify_on_start(db, None)
+    assert [s for s, _, _ in sink.events] == ["audit-chain"], sink.events
+    assert "broken at seq=2" in sink.events[0][1]
 
 
 async def test_startup_anchor_absent_file_warns_and_never_blocks(tmp_path: Path) -> None:
