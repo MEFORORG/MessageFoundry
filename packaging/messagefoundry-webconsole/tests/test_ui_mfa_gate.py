@@ -1268,8 +1268,9 @@ async def test_the_password_page_refuses_to_rotate_a_credential_past_its_deadlin
 ) -> None:
     """RED when: a cookie session opened before the deadline still rotates the lapsed password.
 
-    The /ui twin of the JSON refusal: the page delegates to POST /me/password, so the refusal reaches
-    it as that route's 403, and the holder reads why and what to do next.
+    Since BACKLOG #2298 the gate ends that session before the page runs, so the browser lands on
+    sign-in, where the lapsed password is refused. The route's own refusal stays for a deadline
+    that passes inside the request.
     """
     service = await _service(engine, require_mfa=False)
     user_id = await _add(service, "op", Role.OPERATOR)
@@ -1282,10 +1283,48 @@ async def test_the_password_page_refuses_to_rotate_a_credential_past_its_deadlin
         )
         await engine.store._db.commit()
         r = await _change_password(c, current=temp)
-        assert r.status_code == 403, r.text
-        assert "temporary password has expired" in r.text
+        assert r.status_code == 303 and r.headers["location"] == "/ui/login?e=expired", r.text
     user = await service.store.get_user(user_id)
     assert user is not None and user.must_change_password is True
+
+
+async def test_the_factor_page_ends_a_session_whose_temporary_password_lapsed(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: /ui/mfa still serves a session whose temporary credential lapsed.
+
+    BACKLOG #2298 (ASVS 6.4.1). The session was opened before the deadline and the code is right.
+    The page and its submit both resolve the session first (``identity_for_token``), so both land
+    on sign-in, and nothing marks the factor or re-keys the cookie."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    _pin_totp_clock(monkeypatch, 1_000_000.0)
+    secret = await _enroll_totp(service)
+    user = await service.store.get_user_by_username("op")
+    assert user is not None
+    issued = await service.admin_reset_password(user.id, actor="test")
+    async with _client(engine, service) as c:
+        r = await c.post("/ui/login", data={"username": "op", "password": issued.password})
+        assert r.status_code == 303 and r.headers["location"] == "/ui/mfa"
+        tok = c.cookies.get("mf_session")
+        assert tok is not None
+        await engine.store._db.execute(
+            "UPDATE users SET password_changed_at=? WHERE id=?", (1.0, user.id)
+        )
+        await engine.store._db.commit()
+        t1 = 1_000_000.0 + totp.DEFAULT_PERIOD
+        _pin_totp_clock(monkeypatch, t1)
+        # The page first: it resolves the session by hand, and only the session check stops it.
+        page = await c.get("/ui/mfa")
+        assert page.status_code == 303 and page.headers["location"] == "/ui/login?e=expired"
+        r = await c.post("/ui/mfa", data={"code": totp.totp(secret, now=t1)})
+        assert r.status_code == 303 and r.headers["location"] == "/ui/login?e=expired"
+    session = await engine.store.get_session(hash_token(tok))
+    assert session is not None, "the session was re-keyed"
+    assert session.revoked_at is not None and session.mfa_verified_at is None
+    assert await engine.store.list_audit(action="auth.mfa_verified") == []
+    rows = await engine.store.list_audit(action="auth.temp_password_expired")
+    assert len(rows) == 1
 
 
 async def test_the_enrol_first_notice_offers_a_passkey_only_where_one_is_accepted(

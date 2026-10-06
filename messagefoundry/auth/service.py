@@ -2637,6 +2637,51 @@ class AuthService:
             return None
         return password_changed_at + hours * 3600.0
 
+    def _credential_lapsed(self, user: UserRecord, now: float) -> bool:
+        """Whether ``user`` holds an admin-issued must-change credential past its deadline at ``now``.
+
+        THE ONE TEST OF THE 6.4.1 DEADLINE, beside :meth:`initial_credential_deadline`, its one
+        arithmetic. The sign-in gate refuses on it, and so does each leg a session opened before
+        the deadline could still use after it (BACKLOG #2009, #2298): the rotation, the second
+        factor, and :meth:`identity_for_token` under every gate. Strictly after, like the gate: the
+        credential still works AT the deadline."""
+        if not user.must_change_password:
+            return False
+        deadline = self.initial_credential_deadline(user.password_changed_at)
+        return deadline is not None and now > deadline
+
+    async def _end_lapsed_session(
+        self,
+        token_hash: str,
+        username: str,
+        *,
+        at: str,
+        client: str | None,
+        proof: str | None = None,
+        proof_checked: bool = False,
+    ) -> None:
+        """Revoke a session whose temporary credential lapsed under it, and audit why (BACKLOG #2298).
+
+        The credential stopped signing in at its deadline, so the session it opened ends too, the
+        first time it is presented after that. Ending it is also what keeps a retry from writing
+        another row: the next presentation finds a revoked session and stops before any check.
+
+        Audited under the sign-in gate's own ``auth.temp_password_expired`` action, so one query
+        finds every refusal of a lapsed credential. ``at`` names the leg. ``proof`` names the proof
+        the leg asks for (``password`` or ``factor``), and the row records ``<proof>_checked``: at
+        sign-in this action always means the right password was presented, and here it may not."""
+        await self._store.revoke_session(token_hash)
+        detail: dict[str, object] = {
+            "provider": "local",
+            "expiry_hours": self._settings.initial_password_expiry_hours,
+            "at": at,
+        }
+        if proof is not None:
+            detail[f"{proof}_checked"] = proof_checked
+        await self._audit(
+            "auth.temp_password_expired", actor=username, detail=_json(detail), client=client
+        )
+
     # --- login ---------------------------------------------------------------
 
     async def _equalize_failure(
@@ -3036,8 +3081,7 @@ class AuthService:
         # admin_reset_password surfaces to the issuing administrator — so the instant the response
         # states and the instant this gate refuses on are one computation, not two that agree today.
         expiry_hours = self._settings.initial_password_expiry_hours
-        deadline = self.initial_credential_deadline(user.password_changed_at)
-        if user.must_change_password and deadline is not None and now > deadline:
+        if self._credential_lapsed(user, now):
 
             async def expired_row() -> None:
                 await self._audit(
@@ -5947,6 +5991,13 @@ class AuthService:
         ``activity=True`` (the default, for user-driven requests) refreshes the session's idle
         clock; pass ``activity=False`` for background re-checks (e.g. a long-lived WebSocket) so a
         passively-polled token still ages out against real user activity (AUTH-IDLE).
+
+        **A session whose admin-issued temporary credential has passed its deadline is ended here**
+        (BACKLOG #2298, ASVS 6.4.1). The sign-in gate stops that credential at the deadline, and a
+        session opened a second before it would otherwise keep reaching what a must-change session
+        may reach, the second-factor step included. Every gate resolves the caller through this
+        method, so this one check refuses it at ``require()``, ``require_ui`` and the console's
+        hand-authenticated pages alike. See :meth:`_end_lapsed_session`.
         """
         if not token:
             return None
@@ -5966,6 +6017,11 @@ class AuthService:
             await self._store.touch_session(session.token_hash, now=now)
         user = await self._store.get_user(session.user_id)
         if user is None or user.disabled:
+            return None
+        if self._credential_lapsed(user, now):
+            await self._end_lapsed_session(
+                session.token_hash, user.username, at="session", client=None
+            )
             return None
         return await self._build_identity(user)
 
@@ -7717,7 +7773,15 @@ class AuthService:
         directory can still hold this queue through a concurrent re-proof, one success at a time.
 
         **A code that completes an MFA-pending session too soon after sign-in is refused** (BACKLOG
-        #2301): see :meth:`_second_factor_too_early`."""
+        #2301): see :meth:`_second_factor_too_early`.
+
+        **A session whose temporary credential has lapsed is ended, not elevated** (BACKLOG #2298,
+        ASVS 6.4.1). The route's gate already ends it through :meth:`identity_for_token`, but a
+        request can pass that gate before the deadline and wait in the account's queue past it.
+        So the deadline is asked again inside the queue BEFORE the code, which charges nothing,
+        and again after a good code, before the writes that mark the factor, zero the failure
+        counters and re-key the session. The rotation leg of the same credential does the same
+        (:meth:`verify_current_password`)."""
         arrived = totp.wall_clock()
         arrived_at = time.time()  # the service's clock, for the floor; `arrived` is the TOTP clock
         if not token:
@@ -7728,6 +7792,8 @@ class AuthService:
         user = await self._store.get_user(session.user_id)
         if user is None or user.disabled or not user.totp_enabled:
             return Elevation()
+        if await self._mfa_lapsed(token, user, client=client, factor_checked=False):
+            return Elevation(session_lost=True)
         if await self._mfa_lock_refused(user, client=client):
             return Elevation(locked=True)
         if await self._second_factor_too_early(
@@ -7760,10 +7826,20 @@ class AuthService:
             user = await self._store.get_user(session.user_id)
             if user is None or user.disabled or not user.totp_enabled:
                 return Elevation()
+            if await self._mfa_lapsed(token, user, client=client, factor_checked=False):
+                return Elevation(session_lost=True)
             if await self._mfa_lock_refused(user, client=client):
                 return Elevation(locked=True)
             now = time.time()
             if await self._verify_second_factor(user, code, client=client, arrived=arrived):
+                # Asked again after the verify, on the stored row read afresh: a recovery-code walk
+                # is argon2 work off the loop, and the deadline can pass during it. Nothing below may
+                # land on a lapsed session. A row gone meanwhile fails closed the same way.
+                fresh = await self._store.get_user(user.id)
+                if fresh is None or await self._mfa_lapsed(
+                    token, fresh, client=client, factor_checked=True
+                ):
+                    return Elevation(session_lost=True)
                 # ORDER-CRITICAL: this whole three-write group lands against the OLD hash, and only
                 # then does the session rotate. Moving any of them after the rotation writes NOTHING
                 # and reports success — every session stamp UPDATE is rowcount-blind.
@@ -7834,6 +7910,25 @@ class AuthService:
             actor=user.username,
             detail=_json({"reason": TOO_EARLY}),
             client=client,
+        )
+        return True
+
+    async def _mfa_lapsed(
+        self, token: str, user: UserRecord, *, client: str | None, factor_checked: bool
+    ) -> bool:
+        """Whether :meth:`verify_mfa` must end this session because its temporary credential lapsed.
+
+        Ends it and audits the refusal when so (BACKLOG #2298). Checked against the clock NOW, not
+        the request's arrival: the point is a deadline that passed while the request waited."""
+        if not self._credential_lapsed(user, time.time()):
+            return False
+        await self._end_lapsed_session(
+            hash_token(token),
+            user.username,
+            at="mfa_verify",
+            client=client,
+            proof="factor",
+            proof_checked=factor_checked,
         )
         return True
 

@@ -2532,7 +2532,10 @@ async def test_a_session_opened_before_the_deadline_cannot_rotate_the_lapsed_cre
 ) -> None:
     # The session is opened BEFORE the deadline, then the deadline passes under it. The sign-in gate
     # alone would let that session rotate the lapsed credential, so the temporary password would
-    # outlive its deadline through a session minted a second earlier.
+    # outlive its deadline through a session minted a second earlier. Since BACKLOG #2298 the gate
+    # ends that session before the route runs, so the refusal is the 401 of a session that is gone;
+    # the route's own 403 is left for a deadline that passes inside the request (the test after the
+    # next one).
     service = await _service(engine, _expiring_service_settings())
     hal_id = await create_local_user_chosen(
         service,
@@ -2554,8 +2557,7 @@ async def test_a_session_opened_before_the_deadline_cannot_rotate_the_lapsed_cre
             headers=_auth(token),
             json={"current_password": PW, "new_password": PW + "-rotated"},
         )
-        assert lapsed.status_code == 403, lapsed.text
-        assert "temporary password has expired" in lapsed.json()["detail"]
+        assert lapsed.status_code == 401, lapsed.text
         # Nothing rotated: the account still carries the lapsed temporary credential.
         user = await engine.store.get_user(hal_id)
         assert user is not None and user.must_change_password is True
@@ -2563,13 +2565,21 @@ async def test_a_session_opened_before_the_deadline_cannot_rotate_the_lapsed_cre
         # Audited under the sign-in gate's own action, so one query finds both refusals.
         rows = [dict(r) for r in await engine.store.list_audit(action="auth.temp_password_expired")]
         assert len(rows) == 1 and rows[0]["actor"] == "hal"
-        assert '"password_change"' in rows[0]["detail"]
-        assert '"password_checked": false' in rows[0]["detail"]
+        assert '"at": "session"' in rows[0]["detail"]
+        # The session is ended, so a retry writes no second row.
+        retry = await c.post(
+            "/me/password",
+            headers=_auth(token),
+            json={"current_password": PW, "new_password": PW + "-rotated"},
+        )
+        assert retry.status_code == 401
+        assert len(await engine.store.list_audit(action="auth.temp_password_expired")) == 1
 
 
 async def test_a_wrong_password_past_the_deadline_charges_no_lockout(engine: Engine) -> None:
     # The deadline is checked BEFORE the password, so a guess that could not succeed anyway costs
     # the account nothing. Moving the check after the verify turns this red: the guess would count.
+    # Since BACKLOG #2298 that check is the gate's, which ends the session before the route runs.
     service = await _service(engine, _expiring_service_settings())
     jo_id = await create_local_user_chosen(
         service,
@@ -2589,12 +2599,12 @@ async def test_a_wrong_password_past_the_deadline_charges_no_lockout(engine: Eng
             headers=_auth(token),
             json={"current_password": "not-the-password-at-all", "new_password": PW + "-x"},
         )
-        assert lapsed.status_code == 403 and "has expired" in lapsed.json()["detail"]
+        assert lapsed.status_code == 401
     user = await engine.store.get_user(jo_id)
     assert user is not None and user.failed_attempts == 0
     assert await engine.store.list_audit(action="auth.password_change_failed") == []
     rows = [dict(r) for r in await engine.store.list_audit(action="auth.temp_password_expired")]
-    assert len(rows) == 1 and '"password_checked": false' in rows[0]["detail"]
+    assert len(rows) == 1 and '"at": "session"' in rows[0]["detail"]
 
 
 async def test_the_deadline_is_asked_again_after_the_password_is_verified(
