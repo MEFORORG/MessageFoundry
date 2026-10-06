@@ -1511,9 +1511,10 @@ def test_a_superseded_expired_crl_beside_its_fresh_replacement_is_refused(
         harden_crl_check(_verifying_ctx(), _crl_material["ca_expired_then_fresh"])
 
 
-# The first release on each OpenSSL branch with upstream commit 5a3723e254, "Reject delta CRLs as
-# complete CRL candidates". Only a version here or later must follow the new rule. A version below
-# may follow either rule, because a distribution can backport the fix without a version change.
+# The first release on each OpenSSL branch carrying openssl/openssl PR 31044, "Reject delta CRLs
+# as complete CRL candidates". Each branch has its own cherry-pick, so no tag contains the master
+# commit. Only a version here or later must follow the new rule. A version below may follow
+# either rule, because a distribution can backport the fix without a version change.
 _DELTA_FIX_FIRST_PATCH = {(3, 0): 22, (3, 4): 7, (3, 5): 8, (3, 6): 4, (4, 0): 2}
 
 
@@ -1528,22 +1529,16 @@ def test_a_delta_crl_drops_a_revocation_without_the_refusal(
     _crl_material: dict[str, str],
 ) -> None:
     # NEGATIVE CONTROL for the refusal below, and the reason for it. Loaded as OpenSSL would load
-    # it, with no harden_crl_check, one of the two revoked clients gets in. Which one depends on
-    # the linked OpenSSL, and either way a revocation is lost:
-    #
-    # * Before upstream commit 5a3723e254, OpenSSL scores the newer delta CRL as a complete one.
-    #   The client only the BASE CRL revokes gets in.
-    # * With that fix, OpenSSL sets the delta aside, since the engine turns on no delta support.
-    #   The client only the DELTA CRL revokes gets in.
-    #
+    # it, with no harden_crl_check, exactly one of the two revoked clients gets in. Which one
+    # depends on OpenSSL's delta rule; pki.judge_every_crl's docstring states both rules.
     # Python 3.14.7 for Windows bundles OpenSSL 3.5.7, and 3.14.8 bundles 3.5.9. This test used to
     # assert the old rule alone, so it went red on every runner that drew 3.14.8.
     bundle = _crl_material["ca_base_then_delta"]
-    # Both CRLs must load, or the delta is ignored for the wrong reason and the new rule's outcome
-    # appears on any OpenSSL. The count is the only thing that tells loaded from skipped.
+    # Both CRLs must load. A delta OpenSSL skipped at load would show the new rule's outcome on
+    # any OpenSSL, and the count tells that apart from a delta that loaded and was set aside.
     loaded = _verifying_ctx()
     loaded.load_verify_locations(cafile=bundle)
-    assert loaded.cert_store_stats()["crl"] == 2
+    assert loaded.cert_store_stats()["crl"] == 2, (ssl.OPENSSL_VERSION, loaded.cert_store_stats())
     results = {
         stem: _crl_handshake(bundle, stem, _crl_material, raw=True)
         for stem in ("revoked", "delta_revoked")

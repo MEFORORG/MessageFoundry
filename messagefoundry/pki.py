@@ -259,12 +259,12 @@ def judge_every_crl(pem: bytes, *, now: float) -> list[tuple[CrlFacts, CrlBlock]
     (:func:`messagefoundry.config.tls_policy.crl_scratch_context`).
 
     **A delta CRL refuses too.** The engine turns on no extended or delta CRL support, so OpenSSL
-    cannot apply one safely. The outcome depends on whether OpenSSL has upstream commit
-    5a3723e254, "Reject delta CRLs as complete CRL candidates". Without it, OpenSSL uses a newer
-    delta as if it were complete. Revocations only the base CRL lists are then dropped. With it,
-    OpenSSL sets the delta aside, and revocations only the delta lists are dropped. With it, a file
-    holding a delta and no base has no CRL OpenSSL will use, so every client is refused. Give the
-    setting base CRLs only."""
+    loses a revocation from a base-plus-delta file whichever delta rule it has. The rule changed
+    upstream in openssl/openssl PR 31044, "Reject delta CRLs as complete CRL candidates", released
+    in at least 3.0.22, 3.4.7, 3.5.8, 3.6.4 and 4.0.2. Before it, OpenSSL uses a newer delta as if
+    it were complete, so revocations only the base CRL lists are dropped. After it, OpenSSL sets
+    the delta aside, so revocations only the delta lists are dropped. Give the setting base CRLs
+    only."""
     blocks = list(_crl_blocks(pem))
     if len(blocks) != pem.count(_CRL_BEGIN):
         raise ValueError(
@@ -282,9 +282,8 @@ def judge_every_crl(pem: bytes, *, now: float) -> list[tuple[CrlFacts, CrlBlock]
             crl, nxt = _parse_first_crl(block)
             if _is_delta_crl(crl):
                 raise ValueError(
-                    "it is a delta CRL, which OpenSSL cannot apply safely here: depending on "
-                    "its version it drops revocations or refuses every client; give base CRLs "
-                    "only"
+                    "it is a delta CRL, which OpenSSL would read as a complete CRL and so drop "
+                    "every revocation listed only in its base CRL; give base CRLs only"
                 )
             judged.append(
                 (
