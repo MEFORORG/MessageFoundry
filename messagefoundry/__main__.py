@@ -7239,6 +7239,17 @@ def _audit_verify(args: argparse.Namespace) -> int:
     print(("OK: " if ok else "FAIL: ") + (message or ""))
     if not ok:
         return 1
+    if verdict.keyless_walk and keyless_refusal is not None:
+        # Vault BACKLOG #2725. A keyless chain passed, in a shell whose settings require a key. That
+        # is the setup where a rewritten first row turns later tampering into exit 4, so it is said
+        # now, while the chain is clean. The exit stays 0: the chain did verify. Content-free.
+        print(
+            "WARNING: the audit chain is keyless (its first row names no key, and it was checked "
+            "as plain SHA-256), but this shell's settings require a store key. Either the store "
+            "runs keyless under other settings, or the key is missing here. Run this check with "
+            "the settings and key the engine runs with.",
+            file=sys.stderr,
+        )
     if count:
         return 0
 

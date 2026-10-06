@@ -347,14 +347,16 @@ def test_audit_verify_exits_4_on_a_keyed_chain_with_no_key(
     shell: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """The item's case: an intact keyed chain, and a shell with no key. Exit 4, and a line that says
-    the chain was not checked because no key is available, never that it is broken."""
+    what the walk knows: the first row names a key, none is available, so it was NOT CHECKED. It
+    must not claim the chain is keyed, call it broken, or call the result a pass."""
     db = shell / "keyed.db"
     _keyed_chain(db, generate_key())
     rc = main(["audit-verify", "--db", str(db)])
     out = capsys.readouterr().out
     assert rc == 4, out
-    assert out.startswith("NOT CHECKED: ") and "could not be checked" in out, out
-    assert "no store encryption key/MAC" in out, out
+    assert out.startswith("NOT CHECKED: ") and "first row names audit key" in out, out
+    assert "no store encryption key/MAC" in out and "may have been changed" in out, out
+    assert "it is keyed" not in out and "not a finding" not in out, out
     assert "FAIL" not in out and "broken at" not in out, out
 
 
@@ -530,6 +532,86 @@ def test_the_verdict_keeps_its_flag_through_a_copy() -> None:
     for clone in (copy.copy(verdict), copy.deepcopy(verdict), pickle.loads(pickle.dumps(verdict))):
         assert tuple(clone) == (False, "m") and clone.key_unavailable
     assert not AuditVerdict(True, "m", key_unavailable=True).key_unavailable  # only with not-ok
+    clean = AuditVerdict(True, "m", keyless_walk=True)
+    assert pickle.loads(pickle.dumps(clean)).keyless_walk
+    assert not AuditVerdict(False, "m", keyless_walk=True).keyless_walk  # only with ok
+
+
+def _keyless_chain(db: Path) -> None:
+    """A keyless chain of three rows, as a store with no key writes it. One actor value is distinctive
+    so a test can show the warning never quotes a row."""
+
+    async def seed() -> None:
+        store = await MessageStore.open(db)
+        try:
+            for i in range(3):
+                await store.record_audit(f"act{i}", actor="row-content-marker")
+        finally:
+            await store.close()
+
+    asyncio.run(seed())
+
+
+def test_a_keyless_chain_passing_where_the_settings_require_a_key_warns(
+    shell: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A keyless chain verifies clean, exit 0, in a shell whose settings forbid keyless running.
+    That is the setup where a rewritten first row would turn later tampering into exit 4, so it
+    warns now, while the chain is still clean. The exit stays 0, and the warning quotes no row."""
+    db = shell / "keyless.db"
+    _keyless_chain(db)
+    rc = main(["audit-verify", "--db", str(db)])
+    captured = capsys.readouterr()
+    assert rc == 0, (captured.out, captured.err)
+    assert captured.out.startswith("OK: "), captured.out
+    assert "WARNING: the audit chain is keyless" in captured.err, captured.err
+    assert "require a store key" in captured.err, captured.err
+    assert "row-content-marker" not in captured.out + captured.err
+
+
+def test_a_keyless_chain_under_the_opt_out_does_not_warn(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Control for the warning: the same keyless chain, under the audited keyless opt-out, is what
+    the settings say to expect. Exit 0 and no warning. A keyed chain verified with its key is the
+    other control: it is not a keyless walk, so it does not warn either."""
+    db = shell / "keyless.db"
+    _keyless_chain(db)
+    _opt_out(monkeypatch)
+    assert main(["audit-verify", "--db", str(db)]) == 0
+    assert "WARNING" not in capsys.readouterr().err
+
+    monkeypatch.delenv("MEFOR_SECURITY_ALLOW_UNENCRYPTED_PHI")
+    monkeypatch.delenv("MEFOR_SECURITY_ALLOW_UNENCRYPTED_PHI_UNDER_STRICT_ENFORCEMENT")
+    key = generate_key()
+    keyed = shell / "keyed.db"
+    _keyed_chain(keyed, key)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key)
+    assert main(["audit-verify", "--db", str(keyed)]) == 0
+    assert "WARNING" not in capsys.readouterr().err
+
+
+def test_a_key_error_raised_after_the_open_is_not_reported_as_could_not_start(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Pins where the exit-2 key arm sits: around the OPEN only. Once rows are read, a key error is
+    not "could not start", because a row's content might be what raised it. Here the verify itself
+    raises the key error. Catching key errors around the whole run would turn this into exit 2."""
+    from messagefoundry.store.keyprovider import KeyProviderError
+
+    db = shell / "keyed.db"
+    key = generate_key()
+    _keyed_chain(db, key)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key)
+
+    async def raising(self: MessageStore, **kwargs: object) -> object:
+        raise KeyProviderError("raised after the open")
+
+    monkeypatch.setattr(MessageStore, "verify_audit_chain", raising)
+    rc = main(["audit-verify", "--db", str(db)])
+    capsys.readouterr()
+    assert rc != 2, "a key error after the open was reported as could-not-start"
+    assert rc == 1  # the dispatch floor
 
 
 # --- the source guard ----------------------------------------------------------------------------------

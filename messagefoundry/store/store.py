@@ -2517,17 +2517,31 @@ class AuditVerdict(tuple[bool, str | None]):
     store runs keyless, because there a chain naming a key is itself the anomaly. A caller that
     reads exit codes tells it apart from a broken chain by this flag, never by the message text.
 
-    ``==`` and ``hash`` are the tuple's and ignore the flag; ``__reduce__`` keeps it through a copy."""
+    ``keyless_walk`` says a clean verdict came from a process that holds no key, over a chain whose
+    first row names none: a plain SHA-256 walk, which anyone who can write the log can recompute.
+    It is set only with ``ok`` true. A caller whose settings require a key uses it to say the chain
+    it just passed is keyless, before any tamper makes that matter.
+
+    ``==`` and ``hash`` are the tuple's and ignore both flags; ``__reduce__`` keeps them through a
+    copy."""
 
     key_unavailable: bool
+    keyless_walk: bool
 
-    def __new__(cls, ok: bool, message: str | None, key_unavailable: bool = False) -> Self:
+    def __new__(
+        cls,
+        ok: bool,
+        message: str | None,
+        key_unavailable: bool = False,
+        keyless_walk: bool = False,
+    ) -> Self:
         verdict = super().__new__(cls, (ok, message))
         verdict.key_unavailable = key_unavailable and not ok
+        verdict.keyless_walk = keyless_walk and ok
         return verdict
 
     def __reduce__(self) -> tuple[Any, ...]:
-        return (type(self), (self[0], self[1], self.key_unavailable))
+        return (type(self), (self[0], self[1], self.key_unavailable, self.keyless_walk))
 
 
 def verify_audit_rows(
@@ -2582,8 +2596,10 @@ def verify_audit_rows(
     # recomputed, so the walk compares each stored hash with itself rather than mis-flag every keyed
     # row as tampered. It still runs, because a break that needs no key is still a break (#2725).
     key_unavailable = not capable and genesis_key is not None
-    # Range rows are checked whenever the chain is keyed: their digests and links need no key, so a
-    # walk with none still catches an edit inside a closed range. Only the MACs and tags need one.
+    # Range rows are checked whenever the first row names a key: a range row's digest and link need
+    # no key to recompute. So a walk with none catches an edit inside a closed range only while that
+    # range row is left as it was. A writer who also recomputes the digest it carries, or renames
+    # the row, is not seen here: the MACs and handover tags that would show it need the key.
     ranged = capable or key_unavailable
     #: (walk position, row id, reason). The position is the sequence number that row should hold.
     breaks: list[tuple[int, Any, str | None]] = []
@@ -2659,8 +2675,9 @@ def verify_audit_rows(
             else:
                 key, mac = secret
         stored = r["row_hash"]
-        # Not held: the stored hash is compared with itself, so the one check left is that it is a
-        # hash at all. An empty or non-text value is never a MAC, and needs no key to see (#2725).
+        # Not held: the stored hash is compared with itself. The only check left is that it is a
+        # non-empty text value; an empty or non-text one is never a MAC (#2725). Any other text
+        # passes, whether or not it is a real MAC: that needs the key.
         expected = (
             _audit_row_mac(r, prev, key, mac)
             if held
@@ -2758,20 +2775,23 @@ def verify_audit_rows(
         # break, and outranks "could not check".
         return AuditVerdict(
             False,
-            f"audit chain could not be checked: it is keyed (its genesis row names audit key "
-            f"{genesis_key!r}) and no store encryption key/MAC is configured in this process, so "
-            f"no row MAC was recomputed. Only checks that need no key ran over its {count} "
-            "row(s): the sequence numbers and key-range digests"
+            f"audit chain not checked: its first row names audit key {genesis_key!r}, and no "
+            "store encryption key/MAC is configured in this process, so no row MAC was "
+            f"recomputed. Only checks that need no key ran over its {count} row(s) (the sequence "
+            "numbers and key-range digests"
             + (
                 ", and the expected anchor"
                 if expected_anchor is not None or expected_prefix is not None
                 else ""
             )
-            + ". So this is not a finding that the chain is broken. Re-run with the key settings "
-            "the engine runs with",
+            + "), and they found no break. That is not a pass: the first row may have been "
+            "changed to name a key, and any row's content may have been changed, which only the "
+            "key shows. Re-run with the settings and key the engine runs with",
             key_unavailable=True,
         )
-    return AuditVerdict(True, f"verified {count} audit row(s)")
+    return AuditVerdict(
+        True, f"verified {count} audit row(s)", keyless_walk=not capable and genesis_key is None
+    )
 
 
 class AuditRangeHost(Protocol):
