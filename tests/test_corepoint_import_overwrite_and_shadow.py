@@ -120,7 +120,7 @@ def test_a_module_that_appears_after_the_check_is_still_not_overwritten(
     out = tmp_path / "out"
     out.mkdir()
     (out / "IB_BETA.py").write_text(_HAND_FINISHED, encoding="utf-8")
-    monkeypatch.setattr(os.path, "lexists", lambda _p: False)
+    monkeypatch.setattr(os, "listdir", lambda _p: [])
 
     with pytest.raises(CorepointImportError, match=r"IB_BETA\.py .*appeared during the import"):
         import_corepoint(_export(tmp_path), out)
@@ -143,6 +143,35 @@ def test_force_replaces_a_symlink_rather_than_writing_through_it(tmp_path: Path)
 
     assert outside.read_text(encoding="utf-8") == _HAND_FINISHED  # the link's target is untouched
     assert not (out / "IB_ALPHA.py").is_symlink()
+
+
+def test_a_force_import_that_fails_while_staging_changes_nothing(tmp_path: Path) -> None:
+    """Every module is staged before any is replaced, so a failed stage leaves the old modules."""
+    export, out = _export(tmp_path), tmp_path / "out"
+    import_corepoint(export, out)
+    (out / "IB_ALPHA.py").write_text(_HAND_FINISHED, encoding="utf-8")
+    # Occupy IB_BETA's staging name, so staging the second module fails after the first is staged.
+    (out / f".IB_BETA.py.{os.getpid()}.tmp").mkdir()
+
+    with pytest.raises(FileExistsError):
+        import_corepoint(export, out, force=True)
+
+    assert (out / "IB_ALPHA.py").read_text(encoding="utf-8") == _HAND_FINISHED
+    assert sorted(p.name for p in out.iterdir()) == [
+        f".IB_BETA.py.{os.getpid()}.tmp",  # the planted one; IB_ALPHA's staged copy is gone
+        "IB_ALPHA.py",
+        "IB_BETA.py",
+    ]
+
+
+def test_an_existing_module_differing_only_in_case_is_refused(tmp_path: Path) -> None:
+    """On NTFS ``IB_alpha.py`` IS ``IB_ALPHA.py``, so it is refused on a case-sensitive host too."""
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "IB_alpha.py").write_text(_HAND_FINISHED, encoding="utf-8")
+
+    with pytest.raises(CorepointImportError, match=r"1 existing module\(s\).*: IB_alpha\.py;"):
+        import_corepoint(_export(tmp_path), out)
 
 
 def test_stems_that_differ_only_in_case_are_kept_apart(tmp_path: Path) -> None:
@@ -264,13 +293,16 @@ _FULLWIDTH_HANDLER = "\uff48\uff41\uff4e\uff44\uff4c\uff45\uff52"
 
 
 def test_a_fullwidth_name_is_compared_as_python_will_bind_it() -> None:
-    """CPython NFKC-normalizes identifiers, so a fullwidth ``def set_field`` binds ``set_field``."""
+    """CPython NFKC-normalizes identifiers, so a fullwidth ``def set_field`` binds ``set_field``.
+
+    The XML path lower-cases after the fold, so a letter that folds to upper case (U+210C, which
+    folds to ``H``) still yields a lower-case id."""
     lists = "".join(
         f'<ActionList Name="{name}"><List>{_STAMP}</List></ActionList>'
-        for name in (_FULLWIDTH_SET_FIELD, _FULLWIDTH_HANDLER)
+        for name in (_FULLWIDTH_SET_FIELD, _FULLWIDTH_HANDLER, "\u210candle")
     )
     channel = parse_package(f'<Package Name="ACME X">{lists}</Package>')[0]
-    assert [h.name for h in channel.handlers] == ["set_field_2", "handler_2"]
+    assert [h.name for h in channel.handlers] == ["set_field_2", "handler_2", "handle"]
 
 
 def test_a_plain_list_name_is_not_renamed() -> None:

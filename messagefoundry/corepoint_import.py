@@ -87,6 +87,7 @@ from __future__ import annotations
 import html
 import json
 import keyword
+import logging
 import os
 import re
 import unicodedata
@@ -2300,7 +2301,7 @@ def parse_package(text: str, *, source_name: str = "package") -> tuple[Channel, 
         raw_name = _attr(action_list, "Name") or f"transform_{i + 1}"
         # Lower-case BEFORE sanitizing so the keyword guard sees the final identifier ("Class" →
         # "class" → "class_"): the name is both the ``@handler`` id and the emitted ``def``.
-        name = _unique_name(_def_name(raw_name.lower()), taken)
+        name = _unique_name(_def_name(raw_name, lower=True), taken)
         scope = _disabled_scope(action_list, parents)
         # The whole-list gate (BACKLOG #313 step 2, ADR 0086): decided ONCE, for the whole list. A
         # list it does not fully understand takes the step 1 path below untouched, so its output is
@@ -2954,21 +2955,31 @@ def import_corepoint(
             )
         )
 
-    if not force:
-        # ``lexists``: a dangling symlink is a name in the directory too, and ``exists`` reads it as
-        # absent. The ``"x"`` open below is what holds against a file that appears after this check.
-        present = sorted(t.name for t in targets if os.path.lexists(t))
-        if present:
-            raise CorepointImportError(
-                f"refusing to overwrite {len(present)} existing module(s) in {out}: "
-                f"{', '.join(present)}; pass --force to replace them, or import into another "
-                "directory"
-            )
+    sources = [(target, result.source) for target, result in zip(targets, results, strict=True)]
+    if force:
+        _replace_modules(sources)
+    else:
+        _create_modules(sources, out)
+    return ImportResult(tuple(results))
+
+
+def _create_modules(sources: list[tuple[Path, str]], out: Path) -> None:
+    """Write each module as a NEW file, refusing every name already in ``out``; all or nothing.
+
+    The listing is compared case-insensitively: on NTFS, the deployment target, ``IB_acme.py`` and
+    ``IB_ACME.py`` are one file even when this import runs on a case-sensitive host. A directory
+    entry of any kind counts, a dangling symlink included. The ``"x"`` open is what holds against a
+    file that appears after the listing."""
+    wanted = {target.name.casefold() for target, _ in sources}
+    present = sorted(name for name in os.listdir(out) if name.casefold() in wanted)
+    if present:
+        raise CorepointImportError(
+            f"refusing to overwrite {len(present)} existing module(s) in {out}: "
+            f"{', '.join(present)}; pass --force to replace them, or import into another directory"
+        )
     created: list[Path] = []
     try:
-        for target, result in zip(targets, results, strict=True):
-            if force and os.path.lexists(target):
-                target.unlink()  # the entry, so a symlink is replaced rather than written through
+        for target, source in sources:
             try:
                 handle = target.open("x", encoding="utf-8")
             except FileExistsError as exc:
@@ -2978,12 +2989,42 @@ def import_corepoint(
                 ) from exc
             created.append(target)
             with handle:
-                handle.write(result.source)
-    except (CorepointImportError, OSError):
+                handle.write(source)
+    except BaseException:
+        # Whatever stopped the write (an OS error, the race above, Ctrl-C), the modules this run
+        # created go, so a re-run is not refused over files the failed run itself left behind.
         for path in created:
-            path.unlink(missing_ok=True)
+            _discard(path)
         raise
-    return ImportResult(tuple(results))
+
+
+def _replace_modules(sources: list[tuple[Path, str]]) -> None:
+    """``--force``: stage every module beside its target, then ``os.replace`` each into place.
+
+    A failure while staging leaves every existing module as it was. ``os.replace`` swaps the
+    directory entry, so a symlink at the target is replaced and never written through, and each
+    module is whole, old or new, at every moment. The staged name is not a ``.py``, so the loader
+    never reads one left behind."""
+    staged: list[tuple[Path, Path]] = []
+    try:
+        for target, source in sources:
+            temp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+            with temp.open("x", encoding="utf-8") as handle:
+                staged.append((temp, target))
+                handle.write(source)
+        for temp, target in staged:
+            os.replace(temp, target)
+    finally:
+        for temp, _ in staged:
+            _discard(temp)
+
+
+def _discard(path: Path) -> None:
+    """Remove ``path`` if it is there; log rather than raise, so the error being handled survives."""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        _logger.warning("import corepoint: could not remove %s: %s", path, exc)
 
 
 # Control kinds that ARE faithfully represented in the emitted Python (real ``if``/``for``/``try``/…),
@@ -3222,6 +3263,7 @@ def _opt_str(obj: dict[str, Any], key: str) -> str | None:
 # Reduce an arbitrary export name to a safe Python identifier / filename stem: keep word chars, fold the
 # rest to underscores, ensure it does not start with a digit and is not a Python keyword.
 _NON_IDENT = re.compile(r"\W+")
+_logger = logging.getLogger(__name__)
 
 
 def _sanitize(name: str) -> str:
@@ -3253,17 +3295,20 @@ _CONNECTION_NAME_BUDGET = CONNECTION_NAME_MAX_LENGTH - 16
 # surface (the ``from messagefoundry import`` line), the vocabulary (``from messagefoundry.actions
 # import``), the builtins the emitted code names, and the router's ``route``. The builtins are named
 # rather than read from ``dir(builtins)``, which ``site`` and the Python version change, so one export
-# yields the same handler ids on every interpreter.
+# yields the same handler ids under one engine version on every interpreter.
 _EMITTED_BUILTINS = ("Exception", "NotImplementedError")
 _BOUND_NAMES = frozenset({*messagefoundry.__all__, *_actions.__all__, *_EMITTED_BUILTINS, "route"})
 
 
-def _def_name(raw_name: str) -> str:
+def _def_name(raw_name: str, *, lower: bool = False) -> str:
     """The ``def`` identifier for a handler name, folded the way Python folds it.
 
     CPython NFKC-normalizes an identifier as it parses it, so a fullwidth ``ｓｅｔ_ｆｉｅｌｄ`` would
-    define ``set_field``. Normalizing first makes the de-duplication see the name Python will bind."""
-    return _sanitize(unicodedata.normalize("NFKC", raw_name))
+    define ``set_field``. Normalizing first makes the de-duplication see the name Python will bind.
+    ``lower`` applies after the fold (a compatibility letter can fold to an upper-case one) and
+    before :func:`_sanitize`, so its keyword guard sees the final identifier."""
+    folded = unicodedata.normalize("NFKC", raw_name)
+    return _sanitize(folded.lower() if lower else folded)
 
 
 def _unique_name(name: str, taken: set[str], *, casefold: bool = False) -> str:

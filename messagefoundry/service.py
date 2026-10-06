@@ -171,7 +171,9 @@ class ServiceControlOutcome(Enum):
 
     DISPATCHED = "dispatched"  # the elevated command ran and exited 0 (install: it was launched)
     CANCELLED = "cancelled"  # the user dismissed the UAC prompt (ERROR_CANCELLED 1223)
-    FAILED = "failed"  # elevation failed, or the elevated command exited non-zero
+    # elevation failed, the elevated command exited non-zero, or it outran _WAIT_TIMEOUT_MS (then it
+    # may still be running, and may yet succeed)
+    FAILED = "failed"
     UNSUPPORTED = "unsupported"  # not Windows — a no-op
 
 
