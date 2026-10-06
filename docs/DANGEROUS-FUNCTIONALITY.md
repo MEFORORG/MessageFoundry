@@ -359,11 +359,12 @@ pure-Python equivalent:
 - Log path check: `tray/actions.py`, which asks `kernel32`'s `GetDriveTypeW` whether View Log's
   drive letter is a mapped network drive, so it can refuse one before opening the file
 - Process and job control: `proctree.py`, which kills a child together with every process it
-  started. The sandbox worker and the disaster-recovery hook use it. On Windows it puts the child
-  in a `kernel32` job object that ends the whole tree. The hook starts suspended, so it joins the
-  job before it can start anything, and `ntdll`'s `NtResumeProcess` then lets it run (vault
-  BACKLOG #2622). POSIX needs no `ctypes` for this; the child leads its own process group, which
-  gets `SIGKILL`
+  started. When it cannot set up the job or signal the group, it logs one WARNING and kills only
+  the child. The sandbox worker and the disaster-recovery takeover hook use it. On Windows it puts
+  the child in a `kernel32` job object that ends the whole tree. The takeover hook starts
+  suspended, so it joins the job before it can start anything, and `ntdll`'s `NtResumeProcess`
+  then lets it run (vault BACKLOG #2622). POSIX needs no `ctypes` for this; the child leads its
+  own process group, which gets `SIGKILL`
 - Drop-folder confinement: `transports/file.py`, which on Windows calls `kernel32`'s `CreateFileW`
   with `FILE_FLAG_OPEN_REPARSE_POINT`, so it opens each path part as itself rather than through a
   link or junction, `GetFileInformationByHandleEx` to refuse a part that is one, and

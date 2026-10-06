@@ -271,6 +271,111 @@ async def test_a_timed_out_hook_aborts_and_leaves_no_process_behind(tmp_path: Pa
         await store.close()
 
 
+async def test_a_timed_out_release_hook_is_left_to_finish(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Through ``release``: a release hook that runs past the timeout is not killed, and neither is
+    anything it started. Killing a release partway could strand the address on this box.
+
+    The tree writes its markers 6.0s after it starts, past the 4.0s budget, so the release has
+    timed out before either marker is due. Both markers then appear."""
+    store, archive, ss = await _seed(tmp_path)
+    where = tmp_path / "hook"
+    where.mkdir()
+    try:
+        coord, state = _coord(
+            store,
+            ss,
+            seed_archive=archive,
+            release_hook=_tree_hook(where, 6.0),
+            takeover_timeout_seconds=4.0,
+        )
+        await coord.activate(actor="alice")
+        with caplog.at_level("WARNING", logger=dr_module.log.name):
+            result = await coord.release(actor="alice")
+        assert not result.active and not state["active"]
+        assert "VIP release hook timed out" in caplog.text
+        assert not (where / "child-survived").exists()  # the release did not wait for the hook
+        await _await_file(where / "child-survived", within=30.0)
+        await _await_file(where / "grandchild-survived", within=30.0)
+    finally:
+        await store.close()
+
+
+def _job_report_hook(report: Path) -> str:
+    """A hook that writes, as JSON, whether it is in a Windows job and, if so, that job's limit
+    flags and the ids of the processes in it. With no job handle, ``QueryInformationJobObject``
+    reads the job the calling process is directly in."""
+    script = report.with_suffix(".py")
+    script.write_text(
+        "import ctypes, json, sys\n"
+        "from ctypes import wintypes\n"
+        "k = ctypes.WinDLL('kernel32', use_last_error=True)\n"
+        "k.GetCurrentProcess.restype = wintypes.HANDLE\n"
+        "k.IsProcessInJob.argtypes = [wintypes.HANDLE, wintypes.HANDLE,"
+        " ctypes.POINTER(wintypes.BOOL)]\n"
+        "k.QueryInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int,"
+        " ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p]\n"
+        "class Basic(ctypes.Structure):\n"
+        "    _fields_ = [('a', ctypes.c_int64), ('b', ctypes.c_int64),"
+        " ('LimitFlags', ctypes.c_uint32), ('c', ctypes.c_size_t), ('d', ctypes.c_size_t),"
+        " ('e', ctypes.c_uint32), ('f', ctypes.c_size_t), ('g', ctypes.c_uint32),"
+        " ('h', ctypes.c_uint32)]\n"
+        "class Pids(ctypes.Structure):\n"
+        "    _fields_ = [('assigned', wintypes.DWORD), ('listed', wintypes.DWORD),"
+        " ('ids', ctypes.c_size_t * 8192)]\n"
+        "inside = wintypes.BOOL()\n"
+        "assert k.IsProcessInJob(k.GetCurrentProcess(), None, ctypes.byref(inside))\n"
+        "out = {'in_job': bool(inside.value)}\n"
+        "if inside.value:\n"
+        "    basic, pids = Basic(), Pids()\n"
+        "    assert k.QueryInformationJobObject(None, 2, ctypes.byref(basic),"
+        " ctypes.sizeof(basic), None)\n"
+        "    assert k.QueryInformationJobObject(None, 3, ctypes.byref(pids),"
+        " ctypes.sizeof(pids), None)\n"
+        "    out['flags'] = basic.LimitFlags\n"
+        "    out['pids'] = list(pids.ids[: pids.listed])\n"
+        "open(sys.argv[1], 'w').write(json.dumps(out))\n",
+        encoding="utf-8",
+    )
+    # Not sys.executable: in a venv on Windows that is a launcher, which runs the real interpreter
+    # in a kill-on-close job of the launcher's own. The script would then report that job, on
+    # either side. The script needs only the standard library, so the base interpreter runs it.
+    python = getattr(sys, "_base_executable", sys.executable)
+    return f'"{python}" "{script}" "{report}"'
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows job objects")
+async def test_only_the_takeover_hook_joins_a_kill_on_close_job(tmp_path: Path) -> None:
+    """On Windows the takeover hook runs in a kill-on-close job of its own, so the engine can end
+    its tree. The release hook does not: a kill-on-close job also ends its processes when the
+    engine exits, which could stop a release partway (vault BACKLOG #2622).
+
+    The release hook must share the engine's own situation: in no job if the engine is in none,
+    else in the engine's own job. A job of its own would hold the hook's processes and not the
+    engine's, which is what the takeover side asserts."""
+    store, archive, ss = await _seed(tmp_path)
+    try:
+        coord, _state = _coord(
+            store,
+            ss,
+            seed_archive=archive,
+            takeover_hook=_job_report_hook(tmp_path / "takeover.json"),
+            release_hook=_job_report_hook(tmp_path / "release.json"),
+        )
+        await coord.activate(actor="alice")
+        await coord.release(actor="alice")
+        takeover = json.loads((tmp_path / "takeover.json").read_text(encoding="utf-8"))
+        release = json.loads((tmp_path / "release.json").read_text(encoding="utf-8"))
+        kill_on_close = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        assert takeover["in_job"]
+        assert takeover["flags"] & kill_on_close
+        assert os.getpid() not in takeover["pids"]
+        assert not release["in_job"] or os.getpid() in release["pids"], release
+    finally:
+        await store.close()
+
+
 async def test_no_hook_relies_on_passive_lb(tmp_path: Path) -> None:
     # With no takeover_hook (the ADR-0047 LB topology — the passive LB is the fence), activation proceeds
     # and binds the priority listeners (the LB then moves the VIP). vip_hook_ran is False.

@@ -4,14 +4,14 @@
 
 Killing a child kills that one process. Anything it started lives on as an orphan. Two callers need
 the whole tree gone: the sandbox worker (:mod:`messagefoundry.pipeline.sandbox`), whose grandchild
-could hold its response pipe, and the DR hook (:mod:`messagefoundry.pipeline.dr`), whose shell's
+could hold its response pipe, and the DR takeover hook (:mod:`messagefoundry.pipeline.dr`), whose shell's
 children could still be taking the address after the activation was recorded as aborted (vault
 BACKLOG #2622).
 
 * **Windows.** The child is put in a job object with ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE``, and
   :func:`terminate_job` ends every process in it. A process joins a job only when it is created, so
   the child must be in the job before it starts anything. The sandbox worker waits for its boot
-  frame, so assigning it just after the start is safe. A shell does not wait, so the DR hook starts
+  frame, so assigning it just after the start is safe. A shell does not wait, so the takeover hook starts
   suspended (:data:`ADOPT_CREATIONFLAGS`) and :func:`resume_into_job` assigns it before it runs.
 * **POSIX.** The child starts as the leader of its own process group (:data:`ADOPT_NEW_SESSION`),
   and :func:`kill_process_group` sends that group ``SIGKILL``.

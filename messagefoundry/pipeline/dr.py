@@ -857,34 +857,40 @@ async def _run_command(command: str, *, stop_kills: bool = True) -> bool:
     leave the shell and whatever it started running, so an activation recorded as aborted could
     still be taking the address. So the shell starts as the root of a tree
     :mod:`messagefoundry.proctree` can kill, and a cancel kills that tree before it propagates.
-    With ``stop_kills=False`` a cancel leaves the hook running, as it did before. A hook that
-    finishes on its own is left alone either way, including anything it left running."""
+    With ``stop_kills=False`` the hook starts as it did before: in no tree of its own, so neither
+    a cancel nor the engine's own exit ends it. On Windows that matters, because a kill-on-close
+    job also ends its processes when the engine exits. A hook that finishes on its own is left
+    alone either way, including anything it left running."""
     spawn = asyncio.ensure_future(
         asyncio.create_subprocess_shell(
             command,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
             env=hook_environment(),
-            creationflags=proctree.ADOPT_CREATIONFLAGS,
-            start_new_session=proctree.ADOPT_NEW_SESSION,
+            creationflags=proctree.ADOPT_CREATIONFLAGS if stop_kills else 0,
+            start_new_session=proctree.ADOPT_NEW_SESSION and stop_kills,
         )
     )
     try:
         # Shielded so a stop that lands mid-start cannot lose the process: the callback kills it.
-        # A hook stopped before it ran has done nothing, so this kills it whatever stop_kills says.
+        # On Windows a hook this may kill is still suspended then, so it has done nothing yet.
         proc = await asyncio.shield(spawn)
     except (asyncio.CancelledError, GeneratorExit):
-        spawn.add_done_callback(_kill_late_start)
+        if stop_kills:
+            spawn.add_done_callback(_kill_late_start)
         raise
     job: int | None = None
     try:
-        job = proctree.resume_into_job(proc.pid, who="DR hook")
+        if stop_kills:
+            job = proctree.resume_into_job(proc.pid, who="DR hook")
         await proc.wait()
     except GeneratorExit:
-        _stop_hook(proc, job, kill=stop_kills)  # a closing coroutine may not await, so no reap
+        if stop_kills:
+            _kill_hook(proc, job)  # a closing coroutine may not await, so no reap
         raise
     except BaseException:
-        if _stop_hook(proc, job, kill=stop_kills):
+        if stop_kills:
+            _kill_hook(proc, job)
             await _reap_hook(proc)
         raise
     if job is not None:
@@ -899,19 +905,6 @@ _HOOK_REAP_SECONDS = 5.0
 
 #: Reaps started from a done-callback, held so the loop does not drop them mid-wait.
 _LATE_REAPS: set[asyncio.Task[None]] = set()
-
-
-def _stop_hook(proc: asyncio.subprocess.Process, job: int | None, *, kill: bool) -> bool:
-    """Kill the hook when ``kill``, else let it run on. Returns whether it was killed.
-
-    A hook that is left running keeps nothing of the engine's: its job, if any, is released so
-    closing the handle does not kill it."""
-    if kill:
-        _kill_hook(proc, job)
-        return True
-    if job is not None:
-        proctree.release_job(job)
-    return False
 
 
 def _kill_hook(proc: asyncio.subprocess.Process, job: int | None) -> None:
