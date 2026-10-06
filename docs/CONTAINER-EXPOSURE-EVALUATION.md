@@ -346,7 +346,8 @@ The console stays a **host-side process**; only its target URL changes.
   never leak into a production image/compose. Give the production DB a CA-trusted cert instead.
 - **Logs.** Keep the service at INFO (never raise to DEBUG in a PHI container — full-body logging risk
   per the PHI rules). **Off-box log + audit forwarding is built** (`[logging].forward_*` → syslog/SIEM);
-  enable it so a container's logs + PHI-redacted audit rows reach the org pipeline, and set
+  enable it so a container's logs + audit rows reach the org pipeline, both with only best-effort
+  PHI redaction ([PHI.md §7](PHI.md#7-logging--phi-redaction)), and set
   `forward_protocol = "tls"` for the native RFC 5425 TLS hop (ADR 0080; port 6514). Residual: the
   transport **default** is UDP, so TLS is a per-deployment opt-in — set it, front the hop with a local
   TLS-forwarding agent, or rely on the container runtime's log driver to a TLS collector.

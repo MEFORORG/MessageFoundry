@@ -22,7 +22,7 @@ from datetime import UTC, datetime
 from messagefoundry.api.auth_models import CurrentUser, MfaStatusResponse
 
 from .._html import Markup, el, minimal_nav, page, register_nav, wordmark
-from ._common import _deadline_stamp
+from ._common import _deadline_passed, _deadline_stamp
 
 __all__ = [
     "account_page",
@@ -411,19 +411,26 @@ def mfa_gate(
     BACKLOG #2009 (ASVS 6.4.5): the holder of an admin-issued credential who has a second factor
     lands HERE first, before :func:`password_page`. So this page states the same deadline, from the
     same ``credential_expires_at``. ``None`` states nothing: no temporary credential, or no deadline.
+    A deadline already passed is stated as passed (BACKLOG #2298).
     """
     banner = el("p", error, class_="banner") if error else Markup("")
     when = None if credential_expires_at is None else _deadline_stamp(credential_expires_at)
-    deadline = (
-        el(
+    deadline: Markup
+    if credential_expires_at is None or when is None:
+        deadline = Markup("")
+    elif _deadline_passed(credential_expires_at):
+        deadline = el(
+            "p",
+            f"Your temporary password stopped working at {when}. Ask an administrator to reset it.",
+            class_="muted",
+        )
+    else:
+        deadline = el(
             "p",
             "After this step you must change your temporary password. "
             f"It stops working at {when}. After that, ask an administrator to reset it.",
             class_="muted",
         )
-        if when is not None
-        else Markup("")
-    )
     passkey: Markup
     if webauthn_options is not None:
         passkey = el(
@@ -757,16 +764,23 @@ def password_page(
     BACKLOG #1141 (ASVS 6.4.5): the forced variant is the one surface the holder of an admin-issued
     credential always reaches, with no address, mail relay or alert set-up needed. So it states when
     that credential stops working. ``credential_expires_at`` is the instant the login gate refuses
-    on; ``None`` states nothing, because then there is no deadline.
+    on; ``None`` states nothing, because then there is no deadline. A deadline already passed is
+    stated as passed (BACKLOG #2298).
     """
     banner = el("p", error, class_="banner") if error else Markup("")
     forced_text = "Your password must be changed before you can continue."
     when = None if credential_expires_at is None else _deadline_stamp(credential_expires_at)
-    if forced and when is not None:
-        forced_text += (
-            f" Your temporary password stops working at {when}. "
-            "After that, ask an administrator to reset it."
-        )
+    if forced and credential_expires_at is not None and when is not None:
+        if _deadline_passed(credential_expires_at):
+            forced_text += (
+                f" Your temporary password stopped working at {when}. "
+                "Ask an administrator to reset it."
+            )
+        else:
+            forced_text += (
+                f" Your temporary password stops working at {when}. "
+                "After that, ask an administrator to reset it."
+            )
     intro = (
         el("p", forced_text, class_="muted")
         if forced

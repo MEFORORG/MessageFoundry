@@ -260,8 +260,12 @@ that re-encrypts to the engine keeps working with your own `tls_cert_file`.
 
 ### Provisioning the first administrator (ASVS 6.3.2)
 
-**The engine creates no account on its own.** A new store has no users, so nobody can sign in until
-an operator creates the first Administrator at the host:
+**The engine creates no account on its own.** A new store has no users, so nobody can manage the
+engine until an operator creates the first Administrator at the host. A Windows sign-in (Kerberos),
+where configured, is not refused for want of one. On a new store it creates its directory account with
+no role, because only an administrator can map a directory group to a role. That session reaches its
+own account and nothing a role grants. An OIDC sign-in on a new store is refused, because only an
+administrator can link it to an account. Create the first Administrator with:
 
 ```
 messagefoundry provision-admin --username <name> --email <address>
@@ -281,7 +285,9 @@ checks pass (at least the store key, the low-disk floor and the `[alerts]` check
 notice-deliverability gate refuses the start, and the refusal names `provision-admin` and the store
 it opened. Under `[security].enforcement = "warn"`, or with the notice requirement waived in writing
 (`[alerts].security_notifications_required = false`), the engine starts and routes HL7, logs one
-WARNING naming `provision-admin`, and nobody can sign in until it runs. Switching security notices
+WARNING naming `provision-admin`, and on a new store nobody can manage it until that runs. On a store
+that once had an Administrator, the directory group map and the federated links it left still apply.
+Switching security notices
 off alone does not reach this point under `enforce`: the earlier notice-channel check refuses first.
 There is no start that needs no account: `serve` always requires sign-in. A start
 refused because no enabled Administrator has a notification address names `messagefoundry
@@ -2904,7 +2910,7 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   client needs a local account, or a directory account with no binding.
 - **Keep one local, unbound Administrator, and create it before you need it.** A bound account
   has no Windows SSO fallback during an IdP outage. If every enabled Administrator is bound,
-  nobody can sign in to unbind one, and `provision-admin` will not rescue the site: it refuses
+  no Administrator can sign in to unbind one, and `provision-admin` will not rescue the site: it refuses
   while any enabled Administrator exists, and a bound one counts.
 - **Limits of the session sweep.** On the SQL Server store, a session whose token is rotated
   in the instant the sweep runs can be missed, and it then lasts until it expires. The same
@@ -4264,7 +4270,8 @@ to the forwarded stream as to stdout (see [PHI.md §7](PHI.md#7-logging--phi-red
   gate. A host NAME that resolves to loopback does pass, because the check never resolves DNS; that residual belongs to #1199's collector-separation probe.
 
 The **`audit_log`** rows *themselves* are **also** forwarded off-box (sec-offbox-log #361/#363): every
-committed audit row ships as PHI-redacted metadata through the `messagefoundry.audit` logger to the same
+committed audit row ships as metadata, with only best-effort PHI redaction
+([PHI.md §7](PHI.md#7-logging--phi-redaction)), through the `messagefoundry.audit` logger to the same
 forwarder — so it inherits the TLS transport automatically — across all three store backends, so both the
 operational log and the tamper-evident audit trail survive a host/DB compromise.
 

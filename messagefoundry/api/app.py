@@ -7699,13 +7699,19 @@ async def _assert_security_notice_is_deliverable(
     store (AC-11). An Administrator with no address is the other half; ``provision-admin`` refuses
     there, so it names the offline setter ``admin-set-notify-email`` and the audited waiver (AC-16).
 
-    **It is also where a skipped gate still says that nobody can sign in (AC-12).** With sign-in
-    required, notices off or waived in writing, and no enabled Administrator, the engine starts and
-    routes HL7 but no one can reach the console. That is logged as ONE WARNING naming
+    **It is also where a skipped gate still says that no enabled Administrator exists (AC-12).** With
+    sign-in required, notices off or waived in writing, and no enabled Administrator, the engine
+    starts and routes HL7, but no enabled account holds the role that manages users and roles. A
+    Windows sign-in can still create a directory account, with no role on a new store (BACKLOG
+    #1133), so the line must not say that nobody can sign in. That is logged as ONE WARNING naming
     ``provision-admin``. Under ``warn`` the refusal's own WARNING already says it, so nothing more is
-    logged. With sign-in not required no Administrator is needed and nothing is logged. It stays a
-    warning rather than a refusal on purpose: NSSM restarts a service at boot with nobody present,
-    and an operator who chose ``warn`` or the waiver chose to keep HL7 flowing.
+    logged. It stays a warning rather than a refusal on purpose: NSSM restarts a service at boot with
+    nobody present, and an operator who chose ``warn`` or the waiver chose to keep HL7 flowing.
+
+    **Sign-in off returns first, and only an embedding reaches that arm.** ``serve`` refuses to start
+    with sign-in off on any bind, and no config key turns it off (vault BACKLOG #2719). So the early
+    return below serves an app an embedder or a test builds in code, which needs no Administrator and
+    logs nothing. It is not a deployable way to start without one.
 
     **Why deliverability rather than "require an email at creation".** A fix resting on an OPERATOR
     ACTION cannot cover the accounts a directory owns; a startup assertion about the state of the
@@ -7749,13 +7755,15 @@ async def _assert_security_notice_is_deliverable(
         # file, and is left as it is.
         where = str(Path(store.path).resolve()) if Path(store.path).is_file() else store.path
         detail = (
-            "no enabled Administrator exists in this store, so nobody can sign in, and every "
-            "out-of-band security notice about the most privileged accounts would reach nobody. The "
-            f"engine creates no account on its own. {_PROVISION_ADMIN_HINT.format(store=where)}."
+            "no enabled Administrator exists in this store, so no enabled account holds the role "
+            "that manages users and roles, and every out-of-band security notice about the most "
+            "privileged accounts would reach nobody. The engine creates no account on its own. "
+            f"{_PROVISION_ADMIN_HINT.format(store=where)}."
         )
         if not gated:
-            # AC-12: the gate is skipped, so this is the one line that says the console is unreachable.
-            _log.warning("the engine is starting with no way to sign in: %s", detail)
+            # AC-12: the gate is skipped, so this is the one line that says no enabled Administrator
+            # exists. The detail states the fact once; the prefix says only why the start goes on.
+            _log.warning("the engine is starting with the notice gate skipped: %s", detail)
             return
     else:
         detail = (

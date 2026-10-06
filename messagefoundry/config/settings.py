@@ -1172,6 +1172,39 @@ def request_host_is_browser_origin(
     return loopback and not trusted_proxies and not tls_terminated_upstream
 
 
+def _trusted_proxy_refusal(entry: str, exc: ValueError) -> str:
+    """The message for an ``[api].trusted_proxies`` entry that a strict ``ip_network`` refuses.
+
+    A host-bits CIDR such as ``10.0.0.1/24`` gets its own message naming the single proxy address
+    first, then the network it spans (BACKLOG #2488). The address is the host part AS WRITTEN, so
+    an IPv6 zone survives: uvicorn compares a scoped peer with a host entry's zone, and ``fe80::1``
+    never matches ``fe80::1%eth0``. A network entry is matched by prefix alone, zone or not. The network is named, never recommended, because every host inside a
+    trusted range may set its own source address."""
+    try:
+        network = ipaddress.ip_network(entry, strict=False)
+    except ValueError:
+        return (
+            f"[api].trusted_proxies entry {entry!r} is not a valid IP address or CIDR network: "
+            f"{exc} (uvicorn would silently treat it as a literal that never matches, "
+            "collapsing every client source IP to the proxy)"
+        )
+    if network.prefixlen == 0:
+        spans = (
+            f"It spans '{network}', which would trust every peer of its address family, as the "
+            "refused '*' does."
+        )
+    else:
+        spans = (
+            f"It spans the network '{network}'. Trust that range only if every host in it is a "
+            "proxy, since each one may set its own source address."
+        )
+    return (
+        f"[api].trusted_proxies entry {entry!r} has host bits set. uvicorn parses a CIDR strictly, "
+        "so it would treat this entry as a literal that never matches, collapsing every client "
+        f"source IP to the proxy. List the proxy's own address {entry.partition('/')[0]!r}. {spans}"
+    )
+
+
 class ApiSettings(_Section):
     host: str = "127.0.0.1"  # Phase 1 = localhost only
     port: int = 8765
@@ -1426,6 +1459,9 @@ class ApiSettings(_Section):
         #           still satisfies the tls_terminated_upstream pairing check below while trusting
         #           nothing — quietly collapsing every client to the proxy address and degrading the
         #           audit source IP, the per-IP login limiter, and the new-client-IP step-up signal.
+        # A host-bits CIDR such as 10.0.0.1/24 fails the same way: uvicorn parses an entry holding
+        # "/" with a STRICT ip_network, so it too becomes a literal that matches no peer. Parse
+        # strictly here for that reason (BACKLOG #2488).
         for entry in v:
             if entry == "*":
                 raise ValueError(
@@ -1435,13 +1471,9 @@ class ApiSettings(_Section):
                     "proxy's exact address(es) instead."
                 )
             try:
-                ipaddress.ip_network(entry, strict=False)
+                ipaddress.ip_network(entry)
             except ValueError as exc:
-                raise ValueError(
-                    f"[api].trusted_proxies entry {entry!r} is not a valid IP address or CIDR network: "
-                    f"{exc} (uvicorn would silently treat it as a literal that never matches, "
-                    "collapsing every client source IP to the proxy)"
-                ) from exc
+                raise ValueError(_trusted_proxy_refusal(entry, exc)) from exc
         return v
 
     @field_validator("tls_client_cert_identities", mode="before")
@@ -2259,8 +2291,9 @@ class LoggingSettings(_Section):
     # startup rather than at the first collector handshake.
     forward_tls_crl_file: str | None = None
     # Per-hop insecure-forwarding attestation (#200, ADR 0092 shape — the [logging] sibling of a
-    # connection's `tls_hop_attested`). The off-box forwarder ships a PHI-REDACTED copy of every log +
-    # audit row, but the default `forward_protocol = "udp"` puts that evidence stream (usernames,
+    # connection's `tls_hop_attested`). The off-box forwarder ships a copy of every log + audit row
+    # after the same BEST-EFFORT redaction as stdout (a single-token identifier can survive it), but
+    # the default `forward_protocol = "udp"` puts that evidence stream (usernames,
     # message ids, connection names, IPs, the audit chain) on the wire in the clear, and it was the ONE
     # egress path with no posture gate at all. It is now decided by the same shared authority the
     # transports use (see `forward_hop_disposition`): a plaintext / unverified-TLS collector hop is
@@ -2273,7 +2306,8 @@ class LoggingSettings(_Section):
     # Records the collector does not take (down, backing off, or still queued at shutdown) are kept
     # here, in order, and sent when it answers again. None (the default) puts it at
     # `<dir of [store].path>/log-spool/<engine or shard id>`, so each engine shard gets its own. It
-    # holds PHI-REDACTED text only (the filters run before the hand-off queue), PL-1 like the app log.
+    # holds only text the filters already processed (they run before the hand-off queue). That
+    # redaction is best-effort, so the spool may still hold PHI: PL-1 like the app log.
     forward_spool_dir: str | None = None
     # Cap on the spool's size on disk, in bytes. When full, the NEWEST record is dropped and the drop
     # reported, which keeps the oldest evidence. 0 turns the spool off (the pre-#1966 behaviour).
@@ -3962,7 +3996,7 @@ def forward_hop_disposition(log: LoggingSettings, posture: HopPosture) -> HopDis
 
     The ``[logging].forward_*`` syslog/SIEM forwarder was the one PHI-adjacent egress path with **no**
     posture gate: ``forward_protocol`` defaults to plaintext ``udp`` (RFC 5426), so an operator who
-    named a collector shipped a PHI-**redacted** but still sensitive evidence stream — usernames,
+    named a collector shipped a best-effort-redacted and still sensitive evidence stream — usernames,
     connection names, message ids, client IPs, the tamper-evident audit chain — off-box in the clear,
     silently. Native TLS-syslog has existed since ADR 0080 (``forward_protocol = "tls"``, RFC 5425,
     CA-anchored), so a secure transport is available and this is a *default* problem, not a
@@ -7548,10 +7582,10 @@ def security_loosenings(
     # BACKLOG #1131: trusted_proxies ranges covering every peer of a family (0.0.0.0/0, ::/0, or
     # ranges whose union is that) make uvicorn trust X-Forwarded-For from all of them, which is what
     # the refused "*" does. The load still accepts them; naming them is the fix. Parsed STRICTLY, as
-    # uvicorn's _TrustedHosts parses them (__main__ hands it the list verbatim): "10.1.2.3/0" loads
-    # here (the validator is not strict) but fails uvicorn's strict parse and becomes a literal that
-    # matches nothing, so it trusts no peer and is not this loosening. Not gated on sign-in: a forged
-    # source address poisons the audit trail either way.
+    # uvicorn's _TrustedHosts parses them (__main__ hands it the list verbatim). A host-bits entry
+    # such as "10.1.2.3/0" would be a literal that matches nothing there, and the validator now
+    # refuses it at load (BACKLOG #2488), so it never reaches this check. Not gated on sign-in: a
+    # forged source address poisons the audit trail either way.
     # CodeQL's name heuristic reads `trusted_proxies` as a secret (main's alert 209 is that source on
     # an INFO line). The entries reach the serve WARNING and stdout below; no flow is reported today,
     # but a refactor of the helper may raise one. The ranges are quoted on purpose: they are the
