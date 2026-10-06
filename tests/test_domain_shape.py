@@ -45,6 +45,7 @@ _REFUSED = {
     "-mx.example.org": "hyphen",
     "mx-.example.org": "hyphen",
     "x" * 64 + ".example.org": "longer than 63",
+    ".".join(["x" * 63] * 4): "longer than 253",
     "example.123": "start with a letter",
     "0.1": "start with a letter",
     "010.0.0.1": "start with a letter",
@@ -86,7 +87,15 @@ def test_every_list_accepts_the_same_values(list_name: str, value: str) -> None:
     assert _load(list_name, value) == [value.strip().lower()]
 
 
-@pytest.mark.parametrize("value", [*_REFUSED, *_ACCEPTED, _IPV4])
+#: The values whose probe address reaches the domain check: one holding "@", "/", ":" or "*" fails
+#: earlier, in the parse or the local part, so its verdict would agree for an unrelated reason.
+#: The 255-character one is left out too: the address cap refuses it first.
+_DOMAIN_ONLY = [
+    v for v in [*_REFUSED, *_ACCEPTED, _IPV4] if not set(v) & set("@/:*") and len(v) < 250
+]
+
+
+@pytest.mark.parametrize("value", _DOMAIN_ONLY)
 def test_the_address_check_agrees_with_the_recipient_list(value: str) -> None:
     # The send rule and the list a recipient is matched against give one verdict, so no entry is
     # accepted that no sendable address could match, and no sendable domain is unlistable.

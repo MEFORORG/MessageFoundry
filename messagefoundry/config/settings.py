@@ -4188,8 +4188,9 @@ class EgressSettings(_Section):
         operator would believe they had listed a domain they had not. Unlike
         ``[security].organization_domains``, subdomains are NOT matched: each needs its own entry.
 
-        Each entry must pass the shape rule the send path applies to a recipient's domain, so no
-        entry is accepted that no sendable address could match. Normalisation, in
+        Each entry must pass the shape rule the send path applies to a recipient's domain, so an
+        entry shaped like no sendable domain is refused here, not at the gate. The send path also
+        caps the whole address at 254 characters, which this list does not. Normalisation, in
         :func:`_bare_domain_entries`: whitespace stripped, blanks skipped, no dot stripped, and
         lowercased after the check. No IP address is accepted (vault BACKLOG #2843)."""
         return _bare_domain_entries(

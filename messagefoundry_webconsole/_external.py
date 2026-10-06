@@ -22,9 +22,8 @@ Two failure modes drove the details, both from the 3.7.3 research:
 
 from __future__ import annotations
 
+import ipaddress
 from urllib.parse import urlsplit
-
-from messagefoundry.domainshape import is_canonical_ipv4
 
 #: Schemes we will render an interstitial for. Anything else (``javascript:``, ``data:``, ``file:``)
 #: is not a navigation we should be helping the operator complete, so callers treat it as a hard
@@ -74,9 +73,20 @@ def _matches_domain(host: str, domain: str) -> bool:
     domain = domain.strip().lower().lstrip(".")
     if not domain or not host:
         return False
-    if is_canonical_ipv4(domain):
+    if _is_ipv4(domain):
         return host == domain
     return host == domain or host.endswith("." + domain)
+
+
+def _is_ipv4(entry: str) -> bool:
+    """Whether ``entry`` is an IPv4 address. Stdlib rather than the engine's
+    ``messagefoundry.domainshape``: this package is versioned apart from the engine, and the UI
+    seam digest does not cover that module, so importing it could fail against an older engine."""
+    try:
+        ipaddress.IPv4Address(entry)
+    except ValueError:
+        return False
+    return True
 
 
 def is_external(url: str, organization_domains: list[str] | tuple[str, ...]) -> bool:
