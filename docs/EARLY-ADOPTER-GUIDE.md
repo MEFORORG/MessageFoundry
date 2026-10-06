@@ -465,12 +465,23 @@ out. The remaining transport gaps include **raw TCP and X12**, which have no nat
 - [ ] Run **`messagefoundry audit-verify`** periodically (the audit log is tamper-*evident*, not
       tamper-*proof*), and set `[retention]` windows — they are **off by default (kept forever)**.
 - [ ] **Have that scheduled job branch on the exit code, not just on nonzero.** `1` is a broken
-      chain, `2` is "the `--db` path is not an audit database" (absent, zero-byte, or no `audit_log`
-      table — a `touch` in an install script or a failed copy leaves exactly that, and the verifier
-      refuses it rather than creating one), and `3` is a clean walk over an **empty** log. Treating
-      `2` or `3` as a tamper alarm pages someone for a misconfiguration; treating either as a pass
-      leaves the real log unchecked. Add `--allow-empty` only where an empty log is expected.
-      Exit codes and their reasoning: [`SECURITY.md`](SECURITY.md) "Tamper-evidence".
+      chain, `2` is "could not start" (for example the `--db` path is not an audit database: absent,
+      zero-byte, or no `audit_log` table — a `touch` in an install script or a failed copy leaves
+      exactly that, and the verifier refuses it rather than creating one), `3` is a clean walk over
+      an **empty** log, and `4` means the chain's first row names a key that this shell does not
+      hold, so nothing was checked against the key. Run the job with the settings and environment
+      the engine runs with, the key or the keyless opt-out included: the verify reads them to decide
+      between `1` and `4`. Treating `2` or `3` as a tamper alarm pages someone for a
+      misconfiguration. **Treat `4` as a possible tamper, not as a misconfiguration.** A `4` from a
+      job that exited `0` before is a sign the first row was changed: run it again with the
+      engine's settings and key before deciding it is a missing key. Treating any of `2`, `3` or
+      `4` as a pass leaves the real log unchecked. A `WARNING` on stderr with exit `0` says the
+      chain is keyless while this shell's settings require a key. Give the job the engine's
+      settings and key; do not clear the warning with the keyless opt-out unless the engine runs
+      under it. A job that moves from `4` to `0` with that warning is as suspect as one that moves
+      from `0` to `4`. Add `--allow-empty` only
+      where an empty log is expected. Exit codes and their reasoning: [`SECURITY.md`](SECURITY.md)
+      "Tamper-evidence".
 - [ ] **Seal the audit DB across any gap in custody, with an anchor.** A bare `audit-verify` is clean
       after the *newest* rows are deleted — the surviving prefix still chains — so on its own it is
       blind to the attack it is run for. **`messagefoundry audit-anchor`** prints `COUNT:HEAD` (no PHI,
