@@ -5142,8 +5142,9 @@ def _service(args: argparse.Namespace) -> int:
         )
     else:
         print(
-            f"error: `service {action}` of {args.name!r} failed: elevation failed or `net {action}` "
-            "exited non-zero; check `service status`",
+            f"error: `service {action}` of {args.name!r} failed: elevation failed, `net {action}` "
+            "exited non-zero (as it does when the service is already in that state), or it did not "
+            "finish in time; check `service status`",
             file=sys.stderr,
         )
     return 1

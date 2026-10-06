@@ -36,10 +36,18 @@ _reveal = False
 # What ``str.format`` raises on a malformed template, each one measured (vault BACKLOG #2789): a
 # missing slot (``IndexError``/``KeyError``), a bad spec or conversion (``ValueError``), an attribute
 # or index the value lacks (``"{0.x}"`` gives ``AttributeError``, ``"{0[k]}"`` on a str gives
-# ``TypeError``), a width too wide to allocate (``"{:>9999999999999}"`` gives ``MemoryError``), and a
-# template that is not a str at all (``AttributeError``: it has no ``format``). The format runs before
-# ``_logger.debug`` decides anything, so it fails at every log level, INFO included.
-_FORMAT_FAILURES = (AttributeError, IndexError, KeyError, MemoryError, TypeError, ValueError)
+# ``TypeError``), a width too wide to allocate (``MemoryError``), a revealed number out of a spec's
+# range (``"{:c}"`` of ``10**20`` gives ``OverflowError``), and a template that is not a str at all
+# (``AttributeError``: it has no ``format``).
+_FORMAT_FAILURES = (
+    AttributeError,
+    IndexError,
+    KeyError,
+    MemoryError,
+    OverflowError,
+    TypeError,
+    ValueError,
+)
 
 
 def log_note(template: str, /, *values: object) -> None:
@@ -49,6 +57,8 @@ def log_note(template: str, /, *values: object) -> None:
     ``msg.field(...)`` reads). **Every value is redacted by default** — replaced with
     :data:`TRACE_REDACTED` — so no PHI reaches the log unless :data:`_reveal` is explicitly set. Never
     raises: a diagnostic must not fail a transform (a malformed template is swallowed, not propagated)."""
+    if not _logger.isEnabledFor(logging.DEBUG):
+        return  # nothing would be emitted, so neither the format's cost nor its failure is paid
     shown: tuple[object, ...] = values if _reveal else tuple(TRACE_REDACTED for _ in values)
     try:
         _logger.debug(template.format(*shown))

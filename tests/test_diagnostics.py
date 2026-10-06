@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 
 import pytest
 
@@ -59,7 +60,7 @@ def test_log_note_bad_template_never_raises(caplog: pytest.LogCaptureFixture) ->
         ("{0.x}", "AttributeError"),  # an attribute the (redacted, str) value lacks
         ("{0[k]}", "TypeError"),  # a str indexed by a non-integer key
         ("{name}", "KeyError"),  # a named slot with no keyword to fill it
-        ("{:>9999999999999}", "MemoryError"),  # a width too wide to allocate
+        (f"{{:>{sys.maxsize}}}", "MemoryError"),  # a width no allocation can satisfy
         ("{0!z}", "ValueError"),  # an unknown conversion
         (b"{}", "AttributeError"),  # not a str at all: bytes has no .format
     ],
@@ -67,17 +68,27 @@ def test_log_note_bad_template_never_raises(caplog: pytest.LogCaptureFixture) ->
 def test_log_note_never_raises_on_any_malformed_template(
     template: object, raised: str, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Every raising path of the eager ``template.format`` is swallowed and logged (vault BACKLOG
-    #2789). Run at INFO as well as DEBUG: the format runs before the logger decides anything, so the
-    raise reached a transform at a production level too, which is the case the contract is for."""
+    """Every raising path of ``template.format`` is swallowed and logged (vault BACKLOG #2789). At
+    INFO the template is not formatted at all (it used to be, so the raise reached a transform at a
+    production level too); at DEBUG the fallback names the failure type."""
     for level in (logging.INFO, logging.DEBUG):
         caplog.clear()
         with caplog.at_level(level, logger=_LOGGER):
             log_note(template, "100")  # type: ignore[arg-type]  # a non-str template is one arm
-    # The DEBUG pass logged the fallback, naming the failure type.
     assert [r.getMessage() for r in caplog.records] == [
         f"log_note: could not format {template!r} with 1 value(s): {raised}"
     ]
+
+
+def test_log_note_never_raises_on_a_revealed_value_out_of_range(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A revealed number outside a spec's range raises ``OverflowError`` from the format."""
+    monkeypatch.setattr(diag, "_reveal", True)
+    monkeypatch.setattr(logging.getLogger(), "handlers", [caplog.handler])
+    with caplog.at_level(logging.DEBUG, logger=_LOGGER):
+        log_note("{:c}", 10**20)
+    assert caplog.text.rstrip().endswith("with 1 value(s): OverflowError")
 
 
 def test_log_note_fallback_never_quotes_a_revealed_value(

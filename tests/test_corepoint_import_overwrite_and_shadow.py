@@ -126,6 +126,44 @@ def test_a_module_that_appears_after_the_check_is_still_not_overwritten(
         import_corepoint(_export(tmp_path), out)
 
     assert (out / "IB_BETA.py").read_text(encoding="utf-8") == _HAND_FINISHED
+    # IB_ALPHA.py was written before the race was seen; it is removed, so a re-run is not refused
+    # over a module the failed run itself created.
+    assert sorted(p.name for p in out.iterdir()) == ["IB_BETA.py"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="creating a symlink needs a privilege there")
+def test_force_replaces_a_symlink_rather_than_writing_through_it(tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    out.mkdir()
+    outside = tmp_path / "outside.py"
+    outside.write_text(_HAND_FINISHED, encoding="utf-8")
+    (out / "IB_ALPHA.py").symlink_to(outside)
+
+    import_corepoint(_export(tmp_path), out, force=True)
+
+    assert outside.read_text(encoding="utf-8") == _HAND_FINISHED  # the link's target is untouched
+    assert not (out / "IB_ALPHA.py").is_symlink()
+
+
+def test_stems_that_differ_only_in_case_are_kept_apart(tmp_path: Path) -> None:
+    """On NTFS, the deployment target, ``IB_Acme.py`` and ``IB_ACME.py`` are one file, so the second
+    is renamed like any other collision instead of overwriting or refusing against the first."""
+    channels = [
+        {
+            "name": f"C{i}",
+            "inbound": {"connector": "mllp", "port": 2620 + i, "name": inbound},
+            "destinations": [{"name": f"OB_C{i}", "connector": "mllp", "host": "h", "port": 1}],
+            "handlers": [{"name": f"h{i}", "actions": []}],
+        }
+        for i, inbound in enumerate(("IB_Acme", "IB_ACME"))
+    ]
+    export = tmp_path / "export.json"
+    export.write_text(json.dumps({"channels": channels}), encoding="utf-8")
+
+    result = import_corepoint(export, tmp_path / "out")
+
+    assert [c.filename for c in result.channels] == ["IB_Acme.py", "IB_ACME_2.py"]
+    assert result.channels[1].renamed_from == "IB_ACME"
 
 
 def test_the_cli_refuses_without_force_and_replaces_with_it(
@@ -219,6 +257,20 @@ def test_a_json_handler_name_never_shadows_an_imported_name() -> None:
     defs, imported = _defs_and_imports(generate_module(channel))
     assert {"Send", "set_field", "MLLP"} <= imported
     assert not set(defs) & imported
+
+
+_FULLWIDTH_SET_FIELD = "\uff53\uff45\uff54_\uff46\uff49\uff45\uff4c\uff44"
+_FULLWIDTH_HANDLER = "\uff48\uff41\uff4e\uff44\uff4c\uff45\uff52"
+
+
+def test_a_fullwidth_name_is_compared_as_python_will_bind_it() -> None:
+    """CPython NFKC-normalizes identifiers, so a fullwidth ``def set_field`` binds ``set_field``."""
+    lists = "".join(
+        f'<ActionList Name="{name}"><List>{_STAMP}</List></ActionList>'
+        for name in (_FULLWIDTH_SET_FIELD, _FULLWIDTH_HANDLER)
+    )
+    channel = parse_package(f'<Package Name="ACME X">{lists}</Package>')[0]
+    assert [h.name for h in channel.handlers] == ["set_field_2", "handler_2"]
 
 
 def test_a_plain_list_name_is_not_renamed() -> None:

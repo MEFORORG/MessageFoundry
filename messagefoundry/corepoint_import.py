@@ -84,12 +84,12 @@ vendored ``defusedxml`` copy (``messagefoundry/_vendor/defusedxml/``) and its ow
 
 from __future__ import annotations
 
-import builtins
 import html
 import json
 import keyword
 import os
 import re
+import unicodedata
 from dataclasses import dataclass, field, replace
 from math import isfinite
 from pathlib import Path
@@ -551,7 +551,7 @@ def _parse_handler(
     h: dict[str, Any], index: int, channel: str, all_dests: tuple[str, ...], taken: set[str]
 ) -> Handler:
     raw_name = _opt_str(h, "name") or f"handler_{index + 1}"
-    name = _unique_name(_sanitize(raw_name), taken)
+    name = _unique_name(_def_name(raw_name), taken)
     actions_raw = h.get("actions", [])
     if not isinstance(actions_raw, list):
         raise CorepointImportError(
@@ -2300,7 +2300,7 @@ def parse_package(text: str, *, source_name: str = "package") -> tuple[Channel, 
         raw_name = _attr(action_list, "Name") or f"transform_{i + 1}"
         # Lower-case BEFORE sanitizing so the keyword guard sees the final identifier ("Class" →
         # "class" → "class_"): the name is both the ``@handler`` id and the emitted ``def``.
-        name = _unique_name(_sanitize(raw_name.lower()), taken)
+        name = _unique_name(_def_name(raw_name.lower()), taken)
         scope = _disabled_scope(action_list, parents)
         # The whole-list gate (BACKLOG #313 step 2, ADR 0086): decided ONCE, for the whole list. A
         # list it does not fully understand takes the step 1 path below untouched, so its output is
@@ -2887,9 +2887,11 @@ def import_corepoint(
     error).
 
     A module already in ``out_dir`` under a name this import would write is refused, naming every
-    such file, and nothing is written -- unless ``force`` is true (vault BACKLOG #2786). The import's
-    own summary tells the operator to hand-finish the generated modules in place, so a second run into
-    the same directory would otherwise replace that work with fresh stubs and report success."""
+    such file, and nothing is written -- unless ``force`` is true, which replaces the directory entry
+    (a symlink there is removed, never written through) (vault BACKLOG #2786). The import's own
+    summary tells the operator to hand-finish the generated modules in place, so a second run into the
+    same directory would otherwise replace that work with fresh stubs and report success. A write that
+    fails part-way removes the modules this run had already created."""
     epath = Path(export_path)
     unreadable: str | None = None
     try:
@@ -2919,7 +2921,7 @@ def import_corepoint(
         # ``_3``, …), regenerate so the inbound name matches the new stem, and record the rename in the
         # result so the collision is surfaced — never a silent drop (count-and-log ethos).
         renamed_from: str | None = None
-        module_name = _unique_name(ch.module_name, assigned)
+        module_name = _unique_name(ch.module_name, assigned, casefold=True)
         if module_name != ch.module_name:
             renamed_from = ch.module_name
             ch = replace(ch, module_name=module_name)
@@ -2962,16 +2964,25 @@ def import_corepoint(
                 f"{', '.join(present)}; pass --force to replace them, or import into another "
                 "directory"
             )
-    mode = "w" if force else "x"
-    for target, result in zip(targets, results, strict=True):
-        try:
-            with target.open(mode, encoding="utf-8") as handle:
+    created: list[Path] = []
+    try:
+        for target, result in zip(targets, results, strict=True):
+            if force and os.path.lexists(target):
+                target.unlink()  # the entry, so a symlink is replaced rather than written through
+            try:
+                handle = target.open("x", encoding="utf-8")
+            except FileExistsError as exc:
+                raise CorepointImportError(
+                    f"refusing to overwrite {target.name} in {out}: it appeared during the import; "
+                    "pass --force to replace it"
+                ) from exc
+            created.append(target)
+            with handle:
                 handle.write(result.source)
-        except FileExistsError as exc:
-            raise CorepointImportError(
-                f"refusing to overwrite {target.name} in {out}: it appeared during the import; "
-                "pass --force to replace it"
-            ) from exc
+    except (CorepointImportError, OSError):
+        for path in created:
+            path.unlink(missing_ok=True)
+        raise
     return ImportResult(tuple(results))
 
 
@@ -3238,27 +3249,41 @@ _CONNECTION_NAME_BUDGET = CONNECTION_NAME_MAX_LENGTH - 16
 # #2788). A ``def`` rebinds the module global of its name, and ``@handler`` returns the function, so a
 # list named ``set_field`` would replace the vocabulary helper for every other handler in the module,
 # and one named ``handler`` or ``router`` would replace the decorator. So the set is deliberately the
-# whole of what such a module could import or call, not only what this import happened to emit: the
-# public surface (the ``from messagefoundry import`` line), the vocabulary (``from
-# messagefoundry.actions import``), the builtins (the emitted code calls ``NotImplementedError`` and
-# ``Exception``, and an author finishing the module reaches for others), the router's ``route``, and
-# the inline ``sends`` list. A name a hand-finisher adds later then still means what it says.
-_BOUND_NAMES = frozenset(
-    {*messagefoundry.__all__, *_actions.__all__, *dir(builtins), "route", "sends"}
-)
+# whole of what the module could import, not only what this import happened to emit: the public
+# surface (the ``from messagefoundry import`` line), the vocabulary (``from messagefoundry.actions
+# import``), the builtins the emitted code names, and the router's ``route``. The builtins are named
+# rather than read from ``dir(builtins)``, which ``site`` and the Python version change, so one export
+# yields the same handler ids on every interpreter.
+_EMITTED_BUILTINS = ("Exception", "NotImplementedError")
+_BOUND_NAMES = frozenset({*messagefoundry.__all__, *_actions.__all__, *_EMITTED_BUILTINS, "route"})
 
 
-def _unique_name(name: str, taken: set[str]) -> str:
+def _def_name(raw_name: str) -> str:
+    """The ``def`` identifier for a handler name, folded the way Python folds it.
+
+    CPython NFKC-normalizes an identifier as it parses it, so a fullwidth ``ｓｅｔ_ｆｉｅｌｄ`` would
+    define ``set_field``. Normalizing first makes the de-duplication see the name Python will bind."""
+    return _sanitize(unicodedata.normalize("NFKC", raw_name))
+
+
+def _unique_name(name: str, taken: set[str], *, casefold: bool = False) -> str:
     """``name``, or ``name_2``, ``name_3``, ... -- the first not in ``taken``, which it then joins.
 
-    Deterministic: the same export always yields the same names, in list order."""
-    if name in taken:
-        n = 2
-        while f"{name}_{n}" in taken:
-            n += 1
-        name = f"{name}_{n}"
-    taken.add(name)
-    return name
+    With ``casefold`` the comparison ignores case and ``taken`` holds folded keys: a file stem must
+    be unique on a case-insensitive filesystem (NTFS, the deployment target), where ``IB_Acme.py``
+    and ``IB_ACME.py`` are one file. Deterministic: the same export always yields the same names, in
+    list order."""
+
+    def key(candidate: str) -> str:
+        return candidate.casefold() if casefold else candidate
+
+    unique = name
+    n = 2
+    while key(unique) in taken:
+        unique = f"{name}_{n}"
+        n += 1
+    taken.add(key(unique))
+    return unique
 
 
 def _connection_name(name: str) -> str:
