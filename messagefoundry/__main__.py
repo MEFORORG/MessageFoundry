@@ -912,7 +912,9 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         help="exit 0 instead of 3 when the audit log verifies clean but holds no rows. Without it "
         "an empty log is a distinct exit code, so a scheduled job cannot read 'there was nothing "
         "to verify' as a pass (exit 1 stays a BROKEN CHAIN, exit 2 'could not open the store', "
-        "exit 4 'the chain is keyed and this shell holds no key, so it was not checked')",
+        "exit 4 'this shell holds no key while its settings require one, and the chain's first "
+        "row names a key', exit 5 'the same shell, and the chain is keyless'). It does not apply "
+        "in that shell: an empty log there exits 2 or 5",
     )
     # ONE mutually-exclusive group: the two flags carry the same value in two transports, and argparse
     # refusing both is better than silently letting one win.
@@ -1668,11 +1670,14 @@ def _load_service_settings(
 ) -> tuple[ServiceSettings | None, str | None]:
     """Load the service settings for a BOOT-PATH command, returning ``(settings, detail)``.
 
+    It has more callers than the boot path now, at least ``audit-anchor`` and ``audit-verify``
+    (BACKLOG #2094, vault BACKLOG #3054), whose output is meant to be safe to keep in a ticket. The
+    section below on why it exists still describes the two boot-path commands it was written for.
+
     Exactly one side is non-``None``. The PAIR rather than a printed line, because that is the
     shape :func:`messagefoundry.verify.runner._load_settings` already has for the same load, and
-    its caller needs the string for a report row rather than for a stream. Both callers here
-    happen to render it identically today; what is shared is the catch and the rendering, not the
-    emitting.
+    its caller needs the string for a report row rather than for a stream. What is shared is the
+    catch and the rendering, not the emitting.
 
     THE FAILURE IS RENDERED, NEVER STRINGIFIED, for the reason
     :func:`~messagefoundry.config.settings.settings_error_detail` states in full: ``str(exc)`` on a
@@ -7151,9 +7156,7 @@ def _refuse_a_store_that_is_not_an_audit_log(
 
 
 def _audit_verify(args: argparse.Namespace) -> int:
-    from pydantic import ValidationError
-
-    from messagefoundry.config.settings import StoreBackend, keyless_opt_out_refusal, load_settings
+    from messagefoundry.config.settings import StoreBackend, keyless_opt_out_refusal
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import (
         KeylessAuditChainRefused,
@@ -7172,13 +7175,13 @@ def _audit_verify(args: argparse.Namespace) -> int:
     cli: dict[str, dict[str, object]] = {}
     if args.db is not None:
         cli.setdefault("store", {})["path"] = args.db
-    try:
-        settings = load_settings(config_path=args.service_config, cli=cli)
-    except (OSError, ValueError, ValidationError) as exc:
-        # OSError, not only FileNotFoundError (vault BACKLOG #2725): a directory or an unreadable
-        # file named by --service-config reached the dispatch floor and exited 1, a broken chain's
-        # code. Its text names the path, not the file's content.
-        print(f"error: {exc}", file=sys.stderr)
+    settings, detail = _load_service_settings(args.service_config, cli=cli)
+    if settings is None:
+        # Through `_load_service_settings`, as `audit-anchor` loads them (vault BACKLOG #3054). It
+        # RENDERS a `ValidationError` rather than stringifying it, whose `input_value=` would echo a
+        # configured secret, and its catch covers the `OSError` of a directory named as the file,
+        # which reached the dispatch floor and exited 1 before #2725. Exit 2: could not start.
+        _emit_error(detail or "could not load the service settings", as_json=False)
         return 2
 
     # A SQLite store was once CREATED (or schema-migrated) on open: a compliance job pointed at a
@@ -7194,8 +7197,9 @@ def _audit_verify(args: argparse.Namespace) -> int:
     )
     if refused is not None:
         return refused
-    # Decides exit 4 against exit 1 below. The open computes the same verdict inline, because the
-    # #1916 source guard reads that call's argument, so the two cannot be one expression.
+    # Decides exit 4 against exit 1, and exit 5 against exit 0 for a keyless walk (#3054), below.
+    # The open computes the same verdict inline, because the #1916 source guard reads that call's
+    # argument, so the two cannot be one expression.
     keyless_refusal = keyless_opt_out_refusal(settings.store, settings.security)
 
     async def run() -> tuple[AuditVerdict, int]:
@@ -7210,8 +7214,10 @@ def _audit_verify(args: argparse.Namespace) -> int:
         )
         try:
             verdict = await store.verify_audit_chain(expected_anchor=expected_anchor)
-            if not verdict[0]:
-                return verdict, -1  # a FAIL exits 1 or 4 whatever the count; don't query for it
+            if not verdict[0] or (verdict.keyless_walk and keyless_refusal is not None):
+                # A FAIL exits 1 or 4, and a keyless walk here exits 5, whatever the count; so
+                # don't query for it.
+                return verdict, -1
             # The row count decides the empty-log exit below. Ask the store for an integer rather
             # than pattern-matching "verified 0 " out of a human-readable message.
             count, _head = await store.audit_anchor()
@@ -7253,22 +7259,35 @@ def _audit_verify(args: argparse.Namespace) -> int:
             "names one. Either the chain was altered, or this shell lacks the key the store runs "
             "with"
         )
-    print(("OK: " if ok else "FAIL: ") + (message or ""))
     if not ok:
+        print("FAIL: " + (message or ""))
         return 1
     if verdict.keyless_walk and keyless_refusal is not None:
-        # Vault BACKLOG #2725. A keyless chain passed, in a shell whose settings require a key. That
-        # is the setup where a rewritten first row turns later tampering into exit 4, so it is said
-        # now, while the chain is clean. The exit stays 0: the chain did verify. Content-free.
+        # EXIT 5, NOT 0 (vault BACKLOG #3054). A clean walk by a shell that holds no key, whose
+        # settings require one. They say verification is keyed, and this was a plain SHA-256 walk
+        # anyone who can write the log can recompute, so it was not checked to their standard. A job
+        # reading only the code never sees the WARNING, so 0 would hide that. NOT 4 EITHER: this is
+        # the one setup where a rewritten first row turns later tampering from 1 into 4 (#2725). With
+        # 5 as its steady state, that rewrite shows as a move from 5 to 4. Neither the exit nor the
+        # text reads the row count: it is a second query, which a writer can change after the walk,
+        # and an empty log (no first row naming a key) is keyless-shaped too. Content-free.
         print(
-            "WARNING: the audit chain is keyless (its first row names no key, and it was checked "
-            "as plain SHA-256), but this shell's settings require a store key. Causes include at "
-            "least: the store runs keyless under other settings, the key is missing here, or the "
-            "chain was rewritten as keyless, which a keyless check cannot see. Run this check with "
-            "the settings and key the engine runs with; if the engine holds a key, that run "
-            "decides it.",
+            f"NOT CHECKED: this shell holds no store key and its settings require one, so the audit "
+            f"chain was not checked against a key ({message}, as plain SHA-256)"
+        )
+        # "No first row naming a key" rather than "its first row names no key": the open refuses an
+        # empty log here (#1916, exit 2), but one emptied after the open has no first row (#3054).
+        print(
+            "WARNING: the audit chain is keyless (it has no first row naming a key, and it was "
+            "checked as plain SHA-256), but this shell's settings require a store key. Causes "
+            "include at least: the store runs keyless under other settings, the key is missing "
+            "here, or the chain was rewritten as keyless, which a keyless check cannot see. Run "
+            "this check with the settings and key the engine runs with; if the engine holds a "
+            "key, that run decides it.",
             file=sys.stderr,
         )
+        return 5
+    print("OK: " + (message or ""))
     if count:
         return 0
 
