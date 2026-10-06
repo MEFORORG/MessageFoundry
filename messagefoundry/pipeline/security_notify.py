@@ -43,6 +43,7 @@ from messagefoundry.auth.notifications import (
     USERNAME_CHANGED,
     SecurityEvent,
     deadline_utc,
+    notice_kind_log_label,
 )
 from messagefoundry.config.secretprovider import SecretProvider, resolve_connector_secret
 from messagefoundry.config.settings import AlertsSettings
@@ -324,16 +325,24 @@ def _build_body(event: SecurityEvent) -> str:
     if event.event_type == USERNAME_CHANGED:
         # BACKLOG #2017. Both names, so a holder who did not expect the change can tell which
         # account it was and what it is called now. A name the event lacks is left out rather than
-        # printed as "None", and the gap is logged (BACKLOG #2291): the one sender always passes
-        # both, so a missing one is a sender defect the holder's mail cannot report.
+        # printed as "None", and the gap is logged (BACKLOG #2291): the sender in
+        # ``auth/service.py`` passes both, so a missing one is a sender defect the holder's mail
+        # cannot report.
+        #
+        # Printed only when every character is printable: a name carrying a line break could
+        # otherwise write its own lines into this notice. Unlike the issuer's ``Account:`` line
+        # above, a space is let through, because a directory account name may hold one and a
+        # space cannot start a new line.
         for label, key in (("Previous username", "old_username"), ("New username", "new_username")):
-            name = event.detail.get(key)
-            if name:
+            name = str(event.detail.get(key) or "")
+            if name.isprintable() and name:
                 lines.append(f"{label}: {name}")
+            elif name:
+                lines.append(f"{label}: (a username that cannot be shown safely here)")
             else:
                 log.warning(
                     "security notice %s for %s carries no %s, so that line was left out of it",
-                    USERNAME_CHANGED,
+                    notice_kind_log_label(event.event_type),
                     scrub_log_argument(event.username),
                     key,
                 )
@@ -397,11 +406,14 @@ def _build_body(event: SecurityEvent) -> str:
                     "or you will need an administrator to reset your second factor."
                 )
     if event.client_ip and from_directory:
-        # BACKLOG #2291. The directory made this change, so the address is not where it was made.
-        # The only sender passing one is the account's own directory sign-in, which copied the
-        # change down, and a bare "Source IP" line would read as the address of whoever made it.
+        # BACKLOG #2291. The directory made this change, so the address is not where it was made,
+        # and a bare "Source IP" line would read as the address of whoever made it. The sender that
+        # passes one today is a directory sign-in to this account, in ``_upsert_ad_user``, which
+        # copies the change down BEFORE the sign-in is finished: a later step can still refuse it,
+        # or it can still owe a second factor. So the line says a sign-in was under way, never that
+        # one succeeded. A new sender passing any other kind of address must change this line.
         lines.append(
-            f"MessageFoundry picked up this change when your account signed in from "
+            f"MessageFoundry picked up this change during a sign-in to your account from "
             f"{event.client_ip}."
         )
     elif event.client_ip:

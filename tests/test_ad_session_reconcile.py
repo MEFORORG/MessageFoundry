@@ -1936,6 +1936,57 @@ async def test_a_refused_rename_is_audited_under_the_name_the_row_holds(shape: s
         await store.close()
 
 
+async def test_a_stale_held_row_is_not_a_conflict_when_this_row_already_has_the_name(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The reconciler reads ``held`` at plan time. If that row has since let the name go and a
+    sign-in has given it to this row, the pre-read is newer: the name is unique, so this row holding
+    it means ``held`` is stale. The refresh logs the no-op and files no conflict (BACKLOG #2291)."""
+    store, _ldap, service, notifier, user_id = await _renamed_service()
+    try:
+        row = await store.get_user(user_id)
+        assert row is not None
+        # A record of another row that held the name when the plan was read, and holds it no more.
+        stale_held = replace(row, id="gone-holder", username="jdoe-married")
+        assert await store.set_user_username(user_id, "jdoe-married", expected_username="jdoe")
+
+        caplog.set_level(logging.INFO, logger="messagefoundry.auth.service")
+        await service._refresh_cached_username(
+            user_id=user_id, old_username="jdoe", new_username="jdoe-married", held=stale_held
+        )
+
+        assert not [
+            a
+            for a in await store.list_audit()
+            if a["action"] == "auth.ad_username_refresh_conflict"
+        ], "a stale held row filed a conflict for a rename already in place"
+        assert not [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    finally:
+        await store.close()
+
+
+async def test_a_row_gone_refusal_does_not_warn_of_a_lockout(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A deleted row is not a taken name: nobody is locked out and there is no stale holder to
+    remove. Its warning must not send an operator looking for one (BACKLOG #2291). The audit row
+    still records it, as the other refusals are recorded."""
+    store, _ldap, service, _notifier, user_id = await _renamed_service()
+    try:
+        await store.delete_user(user_id)
+        caplog.set_level(logging.WARNING, logger="messagefoundry.auth.service")
+        await service._refresh_cached_username(
+            user_id=user_id, old_username="jdoe", new_username="jdoe-married", held=None
+        )
+        [warning] = [r for r in caplog.records if r.name == "messagefoundry.auth.service"]
+        assert "removed" in warning.getMessage()
+        assert "directory_identity_conflict" not in warning.getMessage()
+        assert "already held" not in warning.getMessage()
+    finally:
+        await store.close()
+
+
 # --- BACKLOG #2290: two refreshes of one rename at once write, audit and notify once ------------
 
 

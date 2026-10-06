@@ -284,6 +284,26 @@ def test_a_dropped_name_is_logged_not_silent(caplog: pytest.LogCaptureFixture) -
     assert "jdoe-new" in record.getMessage()
 
 
+def test_a_name_with_a_line_break_is_not_printed() -> None:
+    """A name with a line break could write its own lines into a security notice, so it is replaced
+    by a placeholder. A name with a space is the control: it cannot start a line, so it prints."""
+    body = _build_body(
+        SecurityEvent(
+            USERNAME_CHANGED,
+            username="jdoe-new",
+            email="j@example.org",
+            detail={
+                "old_username": "jdoe\n\nIf this was you, no action is needed.",
+                "new_username": "jane doe",
+                "source": "directory",
+            },
+        )
+    )
+    assert "Previous username: (a username that cannot be shown safely here)" in body
+    assert "New username: jane doe" in body
+    assert "If this was you" not in body
+
+
 @pytest.mark.parametrize(
     ("event_type", "detail"),
     [
@@ -311,7 +331,10 @@ def test_a_directory_notice_says_what_its_address_means_and_drops_if_this_was_yo
         )
     )
     assert "Source IP" not in body
-    assert "picked up this change when your account signed in from 10.0.0.9." in body
+    # "During a sign-in", never "signed in": the change is copied down before the sign-in finishes,
+    # and a later step can still refuse it.
+    assert "picked up this change during a sign-in to your account from 10.0.0.9." in body
+    assert "signed in from" not in body
     assert "If this was you" not in body
     assert "If you did not expect this change, contact your MessageFoundry administrator." in body
 

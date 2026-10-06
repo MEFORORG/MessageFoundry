@@ -5395,16 +5395,22 @@ class AuthService:
             # must act on. The remedy is theirs -- remove the stale row -- and it is BACKLOG #1471's
             # stated residual, unchanged here.
             #
-            # ``detected`` separates the two ways one condition arrives -- the pre-check saw the
-            # holder, or the write lost a race to it. The OUTCOME is deliberately identical, which is
-            # the whole point of absorbing the race; the discriminator is recorded because an operator
-            # reading a run of these wants to know whether they are looking at one stale row or at
-            # concurrent writers, and those want different fixes.
+            # ``detected`` separates the ways the taken-name condition arrives -- the pre-check saw
+            # the holder (``pre_check``), or the write lost a race to it (``write_race``, or
+            # ``write_noop`` where the store's guard held). The OUTCOME is deliberately identical,
+            # which is the whole point of absorbing the race; the discriminator is recorded because
+            # an operator reading a run of these wants to know whether they are looking at one stale
+            # row or at concurrent writers, and those want different fixes.
+            #
+            # ``row_gone`` is a DIFFERENT condition that shares this audit action: the row was
+            # deleted, so no other row holds anything and nobody is locked out. It gets its own
+            # warning below rather than the lockout one, which would send an operator looking for a
+            # stale holder that does not exist (BACKLOG #2291).
             #
             # ``holds`` is the name the row holds as this method read it, not the caller's
             # ``old_username`` (BACKLOG #2291). The reconciler captured that at plan time, and a
             # sign-in may have renamed the row since, so it can name an account that no longer
-            # exists. The audit actor and this warning both use the name an operator would find.
+            # exists. The audit actor and the warning both use the name an operator would find.
             await self._audit(
                 "auth.ad_username_refresh_conflict",
                 actor=holds,
@@ -5418,24 +5424,35 @@ class AuthService:
                 ),
                 client=client,
             )
+            if detected == "row_gone":
+                _log.warning(
+                    "AD account %s was renamed in the directory but its row was removed before the "
+                    "new name could be written, so nothing was written (BACKLOG #2291)",
+                    scrub_log_argument(holds),
+                )
+                return
             _log.warning(
                 "AD account %s was renamed in the directory but the new name is already held by "
-                "another account (%s). The stored name is left as-is, and this account will be "
-                "refused at its next sign-in (directory_identity_conflict) until the stale row is "
-                "removed; the session it holds now survives only to the absolute cap (BACKLOG #1532)",
+                "another account (id %s, detected %s). The stored name is left as-is, and this "
+                "account will be refused at its next sign-in (directory_identity_conflict) until "
+                "the stale row is removed; the session it holds now survives only to the absolute "
+                "cap (BACKLOG #1532)",
                 scrub_log_argument(holds),
+                held_by,
                 detected,
             )
 
         # BACKLOG #2017. The row as it stands, read before the write, because the caller's
         # ``old_username`` can be stale by now: the reconciler captured it when it planned, and a
-        # directory sign-in may have renamed the row since. Four things follow from that read.
+        # directory sign-in may have renamed the row since. At least four things follow from that
+        # read.
         #
         # A row that already carries the new name has nothing to change, so it gets no second audit
         # row and no second notice. The notice names the name the row actually had, not the plan's.
         # The write below compares on this name (BACKLOG #2290), so a refresh that read it just
-        # before another refresh of this row wrote cannot write as well. And every refusal audits
-        # under this name (BACKLOG #2291), so the read comes BEFORE the ``held`` pre-check.
+        # before another refresh of this row wrote cannot write as well. And each refusal after
+        # this read audits under this name (BACKLOG #2291), so the read comes BEFORE the ``held``
+        # pre-check.
         #
         # WHY THE READ STAYS ON THE LOGIN PATH TOO (BACKLOG #2291 step 4). That caller already holds
         # ``existing``, so the read costs it one ``SELECT``. It runs only on a sign-in that carries a
@@ -5449,17 +5466,20 @@ class AuthService:
             # no name it holds, so the caller's is the last one known for it.
             await _refuse(user_id, "row_gone", old_username)
             return
-        if held is not None and held.id != user_id:
-            await _refuse(held.id, "pre_check", before.username)
-            return
         if before.username == new_username:
             # Another caller applied this rename first, in sequence (BACKLOG #2291). Nothing is
             # wrong, so INFO: the line shows why no audit row or notice followed.
+            #
+            # BEFORE the ``held`` pre-check, because this read is newer than the caller's: the name
+            # is unique, so a row that holds it now means a ``held`` naming another row is stale.
             _log.info(
                 "AD account %s already holds its directory name, so the rename refresh wrote "
                 "nothing and sends no second audit row or notice (BACKLOG #2291)",
                 user_id,
             )
+            return
+        if held is not None and held.id != user_id:
+            await _refuse(held.id, "pre_check", before.username)
             return
         try:
             # BACKLOG #2290. A compare-and-set on the name just read, so of two refreshes of this
