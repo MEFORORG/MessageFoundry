@@ -386,7 +386,8 @@ def _check_tls_ca_file(factory: str, value: Any, *, unread: str | None = None) -
 
     Every connector that reads the key treats a blank value as unset, so a blank literal would look
     pinned in review while the hop falls back to the instance ``[tls]`` anchor or the OS store. An
-    ``env()`` reference resolves later, so a blank RESOLVED value is not caught here. ``unread`` names
+    ``env()`` reference resolves later, so :func:`resolve_env_settings` refuses a blank RESOLVED
+    value (vault BACKLOG #2370). ``unread`` names
     why this connection would never read the CA at all, such as plain FTP.
 
     Raises ``ValueError`` rather than :class:`WiringError`, so ``connections_file._build_spec`` adds
@@ -1049,8 +1050,19 @@ def FhirLookup(
     return spec
 
 
-def resolve_env_settings(settings: Mapping[str, Any], values: Mapping[str, Any]) -> dict[str, Any]:
+#: Settings an ``env()`` reference must not resolve blank (vault BACKLOG #2370). A blank
+#: ``tls_ca_file`` reads as unset, so the hop would quietly trust what it trusts with no pin. A blank
+#: literal is refused at load by ``_check_tls_ca_file``; this is the same refusal once the value is in.
+_NON_BLANK_ENV_SETTINGS = frozenset({"tls_ca_file"})
+
+
+def resolve_env_settings(
+    settings: Mapping[str, Any], values: Mapping[str, Any], *, connection: str | None = None
+) -> dict[str, Any]:
     """Return a copy of ``settings`` with every :class:`EnvRef` resolved against ``values``.
+
+    A setting in :data:`_NON_BLANK_ENV_SETTINGS` whose reference resolves to a blank string is
+    refused in the same error, naming the setting, the key and ``connection`` when given.
 
     Resolution order per ref: the environment value (cast if a ``cast`` was given), else its
     ``default``, else it's *missing*. Raises a single :class:`WiringError` listing **all** problems
@@ -1063,6 +1075,7 @@ def resolve_env_settings(settings: Mapping[str, Any], values: Mapping[str, Any])
     resolved: dict[str, Any] = {}
     missing: list[str] = []
     bad: list[str] = []
+    blank: list[str] = []
     for name, value in settings.items():
         if isinstance(value, EnvRef):
             if value.key in values:
@@ -1108,6 +1121,11 @@ def resolve_env_settings(settings: Mapping[str, Any], values: Mapping[str, Any])
                 resolved[name] = value.default
             else:
                 missing.append(value.key)
+            got = resolved.get(name)
+            if name in _NON_BLANK_ENV_SETTINGS and isinstance(got, str) and not got.strip():
+                # No ":" or "=" after the name: the log scrubber reads "LABEL: value" as a secret.
+                owner = f" of connection {connection!r}" if connection else ""
+                blank.append(f"setting {name!r}{owner} (env {value.key!r}) pins nothing")
         else:
             resolved[name] = value
     problems: list[str] = []
@@ -1115,6 +1133,8 @@ def resolve_env_settings(settings: Mapping[str, Any], values: Mapping[str, Any])
         problems.append("missing: " + ", ".join(sorted(set(missing))))
     if bad:
         problems.append("uncastable: " + "; ".join(bad))
+    if blank:
+        problems.append("blank: " + "; ".join(blank))
     if problems:
         raise WiringError(
             "environment value(s) unusable — "

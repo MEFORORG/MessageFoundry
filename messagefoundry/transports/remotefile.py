@@ -535,6 +535,7 @@ def _ftps_ssl_context(
             connection_ca_file=str(ca) if ca else None,
             host=str(settings.get("host", "")),
             policy=trust_anchor_policy,
+            connection=name or None,
         )
         ctx = build_verifying_client_context(anchor)
     else:
@@ -1751,8 +1752,9 @@ def _make_client(
 ) -> _RemoteClient:
     """Build the protocol-appropriate client. Tests monkeypatch this (or the client classes) so no
     real server/SSH is needed; both connectors call it per operation-batch. ``trust_anchor_policy``
-    (#190, ADR 0093) is the outbound FTPS verify-path internal-CA fallback; the source passes ``None``
-    (byte-identical) and SFTP/plain-FTP ignore it (no server-cert verify)."""
+    (#190, ADR 0093) is the FTPS verify-path internal-CA fallback. Both connectors pass their
+    config's policy (the source since vault BACKLOG #2370); SFTP/plain-FTP ignore it (no server-cert
+    verify)."""
     protocol = remote_file_protocol(settings)
     if protocol == "sftp":
         return _SftpClient(settings)
@@ -2135,7 +2137,13 @@ class RemoteFileSource(SourceConnector):
         _validate_common(
             s, connection=None if config.name is None else inbound_record_name(config.name)
         )
-        self._client = _make_client(s, name=config.name or "")
+        # Vault BACKLOG #2370: the poller verifies its FTPS server under [tls], as the outbound does,
+        # and its warnings and refusals spell it inbound:<name>, as _validate_common above does.
+        self._client = _make_client(
+            s,
+            trust_anchor_policy=config.trust_anchor_policy,
+            name="" if config.name is None else inbound_record_name(config.name),
+        )
         self._host = str(s["host"])
         self._remote_dir = str(s["remote_dir"])
         self._pattern: str = s.get("pattern", "*.hl7")

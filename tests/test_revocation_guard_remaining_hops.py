@@ -35,7 +35,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
-from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.tls_policy import (
     TLS_REVOCATION_ATTESTED_ENV,
@@ -54,7 +54,7 @@ from messagefoundry.transports import remotefile as remotefile_module
 from messagefoundry.transports.dicom import DicomScuDestination
 from messagefoundry.transports.direct import DirectDestination
 from messagefoundry.transports.fhir import FhirLookupExecutor
-from messagefoundry.transports.remotefile import RemoteFileDestination
+from messagefoundry.transports.remotefile import RemoteFileDestination, RemoteFileSource
 from messagefoundry.transports.rest import (
     _NO_REDIRECT_OPENER,
     http_family_trust_anchor,
@@ -510,6 +510,26 @@ def test_a_configured_crl_does_not_admit_an_ftps_upload_whose_context_lacks_it(
     )
     with active_hop_posture(ENFORCING), pytest.raises(InsecureHopRefused, match="revocation"):
         RemoteFileDestination(_ftps(REMOTE, policy=_crl_policy(bare_crl)))
+
+
+def test_an_inbound_ftps_poll_loads_the_instance_crl(bare_crl: str) -> None:
+    """Vault BACKLOG #2370: the poller now gets the ``[tls]`` policy, CRL included. It is still not
+    gated, so the control is that it builds without a CRL and checks none."""
+    settings = {"host": REMOTE, "remote_dir": "/in", "protocol": "ftps"}
+    with active_hop_posture(ENFORCING):
+        polled = RemoteFileSource(
+            Source(
+                type=ConnectorType.REMOTEFILE,
+                name="IB_FTPS",
+                settings=dict(settings),
+                trust_anchor_policy=_crl_policy(bare_crl),
+            )
+        )
+        control = RemoteFileSource(
+            Source(type=ConnectorType.REMOTEFILE, name="IB_FTPS", settings=dict(settings))
+        )
+    assert context_checks_revocation(polled._client.tls_context) is True
+    assert context_checks_revocation(control._client.tls_context) is False
 
 
 def test_an_ftps_upload_crosses_on_its_attestation_and_is_audited() -> None:

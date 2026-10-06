@@ -324,6 +324,10 @@ class Source(BaseModel):
     # `tls_revocation_attested_reason` is mandatory with it and rides into the audit line.
     tls_revocation_attested: bool = False
     tls_revocation_attested_reason: str | None = None
+    # Vault BACKLOG #2370: the instance [tls] client trust-anchor policy, for the one inbound that
+    # dials out and verifies a server, the FTPS poller. Filled by the runner's _source_config, as
+    # Destination.trust_anchor_policy is by _dest_config. Default = the no-op policy.
+    trust_anchor_policy: TrustAnchorPolicy = Field(default_factory=TrustAnchorPolicy)
 
     @model_validator(mode="after")
     def _validate_hop_attestation(self) -> Source:

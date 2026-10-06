@@ -257,9 +257,11 @@ def _narrow_to_approved_suites(ctx: ssl.SSLContext) -> ssl.SSLContext:
     wrapper's inner ``_ctx`` and is a no-op on an interpreter with no ``set_ciphersuites``. So on
     CPython 3.14 the probe still offers the interpreter's TLS 1.3 list, AES-128 included.
 
-    A build that refuses the approved list raises ``RuntimeError`` naming it, as the engine's does.
-    An ``ssl.SSLError`` here would read as "cannot load the engine certificate" to
-    :func:`build_verify` and :func:`load_pin`, which is not what failed."""
+    A build that refuses the approved list raises ``RuntimeError`` naming it, as the engine's two
+    narrowers do. The engine's wrappers turn theirs into a config refusal (BACKLOG #2484); the tray
+    is not a config seam, so it keeps ``RuntimeError``. An ``ssl.SSLError`` here would read as
+    "cannot load the engine certificate" to :func:`build_verify` and :func:`load_pin`, which is not
+    what failed."""
     try:
         ctx.set_ciphers(f"@SECLEVEL={ctx.security_level}:" + ":".join(_APPROVED_TLS12_SUITES))
         target = getattr(ctx, "_ctx", ctx)
