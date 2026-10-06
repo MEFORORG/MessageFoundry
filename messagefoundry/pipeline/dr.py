@@ -258,7 +258,8 @@ class DrCoordinator:
             # (1d) RUN-PROFILE PREFLIGHT (fail-closed, BEFORE any store mutation or VIP step). Step (4)
             # reloads the config dir the running graph came from; if that dir has gone or cannot be
             # read, step (4) would abort AFTER the takeover hook moved the VIP, leaving it on a box
-            # that serves nothing. Step (4) keeps its own check: the dir can still go in between.
+            # that is NOT running the DR run-profile. Step (4) keeps its own check: the dir can
+            # still go in between.
             if self._profile_preflight is not None:
                 try:
                     await self._profile_preflight()
