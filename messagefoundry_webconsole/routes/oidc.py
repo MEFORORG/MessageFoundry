@@ -45,7 +45,11 @@ from fastapi import FastAPI, Query, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from messagefoundry.api._ui_seam import UiDeps
-from messagefoundry.api.security import get_auth, public_route
+from messagefoundry.api.security import (
+    alert_directory_administrator_granted,
+    get_auth,
+    public_route,
+)
 from messagefoundry.auth.oidc import FlowCacheFullError, FlowError
 from messagefoundry.auth.service import AuthService, OidcStepUp
 
@@ -438,6 +442,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             code=code,
             client=client,
             public_origin=getattr(request.app.state, "public_origin", "") or "",
+        )
+        alert_directory_administrator_granted(
+            request.app.state, outcome, via="directory_sign_in_oidc"
         )
         if not outcome.ok or outcome.token is None:
             # complete_oidc_login already audited the closed-set reason; map it to an allow-listed

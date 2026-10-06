@@ -1848,7 +1848,7 @@ What the engine does instead is make the cheap routes loud. It refuses none of t
 | Signal | When | Where it goes |
 |---|---|---|
 | `approval.approver_provenance` audit row and `approval_approver_provenance` alert | A release goes ahead and the approver's account was created, had its password changed, or enrolled TOTP **after** the request was made | Audit row against the approver, with their `client` address (ADR 0150). Alert keyed `approval:<id>`, carrying the changed facts only |
-| `administrator_granted` alert | `POST /users` creates an account with the Administrator role, `PUT /users/{id}/roles` adds it, or `PUT /ad-group-map` newly maps a group to it | Alert keyed `user:<username>` or `ad-group:<group>`, naming the granting administrator |
+| `administrator_granted` alert | `POST /users` creates an account with the Administrator role, `PUT /users/{id}/roles` adds it, `PUT /ad-group-map` newly maps a group to it, or a directory sign-in's role sync newly gives an account the role (vault BACKLOG #2610) | Alert keyed `user:<username>` or `ad-group:<group>`, naming the granting administrator, or `<directory>` for a directory sign-in |
 | `client` on the `user.created` audit row | An account created through `POST /users` or `POST /users/directory` (BACKLOG #2021) | The creating administrator's address, like the approval rows |
 | `account_created` notice | An account created through `POST /users` or `POST /users/directory`, neither of which creates one without a notification address (BACKLOG #2018, #2021) | The new account's own notification address |
 
@@ -1869,18 +1869,25 @@ with no page.
   holds no role until the group map gives it one at sign-in. Created after a request, it is still
   flagged at that release, like any new account, and its notification address gets the
   `account_created` notice.
-- **A directory grant.** An account that gets Administrator because the *directory* added it to a
-  group already mapped to Administrator raises no `administrator_granted` alert. The API's
-  user-administration routes raise that alert, and a directory change does not pass through them.
-  The engine does see the grant, in one of the two places below. Neither names the role in an
-  alert, and the route can end with no alert at all. An account with no live session raises none.
-  Nor does one that signs in again before the next reconciler pass. So watch membership of the
-  mapped group in the directory itself.
+- **A directory grant.** An account can get Administrator because the *directory* added it to a
+  group already mapped to Administrator. The engine sees that grant in one of the two places below,
+  whichever comes first. A sign-in that sees it first raises `administrator_granted`. A reconciler
+  pass that sees it first raises `ad_session_revoked`, which does not name the role. The later
+  sign-in then gains nothing, so it raises no `administrator_granted`. An account that never signs
+  in again and holds no live session raises nothing. So watch membership of the mapped group in the
+  directory itself.
   **CORRECTED 2026-10-01:** this read "raises no alert. The engine never sees that grant."
+  **CORRECTED 2026-10-06:** this read "raises no `administrator_granted` alert", and the sign-in
+  case below read "It raises no alert." Vault BACKLOG #2610 added the sign-in alert.
   - **At the account's next sign-in.** The engine writes an `auth.ad_roles_resynced` audit row
     with the old and new roles. It also sends a best-effort roles-changed notice to that
     account's own notification address, when the account has one and security notices are set
-    up. It raises no alert.
+    up. The sign-in route raises `administrator_granted`, keyed `user:<username>`, with
+    `granted_by` set to `<directory>` and `via` naming the route: `directory_sign_in_negotiate`
+    for `POST /auth/negotiate`, `directory_sign_in_sso` for `GET /ui/sso`, and
+    `directory_sign_in_oidc` for the `/ui/oidc` callback. A sign-in the engine refuses after the
+    sync ran raises it too, because the role was written all the same. An account that already
+    held Administrator raises nothing.
   - **Sooner, when the account holds a live session.** A pass of the
     [directory reconciler](#directory-session-reconciliation--propagating-an-ad-disable-adr-0079-mechanism-2)
     that completes stores the new roles and revokes the session. It writes

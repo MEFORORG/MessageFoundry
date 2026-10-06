@@ -31,7 +31,7 @@ from messagefoundry.api.tls_client_cert import (
 )
 from messagefoundry.auth import AuthProvider, Identity, Permission, Role
 from messagefoundry.auth.notifications import deadline_utc as deadline_utc  # re-export
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import AuthService, LoginOutcome
 from messagefoundry.config.tls_policy import HopDisposition
 
 # Imported, not redefined: the cert->principal matchers live in the neutral package-root leaf, which
@@ -54,6 +54,36 @@ def alert_sink_for(state: Any) -> AlertSink:
     """The running ``[alerts]`` notifier on ``app.state``, or the logging fallback when none is wired."""
     sink: AlertSink | None = getattr(state, "notifier", None)
     return sink if sink is not None else _FALLBACK_ALERT_SINK
+
+
+#: ``granted_by`` on the ``administrator_granted`` alert a directory sign-in raises (vault BACKLOG
+#: #2610): no administrator acted, the directory's group membership did. The angle brackets keep it
+#: out of the username space, as the ``<kerberos>`` audit actor's do.
+DIRECTORY_GRANTED_BY = "<directory>"
+
+
+def alert_administrator_granted(state: Any, key: str, *, via: str, granted_by: str) -> None:
+    """Raise the ``administrator_granted`` alert (BACKLOG #315; why, and the key grammar, are on
+    ``AlertSink.administrator_granted``). Raised in the API, never from ``auth/`` (CLAUDE.md
+    section 4). Best effort: the grant already happened and is audited."""
+    try:
+        alert_sink_for(state).administrator_granted(key, via=via, granted_by=granted_by)
+    except Exception:  # noqa: BLE001 - a sink that breaks its never-raise contract must not 500 a
+        # call whose write is already committed and audited.
+        log.exception("the administrator_granted alert for %r failed to emit", key)
+
+
+def alert_directory_administrator_granted(state: Any, outcome: LoginOutcome, *, via: str) -> None:
+    """Raise ``administrator_granted`` when a directory sign-in's role sync newly gave the account
+    the Administrator role (vault BACKLOG #2610). Every route that completes a directory sign-in
+    calls this with its ``outcome`` BEFORE it reads ``ok``, because a refused outcome can still
+    carry a grant. ``via`` names the route. A sign-in that gained nothing, or gained only other
+    roles, raises nothing."""
+    gained = outcome.roles_gained
+    if gained is not None and Role.ADMINISTRATOR.value in gained.roles:
+        alert_administrator_granted(
+            state, f"user:{gained.username}", via=via, granted_by=DIRECTORY_GRANTED_BY
+        )
 
 
 #: ``path`` reported for a handshake-observed cert: there is no PEM file on this arm (the operator can

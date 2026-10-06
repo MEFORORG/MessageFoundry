@@ -12,7 +12,11 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from messagefoundry.api._ui_seam import UiDeps
-from messagefoundry.api.security import get_auth, public_route
+from messagefoundry.api.security import (
+    alert_directory_administrator_granted,
+    get_auth,
+    public_route,
+)
 
 from .. import pages
 from .._auth import (
@@ -91,6 +95,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # carries the cookie and is covered.
         outcome = await auth.authenticate_kerberos(
             token_bytes, client=client, supersedes=session_token(request)
+        )
+        alert_directory_administrator_granted(
+            request.app.state, outcome, via="directory_sign_in_sso"
         )
         if not outcome.ok or outcome.token is None:
             # authenticate_kerberos audited the reject. NEVER a second 401 — no challenge

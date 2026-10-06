@@ -624,6 +624,18 @@ _T = TypeVar("_T")
 
 
 @dataclass(frozen=True)
+class RolesGained:
+    """The roles a directory sign-in's role sync NEWLY gave an account (vault BACKLOG #2610).
+
+    ``username`` is the account the sync wrote to, which is not always the name the directory
+    presented, so a caller keys on this and never on the sign-in's input. ``roles`` holds role ids
+    and is never empty: a sync that gained nothing reports no :class:`RolesGained` at all."""
+
+    username: str
+    roles: frozenset[str]
+
+
+@dataclass(frozen=True)
 class LoginOutcome:
     """Result of a login attempt. ``error`` is for logs/audit — never leak the reason to clients."""
 
@@ -646,6 +658,12 @@ class LoginOutcome:
     #: "always ``None`` on the local/AD/Kerberos paths" and stopped being true. A slug the browser
     #: layer's map does not know collapses to its generic code, which is the safe default.
     reason: str | None = None
+    #: Set only by a directory sign-in whose role sync newly gave the account a role (vault BACKLOG
+    #: #2610). ``auth/`` raises no alert (CLAUDE.md section 4), so every route that completes a
+    #: directory sign-in reads this and raises ``administrator_granted`` when Administrator is among
+    #: the roles. Set on a refused outcome too: a bind landing between the sync and the mint refuses
+    #: the session after the roles were written, and that grant happened all the same.
+    roles_gained: RolesGained | None = None
 
 
 @dataclass(frozen=True)
@@ -4582,6 +4600,10 @@ class AuthService:
         role_ids = sorted(await self._store.roles_for_ad_groups(principal.groups))
         previous = set(await self._store.get_user_role_ids(user.id))
         await self._store.set_user_roles(user.id, role_ids, assigned_by="ad-sync")
+        # vault BACKLOG #2610: only a role this sync ADDED is reported, so an account that already
+        # held Administrator pages nobody on each sign-in.
+        gained = frozenset(role_ids) - previous
+        roles_gained = RolesGained(user.username, gained) if gained else None
         if set(role_ids) != previous:
             # Directory-side role change (often a downgrade): revoke the user's other live sessions
             # so stale elevated tokens don't linger until expiry (AUTH-AD-REVOKE). The new session
@@ -4671,9 +4693,10 @@ class AuthService:
                 # the account's other sessions as that sync always does. The reason is
                 # also written for a row deleted in the same window, which the guard
                 # refuses too; that row has no binding to look for.
-                return await self._refuse_directory_row(
+                refused = await self._refuse_directory_row(
                     principal.username, FEDERATED_SIGN_IN_REQUIRED, client=client
                 )
+                return replace(refused, roles_gained=roles_gained)
             await self._directory_reject_audit(
                 principal.username, "oidc", "federated_subject_unbound"
             )
@@ -4681,6 +4704,7 @@ class AuthService:
                 ok=False,
                 error="federated sign-in failed",
                 reason="federated_subject_unbound",
+                roles_gained=roles_gained,
             )
         # The password-AD and Kerberos paths must keep emitting EXACTLY {"provider","roles"}: _json is
         # json.dumps(sort_keys=True), so a null-valued key is a different stored string, not a no-op.
@@ -4728,6 +4752,7 @@ class AuthService:
             token=token,
             identity=identity,
             mfa_required=mfa_required,
+            roles_gained=roles_gained,
         )
 
     async def _sync_ad_channel_scope(
