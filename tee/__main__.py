@@ -38,7 +38,9 @@ import logging
 import os
 import re
 import ssl
+import stat
 import sys
+import tempfile
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -467,6 +469,62 @@ async def _load_captures(db: str, since: float | None) -> list[CorepointOutput]:
     ]
 
 
+def _write_owner_only(path: str, text: str) -> None:
+    """Write ``text`` to ``path`` so that, on POSIX, only its owner can read it (vault BACKLOG #2792).
+
+    A ``compare --show-diffs`` report holds field values from both engines. ``write_text`` would
+    create it at the process umask, world-readable under 022, beside a capture DB that
+    :mod:`tee.store` keeps at 0600.
+
+    The report is written to a NEW file that ``mkstemp`` creates exclusively at 0600 in the same
+    directory, flushed to disk, then renamed over ``path``. A regular file already at ``path``, or a
+    link, is replaced rather than written into, so neither its owner nor its mode carries over, and
+    a reader holding the old file open keeps the old contents. A failed write leaves no temp file.
+
+    One exception: a stream the caller named on purpose, such as ``/dev/stdout`` or a shell's
+    ``>(...)``, is written through, since replacing it would break it and nothing is created there.
+    That covers a character device, and a pipe or socket this account owns; any other non-regular
+    file falls to the replace.
+
+    Windows has no POSIX mode, and the tee imports nothing from ``messagefoundry``, so the engine's
+    ``restricted_file`` is out of reach: there the file takes its directory's access list, the
+    stance :mod:`tee.store` takes for the capture DB.
+    """
+    if _is_named_stream(path):
+        with open(path, "w", encoding="utf-8") as stream:
+            stream.write(text)
+        return
+    target = Path(path)
+    fd, temp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
+    try:
+        try:
+            handle = os.fdopen(fd, "w", encoding="utf-8")
+        except BaseException:
+            os.close(fd)  # nothing owns the descriptor yet, and Windows cannot unlink an open file
+            raise
+        with handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, target)
+    except BaseException:
+        Path(temp).unlink(missing_ok=True)
+        raise
+
+
+def _is_named_stream(path: str) -> bool:
+    """Whether ``path`` resolves to a character device, or to a pipe or socket this account owns."""
+    try:
+        status = os.stat(path)
+    except OSError:
+        return False
+    if stat.S_ISREG(status.st_mode) or stat.S_ISDIR(status.st_mode):
+        return False
+    if stat.S_ISCHR(status.st_mode):
+        return True
+    return not hasattr(os, "geteuid") or status.st_uid == os.geteuid()
+
+
 def _compare(args: argparse.Namespace) -> int:
     if args.show_diffs:
         print(
@@ -487,7 +545,11 @@ def _compare(args: argparse.Namespace) -> int:
     report = build_report(mefor, corepoint, correlate_config=config, include_diffs=args.show_diffs)
     text = json.dumps(report, indent=2)
     if args.out:
-        Path(args.out).write_text(text + "\n", encoding="utf-8")
+        try:
+            _write_owner_only(args.out, text + "\n")
+        except OSError as exc:
+            print(f"error: could not write the report to {args.out}: {exc}", file=sys.stderr)
+            return 1
         s = report["summary"]
         print(
             f"wrote parity report to {args.out}: {s['matched']} matched "
