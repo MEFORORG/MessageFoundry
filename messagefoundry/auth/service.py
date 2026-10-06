@@ -56,6 +56,7 @@ from messagefoundry.auth.notifications import (
     ACCOUNT_DISABLED,
     ACCOUNT_LOCKED,
     ADMIN_NEW_IP,
+    DIRECTORY_SESSIONS_ENDED,
     EMAIL_CHANGED,
     FEDERATED_IDENTITY_BOUND,
     FEDERATED_IDENTITY_UNBOUND,
@@ -6603,9 +6604,20 @@ class AuthService:
         # ``account_disabled`` would be a false statement in a security notice, and the login-path
         # scope re-sync this mirrors sends no notice either. The audit row and the
         # ``ad_session_revoked`` alert record it.
+        #
+        # ACCOUNT_DISABLED only when the pass READ the disabled bit (vault BACKLOG #2140). That
+        # notice says an administrator disabled the account, which an absent account or an unreadable
+        # attribute does not establish, so every other whole-account reason, including any added
+        # later, gets the neutral DIRECTORY_SESSIONS_ENDED.
+        if revocation.role_ids is not None:
+            kind = ROLES_CHANGED
+        elif revocation.reason == reconcile.REVOKE_REASONS[reconcile.ProbeOutcome.DISABLED]:
+            kind = ACCOUNT_DISABLED
+        else:
+            kind = DIRECTORY_SESSIONS_ENDED
         if user is not None and revocation.reason != reconcile.SCOPE_CHANGED:
             await self._notify_security(
-                ACCOUNT_DISABLED if revocation.role_ids is None else ROLES_CHANGED,
+                kind,
                 username=user.username,
                 email=user.notify_email,
                 detail={"reason": revocation.reason},

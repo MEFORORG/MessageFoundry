@@ -17,6 +17,7 @@ import pytest
 from messagefoundry.auth.notifications import (
     ACCOUNT_LOCKED,
     ADMIN_NEW_IP,
+    DIRECTORY_SESSIONS_ENDED,
     EMAIL_CHANGED,
     MFA_CREDENTIAL_REMOVED,
     MFA_DISABLED,
@@ -199,6 +200,22 @@ def test_a_non_last_factor_removal_renders_its_own_subject_and_body() -> None:
     assert "removed" in body.lower()
     # Says the account is still protected, and does not claim a disable.
     assert "disabled" not in body.lower()
+
+
+def test_a_directory_sessions_ended_notice_renders_its_own_text_and_claims_no_disable() -> None:
+    """vault BACKLOG #2140. Both renderers fall back silently, so a half-wired kind would mail the
+    generic wording. The directory never answered that the account is disabled or gone, so the text
+    must not say either, and an engine act cannot carry the "if this was you" closing."""
+    assert DIRECTORY_SESSIONS_ENDED in _SUBJECTS
+    body = _build_body(SecurityEvent(DIRECTORY_SESSIONS_ENDED, username="jdoe", email=None))
+    text = (_SUBJECTS[DIRECTORY_SESSIONS_ENDED] + "\n" + body).lower()
+    assert "a security event occurred on your account." not in text
+    assert "directory" in text and "sessions" in text
+    for claim in ("disabled", "deleted", "if this was you"):
+        assert claim not in text
+    assert body.endswith(
+        "If you did not expect this change, contact your MessageFoundry administrator."
+    )
 
 
 def test_body_says_a_directory_repoint_came_from_the_directory() -> None:
