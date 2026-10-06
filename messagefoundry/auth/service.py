@@ -2113,8 +2113,9 @@ class AuthService:
         #: ``"fresh"``: no pass here has held, so it resolves no hold. ``"held"``: a pass here held,
         #: so a release it then sees is its own. ``"forfeit"``: it revoked an undetermined account
         #: first, which a lost latch may have held, so it resolves no hold until it restarts.
-        #: ``"settled"``: a pass here read every signed-in account and found the hold gone, so its
-        #: records now cover what an earlier run held. Only `_advance_hold_standing` moves it.
+        #: ``"settled"``: a pass here found the hold gone with an answer from this process on record
+        #: for every signed-in account, so its records now cover what an earlier run held. Only
+        #: `_advance_hold_standing` moves it.
         self._reconcile_hold_standing: _HoldStanding = "fresh"
         #: user_ids of bound id-less rows the reconciler has already reported as skipped (BACKLOG
         #: #2027), so each is logged and audited once per process rather than once per pass.
@@ -5391,7 +5392,9 @@ class AuthService:
         store as unguarded (the engine shard guard's comment in ``__main__.py``). And a pass
         judges only accounts that hold a session, so a trip or hold whose accounts have all left
         the candidate set clears on the rest. At least these take an account out: it signs out or
-        reaches the session cap, an operator disables it locally, or its row is deleted.
+        reaches the session cap, the reconciler revokes it, an operator disables it locally, or its
+        row is deleted. The forfeit covers only one of those: a hold in a process that has not yet
+        settled, when the reconciler revokes an undetermined account.
         """
         undetermined = reconcile.ProbeOutcome.UNDETERMINED
         revoked = {r.user_id for r in plan.revocations}

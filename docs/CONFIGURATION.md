@@ -740,7 +740,7 @@ At least two cases can still resolve falsely:
   evidence, whatever else shares its store.
 - A pass judges only accounts that hold a session. A trip or hold whose accounts have all left
   resolves on the accounts that remain. An account leaves at least when it signs out, reaches the
-  session cap, is disabled locally, or is deleted.
+  session cap, is revoked by the reconciler, is disabled locally, or is deleted.
 
 ### `[ai]` — AI coding assistance policy
 Implemented (see [AI.md](AI.md)). Controls the IDE AI assistant across the **OFF→PHI-safe** range;

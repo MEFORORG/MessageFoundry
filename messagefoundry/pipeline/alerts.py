@@ -363,7 +363,8 @@ class AlertSink(Protocol):
     def ad_reconcile_hold_released(self, name: str) -> None:
         """The INVERSE of :meth:`ad_reconcile_held` (BACKLOG #2136): a pass that is evidence no
         undetermined-wave hold stands, as the auth service judges it
-        (``AuthService._mark_reconcile_clears`` states the test, which is not the breaker's). Emits **no** notification; when alert-state is wired
+        (``AuthService._mark_reconcile_clears`` states the test, which is not the breaker's).
+        Emits **no** notification; when alert-state is wired
         (ADR 0044) it auto-resolves the open ``ad_reconcile_held`` instance for the same ``name``
         (``"directory-reconciler"``). Raised as :meth:`ad_reconcile_breaker_cleared` is. No PHI.
         Emitted by the API-lifespan reconciler task, never from ``auth/``."""
