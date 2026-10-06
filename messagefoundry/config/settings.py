@@ -1175,21 +1175,33 @@ def request_host_is_browser_origin(
 def _trusted_proxy_refusal(entry: str, exc: ValueError) -> str:
     """The message for an ``[api].trusted_proxies`` entry that a strict ``ip_network`` refuses.
 
-    A host-bits CIDR such as ``10.0.0.1/24`` gets its own message naming both things the operator
-    may have meant: the network, and the single proxy address (BACKLOG #2488)."""
+    A host-bits CIDR such as ``10.0.0.1/24`` gets its own message naming the single proxy address
+    first, then the network it spans (BACKLOG #2488). The address is the host part AS WRITTEN, so
+    an IPv6 zone survives: uvicorn compares a scoped peer with its zone, and ``fe80::1`` never
+    matches ``fe80::1%eth0``. The network is named, never recommended, because every host inside a
+    trusted range may set its own source address."""
     try:
-        meant = ipaddress.ip_interface(entry)
+        network = ipaddress.ip_network(entry, strict=False)
     except ValueError:
         return (
             f"[api].trusted_proxies entry {entry!r} is not a valid IP address or CIDR network: "
             f"{exc} (uvicorn would silently treat it as a literal that never matches, "
             "collapsing every client source IP to the proxy)"
         )
+    if network.prefixlen == 0:
+        spans = (
+            f"It spans '{network}', which would trust every peer of its address family, as the "
+            "refused '*' does."
+        )
+    else:
+        spans = (
+            f"It spans the network '{network}'. Trust that range only if every host in it is a "
+            "proxy, since each one may set its own source address."
+        )
     return (
         f"[api].trusted_proxies entry {entry!r} has host bits set. uvicorn parses a CIDR strictly, "
         "so it would treat this entry as a literal that never matches, collapsing every client "
-        f"source IP to the proxy. List the proxy's own address '{meant.ip}', or write the network "
-        f"as '{meant.network}' if you mean every host in it."
+        f"source IP to the proxy. List the proxy's own address '{entry.partition('/')[0]}'. {spans}"
     )
 
 

@@ -613,31 +613,37 @@ def test_trusted_proxies_accepts_valid_addresses_and_networks(entries: list[str]
         ("10.0.0.1/24", "10.0.0.1", "10.0.0.0/24"),
         ("10.1.2.3/0", "10.1.2.3", "0.0.0.0/0"),
         ("fd00::1/64", "fd00::1", "fd00::/64"),
+        # A zone survives into the suggested address: uvicorn compares a scoped peer with its zone.
+        ("fe80::1%eth0/64", "fe80::1%eth0", "fe80::/64"),
     ],
 )
 def test_trusted_proxies_refuses_a_host_bits_cidr(entry: str, address: str, network: str) -> None:
     """BACKLOG #2488: uvicorn parses an entry holding "/" with a STRICT ``ip_network``, so a
     host-bits CIDR becomes a literal that matches no peer. The validator parsed it with
     ``strict=False`` and let it load, which would collapse every client to the proxy address on a
-    first deployment. The refusal names both things the operator may have meant.
+    first deployment. The refusal names the single address, then the network the entry spans.
 
     Mutation: put ``strict=False`` back on the validator's parse. Red: DID NOT RAISE."""
     from uvicorn.middleware.proxy_headers import _TrustedHosts
 
-    # The premise, read from uvicorn itself: the entry matches neither its own host nor any other
-    # address in its range, while the network form the message suggests does match.
-    in_range = str(ipaddress.ip_network(network)[1])
+    # The premise, read from uvicorn itself: the entry matches neither its own host nor another
+    # address in its range, while the address and the network the message names do match.
+    in_range = str(ipaddress.ip_network(network)[-2])
+    assert in_range != address  # so the second arm tests a different host than the first
     assert address not in _TrustedHosts([entry])
     assert in_range not in _TrustedHosts([entry])
+    assert address in _TrustedHosts([address])
     assert in_range in _TrustedHosts([network])
 
     with pytest.raises(ValidationError) as exc:
         ApiSettings(trusted_proxies=["10.0.0.7", entry], tls_terminated_upstream=True)
     message = str(exc.value)
     assert f"[api].trusted_proxies entry {entry!r} has host bits set" in message
-    assert f"'{address}'" in message
+    assert f"List the proxy's own address '{address}'" in message
     assert f"'{network}'" in message
-    # Its suggestion loads.
+    # A /0 is named as trusting every peer, never offered as a fix.
+    assert ("as the refused '*' does" in message) == (network.endswith("/0"))
+    # Both names load.
     ApiSettings(trusted_proxies=[network], tls_terminated_upstream=True)
     ApiSettings(trusted_proxies=[address], tls_terminated_upstream=True)
 
