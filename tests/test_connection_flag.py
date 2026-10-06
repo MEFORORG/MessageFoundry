@@ -156,9 +156,10 @@ async def test_a_listener_start_leaves_down_refuses_no_reload_toggle_or_dr_activ
     eng = await _exposed_engine(tmp_path, allow=False)
     toml_path = tmp_path / "connections.toml"
     text = toml_path.read_text(encoding="utf-8")
+    # priority = "critical" keeps the DR arm about auto_start alone: no DR threshold parks it.
+    lifecycle = f'auto_start = {str(auto_start).lower()}\npriority = "critical"\n'
     toml_path.write_text(
-        text.replace('router = "r"\n', f'router = "r"\nauto_start = {str(auto_start).lower()}\n'),
-        encoding="utf-8",
+        text.replace('router = "r"\n', f'router = "r"\n{lifecycle}'), encoding="utf-8"
     )
     try:
         eng.add_registry(load_config(tmp_path))
@@ -176,7 +177,7 @@ async def test_a_listener_start_leaves_down_refuses_no_reload_toggle_or_dr_activ
             if auto_start:
                 with pytest.raises(WiringError, match="without TLS") as refused:
                     await run()
-                assert "'IB_TOML' would be started" in str(refused.value), step
+                assert "'IB_TOML' would be bound" in str(refused.value), step
                 assert "auto_start = false" in str(refused.value), step
             else:
                 await run()

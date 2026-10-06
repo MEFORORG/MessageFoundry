@@ -2308,21 +2308,31 @@ class RegistryRunner:
             return False
         return (declared or self._priority_default).rank < threshold.rank
 
-    def _reload_binds_listener(self, ic: InboundConnection) -> bool:
-        """Whether :meth:`reload` would bind ``ic``'s listener if it ran now: the skips of its inbound
-        loop, in order, without their side effects. Deployed; auto-start, or listening now (a reload
-        keeps an operator's start); not parked by the DR run-profile; and inside its active window,
-        when it has one. :meth:`build_check` runs the inbound exposure gates only on these listeners,
-        so a reload, a dry run or a DR activation is never refused for a listener it leaves unbound
-        (vault BACKLOG #2622 item 1). ``start`` applies the first and third of these; a fresh runner
-        has nothing listening, so the second reduces to ``auto_start`` there."""
-        if not ic.deployed:
-            return False
-        if not ic.auto_start and ic.name not in self._sources:
-            return False
-        if self._below_dr_threshold(ic.priority):
-            return False
-        return ic.schedule is None or ic.schedule.is_active(self._schedule_clock())
+    def listener_bind_predicate(self) -> Callable[[InboundConnection], bool]:
+        """Which inbound listeners this runner would bind, as a predicate over a snapshot of what is
+        listening now (vault BACKLOG #2622 item 1). :meth:`build_check` and an engine's flag toggle
+        run the inbound exposure gates only where it holds, so neither refuses a config for a
+        listener the engine leaves unbound.
+
+        It holds for a listener that is deployed; that has ``auto_start``, or is listening now (a
+        reload keeps an operator's start); and that the DR run-profile does not park. These are the
+        skips of :meth:`start` and of :meth:`reload`'s inbound loop, without their side effects.
+        Reload also skips a listener outside its schedule window, but the scheduler binds that one
+        when the window opens, so it is gated here. A fresh runner has nothing listening, so this
+        is exactly :meth:`start`'s test there.
+
+        The snapshot is taken now, on the caller's thread, so the predicate is safe to call from a
+        worker thread (the flag toggle validates off the event loop)."""
+        listening = frozenset(self._sources)
+
+        def binds(ic: InboundConnection) -> bool:
+            if not ic.deployed:
+                return False
+            if not ic.auto_start and ic.name not in listening:
+                return False
+            return not self._below_dr_threshold(ic.priority)
+
+        return binds
 
     def _dr_filters_out(self, name: str, declared: Priority | None, *, kind: Direction) -> bool:
         """Whether the DR run-profile parks this connection (its resolved tier is below the threshold).
@@ -4950,9 +4960,9 @@ class RegistryRunner:
             posture=self._hop_posture,
             trust_anchor_policy=self._trust_anchor_policy,
             allow_insecure_bind=self._allow_insecure_bind,
-            # The exposure gates run on the listeners a reload would bind, read against this runner's
-            # live state. A listener the reload leaves down is refused when something starts it.
-            exposure_gated=self._reload_binds_listener,
+            # The exposure gates run on the listeners this runner would bind, read against its live
+            # state. A listener left unbound meets the same gates when something starts it.
+            exposure_gated=self.listener_bind_predicate(),
         )
         # PT-backend allow-list — folded in here (vs only at Engine.start) so EVERY reload + dry-run
         # path that build-checks the new registry also rejects a PT-on-non-SQLite graph before any
@@ -8908,9 +8918,9 @@ def build_check_registry(
 
     ``exposure_gated`` picks the inbound listeners those four gates run on. ``None`` means
     :func:`inbound_listener_starts`, the deployed-and-auto-start test engine start applies, which is
-    all an offline caller (``check``, ``connection``, a flag toggle) can know. A live runner passes
-    the test its reload applies (:meth:`RegistryRunner._reload_binds_listener`). A listener the gates
-    skip is still refused when it is started: an operator start runs the same gates."""
+    all an offline caller (``check``, ``connection``) can know. A live runner, and an engine's flag
+    toggle, pass :meth:`RegistryRunner.listener_bind_predicate`. A listener the gates skip is still
+    refused when it is started: an operator start runs the same gates."""
     # Port-conflict pre-flight (env-resolved + reserved-port aware): a listener stealing a sibling's or
     # the API's (host, port) fails the whole reload here, before quiescing, naming both ends — rather
     # than half-applying and surfacing as a bare bind OSError. PortConflictError is a WiringError → 422.
@@ -8975,7 +8985,8 @@ def _build_check_connectors(
     resolved and no connector is ever built for it.
 
     This skip IS the feature. This loop is the one place that build-checks EVERY connection with no
-    lifecycle filter at all (``auto_start`` / DR-park / simulate all dodge it by never reaching a build),
+    lifecycle filter (``auto_start`` / DR-park / simulate all dodge it by never reaching a build), the
+    four inbound exposure gates excepted (the last paragraph),
     and it is reached from ``messagefoundry check`` (the required commit/CI gate), from every live reload
     and promote, and from every ``connection upsert``/``remove`` (the GUI write path — where one
     unresolvable connection currently blocks edits to EVERY OTHER connection). Without the skip, a
@@ -9348,9 +9359,10 @@ def _build_check_exposure_tail(name: str) -> str:
     isolates the one listener and brings the rest up (ADR 0031); the build check refuses the whole
     config, so a reload, promote, connection edit or DR activation stops on this one listener."""
     return (
-        f"The build check refuses the whole config while {name!r} would be started; engine start "
-        "would isolate only that listener. To leave it unbound instead, set deployed = false or "
-        "auto_start = false on it; an operator start then meets the same refusal."
+        f"The build check refuses the whole config while {name!r} would be bound; engine start "
+        "would isolate only that listener. To leave it unbound instead, set deployed = false on it, "
+        "or set auto_start = false and stop it if it is running; a later start meets the same "
+        "refusal."
     )
 
 

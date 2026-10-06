@@ -1704,8 +1704,7 @@ def _resolve_snapshot_on_send(
     """Best-effort ``[pipeline].snapshot_on_send`` for the dry-run preview (#230 parity, ADR 0104).
 
     Resolves this instance's ``messagefoundry.toml`` exactly like :func:`_check_posture` (explicit
-    ``service_config`` > the config dir then the working directory when ``suppress_search`` > legacy
-    upward-walk; with none, the environment when ``MEFOR_AI_ENVIRONMENT`` names the instance) and returns the
+    ``service_config`` > root-anchored when ``suppress_search`` > legacy upward-walk) and returns the
     loaded flag. When no settings resolve (no toml, or one that won't parse/validate), fall back to the
     **Settings-model default (True)** — the posture of exactly the default, un-overridden engine —
     never a hardcoded ``False``, which would preview the wrong posture for the engine this gate exists
@@ -1873,25 +1872,44 @@ def _resolve_service_toml(
     config_dir: str | Path, *, service_config: str | Path | None, suppress_search: bool
 ) -> Path | None:
     """The ``messagefoundry.toml`` a check reads, by the ADR 0050 rules the other checks spell inline:
-    an explicit ``--service-config`` wins, ``--project-root`` confines the look to the config dir and
-    then the working directory, and otherwise the legacy upward walk runs. ``None`` when there is
-    none. Every settings-reading leg calls this, through :func:`_settings_source`.
-
-    The working-directory file under ``--project-root`` is the one ``serve --project-root`` reads
-    when it is given no ``--service-config``: it calls ``load_settings`` with no path, which opens
-    ``./messagefoundry.toml``. Skipping it let a settings leg report on the environment alone while
-    ``serve`` read a file, and say there was no file (vault BACKLOG #2355)."""
+    an explicit ``--service-config`` wins, ``--project-root`` confines the look to the config dir, and
+    otherwise the legacy upward walk runs. ``None`` when there is none. Every settings-reading leg
+    calls this, through :func:`_settings_source`."""
     if service_config is not None:
         return Path(service_config) if Path(service_config).is_file() else None
     if suppress_search:
-        for candidate in (
-            Path(config_dir) / "messagefoundry.toml",
-            Path.cwd() / "messagefoundry.toml",
-        ):
-            if candidate.is_file():
-                return candidate
-        return None
+        candidate = Path(config_dir) / "messagefoundry.toml"
+        return candidate if candidate.is_file() else None
     return _find_service_toml(config_dir)
+
+
+def _unread_working_dir_toml(
+    service_config: str | Path | None, suppress_search: bool
+) -> Path | None:
+    """The ``./messagefoundry.toml`` a ``--project-root`` check does not read, or ``None``.
+
+    ``serve --project-root`` with no ``--service-config`` calls ``load_settings`` with no path,
+    which opens ``./messagefoundry.toml`` in serve's own working directory. ``check`` cannot know
+    that directory, and ADR 0050 AC-6 keeps it from reading the one it runs in, which may hold
+    another instance's file. So when that file exists, the settings legs SKIP and name it rather
+    than read the environment alone and report there is no file (vault BACKLOG #2355)."""
+    if service_config is not None or not suppress_search:
+        return None
+    candidate = Path.cwd() / "messagefoundry.toml"
+    return candidate if candidate.is_file() else None
+
+
+def _no_settings_detail(service_config: str | Path | None, suppress_search: bool) -> str:
+    """A settings leg's SKIP text when :func:`_settings_source` found nothing to read. It names an
+    unread working-directory file, so the line never says there is no file when one is there."""
+    unread = _unread_working_dir_toml(service_config, suppress_search)
+    if unread is None:
+        return "no messagefoundry.toml"
+    return (
+        f"no messagefoundry.toml under --project-root; {unread} in the working directory is not "
+        "read, though serve --project-root reads it when started there; name the file serve reads "
+        "with --service-config"
+    )
 
 
 #: Appended to a settings leg's line when no file was read (vault BACKLOG #2355), so a verdict about
@@ -1921,6 +1939,9 @@ def _settings_source(
     environment. ``serve`` refuses that file outright, so reading defaults plus the environment in its
     place would pass a config ``serve`` will not start. It keeps the SKIP it always had.
 
+    Under ``--project-root``, a ``./messagefoundry.toml`` in the working directory also keeps the
+    SKIP, named in its text (:func:`_unread_working_dir_toml`).
+
     ``(None, False)`` is the SKIP the legs have always given a bare dir."""
     from messagefoundry.config.settings import environment_named_by_env
 
@@ -1929,6 +1950,10 @@ def _settings_source(
     )
     if toml is not None or service_config is not None:
         return toml, False
+    if _unread_working_dir_toml(service_config, suppress_search) is not None:
+        # serve started here would read that file as well as the environment, so an
+        # environment-only verdict would grade settings serve does not run with. SKIP and name it.
+        return None, False
     return None, environment_named_by_env() is not None
 
 
@@ -1936,9 +1961,10 @@ def _load_check_settings(
     toml: Path | None, *, cli: Mapping[str, Mapping[str, Any]] | None = None
 ) -> ServiceSettings:
     """Load the settings :func:`_settings_source` resolved: the file when there is one, otherwise the
-    environment alone. The env-only load reads NO file. :func:`_resolve_service_toml` already looks
-    in the working directory on every path, so reaching it means ``./messagefoundry.toml`` was not
-    there; ``default_file=False`` keeps the read to what that resolution found."""
+    environment alone. The env-only load reads NO file, not even ``./messagefoundry.toml``, which
+    ``load_settings`` would otherwise pick up from the gate's working directory. Under
+    ``--project-root``, :func:`_settings_source` does not choose this load when that file exists;
+    it SKIPs and names the file instead."""
     from messagefoundry.config.settings import load_settings
 
     if toml is not None:
@@ -1999,9 +2025,8 @@ def _check_posture(
     closed at runtime (``settings.ai.require_posture()``). Mirror that fail-closed check here.
 
     Service-toml resolution (ADR 0050 AC-6): an explicit ``service_config`` is used as-is; otherwise,
-    when ``suppress_search`` is set (``--project-root`` was given) the upward-walk is skipped and the
-    config dir, then the working directory ``serve`` reads, are tried (:func:`_resolve_service_toml`) —
-    so ``check`` matches ``serve`` only when the flags are given. With neither, the legacy
+    when ``suppress_search`` is set (``--project-root`` was given) the upward-walk is skipped — so
+    ``check`` matches ``serve`` only when the flags are given. With neither, the legacy
     ``_find_service_toml`` upward-walk runs, unchanged.
 
     Best-effort: no ``messagefoundry.toml`` → SKIP (this gate also runs against a bare config dir),
@@ -2016,7 +2041,11 @@ def _check_posture(
     )
     if toml is None and not env_only:
         return CheckResult(
-            "posture", ok=True, required=True, skipped=True, detail="no messagefoundry.toml"
+            "posture",
+            ok=True,
+            required=True,
+            skipped=True,
+            detail=_no_settings_detail(service_config, suppress_search),
         )
     try:
         settings = _load_check_settings(toml)
@@ -2098,7 +2127,11 @@ def _check_build(
         # on, so skip (byte-identical to before this check). An instance declared through
         # MEFOR_AI_ENVIRONMENT with no file is read from the environment instead (vault BACKLOG #2355).
         return CheckResult(
-            "build-check", ok=True, required=True, skipped=True, detail="no messagefoundry.toml"
+            "build-check",
+            ok=True,
+            required=True,
+            skipped=True,
+            detail=_no_settings_detail(service_config, suppress_search),
         )
     # --project-root anchors the env VALUES, applied exactly as `serve` applies it (__main__.py, the
     # `cli["environments"]["base_dir"] = args.project_root` line): as a [environments].base_dir CLI
@@ -2237,7 +2270,11 @@ def _check_alert_smtp_tls(
     )
     if toml is None and not env_only:
         return CheckResult(
-            "alert-smtp-tls", ok=True, required=False, skipped=True, detail="no messagefoundry.toml"
+            "alert-smtp-tls",
+            ok=True,
+            required=False,
+            skipped=True,
+            detail=_no_settings_detail(service_config, suppress_search),
         )
     try:
         settings = _load_check_settings(toml)
@@ -2900,7 +2937,10 @@ def _check_static_credentials(
     settings: ServiceSettings | None = None
     scope = "graph and service settings"
     if toml is None and not env_only:
-        scope = "graph only: no messagefoundry.toml, so the service-settings hops were not read"
+        scope = (
+            f"graph only: {_no_settings_detail(service_config, suppress_search)}, so the "
+            "service-settings hops were not read"
+        )
     else:
         try:
             settings = _load_check_settings(toml)
@@ -3030,7 +3070,7 @@ def _check_oidc_auth_params(
             ok=True,
             required=False,
             skipped=True,
-            detail="no messagefoundry.toml",
+            detail=_no_settings_detail(service_config, suppress_search),
         )
     try:
         settings = _load_check_settings(toml)
@@ -3210,7 +3250,7 @@ def _check_upstream_hop_ack(
             ok=True,
             required=True,
             skipped=True,
-            detail="no messagefoundry.toml",
+            detail=_no_settings_detail(service_config, suppress_search),
         )
     try:
         settings = _load_check_settings(toml)
@@ -3292,7 +3332,7 @@ def _check_reference_backend(
             ok=True,
             required=True,
             skipped=True,
-            detail="no messagefoundry.toml",
+            detail=_no_settings_detail(service_config, suppress_search),
         )
     try:
         settings = _load_check_settings(toml)

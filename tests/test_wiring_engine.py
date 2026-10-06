@@ -518,7 +518,7 @@ async def test_build_check_refuses_what_start_refuses(store: MessageStore) -> No
         )
     # The build check adds why the whole config stops on it, and the two settings that leave it down.
     assert str(at_check.value).startswith(str(at_start.value))
-    assert "'mllp_in' would be started" in str(at_check.value)
+    assert "'mllp_in' would be bound" in str(at_check.value)
     assert "deployed = false" in str(at_check.value) and "auto_start = false" in str(at_check.value)
     # The bind host is what makes it exposed: on loopback the same graph builds clean.
     build_check_registry(
@@ -615,12 +615,13 @@ async def test_reload_build_check_gates_an_operator_started_listener(store: Mess
         runner._sources.pop("mllp_in")
 
 
-async def test_reload_build_check_skips_a_dr_parked_or_schedule_closed_listener(
+async def test_runner_build_check_skips_a_dr_parked_listener_but_gates_a_scheduled_one(
     store: MessageStore,
 ) -> None:
-    # A reload leaves a listener the DR run-profile parks, or one outside its schedule window,
-    # unbound. Refusing a DR activation for a feed the profile is about to park would block the
-    # failover on a listener that never opens.
+    # Start and reload both leave a listener the DR run-profile parks unbound, so the runner's build
+    # check skips it. A listener outside its schedule window is different: the engine's scheduler
+    # binds it when the window opens, with no operator involved, so it is gated whatever the clock
+    # says. Otherwise a reload at noon would pass what the same reload at 08:30 refuses.
     from datetime import UTC, datetime, time
 
     from messagefoundry.config.models import ActiveWindow, Priority, Schedule
@@ -634,11 +635,9 @@ async def test_reload_build_check_skips_a_dr_parked_or_schedule_closed_listener(
         windows=[ActiveWindow(days=frozenset({0}), start=time(8), end=time(9), timezone="UTC")]
     )
     scheduled = _off_loopback_plaintext_mllp(schedule=window)
-    monday_noon = datetime(2026, 7, 13, 12, tzinfo=UTC)  # a Monday, outside 08:00-09:00
-    _strict_runner(scheduled, store, schedule_clock=lambda: monday_noon).build_check(scheduled)
-    monday_open = datetime(2026, 7, 13, 8, 30, tzinfo=UTC)
-    with pytest.raises(WiringError, match="without TLS"):  # control: inside the window
-        _strict_runner(scheduled, store, schedule_clock=lambda: monday_open).build_check(scheduled)
+    for now in (datetime(2026, 7, 13, 12, tzinfo=UTC), datetime(2026, 7, 13, 8, 30, tzinfo=UTC)):
+        with pytest.raises(WiringError, match="without TLS"):  # outside, then inside, the window
+            _strict_runner(scheduled, store, schedule_clock=lambda t=now: t).build_check(scheduled)
 
 
 async def test_pipeline_handler_exception_logs_no_phi(store: MessageStore, tmp_path: Path) -> None:

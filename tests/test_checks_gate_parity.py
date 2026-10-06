@@ -580,12 +580,17 @@ def _bare_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str = _M
     cfg = tmp_path / "config"
     cfg.mkdir()
     (cfg / "c.py").write_text(body, encoding="utf-8")
+    # A --project-root check names a messagefoundry.toml in the working directory, so run from an
+    # empty one: a developer's own file at the repository root must not change these results.
+    empty = tmp_path / "cwd"
+    empty.mkdir()
+    monkeypatch.chdir(empty)
     return cfg
 
 
 def _leg(cfg: Path, name: str) -> CheckResult:
-    # suppress_service_toml_search confines the look to cfg and the working directory, so no file
-    # above tmp_path can stand in for the environment. A test that wants no file must not chdir to one.
+    # suppress_service_toml_search confines the look to cfg, so no file anywhere above tmp_path can
+    # stand in for the environment. _bare_config runs from an empty working directory.
     report = run_checks(cfg, run_lint=False, suppress_service_toml_search=True)
     return next(r for r in report.results if r.name == name)
 
@@ -757,31 +762,31 @@ def test_reference_backend_reads_an_environment_only_backend(
 
 
 @pytest.mark.parametrize("declared", [True, False], ids=["env-declared", "no-env-name"])
-def test_project_root_reads_the_working_directory_file_serve_reads(
+def test_project_root_names_an_unread_working_directory_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, declared: bool
 ) -> None:
-    # Review round 3. `serve --project-root` with no --service-config calls load_settings with no
-    # path, which opens ./messagefoundry.toml. check under --project-root looked only in the config
-    # dir, so with MEFOR_AI_ENVIRONMENT set it read the environment alone and printed an OK line
-    # saying there was no file. It now reads the file serve reads. This one declares a terminator
-    # with no acknowledgement, which the leg refuses only if it reads the file.
-    from messagefoundry.config.settings import load_settings
-
+    # Review round 3. `serve --project-root` with no --service-config reads ./messagefoundry.toml
+    # in its own working directory. check under --project-root does not read the one in its working
+    # directory (ADR 0050 AC-6: it may be another instance's), so with MEFOR_AI_ENVIRONMENT set it
+    # read the environment alone and printed an OK line saying there was no file. It now SKIPs and
+    # names the file. This one declares a terminator with no acknowledgement, which the leg would
+    # refuse if it read it, so a SKIP also shows the file was not read.
     cfg = _bare_config(tmp_path, monkeypatch)
     here = tmp_path / "here"
     here.mkdir()
-    (here / "messagefoundry.toml").write_text(
+    stray = here / "messagefoundry.toml"
+    stray.write_text(
         '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.1"]\n', encoding="utf-8"
     )
     monkeypatch.chdir(here)
     if declared:
         monkeypatch.setenv("MEFOR_AI_ENVIRONMENT", "dev")
-    # serve's own resolution reads it, so the leg must too.
-    assert load_settings().api.tls_terminated_upstream is True
-    result = _leg(cfg, "upstream-hop-ack")
-    assert result.required and not result.ok and not result.skipped, result.detail
-    assert _ENV_ONLY_NOTE not in result.detail
-    assert "no messagefoundry.toml" not in result.detail
+    for name in _SETTINGS_LEGS:
+        result = _leg(cfg, name)
+        assert _ENV_ONLY_NOTE not in result.detail, f"{name}: {result.detail}"
+        assert str(stray) in result.detail and "--service-config" in result.detail, result.detail
+        if name != "static-credentials":  # reads the graph half either way
+            assert result.skipped and result.ok, f"{name}: {result.detail}"
 
 
 # BACKLOG #1967: this file's serve fixtures test other gates, so they bound the two warn-only

@@ -2680,11 +2680,13 @@ BACKLOG #2622 item 1).** The MLLP, DICOM, raw TCP and HTTP listener exposure gat
 listener start, a refusal isolates that one listener and the rest of the graph comes up (ADR 0031).
 At build check, the same refusal fails the whole config. That covers `messagefoundry check`, a
 reload or dry-run reload, promote, a connection edit, a connection-flag toggle and a DR activation.
-The build check runs the gates only on a listener that would be bound: deployed and `auto_start`.
-On a running engine it also skips one the DR run-profile parks or its schedule window keeps closed,
-and it gates one an operator started. So `deployed = false` or `auto_start = false` lets those
-paths through while the listener stays unbound, and an operator start of it meets the same refusal.
-The refusal text names the listener and both settings.
+The build check runs the gates only on a listener the engine would bind: deployed and `auto_start`.
+On a running engine it also skips one the DR run-profile parks, and it gates one an operator
+started. It gates a listener outside its schedule window, because the scheduler binds it when the
+window opens. So `deployed = false`, or `auto_start = false` with the listener stopped, lets those
+paths through while the listener stays unbound. A later start of it meets the same refusal. The
+refusal text names the listener and both settings. The HTTP intake-authentication start gate (ADR
+0154 D7) is not filtered this way: it still runs at build check on every deployed HTTP listener.
 
 The per-connection `source_ip_allowlist` is enforced on **five** listener types, all at **accept**: the four
 stream listeners (MLLP, TCP, X12, HTTP) and the DICOM C-STORE SCP. The SCP closes a non-allowlisted
