@@ -12,12 +12,15 @@ saying so sent them to set a variable that does nothing on a default instance.
 an ``out.append((...))``. A call names the escape when anything in its arguments or keyword
 arguments spells the variable in a string, or refers to ``INSECURE_TLS_ESCAPE_ENV`` by name or as
 an attribute; that covers f-strings, ``%`` and ``+`` formatting, ``.format``, and a ``%s`` logging
-argument. Its text is every string in those arguments that holds a space, so a bare key such as
-the ``""`` default of ``os.environ.get`` is not a message. That text must name the posture.
+argument. A nested call other than ``.format`` keeps its strings to itself, so it cannot lend the
+posture to the call around it. The text is every string in those arguments that holds a space or
+spells the variable, so a bare key such as the ``""`` default of ``os.environ.get`` is not a
+message. That text must name the posture.
 
 **What it does not see**, at least: docstrings and comments, which are not calls; a message built
-in a variable before the call; and the variable imported under another name. A green run is a
-statement about the shapes above, not about every text in the package.
+in a variable before the call; the variable imported under another name; and a message with no
+space that only interpolates the variable, such as ``f"{INSECURE_TLS_ESCAPE_ENV}=1:refused"``. A
+green run is a statement about the shapes above, not about every text in the packages.
 
 **The positive controls are planted and pinned.** The scanner is proved on two planted sources,
 one that must be flagged and one that must pass. The tree walk is proved by pinning the files it
@@ -30,7 +33,10 @@ from pathlib import Path
 
 from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV
 
-_PACKAGE = Path(__file__).resolve().parent.parent / "messagefoundry"
+_REPO = Path(__file__).resolve().parent.parent
+#: Every shipped Python package ci.yml type-checks. The engine is ``messagefoundry``; the others
+#: name no escape today, and are walked so a text added there is judged too.
+_PACKAGES = ("messagefoundry", "messagefoundry_webconsole", "messagefoundry_toolkit")
 _NAME = "INSECURE_TLS_ESCAPE_ENV"
 _POSTURE = "[security].enforcement = warn"
 
@@ -38,16 +44,17 @@ _POSTURE = "[security].enforcement = warn"
 #: fails here instead of passing vacuously.
 _MUST_FIND = frozenset(
     {
-        "auth/ldap.py",
-        "pipeline/alert_sinks.py",
-        "store/postgres.py",
-        "store/sqlserver.py",
-        "transports/ai_broker.py",
-        "transports/database.py",
-        "transports/direct.py",
-        "transports/email.py",
-        "transports/mllp.py",
-        "transports/remotefile.py",
+        "messagefoundry/auth/ldap.py",
+        "messagefoundry/config/settings.py",
+        "messagefoundry/pipeline/alert_sinks.py",
+        "messagefoundry/store/postgres.py",
+        "messagefoundry/store/sqlserver.py",
+        "messagefoundry/transports/ai_broker.py",
+        "messagefoundry/transports/database.py",
+        "messagefoundry/transports/direct.py",
+        "messagefoundry/transports/email.py",
+        "messagefoundry/transports/mllp.py",
+        "messagefoundry/transports/remotefile.py",
     }
 )
 
@@ -64,6 +71,24 @@ def _names_the_escape(node: ast.AST) -> bool:
     )
 
 
+def _own_nodes(operand: ast.AST) -> list[ast.AST]:
+    """``operand`` and what it holds, stopping at a nested call so that call's strings stay its
+    own. A ``"...".format(...)`` call is the exception: its receiver and arguments are this text."""
+    out: list[ast.AST] = []
+    todo = [operand]
+    while todo:
+        node = todo.pop()
+        out.append(node)
+        if isinstance(node, ast.Call):
+            if not (isinstance(node.func, ast.Attribute) and node.func.attr == "format"):
+                continue
+            todo.append(node.func.value)
+            todo.extend([*node.args, *(kw.value for kw in node.keywords)])
+            continue
+        todo.extend(ast.iter_child_nodes(node))
+    return out
+
+
 def escape_texts_without_posture(source: str) -> tuple[list[int], int]:
     """Line numbers of calls whose text names the escape but not the posture, and how many calls
     named the escape at all."""
@@ -73,18 +98,18 @@ def escape_texts_without_posture(source: str) -> tuple[list[int], int]:
         if not isinstance(call, ast.Call):
             continue
         operands = [*call.args, *(kw.value for kw in call.keywords)]
-        nodes = [node for operand in operands for node in ast.walk(operand)]
+        nodes = [node for operand in operands for node in _own_nodes(operand)]
         if not any(_names_the_escape(node) for node in nodes):
             continue
-        texts = [
-            node.value
-            for node in nodes
-            if isinstance(node, ast.Constant) and isinstance(node.value, str) and " " in node.value
+        strings = [
+            n.value for n in nodes if isinstance(n, ast.Constant) and isinstance(n.value, str)
         ]
+        # A spaced string is a message. So is any string that spells the variable, spaced or not.
+        texts = [s for s in strings if " " in s or INSECURE_TLS_ESCAPE_ENV in s]
         if not texts:
             continue
         seen += 1
-        if _POSTURE not in "".join(texts):
+        if _POSTURE not in " ".join(texts):
             unposted.append(call.lineno)
     return unposted, seen
 
@@ -100,10 +125,12 @@ def test_the_scanner_flags_a_text_that_omits_the_posture() -> None:
         "    raise ValueError('set %s=1 to allow it' % settings.INSECURE_TLS_ESCAPE_ENV)\n"
         "    raise HTTPException(detail='set {}=1 to allow it'.format(INSECURE_TLS_ESCAPE_ENV))\n"
         "    out.append(('escape', 'MEFOR_ALLOW_INSECURE_TLS is honoured'))\n"
+        "    log.warning('set by %s', INSECURE_TLS_ESCAPE_ENV, d('[security].enforcement = warn'))\n"
+        "    raise ValueError('MEFOR_ALLOW_INSECURE_TLS=1:refused')\n"
     )
     unposted, seen = escape_texts_without_posture(planted)
-    assert seen == 6
-    assert unposted == [2, 5, 6, 7, 8, 9]
+    assert seen == 8
+    assert unposted == [2, 5, 6, 7, 8, 9, 10, 11]
 
 
 def test_the_scanner_passes_a_text_that_names_the_posture() -> None:
@@ -127,11 +154,13 @@ def test_the_scanner_passes_a_text_that_names_the_posture() -> None:
 def test_every_runtime_text_naming_the_escape_names_the_posture() -> None:
     failures: list[str] = []
     found: set[str] = set()
-    for path in sorted(_PACKAGE.rglob("*.py")):
+    roots = [_REPO / name for name in _PACKAGES]
+    assert all(root.is_dir() for root in roots), roots
+    for path in sorted(p for root in roots for p in root.rglob("*.py")):
         source = path.read_text(encoding="utf-8")
         if _NAME not in source and INSECURE_TLS_ESCAPE_ENV not in source:
             continue
-        rel = path.relative_to(_PACKAGE).as_posix()
+        rel = path.relative_to(_REPO).as_posix()
         unposted, seen = escape_texts_without_posture(source)
         if seen:
             found.add(rel)

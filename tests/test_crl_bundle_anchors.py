@@ -289,7 +289,7 @@ def _dicom_listener(pki: _Pki, crl_file: Path) -> ssl.SSLContext:
 
 _LISTENERS = [
     pytest.param(_api_listener, id="api-tls_client_crl_file"),
-    pytest.param(_mllp_listener, id="mllp-and-http-listener-tls_crl_file"),
+    pytest.param(_mllp_listener, id="mllp-builder-tls_crl_file"),
     pytest.param(_dicom_listener, id="dicom-scp-tls_crl_file"),
 ]
 
