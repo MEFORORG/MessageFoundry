@@ -704,7 +704,8 @@ class CurrentPasswordCheck(Enum):
     SESSION_ENDED = "session_ended"
     #: BACKLOG #2009 (ASVS 6.4.1): the account holds an admin-issued temporary credential whose
     #: deadline has passed. The sign-in gate refuses it past that instant; this refuses the rotation
-    #: a session opened before the instant would otherwise still perform with it.
+    #: a session opened before the instant would otherwise still perform with it. The session is
+    #: ended with the answer (BACKLOG #2298), so the caller's token no longer authenticates.
     EXPIRED = "expired"
 
 
@@ -6320,7 +6321,8 @@ class AuthService:
         while a change refused by policy after a good proof would otherwise re-flag on every retry.
 
         ``EXPIRED`` answers a lapsed temporary credential (BACKLOG #2009), both before the verify
-        and again after a good one; see :meth:`_temporary_credential_lapsed`."""
+        and again after a good one, and ends the session (BACKLOG #2298); see
+        :meth:`_temporary_credential_lapsed`."""
         if token is None:
             # No session to charge a failure to, so no budget: refuse without verifying. Held apart
             # from a revocation in the audit row, because nothing was revoked.
@@ -6331,14 +6333,16 @@ class AuthService:
                 client=client,
             )
             return CurrentPasswordCheck.SESSION_ENDED
-        if await self._temporary_credential_lapsed(identity, client=client, password_checked=False):
+        if await self._temporary_credential_lapsed(
+            identity, token=token, client=client, password_checked=False
+        ):
             return CurrentPasswordCheck.EXPIRED
         proof = await self._reproof(identity, password, directory=False, token=token, clear=False)
         if proof.ok:
             # Asked again after the verify: a request that passed the first check can wait in the
             # per-account re-proof queue, and the deadline can pass while it waits.
             if await self._temporary_credential_lapsed(
-                identity, client=client, password_checked=True
+                identity, token=token, client=client, password_checked=True
             ):
                 return CurrentPasswordCheck.EXPIRED
             return CurrentPasswordCheck.OK
@@ -6356,7 +6360,7 @@ class AuthService:
         return CurrentPasswordCheck.WRONG
 
     async def _temporary_credential_lapsed(
-        self, identity: Identity, *, client: str | None, password_checked: bool
+        self, identity: Identity, *, token: str, client: str | None, password_checked: bool
     ) -> bool:
         """Whether ``identity`` holds an admin-issued temporary credential past its deadline.
 
@@ -6374,29 +6378,25 @@ class AuthService:
         The caller asks again after a good verify, because the deadline can pass while the request
         waits for the per-account re-proof lock. That second ask is reached only by a correct
         password, so a wrong guess that races the deadline this way is charged as ``WRONG``. The
-        window is the lock wait, and the credential cannot sign in after the deadline either way. ``password_checked`` records which ask refused. At
-        sign-in this audit action always means the right password was presented; here it may not,
-        so the row says which."""
+        window is the lock wait, and the credential cannot sign in after the deadline either way.
+        ``password_checked`` records which ask refused. At sign-in this audit action always means
+        the right password was presented; here it may not, so the row says which.
+
+        A refusal also ends the caller's session (``token``), as :meth:`identity_for_token` ends one
+        presented after the deadline (BACKLOG #2298). So a retry is refused at the gate and writes
+        no second row."""
         if not identity.must_change_password:
             return False
         user = await self._store.get_user(identity.user_id)
-        if user is None or not user.must_change_password:
+        if user is None or not self._credential_lapsed(user, time.time()):
             return False
-        deadline = self.initial_credential_deadline(user.password_changed_at)
-        if deadline is None or time.time() <= deadline:
-            return False
-        await self._audit(
-            "auth.temp_password_expired",
-            actor=identity.username,
-            detail=_json(
-                {
-                    "provider": "local",
-                    "expiry_hours": self._settings.initial_password_expiry_hours,
-                    "at": "password_change",
-                    "password_checked": password_checked,
-                }
-            ),
+        await self._end_lapsed_session(
+            hash_token(token),
+            identity.username,
+            at="password_change",
             client=client,
+            proof="password",
+            proof_checked=password_checked,
         )
         return True
 

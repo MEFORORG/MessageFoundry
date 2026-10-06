@@ -20,7 +20,7 @@ from messagefoundry.api.security import deadline_utc
 from messagefoundry.auth import Role, totp
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.ldap import AdPrincipal
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import AuthService, CurrentPasswordCheck
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.config.settings import AiSettings, AuthSettings, EgressSettings, StoreSettings
@@ -2640,10 +2640,58 @@ async def test_the_deadline_is_asked_again_after_the_password_is_verified(
         )
         assert lapsed.status_code == 403, lapsed.text
         assert "temporary password has expired" in lapsed.json()["detail"]
+        # BACKLOG #2298: the refusal ended the session, so a retry is refused at the gate and
+        # writes no second row.
+        retry = await c.post(
+            "/me/password",
+            headers=_auth(token),
+            json={"current_password": PW, "new_password": PW + "-rotated"},
+        )
+        assert retry.status_code == 401
     user = await engine.store.get_user(kit_id)
     assert user is not None and user.must_change_password is True
     rows = [dict(r) for r in await engine.store.list_audit(action="auth.temp_password_expired")]
     assert len(rows) == 1 and '"password_checked": true' in rows[0]["detail"]
+    session = await engine.store.get_session(hash_token(token))
+    assert session is not None and session.revoked_at is not None
+
+
+async def test_the_rotation_asks_the_deadline_before_the_password_and_ends_the_session(
+    engine: Engine,
+) -> None:
+    """RED when: the rotation's first ask moves after the verify, or stops ending the session.
+
+    Called on the service directly, as a request does that passed its gate before the deadline. A
+    wrong guess that could not succeed anyway costs the account nothing (BACKLOG #2009), and the
+    session is ended with the answer (BACKLOG #2298)."""
+    service = await _service(engine, _expiring_service_settings())
+    lu_id = await create_local_user_chosen(
+        service,
+        username="lu",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=["viewer"],
+        actor="t",
+    )
+    await _move_deadline_to(engine, lu_id, time.time() + 30)
+    outcome = await service.login("lu", PW)
+    assert outcome.ok and outcome.token is not None
+    identity = await service.identity_for_token(outcome.token)
+    assert identity is not None
+    await _move_deadline_to(engine, lu_id, time.time() - 1)
+    check = await service.verify_current_password(
+        identity, "not-the-password-at-all", token=outcome.token
+    )
+    assert check is CurrentPasswordCheck.EXPIRED
+    user = await engine.store.get_user(lu_id)
+    assert user is not None and user.failed_attempts == 0
+    assert await engine.store.list_audit(action="auth.password_change_failed") == []
+    session = await engine.store.get_session(hash_token(outcome.token))
+    assert session is not None and session.revoked_at is not None
+    rows = [dict(r) for r in await engine.store.list_audit(action="auth.temp_password_expired")]
+    assert len(rows) == 1 and '"password_checked": false' in rows[0]["detail"]
+    assert '"at": "password_change"' in rows[0]["detail"]
 
 
 async def test_a_session_rotates_the_temporary_credential_before_its_deadline(
