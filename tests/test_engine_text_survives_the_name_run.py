@@ -438,11 +438,9 @@ def test_the_isoformat_scan_fires_on_its_control() -> None:
 @pytest.mark.parametrize("path", _SOURCES, ids=lambda p: p.relative_to(_ENGINE).as_posix())
 def test_engine_text_renders_no_isoformat(path: Path) -> None:
     name = path.relative_to(_ENGINE).as_posix()
-    hits = [
-        hit
-        for hit in _isoformat_calls(path.read_text(encoding="utf-8"))
-        if (name, hit[1]) not in _DATE_ONLY
-    ]
+    source = path.read_text(encoding="utf-8")
+    assert source, f"{name} read empty, so the scan below would see nothing"
+    hits = [hit for hit in _isoformat_calls(source) if (name, hit[1]) not in _DATE_ONLY]
     assert not hits, (
         f"{path.name}: {hits} -- the PHI redaction reads an ISO date-time as a possible date of "
         "birth (vault BACKLOG #2784), so a time rendered this way into a log line or an error "
@@ -500,6 +498,8 @@ def test_the_tables_the_scan_cannot_see_survive_redaction() -> None:
         for right in privilege.SQLSERVER_AUDIT_WRITE_PRIVILEGES
         + privilege.POSTGRES_AUDIT_WRITE_PRIVILEGES
     ]
+    # The tables are non-empty by construction; an empty walk would pass the absence check below.
+    assert len(texts) >= 10, texts
     eaten = {text: redaction.redact(text) for text in texts if redaction.redact(text) != text}
     assert not eaten, eaten
 
