@@ -875,27 +875,52 @@ async def _run_command(command: str) -> bool:
     try:
         job = proctree.resume_into_job(proc.pid, who="DR hook")
         await proc.wait()
+    except GeneratorExit:
+        _kill_hook(proc, job)  # a closing coroutine may not await, so no reap
+        raise
     except BaseException:
-        await _stop_hook(proc, job)
+        _kill_hook(proc, job)
+        await _reap_hook(proc)
         raise
     if job is not None:
         proctree.release_job(job)
     return proc.returncode == 0
 
 
-#: How long a killed hook gets to be reaped before the abort carries on without it.
+#: How long a killed hook gets to be reaped before the abort carries on without it. This adds to
+#: ``[dr].takeover_timeout_seconds`` in the worst case, and docs/CONFIGURATION.md says so.
 _HOOK_REAP_SECONDS = 5.0
 
 
-async def _stop_hook(proc: asyncio.subprocess.Process, job: int | None) -> None:
-    """Kill the hook's shell and everything it started, then reap the shell, bounded."""
+def _kill_hook(proc: asyncio.subprocess.Process, job: int | None) -> None:
+    """Kill the hook's shell and what it started.
+
+    Windows ends the job. POSIX signals the group the shell was started to lead. That group outlives
+    the shell, so it is signalled even when the shell has already exited: its children may not have.
+    POSIX does not reuse a group's id while the group has members, so the signal cannot reach an
+    unrelated group then. Once the group is empty its id can be reused, which is the same narrow
+    risk any kill by process id carries. The single-process kill is the fallback for a job that
+    could not be set up."""
     if job is not None:
         proctree.terminate_job(job)
-    elif proc.returncode is None and not proctree.kill_process_group(proc.pid):
+        return
+    if proctree.kill_process_group(proc.pid, started_as_leader=proctree.ADOPT_NEW_SESSION):
+        return
+    if proc.returncode is None:
         with contextlib.suppress(ProcessLookupError):
             proc.kill()
-    with contextlib.suppress(TimeoutError):
+
+
+async def _reap_hook(proc: asyncio.subprocess.Process) -> None:
+    """Wait for the killed shell to exit, bounded, and say so when it has not."""
+    try:
         await asyncio.wait_for(proc.wait(), _HOOK_REAP_SECONDS)
+    except TimeoutError:
+        log.warning(
+            "DR hook (pid %d) was killed but had not exited %gs later; it may still be running",
+            proc.pid,
+            _HOOK_REAP_SECONDS,
+        )
 
 
 def _kill_late_start(spawn: asyncio.Future[asyncio.subprocess.Process]) -> None:
@@ -903,10 +928,7 @@ def _kill_late_start(spawn: asyncio.Future[asyncio.subprocess.Process]) -> None:
     suspended, so it has started nothing and killing the one process is enough."""
     if spawn.cancelled() or spawn.exception() is not None:
         return
-    proc = spawn.result()
-    if not proctree.kill_process_group(proc.pid):
-        with contextlib.suppress(ProcessLookupError):
-            proc.kill()
+    _kill_hook(spawn.result(), None)
 
 
 def _confined_archive(archive: str, seed_dir: str) -> Path | None:

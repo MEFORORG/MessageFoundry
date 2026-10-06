@@ -152,20 +152,25 @@ async def test_vip_hook_timeout_aborts(tmp_path: Path) -> None:
 
 
 def _tree_hook(where: Path, delay: float) -> str:
-    """A hook that starts a child of its own, records that both are running, and then has each
-    write a marker after ``delay`` seconds. A marker on disk means that process outlived the
-    point where the hook was stopped. The hook is shell -> python -> python, so it is a tree on
-    every shell: cmd.exe on Windows, /bin/sh elsewhere."""
+    """A hook that starts a child of its own and writes ``started`` once both are running. Each
+    then writes a marker ``delay`` seconds after its own start, so both markers are due by
+    ``started`` + ``delay``. A marker on disk means that process outlived the point where the hook
+    was stopped. The hook is shell -> python -> python, so it is a tree on every shell: cmd.exe on
+    Windows, /bin/sh elsewhere."""
     script = where / "hook_tree.py"
     script.write_text(
         "import pathlib, subprocess, sys, time\n"
         "here, delay = pathlib.Path(sys.argv[1]), float(sys.argv[2])\n"
-        "code = 'import pathlib, sys, time; time.sleep(float(sys.argv[2]));"
-        ' pathlib.Path(sys.argv[1]).write_text("x")\'\n'
-        "child = subprocess.Popen(\n"
-        "    [sys.executable, '-c', code, str(here / 'grandchild-survived'), str(delay)]\n"
+        "code = (\n"
+        "    'import pathlib, sys, time; here = pathlib.Path(sys.argv[1]);'\n"
+        '    \' (here / "grandchild-started").write_text("x");\'\n'
+        '    \' time.sleep(float(sys.argv[2])); (here / "grandchild-survived").write_text("x")\'\n'
         ")\n"
-        "(here / 'started').write_text(str(child.pid))\n"
+        "subprocess.Popen([sys.executable, '-c', code, str(here), str(delay)])\n"
+        "deadline = time.monotonic() + 60\n"
+        "while not (here / 'grandchild-started').exists() and time.monotonic() < deadline:\n"
+        "    time.sleep(0.02)\n"
+        "(here / 'started').write_text('x')\n"
         "time.sleep(delay)\n"
         "(here / 'child-survived').write_text('x')\n",
         encoding="utf-8",
@@ -207,8 +212,10 @@ async def test_a_stopped_hook_leaves_no_process_behind(tmp_path: Path) -> None:
 async def test_a_timed_out_hook_aborts_and_leaves_no_process_behind(tmp_path: Path) -> None:
     """The same, through ``activate``: the timeout records the abort, and the hook is dead by then.
 
-    The 3.0s budget is the one :func:`test_vip_hook_timeout_aborts` explains. The hook's tree
-    writes its markers 4.0s after it starts, so it is still running when the budget runs out."""
+    The budget is above the 3.0s :func:`test_vip_hook_timeout_aborts` explains, because two
+    interpreters must start inside it for the control below to hold. The hook's tree writes its
+    markers 5.0s after it starts, so it is still running when the 4.0s budget runs out. A slow
+    start fails the control; it cannot pass the test with a live tree."""
     store, archive, ss = await _seed(tmp_path)
     where = tmp_path / "hook"
     where.mkdir()
@@ -217,8 +224,8 @@ async def test_a_timed_out_hook_aborts_and_leaves_no_process_behind(tmp_path: Pa
             store,
             ss,
             seed_archive=archive,
-            takeover_hook=_tree_hook(where, 4.0),
-            takeover_timeout_seconds=3.0,
+            takeover_hook=_tree_hook(where, 5.0),
+            takeover_timeout_seconds=4.0,
         )
         with pytest.raises(DrActivationError) as exc:
             await coord.activate(actor="alice")
@@ -229,7 +236,7 @@ async def test_a_timed_out_hook_aborts_and_leaves_no_process_behind(tmp_path: Pa
         # The control: the tree was running before the budget ran out.
         assert (where / "started").exists()
         started_at = (where / "started").stat().st_mtime
-        await asyncio.sleep(max(0.0, started_at + 4.0 + 2.0 - time.time()))
+        await asyncio.sleep(max(0.0, started_at + 5.0 + 2.0 - time.time()))
         assert _survivors(where) == []
     finally:
         await store.close()

@@ -25,7 +25,6 @@ Standard library only (``ctypes``), so ``pipeline/`` modules may import it.
 
 from __future__ import annotations
 
-import contextlib
 import ctypes
 import logging
 import os
@@ -206,7 +205,9 @@ def resume_into_job(pid: int, *, who: str) -> int | None:
     handle, or ``None`` off Windows or when the job could not be set up (the child still runs).
 
     The child must have been started with :data:`ADOPT_CREATIONFLAGS`, and its caller must still
-    hold the handle ``subprocess`` opened, so ``pid`` cannot name a different process. Raises
+    hold the handle ``subprocess`` opened, so ``pid`` cannot name a different process. The process
+    is opened again by ``pid`` rather than through that handle, which asyncio keeps private. A
+    process's default access list grants these rights to the account that created it. Raises
     :class:`OSError` when the child cannot be resumed: it would otherwise never run, so the caller
     kills it."""
     if sys.platform != "win32":
@@ -225,32 +226,49 @@ def resume_into_job(pid: int, *, who: str) -> int | None:
     handle = open_process(rights, 0, pid)
     if not handle:
         raise OSError(ctypes.get_last_error(), f"{who}: could not open the started process")
+    job: int | None = None
     try:
         job = kill_on_close_job(int(handle), who=who)
         status = resume(ctypes.c_void_p(handle))
         if status != 0:
-            if job is not None:
-                terminate_job(job)
             raise OSError(f"{who}: could not resume the started process (status {status:#x})")
         return job
+    except BaseException:
+        # The child never ran, so ending the job ends only it. Without this the handle would leak.
+        if job is not None:
+            terminate_job(job)
+        raise
     finally:
         _close_handle(kernel32, int(handle))
 
 
-def kill_process_group(pid: int) -> bool:
-    """``SIGKILL`` the process group that ``pid`` leads, on POSIX.
+def kill_process_group(pid: int, *, started_as_leader: bool = False) -> bool:
+    """``SIGKILL`` the process group that ``pid`` leads, on POSIX. Returns whether the signal was
+    sent.
 
-    Returns ``False``, signalling nothing, when ``pid`` leads no group of its own, its group cannot
-    be read, or this is Windows. The caller then kills the one process. The leadership check means
+    Returns ``False``, signalling nothing, on Windows, when ``pid`` leads no group of its own, when
+    its group cannot be read, or when the signal fails. The caller then kills the one process.
+
+    The leadership check reads ``pid``'s group, so it needs ``pid`` to still be a live process.
+    ``started_as_leader=True`` is for a caller that started ``pid`` with
+    :data:`ADOPT_NEW_SESSION` itself and so knows the group is ``pid``'s. It skips the check, so it
+    still reaches the group's other members after the leader has exited and been reaped. Either way
     this never signals the caller's own group (the engine's, or pytest's)."""
     if sys.platform == "win32":
         return False
+    if started_as_leader:
+        if pid == os.getpgrp():
+            return False
+        pgid = pid
+    else:
+        try:
+            pgid = os.getpgid(pid)
+        except OSError:
+            return False
+        if pgid != pid:
+            return False
     try:
-        pgid = os.getpgid(pid)
+        os.killpg(pgid, signal.SIGKILL)
     except OSError:
         return False
-    if pgid != pid:
-        return False
-    with contextlib.suppress(OSError):
-        os.killpg(pgid, signal.SIGKILL)
     return True
