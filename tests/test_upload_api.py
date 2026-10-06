@@ -929,6 +929,100 @@ async def test_the_prune_audit_row_names_the_system_not_the_pruned_files_owner(
     )
 
 
+async def test_a_deadline_mid_sweep_still_writes_a_prune_row_per_deleted_file(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """BACKLOG #2261, end to end. The request deadline cancels POST /uploads while its save-time
+    sweep is parked mid-pass. The response is the deadline's 503, and every file the sweep removed
+    has an ``upload.prune`` row. Red before the fix: the deleted files had no row at all, and the
+    sweep ran on to delete every aged file."""
+    import dataclasses
+    import threading
+    import time
+
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    settings = StoreSettings(
+        uploads_dir=str(tmp_path / "uploads"),
+        max_upload_bytes=1_000_000,
+        uploads_retention_days=30,
+    )
+    app = create_app(engine, auth=service, store_settings=settings)
+    us = app.state.upload_store
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c, "op")
+        aged: set[str] = set()
+        for i in range(4):
+            r = await c.post(
+                "/uploads", files={"file": (f"f{i}.hl7", BATCH, "text/plain")}, headers=h
+            )
+            assert r.status_code == 200, r.text
+            aged.add(r.json()["file_id"])
+        for meta in await us.list_files():
+            old = dataclasses.replace(meta, uploaded_at=time.time() - 31 * 86_400)
+            (tmp_path / "uploads" / f"{meta.file_id}.meta").write_text(
+                us._encrypt_meta(old),  # noqa: SLF001 -- mirrors tests/test_uploads.py's backdating
+                encoding="utf-8",
+            )
+
+        # Park the sweep's thread before its second aged pair until the pass is told to stop.
+        aborts: list[threading.Event] = []
+        parked = threading.Event()
+        real_prune, real_paths = us.prune_expired, us._paths
+        seen = 0
+
+        async def _prune(**kwargs: Any) -> Any:
+            aborts.append(kwargs.get("abort") or threading.Event())
+            return await real_prune(**kwargs)
+
+        def _paths(file_id: str) -> tuple[Path, Path]:
+            nonlocal seen
+            if file_id in aged:
+                seen += 1
+                if seen == 2:
+                    parked.set()
+                    aborts[-1].wait(timeout=5)
+            return real_paths(file_id)
+
+        us.prune_expired = _prune
+        us._paths = _paths
+        app.state.request_timeout_seconds = 2.0
+        r = await c.post("/uploads", files={"file": ("new.hl7", BATCH, "text/plain")}, headers=h)
+        assert parked.is_set(), "the sweep never reached its second aged pair"
+        assert r.status_code == 503, r.text
+
+    deleted = aged - {m.file_id for m in await us.list_files()}
+    rows = await engine.store.list_audit(action="upload.prune")
+    assert sorted(json.loads(str(a["detail"]))["file_id"] for a in rows) == sorted(deleted)
+    assert len(deleted) == 2, f"expected the sweep to stop after its second pair, got {deleted}"
+
+
+async def test_a_prune_failure_of_any_kind_never_fails_the_upload(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """BACKLOG #2261. The route caught only OSError around the sweep, so anything else the prune
+    raised failed an upload that had already been stored and audited."""
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+
+    async def _boom(**_: Any) -> Any:
+        raise RuntimeError("a sidecar the scan could not read")
+
+    app.state.upload_store.prune_expired = _boom
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c, "op")
+        r = await c.post("/uploads", files={"file": ("a.hl7", BATCH, "text/plain")}, headers=h)
+        assert r.status_code == 200, r.text
+    assert await engine.store.list_audit(action="upload.create")
+
+
 # --- BACKLOG #1184 (ASVS 14.2.1): the PHI needle is off the query string --------------------------
 
 

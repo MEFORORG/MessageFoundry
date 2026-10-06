@@ -37,7 +37,7 @@ import re
 import secrets
 import threading
 import time
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Coroutine, Iterator
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from stat import S_ISREG
@@ -1118,23 +1118,37 @@ class UploadStore:
             uploader_id,
             _LEDGER_CANCEL_WAIT_SECONDS,
         )
-        self._stragglers.add(fut)
 
         def _done(done: asyncio.Future[Any]) -> None:
-            self._stragglers.discard(done)
             if what == "reserve":
                 if self._reserve_took_a_slot(done, uploader_id):
-                    late = asyncio.ensure_future(
-                        self._release_across_shards(uploader_id=uploader_id, size=size)
+                    self._hold(
+                        asyncio.ensure_future(
+                            self._release_across_shards(uploader_id=uploader_id, size=size)
+                        )
                     )
-                    self._stragglers.add(late)
-                    late.add_done_callback(self._stragglers.discard)
             elif done.cancelled():
                 _log.warning(
                     "the cross-shard upload release for %s was cancelled before it finished; "
                     "its slot is not paid back",
                     uploader_id,
                 )
+
+        self._hold(fut, _done)
+
+    def _hold(
+        self,
+        fut: asyncio.Future[Any],
+        on_done: Callable[[asyncio.Future[Any]], None] | None = None,
+    ) -> None:
+        """Keep ``fut`` referenced in ``_stragglers`` until it finishes, then call ``on_done``.
+        The loop holds a Task only weakly, so a task nobody awaits any more must be held here."""
+        self._stragglers.add(fut)
+
+        def _done(done: asyncio.Future[Any]) -> None:
+            self._stragglers.discard(done)
+            if on_done is not None:
+                on_done(done)
 
         fut.add_done_callback(_done)
 
@@ -1642,9 +1656,76 @@ class UploadStore:
                     )
             if stop.is_set():
                 return PruneResult(pruned=pruned)
-            return PruneResult(pruned=pruned, orphans_removed=self._sweep_orphans_sync(now=at))
+            # The orphan sweep runs AFTER the deletions, so a failure in it must not raise out of
+            # here: that would drop `pruned`, and with it the audit rows (BACKLOG #2261).
+            try:
+                orphans = self._sweep_orphans_sync(now=at)
+            except Exception:
+                _log.warning(
+                    "uploaded-logs orphan sweep failed; will retry next pass", exc_info=True
+                )
+                orphans = 0
+            return PruneResult(pruned=pruned, orphans_removed=orphans)
 
         return await asyncio.to_thread(_prune)
+
+    async def prune_and_audit(
+        self,
+        audit: Callable[[UploadedFileMeta], Awaitable[None]] | None,
+        *,
+        now: float | None = None,
+        abort: threading.Event | None = None,
+    ) -> PruneResult:
+        """One :meth:`prune_expired` pass, then one ``audit`` call per pruned file.
+
+        The shared body of the retention runner and the save-time sweep. A failed audit call is
+        logged and the rest still run, so one bad row never costs the others."""
+        result = await self.prune_expired(now=now, abort=abort)
+        if audit is not None:
+            for meta in result.pruned:
+                try:
+                    await audit(meta)
+                except Exception:
+                    _log.warning(
+                        "uploaded-logs prune audit failed for %s", meta.file_id, exc_info=True
+                    )
+        return result
+
+    async def prune_on_save(
+        self, audit: Callable[[UploadedFileMeta], Awaitable[None]]
+    ) -> PruneResult:
+        """The save-time sweep: :meth:`prune_and_audit` that a cancelled caller cannot cut short
+        (BACKLOG #2261).
+
+        The request deadline cancels the upload route, and a cancel used to drop the result naming
+        what the sweep's thread had deleted, so no ``upload.prune`` row was written for those files.
+        The thread kept deleting with nobody left to audit it. This is the retention runner's
+        treatment (#2065): a cancel sets the sweep's ``abort``, so it stops at its next file, and
+        the rows for what it removed are still written. See :meth:`run_to_completion` for the wait."""
+        abort = threading.Event()
+        return await self.run_to_completion(
+            self.prune_and_audit(audit, abort=abort), on_cancel=abort.set
+        )
+
+    async def run_to_completion[T](
+        self, coro: Coroutine[Any, Any, T], *, on_cancel: Callable[[], None] | None = None
+    ) -> T:
+        """Run ``coro`` as its own task, so a cancellation of the caller does not cut it short.
+
+        For the API's save-time sweep, whose deletions must each get an audit row (BACKLOG #2261). The task is outside the caller's cancel scope, so the
+        request deadline does not reach its awaits. A cancelled caller calls ``on_cancel`` first,
+        then waits up to ``_LEDGER_CANCEL_WAIT_SECONDS`` for the task, then the cancellation
+        propagates. A task still running at that bound is held until it finishes. A failure of the
+        task after the cancellation is logged rather than raised, because the cancellation is what
+        propagates. Without one, the task's result or exception is the caller's."""
+        task = asyncio.create_task(coro)
+        try:
+            return await _wait_to_completion(
+                task, cancel_bound=_LEDGER_CANCEL_WAIT_SECONDS, on_cancel=on_cancel
+            )
+        except asyncio.CancelledError:
+            self._hold(task, _log_late_failure)
+            raise
 
     def _sweep_orphans_sync(self, *, now: float) -> int:
         """Remove the write leftovers no other pass can reach, and return how many went (BACKLOG #1678).
@@ -1830,21 +1911,12 @@ class UploadRetentionRunner:
             pass
 
     async def run_once(self, now: float | None = None) -> PruneResult:
-        """Run one prune sweep for ``now`` (default: the injected clock), auditing each pruned file. The
-        audit callback (contractually) never raises, but be defensive — one bad audit call must not abort
-        the remaining prunes. The pass's orphan count rides back in the result; it is logged by the sweep
-        and carries no metadata to audit (see :class:`PruneResult`)."""
-        result = await self._store.prune_expired(
-            now=self._clock() if now is None else now, abort=self._abort
+        """One :meth:`UploadStore.prune_and_audit` pass for ``now`` (default: the injected clock).
+        The pass's orphan count rides back in the result; it is logged by the sweep and carries no
+        metadata to audit (see :class:`PruneResult`)."""
+        return await self._store.prune_and_audit(
+            self._audit, now=self._clock() if now is None else now, abort=self._abort
         )
-        for meta in result.pruned:
-            if self._audit is None:
-                continue
-            try:
-                await self._audit(meta)
-            except Exception:
-                _log.warning("uploaded-logs prune audit failed for %s", meta.file_id, exc_info=True)
-        return result
 
 
 def _reencrypt_value(cipher: AesGcmCipher, stored: str, aad: bytes) -> str:
@@ -1882,7 +1954,19 @@ async def _to_thread_to_completion[T, A](func: Callable[[A], T], arg: A) -> T:
     return await _wait_to_completion(loop.run_in_executor(None, ctx.run, func, arg))
 
 
-async def _wait_to_completion[T](fut: asyncio.Future[T], *, cancel_bound: float | None = None) -> T:
+def _log_late_failure(task: asyncio.Future[Any]) -> None:
+    """Log the failure of a :meth:`UploadStore.run_to_completion` task whose caller was cancelled,
+    since nothing else will read it."""
+    if not task.cancelled() and (exc := task.exception()) is not None:
+        _log.warning("an upload write outlived its cancelled request and failed", exc_info=exc)
+
+
+async def _wait_to_completion[T](
+    fut: asyncio.Future[T],
+    *,
+    cancel_bound: float | None = None,
+    on_cancel: Callable[[], None] | None = None,
+) -> T:
     """Await ``fut``; on a cancellation, wait for it to finish, then raise ``CancelledError``.
 
     The shared body of :func:`_to_thread_to_completion` and the cross-shard ledger calls (BACKLOG
@@ -1919,6 +2003,8 @@ async def _wait_to_completion[T](fut: asyncio.Future[T], *, cancel_bound: float 
         except asyncio.CancelledError:
             if not (cancelled or already) and cancel_bound is not None:
                 deadline = loop.time() + cancel_bound
+            if not cancelled and on_cancel is not None:
+                on_cancel()  # once, at the first cancellation: a sweep's abort (BACKLOG #2261)
             cancelled = True
     if cancelled:
         if not fut.cancelled():
