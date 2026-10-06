@@ -3224,11 +3224,9 @@ revoked. A pass with any referral audits `auth.ad_reconcile_referred` and raises
 `ad_reconcile_aborted` alert with reason `directory_referral`, under its own source
 `directory-reconciler-referral`. So it is its own instance, apart from the breaker's, and muting
 one does not silence the other. The alert's text names `ad_user_search_base` and
-`ad_group_search_base`. It resolves only once every account signed in at the last referral has
-been read present and enabled since, which runs every search a referral can come from. That is
-every candidate, not only the referred ones, because a probe sample can miss accounts the same base
-would refer. Referred accounts stay in
-the mass-revoke breaker's count, as unreachable ones do. Left out, a referring group base would
+`ad_group_search_base`. When it resolves itself is stated once, in
+[CONFIGURATION.md](CONFIGURATION.md#when-the-reconcilers-two-alerts-resolve-themselves).
+Referred accounts stay in the mass-revoke breaker's count, as unreachable ones do. Left out, a referring group base would
 trip the breaker on any handful of genuine disables. A base in another domain of the forest
 refers on every pass. Read as an outage, it would stop revocation on a first deployment without a
 page.

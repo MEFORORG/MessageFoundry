@@ -34,6 +34,7 @@ from typing import Any, cast
 import pytest
 
 from messagefoundry.api.app import (
+    _REFERRAL_ALERT_SOURCE,
     _alert_reconcile_plan,
     _directory_reconciler,
     _is_sole_reconciler,
@@ -846,7 +847,7 @@ _AUTH = SimpleNamespace(
 )
 
 #: The referral's own source label (BACKLOG #2538), apart from the breaker's.
-_REFERRAL_SOURCE = "directory-reconciler-referral"
+_REFERRAL_SOURCE = _REFERRAL_ALERT_SOURCE
 
 
 def _alerted(plan: ReconcilePlan) -> list[str]:
@@ -950,7 +951,7 @@ async def _open_alerts(store: MessageStore) -> set[tuple[str, str]]:
 
 ABORTED = ("ad_reconcile_aborted", "directory-reconciler")
 HELD = ("ad_reconcile_held", "directory-reconciler")
-REFERRAL = ("ad_reconcile_aborted", "directory-reconciler-referral")
+REFERRAL = ("ad_reconcile_aborted", _REFERRAL_ALERT_SOURCE)
 
 
 async def _left_open_by_an_earlier_run(store: MessageStore) -> None:
@@ -1688,6 +1689,39 @@ async def test_a_referring_group_search_base_still_revokes_disabled_and_absent_a
         plan = await _alerted_pass(service, sink)
         assert plan.aborted is None and plan.referred == () and plan.referral_clear
         assert await _open_alerts(store) == revoked  # the referral's instance resolved
+
+
+async def test_a_fresh_process_does_not_resolve_a_referral_its_last_run_left_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The referral's instance outlives the process, and its record of which accounts to read
+    again does not. So a fresh process marks every account on its first pass, as a referral does.
+    Its accounts then read DISABLED, which returns before the group search, so that pass is no
+    evidence the group base was fixed. A later pass that reads them all enabled resolves it.
+
+    RED when: a fresh process starts with nothing marked, so the DISABLED pass resolves the
+    referral's instance while the group base still refers."""
+    names = ["jdoe", "asmith"]
+    groups = {"ad_group_search_base": "OU=Groups,DC=other,DC=invalid"}
+    async with _signed_in_estate(monkeypatch, names, **groups) as estate:
+        directory, last_run, store, _tokens = estate
+        sink = NotifierAlertSink([], store=store)
+        directory.refer_groups = True
+        assert (await _alerted_pass(last_run, sink)).referred
+        assert await _open_alerts(store) == {REFERRAL}
+
+        service = _fresh_process(store, **groups)
+        await service.initialize()
+        directory.uac.update(dict.fromkeys(names, DISABLED))  # one strike each, still signed in
+        plan = await _alerted_pass(service, sink)
+        assert plan.referred == () and plan.revocations == () and not plan.referral_clear
+        assert REFERRAL in await _open_alerts(store)
+
+        directory.uac.update(dict.fromkeys(names, ENABLED))
+        directory.refer_groups = False  # the group base now lies in the bound controller's domain
+        plan = await _alerted_pass(service, sink)
+        assert plan.referred == () and plan.referral_clear
+        assert REFERRAL not in await _open_alerts(store)
 
 
 async def test_a_referral_pass_neither_releases_a_hold_nor_resolves_what_is_open(

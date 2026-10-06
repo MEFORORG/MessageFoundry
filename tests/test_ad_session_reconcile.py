@@ -936,7 +936,7 @@ async def test_a_referral_beside_an_outage_judges_what_answered_and_pages() -> N
         assert both.directory_referral and not both.directory_outage and both.revocations == ()
         # The failures are counted beside the referral, or the outage would read as a base fault.
         message = service.directory_reconcile_referral
-        assert message is not None and "1 could not reach the directory" in message
+        assert message is not None and "1 could not be read" in message
         audit = await store.list_audit()
         assert not any(a["action"] == "auth.ad_reconcile_skipped" for a in audit)
         # list_audit is newest first: the referral-and-outage pass, then the two judged passes.

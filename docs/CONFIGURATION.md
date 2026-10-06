@@ -730,8 +730,9 @@ this engine process, for every signed-in directory account it did not just revok
   So the breaker's alert stays open while a hold stands.
 - An LDAP referral opens its own `ad_reconcile_aborted` instance, with reason `directory_referral`
   and source `directory-reconciler-referral` (BACKLOG #2538). It resolves once every account signed
-  in at the last referral has since been read in full, with no referral. A pass with any referral
-  resolves none of these alerts.
+  in at the last referral has since been read in full, with no referral, and at least one has. A
+  restart counts as a referral here, so a restarted engine first reads every account again. A
+  pass with any referral resolves none of these alerts.
 
 **They never resolve themselves on a `[cluster]` node or in an engine that runs more than one engine
 shard.** Another engine's reconciler may still hold the condition there, so an operator resolves the

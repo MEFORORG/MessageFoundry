@@ -2094,13 +2094,18 @@ class AuthService:
         self._reconcile_alert: str | None = None
         #: Latched LDAP referral (BACKLOG #2538). Its own latch, like the hold's, because a pass with
         #: a referral beside other answers is not aborted and so clears `_reconcile_alert`. Set on a
-        #: pass with a referral. Cleared on a pass without one once `_reconcile_referred` is empty.
+        #: pass with a referral. Cleared by `_mark_reconcile_clears` on the referral clear's test.
         self._reconcile_referral_alert: str | None = None
         #: user_ids signed in at the last pass with a referral and not read PRESENT since (BACKLOG
         #: #2538). Every candidate, not only the referred ones, because a probe sample can miss
         #: accounts the same base would refer. `_mark_reconcile_clears` reports no referral clear
-        #: while one is signed in.
+        #: while one is signed in. A process's first pass with candidates fills it the same way.
         self._reconcile_referred: set[str] = set()
+        #: Whether that first pass has run (BACKLOG #2538).
+        self._reconcile_referral_seeded = False
+        #: Whether a pass has read some account PRESENT since the last referral, or since that
+        #: first pass (BACKLOG #2538). A referral clear needs it.
+        self._reconcile_referral_read = False
         #: user_ids a breaker trip has not yet seen re-read on a pass that was not aborted
         #: (BACKLOG #2136). `_mark_reconcile_clears` reports no breaker clear while one is signed in.
         self._reconcile_unconfirmed: set[str] = set()
@@ -5050,8 +5055,8 @@ class AuthService:
     @property
     def directory_reconcile_referral(self) -> str | None:
         """The standing LDAP referral's operator message, or ``None`` (BACKLOG #2538). Latches until
-        a pass with no referral finds every account signed in at the last referral read PRESENT
-        since, the evidence the referral's alert resolves on."""
+        a pass marks ``referral_clear``, the test the referral's alert resolves on, which
+        ``_mark_reconcile_clears`` states."""
         return self._reconcile_referral_alert
 
     @property
@@ -5337,14 +5342,21 @@ class AuthService:
         # until a later probe reads it PRESENT. Only that answer ran every search a referral can
         # come from; a DISABLED or ABSENT one returns before the group search, so it says nothing
         # about a referring group base. A revoked account leaves with the candidate set.
+        #
+        # A process's first pass counts as a referral too. The instance outlives the process, and a
+        # fresh one cannot tell whether its last run saw a referral, so it reads every account
+        # again first. And a clear needs at least one PRESENT read since: if every marked account
+        # leaves, the DISABLED or ABSENT answers of the rest say nothing about the search base.
         present = reconcile.ProbeOutcome.PRESENT
-        if plan.referred:
+        if plan.referred or not self._reconcile_referral_seeded:
             self._reconcile_referred = set(users)
-        else:
+            self._reconcile_referral_seeded = True
+            self._reconcile_referral_read = False
+        if not plan.referred:
+            read = {uid for uid, outcome in plan.outcomes.items() if outcome is present}
             self._reconcile_referred.intersection_update(users)
-            self._reconcile_referred.difference_update(
-                uid for uid, outcome in plan.outcomes.items() if outcome is present
-            )
+            self._reconcile_referred.difference_update(read)
+            self._reconcile_referral_read = self._reconcile_referral_read or bool(read)
         referral = next((p for p in probes if p.outcome is reconcile.ProbeOutcome.REFERRED), None)
         if plan.aborted is not None:
             if not plan.directory_referral:
@@ -5432,10 +5444,13 @@ class AuthService:
           referred account has no answer from this pass, and an older one on record may predate
           the referral.
         * The referral's own instance is clear when, on top of the first test, every account signed
-          in at the last referral has been read PRESENT since (``_reconcile_referred``). Any
-          referral marks every candidate, not only the referred ones, because a probe sample can
-          miss accounts that would also be referred. Only a PRESENT answer ran every search a
-          referral can come from. A pass of referrals only, or an outage, is never evidence.
+          in at the last referral has been read PRESENT since (``_reconcile_referred``), and at
+          least one account has. Any referral marks every candidate, not only the referred ones,
+          because a probe sample can miss accounts that would also be referred. Only a PRESENT
+          answer ran every search a referral can come from. A process's first pass marks every
+          candidate the same way, because a fresh process cannot tell whether its last run saw a
+          referral. A pass of referrals only, or an outage, is never evidence. The latched message
+          is released on this same test, so the log and the instance agree.
         * The hold is clear when, on top of that, the pass did not hold and these tests pass.
           None of those answers is undetermined; this is the record, across the rotation. No
           account the pass just revoked read undetermined either. At least one probe of THIS pass
@@ -5497,7 +5512,15 @@ class AuthService:
         covered = bool(ids) and None not in outcomes and not plan.referred
         settled = covered and undetermined not in outcomes
         # Called only on a pass that judged something, so a pass of referrals only never gets here.
-        referral_clear = covered and self._reconcile_referred.isdisjoint(ids)
+        referral_clear = (
+            covered and self._reconcile_referral_read and self._reconcile_referred.isdisjoint(ids)
+        )
+        if referral_clear and self._reconcile_referral_alert is not None:
+            self._reconcile_referral_alert = None
+            _log.warning(
+                "directory reconcile: every account signed in at the last LDAP referral has since "
+                "been read without one; the referral cleared"
+            )
         hold_clear = (
             settled
             and not plan.hold
@@ -5916,9 +5939,8 @@ class AuthService:
         referral's search and hosts, and writes an ``auth.ad_reconcile_referred`` row. Its own audit
         action, because a pass with a referral beside other answers is not an aborted one, and an
         ``auth.ad_reconcile_aborted`` row is read as "nothing was revoked". The row's ``aborted``
-        field says what else the pass did. On a pass with no referral it releases a latched
-        message, but only once every account signed in at the last referral has been read PRESENT
-        since. An outage is not called here, so it leaves the message as it is.
+        field says what else the pass did. On a pass with no referral it does nothing:
+        ``_mark_reconcile_clears`` releases the latched message on the referral clear's test.
 
         **Its own latch and its own alert instance**, apart from the breaker's: the lifespan task
         raises it as ``ad_reconcile_aborted`` under its own source label. A shared instance would
@@ -5930,14 +5952,7 @@ class AuthService:
         no username. It is latched before the row is written, so a failed write leaves it set.
         """
         if not plan.referred:
-            # Released on the same evidence as the referral's clear: no account signed in at the
-            # last referral is still waiting to be read PRESENT. A sample that missed some is not.
-            if self._reconcile_referral_alert is not None and not self._reconcile_referred:
-                self._reconcile_referral_alert = None
-                _log.warning(
-                    "directory reconcile: every account signed in at the last LDAP referral has "
-                    "since been read without one; the referral cleared"
-                )
+            # The latch is released in `_mark_reconcile_clears`, on the referral clear's own test.
             return
         others = (
             "The pass revoked nothing."
@@ -5947,7 +5962,10 @@ class AuthService:
         if plan.unavailable:
             # A pass of referrals and failures is recorded here and not as an outage, so the
             # failures are counted here, or a near-total outage would read as a search-base fault.
-            others = f"{plan.unavailable} could not reach the directory. {others}"
+            others = (
+                f"{plan.unavailable} could not be read (the directory was unreachable, or the "
+                f"probe raised). {others}"
+            )
         self._reconcile_referral_alert = (
             "LDAP referral: check [auth].ad_user_search_base and, for nested groups, "
             "[auth].ad_group_search_base; one names a base in another domain of the forest. "
