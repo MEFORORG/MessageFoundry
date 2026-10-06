@@ -91,6 +91,7 @@ from messagefoundry.connection_names import (
 from messagefoundry.controlchars import has_control_char
 from messagefoundry.credential import CERT_NAME_PREFIXES
 from messagefoundry.parsing.message import Message, RawMessage, snapshot_payload
+from messagefoundry.redaction import safe_name
 from messagefoundry.secretscrub import (
     CREDENTIAL_PLACEHOLDER,
     credential_query_params,
@@ -6803,14 +6804,46 @@ def _refuse_shadowing_helper(name: str, path: Path) -> None:
     )
 
 
-def _body_helper_imports(source: bytes, stems: frozenset[str]) -> list[tuple[str, bool]]:
-    """The helpers ``source`` imports inside a function body, each with whether a ``try`` guards it.
+# The exception classes an ``except`` clause can name that catch an ImportError. ``*`` stands for a
+# bare ``except:``. ModuleNotFoundError catches only that subclass; see _guard_covers.
+_IMPORT_GUARD_NAMES = frozenset(
+    {"ImportError", "ModuleNotFoundError", "Exception", "BaseException", "*"}
+)
+
+
+def _caught_import_guards(handler: ast.ExceptHandler) -> frozenset[str]:
+    """The names in ``except`` clause ``handler`` that can catch an ImportError (``builtins.X`` too)."""
+    if handler.type is None:
+        return frozenset({"*"})
+    caught = handler.type
+    names = caught.elts if isinstance(caught, ast.Tuple) else [caught]
+    found = {
+        n.id if isinstance(n, ast.Name) else n.attr
+        for n in names
+        if isinstance(n, ast.Name | ast.Attribute)
+    }
+    return frozenset(found & _IMPORT_GUARD_NAMES)
+
+
+def _guard_covers(caught: frozenset[str], exc: ImportError) -> bool:
+    """Whether a guard catching ``caught`` would catch ``exc`` at run time."""
+    if caught - {"ModuleNotFoundError"}:
+        return True
+    return bool(caught) and isinstance(exc, ModuleNotFoundError)
+
+
+def _body_helper_imports(source: bytes, stems: frozenset[str]) -> list[tuple[str, frozenset[str]]]:
+    """The helpers ``source`` imports inside a function body, each with what its ``try`` guards catch.
 
     Only function bodies: a module's top-level statements already ran, with their real control flow,
     so a top-level import that was skipped (``if TYPE_CHECKING``, a failed optional import) stays
-    skipped. A guarded body import (``try: import _opt`` with any ``except``) is an optional helper; the
-    caller loads it but lets it fail, so the run-time import fails the same way and the guard decides.
-    ``[]`` when the source does not parse: it ran, so a later edit is the next load's to report."""
+    skipped. Inside a body the scan does NOT follow control flow: a helper named under an ``if`` that
+    is never true, or in a function never called, is still loaded with the config. A body import is
+    guarded only when a ``try`` around it has an ``except`` that can catch an ImportError (it names
+    ``ImportError``, ``ModuleNotFoundError``, ``Exception`` or ``BaseException``, or is bare); the
+    caller then lets that helper's own ``ImportError`` stand when the guard would catch it, so the
+    guard decides at run time. ``contextlib.suppress`` is not read as a guard. ``[]`` when the source does not parse: it ran, so a later edit is the next
+    load's to report."""
     if not any(stem.encode() in source for stem in stems):
         return []
     try:
@@ -6818,15 +6851,15 @@ def _body_helper_imports(source: bytes, stems: frozenset[str]) -> list[tuple[str
     except (SyntaxError, ValueError, MemoryError, RecursionError):
         # MemoryError and RecursionError are the parser's width and depth walls (BACKLOG #1858).
         return []
-    found: list[tuple[str, bool]] = []
+    found: list[tuple[str, frozenset[str]]] = []
+    nothing: frozenset[str] = frozenset()
 
-    def visit(node: ast.AST, in_function: bool, guarded: bool) -> None:
+    def visit(node: ast.AST, in_function: bool, guarded: frozenset[str]) -> None:
         for child in ast.iter_child_nodes(node):
-            child_guarded = guarded or (
-                isinstance(node, ast.Try | ast.TryStar)
-                and bool(node.handlers)
-                and any(child is stmt for stmt in node.body)
-            )
+            child_guarded = guarded
+            if isinstance(node, ast.Try | ast.TryStar) and any(child is st for st in node.body):
+                for handler in node.handlers:
+                    child_guarded = child_guarded | _caught_import_guards(handler)
             if in_function and isinstance(child, ast.Import):
                 found.extend((a.name, child_guarded) for a in child.names if a.name in stems)
             elif (
@@ -6838,12 +6871,12 @@ def _body_helper_imports(source: bytes, stems: frozenset[str]) -> list[tuple[str
             ):
                 found.append((child.module, child_guarded))
             if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
-                visit(child, True, False)  # a try around a def does not guard what its body runs
+                visit(child, True, nothing)  # a try around a def does not guard what its body runs
             else:
                 visit(child, in_function, child_guarded)
 
     try:
-        visit(tree, False, False)
+        visit(tree, False, nothing)
     except RecursionError:
         return found  # a deeply nested module that already ran; the preload covers what it reached
     return found
@@ -6885,8 +6918,10 @@ class _HelperImporter:
         self._open = True
         # Helper files whose body imports are not yet loaded, drained by preload().
         self._pending: list[Path] = []
-        # Every module name this load registered in sys.modules, for discard() on a failed load.
-        self.registered: list[str] = []
+        # What this load put in sys.modules, with what each name held before, for discard().
+        self._registered: list[tuple[str, ModuleType, ModuleType | None]] = []
+        # Optional helpers whose ImportError a guard is left to decide, by name.
+        self._failed: dict[str, ImportError] = {}
         # The helper stems present when the load starts: the only names this importer serves, so an
         # ordinary ``import json`` in a Handler body costs one set lookup before the real import.
         self._stems = frozenset(
@@ -6895,13 +6930,51 @@ class _HelperImporter:
         self.builtins: dict[str, Any] = {**vars(builtins), "__import__": self._import}
 
     def close(self) -> None:
-        """End the load: from now on serve only the helpers already loaded, and read no file."""
+        """End the load: from now on serve only the helpers already loaded, and read no file.
+
+        Also drops the load's bookkeeping. Each module's builtins point at this importer for the life
+        of the graph, so a kept ``previous`` module would hold the generation before it alive, and
+        that one the generation before it, for every reload of the service."""
         self._open = False
+        self._registered.clear()
+        self._pending.clear()
+
+    def register(self, mod_name: str, module: ModuleType) -> None:
+        """Put ``module`` in ``sys.modules`` as this load's own entry for ``mod_name``.
+
+        The name is path-derived, so an earlier, live load of the same file holds the same name. The
+        entry it replaces is kept so :meth:`unregister` and :meth:`discard` can put it back."""
+        self._registered.append((mod_name, module, sys.modules.get(mod_name)))
+        sys.modules[mod_name] = module
+
+    def unregister(self, mod_name: str, module: ModuleType) -> None:
+        """Undo :meth:`register` for one module that failed to run."""
+        for index in range(len(self._registered) - 1, -1, -1):
+            name, mine, previous = self._registered[index]
+            if name == mod_name and mine is module:
+                del self._registered[index]
+                self._restore(name, mine, previous)
+                return
 
     def discard(self) -> None:
-        """Drop every module this load registered in ``sys.modules`` (the load failed)."""
-        for mod_name in self.registered:
+        """Undo every :meth:`register` of this load (it failed): each name gets back what it held
+        before, so a live graph loaded earlier from the same files keeps its modules. A name this load
+        no longer owns -- a later load replaced it -- is left alone."""
+        while self._registered:
+            self._restore(*self._registered.pop())
+
+    @staticmethod
+    def _restore(mod_name: str, mine: ModuleType, previous: ModuleType | None) -> None:
+        if sys.modules.get(mod_name) is not mine:
+            return
+        if previous is None:
             sys.modules.pop(mod_name, None)
+        else:
+            sys.modules[mod_name] = previous
+
+    def drop_pending(self) -> None:
+        """Forget queued body scans: the module that queued them failed (or they all ran)."""
+        self._pending.clear()
 
     # The parameter names are __import__'s own, so a keyword call (``__import__(n, fromlist=[...])``)
     # in a config module still works.
@@ -6922,7 +6995,14 @@ class _HelperImporter:
             if not self._open:
                 # Never fall through to the normal import: with the config dir on sys.path it would run
                 # the file at run time and register it under its plain name.
-                raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+                failed = self._failed.get(name)
+                if failed is None:
+                    raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+                raise ModuleNotFoundError(
+                    f"No module named {name!r} (config helper failed at load: "
+                    f"{type(failed).__name__})",
+                    name=name,
+                ) from failed
         return builtins.__import__(name, globals, locals, fromlist, level)
 
     def _load(self, name: str) -> ModuleType | None:
@@ -6937,13 +7017,12 @@ class _HelperImporter:
         module = self.new_module(spec)
         # Cached before it runs, as Python's own import does, so a helper cycle sees the partial module.
         self._modules[name] = module
-        sys.modules[mod_name] = module
-        self.registered.append(mod_name)
+        self.register(mod_name, module)
         try:
             spec.loader.exec_module(module)
         except BaseException:
             del self._modules[name]
-            sys.modules.pop(mod_name, None)
+            self.unregister(mod_name, module)
             raise
         self._pending.append(path)
         return module
@@ -6960,25 +7039,42 @@ class _HelperImporter:
         finished running, so nothing it imports at top level is still half-initialized."""
         self._pending.append(path)
         while self._pending:
-            current = self._pending.pop(0)
-            if not self._stems:
+            self._preload_one(self._pending.pop(0))
+
+    def _preload_one(self, current: Path) -> None:
+        if not self._stems:
+            return
+        try:
+            source = current.read_bytes()
+        except OSError:
+            return  # it already ran; the file going away now is not this pass's to report
+        for name, caught in _body_helper_imports(source, self._stems):
+            if name in self._modules:
+                continue
+            failed = self._failed.get(name)
+            if failed is not None:
+                # Already failed under a guard elsewhere; this import site must be guarded too, or
+                # every message through it would fail.
+                if not _guard_covers(caught, failed):
+                    raise failed
                 continue
             try:
-                source = current.read_bytes()
-            except OSError:
-                continue  # it already ran; the file going away now is not this pass's to report
-            for name, guarded in _body_helper_imports(source, self._stems):
-                if name in self._modules:
-                    continue
-                try:
-                    self._load(name)
-                except WiringError:
-                    raise  # a refused helper name is refused whether or not a try surrounds it
-                except Exception:
-                    if not guarded:
-                        raise
-                    # An optional helper that fails: left unloaded, so the run-time import raises
-                    # ModuleNotFoundError and the body's own guard decides, as it would have.
+                self._load(name)
+            except ImportError as exc:
+                if not _guard_covers(caught, exc):
+                    raise
+                # An optional helper whose own import failed, under a guard that catches it: left
+                # unloaded, so the run-time import raises ModuleNotFoundError (chained to this) and the
+                # guard decides, as it would have. Any other failure is not optional and fails the
+                # load. Kept without its traceback, whose frames would hold the load alive. Names
+                # only, never the exception text (CLAUDE.md section 9).
+                self._failed[name] = exc.with_traceback(None)
+                _logger.warning(
+                    "config helper %s failed to load (%s) and is left to the ImportError guard in %s",
+                    safe_name(f"{name}.py"),
+                    type(exc).__name__,
+                    safe_name(current.name),
+                )
 
 
 # Serializes the shared module-global load state (_active, sys.modules mutations) so a reload
@@ -6991,7 +7087,10 @@ def _loading(directory: Path, registry: Registry) -> Iterator[_HelperImporter]:
     """Hold the load lock, publish ``registry`` as the active declaration target **and its code sets
     as the active set** (so a module-top-level ``code_set(...)`` resolves), and yield the load's
     :class:`_HelperImporter`, closed on exit so it serves only what this load imported. A load that
-    raises leaves none of its helpers in ``sys.modules``."""
+    raises inside this block gets back, in ``sys.modules``, whatever each of its names held before, so
+    a live graph loaded earlier from the same files keeps its modules. (A failure after the block --
+    graph validation, the connections.toml merge -- leaves this load's entries, as it leaves its config
+    modules'.)"""
     global _active
     helpers = _HelperImporter(directory)
     with _load_lock:
@@ -7807,17 +7906,21 @@ def _exec_module(path: Path, helpers: _HelperImporter) -> None:
     if spec is None or spec.loader is None:
         raise WiringError(f"cannot load config module: {path}")
     module = helpers.new_module(spec)
-    sys.modules[mod_name] = module
+    helpers.register(mod_name, module)
     try:
         spec.loader.exec_module(module)
         # The helpers its function bodies import, loaded now that it has run (vault BACKLOG #2783).
         helpers.preload(path)
     except WiringError:
-        sys.modules.pop(mod_name, None)
+        helpers.unregister(mod_name, module)
         raise
     except Exception as exc:
-        sys.modules.pop(mod_name, None)
+        helpers.unregister(mod_name, module)
         raise WiringError(f"error loading config module {path.name}: {exc}") from exc
+    finally:
+        # Whatever this module queued -- a failure part-way included -- is never drained by the next
+        # module, whose diagnostic would then name the wrong file.
+        helpers.drop_pending()
 
 
 def validate_config(directory: str | Path, *, allow_empty: bool = False) -> list[Diagnostic]:

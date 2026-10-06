@@ -528,3 +528,180 @@ def test_a_dot_named_backup_is_not_linted_by_check(tmp_path: Path) -> None:
     # Positive control: the same file under a name the loader runs.
     (tmp_path / "IB_OLD.py").write_text(risky, encoding="utf-8")
     assert not _check_handler_security(tmp_path, strict=True).ok
+
+
+def test_a_failed_reload_keeps_the_live_graphs_helpers(tmp_path: Path) -> None:
+    """A failed load of the same files gives each ``sys.modules`` name back to the live graph's module,
+    and the live graph's in-body helper import still works."""
+    from messagefoundry.config.wiring import _config_module_name
+
+    (tmp_path / "_route_helper.py").write_text("DEST = 'o'\n", encoding="utf-8")
+    _write(tmp_path / "cfg.py", _IN_BODY_HANDLER)
+    live = load_config(tmp_path)
+    helper_name = _config_module_name(tmp_path / "_route_helper.py")
+    live_helper = sys.modules[helper_name]
+
+    cfg_name = _config_module_name(tmp_path / "cfg.py")
+    live_cfg = sys.modules[cfg_name]
+    # The broken reload imports the helper at top level, so it registers the same names, then fails.
+    (tmp_path / "cfg.py").write_text(
+        "import _route_helper\n"
+        + textwrap.dedent(_IN_BODY_HANDLER)
+        + "\nraise RuntimeError('broken reload')\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(WiringError, match="broken reload"):
+        load_config(tmp_path)
+    assert sys.modules[helper_name] is live_helper
+    assert sys.modules[cfg_name] is live_cfg
+    assert live.handlers["h"](_MSG).to == "o"  # type: ignore[union-attr]
+
+
+def test_an_except_that_cannot_catch_an_import_error_is_not_a_guard(tmp_path: Path) -> None:
+    (tmp_path / "_optional.py").write_text("import mefor_no_such_package\n", encoding="utf-8")
+    _write(
+        tmp_path / "cfg.py",
+        """
+        from messagefoundry import outbound, File, handler
+
+        outbound("o", File(directory="./out"))
+
+
+        @handler("h")
+        def handle(msg):
+            try:
+                import _optional
+            except KeyError:
+                return None
+            return None
+        """,
+    )
+    with pytest.raises(WiringError, match="mefor_no_such_package"):
+        load_config(tmp_path)
+
+
+def test_a_guarded_helper_that_fails_with_another_error_fails_the_load(tmp_path: Path) -> None:
+    """``except ImportError`` would not catch a ``NameError`` from the helper, so neither does the load."""
+    (tmp_path / "_optional.py").write_text("VALUE = undefined_name\n", encoding="utf-8")
+    _write(
+        tmp_path / "cfg.py",
+        """
+        from messagefoundry import outbound, File, handler
+
+        outbound("o", File(directory="./out"))
+
+
+        @handler("h")
+        def handle(msg):
+            try:
+                import _optional
+            except ImportError:
+                return None
+            return None
+        """,
+    )
+    with pytest.raises(WiringError, match="undefined_name"):
+        load_config(tmp_path)
+
+
+def test_a_guarded_helper_failure_is_logged(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    (tmp_path / "_optional.py").write_text("import mefor_no_such_package\n", encoding="utf-8")
+    _write(
+        tmp_path / "cfg.py",
+        """
+        from messagefoundry import outbound, File, handler
+
+        outbound("o", File(directory="./out"))
+
+
+        @handler("h")
+        def handle(msg):
+            try:
+                import _optional
+            except ImportError:
+                return None
+            return None
+        """,
+    )
+    with caplog.at_level("WARNING", logger="messagefoundry.config.wiring"):
+        load_config(tmp_path)
+    warnings = [r for r in caplog.records if "ImportError guard" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "ModuleNotFoundError" in warnings[0].getMessage()
+    assert "mefor_no_such_package" not in warnings[0].getMessage()  # names only, never the text
+
+
+def test_a_failed_module_leaves_no_queued_scan_for_the_next(tmp_path: Path) -> None:
+    """validate_config: a module that fails after importing a helper must not hand that helper's body
+    scan to the next module, whose diagnostic would then name the wrong file."""
+    (tmp_path / "_h.py").write_text("def f():\n    import _bad\n", encoding="utf-8")
+    (tmp_path / "_bad.py").write_text("raise RuntimeError('bad helper')\n", encoding="utf-8")
+    (tmp_path / "a_cfg.py").write_text("import _h\nraise RuntimeError('a broke')\n")
+    (tmp_path / "b_cfg.py").write_text(_OUTBOUND, encoding="utf-8")
+    diags = validate_config(tmp_path)
+    assert any("a broke" in d.message for d in diags), diags  # positive control
+    assert all(not (d.file or "").endswith("b_cfg.py") for d in diags), diags
+
+
+def _guarded_handler(name: str, guard: str, *, guarded: bool = True) -> str:
+    body = (
+        f"    try:\n        import _optional\n    except {guard}:\n        return None\n"
+        if guarded
+        else "    import _optional\n"
+    )
+    return (
+        "from messagefoundry import outbound, File, handler\n\n"
+        f"outbound('o_{name}', File(directory='./out'))\n\n\n"
+        f"@handler('{name}')\ndef handle(msg):\n{body}    return None\n"
+    )
+
+
+def test_an_unguarded_site_of_a_helper_that_failed_under_a_guard_fails_the_load(
+    tmp_path: Path,
+) -> None:
+    """One helper, imported under a guard in one module and bare in another: the bare site would fail
+    on every message, so the load fails, whichever module runs first."""
+    (tmp_path / "_optional.py").write_text("import mefor_no_such_package\n", encoding="utf-8")
+    (tmp_path / "a_cfg.py").write_text(_guarded_handler("ha", "ImportError"), encoding="utf-8")
+    (tmp_path / "b_cfg.py").write_text(
+        _guarded_handler("hb", "ImportError", guarded=False), encoding="utf-8"
+    )
+    with pytest.raises(WiringError, match="mefor_no_such_package"):
+        load_config(tmp_path)
+
+
+@pytest.mark.parametrize("guard", ["Exception", "BaseException", "(ValueError, ImportError)"])
+def test_a_broader_except_is_a_guard(tmp_path: Path, guard: str) -> None:
+    (tmp_path / "_optional.py").write_text("import mefor_no_such_package\n", encoding="utf-8")
+    (tmp_path / "cfg.py").write_text(_guarded_handler("h", guard), encoding="utf-8")
+    assert load_config(tmp_path).handlers["h"](_MSG) is None
+
+
+def test_a_module_not_found_guard_does_not_cover_a_plain_import_error(tmp_path: Path) -> None:
+    """``from json import missing`` raises ImportError, which ``except ModuleNotFoundError`` lets
+    through at run time, so the load fails rather than taking the fallback on every message."""
+    (tmp_path / "_optional.py").write_text("from json import mefor_no_such_name\n")
+    (tmp_path / "cfg.py").write_text(_guarded_handler("h", "ModuleNotFoundError"), encoding="utf-8")
+    with pytest.raises(WiringError, match="mefor_no_such_name"):
+        load_config(tmp_path)
+
+
+def test_reloads_do_not_keep_earlier_generations_alive(tmp_path: Path) -> None:
+    """Each module's builtins point at its load's importer for the graph's life; the importer must not
+    hold the module it replaced in sys.modules, or every reload keeps the one before it."""
+    import gc
+    import weakref
+
+    from messagefoundry.config.wiring import _config_module_name
+
+    (tmp_path / "_route_helper.py").write_text("DEST = 'o'\n", encoding="utf-8")
+    _write(tmp_path / "cfg.py", _IN_BODY_HANDLER)
+    cfg_name = _config_module_name(tmp_path / "cfg.py")
+    load_config(tmp_path)
+    first = weakref.ref(sys.modules[cfg_name])
+    for _ in range(3):
+        load_config(tmp_path)
+    gc.collect()
+    assert first() is None

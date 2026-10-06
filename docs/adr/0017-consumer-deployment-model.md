@@ -28,7 +28,10 @@
   ADR is built. *The sentence that stood here, "Nothing in this ADR is built", is now wrong. It is kept
   as history, not as current state.* This ADR builds **on** mechanisms already shipped that must **not**
   be redesigned: the directory-level engine/config split via the loader
-  ([config/wiring.py](../../messagefoundry/config/wiring.py) `load_config`, the `_SiblingHelperFinder`,
+  ([config/wiring.py](../../messagefoundry/config/wiring.py) `load_config`, the `_SiblingHelperFinder`
+  (*amended 2026-10-06: replaced by `_HelperImporter`. Sibling `_` helpers still import, but a helper named like a real
+  module is refused and `importlib.import_module` no longer finds one;
+  vault BACKLOG #2780, ADR 0036 Amendment D*),
   and `codesets/` + `connections.toml` resolved relative to `--config`); the per-environment value layer
   (`env()`/`EnvRef` + `environments/<env>.toml` + `MEFOR_VALUE_*` overlay, fail-loud on a missing key —
   [config/environments.py](../../messagefoundry/config/environments.py),

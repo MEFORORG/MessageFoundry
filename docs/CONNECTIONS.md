@@ -211,9 +211,10 @@ _<feed>_transforms.py       the field-level transform steps the handler delegate
   field manipulations a ported Corepoint child accumulates live in the helper as small, reviewable,
   unit-testable functions rather than a wall of inline code. Shared helpers are imported from siblings
   (the loader skips `_*` as feeds but resolves them as imports). An `import _helper` statement works
-  at module top level and inside a Router or Handler body alike, because every helper a module names
-  in any `import` statement is loaded with the config; `importlib.import_module` does not find a
-  helper. A helper may not share its name with a standard library or installed module
+  at module top level and inside a Router or Handler body alike, because every helper a function
+  body names in an `import` statement is loaded with the config, whether or not that line would run.
+  A helper whose own import fails under an `except ImportError` in the body is left to that guard,
+  with a WARNING. `importlib.import_module` does not find a helper. A helper may not share its name with a standard library or installed module
   (`_csv.py`, `_json.py`): the load refuses one that is imported. A file whose name starts with `.`
   (an editor backup such as `.IB_OLD.py`, a macOS `._` file) is not config and is never run.
 
