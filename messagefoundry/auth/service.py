@@ -4610,6 +4610,10 @@ class AuthService:
                 "a federated login (federated_subject or mech='oidc') needs the OIDC session"
                 " mechanism, and only a federated login may use it"
             )
+        if federated and idp_auth_time is None:
+            # BACKLOG #2143, also a programming error. An OIDC session minted with no IdP auth_time
+            # stores NULL, and every IdP step-up on it is then refused. Fail at the mint instead.
+            raise ValueError("a federated login needs the verified IdP auth_time")
         existing = await self._store.get_user_by_username(principal.username)
         if existing is not None and existing.auth_provider != AuthProvider.AD.value:
             # Never let an AD login adopt/overwrite a like-named LOCAL account (provider confusion).
@@ -6743,8 +6747,8 @@ class AuthService:
             auth_mechanism=mechanism.value,
             # BACKLOG #2143: REQUIRED here, with no default, like the mechanism. The IdP step-up
             # compares the next auth_time with it, and a NULL on an oidc session refuses that
-            # step-up. _complete_ad_login defaults it to None for its Kerberos callers, so nothing
-            # there checks that an oidc mint passed one; the federated caller does.
+            # step-up. _complete_ad_login defaults it to None for its Kerberos callers, and raises
+            # ValueError when a federated mint arrives without one.
             idp_auth_time=idp_auth_time,
         )
         if not issued:
