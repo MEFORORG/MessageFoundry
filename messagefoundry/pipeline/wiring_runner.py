@@ -29,7 +29,7 @@ import json
 import logging
 import math
 import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from concurrent.futures import CancelledError as FutureCancelledError
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
@@ -188,7 +188,7 @@ from messagefoundry.store import (
     StreamingAttachmentsUnsupported,
 )
 from messagefoundry.store.base import AuditStore, pool_over_provisioned_warning
-from messagefoundry.store.crypto import CipherError, StoreKeylessError
+from messagefoundry.store.crypto import CipherError
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.store.sealed_cache import point_in_time
 from messagefoundry.store.store import ConnectionEventWrite, OwnedLanes
@@ -1472,6 +1472,8 @@ class RegistryRunner:
         self._pooled_buildup_at: dict[str, float] = {}
         # Vault BACKLOG #2770: the log backoff for a failing delivery alert check, per check and lane.
         self._delivery_alert_check_runs: dict[str, FailureRun] = {}
+        # Vault BACKLOG #2756: the log backoff for a pre-send store read fault, per lane.
+        self._store_read_fault_runs: dict[str, FailureRun] = {}
         self._singleton_for_stage: dict[Stage, asyncio.Event] = {
             Stage.INGRESS: self._ingress_work,
             Stage.ROUTED: self._routed_work,
@@ -6600,8 +6602,11 @@ class RegistryRunner:
         DEAD row replayed after its message was purged reads ``None`` here and is delivered with no
         ``dynamic_headers`` rather than the headers of its first attempt. Accepted: retaining PHI past
         its window purely to serve a degraded replay is the defect 14.2.7 exists to close. Pinned by
-        test — see PHI.md §8."""
-        raw_meta = await self.store.message_metadata_json(message_id)
+        test — see PHI.md §8. A fault in the store read itself is raised as a
+        :class:`_StoreReadFault` (vault BACKLOG #2756)."""
+        raw_meta = await _read_from_store(
+            "metadata read", lambda: self.store.message_metadata_json(message_id)
+        )
         user_json = user_metadata(raw_meta)
         if not user_json:
             return None
@@ -6635,7 +6640,10 @@ class RegistryRunner:
         async def _reader(sha256: str) -> str:
             # The store read runs off the event loop (aiosqlite), chunk-by-chunk, and the pieces
             # concatenate to the exact verbatim OBX-5.5 base64 the sender sent (Approach B).
-            return "".join([chunk async for chunk in self.store.read_attachment(sha256)])
+            async def _join() -> str:
+                return "".join([chunk async for chunk in self.store.read_attachment(sha256)])
+
+            return await _read_from_store("attachment read", _join)
 
         try:
             return await reattach_documents_in_hl7(payload, _reader)
@@ -6684,7 +6692,9 @@ class RegistryRunner:
         surfaced from ``_mark_failed_and_arm``'s additive return, no store re-read), and
         ``(STOPPED, None)`` where the STOP internal-error policy halted the lane. The per_lane loop
         reads only ``outcome[0]``; ``retry_until`` is the pooled-dispatcher park signal (ADR 0066
-        §4.5). Store errors propagate to the caller's backoff."""
+        §4.5). A store READ fault before the send (a :class:`_StoreReadFault`) re-pends the row on its
+        retry backoff (vault BACKLOG #2756); any other store error propagates to the caller's
+        backoff."""
         # Connector + retry re-resolved per item so a reload can swap an outbound's
         # settings under us with at most one racing send (which fails + retries —
         # outbounds are idempotent). retry_until is the row's re-pend deadline when a send failure
@@ -6739,31 +6749,8 @@ class RegistryRunner:
                 1,
             )
             return _ItemOutcome.STOPPED, None
-        # Vault BACKLOG #2756: the store reads a send needs, the document re-attach and the
-        # dynamic_headers metadata bag, run BEFORE the send try. A driver or pool error from either
-        # then propagates to the caller's re-pend (the per_lane loop's fault arm, the pooled T17 arm)
-        # as the infrastructure fault it is, instead of reaching the internal-error arm below, which
-        # would dead-letter (or STOP the lane on) a message that was never sent. A fault in the
-        # MESSAGE is classified by type, not by position (_PRE_SEND_CONTENT_FAULTS): it is held here
-        # and raised inside the try, so it takes the arm it always did. A missing attachment is a
-        # DeliveryError and retries; a payload that will not parse, or a cell that fails decryption,
-        # still reaches the internal-error policy rather than re-pending forever.
-        simulate = self._simulate.get(name, False)
-        payload = item.payload
-        metadata: dict[str, str] | None = None
-        held: list[Exception] = []  # at most one; see _raise_held
         try:
-            if not simulate or _frames(connector):
-                payload = await self._hydrate_payload(item.payload)
-            if not simulate and getattr(connector, "consumes_metadata", False):
-                # #68: an opted-in outbound (REST/FHIR with dynamic_headers) gets this message's
-                # user-metadata bag so it can project http.header.* entries onto the request. The
-                # read touches only the small metadata column (never the raw body).
-                metadata = await self._user_metadata_for(item.message_id)
-        except _PRE_SEND_CONTENT_FAULTS as exc:
-            held.append(exc)
-        try:
-            if simulate:
+            if self._simulate.get(name, False):
                 # Shadow / parallel-run (#15): suppress the real egress entirely — no bytes/
                 # SQL leave the box. With egress suppressed there is no real partner reply to
                 # capture or re-ingress, so treat it as a completed ONE-WAY delivery: response
@@ -6779,11 +6766,11 @@ class RegistryRunner:
                 # path a re-encode refusal (permanent, code "reencode": ADR 0204, ADR 0206)
                 # dead-letters in shadow as it would live. A shadow BATCH does not: it checks each
                 # member with rewrite=False and never rewrites the envelope. A hydration failure is
-                # not a refusal, so it stays what shadow made it before, a completed delivery.
+                # not a refusal, so it stays what shadow made it before, a completed delivery. A
+                # store read fault is not a hydration failure: it re-pends, as live (vault #2756).
                 if _frames(connector):
                     try:
-                        _raise_held(held)
-                        connector.check_frame(payload)
+                        connector.check_frame(await self._hydrate_payload(item.payload))
                     except NegativeAckError:
                         raise
                     except DeliveryError as exc:
@@ -6798,13 +6785,17 @@ class RegistryRunner:
                 # the partner dial + write + wait-for-ACK — a prime suspect for the ~83 ms ceiling that
                 # loopback can't reproduce. Timed only when the bench lever is on (else `_send_t0 = 0`,
                 # no perf_counter). See the DeliveryPhaseTiming note.
-                # #149 (ADR 0105 Phase 1b): any detached very-large document was re-attached VERBATIM
-                # above, before the send timer (a store read, not the partner round-trip). A payload
-                # with no handle is byte-identical; a missing attachment is a DeliveryError raised
-                # here and caught below, so the row retries and a handle NEVER reaches the connector.
-                _raise_held(held)
+                # #149 (ADR 0105 Phase 1b): re-attach any detached very-large document VERBATIM just
+                # before the send (BEFORE the send timer — a store read, not the partner round-trip). A
+                # payload with no handle is returned byte-identical; a missing attachment raises a
+                # DeliveryError (caught below → retry), so a handle NEVER reaches the connector.
+                payload = await self._hydrate_payload(item.payload)
                 _send_t0 = time.perf_counter_ns() if self._delivery_phase_timing else 0
                 if getattr(connector, "consumes_metadata", False):
+                    # #68: an opted-in outbound (REST/FHIR with dynamic_headers) gets this message's
+                    # user-metadata bag so it can project http.header.* entries onto the request. The
+                    # read touches only the small metadata column (never the raw body).
+                    metadata = await self._user_metadata_for(item.message_id)
                     response = await connector.send(payload, metadata=metadata)
                 else:
                     # Default: NO metadata read and the historical send(payload) call shape —
@@ -6848,6 +6839,16 @@ class RegistryRunner:
             else:
                 retry_until = await self._mark_failed_and_arm(name, item.id, safe_exc(exc), retry)
                 await self._delivery_failure_alert_checks(name)
+        except _StoreReadFault as exc:
+            # Vault BACKLOG #2756: a store READ the send needed failed (the document re-attach or the
+            # dynamic_headers metadata), so nothing was sent and nothing is wrong with the message.
+            # Re-pend it on the retry policy's backoff, spending an attempt so a fault that repeats
+            # on one row stays bounded by max_attempts, and run the buildup and stall checks. Not
+            # the internal-error arm, which would dead-letter (or STOP on) an unsent message, and
+            # not _note_lane_unhealthy, because the partner was never contacted.
+            retry_until = await self._mark_failed_and_arm(name, item.id, str(exc), retry)
+            self._note_store_read_fault(name, exc, 1, retry_until)
+            await self._delivery_failure_alert_checks(name)
         except DeliveryError as exc:
             # Transport failure (connect/IO/timeout/unparseable ACK) — transient; retry
             # per policy (the shipped cap is 100 attempts, then the row dead-letters into the
@@ -6897,6 +6898,7 @@ class RegistryRunner:
             # #46: a successful delivery means the lane is up — edge-trigger
             # connection_restored if it had been marked down (no-op otherwise).
             self._note_lane_healthy(name)
+            self._clear_store_read_faults(name)
             # ADR 0013: a capturing outbound returns a DeliveryResponse; persist the reply
             # AND mark the row done in ONE transaction (exactly-once capture). A non-capturing
             # outbound returns None → plain mark_done, byte-identical. The XOR (never both)
@@ -7088,22 +7090,13 @@ class RegistryRunner:
         # no send and no disposition. Members are carried VERBATIM (the head too — never re-encoded); only
         # the head is PARSED, for the BHS separators + the BHS-11 control id.
         refused: list[_RefusedMember] = []
-        # #149 (ADR 0105 Phase 1b): re-attach each member's detached document VERBATIM before framing
-        # the envelope, so a batched streaming feed delivers full inline documents (never a raw
-        # mfdoc:v1:ref: handle). Members with no handle are byte-identical; a missing attachment is a
-        # DeliveryError raised inside the try below, so the whole batch re-pends and the peer never
-        # sees a handle. Vault BACKLOG #2756: the reads run OUTSIDE that try, as on the single-row
-        # path, so a store read fault escapes to the #1579 guard and the caller's re-pend rather than
-        # dead-lettering all N through the internal-error arm. A content fault is held and raised
-        # inside the try, by type, exactly as on the single-row path.
-        hydrated: list[str] = []
-        held: list[Exception] = []  # at most one; see _raise_held
         try:
+            # #149 (ADR 0105 Phase 1b): re-attach each member's detached document VERBATIM before framing
+            # the envelope, so a batched streaming feed delivers full inline documents (never a raw
+            # mfdoc:v1:ref: handle). Members with no handle are byte-identical; a missing attachment raises
+            # a DeliveryError (caught below → the whole batch re-pends), so the peer never sees a handle.
+            # A store read fault is a _StoreReadFault and re-pends the same way (vault BACKLOG #2756).
             hydrated = [await self._hydrate_payload(it.payload) for it in items]
-        except _PRE_SEND_CONTENT_FAULTS as exc:
-            held.append(exc)
-        try:
-            _raise_held(held)
             # ADR 0205 rule 1, per member: one member the frame cannot carry is dead-lettered alone
             # and the rest batch, rather than all N dying on one envelope offset. It runs before the
             # shadow branch below, so a simulate outbound records the same dispositions. The split
@@ -7155,6 +7148,13 @@ class RegistryRunner:
             else:
                 retry_until = await self._mark_batch_failed_and_arm(name, ids, safe_exc(exc), retry)
                 await self._delivery_failure_alert_checks(name)
+        except _StoreReadFault as exc:
+            # Vault BACKLOG #2756, the batch twin of the single-row arm: nothing was sent, so all N
+            # re-pend on the retry policy's backoff rather than dead-lettering through the
+            # internal-error arm below.
+            retry_until = await self._mark_batch_failed_and_arm(name, ids, str(exc), retry)
+            self._note_store_read_fault(name, exc, len(ids), retry_until)
+            await self._delivery_failure_alert_checks(name)
         except DeliveryError as exc:
             retry_until = await self._mark_batch_failed_and_arm(name, ids, safe_exc(exc), retry)
             await self._delivery_failure_alert_checks(name)
@@ -7194,6 +7194,7 @@ class RegistryRunner:
         else:
             if ids:  # nothing was sent when every member was refused
                 self._note_lane_healthy(name)
+                self._clear_store_read_faults(name)
                 await self.store.mark_batch_done(ids)
         await self._dead_letter_refused(name, refused)
         return _ItemOutcome.PROCESSED, retry_until
@@ -8588,6 +8589,41 @@ class RegistryRunner:
             return  # oldest message hasn't stalled long enough yet
         self._fire_stall(name, age=oldest_age, now=now)
 
+    def _note_store_read_fault(
+        self, name: str, exc: _StoreReadFault, rows: int, retry_until: float | None
+    ) -> None:
+        """Log a pre-send store read fault AFTER its outcome is written, so the line says what
+        happened: re-pended, or dead-lettered at the retry cap. Through a per-lane
+        :class:`~messagefoundry.log_backoff.FailureRun`, because an UNORDERED lane can fail a whole
+        backlog fast during a store outage and a line per row would be a flood (BACKLOG #1844)."""
+        outcome = (
+            "re-pended with backoff" if retry_until is not None else "dead-lettered at the cap"
+        )
+        run = self._store_read_fault_runs.get(name, FailureRun())
+        self._store_read_fault_runs[name] = run.record(
+            log,
+            exc,
+            "delivery worker %r: %s before sending %d row(s); %s",
+            name,
+            exc,
+            rows,
+            outcome,
+            level=logging.WARNING,
+            count_label=_WORKER_RUN_COUNT,
+        )
+
+    def _clear_store_read_faults(self, name: str) -> None:
+        """Close the lane's store read fault run on a delivered send, with one recovery line."""
+        run = self._store_read_fault_runs.pop(name, None)
+        if run is not None:
+            run.clear(
+                log,
+                "delivery worker %r: pre-send store reads",
+                name,
+                level=logging.WARNING,
+                count_label=_WORKER_RUN_COUNT,
+            )
+
     async def _delivery_failure_alert_checks(self, name: str) -> None:
         """Run the buildup and stall checks after a delivery failure re-pended rows on ``name``
         (vault BACKLOG #2770). Both read the store (``pending_depth``), and a read error there is a
@@ -8609,14 +8645,19 @@ class RegistryRunner:
             try:
                 await run(name)
             except Exception as exc:  # noqa: BLE001 -- a diagnostic; see the docstring
+                # Logged as a redacted stand-in carrying the original traceback: the driver's own
+                # text can quote a cell (section 9), the frames cannot.
+                stand_in = _RedactedFault(safe_exc(exc)).with_traceback(exc.__traceback__)
                 failures = self._delivery_alert_check_runs.get(key, FailureRun())
                 self._delivery_alert_check_runs[key] = failures.record(
-                    log, exc, "delivery %s check failed for outbound %r", check, name
+                    log, stand_in, "delivery %s check failed for outbound %r", check, name
                 )
             else:
                 open_run = self._delivery_alert_check_runs.pop(key, None)
                 if open_run is not None:
-                    open_run.clear(log, "delivery %s check for outbound %r", check, name)
+                    open_run.clear(
+                        log, "delivery %s check for outbound %r", check, name, level=logging.WARNING
+                    )
 
     async def _inflight_watch_loop(self) -> None:
         """Run :meth:`_check_inflight_strands` every ``_INFLIGHT_WATCH_INTERVAL_SECONDS`` until stop
@@ -8866,30 +8907,49 @@ class RegistryRunner:
             return False
 
 
-# Vault BACKLOG #2756: the exceptions a delivery's pre-send store reads (``_hydrate_payload``,
-# ``_user_metadata_for``) raise for a fault in the MESSAGE rather than in the store. They keep the arm
-# they reached when those reads sat inside the send try: DeliveryError the retry arm (a missing or
-# malformed document handle), the rest the internal-error policy (a payload that will not parse is a
-# ValueError, a cell that fails decryption is a CipherError, an encrypted cell on a keyless store is a
-# StoreKeylessError). Anything else, a driver or pool error, propagates to the caller's re-pend as an
-# infrastructure fault. ValueError and LookupError are here because no store backend's driver error
-# derives from either.
-_PRE_SEND_CONTENT_FAULTS: tuple[type[Exception], ...] = (
-    DeliveryError,
+class _RedactedFault(Exception):
+    """An exception whose message is already redacted with :func:`safe_exc`, so a log line or a
+    ``last_error`` built from it carries no raw driver text, which can quote a cell (section 9)."""
+
+
+class _StoreReadFault(_RedactedFault):
+    """A store READ that a delivery needed before its send failed in the store itself: the document
+    re-attach (``read_attachment``) or the ``dynamic_headers`` metadata (``message_metadata_json``).
+    Vault BACKLOG #2756. Raised only by :func:`_read_from_store`.
+
+    The classification is by ORIGIN, at the store call, not by exception type: a driver or pool error
+    is whatever its backend raises, and aiosqlite and asyncpg both raise ``ValueError`` subclasses for
+    some of theirs, so no type list can tell them from a message fault. The delivery bodies give it
+    its own arm: re-pend on the retry backoff, spending an attempt so a fault that repeats on one row
+    is bounded by ``max_attempts``, never the internal-error arm (which would dead-letter an unsent
+    message at once). At the cap it dead-letters into the replayable DLQ like any other retry."""
+
+
+# What a store read raises for a fault in the stored MESSAGE, not in the store, and so is NOT wrapped
+# in _StoreReadFault: each keeps the arm it always reached. A missing or GC'd attachment (KeyError) and
+# a backend without streaming become a DeliveryError in _hydrate_payload; a cell that fails decryption
+# (CipherError) reaches the internal-error policy. At least one infrastructure fault also arrives as a
+# CipherError -- a Vault Transit cipher wraps an unreachable Vault in one -- and so still takes that
+# arm; telling the two apart needs the cipher to raise a distinct type.
+_STORE_READ_CONTENT_FAULTS: tuple[type[Exception], ...] = (
+    KeyError,
+    StreamingAttachmentsUnsupported,
     CipherError,
-    StoreKeylessError,
-    ValueError,
-    LookupError,
 )
 
 
-def _raise_held(held: list[Exception]) -> None:
-    """Raise the one content fault a pre-send read held, if any (vault BACKLOG #2756). Popped as it is
-    raised so the caller's frame keeps no reference to it: a local holding a caught exception holds
-    its traceback, and with it the frame and every payload in it, in a cycle until the collector
-    runs, which is why :meth:`RegistryRunner._split_unframeable_members` strips its tracebacks."""
-    if held:
-        raise held.pop()
+async def _read_from_store[T](what: str, read: Callable[[], Awaitable[T]]) -> T:
+    """Run one pre-send store read, raising a :class:`_StoreReadFault` for a fault in the store
+    (vault BACKLOG #2756). The fault is raised OUTSIDE the ``except`` block, so it carries no
+    ``__context__``: the driver exception, its unredacted text and the frames holding the payload are
+    dropped with the block rather than chained on."""
+    try:
+        return await read()
+    except _STORE_READ_CONTENT_FAULTS:
+        raise
+    except Exception as exc:
+        fault = _StoreReadFault(f"store {what} failed: {safe_exc(exc)}")
+    raise fault
 
 
 def _frames(connector: object) -> bool:

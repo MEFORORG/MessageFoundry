@@ -2,11 +2,12 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Delivery fault classification and bounded retry backoff (vault BACKLOG #2756, #2770, #2761).
 
-* #2756: the store reads a send needs (the document re-attach, the ``dynamic_headers`` metadata bag)
-  sat inside the send ``try``, so a transient driver error from either reached the internal-error arm
-  and dead-lettered (or STOPped the lane on) a message that was never sent. They now run before it,
-  so the fault propagates to the caller's re-pend. Controls: a missing attachment is still a
-  retryable ``DeliveryError``, and a real internal error from the connector still dead-letters.
+* #2756: a driver error from a store read the send needs (the document re-attach, the
+  ``dynamic_headers`` metadata bag) reached the internal-error arm and dead-lettered (or STOPped the
+  lane on) a message that was never sent. It is now classified by ORIGIN, at the store call, and
+  re-pends on the retry backoff, spending an attempt so a fault that repeats on one row stays bounded.
+  Controls: a missing attachment is still a retryable ``DeliveryError``; a parse failure, a
+  decryption failure and a code bug in the same path still reach the internal-error policy.
 * #2770: the buildup and stall checks after a failed delivery read ``pending_depth`` unguarded, so a
   read error there escaped the delivery body, which the pooled dispatcher counts as a T17 infra
   fault. It is now logged and the delivery's outcome stands.
@@ -121,10 +122,15 @@ async def _status(store: MessageStore, message_id: str) -> str:
     return str((await store.outbox_for(message_id))[0]["status"])
 
 
-# --- vault BACKLOG #2756: a store read fault is an infrastructure fault, not a delivery failure -----
+# --- vault BACKLOG #2756: a store read fault re-pends on the retry backoff, never dead-letters at once -
 
 
-async def test_an_attachment_read_fault_propagates_and_the_row_is_retried(
+async def _last_error_and_attempts(store: MessageStore, message_id: str) -> tuple[str, int]:
+    row = (await store.outbox_for(message_id))[0]
+    return str(row["last_error"]), int(row["attempts"])
+
+
+async def test_an_attachment_read_fault_re_pends_with_backoff_and_the_row_is_retried(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     mid = await _skeleton(store)
@@ -134,25 +140,25 @@ async def test_an_attachment_read_fault_propagates_and_the_row_is_retried(
 
     item = await store.claim_next_fifo(DEST)
     assert item is not None
-    with pytest.raises(sqlite3.OperationalError):
-        await runner._process_delivery_item(DEST, item)
-    assert calls == [1]
-    # Not dead-lettered and not sent: the row is still the caller's to re-pend.
-    assert await store.count_dead() == 0
-    assert await _status(store, mid) == OutboxStatus.INFLIGHT.value
-    assert sender.sent == []
+    outcome, retry_until = await runner._process_delivery_item(DEST, item)
 
-    # The caller's fault arm (per_lane #1611, the same re-pend T17 makes) hands it back, and the
-    # next attempt reads the attachment and delivers.
-    await runner._repend_claimed_on_fault("delivery", DEST, [item.id])
-    again = await store.claim_next_fifo(DEST, now=time.time() + 60)
+    assert calls == [1]
+    assert outcome is _ItemOutcome.PROCESSED and retry_until is not None
+    assert await store.count_dead() == 0
+    assert await _status(store, mid) == OutboxStatus.PENDING.value
+    assert sender.sent == []
+    last_error, attempts = await _last_error_and_attempts(store, mid)
+    assert last_error.startswith("store attachment read failed: OperationalError")
+    assert attempts == 1  # spent, so the retry cap bounds a fault that repeats on this row
+
+    again = await store.claim_next_fifo(DEST, now=retry_until + 1)
     assert again is not None and again.id == item.id
     await runner._process_delivery_item(DEST, again)
     assert len(sender.sent) == 1
     assert await _status(store, mid) == OutboxStatus.DONE.value
 
 
-async def test_a_metadata_read_fault_propagates_instead_of_dead_lettering(
+async def test_a_metadata_read_fault_re_pends_instead_of_dead_lettering(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     raw = _hl7("plain")
@@ -172,18 +178,111 @@ async def test_a_metadata_read_fault_propagates_instead_of_dead_lettering(
 
     item = await store.claim_next_fifo(DEST)
     assert item is not None
-    with pytest.raises(sqlite3.OperationalError):
-        await runner._process_delivery_item(DEST, item)
+    outcome, retry_until = await runner._process_delivery_item(DEST, item)
+    assert outcome is _ItemOutcome.PROCESSED and retry_until is not None
     assert await store.count_dead() == 0
-    assert await _status(store, mid) == OutboxStatus.INFLIGHT.value
+    assert await _status(store, mid) == OutboxStatus.PENDING.value
     assert sender.sent == []
 
-    await runner._repend_claimed_on_fault("delivery", DEST, [item.id])
-    again = await store.claim_next_fifo(DEST, now=time.time() + 60)
+    again = await store.claim_next_fifo(DEST, now=retry_until + 1)
     assert again is not None
     await runner._process_delivery_item(DEST, again)
     assert sender.sent == [raw] and sender.metadata == [None]
     assert await _status(store, mid) == OutboxStatus.DONE.value
+
+
+async def test_a_closed_read_connection_re_pends_an_unsent_message(
+    store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The case a type list got wrong: aiosqlite raises a plain ValueError on a closed connection,
+    the type a parse failure also has. Classified by origin, it is a store fault and re-pends."""
+    await _skeleton(store)
+    sender = _Sender()
+    runner = _runner(store, sender)
+    item = await store.claim_next_fifo(DEST)
+    assert item is not None
+    assert store._read_conns, "the file-backed store reads through its pool"
+    for conn in store._read_conns:
+        await conn.close()
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.wiring_runner"):
+        outcome, retry_until = await runner._process_delivery_item(DEST, item)
+
+    assert "store attachment read failed: ValueError" in caplog.text
+
+    assert outcome is _ItemOutcome.PROCESSED and retry_until is not None
+    assert sender.sent == []
+    # The read pool is closed, so read the row back on the writer connection.
+    cur = await store._db.execute("SELECT status, attempts FROM queue WHERE id=?", (item.id,))
+    row = await cur.fetchone()
+    assert row is not None
+    assert (row["status"], row["attempts"]) == (OutboxStatus.PENDING.value, 1)
+
+
+async def test_a_store_fault_that_repeats_on_one_row_is_bounded_by_the_retry_cap(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each store read fault spends an attempt, so a row whose read never succeeds reaches the
+    replayable DLQ at max_attempts instead of re-pending forever."""
+    mid = await _skeleton(store)
+    runner = _runner(store, _Sender(), retry=RetryPolicy(max_attempts=3, backoff_seconds=0.01))
+
+    async def _locked() -> AsyncIterator[str]:
+        raise sqlite3.OperationalError("database disk image is malformed")
+        yield ""  # pragma: no cover - makes this an async generator
+
+    monkeypatch.setattr(store, "read_attachment", lambda sha256: _locked())
+    later = time.time()
+    for _ in range(3):
+        later += 10.0
+        item = await store.claim_next_fifo(DEST, now=later)
+        assert item is not None
+        await runner._process_delivery_item(DEST, item)
+
+    assert await _status(store, mid) == OutboxStatus.DEAD.value
+
+
+async def test_a_store_fault_log_line_carries_no_raw_driver_text(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    mid = await _skeleton(store)
+    runner = _runner(store, _Sender())
+    leak = "PID|1||TESTMRN99^^^FAC||SAMPLE^LEAKED"
+
+    async def _noisy() -> AsyncIterator[str]:
+        raise sqlite3.OperationalError(f"could not decode column with text {leak}")
+        yield ""  # pragma: no cover - makes this an async generator
+
+    monkeypatch.setattr(store, "read_attachment", lambda sha256: _noisy())
+    item = await store.claim_next_fifo(DEST)
+    assert item is not None
+    with caplog.at_level(logging.DEBUG):
+        await runner._process_delivery_item(DEST, item)
+
+    assert "store attachment read failed" in caplog.text
+    assert "TESTMRN99" not in caplog.text and "LEAKED" not in caplog.text
+    last_error, _attempts = await _last_error_and_attempts(store, mid)
+    assert "TESTMRN99" not in last_error
+
+
+async def test_control_a_code_bug_in_the_read_path_still_dead_letters(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fault that does not come from a store call keeps today's arm, whatever its type."""
+    mid = await _skeleton(store)
+    runner = _runner(store, _Sender())
+
+    async def buggy(payload: str) -> str:
+        raise TypeError("a bug in the re-attach")
+
+    monkeypatch.setattr(runner, "_hydrate_payload", buggy)
+    item = await store.claim_next_fifo(DEST)
+    assert item is not None
+
+    outcome, retry_until = await runner._process_delivery_item(DEST, item)
+
+    assert outcome is _ItemOutcome.PROCESSED and retry_until is None
+    assert await _status(store, mid) == OutboxStatus.DEAD.value
 
 
 async def test_control_a_missing_attachment_is_still_a_retryable_delivery_error(
@@ -225,9 +324,9 @@ async def test_control_an_internal_error_from_the_send_still_dead_letters(
 async def test_control_a_payload_that_will_not_parse_still_dead_letters(
     store: MessageStore,
 ) -> None:
-    """Classified by type, not by position: a non-HL7 payload carrying the document marker fails to
-    parse inside the re-attach, now before the send try, and still reaches the internal-error policy
-    (dead-letter under the default CONTINUE) instead of re-pending as an infra fault forever."""
+    """Classified by origin: a non-HL7 payload carrying the document marker fails to parse inside
+    the re-attach, not in a store call, so it still reaches the internal-error policy (dead-letter
+    under the default CONTINUE) although its ValueError type is one a store driver can also raise."""
     raw = '{"note": "' + DOC_REF_MARKER + 'not-a-handle"}'
     mid = await store.enqueue_message(channel_id="IB", raw=raw, deliveries=[(DEST, raw)], now=100.0)
     sender = _Sender()
@@ -280,7 +379,7 @@ async def test_control_a_batch_member_that_will_not_parse_still_dead_letters(
     assert await _status(store, mid) == OutboxStatus.DEAD.value
 
 
-async def test_a_batch_member_read_fault_propagates_and_dead_letters_nothing(
+async def test_a_batch_member_read_fault_re_pends_the_batch_and_dead_letters_nothing(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     first = await _skeleton(store, "MSG1")
@@ -292,13 +391,12 @@ async def test_a_batch_member_read_fault_propagates_and_dead_letters_nothing(
 
     head = await store.claim_next_fifo(DEST)
     assert head is not None
-    with pytest.raises(sqlite3.OperationalError):
-        await runner._process_delivery_batch(DEST, head, cfg)
+    outcome, retry_until = await runner._process_delivery_batch(DEST, head, cfg)
 
+    assert outcome is _ItemOutcome.PROCESSED and retry_until is not None
     assert await store.count_dead() == 0
     assert sender.sent == []
-    # The head is the caller's to re-pend; the coalesced extra was handed back by the #1579 guard.
-    assert await _status(store, first) == OutboxStatus.INFLIGHT.value
+    assert await _status(store, first) == OutboxStatus.PENDING.value
     assert await _status(store, second) == OutboxStatus.PENDING.value
 
 
