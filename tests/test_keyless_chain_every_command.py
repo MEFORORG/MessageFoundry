@@ -18,6 +18,9 @@ Also pinned: ``provision-admin`` refuses BEFORE writing when the opened store ca
 (a keyed chain opened from a shell with no key and a stale opt-out used to write the account and then
 crash on the audit row), and every command that opens a keyed store onto keyless rows says so.
 
+Also pinned (vault BACKLOG #2725): ``audit-verify`` exits 4, not a broken chain's 1, on a keyed chain
+in a shell that holds no key, and 2 when the key the settings name does not resolve.
+
 Severity is conditional (CLAUDE.md section 0): zero deployments, so this is what a first deployment
 would have inherited.
 """
@@ -27,6 +30,7 @@ from __future__ import annotations
 import argparse
 import ast
 import asyncio
+import contextlib
 import json
 import logging
 import sqlite3
@@ -302,6 +306,147 @@ def test_a_command_that_opens_a_keyed_store_onto_keyless_rows_reports_them(
     assert rc == 0
     assert reports and "audit-verify" in reports[0] and "rekey-audit" not in reports[0]
     assert main(["audit-verify", "--db", str(db)]) == 1, "a keyed verify must report the chain"
+
+
+# --- vault BACKLOG #2725: a keyed chain with no key in this shell exits 4, not 1 ---------------------
+#
+# `audit-verify` spent exit 1, a broken chain's code, on a keyed chain verified in a shell that holds
+# no key. A scheduled job reads the code and nothing else, so it would have reported tampering on an
+# intact log. Measured on the unfixed code: exit 1 with "FAIL: audit chain is keyed ... but no store
+# encryption key/MAC is configured to verify it". A key the settings name but that does not resolve
+# went to the dispatch floor, also exit 1.
+
+
+def _keyed_chain(db: Path, key: str) -> None:
+    """A keyed chain of three rows: the genesis row the keyed open writes, then two actions."""
+
+    async def build() -> None:
+        cipher = make_cipher(key)
+        store = await MessageStore.open(db, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
+        try:
+            await store.record_audit("first", actor="test")
+            await store.record_audit("second", actor="test")
+        finally:
+            await store.close()
+
+    asyncio.run(build())
+
+
+def _write(db: Path, statement: str) -> None:
+    """One out-of-band statement by a writer that holds no key."""
+    with contextlib.closing(sqlite3.connect(db)) as conn:
+        conn.execute(statement)
+        conn.commit()
+
+
+_EDIT_ROW_2 = "UPDATE audit_log SET actor = 'someone_else' WHERE seq = 2"
+_DELETE_ROW_2 = "DELETE FROM audit_log WHERE seq = 2"
+
+
+def test_audit_verify_exits_4_on_a_keyed_chain_with_no_key(
+    shell: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The item's case: an intact keyed chain, and a shell with no key. Exit 4, and a line that says
+    the chain was not checked because no key is available, never that it is broken."""
+    db = shell / "keyed.db"
+    _keyed_chain(db, generate_key())
+    rc = main(["audit-verify", "--db", str(db)])
+    out = capsys.readouterr().out
+    assert rc == 4, out
+    assert out.startswith("NOT CHECKED: ") and "could not be checked" in out, out
+    assert "no store encryption key/MAC" in out, out
+    assert "FAIL" not in out and "broken at" not in out, out
+
+
+@pytest.mark.parametrize(
+    ("change", "expected"),
+    [(None, 0), (_EDIT_ROW_2, 1), (_DELETE_ROW_2, 1)],
+    ids=["intact", "edited-row", "deleted-row"],
+)
+def test_audit_verify_with_the_key_keeps_0_and_1(
+    change: str | None,
+    expected: int,
+    shell: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Controls: with the key, an intact chain exits 0 and a tampered one exits 1. A process that
+    holds a key can never be told its chain is unchecked, whatever the database holds."""
+    key = generate_key()
+    db = shell / "keyed.db"
+    _keyed_chain(db, key)
+    if change is not None:
+        _write(db, change)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key)
+    rc = main(["audit-verify", "--db", str(db)])
+    out = capsys.readouterr().out
+    assert rc == expected, out
+    assert "NOT CHECKED" not in out, out
+
+
+def test_audit_verify_with_the_wrong_key_exits_1(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A key is held, just not the chain's. That is a finding about this chain and this key, so it
+    stays exit 1: a shell that holds a key never gets the "not checked" code."""
+    db = shell / "keyed.db"
+    _keyed_chain(db, generate_key())
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
+    rc = main(["audit-verify", "--db", str(db)])
+    out = capsys.readouterr().out
+    assert rc == 1, out
+    assert out.startswith("FAIL: "), out
+
+
+def test_a_break_that_needs_no_key_exits_1_with_no_key(
+    shell: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Tampering that a shell with no key CAN see still exits 1, not 4: a row missing from the middle
+    (its sequence numbers stop matching), and a tail cut off after an anchor was taken."""
+    db = shell / "keyed.db"
+    _keyed_chain(db, generate_key())
+    _write(db, _DELETE_ROW_2)
+    assert main(["audit-verify", "--db", str(db)]) == 1
+    assert "broken at seq=2" in capsys.readouterr().out
+
+    db = shell / "anchored.db"
+    _keyed_chain(db, generate_key())
+    assert main(["audit-anchor", "--db", str(db), "--json"]) == 0
+    anchor = json.loads(capsys.readouterr().out)["anchor"]
+    assert main(["audit-verify", "--db", str(db), "--expected-anchor", anchor]) == 4  # the control
+    capsys.readouterr()
+    _write(db, "DELETE FROM audit_log WHERE seq = 3")
+    assert main(["audit-verify", "--db", str(db), "--expected-anchor", anchor]) == 1
+    assert "diverges from recorded anchor" in capsys.readouterr().out
+
+
+def test_an_edit_a_shell_with_no_key_cannot_see_is_still_not_a_pass(
+    shell: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The limit, pinned so nobody reads 4 as clean: an edited row's content shows only in its MAC,
+    which needs the key. With no key the result is 4, "not checked", and never 0."""
+    db = shell / "keyed.db"
+    _keyed_chain(db, generate_key())
+    _write(db, _EDIT_ROW_2)
+    assert main(["audit-verify", "--db", str(db)]) == 4
+    assert "NOT CHECKED" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("command", ["audit-verify", "audit-anchor"])
+def test_a_key_that_does_not_resolve_exits_2(
+    command: str, shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A key the settings name that cannot be resolved stops the command before it reads a row: here
+    `vault_transit` with no Transit key named. Exit 2, could not start, as `rotate-key` and
+    `provision-admin` exit on the same errors. It used to reach the dispatch floor and exit 1."""
+    db = shell / "keyed.db"
+    _keyed_chain(db, generate_key())
+    monkeypatch.setenv("MEFOR_STORE_CIPHER_PROVIDER", "vault_transit")
+    rc = main(_argv(command, db, shell))
+    captured = capsys.readouterr()
+    assert rc == 2, (captured.out, captured.err)
+    text = json.loads(captured.out)["error"] if command == "audit-anchor" else captured.err
+    assert "MEFOR_STORE_TRANSIT_KEY" in text, text
 
 
 # --- the source guard ----------------------------------------------------------------------------------

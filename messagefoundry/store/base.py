@@ -68,6 +68,7 @@ from messagefoundry.store.store import (
     AlertInstance,
     AlertSummary,
     AuditAppend,
+    AuditVerdict,
     CapturedResponse,
     ChannelScopeSource,
     ClaimedHeads,
@@ -1762,7 +1763,7 @@ class AuditStore(Protocol):
         *,
         expected_anchor: tuple[int, str] | None = None,
         expected_prefix: tuple[int, str] | None = None,
-    ) -> tuple[bool, str | None]: ...
+    ) -> AuditVerdict: ...
 
     async def roll_audit_key_epoch(self) -> tuple[bool, str]:
         """``rotate-key``'s audit step (BACKLOG #1904, ADR 0193): open a range of the audit chain under

@@ -906,7 +906,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         action="store_true",
         help="exit 0 instead of 3 when the audit log verifies clean but holds no rows. Without it "
         "an empty log is a distinct exit code, so a scheduled job cannot read 'there was nothing "
-        "to verify' as a pass (exit 1 stays a BROKEN CHAIN, exit 2 'could not open the store')",
+        "to verify' as a pass (exit 1 stays a BROKEN CHAIN, exit 2 'could not open the store', "
+        "exit 4 'the chain is keyed and this shell holds no key, so it was not checked')",
     )
     # ONE mutually-exclusive group: the two flags carry the same value in two transports, and argparse
     # refusing both is better than silently letting one win.
@@ -7143,6 +7144,7 @@ def _audit_verify(args: argparse.Namespace) -> int:
     from messagefoundry.config.settings import StoreBackend, keyless_opt_out_refusal, load_settings
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import (
+        AuditVerdict,
         KeylessAuditChainRefused,
         StoreNotFoundError,
         open_store,
@@ -7178,7 +7180,7 @@ def _audit_verify(args: argparse.Namespace) -> int:
     if refused is not None:
         return refused
 
-    async def run() -> tuple[bool, str | None, int]:
+    async def run() -> tuple[AuditVerdict, int]:
         # Read-only (BACKLOG #1780, #2101): the evidence is neither migrated nor refused for a schema
         # this build does not match, so a store an incompatible version wrote can still be verified.
         store = await open_store(
@@ -7187,22 +7189,23 @@ def _audit_verify(args: argparse.Namespace) -> int:
             keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
         )
         try:
-            ok, message = await store.verify_audit_chain(expected_anchor=expected_anchor)
-            if not ok:
-                return ok, message, -1  # a FAIL exits 1 whatever the count; don't query for it
+            verdict = await store.verify_audit_chain(expected_anchor=expected_anchor)
+            if not verdict[0]:
+                return verdict, -1  # a FAIL exits 1 or 4 whatever the count; don't query for it
             # The row count decides the empty-log exit below. Ask the store for an integer rather
             # than pattern-matching "verified 0 " out of a human-readable message.
             count, _head = await store.audit_anchor()
-            return ok, message, count
+            return verdict, count
         finally:
             await store.close()
 
     try:
-        ok, message, count = run_guarded(run())
+        verdict, count = run_guarded(run())
     except (
         KeylessAuditChainRefused,
         StoreNotFoundError,
-    ) as exc:  # #1916; #1780: a server database with no store. Could not start.
+        *_key_unresolved(),
+    ) as exc:  # #1916; #1780: a server database with no store; #2725: no key. Could not start.
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
@@ -7210,6 +7213,13 @@ def _audit_verify(args: argparse.Namespace) -> int:
         # ONLY SQLite; this catch is what a server backend and any error raised after the open
         # still land in, so both guards stay live.
         return _emit_store_open_error(exc, settings.store.path, as_json=False)
+    ok, message = verdict
+    if verdict.key_unavailable:
+        # EXIT 4, NOT 1 (vault BACKLOG #2725). The chain is keyed and this shell holds no key, so no
+        # row MAC was checked. 1 would tell a job that reads only the code that the chain is broken.
+        # The flag, not the message, decides: only a process holding no key can set it.
+        print("NOT CHECKED: " + (message or ""))
+        return 4
     print(("OK: " if ok else "FAIL: ") + (message or ""))
     if not ok:
         return 1
@@ -7294,7 +7304,11 @@ def _audit_anchor(args: argparse.Namespace) -> int:
 
     try:
         count, head = run_guarded(run())
-    except (KeylessAuditChainRefused, StoreNotFoundError) as exc:  # #1916, #1780, as audit-verify
+    except (
+        KeylessAuditChainRefused,
+        StoreNotFoundError,
+        *_key_unresolved(),
+    ) as exc:  # #1916, #1780, #2725, as audit-verify
         _emit_error(str(exc), as_json=args.json)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
@@ -8695,6 +8709,19 @@ def _paste_safe_option(option: str, value: str) -> str | None:
         or value.startswith("/")
     )
     return None if unsafe else f'{option}="{value}"'
+
+
+def _key_unresolved() -> tuple[type[Exception], ...]:
+    """What ``open_store`` raises when the store key the settings name cannot be resolved: an
+    unreadable key file, or a key provider (Vault, Transit) that refuses or cannot be reached.
+
+    Each is raised while the key is resolved, before the store reads a row, so nothing a database
+    holds can cause one. Their texts name settings, environment variables and files, never a key.
+    Imported here, not at module level, so the CLI's import cost stays where it is."""
+    from messagefoundry.secrets_dpapi import DpapiError, DpapiUnavailable
+    from messagefoundry.store.keyprovider import KeyProviderError
+
+    return (KeyProviderError, DpapiError, DpapiUnavailable)
 
 
 def _emit_store_open_error(exc: sqlite3.DatabaseError, path: str, *, as_json: bool) -> int:

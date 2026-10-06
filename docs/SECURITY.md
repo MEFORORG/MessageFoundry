@@ -4158,29 +4158,38 @@ was true until the keyed-from mark was removed. Verify the chain with
 reordered by someone who could not recompute the chain. Run it with the key settings and environment
 the engine runs with, which under `cipher_provider = "vault_transit"` include the Transit settings
 listed under `cipher_provider` in [CONFIGURATION.md](CONFIGURATION.md). A keyed chain cannot be
-verified without them, and the verify exits 1. With no store key configured it prints a `FAIL` line
-saying the chain is keyed and no key is configured. Under `vault_transit` with the Transit settings
-missing, it stops with an error before it reads the chain. With the key,
+verified without them. With no store key configured, the verify prints a `NOT CHECKED` line saying
+the chain is keyed and no key is configured, and exits 4. Under `vault_transit` with the Transit
+settings missing, or with a key file it cannot read, it stops with an error before it reads the chain,
+and exits 2. With the key,
 exit 0 also means every row is keyed. With no key, which only the keyless store mode allows, exit 0
 covers a keyless chain and says no more than the paragraph above. A store that has a key and opens
 onto keyless rows fails the verify, and is also reported as
 [`audit_chain_unkeyed`](SECURITY-LOOSENING.md#audit_chain_unkeyed--the-store-has-a-key-but-its-audit-chain-is-keyless).
-**A scheduled job reads the exit code and nothing else, so
-these four are kept distinct:** `0` a clean walk over at least one row, `1` a chain that did not
-verify, `2` the
-path is not an audit database, and `3` a clean walk over an **empty** log. Exit 2 covers at least an
-absent path, a zero-byte file, a file carrying no `audit_log` table, and a path that is not a SQLite
-database at all — the verifier refuses each rather than creating or migrating the evidence it was
-asked to check, and it opens read-only so it cannot write to that file either way. It never spends
-`1` on any of them. Exit 1 covers at least a broken chain, a mismatch with `--expected-anchor`, and a
-keyed chain checked with no key, and the `FAIL` line says which. It also covers the `vault_transit`
-error above, which prints no `FAIL` line, so by the code alone a job cannot tell that case from a
-broken chain. Exit 3
+**A scheduled job reads the exit code and nothing else, so these five are kept distinct:**
+
+| Exit | Meaning |
+|---|---|
+| `0` | A clean walk over at least one row. |
+| `1` | The chain did not verify. It covers at least a broken chain, a mismatch with `--expected-anchor`, and a chain checked with a key that is not the chain's. The `FAIL` line says which. |
+| `2` | The command could not start. It covers at least an absent path, a zero-byte file, a file carrying no `audit_log` table, a path that is not a SQLite database at all, settings that do not load, and a store key the settings name that cannot be resolved. |
+| `3` | A clean walk over an **empty** log. |
+| `4` | The chain is keyed and this shell holds no key, so no row was checked against its MAC. This is not a pass and not a finding that the chain is broken. |
+
+For exit 2 the verifier refuses each case rather than creating or migrating the evidence it was asked
+to check, and it opens read-only so it cannot write to that file either way. It never spends `1` on
+any of them. Exit 4 is decided by the store's verify, which sets it only in a process that holds no
+key, so nothing a database holds can turn a key-holding verify into a 4 (vault BACKLOG #2725).
+Without a key the verify still checks what needs none: the sequence numbers, and an expected anchor if
+one is passed. A break there exits 1, not 4. **Treat 4 as unchecked, never as clean.** Without the key,
+an edited row is invisible, and a keyless chain whose first row was rewritten to name a key reads
+the same as a keyed one. Re-run with the key settings the engine runs with. Exit 3
 exists because "there was nothing to verify" is not a
 pass; pass `--allow-empty` to accept it as one on an instance that has not logged anything yet, or
 pass an expected anchor of `0:`, which asserts the same thing and is checked. `audit-anchor` keeps
 exit 0 on an empty log — sealing a fresh instance as `0:` is the point of it — but refuses the same
-non-audit-database paths. It does **not** mean nothing was removed: deleting the *newest*
+non-audit-database paths and an unresolvable key with exit 2. It needs no key to read a keyed chain's
+anchor, so it has no exit 4. A clean verify does **not** mean nothing was removed: deleting the *newest*
 rows leaves a prefix that still chains cleanly, so a bare verify is clean after a tail-truncation.
 The sequence number does not change that: it shows a row missing from the middle, not rows missing
 from the end. A log emptied altogether is the same case, since the next start writes a new genesis
