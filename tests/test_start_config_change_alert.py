@@ -645,6 +645,35 @@ async def test_the_reload_route_row_still_names_the_reloaded_graph(
     assert (start["inbound"], start["outbound"]) == (1, 1)
 
 
+async def test_a_convergence_row_with_no_digest_is_passed_over(
+    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
+) -> None:
+    """vault BACKLOG #3076: a convergence reload that could not take its digest writes a degraded
+    row with no fingerprint. It is marked unchecked, so a later start compares against the older
+    row with a digest and still reports an edit nobody reloaded."""
+    before = config_fingerprint(cfg)
+    await _start(tmp_path, cfg)  # the baseline
+    app = _app(tmp_path, cfg)
+    async with app.router.lifespan_context(app):
+        engine: Engine = app.state.engine
+
+        async def _no_digest(self: Engine, path: Path) -> tuple[None, str]:
+            return None, "synthetic: unreadable bundle"
+
+        with monkeypatch.context() as patch:
+            patch.setattr(Engine, "fingerprint_bundle", _no_digest)
+            await engine._converge_reload()
+        reload_rows = await engine.store.list_audit(action="config_reload")
+    assert len(reload_rows) == 1
+    row = json.loads(reload_rows[0]["detail"])
+    assert "fingerprint" not in row and row["failed_steps"] == ["config_fingerprint"]
+    assert row["baseline_unchecked"] is True
+    _edit(cfg)
+    rows = await _start(tmp_path, cfg)
+    assert rows[-1]["comparison"] == "compared", "not degraded_baseline: the row was passed over"
+    assert len(alerts) == 1 and alerts[0]["previous_fingerprint"] == before
+
+
 async def test_the_lifespan_seeds_the_config_version_before_its_first_load(
     tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

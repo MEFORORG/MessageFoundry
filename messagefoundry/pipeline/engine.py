@@ -1849,8 +1849,9 @@ class Engine:
         A bump that lands between this read and the load costs one redundant reload of the same
         bytes, which is the safe side. That reload writes its own ``config_reload`` row, and when it
         lands before the start's ``config_loaded`` row, that row is marked superseded with
-        ``loosenings`` null; the next start then compares against the reload's row. A failed read is logged and leaves :meth:`start` to seed, as
-        it did before; it never refuses a start that the old order allowed."""
+        ``loosenings`` null; the next start then compares against the reload's row.
+        A failed read is logged and leaves :meth:`start` to seed, as it did before; it never refuses
+        a start that the old order allowed."""
         if not self._coordinator.is_clustered():
             return
         try:

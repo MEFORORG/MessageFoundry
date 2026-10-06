@@ -1297,7 +1297,8 @@ started together, can each raise it; the alert list folds them into one instance
 - A convergence reload writes its own `config_reload` row, in the shape an operator reload writes
   (vault BACKLOG #3076). Its actor is `system:cluster-convergence` and its `initiator` is
   `cluster_convergence`. So the store's newest baseline names the graph the node converged on,
-  whether the reload lands before or after the start's row.
+  whether the reload lands before or after the start's row. A convergence row that could not take
+  a fingerprint is marked `baseline_unchecked`, so a later start passes over it.
 - The pass-over looks through the newest 50 config rows at most. If none is usable, the start
   begins a new baseline and says at WARNING that a change made before those rows is not reported.
 
