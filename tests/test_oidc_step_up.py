@@ -116,7 +116,7 @@ async def _return_from_idp(
     rsa_key: rsa.RSAPrivateKey,
     flow_id: str,
     *,
-    client: str = "10.0.0.9",
+    client: str | None = "10.0.0.9",
     **claim_over: Any,
 ) -> Any:
     """Answer the staged flow the way the IdP would, with claims the test may vary."""
@@ -338,6 +338,58 @@ async def test_the_idp_step_up_re_anchors_the_session_and_clears_the_new_address
         # Moved, not disarmed: the old anchor and the start leg's address both count as new now.
         assert await service.flag_new_client_ip(new, "10.0.0.1", path=NEXT)
         assert await service.flag_new_client_ip(new, "10.0.0.8", path=NEXT)
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    ("start", "callback", "start_client", "moved"),
+    [
+        # The re-anchor test's own pair: started at one address, returned from another.
+        ("10.0.0.8", "10.0.0.9", "10.0.0.8", True),
+        ("10.0.0.9", "10.0.0.9", "10.0.0.9", False),
+        # One host in two spellings: compared as the new-address signal compares (BACKLOG #2159).
+        ("::ffff:10.0.0.9", "10.0.0.9", "::ffff:10.0.0.9", False),
+        ("127.0.0.1", "::1", "127.0.0.1", False),
+        # An address missing on either leg proves no move either way.
+        ("", "10.0.0.9", None, None),
+        ("10.0.0.8", None, "10.0.0.8", None),
+    ],
+    ids=["moved", "same", "mapped-same-host", "loopback", "start-unknown", "callback-unknown"],
+)
+async def test_the_step_up_row_records_whether_the_address_moved_mid_ceremony(
+    rsa_key: rsa.RSAPrivateKey,
+    monkeypatch: pytest.MonkeyPatch,
+    start: str,
+    callback: str | None,
+    start_client: str | None,
+    moved: bool | None,
+) -> None:
+    """BACKLOG #2160. The start leg stages its caller's address and the callback re-anchors to its
+    own. The success row records both and whether they differ. A move is recorded, never refused,
+    and the anchor stays on the callback's address: either change is an ADR 0142 Amendment B
+    ruling."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key)
+        token = await _oidc_session(service, monkeypatch, rsa_key)
+        flow_id, _url = await _begin(service, token, client=start)
+        out = await _return_from_idp(service, monkeypatch, rsa_key, flow_id, client=callback)
+
+        assert out.ok, out
+        assert out.elevation.token is not None
+        session = await store.get_session(hash_token(out.elevation.token))
+        assert session is not None
+        if callback is not None:  # with none, the store keeps the earlier anchor
+            assert session.client == callback
+        rows = await _audit_rows(store, "auth.reauth")
+        assert len(rows) == 1, rows
+        row = rows[0]
+        assert row["client"] == callback
+        detail = json.loads(str(row["detail"]))
+        assert detail["ok"] is True
+        assert detail["start_client"] == start_client
+        assert detail["client_moved"] is moved
     finally:
         await store.close()
 

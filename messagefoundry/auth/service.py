@@ -4134,6 +4134,12 @@ class AuthService:
         Refusals are audited under the staged session's account wherever the flow names one, so they
         appear in that person's security events rather than under an anonymous actor.
 
+        The session is re-anchored to the callback's address when the callback has one. The success
+        ``auth.reauth`` row also records the start leg's address as ``start_client`` and whether the
+        two are different hosts as ``client_moved`` (BACKLOG #2160); refusal rows carry neither. A
+        move is recorded, never refused. Behind a proxy the engine does not trust, both legs carry
+        the proxy's address, so ``client_moved`` reads false there.
+
         Not padded to a deadline, unlike the sign-in callback: the caller already holds a session,
         and the step-up leg does not choose between accounts.
         """
@@ -4272,6 +4278,15 @@ class AuthService:
             # (3) The purpose-bound grant, against the NEW hash.
             self._grant_action_step_up(hash_token(elevation.token), purpose)
         self.clear_oidc_unavailable()
+        # BACKLOG #2160: the start leg staged its caller's address, and the session is re-anchored
+        # to the callback's above. Record whether the address moved mid-ceremony, compared as the
+        # new-address signal compares. Recorded only: refusing a move, or anchoring to the start
+        # address, would change ADR 0142 Amendment B and needs a ruling first. None when either
+        # address is unknown, since an empty string matches nothing and proves no move.
+        start_client = flow.client_ip or None
+        client_moved = (
+            not self._same_host(start_client, client) if start_client and client else None
+        )
         await self._audit(
             "auth.reauth",
             actor=user.username,
@@ -4284,6 +4299,8 @@ class AuthService:
                     "session_lost": elevation.session_lost,
                     "grant_refused": grant_refused,
                     "session_revoked": False,
+                    "start_client": start_client,
+                    "client_moved": client_moved,
                 }
             ),
             client=client,
