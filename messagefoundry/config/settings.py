@@ -2865,6 +2865,8 @@ class AuthSettings(_Section):
     # session was minted is refused with the leg's ordinary failure, so the refusal says nothing about
     # timing. It is audited with reason "too_early", charges no lockout and spends no code. Only the
     # PENDING session is floored; a step-up code on a session whose factor is already satisfied is not.
+    # An enrolment that would satisfy a pending session, POST /me/mfa/confirm or a passkey
+    # registration, is floored the same way (BACKLOG #2389).
     # Sized from the keystroke-level model (Card, Moran and Newell, "The keystroke-level model for user
     # performance time with interactive systems", Communications of the ACM 23(7), 1980, pp. 396-410):
     #   M   take in a prompt the person has not seen, and decide    1.35 s

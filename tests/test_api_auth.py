@@ -349,7 +349,11 @@ async def test_require_mfa_admin_is_not_bootstrap_locked_out(engine: Engine) -> 
     # factor must NOT be locked out — the enroll/confirm routes are gated by an action-bound PASSWORD
     # step-up, never by the MFA gate, so there is no chicken-and-egg deadlock. Drive the whole escape
     # path end-to-end under the DEFAULT settings and confirm the admin ends up MFA-enrolled + satisfied.
-    service = await _service(engine, AuthSettings(login_rate_limit_enabled=False))  # require_mfa on
+    # require_mfa on. The login-to-MFA floor is off, since the confirm below runs at once on the
+    # session it signed in and the floor covers it (BACKLOG #2389); the floor has its own suite.
+    service = await _service(
+        engine, AuthSettings(mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False)
+    )
     await _add(service, "adm", Role.ADMINISTRATOR)
     async with _client(engine, service) as c:
         lr = (await _login(c, "adm")).json()
@@ -1272,7 +1276,13 @@ async def test_require_paced_inherits_the_mfa_access_gate(engine: Engine) -> Non
     # the gate: once the second factor is satisfied, the paced route passes while the step-up route
     # keeps demanding a fresh password proof. Pinning it there keeps the original intent testable
     # instead of deleting the coverage.
-    service = await _service(engine, AuthSettings(require_mfa=True, login_rate_limit_enabled=False))
+    # The floor is off: the confirm below runs at once on the signed-in session (BACKLOG #2389).
+    service = await _service(
+        engine,
+        AuthSettings(
+            require_mfa=True, mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False
+        ),
+    )
     await _add(service, "adm", Role.ADMINISTRATOR)  # second factor not enrolled
     async with _client(engine, service) as c:
         tok = (await _login(c, "adm")).json()["token"]
@@ -2189,7 +2199,10 @@ async def test_disabling_the_LAST_second_factor_is_a_400_not_a_500(
     ``/me/mfa/confirm`` route already mapped ValueError to 400; this one did not, so adding the guard
     without touching the route would have turned a refusal into an internal error.
     """
-    service = await _service(engine, AuthSettings(login_rate_limit_enabled=False))
+    # The floor is off: the confirm below runs at once on the signed-in session (BACKLOG #2389).
+    service = await _service(
+        engine, AuthSettings(mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False)
+    )
     await _add(service, "adm", Role.ADMINISTRATOR)
     async with _client(engine, service) as c:
         tok = (await _login(c, "adm")).json()["token"]

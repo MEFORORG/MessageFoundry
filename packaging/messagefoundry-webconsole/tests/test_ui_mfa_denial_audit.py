@@ -524,7 +524,9 @@ async def test_the_older_mfa_denial_rows_read_the_client_through_client_ip(
     An address check alone cannot see the inline read: both reads return the same peer today. With
     ``client_ip`` answering a value no transport reports, only a row written through it carries it.
     """
-    service = await _service(engine, require_mfa=True)
+    # The floor is off: _enroll_totp confirms at once on the session it signed in, which the
+    # login-to-MFA floor covers (BACKLOG #2389).
+    service = await _service(engine, require_mfa=True, mfa_verify_min_elapsed_seconds=0)
     await _add(service, "op", Role.OPERATOR)
     await _enroll_totp(service)
 
@@ -574,7 +576,8 @@ async def test_a_denial_behind_a_trusted_proxy_records_the_forwarded_client(
     """
     from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
-    service = await _service(engine, require_mfa=True)
+    # The floor is off, as in the test above (BACKLOG #2389).
+    service = await _service(engine, require_mfa=True, mfa_verify_min_elapsed_seconds=0)
     await _add(service, "op", Role.OPERATOR)
     await _enroll_totp(service)
     # Any, as in tests/test_client_network_allowlist.py: uvicorn's typed ASGI signatures and

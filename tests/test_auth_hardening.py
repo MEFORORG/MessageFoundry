@@ -198,7 +198,11 @@ async def test_must_change_password_blocks_until_rotated(engine: Engine) -> None
     # chosen password, no factor, no session", which anyone who knows the username could lock. Now
     # it ENROLS TOTP first, from the pending must-change session, then rotates. The pair is still
     # escapable -- the bricked-fresh-account regression this test was written against.
-    service = AuthService(engine.store, AuthSettings(login_rate_limit_enabled=False))
+    # The login-to-MFA floor is off: the confirm below runs at once on the signed-in session, and
+    # the floor covers it (BACKLOG #2389).
+    service = AuthService(
+        engine.store, AuthSettings(mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False)
+    )
     admin = await create_admin(service)
     async with _client(engine, service) as c:
         login = await _login(c, admin.username, admin.password)
