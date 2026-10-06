@@ -8100,14 +8100,30 @@ def test_the_voluntary_change_page_states_no_deadline() -> None:
     # Control for the page builder: the deadline sentence belongs to the forced variant only.
     from messagefoundry_webconsole.pages import account as pages
 
-    assert "stops working" in str(pages.password_page(forced=True, credential_expires_at=1.8e9))
+    # Relative to now: since BACKLOG #2298 a deadline already passed is stated as passed.
+    ahead = time.time() + 3600
+    assert "stops working" in str(pages.password_page(forced=True, credential_expires_at=ahead))
     assert "stops working" not in str(pages.password_page(forced=True))
     assert "stops working" not in str(
-        pages.password_page(forced=False, credential_expires_at=1.8e9)
+        pages.password_page(forced=False, credential_expires_at=ahead)
     )
     # A deadline past what the clock can render drops the sentence instead of raising: this page is
     # the only one a must-change holder can reach, so it must never 500.
     assert "stops working" not in str(pages.password_page(forced=True, credential_expires_at=1e15))
+
+
+def test_the_forced_change_page_states_a_passed_deadline_as_passed() -> None:
+    """RED when: the forced page tells a holder a lapsed password "stops working" at a past instant.
+
+    BACKLOG #2298 (ASVS 6.4.5). One second past the deadline, the sentence is in the past tense and
+    names the one remedy left. The control is the test above, with a deadline an hour ahead."""
+    from messagefoundry_webconsole.pages import account as pages
+
+    passed = time.time() - 1
+    text = str(pages.password_page(forced=True, credential_expires_at=passed))
+    assert f"Your temporary password stopped working at {_console_stamp(passed)}." in text
+    assert "Ask an administrator to reset it." in text
+    assert "stops working" not in text
 
 
 def test_the_create_form_states_a_large_window_in_plain_digits() -> None:

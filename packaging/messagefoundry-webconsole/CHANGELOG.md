@@ -20,6 +20,13 @@ engine compatibility range.
 [`messagefoundry_webconsole/__init__.py`](../../messagefoundry_webconsole/__init__.py), not from
 this line.**
 
+### Fixed
+
+- **A temporary password's deadline is stated in the past tense once it has passed.** The factor
+  page (`/ui/mfa`) and the forced password page used to tell the holder the password "stops
+  working" at an instant already gone. They now say it stopped working then, and to ask an
+  administrator to reset it. No seam change. (vault BACKLOG #2298)
+
 ### Security
 
 - **Every console route declares its authorization.** Each `require_ui*` gate carries the engine's

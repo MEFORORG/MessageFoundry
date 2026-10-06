@@ -365,12 +365,24 @@ def client_ip(conn: Request | WebSocket) -> str | None:
     return conn.client.host if conn.client else None
 
 
-def _password_change_required(deadline: float | None) -> str:
-    """The 403 detail for a must-change session, naming the credential's deadline when it has one."""
+def _password_change_required(deadline: float | None, *, suffix: str = "") -> str:
+    """The 403 detail for a must-change session, naming the credential's deadline when it has one.
+
+    ``suffix`` names the next step the session can take (the enrol-first step), appended.
+
+    A deadline already passed is stated in the past tense with the one remedy left, and no
+    ``suffix``: no step the session takes can revive the credential (BACKLOG #2298). The session
+    check ends such a session before this runs, so it is reached only when the deadline passes
+    between that check and this read. Strictly after, as the sign-in gate compares."""
     when = None if deadline is None else deadline_utc(deadline)
     if when is None:
-        return "password change required"
-    return f"password change required; the temporary password stops working at {when}"
+        return "password change required" + suffix
+    if deadline is not None and time.time() > deadline:
+        return (
+            f"password change required; the temporary password stopped working at {when};"
+            " ask an administrator to reset it"
+        )
+    return f"password change required; the temporary password stops working at {when}" + suffix
 
 
 # --- Answering before the request body is read (vault BACKLOG #2739) ---------------------------------
@@ -788,9 +800,9 @@ def require(
                 raise HTTPException(
                     status.HTTP_403_FORBIDDEN,
                     _password_change_required(
-                        await pending_credential_deadline_for(auth, identity.user_id)
-                    )
-                    + (_ENROL_FIRST_SUFFIX if enrol_first else ""),
+                        await pending_credential_deadline_for(auth, identity.user_id),
+                        suffix=_ENROL_FIRST_SUFFIX if enrol_first else "",
+                    ),
                 )
         # ASVS 6.3.3 — MFA is an ACCESS gate, not only a step-up gate. Ordering is load-bearing in
         # BOTH directions. must_change stays FIRST: a fresh account (a new user) is
