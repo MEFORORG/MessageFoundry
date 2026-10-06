@@ -466,7 +466,7 @@ def test_engine_timestamps_survive_redaction() -> None:
 
     when = datetime(2026, 10, 6, 12, 30, tzinfo=UTC)
     stamp = redaction.log_timestamp(when)
-    assert stamp == "06 Oct 2026 12:30:00 UTC" == tls_policy._crl_time(when)
+    assert stamp == "06 Oct 2026 12:30:00 +0000" == tls_policy._crl_time(when)
     assert redaction.log_timestamp("2026-10-06T17:30:00+05:00") == stamp
     assert redaction.log_timestamp(when.replace(tzinfo=None)) == stamp
     archive = f"could not publish mefor-backup-dev-{dr_backup._utc_stamp(1_791_290_000)}.mfbak"

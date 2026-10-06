@@ -845,9 +845,9 @@ def _renew_generated_pair(
         "holds the old certificate must import the new one.",
         cert_path,
         event.old_sha256,
-        event.old_not_after,
+        "at an unknown date" if event.old_not_after is None else log_timestamp(event.old_not_after),
         event.new_sha256,
-        event.new_not_after,
+        log_timestamp(event.new_not_after),
     )
 
 

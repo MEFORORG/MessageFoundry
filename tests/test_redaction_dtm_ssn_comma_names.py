@@ -216,6 +216,9 @@ def test_the_carve_does_not_reach_a_stamp_without_the_suffix() -> None:
     group stops a match giving back its ``Z`` to dodge the lookahead."""
     assert redact("dob 20261006T123000Z.txt") == "dob [redacted].txt"
     assert redact("dob 19800505T123000Z") == "dob [redacted]"
+    # The carve needs the archive's own shape: a `-` before the date, seconds and `Z` after it.
+    assert redact("dob 19800505T123000Z.mfbak") == "dob [redacted].mfbak"
+    assert redact("x-19800505T1230.mfbak") == "x-[redacted].mfbak"
 
 
 def test_an_engine_time_rendered_by_log_timestamp_survives() -> None:

@@ -4383,7 +4383,7 @@ def test_a_lock_the_start_cannot_take_keeps_a_still_valid_pair(
             ) == (str(cert), str(key))
             assert "could not check or renew" in caplog.text
             assert (
-                " UTC, and the next start" in caplog.text
+                " +0000, and the next start" in caplog.text
             )  # the deadline is named, not only the failure
         else:
             with pytest.raises(TimeoutError):

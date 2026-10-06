@@ -239,11 +239,12 @@ _CREDENTIAL_AHEAD = re.compile(
 #: ``support.redact`` for both log formats.
 #:
 #: The eight-digit arm also takes an ISO BASIC time glued by ``T`` (``19800505T123000``). **One
-#: engine-owned shape is carved out of it, by name:** a backup archive's stamp, which the archive
-#: name follows with ``.mfbak`` (``mefor-backup-dev-20261006T123000Z.mfbak``, or ``.corrupt.mfbak``),
-#: so an operator still reads which archive a message is about. A date of birth in content is never
-#: followed by that suffix. The time is an atomic group, so a match cannot give back its ``Z`` to
-#: slip past the carve. Every other time the ENGINE puts in a message is rendered by
+#: engine-owned shape is carved out of it, by its exact form:** a backup archive's stamp, written by
+#: ``dr_backup._utc_stamp`` after a ``-`` and followed by ``.mfbak`` (``mefor-backup-dev-
+#: 20261006T123000Z.mfbak``, or ``.corrupt.mfbak``), so an operator still reads which archive a
+#: message is about. The carve is tested once, right after the ``T``, so no shorter match can slip
+#: past it. A content value of exactly that shape (a ``-``, a basic stamp with seconds and ``Z``,
+#: then ``.mfbak``) passes too, which is the price of naming the archive. Every other time the ENGINE puts in a message is rendered by
 #: :func:`log_timestamp` in a form no arm here reads, and ``isoformat()`` in engine text fails
 #: ``tests/test_engine_text_survives_the_name_run.py``. Residual, at least: the US ``MM/DD/YYYY`` arm
 #: takes no time, so ``05/05/1980T12:30`` passes; the "never put PHI in an exception message"
@@ -254,8 +255,8 @@ _DATE_RUN = re.compile(
     r"|\b\d{1,2}[-/]\d{1,2}[-/]\d{4}\b"
     r"|\b(?:19|20)\d{6}"
     r"(?:(?:\d{2}(?:\d{2}(?:\d{2}(?:\.\d{1,4})?)?)?)?(?:[+-]\d{4})?\b"
-    r"|[Tt](?>\d{2}(?::?\d{2}(?::?\d{2}(?:[.,]\d{1,9})?)?)?(?:[Zz]|[+-]\d{2}(?::?\d{2})?)?)"
-    r"(?!\.(?:corrupt\.)?mfbak))"
+    r"|[Tt](?!(?<=-\d{8}T)\d{6}Z\.(?:corrupt\.)?mfbak)"
+    r"\d{2}(?::?\d{2}(?::?\d{2}(?:[.,]\d{1,9})?)?)?(?:[Zz]|[+-]\d{2}(?::?\d{2})?)?)"
 )
 
 
@@ -264,20 +265,26 @@ _MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct",
 
 
 def log_timestamp(when: datetime | str) -> str:
-    """``when`` in UTC as ``06 Oct 2026 12:30:00 UTC``, for a time the ENGINE puts in message text.
+    """``when`` in UTC as ``06 Oct 2026 12:30:00 +0000``, for a time the ENGINE puts in message text.
 
     **Use this, never ``isoformat()`` or an ``*_iso`` string, in a log line or an error (vault
     BACKLOG #2784).** :data:`_DATE_RUN` reads an ISO date-time as a possible date of birth, so
     ``2026-10-06T12:30:00+00:00`` reaches the log as ``[redacted]`` and an operator loses the time a
     CRL takes effect or a certificate expires. This form is one no pattern here reads: the month is a
-    word, so no date arm matches, and no two capitalized words touch, so no name run does. ``when``
-    may be an ISO string, which is parsed first. A naive time is read as UTC."""
+    word, so no date arm matches, and its only capital is the month's, so no name run can join it to
+    what follows (a zone word such as ``UTC`` would). ``when`` may be an ISO string, which is parsed
+    first; one that does not parse is returned as given. A naive time is read as UTC."""
     if isinstance(when, str):
-        when = datetime.fromisoformat(when)
-    if when.tzinfo is None:
-        when = when.replace(tzinfo=UTC)
-    when = when.astimezone(UTC)
-    return f"{when.day:02d} {_MONTHS[when.month - 1]} {when.year} {when:%H:%M:%S} UTC"
+        try:
+            moment = datetime.fromisoformat(when)
+        except ValueError:
+            return when  # not a time this can read: shown as given, never a crash in a log call
+    else:
+        moment = when
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    moment = moment.astimezone(UTC)
+    return f"{moment.day:02d} {_MONTHS[moment.month - 1]} {moment.year} {moment:%H:%M:%S} +0000"
 
 
 #: A **dashed US SSN**, ``NNN-NN-NNNN`` (vault BACKLOG #2784). No other pass reads one: it holds no

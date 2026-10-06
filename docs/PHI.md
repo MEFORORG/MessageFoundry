@@ -1340,7 +1340,7 @@ apostrophe or an inner capital (`O'Brien`, `McDoe`). One engine-owned shape is c
 backup archive's stamp followed by `.mfbak`. The price is over-redaction of a 10-, 12- or 14-digit
 number opening `19` or `20`, of any ISO time in a message, and of upper-case codes joined with a
 comma. Engine text works around that at its source, which is a convention and not a guarantee:
-`redaction.log_timestamp` renders an engine time as `06 Oct 2026 12:30:00 UTC`, which no pattern
+`redaction.log_timestamp` renders an engine time as `06 Oct 2026 12:30:00 +0000`, which no pattern
 reads, and code lists are joined with `/` or `:`. `tests/test_engine_text_survives_the_name_run.py`
 catches at least a literal `isoformat()` or `*_iso` rendered into an f-string, a logging argument or
 an exception message, and a comma run in a message literal; it cannot see a time passed whole to
