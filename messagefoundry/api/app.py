@@ -205,6 +205,7 @@ from messagefoundry.api.multipart import (
     MultipartTooLargeError,
     parse_single_file_upload,
 )
+from messagefoundry.api.outlive import OutlivingOperations
 from messagefoundry.api.request_timeout import RequestTimeoutMiddleware
 from messagefoundry.api.security import (
     AuthenticatedBeforeBodyRoute,
@@ -344,7 +345,7 @@ from messagefoundry.last_resort import install_loop_exception_handler
 from messagefoundry.logging_guard import active_guard as active_log_guard
 from messagefoundry.logging_setup import LOG_LEVELS, current_log_level, set_runtime_level
 from messagefoundry.parsing.sniff import attachment_mime_agrees, nontext_upload_reason
-from messagefoundry.pipeline import ConfigReloadDenied, Engine
+from messagefoundry.pipeline import ConfigReloadDenied, Engine, ReloadOutcome
 from messagefoundry.pipeline.alert_sinks import EmailTransport, notifier_from_settings
 from messagefoundry.pipeline.alerts import (
     AlertSink,
@@ -767,6 +768,7 @@ def _build_approval_gate(
     *,
     resolve_identity: IdentityResolver | None = None,
     alert_sink: AlertSink | None = None,
+    outliving: OutlivingOperations,
 ) -> ApprovalGate:
     """Build the approval gate and register the high-value operations dual-control can hold. Each
     executor re-runs its captured operation on approval (params are JSON, persisted at request time).
@@ -778,6 +780,8 @@ def _build_approval_gate(
     gate = ApprovalGate(
         engine.store, settings, resolve_identity=resolve_identity, alert_sink=alert_sink
     )
+    # A released reload runs inside the approve request, so it outlives that request's deadline the
+    # way the inline route's does (vault BACKLOG #2753). Required, so the lifespan's drain sees it.
 
     async def _replay(p: Mapping[str, Any]) -> dict[str, Any]:
         # BACKLOG #1646: write the same dead_letter_replay row the inline route writes, so an
@@ -853,37 +857,45 @@ def _build_approval_gate(
         # reload_detail for parity with the inline route (BACKLOG #1111): a released reload that
         # swapped the graph and then failed a follow-on step must report the same degraded outcome
         # the inline path reports, or dual control would be the quieter of the two.
-        try:
-            outcome = await engine.reload_detail(config_dir, dry_run=False, propagate=True)
-        except WiringError as exc:
-            # BACKLOG #2034: a release the engine refuses (a settings or inbound trust anchor, or a
-            # bad config) answers 422 and records the row the inline route records, rather than
-            # escaping the approve route as a 500. The gate still marks the approval failed.
-            anchor_refused = isinstance(exc.__cause__, TrustAnchorError)
-            _log.warning("released config reload refused: %s", exc)
-            await engine.store.record_audit(
-                "config_reload_failed",
-                actor=actor,
-                detail=json.dumps(
-                    {
-                        "requested": config_dir,
-                        "dry_run": False,
-                        "reason": "trust_anchor" if anchor_refused else "invalid_config",
-                    }
-                ),
+
+        async def _apply() -> dict[str, Any]:
+            try:
+                outcome = await _reload_or_record_interruption(
+                    engine, config_dir, actor=actor, client=None
+                )
+            except WiringError as exc:
+                # BACKLOG #2034: a release the engine refuses (a settings or inbound trust anchor,
+                # or a bad config) answers 422 and records the row the inline route records, rather
+                # than escaping the approve route as a 500. The gate still marks the approval failed.
+                anchor_refused = isinstance(exc.__cause__, TrustAnchorError)
+                _log.warning("released config reload refused: %s", exc)
+                await engine.store.record_audit(
+                    "config_reload_failed",
+                    actor=actor,
+                    detail=json.dumps(
+                        {
+                            "requested": config_dir,
+                            "dry_run": False,
+                            "reason": "trust_anchor" if anchor_refused else "invalid_config",
+                        }
+                    ),
+                )
+                raise ApprovalError(422, "invalid configuration") from exc
+            registry = outcome.registry
+            # BACKLOG #1940: never raises after the swap; see _record_reload_audit.
+            failures = await _record_reload_audit(
+                engine, actor=actor, failed_steps=[f.step for f in outcome.failures]
             )
-            raise ApprovalError(422, "invalid configuration") from exc
-        registry = outcome.registry
-        # BACKLOG #1940: never raises after the swap; see _record_reload_audit.
-        failures = await _record_reload_audit(
-            engine, actor=actor, failed_steps=[f.step for f in outcome.failures]
-        )
-        return {
-            "inbound": len(registry.inbound),
-            "outbound": len(registry.outbound),
-            "degraded": outcome.applied and bool(failures),
-            "failures": failures,
-        }
+            return {
+                "inbound": len(registry.inbound),
+                "outbound": len(registry.outbound),
+                "degraded": outcome.applied and bool(failures),
+                "failures": failures,
+            }
+
+        # A cancelled approve records 'interrupted' in the gate (#1562), and this reload goes on to
+        # write its own config_reload row rather than stopping with intake half swapped.
+        return await outliving.run(_apply(), "released config reload")
 
     def _replay_params_in_scope(identity: Identity, p: Mapping[str, Any]) -> bool:
         channel_id = p.get("channel_id")
@@ -1069,6 +1081,36 @@ class _LoadedConfig:
 _UNKNOWN_LOADED = _LoadedConfig(
     directory=None, shard=None, inbound=None, outbound=None, fingerprint=None, registry=None
 )
+
+
+async def _reload_or_record_interruption(
+    engine: Engine, config_dir: str | None, *, actor: str, client: str | None
+) -> ReloadOutcome:
+    """A real (non-dry-run) reload with ``propagate=True``, which records its own cancellation.
+
+    The routes run a reload so that a request deadline does not cancel it (``api/outlive.py``),
+    which leaves at least a shutdown that still can. ``RegistryRunner.reload`` then rolls intake back
+    to the previous graph, and this writes a ``config_reload_interrupted`` row before the
+    cancellation goes on (vault BACKLOG #2753), so the attempt is not missing from the audit log.
+    Its detail does not claim either graph is live: a cancellation after the swap committed, in a
+    follow-on step, leaves the new graph serving. ``GET /config/provenance`` says which one is."""
+    try:
+        return await engine.reload_detail(config_dir, dry_run=False, propagate=True)
+    except asyncio.CancelledError:
+        try:
+            await engine.store.record_audit(
+                "config_reload_interrupted",
+                actor=actor,
+                detail=json.dumps({"requested": config_dir, "dry_run": False}),
+                client=client,
+            )
+        except Exception as exc:
+            _log.warning(
+                "config reload: cancelled, and the config_reload_interrupted audit row could not "
+                "be written: %s",
+                safe_exc(exc),
+            )
+        raise
 
 
 async def _record_reload_audit(
@@ -2196,6 +2238,12 @@ def create_app(
     # says what it does not cover; a route reached through ``include_router`` is one. The engine
     # includes no router; refuse_undeclared_route refuses a route whose gate only an include adds.
     app.router.route_class = AuthenticatedBeforeBodyRoute
+    # DR activate, DR release and config reload outlive a caller the request deadline cancels, and
+    # the managed lifespan drains what is still running before engine.stop() (vault BACKLOG #2751,
+    # #2752, #2753). One per app; the handlers below close over it, so /ui gets it too, and so does
+    # the approval gate's released reload.
+    outliving = OutlivingOperations()
+    app.state.outliving_operations = outliving
     if engine is not None:
         app.state.engine = engine
         # No notifier exists on this direct-construction path, so the gate's alerts log (its default).
@@ -2203,6 +2251,7 @@ def create_app(
             engine,
             approvals or ApprovalsSettings(),
             resolve_identity=_requester_identity_resolver(app),
+            outliving=outliving,
         )
     if auth is not None:
         app.state.auth = auth
@@ -4451,6 +4500,19 @@ def create_app(
         # reload, so a swapped or newly exposed anchor refuses the deploy (422, audited as
         # reason="trust_anchor" below). It moved there from this route in BACKLOG #2034, so a held,
         # convergence or DR reload runs it too.
+        #
+        # The reload and its audit rows run as one operation that outlives this request: a request
+        # deadline ends the response, never the swap, so the reload finishes or rolls back and
+        # writes its own row either way (vault BACKLOG #2753). Every exit of
+        # _reload_config_apply, refusals included, is inside that operation.
+        return await outliving.run(
+            _reload_config_apply(req, request, engine, user), "config reload"
+        )
+
+    async def _reload_config_apply(
+        req: ReloadRequest, request: Request, engine: Engine, user: Identity
+    ) -> ReloadResult:
+        """The body of :func:`reload_config` past its dual-control hold, run by ``outliving``."""
         try:
             # propagate=True on the real apply so an operator reload on one node bumps the cluster-wide
             # config version and every other node converges (Track B Step 6); a dry_run never propagates
@@ -4459,9 +4521,12 @@ def create_app(
             # provenance fingerprint, the reference-set reconcile, the cluster version bump) fails,
             # and reload() projects that away to a Registry. Reporting it is the whole point of
             # BACKLOG #1111 -- without this the route answers a degraded apply as clean success.
-            outcome = await engine.reload_detail(
-                req.config_dir, dry_run=req.dry_run, propagate=not req.dry_run
-            )
+            if req.dry_run:
+                outcome = await engine.reload_detail(req.config_dir, dry_run=True, propagate=False)
+            else:
+                outcome = await _reload_or_record_interruption(
+                    engine, req.config_dir, actor=user.username, client=client_ip(request)
+                )
             registry = outcome.registry
         except ConfigReloadDenied as exc:
             await engine.store.record_audit(
@@ -7396,16 +7461,25 @@ def create_app(
         archive = body.archive if body is not None else None
         dba_attests_restored = body.dba_attests_restored if body is not None else False
         try:
-            result = await coord.activate(
-                archive=archive,
-                dba_attests_restored=dba_attests_restored,
-                actor=identity.username,
+            # Outlives this request (vault BACKLOG #2751): a request deadline ends the response and
+            # never cuts an activation between its steps. A retry waits on the coordinator's lock,
+            # then reads the activation's real outcome.
+            result = await outliving.run(
+                coord.activate(
+                    archive=archive,
+                    dba_attests_restored=dba_attests_restored,
+                    actor=identity.username,
+                ),
+                "DR activation",
             )
         except DrActivationError as exc:
-            # The coordinator already recorded a dr_activation_aborted audit row. Map the failing phase
-            # to an HTTP status: a missing/unverified seed or a not-this-box state is the client's input
-            # (409/422); a key-unavailable / VIP-not-acquired / profile failure is an environment
-            # condition (503 — retry once the cause is fixed). Never echo a body (the message is scrubbed).
+            # For an abort, the coordinator already recorded a dr_activation_aborted audit row. Map the
+            # failing phase to an HTTP status: a missing/unverified seed or a not-this-box state is the
+            # client's input (409/422); a key-unavailable / VIP-not-acquired / profile failure is an
+            # environment condition (503 — retry once the cause is fixed). Kind "audit" is not an
+            # abort: an earlier activate or release changed the box's posture and its audit row could
+            # not be written, so it too is a 503 to retry, and the message says which posture holds
+            # (vault BACKLOG #2751, #2752). Never echo a body (the message is scrubbed).
             status_code = {"state": 409, "seed": 422}.get(exc.kind, 503)
             raise HTTPException(status_code, str(exc)) from exc
         return DrActionResult(
@@ -7435,7 +7509,9 @@ def create_app(
         if coord is None:
             raise HTTPException(503, "this deployment is not a DR standby ([dr].enabled is false)")
         try:
-            result = await coord.release(actor=identity.username)
+            # Outlives this request (vault BACKLOG #2752): the drain can run longer than the request
+            # deadline, and a release cut off there left intake unbound with the box still active.
+            result = await outliving.run(coord.release(actor=identity.username), "DR release")
         except DrActivationError as exc:
             raise HTTPException(503, str(exc)) from exc
         return DrActionResult(
@@ -7443,6 +7519,7 @@ def create_app(
             active=result.active,
             threshold=result.threshold,
             vip_hook_ran=result.vip_hook_ran,
+            depth_left=result.depth_left,
         )
 
     @app.post("/status/integrity-check", response_model=IntegrityResult)
@@ -8881,6 +8958,7 @@ def create_managed_app(
                 # ASVS 8.3.2: late-bound, because the auth service is attached further down.
                 resolve_identity=_requester_identity_resolver(app),
                 alert_sink=notifier,  # None -> the gate's own LoggingAlertSink default
+                outliving=app.state.outliving_operations,
             )
             # ASVS 5.2.4: age-based retention prune for the uploaded-logs surface. Owned by this lifespan
             # (started here, stopped in the finally) — the runner pattern of cert_expiry, but wired where the
@@ -9065,6 +9143,16 @@ def create_managed_app(
             if credential_reminder is not None:
                 credential_reminder.cancel()
                 await asyncio.gather(credential_reminder, return_exceptions=True)
+            # vault BACKLOG #2751-#2753: a DR activate or release, or a config reload, whose caller
+            # was cancelled is still running on its own. Let it finish, or cancel it so its own
+            # rollback arm restores state and records 'interrupted', while the store is open.
+            # Before the approval drain: a released reload's outcome write follows it.
+            try:
+                await app.state.outliving_operations.drain()
+            except Exception:
+                _log.exception(
+                    "long operations: the shutdown drain failed; continuing the teardown"
+                )
             # BACKLOG #2087: let approval outcome writes still running land before the store closes.
             # A write whose caller was cancelled, such as by a request timeout, finishes on its own,
             # and would otherwise meet a closed store. drain() is bounded, and it is guarded like the
