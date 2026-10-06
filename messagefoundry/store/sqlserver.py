@@ -210,6 +210,7 @@ from messagefoundry.store.store import (
     roll_audit_key_range,
     rotation_factor_term,
     should_record_event,
+    totp_enable_term,
     verify_audit_rows,
 )
 from messagefoundry.support.redact import redact_log_line
@@ -11352,13 +11353,16 @@ class SqlServerStore:
 
     async def enable_totp(
         self, user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
-    ) -> None:
+    ) -> bool:
         now = time.time() if now is None else now
-        await self._execute(
+        # Conditional (see ``totp_enable_term``, #2224). The OUTPUT rowset, never the row count,
+        # says whether it wrote, for the reason ``_execute_output`` gives.
+        rows = await self._execute_output(
             "UPDATE users SET totp_enabled=1, totp_enrolled_at=?, totp_recovery_codes=?,"
-            " updated_at=? WHERE id=?",
+            f" updated_at=? OUTPUT inserted.id WHERE id=?{totp_enable_term('0')}",
             (now, json.dumps(recovery_code_hashes), now, user_id),
         )
+        return bool(rows)
 
     async def disable_totp(self, user_id: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
