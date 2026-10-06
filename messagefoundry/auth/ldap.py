@@ -92,6 +92,15 @@ class LdapError(RuntimeError):
     """LDAP/Kerberos configuration or connectivity failure (distinct from rejected credentials)."""
 
 
+class LdapReferralError(LdapError):
+    """The directory answered with a referral, which the engine never follows (BACKLOG #2530).
+
+    A subclass, so every ``except LdapError`` still refuses it as before. The session reconciler
+    tells it apart (BACKLOG #2538): a referral is a configuration error that recurs on every pass,
+    not an outage that passes, so it must page rather than read as unavailable forever.
+    """
+
+
 class DirectoryAnswer(Enum):
     """What one password-free lookup of one account established (ADR 0195 rule item 2).
 
@@ -473,7 +482,8 @@ def _referred_hosts(referrals: Iterable[object]) -> str:
 
 
 def _refuse_referral(conn: Any, operation: str) -> None:
-    """Raise :class:`LdapError` when the directory answered ``conn``'s last operation with a referral.
+    """Raise :class:`LdapReferralError` when the directory answered ``conn``'s last operation with a
+    referral.
 
     BACKLOG #2530. With ``auto_referrals`` on, which is ldap3's default, ldap3 2.9.1 opens a new
     connection to the referred host and, on a bound connection, binds there with this connection's
@@ -486,9 +496,9 @@ def _refuse_referral(conn: Any, operation: str) -> None:
     **A refusal, not a "no match" or a wrong password.** Left alone, a referred search reads as no
     entries, which the session reconciler would count toward revoking the account. A referred bind
     reads as a rejected password, which the step-up re-bind would count toward the engine lockout.
-    An :class:`LdapError` is audited as ``auth.login_error`` at sign-in, and read as unavailable by
-    the reconciler, which never revokes. A referral usually means a search base in another domain of
-    the forest.
+    An :class:`LdapError` is audited as ``auth.login_error`` at sign-in. The reconciler reads this
+    subclass as referred, which never revokes that account and alerts (BACKLOG #2538). A
+    referral usually means a search base in another domain of the forest.
 
     **Only a referral RESULT (resultCode 10).** A search continuation reference (``searchResRef``)
     arrives with resultCode 0, beside the entries. ldap3 never follows one, with or without this
@@ -509,7 +519,7 @@ def _refuse_referral(conn: Any, operation: str) -> None:
         "which carries universal-group membership only (ADR 0180 Amendment F)."
     )
     _warn_once(f"referral: {operation}", "%s Reported once per operation.", message)
-    raise LdapError(message)
+    raise LdapReferralError(message)
 
 
 def _search(conn: Any, operation: str, **kwargs: Any) -> None:
