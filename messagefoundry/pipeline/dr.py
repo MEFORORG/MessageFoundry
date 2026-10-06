@@ -184,13 +184,17 @@ class DrCoordinator:
         self._active = bool(settings.enabled and settings.activate)
         # An activation whose run-profile is applied but whose dr.activate row is not yet known to be
         # written: (detail, actor, now). Set before the write and cleared after it, so a write that a
-        # cancellation or a store error cut short is written on the next activate call rather than
-        # that call answering success with no row (vault BACKLOG #2751). A box active from
-        # [dr].activate at boot never set it: that activation is the configuration's, not a request's.
+        # cancellation or a store error cut short is written by the next activate or release call
+        # rather than that call answering success with no row (vault BACKLOG #2751). Held in memory
+        # only, so a restart loses it; the refusal and its log line are what record that. A box active
+        # from [dr].activate at boot never set it: that activation is the configuration's.
         self._unrecorded_activation: tuple[dict[str, object], str, float] | None = None
         # The same for a completed hand-back whose dr.release row is not yet known to be written
         # (vault BACKLOG #2752). The next activate or release call writes it first.
         self._unrecorded_release: tuple[dict[str, object], str, float] | None = None
+        # The last completed hand-back, so a retry that finds the box passive answers with that
+        # release's outcome (its depth left) rather than with nothing known.
+        self._last_release: DrResult | None = None
         # Serialize activate/release so a double-promotion can't race the cold-seed/VIP/profile steps.
         self._lock = asyncio.Lock()
 
@@ -367,6 +371,7 @@ class DrCoordinator:
         progress.step = "profile"
         try:
             self._active = True
+            self._last_release = None  # an earlier fail-back's outcome no longer describes this box
             await self._activate_profile()
         except Exception as exc:
             self._active = False
@@ -414,7 +419,7 @@ class DrCoordinator:
                 # release owes first, or refuse (vault BACKLOG #2752).
                 if self._unrecorded_release is not None:
                     await self._record_owed_release()
-                return DrResult(
+                return self._last_release or DrResult(
                     action="release",
                     active=False,
                     threshold=self._settings.priority_threshold.value,
@@ -441,7 +446,6 @@ class DrCoordinator:
                     # A failed drain leaves the box active (still draining) — report it loudly, do NOT
                     # claim a clean hand-back (a half-drained release would risk cross-store divergence
                     # the runbook can't account for). The failure has its own row (vault BACKLOG #2752).
-                    phase = "drain_failed"
                     await self._record_release_failed(
                         "drain_failed", phase, hook_ran, actor, now, error=exc
                     )
@@ -451,6 +455,13 @@ class DrCoordinator:
                     ) from exc
                 phase = "record"
                 self._active = False
+                self._last_release = DrResult(
+                    action="release",
+                    active=False,
+                    threshold=self._settings.priority_threshold.value,
+                    vip_hook_ran=hook_ran,
+                    depth_left=depth,
+                )
                 # Owed from here: a write cut short is made good by the next activate or release.
                 self._unrecorded_release = (_release_detail(hook_ran, depth), actor, now)
                 await self._record_owed_release(late=False)
@@ -470,8 +481,12 @@ class DrCoordinator:
                             "still owed; the next activate or release call writes it",
                             exc_info=True,
                         )
-                elif phase != "drain_failed":
-                    # drain_failed: the arm above was already writing that release's row.
+                else:
+                    # After a drain failure whose own row was being written this may be a second
+                    # row for one release; a duplicate is the safer of the two failures.
+                    if phase == "release_hook":
+                        # The hook was started, and a release hook is not killed (vault BACKLOG #2622).
+                        hook_ran = bool(self._settings.release_hook)
                     await self._record_release_failed("interrupted", phase, hook_ran, actor, now)
                 raise
             return DrResult(
@@ -507,12 +522,13 @@ class DrCoordinator:
                 now=now,
             )
         except Exception as exc:
-            if not late:
-                raise
+            # Kind "audit" on every call, so the route answers 503 with this message rather than a
+            # bare 500 that hides that the activation happened.
             raise DrActivationError(
                 "audit",
                 "this box is serving the DR run-profile, but the dr.activate audit row for that "
-                f"activation could not be written; retry the activation: {safe_exc(exc)}",
+                "activation could not be written, so DR calls are refused until it is; retry once "
+                f"the audit log accepts writes: {safe_exc(exc)}",
             ) from exc
         self._unrecorded_activation = None
         log.warning(
@@ -544,7 +560,7 @@ class DrCoordinator:
             except DrActivationError:
                 log.warning(
                     "DR: an interrupted activation left the run-profile applied, and its dr.activate "
-                    "row is still owed; the next activate call writes it",
+                    "row is still owed; the next activate or release call writes it",
                     exc_info=True,
                 )
             return
@@ -575,7 +591,7 @@ class DrCoordinator:
         if phase == "release_hook":
             # A release hook is not killed when its caller is cancelled (_run_vip_hook, vault
             # BACKLOG #2622), so it may still hand the address back to the primary.
-            detail["hook_left_running"] = True
+            detail["hook_left_running"] = hook_ran
         try:
             await self._store.record_audit(
                 _ACTION_RELEASE_FAILED,
@@ -615,12 +631,11 @@ class DrCoordinator:
                 now=now,
             )
         except Exception as exc:
-            if not late:
-                raise
             raise DrActivationError(
                 "audit",
                 "this box has handed back, but the dr.release audit row for that release could "
-                f"not be written; retry the release: {safe_exc(exc)}",
+                "not be written, so DR calls are refused until it is; retry once the audit log "
+                f"accepts writes: {safe_exc(exc)}",
             ) from exc
         self._unrecorded_release = None
         depth = detail.get("depth_left")

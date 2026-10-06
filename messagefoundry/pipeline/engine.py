@@ -2287,11 +2287,12 @@ class Engine:
             try:
                 runner.build_check(registry)  # bad connector → WiringError (422), before any start
                 await runner.start()
-            except BaseException:
+            except Exception:
                 # Don't leave a half-started runner: a later reload would take the "runner exists"
                 # path and no-op the start, wedging intake. Clear it so a retry re-enters cleanly.
-                # BaseException: a cancelled start leaves the same half-started runner (vault
-                # BACKLOG #2753).
+                # Exception only: RegistryRunner.start() does not tear itself down on a
+                # cancellation, so clearing the reference then would orphan a running runner that
+                # engine.stop() could no longer reach.
                 self._registry_runner = None
                 raise
         else:

@@ -438,7 +438,7 @@ async def test_an_activation_whose_row_was_not_written_is_recorded_by_the_retry(
         return await real_record(action, *args, **kwargs)
 
     monkeypatch.setattr(store, "record_audit", flaky_record)
-    with pytest.raises(OSError):
+    with pytest.raises(DrActivationError):
         await coord.activate(actor="dradmin")
     assert coord.active  # the run-profile IS applied; only the row is missing
 
@@ -524,7 +524,7 @@ async def test_a_release_records_an_activation_still_owed_its_row_before_handing
         return await real_record(action, *args, **kwargs)
 
     monkeypatch.setattr(store, "record_audit", flaky_record)
-    with pytest.raises(OSError):
+    with pytest.raises(DrActivationError):
         await coord.activate(actor="dradmin")
     assert coord.active
 
@@ -553,12 +553,13 @@ async def test_a_release_whose_row_was_not_written_is_recorded_by_the_retry(
         return await real_record(action, *args, **kwargs)
 
     monkeypatch.setattr(store, "record_audit", flaky_record)
-    with pytest.raises(OSError):
+    with pytest.raises(DrActivationError) as refused:
         await coord.release(actor="dradmin")
+    assert refused.value.kind == "audit"
     assert not coord.active  # the hand-back happened; only its row is missing
 
     result = await coord.release(actor="dradmin")
-    assert result.active is False
+    assert result.active is False and result.depth_left is not None  # the first call's outcome
     rows = await _rows(store, "dr.release")
     assert len(rows) == 1 and rows[0]["recorded_late"] is True and rows[0]["drained"] is False
 
@@ -577,6 +578,10 @@ async def test_a_release_cancelled_in_its_hook_says_the_hook_may_still_move_the_
         return True
 
     monkeypatch.setattr(coord, "_run_vip_hook", hung_hook)
+    # A configured release hook, which the stub above stands in for.
+    monkeypatch.setattr(
+        coord, "_settings", coord.settings.model_copy(update={"release_hook": "exit 0"})
+    )
     task = asyncio.create_task(coord.release(actor="dradmin"))
     await asyncio.wait_for(entered.wait(), 10)
     task.cancel()
@@ -586,3 +591,66 @@ async def test_a_release_cancelled_in_its_hook_says_the_hook_may_still_move_the_
     failed = await _rows(engine.store, "dr_release_failed")
     assert len(failed) == 1
     assert failed[0]["phase"] == "release_hook" and failed[0]["hook_left_running"] is True
+
+
+async def test_a_release_cancelled_while_recording_a_failed_drain_still_leaves_a_row(
+    seeded: tuple[Engine, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, _archive = seeded
+    await _activate_directly(engine)
+    coord = _coordinator(engine)
+    store = engine.store
+    real_record = store.record_audit
+    entered = asyncio.Event()
+    hang = {"once": True}
+
+    async def failing_drain() -> int:
+        raise RuntimeError("the drain could not run")
+
+    async def hanging_record(action: str, *args: Any, **kwargs: Any) -> Any:
+        if action == "dr_release_failed" and hang["once"]:
+            hang["once"] = False
+            entered.set()
+            await asyncio.Event().wait()
+        return await real_record(action, *args, **kwargs)
+
+    monkeypatch.setattr(coord, "_deactivate_profile", failing_drain)
+    monkeypatch.setattr(store, "record_audit", hanging_record)
+    task = asyncio.create_task(coord.release(actor="dradmin"))
+    await asyncio.wait_for(entered.wait(), 10)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert coord.active
+    failed = await _rows(store, "dr_release_failed")
+    assert [row["reason"] for row in failed] == ["interrupted"]
+    assert failed[0]["phase"] == "drain"
+
+
+async def test_an_activation_records_a_release_still_owed_its_row_before_promoting(
+    seeded: tuple[Engine, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, _archive = seeded
+    await _activate_directly(engine)
+    monkeypatch.setattr(engine_module, "DR_RELEASE_DRAIN_TIMEOUT_SECONDS", 0.2)
+    coord = _coordinator(engine)
+    store = engine.store
+    real_record = store.record_audit
+    failures = {"left": 1}
+
+    async def flaky_record(action: str, *args: Any, **kwargs: Any) -> Any:
+        if action == "dr.release" and failures["left"]:
+            failures["left"] -= 1
+            raise OSError("the audit log refused the write")
+        return await real_record(action, *args, **kwargs)
+
+    monkeypatch.setattr(store, "record_audit", flaky_record)
+    with pytest.raises(DrActivationError):
+        await coord.release(actor="dradmin")
+
+    await coord.activate(actor="dradmin")
+    rows = await store.list_audit(limit=200)
+    release_seq = max(r["seq"] for r in rows if r["action"] == "dr.release")
+    activate_seq = max(r["seq"] for r in rows if r["action"] == "dr.activate")
+    assert release_seq < activate_seq
+    assert (await _rows(store, "dr.release"))[0]["recorded_late"] is True

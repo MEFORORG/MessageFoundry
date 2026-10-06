@@ -7477,9 +7477,9 @@ def create_app(
             # failing phase to an HTTP status: a missing/unverified seed or a not-this-box state is the
             # client's input (409/422); a key-unavailable / VIP-not-acquired / profile failure is an
             # environment condition (503 — retry once the cause is fixed). Kind "audit" is not an
-            # abort: the box IS serving and its dr.activate row could not be written, so it too is a
-            # 503 to retry, and the message says the box is active (vault BACKLOG #2751). Never echo a
-            # body (the message is scrubbed).
+            # abort: an earlier activate or release changed the box's posture and its audit row could
+            # not be written, so it too is a 503 to retry, and the message says which posture holds
+            # (vault BACKLOG #2751, #2752). Never echo a body (the message is scrubbed).
             status_code = {"state": 409, "seed": 422}.get(exc.kind, 503)
             raise HTTPException(status_code, str(exc)) from exc
         return DrActionResult(
