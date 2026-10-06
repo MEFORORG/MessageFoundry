@@ -228,7 +228,9 @@ in-flight rows stranded.
 > threshold only at construction, and the activation reloaded through the same runner, so a box built passive
 > parked nothing on activation. A runner built under the profile likewise kept parking feeds after a release.
 > The engine now hands the running runner the threshold before the activation reload, and clears it on release.
-> A reload still re-evaluates the whole graph, so the in-flight guarantee above holds.
+> A reload still re-evaluates the whole graph, so the in-flight guarantee above holds. A box built passive
+> still binds its whole graph, every tier, before activation. That contradicts this ADR's load-balancer fence,
+> which relies on a passive box binding no high-priority listener, and the gap is a recorded defect.
 >
 > **Decision 1: the activation re-applies the graph the engine is running, not a config dir.** It used to
 > reload the config dir from disk. That put live any bytes edited there since the last approved reload, with
