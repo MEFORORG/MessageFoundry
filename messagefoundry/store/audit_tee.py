@@ -128,13 +128,18 @@ def emit_audit_tee(
     escape such as ``\\u007f`` ends in a word character, so ``\\b``-anchored patterns no longer
     matched the next word. ``ensure_ascii=True`` is the same mistake, for every non-ASCII character.
 
-    **At least two residuals remain, and both break the JSON.** The redaction and credential
-    filters rewrite spans of this document as text, and a span can take a closing quote with it:
-    an ASCII ``actor`` of ``a%7Cb%7Cc`` does that on every sink. And every handler re-filters the
-    one shared ``LogRecord``, so the file handler and the forwarder run redaction again over the
-    first handler's escaped text. There, ``x%7Cy%7Cz`` followed by U+2028 parses on stdout and not
-    in the file; ``tests/test_audit_offbox_tee.py`` pins that as a strict xfail. Serializing after
-    the filters, from structured fields on the record, would close both.
+    **At least two residuals remain, and both break the JSON a collector receives.**
+
+    * The redaction and credential filters rewrite spans of this document as text, and a span can
+      take a closing quote with it. A typed name of ``password=`` or ``a|b|c`` does that on every
+      sink, with no escaped character involved.
+    * Every handler re-filters the one shared ``LogRecord``, so the file handler and the forwarder
+      run the chain again over the first handler's escaped text (``_install_phi_filters``). Then
+      ``x%7Cy%7Cz`` followed by DEL, or by U+2028, parses on stdout and not on the later sinks,
+      the forwarder included. ``tests/test_audit_offbox_tee.py`` pins that as a strict xfail.
+
+    Running the chain once per record, rather than once per handler, would close the second. The
+    first needs filters that do not rewrite this document as plain text.
 
     Best-effort: a logging failure must never fail the audit write (already committed), so it is
     caught and logged, not raised. Callers invoke this **after commit** and **outside any write

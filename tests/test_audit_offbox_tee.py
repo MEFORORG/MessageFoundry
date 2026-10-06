@@ -425,38 +425,52 @@ def test_the_redaction_filters_fire_across_an_escaped_character(
         assert needle not in line, line
 
 
+def _tee_line(text: str) -> str:
+    (line,) = (ln for ln in text.splitlines() if "auth.login_failed" in ln)
+    return line.split("messagefoundry.audit: ", 1)[1]
+
+
 @pytest.mark.xfail(
     strict=True,
     raises=json.JSONDecodeError,
     reason="KNOWN RESIDUAL, not built here: every handler re-filters the one shared LogRecord, so "
-    "the file handler and the forwarder re-run redaction over the first handler's escaped text, "
-    "and a field-run pass takes the closing quote. U+2028 was spelled the same before #3012.",
+    "the file handler and the forwarder re-run the chain over the first handler's escaped text, "
+    "and a field-run pass takes the closing quote. See emit_audit_tee's docstring.",
 )
-def test_a_later_handler_keeps_the_tee_json(tmp_path: Path, capsys) -> None:
+@pytest.mark.parametrize("separator", [chr(0x7F), chr(0x2028)])
+def test_a_later_handler_keeps_the_tee_json(separator: str, tmp_path: Path, capsys) -> None:
     """The second sink must parse too. It does not yet; when it does, this flips to a failure
-    and the marker comes off. The first sink, stdout, parses (the tests above)."""
+    and the marker comes off. The first sink, stdout, parses, and that is asserted first, so the
+    expected failure can only come from the later sink."""
     from messagefoundry.logging_setup import LogFile
 
     log_path = tmp_path / "engine.log"
     with _handlerless_process():
-        configure_logging("INFO", fmt="text", log_file=LogFile(path=str(log_path)))
-        emit_audit_tee(
-            action="auth.login_failed",
-            actor=f"x%7Cy%7Cz{chr(0x2028)}",
-            channel_id=None,
-            detail="ok",
-            ts=1.0,
-            row_id=1,
-            seq=1,
-            row_hash=_HASH,
-        )
-        for handler in logging.getLogger().handlers:
-            handler.flush()
-        file_text = log_path.read_text(encoding="utf-8")
-        for handler in list(logging.getLogger().handlers):
-            handler.close()
-    (line,) = (ln for ln in file_text.splitlines() if "auth.login_failed" in ln)
-    json.loads(line.split("messagefoundry.audit: ", 1)[1])
+        try:
+            configure_logging("INFO", fmt="text", log_file=LogFile(path=str(log_path)))
+            capsys.readouterr()
+            emit_audit_tee(
+                action="auth.login_failed",
+                actor=f"x%7Cy%7Cz{separator}",
+                channel_id=None,
+                detail="ok",
+                ts=1.0,
+                row_id=1,
+                seq=1,
+                row_hash=_HASH,
+            )
+            for handler in logging.getLogger().handlers:
+                handler.flush()
+            stdout_text = capsys.readouterr().out
+            file_text = log_path.read_text(encoding="utf-8")
+        finally:
+            for handler in list(logging.getLogger().handlers):
+                handler.close()
+    try:
+        json.loads(_tee_line(stdout_text))
+    except json.JSONDecodeError as exc:  # not the residual, so not the expected failure
+        raise AssertionError(f"the FIRST sink broke too: {stdout_text!r}") from exc
+    json.loads(_tee_line(file_text))
 
 
 def test_emit_audit_tee_is_best_effort_on_logging_failure(audit_capture, monkeypatch) -> None:

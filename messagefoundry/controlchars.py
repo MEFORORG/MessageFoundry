@@ -185,11 +185,11 @@ def _log_escape(code: int) -> str:
 
     CR and LF are ``\\r`` and ``\\n``. A lone surrogate is ``\\\\udc80``, a doubled backslash and
     the hex (see below). Every other code point is :func:`json_unicode_escape`: ``\\u007f``,
-    ``\\u0085``, ``\\u2028``, and a surrogate pair past U+FFFF. So a JSON document logged as a
-    message, such as the off-box audit record, still parses after the scrub, and the redaction
-    filters that run before the scrub see the raw characters (vault BACKLOG #3012). Python's
-    ``ascii`` spelling, used until then, wrote ``\\x7f`` and ``\\U000e0001``, which JSON does not
-    define.
+    ``\\u0085``, ``\\u2028``, and a surrogate pair past U+FFFF. So a document from ``json.dumps``
+    without ``indent``, such as the off-box audit record, still parses after the scrub. And the
+    redaction filters that run before the scrub see the raw characters (vault BACKLOG #3012).
+    Python's ``ascii`` spelling, used until then, wrote ``\\x7f`` and ``\\U000e0001``, which JSON
+    does not define.
 
     A LONE SURROGATE IS SPELLED AS TEXT, NOT AS A CHARACTER. ``\\udc80`` alone is accepted by
     Python's ``json`` and refused by a strict decoder such as jiter. Worse, a lone high surrogate
@@ -198,11 +198,13 @@ def _log_escape(code: int) -> str:
     decoder reads them as the six characters of text ``\\udc80``: the code point is still shown,
     and nothing is invented.
 
-    At least two ambiguities are accepted. A backslash in the text is not doubled, as it never
-    was, so peer text that spells an escape reads the same as an escaped character; in a decoded
-    JSON document a lone surrogate reads the same as a peer who typed its six characters. And a
-    noncharacter such as U+FFFF is written as its JSON escape, which strict decoders accept and
-    I-JSON (RFC 7493) forbids, so a collector that enforces I-JSON would refuse that record."""
+    One ambiguity is accepted. A backslash in the text is not doubled, as it never was. So peer
+    text that spells an escape reads the same as an escaped character. In a decoded JSON document,
+    a lone surrogate likewise reads the same as a peer who typed its six characters.
+
+    One limit is accepted too. I-JSON (RFC 7493) forbids a noncharacter such as U+FFFF however it
+    is written. A collector that enforces I-JSON would refuse a record holding one; jiter and
+    Python's ``json`` accept it."""
     if code == 0x0A:
         return "\\n"
     if code == 0x0D:
