@@ -67,6 +67,7 @@ import hashlib
 import json
 import re
 from collections.abc import Callable
+from datetime import UTC, datetime
 from functools import lru_cache
 from string import ascii_lowercase, ascii_uppercase, whitespace
 from typing import Any
@@ -74,6 +75,7 @@ from typing import Any
 __all__ = [
     "clamp_untrusted",
     "json_loads_or_refusal",
+    "log_timestamp",
     "redact",
     "redact_untrusted",
     "safe_error",
@@ -230,20 +232,54 @@ _CREDENTIAL_AHEAD = re.compile(
 #: time glued to the date removes that boundary, so the whole value walked through: an HL7 DTM such as
 #: ``19800505123000-0500`` (``\b`` fails inside a longer digit run) and an ISO ``1980-05-05T12:30``
 #: (``T`` is a word character). Now the eight-digit arm takes an optional HL7 time, fraction and offset
-#: before its ``\b``, and both it and the ``YYYY-MM-DD`` arm take an optional ISO ``T`` time with a
-#: ``Z`` or numeric offset. A time digit is not range-checked: an impossible hour after a real date
-#: must still take the date with it. The cost is over-redaction of a 10-, 12- or 14-digit number that
-#: opens ``19`` or ``20``, and of an ISO timestamp an engine message interpolates, which the bare date
-#: arm already cost. A log FILE line's own leading timestamp is carved off before this pass, by
+#: before its ``\b``, and the ``YYYY-MM-DD`` arm takes an optional ISO ``T`` time with a ``Z`` or
+#: numeric offset. A time digit is not range-checked: an impossible hour after a real date must still
+#: take the date with it. The cost is over-redaction of a 10-, 12- or 14-digit number that opens ``19``
+#: or ``20``. A log FILE line's own leading timestamp is carved off before this pass, by
 #: ``support.redact`` for both log formats.
+#:
+#: The eight-digit arm also takes an ISO BASIC time glued by ``T`` (``19800505T123000``). **One
+#: engine-owned shape is carved out of it, by name:** a backup archive's stamp, which the archive
+#: name follows with ``.mfbak`` (``mefor-backup-dev-20261006T123000Z.mfbak``, or ``.corrupt.mfbak``),
+#: so an operator still reads which archive a message is about. A date of birth in content is never
+#: followed by that suffix. The time is an atomic group, so a match cannot give back its ``Z`` to
+#: slip past the carve. Every other time the ENGINE puts in a message is rendered by
+#: :func:`log_timestamp` in a form no arm here reads, and ``isoformat()`` in engine text fails
+#: ``tests/test_engine_text_survives_the_name_run.py``. Residual, at least: the US ``MM/DD/YYYY`` arm
+#: takes no time, so ``05/05/1980T12:30`` passes; the "never put PHI in an exception message"
+#: convention remains the control.
 _DATE_RUN = re.compile(
     r"\b\d{4}[-/]\d{1,2}[-/]\d{1,2}"
     r"(?:[Tt]\d{2}(?::?\d{2}(?::?\d{2}(?:[.,]\d{1,9})?)?)?(?:[Zz]|[+-]\d{2}(?::?\d{2})?)?|\b)"
     r"|\b\d{1,2}[-/]\d{1,2}[-/]\d{4}\b"
     r"|\b(?:19|20)\d{6}"
     r"(?:(?:\d{2}(?:\d{2}(?:\d{2}(?:\.\d{1,4})?)?)?)?(?:[+-]\d{4})?\b"
-    r"|[Tt]\d{2}(?::?\d{2}(?::?\d{2}(?:[.,]\d{1,9})?)?)?(?:[Zz]|[+-]\d{2}(?::?\d{2})?)?)"
+    r"|[Tt](?>\d{2}(?::?\d{2}(?::?\d{2}(?:[.,]\d{1,9})?)?)?(?:[Zz]|[+-]\d{2}(?::?\d{2})?)?)"
+    r"(?!\.(?:corrupt\.)?mfbak))"
 )
+
+
+#: English month abbreviations for :func:`log_timestamp`, spelled out so a locale cannot change them.
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def log_timestamp(when: datetime | str) -> str:
+    """``when`` in UTC as ``06 Oct 2026 12:30:00 UTC``, for a time the ENGINE puts in message text.
+
+    **Use this, never ``isoformat()`` or an ``*_iso`` string, in a log line or an error (vault
+    BACKLOG #2784).** :data:`_DATE_RUN` reads an ISO date-time as a possible date of birth, so
+    ``2026-10-06T12:30:00+00:00`` reaches the log as ``[redacted]`` and an operator loses the time a
+    CRL takes effect or a certificate expires. This form is one no pattern here reads: the month is a
+    word, so no date arm matches, and no two capitalized words touch, so no name run does. ``when``
+    may be an ISO string, which is parsed first. A naive time is read as UTC."""
+    if isinstance(when, str):
+        when = datetime.fromisoformat(when)
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    when = when.astimezone(UTC)
+    return f"{when.day:02d} {_MONTHS[when.month - 1]} {when.year} {when:%H:%M:%S} UTC"
+
+
 #: A **dashed US SSN**, ``NNN-NN-NNNN`` (vault BACKLOG #2784). No other pass reads one: it holds no
 #: HL7 delimiter and no date shape. Only the dashed form: an undashed nine-digit run is any number, and
 #: a spaced one is three tokens (:func:`_whole_token_prefix` names that residual). Fixed width, so

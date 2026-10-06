@@ -726,10 +726,10 @@ def _acl_message(spec: AnchorSpec) -> str:
     ]
     if os.name == "nt":
         q = _ps_quote(spec.path)
-        rights = ", ".join(sorted(_WRITE_RIGHTS))
+        rights = "/".join(sorted(_WRITE_RIGHTS))
         lines += [
             "Fix, from an elevated PowerShell. List the DACL, and note each group or world "
-            "principal, such as Everyone, Authenticated Users or Users, that holds a write right "
+            "principal, such as Everyone or Users (or Authenticated Users), that holds a write right "
             f"({rights}):",
             f"  icacls {q}",
             "Turn inherited entries into explicit ones, so the next command reaches them:",

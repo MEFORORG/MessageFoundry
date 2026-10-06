@@ -2379,9 +2379,7 @@ class LoggingSettings(_Section):
     def _normalize_level(cls, value: str) -> str:
         upper = value.upper()
         if upper not in LOG_LEVELS:
-            raise ValueError(
-                f"invalid log level {value!r}; expected one of {', '.join(LOG_LEVELS)}"
-            )
+            raise ValueError(f"invalid log level {value!r}; expected one of {'/'.join(LOG_LEVELS)}")
         return upper
 
     @field_validator("forward_port")

@@ -119,6 +119,7 @@ from messagefoundry.config.tls_policy import (
     staged_crl,
 )
 from messagefoundry.pki import CrlBlock, CrlFacts, crl_signature_refusal
+from messagefoundry.redaction import log_timestamp
 
 __all__ = [
     "BAD_SIGNATURE",
@@ -226,12 +227,12 @@ def _waiting(
     Nothing in the file reaches the hop until then, so waiting is right only when every CRL the
     hop holds lasts that long (:func:`_first_lapse`), whatever its issuer. When one lapses first,
     the hop refuses its peers in between, so the file must change instead."""
-    reason = f"its CRL from issuer {issuer!r} is not in effect until {takes_effect.isoformat()}"
+    reason = f"its CRL from issuer {issuer!r} is not in effect until {log_timestamp(takes_effect)}"
     lapsing = _first_lapse(held)
     if lapsing is not None and lapsing.next_update < takes_effect:
         return (
             f"{reason}, and the hop's CRL from issuer {lapsing.issuer!r} lapses earlier, at "
-            f"{lapsing.next_update.isoformat()}"
+            f"{log_timestamp(lapsing.next_update)}"
         ), LAPSES_FIRST
     return reason, WAIT
 
@@ -257,8 +258,8 @@ def supersede_refusal(
             continue
         reason = (
             f"it carries no CRL from issuer {old.issuer!r} that OpenSSL would choose over the one "
-            f"the running hop holds (thisUpdate {old.this_update.isoformat()}, nextUpdate "
-            f"{old.next_update.isoformat()}). A superseding CRL must have a later thisUpdate, a "
+            f"the running hop holds (thisUpdate {log_timestamp(old.this_update)}, nextUpdate "
+            f"{log_timestamp(old.next_update)}). A superseding CRL must have a later thisUpdate, a "
             "nextUpdate no earlier, and the same scope, signing key and critical extensions. A "
             "running hop can only add CRLs"
         )
@@ -513,7 +514,7 @@ def _reload_path(
     ):
         why, remedy = refusals.strongest
         refusals.strongest = (
-            f"{why}. Not before {unmet.this_update.isoformat()}: a start until then refuses this "
+            f"{why}. Not before {log_timestamp(unmet.this_update)}: a start until then refuses this "
             f"file too, since its CRL from issuer {unmet.issuer!r} is not in effect",
             remedy,
         )

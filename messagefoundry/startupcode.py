@@ -575,7 +575,7 @@ def startup_loosenings(posture: StartupPosture) -> list[tuple[str, str]]:
     ``security_loosenings()`` and the ``supervise`` start-up lines cannot say different things."""
     out: list[tuple[str, str]] = []
     launch = posture.launch
-    variables = ", ".join(launch.code_path_variables)
+    variables = "/".join(launch.code_path_variables)
     if not launch.isolated:
         if launch.ignore_environment:
             reads = "It was told to ignore the PYTHON* environment variables (-E)."
@@ -604,7 +604,7 @@ def startup_loosenings(posture: StartupPosture) -> list[tuple[str, str]]:
         out.append(
             (
                 "python_variables_reach_children",
-                f"{', '.join(launch.reaching_children)} is set in the engine's environment. The "
+                f"{'/'.join(launch.reaching_children)} is set in the engine's environment. The "
                 "engine ignores it, but the "
                 "Python children it starts (the sandbox worker, and each engine shard under "
                 "`supervise`) are not isolated and would import from where it points. Remove it "

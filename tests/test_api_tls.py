@@ -4382,7 +4382,9 @@ def test_a_lock_the_start_cannot_take_keeps_a_still_valid_pair(
                 ApiSettings(), state_dir=tmp_path, replacements=events
             ) == (str(cert), str(key))
             assert "could not check or renew" in caplog.text
-            assert "expires 20" in caplog.text  # the deadline is named, not only the failure
+            assert (
+                " UTC, and the next start" in caplog.text
+            )  # the deadline is named, not only the failure
         else:
             with pytest.raises(TimeoutError):
                 ensure_api_tls_material(ApiSettings(), state_dir=tmp_path, replacements=events)

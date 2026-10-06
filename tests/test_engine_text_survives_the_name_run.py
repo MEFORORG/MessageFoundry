@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import ast
 import functools
+import types
 from pathlib import Path
+from typing import TypeGuard
 
 import pytest
 
@@ -143,6 +145,17 @@ def _message_literals(tree: ast.Module) -> list[tuple[int, str]]:
     (``model.CheckResult(...)``), through a relative import or a re-export, or to a field a base class
     declares. Those were reworded by hand, and a new one can regress with this test green.
     :func:`test_the_tables_the_scan_cannot_see_survive_redaction` pins the ones found."""
+    found: dict[tuple[int, int], tuple[int, str]] = {}
+    for first in _message_nodes(tree):
+        for sub in ast.walk(first):
+            if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                found[(sub.lineno, sub.col_offset)] = (sub.lineno, sub.value)
+    return list(found.values())
+
+
+def _message_nodes(tree: ast.Module) -> list[ast.expr]:
+    """The expressions :func:`_message_literals` reads its literals from: every message argument, in
+    the shapes that function names."""
     local = _local_positions(tree)
     imported = _imported_positions(tree)
     firsts: list[ast.expr] = []
@@ -163,12 +176,7 @@ def _message_literals(tree: ast.Module) -> list[tuple[int, str]]:
                     firsts.extend(node.args[i] for i in at if i < len(node.args))
         elif isinstance(node, ast.Raise) and node.exc is not None:
             firsts.append(node.exc)
-    found: dict[tuple[int, int], tuple[int, str]] = {}
-    for first in firsts:
-        for sub in ast.walk(first):
-            if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
-                found[(sub.lineno, sub.col_offset)] = (sub.lineno, sub.value)
-    return list(found.values())
+    return firsts
 
 
 def _runs(source: str) -> list[tuple[int, str]]:
@@ -363,6 +371,109 @@ def test_engine_message_text_holds_no_comma_name_run(path: Path) -> None:
     )
 
 
+def _is_iso_render(node: ast.AST) -> TypeGuard[ast.expr]:
+    """A call to ``isoformat()``, or an ``*_iso`` attribute (a time a record stores pre-rendered)."""
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+        return node.func.attr == "isoformat"
+    return isinstance(node, ast.Attribute) and node.attr.endswith("_iso")
+
+
+def _isoformat_calls(source: str) -> list[tuple[int, str]]:
+    """``(line, expression)`` for each ISO time rendered into text: in an f-string, as any argument
+    of a logging call, or anywhere in a message argument (:func:`_message_nodes`, which reaches a
+    ``raise`` built by ``+``). Lexical, so it cannot see a time passed whole to ``%s`` or ``{}``, or
+    rendered by ``str.format``; those were checked by hand when this landed."""
+    tree = parse_source(source)
+    roots: list[ast.expr] = list(_message_nodes(tree))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.JoinedStr):
+            roots.append(node)
+        elif isinstance(node, ast.Call) and (callee_name(node) or "") in {*_LOG_METHODS, "log"}:
+            roots.extend(node.args)
+    rendered = {
+        id(sub)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and (callee_name(node) or "") in _TIME_RENDERERS
+        for sub in ast.walk(node)
+    }
+    found = {
+        (sub.lineno, ast.unparse(sub))
+        for root in roots
+        for sub in ast.walk(root)
+        if _is_iso_render(sub) and id(sub) not in rendered
+    }
+    return sorted(found)
+
+
+#: The helpers that render an engine time in a form the redaction leaves alone: what they wrap is
+#: the fix, not a hit.
+_TIME_RENDERERS = frozenset({"log_timestamp", "_crl_time"})
+
+
+#: Renders that are a DATE, not an engine time, or that never reach a redaction pass, by file and
+#: expression, each with its reason. A
+#: bare ``YYYY-MM-DD`` was redacted before vault BACKLOG #2784 as well, and an eight-digit form is
+#: read by the same pass, so :func:`messagefoundry.redaction.log_timestamp` does not help a date.
+_DATE_ONLY = {
+    ("timezone.py", "born.isoformat()"): "a patient's date of birth, which must be redacted",
+    ("timezone.py", "ref.isoformat()"): "the reference date beside that date of birth",
+    ("pipeline/secret_rotation.py", "eff_last.isoformat()"): "a key rotation date, redacted before",
+    # `messagefoundry certs` prints to stdout, which no redaction pass reads, so ISO stays there.
+    ("__main__.py", "parsed.next_update_iso"): "CLI stdout, never redacted",
+    ("__main__.py", "facts.not_after_iso"): "CLI stdout, never redacted",
+}
+
+
+def test_the_isoformat_scan_fires_on_its_control() -> None:
+    planted = "\n".join(
+        [
+            "logger.warning('due %s', when.isoformat())",
+            "reason = f'not until {when.isoformat()}'",
+            "stamp = when.isoformat()",  # not rendered into text
+        ]
+    )
+    assert [line for line, _ in _isoformat_calls(planted)] == [1, 2]
+
+
+@pytest.mark.parametrize("path", _SOURCES, ids=lambda p: p.relative_to(_ENGINE).as_posix())
+def test_engine_text_renders_no_isoformat(path: Path) -> None:
+    name = path.relative_to(_ENGINE).as_posix()
+    hits = [
+        hit
+        for hit in _isoformat_calls(path.read_text(encoding="utf-8"))
+        if (name, hit[1]) not in _DATE_ONLY
+    ]
+    assert not hits, (
+        f"{path.name}: {hits} -- the PHI redaction reads an ISO date-time as a possible date of "
+        "birth (vault BACKLOG #2784), so a time rendered this way into a log line or an error "
+        "reaches it as [redacted]. Render it with messagefoundry.redaction.log_timestamp(). If "
+        "this is a protocol value (a FHIR search, a header) and never operator text, keep the ISO "
+        "form and add it to _DATE_ONLY with that reason instead."
+    )
+
+
+def test_the_date_only_exemptions_are_still_needed() -> None:
+    for name, expression in _DATE_ONLY:
+        found = _isoformat_calls((_ENGINE / name).read_text(encoding="utf-8"))
+        assert expression in {text for _, text in found}, (name, expression)
+
+
+def test_engine_timestamps_survive_redaction() -> None:
+    from datetime import UTC, datetime
+
+    from messagefoundry.config import tls_policy
+    from messagefoundry.pipeline import dr_backup
+
+    when = datetime(2026, 10, 6, 12, 30, tzinfo=UTC)
+    stamp = redaction.log_timestamp(when)
+    assert stamp == "06 Oct 2026 12:30:00 UTC" == tls_policy._crl_time(when)
+    assert redaction.log_timestamp("2026-10-06T17:30:00+05:00") == stamp
+    assert redaction.log_timestamp(when.replace(tzinfo=None)) == stamp
+    archive = f"could not publish mefor-backup-dev-{dr_backup._utc_stamp(1_791_290_000)}.mfbak"
+    for text in (f"CRL not in effect until {stamp}", archive):
+        assert redaction.redact(text) == text
+
+
 def test_the_tables_the_scan_cannot_see_survive_redaction() -> None:
     """Text the lexical scan cannot see that a refusal, alert or log line renders verbatim."""
     from messagefoundry.auth import anchor_path
@@ -391,6 +502,45 @@ def test_the_tables_the_scan_cannot_see_survive_redaction() -> None:
     ]
     eaten = {text: redaction.redact(text) for text in texts if redaction.redact(text) != text}
     assert not eaten, eaten
+
+
+def test_runtime_joined_code_lists_survive_redaction(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Lists of upper-case codes the engine joins at run time, where the comma name arm (vault
+    BACKLOG #2784) would read ``A, B`` as a family-comma-given name. They join with ``/`` instead."""
+    from messagefoundry.auth import trust_anchors
+    from messagefoundry.startupcode import InterpreterLaunch, StartupPosture, startup_loosenings
+
+    # A stand-in on the module, not os.name itself: pathlib reads the real one.
+    monkeypatch.setattr(trust_anchors, "os", types.SimpleNamespace(name="nt"))
+    spec = trust_anchors.AnchorSpec(label="oidc", setting="[oidc].ca_file", path="C:/ca.pem")
+    texts = [trust_anchors._acl_message(spec)]
+    launch = InterpreterLaunch(
+        False,
+        False,
+        False,
+        False,
+        code_path_variables=("PYTHONPATH", "PYTHONHOME", "PYTHONUSERBASE"),
+        reaching_children=("PYTHONPATH", "PYTHONHOME"),
+    )
+    texts += [risk for _, risk in startup_loosenings(StartupPosture(launch=launch))]
+    # Under -I the children branch is the one that names the variables reaching a child.
+    isolated = InterpreterLaunch(
+        True,
+        True,
+        True,
+        True,
+        code_path_variables=("PYTHONPATH", "PYTHONHOME"),
+        reaching_children=("PYTHONPATH", "PYTHONHOME"),
+    )
+    texts += [risk for _, risk in startup_loosenings(StartupPosture(launch=isolated))]
+    rendered = "\n".join(redaction.redact(text) for text in texts)
+    for joined in (
+        "/".join(sorted(trust_anchors._WRITE_RIGHTS)),
+        "PYTHONPATH/PYTHONHOME/PYTHONUSERBASE is set",
+        "PYTHONPATH/PYTHONHOME is set in the engine's environment",
+        "such as Everyone or Users",
+    ):
+        assert joined in rendered, (joined, rendered)
 
 
 def test_the_out_of_scan_probe_can_fail() -> None:

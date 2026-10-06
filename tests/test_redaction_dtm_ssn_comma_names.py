@@ -29,6 +29,7 @@ _LEAKED_BEFORE = [
     "19800505123000.1234+0530",
     "1980050512",
     "19800505T123000",
+    "19800505T1230-0500",
     "1980-05-05T12:30",
     "1980-05-05T12:30:00Z",
     "1980-05-05T12:30:00.123-05:00",
@@ -189,3 +190,52 @@ def test_an_mrn_label_glued_to_the_comma_keeps_its_number_redacted(text: str) ->
 @pytest.mark.parametrize("text", ["SSN123-45-6789 rejected", "id_123-45-6789 rejected"])
 def test_an_ssn_glued_to_a_word_is_redacted(text: str) -> None:
     assert "6789" not in redact(text)
+
+
+def test_documented_residual_a_us_date_with_a_time_passes() -> None:
+    """DOCUMENTED RESIDUAL, pinned so a change to it is deliberate: the US date arm takes no time."""
+    assert redact("at 05/05/1980T12:30 now") == "at 05/05/1980T12:30 now"
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "mefor-backup-dev-20261006T123000Z.mfbak",
+        "mefor-backup-dev-20261006T123000Z.mfbak.part",
+        "mefor-backup-dev-20261006T123000Z.mfbak.plain",
+        "mefor-backup-dev-20261006T123000Z.corrupt.mfbak",
+    ],
+)
+def test_a_backup_archive_name_is_carved_out(name: str) -> None:
+    """The one engine-owned basic-form stamp the date pass leaves, by its ``.mfbak`` suffix."""
+    assert redact(f"published {name} ok") == f"published {name} ok"
+
+
+def test_the_carve_does_not_reach_a_stamp_without_the_suffix() -> None:
+    """Control: the same stamp with any other suffix is read as a date-time, and the time's atomic
+    group stops a match giving back its ``Z`` to dodge the lookahead."""
+    assert redact("dob 20261006T123000Z.txt") == "dob [redacted].txt"
+    assert redact("dob 19800505T123000Z") == "dob [redacted]"
+
+
+def test_an_engine_time_rendered_by_log_timestamp_survives() -> None:
+    from datetime import UTC, datetime
+
+    stamp = redaction.log_timestamp(datetime(2026, 10, 6, 12, 30, tzinfo=UTC))
+    assert redact(f"CRL not in effect until {stamp}") == f"CRL not in effect until {stamp}"
+
+
+def test_the_json_carve_matches_what_the_json_formatter_writes() -> None:
+    """Pins the carve to the real formatter, not to a hand-built line: a change to the key order,
+    the separators or the time format makes this fail instead of silently redacting every JSON
+    line's timestamp."""
+    import logging
+
+    from messagefoundry.logging_setup import JsonFormatter
+
+    record = logging.LogRecord(
+        "messagefoundry.pipeline", logging.INFO, __file__, 1, "PID-7 %s in future", ("x",), None
+    )
+    line = JsonFormatter().format(record)
+    stamp = json.loads(line)["time"]
+    assert json.loads(redact_log_line(line))["time"] == stamp

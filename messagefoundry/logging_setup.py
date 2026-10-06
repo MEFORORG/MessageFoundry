@@ -1551,7 +1551,7 @@ def set_runtime_level(level: str) -> str:
     level name applied."""
     normalized = level.upper()
     if normalized not in LOG_LEVELS:
-        raise ValueError(f"invalid log level: {level!r}; expected one of {', '.join(LOG_LEVELS)}")
+        raise ValueError(f"invalid log level: {level!r}; expected one of {'/'.join(LOG_LEVELS)}")
     numeric = _resolve_level(normalized)
     logging.getLogger().setLevel(numeric)
     for name in _UVICORN_LOGGERS:

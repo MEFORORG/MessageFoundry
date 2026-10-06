@@ -35,6 +35,7 @@ from messagefoundry.config.tls_policy import (
     narrow_to_approved_suites,
 )
 from messagefoundry.keywrap import load_checked_cert_chain
+from messagefoundry.redaction import log_timestamp
 
 if TYPE_CHECKING:
     from messagefoundry.pki import SelfSignedFacts
@@ -663,7 +664,7 @@ def ensure_api_tls_material(
             "certificate, which expires %s, and the next start tries again.",
             cert_path,
             exc,
-            "at an unknown date" if current is None else current.not_after_iso,
+            "at an unknown date" if current is None else log_timestamp(current.not_after_iso),
         )
     return str(cert_path), str(key_path)
 
@@ -768,7 +769,7 @@ def _renewal_due(cert_path: Path) -> SelfSignedFacts | None:
             "generated, so the engine leaves it alone. Replace it yourself, or set "
             "[api].tls_cert_file.",
             cert_path,
-            facts.not_after_iso,
+            log_timestamp(facts.not_after_iso),
         )
         return None
     return facts
