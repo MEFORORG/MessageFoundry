@@ -26,9 +26,13 @@ from .._auth import assert_same_origin, register_ui_action, require_ui, require_
 #: Where /ui/reauth sends an operator whose resolve met a stale step-up window (BACKLOG #2460).
 #: The resolve itself is deliberately NOT an auto-retry continuation: /ui/reauth re-POSTs one
 #: without showing it, so whoever wrote a ``next=`` link would choose the outcome recorded under
-#: the approver's name. The operator lands back on the page and clicks the outcome themselves.
-_RESOLVE_REAUTH_LANDING = "/ui/approvals"
-register_ui_action(r"^/ui/approvals$", None, auto_retry=False, unlock=True)
+#: the approver's name. The operator lands back on the page, told nothing was recorded, and clicks
+#: the outcome themselves. Query-tolerant so the landing can carry that ``?m=`` notice code, which
+#: the page reads from an allow-list only.
+_RESOLVE_REAUTH_LANDING = "/ui/approvals?m=choose_again"
+register_ui_action(
+    r"^/ui/approvals(\?[^#]*)?$", Permission.APPROVALS_APPROVE, auto_retry=False, unlock=True
+)
 
 
 def _refused(exc: HTTPException, *, resolving: bool = False) -> HTMLResponse:

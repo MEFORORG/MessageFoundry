@@ -93,7 +93,7 @@ def _stored_params(approval_id: str, raw: Any) -> dict[str, Any] | None:
     Logged by id only, because the value may be anything."""
     try:
         params = json.loads(str(raw))
-    except ValueError:
+    except (ValueError, RecursionError):  # RecursionError: a deeply nested stored value
         params = None
     if not isinstance(params, dict):
         log.warning("approval %s: its stored params are not a JSON object", approval_id)
@@ -391,6 +391,12 @@ class ApprovalGate:
             op is None
         ):  # registered op was removed between request and approval — refuse, stay pending
             raise ApprovalError(409, f"operation '{operation}' is no longer available")
+        params = _stored_params(approval_id, row["params"])
+        if params is None:
+            # The queue lists such a row as "unreadable" (BACKLOG #2458). Refuse it as a 409 that
+            # leaves the row pending for a reject, rather than a 500 from a bare parse. Before the
+            # dwell floor, so a row that can never be released writes no too-early row or alert.
+            raise ApprovalError(409, "request parameters are unreadable; reject it instead")
         # ASVS 2.4.2: the FLOOR on the request's age, beside the expiry CEILING in _require_pending.
         # Here, inside approve(), because every release path calls this method, so no caller can skip
         # it. Checked BEFORE the transition, so the row stays pending and the approver can simply
@@ -443,11 +449,6 @@ class ApprovalGate:
                 f"review it and approve it again in {wait} second(s)",
                 headers={"Retry-After": str(wait)},
             )
-        params = _stored_params(approval_id, row["params"])
-        if params is None:
-            # The queue lists such a row as "unreadable" (BACKLOG #2458). Refuse it as a 409 that
-            # leaves the row pending for a reject, rather than a 500 from a bare parse.
-            raise ApprovalError(409, "request parameters are unreadable; reject it instead")
         # ASVS 8.3.2: the requester's authority is re-read NOW. It was checked when the request was
         # made, and it can be withdrawn at any point inside the expiry window: the user deleted or
         # disabled, a role removed, a channel scope narrowed. It reads the engine's copy of the

@@ -14,6 +14,7 @@ from __future__ import annotations
 import re
 import time
 from typing import get_args
+from urllib.parse import quote
 from uuid import uuid4
 
 import httpx
@@ -87,7 +88,7 @@ async def test_the_page_lists_a_hold_with_both_buttons(engine: Engine) -> None:
     assert "Parameters" in r.text
     assert "channel_id: ch1" in r.text
     # A None reads as the scope it means, never as "not set" (an approver would read that as empty).
-    assert "destination_name: all outbound connections" in r.text
+    assert "destination_name: any destination" in r.text
     # The requester key that only carries the requester to the executor is not a shown parameter.
     assert "requester: maker" not in r.text
     # The nav carries the page under Admin.
@@ -283,6 +284,9 @@ async def test_an_interrupted_release_offers_the_resolve_and_not_approve(engine:
         assert f'formaction="{_resolve(approval_id, "effects_not_applied")}"' in r.text
         # One required box covers both outcomes, so a click is a checked choice.
         assert 'type="checkbox" required' in r.text
+        # A submission with no button goes to the page (405 on POST), never to an outcome.
+        assert 'action="/ui/approvals"' in r.text
+        assert (await checker.post("/ui/approvals", headers=SAME_ORIGIN)).status_code == 405
         assert f"/ui/approvals/{approval_id}/approve" not in r.text
         assert f"/ui/approvals/{approval_id}/reject" not in r.text
         assert "No request is waiting for a second approver." in r.text
@@ -366,9 +370,13 @@ async def test_a_stale_step_up_window_resolves_nothing(engine: Engine) -> None:
         await cookie_login(checker, "checker")
         r = await checker.post(_resolve(approval_id), headers=SAME_ORIGIN)
     assert r.status_code == 303
-    assert r.headers["location"] == "/ui/reauth?next=/ui/approvals"
+    landing = "/ui/approvals?m=choose_again"
+    assert r.headers["location"] == f"/ui/reauth?next={quote(landing, safe='/')}"
     # /ui/reauth accepts that landing, and would refuse to re-POST either resolve on its own.
-    assert is_unlock_action("/ui/approvals")
+    assert is_unlock_action(landing)
+    assert "Nothing was recorded" in str(
+        pages.approvals_page(ApprovalList(approvals=[]), notice="choose_again")
+    )
     for outcome in get_args(ResolveOutcome):
         assert not is_safe_ui_action(_resolve(approval_id, outcome))
     assert await _status(engine, approval_id) == "interrupted"
@@ -430,10 +438,13 @@ def test_params_that_did_not_parse_or_are_empty_say_so() -> None:
     # The gate refuses to release a row it cannot read, so the page does not offer Approve.
     assert "/approve" not in unreadable and "/reject" in unreadable
     assert ">none<" in str(pages.approvals_page(ApprovalList(approvals=[_row({})])))
-    # A row whose only key is the requester carry-over shows no parameters either.
+    # The requester carry-over is left out while it repeats the Requester column...
     assert ">none<" in str(
         pages.approvals_page(ApprovalList(approvals=[_row({"requester": "maker"})]))
     )
+    # ...and shown when it differs, since the release audits under that value.
+    differs = str(pages.approvals_page(ApprovalList(approvals=[_row({"requester": "other"})])))
+    assert "requester: other" in differs
 
 
 def test_a_notice_code_selects_a_sentence_and_never_supplies_one() -> None:

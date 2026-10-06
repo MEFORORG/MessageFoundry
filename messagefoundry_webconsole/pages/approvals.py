@@ -65,6 +65,7 @@ _NOTICES: dict[str, str] = {
     "effects_not_applied": (
         "Recorded: the interrupted release's effects were not applied. Nothing was re-run."
     ),
+    "choose_again": "Nothing was recorded. You proved it is you; choose the outcome again.",
 }
 
 # The resolve buttons, one per ResolveOutcome; a test pins that every outcome has one.
@@ -84,15 +85,13 @@ _OWN_REQUEST = "Your request. A different approver decides it."
 
 # What a None parameter means for the operations that hold one: the broadest scope, not "nothing".
 # Any other None reads "not set".
+# Worded as "no filter" so it stays true beside a narrower key: a replay of one inbound with no
+# destination is every destination of THAT inbound.
 _NONE_MEANS: dict[str, str] = {
-    "channel_id": "all inbound connections",
-    "destination_name": "all outbound connections",
+    "channel_id": "any inbound connection",
+    "destination_name": "any destination",
     "config_dir": "the engine's startup config directory",
 }
-
-# Captured only to carry the requester to the executor (BACKLOG #1646). The Requester column
-# already shows it, so the Parameters cell leaves it out; the JSON queue keeps it.
-_HIDDEN_PARAMS = frozenset({"requester"})
 
 # Guidance for a refusal, keyed by the status the engine raised. The engine's own message follows it
 # verbatim, because one status covers several causes (a 409 is at least already decided, expired,
@@ -136,9 +135,9 @@ _RESOLVE_REFUSALS: dict[int, tuple[str, str]] = {
     404: _REFUSALS[404],
     409: (
         "The release cannot be recorded now",
-        "It is no longer interrupted, and the engine's message below says why. Another operator "
-        "may have recorded it first. Check the audit log for what was recorded before you request "
-        "the operation again, because it may already have run.",
+        "The engine's message below says why. At least: another operator recorded it first, it "
+        "was never an interrupted release, or it cannot be recorded at all. Check the audit log "
+        "before you request the operation again, because it may already have run.",
     ),
     503: (
         "Nothing was recorded",
@@ -167,7 +166,9 @@ def _params(a: PendingApprovalInfo) -> Markup:
     #2458)."""
     if a.params is None:
         return el("span", "unreadable", class_="muted")
-    shown = sorted(key for key in a.params if key not in _HIDDEN_PARAMS)
+    # ``requester`` only carries the requester to the executor (BACKLOG #1646), so it is left out
+    # while it repeats the Requester column, and shown if it ever differs from it.
+    shown = sorted(k for k in a.params if k != "requester" or a.params[k] != a.requester)
     if not shown:
         return el("span", "none", class_="muted")
     return el("div", *(el("div", f"{key}: {_param_value(key, a.params[key])}") for key in shown))
@@ -175,7 +176,6 @@ def _params(a: PendingApprovalInfo) -> Markup:
 
 def _pending_row(a: PendingApprovalInfo) -> list[object]:
     base = f"{_PAGE}/{_seg(a.id)}"
-    reject = _post_button(f"{base}/reject", "Reject")
     # BACKLOG #2460: Approve is not offered where the gate would refuse it: to the requester, and
     # on a row whose params are unreadable.
     if a.caller_is_requester:
@@ -184,9 +184,15 @@ def _pending_row(a: PendingApprovalInfo) -> list[object]:
             el("span", _OWN_REQUEST, class_="muted"),
         ]
     elif a.params is None:
-        controls = [reject, el("span", "Unreadable; reject it.", class_="muted")]
+        controls = [
+            _post_button(f"{base}/reject", "Reject"),
+            el("span", "Unreadable; reject it.", class_="muted"),
+        ]
     else:
-        controls = [_post_button(f"{base}/approve", "Approve"), reject]
+        controls = [
+            _post_button(f"{base}/approve", "Approve"),
+            _post_button(f"{base}/reject", "Reject"),
+        ]
     actions = el("div", *controls, class_="ctls")
     return [
         _ts(a.requested_at),
@@ -202,7 +208,9 @@ def _pending_row(a: PendingApprovalInfo) -> list[object]:
 def _resolve_form(approval_id: str) -> Markup:
     """One form, one button per outcome (BACKLOG #2460). Each button posts to its own outcome path
     through ``formaction``. The required box means a click is a checked choice, not a slip
-    between two adjacent final buttons; the browser enforces it, with no script."""
+    between two adjacent final buttons; the browser enforces it, with no script. The form's own
+    action is the page, which answers a POST with 405, so a submission with no button records no
+    outcome."""
     base = f"{_PAGE}/{_seg(approval_id)}/resolve"
     buttons = [
         el("button", label, type="submit", formaction=f"{base}/{outcome}")
@@ -213,7 +221,7 @@ def _resolve_form(approval_id: str) -> Markup:
         el("label", el("input", type="checkbox", required=True), " I checked its effects"),
         *buttons,
         method="post",
-        action=f"{base}/{next(iter(_RESOLVE_LABELS))}",
+        action=_PAGE,
         class_="ctl",
     )
 
