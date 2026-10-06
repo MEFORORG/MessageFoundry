@@ -1991,3 +1991,74 @@ async def test_the_restart_required_log_quotes_the_path(
         await ta._report_restart_required([spec], store, seen={"ad": "ab" * 32})
     (record,) = [r for r in caplog.records if r.name == ta.log.name]
     _quoted(record.getMessage())
+
+
+# --- BACKLOG #2270: an encrypted PEM block refuses before OpenSSL can ask for a password -----------
+#
+# A Proc-Type: 4,ENCRYPTED header sends OpenSSL to its password callback, and cadata= sets none, so
+# it falls back to the default one. Measured on Windows, a cadata= load of such a block did not
+# return within 20 seconds (anchor_cadata's docstring). So every test here swaps in _NoTlsLoad: a
+# regression then fails at once instead of hanging the run.
+
+_ENCRYPTED = b"Proc-Type: 4,ENCRYPTED\nDEK-Info: AES-256-CBC,00112233445566778899AABBCCDDEEFF\n\n"
+
+
+def _with_headers(headers: bytes) -> bytes:
+    cert = _real_ca("crl-test-ca")[0]
+    begin = b"-----BEGIN CERTIFICATE-----\n"
+    return cert.replace(begin, begin + headers)
+
+
+class _NoTlsLoad:
+    """Stands in for the ssl module: a refusal must come before OpenSSL is handed the text."""
+
+    PROTOCOL_TLS_CLIENT = ssl.PROTOCOL_TLS_CLIENT
+    SSLError = ssl.SSLError
+
+    @staticmethod
+    def SSLContext(_protocol: object) -> Any:
+        raise AssertionError("the TLS library was handed an encrypted block")
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        pytest.param(_ENCRYPTED, id="Proc-Type and DEK-Info"),
+        pytest.param(b"DEK-Info: AES-256-CBC,00112233445566778899AABBCCDDEEFF\n\n", id="DEK-Info"),
+        pytest.param(b"proc-type: 4,ENCRYPTED\n\n", id="lower case"),
+        pytest.param(b"  Proc-Type: 4,ENCRYPTED\n\n", id="leading space"),
+    ],
+)
+def test_an_encrypted_pem_block_refuses_before_the_tls_load(
+    monkeypatch: pytest.MonkeyPatch, headers: bytes
+) -> None:
+    spec = AnchorSpec("api_client", "[api].tls_client_ca_file", "ca.pem", None)
+    monkeypatch.setattr(ta, "ssl", _NoTlsLoad)
+    with pytest.raises(TrustAnchorError, match="holds an encrypted PEM block"):
+        ta.anchor_cadata(_with_headers(headers), spec)
+
+
+def test_an_encryption_header_outside_a_block_still_passes() -> None:
+    """The control: OpenSSL skips every line outside a block, so the same text in a comment above
+    the certificate loads, and the shape check passes it too."""
+    data = b"Proc-Type: 4,ENCRYPTED\n" + _real_ca("crl-test-ca")[0]
+    ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).load_verify_locations(cadata=data.decode())
+    spec = AnchorSpec("api_client", "[api].tls_client_ca_file", "ca.pem", None)
+    assert ta.anchor_cadata(data, spec) == data.decode()
+
+
+async def test_the_preflight_refuses_an_encrypted_anchor_as_the_consumer_does(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = _pem(tmp_path, _with_headers(_ENCRYPTED))
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    monkeypatch.setattr(ta, "ssl", _NoTlsLoad)
+    spec = AnchorSpec("api_client", "[api].tls_client_ca_file", str(p), None)
+    with pytest.raises(TrustAnchorError) as central:
+        await run_anchor_preflight([spec], store, enforcing=True)
+    with pytest.raises(TrustAnchorError) as consumer:
+        ta.verified_anchor_cadata(spec, enforcing=True)
+    assert str(central.value) == str(consumer.value)
+    assert "encrypted PEM block" in str(central.value)
+    assert "pem_refused" in {r["event"] for r in await _rows(store, "api_client")}

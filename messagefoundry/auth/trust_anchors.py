@@ -173,6 +173,8 @@ _UTF8_BOM = b"\xef\xbb\xbf"
 _PEM_BEGIN = b"-----BEGIN "
 _PEM_END = b"-----END "
 _PEM_TRUSTED = b"-----BEGIN TRUSTED CERTIFICATE-----"
+#: The RFC 1421 headers of an encrypted PEM block, lower-cased (BACKLOG #2270, :func:`anchor_cadata`).
+_PEM_ENCRYPTION_HEADERS = (b"proc-type:", b"dek-info:")
 #: The source-location tail CPython appends to an ``ssl.SSLError`` message, dropped from a refusal.
 _SSL_WHERE = re.compile(r"\s*\(_ssl\.c:\d+\)$")
 
@@ -215,7 +217,19 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
     the verdict is OpenSSL's own. Measured on CPython 3.14.6 / OpenSSL 3.5.7: a lone ``X509 CRL``
     block refuses, and a well-formed CRL beside a certificate, in either order, loads the one
     certificate and no CRL, so that file still passes. The throwaway context is discarded. It checks
-    that the text loads, not that a certificate in it is a CA; a leaf still loads here."""
+    that the text loads, not that a certificate in it is a CA; a leaf still loads here.
+
+    **An encryption header inside a block refuses, before that load** (BACKLOG #2270). A
+    ``Proc-Type: 4,ENCRYPTED`` header sends OpenSSL to its password callback, and ``cadata=`` sets
+    none, so OpenSSL falls back to its default one, which reads the terminal. The POSIX TTY run the
+    row asked for was NOT done: the box this was built on is Windows. What was measured there, on
+    CPython 3.14.6 / OpenSSL 3.5.7 in a child process with stdin on the null device: the
+    ``cadata=`` load of a certificate block carrying ``Proc-Type: 4,ENCRYPTED`` and ``DEK-Info:``
+    did not return within 20 seconds and was killed, while ``cafile=`` on the same bytes refused at
+    once with ``PEM lib``. So a start or a reload could hang on this file. A CA certificate never
+    carries an RFC 1421 encryption header, so ``Proc-Type:`` and ``DEK-Info:`` both refuse, in any
+    case, and OpenSSL is never handed the block. The same header in a comment outside a block still
+    passes, since OpenSSL skips every line outside a block."""
     kept: list[bytes] = []
     inside = False
     blocks = 0
@@ -233,6 +247,13 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
         if line.startswith(_PEM_BEGIN):
             inside = True
             blocks += 1
+        elif inside and line.lstrip().lower().startswith(_PEM_ENCRYPTION_HEADERS):
+            raise TrustAnchorError(
+                f"{spec.setting}: the trust anchor {spec.path!r} holds an encrypted PEM block (a "
+                "Proc-Type or DEK-Info header). A CA certificate is never encrypted, and loading one "
+                "would make the TLS library ask for a password. Export the CA certificate as a "
+                "plain CERTIFICATE block"
+            )
         if inside or line.isascii():
             kept.append(line)
         if line.startswith(_PEM_END):
