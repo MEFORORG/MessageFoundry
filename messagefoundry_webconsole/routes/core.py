@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import Callable, Mapping
@@ -36,6 +37,7 @@ from messagefoundry.auth.identity import AuthProvider
 from messagefoundry.auth.service import AuthService, Elevation, MfaStatus
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.parsing import HL7PeekError, parse_tree
+from messagefoundry.parsing.tree import ParseTreeTooLargeError
 
 from .. import pages
 from .._auth import (
@@ -398,6 +400,21 @@ def _is_expected_csp_probe_report(report: dict[str, object], origin: str | None)
     if not parts.netloc:
         return True
     return origin is not None and f"{parts.scheme.lower()}://{parts.netloc.lower()}" == origin
+
+
+def _parse_tree_response(message_id: str, raw: str) -> HTMLResponse:
+    """The parse-tree page for ``raw``. Blocking, so the route runs it off the event loop; the
+    response is built here too, so encoding a large page does not run on the loop either.
+
+    Non-HL7 bodies (X12/DICOM/binary) have no HL7 tree and say so rather than 500; a tree past
+    the node cap says it is too large and points at the raw view (vault BACKLOG #2762)."""
+    try:
+        nodes = parse_tree(raw)
+    except ParseTreeTooLargeError as exc:
+        return HTMLResponse(pages.parse_tree_too_large(message_id, str(exc)))
+    except HL7PeekError as exc:
+        return HTMLResponse(pages.parse_tree_unavailable(message_id, str(exc)))
+    return HTMLResponse(pages.parse_tree_page(message_id, nodes))
 
 
 async def _has_stale_session_cookie(request: Request, auth: AuthService | None) -> bool:
@@ -894,12 +911,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # message_body_view audit row), then render the tree server-side via the pure parsing lib. The page shows no
         # metadata, so it does not open the message too. Non-HL7 bodies (X12/DICOM/binary) have no
         # HL7 tree — surface that rather than 500. No new PHI egress beyond the audited body fetch.
+        # The build and the render run in a worker thread: both are linear in the node count, and
+        # the console shares the engine's event loop, so on the loop a large tree would stall every
+        # listener and worker for as long as it took (vault BACKLOG #2762). The tree is also capped.
         raw = await _message_body(message_id, request, engine, identity)
-        try:
-            nodes = parse_tree(raw)
-        except HL7PeekError as exc:
-            return HTMLResponse(pages.parse_tree_unavailable(message_id, str(exc)))
-        return HTMLResponse(pages.parse_tree_page(message_id, nodes))
+        return await asyncio.to_thread(_parse_tree_response, message_id, raw)
 
     @app.get("/ui/messages/{message_id}/attachments/{attachment_id}")
     async def ui_download_attachment(
