@@ -46,13 +46,16 @@ _CRIT = "IB_CRIT_ADT"
 _NORM = "IB_NORM_ADT"
 
 
-def _free_port() -> int:
-    s = socket.socket()
+def _free_ports(count: int) -> list[int]:
+    """Distinct free ports: every socket stays bound until all are picked, so no two match."""
+    socks = [socket.socket() for _ in range(count)]
     try:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
+        for s in socks:
+            s.bind(("127.0.0.1", 0))
+        return [int(s.getsockname()[1]) for s in socks]
     finally:
-        s.close()
+        for s in socks:
+            s.close()
 
 
 def _write_graph(cfg: Path, tmp_path: Path, inbound: str) -> None:
@@ -81,12 +84,12 @@ def _write_tiered_graph(cfg: Path, tmp_path: Path) -> None:
     out_crit, out_norm = tmp_path / "out-crit", tmp_path / "out-norm"
     out_crit.mkdir(exist_ok=True)
     out_norm.mkdir(exist_ok=True)
+    crit_port, norm_port = _free_ports(2)
     (cfg / "cfg.py").write_text(
         "from messagefoundry import inbound, outbound, router, handler, Send, File, MLLP\n"
         "from messagefoundry.config.models import Priority\n"
-        f"inbound({_CRIT!r}, MLLP(port={_free_port()}), router='r', "
-        "priority=Priority.CRITICAL)\n"
-        f"inbound({_NORM!r}, MLLP(port={_free_port()}), router='r', priority=Priority.NORMAL)\n"
+        f"inbound({_CRIT!r}, MLLP(port={crit_port}), router='r', priority=Priority.CRITICAL)\n"
+        f"inbound({_NORM!r}, MLLP(port={norm_port}), router='r', priority=Priority.NORMAL)\n"
         f"outbound('OB_CRIT_ADT', File(directory={str(out_crit)!r}), "
         "priority=Priority.CRITICAL)\n"
         f"outbound('OB_NORM_ADT', File(directory={str(out_norm)!r}), priority=Priority.NORMAL)\n"
@@ -216,6 +219,8 @@ async def test_a_release_then_a_reload_binds_the_normal_feed_again(box: _Box) ->
     await coord.release(actor="alice")
     assert engine.dr_active is False and rr.dr_threshold is None
     assert not rr.inbound_running(_CRIT)  # the release unbound all intake
+    # Released, nothing reports parked, even before a reload re-evaluates the graph.
+    assert rr.filtered_inbound() == {} and rr.filtered_outbound() == {}
 
     await engine.reload_detail(box.tiered)
     assert rr.inbound_running(_CRIT) and rr.inbound_running(_NORM)
@@ -235,6 +240,7 @@ async def test_a_refused_activation_puts_the_threshold_back(
     async def refuse(registry: object) -> None:
         raise WiringError("a trust anchor this graph names is not readable")
 
+    real_preflight = engine.preflight_registry
     monkeypatch.setattr(engine, "preflight_registry", refuse)
     coord = engine.dr_coordinator
     assert coord is not None
@@ -246,7 +252,7 @@ async def test_a_refused_activation_puts_the_threshold_back(
     assert coord.active is False and engine.dr_active is False
     assert rr.dr_threshold is None
     assert rr.inbound_running(_CRIT) and rr.inbound_running(_NORM)
-    monkeypatch.undo()
+    monkeypatch.setattr(engine, "preflight_registry", real_preflight)
     await engine.reload_detail(box.tiered)
     assert rr.inbound_running(_NORM)
 
@@ -371,6 +377,47 @@ async def test_a_dir_that_goes_during_the_takeover_hook_does_not_abort(
     assert result.active is True and engine.dr_active is True
     assert _inbound_names(engine) == {"IB_STAGING_ADT"}
     assert (await _activate_row(engine))["disk_config"] == "unreadable"
+
+
+async def test_a_drift_check_that_raises_does_not_undo_the_activation(
+    box: _Box, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The check runs after the graph is live. A raise there used to reach the coordinator, which
+    recorded an abort and reported the box as not active while it served the profile."""
+    engine = box.engine
+    await engine.reload_detail(box.tiered)
+    rr = engine.registry_runner
+    assert rr is not None
+
+    async def broken(path: Path) -> tuple[dict[str, object] | None, str | None]:
+        raise RuntimeError("the fingerprint module failed")
+
+    monkeypatch.setattr(engine, "fingerprint_bundle", broken)
+    coord = engine.dr_coordinator
+    assert coord is not None
+    result = await coord.activate(actor="alice")
+
+    assert result.active is True and coord.active is True and engine.dr_active is True
+    assert not rr.inbound_running(_NORM)
+    assert await engine.store.list_audit(action="dr_activation_aborted") == []
+    row = await _activate_row(engine)
+    assert row["disk_config"] == "unreadable"
+    assert "the fingerprint module failed" in str(row["disk_config_error"])
+
+
+async def test_a_running_graph_with_no_digest_is_recorded_as_unknown(box: _Box) -> None:
+    """With nothing to compare, the verdict is ``unknown``, not ``differs``."""
+    engine = box.engine
+    await engine.reload_detail(box.staging)
+    engine.loaded_config_fingerprint = None  # as when the load could not read its bundle
+    coord = engine.dr_coordinator
+    assert coord is not None
+    await coord.activate(actor="alice")
+
+    row = await _activate_row(engine)
+    assert row["config_fingerprint"] is None
+    assert row["disk_config"] == "unknown"
+    assert row["disk_config_fingerprint"] == fp.config_fingerprint(box.staging)
 
 
 async def test_convergence_still_reloads_the_startup_dir(box: _Box) -> None:

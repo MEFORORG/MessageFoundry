@@ -241,8 +241,11 @@ in-flight rows stranded.
 > **Decision 2: disk drift is recorded and logged, and only the gated reload applies it.** After the
 > re-apply, the engine digests the running config dir off the event loop, bounded by
 > `[dr].takeover_timeout_seconds`. The `dr.activate` row records the activated graph's digest, and a
-> `disk_config` verdict of `matches`, `differs` or `unreadable`. On `differs` it also records the disk digest,
-> and the engine logs one WARNING naming both digests and the dir. On `unreadable` it records why and goes on.
+> `disk_config` verdict of `matches`, `differs`, `unreadable` or `unknown` (the running graph has no digest to
+> compare). On `differs` it also records the disk digest, and the engine logs one WARNING naming both digests
+> and the dir. On `unreadable` it records why and goes on: the check runs after the graph is live, so it never
+> fails the activation. The re-apply runs the current graph once it holds the runner's reload lock, so an
+> operator reload that lands first is re-evaluated under the threshold rather than reverted.
 > `POST /config/reload`, under its own approval gate, is what applies the disk. This is not a `config_changed`
 > alert, whose contract is a start loading different bytes. The `dr_seed` marker records the activated graph's
 > digest too, not a disk digest taken before the takeover hook.

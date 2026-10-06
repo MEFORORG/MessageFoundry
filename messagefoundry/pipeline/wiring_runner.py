@@ -2351,8 +2351,14 @@ class RegistryRunner:
 
         The engine calls it when ``POST /dr/activate`` or ``/dr/release`` flips the run-profile on
         a running box. Without it the threshold stayed at its construction value, so an activation
-        reload parked nothing on a box built passive (vault BACKLOG #3067)."""
+        reload parked nothing on a box built passive (vault BACKLOG #3067).
+
+        Clearing it also drops every ``filtered`` marker, which only the DR profile writes. Left in
+        place, a released box kept reporting connections as parked, the scheduler kept skipping
+        them, and an operator start built no connector for a parked outbound."""
         self._dr_threshold = threshold
+        if threshold is None:
+            self._filtered.clear()
 
     def _dr_filters_out(self, name: str, declared: Priority | None, *, kind: Direction) -> bool:
         """Whether the DR run-profile parks this connection (its resolved tier is below the threshold).
@@ -5365,8 +5371,13 @@ class RegistryRunner:
             )
         return stranded
 
-    async def reload(self, new_registry: Registry) -> None:
+    async def reload(self, new_registry: Registry | None = None) -> None:
         """Atomically swap to ``new_registry`` on the running graph (whole-config swap).
+
+        ``None`` re-applies the graph that is current once the reload lock is held, so a reload
+        queued behind another one re-evaluates that one's graph rather than reverting it. A DR
+        activation uses it to re-apply the running graph under a new threshold (vault BACKLOG
+        #3067).
 
         Quiesce-and-swap, in this order: (0) build-check every new connector — a bad spec raises
         here, before anything is touched, so the running graph is left intact; (1) stop accepting new
@@ -5387,6 +5398,8 @@ class RegistryRunner:
         before reconciling outbounds means a slow/hung outbound never blocks the engine's intake.
         """
         async with self._reload_lock:
+            if new_registry is None:
+                new_registry = self.registry
             self.build_check(new_registry)  # raises before any change on a bad connector
             if not self._running:
                 self.registry = new_registry

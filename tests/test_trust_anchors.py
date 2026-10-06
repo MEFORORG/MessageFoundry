@@ -1506,7 +1506,7 @@ async def test_every_reload_route_refuses_a_swapped_settings_anchor(
         real_reload = rr.reload
         applied: list[object] = []
 
-        async def counting(registry: Any) -> None:
+        async def counting(registry: Any = None) -> None:
             applied.append(registry)
             await real_reload(registry)
 
@@ -1572,7 +1572,7 @@ async def test_the_dr_profile_reload_without_a_config_dir_refuses_too(
     try:
         rr = engine.add_registry(load_config(cfg))
 
-        async def spy(registry: object) -> None:
+        async def spy(registry: object = None) -> None:
             reloaded.append(registry)
 
         monkeypatch.setattr(rr, "reload", spy)

@@ -760,10 +760,10 @@ class Engine:
         quiesce-and-swap). Returns the provenance fields for the ``dr.activate`` audit row
         (:meth:`_dr_config_drift`)."""
         was_active = self._dr_active
-        # Before the reload, which is where the runner re-evaluates every connection (#3067).
-        self._set_dr_active(True)
         rr = self._registry_runner
-        if rr is not None:
+        if rr is None:
+            self._dr_active = True  # a runner built later takes the threshold at construction
+        else:
             # Re-apply the graph the runner holds in memory, not a config dir read from disk. The
             # running graph is what the operator last applied, through whatever approval that reload
             # needed, so an activation must not swap in bytes edited since then with no second person,
@@ -772,10 +772,15 @@ class Engine:
             # hook moved the VIP. The two preflights are the ones reload_detail runs on a real
             # reload, and rr.reload still runs build_check, so the egress and exposure gates still
             # run. propagate does not arise: a local DR decision is never a cluster-wide config bump.
+            # The threshold goes to the runner after the preflights, which only read, and before
+            # the reload, which is where the runner re-evaluates every connection. rr.reload(None)
+            # re-applies whichever graph is current once it holds the reload lock, so an operator
+            # reload that lands first is re-evaluated rather than reverted.
             try:
                 await self.preflight_settings()
                 await self.preflight_registry(rr.registry)
-                await rr.reload(rr.registry)
+                self._set_dr_active(True)
+                await rr.reload()
             except Exception:
                 # A refused reload (BACKLOG #2034: a settings trust anchor, say) applied no DR profile,
                 # so the latch and the runner's threshold go back too. Left set, the next operator
@@ -794,9 +799,11 @@ class Engine:
         applies it, under that route's own approval gate. This is deliberately not a
         ``config_changed`` alert, whose contract is a START loading different bytes. The digest is
         taken off the event loop and bounded by ``[dr].takeover_timeout_seconds``. A directory that
-        has gone, cannot be read or does not answer in time is recorded as ``unreadable`` and never
-        fails the activation. The log line carries digests and the directory path, never config
-        content."""
+        has gone, cannot be read or does not answer in time is recorded as ``unreadable``. It runs
+        after the graph is live, so nothing it raises may fail the activation: the coordinator
+        would then record an abort, and report the box as not active, while it serves the profile.
+        With no digest of the running graph there is nothing to compare, and the verdict is
+        ``unknown``. The log line carries digests and the directory path, never config content."""
         from messagefoundry.config.fingerprint import fingerprint_matches
 
         activated = await self._dr_config_fingerprint()
@@ -815,6 +822,10 @@ class Engine:
                     disk = (bundle or {}).get("fingerprint")
         except TimeoutError:
             reason = f"no answer within {self._dr_settings.takeover_timeout_seconds:g}s"
+        except Exception as exc:
+            # Broad on purpose, and logged below: fingerprint_bundle lets anything but OSError and
+            # ValueError through, and this record must not undo an activation that has applied.
+            reason = safe_exc(exc)
         if not isinstance(disk, str):
             fields["disk_config"] = "unreadable"
             fields["disk_config_error"] = reason or "no digest was taken"
@@ -825,7 +836,11 @@ class Engine:
                 fields["disk_config_error"],
             )
             return fields
-        if activated is not None and fingerprint_matches(disk, activated):
+        if activated is None:
+            fields["disk_config"] = "unknown"
+            fields["disk_config_fingerprint"] = disk
+            return fields
+        if fingerprint_matches(disk, activated):
             fields["disk_config"] = "matches"
             return fields
         fields["disk_config"] = "differs"
