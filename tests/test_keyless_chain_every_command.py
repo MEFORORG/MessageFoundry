@@ -555,18 +555,19 @@ def _keyless_chain(db: Path) -> None:
     asyncio.run(seed())
 
 
-def test_a_keyless_chain_passing_where_the_settings_require_a_key_exits_4(
+def test_a_keyless_chain_passing_where_the_settings_require_a_key_exits_5(
     shell: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A keyless chain walks clean in a shell whose settings forbid keyless running. Exit 4, not 0
+    """A keyless chain walks clean in a shell whose settings forbid keyless running. Exit 5, not 0
     (vault BACKLOG #3054): the settings say verification is keyed, and a plain SHA-256 walk is not
     that, so the chain was not checked to their standard. A job reading only the code must see it.
-    The WARNING still goes to stderr, and neither line quotes a row."""
+    Not 4, which a forged first row produces, so that forgery shows as a move from 5 to 4. The
+    WARNING still goes to stderr, and neither line quotes a row."""
     db = shell / "keyless.db"
     _keyless_chain(db)
     rc = main(["audit-verify", "--db", str(db)])
     captured = capsys.readouterr()
-    assert rc == 4, (captured.out, captured.err)
+    assert rc == 5, (captured.out, captured.err)
     assert captured.out.startswith("NOT CHECKED: "), captured.out
     assert "OK" not in captured.out, captured.out
     assert "WARNING: the audit chain is keyless" in captured.err, captured.err
@@ -577,7 +578,7 @@ def test_a_keyless_chain_passing_where_the_settings_require_a_key_exits_4(
     # require. Pinned, so a change that lets an anchor turn this into a pass is a decision, not drift.
     assert main(["audit-anchor", "--db", str(db)]) == 0
     anchor = capsys.readouterr().out.strip()
-    assert main(["audit-verify", "--db", str(db), "--expected-anchor", anchor]) == 4
+    assert main(["audit-verify", "--db", str(db), "--expected-anchor", anchor]) == 5
     assert capsys.readouterr().out.startswith("NOT CHECKED: ")
 
 
@@ -589,7 +590,7 @@ def test_an_empty_log_where_the_settings_require_a_key_names_no_first_row(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Vault BACKLOG #3054, item 3. An EMPTY log has no first row, so the WARNING must not say its
-    first row names no key; it says there is no first row naming one. The exit is still 4,
+    first row names no key; it says there is no first row naming one. The exit is still 5,
     --allow-empty or not: this setup never reports a pass.
 
     The open refuses this state first, exit 2 (#1916): an empty log with no key and no opt-out is a
@@ -610,7 +611,7 @@ def test_an_empty_log_where_the_settings_require_a_key_names_no_first_row(
     monkeypatch.setattr(store_base, "_refuse_to_start_a_keyless_chain", _no_refusal)
     rc = main(argv)
     captured = capsys.readouterr()
-    assert rc == 4, (captured.out, captured.err)
+    assert rc == 5, (captured.out, captured.err)
     assert captured.out.startswith("NOT CHECKED: "), captured.out
     assert "first row names" not in captured.out + captured.err, captured.err
     assert "it has no first row naming a key" in captured.err, captured.err
@@ -673,18 +674,18 @@ def test_the_weaker_setup_is_pinned_a_keyless_store_from_a_shell_that_requires_a
     """The setup vault BACKLOG #2725 made weaker, pinned so it cannot widen unseen. A keyless store,
     verified from a shell whose settings require a key and that holds none. A writer who rewrites
     the first row to name a key and edits another row gets exit 4, where it was 1 before #2725, and
-    no WARNING. Since #3054 the CLEAN chain exits 4 too, with the WARNING, so the rewrite no longer
-    moves a job off 0: 4 is this setup's steady state, and the way out is to key the store or to
+    no WARNING. Since #3054 the CLEAN chain exits 5, with the WARNING: this setup's steady state,
+    never a pass. So the rewrite shows as a move from 5 to 4. The way out is to key the store or to
     set the keyless opt-out the engine runs under."""
     db = shell / "keyless.db"
     _keyless_chain(db)
-    assert main(["audit-verify", "--db", str(db)]) == 4
+    assert main(["audit-verify", "--db", str(db)]) == 5  # clean: the steady state
     assert "WARNING: the audit chain is keyless" in capsys.readouterr().err
     _write(db, _FORGE_GENESIS)
     _write(db, _EDIT_ROW_2)
     rc = main(["audit-verify", "--db", str(db)])
     captured = capsys.readouterr()
-    assert rc == 4, captured.out
+    assert rc == 4, captured.out  # forged first row: a move from 5 to 4 is the tamper sign
     assert "may have been changed" in captured.out and "WARNING" not in captured.err
 
 
@@ -693,7 +694,7 @@ def test_a_keyed_chain_rewritten_as_keyless_warns_with_no_key_and_fails_with_it(
 ) -> None:
     """A keyed chain that a writer with no key rewrites as keyless: row 1 made ordinary, a row
     edited, every hash recomputed as plain SHA-256. From a shell with no key it walks clean, so it
-    exits 4 (#3054) and the WARNING must fire and name the rewrite as a cause. With the engine's key
+    exits 5 (#3054) and the WARNING must fire and name the rewrite as a cause. With the engine's key
     the same chain fails, exit 1."""
     from messagefoundry.store.store import _audit_row_mac
 
@@ -714,7 +715,7 @@ def test_a_keyed_chain_rewritten_as_keyless_warns_with_no_key_and_fails_with_it(
             prev = digest
         conn.commit()
 
-    assert main(["audit-verify", "--db", str(db)]) == 4
+    assert main(["audit-verify", "--db", str(db)]) == 5
     err = capsys.readouterr().err
     assert "WARNING: the audit chain is keyless" in err and "rewritten as keyless" in err, err
 

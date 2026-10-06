@@ -2520,7 +2520,7 @@ class AuditVerdict(tuple[bool, str | None]):
     ``keyless_walk`` says a clean verdict came from a process that holds no key, over a chain whose
     first row names none: a plain SHA-256 walk, which anyone who can write the log can recompute.
     It is set only with ``ok`` true. A caller whose settings require a key must not report it as a
-    pass: ``audit-verify`` exits 4, "not checked", on it (vault BACKLOG #3054).
+    pass: ``audit-verify`` exits 5, "not checked", on it (vault BACKLOG #3054).
 
     ``==`` and ``hash`` are the tuple's and ignore both flags; ``__reduce__`` keeps them through a
     copy."""

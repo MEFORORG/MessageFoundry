@@ -468,15 +468,18 @@ out. The remaining transport gaps include **raw TCP and X12**, which have no nat
       chain, `2` is "could not start" (for example the `--db` path is not an audit database: absent,
       zero-byte, or no `audit_log` table — a `touch` in an install script or a failed copy leaves
       exactly that, and the verifier refuses it rather than creating one), `3` is a clean walk over
-      an **empty** log, and `4` means this shell holds no key while its settings require one, so
-      nothing was checked against a key. Run the job with the settings and environment the engine
-      runs with, the key or the keyless opt-out included: the verify reads them to decide between
-      `0`, `1` and `4`. Treating `2` or `3` as a tamper alarm pages someone for a
-      misconfiguration. **Never treat `4` as a pass.** A job with neither the key nor the opt-out
-      can never exit `0`, even on a clean keyless chain. Give it the engine's settings and key. Do
-      not clear the `4` with the keyless opt-out unless the engine runs under it. A job that moves
-      from `0` to `4` changed, not the database: find out what changed it. Treating any of `2`,
-      `3` or `4` as a pass leaves the real log unchecked. Add `--allow-empty` only
+      an **empty** log, `4` means the chain's first row names a key that this shell does not hold,
+      and `5` means a keyless chain walked clean in a shell whose settings require a key. Neither
+      `4` nor `5` checked anything against a key. Run the job with the settings and environment
+      the engine runs with, the key or the keyless opt-out included: the verify reads them to
+      decide between `0`, `1`, `4` and `5`. Treating `2` or `3` as a tamper alarm pages someone
+      for a misconfiguration. **Never treat `4` or `5` as a pass.** A job with neither the key nor
+      the opt-out exits `5` on a clean keyless chain. **A move from `5` to `4` means the first row
+      was changed to name a key: treat it as tampering** until a run with the engine's settings
+      and key says otherwise. Give the job the engine's settings and key. Do not clear the `5`
+      with the keyless opt-out unless the engine runs under it. A job that moves from `0` to `4`
+      or `5` changed, not the database: find out what changed it. Treating any of `2` to `5` as a
+      pass leaves the real log unchecked. Add `--allow-empty` only
       where an empty log is expected. Exit codes and their reasoning: [`SECURITY.md`](SECURITY.md)
       "Tamper-evidence".
 - [ ] **Seal the audit DB across any gap in custody, with an anchor.** A bare `audit-verify` is clean

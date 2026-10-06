@@ -417,10 +417,10 @@ async def test_message_events_all_records_routine(tmp_path: Path) -> None:
 def keyless_verify(monkeypatch: pytest.MonkeyPatch) -> None:
     """Settings that let the store run keyless, for a CLI test that verifies a KEYLESS chain.
 
-    Since vault BACKLOG #3054 a keyless chain that walks clean exits 4, not 0, in a shell whose
+    Since vault BACKLOG #3054 a keyless chain that walks clean exits 5, not 0, in a shell whose
     settings require a store key: it was not checked to the standard they set. These tests seed a
     keyless store, which only a keyless engine writes, so they verify it as that engine would, under
-    the audited opt-out. `tests/test_keyless_chain_every_command.py` pins the exit-4 arm."""
+    the audited opt-out. `tests/test_keyless_chain_every_command.py` pins the exit-5 arm."""
     setenv_at_rest_opt_out(monkeypatch)
 
 

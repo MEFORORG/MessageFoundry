@@ -912,8 +912,9 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         help="exit 0 instead of 3 when the audit log verifies clean but holds no rows. Without it "
         "an empty log is a distinct exit code, so a scheduled job cannot read 'there was nothing "
         "to verify' as a pass (exit 1 stays a BROKEN CHAIN, exit 2 'could not open the store', "
-        "exit 4 'this shell holds no store key while its settings require one, so the chain was not "
-        "checked against a key'). It does not apply in that setup: an empty log there exits 2 or 4",
+        "exit 4 'the chain's first row names a key and this shell holds none', exit 5 'the chain is "
+        "keyless, this shell holds no key, and its settings require one'). It does not apply in that "
+        "last setup: an empty log there exits 2 or 5",
     )
     # ONE mutually-exclusive group: the two flags carry the same value in two transports, and argparse
     # refusing both is better than silently letting one win.
@@ -7168,7 +7169,7 @@ def _audit_verify(args: argparse.Namespace) -> int:
     )
     if refused is not None:
         return refused
-    # Decides exit 4 against exit 1, and against exit 0 for a keyless walk (#3054), below. The open
+    # Decides exit 4 against exit 1, and exit 5 against exit 0 for a keyless walk (#3054), below. The open
     # computes the same verdict inline, because the
     # #1916 source guard reads that call's argument, so the two cannot be one expression.
     keyless_refusal = keyless_opt_out_refusal(settings.store, settings.security)
@@ -7232,13 +7233,14 @@ def _audit_verify(args: argparse.Namespace) -> int:
         print("FAIL: " + (message or ""))
         return 1
     if verdict.keyless_walk and keyless_refusal is not None:
-        # EXIT 4, NOT 0 (vault BACKLOG #3054). A clean walk by a shell that holds no key, whose
+        # EXIT 5, NOT 0 (vault BACKLOG #3054). A clean walk by a shell that holds no key, whose
         # settings require one. They say verification is keyed, and this was a plain SHA-256 walk
         # anyone who can write the log can recompute, so it was not checked to their standard. A job
-        # reading only the code never sees the WARNING, and 0 would let a site sit in the one setup
-        # where a rewritten first row turns later tampering from 1 into 4 (#2725). Here 4 is the
-        # steady state. Neither the exit nor the text reads the row count: it is a second query, which
-        # a writer can change after the walk. Content-free: neither line quotes a row.
+        # reading only the code never sees the WARNING, so 0 would hide that. NOT 4 EITHER: this is
+        # the one setup where a rewritten first row turns later tampering from 1 into 4 (#2725). With
+        # 5 as its steady state, that rewrite shows as a move from 5 to 4. Neither the exit nor the
+        # text reads the row count: it is a second query, which a writer can change after the walk,
+        # and an empty log (no first row naming a key) is keyless-shaped too. Content-free.
         print(
             f"NOT CHECKED: this shell holds no store key and its settings require one, so the audit "
             f"chain was not checked against a key ({message}, as plain SHA-256)"
@@ -7254,7 +7256,7 @@ def _audit_verify(args: argparse.Namespace) -> int:
             "key, that run decides it.",
             file=sys.stderr,
         )
-        return 4
+        return 5
     print("OK: " + (message or ""))
     if count:
         return 0

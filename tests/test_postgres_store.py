@@ -4421,7 +4421,7 @@ async def test_audit_verify_cli_server(store, capsys, monkeypatch) -> None:
     from tests._phi_gate_provisions import setenv_at_rest_opt_out
 
     # The chain is keyless, so verify it under the opt-out a keyless engine runs with: in a shell
-    # whose settings require a key, a clean keyless walk exits 4 (vault BACKLOG #3054).
+    # whose settings require a key, a clean keyless walk exits 5 (vault BACKLOG #3054).
     setenv_at_rest_opt_out(monkeypatch)
     await store.record_audit("message_view", actor="alice", detail="v1")
     await store.record_audit("export", actor="bob", detail="e1")

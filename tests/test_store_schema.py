@@ -587,7 +587,7 @@ def test_the_audit_commands_read_a_store_this_build_refuses(
     from tests._phi_gate_provisions import setenv_at_rest_opt_out
 
     # The store is keyless, so verify it under the opt-out a keyless engine runs with: in a shell
-    # whose settings require a key, a keyless chain exits 4 (vault BACKLOG #3054).
+    # whose settings require a key, a keyless chain exits 5 (vault BACKLOG #3054).
     setenv_at_rest_opt_out(monkeypatch)
     db = tmp_path / "incompatible.db"
     _incompatible_store(db)
