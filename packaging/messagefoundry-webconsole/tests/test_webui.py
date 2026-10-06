@@ -910,7 +910,9 @@ async def test_reauth_rejects_unsafe_next(engine: Engine) -> None:
     # URL (anti open-redirect / anti open-POST gadget). Rejected values bounce to /ui, not to the target.
     service = await _service(engine)
     async with _client(engine, service) as c:
-        for bad in ("https://evil.example/x", "//evil.example", "/ui/messages", "/etc/passwd"):
+        # "/ui/audit" stands for an unregistered /ui page. This used "/ui/messages" until vault
+        # BACKLOG #2620 registered the PHI pages as unlock continuations.
+        for bad in ("https://evil.example/x", "//evil.example", "/ui/audit", "/etc/passwd"):
             r = await c.get("/ui/reauth", params={"next": bad})
             assert r.status_code == 303 and r.headers["location"] == "/ui"
 
@@ -8133,3 +8135,195 @@ def test_the_create_form_states_a_large_window_in_plain_digits() -> None:
         pages.user_new_page([], credential_window_hours=1_000_000.0)
     )
     assert "stops working 1 hour after" in str(pages.user_new_page([], credential_window_hours=1.0))
+
+
+# --- vault BACKLOG #2620: a replayed cookie from a second address --------------------------------
+
+
+def _client_from(engine: Engine, service: AuthService, ip: str) -> httpx.AsyncClient:
+    """A browser at ``ip``, otherwise as :func:`_client`."""
+    app = create_app(engine, auth=service, serve_ui=True, webauthn_rp_from_request=True)
+    transport = httpx.ASGITransport(app=app, client=(ip, 51000))
+    return httpx.AsyncClient(transport=transport, base_url="http://t")
+
+
+async def test_a_cookie_replayed_from_a_second_address_is_sent_to_reauth(engine: Engine) -> None:
+    """RED when: a session cookie presented from a host it never verified from reads a message page
+    or calls a paced write (vault BACKLOG #2620).
+
+    The PHI arm sends it to ``/ui/reauth`` and back to the page; a write lands on ``/ui`` after the
+    re-auth. The same cookie from the sign-in address is the control, and a non-PHI page from the new
+    address is the proof the base gate still lets it through."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    mid = await _seed(engine)
+    same = {"Sec-Fetch-Site": "same-origin"}
+    async with _client_from(engine, service, "10.0.0.1") as a:
+        assert (await _cookie_login(a, "op")).status_code == 303
+        tok = a.cookies.get("mf_session")
+        assert tok is not None
+        # The control: the sign-in address reads and writes.
+        assert (await a.get(f"/ui/messages/{mid}")).status_code == 200
+        r = await a.post("/ui/statistics/reset", headers=same)
+        assert (r.status_code, r.headers["location"]) == (303, "/ui/status")
+    async with _client_from(engine, service, "10.9.9.9") as b:
+        b.cookies.set("mf_session", tok)
+        for page in (f"/ui/messages/{mid}", "/ui/messages", "/ui/dead-letters"):
+            r = await b.get(page)
+            assert (r.status_code, r.headers.get("location")) == (303, f"/ui/reauth?next={page}")
+        # A filtered or deferred list comes back with its query, never as a broader read.
+        listed = "/ui/messages?channel_id=ch1&defer=1"
+        r = await b.get(listed)
+        assert r.headers.get("location") == "/ui/reauth?next=" + quote(listed, safe="/")
+        assert (await b.get("/ui/reauth", params={"next": listed})).status_code == 200
+        r = await b.post("/ui/statistics/reset", headers=same)
+        assert (r.status_code, r.headers["location"]) == (303, "/ui/reauth?next=/ui")
+        # Not every request: the dashboard is no PHI page and no write.
+        assert (await b.get("/ui")).status_code == 200
+        # /ui/reauth accepts both continuations, so the operator is not stranded on /ui.
+        assert (await b.get(f"/ui/reauth?next=/ui/messages/{mid}")).status_code == 200
+        assert (await b.get("/ui/reauth?next=/ui")).status_code == 200
+        done = await b.post(
+            "/ui/reauth", data={"next": f"/ui/messages/{mid}", "password": PW}, headers=same
+        )
+        assert (done.status_code, done.headers["location"]) == (303, f"/ui/messages/{mid}")
+        # The re-auth re-anchored the session at this address.
+        assert (await b.get(f"/ui/messages/{mid}")).status_code == 200
+    seen = [
+        json.loads(str(dict(a)["detail"]))["path"]
+        for a in await engine.store.list_audit(action="auth.admin_action_new_ip", limit=100)
+    ]
+    assert seen == [f"/ui/messages/{mid}"]  # one row: a first sighting, then deduped
+
+
+async def test_a_refused_new_address_spends_no_budget(engine: Engine) -> None:
+    """RED when: a request refused for a new address first charges the holder's PHI-read or
+    admin-write budget (vault BACKLOG #2620, the BACKLOG #1973 rule). With a budget of one, the
+    holder still reads and writes once after the refusals."""
+    service = AuthService(
+        engine.store,
+        AuthSettings(
+            admin_write_min_interval_seconds=0,
+            admin_write_rate_limit_per_actor=1,
+            phi_read_rate_limit_per_actor=1,
+            require_mfa=False,
+        ),
+    )
+    await service.initialize()
+    await _add(service, "op", Role.OPERATOR)
+    mid = await _seed(engine)
+    same = {"Sec-Fetch-Site": "same-origin"}
+    async with _client_from(engine, service, "10.0.0.1") as a:
+        await _cookie_login(a, "op")
+        tok = a.cookies.get("mf_session")
+        assert tok is not None
+    async with _client_from(engine, service, "10.9.9.9") as b:
+        b.cookies.set("mf_session", tok)
+        for _ in range(3):
+            assert (await b.get(f"/ui/messages/{mid}")).status_code == 303
+            assert (await b.post("/ui/statistics/reset", headers=same)).status_code == 303
+    async with _client_from(engine, service, "10.0.0.1") as a:
+        a.cookies.set("mf_session", tok)
+        assert (await a.get(f"/ui/messages/{mid}")).status_code == 200
+        r = await a.post("/ui/statistics/reset", headers=same)
+        assert (r.status_code, r.headers["location"]) == (303, "/ui/status")
+
+
+async def test_every_phi_page_has_a_reauth_continuation(engine: Engine) -> None:
+    """RED when: a ``require_ui(..., phi=True)`` GET page is added without registering it as an
+    unlock continuation (vault BACKLOG #2620). Its new-address refusal sends the browser to
+    ``/ui/reauth?next=<path>``, and an unregistered ``next`` bounces to ``/ui`` with the session
+    still anchored elsewhere, so the operator could never reach the page from the new address.
+
+    Walks the mounted routes and reads ``phi`` and ``new_address_check`` from each ``require_ui``
+    dependency's closure, so the set is derived and not a list kept by hand."""
+    from fastapi.routing import APIRoute
+
+    from messagefoundry_webconsole._auth import is_unlock_action
+
+    service = await _service(engine)
+    app = create_app(engine, auth=service, serve_ui=True)
+    checked: list[str] = []
+    for route in app.routes:
+        if not isinstance(route, APIRoute) or not route.path.startswith("/ui"):
+            continue
+        if "GET" not in route.methods:
+            continue
+        for dep in route.dependant.dependencies:
+            call = dep.call
+            code = getattr(call, "__code__", None)
+            if (
+                code is None
+                or getattr(call, "__qualname__", "") != "require_ui.<locals>.dependency"
+            ):
+                continue
+            closure = getattr(call, "__closure__", None) or ()
+            cells = dict(zip(code.co_freevars, (c.cell_contents for c in closure), strict=True))
+            if cells.get("phi") and cells.get("new_address_check"):
+                concrete = re.sub(r"\{[^}]+\}", "x1", route.path)
+                assert is_unlock_action(concrete), f"{route.path} has no unlock continuation"
+                # Query-tolerant, so a filtered page comes back filtered.
+                assert is_unlock_action(concrete + "?a=1"), f"{route.path} drops its query"
+                checked.append(route.path)
+    # The control: the walk found the PHI pages it exists for, so a zero is not a pass.
+    assert "/ui/messages/{message_id}" in checked and "/ui/dead-letters" in checked, checked
+
+
+async def test_the_password_page_is_not_refused_for_a_new_address(engine: Engine) -> None:
+    """RED when: a must-change session's password POST from a new address is sent to
+    ``/ui/reauth``. That page sends a must-change session straight back to the password page, so
+    the refusal would loop with no message (vault BACKLOG #2620, review round 1). A mismatched
+    pair proves the handler ran: it answers 400 in place."""
+    service = await _service(engine)
+    await _add(service, "fresh", Role.OPERATOR)
+    user = await service.store.get_user_by_username("fresh")
+    assert user is not None and user.password_hash is not None
+    await service.store.set_password(
+        user.id,
+        password_hash=user.password_hash,
+        must_change_password=True,
+        password_generated=False,
+    )
+    async with _client_from(engine, service, "10.0.0.1") as a:
+        await _cookie_login(a, "fresh")
+        tok = a.cookies.get("mf_session")
+        assert tok is not None
+    async with _client_from(engine, service, "10.9.9.9") as b:
+        b.cookies.set("mf_session", tok)
+        r = await b.post(
+            "/ui/account/password",
+            data={"current_password": PW, "new_password": "a" * 20, "new_password2": "b" * 20},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 400, r.headers.get("location")
+
+
+def test_a_new_address_continuation_never_drops_a_query_or_overflows() -> None:
+    """RED when: a refused GET's continuation drops its query (a broader read after the re-auth)
+    or exceeds ``/ui/reauth``'s 512-character cap on ``next`` (a 422 with no form). Either way the
+    landing is used instead (vault BACKLOG #2620, review round 2)."""
+    from starlette.requests import Request
+
+    from messagefoundry_webconsole._auth import _new_address_continuation
+
+    def req(method: str, path: str, query: str = "") -> Request:
+        scope = {
+            "type": "http",
+            "method": method,
+            "path": path,
+            "raw_path": path.encode(),
+            "query_string": query.encode(),
+            "headers": [],
+        }
+        return Request(scope)
+
+    land = "/ui/account"
+    assert _new_address_continuation(req("GET", "/ui/messages"), landing=land) == "/ui/messages"
+    filtered = req("GET", "/ui/messages", "channel_id=ch1&defer=1")
+    assert (
+        _new_address_continuation(filtered, landing=land) == "/ui/messages?channel_id=ch1&defer=1"
+    )
+    long_name = "/ui/connection/" + "n" * 600 + "/events/1/reason"
+    assert _new_address_continuation(req("GET", long_name), landing=land) == land
+    assert _new_address_continuation(req("GET", "/ui/audit"), landing=land) == land
+    assert _new_address_continuation(req("POST", "/ui/messages"), landing=land) == land

@@ -228,6 +228,10 @@ account is not exempt from the engine's second factor
   [`SECURITY.md`](SECURITY.md).
 - Keep `[auth].admin_new_ip_step_up` at its default (`true`, since BACKLOG #288). It forces a fresh
   step-up when an admin action arrives from a new client IP; turning it off is a named loosening.
+  Since vault BACKLOG #2620 a PHI page or a console write from a new address also goes to
+  `/ui/reauth` first, so an operator whose address changes re-authenticates there.
+  [SECURITY.md](SECURITY.md#administrative-interface-defense-in-depth-wp-l3-13-asvs-842) item 6
+  lists the gates.
 
 ---
 

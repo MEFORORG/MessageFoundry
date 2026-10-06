@@ -641,8 +641,9 @@ _CONTEXTUAL_PROSE_ONLY = frozenset(
 #: gate), so the counts are pinned too: removing ANY row reds CI.
 # -1 BACKLOG #1136 (ADR 0183 Amendment A, Wave 4): the first-run account's claim-state row went with
 # that account; +2 BACKLOG #288: the first-seen sign-in address, split by outcome; +1 BACKLOG #1957
-# (ADR 0198): the reconciler's scope re-diff; +2 BACKLOG #2301: the two second-step time floors.
-_CONTEXT_TABLE_A_ROWS = 42
+# (ADR 0198): the reconciler's scope re-diff; +2 BACKLOG #2301: the two second-step time floors;
+# +1 BACKLOG #2298: a session whose temporary credential lapsed is ended.
+_CONTEXT_TABLE_A_ROWS = 43
 _CONTEXT_TABLE_B_ROWS = 13
 
 #: The closed action vocabulary the section declares. Every Action cell in BOTH tables must OPEN with

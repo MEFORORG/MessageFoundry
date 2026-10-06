@@ -181,6 +181,40 @@ register_ui_action(
     r"^/ui/messages/[^/?#]+/edit$", Permission.MESSAGES_EDIT, auto_retry=False, unlock=True
 )
 
+# The PHI pages `require_ui(..., phi=True)` gates, as unlock continuations (vault BACKLOG #2620).
+# That gate sends a read from a host the session has not verified from to /ui/reauth, carrying the
+# page's own target, and /ui/reauth acts only on a registered continuation: without these the
+# operator would land on /ui with the session still anchored elsewhere.
+# QUERY-TOLERANT, for the reason `_auth.is_unlock_action` sets out: a filtered or deferred list must
+# come back filtered or deferred, not as a broader read than the operator asked for. Each route's
+# own Query bounds still judge the query. Every path here serves GET only. The message pattern
+# excludes `search`, which routes/search.py registers with its own flags, so the first-match lookup
+# never depends on import order. The reveal routes are registered in monitoring.py.
+register_ui_action(
+    r"^/ui/messages(\?[^#]*)?$", Permission.MESSAGES_READ, auto_retry=False, unlock=True
+)
+register_ui_action(
+    r"^/ui/messages/(?!search(?:$|[/?#]))[^/?#]+(/(summary|body|errors|parse-tree))?(\?[^#]*)?$",
+    Permission.MESSAGES_VIEW_RAW,
+    auto_retry=False,
+    unlock=True,
+)
+register_ui_action(
+    r"^/ui/messages/[^/?#]+/attachments/[^/?#]+(\?[^#]*)?$",
+    Permission.MESSAGES_VIEW_RAW,
+    auto_retry=False,
+    unlock=True,
+)
+register_ui_action(
+    r"^/ui/dead-letters(\?[^#]*)?$", Permission.MESSAGES_READ, auto_retry=False, unlock=True
+)
+register_ui_action(
+    r"^/ui/connection/[^/?#]+/events/[^/?#]+/reason(\?[^#]*)?$",
+    Permission.MESSAGES_VIEW_SUMMARY,
+    auto_retry=False,
+    unlock=True,
+)
+
 # Resend to an ALTERNATE outbound (ADR 0090 §§1-8, BACKLOG #123/#1500). The GET confirm page is the
 # step-up `unlock` continuation; the POST behind it is deliberately NOT registered — its
 # `reauth_next` maps a stale-window step-up back to that confirm page, which re-renders with a fresh
