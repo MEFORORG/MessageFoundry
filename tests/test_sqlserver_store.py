@@ -2009,6 +2009,27 @@ async def test_cancel_queued_finalizes_via_batch_lock(store) -> None:
     assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
 
 
+async def test_cancel_queued_top_only_cancels_a_backing_off_head(store) -> None:
+    # vault BACKLOG #2754: a backed-off head is later-due than the row behind it; "purge top" must
+    # still cancel the FIFO head (seq order, as claim_next_fifo), not the earliest-due row.
+    m1 = await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB", "p1")], now=100.0)
+    m2 = await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB", "p2")], now=101.0)
+    head = await store.claim_next_fifo("OB", now=102.0)
+    assert head is not None and head.message_id == m1
+    await store.mark_failed(
+        head.id, "boom", RetryPolicy(max_attempts=None, backoff_seconds=60.0), now=102.0
+    )
+    assert (await store.outbox_for(m1))[0]["next_attempt_at"] > (await store.outbox_for(m2))[0][
+        "next_attempt_at"
+    ]
+    assert await store.claim_next_fifo("OB", now=103.0) is None  # the head blocks the lane
+    assert await store.cancel_queued(None, "OB", top_only=True, now=103.0) == 1
+    assert (await store.outbox_for(m1))[0]["status"] == OutboxStatus.CANCELLED.value
+    assert (await store.outbox_for(m2))[0]["status"] == OutboxStatus.PENDING.value
+    nxt = await store.claim_next_fifo("OB", now=103.0)
+    assert nxt is not None and nxt.message_id == m2
+
+
 # --- query/response (ADR 0013) — capture, correlate, re-ingress on real SQL Server ------------
 
 
