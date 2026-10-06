@@ -78,10 +78,12 @@ def _rival_takes_the_name(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch, **rival: Any
 ) -> None:
     """Make the next ``create_user`` lose the race: a rival row takes the name first, then the real
-    insert runs and meets the UNIQUE index, as a concurrent create would. ``disabled`` is applied to
-    the rival after its insert; every other keyword goes to the rival's ``create_user``."""
+    insert runs and meets the UNIQUE index, as a concurrent create would. ``disabled`` and ``locked``
+    are applied to the rival after its insert; every other keyword goes to the rival's
+    ``create_user``."""
     original = store.create_user
     disabled = bool(rival.pop("disabled", False))
+    locked = bool(rival.pop("locked", False))
 
     async def racing(**kwargs: Any) -> None:
         monkeypatch.setattr(store, "create_user", original)
@@ -90,6 +92,10 @@ def _rival_takes_the_name(
         )
         if disabled:
             await store.set_user_disabled("rival", disabled=True)
+        if locked:
+            await store.record_login_failure(
+                "rival", failed_attempts=5, locked_until=time.time() + 3600
+            )
         await original(**kwargs)
 
     monkeypatch.setattr(store, "create_user", racing)
@@ -194,6 +200,71 @@ async def test_a_lost_race_to_a_different_directory_identity_is_refused_as_a_con
         row = await store.get_user("rival")
         assert row is not None and row.email == "kept@example.org"
         assert row.directory_object_id == _OTHER_OBJECT_ID
+    finally:
+        await store.close()
+
+
+async def test_a_lost_race_to_a_directory_row_with_no_object_id_is_refused_not_adopted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # THE TAKEOVER SHAPE. A directory row with no immutable id proves nothing about whose it is, so
+    # a guard that read a missing id as a match would hand this principal the winner's row, its
+    # user_id and its roles.
+    store, service = await _service()
+    try:
+        _rival_takes_the_name(
+            store,
+            monkeypatch,
+            auth_provider=AuthProvider.AD.value,
+            directory_object_id=None,
+            email="kept@example.org",
+        )
+        out = await service._complete_ad_login(_principal(), "10.0.0.7", mfa_verified=True)
+        assert not out.ok and out.token is None and out.identity is None
+        assert out.error == "account conflict"
+        assert out.reason == DIRECTORY_IDENTITY_CONFLICT
+        assert await store.list_sessions("rival") == []
+        assert await store.count_users() == 1
+        # Refused before any write: the rival keeps its profile and its missing id.
+        row = await store.get_user("rival")
+        assert row is not None and row.email == "kept@example.org"
+        assert row.directory_object_id is None
+        # The conflict row names who asked, from where, and through which provider.
+        failed = [row for row in await store.list_audit() if row["action"] == "auth.login_failed"]
+        assert len(failed) == 1
+        assert failed[0]["actor"] == "pfielding"
+        assert failed[0]["client"] == "10.0.0.7"
+        assert json.loads(failed[0]["detail"]) == {
+            "provider": "ad",
+            "reason": DIRECTORY_IDENTITY_CONFLICT,
+        }
+    finally:
+        await store.close()
+
+
+async def test_a_lost_race_to_a_locked_row_of_the_same_account_is_refused_as_locked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #1638 on the adopted row: a lock set on the winner is not cleared by the loser's
+    # sign-in, and the refusal comes before the profile write.
+    store, service = await _service()
+    try:
+        _rival_takes_the_name(
+            store,
+            monkeypatch,
+            auth_provider=AuthProvider.AD.value,
+            directory_object_id=_OBJECT_ID,
+            email="kept@example.org",
+            locked=True,
+        )
+        out = await service._complete_ad_login(_principal(), None, mfa_verified=True)
+        assert not out.ok and out.token is None
+        assert out.reason == "locked"
+        assert await _failed_reasons(store) == ["locked"]
+        row = await store.get_user("rival")
+        assert row is not None and row.email == "kept@example.org"
+        assert row.locked_until is not None and row.locked_until > time.time()
+        assert await store.list_sessions("rival") == []
     finally:
         await store.close()
 
