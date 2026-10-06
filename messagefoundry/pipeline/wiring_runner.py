@@ -2299,6 +2299,31 @@ class RegistryRunner:
             return oc.priority or self._priority_default
         return self._priority_default
 
+    def _below_dr_threshold(self, declared: Priority | None) -> bool:
+        """Whether the active DR run-profile parks a connection of this declared tier. The pure half of
+        :meth:`_dr_filters_out`, which also records the ``filtered`` marker; :meth:`build_check`
+        needs the answer without the marker (vault BACKLOG #2622 item 1)."""
+        threshold = self._dr_threshold
+        if threshold is None:
+            return False
+        return (declared or self._priority_default).rank < threshold.rank
+
+    def _reload_binds_listener(self, ic: InboundConnection) -> bool:
+        """Whether :meth:`reload` would bind ``ic``'s listener if it ran now: the skips of its inbound
+        loop, in order, without their side effects. Deployed; auto-start, or listening now (a reload
+        keeps an operator's start); not parked by the DR run-profile; and inside its active window,
+        when it has one. :meth:`build_check` runs the inbound exposure gates only on these listeners,
+        so a reload, a dry run or a DR activation is never refused for a listener it leaves unbound
+        (vault BACKLOG #2622 item 1). ``start`` applies the first and third of these; a fresh runner
+        has nothing listening, so the second reduces to ``auto_start`` there."""
+        if not ic.deployed:
+            return False
+        if not ic.auto_start and ic.name not in self._sources:
+            return False
+        if self._below_dr_threshold(ic.priority):
+            return False
+        return ic.schedule is None or ic.schedule.is_active(self._schedule_clock())
+
     def _dr_filters_out(self, name: str, declared: Priority | None, *, kind: Direction) -> bool:
         """Whether the DR run-profile parks this connection (its resolved tier is below the threshold).
 
@@ -2311,7 +2336,7 @@ class RegistryRunner:
         if threshold is None:
             return False
         resolved = declared or self._priority_default
-        if resolved.rank >= threshold.rank:
+        if not self._below_dr_threshold(declared):
             self._filtered.pop((kind, name), None)  # at/above threshold — not parked
             return False
         self._filtered[(kind, name)] = (
@@ -3859,14 +3884,14 @@ class RegistryRunner:
                     # ARE still spawned below (the ADR-0048 AC-3 rule): flipping a live feed to
                     # not-deployed while rows are in flight must not STRAND them — the listener stops
                     # accepting NEW work while the existing ingress/routed backlog drains to completion.
-                    if not ic.deployed:
-                        continue
                     # Per-connection auto-start (#115): a start-disabled inbound listener is NOT bound at
                     # engine start — it reports status:"stopped" and an operator can start it at runtime
                     # (POST /connections/{name}/start). Its router + transform workers are still spawned
                     # below (backlog drains), exactly like a DR-filtered listener. No-op (byte-identical)
-                    # when auto_start is True — every normal connection.
-                    if not ic.auto_start:
+                    # when auto_start is True — every normal connection. Both flags are read through
+                    # inbound_listener_starts, the predicate the offline build check uses to pick the
+                    # listeners it runs the exposure gates on (vault BACKLOG #2622 item 1).
+                    if not inbound_listener_starts(ic):
                         continue
                     # DR run-profile (#61, ADR 0048): a below-threshold inbound LISTENER is NOT bound
                     # (no source.start) — but its router + transform workers are still spawned below, so
@@ -4925,6 +4950,9 @@ class RegistryRunner:
             posture=self._hop_posture,
             trust_anchor_policy=self._trust_anchor_policy,
             allow_insecure_bind=self._allow_insecure_bind,
+            # The exposure gates run on the listeners a reload would bind, read against this runner's
+            # live state. A listener the reload leaves down is refused when something starts it.
+            exposure_gated=self._reload_binds_listener,
         )
         # PT-backend allow-list — folded in here (vs only at Engine.start) so EVERY reload + dry-run
         # path that build-checks the new registry also rejects a PT-on-non-SQLite graph before any
@@ -8849,6 +8877,7 @@ def build_check_registry(
     trust_anchor_policy: TrustAnchorPolicy | None = None,
     delivery: DeliverySettings | None = None,
     allow_insecure_bind: bool = False,
+    exposure_gated: Callable[[InboundConnection], bool] | None = None,
 ) -> None:
     """Construct (and discard) every **deployed** connector in ``registry`` + run the fail-closed
     connect/egress allowlists, so a bad connector spec or a non-allowlisted host fails as a
@@ -8875,7 +8904,13 @@ def build_check_registry(
     ``[security].require_encryption_for_remote = false``, exactly as ``serve`` folds them. Pass the
     value the caller really has. A running engine passes its own, so a reload or flag toggle accepts
     the listener the engine already accepted; ``messagefoundry check`` has no such flag and passes the
-    setting half alone. The default ``False`` is the strict side: it refuses, never admits."""
+    setting half alone. The default ``False`` is the strict side: it refuses, never admits.
+
+    ``exposure_gated`` picks the inbound listeners those four gates run on. ``None`` means
+    :func:`inbound_listener_starts`, the deployed-and-auto-start test engine start applies, which is
+    all an offline caller (``check``, ``connection``, a flag toggle) can know. A live runner passes
+    the test its reload applies (:meth:`RegistryRunner._reload_binds_listener`). A listener the gates
+    skip is still refused when it is started: an operator start runs the same gates."""
     # Port-conflict pre-flight (env-resolved + reserved-port aware): a listener stealing a sibling's or
     # the API's (host, port) fails the whole reload here, before quiescing, naming both ends — rather
     # than half-applying and surfacing as a bare bind OSError. PortConflictError is a WiringError → 422.
@@ -8911,6 +8946,7 @@ def build_check_registry(
                 trust_anchor_policy,
                 delivery,
                 allow_insecure_bind=allow_insecure_bind,
+                exposure_gated=exposure_gated,
             )
     except WiringError:
         raise
@@ -8927,6 +8963,7 @@ def _build_check_connectors(
     delivery: DeliverySettings | None = None,
     *,
     allow_insecure_bind: bool = False,
+    exposure_gated: Callable[[InboundConnection], bool] | None = None,
 ) -> None:
     """Construct-and-discard every DEPLOYED connector + run the connect/egress allowlists (the body of
     :func:`build_check_registry`, split out so the whole block runs inside the ``active_hop_posture``
@@ -8945,10 +8982,14 @@ def _build_check_connectors(
     connection whose credentials do not exist yet still explodes on all of those paths and the state buys
     nothing. The fail-loud guarantee is UNCHANGED for a deployed connection: a missing ``env()`` value on
     one still raises here, which is exactly the promote-time gate ("a graph whose env keys aren't defined
-    for the target never goes live")."""
+    for the target never goes live").
+
+    The four inbound exposure gates are the one lifecycle-filtered step: they run only on a listener
+    ``exposure_gated`` says would be bound (:func:`build_check_registry` says why)."""
     # ADR 0154 D4: normalise the graph BEFORE validating it, so the passthrough content-type rule
     # below sees the implied header rather than refusing the ADR's own headline shape. Idempotent.
     apply_sync_reply_capture_implication(registry)
+    listener_starts = exposure_gated or inbound_listener_starts
     for ic in registry.inbound.values():
         if not ic.deployed:
             continue
@@ -8961,12 +9002,18 @@ def _build_check_connectors(
         # `messagefoundry check` passed a cleartext off-loopback listener that serve then refused.
         # Same posture (the one active_hop_posture stamped) and the caller's own escape value. The
         # revocation gate that follows them at start, check_inbound_revocation, is NOT run here.
-        check_inbound_tls_exposure(
-            source_cfg,
-            ic.name,
-            allow_insecure_bind=allow_insecure_bind,
-            posture=current_hop_posture(),
-        )
+        # Only on a listener the caller's start or reload would bind: refusing a reload or a DR
+        # activation for one that stays down would be worse than start, which never sees it.
+        if listener_starts(ic):
+            try:
+                check_inbound_tls_exposure(
+                    source_cfg,
+                    ic.name,
+                    allow_insecure_bind=allow_insecure_bind,
+                    posture=current_hop_posture(),
+                )
+            except WiringError as exc:
+                raise WiringError(f"{exc} {_build_check_exposure_tail(ic.name)}") from exc
         # ADR 0154 D7's parallel offline arm. The runner-side call in _start_inbound_unsafe does NOT
         # fire at `messagefoundry check`, so without this a config that refuses to start would pass
         # the commit/CI gate and only fail at serve. Same predicate, and posture-keyed the same way:
@@ -9284,6 +9331,26 @@ def check_inbound_revocation(
         "revocation-checking PKI covers these certificates outside the engine. An HTTP proxy can "
         "terminate neither MLLP nor DIMSE, so for those listeners the proxy-based OCSP delegation "
         "does not reach."
+    )
+
+
+def inbound_listener_starts(ic: InboundConnection) -> bool:
+    """Whether engine start binds ``ic``'s listener, by its declared lifecycle flags: deployed
+    (#233, ADR 0111) and auto-start (#115). :meth:`RegistryRunner.start` applies it before the DR
+    filter, and the offline build check runs the inbound exposure gates only where it holds (vault
+    BACKLOG #2622 item 1). An operator can still start an ``auto_start = false`` listener at run time,
+    and that start runs the same gates."""
+    return ic.deployed and ic.auto_start
+
+
+def _build_check_exposure_tail(name: str) -> str:
+    """What the build check adds to an inbound exposure refusal (vault BACKLOG #2622 item 1). Start
+    isolates the one listener and brings the rest up (ADR 0031); the build check refuses the whole
+    config, so a reload, promote, connection edit or DR activation stops on this one listener."""
+    return (
+        f"The build check refuses the whole config while {name!r} would be started; engine start "
+        "would isolate only that listener. To leave it unbound instead, set deployed = false or "
+        "auto_start = false on it; an operator start then meets the same refusal."
     )
 
 

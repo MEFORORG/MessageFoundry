@@ -143,6 +143,49 @@ async def test_flag_toggle_and_dry_run_carry_the_engines_escape(
         await eng.stop()
 
 
+@pytest.mark.parametrize("auto_start", [False, True])
+async def test_a_listener_start_leaves_down_refuses_no_reload_toggle_or_dr_activation(
+    tmp_path: Path, auto_start: bool
+) -> None:
+    """Vault BACKLOG #2622 item 1, review round 3. IB_TOML binds 0.0.0.0 in cleartext with no escape.
+    With ``auto_start = false`` engine start never binds it, so a dry run, a reload, a flag toggle
+    and a DR activation (a reload of the config dir) must all apply, as they did before the build
+    check ran the exposure gates. With ``auto_start = true`` the listener would be bound, so the
+    build check still refuses all four, naming the listener and the two settings that leave it
+    down. That is the control: the passes are the predicate, not a gate that never ran."""
+    eng = await _exposed_engine(tmp_path, allow=False)
+    toml_path = tmp_path / "connections.toml"
+    text = toml_path.read_text(encoding="utf-8")
+    toml_path.write_text(
+        text.replace('router = "r"\n', f'router = "r"\nauto_start = {str(auto_start).lower()}\n'),
+        encoding="utf-8",
+    )
+    try:
+        eng.add_registry(load_config(tmp_path))
+
+        async def _flag() -> None:
+            await eng.set_connection_flag("OB_TOML", direction="outbound", flagged=True)
+
+        steps = {
+            "dry run": lambda: eng.reload_detail(str(tmp_path), dry_run=True),
+            "reload": lambda: eng.reload(tmp_path),
+            "flag toggle": _flag,
+            "DR activation": eng._dr_activate_profile,
+        }
+        for step, run in steps.items():
+            if auto_start:
+                with pytest.raises(WiringError, match="without TLS") as refused:
+                    await run()
+                assert "'IB_TOML' would be started" in str(refused.value), step
+                assert "auto_start = false" in str(refused.value), step
+            else:
+                await run()
+        # A refused activation puts the DR latch back; an applied one leaves it set.
+        assert eng.dr_active is (not auto_start)
+    finally:
+        await eng.stop()
+
+
 async def test_flag_toggle_reflects_on_inbound(engine: Engine, tmp_path: Path) -> None:
     await engine.set_connection_flag("IB_TOML", direction="inbound", flagged=True)
     assert engine.registry_runner is not None

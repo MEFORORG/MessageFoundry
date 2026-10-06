@@ -246,9 +246,10 @@ loosening, and [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) says how each star
 not required. The proxy must then speak https to the engine and trust that certificate, or every
 request through it fails. Setting the acknowledgement without `tls_terminated_upstream` is refused at
 load. `messagefoundry check` runs the same test as a required check, `upstream-hop-ack`, against the
-`messagefoundry.toml` it finds, so the commit/CI gate catches the refusal before `serve` does. With
-no file it reads the environment instead, when `MEFOR_AI_ENVIRONMENT` names the instance, and its
-line says so. A terminator set through `MEFOR_API_*` variables with no file and no
+`messagefoundry.toml` it finds, so the commit/CI gate catches the refusal before `serve` does. When
+it finds no file and no `--service-config` names one, it reads the environment instead, if
+`MEFOR_AI_ENVIRONMENT` names the instance, and its line says so. A `--service-config` naming a
+missing file keeps the skip, because `serve` refuses that file. A terminator set through `MEFOR_API_*` variables with no file and no
 `MEFOR_AI_ENVIRONMENT`, for example on a site that names its environment only with `serve --env`,
 still reaches `serve` and not the check.
 
@@ -2673,6 +2674,17 @@ slack.
 | Fetch metadata on **every** `/ui` request, including the `/ui/static` mount | `Sec-Fetch-Site` / `-Mode` / `-Dest` / `-User`, read as ASGI middleware (`_security.UiFetchMetadataMiddleware`) rather than as a route dependency — a Starlette `Mount` runs no dependencies, so the asset tier is the one surface the row above cannot reach | `Sec-Fetch-Site` ∈ {cross-site, same-site}, **unless** the request is a safe top-level navigation: `Sec-Fetch-Mode: navigate` **and** method GET/HEAD **and** `Sec-Fetch-Dest: document` (an **allowlist** — `iframe`/`frame`/`object`/`embed` and an omitted destination are all framing or evasion) **and**, for `same-site` only, `Sec-Fetch-User: ?1`. Only the `same-site` half demands user activation, because `SameSite` keys on the site and a site ignores the port: on the loopback default `http://127.0.0.1:9999` is same-site, so its scripted `window.open` arrives **with the session cookie**, which a cross-site page cannot manage. Cross-site is deliberately **not** asked for `?1` — the IdP's redirect back to the OIDC callback is a server-driven 302 with no user activation once the IdP session is established. An **absent** `Sec-Fetch-Site` is ALLOWED and every rule here is reached only after it has arrived, so a non-browser client (the shipped Windows tray's own liveness `GET /ui` sends no headers at all) is wholly unaffected; failing closed there is a browser-support decision rather than a hardening pass, and is tracked with its measured cost on **BACKLOG #1122** | **DENY** 403, **never 404** (`tray/probe.py` reads 404 as console-DISABLED and every other status as ENABLED) | on | (no knob) |
 
 #### Table B — data plane (ingest listeners)
+
+**One cleartext off-loopback listener fails the whole build check, and only itself at start (vault
+BACKLOG #2622 item 1).** The MLLP, DICOM, raw TCP and HTTP listener exposure gates run in two places. At
+listener start, a refusal isolates that one listener and the rest of the graph comes up (ADR 0031).
+At build check, the same refusal fails the whole config. That covers `messagefoundry check`, a
+reload or dry-run reload, promote, a connection edit, a connection-flag toggle and a DR activation.
+The build check runs the gates only on a listener that would be bound: deployed and `auto_start`.
+On a running engine it also skips one the DR run-profile parks or its schedule window keeps closed,
+and it gates one an operator started. So `deployed = false` or `auto_start = false` lets those
+paths through while the listener stays unbound, and an operator start of it meets the same refusal.
+The refusal text names the listener and both settings.
 
 The per-connection `source_ip_allowlist` is enforced on **five** listener types, all at **accept**: the four
 stream listeners (MLLP, TCP, X12, HTTP) and the DICOM C-STORE SCP. The SCP closes a non-allowlisted

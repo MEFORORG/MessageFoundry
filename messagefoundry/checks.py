@@ -1704,7 +1704,8 @@ def _resolve_snapshot_on_send(
     """Best-effort ``[pipeline].snapshot_on_send`` for the dry-run preview (#230 parity, ADR 0104).
 
     Resolves this instance's ``messagefoundry.toml`` exactly like :func:`_check_posture` (explicit
-    ``service_config`` > root-anchored when ``suppress_search`` > legacy upward-walk) and returns the
+    ``service_config`` > the config dir then the working directory when ``suppress_search`` > legacy
+    upward-walk; with none, the environment when ``MEFOR_AI_ENVIRONMENT`` names the instance) and returns the
     loaded flag. When no settings resolve (no toml, or one that won't parse/validate), fall back to the
     **Settings-model default (True)** — the posture of exactly the default, un-overridden engine —
     never a hardcoded ``False``, which would preview the wrong posture for the engine this gate exists
@@ -1872,14 +1873,24 @@ def _resolve_service_toml(
     config_dir: str | Path, *, service_config: str | Path | None, suppress_search: bool
 ) -> Path | None:
     """The ``messagefoundry.toml`` a check reads, by the ADR 0050 rules the other checks spell inline:
-    an explicit ``--service-config`` wins, ``--project-root`` confines the look to the config dir, and
-    otherwise the legacy upward walk runs. ``None`` when there is none. Every settings-reading leg
-    calls this, through :func:`_settings_source`."""
+    an explicit ``--service-config`` wins, ``--project-root`` confines the look to the config dir and
+    then the working directory, and otherwise the legacy upward walk runs. ``None`` when there is
+    none. Every settings-reading leg calls this, through :func:`_settings_source`.
+
+    The working-directory file under ``--project-root`` is the one ``serve --project-root`` reads
+    when it is given no ``--service-config``: it calls ``load_settings`` with no path, which opens
+    ``./messagefoundry.toml``. Skipping it let a settings leg report on the environment alone while
+    ``serve`` read a file, and say there was no file (vault BACKLOG #2355)."""
     if service_config is not None:
         return Path(service_config) if Path(service_config).is_file() else None
     if suppress_search:
-        candidate = Path(config_dir) / "messagefoundry.toml"
-        return candidate if candidate.is_file() else None
+        for candidate in (
+            Path(config_dir) / "messagefoundry.toml",
+            Path.cwd() / "messagefoundry.toml",
+        ):
+            if candidate.is_file():
+                return candidate
+        return None
     return _find_service_toml(config_dir)
 
 
@@ -1925,8 +1936,9 @@ def _load_check_settings(
     toml: Path | None, *, cli: Mapping[str, Mapping[str, Any]] | None = None
 ) -> ServiceSettings:
     """Load the settings :func:`_settings_source` resolved: the file when there is one, otherwise the
-    environment alone. The env-only load reads NO file, not even ``./messagefoundry.toml``, which
-    ``load_settings`` would otherwise pick up from the gate's working directory."""
+    environment alone. The env-only load reads NO file. :func:`_resolve_service_toml` already looks
+    in the working directory on every path, so reaching it means ``./messagefoundry.toml`` was not
+    there; ``default_file=False`` keeps the read to what that resolution found."""
     from messagefoundry.config.settings import load_settings
 
     if toml is not None:
@@ -1987,8 +1999,9 @@ def _check_posture(
     closed at runtime (``settings.ai.require_posture()``). Mirror that fail-closed check here.
 
     Service-toml resolution (ADR 0050 AC-6): an explicit ``service_config`` is used as-is; otherwise,
-    when ``suppress_search`` is set (``--project-root`` was given) the upward-walk is skipped — so
-    ``check`` matches ``serve`` only when the flags are given. With neither, the legacy
+    when ``suppress_search`` is set (``--project-root`` was given) the upward-walk is skipped and the
+    config dir, then the working directory ``serve`` reads, are tried (:func:`_resolve_service_toml`) —
+    so ``check`` matches ``serve`` only when the flags are given. With neither, the legacy
     ``_find_service_toml`` upward-walk runs, unchanged.
 
     Best-effort: no ``messagefoundry.toml`` → SKIP (this gate also runs against a bare config dir),

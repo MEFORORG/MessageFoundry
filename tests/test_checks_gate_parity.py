@@ -584,8 +584,8 @@ def _bare_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str = _M
 
 
 def _leg(cfg: Path, name: str) -> CheckResult:
-    # suppress_service_toml_search confines the look to cfg, so no file anywhere above tmp_path or in
-    # the working directory can stand in for the environment.
+    # suppress_service_toml_search confines the look to cfg and the working directory, so no file
+    # above tmp_path can stand in for the environment. A test that wants no file must not chdir to one.
     report = run_checks(cfg, run_lint=False, suppress_service_toml_search=True)
     return next(r for r in report.results if r.name == name)
 
@@ -756,23 +756,32 @@ def test_reference_backend_reads_an_environment_only_backend(
     assert "provider_npi" in result.detail and "sqlserver" in result.detail
 
 
-def test_an_environment_only_load_ignores_a_stray_file_in_the_working_directory(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("declared", [True, False], ids=["env-declared", "no-env-name"])
+def test_project_root_reads_the_working_directory_file_serve_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, declared: bool
 ) -> None:
-    # Trap 1 of the item: load_settings with no path reads ./messagefoundry.toml. A file the gate
-    # did not resolve must not leak into an environment-only read. This stray one declares a
-    # terminator with no acknowledgement, which the leg would refuse if it read it.
+    # Review round 3. `serve --project-root` with no --service-config calls load_settings with no
+    # path, which opens ./messagefoundry.toml. check under --project-root looked only in the config
+    # dir, so with MEFOR_AI_ENVIRONMENT set it read the environment alone and printed an OK line
+    # saying there was no file. It now reads the file serve reads. This one declares a terminator
+    # with no acknowledgement, which the leg refuses only if it reads the file.
+    from messagefoundry.config.settings import load_settings
+
     cfg = _bare_config(tmp_path, monkeypatch)
-    elsewhere = tmp_path / "elsewhere"
-    elsewhere.mkdir()
-    (elsewhere / "messagefoundry.toml").write_text(
+    here = tmp_path / "here"
+    here.mkdir()
+    (here / "messagefoundry.toml").write_text(
         '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.1"]\n', encoding="utf-8"
     )
-    monkeypatch.chdir(elsewhere)
-    monkeypatch.setenv("MEFOR_AI_ENVIRONMENT", "dev")
+    monkeypatch.chdir(here)
+    if declared:
+        monkeypatch.setenv("MEFOR_AI_ENVIRONMENT", "dev")
+    # serve's own resolution reads it, so the leg must too.
+    assert load_settings().api.tls_terminated_upstream is True
     result = _leg(cfg, "upstream-hop-ack")
-    assert result.ok and not result.skipped, result.detail
-    assert _ENV_ONLY_NOTE in result.detail
+    assert result.required and not result.ok and not result.skipped, result.detail
+    assert _ENV_ONLY_NOTE not in result.detail
+    assert "no messagefoundry.toml" not in result.detail
 
 
 # BACKLOG #1967: this file's serve fixtures test other gates, so they bound the two warn-only

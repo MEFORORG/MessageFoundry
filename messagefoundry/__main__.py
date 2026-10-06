@@ -390,9 +390,10 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         help="run validate + dryrun (+ advisory ruff/mypy) as a commit/CI gate",
         description="Run validate + dryrun (+ advisory ruff/mypy) as a commit/CI gate. The dryrun "
         "sub-check previews under [pipeline].snapshot_on_send (copy-on-Send, ADR 0104) resolved "
-        "best-effort from this instance's messagefoundry.toml (same resolution as the posture "
-        "check); when no settings load it falls back to the setting's own default (ON) — matching "
-        "the default engine, never a silent OFF (#230).",
+        "best-effort from the settings the posture check reads: this instance's "
+        "messagefoundry.toml, or with no file, the MEFOR_* environment when MEFOR_AI_ENVIRONMENT "
+        "names the instance; when no settings load it falls back to the setting's own default (ON) "
+        "— matching the default engine, never a silent OFF (#230).",
     )
     check.add_argument("--config", default="samples/config", help="config modules directory")
     _add_anchor_flags(check)
