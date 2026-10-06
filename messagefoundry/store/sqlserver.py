@@ -11024,23 +11024,23 @@ class SqlServerStore:
 
     # --- auth: users / roles / sessions --------------------------------------
 
-    async def list_audit(
-        self,
+    @staticmethod
+    def _audit_where(
         *,
-        limit: int = 50,
-        actor: str | None = None,
-        action: str | None = None,
-        since: float | None = None,
-        until: float | None = None,
-        exclude: AuditExclusion | None = None,
-    ) -> list[dict[str, Any]]:
-        """Most-recent-first audit entries, optionally filtered (BACKLOG #170).
+        actor: str | None,
+        action: str | None,
+        since: float | None,
+        until: float | None,
+        exclude: AuditExclusion | None,
+        before_id: int | None,
+    ) -> tuple[str, list[Any]]:
+        """The ``WHERE`` text and its bound values for :meth:`list_audit` and :meth:`count_audit`.
 
-        Filters are ANDed as bound ``?`` parameters (the ``TOP (?)`` limit is the first ``?``, so its
-        value leads the tuple) — only the fixed column/operator template is formatted into the SQL,
-        never a value — so a filter value cannot inject."""
+        Filters are ANDed as bound ``?`` parameters — only the fixed column/operator template is
+        formatted into the SQL, never a value — so a filter value cannot inject. Each caller's
+        ``TOP (?)`` placeholder comes BEFORE this text, so it binds that value ahead of these."""
         clauses: list[str] = []
-        params: list[Any] = [limit]
+        params: list[Any] = []
         if actor is not None:
             clauses.append("actor = ?")
             params.append(actor)
@@ -11054,16 +11054,69 @@ class SqlServerStore:
             clauses.append("ts <= ?")
             params.append(until)
         if exclude is not None:
-            # After TOP (?)'s value in ``params``, which is the order the placeholders appear in.
 
             def bind(value: str) -> str:
                 params.append(value)
                 return "?"
 
             clauses.extend(exclude.clauses(bind))
-        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        if before_id is not None:
+            clauses.append("id < ?")
+            params.append(before_id)
+        return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
+
+    async def list_audit(
+        self,
+        *,
+        limit: int = 50,
+        actor: str | None = None,
+        action: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+        exclude: AuditExclusion | None = None,
+        before_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Most-recent-first audit entries, optionally filtered (BACKLOG #170), and optionally only
+        those older than ``before_id``, the keyset cursor a paged reader passes (vault BACKLOG #2776).
+        Every value is a bound parameter; see :meth:`_audit_where`."""
+        where, params = self._audit_where(
+            actor=actor,
+            action=action,
+            since=since,
+            until=until,
+            exclude=exclude,
+            before_id=before_id,
+        )
         sql = f"SELECT TOP (?) * FROM audit_log{where} ORDER BY id DESC"
-        return await self._fetchall(sql, tuple(params))
+        return await self._fetchall(sql, (limit, *params))
+
+    async def count_audit(
+        self,
+        *,
+        limit: int,
+        actor: str | None = None,
+        action: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+        exclude: AuditExclusion | None = None,
+        before_id: int | None = None,
+    ) -> int:
+        """How many rows :meth:`list_audit` would return for the same arguments, without reading
+        them (vault BACKLOG #2776). Every value is a bound parameter; see :meth:`_audit_where`."""
+        where, params = self._audit_where(
+            actor=actor,
+            action=action,
+            since=since,
+            until=until,
+            exclude=exclude,
+            before_id=before_id,
+        )
+        sql = (
+            f"SELECT COUNT(*) AS n FROM (SELECT TOP (?) id FROM audit_log{where}"
+            " ORDER BY id DESC) t"
+        )
+        row = await self._fetchone(sql, (limit, *params))
+        return int(row["n"]) if row is not None else 0
 
     async def recent_audit_of(self, actions: Sequence[str], *, limit: int) -> list[dict[str, Any]]:
         """Up to ``limit`` newest audit rows whose action is one of ``actions``, newest first (vault

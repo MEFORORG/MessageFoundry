@@ -7129,20 +7129,21 @@ class PostgresStore:
         )
         return AppendedAuditRow(int(new_id or 0), seq, row_hash)
 
-    async def list_audit(
-        self,
+    @staticmethod
+    def _audit_where(
         *,
-        limit: int = 50,
-        actor: str | None = None,
-        action: str | None = None,
-        since: float | None = None,
-        until: float | None = None,
-        exclude: AuditExclusion | None = None,
-    ) -> Sequence[Row]:
-        """Most-recent-first audit entries, optionally filtered (BACKLOG #170).
+        actor: str | None,
+        action: str | None,
+        since: float | None,
+        until: float | None,
+        exclude: AuditExclusion | None,
+        before_id: int | None,
+    ) -> tuple[str, list[Any]]:
+        """The ``WHERE`` text and its bound values for :meth:`list_audit` and :meth:`count_audit`.
 
         Filters are ANDed as bound ``$N`` parameters — only the fixed column/operator template is
-        formatted into the SQL, never a value — so a filter value cannot inject."""
+        formatted into the SQL, never a value — so a filter value cannot inject. The caller binds
+        its ``LIMIT`` value after these, as the next ``$N``."""
         clauses: list[str] = []
         params: list[Any] = []
         if actor is not None:
@@ -7164,10 +7165,65 @@ class PostgresStore:
                 return f"${len(params)}"
 
             clauses.extend(exclude.clauses(bind))
-        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        if before_id is not None:
+            params.append(before_id)
+            clauses.append(f"id < ${len(params)}")
+        return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
+
+    async def list_audit(
+        self,
+        *,
+        limit: int = 50,
+        actor: str | None = None,
+        action: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+        exclude: AuditExclusion | None = None,
+        before_id: int | None = None,
+    ) -> Sequence[Row]:
+        """Most-recent-first audit entries, optionally filtered (BACKLOG #170), and optionally only
+        those older than ``before_id``, the keyset cursor a paged reader passes (vault BACKLOG #2776).
+        Every value is a bound parameter; see :meth:`_audit_where`."""
+        where, params = self._audit_where(
+            actor=actor,
+            action=action,
+            since=since,
+            until=until,
+            exclude=exclude,
+            before_id=before_id,
+        )
         params.append(limit)
         sql = f"SELECT * FROM audit_log{where} ORDER BY id DESC LIMIT ${len(params)}"
         return await self._fetchall(sql, *params)
+
+    async def count_audit(
+        self,
+        *,
+        limit: int,
+        actor: str | None = None,
+        action: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+        exclude: AuditExclusion | None = None,
+        before_id: int | None = None,
+    ) -> int:
+        """How many rows :meth:`list_audit` would return for the same arguments, without reading
+        them (vault BACKLOG #2776). Every value is a bound parameter; see :meth:`_audit_where`."""
+        where, params = self._audit_where(
+            actor=actor,
+            action=action,
+            since=since,
+            until=until,
+            exclude=exclude,
+            before_id=before_id,
+        )
+        params.append(limit)
+        sql = (
+            f"SELECT COUNT(*) AS n FROM (SELECT id FROM audit_log{where}"
+            f" ORDER BY id DESC LIMIT ${len(params)}) t"
+        )
+        row = await self._fetchone(sql, *params)
+        return int(row["n"]) if row is not None else 0
 
     async def recent_audit_of(self, actions: Sequence[str], *, limit: int) -> list[dict[str, Any]]:
         """Up to ``limit`` newest audit rows whose action is one of ``actions``, newest first (vault

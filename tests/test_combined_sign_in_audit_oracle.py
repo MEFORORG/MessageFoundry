@@ -666,19 +666,22 @@ async def test_the_hidden_refusal_details_match_what_the_writers_store(
 
 def test_every_api_read_of_the_trail_goes_through_the_one_filtered_helper() -> None:
     """A new route that called ``store.list_audit`` directly would skip the exclusion. The API and
-    the console packages may call it in ONE place, the helper that applies it."""
+    the console packages may call it in ONE place, the helper that applies it. The export's count,
+    ``store.count_audit`` (vault BACKLOG #2776), is held to the same rule by its own helper, so the
+    recorded count can never include a row the caller was not sent."""
     root = Path(__file__).resolve().parents[1]
-    calls: list[str] = []
-    for package in ("messagefoundry/api", "messagefoundry_webconsole"):
-        for path in sorted((root / package).rglob("*.py")):
-            for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-                if "store.list_audit(" in line:
-                    calls.append(f"{path.relative_to(root).as_posix()}:{n}")
-    assert len(calls) == 1 and calls[0].startswith("messagefoundry/api/auth_routes.py:"), calls
     source = (root / "messagefoundry/api/auth_routes.py").read_text(encoding="utf-8")
-    helper = source[source.index("async def _read_audit(") :]
-    helper = helper[: helper.index("\n    async def ", 1)]
-    assert "store.list_audit(" in helper and "exclude=audit_exclusion_for(identity)" in helper
+    for read, helper_name in (("list_audit", "_read_audit"), ("count_audit", "_count_audit")):
+        calls: list[str] = []
+        for package in ("messagefoundry/api", "messagefoundry_webconsole"):
+            for path in sorted((root / package).rglob("*.py")):
+                for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                    if f"store.{read}(" in line:
+                        calls.append(f"{path.relative_to(root).as_posix()}:{n}")
+        assert len(calls) == 1 and calls[0].startswith("messagefoundry/api/auth_routes.py:"), calls
+        helper = source[source.index(f"async def {helper_name}(") :]
+        helper = helper[: helper.index("\n    async def ", 1)]
+        assert f"store.{read}(" in helper and "exclude=audit_exclusion_for(identity)" in helper
 
 
 def test_an_empty_excluded_detail_is_refused() -> None:
