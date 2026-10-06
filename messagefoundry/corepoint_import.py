@@ -551,7 +551,7 @@ def _parse_handler(
     h: dict[str, Any], index: int, channel: str, all_dests: tuple[str, ...], taken: set[str]
 ) -> Handler:
     raw_name = _opt_str(h, "name") or f"handler_{index + 1}"
-    name = _unique_def_name(_sanitize(raw_name), taken)
+    name = _unique_name(_sanitize(raw_name), taken)
     actions_raw = h.get("actions", [])
     if not isinstance(actions_raw, list):
         raise CorepointImportError(
@@ -2300,7 +2300,7 @@ def parse_package(text: str, *, source_name: str = "package") -> tuple[Channel, 
         raw_name = _attr(action_list, "Name") or f"transform_{i + 1}"
         # Lower-case BEFORE sanitizing so the keyword guard sees the final identifier ("Class" →
         # "class" → "class_"): the name is both the ``@handler`` id and the emitted ``def``.
-        name = _unique_def_name(_sanitize(raw_name.lower()), taken)
+        name = _unique_name(_sanitize(raw_name.lower()), taken)
         scope = _disabled_scope(action_list, parents)
         # The whole-list gate (BACKLOG #313 step 2, ADR 0086): decided ONCE, for the whole list. A
         # list it does not fully understand takes the step 1 path below untouched, so its output is
@@ -2919,15 +2919,10 @@ def import_corepoint(
         # ``_3``, …), regenerate so the inbound name matches the new stem, and record the rename in the
         # result so the collision is surfaced — never a silent drop (count-and-log ethos).
         renamed_from: str | None = None
-        module_name = ch.module_name
-        if module_name in assigned:
-            renamed_from = module_name
-            n = 2
-            while f"{ch.module_name}_{n}" in assigned:
-                n += 1
-            module_name = f"{ch.module_name}_{n}"
+        module_name = _unique_name(ch.module_name, assigned)
+        if module_name != ch.module_name:
+            renamed_from = ch.module_name
             ch = replace(ch, module_name=module_name)
-        assigned.add(module_name)
 
         source = generate_module(ch)
         mapped = 0
@@ -3253,7 +3248,7 @@ _BOUND_NAMES = frozenset(
 )
 
 
-def _unique_def_name(name: str, taken: set[str]) -> str:
+def _unique_name(name: str, taken: set[str]) -> str:
     """``name``, or ``name_2``, ``name_3``, ... -- the first not in ``taken``, which it then joins.
 
     Deterministic: the same export always yields the same names, in list order."""
