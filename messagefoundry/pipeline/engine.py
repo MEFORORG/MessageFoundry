@@ -18,6 +18,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from messagefoundry.auth.trust_anchors import LaneAnchorCheck, RegistryAnchorPreflight
 from messagefoundry.config.models import (
     AckAfter,
     BuildupThreshold,
@@ -250,8 +251,9 @@ class Engine:
         registry_guard: Callable[[Registry], None] | None = None,
         sandbox_settings: SandboxSettings | None = None,
         log_dir: str | None = None,
-        registry_preflight: Callable[[Registry, Mapping[str, Any]], Awaitable[None]] | None = None,
+        registry_preflight: RegistryAnchorPreflight | None = None,
         settings_preflight: Callable[[], Awaitable[None]] | None = None,
+        lane_anchor_check: LaneAnchorCheck | None = None,
     ) -> None:
         self.store = store
         # [sandbox] opt-in Router/Handler subprocess isolation (ADR 0087, #197). None → the
@@ -275,6 +277,10 @@ class Engine:
         # raises WiringError to refuse. `serve` passes the per-connection trust-anchor preflight here
         # (BACKLOG #1142, slice 3); None = no preflight.
         self._registry_preflight = registry_preflight
+        # vault BACKLOG #2371, ADR 0031 as amended 2026-10-06: the dialling-CA check each runner
+        # awaits when it builds an outbound lane or binds an Ftp poller, so a refused CA fails that
+        # lane, not the start. `serve` passes it; None = no check. Not handed to a dry-run checker.
+        self._lane_anchor_check = lane_anchor_check
         # An optional async check run first on EVERY real reload, whoever starts it: the reload route,
         # a held reload a second approver releases, cluster convergence, and the DR profile reload.
         # Dry runs skip it, because it writes audit rows. It raises WiringError to refuse. `serve`
@@ -882,6 +888,7 @@ class Engine:
             egress=self._egress_settings,
             hop_posture=self._hop_posture,
             trust_anchor_policy=self._trust_anchor_policy,
+            lane_anchor_check=self._lane_anchor_check,
             simulate_all=self._shadow_settings.simulate_all_egress,
             env_values=self._env_values,
             active_environment=self._active_environment,
@@ -2022,13 +2029,14 @@ class Engine:
         if self._registry_guard is not None:
             self._registry_guard(registry)
 
-    async def preflight_registry(self, registry: Registry) -> None:
+    async def preflight_registry(self, registry: Registry, *, at_start: bool = False) -> None:
         """Run the engine's registry preflight over ``registry``; raises ``WiringError`` to refuse it.
 
         A no-op when none was configured. Public for the same reason as :meth:`guard_registry`: the
-        managed app's first load reaches ``add_registry`` directly."""
+        managed app's first load reaches ``add_registry`` directly, and passes ``at_start=True``.
+        The start leaves the lane CAs to the runner's lane check (vault BACKLOG #2371)."""
         if self._registry_preflight is not None:
-            await self._registry_preflight(registry, self._env_values)
+            await self._registry_preflight(registry, self._env_values, at_start=at_start)
 
     async def preflight_settings(self) -> None:
         """Run the engine's settings preflight; raises ``WiringError`` to refuse. A no-op when none

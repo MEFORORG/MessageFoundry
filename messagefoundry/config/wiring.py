@@ -404,19 +404,26 @@ def _check_tls_ca_file(factory: str, value: Any, *, unread: str | None = None) -
 
 
 def _check_tls_ca_pin(factory: str, pin: Any, ca: Any) -> None:
-    """Refuse a ``tls_ca_pin`` that nothing would check (vault BACKLOG #2371).
+    """Refuse a ``tls_ca_pin`` that is malformed or that nothing would check (vault BACKLOG #2371).
 
-    The pin is the SHA-256 of ``tls_ca_file``, checked by the graph preflight at load and at every
-    reload (``auth/trust_anchors.py``, ``registry_anchor_specs``). With no ``tls_ca_file`` there is
-    nothing to check, so the config would read as pinned while nothing is. A blank literal is
-    refused as the inbound pin's is; a blank ``env()`` value is refused by that preflight once it
-    resolves. Raises ``ValueError`` for the reason :func:`_check_tls_ca_file` does."""
+    The pin is the SHA-256 of ``tls_ca_file``; ``auth/trust_anchors.py``, module item 9, says when
+    the engine checks it. A literal is refused here if it is blank or not a SHA-256 hex digest, so
+    ``messagefoundry check`` and a dry run catch it; an ``env()`` value is checked once it resolves.
+    With no ``tls_ca_file`` there is nothing to check, so the config would read as pinned while
+    nothing is. :meth:`Registry.dialling_pin_problems` refuses a pin whose hop never reads the CA,
+    once a token hop can no longer be composed on. Raises ``ValueError`` for the reason
+    :func:`_check_tls_ca_file` does."""
     if pin is None:
         return
     if isinstance(pin, str):
+        from messagefoundry.auth.trust_anchors import TrustAnchorError, _normalize_pin
         from messagefoundry.config.settings import refuse_a_blank_anchor_pin
 
         refuse_a_blank_anchor_pin(pin, f"{factory} tls_ca_pin")
+        try:
+            _normalize_pin(pin)
+        except TrustAnchorError as exc:
+            raise ValueError(f"{factory} tls_ca_pin: {exc}") from exc
     if ca is None or (isinstance(ca, str) and not ca.strip()):
         raise ValueError(
             f"{factory} tls_ca_pin is set without a tls_ca_file, so nothing would check it. It "
@@ -2938,6 +2945,7 @@ def Email(
     re-sends the email — a mailbox has no idempotency key, so a rare duplicate is possible and accepted
     (a duplicate beats a drop). ADR 0029."""
     _reject_envref_in_lists("Email", recipients=recipients)
+    _check_tls_ca_file("Email", tls_ca_file)
     _check_tls_ca_pin("Email", tls_ca_pin, tls_ca_file)
     return ConnectionSpec(
         ConnectorType.EMAIL,
@@ -3016,6 +3024,7 @@ def Direct(
     the pinned ``cryptography`` exposes no OAEP alternative on ``PKCS7EnvelopeBuilder``, so this
     setting does not make the whole message OAEP-clean."""
     _reject_envref_in_lists("Direct", recipients=recipients)
+    _check_tls_ca_file("Direct", tls_ca_file)
     _check_tls_ca_pin("Direct", tls_ca_pin, tls_ca_file)
     return ConnectionSpec(
         ConnectorType.DIRECT,
@@ -4896,8 +4905,36 @@ class Registry:
             except WiringError as exc:
                 yield str(exc)
         yield from self.encoding_problems()
+        yield from self.dialling_pin_problems()
         for port, first, second in self.port_collisions():  # low-13
             yield f"inbound connections {first!r} and {second!r} both bind port {port}"
+
+    def dialling_pin_problems(self) -> list[str]:
+        """A ``tls_ca_pin`` on a connection that dials out, whose hop never reads ``tls_ca_file``
+        (vault BACKLOG #2371). Such a pin reads as pinned while nothing checks it.
+
+        Here and not in the factories: a SMART or OAuth2 token hop, which reads the CA, is composed
+        onto a spec after its factory returns. The reasons are those of ``unread_ca_reason`` in
+        ``auth/trust_anchors.py``. Literal values only, as :meth:`encoding_problems`: an ``env()``
+        value reads as unknown, and the check after resolution refuses it then."""
+        from messagefoundry.auth.trust_anchors import unread_ca_reason, unread_pin_message
+
+        dialling = [
+            ("outbound connection", c.name, c.spec.settings) for c in self.outbound.values()
+        ]
+        dialling += [
+            ("inbound connection", c.name, c.spec.settings)
+            for c in self.inbound.values()
+            if c.spec.type is ConnectorType.REMOTEFILE
+        ]
+        dialling += [("fhir lookup", s.name, s.settings) for s in self.fhir_lookups.values()]
+        problems: list[str] = []
+        for kind, name, settings in dialling:
+            if settings.get("tls_ca_pin") is None or not settings.get("tls_ca_file"):
+                continue
+            if (unread := unread_ca_reason(settings)) is not None:
+                problems.append(unread_pin_message(f"{kind} {name!r}:", unread))
+        return problems
 
     def port_collisions(self) -> list[tuple[int, str, str]]:
         """Inbound listeners that bind a shared literal port on overlapping interfaces, as

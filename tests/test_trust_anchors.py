@@ -1334,7 +1334,7 @@ async def test_the_start_and_the_reload_refuse_an_ad_trusted_certificate_block_a
 )
 def test_a_ca_pin_nothing_reads_is_refused(settings: dict, inbound: bool) -> None:
     """A tls_ca_pin set where no check reads it would read as a pin and enforce nothing."""
-    with pytest.raises(ValueError, match="tls_ca_pin is set on"):
+    with pytest.raises(ValueError, match="tls_ca_pin is set"):
         ta.refuse_an_unread_ca_pin(settings, inbound=inbound, connector="x")
     # The control: the places it is read, in both directions since vault BACKLOG #2371, and every
     # place it is absent.

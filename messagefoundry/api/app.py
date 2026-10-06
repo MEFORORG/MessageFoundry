@@ -256,6 +256,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.trust_anchors import (
     AnchorSpec,
     TrustAnchorError,
+    make_lane_anchor_check,
     make_registry_anchor_preflight,
     make_settings_anchor_preflight,
     run_anchor_preflight,
@@ -8705,12 +8706,15 @@ def create_managed_app(
             # BACKLOG #1142, slice 3: the audited preflight for every inbound CA that requires a
             # peer certificate (MLLP, the HTTP listener, the DICOM SCP), at the first load and at
             # every real reload. Each listener's own build then enforces again and loads the bytes
-            # it read. Since vault BACKLOG #2371 it also checks the CA each connection that dials
-            # out names (every outbound, an inbound Ftp poller, a FhirLookup); those still load by
-            # path. Dormant when no connection names a CA: no store call, no audit row.
+            # it read. Since vault BACKLOG #2371 it also checks the CA of each connection that dials
+            # out; when, and what a refusal fails, is module item 9 of auth/trust_anchors.py.
+            # Dormant when no connection names a CA: no store call, no audit row.
             registry_preflight=make_registry_anchor_preflight(
                 store, enforcing=trust_anchors_enforcing
             ),
+            # vault BACKLOG #2371: the same check, per lane, as the runner builds an outbound or
+            # binds an Ftp poller, so a refused CA fails that lane only (ADR 0031).
+            lane_anchor_check=make_lane_anchor_check(store, enforcing=trust_anchors_enforcing),
             # BACKLOG #2034: the settings anchors (OIDC / AD / api-mTLS client CA), re-verified by
             # the engine on EVERY real reload, not only the direct /config/reload route. None when
             # no settings anchor is configured.
@@ -8739,7 +8743,8 @@ def create_managed_app(
                 if registry_filter is not None:
                     loaded = registry_filter(loaded)
                 # After the filter, as the reload path does: the anchors this process will load.
-                await engine.preflight_registry(loaded)
+                # at_start: the lane CAs are checked lane by lane as the runner builds them.
+                await engine.preflight_registry(loaded, at_start=True)
                 # Inside the span too (BACKLOG #1989): a raise from add_registry is past every check
                 # above and before the teardown span below, so nothing else would close the store.
                 engine.add_registry(loaded)

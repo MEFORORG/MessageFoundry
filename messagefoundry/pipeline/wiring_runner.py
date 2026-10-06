@@ -38,6 +38,7 @@ from enum import Enum, StrEnum
 from typing import Any, Literal, NamedTuple, Protocol, cast
 
 from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
+from messagefoundry.auth.trust_anchors import LaneAnchorCheck
 from messagefoundry.config.db_lookup import DbLookupError
 from messagefoundry.config.db_lookup import activated as db_lookup_activated
 from messagefoundry.config.fhir_lookup import (
@@ -962,6 +963,7 @@ class RegistryRunner:
         egress: EgressSettings,
         hop_posture: HopPosture | None = None,
         trust_anchor_policy: TrustAnchorPolicy | None = None,
+        lane_anchor_check: LaneAnchorCheck | None = None,
         simulate_all: bool = False,
         env_values: Mapping[str, Any] | None = None,
         active_environment: str | None = None,
@@ -1096,6 +1098,9 @@ class RegistryRunner:
         # FTPS) resolve the same org internal-CA anchor at build_check AND live construction. None → the
         # default system/no-op policy (byte-identical — the OS trust store verifies the peer).
         self._trust_anchor_policy = trust_anchor_policy or TrustAnchorPolicy()
+        # vault BACKLOG #2371: the audited check of a dialling CA, awaited where a lane is built
+        # (:meth:`_check_lane_anchor`). None in a test or embedding that passes none: no check.
+        self._lane_anchor_check = lane_anchor_check
         # Deployment-wide shadow override ([shadow].simulate_all_egress, #15): when True, EVERY outbound
         # runs egress-suppressed regardless of its own simulate= flag. Resolved per-connection into
         # self._simulate at reconcile (per-connection simulate OR this).
@@ -2483,6 +2488,7 @@ class RegistryRunner:
         reload()/stop() mutating _sources/_workers (review M-10). Internal callers that already hold
         the lock (start, reload) use :meth:`_start_inbound_unsafe`."""
         async with self._reload_lock:
+            await self._check_inbound_lane_anchor(name)
             await self._start_inbound_unsafe(name)
 
     async def stop_inbound(self, name: str) -> None:
@@ -2494,6 +2500,7 @@ class RegistryRunner:
         # One lock span so stop+start is atomic w.r.t. a concurrent reload (review M-10).
         async with self._reload_lock:
             await self._stop_inbound_unsafe(name)
+            await self._check_inbound_lane_anchor(name)
             await self._start_inbound_unsafe(name)
 
     def _require_owned_destination(self, name: str) -> None:
@@ -2669,6 +2676,34 @@ class RegistryRunner:
         else:
             self._outbound_resume.setdefault(name, asyncio.Event()).set()
 
+    async def _check_lane_anchor(
+        self, direction: Direction, name: str, settings: Mapping[str, Any]
+    ) -> None:
+        """Check a lane's dialling CA as it is built (vault BACKLOG #2371). Each caller awaits it
+        inside the ADR 0031 isolation, so a refusal fails that lane only. A reload does not call
+        it: the engine's reload preflight has checked every lane's CA before the swap, and refuses
+        the whole reload. ``auth.trust_anchors``, module item 9, states the rule once."""
+        if self._lane_anchor_check is not None:
+            await self._lane_anchor_check(direction, name, settings)
+
+    async def _check_inbound_lane_anchor(self, name: str) -> None:
+        """:meth:`_check_lane_anchor` for an inbound ``Ftp`` poller about to bind, the one inbound
+        that dials out. A no-op for any other inbound, a bound one, an unknown name and one not
+        deployed: :meth:`_start_inbound_unsafe` answers those itself."""
+        ic = self.registry.inbound.get(name)
+        if (
+            self._lane_anchor_check is None
+            or ic is None
+            or name in self._sources
+            or not ic.deployed
+            or ic.spec.type is not ConnectorType.REMOTEFILE
+        ):
+            return
+        source_cfg = _source_config(
+            ic, self._inbound_bind_host, self._env_values, self._trust_anchor_policy
+        )
+        await self._check_lane_anchor("inbound", name, source_cfg.settings)
+
     async def _ensure_destination_built(self, name: str) -> None:
         """Build ``name``'s connector into ``_destinations`` if the lane has none — the missing half of
         an operator start (#115). The ``auto_start=False`` boot gate leaves a CONNECTOR-LESS lane, so a
@@ -2699,6 +2734,9 @@ class RegistryRunner:
         connector: DestinationConnector | None = None
         try:
             dest = _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress)
+            # vault BACKLOG #2371: the operator start of a lane the boot gates left unbuilt checks
+            # its CA too, isolated with the build below.
+            await self._check_lane_anchor("outbound", name, dest.settings)
             # #200 (ADR 0092): stamp the derived instance posture, exactly as _start_outbound does —
             # an unstamped build makes the posture-keyed insecure-hop cells decide against the wrong
             # (fail-closed/no-op default) posture.
@@ -3745,6 +3783,8 @@ class RegistryRunner:
         connector: DestinationConnector | None = None
         try:
             dest = _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress)
+            # vault BACKLOG #2371, ADR 0031 as amended 2026-10-06: a refused CA fails this lane only.
+            await self._check_lane_anchor("outbound", name, dest.settings)
             # #200 (ADR 0092): stamp the derived instance posture for the connector build so each cell's
             # posture-keyed insecure-hop refusal decides against THIS config's posture — NOT the unstamped
             # fail-closed/no-op default. engine.start() never calls build_check (add_registry has already
@@ -3924,6 +3964,7 @@ class RegistryRunner:
                         ("inbound", ic.name), None
                     )  # at/above threshold this run — clear the marker
                     try:
+                        await self._check_inbound_lane_anchor(ic.name)
                         await self._start_inbound_unsafe(ic.name)
                     except Exception as exc:
                         # Isolate this inbound (bad bind / port in use / cleartext-exposure refusal /

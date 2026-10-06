@@ -247,8 +247,9 @@ async def test_a_matching_pin_is_not_the_escape_for_an_unjudged_outbound_ca(
     store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
 ) -> None:
     """The hop reads the file again by path, so a pin cannot vouch for the bytes it loads. An
-    unjudged CA refuses at enforce even with a matching pin, and the refusal says so. The control:
-    an inbound CA's matching pin lets the same file load."""
+    unjudged CA refuses at enforce even with a matching pin, and the refusal says so. Its row says
+    ``pinned: False``, since the pin let nothing through (review R6). The control: an inbound CA's
+    matching pin lets the same file load, and its row says ``pinned: True``."""
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: None)
     monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
     ca = _ca(tmp_path)
@@ -257,13 +258,15 @@ async def test_a_matching_pin_is_not_the_escape_for_an_unjudged_outbound_ca(
     with pytest.raises(WiringError, match="A pin does not help here"):
         await _preflight(store, cfg, enforcing=True)
     (row,) = [r for r in await _rows(store, "outbound:OUT") if r["event"] == "acl_indeterminate"]
-    assert row["pinned"] is True
+    assert row["pinned"] is False
 
     inbound = ta.connection_anchor_spec(
         "IB", {"tls": True, "tls_ca_file": str(ca), "tls_ca_pin": _sha(ca)}
     )
     assert inbound is not None
     await ta.run_anchor_preflight([inbound], store, enforcing=True)
+    (row,) = [r for r in await _rows(store, "inbound:IB") if r["event"] == "acl_indeterminate"]
+    assert row["pinned"] is True
 
 
 async def test_the_outbound_preflight_does_not_refuse_what_cafile_loads(
@@ -418,10 +421,9 @@ def test_a_pin_with_no_ca_or_a_blank_pin_is_refused(factory: str) -> None:
         _FACTORIES[factory](tls_ca_pin="ab" * 32)
     with pytest.raises(errors, match=f"{factory} tls_ca_pin is set but empty"):
         _FACTORIES[factory](tls_ca_file="/org/ca.pem", tls_ca_pin="  ")
-    # A blank CA is no CA. Email and Direct do not refuse a blank one themselves.
-    if factory in ("Email", "Direct"):
-        with pytest.raises(errors, match=f"{factory} tls_ca_pin is set without a tls_ca_file"):
-            _FACTORIES[factory](tls_ca_file=" ", tls_ca_pin="ab" * 32)
+    # A blank CA pins nothing, so every factory refuses it, Email and Direct included (review R4).
+    with pytest.raises(errors, match=f"{factory} tls_ca_file is blank"):
+        _FACTORIES[factory](tls_ca_file=" ")
 
 
 def test_the_pin_loads_from_connections_toml(tmp_path: Path) -> None:
