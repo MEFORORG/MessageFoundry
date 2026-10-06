@@ -4522,7 +4522,7 @@ different trust role. With no `[tls]` block the built SSL context is byte-identi
 A connection's own `tls_ca_file` is checked as an inbound listener's CA is (vault BACKLOG #2371): an
 optional `tls_ca_pin`, a refusal under `enforce` for a file another account could replace, and an
 `auth.trust_anchor` row when the file changes. A refused CA fails only its own connection at start,
-or at an operator start of that connection, and refuses a whole reload ([ADR 0031](adr/0031-startup-connection-fault-isolation.md),
+or at an operator start of that connection. It refuses a whole reload that builds or keeps that lane running ([ADR 0031](adr/0031-startup-connection-fault-isolation.md),
 amended 2026-10-06). One gap remains. The hop reads the file again by path when it builds its
 context, so a file swapped after the check would be trusted until that connection is built again.
 A matching pin is no escape for a file whose permissions the engine cannot read.

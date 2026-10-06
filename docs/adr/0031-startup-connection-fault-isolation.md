@@ -304,8 +304,20 @@ Context above names: feed #21's downstream cert should not stop the other 20.
    `_ensure_destination_built` for an outbound, and `start_inbound` for a poller. The exception is
    a **`FhirLookup`**. Its executor is built graph-wide, which §1 leaves to the backstop, so its
    refused CA still refuses the start.
-2. **At reload, any refused CA refuses the reload**, as §4 already says. The engine's reload
-   preflight checks every one before the swap, so the reload's own builds do not check again.
+2. **At reload, a refused CA refuses the reload, but only on a lane the reload builds or keeps
+   running** (Manager decision, 2026-10-06). That keeps §4's fail-fast rule for what the reload
+   touches. Before it quiesces, the runner checks each lane it will build or keep running, and
+   the engine's preflight checks each `FhirLookup` and inbound listener CA. The reload does not
+   read an idle lane's CA:
+   - a lane below the DR threshold, which the reload parks;
+   - an `auto_start = false` lane that is not running;
+   - an `Ftp` poller outside its schedule window;
+   - a lane its CA refused, whose config has not changed since. The reload leaves it failed, so
+     §4's reload self-heal does not apply to it. A config change rebuilds it, and the reload
+     checks it then. An operator start, or a restart, checks and builds it too.
+
+   So a bad CA on an idle lane never refuses a reload, a DR activation or a follower convergence.
+   Each idle lane is checked when it is built, under rule 1.
 3. **An inbound listener CA refused at start refuses the start. This records existing behaviour;
    it is not a new decision.** BACKLOG #1142 slice 3 shipped it (engine PR 1535, `29ab2e60b8`):
    the start preflight checks every inbound CA that requires a peer certificate, before any
@@ -316,6 +328,7 @@ because #2371 did not set out to move it. Whether an inbound listener's CA shoul
 instead is a separate question, not asked here.
 
 **Consequences.** A start with a broken outbound CA comes up degraded, and the lane reads `failed`
-with a `TrustAnchorError` reason. The next reload is refused until the file is fixed, since a
-reload checks every CA. A lane DR-parked or left down by `auto_start = false` is not checked at
-start; it is checked when an operator starts it.
+with a `TrustAnchorError` reason. A reload that leaves that lane's config alone goes through and
+leaves it failed. Fixing the file alone does not heal it on a reload; an operator start or a
+restart does. A lane DR-parked or left down by `auto_start = false` is not checked at start or
+at a reload; it is checked when it is built.
