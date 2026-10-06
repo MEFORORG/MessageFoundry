@@ -10548,6 +10548,9 @@ class AuthService:
         Raises :class:`ValueError` for an unknown user, and for an account with no binding: an
         unbind of nothing would still revoke sessions, and a no-op should not sign anybody out. The
         store decides both, inside the transaction, and writes nothing in either case.
+
+        A :class:`FederatedBindingChanged` refusal changes nothing but is still audited, as
+        ``auth.federated_unbind_refused`` naming the actor and the pair it expected (BACKLOG #2331).
         """
         outcome = await self._store.clear_user_federated_subject(
             user_id, expected_issuer=expected_issuer, expected_subject=expected_subject
@@ -10555,7 +10558,13 @@ class AuthService:
         if outcome is None:
             raise ValueError("no such user")
         if outcome.changed:
-            raise FederatedBindingChanged()
+            raise await self._audit_binding_changed(
+                "auth.federated_unbind_refused",
+                {"user_id": user_id, "username": outcome.username},
+                actor=actor,
+                expected_issuer=expected_issuer,
+                expected_subject=expected_subject,
+            )
         # BOTH halves, matching the store's own predicate: either one set means the row had
         # something to clear and the store cleared it, so raising here would report "nothing to
         # remove" about a write that just happened.
@@ -10563,6 +10572,38 @@ class AuthService:
             raise ValueError("the account has no federated binding to remove")
         await self._record_federated_unbind(user_id, outcome, actor=actor)
         return outcome.sessions_revoked
+
+    async def _audit_binding_changed(
+        self,
+        action: str,
+        detail: dict[str, object],
+        *,
+        actor: str,
+        expected_issuer: str | None,
+        expected_subject: str | None,
+    ) -> FederatedBindingChanged:
+        """Audit a :class:`FederatedBindingChanged` refusal, and return the exception to raise
+        (BACKLOG #2331).
+
+        Nothing was written, but an attempt to change who may sign in as an account is worth a row
+        even when it is refused. The row records what the caller expected, and says nothing about
+        why the pair differed: another administrator's change, or a retry of the caller's own call
+        that had already landed, look the same here. It does not carry the pair the row holds,
+        because one refusal arm finds it changed without reading it.
+        """
+        await self._audit(
+            action,
+            actor=actor,
+            detail=_json(
+                {
+                    **detail,
+                    "expected_issuer": expected_issuer,
+                    "expected_subject": expected_subject,
+                    "reason": FEDERATED_BINDING_CHANGED,
+                }
+            ),
+        )
+        return FederatedBindingChanged()
 
     async def _record_federated_unbind(
         self, user_id: str, outcome: FederatedUnbind, *, actor: str
@@ -10622,8 +10663,11 @@ class AuthService:
 
         Refuses, as :class:`ValueError` with an operator-facing message: no configured issuer, an
         unknown user, a non-directory account (ADR 0184 part 3), and a pair the account already
-        holds -- a no-op should not sign anybody out. Refuses as :class:`FederatedSubjectHeld` when a
-        different account holds the pair.
+        holds -- a no-op should not sign anybody out. An account deleted while the bind runs is the
+        unknown user too, not a conflict (BACKLOG #2331). Refuses as :class:`FederatedSubjectHeld`
+        when a different account holds the pair. A :class:`FederatedBindingChanged` refusal writes
+        an ``auth.federated_bind_refused`` row with reason ``federated_binding_changed`` and the pair
+        the caller expected (BACKLOG #2331).
 
         **Refuses as :class:`DirectoryObjectIdMissing` an account with no ``directory_object_id``**,
         and writes an ``auth.federated_bind_refused`` audit row naming the actor (BACKLOG #1143
@@ -10675,10 +10719,21 @@ class AuthService:
         # changes nothing, and must not be told that a competing change happened.
         if (user.oidc_issuer, user.oidc_subject) == (issuer, subject):
             raise ValueError("the account already holds that identity")
+
+        async def audit_changed(username: str) -> FederatedBindingChanged:
+            # BACKLOG #2331: each of the three changed-pair refusals below writes this one row.
+            return await self._audit_binding_changed(
+                "auth.federated_bind_refused",
+                {"user_id": user_id, "username": username, "issuer": issuer, "subject": subject},
+                actor=actor,
+                expected_issuer=expected_issuer,
+                expected_subject=expected_subject,
+            )
+
         # A caller whose pair is already stale gets the stale answer, not whichever refusal below
         # this read happens to trip. The locked compare in the clear is still the authority.
         if (user.oidc_issuer, user.oidc_subject) != (expected_issuer, expected_subject):
-            raise FederatedBindingChanged()
+            raise await audit_changed(user.username)
         if user.auth_provider != AuthProvider.AD.value:
             raise ValueError("only a directory (AD) account can take a federated binding")
         if not user.directory_object_id:
@@ -10724,7 +10779,7 @@ class AuthService:
         if cleared is None:
             raise ValueError("no such user")
         if cleared.changed:
-            raise FederatedBindingChanged()
+            raise await audit_changed(cleared.username)
         previous_issuer, previous_subject = cleared.issuer, cleared.subject
         revoked = cleared.sessions_revoked
         rebind = previous_issuer is not None or previous_subject is not None
@@ -10754,10 +10809,17 @@ class AuthService:
                 )
             ) from exc
         if swept is None:
+            # The set also matches no row when the account was deleted after the clear. That is the
+            # unknown-user answer, 404 at the route, not a conflict to retry (BACKLOG #2331). The
+            # clear's own removal of a previous binding is still recorded first.
+            if await self._store.get_user(user_id) is None:
+                if rebind:
+                    await self._record_federated_unbind(user_id, cleared, actor=actor)
+                raise ValueError("no such user")
             if not rebind:
                 # Nothing was written: the caller saw the account unbound and another bind landed
                 # first. That is the changed-pair refusal, with its code (BACKLOG #2026).
-                raise FederatedBindingChanged()
+                raise await audit_changed(cleared.username)
             await self._record_federated_unbind(user_id, cleared, actor=actor)
             # This request DID write: its clear removed the pair it expected. So not the
             # changed-pair refusal, whose promise is that nothing changed.
