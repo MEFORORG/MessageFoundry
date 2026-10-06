@@ -157,7 +157,9 @@ class AiBroker:
         if scheme == "http" and not weakened_tls_escape_permitted(posture):
             raise AiBrokerError(
                 "[ai].endpoint over cleartext http would expose the api_key; refused unless "
-                f"{INSECURE_TLS_ESCAPE_ENV} is set (dev/trusted-network only) — use https"
+                f"{INSECURE_TLS_ESCAPE_ENV} is set on an instance at [security].enforcement = warn "
+                "(dev/trusted-network only; the escape has no effect while enforcing, the default, "
+                "or with no posture) — use https"
             )
         # ASVS 4.2.5. Both values are operator-supplied via env() and both ship on every provider call
         # -- the endpoint as the request line, the key as the ``x-api-key`` header. Bounded here rather

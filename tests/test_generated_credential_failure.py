@@ -107,7 +107,7 @@ async def test_create_reset_and_factor_reset_write_nothing_when_no_credential_ca
             actor="test",
         )
         await store.set_totp_secret(target, secret="JBSWY3DPEHPK3PXP")
-        await store.enable_totp(target, recovery_code_hashes=["h"])
+        assert await store.enable_totp(target, recovery_code_hashes=["h"])
         await store.add_webauthn_credential(
             WebAuthnCredential(
                 credential_id_hash="kept-hash",

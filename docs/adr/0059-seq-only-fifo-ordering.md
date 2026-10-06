@@ -38,7 +38,7 @@ Remove `_fifo_created_at` and all its callers on all three backends, and change 
 - **Behavioral change (soft):** `current_ingest_time()` (ADR 0009) is no longer guaranteed non-decreasing per lane across a backward clock step; re-run stability is unaffected (created_at is persisted-once/immutable per message).
 - **Lost signal:** the per-lane "clock regression … clamping" WARNING disappears; consider a node-level clock-regression monitor if that signal is valued.
 - **Index change:** FIFO covering indexes re-key to trail in `seq`.
-- **cancel_pending(top_only=True):** re-keyed to `next_attempt_at, seq` so "cancel the head" stays the true FIFO head.
+- **cancel_queued(top_only=True)** (named `cancel_pending` here before 2026-10-06): re-keyed to `next_attempt_at, seq` so "cancel the head" stays the true FIFO head. *Corrected by the 2026-10-06 amendment below: that key did not pick the FIFO head once the head had backed off; it is now `seq` alone.*
 
 ## Reliability-invariant checklist
 
@@ -54,3 +54,21 @@ Remove `_fifo_created_at` and all its callers on all three backends, and change 
 - `current_ingest_time()` loses its implied per-lane monotonicity across a backward clock step (docstring update + changelog note).
 - `oldest_pending_age` metric can briefly mis-report during an NTP regression (transient, non-reliability).
 - Correctness now rests, with no created_at backstop, on **one serial writer per (stage, lane-key)** and SQLite's `rowid = max(live)+1` allocation; both are pinned by an explicit code comment and a churn regression test so a future second-writer or delete+reinsert-on-retry change cannot silently break FIFO.
+
+## Amendment (2026-10-06) -- purge top orders by `seq` alone
+
+The Consequences line above keyed `cancel_queued(top_only=True)` on `next_attempt_at, seq`. That
+picks the FIFO head only while the two keys agree, and they stop agreeing as soon as the head fails:
+`mark_failed` pushes the head's `next_attempt_at` forward by its backoff, while every younger row
+behind it keeps its earlier one. The earliest-due row is then a healthy younger row, so "purge top"
+would cancel it -- it would finalize `PROCESSED` with no delivery -- and leave the backing-off head
+blocking the lane, which is the case the control exists for. Neither `release_claimed` (stopping the
+outbound) nor anything else re-aligns the keys.
+
+**Ruling** (owner-approved 2026-10-06): "purge top" means the true FIFO head even when it is not yet
+due. `cancel_queued(top_only=True)` now orders by the same key as `claim_next_fifo` -- `rowid` on
+SQLite, `seq` on Postgres and SQL Server -- on all three backends, and the store docstring no longer
+describes the head as "next due". The SQLite and Postgres queries also gained the claim's
+`stage = outbound` term, so all three backends filter on the claim's own lane predicate and the head
+query can seek `ix_queue_fifo_out_seq`. ADR 0060's note on which index serves this query predates the
+change. Vault BACKLOG #2754 (review finding A-2).

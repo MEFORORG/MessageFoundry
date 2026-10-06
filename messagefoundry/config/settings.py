@@ -7470,7 +7470,7 @@ def security_loosenings(
         out.append(
             (
                 "enforcement",
-                "the security REFUSE/WARN dial is at 'warn' — posture weakenings (cleartext/verify-off "
+                "[security].enforcement = warn — posture weakenings (cleartext/verify-off "
                 "hops, keyless PHI, open egress, single-factor sign-in at exposure) are WARNED + audited "
                 "and permitted to continue rather than refused, and MEFOR_ALLOW_INSECURE_TLS / "
                 "--allow-insecure-bind escapes are honored",

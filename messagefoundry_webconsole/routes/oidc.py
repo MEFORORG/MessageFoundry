@@ -54,11 +54,14 @@ from .._auth import (
     allow_reauth_attempt,
     assert_same_origin,
     clear_oidc_flow_cookie,
+    consume_continuation,
+    continues_after_reauth,
     is_unlock_action,
     login_redirect_response,
     lookup_ui_action,
     must_change_target,
     oidc_flow_cookie_name,
+    reauth_landing,
     session_token,
     set_oidc_flow_cookie,
     set_session_cookie,
@@ -68,11 +71,20 @@ from .._external import is_allowlisted, is_external, is_idn_disguised
 _log = logging.getLogger(__name__)
 
 
+def _label(next_path: str) -> str:
+    """The registered label for an already-validated continuation (vault BACKLOG #2764). Every
+    caller passes a path ``lookup_ui_action`` accepted; the fallback exists only so a future caller
+    that does not still names something rather than raising."""
+    action = lookup_ui_action(next_path)
+    return action.label if action is not None else "Continue to the console"
+
+
 def reauth_idp_response(
     deps: UiDeps,
     auth: AuthService,
     next_path: str,
     *,
+    continues: bool,
     error: str | None = None,
     status_code: int = 200,
 ) -> HTMLResponse:
@@ -81,11 +93,15 @@ def reauth_idp_response(
     Shared by ``GET /ui/reauth`` and this module's step-up legs, so the page an operator lands on
     after a refused IdP round trip is the same page they started from. ``next_path`` must already be
     a registered /ui action. The destination host comes from CONFIG, never from the request.
+    ``continues`` says whether the action will run after the confirmation, and the page names the
+    action either way (vault BACKLOG #2764).
     """
     available = deps.oidc_enabled and auth.oidc_enabled
     return HTMLResponse(
         pages.reauth_idp(
             next_path,
+            label=_label(next_path),
+            continues=continues,
             destination_host=deps.oidc_authorization_host or None,
             available=available,
             error=error,
@@ -111,8 +127,19 @@ def _step_up_landing(
     next_ = outcome.return_to if lookup_ui_action(outcome.return_to) is not None else "/ui"
     token = outcome.elevation.token
     if token is None:
-        # A refusal. The page it renders offers the IdP leg again and never a password field.
-        resp = reauth_idp_response(deps, auth, next_, error=outcome.error, status_code=403)
+        # A refusal. The page it renders offers the IdP leg again and never a password field. An
+        # auto-retry target was staged only because it was issued, and the start leg spent that
+        # issue (#2764), so a fresh flow started from this page continues only to an unlock target;
+        # the page says so. (After a state mismatch the original flow is still staged and its real
+        # return would still continue -- the conservative wording errs toward "nothing will run".)
+        resp = reauth_idp_response(
+            deps,
+            auth,
+            next_,
+            continues=is_unlock_action(next_),
+            error=outcome.error,
+            status_code=403,
+        )
         if outcome.reason != "state_mismatch":
             # A state mismatch consumed nothing: the flow waits for the real IdP return, which
             # needs this browser's flow cookie. Every other refusal ended the flow.
@@ -123,7 +150,11 @@ def _step_up_landing(
         resp = HTMLResponse(pages.oidc_landing(next_), status_code=200)
     else:
         # A body-less POST action: re-submit it from a same-origin form, as POST /ui/reauth does.
-        resp = HTMLResponse(pages.reauth_continue(next_), status_code=200)
+        # The start leg staged an auto-retry target only when the console had issued it to this
+        # session, and spent that issue as it staged it (vault BACKLOG #2764). The flow is single-use
+        # and bound to the session and to this browser's flow cookie, so it carries the binding here,
+        # where the SameSite=Strict session cookie never arrives.
+        resp = HTMLResponse(pages.reauth_continue(next_, _label(next_)), status_code=200)
     set_session_cookie(resp, token, request=request)
     clear_oidc_flow_cookie(resp, request)
     return resp
@@ -332,10 +363,20 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if action is None:
             # Never an arbitrary URL (anti open-redirect), exactly as GET /ui/reauth refuses one.
             return RedirectResponse("/ui", status_code=303)
+        # Vault BACKLOG #2764: an auto-retry action is staged as the flow's continuation only when
+        # a step-up gate issued it to this session. Anything else still re-proves at the IdP, and
+        # returns to the console with nothing run and no grant minted for the named action.
+        continues = continues_after_reauth(action, token, next_)
+        return_to = next_ if continues else reauth_landing(identity)
         client = request.client.host if request.client else None
         if not allow_reauth_attempt(auth, identity, client):  # per-ACTOR, not the sign-in budget
             return reauth_idp_response(
-                deps, auth, next_, error="Too many attempts. Wait a moment.", status_code=429
+                deps,
+                auth,
+                next_,
+                continues=continues,
+                error="Too many attempts. Wait a moment.",
+                status_code=429,
             )
         public_origin = getattr(request.app.state, "public_origin", None)
         if not public_origin:
@@ -344,14 +385,15 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 deps,
                 auth,
                 next_,
+                continues=continues,
                 error="Federated sign-in is unavailable: the console's public address is not set.",
                 status_code=503,
             )
         try:
             flow_id, authorization_url = await auth.begin_oidc_step_up(
                 token,
-                return_to=next_,
-                purpose=action.action,
+                return_to=return_to,
+                purpose=action.action if continues else None,
                 client=client,
                 public_origin=public_origin,
             )
@@ -361,6 +403,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 deps,
                 auth,
                 next_,
+                continues=continues,
                 error="Too many sign-ins in progress. Try again shortly.",
                 status_code=429,
             )
@@ -368,6 +411,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # Federation off, or a session the federated login did not mint. Neither falls back to
             # a password: GET /ui/reauth is where a non-OIDC session gets its own form.
             return RedirectResponse("/ui", status_code=303)
+        # Spent only once the flow is staged, so a refusal above leaves it for a retry. From here
+        # the single-use flow is the binding; the callback cannot read this session's cookie.
+        consume_continuation(token, next_)
         resp = RedirectResponse(authorization_url, status_code=303)
         set_oidc_flow_cookie(resp, flow_id, request=request, max_age=auth.oidc_flow_ttl_seconds)
         return resp

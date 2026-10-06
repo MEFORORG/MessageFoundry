@@ -68,6 +68,13 @@ FEDERATED_IDENTITY_UNBOUND = (
 # ran the command, not to the holder being told.
 FIRST_ADMINISTRATOR_TAKEOVER = "first_administrator_takeover"
 ACCOUNT_DISABLED = "account_disabled"  # 6.3.7 — an admin disabled the account
+# 6.3.7 -- the directory session reconciler ended the account's sessions for a reason that is NOT a
+# read disabled bit: the probe could not match the account (``directory_absent``: not found, or its
+# stored id did not match or could not be parsed), or its ``userAccountControl`` could not be read
+# (vault BACKLOG #2140). ACCOUNT_DISABLED would tell the holder an administrator disabled the account,
+# which nothing established. Which reason sends which kind is decided once, in
+# ``AuthService._apply_reconcile_revocation``.
+DIRECTORY_SESSIONS_ENDED = "directory_sessions_ended"
 MFA_ENABLED = "mfa_enabled"  # 6.3.7 — a second factor (TOTP) was enrolled on the account
 MFA_DISABLED = (
     "mfa_disabled"  # 6.3.7 — the account's second factor was removed (self-service or admin reset)
@@ -146,6 +153,7 @@ NOTICE_KIND_LOG_LABELS: Mapping[str, str] = MappingProxyType(
         FEDERATED_IDENTITY_UNBOUND: "federated_identity_unbound",
         FIRST_ADMINISTRATOR_TAKEOVER: "first_administrator_takeover",
         ACCOUNT_DISABLED: "account_disabled",
+        DIRECTORY_SESSIONS_ENDED: "directory_sessions_ended",
         MFA_ENABLED: "mfa_enabled",
         MFA_DISABLED: "mfa_disabled",
         MFA_CREDENTIAL_REMOVED: "mfa_credential_removed",

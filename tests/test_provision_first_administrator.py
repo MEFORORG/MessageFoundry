@@ -1311,7 +1311,7 @@ async def test_a_repair_of_a_row_that_holds_an_address_is_refused_without_an_ema
             password_generated=False,
         )
         await store.set_totp_secret("roleless", secret="JBSWY3DPEHPK3PXP")
-        await store.enable_totp("roleless", recovery_code_hashes=["h1", "h2"])
+        assert await store.enable_totp("roleless", recovery_code_hashes=["h1", "h2"])
         await store.add_webauthn_credential(
             WebAuthnCredential(
                 credential_id_hash="holder-passkey-hash",
@@ -2090,7 +2090,7 @@ async def test_the_repair_branch_clears_the_earlier_holders_factors_and_sessions
             password_generated=False,
         )
         await store.set_totp_secret("earlier", secret="JBSWY3DPEHPK3PXP")
-        await store.enable_totp("earlier", recovery_code_hashes=["h1", "h2"])
+        assert await store.enable_totp("earlier", recovery_code_hashes=["h1", "h2"])
         await store.add_webauthn_credential(
             WebAuthnCredential(
                 credential_id_hash="earlier-passkey-hash",
@@ -2158,6 +2158,46 @@ async def test_a_re_run_in_the_same_step_is_not_blocked_by_the_rows_old_step_mar
         row = await store.get_user("half")
         assert row is not None and row.totp_enabled
         assert Role.ADMINISTRATOR.value in await store.get_user_role_ids("half")
+    finally:
+        await store.close()
+
+
+async def test_an_enable_that_matches_no_row_refuses_before_the_role(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #2224: ``enable_totp`` is conditional, so a factor clear landing between the staged
+    secret and the enable (another run's repair branch) makes it match no row. The run must refuse
+    before ``set_user_roles`` rather than grant the role over an account with TOTP off, and the
+    roleless row it leaves must be one a re-run completes."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings())
+        real_enable = store.enable_totp
+
+        async def cleared_then_enable(
+            user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
+        ) -> bool:
+            await store.disable_totp(user_id)
+            return await real_enable(user_id, recovery_code_hashes=recovery_code_hashes, now=now)
+
+        monkeypatch.setattr(store, "enable_totp", cleared_then_enable)
+        kw = provision_totp()
+        with pytest.raises(FirstAdministratorRefused, match="changed while this command ran"):
+            await service.provision_first_administrator(
+                username="site-admin", password=_PASSWORD, actor="test", **kw
+            )
+        row = await store.get_user_by_username("site-admin")
+        assert row is not None and not row.totp_enabled
+        assert not await store.get_user_role_ids(row.id)
+
+        monkeypatch.setattr(store, "enable_totp", real_enable)
+        outcome = await service.provision_first_administrator(
+            username="site-admin", password=_PASSWORD, actor="test", **kw
+        )
+        assert outcome.repaired and outcome.recovery_codes
+        done = await store.get_user(row.id)
+        assert done is not None and done.totp_enabled
+        assert Role.ADMINISTRATOR.value in await store.get_user_role_ids(row.id)
     finally:
         await store.close()
 

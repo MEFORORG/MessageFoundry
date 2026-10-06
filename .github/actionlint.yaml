@@ -9,7 +9,10 @@ self-hosted-runner:
     # .github/workflows/selfhosted-win2025-sql.yml — SQL Server 2025 suites on real hardware.
     # NOTE: the NucBox self-hosted runners are RETIRED (ci.yml runs every leg on hosted runners now),
     # so this label may currently resolve to no registered runner. Confirm with
-    # `gh api repos/MEFORORG/MessageFoundry/actions/runners` before relying on that workflow; if the
-    # runner is gone for good, delete the workflow and this label together rather than leaving a
-    # declaration that outlives its subject.
+    # `gh api repos/MEFORORG/MessageFoundry/actions/runners` AND `gh api orgs/MEFORORG/actions/runners`
+    # before relying on that workflow: the workflow's header requires an ORGANIZATION runner, which the
+    # repository endpoint does not list. The org endpoint needs an organization-admin token: a 403
+    # leaves the question unanswered, it does not mean there is no runner. If the runner is gone for
+    # good, delete the workflow and this label together rather than leaving a declaration that
+    # outlives its subject.
     - mefor-win2025-sql

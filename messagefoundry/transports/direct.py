@@ -328,8 +328,9 @@ class DirectDestination(DestinationConnector):
             if not weakened_tls_escape_permitted_here():
                 raise ValueError(
                     "Direct destination use_tls=false submits over cleartext SMTP; refused unless "
-                    f"{INSECURE_TLS_ESCAPE_ENV} is set (dev/trusted-network only, and refused on a "
-                    "production-PHI instance even with the escape, #200) — use STARTTLS (the default)"
+                    f"{INSECURE_TLS_ESCAPE_ENV} is set on an instance at [security].enforcement = warn "
+                    "(dev/trusted-network only; the escape has no effect while enforcing, the default, "
+                    "or with no posture) — use STARTTLS (the default)"
                 )
             if self.username is not None:
                 raise ValueError(
@@ -350,8 +351,9 @@ class DirectDestination(DestinationConnector):
                     "S/MIME body still protects the clinical payload, but envelope metadata and any "
                     "SMTP authentication credential are exposed to an on-path attacker presenting any "
                     "certificate. Use a trusted CA (tls_ca_file, or [tls].internal_ca_file for the "
-                    f"instance), or set {INSECURE_TLS_ESCAPE_ENV}=1 to allow it on a trusted-network "
-                    "bind (refused on a production-PHI instance even with the escape, #200)."
+                    f"instance), or set {INSECURE_TLS_ESCAPE_ENV}=1 on an instance at "
+                    "[security].enforcement = warn to allow it on a trusted-network bind (the escape "
+                    "has no effect while enforcing, the default, or with no posture)."
                 )
             if self.username is not None:
                 raise ValueError(

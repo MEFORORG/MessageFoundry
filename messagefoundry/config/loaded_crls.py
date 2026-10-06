@@ -89,8 +89,8 @@ class HeldCrl:
     a held copy from a replaced file. ``facts`` are those of the soonest-expiring CRL block in that
     load, the rule :func:`~messagefoundry.pki.soonest_crl` applies to the file; call
     :meth:`~messagefoundry.pki.CrlFacts.at` for the days left now. ``setting`` names the knob the
-    hop loaded it from, such as ``[tls].crl_file``, or is ``None`` where the caller named none (an
-    inbound connection's ``tls_crl_file``)."""
+    hop loaded it from, such as ``[tls].crl_file`` or ``inbound connection '<name>' tls_crl_file``,
+    or is ``None`` where the caller named none."""
 
     path_key: str
     fingerprint: tuple[int, int]

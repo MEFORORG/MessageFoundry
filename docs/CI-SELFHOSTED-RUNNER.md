@@ -16,7 +16,13 @@
 > ubuntu-only on a fork (so a contributor's own minutes are not spent on the 2x-billed Windows legs).
 >
 > Follow this guide **only** if you are deliberately re-introducing a self-hosted runner. Note
-> `selfhosted-win2025-sql.yml` remains dispatch-only and is currently **runner-less**.
+> `selfhosted-win2025-sql.yml` is dispatch-only and has **no runner known to be registered** (that
+> workflow's header says what that reading can and cannot show). **Dispatch-only is not what keeps
+> fork code off that workflow's runner** (vault BACKLOG #2765). Why, and the controls that must be
+> confirmed before its runner is registered, are stated once, in that workflow's header; they are how
+> point (2) above is met for that one dispatch-only runner. No such control set has been ruled for a
+> runner serving `pull_request` legs, which is what this guide registers, so for it point (2) stands
+> as written.
 
 How to register the **GMKtec Nucbox M5 Ultra** (AMD Ryzen 7 7730U, 8C/16T) as the CI
 runner for the required `test (windows-2025, py3.14)` leg, with **two runner services**
@@ -46,14 +52,16 @@ unchanged: it's still a real Windows Server 2025 SKU.
 - If the box is ever off, the required check just **queues** (up to ~24 h) and auto-merge
   fires when it comes back — jobs queue, they don't fail.
 
-## Security posture (why this is safe here)
+## Security posture (historical; its central premise is false now)
 
-- The repo is **private with no fork PRs** — the classic self-hosted danger (untrusted
-  fork code executing on your hardware) does not apply. Only code you or Dependabot (from
-  allowlisted manifests) pushed ever runs here.
+- **The repository is public.** This section was written when it was private with no fork
+  pull requests, and it then argued that untrusted fork code could not reach the box. That
+  argument no longer holds, so nothing in this section is a reason that a self-hosted runner
+  is safe here.
 - Own label `mefor-ci-win2025`; never reuse `mefor-win2025-sql`. The SQL VM's contract
   (dispatch-only, DB secrets in machine env, one shared local DB) must not leak onto the
-  CI runner and vice-versa.
+  CI runner and vice-versa. Dispatch-only is part of that VM's contract, not its security
+  control; the controls are in the `selfhosted-win2025-sql.yml` header.
 - Run the runner services as a **dedicated non-admin local user**. The `test` leg is pytest
   only — no admin rights. Do NOT point `windows-service-smoke` at this box: it installs a
   real NSSM service and needs admin; it stays GitHub-hosted (nightly).
