@@ -554,6 +554,8 @@ def test_build_check_runs_the_inbound_exposure_gates(
     assert result.ok is ok, f"{arm}: {result.detail}"
     if not ok:
         assert "IB_EXPOSED" in result.detail and "without TLS" in result.detail
+        # The gate's text names serve's flag; the leg must say check cannot read it.
+        assert "reads only [security].require_encryption_for_remote = false" in result.detail
 
 
 # --- vault BACKLOG #2355: an instance declared in MEFOR_* variables alone is checked, not skipped --
@@ -660,6 +662,25 @@ def test_a_graph_skip_is_not_tagged_as_an_environment_read(
         assert _ENV_ONLY_NOTE not in result.detail
     # The settings-only legs still ran, and say where they read from.
     assert _ENV_ONLY_NOTE in next(r for r in report.results if r.name == "posture").detail
+
+
+def test_a_malformed_environment_values_file_fails_the_leg_not_the_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An environment-only instance reaches the env() value load from a bare dir. A broken
+    # environments/<env>.toml used to escape as a traceback that ended the whole run.
+    cfg = _bare_config(tmp_path, monkeypatch)
+    values = tmp_path / "values"
+    (values / "environments").mkdir(parents=True)
+    (values / "environments" / "dev.toml").write_text("this = = broken\n", encoding="utf-8")
+    monkeypatch.chdir(values)
+    monkeypatch.setenv("MEFOR_AI_ENVIRONMENT", "dev")
+    report = run_checks(cfg, run_lint=False, suppress_service_toml_search=True)
+    result = next(r for r in report.results if r.name == "build-check")
+    assert result.required and not result.ok and not result.skipped
+    assert "environment values or [tls] trust anchors did not load" in result.detail
+    # The other legs were still reported.
+    assert any(r.name == "upstream-hop-ack" and r.ok for r in report.results)
 
 
 def test_posture_refuses_an_environment_only_custom_name(

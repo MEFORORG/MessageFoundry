@@ -6329,6 +6329,14 @@ def environment_named_by_env(environ: Mapping[str, str] | None = None) -> str | 
     return value if isinstance(value, str) and value.strip() else None
 
 
+def insecure_bind_escape(settings: ServiceSettings, *, flag: bool = False) -> bool:
+    """The cleartext-listener escape, folded the one way every caller folds it (ADR 0118, BACKLOG
+    #1672): ``serve --allow-insecure-bind`` OR ``[security].require_encryption_for_remote = false``.
+    ``flag`` is the CLI half. ``messagefoundry check`` and ``connection`` have no such flag and pass
+    none. The ADR 0092 clamp on an enforcing instance is applied later, by the gates themselves."""
+    return flag or not settings.security.require_encryption_for_remote
+
+
 def _warn_file_secrets(file_data: Mapping[str, Any], path: Path) -> None:
     """Warn when a secret is supplied via the config file instead of the environment."""
     for section, key in _FILE_SECRET_KEYS:

@@ -101,6 +101,48 @@ async def test_flag_toggle_persists_and_reflects(engine: Engine, tmp_path: Path)
     assert "flagged = false" in toml_path.read_text(encoding="utf-8")
 
 
+async def _exposed_engine(tmp_path: Path, *, allow: bool) -> Engine:
+    """An engine whose inbound listeners bind 0.0.0.0 in cleartext, on a non-enforcing instance, with
+    or without the cleartext escape. IB_TOML is then exposed."""
+    from messagefoundry.config.tls_policy import HopPosture
+
+    cfg = _config_dir(tmp_path)
+    return await Engine.create(
+        tmp_path / "flag.db",
+        poll_interval=0.02,
+        config_dir=cfg,
+        inbound_bind_host="0.0.0.0",
+        allow_insecure_bind=allow,
+        hop_posture=HopPosture(enforcing=False),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+
+
+@pytest.mark.parametrize("allow", [True, False])
+async def test_flag_toggle_and_dry_run_carry_the_engines_escape(
+    tmp_path: Path, allow: bool
+) -> None:
+    """Vault BACKLOG #2622 item 1: the build check both paths run now includes the inbound exposure
+    gates. An engine started with the escape accepted IB_TOML, so neither its dry-run reload (no
+    live runner, so a throwaway checker) nor a flag toggle may refuse it. Without the escape both
+    refuse, which shows the pass is the escape reaching the gate and not the gate never running."""
+    eng = await _exposed_engine(tmp_path, allow=allow)
+    try:
+        if allow:
+            await eng.reload_detail(str(tmp_path), dry_run=True)
+        else:
+            with pytest.raises(WiringError, match="without TLS"):
+                await eng.reload_detail(str(tmp_path), dry_run=True)
+        eng.add_registry(load_config(tmp_path))
+        if allow:
+            await eng.set_connection_flag("OB_TOML", direction="outbound", flagged=True)
+        else:
+            with pytest.raises(WiringError, match="without TLS"):
+                await eng.set_connection_flag("OB_TOML", direction="outbound", flagged=True)
+    finally:
+        await eng.stop()
+
+
 async def test_flag_toggle_reflects_on_inbound(engine: Engine, tmp_path: Path) -> None:
     await engine.set_connection_flag("IB_TOML", direction="inbound", flagged=True)
     assert engine.registry_runner is not None

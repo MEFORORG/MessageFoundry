@@ -1742,6 +1742,7 @@ def _serve(args: argparse.Namespace) -> int:
         SyslogProtocol,
         forward_hop_disposition,
         hop_posture_from_ai,
+        insecure_bind_escape,
         oidc_second_factor_claim_exception,
         security_loosenings,
     )
@@ -1912,9 +1913,7 @@ def _serve(args: argparse.Namespace) -> int:
     # cleartext inbound listener; BACKLOG #1672). It rides the SAME exposed-bind gate + the SAME
     # ADR 0092 clamp below, keyed on [security].enforcement — it cannot relax either bind under
     # enforcement=enforce. Fold both escapes into one flag the exposed-gate + create_managed_app read.
-    insecure_bind_ok = (
-        args.allow_insecure_bind or not settings.security.require_encryption_for_remote
-    )
+    insecure_bind_ok = insecure_bind_escape(settings, flag=args.allow_insecure_bind)
 
     # Delegated-identity precondition (#203, ASVS 13.2.1/13.3.2): when the operator declares
     # [store].require_managed_identity, refuse to start if the store authenticates with a static
@@ -8035,6 +8034,7 @@ def _connection(args: argparse.Namespace) -> int:
     from messagefoundry.config.settings import (
         BLOCK_UNLISTED_OUTBOUND_IN_FORCE,
         hop_posture_from_ai,
+        insecure_bind_escape,
         load_settings,
     )
     from messagefoundry.config.wiring import API_LISTENER_LABEL, WiringError, load_config
@@ -8102,7 +8102,7 @@ def _connection(args: argparse.Namespace) -> int:
             trust_anchor_policy=settings.tls.policy(),
             # Vault BACKLOG #2622 item 1: the inbound exposure gates read serve's cleartext escape.
             # This command has no --allow-insecure-bind, so pass the settings half serve folds in.
-            allow_insecure_bind=not settings.security.require_encryption_for_remote,
+            allow_insecure_bind=insecure_bind_escape(settings),
         )
 
     try:

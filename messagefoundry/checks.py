@@ -46,16 +46,17 @@ settings leg read the settings from the environment alone and say so on their li
 A fourth required check, ``build-check``, runs the **posture-stamped** ``build_check_registry`` that
 ``serve``/``reload`` run (which ``validate`` does not): it constructs every connector with this
 instance's derived security posture stamped, so a config ``serve`` would REFUSE — most importantly a
-production-PHI cleartext / weakened-TLS transport hop (#200, ADR 0092) — FAILS at commit/CI time
-instead of only at runtime. Fail-safe SKIP when it can't resolve a real posture (no
-``messagefoundry.toml``, or settings/graph that won't load), so a bare config dir is byte-identical.
+production-PHI cleartext / weakened-TLS transport hop (#200, ADR 0092), or a cleartext off-loopback
+inbound listener (vault BACKLOG #2622 item 1) — FAILS at commit/CI time instead of only at runtime.
+Fail-safe SKIP when it can't resolve a real posture (no ``messagefoundry.toml`` and no
+``MEFOR_AI_ENVIRONMENT``, or a graph that won't load), so a bare config dir is byte-identical.
+Settings that won't load FAIL (BACKLOG #1318).
 
 A fifth required check, ``reference-backend``, closes the ADR 0006 gap: a config declaring a
 ``Reference(...)`` against a ``[store] backend`` with no reference-snapshot store (SQL Server — its schema
 has no ``reference`` tables) would pass this gate and then raise on every ``reference(...)`` read at run
 time, post-ACK, forever. It refuses that pairing here, keyed on the DECLARED backend, mirroring the
-engine's start-time refusal. Same fail-safe SKIPs as ``build-check`` (no ``messagefoundry.toml``, or
-settings/config that won't load).
+engine's start-time refusal. Same fail-safe SKIPs and the same settings FAIL as ``build-check``.
 
 ``ruff`` and ``mypy`` are **advisory**: run only when installed (``shutil.which``) and never block —
 a non-developer author shouldn't be stopped by a lint nit. So is ``raise-fstring`` — an AST scan of the
@@ -232,23 +233,21 @@ def run_checks(
 
     With no ``messagefoundry.toml``, the seven legs that read service settings, and the dry-run
     preview's ``snapshot_on_send``, read them from the environment when ``MEFOR_AI_ENVIRONMENT``
-    names the instance (vault BACKLOG #2355), and each line that ran says so.
-    :func:`_settings_source` says why that variable is the trigger.
+    names the instance (vault BACKLOG #2355). Each of the seven lines that ran says so; the dry-run
+    line does not. :func:`_settings_source` says why that variable is the trigger.
     """
     _toml, env_only = _settings_source(
         config_dir, service_config=service_config, suppress_search=suppress_service_toml_search
     )
     results = [
         _check_validate(config_dir, allow_empty=allow_empty_config),
-        # Tagged too: its preview runs under the snapshot_on_send it resolved the same way.
-        _with_source(
-            _check_dryrun(
-                config_dir,
-                messages_dir,
-                service_config=service_config,
-                suppress_search=suppress_service_toml_search,
-            ),
-            env_only,
+        # Not tagged. Several of its arms read no settings, and its preview falls back to the model
+        # default when a load fails, so a tag here would claim a source the line may not rest on.
+        _check_dryrun(
+            config_dir,
+            messages_dir,
+            service_config=service_config,
+            suppress_search=suppress_service_toml_search,
         ),
         _with_source(
             _check_posture(
@@ -2074,7 +2073,7 @@ def _check_build(
         load_environment_values,
         resolve_values_base_dir,
     )
-    from messagefoundry.config.settings import hop_posture_from_ai
+    from messagefoundry.config.settings import hop_posture_from_ai, insecure_bind_escape
     from messagefoundry.config.wiring import API_LISTENER_LABEL, WiringError, load_config
     from messagefoundry.pipeline.wiring_runner import build_check_registry
 
@@ -2132,16 +2131,29 @@ def _check_build(
     env_name = settings.ai.environment
     # Resolve env() against the active environment the same way serve does, so a hop's host/scheme (an
     # env()-supplied value) is built exactly as at runtime rather than left as an unresolved reference.
-    env_values = (
-        load_environment_values(
-            base_dir=resolve_values_base_dir(settings.environments.base_dir, cwd=Path.cwd()),
-            dir_name=settings.environments.dir,
-            environment=env_name,
-            environ=os.environ,
+    try:
+        env_values = (
+            load_environment_values(
+                base_dir=resolve_values_base_dir(settings.environments.base_dir, cwd=Path.cwd()),
+                dir_name=settings.environments.dir,
+                environment=env_name,
+                environ=os.environ,
+            )
+            if env_name is not None
+            else {}
         )
-        if env_name is not None
-        else {}
-    )
+        trust_anchor_policy = settings.tls.policy()
+    except (ValueError, OSError) as exc:
+        # A malformed environments/<env>.toml (TOMLDecodeError is a ValueError) or an unreadable
+        # [tls] anchor. serve refuses both, so this FAILS; it used to escape as a traceback that
+        # ended the whole gate, which an environment-only instance can now reach from a bare dir
+        # (vault BACKLOG #2355). The decoder's message names a line and column, not a value.
+        return CheckResult(
+            "build-check",
+            ok=False,
+            required=True,
+            detail=f"environment values or [tls] trust anchors did not load: {exc}",
+        )
     try:
         build_check_registry(
             registry,
@@ -2153,7 +2165,7 @@ def _check_build(
             # refusal (ADR 0092) decides at commit/CI exactly as serve/reload do — a prod-PHI cleartext
             # hop raises here rather than shipping and only refusing at serve.
             posture=hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement),
-            trust_anchor_policy=settings.tls.policy(),
+            trust_anchor_policy=trust_anchor_policy,
             # ADR 0154 D4: the EFFECTIVE ordering / max_attempts refusals need the resolved
             # [delivery] defaults. Without them that arm is skipped rather than guessed, and the
             # misconfiguration would surface only at serve rather than at commit/CI.
@@ -2161,10 +2173,18 @@ def _check_build(
             # Vault BACKLOG #2622 item 1: the inbound exposure gates now run here, so pass serve's
             # cleartext escape. `check` has no --allow-insecure-bind, so this is the settings half of
             # serve's fold alone; a site that relies on the flag sees check refuse what serve admits.
-            allow_insecure_bind=not settings.security.require_encryption_for_remote,
+            allow_insecure_bind=insecure_bind_escape(settings),
         )
     except WiringError as exc:
-        return CheckResult("build-check", ok=False, required=True, detail=str(exc))
+        detail = str(exc)
+        if "--allow-insecure-bind" in detail:
+            # The gate's own text names serve's flag, which this command cannot read. Say which
+            # escape check does honour, or an operator adds the flag and the leg stays red.
+            detail += (
+                "; `messagefoundry check` has no --allow-insecure-bind and reads only "
+                "[security].require_encryption_for_remote = false"
+            )
+        return CheckResult("build-check", ok=False, required=True, detail=detail)
     return CheckResult(
         "build-check",
         ok=True,
@@ -3242,9 +3262,8 @@ def _check_reference_backend(
     Required, but **fail-safe SKIP** on the same convention as :func:`_check_build`: no
     ``messagefoundry.toml`` and no ``MEFOR_AI_ENVIRONMENT`` (vault BACKLOG #2355; with one, a
     ``MEFOR_STORE_BACKEND`` is read from the environment) → SKIP (a bare config dir declares no
-    backend, and the SQLITE default supports
-    reference sets anyway); settings or config that won't load → SKIP (``validate``/``build-check`` already
-    report those). A ``serve``-time backend override can still diverge from the toml this reads — the
+    backend, and the SQLITE default supports reference sets anyway); a config that won't load → SKIP
+    (``validate`` already reports it); settings that won't load → FAIL (BACKLOG #1318). A ``serve``-time backend override can still diverge from the toml this reads — the
     engine-start gate is the backstop for that, which is why both halves exist."""
     from pydantic import ValidationError
 
