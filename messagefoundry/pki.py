@@ -258,10 +258,12 @@ def judge_every_crl(pem: bytes, *, now: float) -> list[tuple[CrlFacts, CrlBlock]
     a model of OpenSSL, not a proof, so a load still counts what OpenSSL took
     (:func:`messagefoundry.config.tls_policy.crl_scratch_context`).
 
-    **A delta CRL refuses too.** The engine turns on no extended CRL support, and without it
-    OpenSSL was measured to use a newer delta CRL as if it were complete. Revocations listed only
-    in the base CRL were then dropped, and a revoked client was accepted. Give the setting base
-    CRLs only."""
+    **A delta CRL refuses too.** The engine turns on no extended CRL support, and without it every
+    OpenSSL build measured so far loses a revocation from a base CRL plus its delta, in one of two ways
+    depending on the build: older builds use the newer delta as if it were complete, dropping the
+    revocations listed only in the base, and OpenSSL 3.5.9 and 4.0.2 ignore the delta, dropping
+    the revocations listed only in it. Either way a revoked client is accepted. Measured 2026-10-06;
+    the build list is in ``tests/test_tls_policy.py``. Give the setting base CRLs only."""
     blocks = list(_crl_blocks(pem))
     if len(blocks) != pem.count(_CRL_BEGIN):
         raise ValueError(
@@ -279,8 +281,9 @@ def judge_every_crl(pem: bytes, *, now: float) -> list[tuple[CrlFacts, CrlBlock]
             crl, nxt = _parse_first_crl(block)
             if _is_delta_crl(crl):
                 raise ValueError(
-                    "it is a delta CRL, which OpenSSL would read as a complete CRL and so drop "
-                    "every revocation listed only in its base CRL; give base CRLs only"
+                    "it is a delta CRL, which an OpenSSL build may read as a complete CRL or "
+                    "ignore, so the revocations listed only in the base CRL or "
+                    "only in the delta are dropped; give base CRLs only"
                 )
             judged.append(
                 (
