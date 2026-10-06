@@ -652,8 +652,9 @@ def _mllp_ssl_context(
     if not verify and not weakened_tls_escape_permitted_here():
         raise ValueError(
             "MLLP tls_verify=false disables server-certificate verification (MITM risk). Use a trusted "
-            f"CA (tls_ca_file), or set {INSECURE_TLS_ESCAPE_ENV}=1 to allow it on a trusted-network bind "
-            "(refused on a production-PHI instance even with the escape, #200)."
+            f"CA (tls_ca_file), or set {INSECURE_TLS_ESCAPE_ENV}=1 on an instance at "
+            "[security].enforcement = warn to allow it on a trusted-network bind (the escape has no "
+            "effect while enforcing, the default, or with no posture)."
         )
     # #190 (ADR 0093): resolve the trust anchor — the connection's own tls_ca_file wins verbatim, else an
     # internal hop may anchor on the [tls] internal CA. Only the VERIFY path uses it; the tls_verify=false
@@ -676,7 +677,8 @@ def _mllp_ssl_context(
             )
     else:
         logger.warning(
-            "MLLP-over-TLS certificate verification is DISABLED (tls_verify=false, permitted by %s).",
+            "MLLP-over-TLS certificate verification is DISABLED (tls_verify=false, permitted by %s "
+            "at [security].enforcement = warn).",
             INSECURE_TLS_ESCAPE_ENV,
         )
         ctx.check_hostname = False
