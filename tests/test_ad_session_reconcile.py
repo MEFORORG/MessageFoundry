@@ -3296,3 +3296,21 @@ async def test_each_revocation_reason_sends_its_decided_notice(reason: str) -> N
             assert notifier.sent[0].detail == {"reason": reason}
     finally:
         await store.close()
+
+
+async def test_an_undecided_whole_account_reason_falls_to_the_neutral_notice() -> None:
+    """vault BACKLOG #2140. Only a READ disabled bit may say "disabled", so a whole-account reason
+    the apply step does not name gets the neutral notice, never ACCOUNT_DISABLED."""
+    store, _, service, _ = await _scoped_service(_GRP_A)
+    try:
+        notifier = _CapturingNotifier()
+        service._security_notifier = notifier
+        user = await store.get_user_by_username("jdoe")
+        assert user is not None
+        revocation = reconcile.SessionRevocation(
+            user.id, user.username, reason="directory_synthetic_new_reason"
+        )
+        assert await service._apply_reconcile_revocation(revocation)
+        assert [e.event_type for e in notifier.sent] == [DIRECTORY_SESSIONS_ENDED]
+    finally:
+        await store.close()

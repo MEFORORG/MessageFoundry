@@ -69,7 +69,8 @@ FEDERATED_IDENTITY_UNBOUND = (
 FIRST_ADMINISTRATOR_TAKEOVER = "first_administrator_takeover"
 ACCOUNT_DISABLED = "account_disabled"  # 6.3.7 — an admin disabled the account
 # 6.3.7 -- the directory session reconciler ended the account's sessions for a reason that is NOT a
-# read disabled bit: the account was not found, or its ``userAccountControl`` could not be read
+# read disabled bit: the probe could not match the account (``directory_absent``: not found, or its
+# stored id did not match or could not be parsed), or its ``userAccountControl`` could not be read
 # (vault BACKLOG #2140). ACCOUNT_DISABLED would tell the holder an administrator disabled the account,
 # which nothing established. Which reason sends which kind is decided once, in
 # ``AuthService._apply_reconcile_revocation``.

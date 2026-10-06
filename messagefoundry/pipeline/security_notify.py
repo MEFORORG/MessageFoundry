@@ -109,8 +109,8 @@ _DESCRIPTIONS = {
         "no longer works."
     ),
     ACCOUNT_DISABLED: "Your account was disabled by an administrator.",
-    # vault BACKLOG #2140. Says only what the engine did. The directory either did not find the
-    # account or did not answer whether it is disabled, so this must not say disabled or deleted.
+    # vault BACKLOG #2140. Says only what the engine did. The probe either could not match the
+    # account or could not read whether it is disabled, so this must not say disabled or deleted.
     DIRECTORY_SESSIONS_ENDED: (
         "A check against your organization's directory ended your MessageFoundry sessions."
     ),
@@ -455,10 +455,6 @@ def _build_body(event: SecurityEvent) -> str:
         # The takeover runs only when the install has no enabled Administrator, so "contact your
         # administrator" would name nobody, or the person who ran it.
         closing = "If you did not expect this, tell whoever operates the MessageFoundry host."
-    elif event.event_type == DIRECTORY_SESSIONS_ENDED:
-        # vault BACKLOG #2140. The engine did this on a directory answer, so "if this was you" cannot
-        # apply.
-        closing = "If you did not expect this, contact your MessageFoundry administrator."
     elif (
         moved_by_admin
         or set_by_admin
@@ -469,11 +465,13 @@ def _build_body(event: SecurityEvent) -> str:
             USERNAME_CHANGED,
             FEDERATED_IDENTITY_BOUND,
             FEDERATED_IDENTITY_UNBOUND,
+            DIRECTORY_SESSIONS_ENDED,
         )
     ):
         # A directory rename or email change is an administrator's act, so "if this was you"
         # cannot apply to it (the email half is BACKLOG #2291). Nor to a federated link or unlink:
-        # both routes refuse an administrator changing their own account's binding.
+        # both routes refuse an administrator changing their own account's binding. Nor to the
+        # engine ending sessions on a directory answer (vault BACKLOG #2140).
         closing = "If you did not expect this change, contact your MessageFoundry administrator."
     else:
         closing = "If this was you, no action is needed. If not, contact your MessageFoundry administrator."
