@@ -29,7 +29,10 @@ they never do network I/O (the outbox worker delivers, preserving at-least-once)
 
 from __future__ import annotations
 
+import ast
+import builtins
 import hashlib
+import importlib.machinery
 import importlib.util
 import inspect
 import ipaddress
@@ -40,9 +43,10 @@ import sys
 import threading
 import urllib.parse
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import ModuleType
 from typing import Any, Final, Literal, TypeIs
 
 from messagefoundry.config.code_sets import (
@@ -152,6 +156,7 @@ __all__ = [
     "HandlerAccepts",
     "message_type_of",
     "MessageTypeError",
+    "config_py_files",
     "load_config",
     "validate_config",
     "accepted_cleartext_hops",
@@ -6730,68 +6735,278 @@ def handler(
 # --- loader ------------------------------------------------------------------
 
 
-class _SiblingHelperFinder:
-    """Resolve a config module's top-level ``import _helpers`` to a sibling ``.py`` in the config dir.
+def config_py_files(directory: Path) -> list[Path]:
+    """Every ``*.py`` in ``directory`` the loader may run or import, sorted: dot-named files excluded.
+
+    ``Path.glob("*.py")`` matches ``.IB_OLD.py`` (an editor or manual backup) and ``._IB_ACME_ADT.py``
+    (a macOS AppleDouble file left by an SMB copy) too, because pathlib has no hidden-file rule. Neither
+    is config, so the loader, both config-source trust checks and the fingerprint skip a dot-named
+    module the same way (vault BACKLOG #2781). The ``_``-helper skip is the loader's own rule on top of
+    this, not part of it: a helper is still run when a sibling imports it, so the trust check and the
+    fingerprint keep it."""
+    return sorted(p for p in directory.glob("*.py") if not p.name.startswith("."))
+
+
+def _config_module_name(path: Path) -> str:
+    # Derive a collision-free module name from the resolved absolute path (not just the stem):
+    # two same-stem files in different dirs must not share __module__ (breaks pickling, dataclass
+    # __module__, get_type_hints). Helpers are named the same way, so a helper is never registered
+    # under the plain name a stdlib or installed module would use (vault BACKLOG #2780).
+    digest = hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()[:12]
+    return f"mefor_config_{path.stem}_{digest}"
+
+
+def _is_helper_name(name: str) -> bool:
+    """A top-level import name the helper convention covers: ``_``-prefixed and not dotted."""
+    return name.startswith("_") and "." not in name and name.isidentifier()
+
+
+def _same_file(origin: str | None, path: Path) -> bool:
+    if not origin:
+        return False
+    try:
+        return os.path.samefile(origin, path)
+    except OSError:
+        return False
+
+
+def _refuse_shadowing_helper(name: str, path: Path) -> None:
+    """Refuse a helper whose name is already a module's: ``_csv.py``, ``_json.py``, ``_pytest.py``.
+
+    Helpers are served only to config modules (see :class:`_HelperImporter`), so such a helper can no
+    longer replace the real module for the rest of the process. But ``import _csv`` in a config module
+    would still mean two different things depending on whether ``_csv.py`` sits beside it, and the
+    reader of the config cannot tell which one runs. So the name is refused, naming the file
+    (vault BACKLOG #2780).
+
+    The standard library has many ``_``-prefixed top-level modules (``_csv``, ``_json``,
+    ``_strptime``, ``_decimal``, ...), and installed packages add more (``_cffi_backend``,
+    ``_pytest``), so the ``_`` prefix alone never separated a helper from a real module. A module
+    found at the helper's own path (the config dir on ``sys.path``, as when the engine runs from it)
+    is the helper itself, not a clash."""
+    if name in sys.stdlib_module_names:
+        clash = "a standard library module"
+    elif name in sys.modules and not _same_file(getattr(sys.modules[name], "__file__", None), path):
+        clash = "a module this process has already imported"
+    else:
+        try:
+            spec = importlib.machinery.PathFinder.find_spec(name)
+        except (ImportError, ValueError):
+            spec = None
+        # A spec with no origin is a namespace package (a plain directory on sys.path), not a module.
+        if spec is None or spec.origin is None or _same_file(spec.origin, path):
+            return
+        clash = "an installed module"
+    raise WiringError(
+        f"config helper {path.name} has the same name as {clash} ({name}); rename the helper, "
+        f"for example to _cfg{name}.py, and update the imports that name it"
+    )
+
+
+def _body_helper_imports(source: bytes, stems: frozenset[str]) -> list[tuple[str, bool]]:
+    """The helpers ``source`` imports inside a function body, each with whether a ``try`` guards it.
+
+    Only function bodies: a module's top-level statements already ran, with their real control flow,
+    so a top-level import that was skipped (``if TYPE_CHECKING``, a failed optional import) stays
+    skipped. A guarded body import (``try: import _opt`` with any ``except``) is an optional helper; the
+    caller loads it but lets it fail, so the run-time import fails the same way and the guard decides.
+    ``[]`` when the source does not parse: it ran, so a later edit is the next load's to report."""
+    if not any(stem.encode() in source for stem in stems):
+        return []
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError, MemoryError, RecursionError):
+        # MemoryError and RecursionError are the parser's width and depth walls (BACKLOG #1858).
+        return []
+    found: list[tuple[str, bool]] = []
+
+    def visit(node: ast.AST, in_function: bool, guarded: bool) -> None:
+        for child in ast.iter_child_nodes(node):
+            child_guarded = guarded or (
+                isinstance(node, ast.Try | ast.TryStar)
+                and bool(node.handlers)
+                and any(child is stmt for stmt in node.body)
+            )
+            if in_function and isinstance(child, ast.Import):
+                found.extend((a.name, child_guarded) for a in child.names if a.name in stems)
+            elif (
+                in_function
+                and isinstance(child, ast.ImportFrom)
+                and child.level == 0
+                and child.module is not None
+                and child.module in stems
+            ):
+                found.append((child.module, child_guarded))
+            if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
+                visit(child, True, False)  # a try around a def does not guard what its body runs
+            else:
+                visit(child, in_function, child_guarded)
+
+    try:
+        visit(tree, False, False)
+    except RecursionError:
+        return found  # a deeply nested module that already ran; the preload covers what it reached
+    return found
+
+
+class _HelperImporter:
+    """Resolve a config module's ``import _helpers`` to a sibling ``_helpers.py``, for one load only.
 
     The loader runs non-``_`` modules under mangled names and skips ``_``-prefixed files as top-level
-    modules, but CLAUDE.md §4 documents importing shared ``_``-prefixed helpers from siblings. Those
-    files aren't on ``sys.path``, so without a finder Python can't locate them and the import fails
-    (review low-10). Installed on ``sys.meta_path`` only while a config dir loads, and resolves **only**
-    ``_``-prefixed top-level names (matching the loader's ``_*``-skip rule) against ``<name>.py`` in
-    that dir. Scoping to ``_``-prefixed names means a config-dir file named after a real module
-    (``os.py``, ``json.py``, ``ssl.py``, ``requests.py`` — none start with ``_``) can no longer
-    shadow the stdlib/installed module for the duration of the load (SEC-019, CWE-427); only the
-    documented ``_``-helper convention is served. :func:`_assert_safe_config_source` already vets every
-    ``*.py`` (including ``_*``), so a helper sits inside the same trust boundary as its importers."""
+    modules, but CLAUDE.md section 4 documents importing shared ``_``-prefixed helpers from siblings.
+    Those files are not on ``sys.path``, so Python cannot find them unaided (review low-10).
 
-    def __init__(self, directory: Path, created: set[str]) -> None:
+    This importer is bound into each config module and each helper as that module's own
+    ``__import__`` (its ``__builtins__``), and nowhere else. Nothing is put on ``sys.meta_path`` and
+    no helper is registered under its plain name, so an import anywhere else in the process -- another
+    thread's first ``import csv`` during a reload, which reaches ``_csv`` -- never sees the config dir
+    (vault BACKLOG #2780; this replaced a process-wide finder whose ``_`` scoping assumed no real
+    top-level module starts with ``_``, which is false). A config-dir file named after a real module
+    without a ``_`` (``os.py``, ``json.py``) is never served either (SEC-019, CWE-427).
+
+    Because the binding lives in the module's globals, a Router or Handler that imports a helper
+    inside its body resolves it at run time too, long after the load (vault BACKLOG #2783). So that
+    the run-time path never reads the config dir or runs a file, every helper a function body imports
+    is loaded during the load, once the config module that started the chain has finished (so an
+    in-body import written to break a cycle still breaks it). An unguarded failure there is a load
+    or ``check`` error rather than a dead-lettered message. After :meth:`close` the importer serves
+    only the helpers already loaded.
+
+    Two limits. Only the ``import`` statement goes through ``__import__``:
+    ``importlib.import_module("_x")`` in a config module does not find a helper. And the module's
+    builtins are a copy taken when the load starts, so a name added to :mod:`builtins` later is not
+    seen by config code; a live view would cost a Python-level lookup on every builtin name a
+    Handler reads, on the per-message path. :func:`_assert_safe_config_source` vets every ``*.py``
+    (including ``_*``), so a helper sits inside the same trust boundary as its importers."""
+
+    def __init__(self, directory: Path) -> None:
         self._dir = directory
-        self._created = created
+        self._modules: dict[str, ModuleType] = {}
+        self._open = True
+        # Helper files whose body imports are not yet loaded, drained by preload().
+        self._pending: list[Path] = []
+        # Every module name this load registered in sys.modules, for discard() on a failed load.
+        self.registered: list[str] = []
+        # The helper stems present when the load starts: the only names this importer serves, so an
+        # ordinary ``import json`` in a Handler body costs one set lookup before the real import.
+        self._stems = frozenset(
+            p.stem for p in config_py_files(directory) if _is_helper_name(p.stem)
+        )
+        self.builtins: dict[str, Any] = {**vars(builtins), "__import__": self._import}
 
-    def find_spec(self, fullname: str, path: Any, target: Any = None) -> Any:
-        if path is not None or "." in fullname:
-            return None  # only top-level absolute imports, resolved against the config dir
-        # SEC-019 (CWE-427): only serve the documented ``_``-prefixed helper convention so a config-dir
-        # file named after a real stdlib/installed module (os/json/ssl/requests — none start with ``_``)
-        # cannot pre-empt normal finder resolution and silently shadow it. No stdlib/installed top-level
-        # module name starts with ``_``, and every legitimate sibling helper does, so this is sufficient.
-        if not fullname.startswith("_"):
-            return None
-        candidate = self._dir / f"{fullname}.py"
-        if not candidate.is_file():
-            return None
-        self._created.add(fullname)
-        return importlib.util.spec_from_file_location(fullname, candidate)
+    def close(self) -> None:
+        """End the load: from now on serve only the helpers already loaded, and read no file."""
+        self._open = False
+
+    def discard(self) -> None:
+        """Drop every module this load registered in ``sys.modules`` (the load failed)."""
+        for mod_name in self.registered:
+            sys.modules.pop(mod_name, None)
+
+    # The parameter names are __import__'s own, so a keyword call (``__import__(n, fromlist=[...])``)
+    # in a config module still works.
+    def _import(
+        self,
+        name: str,
+        globals: Mapping[str, object] | None = None,
+        locals: Mapping[str, object] | None = None,
+        fromlist: Sequence[str] = (),
+        level: int = 0,
+    ) -> ModuleType:
+        if level == 0 and name in self._stems:
+            module = self._modules.get(name)
+            if module is None and self._open:
+                module = self._load(name)
+            if module is not None:
+                return module
+            if not self._open:
+                # Never fall through to the normal import: with the config dir on sys.path it would run
+                # the file at run time and register it under its plain name.
+                raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+        return builtins.__import__(name, globals, locals, fromlist, level)
+
+    def _load(self, name: str) -> ModuleType | None:
+        path = self._dir / f"{name}.py"
+        if not path.is_file():
+            return None  # gone since the load started: resolved the normal way
+        _refuse_shadowing_helper(name, path)
+        mod_name = _config_module_name(path)
+        spec = importlib.util.spec_from_file_location(mod_name, path)
+        if spec is None or spec.loader is None:
+            raise WiringError(f"cannot load config helper: {path}")
+        module = self.new_module(spec)
+        # Cached before it runs, as Python's own import does, so a helper cycle sees the partial module.
+        self._modules[name] = module
+        sys.modules[mod_name] = module
+        self.registered.append(mod_name)
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            del self._modules[name]
+            sys.modules.pop(mod_name, None)
+            raise
+        self._pending.append(path)
+        return module
+
+    def new_module(self, spec: importlib.machinery.ModuleSpec) -> ModuleType:
+        """A module for ``spec`` whose own ``import`` statements resolve helpers through this load."""
+        module = importlib.util.module_from_spec(spec)
+        module.__dict__["__builtins__"] = self.builtins
+        return module
+
+    def preload(self, path: Path) -> None:
+        """Load every helper a function body in ``path`` imports -- and, in turn, every helper those
+        helpers' bodies import -- so an in-body import works after the load. Called once ``path`` has
+        finished running, so nothing it imports at top level is still half-initialized."""
+        self._pending.append(path)
+        while self._pending:
+            current = self._pending.pop(0)
+            if not self._stems:
+                continue
+            try:
+                source = current.read_bytes()
+            except OSError:
+                continue  # it already ran; the file going away now is not this pass's to report
+            for name, guarded in _body_helper_imports(source, self._stems):
+                if name in self._modules:
+                    continue
+                try:
+                    self._load(name)
+                except WiringError:
+                    raise  # a refused helper name is refused whether or not a try surrounds it
+                except Exception:
+                    if not guarded:
+                        raise
+                    # An optional helper that fails: left unloaded, so the run-time import raises
+                    # ModuleNotFoundError and the body's own guard decides, as it would have.
 
 
-# Serializes the shared module-global load state (_active, sys.meta_path/sys.modules mutations) so a
-# reload offloaded to a worker thread can't race a concurrent validate/load (review low-3).
+# Serializes the shared module-global load state (_active, sys.modules mutations) so a reload
+# offloaded to a worker thread can't race a concurrent validate/load (review low-3).
 _load_lock = threading.Lock()
 
 
 @contextmanager
-def _loading(directory: Path, registry: Registry) -> Iterator[None]:
+def _loading(directory: Path, registry: Registry) -> Iterator[_HelperImporter]:
     """Hold the load lock, publish ``registry`` as the active declaration target **and its code sets
-    as the active set** (so a module-top-level ``code_set(...)`` resolves), and install the
-    sibling-helper import finder for ``directory`` — tearing all of it down (including any helper
-    modules registered under their plain name) on exit."""
+    as the active set** (so a module-top-level ``code_set(...)`` resolves), and yield the load's
+    :class:`_HelperImporter`, closed on exit so it serves only what this load imported. A load that
+    raises leaves none of its helpers in ``sys.modules``."""
     global _active
-    helpers: set[str] = set()
-    finder = _SiblingHelperFinder(directory, helpers)
+    helpers = _HelperImporter(directory)
     with _load_lock:
         _active = registry
-        sys.meta_path.insert(0, finder)
         # Code sets are published BEFORE the modules run so a top-level capture resolves; the registry
         # already holds them (loaded in load_config/validate_config), and activated() restores cleanly.
         try:
             with _code_sets_activated(registry.code_sets):
-                yield
+                yield helpers
+        except BaseException:
+            helpers.discard()
+            raise
         finally:
             _active = None
-            with suppress(ValueError):
-                sys.meta_path.remove(finder)
-            for name in helpers:
-                sys.modules.pop(name, None)
+            helpers.close()
 
 
 def load_config(directory: str | Path, *, allow_empty: bool = False) -> Registry:
@@ -6820,9 +7035,10 @@ def load_config(directory: str | Path, *, allow_empty: bool = False) -> Registry
         registry.code_sets = load_code_sets(directory / CODESETS_DIR_NAME)
     except CodeSetError as exc:
         raise WiringError(str(exc)) from exc
-    with _loading(directory, registry):
-        for path in sorted(p for p in directory.glob("*.py") if not p.name.startswith("_")):
-            _exec_module(path)
+    with _loading(directory, registry) as helpers:
+        for path in config_py_files(directory):
+            if not path.name.startswith("_"):
+                _exec_module(path, helpers)
     # Connections may also be authored as data (ADR 0007): merge connections.toml into the SAME
     # registry the code-first inbound()/outbound() calls populated, before validating the whole graph.
     # Imported lazily to avoid a wiring<->connections_file import cycle. A name in both surfaces is a
@@ -7085,7 +7301,7 @@ def _enforce_windows_config_source(directory: Path, probes: _WinConfigSourceProb
             f"refusing to load config from {directory}: this process's own user SID could not be "
             f"read, so the owner of the config source cannot be vetted; see docs/SERVICE.md"
         )
-    for path in [directory, *directory.glob("*.py")]:
+    for path in [directory, *config_py_files(directory)]:
         sec = probes.read_path(path)
         if sec.status in _WIN_PATH_GONE_ERRORS and path != directory and not os.path.lexists(path):
             continue
@@ -7562,7 +7778,7 @@ def _assert_safe_config_source(directory: Path) -> None:
     self_uid: int | None = _getuid() if _getuid is not None else None
     # Include _*.py: the loader skips them as top-level modules, but a sibling can import them, so a
     # writable/foreign-owned helper is just as much an injection vector (review M-21).
-    candidates = [directory, *directory.glob("*.py")]
+    candidates = [directory, *config_py_files(directory)]
     for path in candidates:
         try:
             st = path.stat()
@@ -7583,20 +7799,19 @@ def _assert_safe_config_source(directory: Path) -> None:
             )
 
 
-def _exec_module(path: Path) -> None:
-    # Derive a collision-free module name from the resolved absolute path (not just the stem):
-    # two same-stem files in different dirs must not share __module__ (breaks pickling, dataclass
-    # __module__, get_type_hints). Register it in sys.modules so intra-config imports and anything
-    # relying on sys.modules[__name__] resolve correctly; remove it again on failure.
-    digest = hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()[:12]
-    mod_name = f"mefor_config_{path.stem}_{digest}"
+def _exec_module(path: Path, helpers: _HelperImporter) -> None:
+    # Register the module in sys.modules under its path-derived name so intra-config imports and
+    # anything relying on sys.modules[__name__] resolve correctly; remove it again on failure.
+    mod_name = _config_module_name(path)
     spec = importlib.util.spec_from_file_location(mod_name, path)
     if spec is None or spec.loader is None:
         raise WiringError(f"cannot load config module: {path}")
-    module = importlib.util.module_from_spec(spec)
+    module = helpers.new_module(spec)
     sys.modules[mod_name] = module
     try:
         spec.loader.exec_module(module)
+        # The helpers its function bodies import, loaded now that it has run (vault BACKLOG #2783).
+        helpers.preload(path)
     except WiringError:
         sys.modules.pop(mod_name, None)
         raise
@@ -7637,10 +7852,12 @@ def validate_config(directory: str | Path, *, allow_empty: bool = False) -> list
         registry.code_sets = load_code_sets(codesets_dir)
     except CodeSetError as exc:
         diagnostics.append(Diagnostic(message=str(exc), file=str(codesets_dir)))
-    with _loading(directory, registry):
-        for path in sorted(p for p in directory.glob("*.py") if not p.name.startswith("_")):
+    with _loading(directory, registry) as helpers:
+        for path in config_py_files(directory):
+            if path.name.startswith("_"):
+                continue
             try:
-                _exec_module(path)
+                _exec_module(path, helpers)
             except WiringError as exc:
                 diagnostics.append(Diagnostic(message=str(exc), file=str(path)))
                 declaring_source_failed = True

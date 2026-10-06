@@ -149,7 +149,8 @@ def test_loader_skips_underscore_modules(tmp_path: Path) -> None:
 
 def test_config_module_can_import_sibling_helper(tmp_path: Path) -> None:
     # low-10: CLAUDE.md §4 documents sharing `_`-prefixed helpers imported from sibling config
-    # modules. A scoped finder resolves the import against the config dir; it isn't left in sys.modules.
+    # modules. The load's helper importer resolves it against the config dir; it is never registered
+    # under its plain name in sys.modules.
     (tmp_path / "_shared.py").write_text("ROUTER = 'adt_router'\n", encoding="utf-8")
     _write(
         tmp_path,

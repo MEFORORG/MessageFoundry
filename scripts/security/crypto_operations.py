@@ -259,9 +259,10 @@ OPAQUE_PROVIDERS: dict[str, str] = {
         "derivation counted once in redaction.py, and its callers (with safe_exc's, about 160) are "
         "logging and error reporting, not hashing"
     ),
-    "messagefoundry.config.wiring._exec_module": (
-        "names a loaded config module after a SHA-256 of its resolved path, so two same-stem files "
-        "cannot collide in sys.modules; naming, and no caller of the loader decides anything by it"
+    "messagefoundry.config.wiring._config_module_name": (
+        "names a loaded config module or helper after a SHA-256 of its resolved path, so two "
+        "same-stem files cannot collide in sys.modules; naming, and no caller of the loader decides "
+        "anything by it"
     ),
     "messagefoundry.pipeline.sharding.owner_shard_of_destination": (
         "rendezvous placement uses SHA-256 as a restart-stable hash with no secret; a caller picks "

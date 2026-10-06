@@ -110,6 +110,15 @@ if TYPE_CHECKING:
 
 __all__ = ["CheckResult", "CheckReport", "run_checks"]
 
+
+def _config_modules(base: Path) -> list[Path]:
+    """The config dir's ``*.py`` files, by the loader's own rule: a dot-named backup is never run, so
+    the static lints do not report on it either (vault BACKLOG #2781)."""
+    from messagefoundry.config.wiring import config_py_files
+
+    return config_py_files(base)
+
+
 # What ``_parse_config_module`` raises on a config module it cannot turn into a tree (BACKLOG #1858).
 # The advisory legs skip such a file, because ``validate`` runs first and names it: the loader's broad
 # catch reports each of these as ``error loading config module <file>``. Catching ``SyntaxError`` alone
@@ -505,7 +514,7 @@ def _check_raise_fstring(config_dir: str | Path) -> CheckResult:
             "raise-fstring", ok=True, required=False, skipped=True, detail="not a config dir"
         )
     hits: list[str] = []
-    for path in sorted(base.glob("*.py")):
+    for path in _config_modules(base):
         try:
             tree = _parse_config_module(path)
         except _UNPARSEABLE_MODULE:
@@ -635,7 +644,7 @@ def _check_accepts_candidate(config_dir: str | Path) -> CheckResult:
             "accepts-candidate", ok=True, required=False, skipped=True, detail="not a config dir"
         )
     hits: list[str] = []
-    for path in sorted(base.glob("*.py")):
+    for path in _config_modules(base):
         try:
             tree = _parse_config_module(path)
         except _UNPARSEABLE_MODULE:
@@ -1541,12 +1550,12 @@ def _check_handler_security(
             "handler-security", ok=True, required=False, skipped=True, detail="not a config dir"
         )
     # sibling config modules (the dir's own *.py stems) are first-party for the unvetted-import rule.
-    local_modules = frozenset(p.stem for p in base.glob("*.py"))
+    local_modules = frozenset(p.stem for p in _config_modules(base))
     # unvetted-import needs a trustworthy shipped-dep set to tell operator-added from shipped; if the
     # metadata probe degraded to empty, skip the rule entirely rather than flag/block on a blind vet.
     shipped = _shipped_dep_import_roots()
     hits: list[str] = []
-    for path in sorted(base.glob("*.py")):
+    for path in _config_modules(base):
         try:
             tree = _parse_config_module(path)
         except _UNPARSEABLE_MODULE:
