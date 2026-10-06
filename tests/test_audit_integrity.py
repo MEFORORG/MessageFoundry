@@ -1522,7 +1522,8 @@ async def test_startup_check_with_no_key_still_alerts_on_a_chain_that_names_a_ke
 
     sink, _cap = await _verify_on_start(db, None)  # `_verify_on_start` opens with no key
     assert [s for s, _, _ in sink.events] == ["audit-chain"], sink.events
-    assert "could not be checked" in sink.events[0][1]
+    reason = sink.events[0][1]
+    assert "first row names a store key" in reason and "not a finding" not in reason, reason
 
     with contextlib.closing(sqlite3.connect(db)) as conn:
         conn.execute("DELETE FROM audit_log WHERE seq = 2")

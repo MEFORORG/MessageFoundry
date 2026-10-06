@@ -2658,7 +2658,14 @@ def verify_audit_rows(
                 held = False  # proved by the closing range row's digest instead (checked below)
             else:
                 key, mac = secret
-        expected = _audit_row_mac(r, prev, key, mac) if held else r["row_hash"]
+        stored = r["row_hash"]
+        # Not held: the stored hash is compared with itself, so the one check left is that it is a
+        # hash at all. An empty or non-text value is never a MAC, and needs no key to see (#2725).
+        expected = (
+            _audit_row_mac(r, prev, key, mac)
+            if held
+            else (stored if isinstance(stored, str) and stored else None)
+        )
         # Bind the compare first so it is ALWAYS evaluated: folding it behind a known-break test
         # would short-circuit the comparator once a break is known.
         mac_ok = hmac.compare_digest(audit_mac_bytes(r["row_hash"]), audit_mac_bytes(expected))

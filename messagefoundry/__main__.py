@@ -51,7 +51,7 @@ import logging  # noqa: E402
 import sqlite3  # noqa: E402  # stdlib; the exception the store-opening subcommands translate (#1670) + the ro probe (#1669)
 import sys  # noqa: E402
 import tomllib  # noqa: E402  # stdlib; classifies a malformed SERVICE-config TOML (_env_dir_name + `security show`)
-from collections.abc import Mapping, Sequence  # noqa: E402
+from collections.abc import Awaitable, Mapping, Sequence  # noqa: E402
 from pathlib import (  # noqa: E402
     Path,
 )  # stdlib, imported at interpreter startup — no cost to the fast subcommands
@@ -89,7 +89,7 @@ if TYPE_CHECKING:
     # `hl7schema` call must not pay for it (see the module docstring on deferred heavy imports).
     from messagefoundry.auth.service import AuthService
     from messagefoundry.auth.trust_anchors import TrustAnchorError
-    from messagefoundry.config.settings import ServiceSettings, StoreSettings
+    from messagefoundry.config.settings import ServiceSettings
     from messagefoundry.config.tls_policy import HopPosture
     from messagefoundry.pipeline.security_notify import SecurityEventNotifier
     from messagefoundry.store.base import AdminStore, Store
@@ -7177,18 +7177,19 @@ def _audit_verify(args: argparse.Namespace) -> int:
     )
     if refused is not None:
         return refused
-    unresolved = _refuse_an_unresolvable_store_key(settings.store, as_json=False)
-    if unresolved is not None:
-        return unresolved
+    # Decides exit 4 against exit 1 below. The open computes the same verdict inline, because the
+    # #1916 source guard reads that call's argument, so the two cannot be one expression.
     keyless_refusal = keyless_opt_out_refusal(settings.store, settings.security)
 
     async def run() -> tuple[AuditVerdict, int]:
         # Read-only (BACKLOG #1780, #2101): the evidence is neither migrated nor refused for a schema
         # this build does not match, so a store an incompatible version wrote can still be verified.
-        store = await open_store(
-            settings.store,
-            read_only=True,
-            keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+        store = await _open_store_or_refuse_the_key(
+            open_store(
+                settings.store,
+                read_only=True,
+                keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+            )
         )
         try:
             verdict = await store.verify_audit_chain(expected_anchor=expected_anchor)
@@ -7206,7 +7207,8 @@ def _audit_verify(args: argparse.Namespace) -> int:
     except (
         KeylessAuditChainRefused,
         StoreNotFoundError,
-    ) as exc:  # #1916; #1780: a server database with no store. Could not start.
+        _StoreKeyUnresolved,
+    ) as exc:  # #1916; #1780: a server database with no store; #2725: no key. Could not start.
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
@@ -7223,13 +7225,16 @@ def _audit_verify(args: argparse.Namespace) -> int:
             # broken. The flag decides, never the message, and only a process with no key sets it.
             print("NOT CHECKED: " + (message or ""))
             return 4
-        # Under the audited keyless opt-out the store runs with no key, so a chain whose first row
-        # names one is the anomaly. Reading it as "not checked" would let a forged genesis row turn
-        # every other edit into a 4, so it stays a broken chain.
+        # Under the audited keyless opt-out the store may run with no key, and then a chain whose
+        # first row names one is the anomaly. Reading it as "not checked" would let a forged genesis
+        # row turn every other edit into a 4, so it stays a broken chain. The cost: a store keyed
+        # under the opt-out, verified from a shell missing its key, also exits 1, and the line says
+        # that is the other explanation.
         message = (
-            "audit chain broken: its first row names a store key, but this shell's settings run "
-            "the store keyless (the audited opt-out), and a keyless store's chain never names one. "
-            "Either the chain was altered, or these are not the settings the store runs with"
+            "audit chain broken: its first row names a store key, this shell holds no key, and its "
+            "settings allow the store to run keyless (the audited opt-out), where a chain never "
+            "names one. Either the chain was altered, or this shell lacks the key the store runs "
+            "with"
         )
     print(("OK: " if ok else "FAIL: ") + (message or ""))
     if not ok:
@@ -7300,16 +7305,15 @@ def _audit_anchor(args: argparse.Namespace) -> int:
     )
     if refused is not None:
         return refused
-    unresolved = _refuse_an_unresolvable_store_key(settings.store, as_json=args.json)
-    if unresolved is not None:
-        return unresolved
 
     async def run() -> tuple[int, str]:
         # Read-only, as audit-verify opens it (BACKLOG #1780, #2101).
-        store = await open_store(
-            settings.store,
-            read_only=True,
-            keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+        store = await _open_store_or_refuse_the_key(
+            open_store(
+                settings.store,
+                read_only=True,
+                keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+            )
         )
         try:
             return await store.audit_anchor()
@@ -7318,7 +7322,11 @@ def _audit_anchor(args: argparse.Namespace) -> int:
 
     try:
         count, head = run_guarded(run())
-    except (KeylessAuditChainRefused, StoreNotFoundError) as exc:  # #1916, #1780, as audit-verify
+    except (
+        KeylessAuditChainRefused,
+        StoreNotFoundError,
+        _StoreKeyUnresolved,
+    ) as exc:  # #1916, #1780, #2725, as audit-verify
         _emit_error(str(exc), as_json=args.json)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
@@ -8732,24 +8740,23 @@ def _key_unresolved() -> tuple[type[Exception], ...]:
     return (KeyProviderError, DpapiError, DpapiUnavailable)
 
 
-def _refuse_an_unresolvable_store_key(store: StoreSettings, *, as_json: bool) -> int | None:
-    """Exit 2 when the store key the settings name cannot be resolved, else ``None`` (vault
-    BACKLOG #2725). For ``audit-verify`` and ``audit-anchor``, where 1 is a broken chain's code.
+class _StoreKeyUnresolved(RuntimeError):
+    """The store key the settings name could not be resolved while the store opened (vault BACKLOG
+    #2725). Its text is the resolution error's, which names settings, variables and files."""
 
-    It builds the at-rest cipher, which is what ``open_store`` does first, and opens nothing. So
-    every refusal here comes before any row is read, and nothing a database holds can turn a tamper
-    finding into "could not start". The cost is resolving the key twice, a second Vault round trip
-    where one is used, as ``provision-admin`` already pays. ``ValueError`` covers a malformed key
-    and the Transit client's own refusals; its texts name settings, not values. A key error the
-    open raises later is not caught here, and reaches the dispatch floor."""
-    from messagefoundry.store.base import build_store_cipher
 
+async def _open_store_or_refuse_the_key(opening: Awaitable[Store]) -> Store:
+    """Await a store open, turning a key that cannot be resolved into :class:`_StoreKeyUnresolved`.
+
+    For ``audit-verify`` and ``audit-anchor``, where the dispatch floor's exit 1 is a broken chain's
+    code. Only the OPEN is wrapped: ``open_store`` resolves the key before the backend reads a row,
+    so nothing a database holds can turn a finding into "could not start". A malformed key raises
+    ``ValueError``, which is not caught, because the open raises ``ValueError`` for other reasons too.
+    """
     try:
-        build_store_cipher(store)
-    except _key_unresolved() + (ValueError,) as exc:
-        _emit_error(f"cannot resolve the store key: {exc}", as_json=as_json)
-        return 2
-    return None
+        return await opening
+    except _key_unresolved() as exc:
+        raise _StoreKeyUnresolved(str(exc)) from exc
 
 
 def _emit_store_open_error(exc: sqlite3.DatabaseError, path: str, *, as_json: bool) -> int:

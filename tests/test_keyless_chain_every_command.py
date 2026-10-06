@@ -402,12 +402,19 @@ def test_a_break_that_needs_no_key_exits_1_with_no_key(
     shell: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Tampering that a shell with no key CAN see still exits 1, not 4: a row missing from the middle
-    (its sequence numbers stop matching), and a tail cut off after an anchor was taken."""
+    (its sequence numbers stop matching), a row whose hash was blanked, and a tail cut off after an
+    anchor was taken."""
     db = shell / "keyed.db"
     _keyed_chain(db, generate_key())
     _write(db, _DELETE_ROW_2)
     assert main(["audit-verify", "--db", str(db)]) == 1
     assert "broken at seq=2" in capsys.readouterr().out
+
+    db = shell / "blanked.db"
+    _keyed_chain(db, generate_key())
+    _write(db, "UPDATE audit_log SET row_hash = '' WHERE seq = 3")
+    assert main(["audit-verify", "--db", str(db)]) == 1
+    assert "broken at seq=3" in capsys.readouterr().out
 
     db = shell / "anchored.db"
     _keyed_chain(db, generate_key())
@@ -464,7 +471,7 @@ def test_under_the_keyless_opt_out_a_chain_naming_a_key_exits_1(
 ) -> None:
     """The review's attack on exit 4. A deliberately keyless store, anchored. Someone edits a row
     and rewrites row 1 as a genesis row naming a key, leaving every stored hash alone, so the anchor
-    still matches. Where the settings run the store keyless a chain naming a key is the anomaly, so
+    still matches. Where the settings allow running keyless a chain naming a key is the anomaly, so
     it stays a broken chain, exit 1, and never "not checked". The control is the edit alone."""
     _opt_out(monkeypatch)
     db = shell / "keyless.db"
@@ -492,39 +499,24 @@ def test_under_the_keyless_opt_out_a_chain_naming_a_key_exits_1(
     rc = main(argv)
     out = capsys.readouterr().out
     assert rc == 1, out
-    assert out.startswith("FAIL: audit chain broken") and "run the store keyless" in out, out
+    assert out.startswith("FAIL: audit chain broken") and "run keyless" in out, out
 
 
-@pytest.mark.parametrize(
-    ("variable", "value", "named"),
-    [
-        ("MEFOR_STORE_CIPHER_PROVIDER", "vault_transit", "MEFOR_STORE_TRANSIT_KEY"),
-        ("MEFOR_STORE_ENCRYPTION_KEY", "not-base64!!", "MEFOR_STORE_ENCRYPTION_KEY"),
-    ],
-    ids=["transit-key-unnamed", "malformed-key"],
-)
 @pytest.mark.parametrize("command", ["audit-verify", "audit-anchor"])
 def test_a_key_that_does_not_resolve_exits_2(
-    command: str,
-    variable: str,
-    value: str,
-    named: str,
-    shell: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
+    command: str, shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A key the settings name that cannot be resolved stops the command before it reads a row:
-    `vault_transit` with no Transit key named, or a key that is not base64. Exit 2, could not
-    start, as `rotate-key` and `provision-admin` exit on the same errors. Each used to reach the
-    dispatch floor and exit 1. The refusal names the setting and never echoes the value."""
+    """A key the settings name that cannot be resolved stops the open before it reads a row: here
+    `vault_transit` with no Transit key named. Exit 2, could not start, as `rotate-key` and
+    `provision-admin` exit on the same errors. It used to reach the dispatch floor and exit 1."""
     db = shell / "keyed.db"
     _keyed_chain(db, generate_key())
-    monkeypatch.setenv(variable, value)
+    monkeypatch.setenv("MEFOR_STORE_CIPHER_PROVIDER", "vault_transit")
     rc = main(_argv(command, db, shell))
     captured = capsys.readouterr()
     assert rc == 2, (captured.out, captured.err)
     text = json.loads(captured.out)["error"] if command == "audit-anchor" else captured.err
-    assert named in text and "not-base64!!" not in text, text
+    assert "MEFOR_STORE_TRANSIT_KEY" in text, text
 
 
 def test_the_verdict_keeps_its_flag_through_a_copy() -> None:

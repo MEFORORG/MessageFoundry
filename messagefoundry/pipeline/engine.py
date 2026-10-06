@@ -1105,14 +1105,11 @@ class Engine:
         backends; it is not done here. Read a break as *"at least* a break"."""
         expected_prefix = await self._load_audit_anchor()
         try:
-            # The verdict's `key_unavailable` is NOT read here, on purpose (vault BACKLOG #2725). An
-            # engine holds no key only under the audited keyless opt-out, and there a chain whose
-            # first row names a key is the anomaly: a forged genesis row would otherwise silence
-            # this alert for every other edit. So it alerts as a chain break, as it always has.
-            ok, msg = await self.store.verify_audit_chain(expected_prefix=expected_prefix)
+            verdict = await self.store.verify_audit_chain(expected_prefix=expected_prefix)
         except Exception as exc:  # never let a verify failure crash startup
             log.warning("startup audit-chain verification could not run: %s", safe_exc(exc))
             return
+        ok, msg = verdict
         # Say what the pass COVERED beside the verdict: an anchored pass and a bare one read identically
         # otherwise, and only one of them has ruled out a truncated tail.
         coverage = (
@@ -1125,6 +1122,17 @@ class Engine:
             log.info("startup audit-chain verification: %s (%s)", msg, coverage)
             return
         reason = msg or "audit chain verification failed"
+        if getattr(verdict, "key_unavailable", False):
+            # Vault BACKLOG #2725: unlike `audit-verify`'s exit 4, this stays a chain-break alert.
+            # An engine holds no key only under the audited keyless opt-out, where a chain whose
+            # first row names a key is the anomaly, and "not checked" would let a forged genesis row
+            # silence this alert for every other edit. The store's text says "not a finding", so
+            # the alert carries its own.
+            reason = (
+                "audit chain broken: its first row names a store key, but this engine holds none. "
+                "An engine runs with no key only under the audited keyless opt-out, where a chain "
+                "never names one: either the chain was altered, or the engine lost its key"
+            )
         # verify_audit_chain folds both verdicts into one (ok, message) and reports a chain break FIRST,
         # so the marker is the only thing that separates them without walking the log a second time.
         truncated = AUDIT_PREFIX_BREAK_MARKER in reason
