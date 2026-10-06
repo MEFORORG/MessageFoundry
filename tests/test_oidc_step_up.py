@@ -14,9 +14,11 @@ cross-backend half of the field (persisted at mint, carried by rotation) is in
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import urllib.parse
+from collections.abc import Callable, Coroutine
 from typing import Any
 
 import pytest
@@ -608,5 +610,75 @@ async def test_the_idp_step_up_records_its_address_only_for_an_account_that_owes
 
         assert out.ok, out
         assert await store.list_known_login_addresses(uid, since=0.0) == recorded
+    finally:
+        await store.close()
+
+
+# --- BACKLOG #2153: the reads after the token exchange are freshness checks -------------------------
+
+
+async def _revoke(store: MessageStore, token: str, user_id: str) -> None:
+    await store.revoke_session(hash_token(token))
+
+
+async def _disable(store: MessageStore, token: str, user_id: str) -> None:
+    await store.set_user_disabled(user_id, disabled=True)
+
+
+async def _rebind(store: MessageStore, token: str, user_id: str) -> None:
+    await store.set_user_federated_subject(user_id, "https://idp.example", "someone-else")
+    user = await store.get_user(user_id)
+    # Without this the arm could pass on a write that never happened.
+    assert user is not None and user.oidc_subject == "someone-else"
+
+
+async def _nothing(store: MessageStore, token: str, user_id: str) -> None:
+    return None
+
+
+@pytest.mark.parametrize(
+    ("change", "elevated"),
+    [(_revoke, False), (_disable, False), (_rebind, False), (_nothing, True)],
+    ids=["revoked", "disabled", "rebound", "control"],
+)
+async def test_an_account_change_during_the_token_exchange_is_not_elevated(
+    rsa_key: rsa.RSAPrivateKey,
+    monkeypatch: pytest.MonkeyPatch,
+    change: Callable[[MessageStore, str, str], Coroutine[Any, Any, None]],
+    elevated: bool,
+) -> None:
+    """BACKLOG #2153 step 2 asked to reuse the reads taken before the exchange. It is declined, and
+    this pins why. The exchange is a network round trip, and the session or the account can change
+    while it runs. The session and user reads after it are what see that change, so reusing the
+    earlier reads would elevate a session revoked, disabled or re-bound in the meantime. The control
+    arm changes nothing and must elevate, or the refusals prove nothing about the race."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key)
+        token = await _oidc_session(service, monkeypatch, rsa_key)
+        uid = await _user_id(service, token)
+        flow_id, _url = await _begin(service, token)
+        loop = asyncio.get_running_loop()
+        real = service._exchange_and_validate
+
+        def _racing(code: str, flow: oidc.PendingFlow, redirect_uri: str) -> Any:
+            principal = real(code, flow, redirect_uri)
+            # This runs in the worker thread while the loop waits on it, so the loop is free to
+            # run the change. It lands after the IdP answered and before the service reads again.
+            asyncio.run_coroutine_threadsafe(change(store, token, uid), loop).result(timeout=10)
+            return principal
+
+        monkeypatch.setattr(service, "_exchange_and_validate", _racing)
+        out = await _return_from_idp(service, monkeypatch, rsa_key, flow_id)
+
+        assert out.ok is elevated, out
+        if elevated:
+            assert out.elevation.token is not None
+            session = await store.get_session(hash_token(out.elevation.token))
+            assert session is not None and session.reauth_at is not None
+        else:
+            # The staged session was neither rotated nor stamped.
+            session = await store.get_session(hash_token(token))
+            assert session is not None and session.reauth_at is None
     finally:
         await store.close()
