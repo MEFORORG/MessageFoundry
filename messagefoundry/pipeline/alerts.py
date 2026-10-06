@@ -351,10 +351,9 @@ class AlertSink(Protocol):
         mass-revoke breaker is not tripped, as the auth service judges it
         (``AuthService._mark_reconcile_clears`` states the test). Emits **no** notification; when
         alert-state is wired (ADR 0044) it auto-resolves the open ``ad_reconcile_aborted`` instance
-        for the same ``name`` (``"directory-reconciler"``). Raised on every such pass, so a resolve
-        that failed to write is retried, and an instance left open by an engine that stopped while
-        tripped is resolved by the next run. No PHI. Emitted by the API-lifespan reconciler task,
-        never from ``auth/``."""
+        for the same ``name`` (``"directory-reconciler"``). Raised on every such pass, and never
+        where another reconciler may share the store (``api/app.py::_without_clears``). No PHI.
+        Emitted by the API-lifespan reconciler task, never from ``auth/``."""
         ...
 
     def ad_reconcile_hold_released(self, name: str) -> None:
@@ -362,8 +361,8 @@ class AlertSink(Protocol):
         undetermined-wave hold stands, by the same service-side test as
         :meth:`ad_reconcile_breaker_cleared`. Emits **no** notification; when alert-state is wired
         (ADR 0044) it auto-resolves the open ``ad_reconcile_held`` instance for the same ``name``
-        (``"directory-reconciler"``). Raised on every such pass. No PHI. Emitted by the API-lifespan
-        reconciler task, never from ``auth/``."""
+        (``"directory-reconciler"``). Raised as :meth:`ad_reconcile_breaker_cleared` is. No PHI.
+        Emitted by the API-lifespan reconciler task, never from ``auth/``."""
         ...
 
     def ad_session_revoked(self, name: str, *, reason: str) -> None:

@@ -34,6 +34,7 @@ from messagefoundry.auth.notifications import USERNAME_CHANGED
 from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.service import AuthService, DirectoryObjectIdMissing
 from messagefoundry.config.settings import AuthSettings
+from messagefoundry.store.crypto import CipherError
 from messagefoundry.store.store import SCOPE_SOURCE_AD, SCOPE_SOURCE_MANUAL, MessageStore
 from tests._admin_account import create_local_user_chosen
 
@@ -1240,13 +1241,27 @@ async def _two_unkeyed_bindings(store: MessageStore) -> AuthService:
     return service
 
 
-async def test_a_refused_skip_report_logs_one_error_per_pass_not_one_per_account(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+async def _reported(store: MessageStore) -> list[str]:
+    return sorted(
+        json.loads(a["detail"])["username"]
+        for a in await store.list_audit()
+        if a["action"] == "auth.ad_reconcile_binding_unkeyed"
+    )
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    [sqlite3.OperationalError("synthetic: disk I/O error"), CipherError("synthetic: Transit down")],
+    ids=["driver", "transit-mac"],
+)
+async def test_a_refused_skip_report_logs_once_per_pass_and_tries_the_next_account_next(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, refusal: Exception
 ) -> None:
-    """The Lander's finding 6 on PR 2036. While the write keeps failing, ``main`` logged one ERROR
-    per pass, because the first failure ended the pass. Logging it and going on must not turn that
-    into one traceback per unkeyed account on every pass. Both accounts are still reported once the
-    store accepts the write again."""
+    """The Lander's finding 6 on PR 2036. While the store refuses every write, ``main`` logged one
+    ERROR per pass, because the first failure ended the pass. So does this: the report stops at the
+    first refusal, which also keeps a pool that times out each write to one timeout per pass. The
+    account it refused goes last next pass, so the next account is tried. Both are reported once the
+    store accepts the write. A Transit outage refuses like a driver error (ADR 0138)."""
     store = await MessageStore.open(":memory:")
     try:
         service = await _two_unkeyed_bindings(store)
@@ -1255,45 +1270,63 @@ async def test_a_refused_skip_report_logs_one_error_per_pass_not_one_per_account
 
         async def failing(action: str, **kwargs: Any) -> None:
             if action == "auth.ad_reconcile_binding_unkeyed":
-                attempts.append(action)
-                raise sqlite3.OperationalError("synthetic: disk I/O error")
+                attempts.append(json.loads(kwargs["detail"])["username"])
+                raise refusal
             await real_record(action, **kwargs)
 
         monkeypatch.setattr(store, "record_audit", failing)
         for _ in range(2):
             caplog.clear()
-            with caplog.at_level(logging.ERROR, logger="messagefoundry.auth.service"):
+            with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
                 assert (await service.reconcile_directory_sessions()).aborted is None
-            errors = [
-                r
-                for r in caplog.records
-                if r.levelno == logging.ERROR
-                and "auth.ad_reconcile_binding_unkeyed" in r.getMessage()
-            ]
-            assert len(errors) == 1, "one ERROR per pass while the write keeps failing"
-        # Every account is still tried on every pass, so one row the store refuses cannot starve
-        # the reports behind it.
-        assert len(attempts) == 4, "a pass stopped writing after the store refused one row"
+            messages = [r.getMessage() for r in caplog.records]
+            assert sum("auth.ad_reconcile_binding_unkeyed" in m for m in messages) == 1
+            assert sum("carries a federated binding" in m for m in messages) == 1
+        assert sorted(attempts) == ["legacy1", "legacy2"], "the refused account was tried first"
 
         monkeypatch.setattr(store, "record_audit", real_record)
         await service.reconcile_directory_sessions()
-        reported = [
-            json.loads(a["detail"])["username"]
-            for a in await store.list_audit()
-            if a["action"] == "auth.ad_reconcile_binding_unkeyed"
-        ]
-        assert sorted(reported) == ["legacy1", "legacy2"]
+        assert await _reported(store) == ["legacy1", "legacy2"]
     finally:
         await store.close()
 
 
-@pytest.mark.parametrize("defect", [NotImplementedError, RecursionError])
+async def test_one_skip_report_the_store_keeps_refusing_does_not_starve_the_rest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refusal tied to one row: the account behind it goes last, so the others are reported on
+    the next pass and only it is retried after them."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _two_unkeyed_bindings(store)
+        real_record = store.record_audit
+        attempts: list[str] = []
+
+        async def failing(action: str, **kwargs: Any) -> None:
+            if action == "auth.ad_reconcile_binding_unkeyed":
+                name = json.loads(kwargs["detail"])["username"]
+                attempts.append(name)
+                if name == attempts[0]:
+                    raise sqlite3.OperationalError("synthetic: this row is refused")
+            await real_record(action, **kwargs)
+
+        monkeypatch.setattr(store, "record_audit", failing)
+        await service.reconcile_directory_sessions()
+        await service.reconcile_directory_sessions()
+        refused = attempts[0]
+        assert await _reported(store) == sorted({"legacy1", "legacy2"} - {refused})
+        assert attempts == [refused, *sorted({"legacy1", "legacy2"} - {refused}), refused]
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("defect", [NotImplementedError, RecursionError, sqlite3.ProgrammingError])
 async def test_a_defect_in_a_reconciler_audit_write_is_raised_not_passed_over(
-    monkeypatch: pytest.MonkeyPatch, defect: type[RuntimeError]
+    monkeypatch: pytest.MonkeyPatch, defect: type[Exception]
 ) -> None:
     """The Lander's finding 4 on PR 2036. The catch keeps ``RuntimeError`` because the store raises
     it for its own refusals. Its two subclasses that mean a defect in the code, not a refused write,
-    still end the pass."""
+    still end the pass, and so does a bad statement on SQLite."""
     store = await MessageStore.open(":memory:")
     try:
         service = await _two_unkeyed_bindings(store)
