@@ -561,8 +561,14 @@ def transform_one(
         # closed HERE if unknown: an undeliverable target would otherwise enqueue a row no worker drains
         # (silent accept-and-strand). A non-PT inbound is NOT a valid target (only an outbound or a PT).
         tic = registry.inbound.get(send.to)
+        foreign_pt = registry.all_pt_inbound
         if tic is not None and tic.spec.type is ConnectorType.PT:
             is_pt, deployed = True, tic.deployed
+        elif tic is None and foreign_pt is not None and send.to in foreign_pt:
+            # Engine-sharded: a PT ANOTHER shard owns (vault BACKLOG #2755). `inbound` holds only this
+            # shard's, so resolve against the pinned whole-config PT map. The child INGRESS row lands
+            # in the unified store (ADR 0063) and the owning shard's router worker drains it.
+            is_pt, deployed = True, foreign_pt[send.to]
         else:
             is_pt = False
             oc = registry.outbound.get(send.to)
