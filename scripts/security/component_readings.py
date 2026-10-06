@@ -40,11 +40,13 @@ from the page's own tiers. ``tests/test_risky_component_designation.py`` re-deri
 and re-renders the section, WITHOUT the network, and fails if either differs from what is tracked.
 
 WHAT A WHEEL CARRIES is answered by a third file, ``security/bundled-code-survey.json`` (BACKLOG
-#2935): a survey, made by hand, of whether each pinned wheel carries another project's compiled
-code. This script never writes it. It renders it into the same page section, and
-``survey_problems`` holds it to the snapshot: one answer per reading at the reading's pin, and a
-route for each not-designated wheel that was not shown to carry nothing. A run that leaves the
-survey behind says so and exits 1, after writing the snapshot and the page.
+#2935): a survey, made by hand, of whether each pinned wheel carries a package, a library tree or
+a data set of another project, as compiled code, source code or data. A single module adapted
+from another project is recorded where the survey's search found one, and changes no answer. This
+script never writes the survey. It renders it into the same page section, and ``survey_problems``
+holds it to the snapshot: one answer per reading at the reading's pin, an answer for every form,
+and a route for each not-designated wheel that counts as carrying another project's code. A run
+that leaves the survey behind says so and exits 1, after writing the snapshot and the page.
 
 A full run needs the network and runs by hand, never in CI. Standard library only, like
 ``runtime_closure.py`` beside it, so it runs under any Python 3.11 or later with nothing installed:
@@ -156,9 +158,16 @@ EXTRAS_HEADING = "### The names the assessed extras add"
 #: The rendered subsection that says what each wheel carries inside it, from ``SURVEY``.
 SURVEY_HEADING = "### What each wheel carries inside it"
 
-#: A survey answer to "does the pinned wheel carry another project's compiled code". The last one
-#: counts as carrying wherever a route is decided: a guessed "no" is what the survey exists to stop.
+#: A survey answer to "does the pinned wheel carry a bundled copy of another project in this form".
+#: The last one counts as carrying code wherever a route is decided: a guessed "no" is what the
+#: survey exists to stop.
 CARRIES = ("yes", "no", "not established")
+#: The forms the survey answers for. A wheel's top-level ``carries`` and ``projects`` answer for
+#: compiled code; its ``source`` and ``data`` entries answer for the other two.
+FORMS = ("compiled", "source", "data")
+#: The forms that are another project's CODE. Carrying one is what owes a not-designated wheel a
+#: route. Data alone owes none: the page lists it and says why.
+CODE_FORMS = ("compiled", "source")
 #: What an answer may rest on. A ``none-any`` wheel whose files were listed can only support "no".
 #: A source-tree answer names the source distribution it read. A file-list answer names wheels
 #: only: no source distribution was read, so it cannot show what is linked into a compiled file,
@@ -173,6 +182,16 @@ EVIDENCE_KINDS = (TAG_AND_LIST, SOURCE_TREE, FILE_LIST, METADATA_ONLY)
 #: carries, or read the carried project's own advisories. A ``read`` route records these fields.
 ROUTES = ("highlight", "read")
 READ_FIELDS = ("source", "date", "version", "result")
+#: What a file the word search hit was recorded as. Only the first is listed on the page: a single
+#: module adapted from another project. It is not the survey's unit, and is owed no route.
+ADAPTED, COPIED_LINES, PROSE = "adapted module", "copied lines", "prose"
+HIT_KINDS = (ADAPTED, COPIED_LINES, PROSE)
+#: The rules of the source and data search that the control must be shown to fire. Each needs a
+#: path in the control wheel that it fired on.
+CONTROL_RULES = ("directory", "licence file", "data", "words")
+#: What the record's ``search`` entry must state: the lists as lists, the rules as text.
+SEARCH_LISTS = ("directories", "words", "suffixes", "cannot_see")
+SEARCH_RULES = ("directory_rule", "top_level_rule", "licence_rule", "size_rule", "word_rule")
 
 
 class Advisory(TypedDict):
@@ -594,14 +613,55 @@ def snapshot(as_of: dt.date, fetch: Fetch = fetch_json) -> dict[str, Any]:
 # --- The survey of what each wheel carries (BACKLOG #2935) ---------------------------------------
 
 
+def form_answer(wheel: Mapping[str, Any], form: str) -> Mapping[str, Any]:
+    """The wheel's answer for one form: its ``carries``, ``projects`` and ``evidence``.
+
+    Compiled code is answered by the wheel's own top-level fields. A missing entry for another
+    form is an empty answer, which ``survey_problems`` reports.
+    """
+    answer = wheel if form == "compiled" else wheel.get(form)
+    return answer if isinstance(answer, Mapping) else {}
+
+
+def carries_code(wheel: Mapping[str, Any]) -> bool:
+    """Whether the wheel counts as carrying another project's code, compiled or source.
+
+    It does unless both code forms were shown to be "no" and the data answer was established. An
+    answer that is not established, for any form, counts as code: what is in the wheel is not known.
+    """
+    return any(form_answer(wheel, form).get("carries") != "no" for form in CODE_FORMS) or (
+        form_answer(wheel, "data").get("carries") not in ("yes", "no")
+    )
+
+
+def carries_anything(wheel: Mapping[str, Any]) -> bool:
+    """Whether any form's answer is other than a shown "no"."""
+    return any(form_answer(wheel, form).get("carries") != "no" for form in FORMS)
+
+
 def _needs_route(wheel: Mapping[str, Any], labels: Mapping[str, str]) -> bool:
-    """Whether the page owes this wheel a route: it is not designated, and "no" was not shown."""
-    return wheel["name"] not in labels and wheel.get("carries") != "no"
+    """Whether the page owes this wheel a route: it is not designated, and counts as carrying code."""
+    return wheel["name"] not in labels and carries_code(wheel)
 
 
 def _said(value: object) -> bool:
     """Whether a recorded field says anything: a JSON null, or blank text, does not."""
     return bool(str(value or "").strip())
+
+
+def _said_list(value: object) -> bool:
+    """Whether a recorded field is a list with an entry, where every entry says something."""
+    return isinstance(value, list) and bool(value) and all(_said(item) for item in value)
+
+
+def _entries(value: object) -> list[Mapping[str, Any]]:
+    """A recorded list of entries, each as a mapping. An entry of another shape reads as empty.
+
+    So a malformed entry is reported by the check on its fields, and never raises there or in
+    the renderer.
+    """
+    items = value if isinstance(value, list) else []
+    return [item if isinstance(item, Mapping) else {} for item in items]
 
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -627,13 +687,51 @@ def survey_problems(
 
     One answer per reading, at the reading's pin, so a re-read that moves a pin leaves the survey
     behind visibly. Each answer names the files it was read from, and each file name must carry
-    the surveyed pin, so moving the pin alone does not pass. A not-designated wheel that carries,
-    or whose answer is not established, must have a route; a designated wheel, or one shown to
-    carry nothing, must have none. Each file named must carry a sha256, a source-tree answer
-    must name a wheel and a source distribution, a file-list answer wheels only, and a metadata
-    answer no file. A missing field of a wheel is reported, never raised, except its ``name``.
+    the surveyed pin, so moving the pin alone does not pass. Each file named must carry a sha256,
+    a source-tree answer must name a wheel and a source distribution, a file-list answer wheels
+    only, and a metadata answer no file. A missing or malformed field of a wheel is reported,
+    never raised, except its ``name``.
+
+    Every wheel answers for every form in ``FORMS``. A source or data answer of "yes" or "no"
+    needs a wheel that was listed, and those answers may not be dated before the compiled one.
+
+    The route rule reads all the forms. A not-designated wheel is owed a route when it carries
+    another project's code, compiled or source, or when any form's answer is not established. A
+    designated wheel is owed none. Nor is a wheel shown to carry no code from another project,
+    whether it carries nothing or carries data only.
+
+    The record must state its search under ``search``, and name a control wheel outside the
+    survey with a path for each rule in ``CONTROL_RULES`` that fired on it. Each file the word
+    search hit is recorded with a kind in ``HIT_KINDS``, and the files recorded as adapted modules
+    must be the ones ``adapted_modules`` names. A wheel nobody fetched can record neither.
     """
     problems: list[str] = []
+    search = survey.get("search")
+    search = search if isinstance(search, Mapping) else {}
+    if not all(_said_list(search.get(key)) for key in SEARCH_LISTS) or not all(
+        _said(search.get(key)) for key in SEARCH_RULES
+    ):
+        problems.append(f"the survey does not state its search: {SEARCH_LISTS + SEARCH_RULES}")
+    listed = search.get("words")
+    words = {str(word) for word in listed} if isinstance(listed, list) else set()
+    control = survey.get("control")
+    control = control if isinstance(control, Mapping) else {}
+    fired = control.get("fired_on")
+    fired = fired if isinstance(fired, Mapping) else {}
+    if not (
+        _said(control.get("file"))
+        and _SHA256.fullmatch(str(control.get("sha256", "")))
+        and all(_said_list(fired.get(rule)) for rule in CONTROL_RULES)
+    ):
+        problems.append(
+            "the survey names no control with a path that each rule of its search fired on: "
+            f"{CONTROL_RULES}"
+        )
+    if str(control.get("word")) not in words:
+        problems.append("the control names no listed word that the word search hit")
+    surveyed_names = {str(wheel["name"]) for wheel in survey["wheels"]}
+    if _file_pin(str(control.get("file", "")))[0] in surveyed_names:
+        problems.append("the control is one of the surveyed wheels, so it controls nothing")
     pins = {r["name"]: r["pinned"] for r in data["readings"]}
     answers: dict[str, Mapping[str, Any]] = {}
     for wheel in survey["wheels"]:
@@ -656,16 +754,14 @@ def survey_problems(
             problems.append(f"{name}: no date is recorded for the answer")
         carries, kind = wheel.get("carries"), wheel.get("evidence_kind")
         projects = wheel.get("projects") or []
-        read = wheel.get("files_read") or []
+        read = _entries(wheel.get("files_read"))
         files = [str(f.get("file", "")) for f in read]
         wheels_named = sum(f.endswith(".whl") for f in files)
         if carries not in CARRIES:
             problems.append(f"{name}: the answer {carries!r} is not one of {CARRIES}")
         if kind not in EVIDENCE_KINDS or not _said(wheel.get("evidence")):
             problems.append(f"{name}: no evidence of a known kind is recorded")
-        if (carries == "yes") != bool(projects) or not all(
-            _said(p.get("name")) and _said(p.get("version")) for p in projects
-        ):
+        if (carries == "yes") != bool(projects) or not _projects_named(projects):
             problems.append(f"{name}: the answer {carries!r} does not match the projects named")
         # Project metadata lists no file, so it cannot show that a wheel carries nothing.
         if kind == METADATA_ONLY:
@@ -685,47 +781,265 @@ def survey_problems(
             problems.append(f"{name}: the files read do not match the evidence kind {kind!r}")
         if not all(_SHA256.fullmatch(str(f.get("sha256", ""))) for f in read):
             problems.append(f"{name}: a file read has no sha256 recorded")
+        for form in FORMS[1:]:
+            answer = form_answer(wheel, form)
+            said, named = answer.get("carries"), answer.get("projects") or []
+            if said not in CARRIES:
+                problems.append(f"{name}: no answer for {form} that is one of {CARRIES}")
+                continue
+            if (said == "yes") != bool(named) or not _projects_named(named):
+                problems.append(f"{name}: the {form} answer {said!r} does not match the projects")
+            if not _said(answer.get("evidence")):
+                problems.append(f"{name}: no evidence is recorded for {form}")
+            # A file list is what shows source or data, so an answer needs a wheel that was read.
+            if said != "not established" and not wheels_named:
+                problems.append(f"{name}: a {form} answer of {said!r} names no wheel it listed")
+        try:
+            forms_day = dt.date.fromisoformat(str(wheel.get("forms_surveyed")))
+        except ValueError:
+            problems.append(f"{name}: no date is recorded for the source and data answers")
+        else:
+            # An unreadable ``surveyed`` is reported above, and is not reported again here.
+            try:
+                early = forms_day < dt.date.fromisoformat(str(wheel.get("surveyed")))
+            except ValueError:
+                early = False
+            if early:
+                problems.append(f"{name}: the source and data answers are dated before the first")
+        problems += [f"{name}: {problem}" for problem in _hit_problems(wheel, words, wheels_named)]
         route = wheel.get("route")
         if not _needs_route(wheel, labels):
             if route is not None:
                 problems.append(f"{name}: a route is recorded where the page owes none")
         elif route not in ROUTES or not _said(wheel.get("route_reason")):
-            problems.append(f"{name}: not designated and not shown to carry nothing, with no route")
+            problems.append(f"{name}: not designated and not shown to carry no code, with no route")
         elif route == "read" and not all(
-            _said((wheel.get("read") or {}).get(field)) for field in READ_FIELDS
+            _said(_entries([wheel.get("read")])[0].get(field)) for field in READ_FIELDS
         ):
             problems.append(f"{name}: a read route must record {READ_FIELDS}")
     return problems
 
 
-def _carried(wheel: Mapping[str, Any]) -> str:
-    """What the wheel carries, for a table cell: each project, and its version or the lack of one."""
+def _projects_named(projects: object) -> bool:
+    """Whether ``projects`` is a list whose every entry is a mapping with a name and a version."""
+    return isinstance(projects, list) and all(
+        isinstance(p, Mapping) and _said(p.get("name")) and _said(p.get("version"))
+        for p in projects
+    )
+
+
+def _hit_problems(wheel: Mapping[str, Any], words: set[str], wheels_named: int) -> list[str]:
+    """Where a wheel's word-search hits and adapted modules are not recorded as the page needs.
+
+    Both must be lists. Each hit names its files, the listed words that hit and a kind in
+    ``HIT_KINDS``, and says what the hit is. Each adapted module names its file, the project the
+    file names and the words that say so. The files recorded as adapted modules must be the same
+    in both lists, so neither can be edited alone. A wheel that was not fetched records none.
+    """
+    hits, modules = wheel.get("word_hits"), wheel.get("adapted_modules")
+    if not isinstance(hits, list) or not isinstance(modules, list):
+        return ["the word-search hits and the adapted modules are not both recorded as lists"]
+    if not wheels_named:
+        return ["a wheel that was not fetched records a word-search hit"] if hits or modules else []
+    problems = []
+    for hit in _entries(hits):
+        named = hit.get("words")
+        if not (
+            _said_list(hit.get("files"))
+            and _said_list(named)
+            and {str(word) for word in named or []} <= words
+            and hit.get("kind") in HIT_KINDS
+            and _said(hit.get("says"))
+        ):
+            problems.append(f"a word-search hit is not fully recorded: {hit.get('files')!r}")
+    if not all(
+        _said(m.get(key)) for m in _entries(modules) for key in ("file", "project", "words")
+    ):
+        problems.append("an adapted module lacks its file, its project or its words")
+    as_hits = {
+        str(file)
+        for hit in _entries(hits)
+        if hit.get("kind") == ADAPTED and isinstance(hit.get("files"), list)
+        for file in hit["files"]
+    }
+    as_modules = {str(m.get("file")) for m in _entries(modules)}
+    if as_hits != as_modules:
+        problems.append(
+            f"the adapted modules and the hits of that kind differ on {sorted(as_hits ^ as_modules)}"
+        )
+    return problems
+
+
+_FORM_WORDS = {"compiled": "compiled code", "source": "source code", "data": "data"}
+
+#: The page's unit, stated once: what counts as a bundled copy. The guard holds this exact text.
+SURVEY_UNIT = (
+    "**This page's unit.** A bundled copy counts when it is a package, a library tree or a data "
+    "set of another project, in any form. The forms are compiled code, source code and data. A "
+    "single module adapted from another project is not that unit. It is recorded where the "
+    "search found one, and is owed no route. Lines copied into a wheel's own module are not "
+    "counted."
+)
+
+#: The page's rule for which wheel is owed a route, stated once. The guard holds this exact text.
+SURVEY_CRITERION = (
+    "**This page's criterion.** A wheel that is not designated is owed a route when it carries "
+    "another project's code, compiled or source. A wheel that carries only another project's "
+    "data is listed below with what it carries. It is owed no route, because data holds another "
+    "project's tables and none of its logic. That holds where the tables are kept as generated "
+    "Python modules too. That line is this page's choice, and a reader can draw it elsewhere: "
+    "data still decides things, as a list of root certificates decides what is trusted. A wheel "
+    "whose answer is not established, for any form, is treated as carrying code."
+)
+
+
+def _carried(wheel: Mapping[str, Any], forms: Iterable[str] = ("compiled",)) -> str:
+    """What the wheel carries in ``forms``, for a table cell: each project, and its version."""
     words = {"not established": ", version not established", "as locked": ""}
     return (
         "; ".join(
-            str(p.get("name")) + words.get(str(p.get("version")), f" {p.get('version')}")
-            for p in wheel.get("projects") or []
+            # ``display`` is the whole phrase, for a project whose name and version do not join.
+            str(p["display"])
+            if _said(p.get("display"))
+            else str(p.get("name")) + words.get(str(p.get("version")), f" {p.get('version')}")
+            for form in forms
+            for p in _entries(form_answer(wheel, form).get("projects"))
         )
         or "not established"
     )
 
 
-def _surveyed_on(wheels: list[Mapping[str, Any]]) -> str:
-    """The day the answers were made, or the span of days where some were made again later."""
-    days = sorted({str(w.get("surveyed")) for w in wheels})
-    return f"on {days[0]}" if len(days) == 1 else f"between {days[0]} and {days[-1]}"
+def _days(days: Iterable[object]) -> str:
+    """One day, or the span of days where some answers were made again later."""
+    span = sorted({str(day) for day in days})
+    return f"on {span[0]}" if len(span) == 1 else f"between {span[0]} and {span[-1]}"
+
+
+def _form_evidence(wheel: Mapping[str, Any], form: str) -> str:
+    """The kind of evidence behind one form's answer, for a table cell."""
+    if form == "compiled":
+        return str(wheel.get("evidence_kind"))
+    listed = any(str(f.get("file", "")).endswith(".whl") for f in _entries(wheel.get("files_read")))
+    # The source and data search lists the wheel and opens files in it, so it is more than a list.
+    return "wheel file list and files opened" if listed else "wheel not fetched"
+
+
+def survey_counts(wheels: Iterable[Mapping[str, Any]], form: str) -> str:
+    """The page's count sentence for one form, with its arithmetic."""
+    said = [form_answer(w, form).get("carries") for w in wheels]
+    # Anything that is not a plain yes or no counts as not established, a missing answer too, so
+    # the arithmetic printed is always true.
+    yes, no = said.count("yes"), said.count("no")
+    unknown = len(said) - yes - no
+    return (
+        f"**Another project's {_FORM_WORDS[form]}: found in {yes} of {len(said)}. Not found in "
+        f"{no}. Not established: {unknown}. {yes} plus {no} plus {unknown} is {len(said)}.**"
+    )
+
+
+def _listed_count(search: Mapping[str, Any], key: str) -> str:
+    """How many entries the record's search lists under ``key``, or that it lists none."""
+    listed = search.get(key)
+    return str(len(listed)) if isinstance(listed, list) and listed else "no recorded"
+
+
+def _listed_names(search: Mapping[str, Any], key: str) -> str:
+    """The entries the record's search lists under ``key``, each in code marks, or that none is."""
+    listed = search.get(key)
+    if not (isinstance(listed, list) and listed):
+        return "not recorded"
+    return ", ".join(f"`{item}`" for item in listed)
+
+
+def _first(paths: object) -> str:
+    """The first path a control rule fired on, or that none is recorded."""
+    return str(paths[0]) if isinstance(paths, list) and paths else "not recorded"
+
+
+def hit_counts(wheels: Iterable[Mapping[str, Any]]) -> dict[str, int]:
+    """How many files the word search hit, by the kind each was recorded as."""
+    counts = dict.fromkeys(HIT_KINDS, 0)
+    for wheel in wheels:
+        for hit in _entries(wheel.get("word_hits")):
+            files, kind = hit.get("files"), hit.get("kind")
+            # A kind that is not text cannot be a key, and is reported by ``_hit_problems``.
+            if isinstance(kind, str) and kind in counts and isinstance(files, list):
+                counts[kind] += len(files)
+    return counts
+
+
+def _render_adapted(wheels: list[Mapping[str, Any]], labels: Mapping[str, str]) -> list[str]:
+    """What the word search hit: its counts, the adapted modules, and a wheel's own second line."""
+    counts = hit_counts(wheels)
+    searched = sum(
+        any(str(f.get("file", "")).endswith(".whl") for f in _entries(w.get("files_read")))
+        for w in wheels
+    )
+    out = [
+        "",
+        f"The word search ran over the {searched} wheels that were fetched. It hit "
+        + _count(sum(counts.values()), "file", "files")
+        + f". Counted in files: {_count(counts[ADAPTED], 'holds', 'hold')} a single module "
+        f"adapted from another project, {_count(counts[COPIED_LINES], 'holds', 'hold')} lines "
+        f"copied into a wheel's own module, and {_count(counts[PROSE], 'holds', 'hold')} prose "
+        "that marks no copy, such as a project's own licence header. The record lists each hit "
+        "under its wheel.",
+    ]
+    rows = [
+        f"| `{w['name']}` | `{m.get('file')}` | {m.get('project')} | "
+        f"{'yes, ' + labels[w['name']] if w['name'] in labels else 'no'} |"
+        for w in wheels
+        for m in _entries(w.get("adapted_modules"))
+    ]
+    if rows:
+        out += [
+            "",
+            "**Single modules adapted from another project, as found:**",
+            "",
+            "| Component | File | The project the file names | Designated above |",
+            "|---|---|---|---|",
+            *rows,
+            "",
+            "Each row is what the file says of itself. No file was compared with the project it "
+            "names, and no advisory for that project was read. Under the unit above, none of "
+            "these moves a count or owes a route. The list is what the word search found, and "
+            "it is not a full list: a module adapted from another project that does not say so "
+            "in one of the listed words is not in it.",
+        ]
+    for wheel in wheels:
+        for line in _entries(wheel.get("own_release_lines")):
+            out += [
+                "",
+                f"`{wheel['name']}` also holds a second release line of its own project: "
+                f"`{line.get('path')}`, {line.get('files')} files, version {line.get('version')}. "
+                "That is the same project, so it is not counted as another project's source. An "
+                f"advisory against that line would name `{wheel['name']}`, at that line's own "
+                "version numbers. The reading above asks OSV for every advisory recorded under "
+                "that name, at any version, and for the ones that affect the pinned version. An "
+                "advisory OSV records against that line would be among the first. Nothing was "
+                f"asked at version {line.get('version')}, so the reading does not say which "
+                "advisories affect that line.",
+            ]
+    return out
 
 
 def _render_survey(survey: Mapping[str, Any], labels: Mapping[str, str]) -> list[str]:
-    """The survey subsection: what was found, on what evidence, and the route each wheel took."""
+    """The survey subsection: what was found in each form, on what evidence, and each route."""
     wheels = sorted(survey["wheels"], key=lambda w: str(w["name"]))
     size = len(wheels)
-    counts = {answer: sum(w.get("carries") == answer for w in wheels) for answer in CARRIES}
     routed = [w for w in wheels if _needs_route(w, labels)]
+    control = survey.get("control")
+    control = control if isinstance(control, Mapping) else {}
+    fired = control.get("fired_on")
+    fired = fired if isinstance(fired, Mapping) else {}
+    search = survey.get("search")
+    search = search if isinstance(search, Mapping) else {}
 
     def route(wheel: Mapping[str, Any]) -> str:
         if wheel["name"] in labels:
             return f"designated, {labels[wheel['name']]}"
+        if not carries_code(wheel):
+            return "none owed: data only"
         words = {"highlight": "highlighted below", "read": "read below"}
         return words.get(str(wheel.get("route")), "none")
 
@@ -733,26 +1047,38 @@ def _render_survey(survey: Mapping[str, Any], labels: Mapping[str, str]) -> list
         SURVEY_HEADING,
         "",
         "The vulnerability-history test reads advisories by PyPI name. This survey asks what "
-        f"that test cannot: whether each of the {size} pinned wheels carries compiled code from "
-        f"another project. It was made by hand {_surveyed_on(wheels)}, against the pins the "
-        "snapshot reads. Its evidence, the files read and their hashes are recorded in "
+        f"that test cannot: whether each of the {size} pinned wheels carries a bundled copy of "
+        "another separately distributed project, and in what form. The "
+        f"compiled-code answers were made by hand {_days(w.get('surveyed') for w in wheels)}, "
+        f"and the source and data answers {_days(w.get('forms_surveyed') for w in wheels)}, "
+        "against the pins the snapshot reads. The evidence, the files read and their hashes are "
+        "recorded in "
         "[`security/bundled-code-survey.json`](../security/bundled-code-survey.json). A run of "
         "the script does not repeat it.",
         "",
-        f"**Carries another project's compiled code: {counts['yes']} of {size}. Does not: "
-        f"{counts['no']}. Not established: {counts['not established']}. {counts['yes']} plus "
-        f"{counts['no']} plus {counts['not established']} is {size}.**",
+        SURVEY_UNIT,
         "",
-        "A wheel whose answer is not established is treated as carrying.",
+        SURVEY_CRITERION,
+    ]
+    for form in FORMS:
+        out += ["", survey_counts(wheels, form)]
+    out += [
         "",
-        "| Component | Pinned | Carries | Evidence | Route |",
-        "|---|---|---|---|---|",
+        "Each count is what the search described below found, and not a statement of what a "
+        "wheel holds. The search reads names, sizes and marked text. It can miss a copy that has "
+        "no marker, so a wheel counted as not found can still carry one.",
+        "",
+        "The table has one row for each wheel and form where the answer is not a plain no.",
+        "",
+        "| Component | Pinned | Form | Carries | Evidence | Route |",
+        "|---|---|---|---|---|---|",
     ]
     out += [
-        f"| `{w['name']}` | {w.get('pinned')} | {_carried(w)} | {w.get('evidence_kind')} "
-        f"| {route(w)} |"
+        f"| `{w['name']}` | {w.get('pinned')} | {_FORM_WORDS[form]} | {_carried(w, (form,))} "
+        f"| {_form_evidence(w, form)} | {route(w)} |"
         for w in wheels
-        if w.get("carries") != "no"
+        for form in FORMS
+        if form_answer(w, form).get("carries") != "no"
     ]
     for kind in EVIDENCE_KINDS:
         names = [
@@ -764,10 +1090,37 @@ def _render_survey(survey: Mapping[str, Any], labels: Mapping[str, str]) -> list
             out += [
                 "",
                 _count(len(names), "wheel was", "wheels were")
-                + f" found to carry none, on the evidence of the {kind}: "
+                + f" found to carry no compiled code, on the evidence of the {kind}: "
                 + ", ".join(names)
                 + ".",
             ]
+    clear = sum(not carries_anything(w) for w in wheels)
+    out += [
+        "",
+        _count(clear, "wheel has", "wheels have")
+        + " no row in the table: the search found no package, library tree or data set of "
+        "another project in them, in any form.",
+    ]
+    out += _render_adapted(wheels, labels)
+    data_only = [
+        w for w in wheels if not carries_code(w) and form_answer(w, "data").get("carries") == "yes"
+    ]
+    if data_only:
+        loose = [f"`{w['name']}`" for w in data_only if w["name"] not in labels]
+        out += [
+            "",
+            _count(len(data_only), "wheel carries", "wheels carry")
+            + " another project's data and none of its code: "
+            + ", ".join(f"`{w['name']}`" for w in data_only)
+            + ". "
+            + (
+                f"Not designated among them: {', '.join(loose)}. Under the criterion above, "
+                "that owes no route."
+                if loose
+                else "Each of them is designated."
+            )
+            + " No notice about any of that data was read.",
+        ]
     out += [
         "",
         "Each answer rests on the evidence the record names. A wheel tagged `none-any` had its "
@@ -777,8 +1130,36 @@ def _render_survey(survey: Mapping[str, Any], labels: Mapping[str, str]) -> list
         "the pinned source distribution was read too. A wheel the record does not name was not "
         "read, and can carry something else. That holds for another platform, and for a second "
         "Linux x86_64 wheel where the lock carries more than one.",
+        "",
+        "The source and data answers rest on the same wheels, fetched again. The search looked "
+        f"for a directory with one of {_listed_count(search, 'directories')} vendoring names, a "
+        "top-level name beyond the project's own, a licence file named for another project, a "
+        "large file that is not a Python module, and any of "
+        f"{_listed_count(search, 'words')} marker words. The words were looked for in each file "
+        f"outside `.dist-info` whose name ends in one of {_listed_count(search, 'suffixes')} "
+        f"suffixes: {_listed_names(search, 'suffixes')}. The record gives "
+        "the names, the size and the words under `search`. A Python module was opened as a "
+        "possible table only where its name or size suggested one, which is a judgement and "
+        "not an exact rule. Not every large module was opened. Under `cannot_see`, the record "
+        "names large modules that were not, so a count of not found does not rest on every "
+        "large module having been read. No file was compared with the project it names.",
+        "",
+        "As a control, the same search was run over "
+        f"`{control.get('file', 'not recorded')}`, a wheel known to vendor source and not one "
+        "of the wheels surveyed. "
+        + " ".join(
+            f"The {words} fired on `{_first(fired.get(rule))}`."
+            for rule, words in (
+                ("directory", "directory search"),
+                ("licence file", "licence-file search"),
+                ("data", "size search"),
+                ("words", "word search"),
+            )
+        )
+        + " The top-level-name search has no control: that wheel has one top-level name, its "
+        "own.",
     ]
-    # The two kinds of evidence that fall short of the paragraph above, each naming its wheels.
+    # The two kinds of evidence that fall short of the paragraphs above, each naming its wheels.
     for kind, lead, rests_on in (
         (
             FILE_LIST,
@@ -789,21 +1170,24 @@ def _render_survey(survey: Mapping[str, Any], labels: Mapping[str, str]) -> list
             METADATA_ONLY,
             "No wheel was fetched for {}.",
             "PyPI project metadata, which lists no file. What the table names for such a wheel "
-            "is the least it carries: nothing else was looked for.",
+            "is the least it carries: nothing else was looked for. For the same reason, no "
+            "source or data answer is established for such a wheel.",
         ),
     ):
         names = [f"`{w['name']}`" for w in wheels if w.get("evidence_kind") == kind]
         if names:
-            whose = "Its answer rests on" if len(names) == 1 else "Their answers rest on"
-            out += ["", f"{lead.format(_series(names, 'or'))} {whose} {rests_on}"]
+            whose = (
+                "Its compiled answer rests" if len(names) == 1 else "Their compiled answers rest"
+            )
+            out += ["", f"{lead.format(_series(names, 'or'))} {whose} on {rests_on}"]
     out += [
         "",
         "A designated wheel is already highlighted, by its tier. No carried project's advisories "
         "were read for a designated wheel. "
         + _count(len(routed), "wheel is", "wheels are")
-        + " not designated and not shown to carry nothing. Each takes one of two routes: this "
-        "page highlights it as risky on what it carries, or reads the carried project's own "
-        "advisories.",
+        + " not designated and counted as carrying another project's code. Each takes one of "
+        "two routes: this page highlights it as risky on what it carries, or reads the carried "
+        "project's own advisories.",
     ]
     highlighted = [w for w in routed if w.get("route") == "highlight"]
     if highlighted:
@@ -814,7 +1198,10 @@ def _render_survey(survey: Mapping[str, Any], labels: Mapping[str, str]) -> list
             "| Component | Carries | Why |",
             "|---|---|---|",
         ]
-        out += [f"| `{w['name']}` | {_carried(w)} | {w.get('route_reason')} |" for w in highlighted]
+        out += [
+            f"| `{w['name']}` | {_carried(w, CODE_FORMS)} | {w.get('route_reason')} |"
+            for w in highlighted
+        ]
         out += [
             "",
             "No advisory for a carried project was read for these. A reader who needs that has "
@@ -832,8 +1219,8 @@ def _render_survey(survey: Mapping[str, Any], labels: Mapping[str, str]) -> list
             "|---|---|---|---|---|---|",
         ]
         out += [
-            f"| `{w['name']}` | {_carried(w)} | "
-            + " | ".join(str((w.get("read") or {}).get(field)) for field in READ_FIELDS)
+            f"| `{w['name']}` | {_carried(w, CODE_FORMS)} | "
+            + " | ".join(str(_entries([w.get("read")])[0].get(field)) for field in READ_FIELDS)
             + " |"
             for w in read
         ]
@@ -957,11 +1344,12 @@ def render_section(
         "Vulnerability Scoring System. An advisory with neither does not count. The ones in the "
         "window are named below so a reader can judge them.",
         "",
-        "OSV matches an advisory to a component by its PyPI name. A flaw in code a wheel carries "
-        "inside it, such as a compiled library, shows up here only when an advisory names the "
-        "PyPI package. So nothing below shows that the code inside a wheel is free of known "
-        f"flaws. *{SURVEY_HEADING.removeprefix('### ')}*, further down, says which wheels carry "
-        "such code and what this page does about each.",
+        "OSV matches an advisory to a component by its PyPI name. A flaw in something a wheel "
+        "carries inside it from another project shows up here only when an advisory names the "
+        "PyPI package. That holds for a compiled library, for a copy of another project's "
+        "source, and for its data. So nothing below shows that what a wheel carries is free of "
+        f"known flaws. *{SURVEY_HEADING.removeprefix('### ')}*, further down, says which wheels "
+        "carry another project in any of those forms, and what this page does about each.",
         "",
         "These tests are mechanical. A small library that is finished can trip the first one "
         "without being neglected. The reading says where to look; it does not say the library is "

@@ -46,6 +46,12 @@ async def store(tmp_path: Path):
     await s.close()
 
 
+@pytest.fixture(autouse=True)
+def _fresh_loaded_anchors(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each test starts with no consumer load recorded (BACKLOG #2185), whatever ran before it."""
+    monkeypatch.setattr(ta, "_LOADED", {})
+
+
 def _pem(tmp_path: Path, body: bytes | None = None) -> Path:
     p = tmp_path / "anchor.pem"
     p.write_bytes(_block(b"anchor") if body is None else body)
@@ -1639,6 +1645,152 @@ async def test_the_reload_route_still_refuses_a_swapped_settings_anchor_the_same
         assert [json.loads(r["detail"]) for r in rows] == [
             {"requested": None, "dry_run": False, "reason": "trust_anchor"}
         ]
+
+
+# --- BACKLOG #2185: a changed settings anchor takes a restart, and a reload says so ---------------
+
+
+def _events(rows: list[dict], event: str) -> list[dict]:
+    return [r for r in rows if r["event"] == event]
+
+
+def _settings_spec(kind: str, path: Path) -> AnchorSpec:
+    """One settings anchor of each kind, through the builder ``serve`` uses for it."""
+    if kind == "ad":
+        spec = ta.ad_anchor_spec(AuthSettings(ad_tls_ca_cert_file=str(path)))
+    elif kind == "oidc":
+        spec = ta.oidc_anchor_spec(str(path), None)
+    else:
+        spec = ta.api_client_anchor_spec(
+            ApiSettings(tls_cert_file=str(path.parent / "server.pem"), tls_client_ca_file=str(path))
+        )
+    assert spec is not None
+    return spec
+
+
+@pytest.mark.parametrize("kind", ["ad", "oidc", "api_client"])
+async def test_a_reload_after_a_ca_swap_says_a_restart_is_needed_every_time(
+    store: MessageStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    kind: str,
+) -> None:
+    """The consumers keep the bytes they read at start, so a reload that passes on a new CA must
+    say a restart is needed, and keep saying it. Red under a compare with the last AUDITED
+    fingerprint: the second reload then finds the new bytes already audited and goes quiet, which
+    the ``changed`` count below shows is what that baseline does."""
+    good, rotated = _block(b"good"), _block(b"rotated")
+    p = tmp_path / "ca.pem"
+    p.write_bytes(good)
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    spec = _settings_spec(kind, p)
+    await run_anchor_preflight([spec], store, enforcing=True)  # serve's start preflight
+    ta.verified_anchor_cadata(spec, enforcing=True)  # the consumer's load, as each one makes it
+    preflight = ta.make_settings_anchor_preflight([spec], store, enforcing=True)
+    assert preflight is not None
+
+    await preflight()  # the control: an unchanged anchor says nothing
+    assert _events(await _rows(store, spec.label), "restart_required") == []
+
+    p.write_bytes(rotated)
+    caplog.set_level("WARNING", logger=ta.__name__)
+    await preflight()
+    await preflight()  # the second reload: the audited baseline has already moved
+    rows = await _rows(store, spec.label)
+    assert len(_events(rows, "changed")) == 1  # the trap: the audit chain fires once
+    restart = _events(rows, "restart_required")
+    want = {
+        "label": spec.label,
+        "setting": spec.setting,
+        "event": "restart_required",
+        "fingerprint": hashlib.sha256(rotated).hexdigest(),
+        "in_use": hashlib.sha256(good).hexdigest(),
+    }
+    assert restart == [want, want]
+    warned = [r.getMessage() for r in caplog.records if "Restart the engine" in r.getMessage()]
+    assert len(warned) == 2 and spec.setting in warned[0]
+
+    p.write_bytes(good)  # rotated back to the bytes in use: nothing left to apply
+    await preflight()
+    assert len(_events(await _rows(store, spec.label), "restart_required")) == 2
+
+
+async def test_a_refused_reload_writes_no_restart_row(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A swap the reload refuses is reported by the refusal. The new bytes were never accepted, so
+    there is nothing a restart would apply."""
+    from messagefoundry.config.wiring import WiringError
+
+    spec, anchor = _pinned_ad_anchor(tmp_path, monkeypatch)
+    ta.verified_anchor_cadata(spec, enforcing=True)  # a consumer loaded it, so a row could fire
+    preflight = ta.make_settings_anchor_preflight([spec], store, enforcing=True)
+    assert preflight is not None
+    anchor.write_bytes(_block(b"evil"))
+    with pytest.raises(WiringError):
+        await preflight()
+    rows = await _rows(store, "ad")
+    assert _events(rows, "pin_mismatch") and not _events(rows, "restart_required")
+
+
+async def test_an_anchor_no_consumer_loaded_writes_no_restart_row(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An AD CA path set while nothing binds to AD: no consumer loaded the file, so a restart would
+    apply nothing, and the reload must not ask for one. The ``changed`` row is the control that the
+    swap was seen."""
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    p = tmp_path / "unused.pem"
+    p.write_bytes(_block(b"good"))
+    spec = _settings_spec("ad", p)
+    await run_anchor_preflight([spec], store, enforcing=True)
+    preflight = ta.make_settings_anchor_preflight([spec], store, enforcing=True)
+    assert preflight is not None
+    p.write_bytes(_block(b"rotated"))
+    await preflight()
+    rows = await _rows(store, "ad")
+    assert _events(rows, "changed") and not _events(rows, "restart_required")
+
+
+async def test_the_reload_route_says_a_rotated_ad_ca_needs_a_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Through the real managed-app wiring and a real LDAPS authenticator: the swap lands after
+    the authenticator loaded the CA, so two reloads after it both pass and both write the row."""
+    import httpx
+
+    from messagefoundry.api.app import create_managed_app
+    from messagefoundry.auth.ldap import LdapAuthenticator
+    from tests.test_tls_cipher_assertion_sites import _ad_settings
+
+    p = tmp_path / "ad-ca.pem"
+    p.write_bytes(_block(b"good"))
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    settings = _ad_settings(ad_tls_ca_cert_file=str(p))
+    LdapAuthenticator(settings)  # the consumer: it loads the checked bytes and keeps them
+    (spec,) = collect_anchor_specs(settings, ApiSettings())
+    cfg = tmp_path / "cfg"
+    _file_graph(cfg)
+    app = create_managed_app(
+        db_path=tmp_path / "m.db",
+        config_dir=cfg,
+        trust_anchor_specs=[spec],
+        allow_no_auth=True,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    async with app.router.lifespan_context(app):
+        p.write_bytes(_block(b"rotated"))
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+            for _ in range(2):
+                r = await client.post("/config/reload", json={})
+                assert r.status_code == 200, r.text
+        rows = await _rows(app.state.engine.store, "ad")
+    assert len(_events(rows, "restart_required")) == 2
 
 
 # --- QA round two: a blank pin refuses, never reads as no pin (BACKLOG #1142) ----------------------

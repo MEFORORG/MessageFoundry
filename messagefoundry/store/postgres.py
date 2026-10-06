@@ -2240,9 +2240,44 @@ class PostgresStore:
         async with self._timed_acquire(record=False) as conn:
             return await conn.fetchrow(sql, *params)
 
-    async def _execute(self, sql: str, *params: Any) -> None:
+    async def _execute(self, sql: str, *params: Any) -> int:
+        """Run one write on a bounded borrow and return its row count, read from asyncpg's status
+        tag. Most callers ignore it; the session purge and the session cap read it (BACKLOG
+        #2283). Two session writes that need the count borrow without the bound instead, for the
+        reason :meth:`_execute_after_commit` gives."""
         async with self._timed_acquire(record=False) as conn:
-            await conn.execute(sql, *params)
+            return _rowcount(await conn.execute(sql, *params))
+
+    async def _execute_after_commit(self, sql: str, *params: Any) -> int:
+        """Run one session write that FOLLOWS a write its caller has already committed, and return
+        its row count. **The borrow is unbounded on purpose (BACKLOG #2283).**
+
+        ``rotate_session`` and ``revoke_user_sessions`` finish what an auth change started: a reset
+        password, a disabled account, a changed role, a completed factor ceremony. By the time they
+        run, that change is committed. Under ``[store].acquire_timeout`` a saturated pool would make
+        them raise after it, and nothing retries them: a reset password would leave every other
+        session live with no audit row, and a factor ceremony would leave the old token elevated and
+        unrotated. Waiting for a connection instead finishes the write once the pool frees, which is
+        what both did before BACKLOG #2283 moved them onto the bounded ``_execute``.
+
+        This closes the gap at these two statements only. The same callers make other bounded
+        writes after their change commits, such as stamps and audit rows, and any of those can
+        still fail at the limit.
+
+        Not every caller has committed first. At least "sign out everywhere else", an
+        administrator's force sign-out and the directory reconciler when it writes no roles have no
+        earlier write, and they wait the same way, as they did before. A per-caller choice would
+        need a store parameter on all three backends. The wait has a known price, also as before:
+        it holds whatever lock its caller holds, such as a ceremony's per-account lock, until the
+        pool frees.
+
+        A bounded retry that fell back to this wait would end the same way, later, since each retry
+        rejoins the back of asyncpg's queue. Moving each write into its caller's transaction would
+        close the gap entirely, but every caller commits through a different store method on three
+        backends. ``self._pool.execute`` borrows inside asyncpg with no timeout and returns the
+        status tag the count is read from. ``tests/test_store_pool_acquire_timeout.py`` counts this
+        site among the pinned unbounded borrows, and pins which methods call it."""
+        return _rowcount(await self._pool.execute(sql, *params))
 
     async def _count(self, table: str) -> int:
         row = await self._pool.fetchrow(f"SELECT COUNT(*) AS n FROM {table}")  # table is a constant
@@ -4829,7 +4864,7 @@ class PostgresStore:
             )
             enc_detail = (
                 self._enc(
-                    safe_text(detail)[:200],
+                    safe_text(detail, limit=200),  # whole: a slice cuts its note (#1797)
                     aad=cell_aad("response", "detail", message_id, dest, seq),
                 )
                 if detail
@@ -4907,7 +4942,7 @@ class PostgresStore:
         # Bound to (connection, ts, kind) — the id is BIGSERIAL, unknown here (ASVS 11.3.3).
         reason_enc = (
             self._enc(
-                safe_text(reason)[:200],
+                safe_text(reason, limit=200),  # whole: a slice cuts its note (#1797)
                 aad=cell_aad("connection_event", "reason", connection, now, kind),
             )
             if reason
@@ -5134,7 +5169,7 @@ class PostgresStore:
         # the INSERT and the ON CONFLICT UPDATE that never sees the BIGSERIAL id (ASVS 11.3.3).
         reason_enc = (
             self._enc(
-                safe_text(reason)[:200],
+                safe_text(reason, limit=200),  # whole: a slice cuts its note (#1797)
                 aad=cell_aad("alert_instance", "reason", event_type, connection),
             )
             if reason
@@ -8262,14 +8297,14 @@ class PostgresStore:
         now = time.time() if now is None else now
         if idle_seconds is None:
             rows = await self._fetchall(
-                "SELECT * FROM sessions WHERE user_id=$1 AND revoked_at IS NULL AND expires_at > $2"
+                "SELECT * FROM sessions WHERE user_id=$1 AND revoked_at IS NULL AND expires_at >= $2"
                 " ORDER BY last_used_at DESC",
                 user_id,
                 now,
             )
         else:
             rows = await self._fetchall(
-                "SELECT * FROM sessions WHERE user_id=$1 AND revoked_at IS NULL AND expires_at > $2"
+                "SELECT * FROM sessions WHERE user_id=$1 AND revoked_at IS NULL AND expires_at >= $2"
                 " AND $2 - last_used_at <= $3 ORDER BY last_used_at DESC",
                 user_id,
                 now,
@@ -8305,14 +8340,14 @@ class PostgresStore:
     async def rotate_session(self, token_hash: str, *, new_token_hash: str) -> bool:
         """Re-key a live session in place (ASVS 7.2.4). See :meth:`AuthStore.rotate_session`.
 
-        Uses ``self._pool.execute`` rather than ``self._execute``: only the former returns asyncpg's
-        status tag, and this op's contract is its rowcount."""
-        result = await self._pool.execute(
+        Through ``self._execute_after_commit``, which returns the rowcount this op's contract is.
+        Why that borrow has no timeout is its docstring's to say (BACKLOG #2283)."""
+        changed = await self._execute_after_commit(
             "UPDATE sessions SET token_hash=$1 WHERE token_hash=$2 AND revoked_at IS NULL",
             new_token_hash,
             token_hash,
         )
-        return _rowcount(result) > 0
+        return changed > 0
 
     async def revoke_session(self, token_hash: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
@@ -8322,19 +8357,29 @@ class PostgresStore:
             token_hash,
         )
 
+    async def supersede_session(self, token_hash: str, *, now: float) -> SessionRecord | None:
+        """Revoke and return in one statement (BACKLOG #2146). See :meth:`AuthStore.supersede_session`."""
+        d = await self._fetchone(
+            "UPDATE sessions SET revoked_at=$1 WHERE token_hash=$2 AND revoked_at IS NULL"
+            " RETURNING *",
+            now,
+            token_hash,
+        )
+        return SessionRecord.from_mapping(dict(d)) if d else None
+
     async def revoke_user_sessions(
         self, user_id: str, *, except_token_hash: str | None = None, now: float | None = None
     ) -> int:
         """Revoke a user's active sessions (all, or all but ``except_token_hash``). Returns the count."""
         now = time.time() if now is None else now
-        result = await self._pool.execute(
+        # Unbounded; `_execute_after_commit` says why (BACKLOG #2283).
+        return await self._execute_after_commit(
             "UPDATE sessions SET revoked_at=$1 WHERE user_id=$2 AND revoked_at IS NULL"
             " AND ($3::text IS NULL OR token_hash != $3)",
             now,
             user_id,
             except_token_hash,
         )
-        return _rowcount(result)
 
     async def enforce_session_cap(
         self,
@@ -8344,18 +8389,18 @@ class PostgresStore:
         idle_seconds: float,
         split_mfa_pending: bool,
         now: float | None = None,
-    ) -> None:
+    ) -> int:
         """Keep a user's ``keep`` newest LIVE sessions (per group) and revoke the other unrevoked
-        ones that are not stamped ahead of ``now`` (AUTH-SESS-CAP). See
+        ones that are not stamped ahead of ``now`` (AUTH-SESS-CAP). Returns the count revoked. See
         :meth:`AuthStore.enforce_session_cap`.
 
         The clauses are store.py's ``_SESSION_NOT_AHEAD_SQL``, ``_SESSION_LIVE_SQL`` and
         ``_SESSION_CAP_RANK_NOT_AHEAD_SQL``, respelled for ``$n``. Every group reuses ``$1`` to
         ``$4``, so a split adds no parameters."""
         if keep <= 0:
-            return
+            return 0
         now = time.time() if now is None else now
-        await self._execute(
+        return await self._execute(
             "UPDATE sessions SET revoked_at=$1 WHERE user_id=$2 AND revoked_at IS NULL"
             " AND created_at <= $1 AND last_used_at <= $1"
             " AND COALESCE(mfa_verified_at, created_at) <= $1"
@@ -8370,19 +8415,16 @@ class PostgresStore:
         self, *, now: float | None = None, idle_seconds: float | None = None
     ) -> int:
         now = time.time() if now is None else now
-        # Borrowed through the bounded helper rather than `self._pool.execute`, which acquires with
-        # no timeout (BACKLOG #1052); `record=False` keeps this hourly sweep out of the worker
-        # acquire-wait curve, as the `_fetchall` family does.
-        async with self._timed_acquire(record=False) as conn:
-            if idle_seconds is None:
-                result = await conn.execute("DELETE FROM sessions WHERE expires_at < $1", now)
-            else:
-                result = await conn.execute(
-                    "DELETE FROM sessions WHERE expires_at < $1 OR $1 - last_used_at > $2",
-                    now,
-                    float(idle_seconds),
-                )
-        return _rowcount(result)
+        # Through `_execute`, the bounded borrow, rather than `self._pool.execute`, which acquires
+        # with no timeout (BACKLOG #1052). `_execute` borrows with `record=False`, which keeps this
+        # hourly sweep out of the worker acquire-wait curve, and returns the count (BACKLOG #2283).
+        if idle_seconds is None:
+            return await self._execute("DELETE FROM sessions WHERE expires_at < $1", now)
+        return await self._execute(
+            "DELETE FROM sessions WHERE expires_at < $1 OR $1 - last_used_at > $2",
+            now,
+            float(idle_seconds),
+        )
 
     # --- retention / purge + maintenance (PHI.md §8) -------------------------
 

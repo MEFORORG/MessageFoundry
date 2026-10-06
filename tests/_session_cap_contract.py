@@ -78,9 +78,13 @@ async def assert_session_cap_contract(store: Any, *, user_id: str = "cap-u1") ->
     )
     new_login = await _session(store, user_id, created=now, expires=now + FAR)
 
-    await store.enforce_session_cap(
-        user_id, keep=2, idle_seconds=IDLE, split_mfa_pending=False, now=now
-    )
+    # BACKLOG #2283: the cap returns how many rows it revoked, so the caller can audit it.
+    assert (
+        await store.enforce_session_cap(
+            user_id, keep=2, idle_seconds=IDLE, split_mfa_pending=False, now=now
+        )
+        == 2
+    ), "the cap must count the two lapsed rows it revoked"
 
     assert not await _revoked(store, live_device), (
         "a live device was signed out to make room for lapsed rows -- the cap counted sessions the "
@@ -93,9 +97,20 @@ async def assert_session_cap_contract(store: Any, *, user_id: str = "cap-u1") ->
     assert await _revoked(store, abs_lapsed), "an expired row must be revoked, not skipped"
 
     # --- the cap still binds among live sessions, oldest-created first ------------------------
-    await store.enforce_session_cap(
-        user_id, keep=1, idle_seconds=IDLE, split_mfa_pending=False, now=now
+    # A keep of zero or less is "no cap": it revokes nothing and says so.
+    assert (
+        await store.enforce_session_cap(
+            user_id, keep=0, idle_seconds=IDLE, split_mfa_pending=False, now=now
+        )
+        == 0
     )
+    assert not await _revoked(store, live_device)
+    assert (
+        await store.enforce_session_cap(
+            user_id, keep=1, idle_seconds=IDLE, split_mfa_pending=False, now=now
+        )
+        == 1
+    ), "already-revoked rows must not be counted again"
     assert await _revoked(store, live_device), "the older live session must go once over the cap"
     assert not await _revoked(store, new_login), "the newest session always survives the cap"
 
@@ -114,8 +129,11 @@ async def assert_session_cap_contract(store: Any, *, user_id: str = "cap-u1") ->
     past_abs = await _session(store, edge, created=now - 1600, expires=now - 1)
     newest = await _session(store, edge, created=now, expires=now + FAR)
 
-    await store.enforce_session_cap(
-        edge, keep=3, idle_seconds=IDLE, split_mfa_pending=False, now=now
+    assert (
+        await store.enforce_session_cap(
+            edge, keep=3, idle_seconds=IDLE, split_mfa_pending=False, now=now
+        )
+        == 2
     )
 
     assert not await _revoked(store, on_idle), (
@@ -141,9 +159,14 @@ async def assert_session_cap_contract(store: Any, *, user_id: str = "cap-u1") ->
         store, fut, created=now - 40, last_used=now + 100, expires=now + FAR
     )
 
-    await store.enforce_session_cap(
-        fut, keep=2, idle_seconds=IDLE, split_mfa_pending=False, now=now
-    )
+    # Nothing to revoke here, so the count is zero. On SQL Server this is the case a driver row
+    # count under SET NOCOUNT ON would report as -1.
+    assert (
+        await store.enforce_session_cap(
+            fut, keep=2, idle_seconds=IDLE, split_mfa_pending=False, now=now
+        )
+        == 0
+    ), "a cap run that revoked nothing must report zero"
 
     assert not await _revoked(store, older), "a row created ahead of now took a live device's place"
     assert not await _revoked(store, current)
@@ -185,13 +208,22 @@ async def _assert_idle_rows_hidden_and_purged(store: Any, user_id: str) -> None:
         "the inventory hid a clock-stepped session the user must still be able to see and end"
     )
     assert idle not in listed, "the inventory listed an idle-expired session"
-    assert on_expiry not in listed, "the inventory listed a session at its absolute expiry"
-    assert listed == {fresh, on_idle, ahead}
+    # BACKLOG #2283: `expires_at == now` is live to the validator, so the inventory lists it. It used
+    # to hide it, the one instant where the list and the validator disagreed.
+    assert on_expiry in listed, "the inventory hid a session the validator still accepts"
+    past_expiry = await _session(store, u, created=base - 100, expires=base - 1)
+    listed = {s.token_hash for s in await store.list_sessions(u, now=base, idle_seconds=IDLE)}
+    assert past_expiry not in listed, "the inventory listed a session past its absolute expiry"
+    assert listed == {fresh, on_idle, on_expiry, ahead}
     unfiltered = {s.token_hash for s in await store.list_sessions(u, now=base)}
-    assert unfiltered == {fresh, on_idle, idle, ahead}, "no idle_seconds must mean the old filter"
+    assert unfiltered == {fresh, on_idle, idle, on_expiry, ahead}, (
+        "no idle_seconds must mean the expiry filter alone"
+    )
 
     await store.purge_expired_sessions(now=base)
     assert await store.get_session(idle) is not None, "no idle_seconds must mean no idle purge"
+    assert await store.get_session(past_expiry) is None, "an expired row survived the purge"
+    assert await store.get_session(on_expiry) is not None, "expires_at == now is still live"
     assert await store.purge_expired_sessions(now=base, idle_seconds=IDLE) >= 1
     assert await store.get_session(idle) is None, "an idle-expired row survived the purge"
     assert await store.get_session(on_idle) is not None, "idle == timeout is still live"

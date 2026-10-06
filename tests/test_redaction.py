@@ -1275,8 +1275,9 @@ def test_no_token_survives_the_clamp_that_the_unbounded_scan_scrubs() -> None:
     tokens. It cannot reach a leak that turns on text the window never sees: a clamp that drops the
     ``MSH`` declaring custom delimiters leaves ``_sniff_delimiters`` nothing to read, and no token
     list produces that, because the dependency is on the whole text rather than on a span. That one
-    is a known open gap recorded on the pull request, and both controls share the blind spot, so a
-    zero here is evidence about the two walks and about nothing else."""
+    is an accepted residual (BACKLOG #1848), pinned by the strict xfail
+    ``test_a_custom_delimiter_fragment_whose_msh_the_clamp_drops_is_scrubbed``. Both controls share
+    the blind spot, so a zero here is evidence about the two walks and about nothing else."""
     shipped = _clamp_leaks(redaction._clamp, 1_500)
     name_control = _clamp_leaks(_three_step_clamp, 1_500)
     credential_control = _clamp_leaks(_clamp_without_the_credential_walk, 1_500)
@@ -2648,3 +2649,173 @@ def test_the_backstop_and_the_encoded_run_stay_linear_and_affordable(unit: str) 
     assert t_large / t_small < 24, f"{t_large / t_small:.1f}x for 8x the input on {unit!r}"
     window = sized(redaction._REDACT_WINDOW)
     assert _best_of(lambda: redact(window)) < 0.5
+
+
+# --- BACKLOG #1797: the length bound never keeps half a token ---------------------------------------
+
+#: A synthetic identifier in the shape a database driver quotes one: bare digits in prose, which no
+#: pass recognises. No real PHI (PHI.md section 9).
+_BARE_IDENTIFIER = "900123456"
+
+
+def _identifier_straddling(limit: int) -> str:
+    """Prose whose bracketed identifier starts four characters before ``limit``, so ``text[:limit]``
+    would keep ``(900`` and drop the rest. Everything before it survives ``redact`` unchanged, which
+    the control arm below checks rather than assumes."""
+    lead = " duplicate key value violates unique constraint, the duplicate key value is "
+    pad = _filler(limit - 4 - len(lead))
+    return f"{pad}{lead}{_STRADDLING_TAIL}"
+
+
+#: What follows ``value is`` in the fixture above: every character the bound drops there.
+_STRADDLING_TAIL = f"({_BARE_IDENTIFIER}) already exists"
+
+
+def test_the_bound_does_not_keep_the_head_of_an_identifier_it_splits() -> None:
+    """The measured case: a 200-character bound sliced a driver message to ``... is (4242``, a partial
+    identifier that also looked redacted. A token the bound would split now goes whole."""
+    out = safe_exc(ValueError(_identifier_straddling(redaction._DEFAULT_LIMIT)))
+    assert out.startswith("ValueError: ")
+    assert "900" not in out, out
+    # The space before the identifier goes too, so the count is the tail plus one.
+    assert out.endswith(f"value is…(+{len(_STRADDLING_TAIL) + 1} chars)"), out
+
+
+def test_control_the_straddling_identifier_survives_redact_and_a_wider_bound() -> None:
+    """Non-vacuity for the arm above. ``redact`` leaves the identifier alone, and a bound past it keeps
+    it whole, so only the token cut removes it there.
+
+    **The second assertion pins a RESIDUAL, not a property to defend.** A bare identifier inside the
+    bound is kept. That half of BACKLOG #1797 waits on the posture decision the owner ruled on
+    2026-10-04 to take with #2644 under one ADR. Change it there, not by adding a pattern here."""
+    text = _identifier_straddling(redaction._DEFAULT_LIMIT)
+    assert redact(text) == text
+    assert f"({_BARE_IDENTIFIER})" in safe_text(text, limit=len(text))
+
+
+@pytest.mark.parametrize("separator", [" ", "\t", "\n"], ids=["space", "tab", "newline"])
+@pytest.mark.parametrize("limit", range(150, 230))
+def test_the_count_covers_every_character_the_bound_drops(limit: int, separator: str) -> None:
+    """``(+N chars)`` plus what is kept accounts for the whole redacted text, wherever the bound falls:
+    inside a token, on whitespace, or on a whitespace run. And no kept token is a fragment. Run over
+    each kind of boundary, since the cut searches for every whitespace character separately."""
+    text = (_identifier_straddling(200) + "  trailing words here").replace(" ", separator)
+    full = redact(text).strip()
+    out = safe_text(text, limit=limit)
+    head, marker, rest = out.partition("…(+")
+    assert marker, out
+    count = int(rest.removesuffix(" chars)"))
+    assert len(head) + count == len(full)
+    assert len(head) <= limit
+    assert full.startswith(head) and head == head.rstrip()
+    assert full[len(head)] in redaction._CUT_CHARS  # the head ends where a token does
+
+
+def test_a_single_token_longer_than_the_bound_is_dropped_whole() -> None:
+    """No whitespace to cut back to means nothing is kept, the same choice ``_clamp`` makes for a
+    window with no boundary in it. The count is the whole token."""
+    assert safe_text("A1" * 300, limit=40) == "…(+600 chars)"
+    assert safe_exc(RuntimeError("x" * 5000), limit=50) == "RuntimeError: …(+5000 chars)"
+
+
+def _plain_words(length: int) -> str:
+    """``length`` characters of lowercase ten-letter tokens that ``redact`` leaves alone, ending on a
+    whole token."""
+    return ("abcdefghi " * (length // 10 + 1))[: length - 1] + "j"
+
+
+@pytest.mark.parametrize(
+    ("text", "kept"),
+    [
+        (_plain_words(190) + "…(+150 chars)", 190),
+        (_plain_words(170) + " " + redaction._clamp_marker(5_000), 170),
+        # The cut falls in the bound note, and moving back before it would end on a whole count.
+        (_plain_words(150) + "…(+65000 chars) " + redaction._clamp_marker(1_234_567), 150),
+    ],
+    ids=["count-note", "bound-note", "count-then-bound-note"],
+)
+def test_a_further_call_does_not_split_a_note_an_earlier_call_wrote(text: str, kept: int) -> None:
+    """The store calls ``safe_text`` again on a value an emit site already bounded. The cut must not
+    keep half of the earlier note and glue its own after it, as in ``…(+150…(+7 chars)``, nor end on
+    a whole earlier count and add a second. THE CONTROL: the plain whole-token cut does fall inside
+    a note on every text."""
+    assert redact(text) == text
+    plain = redaction._whole_token_prefix(text, 200)
+    fragment = text[kept:plain].strip()
+    assert plain < len(text) and fragment.startswith(("…(+", "[redaction")), "no control"
+    assert safe_text(text, limit=200) == f"{text[:kept]}…(+{len(text) - kept} chars)"
+
+
+def test_the_store_pass_over_a_bounded_exception_keeps_the_most_it_can() -> None:
+    """The path the store takes: ``safe_exc`` at the emit site, then ``safe_text`` at the store, over
+    token widths and message lengths near the bound. The stored head is the plain whole-token cut,
+    or ends just before the first call's note when that cut would fall inside it, and the count is
+    every character held back. THE CONTROL: the cut does fall inside the note on some of these."""
+    split = 0
+    for width in range(5, 60):
+        for length in range(189, 260):
+            words = ("a" * (width - 1) + " ") * (length // width + 1)
+            first = safe_exc(ValueError(words[: length - 1] + "j"))
+            assert redact(first) == first
+            stored = safe_text(first, limit=200)
+            if len(first) <= 200:
+                assert stored == first
+                continue
+            plain = redaction._whole_token_prefix(first, 200)
+            note = first.find("…(+")
+            kept = plain if note == -1 or plain < note else note
+            split += kept != plain
+            assert stored == f"{first[:kept]}…(+{len(first) - kept} chars)", (width, length)
+    assert split > 0, "the control does not hold"
+
+
+# --- BACKLOG #1848: a whole-text dependency the clamp cannot hold ------------------------------------
+
+#: A headerless fragment in the fully-custom delimiters, then filler past the window, then the MSH
+#: that declares those delimiters. Unclamped, the sniff reads the tail's MSH and the fragment in the
+#: head is scrubbed. Clamped, the MSH is gone and the fragment survives.
+_FRAGMENT_IDENTIFIER = "MRN123"
+
+
+def _fragment_then_msh_past_the_window() -> str:
+    return (
+        f"id {_FRAGMENT_IDENTIFIER}$$$H$MR here "
+        + _filler(redaction._REDACT_WINDOW)
+        + " "
+        + ADT_FULLY_CUSTOM
+    )
+
+
+def test_control_unclamped_redact_scrubs_the_fragment_by_the_tail_msh() -> None:
+    """Non-vacuity for the xfail below. The unbounded scan scrubs the fragment, and only because of
+    the MSH past the window: the same fragment alone is the headerless residual and survives."""
+    text = _fragment_then_msh_past_the_window()
+    assert len(text) > redaction._REDACT_WINDOW
+    assert _FRAGMENT_IDENTIFIER not in redact(text).split("MSH", 1)[0]
+    assert _FRAGMENT_IDENTIFIER in redact(f"id {_FRAGMENT_IDENTIFIER}$$$H$MR here")
+    assert "MSH" not in clamp_untrusted(text), "the clamp kept the header, so nothing is measured"
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason=(
+        "BACKLOG #1848, accepted residual: the clamp drops the MSH that declares the delimiters, so "
+        "the sniff has nothing to read. A whole-text sniff would close it and undo the #1576 bound."
+    ),
+)
+@pytest.mark.parametrize(
+    "bounded",
+    [redact_untrusted, lambda text: safe_text(text, limit=100_000)],
+    ids=["redact_untrusted", "safe_text"],
+)
+def test_a_custom_delimiter_fragment_whose_msh_the_clamp_drops_is_scrubbed(
+    bounded: Callable[[str], str],
+) -> None:
+    """ASSERTS THE BEHAVIOUR WE DO NOT HAVE, so it fails today and is marked a strict xfail.
+
+    One case per bounded path, so closing the gap on either one alone passes that case, and strict
+    mode turns the pass into a failure. Whoever closed it removes the mark and updates the residual in
+    the module docstring. ``raises`` keeps an unrelated error from passing as the expected failure.
+    The day a change makes the shape worse, nothing here moves -- that is the cost of accepting it."""
+    assert _FRAGMENT_IDENTIFIER not in bounded(_fragment_then_msh_past_the_window())

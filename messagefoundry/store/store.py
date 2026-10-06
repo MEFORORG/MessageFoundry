@@ -8845,7 +8845,7 @@ class MessageStore:
             )
             enc_detail = (
                 self._enc(
-                    safe_text(detail)[:200],
+                    safe_text(detail, limit=200),  # whole: a slice cuts its note (#1797)
                     aad=cell_aad("response", "detail", message_id, dest, seq),
                 )
                 if detail
@@ -10411,7 +10411,7 @@ class MessageStore:
         # autoincrement, unknown here, so cell_aad can't use it (ASVS 11.3.3).
         reason_enc = (
             self._enc(
-                safe_text(reason)[:200],
+                safe_text(reason, limit=200),  # whole: a slice cuts its note (#1797)
                 aad=cell_aad("connection_event", "reason", connection, now, kind),
             )
             if reason
@@ -10511,7 +10511,7 @@ class MessageStore:
         # both the INSERT and the re-fire UPDATE that never sees the autoincrement id (ASVS 11.3.3).
         reason_enc = (
             self._enc(
-                safe_text(reason)[:200],
+                safe_text(reason, limit=200),  # whole: a slice cuts its note (#1797)
                 aad=cell_aad("alert_instance", "reason", event_type, connection),
             )
             if reason
@@ -12315,13 +12315,13 @@ class MessageStore:
         async with self._read() as db:
             if idle_seconds is None:
                 cur = await db.execute(
-                    "SELECT * FROM sessions WHERE user_id=? AND revoked_at IS NULL AND expires_at > ?"
+                    "SELECT * FROM sessions WHERE user_id=? AND revoked_at IS NULL AND expires_at >= ?"
                     " ORDER BY last_used_at DESC",
                     (user_id, now),
                 )
             else:
                 cur = await db.execute(
-                    "SELECT * FROM sessions WHERE user_id=? AND revoked_at IS NULL AND expires_at > ?"
+                    "SELECT * FROM sessions WHERE user_id=? AND revoked_at IS NULL AND expires_at >= ?"
                     " AND ? - last_used_at <= ? ORDER BY last_used_at DESC",
                     (user_id, now, now, float(idle_seconds)),
                 )
@@ -12381,6 +12381,29 @@ class MessageStore:
             )
             await self._commit()
 
+    async def supersede_session(self, token_hash: str, *, now: float) -> SessionRecord | None:
+        """Revoke, then read the row back in the SAME transaction (BACKLOG #2146). See
+        :meth:`AuthStore.supersede_session`.
+
+        Two statements here rather than one ``UPDATE ... RETURNING``, because ``RETURNING`` needs
+        SQLite 3.35 and a Linux Python can link an older system library. They are still one unit:
+        the writer lock orders them against every in-process writer, ``rotate_session`` included,
+        and the write lock the ``UPDATE`` takes holds until the commit, so no other process can
+        re-key the row between them."""
+        async with _writer_guard(self._db, self._lock):
+            cur = await self._db.execute(
+                "UPDATE sessions SET revoked_at=? WHERE token_hash=? AND revoked_at IS NULL",
+                (now, token_hash),
+            )
+            row = None
+            if cur.rowcount:
+                cur = await self._db.execute(
+                    "SELECT * FROM sessions WHERE token_hash=?", (token_hash,)
+                )
+                row = await cur.fetchone()
+            await self._commit()
+        return SessionRecord.from_mapping(dict(row)) if row else None
+
     async def revoke_user_sessions(
         self, user_id: str, *, except_token_hash: str | None = None, now: float | None = None
     ) -> int:
@@ -12405,12 +12428,12 @@ class MessageStore:
         idle_seconds: float,
         split_mfa_pending: bool,
         now: float | None = None,
-    ) -> None:
+    ) -> int:
         """Keep a user's ``keep`` newest LIVE sessions (per group) and revoke the other unrevoked
-        ones that are not stamped ahead of ``now`` (AUTH-SESS-CAP). See
+        ones that are not stamped ahead of ``now`` (AUTH-SESS-CAP). Returns the count revoked. See
         :meth:`AuthStore.enforce_session_cap`."""
         if keep <= 0:
-            return
+            return 0
         now = time.time() if now is None else now
         per_group = (user_id, *_session_live_params(now, idle_seconds), now, keep)
         groups = len(_session_cap_groups(split_mfa_pending))
@@ -12418,13 +12441,14 @@ class MessageStore:
             # The statement is spelled at the call, not built in a local, because
             # `tests/test_writer_txn_is_the_only_begin.py` cannot read a local and pins how many it
             # cannot read.
-            await self._db.execute(
+            cur = await self._db.execute(
                 "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL"
                 f" AND {_SESSION_NOT_AHEAD_SQL} AND {_SESSION_CAP_RANK_NOT_AHEAD_SQL}"
                 f"{_sqlite_session_cap_keep_sql(split_mfa_pending)}",
                 (now, user_id, now, now, now, *(per_group * groups)),
             )
             await self._commit()
+            return int(cur.rowcount)
 
     async def purge_expired_sessions(
         self, *, now: float | None = None, idle_seconds: float | None = None

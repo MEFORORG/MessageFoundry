@@ -654,9 +654,10 @@ async def test_rest_invalid_url_is_a_permanent_nak() -> None:
 
 async def test_the_invalid_value_arm_leaves_the_transient_classes_alone() -> None:
     """A guard on the new arm's blast radius, not a reproduction of the bug -- it passes before the
-    fix too. `ResponseTooLargeError` is a `DeliveryError`, not a `ValueError`, so an over-large reply
-    must still RETRY. Mutation: widen the arm to `except Exception`. Red: the over-large reply
-    dead-letters instead, and every transient class below is silently made permanent."""
+    fix too. `ResponseTooLargeError` is a `DeliveryError`, not a `ValueError`, so one that comes out
+    of `open()` must still RETRY. (An over-large body read after a 2xx is a different arm: vault
+    BACKLOG #2180.) Mutation: widen the arm to `except Exception`. Red: the refusal dead-letters
+    instead, and every transient class below is silently made permanent."""
     from messagefoundry.transports.bounded_read import ResponseTooLargeError
 
     for cls in (DeliveryError, NegativeAckError, ResponseTooLargeError):

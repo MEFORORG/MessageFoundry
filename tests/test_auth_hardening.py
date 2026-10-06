@@ -40,6 +40,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStatus
+from messagefoundry.store.store import MessageStore
 from tests._admin_account import ADMIN_USERNAME, create_admin, create_local_user_chosen
 
 PW = "a-strong-test-passphrase"  # ≥15, no app/vendor terms — satisfies the ASVS policy (WP-3)
@@ -753,7 +754,14 @@ def test_secret_in_config_file_warns(tmp_path: Path, caplog: pytest.LogCaptureFi
 # --- L14: the session reaper purges expired sessions -------------------------
 
 
-async def test_session_reaper_purges_expired_sessions(engine: Engine) -> None:
+async def test_session_reaper_purges_expired_sessions(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from messagefoundry.api import app as api_app
+
+    # The reaper waits before its first pass (BACKLOG #2283), so shorten both waits.
+    monkeypatch.setattr(api_app, "_SESSION_REAP_INTERVAL", 0.01)
+    monkeypatch.setattr(api_app, "_SESSION_REAP_FIRST_DELAY", 0.01)
     await engine.store.create_user(
         user_id="u",
         username="reaper",
@@ -765,10 +773,13 @@ async def test_session_reaper_purges_expired_sessions(engine: Engine) -> None:
         token_hash="expired-hash", user_id="u", expires_at=1.0, now=1.0
     )
     # BACKLOG #2096: an idle-expired row goes too, since the validator refuses it on presentation.
-    # A row inside the idle window is the control: the purge must not take it.
+    # A row inside the idle window is the control: the purge must not take it. The reaper purges as
+    # of `_SESSION_REAP_STEP_TOLERANCE` before its reading (BACKLOG #2283), so the idle row is idle
+    # past the window by more than that.
     now = time.time()
+    lag = api_app._SESSION_REAP_STEP_TOLERANCE
     await engine.store.create_session(
-        token_hash="idle-hash", user_id="u", expires_at=now + 3600, now=now - 1000
+        token_hash="idle-hash", user_id="u", expires_at=now + 3600, now=now - 600 - lag - 100
     )
     await engine.store.create_session(
         token_hash="live-hash", user_id="u", expires_at=now + 3600, now=now - 10
@@ -786,6 +797,122 @@ async def test_session_reaper_purges_expired_sessions(engine: Engine) -> None:
     assert await engine.store.get_session("expired-hash") is None
     assert await engine.store.get_session("idle-hash") is None
     assert await engine.store.get_session("live-hash") is not None
+
+
+async def test_session_reaper_skips_a_pass_after_a_forward_clock_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #2283: a forward wall-clock step makes every session look idle, and a purge cannot
+    be undone. The pass that sees the wall clock outrun the monotonic clock deletes nothing. The
+    next pass compares against that one, so a step that holds is purged by then. A drift inside the
+    tolerance is the control: that pass purges as usual. The first reading is a baseline and purges
+    nothing, so a clock already wrong at start-up is never purged by on sight."""
+    from messagefoundry.api import app as api_app
+
+    idle = 1800.0
+    tolerance = api_app._SESSION_REAP_STEP_TOLERANCE
+    hour = 3600.0
+    # (wall, monotonic) per reading. Reading 0 is the start-up baseline. Pass 1 drifts inside the
+    # tolerance; pass 2 steps forward by a day; pass 3 holds the step.
+    readings = [
+        (1_000.0, 50.0),
+        (1_000.0 + hour + tolerance, 50.0 + hour),
+        (1_000.0 + 2 * hour + tolerance + 86_400, 50.0 + 2 * hour),
+        (1_000.0 + 3 * hour + tolerance + 86_400, 50.0 + 3 * hour),
+    ]
+    purged = await _run_reaper(monkeypatch, readings, idle_seconds=idle)
+    assert purged == [readings[1][0] - tolerance, readings[3][0] - tolerance], (
+        "the reaper purged on its start-up baseline or right after a forward clock step; each purge"
+        " must also use its own pass's reading, less the tolerance"
+    )
+
+
+async def test_a_step_under_the_tolerance_deletes_no_session_the_validator_accepts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #2283: with a 5-minute idle window, a forward step of 400 s is longer than the window
+    and shorter than the 600 s tolerance, so the guard lets the pass run. Purged as of its own
+    reading, that pass would delete a session used 250 s ago and one with 100 s of life left, both
+    of which the validator accepts at the true time. The pass purges as of the tolerance earlier,
+    so both survive. A row idle for 1000 real seconds is the control: it still goes."""
+    from messagefoundry.api import app as api_app
+
+    idle = 300.0
+    step = 400.0
+    assert idle < step < api_app._SESSION_REAP_STEP_TOLERANCE, "the step must sit between"
+    true_now = 1_000_000.0
+    store = await MessageStore.open(":memory:")
+    try:
+        await store.create_user(
+            user_id="u", username="stepped", auth_provider="local", password_generated=False
+        )
+
+        async def _row(h: str, *, last_used: float, expires: float) -> None:
+            await store.create_session(
+                token_hash=h, user_id="u", expires_at=expires, now=true_now - 2000
+            )
+            await store.touch_session(h, now=last_used)
+
+        await _row("used-250s-ago", last_used=true_now - 250, expires=true_now + 10_000)
+        await _row("expires-in-100s", last_used=true_now, expires=true_now + 100)
+        await _row("idle-1000s", last_used=true_now - 1000, expires=true_now + 10_000)
+        # Baseline an hour before; the pass reads the wall clock an hour plus the step later.
+        readings = [(true_now - 3600, 50.0), (true_now + step, 50.0 + 3600)]
+        await _run_reaper(monkeypatch, readings, idle_seconds=idle, inner=store)
+
+        assert await store.get_session("used-250s-ago") is not None, (
+            "a forward step under the tolerance purged a session used inside its idle window"
+        )
+        assert await store.get_session("expires-in-100s") is not None, (
+            "a forward step under the tolerance purged a session before its absolute expiry"
+        )
+        assert await store.get_session("idle-1000s") is None, "the control row was not purged"
+    finally:
+        await store.close()
+
+
+async def _run_reaper(
+    monkeypatch: pytest.MonkeyPatch,
+    readings: list[tuple[float, float]],
+    *,
+    idle_seconds: float,
+    inner: MessageStore | None = None,
+) -> list[float | None]:
+    """Run the reaper over ``readings`` of (wall, monotonic), one per pass after the baseline, and
+    return the ``now`` each purge was given. With ``inner``, each purge also runs against it."""
+    from messagefoundry.api import app as api_app
+
+    monkeypatch.setattr(api_app, "_SESSION_REAP_INTERVAL", 0)
+    monkeypatch.setattr(api_app, "_SESSION_REAP_FIRST_DELAY", 0)
+    wall = iter(r[0] for r in readings)
+    mono = iter(r[1] for r in readings)
+    purged: list[float | None] = []
+    done = asyncio.Event()
+
+    class _Store:
+        async def purge_expired_sessions(
+            self, *, now: float | None = None, idle_seconds: float | None = None
+        ) -> None:
+            purged.append(now)
+            if inner is not None:
+                await inner.purge_expired_sessions(now=now, idle_seconds=idle_seconds)
+
+    def _wall() -> float:
+        try:
+            return next(wall)
+        except StopIteration:
+            done.set()
+            raise asyncio.CancelledError from None
+
+    task = asyncio.create_task(
+        _session_reaper(  # type: ignore[arg-type]
+            _Store(), idle_seconds=idle_seconds, wall=_wall, mono=lambda: next(mono)
+        )
+    )
+    await asyncio.wait_for(done.wait(), timeout=5)
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    return purged
 
 
 # --- F1: /dead-letters gates the PHI summary the same way as /messages -------

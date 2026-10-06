@@ -701,6 +701,18 @@ def test_construction_probe_refuses_a_subject_with_a_line_break(pki: dict[str, A
         DirectDestination(_dest(pki, subject="Referral\nBcc: someone@hisp.example"))
 
 
+@pytest.mark.parametrize("code", [0xD800, 0xDC80])
+def test_a_subject_with_a_lone_surrogate_is_refused_at_construction(
+    pki: dict[str, Any], code: int
+) -> None:
+    # vault BACKLOG #2842. The construction probe already refused U+D800, whose build raises. It
+    # accepted U+DC80, which goes out as a garbled header, while the Email destination refuses both.
+    subject = f"Referral {chr(code)} note"
+    with pytest.raises(ValueError, match="'subject' holds a lone surrogate") as caught:
+        DirectDestination(_dest(pki, subject=subject))
+    assert subject not in str(caught.value)
+
+
 def test_construction_probe_refuses_a_cryptography_internal_error(
     monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any]
 ) -> None:
