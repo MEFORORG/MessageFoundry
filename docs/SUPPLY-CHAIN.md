@@ -318,7 +318,11 @@ have not, the document says nothing about that CVE and your scanner's finding st
 - **VS Code extension** — `@cyclonedx/cyclonedx-npm --package-lock-only` over the committed
   `ide/package-lock.json` (install-free, full tree). The extension bundles its payload with esbuild and
   has no runtime npm dependencies, so the SBOM inventories the build toolchain. Continuously audited by
-  **npm-audit**.
+  **npm-audit**. The generator itself, and the jscpd clone report in `quality-advisory.yml`, install
+  from a separate committed lock, `ci/npm-tools/package-lock.json` (vault BACKLOG #2793). **No
+  blocking audit lane reads that lock**; Dependabot watches it. Read 2026-10-06, `npm audit` on it
+  reports 5 high findings, all one advisory against `braces` reached through jscpd 4.x, whose only
+  fix is the 5.x line that lock deliberately holds back.
 - **Container image** — `trivy image --format cyclonedx` over the built image (OS + Python layers).
   Continuously vuln-scanned by **Trivy** (with our VEX applied).
 

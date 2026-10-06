@@ -51,6 +51,7 @@ tests/test_ci_refused_subjects.py
 tests/test_ci_retry_native_crash.py
 tests/test_ci_rig_legs_sign_in.py
 tests/test_ci_step_margin.py
+tests/test_ci_tool_and_image_pins.py
 tests/test_ci_tooling_gate.py
 tests/test_ci_venv_pinning.py
 tests/test_cla_action_advisory_gate.py
