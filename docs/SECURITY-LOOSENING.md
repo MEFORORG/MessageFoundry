@@ -596,7 +596,8 @@ This section is kept rather than deleted, because the claim it used to make is t
 > guard, so it is reported **only** while auth is on, which `serve` always is. The default is `true` since BACKLOG #288
 > (owner ruling 2026-09-26); before that it shipped off, with an exposure-time advisory.
 - **What you lose:** a session token presented from a **client address it has not verified from**
-  can perform a sensitive admin action on the strength of the ordinary step-up window alone. Nothing
+  can perform a sensitive admin action on the strength of the ordinary step-up window alone, and can
+  read message bodies and call the paced writes with no step-up at all (vault BACKLOG #2620). Nothing
   writes `auth.admin_action_new_ip`, nothing notifies the account holder, and nothing forces a fresh
   step-up. A stolen token replayed from another host is the case this signal exists for.
 - **When acceptable:** a deployment whose operators reach the console through a pool of egress
