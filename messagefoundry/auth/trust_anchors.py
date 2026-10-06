@@ -225,7 +225,7 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
         fresh = False
         if line.startswith(_PEM_TRUSTED):
             raise TrustAnchorError(
-                f"{spec.setting}: the trust anchor '{spec.path}' holds an OpenSSL trusted-certificate block, "
+                f"{spec.setting}: the trust anchor {spec.path!r} holds an OpenSSL trusted-certificate block, "
                 "which the engine does not load. Re-export each certificate in it as a plain "
                 "CERTIFICATE block; openssl x509 -in <one cert> -out <plain.pem> converts one "
                 "certificate per run"
@@ -240,14 +240,14 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
             fresh = True
     if not blocks:
         raise TrustAnchorError(
-            f"{spec.setting}: the trust anchor '{spec.path}' holds no PEM block, so it names no "
+            f"{spec.setting}: the trust anchor {spec.path!r} holds no PEM block, so it names no "
             "certificate to trust"
         )
     try:
         text = b"".join(kept).decode("ascii")
     except UnicodeDecodeError as exc:
         raise TrustAnchorError(
-            f"{spec.setting}: the trust anchor '{spec.path}' has a non-ASCII byte inside a PEM "
+            f"{spec.setting}: the trust anchor {spec.path!r} has a non-ASCII byte inside a PEM "
             "block, so it is not a readable certificate"
         ) from exc
     try:
@@ -255,7 +255,7 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
     except ssl.SSLError as exc:
         why = _SSL_WHERE.sub("", str(exc))
         raise TrustAnchorError(
-            f"{spec.setting}: the TLS library cannot load the trust anchor '{spec.path}' ({why}). "
+            f"{spec.setting}: the TLS library cannot load the trust anchor {spec.path!r} ({why}). "
             "Every PEM block in it must be well-formed, and at least one must be a plain "
             "CERTIFICATE block. A file holding only a CRL names no certificate to trust; a hop "
             "that checks revocation reads its CRL from its own CRL setting"
@@ -605,15 +605,15 @@ def dacl_is_owner_only(path: str | os.PathLike[str]) -> bool | None:
                 errors="replace",
             )
         except OSError as exc:
-            log.warning("icacls could not read the DACL of %s: %s", path, exc)
+            log.warning("icacls could not read the DACL of %r: %s", os.fspath(path), exc)
             return None
         if result.stdout is None:
-            log.warning("icacls returned no readable output for %s", path)
+            log.warning("icacls returned no readable output for %r", os.fspath(path))
             return None
         if result.returncode != 0:
             log.warning(
-                "icacls could not read the DACL of %s (exit %s): %s",
-                path,
+                "icacls could not read the DACL of %r (exit %s): %r",
+                os.fspath(path),
                 result.returncode,
                 (result.stderr or result.stdout or "").strip(),
             )
@@ -621,16 +621,16 @@ def dacl_is_owner_only(path: str | os.PathLike[str]) -> bool | None:
         parsed = owner_only_from_icacls(result.stdout, anchor_path=os.fspath(path))
         if parsed is None:
             log.warning(
-                "icacls exited 0 for %s but its output carried no readable ACE, granted write to a "
+                "icacls exited 0 for %r but its output carried no readable ACE, granted write to a "
                 "bare principal name it does not recognise, or granted write on a first line whose "
                 "path echo did not match; the DACL could not be determined",
-                path,
+                os.fspath(path),
             )
         return parsed
     try:
         mode = Path(path).stat().st_mode
     except OSError as exc:
-        log.warning("could not stat %s to check its permissions: %s", path, exc)
+        log.warning("could not stat %r to check its permissions: %s", os.fspath(path), exc)
         return None
     return (mode & 0o022) == 0
 
@@ -676,7 +676,7 @@ def _acl_message(spec: AnchorSpec) -> str:
     leaves read, so an engine account that reads the anchor through that group still can. The
     rights it names are :data:`_WRITE_RIGHTS`, so the text cannot drift from the check."""
     lines = [
-        f"{spec.setting}: the trust anchor '{spec.path}' is writable by a non-owner (a group or "
+        f"{spec.setting}: the trust anchor {spec.path!r} is writable by a non-owner (a group or "
         "world principal can write it). Anyone who can modify it can substitute the CA and defeat "
         "authentication. Restrict it to owner-only write."
     ]
@@ -771,10 +771,10 @@ def _path_fix(verdict: AnchorVerdict) -> list[str]:
 
 def _path_message(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
     lines = [
-        f"{spec.setting}: the trust anchor '{spec.path}' can be replaced through its path, and "
+        f"{spec.setting}: the trust anchor {spec.path!r} can be replaced through its path, and "
         "anyone who replaces it can substitute the CA and defeat authentication:"
     ]
-    lines += [f"  {f.kind} '{f.path}': {f.reason}" for f in _findings(verdict, insecure=True)]
+    lines += [f"  {f.kind} {f.path!r}: {f.reason}" for f in _findings(verdict, insecure=True)]
     check = verdict.path_check
     if check is not None and check.engine:
         lines.append(
@@ -788,15 +788,15 @@ def _indeterminate_message(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
     """What could not be read, object by object. The caller adds the outcome."""
     lines = [
         f"{spec.setting}: could not settle whether anyone else can replace the trust anchor "
-        f"'{spec.path}':"
+        f"{spec.path!r}:"
     ]
     if verdict.acl_ok is None:
         lines.append(
-            f"  file '{spec.path}': its permissions could not be read, or they grant write to a "
+            f"  file {spec.path!r}: its permissions could not be read, or they grant write to a "
             "principal the engine could not identify"
         )
     if verdict.path_ok is None:
-        lines += [f"  {f.kind} '{f.path}': {f.reason}" for f in _findings(verdict, insecure=False)]
+        lines += [f"  {f.kind} {f.path!r}: {f.reason}" for f in _findings(verdict, insecure=False)]
     return "\n".join(lines)
 
 
@@ -1044,7 +1044,7 @@ def inbound_ca_cadata(name: str, settings: Mapping[str, Any], *, enforcing: bool
         return verified_anchor_cadata(spec, enforcing=enforcing)
     except OSError as exc:
         raise TrustAnchorError(
-            f"{spec.setting}: could not read the trust anchor '{spec.path}': {exc.strerror or exc}"
+            f"{spec.setting}: could not read the trust anchor {spec.path!r}: {exc.strerror or exc}"
         ) from exc
 
 
@@ -1245,7 +1245,7 @@ async def _report_restart_required(
         if in_use is None or in_use == now:
             continue
         log.warning(
-            "%s: the trust anchor '%s' changed on disk since the engine loaded it (sha256 %s, was "
+            "%s: the trust anchor %r changed on disk since the engine loaded it (sha256 %s, was "
             "%s). This reload checked the new file but does not apply it. The engine keeps "
             "trusting the CA it loaded until it restarts. Restart the engine to apply the new CA",
             spec.setting,

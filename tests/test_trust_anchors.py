@@ -21,7 +21,7 @@ from pydantic import BaseModel
 
 from messagefoundry.api.tls import build_api_ssl_context
 from messagefoundry.auth import trust_anchors as ta
-from messagefoundry.auth.anchor_path import PathVerdict
+from messagefoundry.auth.anchor_path import DIRECTORY, ChainFinding, PathVerdict
 from messagefoundry.auth.trust_anchors import (
     AUDIT_ACTION,
     AnchorSpec,
@@ -1901,3 +1901,93 @@ def test_a_blank_pin_without_mtls_fails_its_own_lane_not_the_graph() -> None:
     assert ta.connection_anchor_spec("PLAIN", plain) is None
     with pytest.raises(ValueError, match="MLLP listener: tls_ca_pin is set but empty"):
         _mllp_ssl_context(plain, server=True)
+
+
+# --- BACKLOG #2358: a path in a refusal or a log line is quoted with repr -------------------------
+#
+# Engine PR 1744 rewrote one refusal and dropped its ``!r``, and most of the others never had it. A
+# newline or an escape byte in a configured anchor path then reached the refusal, and every log line
+# that carries it, raw: a refusal could be split into a second, forged-looking line. ``repr`` escapes
+# both. The fix commands keep their own shell quoting (``_ps_quote``, ``shlex.quote``) unchanged.
+
+_CONTROL_PATH = "C:/anchors/evil\nFORGED: line\x1b[31m.pem"
+
+
+def _quoted(text: str) -> None:
+    """``text`` names the control-character path only in its escaped form."""
+    assert repr(_CONTROL_PATH) in text, text
+    assert "\x1b" not in text and "\nFORGED" not in text, text
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        pytest.param(b"", id="no PEM block"),
+        pytest.param(b"-----BEGIN TRUSTED CERTIFICATE-----\nAAAA\n", id="TRUSTED block"),
+        pytest.param(
+            b"-----BEGIN CERTIFICATE-----\n\xff\n-----END CERTIFICATE-----\n", id="non-ASCII"
+        ),
+        pytest.param(
+            b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n", id="TLS refuses"
+        ),
+    ],
+)
+def test_a_pem_shape_refusal_quotes_the_path(data: bytes) -> None:
+    spec = AnchorSpec("api_client", "[api].tls_client_ca_file", _CONTROL_PATH, None)
+    with pytest.raises(TrustAnchorError) as err:
+        ta.anchor_cadata(data, spec)
+    _quoted(str(err.value))
+
+
+def test_the_verdict_refusals_quote_the_path() -> None:
+    """The pin, file, path and indeterminate messages. The control is the pin message, which kept
+    its ``!r`` through PR 1744."""
+    spec = AnchorSpec("t", "[api].tls_client_ca_file", _CONTROL_PATH, None)
+    finding = ChainFinding(_CONTROL_PATH, DIRECTORY, True, "Users can delete entries", ("S-1-1-0",))
+    unsure = ChainFinding(_CONTROL_PATH, DIRECTORY, False, "access denied")
+    insecure = ta.AnchorVerdict(
+        "ab" * 32,
+        acl_ok=False,
+        pin_ok=False,
+        path_ok=False,
+        path_check=PathVerdict(False, (finding,)),
+    )
+    unknown = ta.AnchorVerdict(
+        "ab" * 32, acl_ok=None, pin_ok=None, path_ok=None, path_check=PathVerdict(None, (unsure,))
+    )
+    _quoted(ta._pin_mismatch_message(spec, insecure))
+    # The prose lines only: the fix lines below them are commands, quoted for their shell.
+    _quoted(ta._acl_message(spec).split("\n")[0])
+    path_lines = ta._path_message(spec, insecure).split("\n")
+    _quoted(path_lines[0])
+    _quoted(path_lines[1])
+    assert path_lines[1].startswith(f"  {DIRECTORY} ")
+    _quoted(ta._indeterminate_message(spec, unknown))
+    assert len(ta._indeterminate_message(spec, unknown).split("\n")) == 3  # header, file, finding
+
+
+def test_an_unreadable_inbound_ca_refusal_quotes_the_path() -> None:
+    settings = {"tls": True, "tls_ca_file": _CONTROL_PATH}
+    with pytest.raises(TrustAnchorError, match="could not read the trust anchor") as err:
+        ta.inbound_ca_cadata("ADT_IN", settings, enforcing=True)
+    _quoted(str(err.value))
+
+
+def test_the_dacl_read_log_quotes_the_path(caplog: pytest.LogCaptureFixture) -> None:
+    """The DACL read cannot answer for a path that cannot exist. On Windows icacls echoes the path
+    in its own error text, so that text is quoted as well."""
+    with caplog.at_level("WARNING", logger=ta.log.name):
+        assert dacl_is_owner_only(_CONTROL_PATH) is None
+    (record,) = [r for r in caplog.records if r.name == ta.log.name]
+    _quoted(record.getMessage())
+
+
+async def test_the_restart_required_log_quotes_the_path(
+    store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    spec = AnchorSpec("ad", "[auth].ad_tls_ca_cert_file", _CONTROL_PATH, None)
+    ta._LOADED[(spec.label, spec.path)] = "00" * 32
+    with caplog.at_level("WARNING", logger=ta.log.name):
+        await ta._report_restart_required([spec], store, seen={"ad": "ab" * 32})
+    (record,) = [r for r in caplog.records if r.name == ta.log.name]
+    _quoted(record.getMessage())
