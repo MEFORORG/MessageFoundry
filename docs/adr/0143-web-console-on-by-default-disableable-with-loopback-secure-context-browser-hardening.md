@@ -222,11 +222,14 @@ console being served. This ADR mentioned neither `require_mfa` nor `admin_expose
 interaction came to exist without ever being adjudicated; recording it here is what puts it on the
 record.
 
-## Cross-reference (2026-10-05) -- the console exposure flags count `[api].trusted_proxies` (BACKLOG #2218)
+## Cross-reference (2026-10-05) -- the console exposure flags count `[api].trusted_proxies` (vault BACKLOG #2218)
 
 Section 3's "Exposed bind" bullet names three exposed cases. Engine PR 1717 (merged 2026-09-27
-Central) added a fourth: a non-empty `[api].trusted_proxies` on a loopback bind. In `serve`, both
-console flags now read `not settings.api.host_is_browser_origin`. That property wraps
+Central) widened them: a loopback bind with `[api].trusted_proxies` set now counts too. A loopback
+bind with a declared terminator already counted, so the new case is a proxy that re-encrypts to an
+operator certificate.
+
+In `serve`, both console flags read `not settings.api.host_is_browser_origin`. That property wraps
 `request_host_is_browser_origin` in `messagefoundry/config/settings.py`.
 
 - `console_exposed` drives the auto-degrade of a default-on console.
@@ -236,32 +239,31 @@ console flags now read `not settings.api.host_is_browser_origin`. That property 
 
 So one boot gets the degrade or the advisories, never both.
 
-Why the console flags count it: `ApiSettings._check_tls_cert_dependency` refuses `trusted_proxies`
-unless a terminator or an operator certificate is also set (BACKLOG #2055). So on a loopback bind,
-the list declares a proxy in front of the engine. The engine then expects browsers to arrive through
-that proxy, from off the box. Section 3 makes the default-on console a local-loopback convenience, so
-in this posture the console must be asked for by name. The rule reads config, not the request. An
-operator browsing to the loopback address on the box itself also gets JSON-only, unless the console
-was enabled explicitly.
+**Why the console flags count it.** `ApiSettings._check_tls_cert_dependency` refuses
+`trusted_proxies` without a terminator or an operator certificate (vault BACKLOG #2055). So the list
+declares a proxy in front of the engine.
 
-It adds no start failure. In this posture the auto-degrade keeps the engine serving JSON-only with a
-warning, and the advisories only print. The same posture does get request-time refusals: the `/ui`
-origin checks stop trusting the forwarded `Host` (BACKLOG #2217). Those belong to ADR 0068, not to
-this ADR.
+The engine then expects browsers to arrive through that proxy, from off the box. Section 3 makes the
+default-on console a local-loopback convenience, so here the console must be asked for by name.
 
-ADR 0068 uses the same predicate for a different rule. Its 2026-09-28 amendment (BACKLOG #2220)
-refuses to take the passkey rp_id from a forwarded `Host`, for phishing resistance. That reason does
-not by itself decide whether a console counts as exposed, which is why this note gives its own. In
-`serve` the two rules read one property, so they agree. An app factory's caller can still pass an
-explicit `webauthn_rp_from_request`, which overrides the predicate there.
+The rule reads config, not the request. An operator browsing to the loopback address on the box
+itself also gets JSON-only, unless the console was enabled explicitly.
 
-The 2026-08-04 cross-reference above scopes `ui_exposed` to "/ui-specific origin/TLS refusals and
-browser-console advisories". Today no refusal reads it. It gates the two advisories only, and the
-off-loopback `/ui` refusals read the bind and `exposure_protected` directly.
+It adds no start failure. The auto-degrade keeps the engine serving JSON-only with a warning, and
+the advisories only print.
 
-**`instance_exposed` does not count this posture yet.** The MFA-at-exposure refusal, the dual-control
-warning and the in-use-memory declaration gate all read it. The 2026-08-04 cross-reference above
-defines it: an off-loopback bind or `tls_terminated_upstream`. A loopback bind behind a re-encrypting
-proxy has an operator certificate and no declared terminator. A site that deployed one would get the
-console signals above, and none of those three gates. Vault BACKLOG #2251 would count it there, and
-is still open. Section 3 is left as written and dated by this note.
+An explicitly enabled console in this posture does get request-time refusals. The `/ui` origin checks
+stop trusting the forwarded `Host` (vault BACKLOG #2217). Those checks are
+[ADR 0065](0065-web-ops-dashboard.md)'s, not this ADR's.
+
+ADR 0068 reads the same predicate for a different rule. Its 2026-09-28 amendment (vault BACKLOG
+#2220) refuses to take the passkey rp_id from a forwarded `Host`. That reason is phishing
+resistance. It does not decide whether a console counts as exposed, so this note gives its own.
+
+The two rules agree only where one property feeds both, which is `serve`. An app factory has no
+console degrade or advisories. Its caller may pass an explicit `webauthn_rp_from_request`, which
+overrides the predicate for the rp_id and for the console's origin fallback.
+
+This note does not touch `instance_exposed`, which the 2026-08-04 cross-reference above describes.
+Whether that predicate should count this posture is a separate ledger item. Section 3 is left as
+written and dated by this note.
