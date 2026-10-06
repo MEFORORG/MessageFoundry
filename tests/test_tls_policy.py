@@ -1410,6 +1410,8 @@ def _crl_material(tmp_path_factory: pytest.TempPathFactory) -> dict[str, str]:
         return builder.sign(key, hashes.SHA256()).public_bytes(serialization.Encoding.PEM)
 
     put("ca_base_then_delta.pem", ca_pem + numbered(1, None) + numbered(2, 1))
+    # The same delta with no base beside it: the probe for how this OpenSSL scores a delta CRL.
+    put("ca_and_delta.pem", ca_pem + numbered(2, 1))
     for cn, serial, is_server, stem in (
         ("localhost", 2000, True, "server"),
         ("good-client", 3000, False, "good"),
@@ -1510,14 +1512,66 @@ def test_a_superseded_expired_crl_beside_its_fresh_replacement_is_refused(
         harden_crl_check(_verifying_ctx(), _crl_material["ca_expired_then_fresh"])
 
 
-def test_a_delta_crl_drops_base_revocations_without_the_refusal(
-    _crl_material: dict[str, str],
+#: OpenSSL's ``X509_V_FLAG_EXTENDED_CRL_SUPPORT``. The ssl module exports no name for it.
+_X509_V_FLAG_EXTENDED_CRL_SUPPORT = 0x1000
+
+#: The first release on each OpenSSL branch that never scores a delta CRL as a complete one
+#: (openssl/openssl PR 31044, issue 31040; on 3.5 it is commit 6cbbf4c167d9). Read from each
+#: branch's release tags. Before it, get_crl_score skipped its delta check unless extended CRL
+#: support was on. A branch newer than these forked after the fix.
+_DELTA_SCORING_FIX = {(3, 0): 22, (3, 4): 7, (3, 5): 8, (3, 6): 4}
+
+
+def _release_has_the_delta_scoring_fix() -> bool:
+    """True when the linked OpenSSL's version is at or past the upstream fix.
+
+    False says only that the VERSION predates it: a vendor can backport the fix without a new
+    number. So this may only ever demand the fixed behaviour, never the old one."""
+    major, minor, _, patch, _ = ssl.OPENSSL_VERSION_INFO
+    first = _DELTA_SCORING_FIX.get((major, minor))
+    if first is not None:
+        return patch >= first
+    return (major, minor) > (3, 6)
+
+
+@pytest.mark.parametrize(
+    "extra_flags",
+    [0, _X509_V_FLAG_EXTENDED_CRL_SUPPORT],
+    ids=["as-linked", "deltas-never-complete"],
+)
+def test_a_delta_crl_drops_base_revocations_where_openssl_scores_it_complete(
+    _crl_material: dict[str, str], extra_flags: int
 ) -> None:
-    # NEGATIVE CONTROL for the refusal below, and the reason for it: loaded as OpenSSL would load
-    # it, with no harden_crl_check, the newer delta CRL is used as if complete and the client the
-    # base CRL revokes gets in.
-    bundle = _crl_material["ca_base_then_delta"]
-    assert _crl_handshake(bundle, "revoked", _crl_material, raw=True) == "ACCEPTED"
+    # NEGATIVE CONTROL for the refusal below, and the reason for it. Loaded with no
+    # harden_crl_check, a build that scores a delta CRL as a complete one picks the newer delta,
+    # and the client the base CRL revokes gets in.
+    #
+    # Which builds do that changed under this test. OpenSSL 3.5.7 does; 3.5.8 and later do not
+    # (see _DELTA_SCORING_FIX). CPython 3.14.8 for Windows ships 3.5.9 and 3.14.7 ships 3.5.7, so
+    # a fixed assertion of ACCEPTED failed on every runner that resolved 3.14.8 and passed on the
+    # rest. That read as a flake. So the build is probed first, with the delta alone, and the
+    # outcome must match the probe.
+    #
+    # The second arm turns on extended CRL support. Every OpenSSL version then refuses to score a
+    # delta as complete, so the fixed-build branch below runs on every runner, not only on one
+    # that happens to link a fixed OpenSSL.
+    def handshake(stem: str) -> str:
+        return _crl_handshake(
+            _crl_material[stem], "revoked", _crl_material, raw=True, extra_flags=extra_flags
+        )
+
+    probe = handshake("ca_and_delta")
+    bundle = handshake("ca_base_then_delta")
+    where = f"{ssl.OPENSSL_VERSION}, extra verify flags {extra_flags:#x}"
+    if probe == "ACCEPTED":
+        # The delta alone stood in for a complete CRL, so beside its base it wins as the newer.
+        assert bundle == "ACCEPTED", f"{where}: {bundle}"
+    else:
+        # The delta alone is no CRL at all to this build, so the base decides.
+        assert "unable to get certificate crl" in probe.lower(), f"{where}: {probe}"
+        assert "certificate revoked" in bundle.lower(), f"{where}: {bundle}"
+    if extra_flags or _release_has_the_delta_scoring_fix():
+        assert probe != "ACCEPTED", f"{where}: this build should not score a delta as complete"
 
 
 def test_harden_crl_check_refuses_a_delta_crl(_crl_material: dict[str, str]) -> None:
@@ -1548,12 +1602,18 @@ def test_harden_crl_check_without_a_setting_names_the_path_alone(tmp_path: Path)
 
 
 def _crl_handshake(
-    crl_bundle: str | None, client_stem: str, mat: dict[str, str], *, raw: bool = False
+    crl_bundle: str | None,
+    client_stem: str,
+    mat: dict[str, str],
+    *,
+    raw: bool = False,
+    extra_flags: int = 0,
 ) -> str:
     """Complete one real mTLS handshake. Returns "ACCEPTED" or the OpenSSL refusal reason.
 
     ``raw`` loads the bundle and sets the check flag directly, with none of harden_crl_check's
     refusals, to show what OpenSSL alone does with a file those refusals exist to stop.
+    ``extra_flags`` adds raw OpenSSL verify flags on that path only.
 
     TLS 1.2 is pinned so client authentication happens IN the handshake and the server-side
     outcome is unambiguous -- under 1.3 the client cert arrives after the server has finished and
@@ -1570,7 +1630,7 @@ def _crl_handshake(
     srv_ctx.load_verify_locations(cafile=mat["ca_only"])
     if crl_bundle is not None and raw:
         srv_ctx.load_verify_locations(cafile=crl_bundle)
-        srv_ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
+        srv_ctx.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF | extra_flags
     elif crl_bundle is not None:
         harden_crl_check(srv_ctx, crl_bundle)
 
