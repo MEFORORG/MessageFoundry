@@ -222,6 +222,31 @@ engine). The DR profile is a **startup decision**, not a runtime toggle: the thr
 a reload re-evaluates the whole graph, so a connection never flips between bound and filtered mid-run with
 in-flight rows stranded.
 
+> **Amendment (vault BACKLOG #3067): `POST /dr/activate` applies the RUNNING graph, and disk drift is only
+> recorded.** The paragraph above calls the profile a startup decision, but `POST /dr/activate` and
+> `POST /dr/release` turn it on and off on a running engine. That half was broken: the runner took its
+> threshold only at construction, and the activation reloaded through the same runner, so a box built passive
+> parked nothing on activation. A runner built under the profile likewise kept parking feeds after a release.
+> The engine now hands the running runner the threshold before the activation reload, and clears it on release.
+> A reload still re-evaluates the whole graph, so the in-flight guarantee above holds.
+>
+> **Decision 1: the activation re-applies the graph the engine is running, not a config dir.** It used to
+> reload the config dir from disk. That put live any bytes edited there since the last approved reload, with
+> no second person, and a dir that had gone with the failed site refused the activation after the takeover
+> hook had moved the VIP. The activation now runs the settings preflight, the registry preflight and the
+> runner's reload over the in-memory graph. The runner's reload still runs the build check, so the egress and
+> exposure gates still apply. The preflight that refused an activation whose config dir could not be listed
+> (vault BACKLOG #2840) is removed with it, since the activation no longer needs the dir.
+>
+> **Decision 2: disk drift is recorded and logged, and only the gated reload applies it.** After the
+> re-apply, the engine digests the running config dir off the event loop, bounded by
+> `[dr].takeover_timeout_seconds`. The `dr.activate` row records the activated graph's digest, and a
+> `disk_config` verdict of `matches`, `differs` or `unreadable`. On `differs` it also records the disk digest,
+> and the engine logs one WARNING naming both digests and the dir. On `unreadable` it records why and goes on.
+> `POST /config/reload`, under its own approval gate, is what applies the disk. This is not a `config_changed`
+> alert, whose contract is a start loading different bytes. The `dr_seed` marker records the activated graph's
+> digest too, not a disk digest taken before the takeover hook.
+
 ### Seeding DR state — cold-from-#60 (the owner-locked default)
 
 **Locked (owner posture, 2026-06-28): the DR store is COLD-seeded from #60's encrypted backups on activation —

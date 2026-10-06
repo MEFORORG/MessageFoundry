@@ -2327,7 +2327,8 @@ class RegistryRunner:
 
         The listening set is snapshotted now, on the caller's thread, so the predicate can run on a
         worker thread (the flag toggle validates off the event loop). The DR threshold and default
-        tier are read through ``self`` when it runs; both are set only at construction."""
+        tier are read through ``self`` when it runs. The tier is set only at construction; the
+        threshold is set there and by :meth:`set_dr_threshold`."""
         listening = frozenset(self._sources)
 
         def binds(ic: InboundConnection) -> bool:
@@ -2338,6 +2339,20 @@ class RegistryRunner:
             return not self._below_dr_threshold(ic.priority)
 
         return binds
+
+    @property
+    def dr_threshold(self) -> Priority | None:
+        """The DR run-profile threshold this runner applies, or ``None`` when it parks nothing."""
+        return self._dr_threshold
+
+    def set_dr_threshold(self, threshold: Priority | None) -> None:
+        """Set the DR run-profile threshold (#61, ADR 0048) for the next :meth:`start` or
+        :meth:`reload`. It binds and unbinds nothing itself, so the caller follows it with a reload.
+
+        The engine calls it when ``POST /dr/activate`` or ``/dr/release`` flips the run-profile on
+        a running box. Without it the threshold stayed at its construction value, so an activation
+        reload parked nothing on a box built passive (vault BACKLOG #3067)."""
+        self._dr_threshold = threshold
 
     def _dr_filters_out(self, name: str, declared: Priority | None, *, kind: Direction) -> bool:
         """Whether the DR run-profile parks this connection (its resolved tier is below the threshold).
