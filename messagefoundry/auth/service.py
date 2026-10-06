@@ -619,7 +619,8 @@ DIRECTORY_UNCONFIRMED = "directory_unconfirmed"
 
 #: The outcome :meth:`AuthService._directory_step_up_refusal` gives a present, enabled directory
 #: account whose stored roles are not all among the roles its current groups map to (BACKLOG #2240).
-#: Audited beside :data:`DIRECTORY_UNCONFIRMED`, like the probe's own outcomes.
+#: Audited beside :data:`DIRECTORY_UNCONFIRMED`, like the probe's own outcomes. The federated
+#: step-up leg refuses with it too, as its own closed-set reason (BACKLOG #2154).
 DIRECTORY_ROLES_DEMOTED = "directory_roles_demoted"
 
 #: The closed-set reasons the federated step-up leg refuses with (BACKLOG #296), on the
@@ -656,6 +657,10 @@ _STEP_UP_ERRORS: Final[Mapping[str, str]] = MappingProxyType(
             "Your directory account could not be found or is disabled. Ask an administrator."
         ),
         "directory_unavailable": "The directory is unavailable. Try again later.",
+        DIRECTORY_ROLES_DEMOTED: (
+            "Your directory groups no longer grant the roles this session holds. Ask an"
+            " administrator."
+        ),
     }
 )
 
@@ -4266,10 +4271,11 @@ class AuthService:
         the pinned issuer, ``auth_time`` present and within ``oidc_max_age_seconds``, and the MFA
         claim when that gate is on); the session is still live by every test
         :meth:`identity_for_token` applies, and still an OIDC session; ``auth_time`` is fresh (see
-        the inline note); the account is enabled, still a directory account, and still in the
-        directory; and the token's verified ``(issuer, sub)`` is byte-for-byte the pair bound to the
-        account. Then it elevates through :meth:`_elevated_hash`, so rotation, the MFA carry and the
-        single-use grant follow the password leg's rules exactly.
+        the inline note); the account is enabled and still a directory account; the token's
+        verified ``(issuer, sub)`` is byte-for-byte the pair bound to the account; the directory
+        still has the account; and every role stored on the account is among the roles its current
+        groups map to (BACKLOG #2154). Then it elevates through :meth:`_elevated_hash`, so
+        rotation, the MFA carry and the single-use grant follow the password leg's rules exactly.
 
         Refusals are audited under the staged session's account wherever the flow names one, so they
         appear in that person's security events rather than under an anonymous actor.
@@ -4399,6 +4405,16 @@ class AuthService:
         if principal is None:
             return await self._step_up_refused(
                 "not_in_directory", actor=actor, client=client, return_to=return_to
+            )
+        # BACKLOG #2154: the account's stored roles must all be among the roles its current groups
+        # map to, the same test _directory_step_up_refusal applies on the TOTP and passkey legs
+        # (#2240). Inline rather than through that helper, because its probe would change this
+        # leg's not_in_directory reason. Only a LOST role refuses; refusing writes nothing, and the
+        # reconciler or the next sign-in re-syncs the roles.
+        held = set(await self._store.get_user_role_ids(user.id))
+        if not held <= await self._store.roles_for_ad_groups(principal.groups):
+            return await self._step_up_refused(
+                DIRECTORY_ROLES_DEMOTED, actor=actor, client=client, return_to=return_to
             )
         purpose = flow.step_up_purpose
         # The password leg's three ORDER-CRITICAL steps (see :meth:`reauth`), against the hash.

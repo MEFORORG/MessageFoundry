@@ -521,7 +521,10 @@ B.1 left the verification of what comes back to the build. These are its criteri
   session's account, THEN THE SYSTEM SHALL refuse with `step_up_subject_mismatch` and leave the session
   as it was. IF the directory no longer returns the account by its immutable id, THEN THE SYSTEM SHALL
   refuse with `not_in_directory`, and a row with no immutable id SHALL be refused with
-  `directory_object_id_missing` rather than looked up by name.
+  `directory_object_id_missing` rather than looked up by name. IF a role stored on the account is
+  not among the roles its current directory groups map to, THEN THE SYSTEM SHALL refuse with
+  `directory_roles_demoted`, write no roles, and leave the session as it was (BACKLOG #2154). Only a
+  lost role refuses, and channel scope is not compared.
 - **AC-17 (flow kinds do not cross)** — A step-up flow SHALL NOT mint a session, and a sign-in flow
   SHALL NOT elevate one. Either completion refuses the other kind with `flow_purpose_mismatch`.
 - **AC-18 (the same elevation)** — WHEN the proof holds, THE SYSTEM SHALL elevate through the password

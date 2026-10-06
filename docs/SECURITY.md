@@ -1993,9 +1993,16 @@ not the permissions they grant. So a move from one role to another refuses, even
 grants more. A lookup whose groups map to no role refuses every directory account that holds a
 role. The refusal writes no roles; the next reconciliation pass, when it runs, or the next sign-in
 re-syncs them. Otherwise it behaves as the refusals above, audited with the outcome
-`directory_roles_demoted`. Channel scope is not compared on these legs. At least the password
-re-bind (`POST /me/reauth` and the `/ui/reauth` password leg), the IdP step-up leg and the
-enrolment legs do not compare roles yet.
+`directory_roles_demoted`. Channel scope is not compared on these legs.
+
+**The IdP step-up leg makes the same role test (BACKLOG #2154).** `complete_oidc_step_up` already
+looks the account up by its directory object id. It now maps the groups that lookup returns to
+roles, and refuses when a stored role is not among them. It refuses only; the session stays as it
+was, with no window and no grant, and no roles are written. The `auth.reauth` row carries
+`reason=directory_roles_demoted`, and the refusal tells the operator to ask an administrator.
+Channel scope is not compared on this leg either. At least the
+password re-bind (`POST /me/reauth` and the `/ui/reauth` password leg) and the enrolment legs do
+not compare roles yet.
 
 **The password re-bind gives the code and passkey legs' answer when the directory could not judge
 the password (BACKLOG #2027).** That covers at least a row with no directory object id, no enabled entry for the row's
@@ -3110,9 +3117,11 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
     is within that skew of the request. Closing it needs the sign-in's IdP `auth_time` stored on
     the session, which is not built;
   - the account is enabled and still a directory account;
+  - the verified `(iss, sub)` is byte-for-byte the pair bound to the session's account;
   - the directory still returns the account by its immutable id. A row with no id is refused, as
     at sign-in. The password re-bind this leg replaces would have failed for a deleted account;
-  - the verified `(iss, sub)` is byte-for-byte the pair bound to the session's account.
+  - every role stored on the account is among the roles its current directory groups map to
+    (BACKLOG #2154). Otherwise the leg refuses with `reason=directory_roles_demoted`.
 
   It then elevates through the same path as the password leg: `reauth_at` is stamped, the session
   is rotated (ASVS 7.2.4) and keeps its `mfa_verified_at`, and a single-use action grant is minted

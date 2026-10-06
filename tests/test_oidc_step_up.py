@@ -19,6 +19,7 @@ import json
 import time
 import urllib.parse
 from collections.abc import Callable, Coroutine
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -28,6 +29,7 @@ from messagefoundry.auth import oidc
 from messagefoundry.auth.identity import SessionMechanism
 from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.service import (
+    DIRECTORY_ROLES_DEMOTED,
     FLOW_PURPOSE_MISMATCH,
     IDP_STEP_UP_REQUIRED,
     STEP_UP_ACTION_SESSION_TERMINATE,
@@ -447,6 +449,66 @@ async def test_an_account_gone_from_the_directory_is_refused(
 
         assert not out.ok and out.reason == "not_in_directory"
         await _assert_untouched(service, token)
+    finally:
+        await store.close()
+
+
+#: A second mapped group, for the demotion arms below (BACKLOG #2154). Synthetic.
+_VIEWERS = "cn=mf-viewers,dc=corp,dc=example"
+
+
+@pytest.mark.parametrize(
+    ("now_in", "elevates"),
+    [
+        (frozenset(), False),
+        (frozenset({_VIEWERS}), False),
+        (PRINCIPAL.groups, True),
+        (PRINCIPAL.groups | {_VIEWERS}, True),
+    ],
+    ids=["every-role-lost", "moved-to-another-role", "unchanged", "promoted"],
+)
+async def test_an_account_demoted_in_the_directory_since_sign_in_is_refused(
+    rsa_key: rsa.RSAPrivateKey,
+    monkeypatch: pytest.MonkeyPatch,
+    now_in: frozenset[str],
+    elevates: bool,
+) -> None:
+    """BACKLOG #2154. RED when: the IdP leg elevates a session whose account lost a role in the
+    directory after it signed in, or refuses one whose groups are unchanged or only grew.
+
+    The roles are compared by id, as the TOTP and passkey legs compare them (#2240), so a move to
+    another role refuses even though it is not a strict subset. A refusal writes no roles."""
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _CountingLdap()
+        service = await _service(store, rsa_key, ldap=ldap)
+        await service.set_ad_group_map(
+            [("cn=mf-ops,dc=corp,dc=example", "operator"), (_VIEWERS, "viewer")], actor="admin"
+        )
+        token = await _oidc_session(service, monkeypatch, rsa_key)
+        user_id = await _user_id(service, token)
+        assert set(await store.get_user_role_ids(user_id)) == {"operator"}
+        flow_id, _url = await _begin(service, token)
+        ldap._principal = replace(PRINCIPAL, groups=now_in)
+
+        out = await _return_from_idp(service, monkeypatch, rsa_key, flow_id)
+
+        rows = [json.loads(str(r["detail"])) for r in await _audit_rows(store, "auth.reauth")]
+        assert len(rows) == 1, rows
+        if elevates:
+            assert out.ok, out
+            assert rows[0]["ok"] is True
+        else:
+            assert not out.ok and out.reason == DIRECTORY_ROLES_DEMOTED
+            assert out.error and "administrator" in out.error
+            assert rows[0] == {
+                "ok": False,
+                "provider": "ad",
+                "mech": "oidc",
+                "reason": DIRECTORY_ROLES_DEMOTED,
+            }
+            await _assert_untouched(service, token)
+        assert set(await store.get_user_role_ids(user_id)) == {"operator"}, "roles were written"
     finally:
         await store.close()
 
