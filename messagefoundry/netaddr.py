@@ -10,6 +10,10 @@ disagree about what a CIDR entry means:
 * ``[security].allowed_client_networks`` (:func:`client_network_allowed`), which matches the
   operator API/web-console client address from the ASGI ``scope["client"]``.
 
+It also holds the one rule for whether a ``source_ip_allowlist`` is narrow enough to count as a
+peer control (:func:`allowlist_restricts`). The HTTP intake gate and the DICOM server's gate
+both ask it, so the two cannot disagree about what a wide entry means (vault BACKLOG #2622).
+
 **Neutral and stdlib-only** — no engine, config, FastAPI or Qt imports — so both the transports
 (which must not import the API) and the API (which must not import the transports) can depend on it.
 Lives at the package root for that reason, next to the other neutral leaves
@@ -20,9 +24,22 @@ from __future__ import annotations
 
 import ipaddress
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, Final
 
-__all__ = ["peer_ip_allowed", "client_network_allowed"]
+__all__ = [
+    "ALLOWLIST_MIN_PREFIX_V4",
+    "ALLOWLIST_MIN_PREFIX_V6",
+    "allowlist_restricts",
+    "client_network_allowed",
+    "peer_ip_allowed",
+]
+
+#: Minimum prefix length an entry of ``source_ip_allowlist`` must carry before it counts as an
+#: effective peer control (ADR 0154 D7). Generous on purpose — ``/8`` admits ``10.0.0.0/8``, a
+#: legitimate private scope — but it excludes ``0.0.0.0/0`` and ``::/0``, which allow-list the entire
+#: internet while reading, in a config file, exactly like a restriction.
+ALLOWLIST_MIN_PREFIX_V4: Final = 8
+ALLOWLIST_MIN_PREFIX_V6: Final = 32
 
 
 def _peer_ip(peername: Any) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
@@ -106,3 +123,25 @@ def client_network_allowed(host: str | None, allowlist: Sequence[str] | None) ->
     if addr.is_loopback or (mapped is not None and mapped.is_loopback):
         return True
     return peer_ip_allowed((host, 0), allowlist)
+
+
+def allowlist_restricts(allowlist: Any) -> bool:
+    """Whether a ``source_ip_allowlist`` actually limits who may connect, so a gate may count it as
+    a peer control.
+
+    **Strength-based, not presence-based.** ``["0.0.0.0/0"]`` parses fine and restricts nobody. So
+    every entry must be at least a :data:`ALLOWLIST_MIN_PREFIX_V4` (IPv4) or
+    :data:`ALLOWLIST_MIN_PREFIX_V6` (IPv6) network, and ONE too-wide entry defeats the whole list.
+    An empty or missing list restricts nobody, and so does an unparseable entry, which cannot be
+    shown to restrict anyone."""
+    if not allowlist:
+        return False
+    for entry in allowlist:
+        try:
+            net = ipaddress.ip_network(str(entry), strict=False)
+        except ValueError:
+            return False
+        floor = ALLOWLIST_MIN_PREFIX_V4 if net.version == 4 else ALLOWLIST_MIN_PREFIX_V6
+        if net.prefixlen < floor:
+            return False
+    return True

@@ -89,6 +89,11 @@ from messagefoundry.config.tls_policy import (
     resolve_trust_anchor,
 )
 from messagefoundry.keywrap import load_connection_cert_chain
+from messagefoundry.netaddr import (
+    ALLOWLIST_MIN_PREFIX_V4,
+    ALLOWLIST_MIN_PREFIX_V6,
+    allowlist_restricts,
+)
 from messagefoundry.parsing.binary import BinaryCarriageError
 from messagefoundry.parsing.binary import decode as _carriage_decode
 from messagefoundry.parsing.dicom import _inflate as _dicom_inflate
@@ -621,8 +626,20 @@ class DicomScpSource(SourceConnector):
         # passing a check named "fail-closed peer controls". It remains a useful FILTER (it catches a
         # misrouted sender and pins intent) and is still enforced at association time — it just has to be
         # PAIRED with a control that can actually be verified.
+        #
+        # The allow-list is weighed, not counted (vault BACKLOG #2622 item 2): ["0.0.0.0/0"] parses
+        # and restricts nobody, so it is held to the same prefix floors as the HTTP intake gate, by
+        # the same function (netaddr.allowlist_restricts).
+        #
+        # NOT BUILT HERE, dated 2026-10-06: mTLS is still counted by presence. tls + tls_ca_file
+        # accepts any certificate that CA signed and binds no client subject, which the HTTP gate
+        # refuses (intake_client_subjects). The Manager deferred that half of #2622 item 2 to
+        # #1182 and #316. Read at vault origin/main the same day, #316 is closed (shipped
+        # 2026-07-30, the AE-title half) and #1182 is about backend-hop credentials, so no open row
+        # yet names this half; #2622 holds it until one does.
         mtls_on = bool(s.get("tls")) and bool(s.get("tls_ca_file"))
-        if self._host not in _LOOPBACK_HOSTS and not (self._source_ip_allowlist or mtls_on):
+        allowlist_on = allowlist_restricts(self._source_ip_allowlist)
+        if self._host not in _LOOPBACK_HOSTS and not (allowlist_on or mtls_on):
             unpaired = (
                 " You set calling_ae_allowlist, but an AE Title is asserted by the caller and cannot be"
                 " verified, so it no longer satisfies this gate alone (BACKLOG #316) — keep it as a"
@@ -630,10 +647,18 @@ class DicomScpSource(SourceConnector):
                 if self._calling_ae_allowlist
                 else ""
             )
+            too_wide = (
+                " You set source_ip_allowlist, but an entry in it is wider than"
+                f" /{ALLOWLIST_MIN_PREFIX_V4} (IPv4) or /{ALLOWLIST_MIN_PREFIX_V6} (IPv6), or does"
+                " not parse, so it restricts nobody it can be shown to and does not count (vault"
+                " BACKLOG #2622). Narrow every entry."
+                if self._source_ip_allowlist
+                else ""
+            )
             raise ValueError(
                 f"DICOM C-STORE server (SCP) bound non-loopback host {self._host!r} with no verifiable peer "
                 "control: set source_ip_allowlist, or mTLS (tls + tls_ca_file), to fail closed "
-                f"(deny-by-default, ADR 0025 §9), or bind 127.0.0.1.{unpaired} Authoring surface: pass "
+                f"(deny-by-default, ADR 0025 §9), or bind 127.0.0.1.{too_wide}{unpaired} Authoring surface: pass "
                 'them to inbound(...), e.g. inbound("pacs_in", DICOM(...), '
                 'source_ip_allowlist=["10.0.0.0/8"]). That is the ONLY surface for a DICOM server (SCP) — the '
                 "[inbound] section of messagefoundry.toml has no source_ip_allowlist key and discards it "

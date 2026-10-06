@@ -25,7 +25,6 @@ from __future__ import annotations
 import asyncio
 import errno
 import functools
-import ipaddress
 import json
 import logging
 import time
@@ -103,6 +102,11 @@ from messagefoundry.fhirsearch import FhirSearchParams
 from messagefoundry.log_backoff import IN_THIS_RUN, FailureRun
 from messagefoundry.logging_guard import LogSinkEvent
 from messagefoundry.logging_guard import active_guard as active_log_guard
+from messagefoundry.netaddr import (
+    ALLOWLIST_MIN_PREFIX_V4,
+    ALLOWLIST_MIN_PREFIX_V6,
+    allowlist_restricts,
+)
 from messagefoundry.parsing import (
     HL7PeekError,
     Peek,
@@ -9345,12 +9349,10 @@ def check_http_tls_exposure(
     )
 
 
-#: Minimum prefix length an entry of ``source_ip_allowlist`` must carry before it counts as an
-#: effective peer control (ADR 0154 D7). Generous on purpose — ``/8`` admits ``10.0.0.0/8``, a
-#: legitimate private scope — but it excludes ``0.0.0.0/0`` and ``::/0``, which allow-list the entire
-#: internet while reading, in a config file, exactly like a restriction.
-_INTAKE_ALLOWLIST_MIN_PREFIX_V4 = 8
-_INTAKE_ALLOWLIST_MIN_PREFIX_V6 = 32
+#: The allow-list floors, owned by :mod:`messagefoundry.netaddr` since vault BACKLOG #2622 so the
+#: DICOM server's gate applies the same ones. Kept under these names for the refusal text below.
+_INTAKE_ALLOWLIST_MIN_PREFIX_V4 = ALLOWLIST_MIN_PREFIX_V4
+_INTAKE_ALLOWLIST_MIN_PREFIX_V6 = ALLOWLIST_MIN_PREFIX_V6
 
 
 def _has_effective_peer_control(settings: Mapping[str, Any]) -> bool:
@@ -9370,20 +9372,7 @@ def _has_effective_peer_control(settings: Mapping[str, Any]) -> bool:
         # The subject list is what tls_ca_file alone does not give you.
         return bool(settings.get("tls_ca_file")) and bool(settings.get("intake_client_subjects"))
 
-    allowlist = settings.get("source_ip_allowlist")
-    if not allowlist:
-        return False
-    for entry in allowlist:
-        try:
-            net = ipaddress.ip_network(str(entry), strict=False)
-        except ValueError:
-            return False  # unparseable: cannot be shown to restrict anyone, so it does not count
-        floor = (
-            _INTAKE_ALLOWLIST_MIN_PREFIX_V4 if net.version == 4 else _INTAKE_ALLOWLIST_MIN_PREFIX_V6
-        )
-        if net.prefixlen < floor:
-            return False  # ONE too-wide entry defeats the whole list
-    return True
+    return allowlist_restricts(settings.get("source_ip_allowlist"))
 
 
 def check_http_sync_reply(
