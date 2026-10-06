@@ -101,6 +101,10 @@ order-independent and **path-relative** (a per-file `relpath + sha256(bytes)` Me
 network), computed **off the event loop** (`asyncio.to_thread`, like `load_config`). It additionally
 records a **best-effort git HEAD** (read purely from `.git`, omitted gracefully outside a work tree) as
 advisory provenance — the content digest is the integrity anchor.
+*Amended 2026-10-06 (vault BACKLOG #2781): the scheme is now `mefor-cfg-fp:v2`. A dot-named `*.py`
+(`.IB_OLD.py`, an AppleDouble `._X.py`) is no longer hashed, because the loader no longer runs one; the
+`*.py` set is `config.wiring.config_py_files`, the one rule the loader and ADR 0036's guard share. The
+`v1` text above is kept as the record of what was decided on its date.*
 
 This binds "reviewed-and-merged in git" to "what actually loaded," makes two reloads with different
 on-disk code distinguishable, defeats attribution-laundering (the audit now shows *which code* a given
