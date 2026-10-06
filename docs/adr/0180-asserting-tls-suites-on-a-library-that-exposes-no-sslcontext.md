@@ -345,3 +345,20 @@ A site whose users or groups live in more than one domain of a forest would need
 or a search base in the bound controller's own domain, instead of referrals. A global catalog
 carries the membership of universal groups only, so roles mapped to another domain's domain-local
 or global groups would not resolve through it.
+
+*Note (2026-10-05, BACKLOG #2538).* "Reads it as unavailable" above no longer holds for the
+reconciler. Read that way, a search base in another domain made every pass a silent outage, so no
+directory disable would ever reach a signed-in session. The refusal is now `LdapReferralError`, a
+subclass of `LdapError`, so sign-in is unchanged. The reconciler reads it as its own outcome: it
+never revokes, and a pass with a referred probe aborts as `directory_referral` and raises the
+`ad_reconcile_aborted` alert.
+
+*Note (2026-10-05, later, BACKLOG #2538).* The previous note's "a pass with a referred probe
+aborts" no longer holds. Aborting the whole pass regressed offboarding on a referring group search
+base. That base refers only the accounts the user search found enabled. So the disabled and
+absent answers beside them stopped revoking. A referred account is now left unjudged, like an unreachable
+one, and every other probe in the pass is judged and applied. The pass still raises the
+`ad_reconcile_aborted` alert with reason `directory_referral`, now audited as
+`auth.ad_reconcile_referred` and raised under its own source label, so it is not the breaker's
+instance. This engine process does not resolve it while its own probes are referred. Only a pass
+whose every probe is referred or unreachable judges nothing, as on an outage, and it pages too.
