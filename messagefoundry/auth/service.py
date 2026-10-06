@@ -539,6 +539,11 @@ IDP_STEP_UP_REQUIRED = "idp_step_up_required"
 #: charged.
 DIRECTORY_UNCONFIRMED = "directory_unconfirmed"
 
+#: The outcome :meth:`AuthService._directory_step_up_refusal` gives a present, enabled directory
+#: account whose stored roles are not all among the roles its current groups map to (BACKLOG #2240).
+#: Audited beside :data:`DIRECTORY_UNCONFIRMED`, like the probe's own outcomes.
+DIRECTORY_ROLES_DEMOTED = "directory_roles_demoted"
+
 #: The closed-set reasons the federated step-up leg refuses with (BACKLOG #296), on the
 #: ``auth.reauth`` audit row and on :class:`OidcStepUp`. A claims-ladder slug can also appear there.
 STEP_UP_NOT_FRESH = "step_up_not_fresh"
@@ -8156,6 +8161,14 @@ class AuthService:
         directory may reissue a freed name to someone else, whose account would then vouch for this
         row. The Windows SSO sign-in and the password step-up refuse the same row the same way.
         This leg used to ask an id-less row with no binding by its name.
+
+        **A present account that lost a role in the directory is refused too (BACKLOG #2240).** Its
+        stored roles must all be among the roles its current groups map to, the same pair the
+        reconciler diffs. Otherwise a demoted operator would renew its window, or clear the MFA
+        gate, with roles it no longer holds until the reconciler's role pass. Only a demotion
+        refuses: a promotion leaves the token under-privileged, not over. This refuses and writes
+        nothing; the reconciler or the next sign-in re-syncs the roles. Channel scope is not
+        compared here.
         """
         if self._ldap is None:
             return "not_configured"
@@ -8165,9 +8178,14 @@ class AuthService:
         # They differ on an id-less row only: this leg refuses it above, and the reconciler still
         # probes an unbound one by name (BACKLOG #2027).
         probe = await self._probe_principal(user)
-        if probe.outcome is reconcile.ProbeOutcome.PRESENT:
-            return None
-        return str(probe.outcome.value)
+        if probe.outcome is not reconcile.ProbeOutcome.PRESENT:
+            return str(probe.outcome.value)
+        # The groups came back with the probe, so this costs store reads only. Read after the probe,
+        # so a sign-in that re-synced the roles during the round trip is judged on what it wrote.
+        held = set(await self._store.get_user_role_ids(user.id))
+        if not held <= await self._store.roles_for_ad_groups(probe.groups):
+            return DIRECTORY_ROLES_DEMOTED
+        return None
 
     async def _verify_second_factor(
         self,
