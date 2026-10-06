@@ -219,12 +219,39 @@ async def test_a_release_then_a_reload_binds_the_normal_feed_again(box: _Box) ->
     await coord.release(actor="alice")
     assert engine.dr_active is False and rr.dr_threshold is None
     assert not rr.inbound_running(_CRIT)  # the release unbound all intake
-    # Released, nothing reports parked, even before a reload re-evaluates the graph.
-    assert rr.filtered_inbound() == {} and rr.filtered_outbound() == {}
+    # Until the next reload a parked feed stays parked, so the scheduler cannot bind it.
+    assert _NORM in rr.filtered_inbound()
 
     await engine.reload_detail(box.tiered)
     assert rr.inbound_running(_CRIT) and rr.inbound_running(_NORM)
     assert rr.filtered_inbound() == {} and rr.filtered_outbound() == {}
+
+
+async def test_a_reload_that_fails_after_the_threshold_is_set_puts_it_back(
+    box: _Box, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one case the rollback exists for: the threshold is on the runner and the re-apply
+    fails. Red under a missing rollback, which leaves CRITICAL on a box reported not active."""
+    engine = box.engine
+    await engine.reload_detail(box.tiered)
+    rr = engine.registry_runner
+    assert rr is not None
+    seen: list[object] = []
+
+    async def failing_reload(registry: object = None) -> None:
+        seen.append(rr.dr_threshold)
+        raise OSError("a listener could not bind")
+
+    monkeypatch.setattr(rr, "reload", failing_reload)
+    coord = engine.dr_coordinator
+    assert coord is not None
+    with pytest.raises(DrActivationError) as caught:
+        await coord.activate(actor="alice")
+
+    assert caught.value.kind == "profile"
+    assert seen == [Priority.CRITICAL]  # control: the threshold was on when the reload ran
+    assert rr.dr_threshold is None
+    assert coord.active is False and engine.dr_active is False
 
 
 async def test_a_refused_activation_puts_the_threshold_back(

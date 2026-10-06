@@ -2353,12 +2353,10 @@ class RegistryRunner:
         a running box. Without it the threshold stayed at its construction value, so an activation
         reload parked nothing on a box built passive (vault BACKLOG #3067).
 
-        Clearing it also drops every ``filtered`` marker, which only the DR profile writes. Left in
-        place, a released box kept reporting connections as parked, the scheduler kept skipping
-        them, and an operator start built no connector for a parked outbound."""
+        The ``filtered`` markers stay until that reload, which drops them when no threshold is set.
+        Until then a released box keeps a parked feed parked: the scheduler skips it, and its
+        status says why its outbound has no connector."""
         self._dr_threshold = threshold
-        if threshold is None:
-            self._filtered.clear()
 
     def _dr_filters_out(self, name: str, declared: Priority | None, *, kind: Direction) -> bool:
         """Whether the DR run-profile parks this connection (its resolved tier is below the threshold).
@@ -5401,6 +5399,12 @@ class RegistryRunner:
             if new_registry is None:
                 new_registry = self.registry
             self.build_check(new_registry)  # raises before any change on a bad connector
+            if self._dr_threshold is None:
+                # Only the DR profile writes these, and with it off nothing is parked. The loops
+                # below drop a marker only for a connection that passes the earlier gates, so one
+                # left down by auto_start or deployed would otherwise read "filtered" for good
+                # after a POST /dr/release (vault BACKLOG #3067).
+                self._filtered.clear()
             if not self._running:
                 self.registry = new_registry
                 return

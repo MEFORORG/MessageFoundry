@@ -761,33 +761,34 @@ class Engine:
         (:meth:`_dr_config_drift`)."""
         was_active = self._dr_active
         rr = self._registry_runner
-        if rr is None:
-            self._dr_active = True  # a runner built later takes the threshold at construction
-        else:
-            # Re-apply the graph the runner holds in memory, not a config dir read from disk. The
-            # running graph is what the operator last applied, through whatever approval that reload
-            # needed, so an activation must not swap in bytes edited since then with no second person,
-            # nor the startup dir's older graph (vault BACKLOG #2840). It also needs no config dir,
-            # so a dir on a share at the failed site cannot refuse the activation after the takeover
-            # hook moved the VIP. The two preflights are the ones reload_detail runs on a real
-            # reload, and rr.reload still runs build_check, so the egress and exposure gates still
-            # run. propagate does not arise: a local DR decision is never a cluster-wide config bump.
-            # The threshold goes to the runner after the preflights, which only read, and before
-            # the reload, which is where the runner re-evaluates every connection. rr.reload(None)
-            # re-applies whichever graph is current once it holds the reload lock, so an operator
-            # reload that lands first is re-evaluated rather than reverted.
-            try:
+        # Re-apply the graph the runner holds in memory, not a config dir read from disk. The running
+        # graph is what the operator last applied, through whatever approval that reload needed, so
+        # an activation must not swap in bytes edited since then with no second person, nor the
+        # startup dir's older graph (vault BACKLOG #2840). It also applies nothing from the config
+        # dir, so a dir on a share at the failed site cannot refuse it after the takeover hook moved
+        # the VIP. The settings and registry preflights are the trust-anchor checks reload_detail
+        # runs before a swap; they read anchor files and write audit rows, and they refuse before
+        # anything changes. The graph guard and the env-values re-read are not repeated: the graph
+        # is unchanged, and the values are the ones the runner holds. rr.reload still runs
+        # build_check, so the egress and exposure gates still run. The threshold goes to the runner
+        # after the preflights and before the reload, which is where the runner re-evaluates every
+        # connection. rr.reload() re-applies whichever graph is current once it holds the reload
+        # lock, so an operator reload that lands first is re-evaluated rather than reverted. A local
+        # DR decision is never a cluster-wide config bump.
+        try:
+            if rr is not None:
                 await self.preflight_settings()
                 await self.preflight_registry(rr.registry)
-                self._set_dr_active(True)
+            self._set_dr_active(True)
+            if rr is not None:
                 await rr.reload()
-            except Exception:
-                # A refused reload (BACKLOG #2034: a settings trust anchor, say) applied no DR profile,
-                # so the latch and the runner's threshold go back too. Left set, the next operator
-                # reload would park the feeds below the threshold on a box the DR coordinator reports
-                # as not active.
-                self._set_dr_active(was_active)
-                raise
+        except Exception:
+            # A refused reload (BACKLOG #2034: a settings trust anchor, say) applied no DR profile,
+            # so the latch and the runner's threshold go back too. Left set, the next operator
+            # reload would park the feeds below the threshold on a box the DR coordinator reports
+            # as not active.
+            self._set_dr_active(was_active)
+            raise
         return await self._dr_config_drift()
 
     async def _dr_config_drift(self) -> dict[str, object]:

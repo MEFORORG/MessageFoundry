@@ -247,8 +247,9 @@ in-flight rows stranded.
 > fails the activation. The re-apply runs the current graph once it holds the runner's reload lock, so an
 > operator reload that lands first is re-evaluated under the threshold rather than reverted.
 > `POST /config/reload`, under its own approval gate, is what applies the disk. This is not a `config_changed`
-> alert, whose contract is a start loading different bytes. The `dr_seed` marker records the activated graph's
-> digest too, not a disk digest taken before the takeover hook.
+> alert, whose contract is a start loading different bytes. The `dr_seed` marker records the running graph's
+> digest too, not a disk digest. The marker is written before the takeover hook, so an operator reload that
+> lands during the hook makes it differ from the `dr.activate` row, which records the graph actually applied.
 
 ### Seeding DR state — cold-from-#60 (the owner-locked default)
 

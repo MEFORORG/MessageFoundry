@@ -295,6 +295,9 @@ class DrCoordinator:
                         "vip_hook_ran": hook_ran,
                     },
                     sort_keys=True,
+                    # The profile is live by now, so a callback field json cannot encode must not
+                    # stop the promotion's audit row from being written.
+                    default=str,
                 ),
                 now=now,
             )
