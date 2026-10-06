@@ -88,7 +88,7 @@ use the table below alongside them when planning.
 | Windows-service deployment via NSSM | ✅ Built — see [SERVICE.md](SERVICE.md) |
 | **Native transport TLS** (API + MLLP) | ✅ Built — in-process API TLS (HTTPS/WSS) + per-connection MLLP-over-TLS, ≥TLS 1.2, opt-in mTLS, and a **fail-closed off-loopback bind guard** (a non-loopback bind without TLS is refused). Raw TCP/X12 stay plaintext (loopback/proxy). See [DEPLOYMENT.md](DEPLOYMENT.md). |
 | **Native MFA** (TOTP and passkeys, local and directory accounts) | ✅ Built — RFC 6238 TOTP + single-use recovery codes; `[security].require_mfa` enforces a second factor as an access gate on every authorized route; while it is on, a directory session that proved no factor owes one under either `require_mfa_scope` value (BACKLOG #1144). See [SECURITY.md](SECURITY.md#multi-factor-authentication-totp-wp-14). See [SECURITY.md](SECURITY.md). |
-| **Off-box log + audit forwarding** | ✅ Built — `[logging].forward_*` ships operational logs + PHI-redacted audit rows to a syslog/SIEM collector, over **native TLS** when you set `forward_protocol = "tls"` (RFC 5425, ADR 0080; port 6514, CA anchor via `forward_tls_*`). Residual: the transport **default** is UDP, so TLS is a per-deployment opt-in — set it, or front the collector with a local TLS-forwarding agent. See [PHI.md](PHI.md) §7. |
+| **Off-box log + audit forwarding** | ✅ Built — `[logging].forward_*` ships operational logs + audit rows, both with only best-effort PHI redaction, to a syslog/SIEM collector, over **native TLS** when you set `forward_protocol = "tls"` (RFC 5425, ADR 0080; port 6514, CA anchor via `forward_tls_*`). Residual: the transport **default** is UDP, so TLS is a per-deployment opt-in — set it, or front the collector with a local TLS-forwarding agent. See [PHI.md](PHI.md) §7. |
 | **Active-passive HA / failover** | ✅ Built (Track B) — opt-in leader/standby cluster on a **shared server-DB** store (PostgreSQL or SQL Server): only the leader runs the graph, self-fencing leadership lease, immediate on-promotion recovery. Single-node stays the byte-identical default. See [CLUSTERING.md](CLUSTERING.md) + §14. |
 
 ### Experimental or not yet built — **do not depend on these for a production pilot**
@@ -331,7 +331,10 @@ engine writes, such as a File connection's, to `NT SERVICE\MessageFoundry` by na
 ### 4.5 Provision the first administrator
 
 Auth is **enabled by default**, and **the engine creates no account on its own**. Until you create the
-first Administrator, nobody can sign in. Do it once per store, at the host:
+first Administrator, nobody can manage the engine. At the shipped posture a start with no Administrator
+is refused. If a start goes ahead without one, a Windows sign-in (Kerberos), where configured, can
+still create a directory account, but that account holds no role. Create the
+Administrator once per store, at the host:
 
 1. Set the store key in your shell, the same `MEFOR_STORE_ENCRYPTION_KEY` the service runs with,
    unless it comes from `[store].encryption_key_file`, which the command reads too. Do not generate a
@@ -745,9 +748,9 @@ message, and confirm the **"wiring started"** banner in `service.out.log`.
 
 **Log management:** logs land under `<DataDir>\logs` via NSSM. Configure rotation, keep the level at
 `INFO` or above (DEBUG can leak PHI — §6), treat `service.out/err.log` as **potential-PHI artifacts**
-(ACL them; don't copy these raw files off-box — `[logging].forward_*` forwards a PHI-redacted
-stream to your collector instead), and include them in your retention
-policy.
+(ACL them; don't copy these raw files off-box — `[logging].forward_*` sends the collector a copy
+instead), and include them in your retention policy. The forwarded copy passes the same best-effort
+redaction filters as these files, so treat the collector's copy as potential PHI too.
 
 **Graceful drain for maintenance:** `Stop-Service MessageFoundry` reaches the engine as Ctrl+C,
 through NSSM. That, or Ctrl+C on a foreground `serve`, makes the ASGI lifespan call `engine.stop()`

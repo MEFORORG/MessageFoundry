@@ -2259,8 +2259,9 @@ class LoggingSettings(_Section):
     # startup rather than at the first collector handshake.
     forward_tls_crl_file: str | None = None
     # Per-hop insecure-forwarding attestation (#200, ADR 0092 shape — the [logging] sibling of a
-    # connection's `tls_hop_attested`). The off-box forwarder ships a PHI-REDACTED copy of every log +
-    # audit row, but the default `forward_protocol = "udp"` puts that evidence stream (usernames,
+    # connection's `tls_hop_attested`). The off-box forwarder ships a copy of every log + audit row
+    # after the same BEST-EFFORT redaction as stdout (a single-token identifier can survive it), but
+    # the default `forward_protocol = "udp"` puts that evidence stream (usernames,
     # message ids, connection names, IPs, the audit chain) on the wire in the clear, and it was the ONE
     # egress path with no posture gate at all. It is now decided by the same shared authority the
     # transports use (see `forward_hop_disposition`): a plaintext / unverified-TLS collector hop is
@@ -2273,7 +2274,8 @@ class LoggingSettings(_Section):
     # Records the collector does not take (down, backing off, or still queued at shutdown) are kept
     # here, in order, and sent when it answers again. None (the default) puts it at
     # `<dir of [store].path>/log-spool/<engine or shard id>`, so each engine shard gets its own. It
-    # holds PHI-REDACTED text only (the filters run before the hand-off queue), PL-1 like the app log.
+    # holds only text the filters already processed (they run before the hand-off queue). That
+    # redaction is best-effort, so the spool may still hold PHI: PL-1 like the app log.
     forward_spool_dir: str | None = None
     # Cap on the spool's size on disk, in bytes. When full, the NEWEST record is dropped and the drop
     # reported, which keeps the oldest evidence. 0 turns the spool off (the pre-#1966 behaviour).
@@ -3962,7 +3964,7 @@ def forward_hop_disposition(log: LoggingSettings, posture: HopPosture) -> HopDis
 
     The ``[logging].forward_*`` syslog/SIEM forwarder was the one PHI-adjacent egress path with **no**
     posture gate: ``forward_protocol`` defaults to plaintext ``udp`` (RFC 5426), so an operator who
-    named a collector shipped a PHI-**redacted** but still sensitive evidence stream — usernames,
+    named a collector shipped a best-effort-redacted and still sensitive evidence stream — usernames,
     connection names, message ids, client IPs, the tamper-evident audit chain — off-box in the clear,
     silently. Native TLS-syslog has existed since ADR 0080 (``forward_protocol = "tls"``, RFC 5425,
     CA-anchored), so a secure transport is available and this is a *default* problem, not a

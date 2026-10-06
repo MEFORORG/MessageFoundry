@@ -830,7 +830,7 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "provision-admin",
         help="create the first administrator offline (the engine creates no account on its own)",
         description="Create the first Administrator from the host, against the store the service "
-        "uses. The engine creates no account on its own, so an install has no way to sign in until "
+        "uses. The engine creates no account on its own, so nobody can manage a new install until "
         "this runs. It refuses, before asking for a password, when an enabled Administrator already "
         "exists or an argument is out of range, and it creates the store only once the password "
         "has passed the policy, so a refusal leaves no new SQLite store file behind. Run it with the "
@@ -2243,7 +2243,7 @@ def _serve(args: argparse.Namespace) -> int:
         else None
     )
     # #200 (ADR 0092) residual: the forwarder was the ONE egress path with no posture gate — its
-    # plaintext-UDP default shipped the (PHI-redacted, but still sensitive) log + audit evidence stream
+    # plaintext-UDP default shipped the (best-effort redacted, still sensitive) log + audit evidence stream
     # off-box in the clear, silently. Decide it with the SAME shared authority the transports use, and
     # BEFORE configure_logging installs the handler, so a refused hop never emits a single record.
     # Loopback (the ADR 0080 local-agent deployment) is untouched; no instance is exempt as
