@@ -570,13 +570,18 @@ def _general_names(names: list[str]) -> list[x509.GeneralName]:
 
 
 def make_self_signed(cn: str, sans: list[str], days: int) -> tuple[bytes, bytes]:
-    """Mint a self-signed EC P-256 cert + key for **non-prod** TLS bring-up. Returns ``(cert_pem, key_pem)``.
+    """Mint a self-signed EC P-256 cert + key, a TLS PLACEHOLDER. Returns ``(cert_pem, key_pem)``.
 
     Self-issued (subject == issuer), SHA-256, basic-constraints CA=false, and a SubjectAlternativeName
     covering ``cn`` plus every name in ``sans`` (``cn`` first, de-duplicated, order-stable). Valid
     from one minute ago (clock-skew slack) for ``days`` days. The returned key PEM is unencrypted
-    PKCS#8 — the caller MUST persist it through the CLI's ``_write_private_key``. DEV ONLY: a
-    self-signed cert has no chain of trust and must never front production PHI.
+    PKCS#8 — the caller MUST persist it through the CLI's ``_write_private_key``.
+
+    **The pair is a PLACEHOLDER TO BE REPLACED, not an endorsed production terminator.** A
+    self-signed certificate has no chain of trust: strictly better than cleartext, strictly worse
+    than an operator-supplied chain. Its callers include the engine's own API listener, which
+    serves one on first run when no ``[api].tls_cert_file`` is set (``messagefoundry.api.tls``,
+    ADR 0172), and the ``cert self-signed`` CLI verb.
 
     **An IP literal becomes an** ``iPAddress`` **entry, not a** ``DNSName``. Hostname verification for
     an IP-literal URL matches only against ``iPAddress``; a DNS entry spelling the same characters

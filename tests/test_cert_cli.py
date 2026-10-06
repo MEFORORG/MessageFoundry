@@ -720,13 +720,18 @@ def test_self_signed_ip_literal_lands_as_ip_address_san(
     assert facts.sans == ["127.0.0.1", "localhost", "::1"]
 
 
-def test_self_signed_human_output_warns_dev_only(
+def test_self_signed_human_output_names_it_a_placeholder(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    # BACKLOG #1276, owner override 2026-08-16: the engine serves this primitive's output on first
+    # run (ADR 0172), so the note no longer says "non-prod only". It says what the pair is: a
+    # placeholder with no chain of trust, to be replaced by an operator-supplied chain.
     out = tmp_path / "o"
     assert main(["cert", "self-signed", "--cn", "dev.local", "--out-dir", str(out)]) == 0
     printed = capsys.readouterr().out.lower()
-    assert "non-prod" in printed
+    assert "placeholder" in printed
+    assert "no chain of trust" in printed
+    assert "non-prod" not in printed
 
 
 def test_self_signed_refuses_to_overwrite_existing_key(
