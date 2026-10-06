@@ -154,9 +154,10 @@ def _ascii(name: str) -> str:
     escape stands for.
 
     This covers this module's one line. A lone surrogate in any other log line failed the same two
-    sinks the same way until vault BACKLOG #2815; the handlers' log escape now escapes it as
-    ``\\udcff``. A printable character a sink cannot encode is not in that escape's alphabet, so
-    this function is still what keeps such a name on a strict standard output.
+    sinks the same way until vault BACKLOG #2815; the handlers' log escape now writes it as the
+    text ``\\\\udcff`` (vault BACKLOG #3012), unlike this function's ``\\udcff``. A printable
+    character a sink cannot encode is not in that escape's alphabet, so this function is still
+    what keeps such a name on a strict standard output.
     """
     return name.encode("unicode_escape").decode("ascii")
 

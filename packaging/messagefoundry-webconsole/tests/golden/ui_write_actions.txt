@@ -1,3 +1,5 @@
+^/ui$	-	step_up=1,auto_retry=0,unlock=1
+^/ui/account$	-	step_up=1,auto_retry=0,unlock=1
 ^/ui/account/mfa/confirm$	mfa_confirm	step_up=0,auto_retry=0,unlock=1
 ^/ui/account/mfa/disable$	mfa_disable	step_up=1,auto_retry=1,unlock=0
 ^/ui/account/mfa/enroll$	mfa_enroll	step_up=0,auto_retry=1,unlock=0
@@ -6,13 +8,20 @@
 ^/ui/account/webauthn/[^/?#]+/delete$	webauthn_delete	step_up=1,auto_retry=1,unlock=0
 ^/ui/account/webauthn/enroll$	webauthn_enroll	step_up=0,auto_retry=1,unlock=0
 ^/ui/ad-groups$	-	step_up=1,auto_retry=0,unlock=1
+^/ui/alerts/[^/?#]+/reason(\?[^#]*)?$	-	step_up=1,auto_retry=0,unlock=1
 ^/ui/cluster/force-stepdown-confirm$	-	step_up=1,auto_retry=0,unlock=1
 ^/ui/cluster/stepdown-confirm$	-	step_up=1,auto_retry=0,unlock=1
 ^/ui/config/reload$	-	step_up=1,auto_retry=1,unlock=0
+^/ui/connection/[^/?#]+/events/[^/?#]+/reason(\?[^#]*)?$	-	step_up=1,auto_retry=0,unlock=1
 ^/ui/connections/[^/?#]+/purge/(top|all)$	-	step_up=1,auto_retry=1,unlock=0
 ^/ui/connections/purge-confirm$	-	step_up=1,auto_retry=0,unlock=1
+^/ui/dead-letters(\?[^#]*)?$	-	step_up=1,auto_retry=0,unlock=1
 ^/ui/dead-letters/[^/?#]+(/[^/?#]+)?/replay$	-	step_up=1,auto_retry=1,unlock=0
 ^/ui/dead-letters/replay-all$	-	step_up=1,auto_retry=1,unlock=0
+^/ui/events/[^/?#]+/reason(\?[^#]*)?$	-	step_up=1,auto_retry=0,unlock=1
+^/ui/messages(\?[^#]*)?$	-	step_up=1,auto_retry=0,unlock=1
+^/ui/messages/(?!search(?:$|[/?#]))[^/?#]+(/(summary|body|errors|parse-tree))?(\?[^#]*)?$	-	step_up=1,auto_retry=0,unlock=1
+^/ui/messages/[^/?#]+/attachments/[^/?#]+(\?[^#]*)?$	-	step_up=1,auto_retry=0,unlock=1
 ^/ui/messages/[^/?#]+/edit$	-	step_up=1,auto_retry=0,unlock=1
 ^/ui/messages/[^/?#]+/replay$	-	step_up=1,auto_retry=1,unlock=0
 ^/ui/messages/[^/?#]+/resend-confirm(\?[^#]*)?$	-	step_up=1,auto_retry=0,unlock=1

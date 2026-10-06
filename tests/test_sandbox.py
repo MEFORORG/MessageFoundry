@@ -1289,7 +1289,7 @@ def test_at_debug_content_is_relayed_attributed_and_control_scrubbed(
     message = line.getMessage()
     assert "IB_ERR" in message and "pid " in message and "gen " in message, message
     assert "\x1b" not in message and "\r" not in message, "a raw control byte survived the relay"
-    assert "\\x1b" in message and "\\r" in message, "the control bytes were dropped, not escaped"
+    assert "\\u001b" in message and "\\r" in message, "the control bytes were dropped, not escaped"
     assert "tail" in message, "the text after the CR was lost instead of being kept on one record"
 
 
@@ -1497,7 +1497,7 @@ def test_the_relay_survives_hostile_bytes_and_a_dead_pipe(
     joined = "\n".join(r.getMessage() for r in _content_records(caplog))
     assert "café" in joined, "a character split across two reads was corrupted"
     assert "bad utf-8" in joined  # decoded with replacement rather than raising
-    assert "\x00" not in joined and "\\x00" in joined, "a raw NUL survived the relay"
+    assert "\x00" not in joined and "\\u0000" in joined, "a raw NUL survived the relay"
 
     class _Exploding:
         def read(self, _n: int) -> bytes:

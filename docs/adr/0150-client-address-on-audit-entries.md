@@ -43,6 +43,11 @@ called from exactly four places — `require_step_up`, `require_reauth_only`,
 So on a default deployment it never fired (true when written; it is on by default since BACKLOG #288); on an enabled one it fires only on a *change*, and it
 writes its own `auth.*` row rather than attributing the export row.
 
+*Overtaken 2026-10-05 (vault BACKLOG #2620): `require_phi_read` now calls the signal, so "never
+calls it at all" no longer holds. Neither does the caller list above, which also missed the
+console's gates. A first sighting on a PHI read now writes `auth.admin_action_new_ip`. See
+[ADR 0068](0068-browser-webauthn-passkeys-offloopback.md)'s amendment of that date for the gates.*
+
 **The session record is actively misleading, not merely lossy.** `sessions.client` is captured at
 **login**. On a replayed token it therefore holds the **original victim's** address, so joining an
 audit row to its session to recover "where from" produces a confident, wrong answer that points at
