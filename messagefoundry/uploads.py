@@ -409,9 +409,9 @@ class ResealResult:
     and dropping that key makes it permanently unreadable — so a non-zero ``skipped`` means "run it
     again before you retire anything".
 
-    The two counts use different units. ``resealed`` counts VALUES, so a whole pair adds two.
-    ``skipped`` counts UPLOADS, so a pair adds at most one, whichever half failed (BACKLOG #2322):
-    an unreadable body leaves its sidecar unread and unsealed, and that is still one upload."""
+    The counts use different units. ``resealed`` counts VALUES: each body or sidecar it rewrites
+    adds one. ``skipped`` counts UPLOADS: a pair adds at most one, whichever half failed (BACKLOG
+    #2322). An unreadable body leaves its sidecar unread and unsealed, and that is still one upload."""
 
     resealed: int = 0
     skipped: int = 0
@@ -1202,10 +1202,16 @@ class UploadStore:
                 except (OSError, UnicodeDecodeError) as exc:
                     # A half-deleted pair or an unreadable file. Counted and named, never silent:
                     # this file is still under the OLD key and the operator must not retire it yet.
-                    # `break`: a failure at any kind ends the pair, so a failed body leaves the
-                    # sidecar unsealed and the pair counts once (BACKLOG #2322).
                     skipped += 1
                     _log.warning("uploaded file %s (%s): skipped, unreadable: %s", fid, kind, exc)
+                    if kind == "body" and isinstance(exc, FileNotFoundError):
+                        # A body that is GONE has nothing left to refuse, and no re-run brings it
+                        # back. Sealing its sidecar keeps the pair decryptable after the old key
+                        # goes, so `prune_expired` can still remove it at expiry.
+                        continue
+                    # A body that is present but unreadable ends the pair here, so its sidecar is
+                    # not sealed over a body this pass never sealed (BACKLOG #2322). The sidecar is
+                    # the last kind, so either way the pair counts once in `skipped`.
                     break
                 aad = cell_aad("uploaded_file", kind, fid)
                 # A CipherError here means a prior key was not supplied. It PROPAGATES, before any

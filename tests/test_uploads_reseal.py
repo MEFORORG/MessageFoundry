@@ -25,7 +25,6 @@ from __future__ import annotations
 import base64
 import json
 import logging
-from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -171,36 +170,64 @@ async def test_reseal_raises_rather_than_dropping_a_file_it_cannot_open(tmp_path
     assert (await _keyed_store(root, key_a).read_bytes(fid)).decode() == _ADT
 
 
-def _remove(path: Path) -> None:
-    path.unlink()
-
-
 def _garble(path: Path) -> None:
     path.write_bytes(b"\xff\xfe not utf-8")
 
 
-@pytest.mark.parametrize("break_body", [_remove, _garble], ids=["missing", "undecodable"])
-async def test_an_unreadable_body_is_skipped_and_leaves_its_sidecar_untouched(
-    tmp_path: Path, break_body: Callable[[Path], None]
-) -> None:
-    """A half-deleted or unreadable pair must not be reported as re-sealed, even in part.
+async def test_a_missing_body_is_skipped_and_its_sidecar_still_resealed(tmp_path: Path) -> None:
+    """A half-deleted pair must not be reported as re-sealed.
 
     ``skipped`` is what tells the operator NOT to retire the prior key yet, so it has to be non-zero
-    here; counting the pass as clean is the failure that loses the file two commands later. And the
-    body-first order has to hold when the body FAILS (BACKLOG #2322): the sidecar is the listing key,
-    so it must come out byte-for-byte as it went in, and the pair counts as ONE skipped upload.
+    here; counting the pass as clean is the failure that loses the file two commands later.
+
+    The sidecar IS sealed, unlike a present-but-unreadable body below (BACKLOG #2322). A body that is
+    gone has nothing left to refuse and never comes back, so holding its sidecar under the old key
+    would only strand it there, out of reach of ``prune_expired`` once that key is dropped.
     """
     root = tmp_path / "uploads"
     key_a, key_b = generate_key(), generate_key()
     fid = await _seed(_keyed_store(root, key_a))
-    break_body(root / f"{fid}.blob")
+    (root / f"{fid}.blob").unlink()  # sidecar without a body
+
+    result = await _keyed_store(root, key_b, (key_a,)).reseal_to_active()
+    assert result == ResealResult(resealed=1, skipped=1)
+    assert (await _keyed_store(root, key_b).get_meta(fid)).filename == "acme.hl7"
+
+
+async def test_an_unreadable_body_leaves_its_sidecar_untouched(tmp_path: Path) -> None:
+    """BACKLOG #2322: the body-first order has to hold when the body FAILS, not only when it succeeds.
+
+    The sidecar is the listing key, so it must come out byte-for-byte as it went in, and the pair
+    counts as ONE skipped upload. It is still under key A and readable there, so a re-run after the
+    operator fixes the body has something to seal.
+    """
+    root = tmp_path / "uploads"
+    key_a, key_b = generate_key(), generate_key()
+    fid = await _seed(_keyed_store(root, key_a))
+    _garble(root / f"{fid}.blob")
     sidecar = (root / f"{fid}.meta").read_bytes()
 
     result = await _keyed_store(root, key_b, (key_a,)).reseal_to_active()
     assert result == ResealResult(resealed=0, skipped=1)
     assert (root / f"{fid}.meta").read_bytes() == sidecar
-    # Still under key A and readable there, so the operator's re-run has something to seal.
     assert (await _keyed_store(root, key_a).get_meta(fid)).filename == "acme.hl7"
+
+
+async def test_an_unreadable_plaintext_body_keeps_its_upload_unlisted(tmp_path: Path) -> None:
+    """The case the body-first order exists for: a first key-enable over a plaintext pair.
+
+    A keyed store refuses a plaintext sidecar, so the upload is not listed. Sealing that sidecar over
+    a body the pass could not seal would list an upload whose body is still refused (BACKLOG #2322).
+    """
+    root = tmp_path / "uploads"
+    fid = await _seed(_keyed_store(root, None))
+    _garble(root / f"{fid}.blob")
+    sidecar = (root / f"{fid}.meta").read_bytes()
+
+    keyed = _keyed_store(root, generate_key())
+    assert await keyed.reseal_to_active() == ResealResult(resealed=0, skipped=1)
+    assert (root / f"{fid}.meta").read_bytes() == sidecar
+    assert await keyed.list_files() == []
 
 
 async def test_an_unreadable_sidecar_still_counts_its_pair_once(tmp_path: Path) -> None:

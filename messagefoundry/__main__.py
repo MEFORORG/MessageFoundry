@@ -7646,9 +7646,9 @@ def _rotate_key(args: argparse.Namespace) -> int:
         # Say it plainly and on stderr: a skipped file is STILL under the old key, so retiring that
         # key now destroys it. This is the one outcome where "OK" alone would mislead.
         print(
-            f"warning: {uploads.skipped} uploaded file(s) could not be read and were NOT "
-            "re-sealed — they are still under the prior key. Fix the cause and re-run rotate-key "
-            "BEFORE removing MEFOR_STORE_ENCRYPTION_KEYS_RETIRED.",
+            f"warning: {uploads.skipped} uploaded file(s) could not be read and were NOT fully "
+            "re-sealed — part of each may still be under the prior key. Fix the cause and re-run "
+            "rotate-key BEFORE removing MEFOR_STORE_ENCRYPTION_KEYS_RETIRED.",
             file=sys.stderr,
         )
     if not rolled_ok:
