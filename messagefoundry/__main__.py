@@ -5449,7 +5449,8 @@ def _cert_inventory(args: argparse.Namespace) -> int:
 
 
 #: What `cert self-signed` says its pair is, in the console note and the --json `note` alike, so
-#: the two cannot drift. BACKLOG #1276, owner override 2026-08-16; the same wording as api/tls.py.
+#: those two cannot drift. The parser help is worded separately. BACKLOG #1276, owner override
+#: 2026-08-16; the substance of api/tls.py's PLACEHOLDER docstring, not a copy of it.
 _SELF_SIGNED_PLACEHOLDER_NOTE = (
     "self-signed, so no chain of trust: better than cleartext, worse than an operator-supplied "
     "chain. A placeholder to replace, not an endorsed production terminator"

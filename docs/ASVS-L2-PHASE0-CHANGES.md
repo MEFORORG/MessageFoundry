@@ -289,7 +289,7 @@ have their own rows in the inventory table above.) The engine mints at least the
 - The **store DEK**, on request. `messagefoundry gen-key` prints 32 bytes from `os.urandom`,
   base64-encoded, to stdout and does not persist them (`generate_key` in
   [`store/crypto.py`](../messagefoundry/store/crypto.py)).
-- A **non-production** self-signed EC P-256 certificate and key, on request (`messagefoundry cert
+- A self-signed EC P-256 certificate and key, on request (`messagefoundry cert
   self-signed`, `make_self_signed` in [`pki.py`](../messagefoundry/pki.py)). The key PEM is
   unencrypted PKCS#8, written `O_EXCL` with mode `0o600` and a tightened Windows DACL, and the command
   refuses to overwrite an existing key file. It does not guard `cert.pem` the same way: an existing

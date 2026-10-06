@@ -581,7 +581,9 @@ def make_self_signed(cn: str, sans: list[str], days: int) -> tuple[bytes, bytes]
     self-signed certificate has no chain of trust: strictly better than cleartext, strictly worse
     than an operator-supplied chain. Its callers include the engine's own API listener, which
     serves one on first run when no ``[api].tls_cert_file`` is set and no upstream terminator is
-    declared (``messagefoundry.api.tls``, ADR 0172), and the ``cert self-signed`` CLI verb.
+    declared (``messagefoundry.api.tls``, ADR 0172), and the ``cert self-signed`` CLI verb. The
+    load-test harness (``harness/load/tlsmat.py``) also calls it and writes its per-run pair with a
+    plain write and ``chmod``, not through ``_write_private_key``.
 
     **An IP literal becomes an** ``iPAddress`` **entry, not a** ``DNSName``. Hostname verification for
     an IP-literal URL matches only against ``iPAddress``; a DNS entry spelling the same characters
