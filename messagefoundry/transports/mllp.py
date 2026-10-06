@@ -634,7 +634,7 @@ def _mllp_ssl_context(
             # nothing to revoke. Covers the inbound HTTP listener too: it calls this builder
             # (http_listener.py), so one wiring serves two listeners.
             if crl := s.get("tls_crl_file"):
-                harden_crl_check(ctx, str(crl))
+                harden_crl_check(ctx, str(crl), setting=f"inbound connection '{name}' tls_crl_file")
         harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
         # Narrow first, assert last, both spelled here -- do NOT fold them into one call; see
         # apply_connection_tls_ciphers. Unset (the default) narrows to the approved AEAD suites

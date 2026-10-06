@@ -332,6 +332,26 @@ def test_control_the_planted_bundle_loaded_by_path_admits_the_planted_client(
     _handshake(_client(pki.planted, pki), ctx)
 
 
+@pytest.mark.usefixtures("clean_anchor_checks")
+@pytest.mark.parametrize(
+    ("build", "name"),
+    [
+        pytest.param(_mllp_listener, "adt-in", id="mllp-and-http-listener"),
+        pytest.param(_dicom_listener, "pacs-in", id="dicom-scp"),
+    ],
+)
+def test_a_listener_crl_refusal_names_the_connection_setting(
+    build: _Build, name: str, pki: _Pki, tmp_path: Path
+) -> None:
+    """Vault BACKLOG #1997: these two call sites passed no ``setting``, so a refusal read only
+    ``CRL file '<path>'`` and left the operator to guess which connection's knob it was."""
+    with pytest.raises(ValueError) as err:
+        build(pki, tmp_path / "absent.crl.pem")
+    text = str(err.value)
+    assert f"inbound connection '{name}' tls_crl_file" in text
+    assert not text.startswith("CRL file")
+
+
 # --- the inbound refusal no longer steers an operator into the widening -----------------------------
 
 
