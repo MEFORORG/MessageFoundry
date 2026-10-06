@@ -559,8 +559,9 @@ class Engine:
         # and detect on-disk DRIFT. Holds only a one-way hash + a commit sha — never resolved env values.
         self.loaded_config_fingerprint: dict[str, object] | None = None
         # vault BACKLOG #2597: True when this process's start never checked its config against the
-        # store's baseline (the read failed, or the start took no digest). Every config row it writes
-        # is then marked, so a later start passes over it to the last checked baseline.
+        # store's baseline (the read failed, or the start took no digest). Every flag toggle row it
+        # writes is then marked, so a later start passes over it to the last checked baseline. A
+        # reload row, operator or convergence, is not marked: the reload vouches for what it loaded.
         self.config_baseline_unchecked = False
         # vault BACKLOG #3076: writes the config_reload audit row for a cluster convergence reload,
         # which has no route to write one. The API sets it, since the row builder lives there and the
@@ -1846,7 +1847,9 @@ class Engine:
         already applied, so this node kept the bytes it loaded before that reload and never
         converged. Seeded first, such a bump is ahead of the seed, and the convergence loop reloads.
         A bump that lands between this read and the load costs one redundant reload of the same
-        bytes, which is the safe side. A failed read is logged and leaves :meth:`start` to seed, as
+        bytes, which is the safe side. That reload writes its own ``config_reload`` row, and when it
+        lands before the start's ``config_loaded`` row, that row is marked superseded with
+        ``loosenings`` null; the next start then compares against the reload's row. A failed read is logged and leaves :meth:`start` to seed, as
         it did before; it never refuses a start that the old order allowed."""
         if not self._coordinator.is_clustered():
             return

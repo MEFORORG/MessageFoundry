@@ -35,6 +35,7 @@ from messagefoundry.config.settings import (
     _ALERT_EVENT_TYPES,
     EgressSettings,
 )
+from messagefoundry.config.wiring import load_config
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.alert_sinks import _AUTO_RESOLVE, NotifierAlertSink
 from messagefoundry.pipeline.alerts import LoggingAlertSink
@@ -642,6 +643,29 @@ async def test_the_reload_route_row_still_names_the_reloaded_graph(
     # Control: the start's own row, written before the reload, names the start's graph.
     assert start["fingerprint"] == start_digest
     assert (start["inbound"], start["outbound"]) == (1, 1)
+
+
+async def test_the_lifespan_seeds_the_config_version_before_its_first_load(
+    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """vault BACKLOG #3076 item 2: the order is the fix, so it is pinned at the lifespan. A seed
+    taken after the load reads a sibling's bump in between as already applied."""
+    order: list[str] = []
+    real_seed = Engine.seed_config_version
+    real_load = load_config
+
+    async def _seed(self: Engine) -> None:
+        order.append("seed")
+        await real_seed(self)
+
+    def _load(path: Any) -> Any:
+        order.append("load")
+        return real_load(path)
+
+    monkeypatch.setattr(Engine, "seed_config_version", _seed)
+    monkeypatch.setattr("messagefoundry.api.app.load_config", _load)
+    await _start(tmp_path, cfg)
+    assert order == ["seed", "load"]
 
 
 @pytest.mark.parametrize("reverted", [True, False], ids=["reverted", "kept"])

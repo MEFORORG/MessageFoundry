@@ -1095,7 +1095,9 @@ async def _record_reload_audit(
     shard and cluster node, since each engine-shard process loads the graph.
 
     Shared by the inline reload endpoint and the dual-control executor so a held-then-approved reload
-    records the same fingerprint-bearing row as an ungated one. The fingerprint is the engine's
+    records the same fingerprint-bearing row as an ungated one. A cluster convergence reload writes
+    its row through here too, as :data:`_CONVERGENCE_ACTOR` (vault BACKLOG #3076). The fingerprint
+    is the engine's
     :attr:`~Engine.loaded_config_fingerprint`, the digest it took of the bytes it loaded, so a reload's
     row and ``GET /config/provenance`` name one digest. A start row a reload superseded names the
     start's digest instead (vault BACKLOG #2838). When the engine could not take one, the row is

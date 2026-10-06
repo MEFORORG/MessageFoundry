@@ -1246,28 +1246,27 @@ async def test_a_sibling_reload_between_the_first_load_and_start_is_converged_on
         coordinator=coord,
         egress_settings=EgressSettings(deny_by_default=False),
     )
-    if seed_first:
-        await eng.seed_config_version()  # what the API lifespan runs before its first load
-    eng.add_registry(load_config(cfgdir))
-    # The sibling's change, in the window: a second inbound on disk, and the version bump.
-    inbox2 = tmp_path / "in-2"
-    inbox2.mkdir()
-    with (cfgdir / "c.py").open("a", encoding="utf-8") as fh:
-        fh.write(
-            f"inbound('in2', File(directory={str(inbox2)!r}, pattern='*.hl7', poll_seconds=0.05), "
-            "router='r')\n"
-        )
-    coord._version = 1  # the sibling's bump
-    await eng.start()
     try:
-        runner = eng._config_convergence
-        assert runner is not None
-        # The loop's first pass runs at once; settle it, then run one more to be sure.
-        for _ in range(100):
+        if seed_first:
+            await eng.seed_config_version()  # what the API lifespan runs before its first load
+        eng.add_registry(load_config(cfgdir))
+        # The sibling's change, in the window: a second inbound on disk, and the version bump.
+        inbox2 = tmp_path / "in-2"
+        inbox2.mkdir()
+        with (cfgdir / "c.py").open("a", encoding="utf-8") as fh:
+            fh.write(
+                f"inbound('in2', File(directory={str(inbox2)!r}, pattern='*.hl7', "
+                "poll_seconds=0.05), router='r')\n"
+            )
+        coord._version = 1  # the sibling's bump
+        await eng.start()
+        assert eng._config_convergence is not None
+        # The loop's first pass runs at once. It advances the applied version only after its
+        # reload, so waiting on the version waits the reload out; no second pass runs beside it.
+        for _ in range(500):
             if eng._applied_config_version == 1:
                 break
             await asyncio.sleep(0.02)
-        await runner.converge_once()
         rr = eng.registry_runner
         assert rr is not None
         assert eng._applied_config_version == 1, "control: both arms end at the shared version"
@@ -1305,10 +1304,10 @@ async def test_a_failed_early_seed_falls_back_to_the_start_seed(tmp_path: Path) 
         coordinator=coord,
         egress_settings=EgressSettings(deny_by_default=False),
     )
-    await eng.seed_config_version()  # logs and returns
-    assert coord.calls == 1 and eng._applied_config_version == 0
-    await eng.start()
     try:
+        await eng.seed_config_version()  # logs and returns
+        assert coord.calls == 1 and eng._applied_config_version == 0
+        await eng.start()
         assert coord.calls == 2, "start() read the version itself"
         assert eng._applied_config_version == 3
     finally:
