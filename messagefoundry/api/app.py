@@ -941,6 +941,7 @@ def _posture_loosenings(
     # #1008: the store-principal privilege OBSERVATION the serve lifespan stashed, or None when no
     # preflight ran in this process; the registry then reports nothing for it.
     store_privilege = getattr(state, "store_privilege", None)
+    gate = getattr(state, "approval_gate", None)
     # [store]/[auth] carry posture switches too (ADR 0148: one posture, loosen only), so the registry
     # needs them to report a COMPLETE list. Same stash-or-default pattern as `store` above.
     auth_settings = getattr(state, "auth_settings", None) or AuthSettings()
@@ -1003,6 +1004,8 @@ def _posture_loosenings(
             attested_hops=attested_hops,
             revocation_attested_hops=revocation_hops,
             api=api_settings,
+            # BACKLOG #2489: the dual-control dwell and expiry, read off the gate that enforces them.
+            approvals=gate.settings if gate is not None else ApprovalsSettings(),
             store_privilege=store_privilege,
             # BACKLOG #1905: read off the LIVE store -- settings cannot know what audit_log holds.
             audit_chain_unkeyed=engine.store.audit_chain_unkeyed(),
