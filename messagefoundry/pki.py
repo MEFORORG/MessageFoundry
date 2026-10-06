@@ -261,7 +261,8 @@ def judge_every_crl(pem: bytes, *, now: float) -> list[tuple[CrlFacts, CrlBlock]
     **A delta CRL refuses too.** The engine turns on no extended CRL support, and without it
     OpenSSL 3.5.7 was measured to use a newer delta CRL as if it were complete. Revocations listed
     only in the base CRL were then dropped, and a revoked client was accepted. OpenSSL fixed that
-    in 3.0.22, 3.4.7, 3.5.8 and 3.6.4, and a fixed build ignores the delta instead. The engine
+    in 3.0.22, 3.4.7, 3.5.8, 3.6.4 and 4.0.2 (openssl/openssl PR 31044); 3.1 to 3.3 have no fixed
+    release. A fixed build ignores the delta instead. The engine
     still refuses one, because which OpenSSL it runs on is the Python build's choice, and a
     distribution can carry an older one. Give the setting base CRLs only."""
     blocks = list(_crl_blocks(pem))
@@ -281,9 +282,9 @@ def judge_every_crl(pem: bytes, *, now: float) -> list[tuple[CrlFacts, CrlBlock]
             crl, nxt = _parse_first_crl(block)
             if _is_delta_crl(crl):
                 raise ValueError(
-                    "it is a delta CRL, which an OpenSSL older than 3.0.22, 3.4.7, 3.5.8 or 3.6.4 "
-                    "reads as a complete CRL and so drops every revocation listed only in its base "
-                    "CRL; give base CRLs only"
+                    "it is a delta CRL, which an OpenSSL build without the fix from openssl/openssl "
+                    "PR 31044 reads as a complete CRL and so drops every revocation listed only in "
+                    "its base CRL; give base CRLs only"
                 )
             judged.append(
                 (

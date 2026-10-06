@@ -1518,8 +1518,9 @@ _X509_V_FLAG_EXTENDED_CRL_SUPPORT = 0x1000
 #: The first release on each OpenSSL branch that never scores a delta CRL as a complete one
 #: (openssl/openssl PR 31044, issue 31040; on 3.5 it is commit 6cbbf4c167d9). Read from each
 #: branch's release tags. Before it, get_crl_score skipped its delta check unless extended CRL
-#: support was on. A branch newer than these forked after the fix.
-_DELTA_SCORING_FIX = {(3, 0): 22, (3, 4): 7, (3, 5): 8, (3, 6): 4}
+#: support was on. 3.1 to 3.3 have no fixed release. 4.1 forked after the fix: 4.1.0-alpha1 has it.
+#: A pre-release snapshot reports its target patch number, so this judges one by that.
+_DELTA_SCORING_FIX = {(3, 0): 22, (3, 4): 7, (3, 5): 8, (3, 6): 4, (4, 0): 2}
 
 
 def _release_has_the_delta_scoring_fix() -> bool:
@@ -1531,7 +1532,7 @@ def _release_has_the_delta_scoring_fix() -> bool:
     first = _DELTA_SCORING_FIX.get((major, minor))
     if first is not None:
         return patch >= first
-    return (major, minor) > (3, 6)
+    return (major, minor) > (4, 0)
 
 
 @pytest.mark.parametrize(
@@ -1552,9 +1553,13 @@ def test_a_delta_crl_drops_base_revocations_where_openssl_scores_it_complete(
     # rest. That read as a flake. So the build is probed first, with the delta alone, and the
     # outcome must match the probe.
     #
-    # The second arm turns on extended CRL support. Every OpenSSL version then refuses to score a
-    # delta as complete, so the fixed-build branch below runs on every runner, not only on one
-    # that happens to link a fixed OpenSSL.
+    # The second arm turns on extended CRL support. Every OpenSSL version then refuses to score
+    # THIS delta as complete, so the fixed-build branch below runs on every runner, not only on one
+    # that happens to link a fixed OpenSSL. That holds because the fixture's delta carries no
+    # issuing distribution point: an unfixed build skips the check for a reason-scoped one.
+    #
+    # The ACCEPTED branch, which shows why the refusal exists, runs only where the linked OpenSSL
+    # predates the fix. No verify flag brings the old scoring back on a fixed build.
     def handshake(stem: str) -> str:
         return _crl_handshake(
             _crl_material[stem], "revoked", _crl_material, raw=True, extra_flags=extra_flags
