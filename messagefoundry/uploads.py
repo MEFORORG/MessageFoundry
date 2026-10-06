@@ -407,7 +407,11 @@ class ResealResult:
     ``skipped`` is load-bearing, not decoration: an operator reads it to decide whether it is safe to
     drop the retired key. A file this pass could not read is a file still sealed under the OLD key,
     and dropping that key makes it permanently unreadable — so a non-zero ``skipped`` means "run it
-    again before you retire anything"."""
+    again before you retire anything".
+
+    The two counts use different units. ``resealed`` counts VALUES, so a whole pair adds two.
+    ``skipped`` counts UPLOADS, so a pair adds at most one, whichever half failed (BACKLOG #2322):
+    an unreadable body leaves its sidecar unread and unsealed, and that is still one upload."""
 
     resealed: int = 0
     skipped: int = 0
@@ -1198,9 +1202,11 @@ class UploadStore:
                 except (OSError, UnicodeDecodeError) as exc:
                     # A half-deleted pair or an unreadable file. Counted and named, never silent:
                     # this file is still under the OLD key and the operator must not retire it yet.
+                    # `break`: a failure at any kind ends the pair, so a failed body leaves the
+                    # sidecar unsealed and the pair counts once (BACKLOG #2322).
                     skipped += 1
                     _log.warning("uploaded file %s (%s): skipped, unreadable: %s", fid, kind, exc)
-                    continue
+                    break
                 aad = cell_aad("uploaded_file", kind, fid)
                 # A CipherError here means a prior key was not supplied. It PROPAGATES, before any
                 # write, so the operator is told to supply it rather than losing the file.
@@ -1214,7 +1220,7 @@ class UploadStore:
         if resealed or skipped:
             _log.info(
                 "re-sealed %d uploaded-file value(s) under the active key, sealing %d plaintext "
-                "upload(s) (%d skipped)",
+                "upload(s) (%d upload(s) skipped)",
                 resealed,
                 sealed_plaintext,
                 skipped,
