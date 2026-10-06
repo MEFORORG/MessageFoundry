@@ -155,6 +155,35 @@ def test_an_ungated_row_offers_no_approve() -> None:
     assert f'action="/ui/approvals/{aid}/approve"' not in ungated
     assert f'action="/ui/approvals/{aid}/reject"' in ungated
     assert "Dual control no longer applies" in ungated and "Dual control no longer" not in gated
+    # The requester alone can run the operation again, so their own ungated row says so too.
+    own = str(
+        pages.approvals_page(
+            ApprovalList(
+                approvals=[row.model_copy(update={"gated": False, "caller_is_requester": True})]
+            )
+        )
+    )
+    assert "Withdraw" in own and "Dual control no longer applies" in own
+    assert f'action="/ui/approvals/{aid}/approve"' not in own
+
+
+def test_enter_in_the_resolve_form_records_no_outcome() -> None:
+    """A form's default button is its first submit button, and Enter submits through it. Here it is
+    disabled, so an implicit submission does nothing rather than record the first outcome."""
+    row = PendingApprovalInfo(
+        id="c" * 32,
+        operation="dead_letter_replay",
+        label="Replay",
+        params={},
+        requester="maker",
+        requested_at=time.time(),
+        status="interrupted",
+    )
+    html = str(pages.approvals_page(ApprovalList(approvals=[row])))
+    form = html[html.index("<form", html.index("Interrupted releases")) :]
+    first = re.search(r"<button[^>]*>", form)
+    assert first is not None
+    assert "disabled" in first.group(0) and "formaction" not in first.group(0)
 
 
 async def test_a_second_approver_releases_the_hold(engine: Engine) -> None:

@@ -58,7 +58,8 @@ _INTRO = (
     "releases or rejects each one. Approving runs the held operation now, as it was requested. The "
     "requester cannot approve their own request, and may reject it to withdraw it. With dual "
     "control off nothing new is held. A request held before it was turned off for its operation "
-    "can no longer be approved: reject it, or it stays here until it expires."
+    "can no longer be approved: reject it, or it stays here until it expires, if an expiry is "
+    "set."
 )
 
 # The post-action notices, keyed by the redirect's ?m= code. An allow-list, so the query string can
@@ -190,11 +191,12 @@ def _pending_row(a: PendingApprovalInfo) -> list[object]:
     base = f"{_PAGE}/{_seg(a.id)}"
     # BACKLOG #2460: Approve is not offered where the gate would refuse it: to the requester, on a
     # row whose operation dual control no longer gates, and on a row whose params are unreadable.
-    # Each such row gets the reject and a note saying why, in the order approve() refuses them.
-    if a.caller_is_requester:
-        note: str | None = _OWN_REQUEST
-    elif not a.gated:
-        note = _NOT_GATED
+    # Each such row gets the reject and a note saying why. The not-gated note comes first, so the
+    # requester, who alone can run the operation again, sees it on their own row too.
+    if not a.gated:
+        note: str | None = _NOT_GATED
+    elif a.caller_is_requester:
+        note = _OWN_REQUEST
     elif a.params is None:
         note = _UNREADABLE
     else:
@@ -222,9 +224,16 @@ def _resolve_form(approval_id: str) -> Markup:
     through ``formaction``. The required box means a click is a checked choice, not a slip
     between two adjacent final buttons; the browser enforces it, with no script. The form's own
     action is the page, which answers a POST with 405, so a submission with no button records no
-    outcome."""
+    outcome.
+
+    The first submit button is a hidden, disabled one. A form's default button is its first, and
+    an implicit submission (Enter in the form) does nothing when that button is disabled, per the
+    HTML form submission rules. Without it, Enter on the ticked box would record the first
+    outcome, a final choice the operator never made."""
     base = f"{_PAGE}/{_seg(approval_id)}/resolve"
     buttons = [
+        el("button", "", type="submit", disabled=True, hidden=True),
+    ] + [
         el("button", label, type="submit", formaction=f"{base}/{outcome}")
         for outcome, label in _RESOLVE_LABELS.items()
     ]

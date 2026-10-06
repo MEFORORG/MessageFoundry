@@ -1928,3 +1928,15 @@ async def test_a_drain_failure_does_not_skip_engine_stop(tmp_path: Path) -> None
         if real_stop and "stop" not in calls:
             await real_stop[0]()
     assert calls == ["drain", "stop"]
+
+
+def test_every_resolve_outcome_has_a_status() -> None:
+    """The JSON body, the console path and its buttons all read ``ResolveOutcome``; the gate maps
+    each to a status through ``RESOLVE_OUTCOMES``. Pinned, so a new outcome cannot reach the page
+    and then answer 422 from the gate."""
+    from typing import get_args
+
+    from messagefoundry.api.approvals import RESOLVE_OUTCOMES
+    from messagefoundry.api.models import ResolveOutcome
+
+    assert set(RESOLVE_OUTCOMES) == set(get_args(ResolveOutcome))
