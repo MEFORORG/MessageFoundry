@@ -33,14 +33,15 @@ owns the **priority-feed startup** half (the DR run-profile in
 4. **Begin serving under the DR run-profile.** The engine activates the run-profile (bind only the
    connections at priority >= ``[dr].priority_threshold``; the rest report ``status:"filtered"``) via
    the injected ``activate_profile`` callback, and a ``dr.activate`` audit row records the promotion,
-   with whatever provenance fields that callback returns. The engine's callback re-applies the graph
+   with the fields the optional ``profile_provenance`` callback returns. The engine's callback re-applies the graph
    it is already running and reads no config dir to do it (vault BACKLOG #3067), so a config dir that
    has gone with the failed site cannot refuse this step.
 
 :meth:`release` is **drain-then-hand-back**: release the VIP (the optional ``release_hook`` / let the
 passive LB return it to the recovered primary), wait for convergence, unbind intake while the workers
-drain the staged queue to completion (delivered/dead-lettered) — preserving at-least-once + idempotency
-**within the DR store** — then record ``dr.release``. **Cross-store** reconciliation with the recovered
+drain the staged queue (delivered/dead-lettered) — preserving at-least-once + idempotency **within the
+DR store** — then record ``dr.release``. The drain is bounded, and rows held on outbounds the engine
+parks are left out of it; ``dr.release`` records how many rows are left and how many are held. **Cross-store** reconciliation with the recovered
 primary is operator-verified per the runbook (the engine gives NO cross-store loss/duplicate guarantee).
 
 This module is engine-side and dependency-light (stdlib + the store/settings/dr_backup seams), so it
@@ -141,10 +142,10 @@ class _ActivationProgress:
 class DrCoordinator:
     """Manual, audited DR promotion/fail-back (ADR 0048). Construct with the open store + ``[dr]``
     settings + the store settings (the KeyProvider seam for restore-verify) + two engine callbacks that
-    flip the DR run-profile (``activate_profile`` re-applies the graph with the run-profile ON and
-    returns provenance fields for the ``dr.activate`` row; ``deactivate_profile`` unbinds intake +
-    drains, then turns it OFF, and returns the drain's outcome fields for the ``dr.release`` row),
-    and an optional callback for the seed marker's config digest. Single-writer: the API serializes
+    flip the DR run-profile (``activate_profile`` re-applies the graph with the run-profile ON;
+    ``deactivate_profile`` unbinds intake + drains, then turns it OFF, and returns the drain's
+    outcome fields for the ``dr.release`` row), and optional callbacks for the seed marker's config
+    digest and for provenance fields on the ``dr.activate`` row. Single-writer: the API serializes
     activate/release behind ``[approvals]``-style RBAC; this object additionally guards against a
     concurrent activate/release with its own lock."""
 
@@ -154,20 +155,23 @@ class DrCoordinator:
         settings: DrSettings,
         *,
         store_settings: object,
-        activate_profile: Callable[[], Awaitable[Mapping[str, object] | None]],
+        activate_profile: Callable[[], Awaitable[None]],
         deactivate_profile: Callable[[], Awaitable[Mapping[str, object] | None]],
         config_fingerprint_provider: Callable[[], Awaitable[str | None]] | None = None,
         alert_sink: AlertSink | None = None,
         clock: Callable[[], float] = time.time,
         owned_lanes: Callable[[], OwnedLanes | None] | None = None,
+        profile_provenance: Callable[[], Awaitable[Mapping[str, object]]] | None = None,
     ) -> None:
         self._store = store
         self._settings = settings
         # The store settings carry the KeyProvider seam (ADR 0019) — the DEK the cold-seed archive is
         # encrypted under. Typed loosely to avoid importing StoreSettings here; run_restore_verify takes it.
         self._store_settings = store_settings
-        # Returns extra fields for the dr.activate row, such as the activated graph's digest.
         self._activate_profile = activate_profile
+        # Extra fields for the dr.activate row, such as the activated graph's digest. Awaited after
+        # the profile is applied; it must not raise (the engine's never does).
+        self._provenance = profile_provenance
         self._deactivate_profile = deactivate_profile
         # Awaited per activation, so building the coordinator reads no file (vault BACKLOG #2839).
         self._config_fingerprint_provider = config_fingerprint_provider
@@ -346,13 +350,14 @@ class DrCoordinator:
 
         # (4) Serve under the DR run-profile: bind only the connections at/above the threshold (the
         # rest report status:"filtered"). The engine re-applies its running graph with the
-        # run-profile ON. A cancellation here is not an Exception and passes this arm; activate()'s own arm puts
-        # the flag back, and the engine's reload rolls its intake back (vault BACKLOG #2751).
+        # run-profile ON. A cancellation here is not an Exception and passes this arm; activate()'s
+        # own arm puts the flag back, and the engine's reload rolls its intake back (vault BACKLOG
+        # #2751).
         progress.step = "profile"
         try:
             self._active = True
             self._last_release = None  # an earlier fail-back's outcome no longer describes this box
-            provenance = await self._activate_profile()
+            await self._activate_profile()
         except Exception as exc:
             self._active = False
             reason = (
@@ -363,18 +368,19 @@ class DrCoordinator:
         progress.profile_applied = True
 
         # Owed from here: a write cut short is made good by the next activate or release call.
-        self._unrecorded_activation = (
-            {
-                **(provenance or {}),
-                "archive": _basename(seed),
-                "verify": verify.status,
-                "threshold": self._settings.priority_threshold.value,
-                "seed_segment": seed_segment,
-                "vip_hook_ran": hook_ran,
-            },
-            actor,
-            now,
-        )
+        detail: dict[str, object] = {
+            "archive": _basename(seed),
+            "verify": verify.status,
+            "threshold": self._settings.priority_threshold.value,
+            "seed_segment": seed_segment,
+            "vip_hook_ran": hook_ran,
+        }
+        self._unrecorded_activation = (detail, actor, now)
+        # Provenance is read only once the profile is applied and the row is owed, so a cancellation
+        # while it is read still leaves the box recorded as active (vault BACKLOG #3067). Its fields
+        # never replace the coordinator's own.
+        for key, value in (await self._profile_provenance()).items():
+            detail.setdefault(key, value)
         await self._record_owed_activation(late=False)
         return DrResult(
             action="activate",
@@ -385,6 +391,10 @@ class DrCoordinator:
             seed_segment=seed_segment,
             vip_hook_ran=hook_ran,
         )
+
+    async def _profile_provenance(self) -> Mapping[str, object]:
+        provider = self._provenance
+        return await provider() if provider is not None else {}
 
     # --- release (fail-back) -------------------------------------------------
 
@@ -635,12 +645,12 @@ class DrCoordinator:
         depth = detail.get("depth_left")
         held = detail.get("held_on_parked_outbounds")
         if detail.get("drained") is True and held:
-            # Rows on outbounds the DR run-profile parked cannot drain on this box (vault BACKLOG
-            # #3067). They stay PENDING with no attempt charged, for a reload to deliver.
+            # Rows on outbounds the engine parks cannot drain on this box (vault BACKLOG #3067).
+            # They stay PENDING with no attempt charged.
             log.warning(
                 "DR released by %s: VIP handed back, intake unbound, every drainable row drained; "
-                "%s row(s) stay held on parked outbounds and deliver once a reload brings those "
-                "outbounds up — reconcile per the runbook",
+                "%s row(s) stay held on parked outbounds until those outbounds come up — reconcile "
+                "per the runbook",
                 actor,
                 held,
             )
@@ -659,6 +669,9 @@ class DrCoordinator:
             )
         else:
             # D-V1 (vault BACKLOG #2752): the drain gave up at its bound. Say so, and how many.
+            # Held rows were never waited for, so they are not among those that did not drain.
+            if isinstance(depth, int) and isinstance(held, int):
+                depth -= held
             log.warning(
                 "DR released by %s: VIP handed back, intake unbound, but %s staged row(s) did not "
                 "drain within the bound and stay queued + replayable — reconcile them with the "

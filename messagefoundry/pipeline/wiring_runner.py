@@ -2818,16 +2818,8 @@ class RegistryRunner:
             self._outbound_resume.setdefault(name, asyncio.Event()).clear()
 
     def _refuse_dr_parked(self, name: str) -> None:
-        """Raise :class:`DrParkedError` if the DR run-profile parks outbound ``name``.
-
-        Every door that would change a parked lane's run state asks this and refuses: start, stop,
-        restart, and through them an alert rule's restart, plus the scheduler's resume, which logs
-        instead (:meth:`_resume_unscheduled_outbound`). Deferring a start instead kept turning one
-        kind of pause into another, and each door was a fresh defect (vault BACKLOG #3067). So the
-        lane keeps the state the profile left it in, and only the reload after ``POST /dr/release``
-        un-parks it. That reload restores the state from before the activation: a lane the engine
-        parked comes up, a lane an operator or the calendar paused first stays theirs, and an
-        ``auto_start=False`` lane takes its gate's answer."""
+        """Raise :class:`DrParkedError` if the DR run-profile parks outbound ``name``. Asked by every
+        door that would change a parked lane's run state; the error's docstring says why."""
         if self._dr_parked(name):
             raise DrParkedError(name)
 
@@ -5279,6 +5271,8 @@ class RegistryRunner:
                 if stale is not None:
                     await stale.aclose()
                 self._failed.pop(("outbound", name), None)
+                # Not deployed outranks a DR park, so a door refuses it as not deployed.
+                self._filtered.pop(("outbound", name), None)
                 self._park_outbound_lane(name)
                 continue
             # Per-connection auto-start (#115): a reload must not RESURRECT a start-disabled lane. It had

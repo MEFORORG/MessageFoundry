@@ -745,21 +745,28 @@ async def _alert_control_action(engine: Engine, action: str, target: str) -> Non
     """Run an alert rule's ``control_action`` (#144, ADR 0128) against the running graph.
 
     Re-reads ``engine.registry_runner`` on each call, so it stays right across a reload that swaps
-    the runner. An outbound the DR run-profile parks refuses a restart (vault BACKLOG #3067); that
-    refusal is the rule working as designed, not a failure, so it is logged once here at INFO and
-    nothing else happens. Any other error reaches the notifier, which logs it and never raises."""
+    the runner. A connection the DR run-profile parks is not restarted (vault BACKLOG #3067); that
+    is the rule working as designed, not a failure, so it is logged once here at INFO and nothing
+    else happens. Any other error reaches the notifier, which logs it and never raises."""
     rr = engine.registry_runner
     if rr is None:
         return
     if action == "restart_inbound":
+        if rr.inbound_filtered(target) is not None:
+            # An operator start of a parked inbound overrides the profile; a rule is the engine,
+            # and must not (the scheduler's gate holds the same line, BACKLOG #2067).
+            _log.info(
+                "alert control_action restart_inbound for %r not run: the DR run-profile parks it",
+                target,
+            )
+            return
         await rr.restart_inbound(target)
     elif action == "restart_outbound":
         try:
             await rr.restart_outbound(target)
         except DrParkedError:
             _log.info(
-                "alert control_action restart_outbound for %r not run: the DR run-profile parks "
-                "it, and the reload after POST /dr/release brings it back",
+                "alert control_action restart_outbound for %r not run: the DR run-profile parks it",
                 target,
             )
 

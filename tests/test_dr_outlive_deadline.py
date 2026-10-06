@@ -466,6 +466,34 @@ async def test_an_activation_whose_row_was_not_written_is_recorded_by_the_retry(
     assert rows[0]["archive"].endswith(".mfbak")
 
 
+async def test_an_activation_cancelled_while_reading_its_provenance_stays_active(
+    seeded: tuple[Engine, str],
+) -> None:
+    """The provenance (a config-dir digest, bounded by the takeover timeout) is read after the
+    run-profile is applied. A cancellation there must leave the box recorded as active, with its
+    dr.activate row written late, never as a passive box that is serving (vault BACKLOG #3067)."""
+    engine, _archive = seeded
+    coord = _coordinator(engine)
+    entered = asyncio.Event()
+
+    async def hung_provenance() -> dict[str, object]:
+        entered.set()
+        await asyncio.Event().wait()
+        return {}
+
+    coord._provenance = hung_provenance
+    task = asyncio.create_task(coord.activate(actor="dradmin"))
+    await asyncio.wait_for(entered.wait(), 10)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert coord.active and engine.dr_active
+    assert await _rows(engine.store, "dr_activation_aborted") == []
+    rows = await _rows(engine.store, "dr.activate")
+    assert len(rows) == 1 and rows[0]["recorded_late"] is True
+
+
 async def test_an_activation_cancelled_while_writing_its_row_writes_it_late(
     seeded: tuple[Engine, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:

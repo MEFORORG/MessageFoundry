@@ -421,6 +421,23 @@ async def test_an_alert_rule_restart_on_a_dr_parked_outbound_is_logged_and_does_
     await _assert_delivers_after_release(engine, box, message_id)
 
 
+async def test_an_alert_rule_restart_of_a_dr_parked_inbound_does_nothing(box: _Box) -> None:
+    """An operator start of a parked inbound overrides the profile; an alert rule's restart is the
+    engine, and must leave the inbound parked and unbound."""
+    engine = box.engine
+    await engine.reload_detail(box.tiered)
+    rr = engine.registry_runner
+    assert rr is not None
+    coord = engine.dr_coordinator
+    assert coord is not None
+    await coord.activate(actor="alice")
+    assert rr.inbound_filtered(_NORM) is not None  # control: the profile parked it
+
+    await _alert_control_action(engine, "restart_inbound", _NORM)
+    assert not rr.inbound_running(_NORM)
+    assert rr.inbound_filtered(_NORM) is not None
+
+
 async def test_an_operator_pause_from_before_the_activation_survives_the_release(
     box: _Box,
 ) -> None:

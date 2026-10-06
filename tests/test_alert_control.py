@@ -7,7 +7,7 @@ throttled with the notification, independent of transport suppression, and white
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from pydantic import ValidationError
@@ -260,11 +260,16 @@ async def test_no_control_action_never_dispatches() -> None:
 
 
 async def test_callback_maps_action_to_runner_restart() -> None:
-    # Mirror the api/app.py wiring: the injected callback routes the action string to the matching
+    # The api/app.py wiring itself: _alert_control_action routes the action string to the matching
     # RegistryRunner restart method. Proves the contract the lifespan relies on.
+    from messagefoundry.api.app import _alert_control_action
+
     class _FakeRunner:
         def __init__(self) -> None:
             self.calls: list[tuple[str, str]] = []
+
+        def inbound_filtered(self, name: str) -> str | None:
+            return None
 
         async def restart_inbound(self, name: str) -> None:
             self.calls.append(("restart_inbound", name))
@@ -274,11 +279,11 @@ async def test_callback_maps_action_to_runner_restart() -> None:
 
     rr = _FakeRunner()
 
+    class _FakeEngine:
+        registry_runner = rr
+
     async def _alert_control(action: str, target: str) -> None:
-        if action == "restart_inbound":
-            await rr.restart_inbound(target)
-        elif action == "restart_outbound":
-            await rr.restart_outbound(target)
+        await _alert_control_action(cast(Any, _FakeEngine()), action, target)
 
     rule = AlertRule(event_type="connection_stopped", control_action="restart_outbound")
     sink = NotifierAlertSink([_RecordingTransport()], rules=[rule])

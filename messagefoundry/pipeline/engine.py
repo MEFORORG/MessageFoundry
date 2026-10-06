@@ -738,6 +738,7 @@ class Engine:
                 store_settings=self._store_settings,
                 activate_profile=self._dr_activate_profile,
                 deactivate_profile=self._dr_release_drain,
+                profile_provenance=self._dr_config_drift,
                 config_fingerprint_provider=self._dr_config_fingerprint,
                 alert_sink=self._alert_sink,
                 owned_lanes=self._owned_lanes,  # ADR 0073: scoped activation recovery when sharded
@@ -768,14 +769,14 @@ class Engine:
         if self._registry_runner is not None:
             self._registry_runner.set_dr_threshold(self._dr_run_threshold())
 
-    async def _dr_activate_profile(self) -> dict[str, object]:
+    async def _dr_activate_profile(self) -> None:
         """Engine callback the DR coordinator runs to BEGIN serving under the DR run-profile (#61, ADR
         0048 step 4): latch the run-profile ON, hand the runner the threshold, and re-apply the
         running graph so the runner binds only connections at/above ``[dr].priority_threshold`` (the
         rest report ``status:"filtered"``). A reload (not a cold start) so a box already serving its
         full graph drops to the critical set in place, with in-flight rows preserved (the reload is
-        quiesce-and-swap). Returns the provenance fields for the ``dr.activate`` audit row
-        (:meth:`_dr_config_drift`)."""
+        quiesce-and-swap). The coordinator then reads the ``dr.activate`` row's provenance fields
+        from :meth:`_dr_config_drift`."""
         was_active = self._dr_active
         rr = self._registry_runner
         # Re-apply the graph the runner holds in memory, not a config dir read from disk. The running
@@ -808,7 +809,6 @@ class Engine:
             # to follow it there too.
             self._set_dr_active(was_active)
             raise
-        return await self._dr_config_drift()
 
     async def _dr_config_drift(self) -> dict[str, object]:
         """The provenance fields a DR activation records: the activated graph's digest, and whether
@@ -919,11 +919,13 @@ class Engine:
         rr = self._registry_runner
         deadline = time.monotonic() + bound
         while True:
+            # Depth first: a held row that leaves between the two reads (a purge) then reads as
+            # not drained for one more poll, never as drained early.
+            depth = await self.store.in_pipeline_depth()
             held = 0
             if rr is not None:
                 for name in rr.engine_parked_outbounds():
                     held += (await self.store.pending_depth(name))[0]
-            depth = await self.store.in_pipeline_depth()
             if depth <= held or time.monotonic() >= deadline:
                 break
             await asyncio.sleep(poll)
