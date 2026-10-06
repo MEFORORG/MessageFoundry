@@ -1325,21 +1325,22 @@ class ApiSettings(_Section):
     # --- Posture-B (upstream TLS termination) attestations (#200, ADR 0002) --------
     # In Posture-B the proxy terminates browser TLS and the proxy→engine hop is a plaintext segment on
     # the internal network. The ENGINE cannot observe the proxy's negotiated TLS/KEX or authenticate the
-    # internal hop for itself, so an exposed Posture-B bind must not start on trust alone. These are
-    # operator ATTESTATIONS made FAIL-CLOSED (mirroring MEFOR_TLS_REVOCATION_ATTESTED): the serve gate
+    # internal hop for itself, so an off-loopback Posture-B bind under enforce must not start on trust
+    # alone. These are operator ATTESTATIONS made FAIL-CLOSED (mirroring MEFOR_TLS_REVOCATION_ATTESTED): the serve gate
     # REFUSES an off-loopback Posture-B bind under [security].enforcement=enforce unless both are
     # affirmatively declared, and WARNS on a loopback bind or under enforcement = warn. No instance
     # stays quiet: every instance carries patient data since BACKLOG #1279 (ADR 0186), so the gate
     # reads no synthetic condition. They are NOT runtime enforcement (see the honest docs).
     #
     # proxy_intra_service_auth — HOW the proxy→engine hop is authenticated so a rogue peer on the internal
-    #   segment cannot impersonate the proxy. "none" (default) is undeclared → refuse off-loopback.
-    #   Declare "mtls" (the proxy presents a client cert), "network" (an isolated proxy↔engine segment / host
-    #   firewall allow-list), or "shared_secret" (a pre-shared header the proxy injects). Attestation only.
+    #   segment cannot impersonate the proxy. "none" (default) is undeclared, so an off-loopback bind
+    #   refuses under enforce. Declare "mtls" (the proxy presents a client cert), "network" (an
+    #   isolated proxy↔engine segment / host firewall allow-list), or "shared_secret" (a pre-shared
+    #   header the proxy injects). Attestation only.
     proxy_intra_service_auth: Literal["none", "mtls", "network", "shared_secret"] = "none"
     # proxy_tls_min_version — the operator-DECLARED TLS version floor the reverse proxy negotiates with
-    # browsers ("1.2"/"1.3"). None (default) = undeclared → refuse an off-loopback Posture-B bind. The
-    # engine terminates no browser TLS here, so it cannot inspect the proxy's version (11.6.2) — this
+    # browsers ("1.2"/"1.3"). None (default) is undeclared, so an off-loopback Posture-B bind refuses
+    # under enforce. The engine terminates no browser TLS here, so it cannot inspect the proxy's version (11.6.2) — this
     # is the attested floor, validated only for coherence at load.
     proxy_tls_min_version: str | None = None
     # proxy_tls_ciphers — an OPTIONAL declared OpenSSL cipher list for that proxy floor. When set it must
@@ -1387,14 +1388,14 @@ class ApiSettings(_Section):
     @property
     def proxy_intra_service_declared(self) -> bool:
         """Whether the Posture-B proxy→engine intra-service-auth posture is affirmatively declared
-        (#200). ``"none"`` (the default) is undeclared → an off-loopback Posture-B bind refuses under
-        ``[security].enforcement = enforce``, whatever the tier."""
+        (#200). ``"none"`` (the default) is undeclared, so an off-loopback Posture-B bind refuses
+        under ``[security].enforcement = enforce``, whatever the tier."""
         return self.proxy_intra_service_auth != "none"
 
     @property
     def proxy_tls_floor_declared(self) -> bool:
         """Whether the Posture-B proxy TLS/KEX floor is declared (#200): a ``proxy_tls_min_version`` is
-        set. Undeclared → an off-loopback Posture-B bind refuses under
+        set. When undeclared, an off-loopback Posture-B bind refuses under
         ``[security].enforcement = enforce`` (the engine cannot observe the proxy's TLS)."""
         return self.proxy_tls_min_version is not None
 
@@ -2302,9 +2303,11 @@ class LoggingSettings(_Section):
     # egress path with no posture gate at all. It is now decided by the same shared authority the
     # transports use (see `forward_hop_disposition`): a plaintext / unverified-TLS collector hop is
     # REFUSED under [security].enforcement = enforce, on any tier, unless the operator ATTESTS it —
-    # the acknowledged opt-out, replacing a silent default. Loopback is always allowed, so the ADR
-    # 0080 "point tcp/udp at 127.0.0.1 and let a local rsyslog/Vector agent add TLS" deployment is
-    # untouched.
+    # the acknowledged opt-out, replacing a silent default. That hop check always allows loopback.
+    # It is not the only forwarding gate: under enforce, `forwarding_gate_refusal` (BACKLOG #1966)
+    # also refuses a loopback collector and any hop that is not verified TLS, and this attestation
+    # does not clear it. So the ADR 0080 "point tcp/udp at 127.0.0.1 and let a local rsyslog/Vector
+    # agent add TLS" deployment now starts only under enforcement = warn.
     forward_hop_attested: bool = False
     forward_hop_attested_reason: str | None = None
     # --- On-disk spool behind the forwarder (BACKLOG #1966, ADR 0200) ----------
@@ -2613,8 +2616,9 @@ class RetentionSettings(_Section):
     vacuum_at: str = ""
     # Secure-by-default opt-out (#186a, ASVS 14.2.4): `serve` refuses to start under
     # [security].enforcement=enforce (warns under enforcement = warn) when an auto-bounded PHI window
-    # is unbounded — `messages_days`, `dead_letter_days` and `reference_snapshot_days`, each of which
-    # keeps FULL raw PHI until purged (`auto_bounded_windows()` is the list) — so PHI does not
+    # is unbounded — `messages_days`, `dead_letter_days` and `reference_snapshot_days`
+    # (`auto_bounded_windows()` is the list; the first two keep FULL raw message bodies until
+    # purged, the third covers orphaned reference snapshots only) — so PHI does not
     # accumulate without bound. Unless this override is set, an UNSET window is auto-bounded to 30
     # days, so only an explicit 0 trips the gate. Setting this true is the explicit, audited override
     # that lets an instance run with unbounded (keep-forever) retention. Operators write it as
@@ -5618,7 +5622,7 @@ class BackupSettings(_Section):
     # [store].allow_unencrypted_phi). With no key and this flag off, the BackupRunner's key check
     # REFUSES to write an unencrypted archive (fail-closed). With it on, any keyless instance writes
     # one: the check reads no synthetic or non-PHI condition, and every instance carries patient data
-    # since BACKLOG #1279 (ADR 0186), so the cleartext archive holds PHI. Each backup's `dr_backup`
+    # since BACKLOG #1279 (ADR 0186), so a cleartext archive can hold PHI. Each backup's `dr_backup`
     # audit row carries `encrypted: false`; security_loosenings() does not name this flag.
     allow_unencrypted: bool = False
 

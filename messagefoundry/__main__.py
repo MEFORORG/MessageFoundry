@@ -2251,8 +2251,8 @@ def _serve(args: argparse.Namespace) -> int:
     # plaintext-UDP default shipped the (best-effort redacted, still sensitive) log + audit evidence stream
     # off-box in the clear, silently. Decide it with the SAME shared authority the transports use, and
     # BEFORE configure_logging installs the handler, so a refused hop never emits a single record.
-    # Loopback (the ADR 0080 local-agent deployment) is untouched; no instance is exempt as
-    # synthetic or dev. Any other hop that is not verified TLS and not attested REFUSES under
+    # Loopback (the ADR 0080 local-agent deployment) passes THIS hop check, though the BACKLOG #1966
+    # forwarding gate below refuses it under enforce; no instance is exempt as synthetic or dev. Any other hop that is not verified TLS and not attested REFUSES under
     # [security].enforcement=enforce and WARNS under enforcement = warn. The acknowledged opt-out is
     # [logging].forward_hop_attested, which lets the hop through silently under either dial.
     if log_forward is not None:

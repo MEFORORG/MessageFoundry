@@ -449,8 +449,8 @@ class BackupRunner:
             raise BackupError(
                 "encrypt",
                 "no store encryption key is configured; refusing to write an UNENCRYPTED .mfbak archive "
-                "(configure MEFOR_STORE_ENCRYPTION_KEY, or set [backup].allow_unencrypted=true to "
-                "accept a cleartext archive, which holds the store's PHI)",
+                "(configure a store encryption key, such as MEFOR_STORE_ENCRYPTION_KEY, or set "
+                "[backup].allow_unencrypted=true to accept a cleartext archive, which can hold PHI)",
             )
         key_id = key_fingerprint(key) if key is not None else None
         # ADR 0196: seal the frames under the live store's data sub-key (the header records the salt,
@@ -925,8 +925,8 @@ class BackupRunner:
                     salt=salt,
                 )
             else:
-                # No key + allow_unencrypted: write the plaintext tar verbatim. No synthetic box is
-                # exempt: every instance carries patient data (BACKLOG #1279, ADR 0186).
+                # No key + allow_unencrypted: write the plaintext tar verbatim. It can hold PHI: no
+                # instance is synthetic since BACKLOG #1279 (ADR 0186).
                 while True:
                     buf = src.read(1024 * 1024)
                     if not buf:
