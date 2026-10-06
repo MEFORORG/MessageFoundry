@@ -648,7 +648,7 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **Reversible:** yes, immediately — restore the default (or delete the line) and restart.
 
 ### `[auth].lockout_minutes`, `lockout_threshold` or `lockout_max_minutes` looser than its default — the account lock protects less
-> **Conditional** on sign-in, as above ([BACKLOG #1131](BACKLOG.md)). Each key is named when it is looser
+> No sign-in condition applies, as above ([BACKLOG #1131](BACKLOG.md)). Each key is named when it is looser
 > than its shipped default, and each says whether it is off or only looser.
 >
 > | Value | What loosens |
@@ -679,7 +679,7 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **Reversible:** yes, immediately — restore `15`, `5` and `1440` (or delete the lines) and restart.
 
 ### `[auth].phi_read_rate_limit_*` looser than its default — PHI reads go less paced
-> **Conditional** on sign-in ([BACKLOG #1131](BACKLOG.md), ASVS 2.4.1). Named: `phi_read_rate_limit_enabled
+> No sign-in condition applies ([BACKLOG #1131](BACKLOG.md), ASVS 2.4.1). Named: `phi_read_rate_limit_enabled
 > = false`; a `phi_read_rate_limit_window_seconds` of `0` or less (off) or below `60` s (looser); a
 > `phi_read_rate_limit_per_actor` of `0` (off) or above `120` (looser). The same parts rule applies as for
 > sign-in: with the limiter off, or its window at `0` or less, its count is not named again.
@@ -695,7 +695,7 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **Reversible:** yes, immediately — restore the default (or delete the line) and restart.
 
 ### `[auth].admin_write_*` looser than its default — state-changing admin actions go less paced
-> **Conditional** on sign-in ([BACKLOG #1131](BACKLOG.md), ASVS 2.4.2). Named:
+> No sign-in condition applies ([BACKLOG #1131](BACKLOG.md), ASVS 2.4.2). Named:
 > `admin_write_rate_limit_enabled = false`; an `admin_write_rate_limit_window_seconds` below `15` s; an
 > `admin_write_rate_limit_per_actor` of `0` (off) or above `12`; an `admin_write_min_interval_seconds` of
 > `0` (off) or below `0.15` s. The window cannot be `0` or less (the load refuses it), but a tiny one,
@@ -712,7 +712,7 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **Reversible:** yes, immediately — restore the default (or delete the line) and restart.
 
 ### `[auth].mfa_verify_min_elapsed_seconds` or `oidc_callback_min_elapsed_seconds` below `1.0` s — a second step may come at machine speed
-> **Conditional** on sign-in ([BACKLOG #1131](BACKLOG.md), ASVS 2.4.2), and the callback floor only while
+> No sign-in condition applies ([BACKLOG #1131](BACKLOG.md), ASVS 2.4.2). The callback floor is named only while
 > `[auth].oidc_enabled` is on. These are the BACKLOG #2301 time floors, beside
 > `admin_write_min_interval_seconds` above. Each refuses an action that comes sooner than the floor and
 > skips the check at `0`, so a floor below its default of `1.0` s is named as looser and `0` as off. A
@@ -731,7 +731,7 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **Reversible:** yes, immediately — restore `1.0` (or delete the line) and restart.
 
 ### `[auth].max_sessions_per_user` of `0` or above `5` — more live sessions per user
-> **Conditional** on sign-in ([BACKLOG #1131](BACKLOG.md), ASVS 7.1.2). `0` or less means unlimited, so it
+> No sign-in condition applies ([BACKLOG #1131](BACKLOG.md), ASVS 7.1.2). `0` or less means unlimited, so it
 > is named as off; any cap above `5` is named as looser.
 - **What you lose:** a new sign-in beyond the cap revokes the user's oldest live session. With a higher
   cap, or none, a stolen or forgotten session stays live beside the owner's for longer.
@@ -742,7 +742,7 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **Reversible:** yes, immediately — restore `5` (or delete the line) and restart.
 
 ### `[auth].oidc_flow_cache_max` above `512` — more pending federated sign-ins held in memory
-> **Conditional** on sign-in and on `[auth].oidc_enabled`, since the cache is built only with federation on
+> **Conditional** on `[auth].oidc_enabled`, since the cache is built only with federation on
 > ([BACKLOG #1131](BACKLOG.md)). The cache refuses a new flow once it holds this many, so a cap of `0` or
 > less refuses **every** federated sign-in. That is stricter, not looser, and it is not named. A cap above
 > `512` is named. A very large one, such as `1e9`, removes the engine-wide bound in practice.
