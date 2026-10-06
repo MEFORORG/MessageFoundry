@@ -48,6 +48,7 @@ it never blocks asyncio; **PHI is never logged** (only counts / paths / one-way 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import socket
@@ -57,6 +58,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
 
+from messagefoundry import proctree
 from messagefoundry.childenv import hook_environment
 from messagefoundry.config.settings import DrSettings, StoreBackend
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
@@ -845,15 +847,66 @@ async def _run_command(command: str) -> bool:
     backup destination / other operator-configured paths are trusted).
 
     Its environment is :func:`messagefoundry.childenv.hook_environment`: the operator's ordinary
-    variables, without the engine's own (vault BACKLOG #2587)."""
-    proc = await asyncio.create_subprocess_shell(
-        command,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
-        env=hook_environment(),
+    variables, without the engine's own (vault BACKLOG #2587).
+
+    **Stopping it stops the whole hook** (vault BACKLOG #2622). The caller bounds this with
+    ``wait_for``, which stops it by cancelling it. Cancelling only the wait would leave the shell
+    and whatever it started running, so an activation recorded as aborted could still be taking the
+    address. So the shell starts as the root of a tree :mod:`messagefoundry.proctree` can kill, and
+    a cancel kills that tree before it propagates. A hook that finishes on its own is left alone,
+    including anything it left running, as before."""
+    spawn = asyncio.ensure_future(
+        asyncio.create_subprocess_shell(
+            command,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=hook_environment(),
+            creationflags=proctree.ADOPT_CREATIONFLAGS,
+            start_new_session=proctree.ADOPT_NEW_SESSION,
+        )
     )
-    await proc.wait()
+    try:
+        # Shielded so a cancel that lands mid-start cannot lose the process: the callback kills it.
+        proc = await asyncio.shield(spawn)
+    except asyncio.CancelledError:
+        spawn.add_done_callback(_kill_late_start)
+        raise
+    job: int | None = None
+    try:
+        job = proctree.resume_into_job(proc.pid, who="DR hook")
+        await proc.wait()
+    except BaseException:
+        await _stop_hook(proc, job)
+        raise
+    if job is not None:
+        proctree.release_job(job)
     return proc.returncode == 0
+
+
+#: How long a killed hook gets to be reaped before the abort carries on without it.
+_HOOK_REAP_SECONDS = 5.0
+
+
+async def _stop_hook(proc: asyncio.subprocess.Process, job: int | None) -> None:
+    """Kill the hook's shell and everything it started, then reap the shell, bounded."""
+    if job is not None:
+        proctree.terminate_job(job)
+    elif proc.returncode is None and not proctree.kill_process_group(proc.pid):
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+    with contextlib.suppress(TimeoutError):
+        await asyncio.wait_for(proc.wait(), _HOOK_REAP_SECONDS)
+
+
+def _kill_late_start(spawn: asyncio.Future[asyncio.subprocess.Process]) -> None:
+    """Kill a hook whose start finished after its caller was cancelled. On Windows it is still
+    suspended, so it has started nothing and killing the one process is enough."""
+    if spawn.cancelled() or spawn.exception() is not None:
+        return
+    proc = spawn.result()
+    if not proctree.kill_process_group(proc.pid):
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
 
 
 def _confined_archive(archive: str, seed_dir: str) -> Path | None:

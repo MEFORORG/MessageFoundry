@@ -7,6 +7,7 @@ listener, stays passive, and records a dr_activation_aborted audit row (AC-6). A
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sys
@@ -143,6 +144,93 @@ async def test_vip_hook_timeout_aborts(tmp_path: Path) -> None:
             await coord.activate(actor="alice")
         assert exc.value.kind == "vip"
         assert not coord.active and not state["active"]
+    finally:
+        await store.close()
+
+
+# --- vault BACKLOG #2622 item 3: a hook that runs past its timeout is killed, with its children ----
+
+
+def _tree_hook(where: Path, delay: float) -> str:
+    """A hook that starts a child of its own, records that both are running, and then has each
+    write a marker after ``delay`` seconds. A marker on disk means that process outlived the
+    point where the hook was stopped. The hook is shell -> python -> python, so it is a tree on
+    every shell: cmd.exe on Windows, /bin/sh elsewhere."""
+    script = where / "hook_tree.py"
+    script.write_text(
+        "import pathlib, subprocess, sys, time\n"
+        "here, delay = pathlib.Path(sys.argv[1]), float(sys.argv[2])\n"
+        "code = 'import pathlib, sys, time; time.sleep(float(sys.argv[2]));"
+        ' pathlib.Path(sys.argv[1]).write_text("x")\'\n'
+        "child = subprocess.Popen(\n"
+        "    [sys.executable, '-c', code, str(here / 'grandchild-survived'), str(delay)]\n"
+        ")\n"
+        "(here / 'started').write_text(str(child.pid))\n"
+        "time.sleep(delay)\n"
+        "(here / 'child-survived').write_text('x')\n",
+        encoding="utf-8",
+    )
+    return f'"{sys.executable}" "{script}" "{where}" {delay}'
+
+
+async def _await_file(path: Path, *, within: float) -> None:
+    deadline = time.monotonic() + within
+    while not path.exists():
+        assert time.monotonic() < deadline, f"{path.name} never appeared"
+        await asyncio.sleep(0.05)
+
+
+def _survivors(where: Path) -> list[str]:
+    return sorted(p.name for p in where.glob("*-survived"))
+
+
+async def test_a_stopped_hook_leaves_no_process_behind(tmp_path: Path) -> None:
+    """Stopping the hook stops every process it started.
+
+    ``wait_for`` stops ``_run_command`` by cancelling it, so this cancels it directly once the
+    hook's tree is known to be running. RED on the code before #2622, which only awaited the
+    shell: both markers appeared after the cancel. The ``started`` file is the control: without
+    it, a hook that never ran would also leave no marker."""
+    task = asyncio.ensure_future(dr_module._run_command(_tree_hook(tmp_path, 2.0)))
+    try:
+        await _await_file(tmp_path / "started", within=30.0)
+    finally:
+        task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    started_at = (tmp_path / "started").stat().st_mtime
+    # Wait past the moment each process would have written its marker, plus a margin.
+    await asyncio.sleep(max(0.0, started_at + 2.0 + 2.0 - time.time()))
+    assert _survivors(tmp_path) == []
+
+
+async def test_a_timed_out_hook_aborts_and_leaves_no_process_behind(tmp_path: Path) -> None:
+    """The same, through ``activate``: the timeout records the abort, and the hook is dead by then.
+
+    The 3.0s budget is the one :func:`test_vip_hook_timeout_aborts` explains. The hook's tree
+    writes its markers 4.0s after it starts, so it is still running when the budget runs out."""
+    store, archive, ss = await _seed(tmp_path)
+    where = tmp_path / "hook"
+    where.mkdir()
+    try:
+        coord, state = _coord(
+            store,
+            ss,
+            seed_archive=archive,
+            takeover_hook=_tree_hook(where, 4.0),
+            takeover_timeout_seconds=3.0,
+        )
+        with pytest.raises(DrActivationError) as exc:
+            await coord.activate(actor="alice")
+        assert exc.value.kind == "vip"
+        assert "timed out" in str(exc.value)
+        assert not coord.active and not state["active"]
+        assert "dr_activation_aborted" in await _actions(store)
+        # The control: the tree was running before the budget ran out.
+        assert (where / "started").exists()
+        started_at = (where / "started").stat().st_mtime
+        await asyncio.sleep(max(0.0, started_at + 4.0 + 2.0 - time.time()))
+        assert _survivors(where) == []
     finally:
         await store.close()
 

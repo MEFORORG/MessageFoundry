@@ -85,13 +85,10 @@ imports. It depends only on ``config`` (the :class:`RunContext` shape), its own 
 
 from __future__ import annotations
 
-import ctypes
 import enum
 import logging
-import os
 import queue
 import secrets
-import signal
 import struct
 import subprocess
 import sys
@@ -102,6 +99,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any, Final
 
+from messagefoundry import proctree
 from messagefoundry.childenv import python_child_argv, worker_environment
 from messagefoundry.config.code_sets import CodeSet
 from messagefoundry.config.run_context import RunContext
@@ -475,50 +473,7 @@ def _read_frame_bytes(stream: Any) -> bytes | None:
 # whole tree. This is best-effort process hygiene, NOT the trust control — ADR 0087's codec, the
 # per-dispatch ``secrets`` id, and the unsolicited-frame check are what keep a stray grandchild frame
 # harmless — so a setup failure degrades to a single-process kill (logged) rather than wedging a feed.
-
-#: ``SetInformationJobObject`` info class + the ``LimitFlags`` bit for a job that terminates its whole
-#: process tree when the job is closed/terminated (``JOBOBJECTINFOCLASS`` / ``winnt.h``).
-_JobObjectExtendedLimitInformation: Final = 9
-_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: Final = 0x2000
-
-
-# The three Win32 structs below are plain ctypes layout classes (no Windows-only ctypes types), so
-# they define cleanly on every platform and are only ever *used* under a ``sys.platform == "win32"``
-# guard. Field names/types mirror ``winnt.h`` exactly — the layout must match for the API to read it.
-class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
-    _fields_ = (
-        ("PerProcessUserTimeLimit", ctypes.c_int64),
-        ("PerJobUserTimeLimit", ctypes.c_int64),
-        ("LimitFlags", ctypes.c_uint32),
-        ("MinimumWorkingSetSize", ctypes.c_size_t),
-        ("MaximumWorkingSetSize", ctypes.c_size_t),
-        ("ActiveProcessLimit", ctypes.c_uint32),
-        ("Affinity", ctypes.c_size_t),
-        ("PriorityClass", ctypes.c_uint32),
-        ("SchedulingClass", ctypes.c_uint32),
-    )
-
-
-class _IO_COUNTERS(ctypes.Structure):
-    _fields_ = (
-        ("ReadOperationCount", ctypes.c_uint64),
-        ("WriteOperationCount", ctypes.c_uint64),
-        ("OtherOperationCount", ctypes.c_uint64),
-        ("ReadTransferCount", ctypes.c_uint64),
-        ("WriteTransferCount", ctypes.c_uint64),
-        ("OtherTransferCount", ctypes.c_uint64),
-    )
-
-
-class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
-    _fields_ = (
-        ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
-        ("IoInfo", _IO_COUNTERS),
-        ("ProcessMemoryLimit", ctypes.c_size_t),
-        ("JobMemoryLimit", ctypes.c_size_t),
-        ("PeakProcessMemoryUsed", ctypes.c_size_t),
-        ("PeakJobMemoryUsed", ctypes.c_size_t),
-    )
+# The job and group mechanics live in :mod:`messagefoundry.proctree`, shared with the DR hook.
 
 
 def _kill_single(proc: subprocess.Popen[bytes]) -> None:
@@ -529,77 +484,18 @@ def _kill_single(proc: subprocess.Popen[bytes]) -> None:
         pass
 
 
-def _close_handle(kernel32: Any, handle: int) -> None:
-    """Close a Win32 handle, swallowing a failure (nothing to do about it, and it must not raise
-    from a kill path)."""
-    try:  # noqa: SIM105
-        kernel32.CloseHandle(ctypes.c_void_p(handle))
-    except OSError:
-        pass
-
-
 def _assign_kill_on_close_job(proc: subprocess.Popen[bytes]) -> int | None:
     """Assign ``proc`` to a fresh Windows job object whose whole tree dies when the job is terminated
     or its last handle closes; return the job handle (an int) to hold open for the worker's lifetime.
 
-    Returns ``None`` off Windows or on ANY failure (missing API, a job-setup error) — the caller then
-    degrades to a single-process kill and a lingering grandchild is a hygiene residual, not a trust
-    hole (ADR 0087). Mirrors the fail-open ctypes pattern in :mod:`messagefoundry.crashdump`."""
+    Returns ``None`` off Windows or on ANY failure — the caller then degrades to a single-process
+    kill and a lingering grandchild is a hygiene residual, not a trust hole (ADR 0087)."""
     if sys.platform != "win32":
         return None
-    try:
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    except OSError:  # pragma: no cover - kernel32 is always present on win32
-        return None
-    create = getattr(kernel32, "CreateJobObjectW", None)
-    set_info = getattr(kernel32, "SetInformationJobObject", None)
-    assign = getattr(kernel32, "AssignProcessToJobObject", None)
-    if create is None or set_info is None or assign is None:  # pragma: no cover - defensive
-        log.warning(
-            "sandbox: Windows job-object API missing; kill degrades to a single-process kill"
-        )
-        return None
-    create.restype = ctypes.c_void_p
-    create.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
-    set_info.restype = ctypes.c_int
-    set_info.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
-    assign.restype = ctypes.c_int
-    assign.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-    handle = create(None, None)
-    if not handle:  # pragma: no cover - defensive
-        log.warning("sandbox: CreateJobObject failed; kill degrades to a single-process kill")
-        return None
-    info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
-    info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-    set_ok = set_info(
-        handle, _JobObjectExtendedLimitInformation, ctypes.byref(info), ctypes.sizeof(info)
-    )
     # `proc._handle` is the CreateProcess handle (full access); race-free vs PID reuse, unlike a
     # re-OpenProcess by pid. It is a private CPython attr not in typeshed, hence the ignore.
-    if not set_ok or not assign(handle, int(proc._handle)):  # type: ignore[attr-defined,unused-ignore]
-        log.warning("sandbox: job-object setup failed; kill degrades to a single-process kill")
-        _close_handle(kernel32, int(handle))
-        return None
-    return int(handle)
-
-
-def _terminate_job(job: int) -> None:
-    """Terminate every process in ``job`` (the worker and its whole tree) and close the handle."""
-    if sys.platform != "win32":  # pragma: no cover - guard for the type-checker / non-Windows
-        return
-    try:
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    except OSError:  # pragma: no cover - kernel32 is always present on win32
-        return
-    terminate = getattr(kernel32, "TerminateJobObject", None)
-    if terminate is not None:
-        terminate.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-        terminate.restype = ctypes.c_int
-        try:  # noqa: SIM105
-            terminate(ctypes.c_void_p(job), 1)
-        except OSError:  # pragma: no cover - defensive
-            pass
-    _close_handle(kernel32, job)
+    handle = int(proc._handle)  # type: ignore[attr-defined,unused-ignore]
+    return proctree.kill_on_close_job(handle, who="sandbox")
 
 
 def _reap_process_tree(proc: subprocess.Popen[bytes], job: int | None) -> None:
@@ -611,21 +507,11 @@ def _reap_process_tree(proc: subprocess.Popen[bytes], job: int | None) -> None:
     only ever signals the worker's own group and never the caller's (e.g. the engine/pytest group)."""
     if sys.platform == "win32":
         if job is not None:
-            _terminate_job(job)
+            proctree.terminate_job(job)
         else:
             _kill_single(proc)
         return
-    try:
-        pgid = os.getpgid(proc.pid)
-    except (ProcessLookupError, PermissionError, OSError):
-        _kill_single(proc)
-        return
-    if pgid == proc.pid:
-        try:  # noqa: SIM105
-            os.killpg(pgid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):  # pragma: no cover - defensive
-            pass
-    else:  # pragma: no cover - start_new_session guarantees leadership; belt-and-suspenders
+    if not proctree.kill_process_group(proc.pid):
         _kill_single(proc)
 
 
