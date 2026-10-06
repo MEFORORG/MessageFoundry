@@ -2675,6 +2675,23 @@ async def test_a_session_rotates_the_temporary_credential_before_its_deadline(
         assert await engine.store.list_audit(action="auth.temp_password_expired") == []
 
 
+def test_the_must_change_refusal_states_a_passed_deadline_as_passed() -> None:
+    """RED when: ``require()``'s must-change refusal states a past deadline as if it were ahead.
+
+    BACKLOG #2298 (ASVS 6.4.5). Both tenses keep the leading text clients match on."""
+    from messagefoundry.api.security import _password_change_required, deadline_utc
+
+    ahead, passed = time.time() + 3600, time.time() - 1
+    assert _password_change_required(ahead) == (
+        f"password change required; the temporary password stops working at {deadline_utc(ahead)}"
+    )
+    assert _password_change_required(passed) == (
+        "password change required; the temporary password stopped working at"
+        f" {deadline_utc(passed)}; ask an administrator to reset it"
+    )
+    assert _password_change_required(None) == "password change required"
+
+
 # --- BACKLOG #2096: POST /auth/login ends the token the client names, before the cap -----------
 
 

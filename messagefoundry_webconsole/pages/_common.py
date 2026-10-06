@@ -18,6 +18,7 @@ this module exists to keep in one place.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from urllib.parse import quote, urlencode
@@ -48,6 +49,14 @@ def _deadline_stamp(ts: float) -> str | None:
         return datetime.fromtimestamp(ts, UTC).strftime("%Y-%m-%d %H:%M:%SZ")
     except (OverflowError, OSError, ValueError):
         return None
+
+
+def _deadline_passed(ts: float) -> bool:
+    """Whether a credential deadline is already behind us, compared as the sign-in gate compares.
+
+    BACKLOG #2298. A page that states a deadline states a past one in the past tense, rather than
+    telling the holder a password that no longer works "stops working" at an instant gone by."""
+    return time.time() > ts
 
 
 def _pager(

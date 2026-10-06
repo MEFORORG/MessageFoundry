@@ -366,10 +366,19 @@ def client_ip(conn: Request | WebSocket) -> str | None:
 
 
 def _password_change_required(deadline: float | None) -> str:
-    """The 403 detail for a must-change session, naming the credential's deadline when it has one."""
+    """The 403 detail for a must-change session, naming the credential's deadline when it has one.
+
+    A deadline already passed is stated in the past tense with the one remedy left (BACKLOG
+    #2298). The session check ends such a session before this runs, so it is reached only when the
+    deadline passes between that check and this read. Strictly after, as the sign-in gate compares."""
     when = None if deadline is None else deadline_utc(deadline)
     if when is None:
         return "password change required"
+    if deadline is not None and time.time() > deadline:
+        return (
+            f"password change required; the temporary password stopped working at {when};"
+            " ask an administrator to reset it"
+        )
     return f"password change required; the temporary password stops working at {when}"
 
 

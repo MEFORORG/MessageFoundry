@@ -13,6 +13,7 @@ Each test names the mutation that must turn it RED.
 from __future__ import annotations
 
 import asyncio
+import time
 from uuid import uuid4
 
 import httpx
@@ -1252,8 +1253,9 @@ async def test_the_factor_page_states_no_deadline_for_a_password_the_holder_chos
 def test_the_factor_page_builder_states_the_deadline_only_when_given_one() -> None:
     from messagefoundry_webconsole.pages import account as pages
 
+    # Relative to now: since BACKLOG #2298 a deadline already passed is stated as passed.
     assert "stops working at" in str(
-        pages.mfa_gate(totp_enrolled=True, credential_expires_at=1.8e9)
+        pages.mfa_gate(totp_enrolled=True, credential_expires_at=time.time() + 3600)
     )
     assert "stops working" not in str(pages.mfa_gate(totp_enrolled=True))
     # A deadline past what the clock can render drops the sentence instead of raising: this page is
@@ -1261,6 +1263,20 @@ def test_the_factor_page_builder_states_the_deadline_only_when_given_one() -> No
     assert "stops working" not in str(
         pages.mfa_gate(totp_enrolled=True, credential_expires_at=1e15)
     )
+
+
+def test_the_factor_page_states_a_passed_deadline_as_passed() -> None:
+    """RED when: /ui/mfa tells a holder a lapsed password "stops working" at a past instant.
+
+    BACKLOG #2298 (ASVS 6.4.5). One second past the deadline the sentence is in the past tense,
+    names the one remedy left, and no longer promises a password change after this step."""
+    from messagefoundry_webconsole.pages import account as pages
+
+    passed = time.time() - 1
+    text = str(pages.mfa_gate(totp_enrolled=True, credential_expires_at=passed))
+    assert f"Your temporary password stopped working at {_console_stamp(passed)}." in text
+    assert "Ask an administrator to reset it." in text
+    assert "stops working" not in text and "After this step" not in text
 
 
 async def test_the_password_page_refuses_to_rotate_a_credential_past_its_deadline(
