@@ -33,23 +33,6 @@ TRACE_REDACTED = "‹redacted›"  # ‹redacted›
 _reveal = False
 
 
-# What ``str.format`` raises on a malformed template, each one measured (vault BACKLOG #2789): a
-# missing slot (``IndexError``/``KeyError``), a bad spec or conversion (``ValueError``), an attribute
-# or index the value lacks (``"{0.x}"`` gives ``AttributeError``, ``"{0[k]}"`` on a str gives
-# ``TypeError``), a width too wide to allocate (``MemoryError``), a revealed number out of a spec's
-# range (``"{:c}"`` of ``10**20`` gives ``OverflowError``), and a template that is not a str at all
-# (``AttributeError``: it has no ``format``).
-_FORMAT_FAILURES = (
-    AttributeError,
-    IndexError,
-    KeyError,
-    MemoryError,
-    OverflowError,
-    TypeError,
-    ValueError,
-)
-
-
 def log_note(template: str, /, *values: object) -> None:
     """Emit a diagnostic line to the ``messagefoundry.diagnostics`` DEBUG log (Corepoint ``EnvLogText``).
 
@@ -61,15 +44,25 @@ def log_note(template: str, /, *values: object) -> None:
         return  # nothing would be emitted, so neither the format's cost nor its failure is paid
     shown: tuple[object, ...] = values if _reveal else tuple(TRACE_REDACTED for _ in values)
     try:
-        _logger.debug(template.format(*shown))
-    except _FORMAT_FAILURES as exc:
-        # The type name only: an exception's text can quote a slot or a revealed value.
+        line = template.format(*shown)
+    except Exception as exc:  # noqa: BLE001 - the "never raises" boundary of a diagnostic helper
+        # Exception, not a list of types, and deliberately (vault BACKLOG #2789). The format runs the
+        # template's own spec and, under the dev reveal, each value's __format__/__getattr__/
+        # __getitem__/__repr__, so what it can raise is open-ended: at least AttributeError,
+        # IndexError, KeyError, MemoryError, OverflowError, RecursionError, TypeError and ValueError
+        # are measured, and two review rounds each found one more past a fixed tuple. The contract is
+        # that a diagnostic never fails a transform, so this is the specific catch for it. It is not
+        # BaseException: KeyboardInterrupt, SystemExit and CancelledError still propagate. Not silent
+        # either: the failure is logged, by type name only, since its text can quote a slot or a
+        # revealed value.
         _logger.debug(
             "log_note: could not format %r with %d value(s): %s",
             template,
             len(values),
             type(exc).__name__,
         )
+        return
+    _logger.debug(line)
 
 
 def checkpoint(msg: Message, label: str = "") -> None:

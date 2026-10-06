@@ -85,6 +85,65 @@ def test_service_start_stop_refused_elevation_exits_1(
     assert captured.out == ""
 
 
+@pytest.mark.parametrize(("action", "state"), [("stop", "stopped"), ("start", "running")])
+def test_service_already_in_the_requested_state_exits_0_without_elevating(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    action: str,
+    state: str,
+) -> None:
+    """Stopping a stopped service is the end state asked for, not a failure: `net stop` exits
+    non-zero there, and an operator script or the uninstall path that stops first must not abort.
+    The state is asked first, so no UAC prompt is raised for a no-op."""
+    elevations: list[str] = []
+
+    def _control(action: str, name: str) -> svc.ServiceControlOutcome:
+        elevations.append(action)
+        return svc.ServiceControlOutcome.FAILED
+
+    monkeypatch.setattr(svc, "service_state", lambda name: state)
+    monkeypatch.setattr(svc, "control_service_ex", _control)
+
+    assert main(["service", action, "--name", "MyEngine"]) == 0
+    captured = capsys.readouterr()
+    assert f"already {state}" in captured.out
+    assert captured.err == ""
+    assert elevations == []
+
+
+@pytest.mark.parametrize(("action", "state"), [("stop", "stopped"), ("start", "running")])
+def test_service_reaching_the_state_during_a_failed_call_exits_0(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    action: str,
+    state: str,
+) -> None:
+    """The state is asked again after a FAILED, for a service that got there while `net` ran."""
+    states = iter(["running" if state == "stopped" else "stopped", state])
+    monkeypatch.setattr(svc, "service_state", lambda name: next(states))
+    monkeypatch.setattr(
+        svc, "control_service_ex", lambda action, name: svc.ServiceControlOutcome.FAILED
+    )
+
+    assert main(["service", action, "--name", "MyEngine"]) == 0
+    assert f"already {state}" in capsys.readouterr().out
+
+
+def test_service_stop_that_genuinely_fails_still_exits_1(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The control: a stop that fails with the service still running is a failure."""
+    monkeypatch.setattr(svc, "service_state", lambda name: "running")
+    monkeypatch.setattr(
+        svc, "control_service_ex", lambda action, name: svc.ServiceControlOutcome.FAILED
+    )
+
+    assert main(["service", "stop", "--name", "MyEngine"]) == 1
+    captured = capsys.readouterr()
+    assert "failed" in captured.err
+    assert captured.out == ""
+
+
 def test_service_install_requires_env(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["service", "install"]) == 2
     assert "requires --env" in capsys.readouterr().err

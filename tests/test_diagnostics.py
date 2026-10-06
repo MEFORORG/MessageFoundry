@@ -104,6 +104,47 @@ def test_log_note_fallback_never_quotes_a_revealed_value(
     assert "doe-jane-synthetic" not in caplog.text
 
 
+class _RaisingValue:
+    """A revealed value whose own ``__format__`` raises, as a deeply nested repr or a domain type can."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self.exc = exc
+
+    def __format__(self, spec: str) -> str:
+        raise self.exc
+
+
+class _DomainError(LookupError):
+    """A custom exception no fixed list of format failures would name."""
+
+
+@pytest.mark.parametrize(
+    "exc", [RecursionError("maximum recursion depth exceeded"), _DomainError("doe-jane-synthetic")]
+)
+def test_log_note_never_raises_whatever_a_revealed_value_raises(
+    exc: Exception, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The contract is "never raises", so the catch is Exception, not a list of types (vault BACKLOG
+    #2789): a fixed tuple let RecursionError and any domain exception escape into the transform."""
+    monkeypatch.setattr(diag, "_reveal", True)
+    monkeypatch.setattr(logging.getLogger(), "handlers", [caplog.handler])
+    with caplog.at_level(logging.DEBUG, logger=_LOGGER):
+        log_note("{}", _RaisingValue(exc))
+    assert [r.getMessage() for r in caplog.records] == [
+        f"log_note: could not format '{{}}' with 1 value(s): {type(exc).__name__}"
+    ]
+    assert "doe-jane-synthetic" not in caplog.text  # the exception's text is never logged
+
+
+def test_log_note_lets_an_interrupt_through(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Exception, not BaseException: Ctrl-C (and SystemExit, CancelledError) still propagate."""
+    monkeypatch.setattr(diag, "_reveal", True)
+    with caplog.at_level(logging.DEBUG, logger=_LOGGER), pytest.raises(KeyboardInterrupt):
+        log_note("{}", _RaisingValue(KeyboardInterrupt()))
+
+
 def test_checkpoint_logs_segment_ids_not_field_values(caplog: pytest.LogCaptureFixture) -> None:
     m = _msg()
     with caplog.at_level(logging.DEBUG, logger=_LOGGER):

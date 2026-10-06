@@ -5084,7 +5084,8 @@ def _service(args: argparse.Namespace) -> int:
     the actions are no-ops (return 1) and ``status`` prints ``unavailable``.
 
     A declined UAC prompt or a failed elevation exits 1 with the reason on stderr, so a wrapper
-    script never reads a refused action as success (vault BACKLOG #2787)."""
+    script never reads a refused action as success (vault BACKLOG #2787). A service already in the
+    requested state exits 0, so ``stop`` and ``start`` are idempotent."""
     from messagefoundry import service as svc
 
     action = args.action
@@ -5124,7 +5125,15 @@ def _service(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
         return 1
-    # start / stop
+    # start / stop. Already in the requested state is success, not a failure: `net stop` of a stopped
+    # service exits non-zero, and an operator script or the uninstall path that stops first must not
+    # abort on it. Asked BEFORE elevating, so a no-op raises no UAC prompt, and again after a FAILED,
+    # for a service that reached the state while this ran.
+    wanted = "stopped" if action == "stop" else "running"
+    already = f"service {args.name!r} is already {wanted}; nothing to {action}"
+    if svc.service_state(args.name) == wanted:
+        print(already)
+        return 0
     try:
         outcome = svc.control_service_ex(action, args.name)
     except ValueError as exc:
@@ -5140,11 +5149,13 @@ def _service(args: argparse.Namespace) -> int:
             f"error: the UAC prompt was declined; `service {action}` of {args.name!r} did not run",
             file=sys.stderr,
         )
+    elif svc.service_state(args.name) == wanted:
+        print(already)
+        return 0
     else:
         print(
             f"error: `service {action}` of {args.name!r} failed: elevation failed, `net {action}` "
-            "exited non-zero (as it does when the service is already in that state), or it did not "
-            "finish in time; check `service status`",
+            "exited non-zero, or it did not finish in time; check `service status`",
             file=sys.stderr,
         )
     return 1
