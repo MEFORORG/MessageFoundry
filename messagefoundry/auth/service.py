@@ -2094,7 +2094,7 @@ class AuthService:
         self._reconcile_last_probed: dict[str, float] = {}
         #: Latched mass-revoke circuit-breaker trip, cleared by the next clean pass.
         self._reconcile_alert: str | None = None
-        #: user_ids a breaker trip has not yet seen re-read on a pass that was not aborted
+        #: user_ids a breaker trip has not yet seen read PRESENT on a pass that was not aborted
         #: (BACKLOG #2136). `_mark_reconcile_clears` reports no breaker clear while one is signed in.
         self._reconcile_unconfirmed: set[str] = set()
         #: Whether THIS process may resolve the durable ``ad_reconcile_aborted`` instance (BACKLOG
@@ -5275,16 +5275,18 @@ class AuthService:
         if plan.hold:
             self._advance_hold_standing("held")
         # BACKLOG #2136. A trip makes every candidate unconfirmed until a pass that is not aborted
-        # reads it again, so a probe sample that missed the accounts behind the trip is no clear. A
-        # held account is not read again: its probe judged neither its roles nor its scope, and its
-        # strike went back to 0, so it stays unconfirmed. An account that left has already been
+        # reads it clean, PRESENT, so a probe sample that missed the accounts behind the trip is no
+        # clear. Only PRESENT confirms. A held account's probe judged neither its roles nor its
+        # scope, and its strike went back to 0. An ABSENT, DISABLED or lone undetermined read is a
+        # strike, and the strike ledger forgets it once the account leaves. So each of those stays
+        # unconfirmed, and its leaving forfeits the clear. An account that left has already been
         # dropped from the set (`_forfeit_clears_on_attrition`). Kept as it stood before this pass,
         # for the revocation loop below.
         unconfirmed = frozenset(self._reconcile_unconfirmed)
         if plan.aborted is None:
-            held = set(plan.held)
+            present = reconcile.ProbeOutcome.PRESENT
             self._reconcile_unconfirmed.difference_update(
-                uid for uid in plan.outcomes if uid not in held
+                uid for uid, outcome in plan.outcomes.items() if outcome is present
             )
         elif not plan.directory_outage:
             self._reconcile_unconfirmed = set(users)
@@ -5364,14 +5366,22 @@ class AuthService:
         probe budget has reached every account, a pass can read clear while the condition stands.
 
         **The rule for both alerts, and the one statement of it: a process clears only what it
-        watched open.** It resolves a trip only after a pass of its own tripped, and a hold only
-        after a pass of its own held, and then only on a pass that passes the tests below.
-        ``_reconcile_breaker_standing`` and ``_reconcile_hold_standing`` carry it. A restart
-        forgets which accounts were behind a trip or a hold, and an account that leaves across it
-        is not seen to leave. So a fresh process resolves neither alert an earlier run left open,
-        however clean its estate reads, and that instance stays open for an operator. Within one
-        process, an account behind either that leaves before it reads clean forfeits that clear
-        until a restart (`_forfeit_clears_on_attrition`).
+        watched open.** A restart forgets which accounts were behind a trip or a hold, and an
+        account that leaves across it is not seen to leave. Two layers keep the rule.
+
+        * Here: a pass marks a trip clear only after a pass of this process tripped, and a hold
+          clear only after one held (``_reconcile_breaker_standing``,
+          ``_reconcile_hold_standing``), and then only on a pass that passes the tests below.
+        * In the lifespan task: ``api/app.py::_without_inherited_clears`` drops a clear while the
+          instance it would resolve is one that was already open when the task first read alert
+          state. Each alert has one instance row, so a trip or hold of this process's own folds
+          into an earlier run's open instance, and resolving that would rest on accounts the
+          earlier run saw and this process never did.
+
+        So a fresh process never resolves an instance an earlier run left open, however clean its
+        estate reads, and that instance stays open for an operator. Within one process, an account
+        behind either alert that leaves before it reads clean forfeits that clear until a restart
+        (`_forfeit_clears_on_attrition`).
 
         * Both need an answer on record, from this process, for every signed-in account the pass
           did not just revoke. A probe that could not reach the directory leaves none.
@@ -5393,7 +5403,7 @@ class AuthService:
           pass here holds again.
         * The breaker is clear when the pass was not aborted, none of those answers is undetermined,
           every one of those accounts carries no strike, and every account still signed in since
-          the last trip has been read again by a pass that was not aborted, and was not held there.
+          the last trip has read PRESENT on a pass that was not aborted.
           A pending strike is a revocation the breaker has not judged yet, so it says nothing
           either way. A held account's probe judged neither its roles nor its scope, and a trip
           on role or scope changes leaves no strike, so a probe sample that missed or held the

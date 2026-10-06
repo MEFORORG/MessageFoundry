@@ -46,7 +46,7 @@ from dataclasses import asdict, dataclass, fields, replace
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
-from typing import Annotated, Any, Literal, NoReturn, TypeVar
+from typing import Annotated, Any, Final, Literal, NoReturn, TypeVar
 from uuid import uuid4
 
 from fastapi import (
@@ -7864,7 +7864,12 @@ async def _session_reaper(
 
 
 async def _directory_reconciler(
-    auth: AuthService, interval: float, sink: AlertSink, *, sole_reconciler: bool
+    auth: AuthService,
+    interval: float,
+    sink: AlertSink,
+    *,
+    sole_reconciler: bool,
+    alert_state: Store | None,
 ) -> None:
     """Re-resolve directory principals holding live sessions, revoking those AD has disabled or
     deleted (ADR 0079 mechanism 2). Created only when AD is wired and
@@ -7878,16 +7883,28 @@ async def _directory_reconciler(
     lives in this task and never in ``auth/``, which does not import the pipeline's sinks.
 
     With ``sole_reconciler`` False no inverse is raised; :func:`_without_clears` says why, and
-    :func:`_is_sole_reconciler` decides it. Required, so a new caller has to decide it.
+    :func:`_is_sole_reconciler` decides it. ``alert_state`` is the store the sink records alert
+    instances in, or None where nothing records them; :func:`_without_inherited_clears` reads it.
+    Both are required, so a new caller has to decide them.
 
     A transient failure must not kill the loop for the process lifetime (that would silently disable
     the control until restart) — log and retry next interval, the session-reaper precedent."""
+    # BACKLOG #2136. The ids of the reconcile instances open before this process's first pass, read
+    # just before that pass. None until a read succeeds, and every clear is dropped until then. An
+    # instance a pass of this process opened while the read kept failing then counts as inherited:
+    # a missed clear, never a false one.
+    inherited: frozenset[int] | None = None if alert_state is not None else frozenset()
     while True:
         await asyncio.sleep(interval)
         try:
+            if inherited is None and alert_state is not None:
+                found = await _open_reconcile_instances(alert_state)
+                inherited = None if found is None else frozenset(found)
             plan = await auth.reconcile_directory_sessions()
-            if not sole_reconciler:
+            if not sole_reconciler or inherited is None:
                 plan = _without_clears(plan)
+            elif alert_state is not None:
+                plan = await _without_inherited_clears(plan, alert_state, inherited)
             # Inside the try: a sink that breaks its never-raise contract must not kill the loop.
             _alert_reconcile_plan(plan, auth, sink)
         except asyncio.CancelledError:
@@ -7919,8 +7936,8 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     An outage or a pass with no signed-in account sets neither. The inverse is raised on EVERY pass
     that sets its flag, not once per clear: resolving is an idempotent update, and a resolve the
     notifier failed to write is retried that way. A process clears only what it watched open, so a
-    fresh process resolves neither alert an earlier run left open; ``_mark_reconcile_clears``
-    states that rule once."""
+    fresh process resolves neither alert an earlier run left open (:func:`_without_inherited_clears`
+    drops that clear); ``_mark_reconcile_clears`` states that rule once."""
     if plan.directory_outage:
         return
     if plan.aborted is not None:
@@ -7971,6 +7988,68 @@ def _without_clears(plan: ReconcilePlan) -> ReconcilePlan:
     a flag a later item adds is covered without an edit here."""
     cleared: dict[str, Any] = {f.name: False for f in fields(plan) if f.name.endswith("_clear")}
     return replace(plan, **cleared)
+
+
+#: Each ``*_clear`` flag on a plan, and the alert instance its inverse resolves (BACKLOG #2136).
+_RECONCILE_CLEAR_RESOLVES: Final[Mapping[str, str]] = {
+    "breaker_clear": "ad_reconcile_aborted",
+    "hold_clear": "ad_reconcile_held",
+}
+
+
+async def _open_reconcile_instances(store: Store) -> dict[int, str] | None:
+    """``id -> event_type`` of the open or acknowledged reconcile alert instances, or None when the
+    read failed, which is logged.
+
+    Catches ``Exception``, on purpose and only around this one read. Its failures are no closed
+    family: each backend's driver errors, the engine's own ``RuntimeError``, aiosqlite's
+    ``ValueError`` on a closed connection, and a cipher error opening a stored ``reason``. One
+    that escaped would cost the pass's pages, or the whole pass, through the loop's own catch. Any
+    failure here only drops a clear, which is a missed clear, never a false one."""
+    try:
+        rows = await store.list_active_alert_instances(allowed_channels=["directory-reconciler"])
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        _log.warning(
+            "directory reconcile: alert state could not be read (%s), so this pass resolves no "
+            "reconcile alert",
+            type(exc).__name__,
+        )
+        return None
+    resolvable = set(_RECONCILE_CLEAR_RESOLVES.values())
+    return {row.id: row.event_type for row in rows if row.event_type in resolvable}
+
+
+async def _without_inherited_clears(
+    plan: ReconcilePlan,
+    store: Store,
+    inherited: frozenset[int],
+) -> ReconcilePlan:
+    """The plan with each clear dropped whose instance this process did not watch open (BACKLOG
+    #2136).
+
+    ``inherited`` holds the instances already open before this process's first pass. Each alert has
+    one instance row, so a trip or a hold of this process's own folds into an earlier run's open
+    row, and the auth service's evidence covers only the accounts this process saw. The earlier
+    run's accounts may have left across the restart. So while an inherited row is still open, its
+    clear is dropped and an operator resolves it. Once an operator has, the next trip or hold opens
+    a new row, and that one is this process's own. ``AuthService._mark_reconcile_clears`` states
+    the rule this keeps. A flag this map does not name is dropped too, and so is every flag when
+    the read fails: a missed clear, never a false one."""
+    named = set(_RECONCILE_CLEAR_RESOLVES)
+    flags = {f.name: getattr(plan, f.name) for f in fields(plan) if f.name.endswith("_clear")}
+    if not any(flags.values()):
+        return plan
+    now_open = await _open_reconcile_instances(store)
+    if now_open is None:
+        return _without_clears(plan)
+    stale = {event for row_id, event in now_open.items() if row_id in inherited}
+    kept: dict[str, Any] = {
+        flag: value and flag in named and _RECONCILE_CLEAR_RESOLVES[flag] not in stale
+        for flag, value in flags.items()
+    }
+    return replace(plan, **kept)
 
 
 def _is_sole_reconciler(
@@ -8834,6 +8913,8 @@ def create_managed_app(
                             sole_reconciler=_is_sole_reconciler(
                                 coordinator, registry_filter, engine.registry_runner
                             ),
+                            # The store the notifier records instances in; none without one.
+                            alert_state=store if notifier is not None else None,
                         )
                     )
             yield

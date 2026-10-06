@@ -719,11 +719,11 @@ needs alert state ([ADR 0044](adr/0044-operator-alert-state.md)). The pass must 
 this engine process, for every signed-in directory account it did not just revoke.
 
 **An engine process resolves only an alert it watched open.** It resolves the breaker only after a
-pass of its own tripped, and the hold only after a pass of its own held. A restart forgets which
-accounts were behind a trip or a hold, and it cannot see the accounts that sign out while the
-engine is down. So a restarted engine leaves open both alerts its last run left open, however clean
-the directory reads. An operator resolves them, unless the restarted engine trips or holds itself
-and then sees that clear.
+pass of its own tripped, and the hold only after a pass of its own held. It never resolves an
+alert that was already open when it started, even after it trips or holds itself. A restart
+forgets which accounts were behind a trip or a hold, and it cannot see the accounts that sign out
+while the engine is down. So an operator resolves an alert the last run left open. After that, the
+engine resolves the next trip or hold on its own.
 
 - The hold resolves when no answer is undetermined and this pass read `userAccountControl` at
   least once. An account the pass just revoked still counts as an answer here.
@@ -732,11 +732,12 @@ and then sees that clear.
   reconciler may revoke it, or its sessions may end some other way. The engine then resolves no
   hold until its next restart.
 - The breaker resolves when the pass did not abort, no answer is undetermined, no account carries a
-  strike, and every account still signed in since the last trip has been read again, and not held.
+  strike, and every account signed in at the last trip that is still signed in has read clean.
   So the breaker's alert stays open while a hold stands.
 - An engine gives up resolving the breaker when an account signed in at the last trip leaves before
-  it reads clean. Reading clean means a pass that did not abort read it, and did not hold it. The
-  reconciler revoking the account counts as leaving. The engine then resolves no trip until its
+  it reads clean. Reading clean means a pass that did not abort found the account present and
+  enabled. A held read, or one that adds a strike, does not count. The reconciler revoking the
+  account counts as leaving. The engine then resolves no trip until its
   next restart. The engine logs a warning when it gives up either resolve.
 
 A pass judges only accounts that hold a session, and nothing reads an account again once it has
