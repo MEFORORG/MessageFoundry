@@ -31,6 +31,11 @@ All notable changes to MessageFoundry are documented here. The format follows
   `approval.request_repeated` audit row. Concurrent repeats file one request between them, on all
   three store backends. A different requester still gets a request of their own. (vault
   `BACKLOG #2445`)
+- **A held request is no longer released after dual control stops applying to it.** Before, a
+  request held while `[approvals]` gated its operation could still be approved, and run, after
+  `[approvals].enabled` was turned off or the operation left `[approvals].operations`. The approve
+  now answers 409 with an `approval.no_longer_gated` audit row, runs nothing, and leaves the
+  request pending for an approver to reject.
 
 ## [0.5.1] — 2026-10-01 — Early Access
 

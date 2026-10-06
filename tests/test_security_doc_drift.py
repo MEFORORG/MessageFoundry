@@ -483,6 +483,8 @@ _CONTEXTUAL_TOKENS = frozenset(
         "approval.too_early",
         # a repeat of an open hold joins it rather than filing a second (vault BACKLOG #2445)
         "approval.request_repeated",
+        # a hold whose operation dual control no longer gates is refused, not released
+        "approval.no_longer_gated",
         # observable outcomes
         "X-MessageFoundry-Denied",
         "client-network",

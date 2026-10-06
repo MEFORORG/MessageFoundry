@@ -48,7 +48,7 @@ import math
 import time
 from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NoReturn
 from uuid import uuid4
 
 from messagefoundry.auth.identity import Identity
@@ -391,7 +391,9 @@ class ApprovalGate:
         """Release a pending request: the captured operation is re-executed and both identities are
         audited. Refuses self-approval (the requester is not a valid second approver). Also refuses a
         request whose requester no longer holds the authority it needs (:meth:`_requester_standing`),
-        and one younger than ``[approvals].min_dwell_seconds`` (409, ``approval.too_early``).
+        one younger than ``[approvals].min_dwell_seconds`` (409, ``approval.too_early``), and one
+        whose operation dual control no longer gates (409, ``approval.no_longer_gated``;
+        :meth:`_refuse_ungated`).
 
         **The refusal compares user ids, never usernames (BACKLOG #1540).** The stored ``requester``
         and the live ``approver`` are two snapshots of a directory-writable name, taken up to
@@ -407,9 +409,9 @@ class ApprovalGate:
         :meth:`_settle`.
 
         **The writes on this path answer a mapped status in a store outage (vault BACKLOG #2255).** A
-        refusal's own audit row (``approval.too_early``, ``approval.stale_requester``) that fails
-        to write is logged and the refusal still answers 409, since it runs nothing. Every audit
-        row the gate loses also raises the
+        refusal's own audit row (``approval.too_early``, ``approval.stale_requester``,
+        ``approval.no_longer_gated``) that fails to write is logged and the refusal still answers
+        409, since it runs nothing. Every audit row the gate loses also raises the
         ``audit_write_failed`` alert. The store READS here (the request row, the requester's
         account) are not mapped, so a store that refuses reads can still answer a raw 500.
 
@@ -442,6 +444,12 @@ class ApprovalGate:
             op is None
         ):  # registered op was removed between request and approval — refuse, stay pending
             raise ApprovalError(409, f"operation '{operation}' is no longer available")
+        if not self._gated(operation):
+            # Dual control was turned off for this operation after the request was held. Releasing
+            # it now would run a held request under a control the deployment no longer applies,
+            # and the request's own configured shape (who must approve, how old) says nothing
+            # about that. Fail closed: refuse, stay pending until it expires or is rejected.
+            await self._refuse_ungated(approval_id, row, approver=approver, client=client)
         # ASVS 2.4.2: the FLOOR on the request's age, beside the expiry CEILING in _require_pending.
         # Here, inside approve(), because every release path calls this method, so no caller can skip
         # it. Checked BEFORE the transition, so the row stays pending and the approver can simply
@@ -957,6 +965,44 @@ class ApprovalGate:
         except Exception:  # noqa: BLE001 - a sink that breaks its never-raise contract must not
             # turn the documented 409 into a 500. The audit row above is already attempted.
             log.exception("approval %s: the stale-requester alert failed to emit", approval_id)
+
+    async def _refuse_ungated(
+        self, approval_id: str, row: Any, *, approver: str, client: str | None
+    ) -> NoReturn:
+        """Refuse a release whose operation dual control no longer gates, and say why.
+
+        Either ``[approvals].enabled`` is now off, or the operation has left
+        ``[approvals].operations``. The audit row is ``approval.no_longer_gated``, written soft like
+        the other refusals: it runs nothing, so a lost row must not turn the 409 into a 500. The
+        request stays ``pending``; the approver rejects it, or it expires."""
+        operation = str(row["operation"])
+        if not self._settings.enabled:
+            reason, why = "approvals_disabled", "dual control is now off ([approvals].enabled)"
+        else:
+            reason, why = (
+                "operation_not_gated",
+                f"'{operation}' is no longer in [approvals].operations",
+            )
+        await self._record_audit_soft(
+            approval_id,
+            "approval.no_longer_gated",
+            actor=approver,
+            detail=json.dumps(
+                {
+                    "approval_id": approval_id,
+                    "operation": operation,
+                    "requester": str(row["requester"]),
+                    "reason": reason,
+                }
+            ),
+            client=client,  # ADR 0150: the approver's address, matching this row's actor
+            context="the release was refused",
+        )
+        raise ApprovalError(
+            409,
+            f"{why}, so this held request can no longer be released. Reject it. If the operation "
+            "is still needed, run it again: it now runs without a second approver",
+        )
 
     def _alert_lost_audit(self, approval_id: str, action: str) -> None:
         """Page on an audit row the gate could not write (vault BACKLOG #2255).
