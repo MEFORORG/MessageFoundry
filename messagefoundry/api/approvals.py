@@ -749,7 +749,9 @@ class ApprovalGate:
         status write failed."""
 
         def detail(moved: bool | None) -> str:
-            return json.dumps(fields if flag is None else {**fields, flag: moved})
+            # default=str: a result json cannot encode must not raise here, before the status
+            # moves, after the operation ran. That would strand the row 'executing'.
+            return json.dumps(fields if flag is None else {**fields, flag: moved}, default=str)
 
         combined = AuditAppend(action, actor=approver, detail=detail(True), client=client)
         moved: bool | None
@@ -772,6 +774,18 @@ class ApprovalGate:
                 action,
             )
             moved = await self._settle_status_only(approval_id, status=status, approver=approver)
+            if moved is False:
+                # Nothing else moves a row out of 'executing' yet, so the likeliest reason is that
+                # the combined write COMMITTED and only its reply was lost: its row is then already
+                # in the log, and writing another would duplicate the outcome with a false flag.
+                log.error(
+                    "approval %s: %s; the combined write most likely committed, so no second %s "
+                    "row is written. Check the audit log for it",
+                    approval_id,
+                    context,
+                    action,
+                )
+                return
         else:
             if moved:
                 return
@@ -833,8 +847,13 @@ class ApprovalGate:
             claimed = await claim
         except Exception:  # noqa: BLE001 - the caller's cancellation is re-raised either way
             log.exception(
-                "approval %s: the approve was cancelled and its claim failed", approval_id
+                "approval %s: the approve was cancelled and its claim failed, so its "
+                "approval.release_attempted row was not written",
+                approval_id,
             )
+            # The claim carries its audit row, so a failed claim lost that row too; page it, as
+            # the uncancelled path does through _store_fault.
+            self._alert_lost_audit(approval_id, "approval.release_attempted")
             return
         if claimed:
             await self._compensate_failed_execution(
@@ -1323,8 +1342,11 @@ class ApprovalGate:
     ) -> ApprovalError:
         """Log and page a fault on a status write made before anything ran, and return the 503
         that answers it (vault BACKLOG #2255). The status and its ``action`` audit row are one
-        write, so neither landed, and the store cannot say which of the two refused. ``what``
-        names the decision in the log and the detail; ``retry`` tells the caller what to do."""
+        write, so neither landed, and the store cannot say which of the two refused. So this
+        pages ``audit_write_failed`` for any fault on that write, a pool timeout included: the
+        row WAS lost, whatever the cause, and the ERROR line beside it carries the exception that
+        says which. ``what`` names the decision in the log and the detail; ``retry`` tells the
+        caller what to do."""
         log.error(
             "approval %s: the store failed to record the %s and its %s audit row",
             approval_id,

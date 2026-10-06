@@ -7215,6 +7215,8 @@ class PostgresStore:
             existing = None
             if on_repeat is not None:
                 await self._advisory_lock(conn, _LOCK_CLASS_AUDIT, _AUDIT_LOCK)
+                # The open-request rule is the Store protocol's; the SQLite and SQL Server
+                # twins state it in their own SQL, and the shared repeat contract checks all three.
                 existing = await conn.fetchval(
                     "SELECT id FROM pending_approvals WHERE operation = $1 AND params = $2"
                     " AND requester_user_id = $3 AND status = 'pending'"
@@ -7524,15 +7526,7 @@ class PostgresStore:
         # account back. `record=False` as `_execute` passes: a sign-in is not a pipeline borrow.
         async with self._timed_acquire(record=False) as conn, conn.transaction():
             await conn.execute(sql, *params)
-            appended = await self._append_audit_row(
-                conn,
-                audit.action,
-                actor=audit.actor,
-                channel_id=None,
-                detail=audit.detail,
-                client=audit.client,
-                now=now,
-            )
+            appended = await self._append_audit(conn, audit, now)
         audit.tee(ts=now, row=appended)
 
     async def get_user(self, user_id: str) -> UserRecord | None:

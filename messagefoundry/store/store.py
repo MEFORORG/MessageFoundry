@@ -3999,8 +3999,9 @@ def seed_notify_email(email: str | None) -> str | None:
 #: The open request a repeat joins (vault BACKLOG #2445): same operation, same captured params, same
 #: requester id, still ``pending`` and unexpired at the repeat's time. Binds four ``?``: operation,
 #: params, requester_user_id, now. The Store protocol's ``create_pending_approval`` says why the
-#: requester is part of the match. Shared by the SQLite and SQL Server stores, which both bind ``?``.
-OPEN_REPEAT_WHERE = (
+#: requester is part of the match. SQL Server keeps its own text, because it must name a binary
+#: collation; Postgres keeps its own for its ``$n`` placeholders.
+_SQLITE_OPEN_REPEAT = (
     "operation = ? AND params = ? AND requester_user_id = ? AND status = 'pending'"
     " AND (expires_at IS NULL OR expires_at > ?)"
 )
@@ -11092,7 +11093,7 @@ class MessageStore:
             # connection to the file too, where the in-process lock does not reach.
             sql = (
                 f"{insert} SELECT ?,?,?,?,?,?,'pending',? WHERE NOT EXISTS ("
-                f"SELECT 1 FROM pending_approvals WHERE {OPEN_REPEAT_WHERE})"
+                f"SELECT 1 FROM pending_approvals WHERE {_SQLITE_OPEN_REPEAT})"
             )
             args += match
         now = time.time()
@@ -11104,7 +11105,7 @@ class MessageStore:
                 # The INSERT opened this connection's write transaction, so this read is the
                 # authoritative one. Oldest first: that is the request every earlier caller got.
                 found = await self._db.execute(
-                    f"SELECT id FROM pending_approvals WHERE {OPEN_REPEAT_WHERE}"
+                    f"SELECT id FROM pending_approvals WHERE {_SQLITE_OPEN_REPEAT}"
                     " ORDER BY requested_at ASC LIMIT 1",
                     match,
                 )
@@ -11489,14 +11490,7 @@ class MessageStore:
             )
             if audit is not None:
                 # BACKLOG #2100. Before the one commit, so a failed append rolls the account back.
-                appended = await self._append_audit_row(
-                    audit.action,
-                    actor=audit.actor,
-                    channel_id=None,
-                    detail=audit.detail,
-                    client=audit.client,
-                    now=now,
-                )
+                appended = await self._append_audit(audit, now)
             await self._commit()
         if audit is not None:
             audit.tee(ts=now, row=appended)

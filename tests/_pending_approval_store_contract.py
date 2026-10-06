@@ -231,8 +231,11 @@ async def _assert_repeat_request_contract(store: Any) -> None:
     try:
         first = await request()
         assert await request() == first
-        # The race: every concurrent repeat joins one request. A backend whose check and insert are
-        # not one serialized step files more than one here.
+        # The race, within ONE process: every concurrent repeat joins one request. On SQLite and SQL
+        # Server the in-process lock already serializes these calls, so this arm cannot show the
+        # database-level serialization that holds ACROSS processes; that rests on the SQL itself
+        # (one INSERT ... WHERE NOT EXISTS, or a read under the audit lock). Postgres has no
+        # in-process lock here, so on that leg this arm does exercise the database's own.
         raced = await asyncio.gather(*(request() for _ in range(6)))
         assert set(raced) == {first}
         assert len(await _audit_rows_for(store, "approval.requested", first)) == 1

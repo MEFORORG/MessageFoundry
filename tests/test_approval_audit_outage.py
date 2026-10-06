@@ -268,6 +268,51 @@ async def test_a_lost_approval_approved_row_pages(store: MessageStore) -> None:
     assert sink.lost == [(f"approval:{approval_id}", "approval.approved")]
 
 
+async def test_a_combined_outcome_write_whose_reply_is_lost_writes_no_second_row(
+    store: MessageStore,
+) -> None:
+    """The combined status and approval.approved write COMMITS and then reports a fault, as a lost
+    commit reply does. The status-only fallback then moves nothing, and the gate must not write a
+    second approval.approved row on top of the one that landed."""
+
+    class _ReplyLost(_StandingStore):
+        async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
+            moved = bool(await self._store.decide_pending_approval(approval_id, **kw))
+            audit = kw.get("audit")
+            if audit is not None and audit.action == "approval.approved":
+                raise sqlite3.OperationalError("connection reset after COMMIT")
+            return moved
+
+    sink = _Sink()
+    runs: list[str] = []
+    gate = _gate(_ReplyLost(store), sink, runs=runs)
+    approval_id = await _request(gate)
+    await gate.approve(approval_id, approver="checker", approver_user_id=_APPROVER_ID)
+    assert runs == ["ran"] and await _status(store, approval_id) == "approved"
+    assert len(await store.list_audit(action="approval.approved")) == 1
+
+
+async def test_an_unencodable_result_still_settles_the_release(store: MessageStore) -> None:
+    """The operation ran. A result json cannot encode used to raise before the status moved,
+    stranding the row 'executing' and answering 500."""
+    import datetime
+
+    settings = ApprovalsSettings(
+        enabled=True, operations=["dead_letter_replay"], min_dwell_seconds=0.0
+    )
+    gate = ApprovalGate(_StandingStore(store), settings, resolve_identity=_resolve)
+
+    async def _execute(_p: Mapping[str, Any]) -> dict[str, Any]:
+        return {"at": datetime.datetime(2026, 1, 1)}
+
+    gate.register("dead_letter_replay", "op", _execute, permission=Permission.MESSAGES_REPLAY)
+    approval_id = await _request(gate)
+    await gate.approve(approval_id, approver="checker", approver_user_id=_APPROVER_ID)
+    assert await _status(store, approval_id) == "approved"
+    rows = await store.list_audit(action="approval.approved")
+    assert len(rows) == 1 and "2026-01-01" in str(rows[0]["detail"])
+
+
 async def test_a_refused_release_row_pages_as_well_as_answering_503(store: MessageStore) -> None:
     sink = _Sink()
     gate = _gate(_Faulty(store, audit_fails=("approval.release_attempted",)), sink)
