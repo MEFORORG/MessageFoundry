@@ -28,11 +28,14 @@ from collections.abc import AsyncIterator, Iterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import fields as dataclass_fields
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 
+from messagefoundry.api import app as app_module
+from messagefoundry.api import create_managed_app
 from messagefoundry.api.app import (
     _alert_reconcile_plan,
     _directory_reconciler,
@@ -49,7 +52,14 @@ from messagefoundry.auth.reconcile import (
     SessionRevocation,
 )
 from messagefoundry.auth.service import AuthService, _HoldStanding
-from messagefoundry.config.settings import _ALERT_EVENT_TYPES, AuthSettings
+from messagefoundry.config.settings import (
+    _ALERT_EVENT_TYPES,
+    AuthSettings,
+    EgressSettings,
+    SecurityEnforcement,
+    SecuritySettings,
+    StoreSettings,
+)
 from messagefoundry.pipeline.alert_sinks import _AUTO_RESOLVE, NotifierAlertSink
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
@@ -946,6 +956,109 @@ async def test_a_breaker_trip_resolves_only_once_the_directory_reads_clean(
         assert await _open_alerts(store) == set()
 
 
+async def test_a_trip_does_not_resolve_when_the_accounts_behind_it_leave(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Lander's driven case. Ten of twelve accounts read absent, the breaker trips, and the ten
+    sessions then end, as the absolute cap ends them. Nothing is fixed. The users cannot sign back
+    in, so nothing re-reads them, and the two that remain read clean. That is no evidence the trip
+    has gone: the accounts behind it left unconfirmed, so this process forfeits the clear."""
+    names = ["ok1", "ok2"] + [f"gone{i}" for i in range(10)]
+    async with _signed_in_estate(monkeypatch, names) as (directory, service, store, _tokens):
+        sink = NotifierAlertSink([], store=store)
+        for name in names[2:]:
+            directory.delete(name)
+        assert not (await _alerted_pass(service, sink)).breaker_clear  # strike 1
+        assert (await _alerted_pass(service, sink)).aborted == "mass_revoke_breaker"
+        assert await _open_alerts(store) == {ABORTED}
+        await _expire(store, names[2:])
+        for _ in range(2):  # not a matter of waiting another pass
+            plan = await _alerted_pass(service, sink)
+            assert plan.aborted is None and plan.readable == 2
+            assert not plan.breaker_clear, "the trip resolved once its accounts left"
+            assert await _open_alerts(store) == {ABORTED}
+
+
+async def test_an_account_that_leaves_after_it_was_read_again_does_not_forfeit_the_trip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The control for the test above. Once a pass that was not aborted has read every account
+    again, the trip is confirmed gone, and an ordinary sign-out after that forfeits nothing."""
+    names = ["ok1", "ok2"] + [f"gone{i}" for i in range(10)]
+    async with _signed_in_estate(monkeypatch, names) as (directory, service, store, _tokens):
+        sink = NotifierAlertSink([], store=store)
+        saved = dict(directory.ids)
+        for name in names[2:]:
+            directory.delete(name)
+        await _alerted_pass(service, sink)
+        assert (await _alerted_pass(service, sink)).aborted == "mass_revoke_breaker"
+        directory.ids.update(saved)
+        assert (await _alerted_pass(service, sink)).breaker_clear
+        await _expire(store, ["gone0"])
+        assert (await _alerted_pass(service, sink)).breaker_clear
+
+
+async def test_a_hold_does_not_release_when_the_accounts_it_holds_leave(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Lander's second driven case. Two unreadable accounts are held, then their sessions end.
+    Nothing re-reads them, and the rest of the estate reads clean. The held accounts left with an
+    undetermined answer, so this process forfeits the release."""
+    names = ["u1", "u2", "ok1", "ok2", "ok3"]
+    async with _signed_in_estate(monkeypatch, names) as (directory, service, store, _tokens):
+        sink = NotifierAlertSink([], store=store)
+        directory.uac.update({"u1": ABSENT, "u2": ABSENT})
+        assert (await _alerted_pass(service, sink)).hold
+        assert await _open_alerts(store) == {HELD}
+        await _expire(store, ["u1", "u2"])
+        for _ in range(2):
+            plan = await _alerted_pass(service, sink)
+            assert plan.aborted is None and not plan.hold and plan.readable == 3
+            assert not plan.hold_clear, "the hold released once its accounts left"
+            assert await _open_alerts(store) == {HELD}
+
+
+async def test_a_settled_process_that_holds_again_still_forfeits_when_the_held_accounts_leave(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A settled process does not forfeit on a lone undetermined account, because its records
+    cover what an earlier run held. A hold of its own later is a new condition, and its accounts
+    can leave before it releases just the same, so a new hold takes the process out of settled."""
+    names = ["u1", "u2", "ok1", "ok2", "ok3"]
+    async with _signed_in_estate(monkeypatch, names) as (directory, service, store, _tokens):
+        sink = NotifierAlertSink([], store=store)
+        directory.uac.update({"u1": ABSENT, "u2": ABSENT})
+        assert (await _alerted_pass(service, sink)).hold
+        directory.uac.update({"u1": ENABLED, "u2": ENABLED})
+        assert (await _alerted_pass(service, sink)).hold_clear
+        assert service._reconcile_hold_standing == "settled"
+        directory.uac.update({"u1": ABSENT, "u2": ABSENT})
+        assert (await _alerted_pass(service, sink)).hold
+        assert await _open_alerts(store) == {HELD}
+        await _expire(store, ["u1", "u2"])
+        plan = await _alerted_pass(service, sink)
+        assert not plan.hold and not plan.hold_clear
+        assert await _open_alerts(store) == {HELD}
+
+
+async def test_a_readable_account_that_leaves_while_a_hold_stands_does_not_forfeit_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The control for the two tests above. Only an undetermined answer forfeits. A readable
+    account signing out while the hold stands changes nothing, and the hold releases once the held
+    accounts read clean."""
+    names = ["u1", "u2", "ok1", "ok2", "ok3"]
+    async with _signed_in_estate(monkeypatch, names) as (directory, service, store, _tokens):
+        sink = NotifierAlertSink([], store=store)
+        directory.uac.update({"u1": ABSENT, "u2": ABSENT})
+        assert (await _alerted_pass(service, sink)).hold
+        await _expire(store, ["ok1"])
+        assert (await _alerted_pass(service, sink)).hold
+        directory.uac.update({"u1": ENABLED, "u2": ENABLED})
+        assert (await _alerted_pass(service, sink)).hold_clear
+        assert await _open_alerts(store) == set()
+
+
 async def test_a_trip_on_role_changes_is_not_cleared_by_a_sample_that_missed_them(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1354,7 +1467,7 @@ async def test_a_process_whose_own_pass_has_not_held_releases_no_hold() -> None:
         ("held", "settled", "settled"),
         ("forfeit", "held", "forfeit"),
         ("forfeit", "settled", "forfeit"),
-        ("settled", "held", "settled"),
+        ("settled", "held", "held"),
         ("settled", "forfeit", "settled"),
     ],
 )
@@ -1362,7 +1475,8 @@ async def test_the_hold_standing_never_leaves_a_forfeit(
     start: _HoldStanding, event: _HoldStanding, end: _HoldStanding
 ) -> None:
     """A forfeit is never left, and a settled process does not forfeit: its records cover what an
-    earlier run held."""
+    earlier run held. A new hold of its own takes it back to held, so the accounts that hold
+    covers forfeit if they leave before it releases."""
     store = await MessageStore.open(":memory:")
     try:
         service = _fresh_process(store)
@@ -1477,6 +1591,45 @@ def test_only_a_process_alone_on_its_store_is_the_sole_reconciler() -> None:
     assert not _is_sole_reconciler(single, shard_filter, _runner(("a", "b")))  # two shards
     assert not _is_sole_reconciler(single, shard_filter, None)  # a shard with no graph
     assert not _is_sole_reconciler(clustered, None, _runner(None))  # a [cluster] node
+
+
+@pytest.mark.parametrize("sole", [False, True], ids=["not-sole", "sole"])
+async def test_the_lifespan_passes_the_sole_reconciler_answer_to_the_reconciler_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sole: bool
+) -> None:
+    """The call site in ``create_managed_app``. The test above pins what the answer is; this one
+    pins that the lifespan asks for it, with the process's own coordinator, filter and runner, and
+    hands it on. A call site passing ``True`` regardless fails the ``not-sole`` case."""
+    asked: list[tuple[object, object, object]] = []
+    handed: list[bool] = []
+
+    def answer(coordinator: object, registry_filter: object, runner: object) -> bool:
+        asked.append((coordinator, registry_filter, runner))
+        return sole
+
+    async def reconciler(
+        auth: AuthService, interval: float, sink: AlertSink, *, sole_reconciler: bool
+    ) -> None:
+        handed.append(sole_reconciler)
+
+    monkeypatch.setattr(app_module, "_is_sole_reconciler", answer)
+    monkeypatch.setattr(app_module, "_directory_reconciler", reconciler)
+    app = create_managed_app(
+        store_settings=StoreSettings(path=str(tmp_path / "sole.db"), allow_unencrypted_phi=True),
+        auth_settings=_settings(),
+        security_settings=SecuritySettings(
+            enforcement=SecurityEnforcement.WARN, allow_unencrypted_phi=True
+        ),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    async with app.router.lifespan_context(app):
+        for _ in range(200):
+            if handed:
+                break
+            await asyncio.sleep(0.005)
+        engine = app.state.engine
+        assert asked == [(engine.coordinator, None, engine.registry_runner)]
+    assert handed == [sole]
 
 
 class _PlanAuth:

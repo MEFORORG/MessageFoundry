@@ -723,11 +723,21 @@ this engine process, for every signed-in directory account it did not just revok
 - The hold also needs this engine process to have held accounts itself since it started. A
   restart forgets which accounts a hold covered. So a restarted engine leaves its last run's hold
   open until it holds and releases accounts of its own. Until then, an operator resolves it.
-- An engine can also give up resolving the hold. That happens when it revokes an undetermined
-  account before it has released a hold. It then resolves no hold until its next restart.
+- An engine can also give up resolving the hold. That happens when an account whose last answer
+  was undetermined leaves, unless the engine has released a hold and has not held since. The
+  reconciler may revoke it, or its sessions may end some other way. The engine then resolves no
+  hold until its next restart.
 - The breaker resolves when the pass did not abort, no answer is undetermined, no account carries a
   strike, and every account still signed in since the last trip has been read again, and not held.
   So the breaker's alert stays open while a hold stands.
+- An engine gives up resolving the breaker when an account signed in at the last trip leaves before
+  a pass has read it again. It then resolves no trip until its next restart.
+
+A pass judges only accounts that hold a session, and nothing reads an account again once it has
+left. An account leaves at least when it signs out, reaches the session cap, is revoked by the
+reconciler, is disabled locally, or is deleted. The two give-up rules above stop an alert resolving
+on the accounts that remain. The cost is a missed resolve when an account leaves for an ordinary
+reason, such as a sign-out, while the evidence is still pending.
 
 **They never resolve themselves on a `[cluster]` node or in an engine that runs more than one engine
 shard.** Another engine's reconciler may still hold the condition there, so an operator resolves the
@@ -738,9 +748,9 @@ At least two cases can still resolve falsely:
 
 - An engine that declares neither `[cluster]` nor more than one engine shard trusts its own
   evidence, whatever else shares its store.
-- A pass judges only accounts that hold a session. A trip or hold whose accounts have all left
-  resolves on the accounts that remain. An account leaves at least when it signs out, reaches the
-  session cap, is revoked by the reconciler, is disabled locally, or is deleted.
+- An engine remembers who left only while it runs. A trip whose accounts leave across a restart
+  can resolve on the accounts that remain. The hold does not, because a restarted engine leaves its
+  last run's hold open.
 
 ### `[ai]` — AI coding assistance policy
 Implemented (see [AI.md](AI.md)). Controls the IDE AI assistant across the **OFF→PHI-safe** range;
