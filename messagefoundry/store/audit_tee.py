@@ -119,6 +119,41 @@ def emit_audit_tee(
     redacting here keeps the off-box guarantee independent of handler config and **identical across
     every backend**.
 
+    **The record survives the scrub, and the scrub is what makes it so.** A failed sign-in sets
+    ``actor`` to the typed name, so a client chooses its characters. ``ControlCharScrubFilter``
+    runs last on every configured handler, and since vault BACKLOG #3012 every escape it writes is
+    valid inside a JSON string (:mod:`messagefoundry.controlchars` says why). So this serializes
+    with plain ``json.dumps`` and adds no escaping of its own. The first handler's filters see each
+    character of the record unescaped, except those ``json.dumps`` must escape in a string: the
+    quote, the backslash and the 32 C0 controls, U+0000 to U+001F. Escaping more here, BEFORE the
+    redaction and credential filters, hid a name or a password from them: an escape such as
+    ``\\u007f`` ends in a word character, so ``\\b``-anchored patterns no longer matched the next
+    word. ``ensure_ascii=True`` is the same mistake, for every non-ASCII character.
+
+    **At least three residuals remain.** The first can break the JSON a collector receives, or
+    alter it silently. The second can break it. The third leaves text unredacted.
+
+    * The redaction and credential filters rewrite spans of this document as text, and a span can
+      take a closing quote with it. A typed name of ``password=`` or ``a|b|c`` does that on every
+      sink, with no escaped character involved. When two fields carry attacker-influenced text,
+      the document can instead still parse, with the fields between them missing. Those can be
+      at least ``channel_id``, ``client``, ``detail`` and the row anchors. A field that survives,
+      such as ``actor``, can then carry another field's text.
+    * Every handler re-filters the one shared ``LogRecord``, so the file handler and the forwarder
+      run the chain again over the first handler's escaped text (``_install_phi_filters``). Then
+      ``x%7Cy%7Cz`` followed by DEL, or by U+2028, parses on stdout and not on the later sinks,
+      the forwarder included. ``tests/test_audit_offbox_tee.py`` pins that as a strict xfail.
+    * ``json.dumps`` escapes the 32 C0 controls before any filter runs. Each escape ends in a word
+      character, as ``\\u0001`` and ``\\t`` do. And a tab, LF or CR stops being whitespace. So a
+      pattern that needs a word boundary or whitespace can miss the text beside a C0 control, on
+      either side. Measured cases include a two-word name, a date, a bearer token, an MRN and a
+      ``password=`` value, and they reach the tee line unredacted. This predates vault BACKLOG
+      #3012. ``tests/test_audit_offbox_tee.py`` pins some of these cases as strict xfails.
+
+    Running the chain once per record, rather than once per handler, would close the second. The
+    first needs filters that do not rewrite this document as plain text. The third needs the
+    patterns to see each field before ``json.dumps`` escapes it.
+
     Best-effort: a logging failure must never fail the audit write (already committed), so it is
     caught and logged, not raised. Callers invoke this **after commit** and **outside any write
     lock/transaction**, so a synchronous syslog send can't block the event loop under a lock."""
@@ -141,6 +176,7 @@ def emit_audit_tee(
     try:
         # Inside the guard: a sink that cannot be built must not fail the caller's audit write either.
         ensure_logger_sink(audit_logger)
+        # Not ensure_ascii, and no escaping here: see "The record survives the scrub" above.
         audit_logger.info(json.dumps(record, ensure_ascii=False))
     except Exception:  # noqa: BLE001 — the audit row is durable; the off-box tee is best-effort
         # Once per process, and never naming the row (BACKLOG #1131). A line per failed row named

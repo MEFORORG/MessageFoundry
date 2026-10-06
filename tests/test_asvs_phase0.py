@@ -80,7 +80,7 @@ def test_control_char_filter_scrubs_interpolated_args() -> None:
     ControlCharScrubFilter().filter(rec)
     out = rec.getMessage()
     assert "\n" not in out and "\x00" not in out
-    assert "a\\nb\\x00c" in out
+    assert "a\\nb\\u0000c" in out  # the JSON-valid spelling since vault BACKLOG #3012
 
 
 def test_control_char_filter_leaves_clean_message_lazy() -> None:
