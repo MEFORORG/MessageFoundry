@@ -123,6 +123,8 @@ _AUTO_RESOLVE: dict[str, str] = {
     "intake_resumed": "intake_paused",
     # #2136: a reconcile pass that is evidence the breaker is not tripped, or that no hold stands,
     # resolves the open instance of that alert. Both carry the fixed "directory-reconciler" label.
+    # #2538: the breaker inverse also resolves the referral's own ad_reconcile_aborted instance,
+    # raised under the "directory-reconciler-referral" label once no referral stands.
     "ad_reconcile_breaker_cleared": "ad_reconcile_aborted",
     "ad_reconcile_hold_released": "ad_reconcile_held",
 }
@@ -1066,7 +1068,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         )
 
     def ad_reconcile_breaker_cleared(self, name: str) -> None:
-        # #2136: the INVERSE -- no page; auto-resolves the open ad_reconcile_aborted via _AUTO_RESOLVE.
+        # #2136: the INVERSE -- no page; auto-resolves the open ad_reconcile_aborted via _AUTO_RESOLVE,
+        # the breaker's or, under the referral's label, the referral's (#2538).
         self._record_state({"type": "ad_reconcile_breaker_cleared", "connection": name}, "info")
 
     def ad_reconcile_hold_released(self, name: str) -> None:

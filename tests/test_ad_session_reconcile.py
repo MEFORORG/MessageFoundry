@@ -853,6 +853,62 @@ async def test_a_referral_beside_other_answers_still_revokes_them_and_pages() ->
         await store.close()
 
 
+async def test_a_referral_is_not_cleared_by_a_sample_that_missed_an_account_it_still_refers() -> (
+    None
+):
+    """BACKLOG #2538. A referral that starts mid-process marks EVERY candidate, not only the one
+    the sample happened to probe. With one probe per pass, the referred account signs out, and the
+    next sample reads only a clean account. Another account the same base still refers was last
+    read before the referral began, so its answer on record says nothing about it.
+
+    RED when: only referred ids are tracked, so that pass marks ``referral_clear`` and releases the
+    message while the base still refers an account no pass has read since."""
+    store = await MessageStore.open(":memory:")
+    try:
+        names = ("jdoe", "asmith", "bwong")
+        ldap = _FakeLdap({n: _principal(n) for n in names})
+        service = AuthService(store, _ad_settings(ad_session_recheck_max_users=1), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        for name in names:
+            await _signed_in_ad_user(service, store, name)
+
+        def _probed() -> str:
+            assert len(ldap.probes) == 1
+            return ldap.probes.pop()
+
+        ldap.probes.clear()
+        order = []
+        for _ in names:  # one full rotation, every answer PRESENT and on record
+            await service.reconcile_directory_sessions()
+            order.append(_probed())
+        assert sorted(order) == sorted(names)
+        first, second, third = order
+
+        ldap.referring = {first, third}  # a referring base that refers two of the three
+        referral = await service.reconcile_directory_sessions()
+        assert _probed() == first and referral.referred and not referral.referral_clear
+        row = await store.get_user_by_username(first)
+        assert row is not None
+        await store.revoke_user_sessions(row.id)  # it signs out, and leaves the candidate set
+
+        missed = await service.reconcile_directory_sessions()
+        assert _probed() == second and missed.referred == ()
+        assert not missed.referral_clear, "a sample that never read the third account cleared it"
+        assert service.directory_reconcile_referral is not None
+
+        still = await service.reconcile_directory_sessions()
+        assert _probed() == third and len(still.referred) == 1  # the base still refers it
+
+        ldap.referring.clear()  # the operator fixes the base
+        partial = await service.reconcile_directory_sessions()
+        assert _probed() == second and not partial.referral_clear
+        fixed = await service.reconcile_directory_sessions()
+        assert _probed() == third and fixed.referral_clear
+        assert service.directory_reconcile_referral is None
+    finally:
+        await store.close()
+
+
 async def test_a_referral_beside_an_outage_judges_what_answered_and_pages() -> None:
     """Referral, outage and answer in one pass. The answer is judged; the referral pages; the
     outage leaves its account's strike alone. With the answer removed, referral plus outage alone

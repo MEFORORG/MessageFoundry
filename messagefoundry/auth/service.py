@@ -2094,10 +2094,12 @@ class AuthService:
         self._reconcile_alert: str | None = None
         #: Latched LDAP referral (BACKLOG #2538). Its own latch, like the hold's, because a pass with
         #: a referral beside other answers is not aborted and so clears `_reconcile_alert`. Set on a
-        #: pass with a referral, cleared on the next pass that reaches the directory without one.
+        #: pass with a referral. Cleared on a pass without one once `_reconcile_referred` is empty.
         self._reconcile_referral_alert: str | None = None
-        #: user_ids referred since a probe last read them without a referral (BACKLOG #2538).
-        #: `_mark_reconcile_clears` reports no referral clear while one is signed in.
+        #: user_ids signed in at the last pass with a referral and not read PRESENT since (BACKLOG
+        #: #2538). Every candidate, not only the referred ones, because a probe sample can miss
+        #: accounts the same base would refer. `_mark_reconcile_clears` reports no referral clear
+        #: while one is signed in.
         self._reconcile_referred: set[str] = set()
         #: user_ids a breaker trip has not yet seen re-read on a pass that was not aborted
         #: (BACKLOG #2136). `_mark_reconcile_clears` reports no breaker clear while one is signed in.
@@ -5048,7 +5050,8 @@ class AuthService:
     @property
     def directory_reconcile_referral(self) -> str | None:
         """The standing LDAP referral's operator message, or ``None`` (BACKLOG #2538). Latches until
-        a pass reaches the directory and no probe is referred."""
+        a pass with no referral finds every account signed in at the last referral read PRESENT
+        since, the evidence the referral's alert resolves on."""
         return self._reconcile_referral_alert
 
     @property
@@ -5327,16 +5330,21 @@ class AuthService:
             )
         elif not plan.judged_nothing:
             self._reconcile_unconfirmed = set(users)
-        # BACKLOG #2538. The same for a referral, on its own record: a referred account counts as
-        # unconfirmed until a probe reads it PRESENT. Only that answer ran every search a referral
-        # can come from; a DISABLED or ABSENT one returns before the group search, so it says
-        # nothing about a referring group base. A revoked account leaves with the candidate set.
+        # BACKLOG #2538. The same for a referral, on its own record. Any referral marks EVERY
+        # candidate unconfirmed, as a trip does: a probe sample can miss accounts that the same
+        # search base would also refer, so tracking only the referred ones would let a later
+        # sample that never reached them clear the referral. An account counts as unconfirmed
+        # until a later probe reads it PRESENT. Only that answer ran every search a referral can
+        # come from; a DISABLED or ABSENT one returns before the group search, so it says nothing
+        # about a referring group base. A revoked account leaves with the candidate set.
         present = reconcile.ProbeOutcome.PRESENT
-        self._reconcile_referred.intersection_update(users)
-        self._reconcile_referred.difference_update(
-            uid for uid, outcome in plan.outcomes.items() if outcome is present
-        )
-        self._reconcile_referred.update(plan.referred)
+        if plan.referred:
+            self._reconcile_referred = set(users)
+        else:
+            self._reconcile_referred.intersection_update(users)
+            self._reconcile_referred.difference_update(
+                uid for uid, outcome in plan.outcomes.items() if outcome is present
+            )
         referral = next((p for p in probes if p.outcome is reconcile.ProbeOutcome.REFERRED), None)
         if plan.aborted is not None:
             if not plan.directory_referral:
@@ -5909,7 +5917,8 @@ class AuthService:
         action, because a pass with a referral beside other answers is not an aborted one, and an
         ``auth.ad_reconcile_aborted`` row is read as "nothing was revoked". The row's ``aborted``
         field says what else the pass did. On a pass with no referral it releases a latched
-        message. An outage is not called here, so it leaves the message as it is.
+        message, but only once every account signed in at the last referral has been read PRESENT
+        since. An outage is not called here, so it leaves the message as it is.
 
         **Its own latch and its own alert instance**, apart from the breaker's: the lifespan task
         raises it as ``ad_reconcile_aborted`` under its own source label. A shared instance would
@@ -5921,13 +5930,13 @@ class AuthService:
         no username. It is latched before the row is written, so a failed write leaves it set.
         """
         if not plan.referred:
-            # Released on the same evidence as the referral's clear: no signed-in account is still
-            # waiting to be read PRESENT. A sample that missed the referred accounts is not that.
+            # Released on the same evidence as the referral's clear: no account signed in at the
+            # last referral is still waiting to be read PRESENT. A sample that missed some is not.
             if self._reconcile_referral_alert is not None and not self._reconcile_referred:
                 self._reconcile_referral_alert = None
                 _log.warning(
-                    "directory reconcile: every referred account has since been read; the LDAP "
-                    "referral cleared"
+                    "directory reconcile: every account signed in at the last LDAP referral has "
+                    "since been read without one; the referral cleared"
                 )
             return
         others = (
