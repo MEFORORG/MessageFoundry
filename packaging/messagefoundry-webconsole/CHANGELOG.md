@@ -29,6 +29,13 @@ this line.**
 
 ### Security
 
+- **A cookie replayed from a second address is sent to re-authenticate before a PHI page or a
+  write.** The message pages, the dead-letter list and the three reason reveals (every
+  `require_ui(..., phi=True)` page), and every write on `require_ui`, now send a session presented
+  from a host it has not verified from to `/ui/reauth`. A PHI page comes back to itself after the
+  re-auth, so those pages are now registered continuations. A write lands on `/ui`, and the
+  operator presses the button again. The step-up routes already did this. Pages that are neither,
+  the dashboard included, still load. No seam change. (vault BACKLOG #2620)
 - **Every console route declares its authorization.** Each `require_ui*` gate carries the engine's
   gate mark, and each sign-in and re-authentication route is marked `public_route` with a reason.
   The engine now refuses a route that declares neither. The supported engine seam moved because the

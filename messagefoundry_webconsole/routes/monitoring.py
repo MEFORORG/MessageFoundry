@@ -14,6 +14,7 @@ from messagefoundry.auth import Identity, Permission
 
 from .. import pages
 from .._auth import (
+    register_ui_action,
     require_ui,
 )
 from ._common import (
@@ -22,6 +23,16 @@ from ._common import (
     blank_to_none,
     check_filters,
     for_echo,
+)
+
+# The two reason reveals are PHI pages (`phi=True`), so a read from a host the session has not
+# verified from goes to /ui/reauth and comes back here. Registered for the reason routes/core.py
+# gives beside its own PHI pages (vault BACKLOG #2620).
+register_ui_action(
+    r"^/ui/alerts/[^/?#]+/reason$", Permission.MESSAGES_VIEW_SUMMARY, auto_retry=False, unlock=True
+)
+register_ui_action(
+    r"^/ui/events/[^/?#]+/reason$", Permission.MESSAGES_VIEW_SUMMARY, auto_retry=False, unlock=True
 )
 
 
