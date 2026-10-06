@@ -3,7 +3,7 @@
 
 # ADR 0171 — Offline administrator unlock: a host-gated CLI recovery path for a sole-administrator lockout
 
-- **Status:** Accepted (2026-08-22) — built with the change
+- **Status:** Accepted (2026-08-22) — built with the change; amended 2026-09-27 (`clear_lockout`, ADR 0197); amended 2026-10-06 — Amendment B, `admin-reset-totp`, by owner ruling (BACKLOG #2226), built with the change
 - **Date:** 2026-08-22
 - **Related:** [BACKLOG #1236](../BACKLOG.md) · [`__main__.py`](../../messagefoundry/__main__.py) `_admin_unlock` · [ADR 0170](0170-constant-work-recovery-code-verification-pad-to-the-configured-slot-count-rather-than-short-circuit.md) (the neighbouring auth work) · [CLAUDE.md](../../CLAUDE.md) §0 (not-deployed beta), §9 (PHI guardrails)
 
@@ -124,3 +124,132 @@ command still needs no credential, and it still does not reset the password. Wha
 for the accounts whose owner has a way past the lock, by escalating those locks per cycle. For every
 other account the number of lock cycles is still unbounded, and `docs/SECURITY.md` control 1 says
 which accounts those are.
+
+## Amendment B (2026-10-06) — `admin-reset-totp`: replace a sole Administrator's TOTP seed from the host (BACKLOG #2226)
+
+**This amends the decision above and does not supersede it.** The 2026-09-27 amendment above is the
+first; this one is called B so code can cite it. It adds a second command on the same gate. The
+gate, the "run it with the engine stopped" rule and the exit-code convention are unchanged.
+
+### The problem
+
+The TOTP seed has no calendar lifetime: the owner exempted it on 2026-09-27 (BACKLOG #1931), and
+the rotation schedule names revocation as the control that remains. For a sole Administrator on an
+account that requires MFA, with TOTP as its only factor, revocation had no path:
+
+| route | why it is closed for that account |
+|---|---|
+| another Administrator's `POST /users/{id}/reset-mfa` | it refuses a self-target (#1022), and there is no other Administrator |
+| self-service TOTP removal | the AC-A3a guard in `disable_mfa` refuses TOTP removal for a covered local account, passkeys or not (since engine PR 1770) |
+| enrol a passkey, then remove TOTP | open only to a directory Administrator, and only with the `[webauthn]` extra |
+| `[security].require_mfa = false` and a restart | turns MFA off for every account for the whole window |
+| an offline command | none reset MFA |
+
+So a suspected seed leak could not be answered by replacing the seed. Severity is conditional
+(CLAUDE.md section 0): zero deployments, so this is what a first deployment with one Administrator
+would meet.
+
+### The ruling
+
+**Owner ruling, 2026-10-06**, given in session to the batch 196 Manager: build a host-gated TOTP
+re-enrolment command, `admin-reset-totp`, through an amendment to this ADR. The reasons put to the
+owner: it never passes through zero factors, and it follows this ADR's precedent. **Declined:**
+relying on "create a second Administrator", which needs `[approvals]` off, and "turn `require_mfa`
+off", which turns MFA off for every account during the window.
+
+### What the command does
+
+`messagefoundry admin-reset-totp --username <name>` takes the same arguments as `admin-unlock`
+(`--service-config`, `--db`, `--json`) and the same host gate, `_host_gated_store_settings`. In
+order:
+
+1. It opens the store and refuses, before any key is shown, at least: an unknown account, an
+   account that does not hold the Administrator role, a disabled account, an account with no TOTP
+   enrolled, and a store whose audit append would be refused (the `admin-unlock` pre-check).
+2. It generates a new seed in memory and shows the key and its URI on the console device, never on
+   stdout or stderr. It uses the same terminal enrolment as `provision-admin` (ADR 0197
+   Amendment A). The operator adds the seed to the authenticator app and types a code. Five wrong
+   codes, or no terminal, refuse with nothing written.
+3. It reopens the store, asks the same refusals again, and makes **one conditional UPDATE**,
+   `replace_totp_enrolment`. That writes the new seed, new recovery-code hashes and the proving
+   code's step, and only where TOTP is still on.
+4. It ends every session of the account. It sends the holder an `mfa_enabled` security notice, best
+   effort, as `provision-admin` sends its takeover notice. Then it appends the audit row.
+5. It shows the new recovery codes on the console device once.
+
+### Why the account never has zero factors
+
+The order is prove first, then swap. Until step 3 commits, the old seed is untouched and still signs
+in. So every refusal and every interruption before it leaves the account exactly as it was. Step 3
+is one statement. It changes the seed, the codes and the step high-water mark together and never
+writes `totp_enabled`, so no reader ever sees TOTP off or the seed empty. It matches only a row where
+TOTP is on, so it cannot turn TOTP on for an account that lacked it. A removal that lands while the
+operator is typing is not undone.
+
+The other design, clearing the seed and forcing enrol-first at the next sign-in, was rejected. It
+passes through a state with no factor. `admin_reset_mfa` needs a generated credential to make that
+state safe (ADR 0197 Amendment A, N-B2). On a sole Administrator that state is the install's only way
+in.
+
+The proving code's step is recorded as spent, so the code typed at the terminal cannot sign in
+afterwards. The new seed starts its own step history, as `disable_totp` resets it for the same
+reason.
+
+`tests/test_admin_reset_totp.py` checks the property with a SQLite trigger. The trigger records any
+UPDATE that leaves the row with TOTP off or no seed. It records nothing during the command, and it
+fires once on `disable_totp`, its positive control.
+
+### Recovery codes are replaced, not kept
+
+A leaked seed or a stolen device usually means the recovery codes kept beside it are exposed too. A
+seed rotation that left them valid would revoke nothing for whoever holds them. So the old codes stop
+working in the same statement that swaps the seed, and a new set is issued. If the console cannot
+show the new codes, the command warns and the new seed still works. Running it again issues codes
+that can be kept.
+
+Passkeys are left alone. They are a separate factor, and nothing here suspects them.
+
+### Sessions end
+
+Every session of the account ends after the swap. A session elevated with the old seed is what a seed
+leak buys, so a revocation that left it standing would not revoke much. The order is swap, then end
+sessions, so a session minted with the old seed just before the swap is still ended.
+
+### Who it accepts
+
+It accepts an **enabled Administrator**, local or directory. A directory Administrator's TOTP seed
+is engine-held state on the engine's user row (BACKLOG #1144), so the replacement fits it as it fits
+a local one. It refuses every other account. An Administrator resets another account's factors from
+the web console (Reset MFA). A host-run replacement would leave the new seed with whoever ran the
+command, not with the holder. That is the same reason this ADR's unlock does not reset a password.
+
+It does not clear a lockout. That stays `admin-unlock`'s job.
+
+### What it audits
+
+Every successful run writes **`auth.admin_totp_reset`**, named like `auth.admin_unlocked`, with the
+OS user as the actor (`cli:<os user>`). The detail holds the username, the sessions ended, the
+recovery codes issued, the passkeys kept, the account's provider and what happened to the notice. It
+never holds the seed or a code. The row is not hidden from readers without `users:manage`. It says a
+seed was replaced, which is no password oracle.
+
+The audit append is checked before the write and made after it, the ordering `admin-unlock` uses. A
+store that would refuse the append is refused before the key is shown.
+
+### A named store method, on all three backends
+
+`replace_totp_enrolment` joins the Store protocol, on SQLite, PostgreSQL and SQL Server. No existing
+method can swap the seed with TOTP on. `enable_totp` writes only where TOTP is off, and
+`set_totp_secret` leaves the old recovery codes and step. Every composition of the existing methods
+passes through a state the property above forbids. The shared TOTP store contract,
+`tests/_webauthn_store_contract.py`, covers the method on every backend.
+
+### Not addressed
+
+- The command trusts the host gate, as `admin-unlock` does. Anyone who can run it already holds the
+  database, so it grants nothing new. It does not stop such a person enrolling their own seed on the
+  Administrator; the audit row and the notice record that it happened.
+- "Run it with the engine stopped" is documented, not checked. The conditional write, and the
+  session revocation after it, narrow what a live engine could race.
+- An audit append that fails after the pre-check passed lands after the swap. That is the same
+  narrow window `admin-unlock` accepts.
