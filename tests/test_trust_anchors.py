@@ -1985,6 +1985,25 @@ def test_the_dacl_read_log_quotes_the_path(caplog: pytest.LogCaptureFixture) -> 
     _quoted(record.getMessage())
 
 
+def test_a_chain_walk_reason_quotes_the_path() -> None:
+    """The reasons anchor_path builds reach the same refusals, so they quote the path too."""
+    from messagefoundry.auth import anchor_path as ap
+
+    def unreadable(_p: str) -> tuple[str, str | None]:
+        raise OSError(13, "denied")
+
+    _chain, cause = ap.windows_chain("C:\\evil\nFORGED line\x1b[31m.pem", "C:\\", unreadable)
+    assert cause is not None and repr("C:\\evil\nFORGED line\x1b[31m.pem") in cause
+    assert "\x1b" not in cause and "\nFORGED" not in cause
+
+    def a_file(_p: str) -> tuple[str, str | None]:
+        return ap.FILE, None
+
+    _chain, cause = ap.windows_chain("C:\\evil\nFORGED\x1b\\ca.pem", "C:\\", a_file)
+    assert cause is not None and cause.endswith("is not a directory")
+    assert "\x1b" not in cause and "\nFORGED" not in cause
+
+
 async def test_the_restart_required_log_quotes_the_path(
     store: MessageStore, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -1998,18 +2017,36 @@ async def test_the_restart_required_log_quotes_the_path(
 
 # --- BACKLOG #2270: an encrypted PEM block refuses before OpenSSL can ask for a password -----------
 #
-# A Proc-Type: 4,ENCRYPTED header sends OpenSSL to its password callback, and cadata= sets none, so
-# it falls back to the default one. Measured on Windows, a cadata= load of such a block did not
-# return within 20 seconds (anchor_cadata's docstring). So every test here swaps in _NoTlsLoad: a
-# regression then fails at once instead of hanging the run.
+# Why a header inside a block must never reach OpenSSL, and what was measured, is in
+# anchor_cadata's docstring. Every refusal test here swaps in _NoTlsLoad, so a regression fails at
+# once instead of waiting on a password. The one exception is the control below it, which needs
+# the real load to show that OpenSSL skips a header outside a block.
 
 _ENCRYPTED = b"Proc-Type: 4,ENCRYPTED\nDEK-Info: AES-256-CBC,00112233445566778899AABBCCDDEEFF\n\n"
+_BEGIN_CERT = b"-----BEGIN CERTIFICATE-----\n"
 
 
 def _with_headers(headers: bytes) -> bytes:
-    cert = _real_ca("crl-test-ca")[0]
-    begin = b"-----BEGIN CERTIFICATE-----\n"
-    return cert.replace(begin, begin + headers)
+    return _real_ca("crl-test-ca")[0].replace(_BEGIN_CERT, _BEGIN_CERT + headers)
+
+
+def _carriage_return_in_the_begin_line() -> bytes:
+    """A bare CR inside the BEGIN line: bytes.splitlines ends the line there, OpenSSL does not."""
+    return _with_headers(_ENCRYPTED).replace(
+        _BEGIN_CERT, b"-----BEGIN CERTIFICATE-----\r-----END X\n"
+    )
+
+
+def _byte_order_mark_before_the_block() -> bytes:
+    return b"\xef\xbb\xbf" + _with_headers(_ENCRYPTED)
+
+
+def _encrypted_key_beside_the_certificate() -> bytes:
+    """Manager decision: a key block refuses too, though cadata= loads the certificate beside it.
+    A trust anchor has no use for a key, and the header is refused in a block of any label."""
+    label = b"RSA PRIVATE" + b" KEY"  # split, so the secret scanner does not read a real key
+    key = b"-----BEGIN " + label + b"-----\n" + _ENCRYPTED + b"AAAA\n-----END " + label + b"-----\n"
+    return _real_ca("crl-test-ca")[0] + key
 
 
 class _NoTlsLoad:
@@ -2024,21 +2061,27 @@ class _NoTlsLoad:
 
 
 @pytest.mark.parametrize(
-    "headers",
+    "shape",
     [
-        pytest.param(_ENCRYPTED, id="Proc-Type and DEK-Info"),
-        pytest.param(b"DEK-Info: AES-256-CBC,00112233445566778899AABBCCDDEEFF\n\n", id="DEK-Info"),
-        pytest.param(b"proc-type: 4,ENCRYPTED\n\n", id="lower case"),
-        pytest.param(b"  Proc-Type: 4,ENCRYPTED\n\n", id="leading space"),
+        pytest.param(lambda: _with_headers(_ENCRYPTED), id="Proc-Type and DEK-Info"),
+        pytest.param(
+            lambda: _with_headers(b"DEK-Info: AES-256-CBC,00112233445566778899AABBCCDDEEFF\n\n"),
+            id="DEK-Info",
+        ),
+        pytest.param(lambda: _with_headers(b"proc-type: 4,ENCRYPTED\n\n"), id="lower case"),
+        pytest.param(lambda: _with_headers(b"  Proc-Type: 4,ENCRYPTED\n\n"), id="leading space"),
+        pytest.param(_carriage_return_in_the_begin_line, id="bare CR in the BEGIN line"),
+        pytest.param(_byte_order_mark_before_the_block, id="byte-order mark"),
+        pytest.param(_encrypted_key_beside_the_certificate, id="encrypted key block"),
     ],
 )
 def test_an_encrypted_pem_block_refuses_before_the_tls_load(
-    monkeypatch: pytest.MonkeyPatch, headers: bytes
+    monkeypatch: pytest.MonkeyPatch, shape: Any
 ) -> None:
     spec = AnchorSpec("api_client", "[api].tls_client_ca_file", "ca.pem", None)
     monkeypatch.setattr(ta, "ssl", _NoTlsLoad)
-    with pytest.raises(TrustAnchorError, match="holds an encrypted PEM block"):
-        ta.anchor_cadata(_with_headers(headers), spec)
+    with pytest.raises(TrustAnchorError, match="holds a PEM block with an encryption header"):
+        ta.anchor_cadata(shape(), spec)
 
 
 def test_an_encryption_header_outside_a_block_still_passes() -> None:
@@ -2063,7 +2106,7 @@ async def test_the_preflight_refuses_an_encrypted_anchor_as_the_consumer_does(
     with pytest.raises(TrustAnchorError) as consumer:
         ta.verified_anchor_cadata(spec, enforcing=True)
     assert str(central.value) == str(consumer.value)
-    assert "encrypted PEM block" in str(central.value)
+    assert "encryption header" in str(central.value)
     assert "pem_refused" in {r["event"] for r in await _rows(store, "api_client")}
 
 
@@ -2125,7 +2168,7 @@ async def test_the_reload_route_audits_an_unreadable_inbound_ca_as_trust_anchor(
 
 # --- BACKLOG #2269: a set anchor path that nothing loads still refuses when it cannot load ---------
 #
-# Owner-side decision, recorded in docs/CONFIGURATION.md: keep the refusal. The preflight checks every
+# Manager decision, recorded in docs/CONFIGURATION.md: keep the refusal. The preflight checks every
 # anchor path that is set, whether or not a consumer uses it, as refuse_an_unread_ca_pin already
 # refuses a pin nothing reads. It fails closed, and unsetting the path is the way out.
 

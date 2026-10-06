@@ -179,6 +179,26 @@ _PEM_ENCRYPTION_HEADERS = (b"proc-type:", b"dek-info:")
 _SSL_WHERE = re.compile(r"\s*\(_ssl\.c:\d+\)$")
 
 
+def _has_encryption_header(data: bytes) -> bool:
+    """Whether a PEM block in ``data`` carries an RFC 1421 encryption header (BACKLOG #2270).
+
+    It splits lines on the line-feed byte alone, as OpenSSL reads them. ``bytes.splitlines`` also
+    splits on a bare carriage return, so one inside a BEGIN line could end a block early there and
+    hand a header behind it to OpenSSL. It errs wide on purpose: a block runs from any line holding ``-----BEGIN ``
+    to a line starting ``-----END ``, and a header name anywhere in such a line counts. A base64
+    body holds no ``:``, so no real certificate line matches."""
+    inside = False
+    for line in data.split(b"\n"):
+        if _PEM_BEGIN in line:
+            inside = True
+        lowered = line.lower()
+        if inside and any(header in lowered for header in _PEM_ENCRYPTION_HEADERS):
+            return True
+        if _PEM_BEGIN not in line and line.lstrip(b" \t\r" + _UTF8_BOM).startswith(_PEM_END):
+            inside = False
+    return False
+
+
 def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
     """The verified anchor bytes as the PEM text ``SSLContext.load_verify_locations(cadata=)`` takes.
 
@@ -228,8 +248,19 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
     did not return within 20 seconds and was killed, while ``cafile=`` on the same bytes refused at
     once with ``PEM lib``. So a start or a reload could hang on this file. A CA certificate never
     carries an RFC 1421 encryption header, so ``Proc-Type:`` and ``DEK-Info:`` both refuse, in any
-    case, and OpenSSL is never handed the block. The same header in a comment outside a block still
-    passes, since OpenSSL skips every line outside a block."""
+    case, in a block of any label, and OpenSSL is never handed the text
+    (:func:`_has_encryption_header`). That is wider than the hang: an encrypted private-key block
+    beside a certificate loads through ``cadata=``, and refuses here, because a trust anchor has no
+    use for a key. The same header in a comment outside a block still passes, since OpenSSL skips
+    every line outside a block."""
+    if _has_encryption_header(data):
+        raise TrustAnchorError(
+            f"{spec.setting}: the trust anchor {spec.path!r} holds a PEM block with an encryption "
+            "header (Proc-Type or DEK-Info), such as an encrypted certificate or private key. A "
+            "trust anchor needs only plain CERTIFICATE blocks, and loading an encrypted one can make "
+            "the TLS library wait for a password. Remove the encrypted block, or export the CA "
+            "certificate as a plain CERTIFICATE block"
+        )
     kept: list[bytes] = []
     inside = False
     blocks = 0
@@ -247,13 +278,6 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
         if line.startswith(_PEM_BEGIN):
             inside = True
             blocks += 1
-        elif inside and line.lstrip().lower().startswith(_PEM_ENCRYPTION_HEADERS):
-            raise TrustAnchorError(
-                f"{spec.setting}: the trust anchor {spec.path!r} holds an encrypted PEM block (a "
-                "Proc-Type or DEK-Info header). A CA certificate is never encrypted, and loading one "
-                "would make the TLS library ask for a password. Export the CA certificate as a "
-                "plain CERTIFICATE block"
-            )
         if inside or line.isascii():
             kept.append(line)
         if line.startswith(_PEM_END):
@@ -604,6 +628,7 @@ def dacl_is_owner_only(path: str | os.PathLike[str]) -> bool | None:
     * POSIX: no group- or other-WRITE bit (``mode & 0o022 == 0``).
     * Windows: read the DACL with ``icacls <path>`` (no modifying flags) and flag any broad-group ACE
       that grants a write-capable right."""
+    name = os.fspath(path)  # the one string icacls or stat checks, and every log line names
     if os.name == "nt":
         try:
             # icacls is pinned to its absolute System32 path and invoked without a shell; the path is
@@ -614,7 +639,7 @@ def dacl_is_owner_only(path: str | os.PathLike[str]) -> bool | None:
             # icacls.exe printing a clean DACL would turn a group-writable anchor into an accepted
             # one (BACKLOG #1769).
             result = subprocess.run(  # nosec B603 B607
-                [_system_exe("icacls.exe"), os.fspath(path)],
+                [_system_exe("icacls.exe"), name],
                 check=False,
                 capture_output=True,
                 # icacls writes the OEM code page to a pipe. Decoding it with the default ANSI code
@@ -626,32 +651,32 @@ def dacl_is_owner_only(path: str | os.PathLike[str]) -> bool | None:
                 errors="replace",
             )
         except OSError as exc:
-            log.warning("icacls could not read the DACL of %r: %s", os.fspath(path), exc)
+            log.warning("icacls could not read the DACL of %r: %s", name, exc)
             return None
         if result.stdout is None:
-            log.warning("icacls returned no readable output for %r", os.fspath(path))
+            log.warning("icacls returned no readable output for %r", name)
             return None
         if result.returncode != 0:
             log.warning(
                 "icacls could not read the DACL of %r (exit %s): %r",
-                os.fspath(path),
+                name,
                 result.returncode,
                 (result.stderr or result.stdout or "").strip(),
             )
             return None
-        parsed = owner_only_from_icacls(result.stdout, anchor_path=os.fspath(path))
+        parsed = owner_only_from_icacls(result.stdout, anchor_path=name)
         if parsed is None:
             log.warning(
                 "icacls exited 0 for %r but its output carried no readable ACE, granted write to a "
                 "bare principal name it does not recognise, or granted write on a first line whose "
                 "path echo did not match; the DACL could not be determined",
-                os.fspath(path),
+                name,
             )
         return parsed
     try:
-        mode = Path(path).stat().st_mode
+        mode = Path(name).stat().st_mode
     except OSError as exc:
-        log.warning("could not stat %r to check its permissions: %s", os.fspath(path), exc)
+        log.warning("could not stat %r to check its permissions: %s", name, exc)
         return None
     return (mode & 0o022) == 0
 
