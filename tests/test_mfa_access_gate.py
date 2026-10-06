@@ -15,6 +15,7 @@ written carelessly — a session's ``mfa_verified_at`` column can be correct whi
 from __future__ import annotations
 
 import ast
+import asyncio
 import json
 import time
 import uuid
@@ -1344,3 +1345,79 @@ async def test_no_ceremony_rekeys_a_session_whose_temporary_password_lapsed(
     rows = await _expired_rows(engine)
     assert len(rows) == 1 and '"at": "mfa_enroll_confirm"' in str(rows[0]["detail"])
     assert rows[0]["client"] == "192.0.2.8"
+
+
+async def test_a_passkey_assertion_that_straddles_the_deadline_marks_nothing(
+    engine: Engine,
+) -> None:
+    """RED when: ``finish_webauthn_assertion`` drops its deadline ask before its writes.
+
+    The passkey leg of /ui/mfa. Called on the service directly, as a request does that passed its
+    gate before the deadline. The assertion is good, and still nothing marks the factor, records
+    the sign-in or re-keys the session."""
+    pytest.importorskip("webauthn")
+    from webauthn.helpers import base64url_to_bytes
+
+    from tests._soft_webauthn import SoftAuthenticator
+
+    rp, origin = "t", "http://t"
+    service = await _service(
+        engine,
+        AuthSettings(
+            require_mfa=False, mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False
+        ),
+    )
+    user_id = await _add(service, "vic", Role.VIEWER)
+    setup = await service.login("vic", PW)
+    assert setup.ok and setup.token is not None
+    identity = await service.identity_for_token(setup.token)
+    assert identity is not None
+    soft = SoftAuthenticator(rp_id=rp, origin=origin)
+    options = json.loads(
+        await service.begin_webauthn_registration(
+            identity, token=setup.token, rp_id=rp, rp_name="MessageFoundry"
+        )
+    )
+    enrolled = await service.finish_webauthn_registration(
+        identity,
+        soft.create_response(base64url_to_bytes(options["challenge"]), transports=["usb"]),
+        label="key",
+        token=setup.token,
+        rp_id=rp,
+        origin=origin,
+    )
+    assert enrolled.ok
+    temp = (await service.admin_reset_password(user_id, actor="test")).password
+    out = await service.login("vic", temp)
+    assert out.ok and out.token is not None and out.must_change_password and out.mfa_required
+    challenge = await service.begin_webauthn_assertion(out.token, rp_id=rp)
+    assert challenge is not None
+    response = soft.get_response(base64url_to_bytes(json.loads(challenge)["challenge"]))
+    await _lapse(engine, service, user_id)
+    elevation = await service.finish_webauthn_assertion(
+        out.token, response, rp_id=rp, origin=origin
+    )
+    assert elevation.session_lost and not elevation.ok
+    session = await engine.store.get_session(hash_token(out.token))
+    assert session is not None and session.revoked_at is not None
+    assert session.mfa_verified_at is None
+    assert await engine.store.list_audit(action="auth.webauthn_verified") == []
+    rows = await _expired_rows(engine)
+    assert len(rows) == 1 and '"at": "webauthn_assert"' in str(rows[0]["detail"])
+
+
+async def test_racing_presentations_of_a_lapsed_session_write_one_row(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: ``_end_lapsed_session`` audits without knowing it ended the row.
+
+    Parallel requests from one browser after the deadline (a page, its nav poll, the socket) each
+    find the session unrevoked. The atomic revoke lets exactly one of them write the row."""
+    service = await _service(engine)
+    user_id, _secret, tok = await _reset_with_a_factor(service, monkeypatch, 1_000_000.0)
+    await _lapse(engine, service, user_id)
+    results = await asyncio.gather(
+        *(service.identity_for_token(tok, activity=False) for _ in range(4))
+    )
+    assert results == [None, None, None, None]
+    assert len(await _expired_rows(engine)) == 1

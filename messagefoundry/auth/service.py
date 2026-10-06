@@ -626,7 +626,9 @@ class Elevation:
     * not ``ok``, ``session_lost`` True -- the session is gone, so the caller must sign in again.
       Either the proof was GOOD but the session was revoked or expired underneath the ceremony, or
       (password re-auth only, BACKLOG #1138) the session is revoked because it spent its re-proof
-      budget, in which case the proof was wrong or never checked. Fails CLOSED: no token is handed
+      budget, in which case the proof was wrong or never checked; or (any ceremony, BACKLOG #2298)
+      the session was ended because its temporary password lapsed, with the proof checked or not,
+      as that ``auth.temp_password_expired`` row records. Fails CLOSED: no token is handed
       back. Held apart from a wrong proof so a route answers 401 rather than re-prompting on a
       session that no longer exists. The ``auth.reauth`` row's ``session_revoked`` says which.
 
@@ -2667,14 +2669,18 @@ class AuthService:
         The credential stopped signing in at its deadline, so the session it opened ends too, the
         first time it is presented after that. Ending it is also what keeps a retry from writing
         another row: the next presentation finds a revoked session and stops before any check.
-        Presentations that race each other can each write one, because the revoke does not report
-        whether it was the one that ended the row.
+
+        The revoke is :meth:`AuthStore.supersede_session`, the store's one atomic revoke that says
+        whether it ended the row, so presentations racing each other write one row between them,
+        and a row a rotation re-keyed first is not reported as ended.
 
         Audited under the sign-in gate's own ``auth.temp_password_expired`` action, so one query
         finds every refusal of a lapsed credential. ``at`` names the leg. ``proof`` names the proof
         the leg asks for (``password`` or ``factor``), and the row records ``<proof>_checked``: at
-        sign-in this action always means the right password was presented, and here it may not."""
-        await self._store.revoke_session(token_hash)
+        sign-in this action always means the right password was presented, and here it may not;
+        with ``at`` set to ``session`` none was presented."""
+        if await self._store.supersede_session(token_hash, now=time.time()) is None:
+            return
         detail: dict[str, object] = {
             "provider": "local",
             "expiry_hours": self._settings.initial_password_expiry_hours,
@@ -5970,7 +5976,9 @@ class AuthService:
         A session whose temporary credential lapsed during the ceremony is ended rather than re-keyed
         (BACKLOG #2298). The gate refused it at the deadline, but a ceremony that passed the gate
         just before can run past it, for example while confirming an enrolment hashes its recovery
-        codes. Refused here, before the rotation, so a confirming enrolment never turns MFA on."""
+        codes. Refused here, before the rotation, so a confirming enrolment refused here does not
+        turn MFA on. The ask is made before the rotation waits for the account's re-proof lock, so
+        a deadline that passes during that wait is not caught."""
         if await self._rotation_lapsed(token_hash, ceremony=ceremony, client=client):
             return Elevation(session_lost=True)
         rotated = await self._rotate_session_hash(token_hash)
@@ -6042,7 +6050,8 @@ class AuthService:
             await self._store.revoke_session(session.token_hash, now=now)
             return None
         user = await self._store.get_user(session.user_id)
-        if user is not None and self._credential_lapsed(user, now):
+        # A disabled account is refused below for that reason, not audited as a lapse.
+        if user is not None and not user.disabled and self._credential_lapsed(user, now):
             # Asked before the touch below, so a session about to end is not first marked used.
             await self._end_lapsed_session(
                 session.token_hash, user.username, at="session", client=None
@@ -7861,9 +7870,10 @@ class AuthService:
             now = time.time()
             if await self._verify_second_factor(user, code, client=client, arrived=arrived):
                 # Asked again after the verify, on the stored row read afresh: a recovery-code walk
-                # is argon2 work off the loop, and the deadline can pass during it. Nothing below may
-                # land on a lapsed session. Only a must-change account has a deadline to pass, so
-                # no other account pays the read. A row gone meanwhile fails closed.
+                # is argon2 work off the loop, and the deadline can pass during it. This ask guards
+                # the writes below; the rotation asks once more. Only a must-change account has a
+                # deadline to pass, so no other account pays the read. A row gone meanwhile fails
+                # closed.
                 if user.must_change_password:
                     fresh = await self._store.get_user(user.id)
                     if fresh is None or await self._mfa_lapsed(
@@ -7944,9 +7954,17 @@ class AuthService:
         return True
 
     async def _mfa_lapsed(
-        self, token: str, user: UserRecord, *, client: str | None, factor_checked: bool
+        self,
+        token: str,
+        user: UserRecord,
+        *,
+        client: str | None,
+        factor_checked: bool,
+        at: str = "mfa_verify",
     ) -> bool:
-        """Whether :meth:`verify_mfa` must end this session because its temporary credential lapsed.
+        """Whether a second-factor leg must end this session because its temporary credential
+        lapsed: :meth:`verify_mfa`, or ``at="webauthn_assert"`` for
+        :meth:`finish_webauthn_assertion`.
 
         Ends it and audits the refusal when so (BACKLOG #2298). Checked against the clock NOW, not
         the request's arrival: the point is a deadline that passed while the request waited."""
@@ -7955,7 +7973,7 @@ class AuthService:
         await self._end_lapsed_session(
             hash_token(token),
             user.username,
-            at="mfa_verify",
+            at=at,
             client=client,
             proof="factor",
             proof_checked=factor_checked,
@@ -8589,6 +8607,12 @@ class AuthService:
                 client=client,
             )
             return Elevation()
+        # BACKLOG #2298: the passkey leg of /ui/mfa, asked as verify_mfa asks after a good code, so
+        # an assertion that straddles the deadline marks nothing and clears no counter.
+        if user.must_change_password and await self._mfa_lapsed(
+            token, user, client=client, factor_checked=True, at="webauthn_assert"
+        ):
+            return Elevation(session_lost=True)
         await self._store.mark_session_mfa_verified(hash_token(token))
         # BACKLOG #1638. A SUCCESSFUL ASSERTION CLEARS THE FAILURE COUNTER, and that is NOT a reversal
         # of the ADR 0068 divergence recorded above. That divergence is about not FEEDING
