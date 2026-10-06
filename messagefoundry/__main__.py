@@ -89,7 +89,7 @@ if TYPE_CHECKING:
     # `hl7schema` call must not pay for it (see the module docstring on deferred heavy imports).
     from messagefoundry.auth.service import AuthService
     from messagefoundry.auth.trust_anchors import TrustAnchorError
-    from messagefoundry.config.settings import ServiceSettings
+    from messagefoundry.config.settings import ServiceSettings, StoreSettings
     from messagefoundry.config.tls_policy import HopPosture
     from messagefoundry.pipeline.security_notify import SecurityEventNotifier
     from messagefoundry.store.base import AdminStore, Store
@@ -7177,6 +7177,10 @@ def _audit_verify(args: argparse.Namespace) -> int:
     )
     if refused is not None:
         return refused
+    unresolved = _refuse_an_unresolvable_store_key(settings.store, as_json=False)
+    if unresolved is not None:
+        return unresolved
+    keyless_refusal = keyless_opt_out_refusal(settings.store, settings.security)
 
     async def run() -> tuple[AuditVerdict, int]:
         # Read-only (BACKLOG #1780, #2101): the evidence is neither migrated nor refused for a schema
@@ -7197,15 +7201,12 @@ def _audit_verify(args: argparse.Namespace) -> int:
         finally:
             await store.close()
 
-    # #1916; #1780: a server database with no store; #2725: a key that does not resolve.
-    could_not_start: tuple[type[Exception], ...] = (
-        KeylessAuditChainRefused,
-        StoreNotFoundError,
-        *_key_unresolved(),
-    )
     try:
         verdict, count = run_guarded(run())
-    except could_not_start as exc:
+    except (
+        KeylessAuditChainRefused,
+        StoreNotFoundError,
+    ) as exc:  # #1916; #1780: a server database with no store. Could not start.
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
@@ -7215,11 +7216,21 @@ def _audit_verify(args: argparse.Namespace) -> int:
         return _emit_store_open_error(exc, settings.store.path, as_json=False)
     ok, message = verdict
     if verdict.key_unavailable:
-        # EXIT 4, NOT 1 (vault BACKLOG #2725). The chain is keyed and this shell holds no key, so no
-        # row MAC was checked. 1 would tell a job that reads only the code that the chain is broken.
-        # The flag, not the message, decides: only a process holding no key can set it.
-        print("NOT CHECKED: " + (message or ""))
-        return 4
+        if keyless_refusal is not None:
+            # EXIT 4, NOT 1 (vault BACKLOG #2725). The chain is keyed, and this shell holds no key
+            # while its settings do not run the store keyless, so it is a shell missing the key. No
+            # row MAC was checked, and 1 would tell a job that reads only the code the chain is
+            # broken. The flag decides, never the message, and only a process with no key sets it.
+            print("NOT CHECKED: " + (message or ""))
+            return 4
+        # Under the audited keyless opt-out the store runs with no key, so a chain whose first row
+        # names one is the anomaly. Reading it as "not checked" would let a forged genesis row turn
+        # every other edit into a 4, so it stays a broken chain.
+        message = (
+            "audit chain broken: its first row names a store key, but this shell's settings run "
+            "the store keyless (the audited opt-out), and a keyless store's chain never names one. "
+            "Either the chain was altered, or these are not the settings the store runs with"
+        )
     print(("OK: " if ok else "FAIL: ") + (message or ""))
     if not ok:
         return 1
@@ -7289,6 +7300,9 @@ def _audit_anchor(args: argparse.Namespace) -> int:
     )
     if refused is not None:
         return refused
+    unresolved = _refuse_an_unresolvable_store_key(settings.store, as_json=args.json)
+    if unresolved is not None:
+        return unresolved
 
     async def run() -> tuple[int, str]:
         # Read-only, as audit-verify opens it (BACKLOG #1780, #2101).
@@ -7302,14 +7316,9 @@ def _audit_anchor(args: argparse.Namespace) -> int:
         finally:
             await store.close()
 
-    could_not_start: tuple[type[Exception], ...] = (
-        KeylessAuditChainRefused,
-        StoreNotFoundError,
-        *_key_unresolved(),
-    )
     try:
         count, head = run_guarded(run())
-    except could_not_start as exc:  # #1916, #1780, #2725, as audit-verify
+    except (KeylessAuditChainRefused, StoreNotFoundError) as exc:  # #1916, #1780, as audit-verify
         _emit_error(str(exc), as_json=args.json)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
@@ -8721,6 +8730,26 @@ def _key_unresolved() -> tuple[type[Exception], ...]:
     from messagefoundry.store.keyprovider import KeyProviderError
 
     return (KeyProviderError, DpapiError, DpapiUnavailable)
+
+
+def _refuse_an_unresolvable_store_key(store: StoreSettings, *, as_json: bool) -> int | None:
+    """Exit 2 when the store key the settings name cannot be resolved, else ``None`` (vault
+    BACKLOG #2725). For ``audit-verify`` and ``audit-anchor``, where 1 is a broken chain's code.
+
+    It builds the at-rest cipher, which is what ``open_store`` does first, and opens nothing. So
+    every refusal here comes before any row is read, and nothing a database holds can turn a tamper
+    finding into "could not start". The cost is resolving the key twice, a second Vault round trip
+    where one is used, as ``provision-admin`` already pays. ``ValueError`` covers a malformed key
+    and the Transit client's own refusals; its texts name settings, not values. A key error the
+    open raises later is not caught here, and reaches the dispatch floor."""
+    from messagefoundry.store.base import build_store_cipher
+
+    try:
+        build_store_cipher(store)
+    except _key_unresolved() + (ValueError,) as exc:
+        _emit_error(f"cannot resolve the store key: {exc}", as_json=as_json)
+        return 2
+    return None
 
 
 def _emit_store_open_error(exc: sqlite3.DatabaseError, path: str, *, as_json: bool) -> int:

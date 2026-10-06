@@ -4160,8 +4160,8 @@ the engine runs with, which under `cipher_provider = "vault_transit"` include th
 listed under `cipher_provider` in [CONFIGURATION.md](CONFIGURATION.md). A keyed chain cannot be
 verified without them. With no store key configured, the verify prints a `NOT CHECKED` line saying
 the chain is keyed and no key is configured, and exits 4. Under `vault_transit` with the Transit
-settings missing, or with a key file it cannot read, it stops with an error before it reads the chain,
-and exits 2. With the key,
+settings missing, with a key file it cannot read, or with a key that is not valid, it stops with an
+error before it reads the chain, and exits 2. With the key,
 exit 0 also means every row is keyed. With no key, which only the keyless store mode allows, exit 0
 covers a keyless chain and says no more than the paragraph above. A store that has a key and opens
 onto keyless rows fails the verify, and is also reported as
@@ -4171,19 +4171,26 @@ onto keyless rows fails the verify, and is also reported as
 | Exit | Meaning |
 |---|---|
 | `0` | A clean walk over at least one row. |
-| `1` | The chain did not verify. It covers at least a broken chain, a mismatch with `--expected-anchor`, and a chain checked with a key that is not the chain's. The `FAIL` line says which. |
+| `1` | The chain did not verify. It covers at least a broken chain, a mismatch with `--expected-anchor`, a chain checked with a key that is not the chain's, and a chain that names a key in a shell whose settings run the store keyless. Those print a `FAIL` line that says which. An error that stops the walk part way, such as a Transit outage, also exits 1 and prints no `FAIL` line, so by the code alone a job cannot tell it from a broken chain. |
 | `2` | The command could not start. It covers at least an absent path, a zero-byte file, a file carrying no `audit_log` table, a path that is not a SQLite database at all, settings that do not load, and a store key the settings name that cannot be resolved. |
 | `3` | A clean walk over an **empty** log. |
-| `4` | The chain is keyed and this shell holds no key, so no row was checked against its MAC. This is not a pass and not a finding that the chain is broken. |
+| `4` | The chain is keyed, this shell holds no key, and its settings do not run the store keyless. No row was checked against its MAC. This is not a pass and not a finding that the chain is broken. |
 
 For exit 2 the verifier refuses each case rather than creating or migrating the evidence it was asked
 to check, and it opens read-only so it cannot write to that file either way. It never spends `1` on
-any of them. Exit 4 is decided by the store's verify, which sets it only in a process that holds no
-key, so nothing a database holds can turn a key-holding verify into a 4 (vault BACKLOG #2725).
-Without a key the verify still checks what needs none: the sequence numbers, and an expected anchor if
-one is passed. A break there exits 1, not 4. **Treat 4 as unchecked, never as clean.** Without the key,
-an edited row is invisible, and a keyless chain whose first row was rewritten to name a key reads
-the same as a keyed one. Re-run with the key settings the engine runs with. Exit 3
+any of them. A store key that cannot be resolved is refused before the store opens, so no row a
+database holds can turn a finding into a 2.
+
+Exit 4 is decided by a flag the store's verify sets only in a process that holds no key, so nothing
+a database holds can turn a verify run with the key into a 4 (vault BACKLOG #2725). Without a key,
+though, the chain's own first row says whether the chain is keyed, and a writer can rewrite that row.
+So the verify reads the shell's settings too. Under the audited keyless opt-out a chain that names a
+key is not expected, and it exits 1. Run the job with the settings and environment the engine runs
+with, the opt-out included, or a rewritten first row on a keyless store reads as a 4. Without a key
+the verify still makes the checks that need none: at least the sequence numbers, each key-range
+row's digest and link, and an expected anchor if one is passed. A break there exits 1, not 4.
+**Treat 4 as unchecked, never as clean.** Without the key an edited row is invisible. Re-run with the
+key settings the engine runs with. Exit 3
 exists because "there was nothing to verify" is not a
 pass; pass `--allow-empty` to accept it as one on an instance that has not logged anything yet, or
 pass an expected anchor of `0:`, which asserts the same thing and is checked. `audit-anchor` keeps

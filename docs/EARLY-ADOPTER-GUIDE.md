@@ -466,10 +466,12 @@ out. The remaining transport gaps include **raw TCP and X12**, which have no nat
       zero-byte, or no `audit_log` table — a `touch` in an install script or a failed copy leaves
       exactly that, and the verifier refuses it rather than creating one), `3` is a clean walk over
       an **empty** log, and `4` is a keyed chain checked from a shell that holds no store key, so
-      nothing was checked against the key. Run the job with the key settings the engine runs with.
-      Treating `2`, `3` or `4` as a tamper alarm pages someone for a misconfiguration; treating any
-      of them as a pass leaves the real log unchecked. Add `--allow-empty` only where an empty log
-      is expected. Exit codes and their reasoning: [`SECURITY.md`](SECURITY.md) "Tamper-evidence".
+      nothing was checked against the key. Run the job with the settings and environment the engine
+      runs with, the key or the keyless opt-out included: the verify reads them to decide between
+      `1` and `4`. Treating `2`, `3` or `4` as a tamper alarm pages someone for a misconfiguration;
+      treating any of them as a pass leaves the real log unchecked. Add `--allow-empty` only where an
+      empty log is expected. Exit codes and their reasoning: [`SECURITY.md`](SECURITY.md)
+      "Tamper-evidence".
 - [ ] **Seal the audit DB across any gap in custody, with an anchor.** A bare `audit-verify` is clean
       after the *newest* rows are deleted — the surviving prefix still chains — so on its own it is
       blind to the attack it is run for. **`messagefoundry audit-anchor`** prints `COUNT:HEAD` (no PHI,

@@ -1083,8 +1083,8 @@ class Engine:
     async def _verify_audit_chain_on_start(self) -> None:
         """Startup audit-chain tamper check (#190-E), ALERT-ONLY: a broken chain logs a WARNING and
         fires the AlertSink but NEVER crashes startup — refusing to boot on a tripped tamper alarm would
-        be a self-inflicted DoS, and the alarm may itself be a false positive. (A keyed store opened
-        without the DEK used to be one; since vault BACKLOG #2725 it logs and fires nothing.) Reuses the ``integrity_drift`` alert channel (the existing in-place-tamper
+        be a self-inflicted DoS, and the alarm may itself be a false positive (e.g. keyed store opened
+        without the DEK). Reuses the ``integrity_drift`` alert channel (the existing in-place-tamper
         signal). Swallows every error: the check is defense-in-depth, never a startup gate.
 
         With ``[integrity].audit_anchor_file`` set it also passes that anchor as ``expected_prefix``, which
@@ -1105,17 +1105,13 @@ class Engine:
         backends; it is not done here. Read a break as *"at least* a break"."""
         expected_prefix = await self._load_audit_anchor()
         try:
-            verdict = await self.store.verify_audit_chain(expected_prefix=expected_prefix)
+            # The verdict's `key_unavailable` is NOT read here, on purpose (vault BACKLOG #2725). An
+            # engine holds no key only under the audited keyless opt-out, and there a chain whose
+            # first row names a key is the anomaly: a forged genesis row would otherwise silence
+            # this alert for every other edit. So it alerts as a chain break, as it always has.
+            ok, msg = await self.store.verify_audit_chain(expected_prefix=expected_prefix)
         except Exception as exc:  # never let a verify failure crash startup
             log.warning("startup audit-chain verification could not run: %s", safe_exc(exc))
-            return
-        ok, msg = verdict
-        if verdict.key_unavailable:
-            # A keyed chain and no key in this process (vault BACKLOG #2725): nothing was checked
-            # against the key, so this is a configuration fault, not a tamper finding, and fires no
-            # tamper alert -- the rule the anchor-file faults already follow. A break the walk could
-            # see without a key comes back as an ordinary not-ok verdict and still alerts below.
-            log.warning("startup audit-chain verification could not run: %s", msg)
             return
         # Say what the pass COVERED beside the verdict: an anchored pass and a bare one read identically
         # otherwise, and only one of them has ruled out a truncated tail.

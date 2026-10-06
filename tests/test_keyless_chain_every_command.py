@@ -432,21 +432,112 @@ def test_an_edit_a_shell_with_no_key_cannot_see_is_still_not_a_pass(
     assert "NOT CHECKED" in capsys.readouterr().out
 
 
+def test_an_edit_inside_a_closed_key_range_exits_1_with_no_key(
+    shell: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A rotated chain: a range under one key, closed by a range row that carries its digest. The
+    digest needs no key, so a shell with no key still sees an edit inside that range and exits 1.
+    The control is the same chain untouched, which exits 4."""
+    from tests.test_audit_key_rotation import _open, _rotate, _seed
+
+    first, second = generate_key(), generate_key()
+    db = shell / "rotated.db"
+
+    async def build() -> None:
+        store = await _open(db, first)
+        try:
+            await _seed(store, "under-first", 2)
+        finally:
+            await store.close()
+        await _rotate(db, first, second)
+
+    asyncio.run(build())
+    assert main(["audit-verify", "--db", str(db)]) == 4  # the control
+    capsys.readouterr()
+    _write(db, _EDIT_ROW_2)
+    assert main(["audit-verify", "--db", str(db)]) == 1
+    assert "does not match the range it closes" in capsys.readouterr().out
+
+
+def test_under_the_keyless_opt_out_a_chain_naming_a_key_exits_1(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The review's attack on exit 4. A deliberately keyless store, anchored. Someone edits a row
+    and rewrites row 1 as a genesis row naming a key, leaving every stored hash alone, so the anchor
+    still matches. Where the settings run the store keyless a chain naming a key is the anomaly, so
+    it stays a broken chain, exit 1, and never "not checked". The control is the edit alone."""
+    _opt_out(monkeypatch)
+    db = shell / "keyless.db"
+
+    async def seed() -> None:
+        store = await MessageStore.open(db)
+        try:
+            for i in range(3):
+                await store.record_audit(f"act{i}", actor="test")
+        finally:
+            await store.close()
+
+    asyncio.run(seed())
+    assert main(["audit-anchor", "--db", str(db), "--json"]) == 0
+    anchor = json.loads(capsys.readouterr().out)["anchor"]
+    _write(db, _EDIT_ROW_2)
+    argv = ["audit-verify", "--db", str(db), "--expected-anchor", anchor]
+    assert main(argv) == 1  # the control
+    capsys.readouterr()
+    _write(
+        db,
+        "UPDATE audit_log SET action = 'audit.key_epoch', "
+        """detail = '{"genesis": 1, "key_id": "forged"}' WHERE seq = 1""",
+    )
+    rc = main(argv)
+    out = capsys.readouterr().out
+    assert rc == 1, out
+    assert out.startswith("FAIL: audit chain broken") and "run the store keyless" in out, out
+
+
+@pytest.mark.parametrize(
+    ("variable", "value", "named"),
+    [
+        ("MEFOR_STORE_CIPHER_PROVIDER", "vault_transit", "MEFOR_STORE_TRANSIT_KEY"),
+        ("MEFOR_STORE_ENCRYPTION_KEY", "not-base64!!", "MEFOR_STORE_ENCRYPTION_KEY"),
+    ],
+    ids=["transit-key-unnamed", "malformed-key"],
+)
 @pytest.mark.parametrize("command", ["audit-verify", "audit-anchor"])
 def test_a_key_that_does_not_resolve_exits_2(
-    command: str, shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    command: str,
+    variable: str,
+    value: str,
+    named: str,
+    shell: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A key the settings name that cannot be resolved stops the command before it reads a row: here
-    `vault_transit` with no Transit key named. Exit 2, could not start, as `rotate-key` and
-    `provision-admin` exit on the same errors. It used to reach the dispatch floor and exit 1."""
+    """A key the settings name that cannot be resolved stops the command before it reads a row:
+    `vault_transit` with no Transit key named, or a key that is not base64. Exit 2, could not
+    start, as `rotate-key` and `provision-admin` exit on the same errors. Each used to reach the
+    dispatch floor and exit 1. The refusal names the setting and never echoes the value."""
     db = shell / "keyed.db"
     _keyed_chain(db, generate_key())
-    monkeypatch.setenv("MEFOR_STORE_CIPHER_PROVIDER", "vault_transit")
+    monkeypatch.setenv(variable, value)
     rc = main(_argv(command, db, shell))
     captured = capsys.readouterr()
     assert rc == 2, (captured.out, captured.err)
     text = json.loads(captured.out)["error"] if command == "audit-anchor" else captured.err
-    assert "MEFOR_STORE_TRANSIT_KEY" in text, text
+    assert named in text and "not-base64!!" not in text, text
+
+
+def test_the_verdict_keeps_its_flag_through_a_copy() -> None:
+    """`AuditVerdict` is a tuple with one extra field, so a copy or a pickle must carry the field."""
+    import copy
+    import pickle
+
+    from messagefoundry.store.store import AuditVerdict
+
+    verdict = AuditVerdict(False, "m", key_unavailable=True)
+    for clone in (copy.copy(verdict), copy.deepcopy(verdict), pickle.loads(pickle.dumps(verdict))):
+        assert tuple(clone) == (False, "m") and clone.key_unavailable
+    assert not AuditVerdict(True, "m", key_unavailable=True).key_unavailable  # only with not-ok
 
 
 # --- the source guard ----------------------------------------------------------------------------------

@@ -2512,15 +2512,22 @@ class AuditVerdict(tuple[bool, str | None]):
     ``key_unavailable`` is the one structured fact a pair cannot carry (vault BACKLOG #2725): the
     chain is keyed and this process holds no keying secret, so no row MAC was recomputed. It is set
     only with ``ok`` false, and only by a process that holds no key, so nothing a database holds can
-    set it for a verifier that has the key. A caller that reads exit codes tells it apart from a
-    broken chain by this flag, never by the message text."""
+    set it for a verifier that has the key. For a process that holds no key, though, the chain's own
+    first row decides it: such a caller must not read it as "unchecked" where its settings say the
+    store runs keyless, because there a chain naming a key is itself the anomaly. A caller that
+    reads exit codes tells it apart from a broken chain by this flag, never by the message text.
+
+    ``==`` and ``hash`` are the tuple's and ignore the flag; ``__reduce__`` keeps it through a copy."""
 
     key_unavailable: bool
 
-    def __new__(cls, ok: bool, message: str | None, *, key_unavailable: bool = False) -> Self:
+    def __new__(cls, ok: bool, message: str | None, key_unavailable: bool = False) -> Self:
         verdict = super().__new__(cls, (ok, message))
         verdict.key_unavailable = key_unavailable and not ok
         return verdict
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (type(self), (self[0], self[1], self.key_unavailable))
 
 
 def verify_audit_rows(
@@ -2540,11 +2547,13 @@ def verify_audit_rows(
     must be a genesis row naming its key, and each row is checked under the key of its own range
     (BACKLOG #1904, ADR 0193). No row in the database can switch that off: a keyless row is a reported
     break. A process that holds no key walks a keyless chain as plain SHA-256. A chain whose genesis
-    row names a key it cannot verify: it still checks what needs no key -- the sequence numbers, that
-    every row carries a hash, and any anchor or prefix -- and reports a break there as a break. If
-    none is found it returns not-ok with ``key_unavailable`` set (vault BACKLOG #2725), which is not
-    a verdict on the chain. Without a key it cannot tell a keyed chain from a keyless one whose first
-    row was rewritten to name a key, so a caller treats that result as unchecked, never as a pass.
+    row names a key it cannot verify, but it still makes the checks below that need no key: at least
+    the sequence numbers, that every row carries a hash, each key-range row's digest and link, and
+    any anchor or prefix. A break there is reported as a break. If none is found it returns not-ok
+    with ``key_unavailable`` set (vault BACKLOG #2725), which is not a verdict on the chain. No row
+    MAC and no handover tag was checked. Without a key it cannot tell a keyed chain from a keyless
+    one whose first row was rewritten to name a key, so a caller treats that result as unchecked,
+    never as a pass, and see :class:`AuditVerdict` for where it must not read it that way at all.
 
     Every row's ``seq`` must equal its position: 1 for the first row, then rising by one. A missing,
     repeated or renumbered row is reported at the position where the numbers stop matching.
@@ -2573,6 +2582,9 @@ def verify_audit_rows(
     # recomputed, so the walk compares each stored hash with itself rather than mis-flag every keyed
     # row as tampered. It still runs, because a break that needs no key is still a break (#2725).
     key_unavailable = not capable and genesis_key is not None
+    # Range rows are checked whenever the chain is keyed: their digests and links need no key, so a
+    # walk with none still catches an edit inside a closed range. Only the MACs and tags need one.
+    ranged = capable or key_unavailable
     #: (walk position, row id, reason). The position is the sequence number that row should hold.
     breaks: list[tuple[int, Any, str | None]] = []
     prev: Any = ""
@@ -2600,14 +2612,14 @@ def verify_audit_rows(
                     "repeated or renumbered",
                 )
             )
-        if capable and pos == 1:
+        if ranged and pos == 1:
             range_from_id = rid
             if genesis_key is None:
                 breaks.append((pos, rid, _AUDIT_NO_GENESIS))
             else:
                 range_key = genesis_key
                 seen_keys.add(genesis_key)
-        elif capable and r["action"] == AUDIT_KEY_EPOCH_ACTION:
+        elif ranged and r["action"] == AUDIT_KEY_EPOCH_ACTION:
             parsed = parse_audit_epoch(r["detail"])
             if parsed is None:
                 breaks.append((pos, rid, "malformed audit key-range row"))
@@ -2652,7 +2664,7 @@ def verify_audit_rows(
         mac_ok = hmac.compare_digest(audit_mac_bytes(r["row_hash"]), audit_mac_bytes(expected))
         if seq_ok and not (mac_ok and expected is not None):
             breaks.append((pos, rid, None))
-        if capable:
+        if ranged:
             range_digest.update(_audit_digest_line(r))
         # Chain from the STORED hash (not `expected`) so a divergence is reported once, at its own
         # row, instead of cascading a false break onto every successor.
@@ -2741,14 +2753,15 @@ def verify_audit_rows(
             False,
             f"audit chain could not be checked: it is keyed (its genesis row names audit key "
             f"{genesis_key!r}) and no store encryption key/MAC is configured in this process, so "
-            f"no row MAC was recomputed. Only the sequence numbers of its {count} row(s)"
+            f"no row MAC was recomputed. Only checks that need no key ran over its {count} "
+            "row(s): the sequence numbers and key-range digests"
             + (
-                " and the expected anchor"
+                ", and the expected anchor"
                 if expected_anchor is not None or expected_prefix is not None
                 else ""
             )
-            + " were checked, so this is not a finding that the chain is broken. Re-run with the "
-            "key settings the engine runs with",
+            + ". So this is not a finding that the chain is broken. Re-run with the key settings "
+            "the engine runs with",
             key_unavailable=True,
         )
     return AuditVerdict(True, f"verified {count} audit row(s)")
