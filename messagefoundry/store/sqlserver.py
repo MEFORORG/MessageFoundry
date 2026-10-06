@@ -3797,8 +3797,8 @@ class SqlServerStore:
             detail=(
                 f"database user {str(row['db_user'] or '')!r}; {note}; measured against the "
                 + (
-                    "runtime (schema_management=external: no db_ddladmin, and no UPDATE, DELETE, "
-                    "ALTER, CONTROL or take ownership on audit_log)"
+                    "runtime (schema_management=external: no db_ddladmin, and no UPDATE/DELETE/"
+                    "ALTER/CONTROL or take ownership on audit_log)"
                     if external
                     else "auto-mode"
                 )

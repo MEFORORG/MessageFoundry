@@ -326,6 +326,43 @@ def test_engine_message_text_holds_no_name_run(path: Path) -> None:
     )
 
 
+def _comma_runs(source: str) -> list[tuple[int, str]]:
+    """Every ``_COMMA_NAME_RUN`` match in the message literals of ``source``, either arm."""
+    return [
+        (line, m.group(0))
+        for line, text in _message_literals(parse_source(source))
+        for m in redaction._COMMA_NAME_RUN.finditer(text)
+    ]
+
+
+def test_the_comma_scan_fires_on_both_arms() -> None:
+    """The comma arm (vault BACKLOG #2784) reads a list of protocol words as a family-comma-given
+    name, so it is held to the same rule. A planted run per arm, and a prose control that holds a
+    comma between a capital and a lower-case word."""
+    planted = "\n".join(
+        [
+            "raise ValueError('expected AA, AE or AR')",
+            "logger.warning('Connection Refused, Retrying now')",
+            "logger.info('Connection refused, retrying')",
+        ]
+    )
+    assert sorted(run for _, run in _comma_runs(planted)) == [
+        "AA, AE",
+        "Connection Refused, Retrying",
+    ]
+
+
+@pytest.mark.parametrize("path", _SOURCES, ids=lambda p: p.relative_to(_ENGINE).as_posix())
+def test_engine_message_text_holds_no_comma_name_run(path: Path) -> None:
+    hits = _comma_runs(path.read_text(encoding="utf-8"))
+    assert not hits, (
+        f"{path.name}: {hits} -- the PHI redaction scrubs a capitalized word, a comma and a second "
+        "capitalized word as a possible family-comma-given name, so this text would reach the log "
+        "with those words replaced by [redacted]. Reword it: join a list of codes with '/' "
+        "(AA/AE/AR), or use a semicolon or brackets where the comma is not a list separator."
+    )
+
+
 def test_the_tables_the_scan_cannot_see_survive_redaction() -> None:
     """Text the lexical scan cannot see that a refusal, alert or log line renders verbatim."""
     from messagefoundry.auth import anchor_path
