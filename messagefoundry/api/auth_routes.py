@@ -941,6 +941,14 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # No step-up, like GET /users/{id}/channel-scope: every users:manage holder is an
         # Administrator, who already reads each lock as it happens (auth.account_locked) in the
         # audit trail with no step-up, so this read gives such a session nothing it lacked.
+        # BACKLOG #2292 (ASVS 16.3.2): on the JSON API, `require` audits this read as a users:read
+        # grant, even when lock state goes out. We judge the route permission enough. Every
+        # users:manage holder also holds audit:read. audit_visibility.audit_exclusion_for shows such
+        # a reader every auth.account_locked row. So this read shows nothing the trail hides from
+        # them. The row does not say whether lock state went out; the actor's roles at that time do.
+        # tests/test_lock_state_surface.py pins the premise and the row. With
+        # [diagnostics].audit_all_authz off, this GET writes no grant row. The web console calls
+        # this handler in-process and writes none at all, an open gap (BACKLOG #1197).
         # One instant for the whole list, so every row answers "locked now?" for the same now.
         lock_state_at = time.time() if identity.has(Permission.USERS_MANAGE) else None
         summaries: list[UserSummary] = []
