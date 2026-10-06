@@ -15,14 +15,14 @@ records whether its effects were applied, through the same handler as
 
 **The requester is offered neither Approve nor the resolve** (BACKLOG #2460). The engine marks each
 row ``caller_is_requester`` by comparing user ids, the key its refusals use (BACKLOG #1540), so the
-page never has to compare names, which are mutable. The requester still gets Withdraw, a reject the
-gate allows them. The engine refuses a hand-built POST either way.
+page never has to compare names, which are mutable. On a pending row the requester still gets
+Withdraw, a reject the gate allows them; on an interrupted row, nothing. The engine refuses a
+hand-built POST either way.
 
 **Each row shows the parameters its hold captured** (BACKLOG #2458), so an approver sees what a
-release would do: which connection a replay or purge names, its scope, a reload's config directory.
+release would do. A ``None`` reads as the scope it means, such as all inbound connections.
 
-Every value goes through the escaping ``el`` builder. Operation labels, captured parameters, user
-names, ids and the engine's refusal text are dual-control metadata, never PHI.
+Every value goes through the escaping ``el`` builder.
 """
 
 from __future__ import annotations
@@ -76,11 +76,23 @@ _RESOLVE_LABELS: dict[ResolveOutcome, str] = {
 _INTERRUPTED_NOTE = (
     "These releases were cut off while the operation ran, so it may have done none, some or all of "
     "its work. Nothing re-runs them. Check the operation's own effects, then record what you found. "
-    "Recording asks you to confirm your password again if you have not done so recently. The "
-    "requester cannot record their own."
+    "Recording is final, and it may ask you to prove it is you again first; if it does, you come "
+    "back here and choose again. The requester cannot record their own."
 )
 
 _OWN_REQUEST = "Your request. A different approver decides it."
+
+# What a None parameter means for the operations that hold one: the broadest scope, not "nothing".
+# Any other None reads "not set".
+_NONE_MEANS: dict[str, str] = {
+    "channel_id": "all inbound connections",
+    "destination_name": "all outbound connections",
+    "config_dir": "the engine's startup config directory",
+}
+
+# Captured only to carry the requester to the executor (BACKLOG #1646). The Requester column
+# already shows it, so the Parameters cell leaves it out; the JSON queue keeps it.
+_HIDDEN_PARAMS = frozenset({"requester"})
 
 # Guidance for a refusal, keyed by the status the engine raised. The engine's own message follows it
 # verbatim, because one status covers several causes (a 409 is at least already decided, expired,
@@ -88,8 +100,8 @@ _OWN_REQUEST = "Your request. A different approver decides it."
 _REFUSALS: dict[int, tuple[str, str]] = {
     403: (
         "Not released",
-        "The engine refused this approver. A requester can never approve their own request, or "
-        "record what its interrupted release did; a different user holding approvals:approve must.",
+        "The engine refused this approver. A requester can never approve their own request; a "
+        "different user holding approvals:approve must release it.",
     ),
     404: ("No such request", "No approval request has this id."),
     409: (
@@ -113,6 +125,28 @@ _REFUSALS: dict[int, tuple[str, str]] = {
 }
 _UNKNOWN_REFUSAL = ("Not done", "The engine refused this action.")
 
+# The resolve's own guidance (BACKLOG #2460). Its refusals mean other things than a release's, and
+# the approve wording would send an operator to request again an operation that may already have run.
+_RESOLVE_REFUSALS: dict[int, tuple[str, str]] = {
+    403: (
+        "Not recorded",
+        "The engine refused this operator. The requester can never record what their own "
+        "interrupted release did; a different user holding approvals:approve must.",
+    ),
+    404: _REFUSALS[404],
+    409: (
+        "The release cannot be recorded now",
+        "It is no longer interrupted, and the engine's message below says why. Another operator "
+        "may have recorded it first. Check the audit log for what was recorded before you request "
+        "the operation again, because it may already have run.",
+    ),
+    503: (
+        "Nothing was recorded",
+        "The engine could not record this now, and its message below says why. The release is "
+        "still interrupted; record it again once the cause is fixed.",
+    ),
+}
+
 
 def _back() -> Markup:
     return el("p", el("a", "Back to Approvals", href=_PAGE))
@@ -122,33 +156,37 @@ def _when(value: float | None) -> str:
     return "—" if value is None else _ts(value)
 
 
-def _param_value(value: object) -> str:
+def _param_value(key: str, value: object) -> str:
     if value is None:
-        return "not set"
+        return _NONE_MEANS.get(key, "not set")
     return value if isinstance(value, str) else json.dumps(value)
 
 
 def _params(a: PendingApprovalInfo) -> Markup:
     """What a release would re-run, one ``name: value`` line per captured parameter (BACKLOG
-    #2458). These are operation metadata such as connection names, never a message body."""
+    #2458)."""
     if a.params is None:
         return el("span", "unreadable", class_="muted")
-    if not a.params:
+    shown = sorted(key for key in a.params if key not in _HIDDEN_PARAMS)
+    if not shown:
         return el("span", "none", class_="muted")
-    return el(
-        "div",
-        *(el("div", f"{key}: {_param_value(a.params[key])}") for key in sorted(a.params)),
-    )
+    return el("div", *(el("div", f"{key}: {_param_value(key, a.params[key])}") for key in shown))
 
 
 def _pending_row(a: PendingApprovalInfo) -> list[object]:
     base = f"{_PAGE}/{_seg(a.id)}"
-    # BACKLOG #2460: the gate would refuse the requester's approve, so it is not offered to them.
-    controls = (
-        [_post_button(f"{base}/reject", "Withdraw"), el("span", _OWN_REQUEST, class_="muted")]
-        if a.caller_is_requester
-        else [_post_button(f"{base}/approve", "Approve"), _post_button(f"{base}/reject", "Reject")]
-    )
+    reject = _post_button(f"{base}/reject", "Reject")
+    # BACKLOG #2460: Approve is not offered where the gate would refuse it: to the requester, and
+    # on a row whose params are unreadable.
+    if a.caller_is_requester:
+        controls = [
+            _post_button(f"{base}/reject", "Withdraw"),
+            el("span", _OWN_REQUEST, class_="muted"),
+        ]
+    elif a.params is None:
+        controls = [reject, el("span", "Unreadable; reject it.", class_="muted")]
+    else:
+        controls = [_post_button(f"{base}/approve", "Approve"), reject]
     actions = el("div", *controls, class_="ctls")
     return [
         _ts(a.requested_at),
@@ -161,17 +199,29 @@ def _pending_row(a: PendingApprovalInfo) -> list[object]:
     ]
 
 
+def _resolve_form(approval_id: str) -> Markup:
+    """One form, one button per outcome (BACKLOG #2460). Each button posts to its own outcome path
+    through ``formaction``. The required box means a click is a checked choice, not a slip
+    between two adjacent final buttons; the browser enforces it, with no script."""
+    base = f"{_PAGE}/{_seg(approval_id)}/resolve"
+    buttons = [
+        el("button", label, type="submit", formaction=f"{base}/{outcome}")
+        for outcome, label in _RESOLVE_LABELS.items()
+    ]
+    return el(
+        "form",
+        el("label", el("input", type="checkbox", required=True), " I checked its effects"),
+        *buttons,
+        method="post",
+        action=f"{base}/{next(iter(_RESOLVE_LABELS))}",
+        class_="ctl",
+    )
+
+
 def _interrupted_row(a: PendingApprovalInfo) -> list[object]:
-    if a.caller_is_requester:
-        actions = el("span", _OWN_REQUEST, class_="muted")
-    else:
-        # BACKLOG #2460: the outcome rides the path, so /ui/reauth can re-POST it after a step-up.
-        base = f"{_PAGE}/{_seg(a.id)}/resolve"
-        actions = el(
-            "div",
-            *(_post_button(f"{base}/{o}", label) for o, label in _RESOLVE_LABELS.items()),
-            class_="ctls",
-        )
+    actions = (
+        el("span", _OWN_REQUEST, class_="muted") if a.caller_is_requester else _resolve_form(a.id)
+    )
     return [
         _ts(a.requested_at),
         a.label,
@@ -186,8 +236,8 @@ def _interrupted_row(a: PendingApprovalInfo) -> list[object]:
 
 def approvals_page(listing: ApprovalList, *, notice: str = "") -> Markup:
     """The open requests: ``pending`` ones with Approve and Reject, then ``interrupted`` ones with
-    the resolve. The caller's own requests offer only Withdraw. ``notice`` is a redirect's ``?m=``
-    code and selects from :data:`_NOTICES` only."""
+    the resolve. The caller's own pending request offers only Withdraw, and their own interrupted
+    one nothing. ``notice`` is a redirect's ``?m=`` code and selects from :data:`_NOTICES` only."""
     pending = [a for a in listing.approvals if a.status == "pending"]
     interrupted = [a for a in listing.approvals if a.status == "interrupted"]
     parts: list[object] = [el("h1", "Approvals"), el("p", _INTRO, class_="muted")]
@@ -268,10 +318,11 @@ def approval_approved(result: ApprovalDecisionResult) -> Markup:
     return page("Request approved", body, active="approvals")
 
 
-def approval_refused(status: int, detail: str) -> Markup:
+def approval_refused(status: int, detail: str, *, resolving: bool = False) -> Markup:
     """The page for an approvals action the engine refused: guidance keyed by status, then the
-    engine's own message verbatim."""
-    headline, guidance = _REFUSALS.get(status, _UNKNOWN_REFUSAL)
+    engine's own message verbatim. ``resolving`` selects the resolve's own guidance."""
+    table = _RESOLVE_REFUSALS if resolving else _REFUSALS
+    headline, guidance = table.get(status, _UNKNOWN_REFUSAL)
     body = el(
         "div",
         el("h1", headline),

@@ -86,7 +86,10 @@ async def test_the_page_lists_a_hold_with_both_buttons(engine: Engine) -> None:
     # BACKLOG #2458: the row shows what the release would re-run, read from the hold itself.
     assert "Parameters" in r.text
     assert "channel_id: ch1" in r.text
-    assert "destination_name: not set" in r.text
+    # A None reads as the scope it means, never as "not set" (an approver would read that as empty).
+    assert "destination_name: all outbound connections" in r.text
+    # The requester key that only carries the requester to the executor is not a shown parameter.
+    assert "requester: maker" not in r.text
     # The nav carries the page under Admin.
     assert 'href="/ui/approvals"' in r.text
 
@@ -276,8 +279,10 @@ async def test_an_interrupted_release_offers_the_resolve_and_not_approve(engine:
         assert r.status_code == 200
         assert "Interrupted releases" in r.text
         assert approval_id in r.text
-        assert f'action="{_resolve(approval_id)}"' in r.text
-        assert f'action="{_resolve(approval_id, "effects_not_applied")}"' in r.text
+        assert f'formaction="{_resolve(approval_id)}"' in r.text
+        assert f'formaction="{_resolve(approval_id, "effects_not_applied")}"' in r.text
+        # One required box covers both outcomes, so a click is a checked choice.
+        assert 'type="checkbox" required' in r.text
         assert f"/ui/approvals/{approval_id}/approve" not in r.text
         assert f"/ui/approvals/{approval_id}/reject" not in r.text
         assert "No request is waiting for a second approver." in r.text
@@ -321,13 +326,32 @@ async def test_the_requester_is_not_offered_and_cannot_resolve(engine: Engine) -
         assert "A different approver decides it." in listing.text
         r = await maker.post(_resolve(approval_id), headers=SAME_ORIGIN)
     assert r.status_code == 403
-    assert "Not released" in r.text
+    # The resolve's own guidance, not the approve wording.
+    assert "Not recorded" in r.text and "Not released" not in r.text
     assert await _status(engine, approval_id) == "interrupted"
+
+
+async def test_a_resolve_that_lost_the_race_warns_against_requesting_again(engine: Engine) -> None:
+    service, maker_id, _checker = await _two_approvers(engine)
+    approval_id = await _interrupted(engine, maker_id)
+    async with _client(engine, service, _ON) as checker:
+        await cookie_login(checker, "checker")
+        first = await checker.post(_resolve(approval_id), headers=SAME_ORIGIN)
+        assert first.status_code == 303
+        second = await checker.post(_resolve(approval_id), headers=SAME_ORIGIN)
+    assert second.status_code == 409
+    assert "The release cannot be recorded now" in second.text
+    assert "it may already have run" in second.text
 
 
 async def test_a_stale_step_up_window_resolves_nothing(engine: Engine) -> None:
     """The resolve route asks for the fresh step-up the JSON resolve does. A stale window is sent to
-    /ui/reauth with the resolve as its continuation, and the STORE shows nothing was recorded."""
+    /ui/reauth, which lands back on the page, and the STORE shows nothing was recorded.
+
+    The landing is the page and never the resolve: /ui/reauth re-POSTs an auto-retry continuation
+    without showing it, so a ``next=`` link would let its author choose the recorded outcome."""
+    from messagefoundry_webconsole._auth import is_safe_ui_action, is_unlock_action
+
     stale = AuthService(
         engine.store,
         AuthSettings(
@@ -342,7 +366,11 @@ async def test_a_stale_step_up_window_resolves_nothing(engine: Engine) -> None:
         await cookie_login(checker, "checker")
         r = await checker.post(_resolve(approval_id), headers=SAME_ORIGIN)
     assert r.status_code == 303
-    assert r.headers["location"] == f"/ui/reauth?next={_resolve(approval_id)}"
+    assert r.headers["location"] == "/ui/reauth?next=/ui/approvals"
+    # /ui/reauth accepts that landing, and would refuse to re-POST either resolve on its own.
+    assert is_unlock_action("/ui/approvals")
+    for outcome in get_args(ResolveOutcome):
+        assert not is_safe_ui_action(_resolve(approval_id, outcome))
     assert await _status(engine, approval_id) == "interrupted"
     assert await engine.store.list_audit(action="approval.resolve_attempted") == []
 
@@ -397,8 +425,15 @@ def test_params_that_did_not_parse_or_are_empty_say_so() -> None:
             params=params,
         )
 
-    assert ">unreadable<" in str(pages.approvals_page(ApprovalList(approvals=[_row(None)])))
+    unreadable = str(pages.approvals_page(ApprovalList(approvals=[_row(None)])))
+    assert ">unreadable<" in unreadable
+    # The gate refuses to release a row it cannot read, so the page does not offer Approve.
+    assert "/approve" not in unreadable and "/reject" in unreadable
     assert ">none<" in str(pages.approvals_page(ApprovalList(approvals=[_row({})])))
+    # A row whose only key is the requester carry-over shows no parameters either.
+    assert ">none<" in str(
+        pages.approvals_page(ApprovalList(approvals=[_row({"requester": "maker"})]))
+    )
 
 
 def test_a_notice_code_selects_a_sentence_and_never_supplies_one() -> None:

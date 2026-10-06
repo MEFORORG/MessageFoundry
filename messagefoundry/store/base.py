@@ -1730,7 +1730,12 @@ class AuditStore(Protocol):
 
     async def get_pending_approval(self, approval_id: str) -> Row | None: ...
 
-    async def list_pending_approvals(self, *, now: float, limit: int = 100) -> Sequence[Row]: ...
+    async def list_pending_approvals(self, *, now: float, limit: int = 100) -> Sequence[Row]:
+        """Open (``pending``, unexpired) requests, newest first. Each row projects at least ``id``,
+        ``operation``, ``params``, ``requester``, ``requester_user_id`` (BACKLOG #2460: the queue
+        marks the caller's own requests by it), ``requested_at``, ``status``, ``approver``,
+        ``decided_at`` and ``expires_at``."""
+        ...
 
     async def list_interrupted_approvals(self, *, limit: int = 100) -> Sequence[Row]:
         """Released requests whose operation was cut off mid-run (status ``interrupted``), OLDEST

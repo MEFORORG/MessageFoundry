@@ -86,10 +86,11 @@ RESOLVE_OUTCOMES: Mapping[str, str] = {
 DRAIN_TIMEOUT_SECONDS = 3.0
 
 
-def _queued_params(approval_id: str, raw: Any) -> dict[str, Any] | None:
-    """The captured params as the approver's queue shows them (BACKLOG #2458), or ``None`` when the
-    stored value is not a JSON object. One unreadable row must not take the whole queue down, so it
-    is logged by id only and listed without its params; approving it still fails on the same parse."""
+def _stored_params(approval_id: str, raw: Any) -> dict[str, Any] | None:
+    """A row's captured params, or ``None`` when the stored value is not a JSON object. The one
+    decoder for the queue (BACKLOG #2458) and for :meth:`ApprovalGate.approve`, so the two agree on
+    what is readable: the queue lists such a row as unreadable, and approve refuses it with a 409.
+    Logged by id only, because the value may be anything."""
     try:
         params = json.loads(str(raw))
     except ValueError:
@@ -274,9 +275,8 @@ class ApprovalGate:
         ``requester_user_id`` is the requester's immutable ``users.id`` and is what
         :meth:`approve` compares; ``requester`` is the display/audit label (BACKLOG #1540).
 
-        Every holder of ``approvals:approve`` sees ``params`` in the queue, because an approver has
-        to see what a release will do (BACKLOG #2458). So they must stay operation metadata, such
-        as connection names, a scope or a config directory, and never carry a message body."""
+        Every approver sees ``params`` in the queue; :class:`~messagefoundry.api.models.PendingApprovalInfo`
+        states what they may carry (BACKLOG #2458)."""
         if not self._gated(operation):
             return None
         # Enforce the write half of the invariant here, matching `create_upload`'s guard on
@@ -331,7 +331,7 @@ class ApprovalGate:
             "id": str(r["id"]),
             "operation": str(r["operation"]),
             "label": self._label(str(r["operation"])),
-            "params": _queued_params(str(r["id"]), r["params"]),
+            "params": _stored_params(str(r["id"]), r["params"]),
             "requester": str(r["requester"]),
             "requested_at": float(r["requested_at"]),
             "expires_at": (None if r["expires_at"] is None else float(r["expires_at"])),
@@ -443,7 +443,11 @@ class ApprovalGate:
                 f"review it and approve it again in {wait} second(s)",
                 headers={"Retry-After": str(wait)},
             )
-        params = json.loads(str(row["params"]))
+        params = _stored_params(approval_id, row["params"])
+        if params is None:
+            # The queue lists such a row as "unreadable" (BACKLOG #2458). Refuse it as a 409 that
+            # leaves the row pending for a reject, rather than a 500 from a bare parse.
+            raise ApprovalError(409, "request parameters are unreadable; reject it instead")
         # ASVS 8.3.2: the requester's authority is re-read NOW. It was checked when the request was
         # made, and it can be withdrawn at any point inside the expiry window: the user deleted or
         # disabled, a role removed, a channel scope narrowed. It reads the engine's copy of the

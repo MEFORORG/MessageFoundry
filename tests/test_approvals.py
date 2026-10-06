@@ -204,9 +204,15 @@ async def test_a_row_whose_params_do_not_parse_is_listed_without_them(engine: En
         expires_at=None,
     )
     async with _client(engine, service, ON) as c:
-        r = await c.get("/approvals", headers=await _token(c, "approver"))
+        approver = await _token(c, "approver")
+        r = await c.get("/approvals", headers=approver)
+        # The same decoder refuses the release as a 409, not a 500 from a bare parse.
+        released = await c.post(f"/approvals/{damaged}/approve", headers=approver)
     assert r.status_code == 200
     assert [a["params"] for a in r.json()["approvals"] if a["id"] == damaged] == [None]
+    assert released.status_code == 409
+    assert "unreadable" in released.json()["detail"]
+    assert await _status_of(engine, damaged) == "pending"
 
 
 async def test_requester_cannot_approve_their_own_request(engine: Engine) -> None:

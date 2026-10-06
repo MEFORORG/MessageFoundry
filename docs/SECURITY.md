@@ -1704,11 +1704,11 @@ a request older than `[approvals].expiry_hours` can no longer be approved. Appro
 at `GET /approvals`, or on the console's **Approvals** page (`/ui/approvals`, BACKLOG #1982), which
 offers Approve and Reject on each pending request and the resolve on each `interrupted` release.
 Each queued request carries `caller_is_requester`, compared on the user id as the refusals are
-(BACKLOG #2460), so the page offers the requester only Withdraw, a reject of their own request.
-Each queued request carries the `params` its hold captured (BACKLOG #2458), so an approver sees
-what a release would re-run: a replay's connection names, a purge's connection and scope, a
-reload's config directory. They are operation metadata and never a message body; only an
-Administrator holds `approvals:approve`, so no channel scope masks them.
+(BACKLOG #2460). On the requester's own pending request the page offers only Withdraw, a reject;
+on their own interrupted release it offers nothing. Each queued request also carries the `params`
+its hold captured (BACKLOG #2458), so an approver sees what a release would re-run. What they may
+carry is stated on `PendingApprovalInfo` in `api/models.py`; only an Administrator holds
+`approvals:approve`, so no channel scope masks them.
 
 **The audit log must accept a release before the operation runs.** Before it claims a request, the
 gate writes an `approval.release_attempted` row against the approver, naming the requester. If the
@@ -1755,8 +1755,8 @@ and when it was cut off. Once the operator has checked, `POST /approvals/{id}/re
 the row to the matching `resolved_*` status (owner ruling 2026-09-26). The resolve:
 
 - needs `approvals:approve` **and a fresh step-up** (`require_step_up`), which approve and reject do
-  not ask for. The console's resolve, `POST /ui/approvals/{approval_id}/resolve/{outcome}`, asks
-  for the same through `require_ui_step_up` (BACKLOG #2460);
+  not ask for. The console's resolve asks for the same (see the /ui route map). A stale window
+  lands the operator back on the page to choose again; the outcome is never re-posted for them;
 - refuses the original requester with **403**, keyed on the user id like the self-approval refusal. The
   approver who released the request may resolve it;
 - **never runs the operation again**, whichever outcome is chosen. If the effects are missing, request
@@ -1805,7 +1805,7 @@ keystroke-level model for user performance time with interactive systems", *Comm
 
 To release a request a person must at least see it and decide (M), pick out that one request (P), and
 submit (K). That is about **2.53 s**, even with the request on screen the instant it exists. The
-console's Approvals page has an Approve button beside each request, and that is exactly this path: see
+console's Approvals page has an Approve button beside each request another user raised, and that is exactly this path: see
 it, point at the button, click. From an HTTP tool, `POST /approvals/{id}/approve`, the person must carry
 the request's 32-character id into the command. Pointing at it costs P, and typing
 it costs 32 K, about 2.56 s, so the bound holds either way. The default sits about 20% below 2.53 s,

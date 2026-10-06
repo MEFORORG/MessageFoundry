@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from typing import Any, get_args
+from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -23,19 +23,20 @@ from messagefoundry.auth import Identity, Permission
 from .. import pages
 from .._auth import assert_same_origin, register_ui_action, require_ui, require_ui_step_up
 
-# BACKLOG #2460: the resolve is a body-less POST whose outcome rides the PATH, so /ui/reauth may
-# re-POST it after a stale step-up window, the way a dead-letter replay or a purge is re-POSTed.
-register_ui_action(
-    rf"^/ui/approvals/[^/?#]+/resolve/({'|'.join(get_args(ResolveOutcome))})$",
-    Permission.APPROVALS_APPROVE,
-)
+#: Where /ui/reauth sends an operator whose resolve met a stale step-up window (BACKLOG #2460).
+#: The resolve itself is deliberately NOT an auto-retry continuation: /ui/reauth re-POSTs one
+#: without showing it, so whoever wrote a ``next=`` link would choose the outcome recorded under
+#: the approver's name. The operator lands back on the page and clicks the outcome themselves.
+_RESOLVE_REAUTH_LANDING = "/ui/approvals"
+register_ui_action(r"^/ui/approvals$", None, auto_retry=False, unlock=True)
 
 
-def _refused(exc: HTTPException) -> HTMLResponse:
+def _refused(exc: HTTPException, *, resolving: bool = False) -> HTMLResponse:
     """A handler refusal as a page, keyed by the engine's status, carrying its headers (a too-new
-    request's ``Retry-After``). The detail is the engine's fixed refusal text, never PHI."""
+    request's ``Retry-After``). The detail is the engine's fixed refusal text, never PHI.
+    ``resolving`` picks the resolve's own guidance, since its 403/409/503 mean other things."""
     return HTMLResponse(
-        pages.approval_refused(exc.status_code, str(exc.detail)),
+        pages.approval_refused(exc.status_code, str(exc.detail), resolving=resolving),
         status_code=exc.status_code,
         headers=exc.headers,
     )
@@ -59,7 +60,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
 
     Approve and reject are not registered with ``register_ui_action``: that registry serves the
     step-up re-auth continuation, and plain ``require_ui`` never routes through ``/ui/reauth``. The
-    resolve is registered above, because its gate does."""
+    resolve's gate does, so the page is registered above as its landing, never the resolve."""
     core = deps.core
 
     @app.get("/ui/approvals", response_class=HTMLResponse)
@@ -109,7 +110,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         approval_id: ResourceId,
         outcome: ResolveOutcome,
         request: Request,
-        identity: Identity = Depends(require_ui_step_up(Permission.APPROVALS_APPROVE)),
+        identity: Identity = Depends(
+            require_ui_step_up(
+                Permission.APPROVALS_APPROVE, reauth_next=lambda _r: _RESOLVE_REAUTH_LANDING
+            )
+        ),
         gate: Any = Depends(deps.get_gate),
     ) -> Response:
         # BACKLOG #2460: record what an interrupted release did. Never re-runs the operation; the
@@ -124,5 +129,5 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 gate=gate,
             )
         except HTTPException as exc:
-            return _refused(exc)
+            return _refused(exc, resolving=True)
         return RedirectResponse(f"/ui/approvals?m={outcome}", status_code=303)
