@@ -169,6 +169,7 @@ from messagefoundry.pipeline.sandbox import (
     SandboxMode,
     SandboxPolicy,
     SandboxSession,
+    SandboxSessionClosed,
     graph_shape,
 )
 from messagefoundry.pipeline.saturation import SaturationDetector
@@ -4143,7 +4144,9 @@ class RegistryRunner:
     async def _close_sandbox_sessions(self) -> None:
         """Drop every sandbox session and close its worker, off the loop: each ``close()`` waits on
         a process. A no-op unless ``[sandbox].mode=subprocess`` spawned any. The next dispatch on an
-        inbound makes a fresh session, whose worker loads the config as it is then."""
+        inbound makes a fresh session, whose worker loads the config as it is then. A dispatch already
+        holding a closed session is retried or re-pended by :meth:`_off_loop_sandboxed`, never
+        dead-lettered as a Router or Handler fault."""
         if not self._sandbox_sessions:
             return
         sessions = list(self._sandbox_sessions.values())
@@ -4188,6 +4191,43 @@ class RegistryRunner:
             )
             self._sandbox_sessions[name] = session
         return session
+
+    async def _off_loop_sandboxed[T](
+        self, name: str, fn: Callable[..., T], registry: Registry, /, *args: Any, **kwargs: Any
+    ) -> T:
+        """``fn(registry, *args, sandbox=<inbound name's session>, **kwargs)`` in a thread, which a
+        reload that closes the session mid-call never turns into a dead-letter (vault BACKLOG #2772).
+
+        A reload closes every session (:meth:`_close_sandbox_sessions`) while the router and transform
+        workers keep running. A worker resolves its session here, on the loop, and dispatches from the
+        thread, so the close can land in between and raise :class:`SandboxSessionClosed`. The
+        dispatch that raised did not run. ``route_only`` dispatches more than once on one session (the
+        Router, then each ``accepts=`` predicate), so the Router itself may already have run; that is
+        safe to run again because Routers and Handlers are pure.
+
+        The retry happens only when ``registry`` is still the one being served, which is the case
+        after a failed reload's rollback. Otherwise every argument the caller built (``registry``, the
+        inbound, the run context) belongs to the old graph while a fresh session's worker would load
+        the new one, so the exception is raised instead, as it is while the runner stops (shutdown
+        closes the sessions after cancelling the workers, and nothing would reap a worker started
+        then). Raising also starts no session for an inbound the reload removed. The caller lets the
+        exception past its internal-error policy to the worker's fault arm, which re-pends the row
+        (per-lane #1611, pooled ADR 0070 T17), and the next claim reads the registry, the inbound and
+        the session afresh. Either way the message is not dead-lettered for the close."""
+        try:
+            return await asyncio.to_thread(
+                fn, registry, *args, sandbox=self._sandbox_for(name), **kwargs
+            )
+        except SandboxSessionClosed:
+            if self._stop.is_set() or self.registry is not registry:
+                raise
+            log.info(
+                "inbound %r: its sandbox worker was recycled mid-dispatch; retrying",
+                name,
+            )
+            return await asyncio.to_thread(
+                fn, registry, *args, sandbox=self._sandbox_for(name), **kwargs
+            )
 
     async def stop(
         self,
@@ -5997,10 +6037,23 @@ class RegistryRunner:
         # instant the attachment(s) are durable and the skeleton is small — the peak this bounds is passed.
         self._stream_inflight_bytes += size
         try:
-            message = Message.parse(text)
+            # Every step that scales with the body runs in a thread (vault BACKLOG #2757): the parse,
+            # each step of the document scan, each handle splice and the re-encode here, and the hash
+            # and seal inside put_attachment. Measured 2026-10-06 on SQLite with the AES-GCM cipher,
+            # the longest event-loop stall fell from about 0.3 s to 0.03 s at a 15 MiB body and from
+            # 1.5-2.0 s to 0.1-0.2 s at 64 MiB. What is left is the longest single string operation,
+            # which holds the GIL in any thread. The scan stays lazy, one document at a time, as the
+            # budget assumes. Only one thread touches `message` at a time: each hop is awaited.
+            message = await asyncio.to_thread(Message.parse, text)
+            documents = iter_obx_documents(message)
+
+            def _next_document() -> tuple[int, str, str] | None:
+                return next(documents, None)
+
             refs: list[str] = []
             detached = 0
-            for occ, verbatim_b64, content_type in iter_obx_documents(message):
+            while (document := await asyncio.to_thread(_next_document)) is not None:
+                occ, verbatim_b64, content_type = document
                 # ASVS 1.3.4/5.2.2: OBX-5.2 is a sender-controlled MIME label. If it names a sniffable
                 # family (image/pdf/zip/xml/json) whose magic bytes the document contradicts, store the
                 # generic octet-stream so the download route can never serve a mislabelled active-content
@@ -6009,7 +6062,9 @@ class RegistryRunner:
                 if not attachment_mime_agrees(content_type, b64_head(verbatim_b64)):
                     safe_ct = _DEFAULT_ATTACHMENT_MIME
                 ref = await self.store.put_attachment(chunk_b64(verbatim_b64), safe_ct)
-                message.set("OBX-5.5", make_doc_ref(ref, safe_ct), occurrence=occ)
+                await asyncio.to_thread(
+                    message.set, "OBX-5.5", make_doc_ref(ref, safe_ct), occurrence=occ
+                )
                 if ref not in refs:
                     refs.append(ref)
                 detached += 1
@@ -6017,7 +6072,7 @@ class RegistryRunner:
                 # An over-threshold body with no detachable document (e.g. a large non-ED message): keep
                 # it byte-identical — no attachment, no skeleton re-encode divergence, no ref to incref.
                 return text, []
-            return message.encode(), refs
+            return await asyncio.to_thread(message.encode), refs
         finally:
             self._stream_inflight_bytes -= size
 
@@ -7534,12 +7589,12 @@ class RegistryRunner:
                 # ADR 0087 (#197): when [sandbox].mode=subprocess, route_only marshals the Router
                 # to the per-inbound worker child (router_rc travels with it) instead of running it
                 # in this thread; sandbox=None (the default) is the byte-identical in-process path.
-                names = await asyncio.to_thread(
+                names = await self._off_loop_sandboxed(
+                    name,
                     route_only,
                     self.registry,
                     ic,
                     item.payload,
-                    sandbox=self._sandbox_for(name),
                     run_context=router_rc,
                 )
             # ADR 0057 inline Step-A fast-path (G1: this whole block is INSIDE the inner try,
@@ -7572,13 +7627,13 @@ class RegistryRunner:
                         state_preview,
                         meta_preview,
                         declined,
-                    ) = await asyncio.to_thread(
+                    ) = await self._off_loop_sandboxed(
+                        name,
                         transform_one,
                         self.registry,
                         hname,
                         item.payload,
                         content_type,
-                        sandbox=self._sandbox_for(name),
                         run_context=inline_rc,
                     )
                 # Split deliveries / pass-through / state exactly as the transform worker does.
@@ -7633,6 +7688,11 @@ class RegistryRunner:
                     # fused — bypass the split route_handoff path entirely
                     return _ItemOutcome.PROCESSED, None
                 # else: ineligible per-message → fall through to the split path verbatim.
+        except SandboxSessionClosed:
+            # Not a Router or Handler fault: the dispatch that raised did not run (see
+            # _off_loop_sandboxed). Raised past the internal-error policy to the caller's fault arm,
+            # which re-pends the row.
+            raise
         except Exception as exc:
             # Router code error (incl. an unknown handler name) OR — on the inline fast-path —
             # a transform_one/handoff failure (G1). Post-ACK, so no NAK — the global
@@ -8079,15 +8139,20 @@ class RegistryRunner:
                     # worker (transform_rc travels with it); a db_lookup/fhir_lookup inside a
                     # sandboxed Handler fails closed there (they can't bridge across the process
                     # boundary in this PR). sandbox=None is the byte-identical in-process path.
-                    outcome = await asyncio.to_thread(
+                    outcome = await self._off_loop_sandboxed(
+                        name,
                         transform_one,
                         self.registry,
                         hname,
                         item.payload,
                         content_type,
-                        sandbox=self._sandbox_for(name),
                         run_context=transform_rc,
                     )
+        except SandboxSessionClosed:
+            # Not a Handler fault: the dispatch that raised did not run (see _off_loop_sandboxed).
+            # Raised, so the caller takes it as INFRA and re-pends the row, like the store-read fault
+            # above.
+            raise
         except Exception as exc:
             # Handler/transform code error (incl. an unknown outbound name). CONTENT: captured as
             # data, NOT raised, so a concurrent gather never cancels a sibling; the serial apply

@@ -6795,24 +6795,32 @@ class MessageStore:
         attachment therefore sits at ``refcount=0`` until increffed — reclaimable by the **next** startup
         sweep, never mid-run (the sweep is startup-only, like ``reset_stale_inflight``)."""
         self._require_streaming_attachments()
-        hasher = hashlib.sha256()
-        total = 0
-        # Cell-bound AAD (ASVS 11.3.3) binds each chunk to its (attachment_id, seq) cell — but the
-        # attachment_id is the sha256 content address, known only once the full plaintext is hashed. So
-        # buffer the verbatim slices, hash them, then seal each under its (ref, seq). `chunks` is a
-        # slicing of an already-materialized OBX-5.5 value, so this adds no order-of-magnitude memory over
-        # the caller's own copy, and each AES-GCM seal still consumes exactly one chunk (one-chunk seal).
-        plaintext_chunks: list[str] = []
-        for chunk in chunks:
-            data = chunk.encode("utf-8")
-            hasher.update(data)
-            total += len(data)
-            plaintext_chunks.append(chunk)
-        ref = hasher.hexdigest()
-        sealed: list[str] = [
-            self._cipher.encrypt(c, aad=cell_aad("attachment_chunk", "ciphertext", ref, seq))
-            for seq, c in enumerate(plaintext_chunks)
-        ]
+
+        def _seal() -> tuple[str, int, list[str]]:
+            # Off the event loop (vault BACKLOG #2757): hashing and sealing a large document is CPU
+            # work in proportion to its size, and nothing else would run meanwhile.
+            hasher = hashlib.sha256()
+            total = 0
+            # Cell-bound AAD (ASVS 11.3.3) binds each chunk to its (attachment_id, seq) cell — but
+            # the attachment_id is the sha256 content address, known only once the full plaintext is
+            # hashed. So buffer the verbatim slices, hash them, then seal each under its (ref, seq).
+            # `chunks` is a slicing of an already-materialized OBX-5.5 value, so this adds no
+            # order-of-magnitude memory over the caller's own copy, and each AES-GCM seal still
+            # consumes exactly one chunk (one-chunk seal).
+            plaintext_chunks: list[str] = []
+            for chunk in chunks:
+                data = chunk.encode("utf-8")
+                hasher.update(data)
+                total += len(data)
+                plaintext_chunks.append(chunk)
+            ref = hasher.hexdigest()
+            sealed: list[str] = [
+                self._cipher.encrypt(c, aad=cell_aad("attachment_chunk", "ciphertext", ref, seq))
+                for seq, c in enumerate(plaintext_chunks)
+            ]
+            return ref, total, sealed
+
+        ref, total, sealed = await asyncio.to_thread(_seal)
         now = time.time()
         async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute("SELECT 1 FROM attachment WHERE id=?", (ref,))
