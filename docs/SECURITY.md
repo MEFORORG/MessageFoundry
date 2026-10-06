@@ -2186,7 +2186,10 @@ self-signed placeholder; the cookie still carries `Secure`, BACKLOG #2163); and 
 `OFF-LOOPBACK-DEPLOYMENT.md` (managed-admin-host runbook +
 reverse-proxy-mTLS reference configs) plus an advisory when `[auth].admin_new_ip_step_up` has been
 turned off on a PHI instance (it defaults **on** since BACKLOG #288, and turning it off is a named
-loosening; it remains advisory + step-up-forcing only, never an authorization input). At runtime, **`exposure_protected` forces the session cookie's
+loosening. The signal never changes an RBAC allow or deny. Since vault BACKLOG #2620 at least the
+PHI reads and paced writes refuse a new address until it re-verifies; item 6 of
+[Administrative-interface defense-in-depth](#administrative-interface-defense-in-depth-wp-l3-13-asvs-842)
+names the gates). At runtime, **`exposure_protected` forces the session cookie's
 `Secure` flag and HSTS regardless of the per-request scheme** — the scheme is computed once at
 login, and a proxy that omits `X-Forwarded-Proto` would otherwise poison the whole session — and a
 one-shot tripwire warns if a `/ui` request ever arrives `scheme=http` while a terminator is
