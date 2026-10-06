@@ -20,7 +20,9 @@ owns the **priority-feed startup** half (the DR run-profile in
    same fail-closed abort (AC-14), distinct from the in-archive decrypt failure (AC-9). Verifying the
    archive is not loading it — the restore is the operator's separate ``messagefoundry restore`` step —
    so activation then **also** refuses when the DR store does not carry the verified seed
-   (:meth:`DrCoordinator._verify_seeded_store`), rather than promoting onto an empty store.
+   (:meth:`DrCoordinator._verify_seeded_store`), rather than promoting onto an empty store. Last
+   in this step, the optional ``profile_preflight`` callback refuses a run-profile step 4 is already
+   bound to fail, such as one whose config dir has gone, so the VIP never moves for it.
 2. **Recover the cold-restored store + start a NEW audit-chain segment.** ``reset_stale_inflight``
    recovers in-flight rows of every stage carried in the backup (AC-15), then a ``dr_seed`` marker
    (seed-marker genesis = source-snapshot SHA-256 + config/DEK fingerprints + the restored chain's tip
@@ -115,7 +117,8 @@ class DrCoordinator:
     """Manual, audited DR promotion/fail-back (ADR 0048). Construct with the open store + ``[dr]``
     settings + the store settings (the KeyProvider seam for restore-verify) + two engine callbacks that
     flip the DR run-profile (``activate_profile`` reloads the graph with the run-profile ON;
-    ``deactivate_profile`` unbinds intake + drains, then turns it OFF). Single-writer: the API serializes
+    ``deactivate_profile`` unbinds intake + drains, then turns it OFF), and optional callbacks for
+    the seed marker's config digest and a run-profile preflight. Single-writer: the API serializes
     activate/release behind ``[approvals]``-style RBAC; this object additionally guards against a
     concurrent activate/release with its own lock."""
 
@@ -131,6 +134,7 @@ class DrCoordinator:
         alert_sink: AlertSink | None = None,
         clock: Callable[[], float] = time.time,
         owned_lanes: Callable[[], OwnedLanes | None] | None = None,
+        profile_preflight: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self._store = store
         self._settings = settings
@@ -141,6 +145,9 @@ class DrCoordinator:
         self._deactivate_profile = deactivate_profile
         # Awaited per activation, so building the coordinator reads no file (vault BACKLOG #2839).
         self._config_fingerprint_provider = config_fingerprint_provider
+        # Raises OSError when activate_profile is already bound to fail, such as when the config dir
+        # it would reload has gone. Run before any store change or VIP step (vault BACKLOG #2840).
+        self._profile_preflight = profile_preflight
         self._alert_sink: AlertSink = alert_sink or LoggingAlertSink()
         # #145: the DR box label carried in dr_activated / dr_released alerts (also the throttle /
         # auto-resolve key). The hostname is stable across an activate/release pair (same box), so the
@@ -167,6 +174,18 @@ class DrCoordinator:
     @property
     def settings(self) -> DrSettings:
         return self._settings
+
+    @staticmethod
+    def _profile_failure(exc: BaseException, *, before_vip: bool) -> str:
+        """The abort reason for a run-profile that cannot be applied. The preflight and the profile
+        step share it, and it says which one refused, because only the second runs after the
+        takeover hook: an operator must know whether the VIP may have moved."""
+        where = (
+            "refused before the VIP step; the takeover hook did not run"
+            if before_vip
+            else "the engine could not bind the priority feeds"
+        )
+        return f"DR run-profile activation failed ({where}): {safe_exc(exc)}"
 
     # --- activate ------------------------------------------------------------
 
@@ -236,6 +255,17 @@ class DrCoordinator:
             # the server-DB gate above.
             await self._verify_seeded_store(verify, actor, now)
 
+            # (1d) RUN-PROFILE PREFLIGHT (fail-closed, BEFORE any store mutation or VIP step). Step (4)
+            # reloads the config dir the running graph came from; if that dir has gone or cannot be
+            # read, step (4) would abort AFTER the takeover hook moved the VIP, leaving it on a box
+            # that serves nothing. Step (4) keeps its own check: the dir can still go in between.
+            if self._profile_preflight is not None:
+                try:
+                    await self._profile_preflight()
+                except OSError as exc:
+                    reason = self._profile_failure(exc, before_vip=True)
+                    await self._record_aborted("profile", reason, actor, now)
+
             # (2) Recover the cold-restored store (every stage, AC-15) + open a NEW audit-chain segment
             # (the seed-marker genesis; do NOT blindly extend the restored chain — ADR 0049/0041).
             # Ownership-scoped when sharded (ADR 0073) — see _owned_lanes in __init__.
@@ -268,13 +298,8 @@ class DrCoordinator:
                 await self._activate_profile()
             except Exception as exc:
                 self._active = False
-                await self._record_aborted(
-                    "profile",
-                    f"DR run-profile activation failed (the engine could not bind the priority feeds): "
-                    f"{safe_exc(exc)}",
-                    actor,
-                    now,
-                )
+                reason = self._profile_failure(exc, before_vip=False)
+                await self._record_aborted("profile", reason, actor, now)
 
             await self._store.record_audit(
                 _ACTION_ACTIVATE,

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -723,8 +724,28 @@ class Engine:
                 config_fingerprint_provider=self._dr_config_fingerprint,
                 alert_sink=self._alert_sink,
                 owned_lanes=self._owned_lanes,  # ADR 0073: scoped activation recovery when sharded
+                profile_preflight=self._dr_profile_preflight,
             )
         return self._dr_coordinator
+
+    async def _dr_profile_preflight(self) -> None:
+        """Raise OSError when :meth:`_dr_activate_profile` would fail to reload because its
+        directory has gone or cannot be listed. The coordinator runs this before the VIP takeover
+        hook, so such an activation aborts with the VIP never moved (vault BACKLOG #2840). It checks
+        :attr:`running_config_dir`, and only when the profile step will reload it. It checks that
+        one cause and no other: the profile step can still refuse after the hook, such as on a
+        config that no longer loads, or a directory that goes in between."""
+        directory = self.running_config_dir
+        if self._registry_runner is None or directory is None:
+            return
+        await asyncio.to_thread(self._open_dir_listing, directory)
+
+    @staticmethod
+    def _open_dir_listing(directory: Path) -> None:
+        """Open ``directory`` for listing: FileNotFoundError when it has gone, NotADirectoryError
+        when it is a file, PermissionError when it cannot be read."""
+        with os.scandir(directory) as entries:
+            next(entries, None)
 
     async def _dr_config_fingerprint(self) -> str | None:
         """The config digest a DR activation's seed marker records, or ``None`` when there is none.

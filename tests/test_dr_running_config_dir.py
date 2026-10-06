@@ -128,24 +128,81 @@ async def test_convergence_still_reloads_the_startup_dir(box: _Box) -> None:
     assert _inbound_names(engine) == {"IB_LIVE_ADT"}
 
 
-async def test_a_removed_reload_dir_aborts_the_activation(box: _Box) -> None:
-    """With the operator's directory gone, the activation aborts at the profile step with a
-    recorded reason rather than falling back to the startup dir. The latch goes back off, and the
-    seed marker records no digest rather than the digest of an empty bundle."""
+async def test_a_removed_reload_dir_aborts_before_the_takeover_hook(
+    box: _Box, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Red at 7a59a4bd24: the gone directory surfaced only at step (4), after the takeover hook
+    had moved the VIP. Now the activation aborts as a ``profile`` refusal before any store change
+    or VIP step, rather than falling back to the startup dir."""
     engine = box.engine
     await engine.reload_detail(box.staging)
     shutil.rmtree(box.staging)
     coord = engine.dr_coordinator
     assert coord is not None
+    hooks: list[str] = []
+    real_hook = coord._run_vip_hook
+
+    async def spy(command: str, *, phase: str, actor: str, now: float) -> bool:
+        hooks.append(phase)
+        return await real_hook(command, phase=phase, actor=actor, now=now)
+
+    monkeypatch.setattr(coord, "_run_vip_hook", spy)
+
+    with pytest.raises(DrActivationError) as caught:
+        await coord.activate(actor="alice")
+
+    assert hooks == []  # the takeover hook was never called
+    assert caught.value.kind == "profile"
+    assert "the takeover hook did not run" in str(caught.value)
+    assert coord.active is False and engine.dr_active is False
+    assert _inbound_names(engine) == {"IB_STAGING_ADT"}  # the running graph was not swapped
+    assert len(await engine.store.list_audit(action="dr_activation_aborted")) == 1
+    assert await engine.store.list_audit(action="dr_seed") == []  # no segment was opened
+
+    # Control: the same box with the directory back runs the hook and activates.
+    _write_graph(box.staging, box.staging.parent, "IB_STAGING_ADT")
+    await coord.activate(actor="alice")
+    assert hooks == ["takeover"] and coord.active is True
+
+
+async def test_the_profile_step_still_refuses_a_dir_that_goes_after_the_preflight(
+    box: _Box, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Step (4) keeps its own refusal, since the directory can go between the preflight and the
+    reload. Here it goes during the takeover hook: the preflight passed, the hook ran, and the
+    profile step refuses, saying the abort came after the VIP step."""
+    engine = box.engine
+    await engine.reload_detail(box.staging)
+    coord = engine.dr_coordinator
+    assert coord is not None
+
+    async def hook_removes_the_dir(command: str, *, phase: str, actor: str, now: float) -> bool:
+        shutil.rmtree(box.staging)
+        return True
+
+    monkeypatch.setattr(coord, "_run_vip_hook", hook_removes_the_dir)
 
     with pytest.raises(DrActivationError) as caught:
         await coord.activate(actor="alice")
 
     assert caught.value.kind == "profile"
+    assert "could not bind the priority feeds" in str(caught.value)
     assert coord.active is False and engine.dr_active is False
-    assert _inbound_names(engine) == {"IB_STAGING_ADT"}  # the running graph was not swapped
+    assert _inbound_names(engine) == {"IB_STAGING_ADT"}
     assert len(await engine.store.list_audit(action="dr_activation_aborted")) == 1
-    assert (await _seed_marker(engine))["config_fingerprint"] is None
+    assert len(await engine.store.list_audit(action="dr_seed")) == 1  # step (2) did run
+
+
+async def test_a_gone_dir_gives_the_seed_marker_no_digest(box: _Box) -> None:
+    """The provider gives ``None`` for a directory that has gone, not the digest of an empty
+    bundle, which the shared rule would return."""
+    engine = box.engine
+    await engine.reload_detail(box.staging)
+    assert isinstance(await engine._dr_config_fingerprint(), str)  # control
+    shutil.rmtree(box.staging)
+    assert isinstance(fp.config_fingerprint(box.staging), str)  # the rule digests an empty bundle
+
+    assert await engine._dr_config_fingerprint() is None
 
 
 async def test_the_seed_marker_fingerprints_the_directory_the_activation_reloads(
