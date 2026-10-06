@@ -390,9 +390,12 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         help="run validate + dryrun (+ advisory ruff/mypy) as a commit/CI gate",
         description="Run validate + dryrun (+ advisory ruff/mypy) as a commit/CI gate. The dryrun "
         "sub-check previews under [pipeline].snapshot_on_send (copy-on-Send, ADR 0104) resolved "
-        "best-effort from this instance's messagefoundry.toml (same resolution as the posture "
-        "check); when no settings load it falls back to the setting's own default (ON) — matching "
-        "the default engine, never a silent OFF (#230).",
+        "best-effort from the settings the posture check reads: this instance's "
+        "messagefoundry.toml, or with no file, the MEFOR_* environment when MEFOR_AI_ENVIRONMENT "
+        "names the instance. Under --project-root, a messagefoundry.toml in a working directory "
+        "other than the project root is not read and stops the environment read. When no "
+        "settings load it falls back to the "
+        "setting's own default (ON) — matching the default engine, never a silent OFF (#230).",
     )
     check.add_argument("--config", default="samples/config", help="config modules directory")
     _add_anchor_flags(check)
@@ -1743,6 +1746,7 @@ def _serve(args: argparse.Namespace) -> int:
         SyslogProtocol,
         forward_hop_disposition,
         hop_posture_from_ai,
+        insecure_bind_escape,
         oidc_second_factor_claim_exception,
         security_loosenings,
     )
@@ -1895,9 +1899,7 @@ def _serve(args: argparse.Namespace) -> int:
     # cleartext inbound listener; BACKLOG #1672). It rides the SAME exposed-bind gate + the SAME
     # ADR 0092 clamp below, keyed on [security].enforcement — it cannot relax either bind under
     # enforcement=enforce. Fold both escapes into one flag the exposed-gate + create_managed_app read.
-    insecure_bind_ok = (
-        args.allow_insecure_bind or not settings.security.require_encryption_for_remote
-    )
+    insecure_bind_ok = insecure_bind_escape(settings, flag=args.allow_insecure_bind)
 
     # Delegated-identity precondition (#203, ASVS 13.2.1/13.3.2): when the operator declares
     # [store].require_managed_identity, refuse to start if the store authenticates with a static
@@ -8055,6 +8057,7 @@ def _connection(args: argparse.Namespace) -> int:
     from messagefoundry.config.settings import (
         BLOCK_UNLISTED_OUTBOUND_IN_FORCE,
         hop_posture_from_ai,
+        insecure_bind_escape,
         load_settings,
     )
     from messagefoundry.config.wiring import API_LISTENER_LABEL, WiringError, load_config
@@ -8120,6 +8123,9 @@ def _connection(args: argparse.Namespace) -> int:
             # #190 (ADR 0093): resolve internal-outbound TLS hops against the [tls] internal-CA anchor at
             # edit-time build-check exactly as at reload (None-safe: default system policy = no-op).
             trust_anchor_policy=settings.tls.policy(),
+            # Vault BACKLOG #2622 item 1: the inbound exposure gates read serve's cleartext escape.
+            # This command has no --allow-insecure-bind, so pass the settings half serve folds in.
+            allow_insecure_bind=insecure_bind_escape(settings),
         )
 
     try:

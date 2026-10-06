@@ -1866,6 +1866,12 @@ class Engine:
                     reserved_bindings=self._reserved_bindings,
                     posture=self._hop_posture,
                     trust_anchor_policy=self._trust_anchor_policy,
+                    # The running engine's own escape, so the toggle never refuses a cleartext
+                    # listener this engine already accepted (vault BACKLOG #2622 item 1).
+                    allow_insecure_bind=self._allow_insecure_bind,
+                    # And the runner's own view of which listeners it binds, so a toggle is not
+                    # refused for one it leaves down. Taken on the loop, before the worker thread.
+                    exposure_gated=binds_listener,
                 )
 
             connections_edit.upsert_connection(cfg_dir, match, validate=validate)
@@ -1882,6 +1888,10 @@ class Engine:
             before = None
             if isinstance(loaded_fp, str):
                 before, _reason = await self.fingerprint_bundle(cfg_dir)
+            # Vault BACKLOG #2622 item 1: the validate callback reads this from the worker thread, so
+            # the runner's listening set is snapshotted here, on the loop. None = the offline test.
+            live = self._registry_runner
+            binds_listener = live.listener_bind_predicate() if live is not None else None
             await asyncio.to_thread(_write)
 
             # Reflect it live, in place (cosmetic field only — no connector rebuild, no reload).
@@ -2161,6 +2171,10 @@ class Engine:
                 fifo_claim_batch=self._fifo_claim_batch,
                 inbound_bind_host=self._inbound_bind_host,
                 reserved_bindings=self._reserved_bindings,
+                # build_check now runs the inbound exposure gates (vault BACKLOG #2622 item 1), so
+                # the throwaway checker needs the engine's escape or a dry run refuses what a real
+                # reload accepts.
+                allow_insecure_bind=self._allow_insecure_bind,
                 delivery_defaults=self._delivery_defaults,
                 ordering_default=self._ordering_default,
                 internal_error_default=self._internal_error_default,

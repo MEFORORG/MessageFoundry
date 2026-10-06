@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -474,6 +475,169 @@ async def test_runner_refuses_non_loopback_plaintext_mllp(store: MessageStore) -
     )
     with pytest.raises(WiringError, match="without TLS"):
         await runner._start_inbound_unsafe("mllp_in")
+
+
+def _off_loopback_plaintext_mllp(**lifecycle: Any) -> Registry:
+    reg = Registry()
+    reg.add_inbound(
+        InboundConnection(
+            "mllp_in", ConnectionSpec(ConnectorType.MLLP, {"port": 0}), router="r", **lifecycle
+        )
+    )
+    reg.add_router("r", lambda m: [])
+    return reg
+
+
+async def test_build_check_refuses_what_start_refuses(store: MessageStore) -> None:
+    # Vault BACKLOG #2622 item 1: the inbound exposure gates ran only at listener start, so the
+    # offline build check (the one `messagefoundry check`, reload and promote run) passed a
+    # cleartext off-loopback listener that start then refused. Both arms must now refuse it, with
+    # the same message, under the same enforcing posture.
+    from messagefoundry.config.tls_policy import HopPosture
+    from messagefoundry.pipeline.wiring_runner import build_check_registry
+
+    reg = _off_loopback_plaintext_mllp()
+    enforcing = HopPosture(enforcing=True)
+    runner = RegistryRunner(
+        reg,
+        store,
+        inbound_bind_host="0.0.0.0",
+        poll_interval=0.02,
+        egress=EgressSettings(deny_by_default=False),
+        hop_posture=enforcing,
+    )
+    with pytest.raises(WiringError, match="without TLS") as at_start:
+        await runner._start_inbound_unsafe("mllp_in")
+    with pytest.raises(WiringError, match="without TLS") as at_check:
+        build_check_registry(
+            reg,
+            inbound_bind_host="0.0.0.0",
+            env_values={},
+            egress=EgressSettings(deny_by_default=False),
+            posture=enforcing,
+        )
+    # The build check adds why the whole config stops on it, and the two settings that leave it down.
+    assert str(at_check.value).startswith(str(at_start.value))
+    assert "'mllp_in' would be bound" in str(at_check.value)
+    assert "deployed = false" in str(at_check.value) and "auto_start = false" in str(at_check.value)
+    # The bind host is what makes it exposed: on loopback the same graph builds clean.
+    build_check_registry(
+        reg,
+        inbound_bind_host="127.0.0.1",
+        env_values={},
+        egress=EgressSettings(deny_by_default=False),
+        posture=enforcing,
+    )
+
+
+async def test_runner_build_check_carries_the_engines_own_escape(store: MessageStore) -> None:
+    # A reload build-checks through RegistryRunner.build_check. An engine started with the cleartext
+    # escape on a non-enforcing instance accepted this listener, so its reload must not refuse it.
+    # Withholding the escape is the control: the same runner shape then refuses, so the pass above
+    # is the escape reaching the gate and not the gate never running.
+    from messagefoundry.config.tls_policy import HopPosture
+
+    reg = _off_loopback_plaintext_mllp()
+
+    def _runner(allow: bool) -> RegistryRunner:
+        return RegistryRunner(
+            reg,
+            store,
+            inbound_bind_host="0.0.0.0",
+            poll_interval=0.02,
+            egress=EgressSettings(deny_by_default=False),
+            hop_posture=HopPosture(enforcing=False),
+            allow_insecure_bind=allow,
+        )
+
+    _runner(True).build_check(reg)  # no raise: warned and crossed, as at start
+    with pytest.raises(WiringError, match="without TLS"):
+        _runner(False).build_check(reg)
+
+
+def _strict_runner(reg: Registry, store: MessageStore, **kw: Any) -> RegistryRunner:
+    """An off-loopback runner with no cleartext escape, so an exposure gate that runs refuses."""
+    from messagefoundry.config.tls_policy import HopPosture
+
+    return RegistryRunner(
+        reg,
+        store,
+        inbound_bind_host="0.0.0.0",
+        poll_interval=0.02,
+        egress=EgressSettings(deny_by_default=False),
+        hop_posture=HopPosture(enforcing=True),
+        **kw,
+    )
+
+
+async def test_build_check_skips_the_exposure_gates_for_a_listener_start_leaves_down(
+    store: MessageStore,
+) -> None:
+    # Vault BACKLOG #2622 item 1, review round 3. Engine start binds no deployed listener with
+    # auto_start = false, so it never meets the gate. The build check ran the gates on it anyway, so
+    # a reload, flag toggle, connection edit or DR activation was refused where start was clean.
+    # Both arms now use one predicate. The auto_start = true control shows the gate still runs.
+    from messagefoundry.pipeline.wiring_runner import build_check_registry, inbound_listener_starts
+
+    def _offline(reg: Registry) -> None:
+        build_check_registry(
+            reg,
+            inbound_bind_host="0.0.0.0",
+            env_values={},
+            egress=EgressSettings(deny_by_default=False),
+            posture=None,
+        )
+
+    down = _off_loopback_plaintext_mllp(auto_start=False)
+    assert not inbound_listener_starts(down.inbound["mllp_in"])
+    _offline(down)
+    _strict_runner(down, store).build_check(down)
+    up = _off_loopback_plaintext_mllp()
+    assert inbound_listener_starts(up.inbound["mllp_in"])
+    with pytest.raises(WiringError, match="without TLS"):
+        _offline(up)
+    with pytest.raises(WiringError, match="without TLS"):
+        _strict_runner(up, store).build_check(up)
+
+
+async def test_reload_build_check_gates_an_operator_started_listener(store: MessageStore) -> None:
+    # A reload keeps an operator's start: it rebinds a listening auto_start = false listener. So the
+    # live runner's build check gates that one, while the same listener left down passes.
+    reg = _off_loopback_plaintext_mllp(auto_start=False)
+    runner = _strict_runner(reg, store)
+    runner.build_check(reg)
+    # Stand in for an operator start without binding a socket: _sources is what reload reads.
+    runner._sources["mllp_in"] = cast(SourceConnector, object())
+    try:
+        with pytest.raises(WiringError, match="without TLS"):
+            runner.build_check(reg)
+    finally:
+        runner._sources.pop("mllp_in")
+
+
+async def test_runner_build_check_skips_a_dr_parked_listener_but_gates_a_scheduled_one(
+    store: MessageStore,
+) -> None:
+    # Start and reload both leave a listener the DR run-profile parks unbound, so the runner's build
+    # check skips it. A listener outside its schedule window is different: the engine's scheduler
+    # binds it when the window opens, with no operator involved, so it is gated whatever the clock
+    # says. Otherwise a reload at noon would pass what the same reload at 08:30 refuses.
+    from datetime import UTC, datetime, time
+
+    from messagefoundry.config.models import ActiveWindow, Priority, Schedule
+
+    low = _off_loopback_plaintext_mllp(priority=Priority.LOW)
+    _strict_runner(low, store, dr_threshold=Priority.CRITICAL).build_check(low)
+    with pytest.raises(WiringError, match="without TLS"):  # control: no DR profile, it would bind
+        _strict_runner(low, store).build_check(low)
+
+    window = Schedule(
+        windows=[ActiveWindow(days=frozenset({0}), start=time(8), end=time(9), timezone="UTC")]
+    )
+    scheduled = _off_loopback_plaintext_mllp(schedule=window)
+    monday_noon = datetime(2026, 7, 13, 12, tzinfo=UTC)  # a Monday, outside 08:00-09:00
+    with pytest.raises(WiringError, match="without TLS"):
+        _strict_runner(scheduled, store, schedule_clock=lambda: monday_noon).build_check(scheduled)
 
 
 async def test_pipeline_handler_exception_logs_no_phi(store: MessageStore, tmp_path: Path) -> None:
