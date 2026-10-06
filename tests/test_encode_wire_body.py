@@ -46,7 +46,7 @@ def _escapes(ch: str) -> list[str]:
         ch,
         ch.encode("unicode_escape").decode("ascii"),  # '\xe9' / '病'
         f"{ord(ch):x}",  # 'e9' / '75c5'
-        f"\\u{ord(ch):04x}",  # 'é': a \u escape below U+0100, which unicode_escape never writes
+        f"\\u{ord(ch):04x}",  # '\\u00e9': a \u escape below U+0100, which unicode_escape never writes
         repr(ch),
     ]
 

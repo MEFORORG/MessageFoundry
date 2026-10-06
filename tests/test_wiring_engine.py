@@ -1232,11 +1232,12 @@ async def test_an_unguarded_encode_stores_no_character_of_the_message(
         reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
     )
     await runner.start()
-    await runner._destinations["file_out"].aclose()
-    runner._destinations["file_out"] = _BareEncoder()
-    # U+015A: its bare hex, 15a, holds a letter, so no decimal position can match it.
-    (inbox / "a.hl7").write_bytes(ADT.replace("JANE", "JANŚ").encode("utf-8"))
     try:
+        replaced = runner._destinations["file_out"]
+        runner._destinations["file_out"] = _BareEncoder()
+        await replaced.aclose()
+        # U+015A: its bare hex, 15a, holds a letter, so no decimal position can match it.
+        (inbox / "a.hl7").write_bytes(ADT.replace("JANE", "JAN\u015a").encode("utf-8"))
         await _until_stat(store, OutboxStatus.DEAD.value, 1)
     finally:
         await runner.stop()
@@ -1248,7 +1249,7 @@ async def test_an_unguarded_encode_stores_no_character_of_the_message(
     }
     for where, text in stored.items():
         assert "UnicodeEncodeError: 'ascii' codec cannot encode at position" in text, where
-        for form in (*_escapes("Ś"), "JAN"):
+        for form in (*_escapes("\u015a"), "JAN"):
             assert form not in text, f"a character of the message reached {where} as {form!r}"
 
 

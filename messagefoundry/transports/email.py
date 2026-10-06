@@ -502,10 +502,10 @@ class EmailDestination(DestinationConnector):
         encode_wire_body(payload, self.encoding, transport=f"Email {self.host}:{self.port}")
         msg = EmailMessage()
         # The headers and the body get separate arms, so a header fault is never reported as the
-        # body's (vault BACKLOG #3033). Load refuses a subject or sender a header cannot encode, so
-        # this arm is a backstop for one that got past that. Every row would fail the same way, so it
-        # is the connection's fault: config_fault stops the lane and keeps the queue rather than
-        # dead-lettering each message as a bad body.
+        # body's (vault BACKLOG #3033). Load refuses a subject, sender or recipient a header cannot
+        # encode, so this arm is a backstop for one that got past that. Every row would fail the same
+        # way, so it is the connection's fault: config_fault, which the delivery worker handles under
+        # credential_fault_policy, rather than a bad body dead-lettered one message at a time.
         failure = ""
         try:
             msg["Subject"] = self.subject
@@ -514,8 +514,8 @@ class EmailDestination(DestinationConnector):
             failure = type(exc).__name__
         if failure:
             raise NegativeAckError(
-                f"Email {self.host}:{self.port}: a configured header (subject or sender) could not "
-                f"be encoded ({failure})",
+                f"Email {self.host}:{self.port}: a configured header (subject, sender or "
+                f"recipients) could not be encoded ({failure})",
                 code="encoding",
                 permanent=True,
                 config_fault=True,

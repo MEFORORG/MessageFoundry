@@ -1527,7 +1527,7 @@ async def test_a_subject_fault_is_not_reported_as_the_body(wire: _WireCapture) -
     with pytest.raises(NegativeAckError) as ei:
         await dest.send(PAYLOAD)
     exc = ei.value
-    assert "header (subject or sender)" in str(exc)
+    assert "a configured header (subject, sender or recipients)" in str(exc)
     assert "the message could not be encoded" not in str(exc)
     assert exc.config_fault is True and exc.permanent is True
     assert exc.__cause__ is None and exc.__context__ is None

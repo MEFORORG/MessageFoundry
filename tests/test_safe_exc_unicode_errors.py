@@ -17,7 +17,7 @@ from tests.test_encode_wire_body import _escapes
 
 #: Synthetic. Distinctive enough that a substring scan of the output cannot miss them.
 #: Its bare hex, ``15a``, holds a letter, so no decimal position in the output can match it.
-_CHAR = "Ś"  # S with acute: not ASCII, not latin-1
+_CHAR = "\u015a"  # S with acute: not ASCII, not latin-1
 _BYTE = 0xFE  # never valid in UTF-8
 _PREFIX = "PID|1||ZZQ"
 _TEXT = f"{_PREFIX}{_CHAR}X"
@@ -111,13 +111,52 @@ def test_a_charmap_encode_names_its_codec() -> None:
     "exc",
     [
         UnicodeError(f"label too long: {_TEXT}"),
-        UnicodeEncodeError("ascii", _TEXT, _POSITION, _POSITION, "empty span"),
         UnicodeDecodeError("utf-8", _TEXT.encode(), 5, 2, "backwards"),
     ],
-    ids=["bare-UnicodeError", "empty-span", "end-before-start"],
+    ids=["bare-UnicodeError", "end-before-start"],
 )
 def test_odd_attributes_fall_back_to_the_class_name(exc: UnicodeError) -> None:
     assert safe_exc(exc) == type(exc).__name__
+
+
+def test_an_empty_span_still_names_codec_and_position() -> None:
+    # Windows mbcs raises with start == end, so an empty span is a real shape, not an odd one.
+    exc = UnicodeEncodeError("mbcs", _TEXT, _POSITION, _POSITION, "invalid character")
+    assert safe_exc(exc) == (
+        f"UnicodeEncodeError: 'mbcs' codec cannot encode at position {_POSITION}: invalid character"
+    )
+
+
+def test_a_stdlib_codec_whose_label_is_not_a_lookup_name_is_still_named() -> None:
+    # unicode_escape reports itself as "unicodeescape", which codecs.lookup does not answer to.
+    with pytest.raises(UnicodeDecodeError) as caught:
+        (_PREFIX.encode() + b"\\x4").decode("unicode_escape")
+    assert caught.value.encoding == "unicodeescape"
+    assert "'unicodeescape' codec cannot decode at positions" in safe_exc(caught.value)
+
+
+def test_a_reason_that_only_compares_equal_to_a_listed_phrase_is_dropped() -> None:
+    class _Lookalike(str):
+        def __eq__(self, other: object) -> bool:
+            return True
+
+        def __hash__(self) -> int:
+            return hash("surrogates not allowed")
+
+    exc = UnicodeEncodeError("ascii", _TEXT, _POSITION, _POSITION + 1, "x")
+    # A single non-ASCII character: no redact() pattern removes it, so only the type check can.
+    exc.reason = _Lookalike(f"note {_CHAR}")
+    text = safe_exc(exc)
+    _assert_no_content(text)
+    assert "note" not in text
+
+
+def test_an_ordinal_reason_with_other_digits_is_dropped() -> None:
+    for digits in ("5551234", "１２８"):
+        exc = UnicodeEncodeError(
+            "ascii", _TEXT, _POSITION, _POSITION + 1, f"ordinal not in range({digits})"
+        )
+        assert digits not in safe_exc(exc)
 
 
 def test_an_encoding_attribute_not_shaped_like_a_codec_is_dropped() -> None:
@@ -141,10 +180,11 @@ def test_a_reason_that_quotes_the_input_is_dropped() -> None:
     """The stdlib idna codec puts the offending character INTO ``.reason``, so a reason is kept
     only from a fixed list. Measured on Python 3.14: ``Invalid character '\\ue000'``."""
     with pytest.raises(UnicodeError) as caught:
-        f"doe{_CHAR}jane.example".encode("idna")
+        f"doe{_CHAR}\ue000jane.example".encode("idna")
+    assert "\\ue000" in str(caught.value), "the probe must quote the character, or it tests nothing"
     text = safe_exc(caught.value)
     _assert_no_content(text)
-    for form in _escapes(""):
+    for form in _escapes("\ue000"):
         assert form not in text, f"the reason leaked the character as {form!r}: {text!r}"
     assert "doe" not in text and "jane" not in text
 
