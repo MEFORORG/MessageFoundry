@@ -451,7 +451,11 @@ def _reload_path(
         return None
     prior = reload_refusal(key, fingerprint)
     shown = next((h.configured_path for _, h in stale if h.configured_path), path)
-    label = crl_label(shown, next((h.setting for _, h in stale if h.setting), None))
+    # Every knob that holds the file, sorted: naming only the first sent an operator to one hop of
+    # several, and an order-dependent label changed the reason a repeat refusal is compared on.
+    # A context that loaded the file twice already holds "A and B" (loaded_crls._both).
+    held_by = sorted({part for _, h in stale if h.setting for part in h.setting.split(" and ")})
+    label = crl_label(shown, " and ".join(held_by) or None)
     refusals = _Refusals()
     reloaded = 0
     blocks: tuple[CrlBlock, ...] = ()  # stays empty when the bytes cannot be judged

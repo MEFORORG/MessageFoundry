@@ -336,7 +336,7 @@ def test_control_the_planted_bundle_loaded_by_path_admits_the_planted_client(
 @pytest.mark.parametrize(
     ("build", "name"),
     [
-        pytest.param(_mllp_listener, "adt-in", id="mllp-and-http-listener"),
+        pytest.param(_mllp_listener, "adt-in", id="mllp-builder"),
         pytest.param(_dicom_listener, "pacs-in", id="dicom-scp"),
     ],
 )

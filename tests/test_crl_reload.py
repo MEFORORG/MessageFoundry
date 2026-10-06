@@ -560,6 +560,30 @@ def test_a_context_stops_taking_reloads_at_the_cap(pki: _Pki) -> None:
     assert _accepts(hop, pki.server())
 
 
+def test_a_refusal_names_every_setting_that_holds_the_file(pki: _Pki) -> None:
+    """Vault BACKLOG #1997: inbound listeners now record their connection's ``tls_crl_file``, so two
+    listeners sharing one CRL hold two settings. The refusal names both, in a fixed order, rather
+    than whichever context the pass met first."""
+    hops = []
+    for setting in (
+        "inbound connection 'b-in' tls_crl_file",
+        "inbound connection 'a-in' tls_crl_file",
+    ):
+        ctx = pki.server()
+        ctx.load_verify_locations(cadata=pki.ca_pem.decode("ascii"))
+        ctx.verify_mode = ssl.CERT_REQUIRED
+        harden_crl_check(ctx, str(pki.crl), setting=setting)
+        hops.append(ctx)
+    pki.crl.write_bytes(pki.crl_pem(issued=10 * _DAY, lasts=-_DAY))
+    outcome = _reload(pki)
+    assert outcome is not None and outcome.refusal is not None
+    assert (
+        "inbound connection 'a-in' tls_crl_file and inbound connection 'b-in' tls_crl_file"
+        in outcome.refusal.reason
+    ), outcome.refusal.reason
+    assert len(hops) == 2  # both contexts stay alive, so both hold the file during the pass
+
+
 def test_a_refusal_names_the_configured_path(pki: _Pki) -> None:
     hop = pki.outbound_hop()
     pki.crl.write_bytes(pki.crl_pem(issued=10 * _DAY, lasts=-_DAY))
