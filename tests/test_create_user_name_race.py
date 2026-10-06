@@ -382,3 +382,59 @@ def test_the_cli_reports_a_server_backends_integrity_refusal_as_a_refused_write(
     error = json.loads(capsys.readouterr().out)["error"]
     assert rc == 1
     assert error.startswith("the store refused one of this command's writes")
+
+
+# Driver-shaped text, one per backend family. Each fragment names schema or a key value the CLI must
+# not print: the constraint, the table and column, and the duplicate value itself. The value is a
+# synthetic marker rather than the username, so its absence cannot be confused with the username
+# simply not being echoed anywhere else.
+_SQLITE_DRIVER_TEXT = "UNIQUE constraint failed: users.username"
+_SERVER_DRIVER_TEXT = (
+    'duplicate key value violates unique constraint "users_username_key"\n'
+    "DETAIL:  Key (username)=(zz-dup-key-value-7731) already exists."
+)
+_DRIVER_FRAGMENTS = (
+    "UNIQUE constraint failed",
+    "users.username",
+    "users_username_key",
+    "Key (username)",
+    "zz-dup-key-value-7731",
+    "duplicate key value",
+)
+
+
+@pytest.mark.parametrize("as_json", [True, False], ids=["json", "text"])
+@pytest.mark.parametrize(
+    ("raised", "class_name"),
+    [
+        (sqlite3.IntegrityError(_SQLITE_DRIVER_TEXT), "IntegrityError"),
+        (UniqueViolationError(_SERVER_DRIVER_TEXT), "UniqueViolationError"),
+    ],
+    ids=["sqlite", "server"],
+)
+def test_the_cli_refused_write_names_the_class_and_never_the_driver_text(
+    raised: Exception,
+    class_name: str,
+    as_json: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The refused-write arm sits ahead of the CLI's redaction floor, which never formats the
+    # exception. So it must not print what that floor would not: the arm once interpolated the
+    # exception, and safe_exc would not help, because it keeps schema names and key values.
+    db = _cli_ready(tmp_path, monkeypatch)
+
+    async def refused(self: MessageStore, **_kwargs: object) -> None:
+        raise raised
+
+    monkeypatch.setattr(MessageStore, "create_user", refused)
+    argv = ["provision-admin", "--username", "site-admin", "--db", str(db)]
+    rc = main(argv + (["--json"] if as_json else []))
+    captured = capsys.readouterr()
+    assert rc == 1
+    error = json.loads(captured.out)["error"] if as_json else captured.err.rsplit("error: ", 1)[1]
+    assert error.startswith(f"the store refused one of this command's writes ({class_name})")
+    for fragment in _DRIVER_FRAGMENTS:
+        assert fragment not in captured.out, fragment
+        assert fragment not in captured.err, fragment

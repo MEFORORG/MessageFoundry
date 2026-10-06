@@ -6770,9 +6770,15 @@ def _provision_admin(args: argparse.Namespace) -> int:
 
     def refused_write(exc: Exception) -> int:
         """An integrity refusal the service did not name (BACKLOG #2697). Exit 1, this command's
-        refusal. Any write can raise one, so the text does not say how far the run got."""
+        refusal. Any write can raise one, so the text does not say how far the run got.
+
+        Names the exception CLASS only, never its text. The driver's message carries the constraint,
+        the table and the duplicate key value, and ``safe_exc`` keeps all three: it redacts PHI
+        shapes, not schema names or a username. This arm sits ahead of the CLI floor, which never
+        formats the exception, so it must not print what that floor would not."""
         return _emit_error(
-            f"the store refused one of this command's writes ({exc}), so the Administrator may be "
+            f"the store refused one of this command's writes ({type(exc).__name__}), so the "
+            "Administrator may be "
             "missing or incomplete. Once no other provision-admin run is in progress, run the "
             "command again: it completes a partly written account, or says why it cannot. If it "
             "is refused the same way again, the store has a fault this command cannot repair",
