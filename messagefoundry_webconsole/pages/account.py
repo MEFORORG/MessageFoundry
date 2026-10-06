@@ -37,6 +37,7 @@ __all__ = [
     "password_page",
     "reauth",
     "reauth_continue",
+    "reauth_nothing_ran",
     "reauth_idp",
     "sessions_page",
     "sso_challenge",
@@ -516,6 +517,28 @@ def mfa_gate(
         class_="card",
     )
     return page("Second factor", body, nav=minimal_nav())
+
+
+def reauth_nothing_ran(label: str, landing: str) -> Markup:
+    """After a successful step-up whose action this session was NOT issued (vault BACKLOG #2764):
+    the confirmation counted, the action did not run, and the page says so in as many words.
+
+    A bare redirect to the console would read as the action done to an operator whose issued entry
+    lapsed while they found their authenticator. ``landing`` is a fixed console page, never input.
+    """
+    body = el(
+        "div",
+        el("h1", "Verified"),
+        el("p", "Nothing ran: ", el("strong", label), class_="muted"),
+        el(
+            "p",
+            "Your sign-in is confirmed, but this action was not started from this session, or its"
+            " confirmation expired. Start it again from the console if you meant to.",
+        ),
+        el("p", el("a", "Return to the console", href=landing)),
+        class_="card",
+    )
+    return page("Verified", body, nav=minimal_nav())
 
 
 def reauth_continue(next_path: str, label: str) -> Markup:

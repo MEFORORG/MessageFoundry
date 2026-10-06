@@ -484,7 +484,7 @@ async def test_a_session_that_proved_its_code_at_reauth_can_end_sessions(
     The console's own path for an enrolled, pending session: ``/ui/reauth`` takes the code, then the
     password, then mints. That must still end the other sessions.
     """
-    service = await _service(engine)
+    service = await _service(engine, admin_write_min_interval_seconds=0)
     await _add(service, "op", Role.OPERATOR)
     t0 = 1_000_000.0
     _pin_totp_clock(monkeypatch, t0)
@@ -528,7 +528,7 @@ async def test_an_account_with_no_factor_still_ends_sessions_from_a_pending_sess
     A fresh account is pending under the default ``require_mfa`` and has no code to give. The
     password-only re-proof is its only way to end a session it does not recognise.
     """
-    service = await _service(engine)
+    service = await _service(engine, admin_write_min_interval_seconds=0)
     await _add(service, "op", Role.OPERATOR)
     other = await service.login("op", PW)
     assert other.ok and other.token is not None

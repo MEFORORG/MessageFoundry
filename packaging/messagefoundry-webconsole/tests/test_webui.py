@@ -3157,12 +3157,14 @@ def test_register_ui_action_rejects_auto_retry_and_unlock() -> None:
     from messagefoundry_webconsole import register_ui_action
     from messagefoundry_webconsole._auth import UiWriteAction
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="auto_retry"):
         register_ui_action(
             r"^/ui/bad$", Permission.USERS_MANAGE, auto_retry=True, unlock=True, label="Bad"
         )
-    with pytest.raises(ValueError):
-        UiWriteAction(re.compile(r"^/ui/bad$"), Permission.USERS_MANAGE, True, True, True)
+    with pytest.raises(ValueError, match="auto_retry"):
+        UiWriteAction(
+            re.compile(r"^/ui/bad$"), Permission.USERS_MANAGE, True, True, True, label="Bad"
+        )
 
 
 async def test_reauth_form_renders_for_unlock_next(engine: Engine) -> None:
@@ -3264,47 +3266,55 @@ async def _stale_window_service(engine: Engine) -> AuthService:
 
 
 _REPLAY_ALL = "/ui/dead-letters/replay-all"
+_REPLAY_ONE = "/ui/messages/abc/replay"
+_SFS_SAME = {"Sec-Fetch-Site": "same-origin"}
+
+
+async def _reauth(c: httpx.AsyncClient, next_path: str) -> httpx.Response:
+    return await c.post("/ui/reauth", data={"next": next_path, "password": PW}, headers=_SFS_SAME)
+
+
+def _nothing_ran(r: httpx.Response, label: str) -> bool:
+    """The re-auth succeeded and said, by name, that the action did not run (no auto-submit)."""
+    return (
+        r.status_code == 200
+        and "Nothing ran" in r.text
+        and label in r.text
+        and "data-autosubmit" not in r.text
+        and 'href="/ui"' in r.text
+    )
 
 
 async def test_reauth_auto_submits_an_issued_continuation_once(engine: Engine) -> None:
     """Vault BACKLOG #2764: the continuation the step-up gate issued auto-submits ONCE.
 
-    RED when POST /ui/reauth auto-submits without consuming the record (the second POST would get
-    the form again), or when the gate stops recording what it hands out (the first would not)."""
+    RED when POST /ui/reauth auto-submits without consuming the record (the second POST would
+    auto-submit again), or when the gate stops recording what it hands out (the first would not)."""
     service = await _stale_window_service(engine)
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")
-        refused = await c.post(_REPLAY_ALL, headers={"Sec-Fetch-Site": "same-origin"})
+        refused = await c.post(_REPLAY_ALL, headers=_SFS_SAME)
         assert refused.status_code == 303
         assert refused.headers["location"] == f"/ui/reauth?next={_REPLAY_ALL}"
         form = await c.get(refused.headers["location"])
-        assert "Confirm it&#x27;s you to: " in form.text or "Confirm it's you to: " in form.text
+        assert "you to: " in form.text
         assert "Replay all dead letters" in form.text  # the page NAMES the action
         assert "nothing will run" not in form.text
-        first = await c.post(
-            "/ui/reauth",
-            data={"next": _REPLAY_ALL, "password": PW},
-            headers={"Sec-Fetch-Site": "same-origin"},
-        )
+        first = await _reauth(c, _REPLAY_ALL)
         assert first.status_code == 200
         assert "data-autosubmit" in first.text  # the same-origin auto-submit POST form
         assert f'action="{_REPLAY_ALL}"' in first.text
         assert "Replay all dead letters" in first.text  # the continuation names it too
-        second = await c.post(
-            "/ui/reauth",
-            data={"next": _REPLAY_ALL, "password": PW},
-            headers={"Sec-Fetch-Site": "same-origin"},
-        )
-        assert second.status_code == 303 and second.headers["location"] == "/ui"
-        assert "data-autosubmit" not in second.text
+        second = await _reauth(c, _REPLAY_ALL)
+        assert _nothing_ran(second, "Replay all dead letters")
 
 
 async def test_reauth_does_not_auto_submit_a_next_the_server_did_not_issue(engine: Engine) -> None:
     """Vault BACKLOG #2764, the finding itself: a typed, bookmarked or clicked
     ``/ui/reauth?next=<registered destructive action>`` (Sec-Fetch-Site: none) still lets the operator
-    re-authenticate, says nothing will run, and lands on the console with no auto-submit and no
-    ADR 0077 grant for the named action."""
+    re-authenticate, says nothing will run, and ends on a page saying nothing ran, with no
+    auto-submit."""
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
@@ -3316,13 +3326,7 @@ async def test_reauth_does_not_auto_submit_a_next_the_server_did_not_issue(engin
         assert "Replay all dead letters" in form.text
         assert "nothing will run" in form.text
         assert "data-autosubmit" not in form.text
-        r = await c.post(
-            "/ui/reauth",
-            data={"next": _REPLAY_ALL, "password": PW},
-            headers={"Sec-Fetch-Site": "same-origin"},
-        )
-        assert r.status_code == 303 and r.headers["location"] == "/ui"
-        assert "data-autosubmit" not in r.text
+        assert _nothing_ran(await _reauth(c, _REPLAY_ALL), "Replay all dead letters")
 
 
 async def test_reauth_no_purpose_grant_for_an_unissued_factor_next(engine: Engine) -> None:
@@ -3332,12 +3336,8 @@ async def test_reauth_no_purpose_grant_for_an_unissued_factor_next(engine: Engin
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")
-        r = await c.post(
-            "/ui/reauth",
-            data={"next": "/ui/account/sessions/revoke-others", "password": PW},
-            headers={"Sec-Fetch-Site": "same-origin"},
-        )
-        assert r.status_code == 303 and r.headers["location"] == "/ui"
+        r = await _reauth(c, "/ui/account/sessions/revoke-others")
+        assert _nothing_ran(r, "Sign out all your other sessions")
         tok = c.cookies.get("mf_session")
         assert tok is not None
         assert await service.has_action_step_up(tok, "session_terminate") is False
@@ -3351,46 +3351,72 @@ async def test_another_session_cannot_consume_an_issued_continuation(engine: Eng
     async with _client(engine, service) as a, _client(engine, service) as b:
         await _cookie_login(a, "op")
         await _cookie_login(b, "op")
-        refused = await a.post(_REPLAY_ALL, headers={"Sec-Fetch-Site": "same-origin"})
+        refused = await a.post(_REPLAY_ALL, headers=_SFS_SAME)
         assert refused.status_code == 303
-        other = await b.post(
-            "/ui/reauth",
-            data={"next": _REPLAY_ALL, "password": PW},
-            headers={"Sec-Fetch-Site": "same-origin"},
-        )
-        assert other.status_code == 303 and other.headers["location"] == "/ui"
-        own = await a.post(
-            "/ui/reauth",
-            data={"next": _REPLAY_ALL, "password": PW},
-            headers={"Sec-Fetch-Site": "same-origin"},
-        )
+        assert _nothing_ran(await _reauth(b, _REPLAY_ALL), "Replay all dead letters")
+        own = await _reauth(a, _REPLAY_ALL)
         assert own.status_code == 200 and "data-autosubmit" in own.text
 
 
-async def test_a_same_site_refusal_issues_no_continuation(engine: Engine) -> None:
-    """A sibling host's POST carries the SameSite=Strict cookie, so the gate can see it. It is
-    refused before it can issue anything: a cross-origin page must not be able to mint the record
-    that authorises an auto-submit."""
+async def test_a_sessions_other_continuations_follow_its_rotation(engine: Engine) -> None:
+    """Two tabs of one session, each refused for its own action, share one cookie. The first tab's
+    re-auth rotates the token, so the second tab's issued entry must move with it, or its
+    re-auth would end with nothing run after a page that said it would continue."""
     service = await _stale_window_service(engine)
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")
-        await c.post(_REPLAY_ALL, headers={"Sec-Fetch-Site": "same-site"})
-        r = await c.post(
-            "/ui/reauth",
-            data={"next": _REPLAY_ALL, "password": PW},
-            headers={"Sec-Fetch-Site": "same-origin"},
-        )
-        assert r.status_code == 303 and r.headers["location"] == "/ui"
+        assert (await c.post(_REPLAY_ALL, headers=_SFS_SAME)).status_code == 303
+        assert (await c.post(_REPLAY_ONE, headers=_SFS_SAME)).status_code == 303
+        before = c.cookies.get("mf_session")
+        tab_a = await _reauth(c, _REPLAY_ALL)
+        assert tab_a.status_code == 200 and "data-autosubmit" in tab_a.text
+        assert c.cookies.get("mf_session") != before  # the password leg rotated the session
+        tab_b = await _reauth(c, _REPLAY_ONE)
+        assert tab_b.status_code == 200 and f'action="{_REPLAY_ONE}"' in tab_b.text
 
 
-def test_the_per_connection_purge_is_not_a_registered_continuation() -> None:
-    """Vault BACKLOG #2764 item 3: no page renders the per-name purge POST, so the re-auth
-    auto-submit must not be a browser entry point to it."""
-    from messagefoundry_webconsole import lookup_ui_action
+async def test_a_same_site_refusal_issues_no_continuation(engine: Engine) -> None:
+    """A sibling host's POST carries the SameSite=Strict cookie, so a gate can see it. A browser that
+    sends fetch metadata is refused by the /ui fetch-metadata middleware before any route runs; one
+    that sends only ``Origin`` (an older browser) reaches the route. On an MFA-PENDING session the
+    factor gate refuses it before ``require_ui`` asserts provenance, so the origin check inside the
+    issuing itself is what keeps that page from minting the record that authorises an auto-submit.
+    The same-origin control shows the instrument can see an issue."""
+    from messagefoundry_webconsole._auth import continuation_issued
 
-    assert lookup_ui_action("/ui/connections/OB_X/purge/all") is None
-    assert lookup_ui_action("/ui/connections/OB_X/purge/top") is None
+    service = AuthService(engine.store, AuthSettings(require_mfa=True, admin_new_ip_step_up=False))
+    await service.initialize()
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        tok = c.cookies.get("mf_session")
+        assert tok is not None and await service.mfa_satisfied(tok) is False  # pending
+        fetch_metadata = await c.post(_REPLAY_ALL, headers={"Sec-Fetch-Site": "same-site"})
+        assert fetch_metadata.status_code == 403  # the middleware, before any route
+        assert continuation_issued(tok, _REPLAY_ALL) is False
+        cross = await c.post(_REPLAY_ALL, headers={"Origin": "http://sibling.t"})
+        assert cross.status_code == 303
+        assert cross.headers["location"] == f"/ui/reauth?next={_REPLAY_ALL}"  # the MFA refusal
+        assert continuation_issued(tok, _REPLAY_ALL) is False
+        own = await c.post(_REPLAY_ALL, headers=_SFS_SAME)
+        assert own.status_code == 303
+        assert continuation_issued(tok, _REPLAY_ALL) is True
+
+
+def test_the_issued_table_bounds_each_session() -> None:
+    """A session that keeps getting refused holds at most the per-session cap, oldest dropped, so
+    it cannot crowd out another session's entries."""
+    from messagefoundry_webconsole import _auth
+
+    table = _auth._IssuedContinuations()
+    cap = _auth._REAUTH_CONTINUATIONS_PER_SESSION
+    table.issue("other-session", "/ui/messages/keep/replay")
+    for n in range(cap + 5):
+        table.issue("noisy-session", f"/ui/messages/{n}/replay")
+    assert not table.issued("noisy-session", "/ui/messages/0/replay")
+    assert table.issued("noisy-session", f"/ui/messages/{cap + 4}/replay")
+    assert table.issued("other-session", "/ui/messages/keep/replay")
 
 
 # --- L4a: users/RBAC admin (/ui/users, /ui/roles, /ui/ad-groups), #75 phase 4 ----------------------

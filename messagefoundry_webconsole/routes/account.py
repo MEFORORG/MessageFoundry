@@ -40,6 +40,7 @@ from .._auth import (
     clear_session_cookie,
     login_redirect_response,
     register_ui_action,
+    rekey_continuations,
     require_ui,
     require_ui_reauth_only,
     require_ui_reauth_only_action,
@@ -453,6 +454,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # session (ASVS 7.2.4), so this response must carry the new cookie or the operator is signed
         # out on the very page showing codes they have not written down yet.
         resp = HTMLResponse(pages.mfa_recovery_page(list(elevation.recovery_codes)))
+        rekey_continuations(token, elevation.token)  # vault BACKLOG #2764
         set_session_cookie(resp, elevation.token, request=request)
         return resp
 
@@ -649,6 +651,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # Enrolling a passkey marks the session MFA-satisfied, so it re-keys (ASVS 7.2.4). The page
         # follows `redirect` immediately, and that GET must carry the new cookie.
         resp = JSONResponse({"ok": True, "redirect": "/ui/account?m=passkey_added"})
+        rekey_continuations(token, elevation.token)  # vault BACKLOG #2764
         set_session_cookie(resp, elevation.token, request=request)
         return resp
 

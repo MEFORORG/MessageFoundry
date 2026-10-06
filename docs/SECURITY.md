@@ -1516,7 +1516,7 @@ else would need its own authorization rule stated here.
 1. `require_ui_step_up` answers a stale session with a **303 to `/ui/reauth`** instead of a 403 the
    browser cannot act on. The page names the action, and after the re-authentication it
    auto-submits a body-less action **only when a step-up gate issued that continuation to this
-   session**, once; any other `next` lands on the console with nothing run (vault BACKLOG #2764,
+   session**, once; any other `next` ends on a page saying nothing ran (vault BACKLOG #2764,
    [ADR 0065](adr/0065-web-ops-dashboard.md) amendment of 2026-10-06).
 2. **The `/ui` write path charges the per-actor admin-write floor in `require_ui` itself**, because
    the console calls the JSON handlers in-process and their pacing `Depends` never runs (see *The

@@ -291,8 +291,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     @app.post("/ui/connections/{name}/purge/{scope}")
     async def ui_purge_connection(
         # Annotated for the same reason as the three per-name controls in routes/core.py: the twin
-        # declares ConnectionName on this path segment, the console renders the name into the form
-        # action, and a hand-built URL is the only way to reach the 422 (BACKLOG #1740).
+        # declares ConnectionName on this path segment, and a hand-built URL is the only way to
+        # reach the 422 (BACKLOG #1740). No console page renders a form to this route; the console
+        # purges through /ui/connections/purge-confirm (vault BACKLOG #2764).
         name: ConnectionName,
         scope: str,
         request: Request,

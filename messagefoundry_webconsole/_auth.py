@@ -14,8 +14,9 @@ from __future__ import annotations
 import os
 import re
 import time
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import quote, urlsplit
 
 from fastapi import HTTPException, Request, Response, WebSocket, status
@@ -660,7 +661,7 @@ class UiWriteAction:
     Exactly one continuation style applies:
 
     * ``auto_retry`` — a URL-complete, **body-less POST** the re-auth flow may **re-POST** (auto-submit)
-      once the window is fresh (replay, purge, config-reload). The re-POST carries no body, so every
+      once the window is fresh (replay, config-reload). The re-POST carries no body, so every
       parameter must live in the PATH.
     * ``unlock`` — a **GET form page** (L4a admin forms) the re-auth flow may **303-GET-redirect** to
       after step-up, so the form re-opens inside a fresh window and the operator submits the body-carrying
@@ -688,7 +689,7 @@ class UiWriteAction:
     # Vault BACKLOG #2764: what the operator is confirming, in words, rendered on the re-auth page
     # ("Confirm it's you to: <label>") and on the continuation. A page that says only "this action"
     # cannot be checked by the person typing the password, so a registration without one is refused.
-    label: str = ""
+    label: str = field(kw_only=True)
 
     def __post_init__(self) -> None:
         # Guard against a mis-registration that would let the re-auth flow POST-auto-submit a GET form
@@ -731,7 +732,7 @@ def register_ui_action(
     exclusive — :class:`UiWriteAction` rejects both).
     """
     entry = UiWriteAction(
-        re.compile(pattern), permission, step_up, auto_retry, unlock, action, label
+        re.compile(pattern), permission, step_up, auto_retry, unlock, action, label=label
     )
     if not any(a.path_re.pattern == entry.path_re.pattern for a in _UI_WRITE_ACTIONS):
         _UI_WRITE_ACTIONS.append(entry)
@@ -762,12 +763,14 @@ register_ui_action(
 #: continuations, so the re-auth lands on the dashboard and the operator clicks again. Registered as
 #: an unlock page so ``/ui/reauth`` accepts it; ``/ui`` serves GET only, so this is no POST gadget.
 WRITE_REAUTH_LANDING = "/ui"
-register_ui_action(r"^/ui$", None, auto_retry=False, unlock=True, label="Open the dashboard")
+register_ui_action(
+    r"^/ui$", None, auto_retry=False, unlock=True, label="Continue to the console dashboard"
+)
 #: The landing for a session without ``monitoring:read``, which ``/ui`` would refuse: a custom role
 #: may hold a write permission without it (ADR 0045). Every signed-in session may load this page.
 ACCOUNT_REAUTH_LANDING = "/ui/account"
 register_ui_action(
-    r"^/ui/account$", None, auto_retry=False, unlock=True, label="Open your account page"
+    r"^/ui/account$", None, auto_retry=False, unlock=True, label="Continue to your account page"
 )
 #: ``GET /ui/reauth``'s own cap on ``next`` (its ``max_length``). A longer continuation would be
 #: answered 422 there, with no re-auth form.
@@ -861,9 +864,12 @@ def reauth_landing(identity: Identity) -> str:
 #: to type a password and a code, or to complete the identity provider's prompt; short because an
 #: entry that lapses costs only the auto-submit. The operator lands on the console and clicks again.
 REAUTH_CONTINUATION_TTL_SECONDS = 300.0
-#: Global bound on outstanding issued continuations. On overflow the OLDEST is evicted, which is
-#: fail-safe for the same reason a lapse is.
-_REAUTH_CONTINUATION_MAX = 4096
+#: Bounds on the issued-continuation table. A session holds at most this many (its oldest is dropped),
+#: so a session that keeps getting refused cannot crowd out anyone else's; the table holds at most
+#: this many sessions (the least recently issued is dropped). Each drop is fail-safe for the same
+#: reason a lapse is: it costs the auto-submit and nothing else.
+_REAUTH_CONTINUATIONS_PER_SESSION = 8
+_REAUTH_CONTINUATION_SESSIONS_MAX = 4096
 
 
 class _IssuedContinuations:
@@ -876,49 +882,72 @@ class _IssuedContinuations:
     (:func:`_reauth_redirect`), and ``/ui/reauth`` auto-submits only an entry recorded for the
     session presenting it, consuming it as it does (single use).
 
-    Keyed by ``(hash_token(session token), next)``, so the raw token is never held and a second
-    session cannot consume another's entry. A re-auth ROTATES the session token, so the ceremony
-    routes that rotate call :meth:`rekey`; a rotation this table did not see strands the entry, and a
-    stranded entry costs the auto-submit and nothing else. Process-local, bounded and TTL'd on the
-    monotonic clock, with the same per-process caveat as the engine's single-use step-up grants.
+    Keyed by ``hash_token(session token)`` and then ``next``, so the raw token is never held and a
+    second session cannot consume another's entry. The console routes that rotate a session's token
+    call :meth:`rekey`; a rotation this table did not see (the federated step-up callback, which
+    never holds the old token) strands the session's other entries, which costs their auto-submit
+    and nothing else. Process-local, bounded and TTL'd on the monotonic clock, with the same
+    per-process caveat as the engine's single-use step-up grants.
+
+    Both levels are ordered oldest-issued first. The TTL is constant, so issue order is deadline
+    order, and pruning and eviction read from the front instead of scanning the table.
     """
 
     def __init__(self) -> None:
-        self._entries: dict[tuple[str, str], float] = {}
+        self._sessions: OrderedDict[str, OrderedDict[str, float]] = OrderedDict()
 
     def _prune(self, now: float) -> None:
-        for key in [k for k, deadline in self._entries.items() if deadline <= now]:
-            del self._entries[key]
+        """Drop whole sessions from the front while their newest entry has lapsed."""
+        while self._sessions:
+            session_hash, entries = next(iter(self._sessions.items()))
+            if entries and next(reversed(entries.values())) > now:
+                return
+            del self._sessions[session_hash]
+
+    def _deadline(self, token: str | None, next_path: str, *, pop: bool) -> float | None:
+        if not token:
+            return None
+        session_hash = hash_token(token)
+        entries = self._sessions.get(session_hash)
+        if entries is None:
+            return None
+        if not pop:
+            return entries.get(next_path)
+        deadline = entries.pop(next_path, None)
+        if not entries:
+            del self._sessions[session_hash]
+        return deadline
 
     def issue(self, token: str, next_path: str) -> None:
         now = time.monotonic()
         self._prune(now)
-        key = (hash_token(token), next_path)
-        if key not in self._entries and len(self._entries) >= _REAUTH_CONTINUATION_MAX:
-            del self._entries[min(self._entries, key=self._entries.__getitem__)]
-        self._entries[key] = now + REAUTH_CONTINUATION_TTL_SECONDS
+        session_hash = hash_token(token)
+        entries = self._sessions.pop(session_hash, None) or OrderedDict()
+        entries.pop(next_path, None)  # re-issuing refreshes the entry and moves it to the back
+        entries[next_path] = now + REAUTH_CONTINUATION_TTL_SECONDS
+        while len(entries) > _REAUTH_CONTINUATIONS_PER_SESSION:
+            entries.popitem(last=False)
+        self._sessions[session_hash] = entries
+        while len(self._sessions) > _REAUTH_CONTINUATION_SESSIONS_MAX:
+            self._sessions.popitem(last=False)
 
     def issued(self, token: str | None, next_path: str) -> bool:
         """Whether a live entry exists for this session and ``next_path``. Does not consume it."""
-        if not token:
-            return False
-        deadline = self._entries.get((hash_token(token), next_path))
+        deadline = self._deadline(token, next_path, pop=False)
         return deadline is not None and deadline > time.monotonic()
 
     def consume(self, token: str | None, next_path: str) -> bool:
         """Pop the entry for this session and ``next_path``; whether it was live (single use)."""
-        if not token:
-            return False
-        deadline = self._entries.pop((hash_token(token), next_path), None)
+        deadline = self._deadline(token, next_path, pop=True)
         return deadline is not None and deadline > time.monotonic()
 
     def rekey(self, old_token: str | None, new_token: str | None) -> None:
         """Carry this session's entries across a token rotation, deadlines unchanged."""
         if not old_token or not new_token or old_token == new_token:
             return
-        old_hash, new_hash = hash_token(old_token), hash_token(new_token)
-        for h, next_path in [k for k in self._entries if k[0] == old_hash]:
-            self._entries[(new_hash, next_path)] = self._entries.pop((h, next_path))
+        entries = self._sessions.pop(hash_token(old_token), None)
+        if entries:
+            self._sessions[hash_token(new_token)] = entries
 
 
 _ISSUED_CONTINUATIONS = _IssuedContinuations()

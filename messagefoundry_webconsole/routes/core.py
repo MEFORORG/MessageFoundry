@@ -1389,6 +1389,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # must-change session proved its factor first and rotates next (BACKLOG #1954).
             target = "/ui/account/password" if identity.must_change_password else "/ui"
             resp = RedirectResponse(target, status_code=303)
+            rekey_continuations(token, elevation.token)  # vault BACKLOG #2764
             set_session_cookie(resp, elevation.token, request=request)
             return resp
         if elevation.session_lost:
@@ -1646,18 +1647,24 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             )
         token = pw_elevation.token  # rotation 2 of 2
         # Fully stepped up. Hand control back per the action's continuation style:
-        #  - an unlock target is a GET admin form → 303-GET-redirect so it re-opens inside the now
+        #  - an unlock target is a GET admin form: 303-GET-redirect so it re-opens inside the now
         #    fresh window; the operator then submits the body-carrying POST (incl. a create-user
         #    password) once, never crossing /ui/reauth (the stateless confirm-after-step-up path).
-        #  - a body-less POST action the console issued to this session → auto-retry it via the
+        #  - a body-less POST action the console issued to this session: auto-retry it via the
         #    same-origin submit form, spending the issue so it auto-submits once (#2764). Consumed
-        #    under the pre-rotation token, which is the key the entry still sits under.
-        #  - any other body-less POST action → the console, with nothing run.
+        #    under the pre-rotation token, which is the key the entry still sits under; the
+        #    session's other issued entries then follow the rotation.
+        #  - any other body-less POST action: a page that says nothing ran, so an operator whose
+        #    entry lapsed (TTL, restart, eviction) does not read the landing as the action done.
         if is_unlock_action(next_):
             return _keep_session(RedirectResponse(next_, status_code=303), token)
-        if consume_continuation(pre_rotation, next_):
+        issued = consume_continuation(pre_rotation, next_)
+        rekey_continuations(pre_rotation, token)
+        if issued:
             return _keep_session(HTMLResponse(pages.reauth_continue(next_, action.label)), token)
-        return _keep_session(RedirectResponse(reauth_landing(identity), status_code=303), token)
+        return _keep_session(
+            HTMLResponse(pages.reauth_nothing_ran(action.label, reauth_landing(identity))), token
+        )
 
     # ADR 0068 decision 6: the browser passkey leg of step-up. A cookie-authed JSON POST
     # (the sanctioned /ui carve — the cookie stays confined to /ui deps; bearer_token()

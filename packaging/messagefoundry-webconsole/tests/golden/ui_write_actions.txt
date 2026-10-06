@@ -1,5 +1,5 @@
-^/ui$	-	step_up=1,auto_retry=0,unlock=1	Open the dashboard
-^/ui/account$	-	step_up=1,auto_retry=0,unlock=1	Open your account page
+^/ui$	-	step_up=1,auto_retry=0,unlock=1	Continue to the console dashboard
+^/ui/account$	-	step_up=1,auto_retry=0,unlock=1	Continue to your account page
 ^/ui/account/mfa/confirm$	mfa_confirm	step_up=0,auto_retry=0,unlock=1	Confirm your authenticator app
 ^/ui/account/mfa/disable$	mfa_disable	step_up=1,auto_retry=1,unlock=0	Turn off your authenticator app
 ^/ui/account/mfa/enroll$	mfa_enroll	step_up=0,auto_retry=1,unlock=0	Set up an authenticator app

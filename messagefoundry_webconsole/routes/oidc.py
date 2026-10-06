@@ -71,6 +71,14 @@ from .._external import is_allowlisted, is_external, is_idn_disguised
 _log = logging.getLogger(__name__)
 
 
+def _label(next_path: str) -> str:
+    """The registered label for an already-validated continuation (vault BACKLOG #2764). Every
+    caller passes a path ``lookup_ui_action`` accepted; the fallback exists only so a future caller
+    that does not still names something rather than raising."""
+    action = lookup_ui_action(next_path)
+    return action.label if action is not None else "Continue to the console"
+
+
 def reauth_idp_response(
     deps: UiDeps,
     auth: AuthService,
@@ -89,11 +97,10 @@ def reauth_idp_response(
     action either way (vault BACKLOG #2764).
     """
     available = deps.oidc_enabled and auth.oidc_enabled
-    action = lookup_ui_action(next_path)
     return HTMLResponse(
         pages.reauth_idp(
             next_path,
-            label=action.label if action is not None else "Open the console",
+            label=_label(next_path),
             continues=continues,
             destination_host=deps.oidc_authorization_host or None,
             available=available,
@@ -121,13 +128,14 @@ def _step_up_landing(
     token = outcome.elevation.token
     if token is None:
         # A refusal. The page it renders offers the IdP leg again and never a password field. An
-        # auto-retry continuation was spent when the start leg staged it (#2764), so only an unlock
-        # target still continues from here; the page says which.
+        # auto-retry target was staged only because it was issued, and the start leg spent that
+        # issue (#2764). A state mismatch leaves the flow staged, so its real return still continues
+        # to it; any other refusal ended the flow, so only an unlock target still continues.
         resp = reauth_idp_response(
             deps,
             auth,
             next_,
-            continues=is_unlock_action(next_),
+            continues=is_unlock_action(next_) or outcome.reason == "state_mismatch",
             error=outcome.error,
             status_code=403,
         )
@@ -145,9 +153,7 @@ def _step_up_landing(
         # session, and spent that issue as it staged it (vault BACKLOG #2764). The flow is single-use
         # and bound to the session and to this browser's flow cookie, so it carries the binding here,
         # where the SameSite=Strict session cookie never arrives.
-        action = lookup_ui_action(next_)
-        label = action.label if action is not None else next_
-        resp = HTMLResponse(pages.reauth_continue(next_, label), status_code=200)
+        resp = HTMLResponse(pages.reauth_continue(next_, _label(next_)), status_code=200)
     set_session_cookie(resp, token, request=request)
     clear_oidc_flow_cookie(resp, request)
     return resp

@@ -341,12 +341,13 @@ derived from `next`, so it attached to the forged action.
 1. **The continuation is bound to the session server-side.** When a step-up gate refuses a same-origin
    POST and `_reauth_redirect` issues the 303, it records the `auto_retry` continuation against that
    session: keyed on the session token's hash and the exact `next`, single use, with a short TTL
-   (`REAUTH_CONTINUATION_TTL_SECONDS`), bounded and process-local. The ceremony routes that rotate the
-   session token carry the record across the rotation. `POST /ui/reauth` auto-submits only a
-   continuation recorded for the session presenting it, and consumes it as it does, so it runs once.
-   Any other `auto_retry` `next` still lets the operator complete the re-authentication, mints no
-   ADR 0077 grant for it, and returns them to `/ui` (`/ui/account` without `monitoring:read`) with
-   nothing run. The federated step-up leg (`POST /ui/reauth/oidc`) applies the same test when it stages
+   (`REAUTH_CONTINUATION_TTL_SECONDS`), bounded per session and in total, and process-local. The
+   console routes that rotate the session token carry the record across the rotation. `POST
+   /ui/reauth` auto-submits only a continuation recorded for the session presenting it, and consumes
+   it as it does, so it runs once. Any other `auto_retry` `next` still lets the operator complete the
+   re-authentication, mints no ADR 0077 grant for it, and ends on a page that says by name that
+   nothing ran, linking back to `/ui` (`/ui/account` without `monitoring:read`). A bare redirect
+   would read as the action done to an operator whose entry lapsed. The federated step-up leg (`POST /ui/reauth/oidc`) applies the same test when it stages
    the flow, and the single-use flow, bound to the session and the browser's flow cookie, carries the
    binding to the callback, which the SameSite=Strict session cookie never reaches.
 2. **The pages name the action.** Every registry entry carries a required `label`. The re-auth page
@@ -360,6 +361,7 @@ derived from `next`, so it attached to the forged action.
 cookies and the CSP are unchanged. `unlock` continuations (GET form pages) keep their 303-GET-redirect;
 they never auto-submit, so they need no record.
 
-**Consequence.** A continuation the record does not hold (it lapsed, the process restarted, or a
-rotation the console did not see moved the token) costs the operator one more click on the action, and
-never runs anything the session did not submit.
+**Consequence.** A continuation the record does not hold (it lapsed, the process restarted, it was
+evicted, or a rotation the console did not see moved the token, as the federated callback does for
+the session's other entries) costs the operator one more click on the action, and never runs
+anything the session did not submit.
