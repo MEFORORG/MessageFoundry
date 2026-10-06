@@ -52,10 +52,10 @@ _log = logging.getLogger(__name__)
 #: uncontrollable through the API either way.
 _NOT_A_CONNECTION_NAME = "not applied: not a valid connection name"
 
-# L3b: the queue purge is step-up-gated, so register it in the write-action allow-list — this is
-# the first extension of the registry L0b introduced (the step-up re-auth may auto-retry the
-# body-less POST because both params, name + scope, live in the PATH).
-register_ui_action(r"^/ui/connections/[^/?#]+/purge/(top|all)$", Permission.MESSAGES_PURGE)
+# The per-name queue purge POST (`/ui/connections/{name}/purge/{scope}`) is deliberately NOT a
+# registered continuation (vault BACKLOG #2764). It was once auto_retry, but no page renders a form
+# to it -- the console purges through the confirm page below -- so the re-auth auto-submit had become
+# its only browser entry point. Its stale-window refusal now lands on that confirm page instead.
 # The bulk purge CONFIRM page is a step-up-UNLOCK GET form (like content-search / create-user): a
 # stale step-up 303s to /ui/reauth and, after re-verification, 303-GET-redirects BACK to it (the
 # ?dest/?scope query is deliberately NOT carried across — the operator re-selects on the fresh
@@ -65,6 +65,7 @@ register_ui_action(
     Permission.MESSAGES_PURGE,
     auto_retry=False,
     unlock=True,
+    label="Open the queue purge confirmation",
 )
 
 
@@ -296,7 +297,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         scope: str,
         request: Request,
         engine: Any = Depends(deps.get_engine),
-        identity: Identity = Depends(require_ui_step_up(Permission.MESSAGES_PURGE)),
+        identity: Identity = Depends(
+            require_ui_step_up(
+                Permission.MESSAGES_PURGE,
+                reauth_next=lambda _r: "/ui/connections/purge-confirm",
+            )
+        ),
         gate: Any = Depends(deps.get_gate),
     ) -> Response:
         assert_same_origin(request)

@@ -494,14 +494,26 @@ async def test_a_session_that_proved_its_code_at_reauth_can_end_sessions(
 
     async with _client(engine, service) as c:
         assert (await _login(c)).status_code == 303
+        # The click the operator makes: refused while pending, which issues the continuation
+        # (vault BACKLOG #2764) that /ui/reauth will auto-submit.
+        refused = await c.post(_REVOKE_OTHERS, headers=SAME_ORIGIN)
+        assert refused.headers["location"] == f"/ui/reauth?next={_REVOKE_OTHERS}"
         t1 = t0 + totp.DEFAULT_PERIOD  # a strictly later step: enrollment consumed its own
         _pin_totp_clock(monkeypatch, t1)
-        minted = await c.post(
+        # A correct code and a WRONG password: the code leg rotates the session and the page
+        # re-renders under the new cookie. The issued continuation must move with the rotation,
+        # or the retry below would land on the console with nothing run.
+        wrong = await c.post(
             "/ui/reauth",
-            data={"next": _REVOKE_OTHERS, "code": totp.totp(secret, now=t1), "password": PW},
+            data={"next": _REVOKE_OTHERS, "code": totp.totp(secret, now=t1), "password": "nope"},
             headers=SAME_ORIGIN,
         )
-        assert minted.status_code == 200
+        assert wrong.status_code == 200 and "Incorrect password." in wrong.text
+        assert "nothing will run" not in wrong.text
+        minted = await c.post(
+            "/ui/reauth", data={"next": _REVOKE_OTHERS, "password": PW}, headers=SAME_ORIGIN
+        )
+        assert minted.status_code == 200 and "data-autosubmit" in minted.text
         r = await c.post(_REVOKE_OTHERS, headers=SAME_ORIGIN)
         assert r.status_code == 303
         assert r.headers["location"] == "/ui/account/sessions?m=signed_out_others"
@@ -525,6 +537,9 @@ async def test_an_account_with_no_factor_still_ends_sessions_from_a_pending_sess
         assert (await _login(c)).status_code == 303
         tok = c.cookies.get("mf_session")
         assert tok is not None and await service.mfa_satisfied(tok) is False
+        # The click, refused for want of a fresh proof; it issues the continuation (#2764).
+        refused = await c.post(_REVOKE_OTHERS, headers=SAME_ORIGIN)
+        assert refused.headers["location"] == f"/ui/reauth?next={_REVOKE_OTHERS}"
         minted = await c.post(
             "/ui/reauth", data={"next": _REVOKE_OTHERS, "password": PW}, headers=SAME_ORIGIN
         )

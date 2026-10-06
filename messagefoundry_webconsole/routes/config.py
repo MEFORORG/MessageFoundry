@@ -26,7 +26,9 @@ from .._auth import (
 
 # L3c: config reload is step-up-gated, so register it in the write-action allow-list (body-less
 # POST, no path params — the /ui/reauth flow may auto-retry it after step-up).
-register_ui_action(r"^/ui/config/reload$", Permission.CONFIG_DEPLOY)
+register_ui_action(
+    r"^/ui/config/reload$", Permission.CONFIG_DEPLOY, label="Reload the engine configuration"
+)
 
 
 def register(app: FastAPI, deps: UiDeps) -> None:

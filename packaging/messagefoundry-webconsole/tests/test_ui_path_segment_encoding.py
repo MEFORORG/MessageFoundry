@@ -184,7 +184,7 @@ def test_the_reauth_next_parameter_is_left_alone() -> None:
     """
     auth = pathlib.Path(__file__).resolve().parents[3] / "messagefoundry_webconsole" / "_auth.py"
     source = auth.read_text(encoding="utf-8")
-    assert 'quote(next_path if next_path is not None else request.url.path, safe="/")' in source, (
+    assert 'quote(target, safe="/")' in source, (
         "the reauth 'next' encoding changed; if a path-segment builder was applied here it is wrong "
         "-- that value is a path carried in a query parameter"
     )

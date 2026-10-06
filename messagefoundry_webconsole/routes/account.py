@@ -64,9 +64,18 @@ from ._common import _client, _form_pairs, _rate_limited
 # 7.5.1 (ADR 0077): each factor lane now carries an action= tag, so /ui/reauth mints the matching
 # single-use grant and each bind consumes exactly one fresh proof (closing the /ui window residual).
 register_ui_action(
-    r"^/ui/account/mfa/enroll$", None, step_up=False, action=STEP_UP_ACTION_MFA_ENROLL
+    r"^/ui/account/mfa/enroll$",
+    None,
+    step_up=False,
+    action=STEP_UP_ACTION_MFA_ENROLL,
+    label="Set up an authenticator app",
 )
-register_ui_action(r"^/ui/account/mfa/disable$", None, action=STEP_UP_ACTION_MFA_DISABLE)
+register_ui_action(
+    r"^/ui/account/mfa/disable$",
+    None,
+    action=STEP_UP_ACTION_MFA_DISABLE,
+    label="Turn off your authenticator app",
+)
 register_ui_action(
     r"^/ui/account/mfa/confirm$",
     None,
@@ -74,6 +83,7 @@ register_ui_action(
     auto_retry=False,
     unlock=True,
     action=STEP_UP_ACTION_MFA_CONFIRM,
+    label="Confirm your authenticator app",
 )
 # --- L5a: WebAuthn passkeys (ADR 0068, WP-14b) -------------------------------
 # Self-scoped actions (permission=None — enforcement is each route's require_ui* dep).
@@ -85,10 +95,17 @@ register_ui_action(
 # — NEVER registered as a continuation (hard invariant); its require_ui_reauth_only maps a
 # stale-window 303 to the REGISTERED enroll action (the #745 ui_mfa_verify precedent).
 register_ui_action(
-    r"^/ui/account/webauthn/enroll$", None, step_up=False, action=STEP_UP_ACTION_WEBAUTHN_ENROLL
+    r"^/ui/account/webauthn/enroll$",
+    None,
+    step_up=False,
+    action=STEP_UP_ACTION_WEBAUTHN_ENROLL,
+    label="Add a passkey",
 )
 register_ui_action(
-    r"^/ui/account/webauthn/[^/?#]+/delete$", None, action=STEP_UP_ACTION_WEBAUTHN_DELETE
+    r"^/ui/account/webauthn/[^/?#]+/delete$",
+    None,
+    action=STEP_UP_ACTION_WEBAUTHN_DELETE,
+    label="Remove a passkey",
 )
 # --- L6b: self-service session TERMINATE (ASVS 7.5.2) — password re-proof before revoke ---
 # Both terminate POSTs are body-less (all params in the PATH), so they register as auto_retry
@@ -106,12 +123,14 @@ register_ui_action(
     None,
     step_up=False,
     action=STEP_UP_ACTION_SESSION_TERMINATE,
+    label="Sign out one of your sessions",
 )
 register_ui_action(
     r"^/ui/account/sessions/revoke-others$",
     None,
     step_up=False,
     action=STEP_UP_ACTION_SESSION_TERMINATE,
+    label="Sign out all your other sessions",
 )
 
 

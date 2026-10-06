@@ -307,6 +307,9 @@ async def test_revoking_an_id_that_no_longer_exists_says_so(engine: Engine) -> N
         r = await c.post("/ui/login", data={"username": "op", "password": PW}, headers=_SAME)
         assert r.status_code == 303
         path = f"/ui/account/sessions/{other_id}/revoke"
+        # The click, refused for want of a fresh proof, issues the continuation (vault BACKLOG #2764).
+        refused = await c.post(path, headers=_SAME)
+        assert refused.headers["location"] == f"/ui/reauth?next={path}"
         minted = await c.post("/ui/reauth", data={"next": path, "password": PW}, headers=_SAME)
         assert minted.status_code in (200, 303), minted.status_code
         r = await c.post(path, headers=_SAME)

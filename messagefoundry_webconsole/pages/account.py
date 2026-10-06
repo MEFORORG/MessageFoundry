@@ -265,9 +265,29 @@ def sso_challenge() -> Markup:
     return page("Windows SSO", body, nav=Markup(""))
 
 
+def _reauth_purpose(label: str, *, continues: bool) -> Markup:
+    """What a step-up page says it is confirming (vault BACKLOG #2764).
+
+    It names the action, so the operator typing the password can check it. When ``continues`` is
+    False the action will NOT run after the confirmation -- the console did not issue it to this
+    session -- and the page says so, rather than letting the operator believe it ran."""
+    named = el("p", "Confirm it's you to: ", el("strong", label), class_="muted")
+    if continues:
+        return named
+    warning = el(
+        "p",
+        "This confirmation was not started by an action in this session, so nothing will run"
+        " after you confirm. You will return to the console and can start the action yourself.",
+        class_="banner",
+    )
+    return Markup(named + warning)  # both halves came from el(), so both are already escaped
+
+
 def reauth(
     next_path: str,
     *,
+    label: str,
+    continues: bool,
     mfa_needed: bool,
     error: str | None = None,
     webauthn_options: str | None = None,
@@ -282,7 +302,8 @@ def reauth(
     assertion satisfies the MFA leg; the password below still completes the step-up).
     ``webauthn_notice`` is the legible fail-closed copy (extra absent / public_origin unset) — a
     dead-end message, never a redirect loop. ``next_path`` (a validated /ui action) rides in a
-    hidden field so a successful re-auth can auto-retry it.
+    hidden field so a successful re-auth can auto-retry it -- when the console issued it to this
+    session, which ``continues`` reports; ``label`` names the action (vault BACKLOG #2764).
     """
     banner = el("p", error, class_="banner") if error else Markup("")
     passkey: Markup
@@ -329,7 +350,7 @@ def reauth(
     body = el(
         "div",
         el("h1", "Confirm it's you"),
-        el("p", "This action needs a fresh sign-in confirmation.", class_="muted"),
+        _reauth_purpose(label, continues=continues),
         banner,
         passkey,
         form,
@@ -341,6 +362,8 @@ def reauth(
 def reauth_idp(
     next_path: str,
     *,
+    label: str,
+    continues: bool,
     destination_host: str | None,
     available: bool = True,
     error: str | None = None,
@@ -383,7 +406,16 @@ def reauth_idp(
             " not available right now. Sign out and sign in again to continue.",
             class_="muted",
         )
-    body = el("div", el("h1", "Confirm it's you"), lead, banner, where, form, class_="card")
+    body = el(
+        "div",
+        el("h1", "Confirm it's you"),
+        _reauth_purpose(label, continues=continues),
+        lead,
+        banner,
+        where,
+        form,
+        class_="card",
+    )
     return page("Confirm", body, nav=minimal_nav())
 
 
@@ -486,15 +518,17 @@ def mfa_gate(
     return page("Second factor", body, nav=minimal_nav())
 
 
-def reauth_continue(next_path: str) -> Markup:
+def reauth_continue(next_path: str, label: str) -> Markup:
     """After a successful step-up, auto-POST the pending action (``next_path``) via app.js.
 
-    ``next_path`` has already been validated as a same-origin /ui replay action. If JavaScript is off,
-    the user clicks Continue (graceful degradation); the POST is same-origin so the CSRF check passes.
+    ``next_path`` has already been validated as a registered auto-retry action AND as one the console
+    issued to this session, consumed on the way here (vault BACKLOG #2764); ``label`` names it. If
+    JavaScript is off, the user clicks Continue (graceful degradation); the POST is same-origin so the
+    CSRF check passes.
     """
     form = el(
         "form",
-        el("button", "Continue", type="submit"),
+        el("button", "Continue: ", label, type="submit"),
         method="post",
         action=next_path,
         data_autosubmit=True,
@@ -503,7 +537,7 @@ def reauth_continue(next_path: str) -> Markup:
     body = el(
         "div",
         el("h1", "Verified"),
-        el("p", "Continuing…", class_="muted"),
+        el("p", "Continuing: ", el("strong", label), class_="muted"),
         form,
         class_="card",
     )
