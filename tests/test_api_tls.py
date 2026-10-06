@@ -1659,7 +1659,7 @@ async def test_a_renamed_account_keeps_its_cert_and_the_name_does_not_move(tmp_p
         )
         # The rename. set_user_username is the store's only username write (the directory cache
         # refresh), and it is exactly the event that frees a name for another row.
-        await engine.store.set_user_username(first, "svc-old")
+        assert await engine.store.set_user_username(first, "svc-old", expected_username="svc")
         second = await create_local_user_chosen(
             service,
             username="svc",

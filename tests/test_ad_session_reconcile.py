@@ -17,7 +17,9 @@ All directory data here is synthetic.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import sqlite3
 import uuid
 from dataclasses import replace
@@ -33,7 +35,12 @@ from messagefoundry.auth.notifications import USERNAME_CHANGED
 from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.service import AuthService, DirectoryObjectIdMissing
 from messagefoundry.config.settings import AuthSettings
-from messagefoundry.store.store import SCOPE_SOURCE_AD, SCOPE_SOURCE_MANUAL, MessageStore
+from messagefoundry.store.store import (
+    SCOPE_SOURCE_AD,
+    SCOPE_SOURCE_MANUAL,
+    MessageStore,
+    UserRecord,
+)
 from tests._admin_account import create_local_user_chosen
 
 PW = "Sup3rSecret!!"
@@ -1448,7 +1455,7 @@ async def test_every_backend_integrity_class_is_absorbed(driver: str, error: Exc
         token = await _signed_in_ad_user(service, store, "jdoe")
         assert token is not None
 
-        async def _raise_driver_error(*a: object, **kw: object) -> None:
+        async def _raise_driver_error(*a: object, **kw: object) -> bool:
             await store.create_user(
                 user_id="winner", username="jbloggs", auth_provider="ad", password_generated=False
             )
@@ -1504,7 +1511,7 @@ async def test_a_lost_username_race_is_absorbed_and_does_not_kill_the_pass() -> 
         # caller's pre-check runs, and must exist by the time the write lands. Creating it up front
         # instead makes the pre-check fire and the write path is never reached -- which is how the
         # first draft of this test passed for the wrong reason.
-        async def _raise_integrity(*a: object, **kw: object) -> None:
+        async def _raise_integrity(*a: object, **kw: object) -> bool:
             await store.create_user(
                 user_id="winner", username="jbloggs", auth_provider="ad", password_generated=False
             )
@@ -1554,7 +1561,7 @@ async def test_a_store_fault_that_is_not_an_integrity_violation_still_propagates
         await service.initialize()
         await _signed_in_ad_user(service, store, "jdoe")
 
-        async def _raise_other(*a: object, **kw: object) -> None:
+        async def _raise_other(*a: object, **kw: object) -> bool:
             raise RuntimeError("synthetic: the store connection died")
 
         store.set_user_username = _raise_other  # type: ignore[method-assign]
@@ -1695,8 +1702,8 @@ async def test_a_rename_that_writes_nothing_sends_no_notice(shape: str) -> None:
     One case per way the refresh refuses. ``pre_check``: the name is already held. ``write_race``:
     another writer claims it between the check and the write, which raises. ``write_noop``: the
     store's guard holds and the write matches no row, which raises nothing and is caught only by the
-    read-back. ``row_gone``: the row is deleted before the write lands. Each is asserted to have
-    refused, so none passes by never reaching the branch.
+    re-read after the write returns ``False``. ``row_gone``: the row is deleted before the write
+    lands. Each is asserted to have refused, so none passes by never reaching the branch.
     """
     store, _ldap, service, notifier, user_id = await _renamed_service()
     try:
@@ -1709,7 +1716,7 @@ async def test_a_rename_that_writes_nothing_sends_no_notice(shape: str) -> None:
             )
         elif shape == "write_race":
 
-            async def _lose(*a: object, **kw: object) -> None:
+            async def _lose(*a: object, **kw: object) -> bool:
                 await store.create_user(
                     user_id="winner",
                     username="jdoe-married",
@@ -1721,15 +1728,23 @@ async def test_a_rename_that_writes_nothing_sends_no_notice(shape: str) -> None:
             store.set_user_username = _lose  # type: ignore[method-assign]
         elif shape == "write_noop":
 
-            async def _match_nothing(*a: object, **kw: object) -> None:
-                return None
+            async def _match_nothing(*a: object, **kw: object) -> bool:
+                # Another row took the name after the pre-check, and the store's guard held.
+                await store.create_user(
+                    user_id="squatter",
+                    username="jdoe-married",
+                    auth_provider="ad",
+                    password_generated=False,
+                )
+                return False
 
             store.set_user_username = _match_nothing  # type: ignore[method-assign]
         else:
             delete_user = store.delete_user
 
-            async def _row_deleted(*a: object, **kw: object) -> None:
+            async def _row_deleted(*a: object, **kw: object) -> bool:
                 await delete_user(user_id)
+                return False
 
             store.set_user_username = _row_deleted  # type: ignore[method-assign]
 
@@ -1747,6 +1762,9 @@ async def test_a_rename_that_writes_nothing_sends_no_notice(shape: str) -> None:
             if a["action"] == "auth.ad_username_refresh_conflict"
         ]
         assert json.loads(conflict["detail"])["detected"] == shape
+        if shape == "write_noop":
+            # The operator has to remove the holder, so the audit names it (BACKLOG #2290).
+            assert json.loads(conflict["detail"])["held_by_user_id"] == "squatter"
         assert not [e for e in notifier.sent if e.event_type == USERNAME_CHANGED], (
             f"a {shape} refresh wrote nothing and still told the holder their name changed"
         )
@@ -1757,15 +1775,19 @@ async def test_a_rename_that_writes_nothing_sends_no_notice(shape: str) -> None:
 async def test_a_rename_already_applied_by_another_caller_is_not_told_twice() -> None:
     """The reconciler plans a rename, a directory sign-in applies it first, then the plan applies.
 
-    The read-back alone cannot see this: the store's guard excludes only OTHER rows, so the UPDATE
-    matches this row and the new name reads back as written. Without the pre-read the holder would
-    get a second notice, and the audit a second ``auth.ad_username_refreshed`` row, for one rename.
+    The pre-read finds the new name already in place and returns before any write, so the holder
+    gets no second notice and the audit no second ``auth.ad_username_refreshed`` row. This is the
+    case in sequence. When both refreshes read the old name at once, the store's compare-and-set
+    stops the second one instead (BACKLOG #2290,
+    ``test_two_refreshes_of_one_rename_at_once_write_audit_and_notify_once``).
     Driven on the method directly, with ``held`` set as the reconciler reads it, because the pass
     offers no hook between its plan and its apply.
     """
     store, _ldap, service, notifier, user_id = await _renamed_service()
     try:
-        await store.set_user_username(user_id, "jdoe-married")  # the sign-in got there first
+        await store.set_user_username(
+            user_id, "jdoe-married", expected_username="jdoe"
+        )  # the sign-in got there first
         held = await store.get_user_by_username("jdoe-married")
         assert held is not None and held.id == user_id
 
@@ -1786,7 +1808,7 @@ async def test_the_notice_names_the_name_the_row_had_not_the_plans() -> None:
     before the plan applies, and the notice must then name what the row was actually called."""
     store, _ldap, service, notifier, user_id = await _renamed_service()
     try:
-        await store.set_user_username(user_id, "jdoe-interim")
+        assert await store.set_user_username(user_id, "jdoe-interim", expected_username="jdoe")
 
         await service._refresh_cached_username(
             user_id=user_id, old_username="jdoe", new_username="jdoe-married", held=None
@@ -1808,8 +1830,9 @@ async def test_a_row_deleted_before_the_apply_is_refused_without_a_write_or_a_no
         await store.delete_user(user_id)
         writes: list[object] = []
 
-        async def _record_write(*a: object, **kw: object) -> None:
+        async def _record_write(*a: object, **kw: object) -> bool:
             writes.append(a)
+            return True
 
         store.set_user_username = _record_write  # type: ignore[method-assign]
 
@@ -1825,6 +1848,90 @@ async def test_a_row_deleted_before_the_apply_is_refused_without_a_write_or_a_no
         ]
         assert json.loads(conflict["detail"])["detected"] == "row_gone"
         assert not [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
+    finally:
+        await store.close()
+
+
+# --- BACKLOG #2290: two refreshes of one rename at once write, audit and notify once ------------
+
+
+async def test_two_refreshes_of_one_rename_at_once_write_audit_and_notify_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A sign-in and a reconciler pass rename one row at the same moment. One of them wins.
+
+    **The barrier is what makes this test the race.** ``asyncio.gather`` alone can run one refresh
+    to completion before the other starts, and then the second one's pre-read sees the new name and
+    returns early, so the test would pass with no compare-and-set at all. Here neither refresh may
+    write until both have finished their pre-read, so both read the old name and both reach the
+    write. Only the write's compare on the old name can then stop the second one.
+    """
+    store, _ldap, service, notifier, user_id = await _renamed_service()
+    try:
+        barrier = asyncio.Barrier(2)
+        pre_reads = 0
+        get_user = store.get_user
+
+        async def _pre_read_then_wait(user_id: str) -> UserRecord | None:
+            # Only the two pre-reads wait. A later read, such as the loser's re-read after its
+            # write matched nothing, must not block on a barrier with one party.
+            nonlocal pre_reads
+            row = await get_user(user_id)
+            pre_reads += 1
+            if pre_reads <= 2:
+                await barrier.wait()
+            return row
+
+        store.get_user = _pre_read_then_wait  # type: ignore[method-assign]
+        writes: list[bool] = []
+        set_user_username = store.set_user_username
+
+        async def _count_write(
+            user_id: str, username: str, *, expected_username: str, now: float | None = None
+        ) -> bool:
+            wrote = await set_user_username(
+                user_id, username, expected_username=expected_username, now=now
+            )
+            writes.append(wrote)
+            return wrote
+
+        store.set_user_username = _count_write  # type: ignore[method-assign]
+
+        caplog.set_level(logging.INFO, logger="messagefoundry.auth.service")
+        # A timeout, so a refresh that skips its pre-read fails here instead of leaving the other
+        # one waiting on the barrier for ever. A task group, so if one refresh raises the other is
+        # cancelled rather than left pending on the barrier.
+        async with asyncio.timeout(10), asyncio.TaskGroup() as tg:
+            for _ in range(2):
+                tg.create_task(
+                    service._refresh_cached_username(
+                        user_id=user_id, old_username="jdoe", new_username="jdoe-married", held=None
+                    )
+                )
+
+        # Both reached the write, which is the proof the barrier made them race.
+        assert sorted(writes) == [False, True], f"expected one winning write, got {writes}"
+        after = await get_user(user_id)
+        assert after is not None and after.username == "jdoe-married"
+        refreshed = [
+            a for a in await store.list_audit() if a["action"] == "auth.ad_username_refreshed"
+        ]
+        assert len(refreshed) == 1, f"one rename audited {len(refreshed)} times"
+        assert not [
+            a
+            for a in await store.list_audit()
+            if a["action"] == "auth.ad_username_refresh_conflict"
+        ], "a lost race to the same rename was audited as a conflict"
+        notices = [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
+        assert len(notices) == 1, f"the holder was told of one rename {len(notices)} times"
+        assert notices[0].detail["old_username"] == "jdoe"
+        # The losing refresh says why it did nothing, at INFO, rather than vanishing.
+        assert any(
+            r.name == "messagefoundry.auth.service"
+            and r.levelno == logging.INFO
+            and "BACKLOG #2290" in r.getMessage()
+            for r in caplog.records
+        ), "the losing refresh logged nothing"
     finally:
         await store.close()
 

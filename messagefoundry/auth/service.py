@@ -5427,22 +5427,26 @@ class AuthService:
             return
         # BACKLOG #2017. The row as it stands, read before the write, because the caller's
         # ``old_username`` can be stale by now: the reconciler captured it when it planned, and a
-        # directory sign-in may have renamed the row since. Two things follow from that read.
+        # directory sign-in may have renamed the row since. Three things follow from that read.
         #
         # A row that already carries the new name has nothing to change, so it gets no second audit
-        # row and no second notice. The read-back below cannot tell that case apart, because the
-        # store's guard excludes only OTHER rows and so the UPDATE matches this one. And the notice
-        # names the name the row actually had, not the plan's.
+        # row and no second notice. The notice names the name the row actually had, not the plan's.
+        # And the write below compares on this name (BACKLOG #2290), so a refresh that read it just
+        # before another refresh of this row wrote cannot write as well.
         before = await self._store.get_user(user_id)
         if before is None:
-            # Deleted between the plan and the apply. Refused as the read-back below refuses it, without
-            # an UPDATE that can only match nothing.
+            # Deleted between the plan and the apply. Refused as a write that finds the row gone is
+            # refused below, without an UPDATE that can only match nothing.
             await _refuse(user_id, "row_gone")
             return
         if before.username == new_username:
             return
         try:
-            await self._store.set_user_username(user_id, new_username)
+            # BACKLOG #2290. A compare-and-set on the name just read, so of two refreshes of this
+            # row running at once only one writes.
+            written = await self._store.set_user_username(
+                user_id, new_username, expected_username=before.username
+            )
         except Exception as exc:
             # THE RESIDUAL RACE, absorbed here because the store's in-statement guard cannot close it
             # (see this method's docstring and the measured note in `store/postgres.py`).
@@ -5490,21 +5494,40 @@ class AuthService:
             winner = await self._store.get_user_by_username(new_username)
             await _refuse(winner.id if winner is not None else None, "write_race")
             return
-        # READ BACK BEFORE AUDITING SUCCESS. The guarded UPDATE can match zero rows and raise nothing
-        # -- that is the whole point of the NOT EXISTS -- so an unconditional success audit would
-        # report a rename that did not happen. Reachable two ways: the race where the losing side's
-        # guard HOLDS (81 of 200 pairs on PostgreSQL, `store/postgres.py`) rather than raising, and a
-        # row deleted between the plan and the apply.
+        # AUDIT SUCCESS ONLY ON A WRITE THAT LANDED. The UPDATE can match zero rows and raise
+        # nothing, so an unconditional success audit would report a rename that did not happen. An
+        # audit trail that says a name moved when it did not is worse than a missing row: an operator
+        # reconciling "who is this account" against the directory would take the engine's word for a
+        # state neither side is in.
         #
-        # An audit trail that says a name moved when it did not is worse than a missing row: an
-        # operator reconciling "who is this account" against the directory would take the engine's
-        # word for a state neither side is in.
-        written = await self._store.get_user(user_id)
-        if written is None or written.username != new_username:
-            await _refuse(
-                None if written is not None else user_id,
-                "write_noop" if written is not None else "row_gone",
-            )
+        # ``False`` covers three cases, and the re-read below tells them apart.
+        #   - The row is gone, deleted between the pre-read and the write: ``row_gone``.
+        #   - The row still holds the name read before, so the compare matched and the NOT EXISTS
+        #     guard is what stopped the write: another row holds the new name. That is the race
+        #     where the losing side's guard HOLDS (81 of 200 pairs on PostgreSQL,
+        #     `store/postgres.py`) rather than raising: ``write_noop``. The holder is looked up, as
+        #     the ``write_race`` arm does, because the operator who must remove it needs its id.
+        #   - The row's name moved after the pre-read, so the compare failed: another refresh of
+        #     this same row wrote first (BACKLOG #2290). That caller audits and notifies, so this one
+        #     does neither. It is not a conflict either, because no other row holds anything. The
+        #     first writer wins, so when two refreshes carry DIFFERENT new names the stored one can
+        #     be the older of the two until the next sign-in or pass copies the directory's name
+        #     down again. Logged at INFO so the skipped write is visible without paging anyone.
+        if not written:
+            after = await self._store.get_user(user_id)
+            if after is None:
+                await _refuse(user_id, "row_gone")
+            elif after.username == before.username:
+                holder = await self._store.get_user_by_username(new_username)
+                await _refuse(holder.id if holder is not None else None, "write_noop")
+            else:
+                _log.info(
+                    "AD account %s: another refresh already changed the stored name (now %s), "
+                    "so this one wrote nothing and sends no second audit row or notice "
+                    "(BACKLOG #2290)",
+                    user_id,
+                    scrub_log_argument(after.username),
+                )
             return
         await self._audit(
             "auth.ad_username_refreshed",
@@ -5515,23 +5538,23 @@ class AuthService:
         # BACKLOG #2017, ASVS 6.3.7: a username change is an update to the account's authentication
         # details, so the holder is told out of band as well as audited. THIS IS THE ONE PLACE THE
         # RULE FOR WHEN IT IS SENT LIVES: only here, after the pre-read showed a different name and
-        # the read-back proved the new one landed. Every refused path above returns first, so a lost
-        # race sends none, and so does a rename another caller already applied.
+        # the compare-and-set on that name reported a write. Every refused path above returns first,
+        # so a lost race sends none, and so does a rename another caller already applied.
         #
-        # **IN SEQUENCE ONLY.** The pre-read and the write are not one statement. Two refreshes of the
-        # SAME row running at once, a sign-in and a reconciler pass, can both read the old name, both
-        # write and both read back the new one, so both audit and both notify. The second notice is
-        # a duplicate, not a false one: the name did change. Closing it needs a compare-and-set in
-        # ``set_user_username`` on every store backend, which this item did not take on.
+        # That holds for two refreshes of the SAME row running at once too, a sign-in and a
+        # reconciler pass (BACKLOG #2290). Both can read the old name, but the store writes only
+        # while the row still holds it, so exactly one of them gets ``True`` and sends.
         #
         # Both callers send it. The reconciler notifies its revocations too, so it has no rule that
-        # holds notices back. Addressed to the engine-owned ``notify_email`` of the row just read, as
-        # the reconciler's own notices are; a rename moves no address, so no old holder needs the
-        # fallback the directory email repoint in ``_upsert_ad_user`` carries.
+        # holds notices back. Addressed to the engine-owned ``notify_email`` of the row read before
+        # the write, as the reconciler's own notices are; a rename moves no address, so no old holder
+        # needs the fallback the directory email repoint in ``_upsert_ad_user`` carries. No second
+        # read for a fresher address: it would run after the rename committed and was audited, so a
+        # store fault there would fail a sign-in, or abort a reconciler pass, over a notice.
         await self._notify_security(
             USERNAME_CHANGED,
             username=new_username,
-            email=written.notify_email,
+            email=before.notify_email,
             client=client,
             detail={
                 "old_username": before.username,

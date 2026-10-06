@@ -11889,9 +11889,15 @@ class SqlServerStore:
         return int(count) > 0
 
     async def set_user_username(
-        self, user_id: str, username: str, *, now: float | None = None
-    ) -> None:
+        self, user_id: str, username: str, *, expected_username: str, now: float | None = None
+    ) -> bool:
         # BACKLOG #1532. Cache refresh for a directory-reported rename -- see AuthStore.
+        # BACKLOG #2290: `username=?` on the old name makes it a compare-and-set; AuthStore says
+        # why a second refresh of the same row then writes nothing. The answer comes from `OUTPUT
+        # inserted.id`, never `cursor.rowcount`: a session-wide `SET NOCOUNT ON` can report -1 for
+        # a write that did land, and a lost audit of a real rename is the wrong way to fail (see
+        # `_execute_output`). The rest of this comment is about the OTHER race, two rows wanting
+        # one name, which the compare does not touch.
         # The NOT EXISTS clause makes a SEQUENTIALLY taken name a no-op rather than the pyodbc
         # IntegrityError that UNIQUE(username) would raise on a background pass.
         #
@@ -11919,11 +11925,13 @@ class SqlServerStore:
         # exactly as it does on SQLite and PostgreSQL. The divergence is real for the id column and
         # imaginary for this one, which is why the cross-backend case arm runs on all three.
         now = time.time() if now is None else now
-        await self._execute(
-            "UPDATE users SET username=?, updated_at=? WHERE id=? AND NOT EXISTS "
-            "(SELECT 1 FROM users other WHERE other.username=? AND other.id<>?)",
-            (username, now, user_id, username, user_id),
+        written = await self._execute_output(
+            "UPDATE users SET username=?, updated_at=? OUTPUT inserted.id"
+            " WHERE id=? AND username=? AND NOT EXISTS"
+            " (SELECT 1 FROM users other WHERE other.username=? AND other.id<>?)",
+            (username, now, user_id, expected_username, username, user_id),
         )
+        return bool(written)
 
     async def set_user_federated_subject(
         self,
