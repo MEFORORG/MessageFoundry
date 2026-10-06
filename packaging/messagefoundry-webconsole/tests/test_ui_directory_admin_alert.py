@@ -25,7 +25,7 @@ from messagefoundry.api.security import DIRECTORY_GRANTED_BY
 from messagefoundry.auth import Role
 from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.oidc import FederatedPrincipal
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import AuthService, _BindingChangedMidLogin
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.alerts import LoggingAlertSink
@@ -121,8 +121,22 @@ async def _sso(engine: Engine, monkeypatch: pytest.MonkeyPatch, *, held: Role | 
     return sink
 
 
-async def _oidc(engine: Engine, monkeypatch: pytest.MonkeyPatch, *, held: Role | None) -> _Sink:
+async def _oidc(
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    held: Role | None,
+    bind_lands_mid_login: bool = False,
+) -> _Sink:
+    """``bind_lands_mid_login`` makes the mint fail as an admin unbind landing after the role write
+    would, so the callback refuses the sign-in after the grant was written."""
     service = await _service(engine, held=held, bind=True)
+    if bind_lands_mid_login:
+
+        async def _bind_landed(*_a: object, **_k: object) -> str:
+            raise _BindingChangedMidLogin
+
+        monkeypatch.setattr(service, "_issue_session", _bind_landed)
 
     def _exchange(*_a: object, **_k: object) -> FederatedPrincipal:
         return FederatedPrincipal(
@@ -151,7 +165,10 @@ async def _oidc(engine: Engine, monkeypatch: pytest.MonkeyPatch, *, held: Role |
             },
             follow_redirects=False,
         )
-        assert r.status_code == 200, r.headers
+        if bind_lands_mid_login:
+            assert r.status_code == 303 and r.headers["location"].startswith("/ui/login?e=")
+        else:
+            assert r.status_code == 200, r.headers
     return sink
 
 
@@ -181,3 +198,12 @@ async def test_ui_oidc_by_an_existing_administrator_raises_none(
 ) -> None:
     sink = await _oidc(engine, monkeypatch, held=Role.ADMINISTRATOR)
     assert sink.events == []
+
+
+async def test_ui_oidc_refused_after_the_role_write_still_raises_the_alert(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The federated arm of the refused-after-sync path: the role was written before the mint
+    failed, and a later sign-in gains nothing, so this refusal is the one chance to page."""
+    sink = await _oidc(engine, monkeypatch, held=None, bind_lands_mid_login=True)
+    assert sink.events == [_grant("directory_sign_in_oidc")]

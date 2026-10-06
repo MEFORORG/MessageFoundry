@@ -179,9 +179,19 @@ async def test_a_sign_in_that_gains_only_a_non_admin_role_raises_none(
         r = await _negotiate(c)
         assert r.status_code == 200, r.text
     assert sink.events == []
-    # The gain IS reported; it is the route that decides only Administrator pages.
-    outcome = await service.authenticate_kerberos(b"tok")
-    assert outcome.ok and outcome.roles_gained is None  # the second sign-in gained nothing
+
+
+async def test_a_non_admin_gain_is_reported_and_a_repeat_sign_in_reports_none(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The gain IS reported whatever the role; it is the route that decides only Administrator
+    pages. A second sign-in gained nothing, so it reports nothing."""
+    service = await _service(engine, monkeypatch, frozenset({OPERATORS}))
+    first = await service.authenticate_kerberos(b"tok")
+    assert first.ok
+    assert first.roles_gained == RolesGained("jdoe", frozenset({Role.OPERATOR.value}))
+    second = await service.authenticate_kerberos(b"tok")
+    assert second.ok and second.roles_gained is None
 
 
 async def test_the_outcome_names_the_account_and_only_the_roles_it_gained(
@@ -198,7 +208,8 @@ async def test_a_sign_in_refused_after_the_sync_still_raises_the_alert(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A bind landing between the role write and the mint refuses the session, but the role was
-    written all the same. A later sign-in would gain nothing, so this is the only chance to page."""
+    written all the same. A later sign-in would gain nothing, so this refusal is the one chance to
+    page."""
     service = await _service(engine, monkeypatch, frozenset({ADMINS}))
 
     async def _bind_landed(*_a: object, **_k: object) -> str:
@@ -213,3 +224,19 @@ async def test_a_sign_in_refused_after_the_sync_still_raises_the_alert(
     jdoe = await engine.store.get_user_by_username("jdoe")
     assert jdoe is not None
     assert Role.ADMINISTRATOR.value in await engine.store.get_user_role_ids(jdoe.id)
+
+
+class _RaisingSink(_Sink):
+    def administrator_granted(self, name: str, *, via: str, granted_by: str) -> None:
+        raise RuntimeError("sink broke its never-raise contract")
+
+
+async def test_a_sink_that_raises_does_not_break_the_sign_in(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the try/except in ``alert_administrator_granted`` goes. The sign-in must still
+    succeed: a 500 here would leave the role written and the retry gaining nothing to page on."""
+    service = await _service(engine, monkeypatch, frozenset({ADMINS}))
+    async with _client(engine, service, _RaisingSink()) as c:
+        r = await _negotiate(c)
+        assert r.status_code == 200, r.text

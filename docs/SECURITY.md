@@ -1871,7 +1871,8 @@ with no page.
   `account_created` notice.
 - **A directory grant.** An account can get Administrator because the *directory* added it to a
   group already mapped to Administrator. The engine sees that grant in one of the two places below,
-  whichever comes first. A sign-in that sees it first raises `administrator_granted`. A reconciler
+  whichever comes first. A sign-in that sees it first raises `administrator_granted`, unless that
+  sign-in fails with a server error after the role write; the retry then gains nothing. A reconciler
   pass that sees it first raises `ad_session_revoked`, which does not name the role. The later
   sign-in then gains nothing, so it raises no `administrator_granted`. An account that never signs
   in again and holds no live session raises nothing. So watch membership of the mapped group in the
