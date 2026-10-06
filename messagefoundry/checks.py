@@ -1895,8 +1895,10 @@ def _unread_working_dir_toml(
     than read the environment alone and report there is no file (vault BACKLOG #2355)."""
     if service_config is not None or not suppress_search:
         return None
+    # exists(), not is_file(): serve's load_settings tests exists() and then opens the path, so a
+    # directory of that name stops serve, and check must not read the environment past it.
     candidate = Path.cwd() / "messagefoundry.toml"
-    return candidate if candidate.is_file() else None
+    return candidate if candidate.exists() else None
 
 
 def _no_settings_detail(service_config: str | Path | None, suppress_search: bool) -> str:
@@ -2226,8 +2228,9 @@ def _check_build(
         if "--allow-insecure-bind" in detail:
             # The gate's own text names serve's flag, which this command cannot read. Say which
             # escape check does honour, or an operator adds the flag and the leg stays red.
+            sep = " " if detail.endswith(".") else "; "
             detail += (
-                "; `messagefoundry check` has no --allow-insecure-bind and reads only "
+                f"{sep}`messagefoundry check` has no --allow-insecure-bind and reads only "
                 "[security].require_encryption_for_remote = false"
             )
         return CheckResult("build-check", ok=False, required=True, detail=detail)

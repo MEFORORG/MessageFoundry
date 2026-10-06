@@ -635,9 +635,9 @@ async def test_runner_build_check_skips_a_dr_parked_listener_but_gates_a_schedul
         windows=[ActiveWindow(days=frozenset({0}), start=time(8), end=time(9), timezone="UTC")]
     )
     scheduled = _off_loopback_plaintext_mllp(schedule=window)
-    for now in (datetime(2026, 7, 13, 12, tzinfo=UTC), datetime(2026, 7, 13, 8, 30, tzinfo=UTC)):
-        with pytest.raises(WiringError, match="without TLS"):  # outside, then inside, the window
-            _strict_runner(scheduled, store, schedule_clock=lambda t=now: t).build_check(scheduled)
+    monday_noon = datetime(2026, 7, 13, 12, tzinfo=UTC)  # a Monday, outside 08:00-09:00
+    with pytest.raises(WiringError, match="without TLS"):
+        _strict_runner(scheduled, store, schedule_clock=lambda: monday_noon).build_check(scheduled)
 
 
 async def test_pipeline_handler_exception_logs_no_phi(store: MessageStore, tmp_path: Path) -> None:

@@ -162,7 +162,10 @@ async def test_a_listener_start_leaves_down_refuses_no_reload_toggle_or_dr_activ
         text.replace('router = "r"\n', f'router = "r"\n{lifecycle}'), encoding="utf-8"
     )
     try:
-        eng.add_registry(load_config(tmp_path))
+        # Running, so the reload and the DR activation take the quiesce-and-swap path rather than the
+        # not-running shortcut. No listener binds: IB_TOML is either auto_start = false, or isolated
+        # by the very gate under test.
+        await eng.add_registry(load_config(tmp_path)).start()
 
         async def _flag() -> None:
             await eng.set_connection_flag("OB_TOML", direction="outbound", flagged=True)

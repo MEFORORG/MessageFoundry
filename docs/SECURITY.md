@@ -246,10 +246,11 @@ loosening, and [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) says how each star
 not required. The proxy must then speak https to the engine and trust that certificate, or every
 request through it fails. Setting the acknowledgement without `tls_terminated_upstream` is refused at
 load. `messagefoundry check` runs the same test as a required check, `upstream-hop-ack`, against the
-`messagefoundry.toml` it finds, so the commit/CI gate catches the refusal before `serve` does. When
-it finds no file and no `--service-config` names one, it reads the environment instead, if
-`MEFOR_AI_ENVIRONMENT` names the instance, and its line says so. A `--service-config` naming a
-missing file keeps the skip, because `serve` refuses that file. A terminator set through `MEFOR_API_*` variables with no file and no
+`messagefoundry.toml` it finds, so the commit/CI gate catches the refusal before `serve` does. With
+no file and no `--service-config`, it reads the environment instead. That needs
+`MEFOR_AI_ENVIRONMENT` to name the instance, and the line says so. Two cases keep the skip. A
+`--service-config` naming a missing file is one, because `serve` refuses that file. The other is
+`--project-root` with a `messagefoundry.toml` in the working directory, which the line names. A terminator set through `MEFOR_API_*` variables with no file and no
 `MEFOR_AI_ENVIRONMENT`, for example on a site that names its environment only with `serve --env`,
 still reaches `serve` and not the check.
 

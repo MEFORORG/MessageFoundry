@@ -789,6 +789,21 @@ def test_project_root_names_an_unread_working_directory_file(
             assert result.skipped and result.ok, f"{name}: {result.detail}"
 
 
+def test_a_directory_named_messagefoundry_toml_is_not_read_past(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # serve's load_settings tests exists() and then opens the path, so a directory of that name in
+    # its working directory stops it. check must not read the environment past it and report OK.
+    cfg = _bare_config(tmp_path, monkeypatch)
+    here = tmp_path / "here"
+    (here / "messagefoundry.toml").mkdir(parents=True)
+    monkeypatch.chdir(here)
+    monkeypatch.setenv("MEFOR_AI_ENVIRONMENT", "dev")
+    result = _leg(cfg, "posture")
+    assert result.skipped and _ENV_ONLY_NOTE not in result.detail, result.detail
+    assert "--service-config" in result.detail
+
+
 # BACKLOG #1967: this file's serve fixtures test other gates, so they bound the two warn-only
 # retention tiers that ship with no window (tests/conftest.py, bounded_warn_only_retention).
 pytestmark = pytest.mark.usefixtures("bounded_warn_only_retention", "verified_log_forwarding")

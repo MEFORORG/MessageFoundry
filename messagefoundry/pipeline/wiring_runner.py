@@ -2321,8 +2321,9 @@ class RegistryRunner:
         when the window opens, so it is gated here. A fresh runner has nothing listening, so this
         is exactly :meth:`start`'s test there.
 
-        The snapshot is taken now, on the caller's thread, so the predicate is safe to call from a
-        worker thread (the flag toggle validates off the event loop)."""
+        The listening set is snapshotted now, on the caller's thread, so the predicate can run on a
+        worker thread (the flag toggle validates off the event loop). The DR threshold and default
+        tier are read through ``self`` when it runs; both are set only at construction."""
         listening = frozenset(self._sources)
 
         def binds(ic: InboundConnection) -> bool:
@@ -9000,7 +9001,7 @@ def _build_check_connectors(
     # ADR 0154 D4: normalise the graph BEFORE validating it, so the passthrough content-type rule
     # below sees the implied header rather than refusing the ADR's own headline shape. Idempotent.
     apply_sync_reply_capture_implication(registry)
-    listener_starts = exposure_gated or inbound_listener_starts
+    listener_starts = exposure_gated if exposure_gated is not None else inbound_listener_starts
     for ic in registry.inbound.values():
         if not ic.deployed:
             continue
