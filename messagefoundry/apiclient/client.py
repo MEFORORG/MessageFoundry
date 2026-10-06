@@ -81,7 +81,7 @@ from messagefoundry.api.models import (
 from messagefoundry.keywrap import KeyWrapRefused, load_checked_cert_chain
 from messagefoundry.redaction import json_loads_or_refusal
 
-__all__ = ["EngineClient", "ApiError"]
+__all__ = ["EngineClient", "ApiError", "IdpStepUpRequired"]
 
 _log = logging.getLogger(__name__)
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
@@ -125,7 +125,7 @@ MAX_RESPONSE_BYTES = 128 * 1024 * 1024
 # They must not ride onto the in-memory replacement response: httpx would try to gunzip an
 # already-gunzipped body (Content-Encoding), or advertise a length that is no longer the body's
 # (Content-Length, Transfer-Encoding). Every other header carries through -- Content-Type, and the
-# X-MFA-Required / X-Step-Up-Required / X-Step-Up-Action headers the retry branches below read.
+# X-MFA-Required / X-Step-Up-Required / X-Step-Up-Action / X-Step-Up-Via headers _request reads.
 _FRAMING_HEADERS = frozenset({"content-encoding", "content-length", "transfer-encoding"})
 
 # ASVS 2.3.5 (BACKLOG #1113): the status the engine answers when dual-control holds a gated
@@ -140,6 +140,17 @@ class ApiError(RuntimeError):
     def __init__(self, message: str, *, status: int | None = None) -> None:
         super().__init__(message)
         self.status = status
+
+
+class IdpStepUpRequired(ApiError):
+    """The engine wants a step-up that only the identity provider can give (BACKLOG #2158).
+
+    Raised on a 403 carrying ``X-Step-Up-Via: idp``, which the engine sends for a session minted by
+    the federated (``oidc``) sign-in. ``POST /me/reauth`` refuses such a session, so this client
+    raises instead of prompting for a password. Its step-up runs in the web console at
+    ``/ui/reauth``, through the IdP, and this client cannot perform it: that leg needs a browser and
+    re-keys the session it steps up. A subclass of :class:`ApiError`, so a caller that catches only
+    that still sees the refusal."""
 
 
 def _buffer_bounded(streaming: httpx.Response, *, limit: int) -> httpx.Response:
@@ -1016,6 +1027,10 @@ class EngineClient:
                 _bearer=_bearer,
                 **kw,
             )
+        # BACKLOG #2158: an ``oidc`` session steps up at the IdP, in a browser. POST /me/reauth
+        # refuses it, so the password prompt below would only earn a second 403.
+        if response.status_code == 403 and response.headers.get("X-Step-Up-Via") == "idp":
+            raise IdpStepUpRequired(_error_detail(response), status=response.status_code)
         # Step-up re-verification (ASVS 7.5.3): the engine refuses a sensitive op with 403 +
         # X-Step-Up-Required when this session hasn't re-proved its credential recently. Prompt the
         # user (the handler re-authenticates via reauth()) and retry once, so the action goes through
@@ -1071,7 +1086,8 @@ class EngineClient:
     def set_step_up_handler(self, handler: Callable[[], bool] | None) -> None:
         """Register the callback invoked when the engine demands step-up re-verification (403 +
         ``X-Step-Up-Required``). It must prompt the user, call :meth:`reauth`, and return ``True`` iff
-        re-verified — the original request is then retried once. Runs on the calling thread (the
+        re-verified — the original request is then retried once. It is not called for a refusal that
+        carries ``X-Step-Up-Via: idp``, which raises :class:`IdpStepUpRequired` instead. Runs on the calling thread (the
         console's sensitive actions run on the Qt main thread, so a modal dialog is safe)."""
         self._step_up_handler = handler
 
