@@ -121,7 +121,11 @@ async def _rows(store: MessageStore, label: str) -> list[dict[str, Any]]:
 
 
 async def _preflight(store: MessageStore, cfg: Path, *, enforcing: bool = True) -> None:
-    await ta.make_registry_anchor_preflight(store, enforcing=enforcing)(load_config(cfg), {})
+    """Every CA in the graph through the shared check and its refusal, lanes included. In
+    production the lanes are checked one by one as the runner builds them; this exercises the
+    checks themselves."""
+    preflight = ta.make_registry_anchor_preflight(store, enforcing=enforcing)
+    await preflight(load_config(cfg), {}, lanes=True)
 
 
 # --- the spec ------------------------------------------------------------------------------------
@@ -340,18 +344,12 @@ async def test_an_undeployed_outbound_is_not_checked(store: MessageStore, tmp_pa
 async def test_an_engine_reload_refuses_a_substituted_outbound_ca(
     store: MessageStore, tmp_path: Path, judged: None
 ) -> None:
-    """The reload twin: the engine runs the same preflight, so a substituted outbound CA refuses
+    """The reload twin: a running lane is one the reload keeps, so its substituted CA refuses
     the reload and the running graph stays. The first load is the start, so it comes first."""
-    from messagefoundry.pipeline import Engine
-
     ca = _ca(tmp_path)
     cfg = tmp_path / "cfg"
     _graph(cfg, _dest("rest", ca, pin=_sha(ca)))
-    engine = Engine(
-        store,
-        registry_preflight=ta.make_registry_anchor_preflight(store, enforcing=True),
-        egress_settings=EgressSettings(deny_by_default=False),
-    )
+    engine = _engine(store)
     try:
         await engine.reload_detail(cfg)
         runner = engine.registry_runner
@@ -474,9 +472,9 @@ def _engine(store: MessageStore) -> Any:
 
 
 async def _start_like_serve(engine: Any, cfg: Path) -> Any:
-    """The managed app's first load: the start-scoped preflight, then the start."""
+    """The managed app's first load: the registry preflight, then the start."""
     reg = load_config(cfg)
-    await engine.preflight_registry(reg, at_start=True)
+    await engine.preflight_registry(reg)
     engine.add_registry(reg)
     await engine.start()
     return engine.registry_runner
@@ -489,6 +487,7 @@ def _two_outbound_graph(cfg: Path, out: str) -> None:
         (cfg.parent / d).mkdir(exist_ok=True)
     (cfg / "feed.py").write_text(
         "from messagefoundry import File, Rest, Send, handler, inbound, outbound, router\n"
+        "from messagefoundry.config.models import Priority\n"
         f"inbound('IB_IN', File(directory={str(cfg.parent / 'in')!r}, poll_seconds=1.0), "
         "router='r')\n"
         f"outbound('OUT', {out})\n"
@@ -497,12 +496,14 @@ def _two_outbound_graph(cfg: Path, out: str) -> None:
     )
 
 
-async def test_a_refused_outbound_ca_fails_its_lane_at_start_and_a_reload_refuses(
+async def test_a_refused_outbound_ca_fails_its_lane_and_a_reload_rebuilds_it_only_on_change(
     store: MessageStore, tmp_path: Path, judged: None
 ) -> None:
     """ADR 0031: the start comes up with ``OUT`` failed and named, ``OB_OK`` and the inbound live,
-    and the audit row written. A reload checks every CA first, so it is refused whole. Red under:
-    the lane check removed from the start build, or the start preflight checking lanes again."""
+    and the audit row written. A reload that does not change ``OUT`` leaves it failed and reads no
+    CA for it, so it goes through. A reload that changes ``OUT`` rebuilds it, so it checks it and is
+    refused. Red under: the start check removed, the registry preflight checking lanes, the reload
+    rebuilding an unchanged refused lane, or the reload check skipped."""
     ca = _ca(tmp_path)
     cfg = tmp_path / "cfg"
     _two_outbound_graph(cfg, _dest("rest", ca, pin="00" * 32))
@@ -513,9 +514,18 @@ async def test_a_refused_outbound_ca_fails_its_lane_at_start_and_a_reload_refuse
         assert set(degraded) == {"OUT"}, degraded
         assert degraded["OUT"].startswith(_REFUSED_OUT), degraded
         assert not runner.degraded_inbound()
-        assert "pin_mismatch" in {r["event"] for r in await _rows(store, "outbound:OUT")}
-        with pytest.raises(WiringError, match=_PIN_MISMATCH):
+        rows = await _rows(store, "outbound:OUT")
+        assert "pin_mismatch" in {r["event"] for r in rows}
+        await engine.reload_detail(cfg)
+        assert runner.degraded_outbound()["OUT"].startswith(_REFUSED_OUT)
+        assert len(await _rows(store, "outbound:OUT")) == len(rows)
+
+        feed = cfg / "feed.py"
+        old = "https://partner.example.org/api"
+        feed.write_text(feed.read_text(encoding="utf-8").replace(old, old + "/v2"), "utf-8")
+        with pytest.raises(WiringError, match=_PIN_MISMATCH) as err:
             await engine.reload_detail(cfg)
+        assert isinstance(err.value.__cause__, TrustAnchorError)
     finally:
         await engine.stop()
 
@@ -524,8 +534,9 @@ async def test_an_operator_start_checks_a_lane_the_boot_gate_left_unbuilt(
     store: MessageStore, tmp_path: Path, judged: None
 ) -> None:
     """Review R1: an ``auto_start=False`` lane is built at its operator start, and the CA is
-    checked then. The start itself reads nothing for it. Red under: the check removed from
-    ``_ensure_destination_built``."""
+    checked then. The start reads nothing for it, and neither does a reload while it is not
+    running. Red under: the check removed from ``_ensure_destination_built``, or the reload check
+    reading a lane it does not start."""
     ca = _ca(tmp_path)
     cfg = tmp_path / "cfg"
     _two_outbound_graph(cfg, _dest("rest", ca, pin="00" * 32) + ", auto_start=False")
@@ -533,6 +544,7 @@ async def test_an_operator_start_checks_a_lane_the_boot_gate_left_unbuilt(
     try:
         runner = await _start_like_serve(engine, cfg)
         assert not runner.degraded_outbound()
+        await engine.reload_detail(cfg)
         assert await _rows(store, "outbound:OUT") == []
         await runner.start_outbound("OUT")
         assert runner.degraded_outbound()["OUT"].startswith(_REFUSED_OUT)
@@ -545,7 +557,8 @@ async def test_a_refused_ftps_poller_ca_fails_that_inbound_at_start(
     store: MessageStore, tmp_path: Path, judged: None
 ) -> None:
     """The inbound twin: an ``Ftp`` poller is checked before it binds, at start and at an operator
-    start, and only it fails. Red under: either call removed from the runner."""
+    start, and only it fails. A reload that does not change it leaves it down and reads nothing
+    for it. Red under: either call removed from the runner, or the reload rebinding it."""
     ca = _ca(tmp_path)
     cfg = tmp_path / "cfg"
     cfg.mkdir()
@@ -562,26 +575,32 @@ async def test_a_refused_ftps_poller_ca_fails_that_inbound_at_start(
         refused = "TrustAnchorError: inbound connection 'IB_FTPS' tls_ca_file: the trust anchor"
         assert runner.degraded_inbound()["IB_FTPS"].startswith(refused)
         assert not runner.degraded_outbound()
-        assert "pin_mismatch" in {r["event"] for r in await _rows(store, "inbound:IB_FTPS")}
+        rows = await _rows(store, "inbound:IB_FTPS")
+        assert "pin_mismatch" in {r["event"] for r in rows}
+        await engine.reload_detail(cfg)
+        assert runner.degraded_inbound()["IB_FTPS"].startswith(refused)
+        assert not runner.inbound_running("IB_FTPS")
+        assert len(await _rows(store, "inbound:IB_FTPS")) == len(rows)
         with pytest.raises(TrustAnchorError, match=_PIN_MISMATCH):
             await runner.start_inbound("IB_FTPS")
     finally:
         await engine.stop()
 
 
-async def test_the_start_preflight_keeps_the_lookup_and_leaves_the_lanes(
+async def test_the_registry_preflight_keeps_the_lookup_and_leaves_the_lanes(
     store: MessageStore, tmp_path: Path, judged: None
 ) -> None:
-    """A ``FhirLookup`` has no lane to fail, so its refused CA still refuses the start. An outbound's
-    does not: the lane check owns it. The reload scope checks both."""
+    """A ``FhirLookup`` has no lane to fail, so its refused CA still refuses the start and the
+    reload. An outbound's does not: the runner checks each lane it builds. ``lanes=True`` is the
+    control that the same graph does carry a refused lane CA."""
     ca = _ca(tmp_path)
     cfg = tmp_path / "cfg"
     _two_outbound_graph(cfg, _dest("rest", ca, pin="00" * 32))
     reg = load_config(cfg)
     preflight = ta.make_registry_anchor_preflight(store, enforcing=True)
-    await preflight(reg, {}, at_start=True)
+    await preflight(reg, {})
     with pytest.raises(WiringError, match="outbound connection 'OUT'"):
-        await preflight(reg, {})
+        await preflight(reg, {}, lanes=True)
 
     wiring._active = Registry()
     lookup = tmp_path / "lookup"
@@ -593,7 +612,7 @@ async def test_the_start_preflight_keeps_the_lookup_and_leaves_the_lanes(
         encoding="utf-8",
     )
     with pytest.raises(WiringError, match="fhir lookup 'EPIC' tls_ca_file"):
-        await preflight(load_config(lookup), {}, at_start=True)
+        await preflight(load_config(lookup), {})
 
 
 async def test_a_missing_outbound_ca_names_the_connection(
@@ -770,3 +789,31 @@ async def test_a_first_load_by_reload_leaves_the_lanes_to_the_runner(
         assert events.count("pin_mismatch") == 1, events
     finally:
         await engine.stop()
+
+
+async def test_a_reload_does_not_read_a_lane_below_the_dr_threshold(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """Manager decision Q1: a DR-parked lane is not built, so a bad CA there must not refuse a reload
+    or a DR activation. Its CA is read when the lane is built. Red under: the reload check
+    ignoring the DR threshold."""
+    from messagefoundry.config.models import Priority
+    from messagefoundry.pipeline.wiring_runner import RegistryRunner
+
+    ca = _ca(tmp_path)
+    cfg = tmp_path / "cfg"
+    _two_outbound_graph(cfg, _dest("rest", ca, pin="00" * 32) + ", priority=Priority.LOW")
+    runner = RegistryRunner(
+        load_config(cfg),
+        store,
+        egress=EgressSettings(deny_by_default=False),
+        lane_anchor_check=ta.make_lane_anchor_check(store, enforcing=True),
+        dr_threshold=Priority.NORMAL,
+    )
+    await runner.start()
+    try:
+        assert not runner.degraded_outbound()
+        await runner.reload(load_config(cfg))
+        assert await _rows(store, "outbound:OUT") == []
+    finally:
+        await runner.stop()

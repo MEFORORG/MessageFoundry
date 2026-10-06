@@ -39,7 +39,11 @@ from enum import Enum, StrEnum
 from typing import Any, Literal, NamedTuple, Protocol, cast
 
 from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
-from messagefoundry.auth.trust_anchors import LaneAnchorCheck
+from messagefoundry.auth.trust_anchors import (
+    LaneAnchorCheck,
+    TrustAnchorError,
+    refused_connection_anchor,
+)
 from messagefoundry.config.db_lookup import DbLookupError
 from messagefoundry.config.db_lookup import activated as db_lookup_activated
 from messagefoundry.config.fhir_lookup import (
@@ -1215,6 +1219,9 @@ class RegistryRunner:
         # vault BACKLOG #2371: the audited check of a dialling CA, awaited where a lane is built
         # (:meth:`_check_lane_anchor`). None in a test or embedding that passes none: no check.
         self._lane_anchor_check = lane_anchor_check
+        # The lanes whose last check refused their CA. A reload does not rebuild one of these unless
+        # its config changed (:meth:`_keeps_anchor_failure`); an operator start checks it again.
+        self._anchor_refused: set[tuple[Direction, str]] = set()
         # Deployment-wide shadow override ([shadow].simulate_all_egress, #15): when True, EVERY outbound
         # runs egress-suppressed regardless of its own simulate= flag. Resolved per-connection into
         # self._simulate at reconcile (per-connection simulate OR this).
@@ -2822,10 +2829,17 @@ class RegistryRunner:
     ) -> None:
         """Check a lane's dialling CA as it is built (vault BACKLOG #2371). Each caller awaits it
         inside the ADR 0031 isolation, so a refusal fails that lane only. A reload does not call
-        it: the engine's reload preflight has checked every lane's CA before the swap, and refuses
-        the whole reload. ``auth.trust_anchors``, module item 9, states the rule once."""
-        if self._lane_anchor_check is not None:
+        it per build: :meth:`_check_reload_lane_anchors` checks the lanes it builds or keeps running
+        before it quiesces, and refuses the whole reload. ``auth.trust_anchors``, module item 9,
+        states the rule once."""
+        if self._lane_anchor_check is None:
+            return
+        try:
             await self._lane_anchor_check(direction, name, settings)
+        except (TrustAnchorError, ValueError):
+            self._anchor_refused.add((direction, name))
+            raise
+        self._anchor_refused.discard((direction, name))
 
     async def _check_inbound_lane_anchor(self, name: str) -> None:
         """:meth:`_check_lane_anchor` for an inbound ``Ftp`` poller about to bind, the one inbound
@@ -2845,6 +2859,83 @@ class RegistryRunner:
             ic, self._inbound_bind_host, self._env_values, self._trust_anchor_policy
         )
         await self._check_lane_anchor("inbound", name, source_cfg.settings)
+
+    def _keeps_anchor_failure(
+        self,
+        direction: Direction,
+        name: str,
+        old: Registry,
+        new: InboundConnection | OutboundConnection,
+    ) -> bool:
+        """Whether a reload leaves ``name`` failed because its last check refused its CA, and its
+        config has not changed since (vault BACKLOG #2371). Such a lane is not rebuilt, so its CA is
+        not read and not checked. A changed config rebuilds it, and the reload check reads it."""
+        if (direction, name) not in self._anchor_refused:
+            return False
+        if isinstance(new, OutboundConnection):
+            prior_out = old.outbound.get(name)
+            return (
+                prior_out is not None
+                and prior_out.spec == new.spec
+                and _hop_policy(prior_out) == _hop_policy(new)
+            )
+        prior_in = old.inbound.get(name)
+        return prior_in is not None and prior_in.spec == new.spec
+
+    def _reload_anchor_lanes(
+        self, old: Registry, new: Registry, old_inbound_names: Sequence[str]
+    ) -> list[tuple[Direction, str, Mapping[str, Any]]]:
+        """The lanes whose CA a reload to ``new`` reads: the ones it builds or keeps running, with
+        settings resolved. It mirrors the gates of :meth:`_reconcile_outbounds` and of
+        :meth:`reload`'s listener restart, read without their side effects. Left out: a lane not
+        deployed, an ``auto_start=False`` lane that is not running, a lane below a DR threshold, an
+        ``Ftp`` poller outside its schedule window, and a lane :meth:`_keeps_anchor_failure` keeps
+        failed. Each of those is checked when it is built."""
+        dr_on = self._dr_threshold is not None
+        lanes: list[tuple[Direction, str, Mapping[str, Any]]] = []
+        for name, oc in new.outbound.items():
+            if (
+                not oc.deployed
+                or (not oc.auto_start and not self._outbound_lane_live(name))
+                or (dr_on and self._below_dr_threshold(oc.priority))
+                or self._keeps_anchor_failure("outbound", name, old, oc)
+            ):
+                continue
+            dest = _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress)
+            lanes.append(("outbound", name, dest.settings))
+        for ic in new.inbound.values():
+            if (
+                ic.spec.type is not ConnectorType.REMOTEFILE
+                or not ic.spec.settings.get("tls_ca_file")
+                or not ic.deployed
+                or (not ic.auto_start and ic.name not in old_inbound_names)
+                or (dr_on and self._below_dr_threshold(ic.priority))
+                or (ic.schedule is not None and not ic.schedule.is_active(self._schedule_clock()))
+                or self._keeps_anchor_failure("inbound", ic.name, old, ic)
+            ):
+                continue
+            cfg = _source_config(
+                ic, self._inbound_bind_host, self._env_values, self._trust_anchor_policy
+            )
+            lanes.append(("inbound", ic.name, cfg.settings))
+        return lanes
+
+    async def _check_reload_lane_anchors(
+        self, old: Registry, new: Registry, old_inbound_names: Sequence[str]
+    ) -> None:
+        """Check the CA of each lane a reload builds or keeps running (vault BACKLOG #2371, ADR
+        0031 as amended 2026-10-06). A refusal refuses the whole reload, before anything changes,
+        as a ``WiringError`` whose cause is the :class:`TrustAnchorError`. An idle lane is not read
+        (:meth:`_reload_anchor_lanes`), so a bad CA there never refuses a reload, a DR activation or
+        a follower convergence."""
+        if self._lane_anchor_check is None:
+            return
+        for direction, name, settings in self._reload_anchor_lanes(old, new, old_inbound_names):
+            try:
+                await self._check_lane_anchor(direction, name, settings)
+            except (TrustAnchorError, ValueError) as exc:
+                error = refused_connection_anchor(exc)
+                raise error from error.__cause__
 
     async def _ensure_destination_built(self, name: str) -> None:
         """Build ``name``'s connector into ``_destinations`` if the lane has none — the missing half of
@@ -5351,6 +5442,12 @@ class RegistryRunner:
                     self._spawn_worker(name)
                 continue
             self._filtered.pop(("outbound", name), None)
+            # vault BACKLOG #2371: a lane its CA failed stays failed, worker and all, until its
+            # config changes or an operator starts it. The reload check did not read its CA.
+            if self._keeps_anchor_failure("outbound", name, old, oc):
+                if worker is None or worker.done():
+                    self._spawn_worker(name)
+                continue
             # A lane with its OWN delivery worker is live iff that worker is alive — a dead one must be
             # respawned or the lane stops draining. A lane the pooled OUTBOUND dispatcher drains has no
             # worker to judge by, so it is live iff its connector is BUILT; judging that one by worker
@@ -5569,6 +5666,8 @@ class RegistryRunner:
 
             old = self.registry
             old_inbound_names = list(self._sources)
+            # vault BACKLOG #2371: before the quiesce, so a refused CA leaves the graph untouched.
+            await self._check_reload_lane_anchors(old, new_registry, old_inbound_names)
 
             try:
                 # 1. Quiesce intake: stop every inbound source so no NEW messages are accepted. Any
@@ -5687,6 +5786,9 @@ class RegistryRunner:
                         self._schedule_clock()
                     ):
                         self._failed.pop(("inbound", ic.name), None)
+                        continue
+                    # vault BACKLOG #2371: an Ftp poller its CA failed stays down, as an outbound does.
+                    if self._keeps_anchor_failure("inbound", ic.name, old, ic):
                         continue
                     await self._start_inbound_unsafe(ic.name)
                 # 2b. Ensure the router + transform workers run for every inbound in the new graph.

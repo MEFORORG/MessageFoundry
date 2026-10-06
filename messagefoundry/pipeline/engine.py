@@ -18,7 +18,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
-from messagefoundry.auth.trust_anchors import LaneAnchorCheck, RegistryAnchorPreflight
+from messagefoundry.auth.trust_anchors import LaneAnchorCheck
 from messagefoundry.config.models import (
     AckAfter,
     BuildupThreshold,
@@ -260,7 +260,7 @@ class Engine:
         registry_guard: Callable[[Registry], None] | None = None,
         sandbox_settings: SandboxSettings | None = None,
         log_dir: str | None = None,
-        registry_preflight: RegistryAnchorPreflight | None = None,
+        registry_preflight: Callable[[Registry, Mapping[str, Any]], Awaitable[None]] | None = None,
         settings_preflight: Callable[[], Awaitable[None]] | None = None,
         lane_anchor_check: LaneAnchorCheck | None = None,
     ) -> None:
@@ -286,9 +286,9 @@ class Engine:
         # raises WiringError to refuse. `serve` passes the per-connection trust-anchor preflight here
         # (BACKLOG #1142, slice 3); None = no preflight.
         self._registry_preflight = registry_preflight
-        # vault BACKLOG #2371, ADR 0031 as amended 2026-10-06: the dialling-CA check each runner
-        # awaits when it builds an outbound lane or binds an Ftp poller, so a refused CA fails that
-        # lane, not the start. `serve` passes it; None = no check. Not handed to a dry-run checker.
+        # vault BACKLOG #2371, ADR 0031 as amended 2026-10-06: the dialling-CA check the runner
+        # awaits for each lane it builds, at start, at an operator start and before a reload. `serve`
+        # passes it; None = no check. Not handed to a dry-run checker, which builds nothing live.
         self._lane_anchor_check = lane_anchor_check
         # An optional async check run first on EVERY real reload, whoever starts it: the reload route,
         # a held reload a second approver releases, cluster convergence, and the DR profile reload.
@@ -2106,17 +2106,12 @@ class Engine:
         if self._registry_guard is not None:
             self._registry_guard(registry)
 
-    async def preflight_registry(self, registry: Registry, *, at_start: bool = False) -> None:
+    async def preflight_registry(self, registry: Registry) -> None:
         """Run the engine's registry preflight over ``registry``; raises ``WiringError`` to refuse it.
 
         A no-op when none was configured. Public for the same reason as :meth:`guard_registry`: the
-        managed app's first load reaches ``add_registry`` directly, and passes ``at_start=True``.
-        The start leaves the lane CAs to the runner's lane check (vault BACKLOG #2371)."""
-        if self._registry_preflight is None:
-            return
-        if at_start:
-            await self._registry_preflight(registry, self._env_values, at_start=True)
-        else:
+        managed app's first load reaches ``add_registry`` directly."""
+        if self._registry_preflight is not None:
             await self._registry_preflight(registry, self._env_values)
 
     async def preflight_settings(self) -> None:
@@ -2292,9 +2287,8 @@ class Engine:
         runner = self._registry_runner
         if not dry_run:
             # The graph this process will run, so after the shard filter. Before anything is swapped,
-            # so a refusal leaves the live graph as it was (BACKLOG #1142, slice 3). With no runner
-            # yet this load is the start, so the lane CAs are left to the runner (vault #2371).
-            await self.preflight_registry(registry, at_start=runner is None)
+            # so a refusal leaves the live graph as it was (BACKLOG #1142, slice 3).
+            await self.preflight_registry(registry)
         if dry_run:
             # Validate against THIS environment without swapping: build-check every connector (which
             # resolves env() refs against this instance's values and raises on a missing key or bad

@@ -75,9 +75,13 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
    * An outbound or an ``Ftp`` poller is checked when its lane is built, at start and at an
      operator start (:func:`make_lane_anchor_check`). A refusal fails that lane only, with the
      audit row, and the rest of the graph comes up.
-   * A ``FhirLookup`` has no lane of its own, so the start preflight checks it and refuses the
-     start (:func:`make_registry_anchor_preflight`).
-   * A reload checks all of them first and refuses the whole reload.
+   * A ``FhirLookup`` has no lane of its own, so the registry preflight checks it and refuses
+     the start or the reload (:func:`make_registry_anchor_preflight`).
+   * Before a reload quiesces, the runner checks each lane the reload builds or keeps running, and
+     a refusal refuses the whole reload. It does not read an idle lane: one not deployed, an
+     ``auto_start=False`` lane not running, one below a DR threshold, a poller outside its
+     schedule window, or a lane its CA failed whose config has not changed. A reload leaves that
+     last kind failed. A config change or an operator start builds it, and checks it then.
 
    **Not covered: the checked bytes are not the loaded bytes here.** These hops build their
    context from the path, with ``cafile=``, after the check. So a file swapped between the check
@@ -117,7 +121,7 @@ from messagefoundry.service_status import _system_exe
 
 if TYPE_CHECKING:
     from messagefoundry.config.settings import ApiSettings, AuthSettings
-    from messagefoundry.config.wiring import Registry
+    from messagefoundry.config.wiring import Registry, WiringError
     from messagefoundry.store.base import Store
 
 log = logging.getLogger(__name__)
@@ -1554,49 +1558,55 @@ async def _preflight_connection(store: Store, spec: AnchorSpec, *, enforcing: bo
         raise _unreadable_anchor(spec, exc) from exc
 
 
+def refused_connection_anchor(exc: Exception) -> WiringError:
+    """A connection CA refusal as the ``WiringError`` a reload answers with 422 (BACKLOG #2183).
+
+    Its cause is always a :class:`TrustAnchorError`, so the reload routes audit
+    ``reason="trust_anchor"``. Any other exception, such as an ``OSError`` or a ``ValueError`` for a
+    blank ``tls_ca_pin`` or an ``env()`` path with a NUL in it, is wrapped in one first, keeping its
+    text. Raise it ``from`` its own ``__cause__``, which keeps that chain. Shared by the registry preflight and the
+    runner's reload check of the lane CAs (vault BACKLOG #2371)."""
+    from messagefoundry.config.wiring import WiringError
+
+    refused = exc if isinstance(exc, TrustAnchorError) else TrustAnchorError(str(exc))
+    if refused is not exc:
+        refused.__cause__ = exc
+    error = WiringError(f"a connection trust anchor was refused: {refused}")
+    error.__cause__ = refused
+    return error
+
+
 def make_registry_anchor_preflight(store: Store, *, enforcing: bool) -> RegistryAnchorPreflight:
     """The engine's ``registry_preflight`` for ``serve``: the audited check over a graph's
     per-connection CAs (:func:`registry_anchor_specs`), at the first load and at every real reload.
-    A refusal is re-raised as ``WiringError``, which the reload route answers with 422 and the first
-    load with a refused start. Dormant when no connection names a CA it checks.
+    A refusal is re-raised as ``WiringError`` (:func:`refused_connection_anchor`), which the reload
+    route answers with 422 and the first load with a refused start. Dormant when no connection names
+    a CA it checks.
 
-    The returned callable takes ``(registry, env_values, *, at_start=False)``. ``at_start=True``
-    leaves out the outbound and ``Ftp`` poller CAs, which the start checks lane by lane through
-    :func:`make_lane_anchor_check`, so one bad file fails its own lane (module item 9). A reload
-    checks them all.
-
-    The ``WiringError`` is always caused by a :class:`TrustAnchorError`, as the settings preflight's
-    is (:func:`make_settings_anchor_preflight`), so the reload routes audit ``reason="trust_anchor"``
-    for both. An unreadable CA (``OSError``) is refused by name, and a ``ValueError``, such as a
-    blank ``tls_ca_pin``, is wrapped in one, keeping its text. Before BACKLOG #2183 they were the
-    cause themselves, and the routes audited ``invalid_config``."""
-    from messagefoundry.config.wiring import WiringError
+    It checks the inbound listener CAs and the ``FhirLookup`` CAs. It leaves out the lane CAs, of
+    the outbounds and the ``Ftp`` pollers: the runner checks those for each lane it builds, at
+    start and before a reload (module item 9). ``lanes=True`` adds them, for a caller that wants
+    the whole graph checked at once, such as a test of the checks themselves."""
 
     async def preflight(
-        registry: Registry, env_values: Mapping[str, Any], *, at_start: bool = False
+        registry: Registry, env_values: Mapping[str, Any], *, lanes: bool = False
     ) -> None:
         try:
             # Inside the try: a blank tls_ca_pin raises ValueError while the specs are collected.
-            for spec in registry_anchor_specs(registry, env_values, lanes=not at_start):
+            for spec in registry_anchor_specs(registry, env_values, lanes=lanes):
                 await _preflight_connection(store, spec, enforcing=enforcing)
-        except TrustAnchorError as exc:
-            raise WiringError(f"a connection trust anchor was refused: {exc}") from exc
-        except (OSError, ValueError) as exc:
-            # ValueError too: an env()-supplied path with a NUL in it raises one from the read, and
-            # a blank tls_ca_pin raises one, and each must reach the route as a refused anchor, not
-            # an unaudited 500. Wrapped as the settings preflight wraps it, with the text unchanged.
-            refused = TrustAnchorError(str(exc))
-            refused.__cause__ = exc
-            raise WiringError(f"a connection trust anchor was refused: {refused}") from refused
+        except (TrustAnchorError, OSError, ValueError) as exc:
+            error = refused_connection_anchor(exc)
+            raise error from error.__cause__
 
     return preflight
 
 
 class RegistryAnchorPreflight(Protocol):
-    """What :func:`make_registry_anchor_preflight` returns, and what the engine calls."""
+    """What :func:`make_registry_anchor_preflight` returns. The engine calls it with two arguments."""
 
     def __call__(
-        self, registry: Registry, env_values: Mapping[str, Any], *, at_start: bool = False
+        self, registry: Registry, env_values: Mapping[str, Any], *, lanes: bool = False
     ) -> Awaitable[None]: ...
 
 
@@ -1608,8 +1618,9 @@ def make_lane_anchor_check(store: Store, *, enforcing: bool) -> LaneAnchorCheck:
     """The engine's per-lane check of a dialling CA (vault BACKLOG #2371, ADR 0031 amendment of
     2026-10-06). The runner awaits it inside each outbound lane build, at start and at an operator
     start, and before it binds an inbound ``Ftp`` poller. A refusal raises there, so the existing
-    isolation fails that lane only. The audit rows are those of the reload preflight, under the
-    same label (:func:`lane_anchor_spec`).
+    isolation fails that lane only. Before a reload quiesces, the runner awaits it for each lane
+    that reload builds or keeps running, and a refusal refuses the reload. Each label is
+    :func:`lane_anchor_spec`'s.
 
     It raises :class:`TrustAnchorError` for a refused or unreadable file, and ``ValueError`` for a
     blank or unread ``tls_ca_pin``. Each names the connection. A lane with no CA it reads is a
