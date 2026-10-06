@@ -632,7 +632,12 @@ async def test_all_declined_finalizes_unrouted(store: MessageStore, tmp_path: Pa
     assert fetched_row is not None
     assert fetched_row["n"] == 0
     # Listable + logged (never accepted-and-dropped), and the disposition is a real logged event.
-    assert mid in {m["id"] for m in await store.list_messages(status=MessageStatus.UNROUTED.value)}
+    assert mid in {
+        m["id"]
+        for m in await store.list_messages(
+            status=MessageStatus.UNROUTED.value, allowed_channels=None
+        )
+    }
     assert "unrouted" in [e["event"] for e in await store.events_for(mid)]
 
     # The finalizer cannot relabel it: FILTERED is reachable ONLY through a prior ROUTED stamp, and
@@ -1225,7 +1230,9 @@ async def test_replay_dead_ignores_ingress_rows(store: MessageStore) -> None:
     mid = await store.enqueue_ingress(channel_id="IB", raw=RAW)
     item = await _claim_ingress(store, "IB")
     await store.dead_letter_now(item.id, "router/handler error")
-    assert await store.count_dead() == 0  # the dead ingress row is not in the DLQ view
+    assert (
+        await store.count_dead(allowed_channels=None) == 0
+    )  # the dead ingress row is not in the DLQ view
     assert await store.replay_dead() == 0  # ...and bulk replay leaves it alone
     fetched = await store.get_message(mid)
     assert fetched is not None

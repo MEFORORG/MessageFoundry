@@ -10144,7 +10144,7 @@ class MessageStore:
         control_id: str | None = None,
         limit: int = 50,
         offset: int = 0,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
         received_from: float | None = None,
         received_to: float | None = None,
     ) -> list[dict[str, Any]]:
@@ -10183,7 +10183,7 @@ class MessageStore:
         status: str | None = None,
         message_type: str | None = None,
         control_id: str | None = None,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
         received_from: float | None = None,
         received_to: float | None = None,
     ) -> int:
@@ -10211,7 +10211,7 @@ class MessageStore:
         message_type: str | None = None,
         control_id: str | None = None,
         limit: int = 50,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> MessageSearchResult:
         """Scan-and-decrypt content search (ADR 0046 #51): pre-filter on the indexed metadata, then
         decrypt + match each candidate body **in memory** (a plain SQL ``LIKE`` is impossible while the
@@ -10280,7 +10280,7 @@ class MessageStore:
         destination_name: str | None = None,
         limit: int = 50,
         offset: int = 0,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> list[dict[str, Any]]:
         """Dead-lettered deliveries (one row per failed message→destination), newest first, joined
         with message metadata for the dead-letter view. Bodies (``raw``) are omitted (metadata only,
@@ -10312,7 +10312,7 @@ class MessageStore:
         *,
         channel_id: str | None = None,
         destination_name: str | None = None,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> int:
         """Total dead-lettered deliveries matching the same filters as :meth:`list_dead`."""
         where, params = self._dead_filter(channel_id, destination_name, allowed_channels)
@@ -10326,7 +10326,7 @@ class MessageStore:
         *,
         channel_id: str | None = None,
         destination_name: str | None = None,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> list[tuple[str, str]]:
         """The contract is ``QueueStore.list_replay_targets``: the :meth:`count_dead` predicate
         narrowed by the two clauses :meth:`replay_dead` applies, so every pair names rows a replay
@@ -10528,7 +10528,7 @@ class MessageStore:
         kinds: Sequence[str] | None = None,
         since: float | None = None,
         limit: int = 100,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> list[ConnectionEvent]:
         limit = max(
             1, min(limit, 1000)
@@ -10631,7 +10631,7 @@ class MessageStore:
         self,
         *,
         limit: int = 200,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> list[AlertInstance]:
         # The read accessor for GET /alerts/active: open + acknowledged instances, newest last_seen
         # first. Runs on the lockfree read path. `allowed_channels` applies the SAME per-channel RBAC
@@ -10655,7 +10655,7 @@ class MessageStore:
             return [self._alert_instance_row(r) for r in await cur.fetchall()]
 
     async def summarize_active_alert_instances(
-        self, *, allowed_channels: Sequence[str] | None = None
+        self, *, allowed_channels: Sequence[str] | None
     ) -> AlertSummary:
         # BACKLOG #1564: the nav bell's count + worst severity over EVERY active instance in scope, not
         # over a page of them. Same predicate and same RBAC scope as list_active_alert_instances above —
@@ -10676,7 +10676,7 @@ class MessageStore:
         return _alert_summary(row)
 
     async def get_alert_instance(
-        self, alert_id: int, *, allowed_channels: Sequence[str] | None = None
+        self, alert_id: int, *, allowed_channels: Sequence[str] | None
     ) -> AlertInstance | None:
         # Read one instance by id (any status) — the API echo for ack/resolve. RBAC-scoped exactly like
         # list_active_alert_instances (a scoped caller can't read an instance outside its channels).
@@ -10776,7 +10776,7 @@ class MessageStore:
             await self._commit()
             if cur.rowcount == 0:
                 return None
-        return await self.get_alert_instance(alert_id)
+        return await self.get_alert_instance(alert_id, allowed_channels=None)
 
     async def resume_alert_instance(
         self, alert_id: int, *, now: float | None = None
@@ -10791,7 +10791,7 @@ class MessageStore:
             await self._commit()
             if cur.rowcount == 0:
                 return None
-        return await self.get_alert_instance(alert_id)
+        return await self.get_alert_instance(alert_id, allowed_channels=None)
 
     async def count_open_alerts_by_connection(self) -> dict[str, int]:
         # Back ConnectionRow.alerts_active (ADR 0044 D4): the OPEN (not acknowledged, not resolved)

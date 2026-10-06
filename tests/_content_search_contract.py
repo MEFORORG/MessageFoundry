@@ -59,8 +59,8 @@ async def assert_search_select_is_capped(store: Any, monkeypatch: pytest.MonkeyP
             )
         everything = [mid for chan_ids in ids_by_channel.values() for mid in chan_ids]
         reads: list[tuple[dict[str, Any], list[str]]] = [
-            ({"channel_id": channel}, ids),
-            ({}, everything),
+            ({"channel_id": channel, "allowed_channels": None}, ids),
+            ({"allowed_channels": None}, everything),
             ({"allowed_channels": sorted(ids_by_channel)}, everything),
         ]
         for kwargs, candidates in reads:

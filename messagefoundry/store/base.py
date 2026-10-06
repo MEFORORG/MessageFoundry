@@ -1070,6 +1070,9 @@ class QueueStore(StoreLifecycle, Protocol):
         :func:`~messagefoundry.store.metadata.user_metadata`."""
         ...
 
+    # ``allowed_channels`` is a REQUIRED keyword on every read below that takes it (BACKLOG #2627).
+    # ``None`` still means every channel, but a caller must now write it, so a route that forgets the
+    # scope fails mypy rather than reading the whole estate. Engine-internal callers pass ``None``.
     async def list_messages(
         self,
         *,
@@ -1079,7 +1082,7 @@ class QueueStore(StoreLifecycle, Protocol):
         control_id: str | None = None,
         limit: int = 50,
         offset: int = 0,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
         received_from: float | None = None,
         received_to: float | None = None,
     ) -> Sequence[Row]: ...
@@ -1091,7 +1094,7 @@ class QueueStore(StoreLifecycle, Protocol):
         status: str | None = None,
         message_type: str | None = None,
         control_id: str | None = None,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
         received_from: float | None = None,
         received_to: float | None = None,
     ) -> int: ...
@@ -1105,7 +1108,7 @@ class QueueStore(StoreLifecycle, Protocol):
         message_type: str | None = None,
         control_id: str | None = None,
         limit: int = 50,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> MessageSearchResult:
         """Scan-and-decrypt content search (ADR 0046 #51): metadata pre-filter in SQL, then decrypt +
         match each candidate body in memory off the event loop — the only mechanism that works while the
@@ -1121,7 +1124,7 @@ class QueueStore(StoreLifecycle, Protocol):
         destination_name: str | None = None,
         limit: int = 50,
         offset: int = 0,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> Sequence[Row]: ...
 
     async def count_dead(
@@ -1129,7 +1132,7 @@ class QueueStore(StoreLifecycle, Protocol):
         *,
         channel_id: str | None = None,
         destination_name: str | None = None,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> int: ...
 
     async def list_replay_targets(
@@ -1137,7 +1140,7 @@ class QueueStore(StoreLifecycle, Protocol):
         *,
         channel_id: str | None = None,
         destination_name: str | None = None,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> list[tuple[str, str]]:
         """The distinct ``(channel_id, destination_name)`` pairs for which :meth:`replay_dead`
         would re-queue at least one row, sorted, under the :meth:`count_dead` filters and
@@ -1232,7 +1235,7 @@ class QueueStore(StoreLifecycle, Protocol):
         kinds: Sequence[str] | None = None,
         since: float | None = None,
         limit: int = 100,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> list[ConnectionEvent]:
         """Read connection events newest-first, optionally filtered by ``connection``, an ``kinds``
         allow-set, and a ``since`` timestamp. ``reason`` is decrypted at the boundary. The read accessor
@@ -1276,7 +1279,7 @@ class QueueStore(StoreLifecycle, Protocol):
         self,
         *,
         limit: int = 200,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> list[AlertInstance]:
         """Read **open + acknowledged** alert instances newest-``last_seen`` first — the read accessor for
         the ``GET /alerts/active`` route. Runs on the lockfree read path; ``limit`` clamped server-side.
@@ -1285,7 +1288,7 @@ class QueueStore(StoreLifecycle, Protocol):
         ...
 
     async def summarize_active_alert_instances(
-        self, *, allowed_channels: Sequence[str] | None = None
+        self, *, allowed_channels: Sequence[str] | None
     ) -> AlertSummary:
         """The count + worst severity of **open + acknowledged** instances across the WHOLE of the
         caller's scope (BACKLOG #1564) — the nav alert bell's read, which a page of rows cannot answer.
@@ -1335,7 +1338,7 @@ class QueueStore(StoreLifecycle, Protocol):
         ...
 
     async def get_alert_instance(
-        self, alert_id: int, *, allowed_channels: Sequence[str] | None = None
+        self, alert_id: int, *, allowed_channels: Sequence[str] | None
     ) -> AlertInstance | None:
         """Read one alert instance by id (any status), RBAC-scoped like
         :meth:`list_active_alert_instances` — the API echo after an ack/resolve. ``None`` if unknown or

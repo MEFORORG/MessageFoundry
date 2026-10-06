@@ -141,7 +141,9 @@ async def _login(c: httpx.AsyncClient) -> dict[str, str]:
 
 
 async def _message_count(engine: Engine, channel: str) -> int:
-    return len(await engine.store.list_messages(channel_id=channel, limit=1000))
+    return len(
+        await engine.store.list_messages(channel_id=channel, limit=1000, allowed_channels=None)
+    )
 
 
 async def _actions(engine: Engine, action: str) -> list[Row]:

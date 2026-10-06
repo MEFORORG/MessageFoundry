@@ -149,7 +149,7 @@ async def _until_message(
     store: MessageStore, status: str, *, channel_id: str = "file_in", timeout: float = 4.0
 ) -> None:
     for _ in range(int(timeout / 0.02)):
-        if await store.list_messages(channel_id=channel_id, status=status):
+        if await store.list_messages(channel_id=channel_id, status=status, allowed_channels=None):
             return
         await asyncio.sleep(0.02)
     raise AssertionError(f"no {status} message within {timeout}s")
@@ -198,7 +198,7 @@ async def test_inline_off_uses_split_path_and_processes(
     assert spy.handoff_calls == 0  # never the inline primitive
     assert spy.route_handoff_calls == 1 and spy.transform_handoff_calls == 1  # the split path
     assert runner._inline_ok["file_in"] is False
-    msgs = await store.list_messages(channel_id="file_in")
+    msgs = await store.list_messages(channel_id="file_in", allowed_channels=None)
     assert len(msgs) == 1 and msgs[0]["status"] == MessageStatus.PROCESSED.value
     assert "FOUNDRY" in (outdir / "MSG1.hl7").read_bytes().decode("utf-8")
 
@@ -229,7 +229,7 @@ async def test_inline_happy_path_fuses_handoff_and_processes(
     assert (
         spy.route_handoff_calls == 0 and spy.transform_handoff_calls == 0
     )  # routed stage bypassed
-    msgs = await store.list_messages(channel_id="file_in")
+    msgs = await store.list_messages(channel_id="file_in", allowed_channels=None)
     assert len(msgs) == 1 and msgs[0]["status"] == MessageStatus.PROCESSED.value
     mid = msgs[0]["id"]
     outbound = await store.outbox_for(mid)
@@ -282,7 +282,7 @@ async def test_inline_multi_handler_falls_back_to_split(
         spy.route_handoff_calls == 1 and spy.transform_handoff_calls == 2
     )  # split, one per handler
     assert (out1 / "MSG1.hl7").exists() and (out2 / "MSG1.hl7").exists()  # neither delivery lost
-    msgs = await store.list_messages(channel_id="file_in")
+    msgs = await store.list_messages(channel_id="file_in", allowed_channels=None)
     assert msgs[0]["status"] == MessageStatus.PROCESSED.value
 
 
@@ -381,7 +381,9 @@ async def test_inline_handler_raises_dead_letters_via_internal_error_policy(
         await runner.stop()
 
     assert spy.handoff_calls == 0  # the fused commit never ran (transform raised first)
-    msgs = await store.list_messages(channel_id="file_in", status=MessageStatus.ERROR.value)
+    msgs = await store.list_messages(
+        channel_id="file_in", status=MessageStatus.ERROR.value, allowed_channels=None
+    )
     assert len(msgs) == 1  # dead-lettered exactly once — not looping
 
 
@@ -428,7 +430,9 @@ async def test_inline_handler_raises_stop_policy_halts_lane(
             await asyncio.sleep(0.02)
         assert sink.stopped == ["file_in"]  # lane halted + alerted
         # The message is NOT dead-lettered (STOP preserves the row for replay after a fix+reload).
-        assert not await store.list_messages(channel_id="file_in", status=MessageStatus.ERROR.value)
+        assert not await store.list_messages(
+            channel_id="file_in", status=MessageStatus.ERROR.value, allowed_channels=None
+        )
     finally:
         await runner.stop()
 
@@ -538,6 +542,8 @@ async def test_inline_g6_dead_letters_at_finite_attempts_ceiling(
     finally:
         await runner.stop()
 
-    msgs = await store.list_messages(channel_id="file_in", status=MessageStatus.ERROR.value)
+    msgs = await store.list_messages(
+        channel_id="file_in", status=MessageStatus.ERROR.value, allowed_channels=None
+    )
     assert len(msgs) == 1  # dead-lettered at the ceiling, not looping
     assert not (outdir / "MSG1.hl7").exists()

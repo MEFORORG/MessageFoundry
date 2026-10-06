@@ -129,7 +129,7 @@ async def _counts(store: MessageStore) -> tuple[int, int]:
     rename reddens it with an assertion rather than an OperationalError. A freshly committed ingress
     row is ``pending``, so ``in_pipeline_depth`` sees it; no worker runs here to move it past that.
     """
-    return await store.count_messages(), await store.in_pipeline_depth()
+    return await store.count_messages(allowed_channels=None), await store.in_pipeline_depth()
 
 
 # --- 1. MLLP/HL7 path: enqueue_ingress fails ------------------------------------------------------
@@ -229,7 +229,7 @@ async def test_control_error_branch_records_error_and_naks_ar(
     assert _has_msa(ack, "AR")
     # One ERROR row, no queue row: a rejected message is recorded, never handed to the ingress stage.
     assert await _counts(store) == (1, 0)
-    assert await store.count_messages(status=MessageStatus.ERROR.value) == 1
+    assert await store.count_messages(status=MessageStatus.ERROR.value, allowed_channels=None) == 1
 
 
 # --- 4. The commit itself fails -------------------------------------------------------------------

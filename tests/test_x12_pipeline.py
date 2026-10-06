@@ -191,7 +191,7 @@ def _client(port: int) -> X12Destination:
 
 async def _until_message(store: MessageStore, status: str, *, timeout: float = 3.0) -> None:
     elapsed = 0.0
-    while not await store.list_messages(channel_id="IB_X12", status=status):
+    while not await store.list_messages(channel_id="IB_X12", status=status, allowed_channels=None):
         await asyncio.sleep(0.02)
         elapsed += 0.02
         if elapsed > timeout:
@@ -225,7 +225,9 @@ async def test_x12_other_transaction_unrouted(store: MessageStore) -> None:
     assert recorder.payloads == []  # count-and-log: recorded UNROUTED, never delivered
     # UNROUTED is not an error and never enqueues an outbound row.
     assert (await store.stats()).get(OutboxStatus.DONE.value) is None
-    assert not await store.list_messages(channel_id="IB_X12", status=MessageStatus.ERROR.value)
+    assert not await store.list_messages(
+        channel_id="IB_X12", status=MessageStatus.ERROR.value, allowed_channels=None
+    )
 
 
 async def test_x12_malformed_isa_errors(store: MessageStore) -> None:

@@ -98,7 +98,7 @@ async def _wait_processed(store: MessageStore, channel_id: str, timeout: float =
     # asserted disposition instead of checking it the instant the file appears (slow-runner flake).
     elapsed = 0.0
     while not await store.list_messages(
-        channel_id=channel_id, status=MessageStatus.PROCESSED.value
+        channel_id=channel_id, status=MessageStatus.PROCESSED.value, allowed_channels=None
     ):
         await asyncio.sleep(0.02)
         elapsed += 0.02
@@ -259,7 +259,7 @@ async def test_failed_outbound_isolated_retries_and_recovers(
         await _wait_pending(store, "bad_out")
         assert not (outdir.exists() and any(outdir.iterdir()))  # nothing written — never dropped
         assert not await store.list_messages(
-            channel_id="file_in", status=MessageStatus.PROCESSED.value
+            channel_id="file_in", status=MessageStatus.PROCESSED.value, allowed_channels=None
         )  # the message is not finalized PROCESSED — it's stuck retrying, recoverable
 
         # Fix the cause (a concrete directory, no env) and reload → the lane self-heals.

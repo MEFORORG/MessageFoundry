@@ -397,7 +397,7 @@ async def test_row8_fanout_finalize_both_modes(store: Any, tmp_path: Path, mode:
 
         async def _gated() -> bool:
             # out_a delivered (DONE) AND out_b claimed + parked in the gate (INFLIGHT).
-            msgs = await store.list_messages()
+            msgs = await store.list_messages(allowed_channels=None)
             if len(msgs) != 1:
                 return False
             rows = await store.outbox_for(msgs[0]["id"])
@@ -414,7 +414,7 @@ async def test_row8_fanout_finalize_both_modes(store: Any, tmp_path: Path, mode:
             # finalized — a finalizer that declared PROCESSED on out_a alone would already show
             # PROCESSED here (the held gate stops that premature PROCESSED from self-healing). It must
             # still be ROUTED.
-            msgs = await store.list_messages()
+            msgs = await store.list_messages(allowed_channels=None)
             mid = msgs[0]["id"]
             assert msgs[0]["status"] == MessageStatus.ROUTED.value, msgs[0]["status"]
             rows = await store.outbox_for(mid)
@@ -429,12 +429,12 @@ async def test_row8_fanout_finalize_both_modes(store: Any, tmp_path: Path, mode:
             gate.release.set()
 
         async def _processed() -> bool:
-            msgs = await store.list_messages()
+            msgs = await store.list_messages(allowed_channels=None)
             return len(msgs) == 1 and msgs[0]["status"] == MessageStatus.PROCESSED.value
 
         await _until(_processed)  # gate released -> both lanes resolve -> finalize PROCESSED
 
-        msgs = await store.list_messages()
+        msgs = await store.list_messages(allowed_channels=None)
         mid = msgs[0]["id"]
         # Both lanes delivered exactly once (out_a via the recorder, out_b via the released gate).
         assert len(col_a.payloads) == 1, col_a.payloads
@@ -530,7 +530,7 @@ async def test_row2_pooled_crash_replay_no_loss_no_fifo_overtake(
         # OUTBOUND lane is PROCESSING (the sweep only marks it dirty, claims nothing), so stop() is a
         # clean cancel that strands exactly the head — no write transaction to poison the reset.
         async def _all_outbound_rows_exist() -> bool:
-            msgs = await store.list_messages()
+            msgs = await store.list_messages(allowed_channels=None)
             if len(msgs) != 3:
                 return False
             total = 0
@@ -563,7 +563,9 @@ async def test_row2_pooled_crash_replay_no_loss_no_fifo_overtake(
     try:
 
         async def _all_processed() -> bool:
-            msgs = await store.list_messages(status=MessageStatus.PROCESSED.value)
+            msgs = await store.list_messages(
+                status=MessageStatus.PROCESSED.value, allowed_channels=None
+            )
             return len(msgs) == 3
 
         await _until(_all_processed)
@@ -571,7 +573,7 @@ async def test_row2_pooled_crash_replay_no_loss_no_fifo_overtake(
         await _stop_quiesced(runner2, store)
 
     # No loss / no duplicate: every message finalized PROCESSED with EXACTLY ONE delivered OUTBOUND row.
-    msgs = await store.list_messages()
+    msgs = await store.list_messages(allowed_channels=None)
     assert {m["control_id"] for m in msgs} == set(cids), msgs
     delivered_event_id: dict[str, int] = {}
     for m in msgs:
@@ -632,7 +634,9 @@ async def test_row3_pooled_retry_schedule_real_clock(store: Any, tmp_path: Path)
         )
 
         async def _processed() -> bool:
-            msgs = await store.list_messages(status=MessageStatus.PROCESSED.value)
+            msgs = await store.list_messages(
+                status=MessageStatus.PROCESSED.value, allowed_channels=None
+            )
             return len(msgs) == 1
 
         await _until(_processed)  # quiescent once delivered

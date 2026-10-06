@@ -175,7 +175,7 @@ async def _assert_connection_clean(store: MessageStore, *, probe: str) -> None:
     await store.record_connection_event(
         connection=probe, transport="mllp", direction="inbound", kind="probe"
     )
-    assert len(await store.list_connection_events(connection=probe)) == 1
+    assert len(await store.list_connection_events(connection=probe, allowed_channels=None)) == 1
 
 
 async def _assert_unwound_and_recovered(

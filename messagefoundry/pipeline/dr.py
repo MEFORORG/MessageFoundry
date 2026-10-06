@@ -549,7 +549,7 @@ class DrCoordinator:
             )
         seeded = int(verify.row_counts.get("messages", 0))
         try:
-            present = await self._store.count_messages()
+            present = await self._store.count_messages(allowed_channels=None)
         except Exception as exc:  # a store that cannot be counted cannot be shown to hold the seed
             await self._record_aborted(
                 "state",

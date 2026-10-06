@@ -316,7 +316,7 @@ async def test_runner_writes_connection_events_to_store(tmp_path: Path) -> None:
             await asyncio.wait_for(
                 runner.stop(), timeout=5.0
             )  # stops the source (closed emitted) then flushes the drain queue
-        events = await store.list_connection_events(connection="IB_T_ADT")
+        events = await store.list_connection_events(connection="IB_T_ADT", allowed_channels=None)
         kinds = {e.kind for e in events}
         assert "established" in kinds and "closed" in kinds
         assert all(e.direction == "inbound" and e.transport == "mllp" for e in events)

@@ -192,7 +192,9 @@ async def test_inbound_unknown_handler_dead_letters_at_ingress(
         outdir / "MSG1.hl7"
     ).exists()  # nothing delivered — failed closed, not accept-and-drop
 
-    rows = await store.list_messages(channel_id="file_in", status=MessageStatus.ERROR.value)
+    rows = await store.list_messages(
+        channel_id="file_in", status=MessageStatus.ERROR.value, allowed_channels=None
+    )
     mid = rows[0]["id"]
     cur = await store._db.execute(
         "SELECT stage, status, handler_name FROM queue WHERE message_id=?", (mid,)
@@ -236,7 +238,9 @@ async def test_unrecognised_handler_return_dead_letters_in_the_live_runner(
         await runner.stop()
     assert not (outdir / "MSG1.hl7").exists()  # nothing delivered
 
-    rows = await store.list_messages(channel_id="file_in", status=MessageStatus.ERROR.value)
+    rows = await store.list_messages(
+        channel_id="file_in", status=MessageStatus.ERROR.value, allowed_channels=None
+    )
     mid = rows[0]["id"]
     errors = await _last_errors(store, mid)
     # The stored signal has to name BOTH the handler and the type, or an operator holding a dead
@@ -377,7 +381,9 @@ async def _until_message(
     store: MessageStore, status: str, *, channel_id: str = "file_in", timeout: float = 3.0
 ) -> None:
     elapsed = 0.0
-    while not await store.list_messages(channel_id=channel_id, status=status):
+    while not await store.list_messages(
+        channel_id=channel_id, status=status, allowed_channels=None
+    ):
         await asyncio.sleep(0.02)
         elapsed += 0.02
         if elapsed > timeout:
@@ -412,9 +418,11 @@ async def test_handler_exception_redacts_phi_from_stored_error(
     finally:
         await runner.stop()
 
-    mid = (await store.list_messages(channel_id="file_in", status=MessageStatus.ERROR.value))[0][
-        "id"
-    ]
+    mid = (
+        await store.list_messages(
+            channel_id="file_in", status=MessageStatus.ERROR.value, allowed_channels=None
+        )
+    )[0]["id"]
     errors = await _last_errors(store, mid)
     assert "ValueError" in errors and "handler error" in errors  # type + context kept
     assert "DOE" not in errors and "JANE" not in errors  # PHI redacted out of last_error
@@ -727,7 +735,7 @@ async def test_router_handler_transforms_and_delivers(store: MessageStore, tmp_p
 
     written = (outdir / "MSG1.hl7").read_bytes().decode("utf-8")
     assert "FOUNDRY" in written  # the Handler's transform was applied before delivery
-    assert len(await store.list_messages(channel_id="file_in")) == 1
+    assert len(await store.list_messages(channel_id="file_in", allowed_channels=None)) == 1
 
 
 async def test_router_routes_nowhere_is_unrouted(store: MessageStore, tmp_path: Path) -> None:
@@ -830,7 +838,11 @@ async def test_strict_validation_nacks(store: MessageStore, tmp_path: Path) -> N
     assert (await store.stats()) == {}  # logged ERROR, never enqueued for delivery
     # #120: the persisted strict-validation error is prefixed and run through the PHI scrub (safe_text),
     # so hl7apy error strings that quote an offending field VALUE can't land raw in messages.error.
-    errored = (await store.list_messages(channel_id="mllp_in", status=MessageStatus.ERROR.value))[0]
+    errored = (
+        await store.list_messages(
+            channel_id="mllp_in", status=MessageStatus.ERROR.value, allowed_channels=None
+        )
+    )[0]
     assert (errored["error"] or "").startswith("strict-validation failed:")
 
 
@@ -866,7 +878,11 @@ async def test_strict_validation_timeout_dead_letters_and_naks(
     finally:
         await runner.stop()
     assert (await store.stats()) == {}  # dead-lettered pre-ingress, never enqueued for delivery
-    errored = (await store.list_messages(channel_id="mllp_in", status=MessageStatus.ERROR.value))[0]
+    errored = (
+        await store.list_messages(
+            channel_id="mllp_in", status=MessageStatus.ERROR.value, allowed_channels=None
+        )
+    )[0]
     # PHI-safe: the persisted disposition carries only the numeric timeout, never a message field value.
     assert (errored["error"] or "").startswith("strict-validation timed out")
 
@@ -1305,7 +1321,9 @@ async def test_stop_policy_halts_connection_and_alerts(store: MessageStore, tmp_
     assert sink.stopped[0][0] == "file_out"
     # message preserved for replay, not dead-lettered
     assert (await store.stats()).get(OutboxStatus.DEAD.value, 0) == 0
-    assert await store.list_messages(channel_id="file_in")  # still in the store, pending redelivery
+    assert await store.list_messages(
+        channel_id="file_in", allowed_channels=None
+    )  # still in the store, pending redelivery
 
 
 async def test_queue_buildup_alert_on_blocked_lane(store: MessageStore, tmp_path: Path) -> None:
@@ -1421,7 +1439,7 @@ async def test_ingress_stop_policy_halts_and_alerts(store: MessageStore, tmp_pat
         await runner.stop()
     assert sink.stopped[0][0] == "file_in"  # keyed by the inbound, not an outbound
     # Message preserved for replay (RECEIVED at ingress), NOT dead-lettered.
-    msgs = await store.list_messages(channel_id="file_in")
+    msgs = await store.list_messages(channel_id="file_in", allowed_channels=None)
     assert msgs and msgs[0]["status"] == MessageStatus.RECEIVED.value
 
 
@@ -1563,7 +1581,7 @@ async def test_two_handlers_both_deliver_end_to_end(store: MessageStore, tmp_pat
     finally:
         await runner.stop()
     assert (outdir / "OUT1.hl7").exists() and (outdir / "OUT2.hl7").exists()
-    msgs = await store.list_messages(channel_id="file_in")
+    msgs = await store.list_messages(channel_id="file_in", allowed_channels=None)
     assert len(msgs) == 1 and msgs[0]["status"] == MessageStatus.PROCESSED.value
     # The transient stages left nothing behind: only the two outbound rows persist (no ingress/routed).
     by_stage = {

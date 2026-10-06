@@ -958,7 +958,10 @@ async def _settle(sink: NotifierAlertSink) -> None:
 
 
 async def _open_alerts(store: MessageStore) -> set[tuple[str, str]]:
-    return {(i.event_type, i.connection) for i in await store.list_active_alert_instances()}
+    return {
+        (i.event_type, i.connection)
+        for i in await store.list_active_alert_instances(allowed_channels=None)
+    }
 
 
 ABORTED = ("ad_reconcile_aborted", "directory-reconciler")

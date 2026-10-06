@@ -2746,7 +2746,7 @@ async def test_a_refused_auth_tls_stops_the_lane_and_keeps_the_row(
         assert retry_until is None
         pending = OutboxStatus.PENDING.value
         assert await _queue_rows(runner, mids) == [(pending, 0, None)] * 3, "every row kept"
-        assert await runner.store.count_dead() == 0
+        assert await runner.store.count_dead(allowed_channels=None) == 0
         assert len(sink.stopped) == 1
         assert sink.stopped[0][0] == _E2E_DEST
         assert "configuration fault" in sink.stopped[0][1]
@@ -2778,7 +2778,7 @@ async def test_a_refused_auth_tls_on_a_batch_stops_the_lane_and_keeps_every_row(
         assert retry_until is None
         pending = OutboxStatus.PENDING.value
         assert await _queue_rows(runner, mids) == [(pending, 0, None)] * 3, "every member kept"
-        assert await runner.store.count_dead() == 0
+        assert await runner.store.count_dead(allowed_channels=None) == 0
         assert [name for name, _ in sink.stopped] == [_E2E_DEST]
         assert "configuration fault" in sink.stopped[0][1]
         assert ("outbound", _E2E_DEST) in runner._stop_held
