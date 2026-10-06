@@ -357,8 +357,8 @@ class DrParkedError(RuntimeError):
     could only charge its held rows failed attempts, and a stop or restart would turn the engine's
     park into an operator pause or the reverse, which the release reload then reads wrongly. Each
     such door was found one at a time while they were deferred. A refusal leaves the lane exactly as
-    the profile parked it, and the reload after ``POST /dr/release`` is the one door that un-parks
-    it, back to the state it had before the activation. The API maps this to 409."""
+    the profile parked it, for the first reload or start after ``POST /dr/release`` to re-evaluate.
+    The API maps this to 409."""
 
     def __init__(self, name: str) -> None:
         super().__init__(
@@ -4031,6 +4031,10 @@ class RegistryRunner:
                 # enters it.
                 await self._teardown_unsafe(TeardownReason.SHUTDOWN)
             self._stop.clear()
+            if self._dr_threshold is None:
+                # As in reload: with the profile off nothing is parked, and a marker left by a run
+                # under it would otherwise refuse doors until the next reload (vault BACKLOG #3067).
+                self._filtered.clear()
             # Capture the engine loop so a handler's worker thread can bridge a db_lookup back onto it.
             self._loop = asyncio.get_running_loop()
             # #122 (ADR 0162): subscribe to the application-log write guard. Done here, after the loop

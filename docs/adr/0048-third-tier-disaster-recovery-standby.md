@@ -263,12 +263,12 @@ in-flight rows stranded.
 > until release, but each door then turned one kind of pause into another, and each was found on its own.
 > A stop dropped the engine's park, so the lane read `stopping` for good. An alert rule's restart turned an
 > operator's pause into an engine park, so the release brought that lane up. So the lane keeps the state the
-> profile left it in, and the first reload after `POST /dr/release` is the one door that un-parks it. That
-> reload restores the state from before the activation: a lane the engine parked comes up, a lane an operator
-> or the calendar paused first stays paused, and an `auto_start = false` lane takes its gate's answer. A purge
-> of a parked lane is allowed, since the lane is paused and nothing is in flight. An INBOUND is unchanged: an
-> operator start of a parked inbound still overrides the profile, as `tests/test_connection_scheduler.py`
-> pins.
+> profile left it in until the first reload or start after `POST /dr/release` re-evaluates it. A lane the
+> engine parked then comes up, and a lane an operator or the calendar paused first stays paused. An
+> `auto_start = false` lane takes its gate's answer, so one an operator had started before DR stays down.
+> A purge of a parked lane is allowed, since the lane is paused and nothing is in flight. For an INBOUND, an
+> operator start still overrides the profile, as `tests/test_connection_scheduler.py` pins. An alert
+> rule's restart of a parked inbound does nothing.
 
 ### Seeding DR state — cold-from-#60 (the owner-locked default)
 

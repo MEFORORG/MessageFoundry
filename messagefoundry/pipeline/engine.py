@@ -916,17 +916,15 @@ class Engine:
         retry-forever head against a dead peer) doesn't hang the release forever; on timeout the
         remaining rows stay queued + replayable, and the runbook reconciliation accounts for them."""
         bound = DR_RELEASE_DRAIN_TIMEOUT_SECONDS if timeout is None else timeout
-        rr = self._registry_runner
         deadline = time.monotonic() + bound
         while True:
-            # Depth first: a held row that leaves between the two reads (a purge) then reads as
-            # not drained for one more poll, never as drained early.
+            # The held count is read on both sides of the depth and the smaller one is used. A row
+            # that becomes held between the reads (a fan-out to parked outbounds) or stops being
+            # held (a purge) then reads as not drained for one more poll, never as drained early.
+            held_before = await self._held_on_parked_outbounds()
             depth = await self.store.in_pipeline_depth()
-            held = 0
-            if rr is not None:
-                for name in rr.engine_parked_outbounds():
-                    held += (await self.store.pending_depth(name))[0]
-            if depth <= held or time.monotonic() >= deadline:
+            held = await self._held_on_parked_outbounds()
+            if depth <= min(held_before, held) or time.monotonic() >= deadline:
                 break
             await asyncio.sleep(poll)
         if depth > held:
@@ -937,6 +935,16 @@ class Engine:
                 depth - held,
             )
         return depth, held
+
+    async def _held_on_parked_outbounds(self) -> int:
+        """The PENDING rows on outbounds the engine parks (vault BACKLOG #3067)."""
+        rr = self._registry_runner
+        if rr is None:
+            return 0
+        held = 0
+        for name in rr.engine_parked_outbounds():
+            held += (await self.store.pending_depth(name))[0]
+        return held
 
     def add_registry(self, registry: Registry) -> RegistryRunner:
         """Run a code-first Connection/Router/Handler graph (one runner for the whole graph)."""

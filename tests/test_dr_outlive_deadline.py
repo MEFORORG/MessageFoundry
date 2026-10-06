@@ -494,6 +494,23 @@ async def test_an_activation_cancelled_while_reading_its_provenance_stays_active
     assert len(rows) == 1 and rows[0]["recorded_late"] is True
 
 
+async def test_a_provenance_fault_is_recorded_and_does_not_fail_the_activation(
+    seeded: tuple[Engine, str],
+) -> None:
+    engine, _archive = seeded
+    coord = _coordinator(engine)
+
+    async def broken_provenance() -> dict[str, object]:
+        raise RuntimeError("the digest could not be taken")
+
+    coord._provenance = broken_provenance
+    result = await coord.activate(actor="dradmin")
+    assert result.active and coord.active and engine.dr_active
+    (row,) = await _rows(engine.store, "dr.activate")
+    assert "digest could not be taken" in str(row["provenance_error"])
+    assert "recorded_late" not in row
+
+
 async def test_an_activation_cancelled_while_writing_its_row_writes_it_late(
     seeded: tuple[Engine, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:

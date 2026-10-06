@@ -170,7 +170,7 @@ class DrCoordinator:
         self._store_settings = store_settings
         self._activate_profile = activate_profile
         # Extra fields for the dr.activate row, such as the activated graph's digest. Awaited after
-        # the profile is applied; it must not raise (the engine's never does).
+        # the profile is applied; a fault is recorded on the row and never fails the activation.
         self._provenance = profile_provenance
         self._deactivate_profile = deactivate_profile
         # Awaited per activation, so building the coordinator reads no file (vault BACKLOG #2839).
@@ -379,8 +379,15 @@ class DrCoordinator:
         # Provenance is read only once the profile is applied and the row is owed, so a cancellation
         # while it is read still leaves the box recorded as active (vault BACKLOG #3067). Its fields
         # never replace the coordinator's own.
-        for key, value in (await self._profile_provenance()).items():
-            detail.setdefault(key, value)
+        if self._provenance is not None:
+            try:
+                provenance = await self._provenance()
+            except Exception as exc:
+                # The profile is live, so a provenance fault must not fail the activation.
+                log.warning("DR activation: could not read the provenance fields", exc_info=True)
+                provenance = {"provenance_error": safe_exc(exc)}
+            for key, value in provenance.items():
+                detail.setdefault(key, value)
         await self._record_owed_activation(late=False)
         return DrResult(
             action="activate",
@@ -391,10 +398,6 @@ class DrCoordinator:
             seed_segment=seed_segment,
             vip_hook_ran=hook_ran,
         )
-
-    async def _profile_provenance(self) -> Mapping[str, object]:
-        provider = self._provenance
-        return await provider() if provider is not None else {}
 
     # --- release (fail-back) -------------------------------------------------
 
@@ -671,7 +674,7 @@ class DrCoordinator:
             # D-V1 (vault BACKLOG #2752): the drain gave up at its bound. Say so, and how many.
             # Held rows were never waited for, so they are not among those that did not drain.
             if isinstance(depth, int) and isinstance(held, int):
-                depth -= held
+                depth = max(depth - held, 0)
             log.warning(
                 "DR released by %s: VIP handed back, intake unbound, but %s staged row(s) did not "
                 "drain within the bound and stay queued + replayable — reconcile them with the "
