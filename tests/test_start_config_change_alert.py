@@ -490,6 +490,65 @@ async def test_a_reload_after_capture_does_not_change_the_comparison(
     assert rows[-1]["superseded"] is True and rows[-1]["baseline_unchecked"] is True
 
 
+async def test_a_snapshot_that_cannot_be_taken_never_blocks_the_start(
+    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
+) -> None:
+    """vault BACKLOG #2838, under #2597 step 5: the start's config snapshot is audit only, so a
+    fault taking it never refuses a start. The start checks nothing, as a start with no digest
+    does, and serves. Its row names no graph, even after a reload swapped one in, and a later
+    start passes over it and reports the change against the older baseline."""
+    before = config_fingerprint(cfg)
+    await _start(tmp_path, cfg)  # the baseline
+    _edit(cfg)
+    calls: list[int] = []
+
+    def _read(cls: type[Any], engine: Engine) -> Any:
+        calls.append(1)
+        raise RuntimeError("synthetic snapshot fault")
+
+    real_start = Engine.start
+    other = {"fingerprint": "f" * 64, "scheme": FINGERPRINT_SCHEME, "files": 1}
+
+    async def _start_then_swap(self: Engine) -> None:
+        await real_start(self)
+        self.loaded_config_fingerprint = dict(other)  # a reload, before the row is written
+
+    with monkeypatch.context() as patch:
+        patch.setattr(app_module._LoadedConfig, "read", classmethod(_read))
+        patch.setattr(Engine, "start", _start_then_swap)
+        rows = await _start(tmp_path, cfg)  # asserts the graph is serving
+    assert len(calls) == 1, "control: the lifespan's read ran, and the row did not read again"
+    assert alerts == [], "a start that checked nothing raises nothing"
+    assert len(rows) == 2
+    row = rows[-1]
+    assert row["comparison"] == "no_start_digest" and row["baseline_unchecked"] is True
+    assert row["degraded"] is True and row["failed_steps"] == ["start_snapshot"]
+    assert "fingerprint" not in row, "the reloaded digest is not named as the start's"
+    assert (row["dir"], row["inbound"], row["outbound"], row["loosenings"]) == (None,) * 4
+
+    rows = await _start(tmp_path, cfg)
+    assert len(alerts) == 1, "the next start passes over the degraded row"
+    assert rows[-1]["previous_fingerprint"] == before
+
+
+async def test_a_swap_check_that_faults_never_blocks_the_start(
+    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
+) -> None:
+    """vault BACKLOG #2838: the row's swap check is audit only too. A fault in it leaves the row
+    naming the start's snapshot, degraded and no baseline, and claims no reload ran."""
+
+    def _swapped(self: Any, engine: Engine) -> bool:
+        raise RuntimeError("synthetic swap-check fault")
+
+    monkeypatch.setattr(app_module._LoadedConfig, "swapped", _swapped)
+    rows = await _start(tmp_path, cfg)  # asserts the graph is serving
+    row = rows[-1]
+    assert row["fingerprint"] == config_fingerprint(cfg)
+    assert row["degraded"] is True and row["failed_steps"] == ["start_swap_check"]
+    assert row["baseline_unchecked"] is True and row["loosenings"] is None
+    assert "superseded" not in row, "a check that faulted saw no reload"
+
+
 def _add_a_connection_pair(cfg: Path, tmp_path: Path) -> None:
     """A second inbound and outbound, so a reload of ``cfg`` changes both counts and the digest."""
     inbox, outdir = tmp_path / "in2", tmp_path / "out2"

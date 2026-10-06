@@ -1246,6 +1246,11 @@ started together, can each raise it; the alert list folds them into one instance
   loaded, with its comparison. It is marked `superseded` and `baseline_unchecked`, and its
   `loosenings` is `null`, since the loosenings reader sees only the reloaded graph. A later start
   passes over it to the reload's own row.
+- A start that could not take that snapshot still starts, with comparison `no_start_digest`. Its
+  row is degraded with the `start_snapshot` step, and its `dir`, counts, digest and `loosenings`
+  are `null`. A start that could not tell whether a reload swapped its graph names its own graph,
+  degraded with the `start_swap_check` step and `loosenings` `null`. A later start passes over
+  both rows.
 - The pass-over looks through the newest 50 config rows at most. If none is usable, the start
   begins a new baseline and says at WARNING that a change made before those rows is not reported.
 
