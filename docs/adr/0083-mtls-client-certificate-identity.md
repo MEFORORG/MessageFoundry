@@ -189,10 +189,14 @@ or group removal never reached the certificate path at all.
   nothing, and never more than the directory now grants. An account removed from one of two mapped
   groups keeps the other role on its next request. Step-up refuses that case outright instead,
   because it renews a window rather than serving one request. An empty set returns no identity.
+  The Administrator check for scope reads this narrowed set, so by deliberate fail-closed choice the
+  path can grant less than a sign-in would, until a sign-in writes the roles the groups now grant.
 - **Channel scope narrows the same way.** The groups are already in hand, so the scope goes through
   `decide_ad_channel_scope`, the rule login and the reconciler share. Only a narrowing applies, and
   only within the stored scope. A cert-only account never signs in, so nothing else would apply it.
-  A widening still waits for a sign-in to write it.
+  A widening still waits for a sign-in to write it. That rule also keeps a scope: when no
+  scope-mapped group matches and an administrator set the stored scope, it stays as stored, so on
+  that branch the identity can reach channels its current groups do not map to.
 - **The row is read again after the probe.** The round trip can take seconds, and a local disable
   or scope edit may land meanwhile.
 - **No cache.** A cached answer would bring back the staleness this closes.
@@ -200,9 +204,13 @@ or group removal never reached the certificate path at all.
   slot within 2 seconds is refused. A slot is held until the probe's worker thread ends, even when
   the request was cancelled, so the threads cannot outnumber the cap.
 - **Refusals do not log one line per request.** An outage (unreachable, referring, a fault reading
-  the entry, or a full cap) logs one WARNING going in and one INFO coming out, naming no account,
-  and at most one WARNING a minute while it flaps. A configuration refusal (no directory wired, no
-  `directory_object_id`) logs one WARNING per reason per process.
+  the entry, or a full cap) logs one WARNING and one INFO when it ends, naming no account, and at
+  most one WARNING a minute while it flaps. An outage that starts within a minute of the last
+  WARNING logs its own on its first refusal after that minute, so a long one is never silent. A
+  change of reason during a logged outage logs one INFO, at most once a minute. A configuration
+  refusal (no directory wired, no `directory_object_id`) logs one WARNING per reason per process.
+- **The answer vouches for one account.** The row read after the probe must still carry the
+  `directory_object_id` and provider the probe asked about, or the request is refused.
 
 **What this does not close.**
 

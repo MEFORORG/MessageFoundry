@@ -2129,7 +2129,8 @@ class AuthService:
         # Instance-scoped (one event loop per AuthService) so it never crosses loops in tests.
         self._argon2_sem = asyncio.Semaphore(_ARGON2_MAX_CONCURRENCY)
         # BACKLOG #2316: the certificate path's directory probes, capped like argon2 above.
-        self._cert_probe_slots = asyncio.Semaphore(_CERT_PROBE_MAX_CONCURRENCY)
+        # Bounded, so a release with no matching acquire raises instead of widening the cap.
+        self._cert_probe_slots = asyncio.BoundedSemaphore(_CERT_PROBE_MAX_CONCURRENCY)
         #: Probe tasks still running, held so none is collected while its caller has gone.
         self._cert_probe_tasks: set[asyncio.Task[reconcile.Probe | str]] = set()
         #: The certificate path's current outage reason, or None (`_note_cert_directory_answer`).
@@ -2137,6 +2138,8 @@ class AuthService:
         #: Monotonic time of its last outage WARNING, and whether the current outage logged one.
         self._cert_outage_warned_at: float | None = None
         self._cert_outage_announced = False
+        #: Monotonic time of the last INFO saying the current outage changed its reason.
+        self._cert_outage_kind_noted_at: float | None = None
         #: Configuration refusals already logged by this process.
         self._cert_config_refusals_logged: set[str] = set()
         self._login_limiter: SlidingWindowRateLimiter | None = (
@@ -6956,7 +6959,8 @@ class AuthService:
         writes nothing and must not grant, and never more than the directory now grants. So an
         account removed from one of two mapped groups keeps the other role on its next request,
         where step-up refuses outright. An empty result returns ``None``. The channel scope narrows
-        the same way, on the same groups (:func:`_cert_narrowed_scope`). Nothing is written: only a
+        on the same groups, by the rule sign-in uses (:func:`_cert_narrowed_scope`), so a scope an
+        administrator set is kept when no scope-mapped group matches. Nothing is written: only a
         sign-in, or a reconciler pass while the account holds a session, re-syncs the row.
 
         **No cache, and a bounded wait.** A cached answer would bring back the staleness this
@@ -6974,8 +6978,16 @@ class AuthService:
             return None
         # Everything below is read after the probe, as step-up does: the round trip can be seconds,
         # and a local disable, a scope edit or a sign-in's role re-sync may have landed meanwhile.
+        # The answer vouches only for the account it asked about, so a row whose immutable id or
+        # provider moved during the round trip is refused rather than judged on another's answer.
+        asked = user
         user = await self._store.get_user(user_id)
-        if user is None or user.disabled:
+        if (
+            user is None
+            or user.disabled
+            or user.auth_provider != asked.auth_provider
+            or user.directory_object_id != asked.directory_object_id
+        ):
             return None
         granted = await self._store.roles_for_ad_groups(answer.groups)
         held = await self._store.get_user_role_ids(user.id)
@@ -7020,24 +7032,39 @@ class AuthService:
         # This task's own context, so the DEBUG level never reaches the reconciler or step-up. A
         # fault on one account's entry would otherwise log a WARNING naming it on every request;
         # the outage line below reports it once instead.
-        _PROBE_FAULT_LOG_LEVEL.set(logging.DEBUG)
-        return await self._directory_presence(user)
+        token = _PROBE_FAULT_LOG_LEVEL.set(logging.DEBUG)
+        try:
+            return await self._directory_presence(user)
+        except Exception:
+            # Returned, never raised: a raise from a probe whose caller was cancelled would reach
+            # the loop's exception handler through the shield, one ERROR per orphaned request.
+            # Read as an outage, which fails closed and logs by the outage rules. The traceback can
+            # quote a directory value, so it goes to DEBUG and names no account.
+            _log.debug("certificate-path directory probe raised", exc_info=True)
+            return reconcile.ProbeOutcome.UNAVAILABLE.value
+        finally:
+            _PROBE_FAULT_LOG_LEVEL.reset(token)
 
     def _cert_probe_done(self, task: asyncio.Task[reconcile.Probe | str]) -> None:
         self._cert_probe_slots.release()
         self._cert_probe_tasks.discard(task)
         if not task.cancelled():
-            task.exception()  # retrieved, so a probe whose caller left never warns unretrieved
+            # Only a BaseException that is not an Exception can end here; _cert_probe returns
+            # everything else. Retrieved so it is not also reported as never retrieved.
+            task.exception()
 
     def _note_cert_directory_answer(self, answer: reconcile.Probe | str) -> None:
         """Log the certificate path's directory refusals without logging one line per request.
 
         An outage is a refusal that says the directory could not be asked: unreachable, referring,
-        a fault reading the entry, or the probe cap full. It logs one WARNING going in and, if that
+        a fault reading the entry, or the probe cap full. It logs one WARNING per outage and, if that
         WARNING was logged, one INFO on the next answer the directory actually gave, whatever it
-        said about the account. A further WARNING within :data:`_CERT_OUTAGE_LOG_INTERVAL_SECONDS`
-        of the last goes to DEBUG, so an outage that flaps (a full cap turning over, or one
-        referring account beside a healthy one) still logs about once a minute.
+        said about the account. WARNINGs are at least :data:`_CERT_OUTAGE_LOG_INTERVAL_SECONDS`
+        apart, so an outage that flaps (a full cap turning over, or one referring account beside a
+        healthy one) still logs about once a minute. An outage that starts inside that interval
+        logs its WARNING on its first refusal after the interval ends, so a long one is never
+        silent. A logged outage whose reason changes logs the change at INFO, at most once per
+        interval, and the closing INFO names the latest reason.
 
         A configuration refusal (no directory wired, a row with no immutable id) asks nothing and
         moves neither way. It logs one WARNING per reason per process instead.
@@ -7046,18 +7073,21 @@ class AuthService:
         and the username is not the useful fact."""
         outcome = answer.outcome.value if isinstance(answer, reconcile.Probe) else answer
         if outcome in _CERT_DIRECTORY_OUTAGES:
-            if self._cert_directory_outage is not None:
-                return
-            self._cert_directory_outage = outcome
             now = time.monotonic()
-            last = self._cert_outage_warned_at
-            self._cert_outage_announced = (
-                last is None or now - last >= _CERT_OUTAGE_LOG_INTERVAL_SECONDS
-            )
-            if not self._cert_outage_announced:
-                _log.debug("certificate-path directory check returned %s again", outcome)
+            latched = self._cert_directory_outage
+            self._cert_directory_outage = outcome
+            if latched is not None and self._cert_outage_announced:
+                if outcome != latched:
+                    self._note_cert_outage_kind_change(latched, outcome, now)
                 return
+            last = self._cert_outage_warned_at
+            if last is not None and now - last < _CERT_OUTAGE_LOG_INTERVAL_SECONDS:
+                if latched is None:
+                    _log.debug("certificate-path directory check returned %s again", outcome)
+                return
+            self._cert_outage_announced = True
             self._cert_outage_warned_at = now
+            self._cert_outage_kind_noted_at = None
             _log.warning(
                 "mTLS certificate identities for directory accounts are refused: the directory "
                 "check returned %s. Logged once until a check reaches the directory again",
@@ -7069,10 +7099,11 @@ class AuthService:
             if self._cert_outage_announced:
                 _log.info(
                     "mTLS certificate identities for directory accounts: the directory check "
-                    "reaches the directory again (it had returned %s)",
+                    "reaches the directory again (it last returned %s)",
                     self._cert_directory_outage,
                 )
             self._cert_directory_outage = None
+            self._cert_outage_announced = False
         elif outcome not in self._cert_config_refusals_logged:
             self._cert_config_refusals_logged.add(outcome)
             _log.warning(
@@ -7080,6 +7111,22 @@ class AuthService:
                 "once per process for this reason",
                 outcome,
             )
+
+    def _note_cert_outage_kind_change(self, before: str, after: str, now: float) -> None:
+        """Log that a logged certificate-path outage changed its reason, at INFO at most once per
+        :data:`_CERT_OUTAGE_LOG_INTERVAL_SECONDS` and otherwise at DEBUG. A full cap and an
+        unreachable directory can alternate request by request, and must not log a line each."""
+        last = self._cert_outage_kind_noted_at
+        if last is not None and now - last < _CERT_OUTAGE_LOG_INTERVAL_SECONDS:
+            _log.debug("certificate-path directory check now returns %s (was %s)", after, before)
+            return
+        self._cert_outage_kind_noted_at = now
+        _log.info(
+            "mTLS certificate identities for directory accounts are still refused: the directory "
+            "check now returns %s (it had returned %s)",
+            after,
+            before,
+        )
 
     async def identity_for_user_id(self, user_id: str) -> Identity | None:
         """Resolve a user id directly to its :class:`Identity` (roles + custom-role overlay), or

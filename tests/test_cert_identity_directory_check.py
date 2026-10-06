@@ -247,7 +247,15 @@ async def test_a_cancelled_request_holds_its_slot_until_the_probe_thread_ends(
         request.cancel()
         with pytest.raises(asyncio.CancelledError):
             await request
-        assert len(service._cert_probe_tasks) == 1  # the probe still runs, and holds its slot
+        assert len(service._cert_probe_tasks) == 1  # the probe still runs
+        # RED when: the slot goes back with the cancelled caller. The orphaned probe holds one,
+        # so only CAP-1 can be taken without waiting, and the CAP-th would block.
+        for _ in range(service_module._CERT_PROBE_MAX_CONCURRENCY - 1):
+            assert not service._cert_probe_slots.locked()
+            await service._cert_probe_slots.acquire()
+        assert service._cert_probe_slots.locked()
+        for _ in range(service_module._CERT_PROBE_MAX_CONCURRENCY - 1):
+            service._cert_probe_slots.release()
     finally:
         gate.set()
     async with asyncio.timeout(10):
@@ -259,6 +267,76 @@ async def test_a_cancelled_request_holds_its_slot_until_the_probe_thread_ends(
         assert not service._cert_probe_slots.locked()
         await service._cert_probe_slots.acquire()
     assert service._cert_probe_slots.locked()
+    for _ in range(service_module._CERT_PROBE_MAX_CONCURRENCY):
+        service._cert_probe_slots.release()
+    with pytest.raises(ValueError):  # bounded: a release with no acquire cannot widen the cap
+        service._cert_probe_slots.release()
+
+
+async def test_a_probe_that_raises_after_its_caller_left_reports_nothing_to_the_loop(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A raise from an orphaned probe would reach the loop's exception handler through the shield,
+    one ERROR per cancelled request. The probe returns an outage instead, and fails closed."""
+    service, _directory, user_id = await _directory_account(store, _VIEWERS)
+    entered, gate = asyncio.Event(), asyncio.Event()
+
+    async def _raises(user: UserRecord) -> reconcile.Probe | str:
+        entered.set()
+        await gate.wait()
+        raise RuntimeError("synthetic fault after the caller left")
+
+    monkeypatch.setattr(service, "_directory_presence", _raises)
+    loop = asyncio.get_running_loop()
+    reported: list[dict[str, object]] = []
+    previous = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: reported.append(context))
+    try:
+        request = asyncio.create_task(service.identity_for_cert_user_id(user_id))
+        await entered.wait()
+        request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+        gate.set()
+        async with asyncio.timeout(10):
+            while service._cert_probe_tasks:
+                await asyncio.sleep(0.01)
+        await asyncio.sleep(0)  # let any done callback the shield scheduled run
+    finally:
+        loop.set_exception_handler(previous)
+
+    assert reported == []
+    gate.clear()
+    gate.set()  # the same fault with the caller still waiting is a refusal, not a raise
+    assert await service.identity_for_cert_user_id(user_id) is None
+
+
+@pytest.mark.parametrize(
+    "moved",
+    [
+        "directory_object_id = 'synthetic-other-object-id'",
+        "auth_provider = 'local'",
+    ],
+    ids=["object-id", "provider"],
+)
+async def test_a_row_whose_directory_key_moved_during_the_probe_is_refused(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, moved: str
+) -> None:
+    """The answer vouches only for the account the probe asked about.
+
+    RED when: the re-read after the probe checks only that the row exists and is enabled."""
+    service, _directory, user_id = await _directory_account(store, _VIEWERS)
+    real_probe = service._probe_principal
+
+    async def _probe(user: UserRecord) -> reconcile.Probe:
+        probe = await real_probe(user)
+        await store._db.execute(f"UPDATE users SET {moved} WHERE id = ?", (user_id,))
+        await store._db.commit()
+        return probe
+
+    monkeypatch.setattr(service, "_probe_principal", _probe)
+
+    assert await service.identity_for_cert_user_id(user_id) is None
 
 
 async def test_a_local_disable_during_the_probe_is_honoured(
@@ -422,6 +500,60 @@ async def test_a_new_outage_past_the_interval_logs_again(
     assert len(_outage_records(caplog, logging.INFO)) == 2
 
 
+async def test_an_outage_that_starts_inside_the_interval_warns_once_the_interval_ends(
+    store: MessageStore, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A blip, its recovery, then a long outage within the minute. The long one must still log a
+    WARNING, or the last line an operator reads says the directory is back.
+
+    RED when: a latched outage that logged nothing never looks at the interval again."""
+    service, directory, user_id = await _directory_account(store, _VIEWERS)
+    caplog.set_level(logging.DEBUG, logger=_SERVICE_LOGGER)
+    directory.unreachable = True
+    assert await service.identity_for_cert_user_id(user_id) is None
+    directory.unreachable = False
+    assert await service.identity_for_cert_user_id(user_id) is not None
+    directory.unreachable = True
+    assert await service.identity_for_cert_user_id(user_id) is None  # inside the interval
+    assert len(_outage_records(caplog, logging.WARNING)) == 1
+
+    monkeypatch.setattr(service_module, "_CERT_OUTAGE_LOG_INTERVAL_SECONDS", 0.0)
+    for _ in range(3):
+        assert await service.identity_for_cert_user_id(user_id) is None
+
+    assert len(_outage_records(caplog, logging.WARNING)) == 2  # one more, not one per request
+    directory.unreachable = False
+    assert await service.identity_for_cert_user_id(user_id) is not None
+    assert len(_outage_records(caplog, logging.INFO)) == 2
+
+
+async def test_a_logged_outage_that_changes_its_reason_says_so_and_the_recovery_names_the_last(
+    store: MessageStore, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, directory, user_id = await _directory_account(store, _VIEWERS)
+    monkeypatch.setattr(service_module, "_CERT_PROBE_SLOT_WAIT_SECONDS", 0.05)
+    caplog.set_level(logging.INFO, logger=_SERVICE_LOGGER)
+    directory.unreachable = True
+    assert await service.identity_for_cert_user_id(user_id) is None
+    cap = service_module._CERT_PROBE_MAX_CONCURRENCY
+    for _ in range(cap):
+        await service._cert_probe_slots.acquire()
+    assert await service.identity_for_cert_user_id(user_id) is None  # saturated
+    for _ in range(cap):
+        service._cert_probe_slots.release()
+    assert await service.identity_for_cert_user_id(user_id) is None  # unavailable again
+
+    changes = [r.getMessage() for r in _outage_records(caplog, logging.INFO)]
+    assert len(changes) == 1  # the flip back is inside the interval, so DEBUG
+    assert "now returns probe_capacity_saturated" in changes[0]
+
+    directory.unreachable = False
+    assert await service.identity_for_cert_user_id(user_id) is not None
+    recovered = _outage_records(caplog, logging.INFO)[-1].getMessage()
+    assert "reaches the directory again (it last returned unavailable)" in recovered
+    assert len(_outage_records(caplog, logging.WARNING)) == 1
+
+
 async def test_a_fault_reading_the_entry_does_not_warn_per_request_by_name(
     store: MessageStore, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -454,9 +586,10 @@ async def test_the_reconciler_and_step_up_still_warn_on_a_fault(
 
     await service.identity_for_cert_user_id(_user_id)
     assert await service._directory_step_up_refusal(user) == "unavailable"
+    await service.reconcile_directory_sessions()  # the sign-in left a live session to probe
 
     raised = [r for r in caplog.records if "raised KeyError" in r.getMessage()]
-    assert [r.levelno for r in raised] == [logging.DEBUG, logging.WARNING]
+    assert [r.levelno for r in raised] == [logging.DEBUG, logging.WARNING, logging.WARNING]
 
 
 async def test_a_configuration_refusal_logs_once_per_process(
