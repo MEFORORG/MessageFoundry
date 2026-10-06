@@ -536,7 +536,9 @@ _LEADING_TS = re.compile(r"^\s*\d{4}[-/]\d{2}[-/]\d{2}(?:[ T]\d{2}:\d{2}:\d{2}(?
 # ``test_a_word_added_to_the_shared_vocabulary_reaches_both_surfaces`` proves it for this function
 # and the write-time pass; the caller list is read off the call graph. A word added only to the copy
 # above still misses the write-time filters. The copy can go once ``secretscrub`` closes the fold-head
-# residual above, and that test file's fold-head control arm will say when by going red.
+# residual above AND the shared pass, placed where the copy runs, prints nothing the copy hid on the
+# full probe. That test file's fold-head control arm going red is the signal to re-run the probe, not
+# the proof.
 def redact_log_line(line: str) -> str:
     """Return ``line`` with PHI/secret patterns replaced by a redaction placeholder.
 
