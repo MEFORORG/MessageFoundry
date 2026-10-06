@@ -3770,8 +3770,8 @@ def Ftp(
     destination (stdlib ``ftplib`` — no extra). Same poll/upload shape as :func:`Sftp`.
 
     Plain ``ftp`` transmits credentials in **cleartext**: supplying a ``username``/``password`` over
-    plain ``ftp`` is **refused** unless ``MEFOR_ALLOW_INSECURE_TLS`` is set (use ``tls=True`` for FTPS,
-    or :func:`Sftp`). FTPS encrypts the control + data channels, so credentials are fine there while
+    plain ``ftp`` is **refused** outright, with no escape (use ``tls=True`` for FTPS, or
+    :func:`Sftp`). FTPS encrypts the control + data channels, so credentials are fine there while
     the server certificate is verified, name included: a hand-built spec that sets
     ``tls_verify=False`` or ``tls_check_hostname=False`` with a ``username`` or ``password`` is
     refused outright, with no escape (vault BACKLOG #2636). Put secrets (``password``) in ``env()``. The host is gated by ``[egress].allowed_remote`` (both

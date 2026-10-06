@@ -279,6 +279,10 @@ _VERIFY_OFF_REFUSAL = re.escape(
 )
 
 
+def _verify_off_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if "verification is DISABLED" in r.getMessage()]
+
+
 @pytest.fixture
 def _escape_permitted(monkeypatch: pytest.MonkeyPatch) -> None:
     """The escape variable set as an operator would set it, and the clamp patched open, so that no
@@ -295,7 +299,7 @@ def _escape_permitted(monkeypatch: pytest.MonkeyPatch) -> None:
     "credential", [{"username": "svc"}, {"password": "synthetic"}], ids=["username", "password"]
 )
 def test_ftps_verify_off_refuses_a_credential_under_the_escape(
-    credential: dict[str, str],
+    credential: dict[str, str], caplog: pytest.LogCaptureFixture
 ) -> None:
     from messagefoundry.transports.remotefile import _ftps_ssl_context
 
@@ -304,16 +308,22 @@ def test_ftps_verify_off_refuses_a_credential_under_the_escape(
         "tls_verify": False,
         **credential,
     }
-    with pytest.raises(ValueError, match=_VERIFY_OFF_REFUSAL) as info:
+    with (
+        caplog.at_level(logging.WARNING),
+        pytest.raises(ValueError, match=_VERIFY_OFF_REFUSAL) as info,
+    ):
         _ftps_ssl_context(settings, name="OB_FTPS")
     message = str(info.value)
     assert "connection 'OB_FTPS'" in message
     assert "tls_verify on" in message and "sftp" in message  # names the remedy
     assert "synthetic" not in message  # never echoes the credential
+    assert _verify_off_warnings(caplog) == []  # refused, not warned and then refused
 
 
 @pytest.mark.usefixtures("_escape_permitted")
-def test_ftps_verify_off_refusal_fires_from_both_directions() -> None:
+def test_ftps_verify_off_refusal_fires_from_both_directions(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     from messagefoundry.transports.remotefile import RemoteFileDestination, RemoteFileSource
 
     settings: dict[str, Any] = {
@@ -324,16 +334,18 @@ def test_ftps_verify_off_refusal_fires_from_both_directions() -> None:
         "remote_dir": "/in",
         "tls_verify": False,
     }
-    with pytest.raises(ValueError, match=_VERIFY_OFF_REFUSAL) as out:
-        RemoteFileDestination(
-            Destination(name="OB_RF", type=ConnectorType.REMOTEFILE, settings=dict(settings))
-        )
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(ValueError, match=_VERIFY_OFF_REFUSAL) as out:
+            RemoteFileDestination(
+                Destination(name="OB_RF", type=ConnectorType.REMOTEFILE, settings=dict(settings))
+            )
+        with pytest.raises(ValueError, match=_VERIFY_OFF_REFUSAL) as inb:
+            RemoteFileSource(
+                Source(name="IB_RF", type=ConnectorType.REMOTEFILE, settings=dict(settings))
+            )
     assert "'OB_RF'" in str(out.value) and "synthetic" not in str(out.value)
-    with pytest.raises(ValueError, match=_VERIFY_OFF_REFUSAL) as inb:
-        RemoteFileSource(
-            Source(name="IB_RF", type=ConnectorType.REMOTEFILE, settings=dict(settings))
-        )
     assert "'inbound:IB_RF'" in str(inb.value) and "synthetic" not in str(inb.value)
+    assert _verify_off_warnings(caplog) == []
 
 
 @pytest.mark.usefixtures("_escape_permitted")
@@ -348,7 +360,7 @@ def test_ftps_verify_off_without_a_credential_is_unchanged_under_the_escape(
             {"host": "ftps.partner.example.invalid", "tls_verify": False}, name="OB_FTPS"
         )
     assert ctx.verify_mode == ssl.CERT_NONE and ctx.check_hostname is False
-    assert any("verification is DISABLED" in r.getMessage() for r in caplog.records)
+    assert _verify_off_warnings(caplog)  # control: the pin above can see the line
 
 
 def test_ftps_verify_off_credential_without_the_escape_gets_the_credential_remedy(

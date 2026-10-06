@@ -235,12 +235,13 @@ def test_credentialed_ftp_refuses_prod_phi_even_with_escape(
             "password": "p",
         },
     )
-    # Finding 4: the strictly-worse credential-on-the-wire hop now gets the same clamp the sibling
-    # anonymous-ftp guard already applied — the escape can't cross it on production-PHI.
+    # Finding 4 clamped the strictly-worse credential-on-the-wire hop on production-PHI. Vault
+    # BACKLOG #2636 made it absolute, as SMTP's cleartext-credential arm is: the escape crosses it
+    # on no posture, non-prod included.
     with active_hop_posture(PROD_PHI), pytest.raises(ValueError, match="CLEARTEXT"):
         RemoteFileDestination(cfg)
-    with active_hop_posture(STAGING_PHI):
-        RemoteFileDestination(cfg)  # crosses with the escape on non-prod
+    with active_hop_posture(STAGING_PHI), pytest.raises(ValueError, match="CLEARTEXT"):
+        RemoteFileDestination(cfg)
 
 
 # --- Fix C: engine<->store weakened-TLS clamp (finding 3) --------------------------------------

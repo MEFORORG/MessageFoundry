@@ -9,11 +9,12 @@ A single connector type (``REMOTEFILE``) with a ``protocol`` setting selecting t
   unless the explicit dev escape ``MEFOR_ALLOW_INSECURE_TLS`` is set (and logged loudly when it is),
   mirroring the SQL Server backend's weakened-TLS posture.
 - ``ftp`` — plain FTP (stdlib ``ftplib``). Cleartext: credentials over plain ``ftp`` are **refused**
-  unless the escape is set (use ``ftps``/``sftp``), mirroring :func:`refuse_cleartext_credentials`.
+  outright, with no escape (use ``ftps``/``sftp``; vault BACKLOG #2636).
 - ``ftps`` — FTP over explicit TLS (``ftplib.FTP_TLS`` + ``PROT P``), credentials encrypted. **The
   server certificate and hostname are verified by default** (a verifying :class:`ssl.SSLContext`, not
   ftplib's no-verify stdlib fallback); ``tls_verify=false`` drops verification only when the explicit
-  escape ``MEFOR_ALLOW_INSECURE_TLS`` is set (and is logged loudly), mirroring the MLLP outbound posture.
+  escape ``MEFOR_ALLOW_INSECURE_TLS`` is set (and is logged loudly), mirroring the MLLP outbound posture,
+  and only on an anonymous hop: with a credential it is refused outright (vault BACKLOG #2636).
 
 **Destination** uploads each payload to ``remote_dir``/``filename`` (``{HL7-path}`` placeholders
 resolved via :func:`render_filename`). The write goes to a temp name then a **rename** to the final
@@ -831,8 +832,8 @@ class _FtpClient(_RemoteClient):
         raise a classified :class:`_RemoteError`. Each step is named, because the step a 5xx reply
         answers decides its class (BACKLOG #2083); see :func:`_ftp_connect_refusal`. The connection
         is closed on every failure."""
-        # B321: plain FTP only when explicitly selected; credentials over it are refused unless
-        # MEFOR_ALLOW_INSECURE_TLS is set (see _validate_common). FTPS/SFTP are the encrypted defaults.
+        # B321: plain FTP only when explicitly selected, and only anonymously: credentials over it
+        # are refused outright (see _validate_common). FTPS/SFTP are the encrypted defaults.
         if self._tls:
             ftp: ftplib.FTP = ftplib.FTP_TLS(context=self._context, timeout=self._timeout)
         else:
@@ -1857,23 +1858,16 @@ def _validate_common(
     if protocol not in _PROTOCOLS:
         raise ValueError(f"REMOTEFILE protocol must be one of {_PROTOCOLS}, got {protocol!r}")
     if protocol == "ftp" and (s.get("username") or s.get("password")):
-        # Plain FTP sends the credential in cleartext (and the body is PHI). Refuse unless the explicit
-        # dev/trusted-network escape is set, mirroring refuse_cleartext_credentials. #200 (ADR 0092
-        # decision 2): the escape is CLAMPED to non production-PHI — the credential-on-the-wire hop (the
-        # strictly-worse case) now gets the same clamp the sibling anonymous-ftp guard already applies, so
-        # MEFOR_ALLOW_INSECURE_TLS can no longer cross a prod-PHI credentialed-ftp hop.
-        if not weakened_tls_escape_permitted_here():
-            raise ValueError(
-                f"{hop_name_prefix(connection)}REMOTEFILE plain ftp transmits credentials in "
-                "CLEARTEXT; refused unless "
-                f"{INSECURE_TLS_ESCAPE_ENV} is set on an instance at [security].enforcement = warn "
-                "(the escape has no effect while enforcing, the default, or with no posture) — use "
-                "ftps (tls=True) or sftp"
-            )
-        logger.warning(
-            "%sREMOTEFILE %s sends credentials over CLEARTEXT ftp (no TLS)",
-            hop_name_prefix(connection),
-            _redact(str(s["host"]), str(s.get("remote_dir", ""))),
+        # Plain FTP puts the credential itself on the wire in the clear. Vault BACKLOG #2636: ABSOLUTE,
+        # keyed on no escape and no posture, as the SMTP cleartext-credential arm is (email.py,
+        # direct.py) and as the two FTPS credential arms in _ftps_ssl_context are. This was clamped
+        # (#200, ADR 0092 decision 2) and the escape released it on a non-enforcing instance, which
+        # left the cleartext rung weaker than the verify-off FTPS rung above it. Keyed on either half.
+        # The anonymous plain-ftp hop is governed by the hop guard below and is unchanged.
+        raise ValueError(
+            f"{hop_name_prefix(connection)}REMOTEFILE plain ftp transmits credentials in CLEARTEXT; "
+            "refused -- credentials require an encrypted, verified session. Use ftps (tls=True) or "
+            "sftp."
         )
     # #200 (ADR 0092): an ANONYMOUS plain-ftp hop carries no credential but still ships the PHI body over
     # cleartext. Refuse a production-PHI hop off-loopback at the ENFORCED construction gate (the

@@ -1213,10 +1213,11 @@ poll/write shape against a remote server, selected by an internal `protocol` set
   certificate and hostname by default** (a verifying `SSLContext`, not ftplib's no-verify fallback).
   A hand-built spec that turns either check off (`tls_verify = false` or `tls_check_hostname = false`)
   while a `username` or `password` is set is **refused outright**, with no escape variable or posture
-  to unlock it (vault BACKLOG #2636, as `Email`/`Direct` refuse it); the escape governs only an
-  anonymous FTPS hop.
-  Plain FTP is cleartext, so supplying a `username`/`password` over it is **refused** (the credential
-  itself would cross in the clear) — use FTPS or `Sftp(...)`; an *anonymous* plain-FTP hop is governed by
+  to unlock it (vault BACKLOG #2636, as `Email`/`Direct` refuse a credentialed hop; they key on
+  `username` alone, FTP on either half); the escape governs only an anonymous FTPS hop.
+  Plain FTP is cleartext, so supplying a `username`/`password` over it is **refused outright**, with
+  no escape variable or posture to unlock it (the credential itself would cross in the clear; vault
+  BACKLOG #2636) — use FTPS or `Sftp(...)`; an *anonymous* plain-FTP hop is governed by
   the [`cleartext_accepted`](#declaring-a-cleartext-hop-cleartext_accepted) declaration below.
 
 | Setting | Dir | Default | Meaning |
