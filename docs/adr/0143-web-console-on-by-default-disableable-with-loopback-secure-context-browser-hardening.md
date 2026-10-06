@@ -267,3 +267,9 @@ overrides the predicate for the rp_id and for the console's origin fallback.
 This note does not touch `instance_exposed`, which the 2026-08-04 cross-reference above describes.
 Whether that predicate should count this posture is a separate ledger item. Section 3 is left as
 written and dated by this note.
+
+*Updated 2026-10-06:* that separate item is vault BACKLOG #2251, and it is now built.
+`instance_exposed` reads `not settings.api.host_is_browser_origin` too, so the refusing arms and the
+console flags agree on this posture. The serve_ui term still separates `ui_exposed` from it. The
+[ADR 0140](0140-two-acknowledged-production-phi-no-loosen-carve-outs-single-factor-admin-at-exposure-keyless-phi-in-production.md)
+amendment of 2026-10-06 records what that changes.
