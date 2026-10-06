@@ -24,6 +24,7 @@ from __future__ import annotations
 import abc
 import asyncio
 import contextlib
+import math
 import ssl
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
@@ -200,6 +201,32 @@ def resolve_poll_ceiling(value: Any, *, knob: str, transport: str) -> int | None
             f"(or 0 for unlimited)"
         )
     return ceiling
+
+
+def poll_interval(settings: Mapping[str, Any], *, default: float, transport: str) -> float:
+    """Read a poll source's ``poll_seconds``: a finite number of seconds above zero, or ``default``
+    when the key is absent (vault BACKLOG #2774).
+
+    The value is the timeout of the wait between scans, so zero or a negative one makes every wait
+    end at once and the source scans a directory or runs its SELECT continuously, and NaN or
+    infinity is no interval at all. On the File and RemoteFile sources it is also the settle window
+    (BACKLOG #1811, #2071), which zero would shrink to nothing. Each is refused at construction, so the typo surfaces at
+    wiring and in ``messagefoundry check``, as ``transports/timer.py`` refuses a non-positive
+    ``interval_seconds``.
+
+    Deliberately not :func:`positive_cap`: that helper reads ``0`` as "off", and an interval has no
+    off. Written ``not interval > 0`` so a NaN, for which every comparison is false, is refused by
+    the same test."""
+    value = settings.get("poll_seconds", default)
+    try:
+        interval = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{transport} poll_seconds={value!r} is not a number of seconds") from exc
+    if not (math.isfinite(interval) and interval > 0):
+        raise ValueError(
+            f"{transport} poll_seconds={value!r} must be a finite number of seconds above zero"
+        )
+    return interval
 
 
 # A source hands each inbound message (raw bytes, MLLP framing already stripped) to this

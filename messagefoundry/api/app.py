@@ -4318,7 +4318,7 @@ def create_app(
         gate: ApprovalGate | None = Depends(_get_gate),
     ) -> DeadLetterReplayResult | PendingApprovalResponse:
         """Re-queue dead-lettered deliveries (optionally scoped). Already-delivered rows are left
-        alone; each affected message reverts from ``error`` to ``received`` and re-drains."""
+        alone; each affected message reverts from ``error`` to ``routed`` and re-drains."""
         # A channel-scoped user must target one of their channels (replay isn't channel-filtered at
         # the engine level, so an unscoped "replay all" would cross channels).
         if not _replay_in_scope(identity, req.channel_id):

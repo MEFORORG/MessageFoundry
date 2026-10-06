@@ -35,6 +35,7 @@ __all__ = [
     "message_search",
     "messages",
     "parse_tree_page",
+    "parse_tree_too_large",
     "parse_tree_unavailable",
 ]
 
@@ -837,6 +838,36 @@ def parse_tree_page(message_id: str, nodes: list[TreeNode]) -> Markup:
         el("p", el("a", "← Message", href=f"/ui/messages/{message_id}")),
         el("h1", "HL7 parse tree"),
         _tree_nodes(nodes),
+        active="messages",
+    )
+
+
+def parse_tree_too_large(message_id: str, reason: str) -> Markup:
+    """Shown when the message is past a parse-tree cap (vault BACKLOG #2762). The raw view still
+    shows the whole body, so the page points there rather than at nothing. ``reason`` carries
+    limits and counts only."""
+    msg = _seg(message_id)
+    return page(
+        "Parse tree",
+        el("p", el("a", "Back to message", href=f"/ui/messages/{msg}")),
+        el("h1", "HL7 parse tree"),
+        el(
+            "p",
+            text(
+                f"This message is not rendered as a tree: {reason}. The raw message is available."
+            ),
+            class_="muted",
+        ),
+        el(
+            "p",
+            el("a", "Show raw message", href=f"/ui/messages/{msg}/body", class_="btn-link"),
+            " ",
+            el(
+                "span",
+                "Shows the full body, including patient identifiers. Each view is audited.",
+                class_="muted",
+            ),
+        ),
         active="messages",
     )
 
