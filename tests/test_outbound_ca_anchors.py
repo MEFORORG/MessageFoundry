@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import ssl
 import textwrap
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
@@ -271,13 +272,49 @@ async def test_the_outbound_preflight_does_not_refuse_what_cafile_loads(
     """The PEM shape checks model ``cadata=``, and this hop loads ``cafile=``, which reads a
     ``TRUSTED CERTIFICATE`` block. Refusing one here would refuse what the build accepts."""
     ca = tmp_path / "trusted.pem"
-    ca.write_bytes(
-        b"-----BEGIN TRUSTED CERTIFICATE-----\nAAAA\n-----END TRUSTED CERTIFICATE-----\n"
-    )
+    ca.write_bytes(_block(b"trusted").replace(b"CERTIFICATE-----", b"TRUSTED CERTIFICATE-----"))
+    # The premise: cafile= loads this file, so the build accepts it.
+    assert len(ssl.create_default_context(cafile=str(ca)).get_ca_certs()) == 1
     cfg = tmp_path / "cfg"
     _graph(cfg, _dest("rest", ca))
     await _preflight(store, cfg)
     assert "pem_refused" not in {r["event"] for r in await _rows(store, "outbound:OUT")}
+
+
+async def test_an_inbound_ftps_pollers_ca_takes_the_checks(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """An inbound Ftp poller dials out and reads its CA by path, as an outbound does. Its pin is
+    checked under its inbound name, so a pin there is not one that nothing reads."""
+    ca = _ca(tmp_path)
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    (cfg / "feed.py").write_text(
+        "from messagefoundry import File, Ftp, Send, handler, inbound, outbound, router\n"
+        "inbound('IB_FTPS', Ftp(host='ftp.example.org', tls=True, remote_dir='/out', "
+        f"tls_ca_file={str(ca)!r}, tls_ca_pin={'00' * 32!r}), router='r')\n"
+        f"outbound('OUT', File(directory={str(tmp_path / 'out')!r}))\n" + _GRAPH_TAIL,
+        encoding="utf-8",
+    )
+    (spec,) = ta.registry_anchor_specs(load_config(cfg), {})
+    assert (spec.label, spec.setting) == (
+        "inbound:IB_FTPS",
+        "inbound connection 'IB_FTPS' tls_ca_file",
+    )
+    assert not spec.loads_verified_bytes
+    with pytest.raises(WiringError, match="does not match its configured SHA-256 pin"):
+        await _preflight(store, cfg)
+
+
+@pytest.mark.parametrize("factory", ["Email", "Direct"])
+def test_a_ca_the_mail_hop_never_reads_is_not_checked(tmp_path: Path, factory: str) -> None:
+    """With use_tls off the SMTP hop builds no TLS context, so its CA is never read. A missing or
+    exposed file there must not refuse the whole load. The control: use_tls on collects it."""
+    gone = str(tmp_path / "gone.pem")
+    off = _FACTORIES[factory](tls_ca_file=gone, use_tls=False)
+    on = _FACTORIES[factory](tls_ca_file=gone)
+    assert ta.outbound_anchor_spec("OB_MAIL", off.settings) is None
+    assert ta.outbound_anchor_spec("OB_MAIL", on.settings) is not None
 
 
 # --- the change audit ----------------------------------------------------------------------------
@@ -381,6 +418,10 @@ def test_a_pin_with_no_ca_or_a_blank_pin_is_refused(factory: str) -> None:
         _FACTORIES[factory](tls_ca_pin="ab" * 32)
     with pytest.raises(errors, match=f"{factory} tls_ca_pin is set but empty"):
         _FACTORIES[factory](tls_ca_file="/org/ca.pem", tls_ca_pin="  ")
+    # A blank CA is no CA. Email and Direct do not refuse a blank one themselves.
+    if factory in ("Email", "Direct"):
+        with pytest.raises(errors, match=f"{factory} tls_ca_pin is set without a tls_ca_file"):
+            _FACTORIES[factory](tls_ca_file=" ", tls_ca_pin="ab" * 32)
 
 
 def test_the_pin_loads_from_connections_toml(tmp_path: Path) -> None:

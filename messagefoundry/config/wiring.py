@@ -417,7 +417,7 @@ def _check_tls_ca_pin(factory: str, pin: Any, ca: Any) -> None:
         from messagefoundry.config.settings import refuse_a_blank_anchor_pin
 
         refuse_a_blank_anchor_pin(pin, f"{factory} tls_ca_pin")
-    if ca is None:
+    if ca is None or (isinstance(ca, str) and not ca.strip()):
         raise ValueError(
             f"{factory} tls_ca_pin is set without a tls_ca_file, so nothing would check it. It "
             "pins the connection's tls_ca_file. Remove it, or set tls_ca_file"

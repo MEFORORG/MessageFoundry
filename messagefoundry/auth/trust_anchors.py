@@ -66,15 +66,19 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
    compares with the last AUDITED fingerprint, so it goes quiet after one reload while the
    consumers still trust the start-time bytes.
 9. **The per-connection outbound CAs** (vault BACKLOG #2371). A connection that dials out reads its
-   ``tls_ca_file`` to verify the server: every outbound that takes the key, and a ``FhirLookup``.
-   :func:`registry_anchor_specs` hands each one to the same preflight, at the first load and at
-   every reload, under the label ``outbound:<name>`` or ``fhir_lookup:<name>``. So the ACL and
+   ``tls_ca_file`` to verify the server: every outbound that takes the key, a ``FhirLookup``, and
+   an inbound ``Ftp`` poller. :func:`registry_anchor_specs` hands each one to the same preflight,
+   at the first load and at every reload, under the label ``outbound:<name>``,
+   ``fhir_lookup:<name>`` or ``inbound:<name>``. So the ACL and
    path checks, the optional ``tls_ca_pin`` and the change audit all apply, on the inbound dial:
    a pin mismatch always refuses, and an exposed or unjudged CA refuses at ``enforce``.
    **Not covered: the checked bytes are not the loaded bytes here.** These consumers still build
    their context from the path, with ``cafile=``, after the preflight passes. So a file swapped
-   between the preflight and the build would be trusted unchecked until the next reload re-checks
-   it. For that reason the spec carries ``loads_verified_bytes=False``: a matching pin is NOT the
+   between the preflight and the build would be trusted unchecked until that connection is built
+   again, which a restart does and a reload does only for a connection whose config changed. A
+   later reload re-checks and audits the file on disk, not the bytes the live hop loaded, and a
+   lane started later, such as one with ``auto_start=False``, reads the file unchecked. For that
+   reason the spec carries ``loads_verified_bytes=False``: a matching pin is NOT the
    item 6 escape for an unjudged outbound CA, and the PEM shape checks are skipped, since
    ``cafile=`` loads what ``cadata=`` refuses. Item 5 closed the same gap for the inbound CAs.
 """
@@ -1091,11 +1095,14 @@ def outbound_anchor_spec(
     """The CA a dialling connection verifies its server with, or ``None`` (vault BACKLOG #2371).
 
     A connection that dials out reads ``tls_ca_file`` to verify the server: every outbound that
-    takes the key, and a ``FhirLookup``, which passes ``kind="fhir lookup"`` and its own label. The
-    test is ``tls_ca_file`` set and ``tls`` not turned off. Connectors with no ``tls`` key (the HTTP
-    family, Email, Direct) read the file whenever it is set. ``MLLP``, ``DICOM`` and ``Ftp`` read
-    it only with ``tls`` on. A CA a hop would not read is not checked here; ``Ftp`` refuses one at
-    load, and ``tls_ca_pin`` beside one is refused by :func:`refuse_an_unread_ca_pin`.
+    takes the key, a ``FhirLookup`` (``kind="fhir lookup"`` and its own label), and an inbound
+    ``Ftp`` poller (``kind="inbound connection"``). The test is ``tls_ca_file`` set and neither
+    ``tls`` nor ``use_tls`` turned off. ``MLLP`` and ``DICOM`` read the file only with ``tls`` on,
+    and ``Email`` and ``Direct`` only with ``use_tls`` on. ``Ftp`` refuses one at load with TLS off.
+    The HTTP family has no such switch, so its CA is checked whenever it is set. With
+    ``verify_tls=False`` the data hop ignores it, but a token hop still reads it, so it is checked
+    then too. ``tls_ca_pin`` beside a CA nothing reads is refused by :func:`refuse_an_unread_ca_pin`
+    or at load.
 
     ``settings`` must already have its ``env()`` references resolved, as for
     :func:`connection_anchor_spec`. A ``tls_ca_pin`` that is blank or not text raises
@@ -1105,7 +1112,7 @@ def outbound_anchor_spec(
         ca = os.fspath(ca)
     if not isinstance(ca, str) or not ca:
         return None
-    if "tls" in settings and not settings["tls"]:
+    if any(key in settings and not settings[key] for key in ("tls", "use_tls")):
         return None
     pin = connection_ca_pin(settings, f"{kind} '{name}' tls_ca_pin")
     return AnchorSpec(
@@ -1171,18 +1178,21 @@ def connection_anchor_specs(
     return [s for name, st in inbound if (s := connection_anchor_spec(name, st)) is not None]
 
 
-#: The connection settings :func:`connection_anchor_spec` reads, and the only ones resolved for it.
-_CONNECTION_ANCHOR_KEYS = ("tls", "tls_ca_file", "tls_ca_pin")
+#: The connection settings :func:`connection_anchor_spec` and :func:`outbound_anchor_spec` read, and
+#: the only ones resolved for them.
+_CONNECTION_ANCHOR_KEYS = ("tls", "use_tls", "tls_ca_file", "tls_ca_pin")
 
 
 def registry_anchor_specs(registry: Registry, env_values: Mapping[str, Any]) -> list[AnchorSpec]:
     """Every per-connection CA in ``registry`` the preflight checks, with ``env()`` references
     resolved against ``env_values``: the CA of each deployed inbound that requires a peer
     certificate (:func:`connection_anchor_spec`), then, since vault BACKLOG #2371, the CA each
-    deployed outbound and each ``FhirLookup`` verifies its server with (:func:`outbound_anchor_spec`).
+    connection that dials out verifies its server with (:func:`outbound_anchor_spec`): each
+    deployed outbound, each deployed inbound ``Ftp`` poller, and each ``FhirLookup``.
 
     A connection whose anchor settings do not resolve is skipped: its own build refuses it, and
     that error names the missing value."""
+    from messagefoundry.config.models import ConnectorType
     from messagefoundry.config.wiring import WiringError, resolve_env_settings
 
     def resolved(settings: Mapping[str, Any]) -> Mapping[str, Any] | None:
@@ -1200,6 +1210,15 @@ def registry_anchor_specs(registry: Registry, env_values: Mapping[str, Any]) -> 
     dialling: list[tuple[str, Mapping[str, Any] | None, str, str | None]] = [
         (oc.name, resolved(oc.spec.settings) if oc.deployed else None, "outbound connection", None)
         for oc in registry.outbound.values()
+    ]
+    # An inbound REMOTEFILE poller dials out over FTPS and reads its CA by path, as an outbound does.
+    # It has no "tls" key, so connection_anchor_spec never takes it.
+    dialling += [
+        (ic.name, st, "inbound connection", inbound_record_name(ic.name))
+        for ic in registry.inbound.values()
+        if ic.deployed
+        and ic.spec.type is ConnectorType.REMOTEFILE
+        and (st := resolved(ic.spec.settings)) is not None
     ]
     dialling += [
         (fl.name, resolved(fl.settings), "fhir lookup", fhir_lookup_record_name(fl.name))

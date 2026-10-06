@@ -8704,8 +8704,10 @@ def create_managed_app(
             registry_guard=registry_guard,
             # BACKLOG #1142, slice 3: the audited preflight for every inbound CA that requires a
             # peer certificate (MLLP, the HTTP listener, the DICOM SCP), at the first load and at
-            # every real reload. Each connector's own build then enforces again and loads the bytes
-            # it read. Dormant when no inbound names a CA: no store call, no audit row.
+            # every real reload. Each listener's own build then enforces again and loads the bytes
+            # it read. Since vault BACKLOG #2371 it also checks the CA each connection that dials
+            # out names (every outbound, an inbound Ftp poller, a FhirLookup); those still load by
+            # path. Dormant when no connection names a CA: no store call, no audit row.
             registry_preflight=make_registry_anchor_preflight(
                 store, enforcing=trust_anchors_enforcing
             ),

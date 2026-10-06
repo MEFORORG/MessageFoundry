@@ -3034,7 +3034,8 @@ The engine checks an outbound `tls_ca_file` at start and at every reload, as it 
 listener's CA (vault BACKLOG #2371). `tls_ca_pin` is optional. It is the file's SHA-256 in hex, with
 `:` separators allowed. Every factory that takes `tls_ca_file` for an outbound hop takes it:
 `Rest()`, `FHIR()`, `Soap()`, `DICOMweb()`, `FhirLookup()`, `Ftp()`, `Email()`, `Direct()`, and an
-outbound `MLLP()` or `DICOM()` with `tls = true`.
+outbound `MLLP()` or `DICOM()` with `tls = true`. An inbound `Ftp()` poller dials out too, so its CA
+takes the same checks.
 
 | What the check finds | What happens |
 |---|---|
@@ -3044,21 +3045,25 @@ outbound `MLLP()` or `DICOM()` with `tls = true`.
 | The file cannot be read at all | The start or reload is refused. |
 | The file's SHA-256 differs from the one the last check saw | An `auth.trust_anchor` audit row with `event` set to `changed`. |
 
-Each check writes its `auth.trust_anchor` rows under `outbound:<connection name>`, or
-`fhir_lookup:<name>` for a `FhirLookup()`. One refused file refuses the whole start or reload, not
+Each check writes its `auth.trust_anchor` rows under `outbound:<connection name>`,
+`fhir_lookup:<name>` for a `FhirLookup()`, or `inbound:<connection name>` for an inbound `Ftp()`
+poller. `Email()` and `Direct()` with `use_tls = false` read no CA, so theirs is not checked. One refused file refuses the whole start or reload, not
 only its own connection. A `deployed = false` connection is not checked, since it is never built.
 
 **Why a matching pin is no escape here.** On an inbound listener, a matching pin lets a CA load whose
 permissions the engine could not read. That works because the listener loads the exact bytes the
 check read. An outbound hop does not, yet. It reads the file again by path when it builds its TLS
 context, after the check. So a file swapped between the check and the build would be trusted
-unchecked until the next reload checks it again, and a pin would vouch for bytes the hop never
-loaded. For the same reason the check does not refuse a file the hop itself can load, such as one
+unchecked until that connection is built again. A restart rebuilds it. A reload rebuilds it only
+when its config changed. A later reload checks and audits the file on disk, not the bytes the
+live hop loaded, and a `changed` row does not mean the hop now trusts the new file. A lane started
+later, such as one with `auto_start = false`, reads the file with no check. A pin would vouch for
+bytes the hop never loaded. For the same reason the check does not refuse a file the hop itself can load, such as one
 holding a `TRUSTED CERTIFICATE` block.
 
 `tls_ca_pin` with no `tls_ca_file` is refused at load, since nothing would check it. So is a pin
-that is empty or whitespace; leave it out for no pin. On `MLLP()` and `DICOM()` a pin is refused
-without `tls = true` too.
+that is empty or whitespace; leave it out for no pin. On `MLLP()` and `DICOM()` both are refused
+when the connection is built instead, and so is a pin without `tls = true`.
 
 On an inbound listener the same key means something different. On `Http()`, and on an inbound
 `MLLP()` or `DICOM()`, it is the CA a **calling client's** certificate must chain to.
