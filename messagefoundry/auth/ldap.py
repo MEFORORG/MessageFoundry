@@ -1001,10 +1001,10 @@ class LdapAuthenticator:
                     # identical response. Do that work anyway and discard it. This is the AD leg's
                     # analogue of _DUMMY_PASSWORD_HASH on the local leg (auth/service.py).
                     #
-                    # DELIBERATELY NOT THE OBVIOUS FIX: the disabled-bit check stays inside
-                    # _find_user. It has TWO callers — this one binds, the Kerberos/SSO one below
-                    # does not — so relocating it into the bind path alone would let a DISABLED
-                    # ACCOUNT AUTHENTICATE OVER SSO. Equalize the CALLER, never move the check.
+                    # DELIBERATELY NOT THE OBVIOUS FIX: the disabled-bit check stays inside the
+                    # shared lookup (_search_user). It has more than one caller -- this one binds,
+                    # the Kerberos/SSO one below does not -- so relocating it into the bind path
+                    # alone would let a DISABLED ACCOUNT AUTHENTICATE OVER SSO. Equalize the CALLER, never move the check.
                     #
                     # A _SOCKET_FAULTS error in the decoy is mapped HERE, the same way the real
                     # bind's is below, so for those types an absent and a present account fail

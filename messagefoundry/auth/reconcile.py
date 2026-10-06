@@ -88,6 +88,12 @@ class ProbeOutcome(Enum):
     #: revocation for the referred accounts without a sound. It never stops the other accounts
     #: being judged.
     REFERRED = "referred"
+    #: The row carries no ``directory_object_id``, so it was NOT probed (BACKLOG #2434). A name
+    #: probe could read another account's entry. No sign-in or step-up admits such a row, so a
+    #: session it holds is anomalous. Plans exactly as :attr:`ABSENT` does: it strikes, and revokes
+    #: at the threshold. It is not a userAccountControl answer, so it never moves the ADR 0195 hold,
+    #: and it is not a readable answer for the hold's ``r``.
+    UNKEYED = "unkeyed"
 
 
 @dataclass(frozen=True)
@@ -131,6 +137,8 @@ REVOKE_REASONS: Mapping[ProbeOutcome, str] = {
     ProbeOutcome.ABSENT: "directory_absent",
     ProbeOutcome.DISABLED: "directory_disabled",
     ProbeOutcome.UNDETERMINED: "directory_undetermined",
+    # The same slug as ``auth.service.DIRECTORY_OBJECT_ID_MISSING``, which this module cannot import.
+    ProbeOutcome.UNKEYED: "directory_object_id_missing",
 }
 
 #: The revocation reason for a directory scope that would be withdrawn or narrowed (ADR 0198). A

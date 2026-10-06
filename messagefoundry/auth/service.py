@@ -1371,11 +1371,12 @@ _REFUSED_OUTCOMES: dict[DirectoryAnswer, reconcile.ProbeOutcome] = {
 }
 
 #: The ``auth.reauth`` reason for each step-up re-bind whose lookup judged no password (BACKLOG
-#: #2434). None is counted toward the lockout. ``None`` is an empty password, which ``_reauth_ad``
-#: refuses before it asks the directory. The disabled and undetermined slugs are the reconciler's.
+#: #2434). None is counted toward the lockout. ``None`` means no lookup ran. ``_reauth_ad`` refuses
+#: an empty password before it asks, so ``None`` from a directory reads as one that could not be
+#: asked, never as ``empty_password``. The disabled and undetermined slugs are the reconciler's.
 _REBIND_REFUSALS: Final[Mapping[DirectoryAnswer | None, str]] = MappingProxyType(
     {
-        None: EMPTY_PASSWORD,
+        None: "directory_unavailable",
         DirectoryAnswer.NOT_FOUND: "not_in_directory",
         DirectoryAnswer.DISABLED: reconcile.REVOKE_REASONS[reconcile.ProbeOutcome.DISABLED],
         DirectoryAnswer.UNDETERMINED: reconcile.REVOKE_REASONS[reconcile.ProbeOutcome.UNDETERMINED],
@@ -5313,7 +5314,7 @@ class AuthService:
 
         No caller hands this a row whose ``directory_object_id`` is NULL (BACKLOG #2434). Such a row
         would probe by name, and a name probe can read another account's entry. The step-up legs
-        refuse it first, and :meth:`reconcile_directory_sessions` reads it as UNDETERMINED unasked,
+        refuse it first, and :meth:`reconcile_directory_sessions` reads it as UNKEYED unasked,
         or skips it when it carries a federated binding (:meth:`_report_unkeyed_bindings`).
 
         ``probe_principal`` is the password-free service-account lookup the Kerberos path uses, with
@@ -5420,8 +5421,8 @@ class AuthService:
           its channel scope, is revoked on one pass, and the scope itself is left for the next login
           to write (ADR 0198);
         * a wave of undetermined answers is held, not revoked, and alerts (ADR 0195);
-        * a row with no directory id is never asked about by name: it reads as undetermined without
-          a lookup, so it strikes and writes no roles (BACKLOG #2434);
+        * a row with no directory id is never asked about by name: it reads as unkeyed without a
+          lookup, so it strikes like an absent account and writes no roles (BACKLOG #2434);
         * a pass that would revoke too many at once aborts wholesale and alerts.
 
         The pass is **planned in full before anything is written**, so an abort leaves the store
@@ -5497,10 +5498,11 @@ class AuthService:
                 # BACKLOG #2434, ADR 0184 amendment 2026-10-06. An id-less row is never asked about
                 # by name. A name probe could read another account's entry and write that
                 # account's roles onto this row, and no sign-in or step-up admits such a row any
-                # more, so a session it holds is anomalous. UNDETERMINED, unasked, writes no roles
-                # and strikes like any other undetermined answer, including under the ADR 0195 hold.
+                # more, so a session it holds is anomalous. UNKEYED, unasked, writes no roles and
+                # strikes like ABSENT. Not UNDETERMINED: that would feed the ADR 0195 hold, which
+                # would hold these rows and forfeit a later hold alert's clear.
                 probes.append(
-                    reconcile.Probe(user.id, user.username, reconcile.ProbeOutcome.UNDETERMINED)
+                    reconcile.Probe(user.id, user.username, reconcile.ProbeOutcome.UNKEYED)
                 )
             self._reconcile_last_probed[user_id] = now
 
@@ -6220,7 +6222,8 @@ class AuthService:
         convention for an account it cannot ask about, the fail-open UNAVAILABLE arm, rather than
         revoking: revoking on every pass would sign a Windows SSO holder out each interval with no
         end. The remedy is the audited admin unbind. The row is then an ordinary id-less account,
-        probed by name as any such row on that directory is.
+        which the pass reads as UNKEYED without a lookup, so its sessions end at the strike
+        threshold (BACKLOG #2434). No sign-in admits an id-less row, so nothing signs it back in.
 
         The row is left bound on purpose. Clearing a binding is an administrator's audited act,
         and this loop has no administrator behind it.
@@ -6241,8 +6244,8 @@ class AuthService:
             _log.warning(
                 "directory reconcile: %s carries a federated binding but no directory object id, "
                 "so it is not probed by name and a directory disable will not end its sessions "
-                "before they expire. Unbind it (DELETE /users/%s/federated-identity) to return it "
-                "to the reconciler.",
+                "before they expire. Unbind it (DELETE /users/%s/federated-identity) so the "
+                "reconciler ends its sessions.",
                 user.username,
                 user.id,
             )

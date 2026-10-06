@@ -124,15 +124,16 @@
   and re-create it with `POST /users/directory` or one Windows SSO sign-in.
 - **Amendment 2026-10-06 (BACKLOG #2434). The 2026-09-29 sentence "What still asks by name: at least
   the reconciler, for an id-less row with no binding" no longer describes the code; it is kept as the
-  record.** `reconcile_directory_sessions` reads an id-less row with no binding as UNDETERMINED
-  without a lookup, so nothing here asks the directory about an id-less row by name. The decision
-  sits in the reconciler's candidate loop, not in `_probe_principal`, whose other caller, the
-  step-up check, already refuses such a row first. Why UNDETERMINED: a name probe could read another
+  record.** `reconcile_directory_sessions` reads an id-less row with no binding as a new outcome,
+  UNKEYED, without a lookup, so nothing here asks the directory about an id-less row by name. The
+  decision sits in the reconciler's candidate loop, not in `_probe_principal`, whose other caller,
+  the step-up check, already refuses such a row first. Why: a name probe could read another
   account's entry and write that account's roles onto the row, and no sign-in or step-up admits an
-  id-less row, so a session it holds is anomalous. UNDETERMINED writes no roles, and its strike rule
-  ends the sessions. **The cost:** the ADR 0195 hold applies to these answers as to any other, so two
-  such rows at once, or one with no readable answer beside it in the pass, are held and alert rather
-  than revoked. A bound id-less row is still skipped and audited, as the slice C remainder says.
+  id-less row, so a session it holds is anomalous. UNKEYED writes no roles and plans as ABSENT does:
+  it strikes, and revokes at the threshold as `directory_object_id_missing`. The build first read
+  such a row as UNDETERMINED, and review found that feeds the ADR 0195 hold: two such rows would
+  latch it and never be revoked, and one revoked row would forfeit a later hold alert's clear. A
+  bound id-less row is still skipped and audited, as the slice C remainder says.
   Pinned by `test_a_row_with_no_immutable_id_is_never_probed_by_name` in
   `tests/test_ad_session_reconcile.py`.
 - **Date:** 2026-09-05 (accepted 2026-09-23; slices A and B built 2026-09-25; slice C built 2026-09-25;

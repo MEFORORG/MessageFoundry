@@ -1265,7 +1265,7 @@ tuple: they act only on the caller's own account.
 > present in a shape it cannot read, or another object's -- so a site on that path learns why its
 > sign-ins fail. The session reconciler asked about an id-less row with no federated binding by its
 > name until BACKLOG #2434, so a directory that reissued the name answered for its new holder there.
-> It now reads that row as undetermined without a lookup. `verify_mfa` asked such a row by name too,
+> It now ends that row's sessions without a lookup. `verify_mfa` asked such a row by name too,
 > until the rest of BACKLOG #2027 refused it.
 >
 > **Owner-only** is the whole rule: list, browse, resend and delete reach the caller's own files.
@@ -3293,10 +3293,10 @@ pass. That is why *renamed* is absent from the ambiguity list below: it used to 
 rename as an absence revoked the renamed person's sessions on every interval. A row with no
 `objectGUID` is **never probed by name** (BACKLOG #2434), because a name probe can read another
 account's entry and write its roles onto the row. No sign-in or step-up admits such a row (BACKLOG
-#2027), so a session it holds is anomalous. The pass reads it as undetermined without a lookup: it
-writes no roles, and it strikes and revokes like any undetermined answer. **The cost:** the ADR 0195
-hold applies to it too, so two such rows at once, or one with no readable answer beside it, are held
-and alert as a lost read right rather than revoked. Such a
+#2027), so a session it holds is anomalous. The pass reads it as unkeyed without a lookup: it
+writes no roles, and it strikes and revokes as an absent account does, with the reason
+`directory_object_id_missing`. It is not a `userAccountControl` answer, so it never moves the ADR
+0195 hold. Such a
 row cannot take a federated binding: the bind refuses it, so every binding the bind has made since
 BACKLOG #1143 slice C sits on a row probed by its id (ADR 0184 AC-5). A binding already on an id-less
 row, made before that refusal, is **never probed by name** (BACKLOG #2027). The pass skips the row and
