@@ -2534,7 +2534,7 @@ def _serve(args: argparse.Namespace) -> int:
     )
     # A non-loopback API bind puts bearer tokens + PHI on the wire. The exposed-gate (ADR 0002 §0):
     # an operator certificate → the first-class secure path (allow); none but --allow-insecure-bind →
-    # a loud dev override (warn); otherwise → refuse fail-closed. `serve` always requires sign-in
+    # a loud dev override (warn); otherwise it refuses, fail-closed. `serve` always requires sign-in
     # (vault BACKLOG #2719, #2825), so no flag here serves full-privilege admin to the network.
     #
     # BACKLOG #1672: WITHOUT AN OPERATOR CERTIFICATE THE HOP IS NOT CLEARTEXT. The unconditional

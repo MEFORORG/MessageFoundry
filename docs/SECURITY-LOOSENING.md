@@ -609,8 +609,8 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **Reversible:** yes, immediately — set it back to `true` (or delete the line) and restart.
 
 ### `[auth].login_rate_limit_enabled = false`, or a limit looser than its default — sign-in attempts go less paced
-> **Conditional** on sign-in, like `admin_new_ip_step_up`: an app an embedder builds with sign-in off has
-> no sign-in to limit, and `serve` always requires it. Each of these values is reported under its own key
+> Reported whenever set, since no setting turns sign-in off (vault BACKLOG #2825). Each of these
+> values is reported under its own key
 > ([BACKLOG #1131](BACKLOG.md), ASVS 6.1.1). The owner ruled on 2026-09-27 that a silent weakening here
 > keeps ASVS 6.1.1 at partial.
 >

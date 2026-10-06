@@ -145,11 +145,12 @@ token at all** — it authenticates by verified mTLS client certificate only. Ev
 with its gate, in [Route → permission map](#route--permission-map-engine-api) below; nothing is left
 implicit.
 
-Both app factories are **fail-closed**. With no enabled `AuthService` attached, `create_app(engine)`
+Both app factories are **fail-closed**. With no `AuthService` attached, `create_app(engine)`
 and `create_managed_app(...)` deny every protected route (503) unless the caller explicitly opts out
 with `allow_no_auth=True`, the escape hatch for embedders and tests. Neither factory reaches
-that mode by omission, and `serve` never passes the opt-in. `serve` refuses to start with
-authentication off on every bind, loopback included (vault BACKLOG #2719). It used to allow a loopback
+that mode by omission, both refuse the opt-in beside an auth service or auth settings, and `serve`
+never passes it. `serve` always requires sign-in, on every bind, loopback included (vault BACKLOG
+#2719), and no setting turns an attached service off (vault BACKLOG #2825). It used to allow a loopback
 bind with no declared terminator to run with sign-in off. That mode was removed: every request in it
 ran as one shared system identity, so the audit trail named no person, and it could not repair an
 account, because with no auth service the account and audit routes answer 503. A config that still

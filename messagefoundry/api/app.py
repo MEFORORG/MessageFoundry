@@ -12,12 +12,12 @@ be driven two ways:
 * :func:`create_managed_app(...)` — own the engine via an ASGI lifespan (the CLI server,
   and anything driven by a synchronous test client).
 
-Authentication + RBAC are enforced whenever an :class:`AuthService` is attached, and an attached
-service cannot be turned off (vault BACKLOG #2825). The ``serve`` path always attaches one, on every
+Authentication + RBAC are enforced whenever an :class:`AuthService` is attached, and no setting
+turns an attached service off (vault BACKLOG #2825). The ``serve`` path always attaches one, on every
 bind (vault BACKLOG #2719). With **no** auth attached, both factories are **fail-closed**: every
 protected route is refused (503) unless the caller passes ``allow_no_auth=True``, in which case
-requests run as the full-access system identity (SYS-1). Only embedders and tests pass it;
-``serve`` never does.
+requests run as the full-access system identity (SYS-1). Both factories refuse that opt-in beside
+an auth service or auth settings. Only embedders and tests pass it; ``serve`` never does.
 
 The API binds localhost by default and
 always serves TLS (ADR 0172): an operator-supplied certificate wins if configured, otherwise the
@@ -2057,6 +2057,13 @@ def create_app(
     log_dir: str | None = None,
     configured_log_level: str | None = None,
 ) -> FastAPI:
+    # The open mode is the opt-in with no service, and nothing else (vault BACKLOG #2825). Beside a
+    # service the opt-in would leave a live open-mode flag on a signed-in app, so it is refused.
+    if allow_no_auth and auth is not None:
+        raise ValueError(
+            "create_app: allow_no_auth=True was passed beside an auth service; pass the opt-in "
+            "only with no service, since a service always requires sign-in"
+        )
     # The interactive docs (/docs, /redoc) and the OpenAPI schema (/openapi.json) are off by
     # default: they widen the attack surface and disclose the schema, which matters the moment the
     # API binds off-loopback. Opt in with [api] expose_docs = true. See docs/PHI.md §10.
@@ -2411,8 +2418,9 @@ def create_app(
         request: Request, identity: Identity | None = Depends(optional_identity)
     ) -> Health:
         # Liveness is always answerable (tokenless), but the build version is fingerprinting info, so
-        # it is disclosed only to an authenticated caller (WP-L3-07 / ASVS 13.4.6). When auth is
-        # disabled-with-allow_no_auth, optional_identity returns the system identity → version shown.
+        # it is disclosed only to an authenticated caller (WP-L3-07 / ASVS 13.4.6). On an app built
+        # with allow_no_auth=True and no service, optional_identity returns the system identity, so
+        # the version is shown.
         #
         # observed_client is echoed ONLY when [security].allowed_client_networks is in use, so the
         # default deployment's /health payload is byte-identical. This route is EXEMPT from the network
@@ -8134,9 +8142,8 @@ def create_managed_app(
             raise ValueError("create_managed_app requires either store_settings or db_path")
         store_settings = sqlite_settings(db_path, synchronous=synchronous)
     resolved = store_settings
-    # create_app can ignore the opt-in beside a service, because it is handed the service
-    # already attached. Here the service attaches in the lifespan, so an app that never ran it
-    # would answer as the system identity. The combination is refused instead.
+    # The open mode is the opt-in with no service (vault BACKLOG #2825), the rule create_app holds.
+    # Checked here and not left to create_app: the service attaches only in the lifespan.
     if allow_no_auth and auth_settings is not None:
         raise ValueError(
             "create_managed_app: allow_no_auth=True was passed beside auth_settings; pass the "
@@ -8639,10 +8646,9 @@ def create_managed_app(
                 )
                 upload_retention_runner.start()
             # Back the COMPLETE loosening list on GET /security/posture: [auth] carries posture switches
-            # (ad_session_recheck_seconds) that security_loosenings() must see. Stashed here, OUTSIDE the
-            # `enabled` guard below, deliberately — a settings object that exists but is disabled is still
-            # the resolved settings, and stashing it only on the enabled path would make the route silently
-            # fall back to AuthSettings() defaults and report a subset. Mirrors store_settings above.
+            # (ad_session_recheck_seconds) that security_loosenings() must see. Without the stash the
+            # route would fall back to AuthSettings() defaults and report a subset. Mirrors
+            # store_settings above.
             if auth_settings is not None:
                 app.state.auth_settings = auth_settings
             # The start's config_loaded row (vault BACKLOG #2597), as early as its readers allow: the

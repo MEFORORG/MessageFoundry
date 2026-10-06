@@ -303,10 +303,8 @@ async def test_a_wrong_credential_fails_closed_at_login() -> None:
 def test_canary_open_auth_is_detected(tmp_path: Path) -> None:
     """AC-3. FAIL ON PURPOSE: authentication disabled at the target must exit 1 with real findings.
 
-    THE TRAP THIS CANARY IS SPECIFIED AROUND: ``allow_no_auth=True`` is honoured ONLY when no
-    ``AuthService`` is attached (``messagefoundry/api/security.py``). Passing it alongside a service
-    is SILENTLY IGNORED, and the canary then reports ZERO findings and "passes clean" —
-    indistinguishable from a blind scanner. ``dast_target`` therefore builds the canary app with no
+    ``allow_no_auth=True`` opens an app ONLY when no ``AuthService`` is attached, and ``create_app``
+    refuses it beside one (vault BACKLOG #2825), so ``dast_target`` builds the canary app with no
     service. If this case ever starts passing with exit 0, the sweep has gone blind; do NOT rerun it,
     and do not relax the floor.
     """

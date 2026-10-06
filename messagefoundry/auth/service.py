@@ -1919,10 +1919,10 @@ class AuthService:
     def enabled(self) -> bool:
         """Always True: a service that exists requires sign-in (vault BACKLOG #2825).
 
-        The open mode is NO service, opted into with the app factories' ``allow_no_auth=True``. No
-        setting turns a built service off, and with no setter an embedder cannot either. So the
-        ``auth is None or not auth.enabled`` guards in the API and the web console mean
-        ``auth is None``."""
+        The open mode is NO service, opted into with the app factories' ``allow_no_auth=True``; both
+        factories refuse that opt-in beside a service. No setting turns a built service off, and the
+        property has no setter. So the ``auth is None or not auth.enabled`` guards in the API and
+        the web console mean ``auth is None``."""
         return True
 
     def __init__(

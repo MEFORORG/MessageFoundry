@@ -2705,6 +2705,22 @@ class AuthSettings(_Section):
     and a service always requires sign-in. The open mode is the app factories' ``allow_no_auth=True``
     with no settings at all."""
 
+    @model_validator(mode="before")
+    @classmethod
+    def _refuse_the_removed_sign_in_switch(cls, data: Any) -> Any:
+        """Refuse ``enabled`` loudly rather than drop it (vault BACKLOG #2825).
+
+        ``extra="ignore"`` would drop it, so settings built in code with ``enabled=False`` would
+        silently require sign-in after all. The loader already refuses the key from a file or the
+        environment as REMOVED (``_REMOVED_KEYS``), before any model is built."""
+        if isinstance(data, Mapping) and "enabled" in data:
+            raise ValueError(
+                "AuthSettings has no `enabled` field: sign-in cannot be turned off (vault BACKLOG "
+                "#2825). For an app with no sign-in, pass the app factory allow_no_auth=True and no "
+                "auth settings"
+            )
+        return data
+
     session_idle_timeout_minutes: int = 30
     session_absolute_hours: int = 12
     # Cap concurrent sessions per user (ASVS 7.1.2); a login beyond the cap revokes the user's oldest

@@ -202,12 +202,10 @@ async def dast_target(
     ``canary`` injects a REAL defect through supported configuration and provisioning only — nothing
     under ``messagefoundry/`` is patched, so the injection survives any refactor of ``require()``:
 
-    * ``"open-auth"`` — authentication bypass. CRITICAL AND COUNTERINTUITIVE: ``allow_no_auth`` is
-      honoured only when NO AuthService is attached (messagefoundry/api/security.py), so passing
-      ``allow_no_auth=True`` alongside a service is SILENTLY IGNORED and the canary reports zero
-      findings — indistinguishable from a blind scanner. A service cannot be turned off (vault
-      BACKLOG #2825), so the app is built with none. Users are still created against the service so
-      the store is byte-identical to a real run.
+    * ``"open-auth"`` — authentication bypass. ``allow_no_auth`` opens an app only when NO
+      AuthService is attached, and ``create_app`` refuses it beside one (vault BACKLOG #2825), so
+      the canary app is built with no service. Users are still created against the service so the
+      store is byte-identical to a real run.
     * ``"bfla"`` — broken function-level authorization, injected by provisioning the low-privilege
       identity with the ADMINISTRATOR role while the sweep's expectation set stays the VIEWER
       permission set. Authentication is untouched, which is precisely why this cannot be caught by the
