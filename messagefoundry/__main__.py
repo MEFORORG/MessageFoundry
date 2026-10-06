@@ -1837,10 +1837,6 @@ def _serve(args: argparse.Namespace) -> int:
     # is exactly how the ASVS 11.7.1 and 6.3.3 arms once disagreed about the same boot (#326).
     instance_exposed = not settings.api.is_loopback or settings.api.tls_terminated_upstream
 
-    # `serve` always requires sign-in, on every bind (vault BACKLOG #2719): it always passes
-    # [auth] and never passes the app factories' allow_no_auth=True. No setting can turn sign-in off,
-    # in a config file or in code (vault BACKLOG #2825), so there is no refusal arm to keep here.
-
     if settings.store.backend is StoreBackend.SQLSERVER:
         import importlib.util
 
@@ -2538,9 +2534,8 @@ def _serve(args: argparse.Namespace) -> int:
     )
     # A non-loopback API bind puts bearer tokens + PHI on the wire. The exposed-gate (ADR 0002 §0):
     # an operator certificate → the first-class secure path (allow); none but --allow-insecure-bind →
-    # a loud dev override (warn); otherwise → refuse fail-closed. The auth-disabled case is refused
-    # above regardless of this flag — serving full-privilege admin to the network is never one "I
-    # accept the risk" away.
+    # a loud dev override (warn); otherwise → refuse fail-closed. `serve` always requires sign-in
+    # (vault BACKLOG #2719, #2825), so no flag here serves full-privilege admin to the network.
     #
     # BACKLOG #1672: WITHOUT AN OPERATOR CERTIFICATE THE HOP IS NOT CLEARTEXT. The unconditional
     # ensure_api_tls_material call further down (ADR 0172) mints a self-signed pair and serves
@@ -6249,9 +6244,10 @@ def _keyless_store_gate(settings: ServiceSettings) -> str | None:
 def _offline_security_notifier(settings: ServiceSettings) -> SecurityEventNotifier | None:
     """The per-user security notifier ``serve`` would wire, built for an offline command (#2019).
 
-    Same conditions as the API lifespan: ``[auth].notify_security_events`` on, and an ``[alerts]`` SMTP host and sender. ``None`` otherwise, and the caller's notice is then
-    dropped with the WARNING ``AuthService`` logs for every notice with no channel. The host and
-    sender are checked first, so a site with no relay never resolves a secret provider.
+    Same conditions as the API lifespan: ``[auth].notify_security_events`` on, and an ``[alerts]``
+    SMTP host and sender. ``None`` otherwise, and the caller's notice is then dropped with the
+    WARNING ``AuthService`` logs for every notice with no channel. The host and sender are checked
+    first, so a site with no relay never resolves a secret provider.
 
     **An SMTP hop that does not authenticate the relay is refused unless acknowledged**, whatever the
     instance's posture. ``serve`` refuses that hop only on a PHI instance under ``enforce``, and that

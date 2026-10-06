@@ -810,7 +810,7 @@ def test_the_least_privilege_auth_rows_need_their_feature(feature: str, row: str
         )
         return next(h for h in hops if h.hop == row)
 
-    off = _hop(_with(auth={feature: False}))
+    off = _hop(_with())
     assert off.state is pc.HopState.NOT_CONFIGURED
     # The control: the feature on, so the row is in use.
     assert _hop(_with(auth={feature: True})).state is not pc.HopState.NOT_CONFIGURED

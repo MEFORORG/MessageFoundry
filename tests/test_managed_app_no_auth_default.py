@@ -19,12 +19,11 @@ from starlette.websockets import WebSocketDisconnect
 
 from messagefoundry.api import create_app, create_managed_app
 from messagefoundry.auth import Role
-from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 
 # The account helpers and the peer address the API auth tests pin, imported rather than copied.
-from tests.test_api_auth import _DEFAULT_PEER, _add, _auth, _login
+from tests.test_api_auth import _DEFAULT_PEER, _add, _auth, _login, _service
 
 #: Settings built in code with the sign-in switch vault BACKLOG #2719 removed from config files.
 #: Built through ``model_validate`` because the key is not a field any more (vault BACKLOG #2825).
@@ -174,8 +173,7 @@ async def test_an_attached_service_enforces_sign_in_even_beside_the_opt_in(tmp_p
         egress_settings=EgressSettings(deny_by_default=False),
     )
     try:
-        service = AuthService(engine.store, _STRAY_SWITCH_OFF)
-        await service.initialize()
+        service = await _service(engine, _STRAY_SWITCH_OFF)
         async with _client(create_app(engine, auth=service, allow_no_auth=True)) as c:
             assert (await c.get(_PROTECTED)).status_code == 401
         # The control: the same opt-in with no service attached is the open mode.

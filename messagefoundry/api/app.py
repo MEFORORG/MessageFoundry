@@ -12,9 +12,9 @@ be driven two ways:
 * :func:`create_managed_app(...)` — own the engine via an ASGI lifespan (the CLI server,
   and anything driven by a synchronous test client).
 
-Authentication + RBAC are enforced whenever an enabled :class:`AuthService` is attached. The
-``serve`` path always attaches one: it refuses to start with sign-in off, on every bind (vault
-BACKLOG #2719). With **no** enabled auth attached, both factories are **fail-closed**: every
+Authentication + RBAC are enforced whenever an :class:`AuthService` is attached, and an attached
+service cannot be turned off (vault BACKLOG #2825). The ``serve`` path always attaches one, on every
+bind (vault BACKLOG #2719). With **no** auth attached, both factories are **fail-closed**: every
 protected route is refused (503) unless the caller passes ``allow_no_auth=True``, in which case
 requests run as the full-access system identity (SYS-1). Only embedders and tests pass it;
 ``serve`` never does.
@@ -8134,7 +8134,7 @@ def create_managed_app(
             raise ValueError("create_managed_app requires either store_settings or db_path")
         store_settings = sqlite_settings(db_path, synchronous=synchronous)
     resolved = store_settings
-    # create_app can ignore the opt-in beside an enabled service, because it is handed the service
+    # create_app can ignore the opt-in beside a service, because it is handed the service
     # already attached. Here the service attaches in the lifespan, so an app that never ran it
     # would answer as the system identity. The combination is refused instead.
     if allow_no_auth and auth_settings is not None:

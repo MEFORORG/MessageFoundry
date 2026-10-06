@@ -52,6 +52,10 @@ this line.**
   directory the engine could not check is counted apart. They come from the new
   `interpreter` block of the engine's security posture, which moves the supported engine UI seam.
   The file names are in `GET /security/posture`. (vault BACKLOG #2701, #2700)
+- **An attached auth service can no longer be turned off.** The engine's `AuthService.enabled` is
+  now a read-only property that is always true, so the console's sign-in checks hold whenever a
+  service is attached. The console code is unchanged; the supported engine UI seam moved because
+  the property is now part of the contract the seam digest reads. (vault BACKLOG #2825)
 
 ## [0.4.0] — 2026-10-01 — Early Access
 

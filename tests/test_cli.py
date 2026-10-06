@@ -20,11 +20,7 @@ import pytest
 
 import messagefoundry.__main__ as cli_module
 from messagefoundry.__main__ import main
-from messagefoundry.config.settings import (
-    AuthSettings,
-    _env_overrides,
-    load_settings,
-)
+from messagefoundry.config.settings import AuthSettings, _env_overrides, load_settings
 from tests._phi_gate_provisions import (
     PHI_GATE_PROVISIONS_TOML,
     RETENTION_WINDOWS_ENV,

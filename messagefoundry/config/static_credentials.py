@@ -408,13 +408,6 @@ def _graph_hops(
 # --- the settings half ------------------------------------------------------------------------------
 
 
-def _auth_features_on(settings: ServiceSettings) -> tuple[bool, bool]:
-    """Whether the engine builds the AD bind and the OIDC client. ``AuthService`` holds both, and
-    ``serve`` always builds it (vault BACKLOG #2719)."""
-    auth = settings.auth
-    return auth.ad_enabled, auth.oidc_enabled
-
-
 def resolved_secret_refs(settings: ServiceSettings) -> list[str]:
     """The ``*_secret`` references the engine hands the ``[secrets]`` provider (BACKLOG #1989).
 
@@ -425,15 +418,14 @@ def resolved_secret_refs(settings: ServiceSettings) -> list[str]:
     build. The single reader: the ``settings:vault.secrets`` hop here
     and the least-privilege table in ``privilege_check`` both call it."""
     auth, alerts = settings.auth, settings.alerts
-    ad_on, oidc_on = _auth_features_on(settings)
     oidc_ref = (
         auth.oidc_client_private_key_ref
         if auth.oidc_private_key_jwt
         else auth.oidc_client_secret_ref
     )
     candidates = (
-        auth.ad_bind_password_secret if ad_on else None,
-        oidc_ref if oidc_on else None,
+        auth.ad_bind_password_secret if auth.ad_enabled else None,
+        oidc_ref if auth.oidc_enabled else None,
         alerts.email_password_secret,
     )
     return [ref for ref in candidates if ref]
@@ -461,7 +453,6 @@ def _settings_hops(settings: ServiceSettings) -> list[StaticCredentialHop]:
     elif store.key_provider == "vault":
         add("vault.store_key", "static", "Vault token from MEFOR_STORE_VAULT_TOKEN", False)
     alerts = settings.alerts
-    ad_on, oidc_on = _auth_features_on(settings)
     if settings.secrets.provider == "vault" and resolved_secret_refs(settings):
         add("vault.secrets", "static", "Vault token from MEFOR_SECRETS_VAULT_TOKEN", False)
     if alerts.webhook_url:
@@ -474,12 +465,12 @@ def _settings_hops(settings: ServiceSettings) -> list[StaticCredentialHop]:
             add("alerts.smtp", "none", "alert SMTP relay, no AUTH", False)
     if settings.ai.mode is AiMode.MANAGED_ENDPOINT:
         add("ai.broker", "static", "AI broker x-api-key from [ai].api_key", False)
-    if ad_on:
+    if settings.auth.ad_enabled:
         add("auth.ad_bind", "static", "LDAP simple bind with a static ad_bind_password", False)
     # BACKLOG #296: under private_key_jwt the token request carries a short-lived signed assertion,
     # a compliant kind like SMART's, so the hop is not reported. Under client_secret_post it is, and
     # the product now offers that compliant kind for it.
-    if oidc_on and not settings.auth.oidc_private_key_jwt:
+    if settings.auth.oidc_enabled and not settings.auth.oidc_private_key_jwt:
         add("auth.oidc", "static", "OIDC token request with a static client_secret", True)
     # The syslog/SIEM forwarder dials the collector. Only TLS with a client certificate authenticates
     # the engine to it; UDP, TCP and server-only TLS present nothing.
