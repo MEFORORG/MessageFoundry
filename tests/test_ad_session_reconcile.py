@@ -909,6 +909,42 @@ async def test_a_referral_is_not_cleared_by_a_sample_that_missed_an_account_it_s
         await store.close()
 
 
+async def test_a_referral_whose_accounts_all_left_is_not_cleared_by_an_absent_answer() -> None:
+    """BACKLOG #2538. Every account signed in at the referral signs out. The one account left reads
+    ABSENT, which returns before the group search, so nothing has run every search since. That is
+    no clear. A later PRESENT read is.
+
+    RED when: a referral clear needs only that no marked account is still signed in."""
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap({n: _principal(n) for n in ("jdoe", "asmith", "bwong")})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        for name in ("jdoe", "asmith"):
+            await _signed_in_ad_user(service, store, name)
+
+        ldap.referring = {"jdoe"}
+        referral = await service.reconcile_directory_sessions()
+        assert referral.referred and service.directory_reconcile_referral is not None
+        ldap.referring.clear()
+        for name in ("jdoe", "asmith"):
+            row = await store.get_user_by_username(name)
+            assert row is not None
+            await store.revoke_user_sessions(row.id)  # both sign out
+        await _signed_in_ad_user(service, store, "bwong")
+        del ldap.present["bwong"]  # one strike, so still signed in
+
+        absent = await service.reconcile_directory_sessions()
+        assert absent.revocations == () and not absent.referral_clear
+        assert service.directory_reconcile_referral is not None
+
+        ldap.present["bwong"] = _principal("bwong")
+        present = await service.reconcile_directory_sessions()
+        assert present.referral_clear and service.directory_reconcile_referral is None
+    finally:
+        await store.close()
+
+
 async def test_a_referral_beside_an_outage_judges_what_answered_and_pages() -> None:
     """Referral, outage and answer in one pass. The answer is judged; the referral pages; the
     outage leaves its account's strike alone. With the answer removed, referral plus outage alone

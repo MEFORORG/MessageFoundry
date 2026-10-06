@@ -3222,8 +3222,10 @@ account unjudged: no strike, no revocation, and no answer on record. Every other
 is judged as usual, so a disabled or absent account whose user search answered cleanly is still
 revoked. A pass with any referral audits `auth.ad_reconcile_referred` and raises the
 `ad_reconcile_aborted` alert with reason `directory_referral`, under its own source
-`directory-reconciler-referral`. So it is its own instance, apart from the breaker's, and muting
-one does not silence the other. The alert's text names `ad_user_search_base` and
+`directory-reconciler-referral`. So it is its own instance, apart from the breaker's, and
+acknowledging or suspending one does not silence the other. An `[alerts]` rule keyed on the event
+type alone matches both, and so does a source glob such as `directory-reconciler*`. To mute only
+the referral, a rule names its source exactly. The alert's text names `ad_user_search_base` and
 `ad_group_search_base`. When it resolves itself is stated once, in
 [CONFIGURATION.md](CONFIGURATION.md#when-the-reconcilers-two-alerts-resolve-themselves).
 Referred accounts stay in the mass-revoke breaker's count, as unreachable ones do. Left out, a referring group base would

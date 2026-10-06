@@ -730,9 +730,11 @@ this engine process, for every signed-in directory account it did not just revok
   So the breaker's alert stays open while a hold stands.
 - An LDAP referral opens its own `ad_reconcile_aborted` instance, with reason `directory_referral`
   and source `directory-reconciler-referral` (BACKLOG #2538). It resolves once every account signed
-  in at the last referral has since been read in full, with no referral, and at least one has. A
-  restart counts as a referral here, so a restarted engine first reads every account again. A
-  pass with any referral resolves none of these alerts.
+  in at the last referral has since been read in full, with no referral. At least one account
+  must have been read that way since. A restart counts as a referral here, so a restarted engine
+  first reads every account again. A pass with any referral resolves none of these alerts.
+- So an account that never reads in full keeps the referral's alert open while it is signed in. A
+  held account, a disabled one awaiting its strikes, and one that never answers all do this.
 
 **They never resolve themselves on a `[cluster]` node or in an engine that runs more than one engine
 shard.** Another engine's reconciler may still hold the condition there, so an operator resolves the
@@ -743,8 +745,8 @@ At least two cases can still resolve falsely:
 
 - An engine that declares neither `[cluster]` nor more than one engine shard trusts its own
   evidence, whatever else shares its store.
-- A pass judges only accounts that hold a session. A trip or hold whose accounts have all left
-  resolves on the accounts that remain. An account leaves at least when it signs out, reaches the
+- A pass judges only accounts that hold a session. A trip, hold or referral whose accounts have all
+  left resolves on the accounts that remain. An account leaves at least when it signs out, reaches the
   session cap, is revoked by the reconciler, is disabled locally, or is deleted.
 
 ### `[ai]` — AI coding assistance policy

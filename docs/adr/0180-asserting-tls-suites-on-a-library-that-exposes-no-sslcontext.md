@@ -355,8 +355,8 @@ never revokes, and a pass with a referred probe aborts as `directory_referral` a
 
 *Note (2026-10-05, later, BACKLOG #2538).* The previous note's "a pass with a referred probe
 aborts" no longer holds. Aborting the whole pass regressed offboarding on a referring group search
-base: that base refers only the accounts the user search found enabled, so the disabled and absent
-answers beside them stopped revoking. A referred account is now left unjudged, like an unreachable
+base. That base refers only the accounts the user search found enabled. So the disabled and
+absent answers beside them stopped revoking. A referred account is now left unjudged, like an unreachable
 one, and every other probe in the pass is judged and applied. The pass still raises the
 `ad_reconcile_aborted` alert with reason `directory_referral`, now audited as
 `auth.ad_reconcile_referred` and raised under its own source label, so it is not the breaker's

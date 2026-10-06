@@ -331,11 +331,13 @@ class AlertSink(Protocol):
         ``auth.ad_reconcile_aborted`` audit row; or the directory answered one or more probes with a
         referral (``directory_referral``, BACKLOG #2538, the ``auth.ad_reconcile_referred`` row),
         which leaves the referred accounts unjudged and may sit beside revocations the pass applied.
-        The type's name predates the second case. Read ``reason`` before naming the cause. ``name``
-        labels the source: ``"directory-reconciler"`` for the breaker, and
+        The type's name predates the second case. Read ``reason`` before naming the cause.
+
+        ``name`` labels the source: ``"directory-reconciler"`` for the breaker, and
         ``"directory-reconciler-referral"`` for a referral, so each is its own instance and
-        throttle; ``reason`` is one of those two closed-set slugs; ``probed`` is how many principals the pass probed; ``detail`` is the
-        operator-facing explanation the auth service latches. No PHI. Emitted by the API-lifespan
+        throttle. ``reason`` is one of those two closed-set slugs. ``probed`` is how many
+        principals the pass probed. ``detail`` is the operator-facing explanation the auth service
+        latches. No PHI. Emitted by the API-lifespan
         reconciler task, never from ``auth/``. A whole-directory outage is NOT this event: it is
         audited as ``auth.ad_reconcile_skipped`` and pages nothing, because the accounts are fine."""
         ...

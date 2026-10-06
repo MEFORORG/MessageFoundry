@@ -7916,8 +7916,9 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     with a referred probe is ``auth.ad_reconcile_referred`` and becomes one ``ad_reconcile_aborted``
     alert with reason ``directory_referral``, under its own source label
     (:data:`_REFERRAL_ALERT_SOURCE`), beside whatever else the pass raised. The type is reused, not
-    new. Its own source keeps it apart from the breaker's instance: acknowledging or muting a
-    standing referral must not silence a later breaker trip, and each keeps its own detail.
+    new. Its own source keeps it apart from the breaker's instance: acknowledging or suspending a
+    standing referral must not silence a later breaker trip, and each keeps its own detail. An
+    ``[alerts]`` rule keyed on the event type alone still matches both.
 
     Reads the RETURNED plan, so it sees only a pass that finished. A failed write of the pass's own
     held, aborted, skipped, referred or unkeyed-binding row no longer ends the pass (BACKLOG #2137):

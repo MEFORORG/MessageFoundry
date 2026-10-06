@@ -5450,7 +5450,8 @@ class AuthService:
           answer ran every search a referral can come from. A process's first pass marks every
           candidate the same way, because a fresh process cannot tell whether its last run saw a
           referral. A pass of referrals only, or an outage, is never evidence. The latched message
-          is released on this same test, so the log and the instance agree.
+          is released on this same test, so on a sole reconciler the log and the instance agree.
+          Where ``_without_clears`` drops the flag, the latch is released and the instance stays.
         * The hold is clear when, on top of that, the pass did not hold and these tests pass.
           None of those answers is undetermined; this is the record, across the rotation. No
           account the pass just revoked read undetermined either. At least one probe of THIS pass
@@ -5489,7 +5490,7 @@ class AuthService:
         the other code sites point here; ``docs/CONFIGURATION.md`` tells operators.
 
         **The usual cost is a missed clear, with one reconciler on the store.** An account that
-        never answers keeps both instances open while it is signed in. So does a hold, for the
+        never answers keeps every instance open while it is signed in. So does a hold, for the
         breaker's instance. So does a reconciler that is switched off, and so does every cluster
         or multi-shard engine. A fresh or forfeited process keeps the hold's instance open. An
         operator resolves those by hand. **At least two cases can still clear falsely.** Any
@@ -5932,9 +5933,10 @@ class AuthService:
     async def _record_reconcile_referral(
         self, plan: reconcile.ReconcilePlan, *, first: reconcile.Probe | None
     ) -> None:
-        """Latch, log and audit a pass in which the directory referred probes, or release the latch.
+        """Latch, log and audit a pass in which the directory referred probes.
 
-        BACKLOG #2538. Called on every pass that reached the directory. On one with a referral,
+        BACKLOG #2538. Called on every pass that judged something, and on a pass of referrals
+        only; an outage pass does not call it. On one with a referral,
         whatever else the pass did, it latches the message, logs it at ERROR with the first
         referral's search and hosts, and writes an ``auth.ad_reconcile_referred`` row. Its own audit
         action, because a pass with a referral beside other answers is not an aborted one, and an
@@ -5944,8 +5946,9 @@ class AuthService:
 
         **Its own latch and its own alert instance**, apart from the breaker's: the lifespan task
         raises it as ``ad_reconcile_aborted`` under its own source label. A shared instance would
-        let an operator who acknowledges or mutes a standing referral also silence a later breaker
-        trip, and would let one detail hide the other.
+        let an operator who acknowledges or suspends a standing referral also silence a later
+        breaker trip, and would let one detail hide the other. An ``[alerts]`` rule keyed on the
+        event type alone still matches both; only a rule naming the exact source keeps them apart.
 
         The message is the alert's detail, so it names the settings to change FIRST: the store
         keeps only the first 200 characters of an alert instance's reason. It carries counts and
