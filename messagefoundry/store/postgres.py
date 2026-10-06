@@ -7179,12 +7179,16 @@ class PostgresStore:
         requester_user_id: str,
         requested_at: float,
         expires_at: float | None,
-    ) -> None:
-        """Persist a high-value action awaiting a distinct second approver (dual-control, 2.3.5)."""
-        await self._execute(
+        audit: AuditAppend | None = None,
+    ) -> str:
+        """Persist a high-value action awaiting a distinct second approver (dual-control, 2.3.5).
+        The Store protocol states the ``audit`` contract and what is returned."""
+        sql = (
             "INSERT INTO pending_approvals "
             "(id, operation, params, requester, requester_user_id, requested_at, status, expires_at)"
-            " VALUES ($1,$2,$3,$4,$5,$6,'pending',$7)",
+            " VALUES ($1,$2,$3,$4,$5,$6,'pending',$7)"
+        )
+        args = (
             approval_id,
             operation,
             params,
@@ -7193,6 +7197,25 @@ class PostgresStore:
             requested_at,
             expires_at,
         )
+        if audit is None:
+            await self._execute(sql, *args)
+            return approval_id
+        now = time.time()
+        # vault BACKLOG #2255. The audit row joins the INSERT's transaction, so a failed append
+        # rolls the request back. `record=False` as `_execute` passes: not a pipeline borrow.
+        async with self._timed_acquire(record=False) as conn, conn.transaction():
+            await conn.execute(sql, *args)
+            appended = await self._append_audit_row(
+                conn,
+                audit.action,
+                actor=audit.actor,
+                channel_id=None,
+                detail=audit.detail,
+                client=audit.client,
+                now=now,
+            )
+        audit.tee(ts=now, row=appended)
+        return approval_id
 
     async def get_pending_approval(self, approval_id: str) -> Row | None:
         row: Row | None = await self._fetchone(
@@ -7233,20 +7256,41 @@ class PostgresStore:
         approver: str | None,
         decided_at: float,
         from_status: str = "pending",
+        audit: AuditAppend | None = None,
     ) -> bool:
         """Atomically move a request in ``from_status`` to ``status``.
         Returns ``True`` iff this call made the transition — guards against a double decision.
-        The SQLite twin documents why the guard is a parameter (ASVS 2.3.3)."""
-        result = await self._pool.execute(
+        The SQLite twin documents why the guard is a parameter (ASVS 2.3.3); the Store protocol
+        states the ``audit`` contract (vault BACKLOG #2255)."""
+        sql = (
             "UPDATE pending_approvals SET status = $1, approver = $2, decided_at = $3"
-            " WHERE id = $4 AND status = $5",
-            status,
-            approver,
-            decided_at,
-            approval_id,
-            from_status,
+            " WHERE id = $4 AND status = $5"
         )
-        return _rowcount(result) > 0
+        args = (status, approver, decided_at, approval_id, from_status)
+        if audit is None:
+            result = await self._pool.execute(sql, *args)
+            return _rowcount(result) > 0
+        now = time.time()
+        async with self._timed_acquire(record=False) as conn, conn.transaction():
+            moved = _rowcount(await conn.execute(sql, *args)) > 0
+            # Inside the transaction, so a failed append rolls the transition back. A transition
+            # that matched no row writes no audit row.
+            appended = (
+                await self._append_audit_row(
+                    conn,
+                    audit.action,
+                    actor=audit.actor,
+                    channel_id=None,
+                    detail=audit.detail,
+                    client=audit.client,
+                    now=now,
+                )
+                if moved
+                else None
+            )
+        if appended is not None:
+            audit.tee(ts=now, row=appended)
+        return moved
 
     # --- per-key AES-GCM invocation bound (ASVS 11.3.4) ----------------------
 

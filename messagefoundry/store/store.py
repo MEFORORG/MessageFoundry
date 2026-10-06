@@ -11055,8 +11055,11 @@ class MessageStore:
         requester_user_id: str,
         requested_at: float,
         expires_at: float | None,
-    ) -> None:
-        """Persist a high-value action awaiting a distinct second approver (dual-control, 2.3.5)."""
+        audit: AuditAppend | None = None,
+    ) -> str:
+        """Persist a high-value action awaiting a distinct second approver (dual-control, 2.3.5).
+        The Store protocol states the ``audit`` contract and what is returned."""
+        now = time.time()
         async with _writer_guard(self._db, self._lock):
             await self._db.execute(
                 "INSERT INTO pending_approvals "
@@ -11072,7 +11075,21 @@ class MessageStore:
                     expires_at,
                 ),
             )
+            if audit is not None:
+                # vault BACKLOG #2255. Before the one commit, so a failed append rolls the request
+                # back and no releasable row is left without its approval.requested row.
+                appended = await self._append_audit_row(
+                    audit.action,
+                    actor=audit.actor,
+                    channel_id=None,
+                    detail=audit.detail,
+                    client=audit.client,
+                    now=now,
+                )
             await self._commit()
+        if audit is not None:
+            audit.tee(ts=now, row=appended)
+        return approval_id
 
     async def get_pending_approval(self, approval_id: str) -> aiosqlite.Row | None:
         async with self._read() as db:
@@ -11118,6 +11135,7 @@ class MessageStore:
         approver: str | None,
         decided_at: float,
         from_status: str = "pending",
+        audit: AuditAppend | None = None,
     ) -> bool:
         """Atomically move a request in ``from_status`` to ``status``.
         Returns ``True`` iff this call made the transition — guards against a double decision.
@@ -11127,15 +11145,31 @@ class MessageStore:
         ``approved``, to ``failed`` (the ASVS 2.3.3 compensation) or to ``interrupted`` (BACKLOG
         #1562) -- none of which may move a row some other caller already rejected or expired, hence
         the guard is a parameter rather than a hardcoded literal. The resolve path moves a row out of
-        ``interrupted`` the same way, so two resolvers cannot both record an outcome."""
+        ``interrupted`` the same way, so two resolvers cannot both record an outcome.
+
+        ``audit``: the Store protocol states the contract (vault BACKLOG #2255)."""
+        now = time.time()
         async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "UPDATE pending_approvals SET status = ?, approver = ?, decided_at = ?"
                 " WHERE id = ? AND status = ?",
                 (status, approver, decided_at, approval_id, from_status),
             )
+            moved = cur.rowcount > 0
+            if moved and audit is not None:
+                # Before the one commit, so a failed append rolls the transition back.
+                appended = await self._append_audit_row(
+                    audit.action,
+                    actor=audit.actor,
+                    channel_id=None,
+                    detail=audit.detail,
+                    client=audit.client,
+                    now=now,
+                )
             await self._commit()
-            return cur.rowcount > 0
+        if moved and audit is not None:
+            audit.tee(ts=now, row=appended)
+        return moved
 
     # --- per-key AES-GCM invocation bound (ASVS 11.3.4) ----------------------
 

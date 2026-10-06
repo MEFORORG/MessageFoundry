@@ -83,6 +83,105 @@ async def _assert_pending_approval_contract(store: Any) -> None:
         )
 
 
+# --- vault BACKLOG #2255: a transition and its audit row are one write -----------------------------
+
+
+class _AppendFails(Exception):
+    pass
+
+
+async def _audit_rows_for(store: Any, action: str, approval_id: str) -> list[Any]:
+    return [
+        r
+        for r in await store.list_audit(action=action, limit=500)
+        if json.loads(str(r["detail"])).get("approval_id") == approval_id
+    ]
+
+
+async def _assert_transition_audit_contract(store: Any) -> None:
+    """``create_pending_approval`` and ``decide_pending_approval`` append their ``audit`` row in the
+    SAME transaction, on this backend's own SQL.
+
+    The fault is injected at the append every audit write on every backend goes through, so the
+    rollback asserted here is the backend's own, not a wrapper declining to call it. Each backend's
+    ``_append_audit_row`` takes a different first argument, hence the catch-all signature."""
+    from uuid import uuid4
+
+    from messagefoundry.store.store import AuditAppend
+
+    approval_id, lost_id = uuid4().hex, uuid4().hex
+
+    def row(action: str, for_id: str = approval_id) -> Any:
+        return AuditAppend(action, actor=_APPROVER, detail=json.dumps({"approval_id": for_id}))
+
+    async def _raises(*_args: Any, **_kwargs: Any) -> Any:
+        raise _AppendFails("audit append refused")
+
+    def request(for_id: str) -> Any:
+        return store.create_pending_approval(
+            approval_id=for_id,
+            operation="dead_letter_replay",
+            params=json.dumps({"contract": for_id}),
+            requester=_REQUESTER,
+            requester_user_id=_REQUESTER_ID,
+            requested_at=1_000.0,
+            expires_at=None,
+            audit=row("approval.requested", for_id),
+        )
+
+    real_append = store._append_audit_row
+    try:
+        assert await request(approval_id) == approval_id
+        assert len(await _audit_rows_for(store, "approval.requested", approval_id)) == 1
+
+        # A failed append rolls the INSERT back: no request is held without its row.
+        store._append_audit_row = _raises
+        with pytest.raises(_AppendFails):
+            await request(lost_id)
+        # ...and a failed append rolls a transition back: the row is still pending.
+        with pytest.raises(_AppendFails):
+            await store.decide_pending_approval(
+                approval_id,
+                status="executing",
+                approver=_APPROVER,
+                decided_at=1_001.0,
+                audit=row("approval.release_attempted"),
+            )
+        store._append_audit_row = real_append
+        assert await store.get_pending_approval(lost_id) is None
+        assert await _status(store, approval_id) == "pending"
+        assert await _audit_rows_for(store, "approval.release_attempted", approval_id) == []
+
+        # A transition that matches no row writes no row.
+        assert not await store.decide_pending_approval(
+            approval_id,
+            status="approved",
+            approver=_APPROVER,
+            decided_at=1_002.0,
+            from_status="executing",
+            audit=row("approval.approved"),
+        )
+        assert await _audit_rows_for(store, "approval.approved", approval_id) == []
+
+        # The control: one that matches moves the row and writes exactly one.
+        assert await store.decide_pending_approval(
+            approval_id,
+            status="rejected",
+            approver=_APPROVER,
+            decided_at=1_003.0,
+            audit=row("approval.rejected"),
+        )
+        assert await _status(store, approval_id) == "rejected"
+        rejected = await _audit_rows_for(store, "approval.rejected", approval_id)
+        assert len(rejected) == 1 and str(rejected[0]["actor"]) == _APPROVER
+    finally:
+        store._append_audit_row = real_append
+        # Leave the table as it was found; the server legs share one database across tests.
+        await store.decide_pending_approval(
+            approval_id, status="rejected", approver="contract-cleanup", decided_at=1_004.0
+        )
+
+
 # --- BACKLOG #1562: the release outcome ------------------------------------------------------------
 
 _APPROVER = "contract-approver-name"
@@ -379,12 +478,9 @@ async def _assert_interrupted_resolution_contract(store: Any) -> None:
         assert len(audited) == 1
         assert str(audited[0]["actor"]) == _RESOLVER
         assert json.loads(str(audited[0]["detail"])) == expected
-        # One attempt row, written before the move. The second resolve above is refused on the
-        # status check, before it writes one.
-        attempted = await _resolved_rows(store, approval_id, "approval.resolve_attempted")
-        assert len(attempted) == 1
-        assert str(attempted[0]["actor"]) == _RESOLVER
-        assert json.loads(str(attempted[0]["detail"])) == expected
+        # The move and its row are one write on this backend (vault BACKLOG #2255), so there is
+        # no separate attempt row before it.
+        assert await _resolved_rows(store, approval_id, "approval.resolve_attempted") == []
         # Resolving writes no second outcome row: the trail still says the release was cut off.
         actions = await _audit_actions(store, approval_id)
         assert actions == ["approval.interrupted"]

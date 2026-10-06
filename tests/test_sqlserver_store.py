@@ -829,6 +829,14 @@ async def test_pending_approval_store_contract(store) -> None:
     await _assert_pending_approval_contract(store)
 
 
+async def test_approval_transition_audit_contract(store) -> None:
+    """vault BACKLOG #2255 on the SQL Server backend: a request or a transition and its audit row
+    commit or roll back together, and a transition that matches no row writes no row."""
+    from tests._pending_approval_store_contract import _assert_transition_audit_contract
+
+    await _assert_transition_audit_contract(store)
+
+
 async def test_approval_release_outcome_contract(store) -> None:
     """BACKLOG #1562: a release is ``executing`` until settled to ``approved``, ``failed`` or
     ``interrupted``, each through a ``from_status``-guarded update this backend's SQL performs."""

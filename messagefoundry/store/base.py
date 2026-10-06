@@ -1711,8 +1711,14 @@ class AuditStore(Protocol):
         requester_user_id: str,
         requested_at: float,
         expires_at: float | None,
-    ) -> None:
+        audit: AuditAppend | None = None,
+    ) -> str:
         """Persist a high-value action awaiting a distinct second approver (dual-control, 2.3.5).
+        Returns the id of the row that holds the request: ``approval_id``.
+
+        ``audit``, when given, is appended to the audit chain in the SAME transaction as the INSERT,
+        so the request and its ``approval.requested`` row commit or roll back together, then teed
+        off-box (vault BACKLOG #2255). Its timestamp is the store's own clock.
 
         ``requester_user_id`` is the **authorization key** and ``requester`` is the display label
         (BACKLOG #1540). :meth:`~messagefoundry.api.approvals.ApprovalGate.approve` is the source of
@@ -1754,7 +1760,17 @@ class AuditStore(Protocol):
         approver: str | None,
         decided_at: float,
         from_status: str = "pending",
-    ) -> bool: ...
+        audit: AuditAppend | None = None,
+    ) -> bool:
+        """Move a request from ``from_status`` to ``status`` in one guarded UPDATE. ``True`` iff
+        this call moved it, which is what guards a double decision.
+
+        ``audit``, when given, is appended to the audit chain in the SAME transaction, and only
+        when the row moved: a transition that matched no row writes no audit row. A failed append
+        rolls the transition back, so the gate never sees a moved row without its audit row, nor
+        the reverse (vault BACKLOG #2255). The row is teed off-box after the commit. Its timestamp
+        is the store's own clock, not ``decided_at``."""
+        ...
 
     async def audit_anchor(self) -> tuple[int, str]: ...
 

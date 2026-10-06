@@ -1702,17 +1702,20 @@ a request older than `[approvals].expiry_hours` can no longer be approved. Appro
 at `GET /approvals`, or on the console's **Approvals** page (`/ui/approvals`, BACKLOG #1982), which
 offers Approve and Reject on each pending request and lists `interrupted` releases read-only.
 
-**The audit log must accept a release before the operation runs.** Before it claims a request, the
-gate writes an `approval.release_attempted` row against the approver, naming the requester. If the
-audit log refuses that write, the approve returns **503**, nothing runs, and the request stays
-pending. `approval.approved` is written after the operation, with its result. If only that later
-audit write fails, the error is logged and the release still succeeds, because the operation has
-already run. At least a release that loses a race with another approve or a reject, or is
-cancelled before its claim lands, leaves an `approval.release_attempted` row with no outcome row
-after it; the request's status says what won.
+**Each state change and its audit row are one write (vault BACKLOG #2255).** The store
+moves the request and appends its audit row in one transaction, so the two commit or roll back
+together. That holds for the request itself (`approval.requested`), the claim, the rejection, each
+outcome below and the resolve. A change that matches no row, such as a claim that lost the race,
+moves nothing and writes no row.
 
-The 503 means the release row is absent, not merely unconfirmed. When a COMMIT fails, no later
-write can commit the row. SQLite's writer guard rolls it back. SQL Server's audit appends roll it
+**The audit log must accept a release before the operation runs.** The gate claims a request with
+an `approval.release_attempted` row against the approver, naming the requester, in that one write.
+If it fails, the approve returns **503**, nothing runs, and the request stays pending.
+`approval.approved` is written after the operation, with its result. If that later write fails,
+the release still succeeds, because the operation has already run; see the outcome table below.
+
+The 503 means the claim and its row are absent, not merely unconfirmed. When a COMMIT fails, no
+later write can commit them. SQLite's writer guard rolls it back. SQL Server's audit appends roll it
 back explicitly, and discard the connection if that rollback fails too. Postgres ends the
 transaction itself, and its pool rolls a connection back before lending it again. There are at
 least two exceptions, where the row may have committed after all:
@@ -1729,30 +1732,32 @@ reload carries that into its `approval.approved` row.
 **An audit or store outage that refuses writes answers a mapped status on at least these approval
 paths (vault BACKLOG #2255).** A refusal runs nothing, so a refusal whose own audit row fails still
 answers **409**: that is `approval.too_early` and `approval.stale_requester`. A claim, a rejection or
-a resolution whose status write the store refuses answers **503**, and nothing runs. After a
-rejection's status write, a failed `approval.rejected` row is logged and the rejection stands. A
-request whose `approval.requested` row fails is withdrawn (moved to `failed`) before the error is
+a resolution that the store cannot write with its audit row answers **503**, and the request does
+not move. A request whose `approval.requested` row fails is not held at all, and the error is
 returned, so a retry cannot leave two releasable copies. Every audit row the gate fails to write is
 logged at ERROR with its detail, and raises an `audit_write_failed` alert keyed `approval:<id>`,
 carrying the lost row's action name.
 
 What this does not cover: a store that refuses READS still answers a raw 500, since the request
-row and the requester's account are read before any of this. The status move and its audit row
-are still two writes, not one transaction, so a status write whose COMMIT landed before a fault
-was reported can leave a row moved with no audit row.
+row and the requester's account are read before any of this.
 
 **A release records what happened to it (BACKLOG #1562).** The gate claims the request as
 `executing` before it runs the operation, so two approvers cannot both release it. It then settles
-the row to one of three outcomes, each with its own audit row after the `approval.release_attempted`
-row:
+the row to one of three outcomes. Each move carries its own audit row, after the
+`approval.release_attempted` row:
 
 | Status | Meaning | Audit row (against the approver) |
 |---|---|---|
 | `approved` | The operation ran and returned | `approval.approved` |
 | `failed` | The operation raised, or the release was cancelled before it started. It did not complete | `approval.failed` |
 | `interrupted` | The release was cancelled while the operation ran, for example by the request timeout. It may have done none, some or all of its work | `approval.interrupted` |
-| `resolved_applied` | An operator checked an `interrupted` release and recorded that its effects were applied | `approval.resolve_attempted`, then `approval.resolved` (against the resolver) |
-| `resolved_not_applied` | An operator checked an `interrupted` release and recorded that its effects were not applied | `approval.resolve_attempted`, then `approval.resolved` (against the resolver) |
+| `resolved_applied` | An operator checked an `interrupted` release and recorded that its effects were applied | `approval.resolved` (against the resolver) |
+| `resolved_not_applied` | An operator checked an `interrupted` release and recorded that its effects were not applied | `approval.resolved` (against the resolver) |
+
+The operation has run, or its outcome is unknown, by the time one of the first three is written, so
+that write never fails the call. If the move and its row cannot be written together, the gate
+writes the status alone, so an audit outage never leaves the row at `executing`. It then writes the
+audit row alone. If that fails too, the loss is logged at ERROR and pages `audit_write_failed`.
 
 Nothing retries an `interrupted` request. Re-running an operation that may already have run would be
 worse than a stuck row, so an operator has to check the operation's own effects. `GET /approvals`
@@ -1768,14 +1773,10 @@ the row to the matching `resolved_*` status (owner ruling 2026-09-26). The resol
 - **never runs the operation again**, whichever outcome is chosen. If the effects are missing, request
   the operation afresh, through dual control;
 - answers **409** for a row that is not `interrupted`, including one another operator resolved first;
-- writes `approval.resolve_attempted` against the resolver **before** the row moves, naming the
-  requester, the releasing approver, the outcome, the new status and the cut-off time. If the audit
-  log refuses it, the resolve answers **503** and the row stays `interrupted`. After the move it writes
-  `approval.resolved` with the same detail; if only that later row fails, the error is logged and the
-  resolve still succeeds, because the attempt row already records it. The row keeps the releasing
-  approver. One case the audit rows cannot settle alone: two resolvers race with the same outcome and
-  the winner's `approval.resolved` is lost. The logged error, which names the approval id, then says
-  who won.
+- writes `approval.resolved` against the resolver in the same write as the move, naming the
+  requester, the releasing approver, the outcome, the new status and the cut-off time. If that write
+  fails, the resolve answers **503** and the row stays `interrupted`. A resolver who loses a race
+  moves nothing and writes no row. The row keeps the releasing approver.
 
 `GET /approvals` lists at most 100 `interrupted` rows, oldest request first, so the requests that
 have waited longest are never the ones cut off.
@@ -1783,10 +1784,10 @@ have waited longest are never the ones cut off.
 A process that dies mid-operation leaves its row at
 `executing`. The engine does not yet reconcile those rows at startup: engine shards and cluster nodes
 share one store, and each would see the others' live releases as leftovers. If the operation ran but
-the move from `executing` to `approved` fails, the error is logged and the release still succeeds,
-because the operation has already run and an error would invite a new request that runs it twice.
-The row may stay at `executing`, and the gate still tries to write the `approval.approved` audit
-row.
+the move from `executing` to `approved` fails even when written alone, the error is logged and the
+release still succeeds, because the operation has already run and an error would invite a new
+request that runs it twice. The row may stay at `executing`, and the gate still tries to write the
+`approval.approved` audit row.
 
 **A request must also be old enough before it can be approved (ASVS 2.4.2).** The expiry is a
 ceiling. `[approvals].min_dwell_seconds` is the floor, default **2 s**. An approve that arrives sooner

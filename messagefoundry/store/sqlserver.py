@@ -11129,22 +11129,52 @@ class SqlServerStore:
         requester_user_id: str,
         requested_at: float,
         expires_at: float | None,
-    ) -> None:
-        """Persist a high-value action awaiting a distinct second approver (dual-control, 2.3.5)."""
-        await self._execute(
+        audit: AuditAppend | None = None,
+    ) -> str:
+        """Persist a high-value action awaiting a distinct second approver (dual-control, 2.3.5).
+        The Store protocol states the ``audit`` contract and what is returned."""
+        sql = (
             "INSERT INTO pending_approvals "
             "(id, operation, params, requester, requester_user_id, requested_at, status, expires_at)"
-            " VALUES (?,?,?,?,?,?,'pending',?)",
-            (
-                approval_id,
-                operation,
-                params,
-                requester,
-                requester_user_id,
-                requested_at,
-                expires_at,
-            ),
+            " VALUES (?,?,?,?,?,?,'pending',?)"
         )
+        args = (
+            approval_id,
+            operation,
+            params,
+            requester,
+            requester_user_id,
+            requested_at,
+            expires_at,
+        )
+        if audit is None:
+            await self._execute(sql, args)
+            return approval_id
+        now = time.time()
+        # vault BACKLOG #2255. The audit row joins the INSERT's transaction, so a failed append
+        # rolls the request back. The INSERT opens that transaction, which the applock inside the
+        # append needs. Same lock order as `record_audit`: the in-process gate, then the connection.
+        async with self._audit_lock:  # noqa: SIM117
+            async with self._acquire() as conn:
+                try:
+                    async with self._cursor(conn) as cur:
+                        await cur.execute(sql, args)
+                        appended = await self._append_audit_row(
+                            cur,
+                            audit.action,
+                            actor=audit.actor,
+                            channel_id=None,
+                            detail=audit.detail,
+                            client=audit.client,
+                            now=now,
+                        )
+                        await self._commit(conn)
+                except Exception:
+                    # BACKLOG #1940: see _rollback_or_discard.
+                    await self._rollback_or_discard(conn)
+                    raise
+        audit.tee(ts=now, row=appended)
+        return approval_id
 
     async def get_pending_approval(self, approval_id: str) -> dict[str, Any] | None:
         return await self._fetchone(
@@ -11183,23 +11213,56 @@ class SqlServerStore:
         approver: str | None,
         decided_at: float,
         from_status: str = "pending",
+        audit: AuditAppend | None = None,
     ) -> bool:
         """Atomically move a request in ``from_status`` to ``status``.
         Returns ``True`` iff this call made the transition — guards against a double decision.
-        The SQLite twin documents why the guard is a parameter (ASVS 2.3.3)."""
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                await cur.execute(
-                    "UPDATE pending_approvals SET status = ?, approver = ?, decided_at = ?"
-                    " WHERE id = ? AND status = ?",
-                    (status, approver, decided_at, approval_id, from_status),
-                )
-                count = cur.rowcount
-                await self._commit(conn)
-            except Exception:
-                await conn.rollback()
-                raise
-        return int(count) > 0
+        The SQLite twin documents why the guard is a parameter (ASVS 2.3.3); the Store protocol
+        states the ``audit`` contract (vault BACKLOG #2255)."""
+        sql = (
+            "UPDATE pending_approvals SET status = ?, approver = ?, decided_at = ?"
+            " WHERE id = ? AND status = ?"
+        )
+        args = (status, approver, decided_at, approval_id, from_status)
+        if audit is None:
+            async with self._acquire() as conn, self._cursor(conn) as cur:
+                try:
+                    await cur.execute(sql, args)
+                    count = cur.rowcount
+                    await self._commit(conn)
+                except Exception:
+                    await conn.rollback()
+                    raise
+            return int(count) > 0
+        now = time.time()
+        appended: AppendedAuditRow | None = None
+        # The UPDATE opens the transaction the append's applock needs. Same lock order as
+        # `record_audit`: the in-process gate, then the connection.
+        async with self._audit_lock:  # noqa: SIM117
+            async with self._acquire() as conn:
+                try:
+                    async with self._cursor(conn) as cur:
+                        await cur.execute(sql, args)
+                        moved = int(cur.rowcount) > 0
+                        if moved:
+                            # Before the one commit, so a failed append rolls the transition back.
+                            appended = await self._append_audit_row(
+                                cur,
+                                audit.action,
+                                actor=audit.actor,
+                                channel_id=None,
+                                detail=audit.detail,
+                                client=audit.client,
+                                now=now,
+                            )
+                        await self._commit(conn)
+                except Exception:
+                    # BACKLOG #1940: see _rollback_or_discard.
+                    await self._rollback_or_discard(conn)
+                    raise
+        if appended is not None:
+            audit.tee(ts=now, row=appended)
+        return moved
 
     async def create_user(
         self,

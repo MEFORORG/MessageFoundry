@@ -14,9 +14,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   (vault `BACKLOG #2459`)
 - **The approval gate answers a mapped status during an audit or store outage, and pages.** A
   too-early or stale-requester refusal whose audit row fails still answers 409. A claim, rejection
-  or resolution whose status write fails answers 503. A request whose `approval.requested` row
-  fails is withdrawn. A new `audit_write_failed` alert, keyed `approval:<id>`, fires for every
-  audit row the gate loses. Store reads on these routes are not covered. (vault `BACKLOG #2255`)
+  or resolution that cannot be written with its audit row answers 503. A new
+  `audit_write_failed` alert, keyed `approval:<id>`, fires for every audit row the gate loses.
+  Store reads on these routes are not covered. (vault `BACKLOG #2255`)
+- **Each approval state change and its audit row are now one write.** The request and
+  `approval.requested`, the claim and `approval.release_attempted`, a rejection, each release
+  outcome and a resolve each commit or roll back together, on all three store backends. A request
+  whose audit row fails is no longer written and then withdrawn: nothing is held. A rejection whose
+  `approval.rejected` row fails now answers 503 and stays pending. A claim that loses a race writes
+  no release row. The resolve no longer writes `approval.resolve_attempted`; its `approval.resolved`
+  row goes with the move. After an operation has run, an outcome that cannot be written with its row
+  is written alone, so the request never stays `executing` for that reason. (vault `BACKLOG #2255`)
 
 ## [0.5.1] — 2026-10-01 — Early Access
 

@@ -506,14 +506,16 @@ async def test_compensation_cannot_clobber_an_already_rejected_row(engine: Engin
 
 
 def _fail_audit_for(monkeypatch: pytest.MonkeyPatch, engine: Engine, *actions: str) -> None:
-    real = engine.store.record_audit
+    """Fail the named audit actions at the one append every audit write goes through: a
+    ``record_audit`` and the row a status write appends with it (vault BACKLOG #2255) alike."""
+    real = engine.store._append_audit_row  # type: ignore[attr-defined]
 
-    async def _record(action: str, **kwargs: Any) -> None:
+    async def _append(action: str, **kwargs: Any) -> Any:
         if action in actions:
             raise sqlite3.OperationalError("disk I/O error")
-        await real(action, **kwargs)
+        return await real(action, **kwargs)
 
-    monkeypatch.setattr(engine.store, "record_audit", _record)
+    monkeypatch.setattr(engine.store, "_append_audit_row", _append)
 
 
 async def _gate_with_spy_op(engine: Engine) -> tuple[ApprovalGate, list[Mapping[str, Any]], str]:
@@ -576,7 +578,7 @@ async def test_the_refused_release_is_a_503_at_the_route(
         _fail_audit_for(monkeypatch, engine, "approval.release_attempted", "approval.approved")
         r = await c.post(f"/approvals/{approval_id}/approve", headers=admin)
         assert r.status_code == 503
-        assert "still pending" in r.json()["detail"]
+        assert "did not run" in r.json()["detail"]
     # The dead letter was not re-queued: nothing ran, and the request did not move.
     assert len(await engine.store.list_dead(limit=10)) == 1
     row = await engine.store.get_pending_approval(approval_id)
@@ -587,38 +589,39 @@ async def test_the_refused_release_is_a_503_at_the_route(
 async def test_a_release_row_whose_commit_failed_never_commits_later(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """PR 1607 review finding 3. The 503 tells the approver the release row is absent. The fault is
-    injected at the COMMIT, so the INSERT really ran. SQLite leaves a transaction open when its
-    COMMIT fails, and a store that did not roll it back would hand it to the next writer, whose
-    COMMIT made the refused row durable after all. The next writer here is the re-approve's own
-    release row, so a leaked row shows up as a second one."""
+    """PR 1607 review finding 3. The 503 tells the approver the claim and its release row are both
+    absent. The fault is injected at the COMMIT, so both statements really ran. SQLite leaves a
+    transaction open when its COMMIT fails, and a store that did not roll it back would hand it to
+    the next writer, whose COMMIT made the refused claim durable after all. The next writer here is
+    the re-approve's own claim, so a leaked claim shows up as a 409 and a leaked row as a second
+    one."""
     gate, calls, maker_id = await _gate_with_spy_op(engine)
     approval_id = await gate.guard(
         "dead_letter_replay", {}, requester="maker", requester_user_id=maker_id
     )
     assert approval_id is not None
     store = engine.store
-    real_record, real_commit = store.record_audit, store._commit  # type: ignore[attr-defined]
+    real_append, real_commit = store._append_audit_row, store._commit  # type: ignore[attr-defined]
     armed = False
 
-    async def _record(action: str, **kwargs: Any) -> None:
+    async def _append(action: str, **kwargs: Any) -> Any:
         nonlocal armed
         armed = action == "approval.release_attempted"
-        try:
-            await real_record(action, **kwargs)
-        finally:
-            armed = False
+        return await real_append(action, **kwargs)
 
     async def _commit() -> None:
+        nonlocal armed
         if armed:
+            armed = False
             raise sqlite3.OperationalError("database is locked")
         await real_commit()
 
-    monkeypatch.setattr(store, "record_audit", _record)
+    monkeypatch.setattr(store, "_append_audit_row", _append)
     monkeypatch.setattr(store, "_commit", _commit)
     with pytest.raises(ApprovalError) as caught:
         await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
     assert caught.value.status == 503 and calls == []
+    assert await _status_of(engine, approval_id) == "pending"  # the claim rolled back with it
 
     monkeypatch.undo()
     outcome = await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
@@ -626,35 +629,78 @@ async def test_a_release_row_whose_commit_failed_never_commits_later(
     assert len(await store.list_audit(action="approval.release_attempted")) == 1
 
 
-async def test_a_release_that_loses_to_a_reject_runs_nothing(
+async def test_a_release_that_loses_to_a_reject_runs_nothing_and_writes_no_release_row(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The documented cost of writing the release row first. A reject that lands between that row
-    and the transition wins: the approve is refused, nothing runs, and the release row stands
-    alone with no approved or failed row after it."""
+    """A reject that lands after the approve's checks and before its claim wins: the approve is
+    refused, nothing runs, and, because the claim and its row are one write (vault BACKLOG #2255),
+    the loser leaves no release row behind. Before the fix it left one with no outcome after it."""
     gate, calls, maker_id = await _gate_with_spy_op(engine)
     approval_id = await gate.guard(
         "dead_letter_replay", {}, requester="maker", requester_user_id=maker_id
     )
     assert approval_id is not None
-    real = engine.store.record_audit
+    real = engine.store.decide_pending_approval
 
-    async def _reject_right_after_the_release_row(action: str, **kwargs: Any) -> None:
-        await real(action, **kwargs)
-        if action == "approval.release_attempted":
-            monkeypatch.undo()  # so the reject's own audit write goes straight through
+    async def _reject_just_before_the_claim(approval_id: str, **kwargs: Any) -> bool:
+        if kwargs["status"] == "executing":
+            monkeypatch.undo()  # so the reject's own write goes straight through
             await gate.reject(approval_id, approver="other-checker")
+        return bool(await real(approval_id, **kwargs))
 
-    monkeypatch.setattr(engine.store, "record_audit", _reject_right_after_the_release_row)
+    monkeypatch.setattr(engine.store, "decide_pending_approval", _reject_just_before_the_claim)
     with pytest.raises(ApprovalError) as caught:
         await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
     assert caught.value.status == 409
     assert calls == []
-    row = await engine.store.get_pending_approval(approval_id)
-    assert row is not None and str(row["status"]) == "rejected"
+    assert await _status_of(engine, approval_id) == "rejected"
     actions = [str(r["action"]) for r in await engine.store.list_audit(limit=50)]
-    assert actions.count("approval.release_attempted") == 1
+    assert actions.count("approval.rejected") == 1
+    assert "approval.release_attempted" not in actions
     assert "approval.approved" not in actions and "approval.failed" not in actions
+
+
+async def test_a_request_whose_requested_row_fails_is_never_held(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The request and its approval.requested row are one write (vault BACKLOG #2255). Before the
+    fix the request was written first and withdrawn after a failed row, so a crash between the two
+    left a releasable request nobody had recorded. The fault is the real append, so this is the
+    store's own rollback, not a wrapper declining to call it."""
+    gate, _calls, maker_id = await _gate_with_spy_op(engine)
+    _fail_audit_for(monkeypatch, engine, "approval.requested")
+    with pytest.raises(sqlite3.OperationalError):
+        await gate.guard("dead_letter_replay", {}, requester="maker", requester_user_id=maker_id)
+    assert await engine.store.list_pending_approvals(now=0.0) == []
+    monkeypatch.undo()
+    # The control: the same request is held once the audit log accepts writes.
+    approval_id = await gate.guard(
+        "dead_letter_replay", {}, requester="maker", requester_user_id=maker_id
+    )
+    assert approval_id is not None and await _status_of(engine, approval_id) == "pending"
+    assert len(await engine.store.list_audit(action="approval.requested")) == 1
+
+
+async def test_a_rejection_whose_rejected_row_fails_is_refused_and_stays_pending(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rejection and its approval.rejected row are one write (vault BACKLOG #2255). Before the
+    fix the row moved first and its audit row could be lost, leaving a rejection nobody signed."""
+    gate, calls, maker_id = await _gate_with_spy_op(engine)
+    approval_id = await gate.guard(
+        "dead_letter_replay", {}, requester="maker", requester_user_id=maker_id
+    )
+    assert approval_id is not None
+    _fail_audit_for(monkeypatch, engine, "approval.rejected")
+    with pytest.raises(ApprovalError) as caught:
+        await gate.reject(approval_id, approver="checker")
+    assert caught.value.status == 503
+    assert await _status_of(engine, approval_id) == "pending"
+    monkeypatch.undo()
+    await gate.reject(approval_id, approver="checker")
+    assert await _status_of(engine, approval_id) == "rejected"
+    assert len(await engine.store.list_audit(action="approval.rejected")) == 1
+    assert calls == []
 
 
 async def test_a_failed_approved_row_after_the_operation_ran_still_reports_success(
@@ -738,6 +784,14 @@ async def test_pending_approval_store_contract(engine: Engine) -> None:
     from tests._pending_approval_store_contract import _assert_pending_approval_contract
 
     await _assert_pending_approval_contract(engine.store)
+
+
+async def test_approval_transition_audit_contract(engine: Engine) -> None:
+    """vault BACKLOG #2255 on the SQLite backend: a request or a transition and its audit row
+    commit or roll back together, and a transition that matches no row writes no row."""
+    from tests._pending_approval_store_contract import _assert_transition_audit_contract
+
+    await _assert_transition_audit_contract(engine.store)
 
 
 # --- BACKLOG #1562: a release is 'executing' until its outcome is known ---------------------------
@@ -951,10 +1005,10 @@ async def test_cancel_during_the_claim_settles_to_failed_and_never_runs(engine: 
 async def test_a_failed_approved_write_still_writes_the_audit_row(
     engine: Engine, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The operation RAN. If moving the row to 'approved' fails, approval.approved is still written,
-    the failure is logged at ERROR, and the approver still gets success: a 500 would invite a new
-    request that runs the operation twice (BACKLOG #1940's reasoning, applied to the status write).
-    The row is left 'executing', never 'failed'."""
+    """The operation RAN. If moving the row to 'approved' fails, both with its row and alone,
+    approval.approved is still written on its own, the failure is logged at ERROR, and the approver
+    still gets success: a 500 would invite a new request that runs the operation twice (BACKLOG
+    #1940's reasoning, applied to the status write). The row is left 'executing', never 'failed'."""
     from tests._pending_approval_store_contract import _resolve, _StandingStore
 
     class _SettleFails(_StandingStore):
@@ -978,7 +1032,7 @@ async def test_a_failed_approved_write_still_writes_the_audit_row(
     assert any(
         r.levelno == logging.ERROR
         and approval_id in r.getMessage()
-        and "moving the row to 'approved' failed" in r.getMessage()
+        and "writing the 'approved' status alone failed too" in r.getMessage()
         for r in caplog.records
     )
 
@@ -1221,14 +1275,12 @@ async def test_resolve_records_the_outcome_audits_it_and_never_runs(
     # The row's decided_at is now the resolution time; the audit rows keep the cut-off time.
     resolved_row = await engine.store.get_pending_approval(approval_id)
     assert resolved_row is not None and float(resolved_row["decided_at"]) != interrupted_at
-    for action in ("approval.resolve_attempted", "approval.resolved"):
-        rows = await engine.store.list_audit(action=action)
-        assert len(rows) == 1, action
-        assert str(rows[0]["actor"]) == "resolver"
-        assert json.loads(str(rows[0]["detail"])) == expected
-    # The attempt row is written BEFORE the move (list_audit is newest-first).
-    actions = [str(r["action"]) for r in await engine.store.list_audit(limit=50)]
-    assert actions.index("approval.resolved") < actions.index("approval.resolve_attempted")
+    rows = await engine.store.list_audit(action="approval.resolved")
+    assert len(rows) == 1
+    assert str(rows[0]["actor"]) == "resolver"
+    assert json.loads(str(rows[0]["detail"])) == expected
+    # One write, one row (vault BACKLOG #2255): no separate attempt row before the move.
+    assert await engine.store.list_audit(action="approval.resolve_attempted") == []
 
 
 async def test_requester_cannot_resolve_their_own_interrupted_request(engine: Engine) -> None:
@@ -1368,10 +1420,9 @@ async def test_a_resolve_that_loses_the_race_answers_409(engine: Engine) -> None
         caught.value.status == 409 and "another operator resolved it first" in caught.value.detail
     )
     assert await _status_of(engine, approval_id) == "resolved_applied"
-    assert len(await engine.store.list_audit(action="approval.resolved")) == 1
-    # The loser got as far as its attempt row; the row's status says who won.
-    attempted = await engine.store.list_audit(action="approval.resolve_attempted")
-    assert sorted(str(r["actor"]) for r in attempted) == ["a", "b"]
+    # The loser moved nothing, so it wrote nothing: the one row is the winner's.
+    resolved = await engine.store.list_audit(action="approval.resolved")
+    assert [str(r["actor"]) for r in resolved] == ["a"]
 
 
 class _AuditRefuses:
@@ -1389,56 +1440,35 @@ class _AuditRefuses:
             raise OSError("audit log unreachable")
         return await self._store.record_audit(action, **kw)
 
+    async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
+        # The row a status write appends with it is refused the same way, and the store then moves
+        # nothing, which is what its own rollback gives.
+        audit = kw.get("audit")
+        if audit is not None and audit.action == self._refused:
+            raise OSError("audit log unreachable")
+        return bool(await self._store.decide_pending_approval(approval_id, **kw))
 
-async def test_a_refused_attempt_row_leaves_the_request_interrupted(engine: Engine) -> None:
-    """The audit log must accept the resolution BEFORE the row moves (BACKLOG #1940's shape), so a
-    refused attempt row answers 503 and changes nothing."""
+
+async def test_a_refused_resolved_row_leaves_the_request_interrupted(engine: Engine) -> None:
+    """The move and its approval.resolved row are one write (vault BACKLOG #2255), so a refused
+    row answers 503 and changes nothing."""
     from tests._pending_approval_store_contract import _resolve
 
     approval_id = await _interrupted_row(engine, "maker", "maker-id")
     before = await engine.store.get_pending_approval(approval_id)
     assert before is not None
-    store = _AuditRefuses(engine.store, "approval.resolve_attempted")
+    store = _AuditRefuses(engine.store, "approval.resolved")
     gate = ApprovalGate(store, ON, resolve_identity=_resolve)
     with pytest.raises(ApprovalError) as caught:
         await gate.resolve_interrupted(
             approval_id, outcome="effects_applied", resolver="a", resolver_user_id="a-id"
         )
-    assert caught.value.status == 503 and "still interrupted" in caught.value.detail
+    assert caught.value.status == 503 and "still reads interrupted" in caught.value.detail
     after = await engine.store.get_pending_approval(approval_id)
     assert after is not None
     assert str(after["status"]) == "interrupted"
     assert float(after["decided_at"]) == float(before["decided_at"])  # never written
     assert await engine.store.list_audit(action="approval.resolved") == []
-
-
-async def test_a_failed_resolved_row_still_resolves_and_is_logged(
-    engine: Engine, caplog: pytest.LogCaptureFixture
-) -> None:
-    """Once the row has moved, a failed approval.resolved write must not turn into an error: the
-    attempt row already names the resolver and the outcome. The loss is logged at ERROR."""
-    from tests._pending_approval_store_contract import _resolve
-
-    approval_id = await _interrupted_row(engine, "maker", "maker-id")
-    store = _AuditRefuses(engine.store, "approval.resolved")
-    gate = ApprovalGate(store, ON, resolve_identity=_resolve)
-    with caplog.at_level(logging.ERROR, logger="messagefoundry.api.approvals"):
-        out = await gate.resolve_interrupted(
-            approval_id, outcome="effects_not_applied", resolver="a", resolver_user_id="a-id"
-        )
-    assert out["status"] == "resolved_not_applied"
-    assert await _status_of(engine, approval_id) == "resolved_not_applied"
-    attempted = await engine.store.list_audit(action="approval.resolve_attempted")
-    assert [str(r["actor"]) for r in attempted] == ["a"]
-    assert json.loads(str(attempted[0]["detail"]))["outcome"] == "effects_not_applied"
-    assert any(
-        r.levelno == logging.ERROR
-        and approval_id in r.getMessage()
-        # Names the resolver: in a same-outcome race this line is what says who won.
-        and "resolver a moved the row" in r.getMessage()
-        and "approval.resolved audit row failed" in r.getMessage()
-        for r in caplog.records
-    )
 
 
 async def test_a_cancel_during_the_status_write_still_records_the_resolution(
