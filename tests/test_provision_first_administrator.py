@@ -1720,7 +1720,7 @@ def _smtp(*, use_tls: bool = True, verify: bool = True) -> AlertsSettings:
 
 
 def test_the_offline_notifier_is_built_on_the_conditions_serve_uses() -> None:
-    """``serve`` wires the notifier only with sign-in on, notices on, and an SMTP host and sender."""
+    """``serve`` wires the notifier only with notices on, and an SMTP host and sender."""
     from messagefoundry.__main__ import _offline_security_notifier
     from messagefoundry.config.settings import ServiceSettings
     from messagefoundry.pipeline.security_notify import SecurityEventNotifier
@@ -1731,8 +1731,6 @@ def test_the_offline_notifier_is_built_on_the_conditions_serve_uses() -> None:
     assert isinstance(built, SecurityEventNotifier)
     off = ServiceSettings(alerts=smtp, auth=AuthSettings(notify_security_events=False))
     assert _offline_security_notifier(off) is None
-    disabled = ServiceSettings(alerts=smtp, auth=AuthSettings(enabled=False))
-    assert _offline_security_notifier(disabled) is None
 
 
 @pytest.mark.parametrize(

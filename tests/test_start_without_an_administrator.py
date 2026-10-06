@@ -64,13 +64,13 @@ def _app(
 ) -> FastAPI:
     """The engine at the shipped PHI posture, with one dial moved per argument.
 
-    ``sign_in`` is ``[auth].enabled``. No config key sets it any more and ``serve`` refuses it off
-    (vault BACKLOG #2719); only an app built in code, as here, can have it off.
+    ``sign_in=False`` passes no auth settings, the one way an app built in code runs without sign-in
+    (vault BACKLOG #2825). ``serve`` always passes them (vault BACKLOG #2719).
     """
     return create_managed_app(
         store_settings=StoreSettings(path=str(db), encryption_key=key),
         poll_interval=0.05,
-        auth_settings=AuthSettings(enabled=sign_in, notify_security_events=notices),
+        auth_settings=AuthSettings(notify_security_events=notices) if sign_in else None,
         alerts_settings=AlertsSettings(
             security_notifications_required=required,
             email_smtp_host="smtp.example.invalid",

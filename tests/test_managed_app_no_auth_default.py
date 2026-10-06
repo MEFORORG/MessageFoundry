@@ -17,12 +17,18 @@ from fastapi import FastAPI
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from messagefoundry.api import create_managed_app
+from messagefoundry.api import create_app, create_managed_app
 from messagefoundry.auth import Role
+from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings, EgressSettings
+from messagefoundry.pipeline import Engine
 
 # The account helpers and the peer address the API auth tests pin, imported rather than copied.
 from tests.test_api_auth import _DEFAULT_PEER, _add, _auth, _login
+
+#: Settings built in code with the sign-in switch vault BACKLOG #2719 removed from config files.
+#: Built through ``model_validate`` because the key is not a field any more (vault BACKLOG #2825).
+_STRAY_SWITCH_OFF = AuthSettings.model_validate({"enabled": False})
 
 #: A route behind ``require(...)``. ``/health`` is the control beside it: it answers a tokenless
 #: caller through ``optional_identity`` in every mode, so it shows the app is up.
@@ -37,23 +43,19 @@ def _client(app: FastAPI) -> httpx.AsyncClient:
 
 
 @pytest.mark.parametrize(
-    ("auth_settings", "allow_no_auth", "status"),
+    ("allow_no_auth", "status"),
     [
-        pytest.param(None, False, 503, id="no-settings"),
-        pytest.param(None, True, 200, id="no-settings-opted-in"),
-        # Settings that say sign-in is off describe the instance. They are not the opt-in.
-        pytest.param(AuthSettings(enabled=False), False, 503, id="disabled-settings"),
-        pytest.param(AuthSettings(enabled=False), True, 200, id="disabled-settings-opted-in"),
+        pytest.param(False, 503, id="no-settings"),
+        pytest.param(True, 200, id="no-settings-opted-in"),
     ],
 )
-async def test_only_the_opt_in_opens_an_app_with_no_enabled_auth(
-    tmp_path: Path, auth_settings: AuthSettings | None, allow_no_auth: bool, status: int
+async def test_only_the_opt_in_opens_an_app_with_no_auth_settings(
+    tmp_path: Path, allow_no_auth: bool, status: int
 ) -> None:
-    """The opt-in decides, and the settings do not: each refusal sits beside its own control."""
+    """The opt-in decides: the refusal sits beside its own control."""
     app = create_managed_app(
         db_path=tmp_path / "managed.db",
         poll_interval=0.05,
-        auth_settings=auth_settings,
         allow_no_auth=allow_no_auth,
         egress_settings=EgressSettings(deny_by_default=False),
     )
@@ -124,12 +126,63 @@ async def test_enabled_auth_settings_refuse_an_anonymous_call_and_answer_a_signe
         assert (await c.get(_PROTECTED, headers=_auth(token))).status_code == 200
 
 
-def test_the_opt_in_beside_enabled_auth_settings_is_refused(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "auth_settings",
+    [
+        pytest.param(AuthSettings(), id="default-settings"),
+        # Vault BACKLOG #2825: before the fix these settings turned sign-in off, and the factory
+        # built an open app from them.
+        pytest.param(_STRAY_SWITCH_OFF, id="settings-carrying-the-removed-switch"),
+    ],
+)
+def test_the_opt_in_beside_auth_settings_is_refused(
+    tmp_path: Path, auth_settings: AuthSettings
+) -> None:
     """Asking for sign-in and for the open mode at once is a mistake, so the factory says so."""
     with pytest.raises(ValueError, match="allow_no_auth"):
         create_managed_app(
             db_path=tmp_path / "both.db",
-            auth_settings=AuthSettings(),
+            auth_settings=auth_settings,
             allow_no_auth=True,
             egress_settings=EgressSettings(deny_by_default=False),
         )
+
+
+# --- vault BACKLOG #2825: the opt-in is the ONLY way into the open mode ------------------------
+
+
+def test_auth_settings_carry_no_sign_in_switch() -> None:
+    """No settings object can say sign-in is off, whether it came from a file or from code.
+
+    The loader already refuses ``[auth].enabled`` (vault BACKLOG #2719); this pins the model. The
+    model ignores a key it does not know, so a stray one builds the default settings, and assigning
+    the attribute is refused."""
+    assert "enabled" not in AuthSettings.model_fields
+    assert AuthSettings() == _STRAY_SWITCH_OFF
+    with pytest.raises(ValueError, match="enabled"):
+        setattr(AuthSettings(), "enabled", False)  # noqa: B010 -- the name is the subject
+
+
+async def test_an_attached_service_enforces_sign_in_even_beside_the_opt_in(tmp_path: Path) -> None:
+    """An auth service, once built, always asks for a session; nothing an embedder sets turns it off.
+
+    So ``allow_no_auth=True`` opens an app only when no service is attached. Before vault BACKLOG
+    #2825 the service below answered as disabled and the app served ``/stats`` to anyone (200)."""
+    engine = await Engine.create(
+        tmp_path / "attached.db",
+        poll_interval=0.05,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        service = AuthService(engine.store, _STRAY_SWITCH_OFF)
+        await service.initialize()
+        async with _client(create_app(engine, auth=service, allow_no_auth=True)) as c:
+            assert (await c.get(_PROTECTED)).status_code == 401
+        # The control: the same opt-in with no service attached is the open mode.
+        async with _client(create_app(engine, allow_no_auth=True)) as c:
+            assert (await c.get(_PROTECTED)).status_code == 200
+        assert service.enabled is True
+        with pytest.raises(AttributeError):
+            setattr(service, "enabled", False)  # noqa: B010 -- the name is the subject
+    finally:
+        await engine.stop()

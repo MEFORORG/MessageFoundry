@@ -95,9 +95,8 @@ MAX_PROBE_RESPONSE_BYTES = 1024 * 1024
 #: every reply.
 #:
 #: **The NAMES are the contract; the VALUES are not, and must never be keyed on.** ``version`` is
-#: ``null`` to an unauthenticated caller under ASVS 13.4.6, but is the real build string on an engine
-#: with ``[auth] enabled = false`` -- ``allow_no_auth`` hands even a tokenless caller the system
-#: identity. ``observed_client`` is ``null`` unless ``[security].allowed_client_networks`` is in use.
+#: ``null`` to an unauthenticated caller under ASVS 13.4.6, but is the real build string on an app
+#: built with ``allow_no_auth=True``, which hands even a tokenless caller the system identity. ``observed_client`` is ``null`` unless ``[security].allowed_client_networks`` is in use.
 #: The key SET is the one thing steady across all of those, which is why :func:`classify_health`
 #: keys on it.
 #:

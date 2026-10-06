@@ -2699,10 +2699,12 @@ _AD_TIMEOUT_MAX_SECONDS = 3600.0
 
 
 class AuthSettings(_Section):
-    """Authentication + RBAC knobs. Secrets (the AD bind password) come from env, never the file."""
+    """Authentication + RBAC knobs. Secrets (the AD bind password) come from env, never the file.
 
-    # Authentication is required by default; this flag exists only for the embedding/test path.
-    enabled: bool = True
+    There is no sign-in switch here (vault BACKLOG #2825). Settings that exist build an auth service,
+    and a service always requires sign-in. The open mode is the app factories' ``allow_no_auth=True``
+    with no settings at all."""
+
     session_idle_timeout_minutes: int = 30
     session_absolute_hours: int = 12
     # Cap concurrent sessions per user (ASVS 7.1.2); a login beyond the cap revokes the user's oldest
@@ -5937,8 +5939,8 @@ class SecuritySettings(_Section):
     # ── Sign-in & identity ───────────────────────────────────────────
     # There is no sign-in switch here. `serve` always requires sign-in (vault BACKLOG #2719): the
     # loopback no-auth mode it once offered was removed, not relocated, so `require_sign_in` is
-    # refused at load as a REMOVED key (_REMOVED_KEYS). AuthSettings.enabled survives only for
-    # embedders and tests that build the app themselves with allow_no_auth=True.
+    # refused at load as a REMOVED key (_REMOVED_KEYS). AuthSettings has no such field either (vault
+    # BACKLOG #2825); only an app built in code with allow_no_auth=True runs without sign-in.
     require_mfa: bool = True  # second factor, enforced as an ACCESS gate (ASVS 6.3.3)
     # Who must enroll one when require_mfa is on. Default widens the gate past the Administrator role
     # to every local account (ASVS 6.3.3); "administrators" restores the pre-6.3.3 posture.
@@ -6180,8 +6182,6 @@ class ServiceSettings(_InputHidingModel):
         it at build for a caller that hands it an ``AuthSettings`` alone. Under ``warn`` the opt-in is
         honoured, warned at build and named by :func:`security_loosenings`.
 
-        Not keyed on ``[auth].enabled``: with sign-in off nothing dials the directory, but turning
-        sign-in on would make the bind live with no second check, so the config is refused either way.
         A loopback ``ldap://`` (an on-box LDAPS proxy) is refused too; the cleartext-hop gradient's
         loopback ALLOW was not extended to this hop."""
         if self.auth.plain_ldap_bind and self.security.enforcement is SecurityEnforcement.ENFORCE:
@@ -7515,10 +7515,8 @@ def security_loosenings(
         )
     # Vault BACKLOG #2354: a plain ldap:// AD bind. ServiceSettings refuses it at load under enforce, so a
     # loaded config reaches this only at warn. Conditional on the bind being live: the flag beside an
-    # ldaps:// address, with AD off, or with sign-in off (nothing builds the authenticator) changes
-    # nothing and is not named. Sign-in is off only on an app an embedder or a test built itself;
-    # `serve` always requires it (vault BACKLOG #2719).
-    if auth.enabled and auth.plain_ldap_bind:
+    # ldaps:// address, or with AD off, changes nothing and is not named.
+    if auth.plain_ldap_bind:
         out.append(
             (
                 "ad_allow_insecure_ldap",
@@ -7527,9 +7525,8 @@ def security_loosenings(
                 "domain controller",
             )
         )
-    # BACKLOG #288: the new-client-IP step-up defaults ON. Conditional on auth, like the entry above is
-    # on the directory: with sign-in off there is no session for the signal to guard.
-    if auth.enabled and not auth.admin_new_ip_step_up:
+    # BACKLOG #288: the new-client-IP step-up defaults ON.
+    if not auth.admin_new_ip_step_up:
         out.append(
             (
                 "admin_new_ip_step_up",
@@ -7541,10 +7538,7 @@ def security_loosenings(
     # BACKLOG #1131, owner ruling 2026-09-27 (#2006): a silent weakening of an anti-automation control
     # keeps its ASVS cell at partial. Every such limit LOOSER THAN ITS SHIPPED DEFAULT is named, not
     # only an off value; _auth_limit_loosenings says why and how each direction was read.
-    # Gated on [auth].enabled. A loaded config always has it on: `serve` requires sign-in and no key
-    # turns it off (vault BACKLOG #2719). Only an app an embedder or a test built itself has it off.
-    if auth.enabled:
-        out.extend(_auth_limit_loosenings(auth))
+    out.extend(_auth_limit_loosenings(auth))
     # BACKLOG #1131: trusted_proxies ranges covering every peer of a family (0.0.0.0/0, ::/0, or
     # ranges whose union is that) make uvicorn trust X-Forwarded-For from all of them, which is what
     # the refused "*" does. The load still accepts them; naming them is the fix. Parsed STRICTLY, as

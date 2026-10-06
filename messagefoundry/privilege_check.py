@@ -520,8 +520,9 @@ def administrative_group(sid: str) -> str | None:
 
 
 def ad_bind_configured(settings: ServiceSettings) -> bool:
-    """AuthService, which holds the AD bind, is built only with ``[auth]`` enabled (BACKLOG #1989)."""
-    return settings.auth.enabled and settings.auth.ad_enabled
+    """Whether ``serve`` builds the AD bind: ``AuthService`` holds it (BACKLOG #1989), and ``serve``
+    always builds that service (vault BACKLOG #2719)."""
+    return settings.auth.ad_enabled
 
 
 def ldap_hop(settings: ServiceSettings, probe: Callable[[], BindAccountReading]) -> HopPrivilege:
@@ -535,7 +536,7 @@ def ldap_hop(settings: ServiceSettings, probe: Callable[[], BindAccountReading])
     failed, a bound Who am I named no identity, or only the direct read was possible and it found
     none."""
     if not ad_bind_configured(settings):
-        return _not_configured("ldap", "[auth].enabled or [auth].ad_enabled is off")
+        return _not_configured("ldap", "[auth].ad_enabled is off")
     auth = settings.auth
     identity = f"bind DN {auth.ad_bind_dn!r} on {auth.ad_server!r}"
     minimal = (
@@ -619,9 +620,9 @@ def _smtp_hop(settings: ServiceSettings) -> HopPrivilege:
 
 def _idp_hop(settings: ServiceSettings) -> HopPrivilege:
     auth = settings.auth
-    # AuthService, which holds the OIDC client, is built only with [auth] enabled (BACKLOG #1989).
-    if not (auth.enabled and auth.oidc_enabled):
-        return _not_configured("idp", "[auth].enabled or [auth].oidc_enabled is off")
+    # AuthService holds the OIDC client (BACKLOG #1989), and serve always builds it (vault #2719).
+    if not auth.oidc_enabled:
+        return _not_configured("idp", "[auth].oidc_enabled is off")
     return HopPrivilege(
         "idp",
         HopState.NOT_PROBED,

@@ -1915,6 +1915,16 @@ def oidc_client_auth_from_settings(
 class AuthService:
     """Authentication + RBAC orchestration over an :class:`AuthStore` and the configured directory."""
 
+    @property
+    def enabled(self) -> bool:
+        """Always True: a service that exists requires sign-in (vault BACKLOG #2825).
+
+        The open mode is NO service, opted into with the app factories' ``allow_no_auth=True``. No
+        setting turns a built service off, and with no setter an embedder cannot either. So the
+        ``auth is None or not auth.enabled`` guards in the API and the web console mean
+        ``auth is None``."""
+        return True
+
     def __init__(
         self,
         store: AdminStore,
@@ -1928,7 +1938,6 @@ class AuthService:
     ) -> None:
         self._store = store
         self._settings = settings
-        self.enabled = settings.enabled
         # #285 (ASVS 6.7.1): the ADR 0148 [security].enforcement dial, threaded in by the caller
         # (the lifespan passes trust_anchors_enforcing). It gates the OIDC anchor's construction-site
         # ACL preflight in build_idp_opener below so a group/world-writable anchor WARNS (not refuses)

@@ -776,11 +776,9 @@ def test_an_auth_secret_reference_dials_vault_only_while_its_feature_is_on(
     auth: dict[str, object], enable: str, hop: str
 ) -> None:
     """``AuthService`` resolves the AD bind password only with AD on and the OIDC client secret only
-    with OIDC on, and the service is built only with ``[auth]`` enabled."""
+    with OIDC on."""
     off = _settings_names(_with(secrets=_VAULT, auth=auth))
     assert "settings:vault.secrets" not in off and hop not in off
-    auth_off = _settings_names(_with(secrets=_VAULT, auth={**auth, enable: True, "enabled": False}))
-    assert "settings:vault.secrets" not in auth_off and hop not in auth_off
     # The control: the feature on, so the reference is resolved and both hops are dialled.
     on = _settings_names(_with(secrets=_VAULT, auth={**auth, enable: True}))
     assert {"settings:vault.secrets", hop} <= on
@@ -799,8 +797,8 @@ def test_the_least_privilege_table_reads_the_same_references() -> None:
 
 
 @pytest.mark.parametrize(("feature", "row"), [("ad_enabled", "ldap"), ("oidc_enabled", "idp")])
-def test_the_least_privilege_auth_rows_need_auth_enabled(feature: str, row: str) -> None:
-    """The LDAP and IdP rows agree with the Vault row: nothing is dialled with ``[auth]`` off."""
+def test_the_least_privilege_auth_rows_need_their_feature(feature: str, row: str) -> None:
+    """The LDAP and IdP rows agree with the Vault row: nothing is dialled with the feature off."""
     import messagefoundry.privilege_check as pc
     from messagefoundry.auth.ldap import BindAccountReading
 
@@ -812,9 +810,9 @@ def test_the_least_privilege_auth_rows_need_auth_enabled(feature: str, row: str)
         )
         return next(h for h in hops if h.hop == row)
 
-    off = _hop(_with(auth={feature: True, "enabled": False}))
+    off = _hop(_with(auth={feature: False}))
     assert off.state is pc.HopState.NOT_CONFIGURED
-    # The control: [auth] on, so the row is in use.
+    # The control: the feature on, so the row is in use.
     assert _hop(_with(auth={feature: True})).state is not pc.HopState.NOT_CONFIGURED
 
 

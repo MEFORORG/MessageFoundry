@@ -409,10 +409,10 @@ def _graph_hops(
 
 
 def _auth_features_on(settings: ServiceSettings) -> tuple[bool, bool]:
-    """Whether the engine builds the AD bind and the OIDC client: ``AuthService``, which holds both,
-    is built only with ``[auth]`` enabled."""
+    """Whether the engine builds the AD bind and the OIDC client. ``AuthService`` holds both, and
+    ``serve`` always builds it (vault BACKLOG #2719)."""
     auth = settings.auth
-    return auth.enabled and auth.ad_enabled, auth.enabled and auth.oidc_enabled
+    return auth.ad_enabled, auth.oidc_enabled
 
 
 def resolved_secret_refs(settings: ServiceSettings) -> list[str]:

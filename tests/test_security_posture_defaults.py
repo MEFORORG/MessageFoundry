@@ -260,14 +260,6 @@ def test_new_ip_step_up_off_is_a_named_loosening() -> None:
     assert "new client address" in named["admin_new_ip_step_up"].lower()
 
 
-def test_new_ip_step_up_off_with_auth_off_is_NOT_a_loosening() -> None:
-    """CONDITIONAL on sign-in: with auth off there is no session for the signal to guard, and the
-    auth-off posture is refused or reported by its own gate."""
-    assert "admin_new_ip_step_up" not in _names(
-        auth=AuthSettings(enabled=False, admin_new_ip_step_up=False)
-    )
-
-
 # --- [auth] anti-automation limits (BACKLOG #1131; ASVS 6.1.1, 6.3.1, 2.3.2) --------------------
 # Owner ruling 2026-09-27 (#2006): a silent weakening of an anti-automation control keeps its ASVS
 # cell at partial. E16 named each value the code reads as OFF; a vault re-read then measured near-off
@@ -601,47 +593,6 @@ def test_a_zero_lockout_never_refuses_the_next_attempt(minutes: int, escalate: b
     assert not after.just_locked
 
 
-def test_sign_in_limiter_and_lockout_off_with_sign_in_off_are_NOT_loosenings() -> None:
-    """CONDITIONAL on sign-in: with it off there is no sign-in to limit. Only an app an embedder or a
-    test builds can have it off; `serve` always requires it (vault BACKLOG #2719)."""
-    named = _names(
-        sec=SecuritySettings(),
-        auth=AuthSettings(
-            enabled=False,
-            login_rate_limit_enabled=False,
-            lockout_minutes=0,
-            lockout_threshold=1_000_000,
-            phi_read_rate_limit_enabled=False,
-            admin_write_rate_limit_enabled=False,
-            max_sessions_per_user=0,
-            mfa_verify_min_elapsed_seconds=0,
-        ),
-    )
-    assert not _SIGN_IN_FIELDS & set(named)
-    assert "mfa_verify_min_elapsed_seconds" not in named
-    # The OIDC-gated entries sit behind the sign-in gate too.
-    federated = _names(
-        sec=SecuritySettings(),
-        auth=_oidc(
-            enabled=False, oidc_callback_min_elapsed_seconds=0, oidc_flow_cache_max=1_000_000_000
-        ),
-    )
-    assert "oidc_callback_min_elapsed_seconds" not in federated
-    assert "oidc_flow_cache_max" not in federated
-
-
-def test_the_limiter_entries_are_gated_on_auth_enabled() -> None:
-    """The gate reads [auth].enabled. [security] has no sign-in switch any more (vault BACKLOG
-    #2719), so `security set` cannot turn sign-in on beside a stale [auth]."""
-    weak = {"login_rate_limit_enabled": False, "lockout_minutes": 0}
-    named = _names(sec=SecuritySettings(), auth=AuthSettings(**weak))  # type: ignore[arg-type]
-    assert "login_rate_limit_enabled" in named
-    assert "lockout_minutes" in named
-    # CONTROL: the same weakening with sign-in off is not named.
-    off = _names(sec=SecuritySettings(), auth=AuthSettings(enabled=False, **weak))  # type: ignore[arg-type]
-    assert "login_rate_limit_enabled" not in off
-
-
 def test_a_disabled_limiter_does_not_also_report_its_zeroed_parts() -> None:
     """With the limiter unbuilt, a zeroed per_ip, global or window changes nothing, so only the
     enable switch is named, as email_tls_verify is not named under a cleartext email_use_tls."""
@@ -925,9 +876,6 @@ def test_a_trust_every_peer_proxy_entry_is_a_named_loosening(entry: str) -> None
     It still loads (this change names it, it does not refuse it)."""
     api = _proxied("10.0.0.1", entry)
     assert _names(api=api) == ["trusted_proxies"]
-    # Not gated on sign-in: a forged source address poisons the audit trail either way.
-    no_auth = _names(api=api, auth=AuthSettings(enabled=False))
-    assert "trusted_proxies" in no_auth
 
 
 @pytest.mark.parametrize(
@@ -1179,14 +1127,6 @@ def test_a_bare_host_with_no_scheme_is_a_plain_bind(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="ad_allow_insecure_ldap is inert under"):
         load_settings(config_path=path, environ=_BIND_ENV)
-
-
-def test_the_opt_in_with_sign_in_off_is_not_named() -> None:
-    """Nothing builds the authenticator with sign-in off, so there is no live bind to report."""
-    auth = _ad(ad_server="ldap://dc.test.invalid:389", ad_allow_insecure_ldap=True)
-    assert "ad_allow_insecure_ldap" in _risks(SecuritySettings(), auth)
-    off = _ad(ad_server="ldap://dc.test.invalid:389", ad_allow_insecure_ldap=True, enabled=False)
-    assert "ad_allow_insecure_ldap" not in _risks(SecuritySettings(), off)
 
 
 def test_an_ldaps_server_under_enforce_still_loads(tmp_path: Path) -> None:
@@ -2263,7 +2203,6 @@ def test_every_store_and_auth_bool_is_reported_or_exempt() -> None:
         # flip never builds (ad_enabled stays off). The plain-LDAP section above pins it (#2354).
         "ad_allow_insecure_ldap",
         # Security-relevant and gated ELSEWHERE, not by this registry — same owed note as [store].
-        "enabled",  # serve refuses auth off on every bind, and no config key sets it (#2719)
         # Not reported through THIS field: it is the desugared copy of [security].require_mfa, which
         # a loaded config reports and the [security] floor covers. Off, it is also refused at exposure
         # by the __main__ gates. An embedder that builds AuthSettings itself is not reported.
@@ -2319,23 +2258,28 @@ async def test_managed_app_stashes_auth_settings_for_the_registry(tmp_path: Path
     stash regresses. This one goes through the lifespan, which is the only thing that proves the
     production path is wired."""
     from messagefoundry.api import create_managed_app
+    from messagefoundry.auth import Role
+    from tests.test_api_auth import _DEFAULT_PEER, _add, _auth, _login
 
     app = create_managed_app(
         db_path=tmp_path / "managed_posture.db",
         poll_interval=0.05,
-        # enabled=False plus the opt-in so the route stays reachable without a session; the stash is
-        # deliberately OUTSIDE the `enabled` guard, and that is exactly what this pins — a settings
-        # object that exists but is disabled is still the resolved settings the registry must read.
-        auth_settings=_ad(ad_session_recheck_seconds=0, enabled=False),
-        allow_no_auth=True,
+        # Settings always build an auth service now (vault BACKLOG #2825), so the route is read with
+        # a session. Notices off skips the ADR 0167 deliverability gate on the empty store.
+        auth_settings=_ad(
+            ad_session_recheck_seconds=0, require_mfa=False, notify_security_events=False
+        ),
         egress_settings=EgressSettings(deny_by_default=False),
     )
-    transport = httpx.ASGITransport(app=app)
+    transport = httpx.ASGITransport(app=app, client=_DEFAULT_PEER)
     async with (
         httpx.AsyncClient(transport=transport, base_url="http://t") as client,
         app.router.lifespan_context(app),
     ):
-        resp = await client.get("/security/posture")
-    assert resp.status_code == 200
+        await _add(app.state.auth, "root", Role.ADMINISTRATOR)
+        signed_in = await _login(client, "root")
+        assert signed_in.status_code == 200, signed_in.text
+        resp = await client.get("/security/posture", headers=_auth(signed_in.json()["token"]))
+    assert resp.status_code == 200, resp.text
     switches = [entry["switch"] for entry in resp.json()["loosenings"]]
     assert "ad_session_recheck_seconds" in switches

@@ -7723,8 +7723,6 @@ async def _assert_security_notice_is_deliverable(
     which is a different and much larger change.
     """
     auth_settings = auth_settings or AuthSettings()
-    if not auth_settings.enabled:
-        return  # sign-in is not required, so no Administrator is needed to reach the engine
     alerts = alerts_settings or AlertsSettings()
     # The two preconditions of the deliverability question. Either one false skips the refusal: the
     # transport gate already governs notices off, and the waiver is the audited, in-writing opt-out.
@@ -8115,10 +8113,10 @@ def create_managed_app(
 
     Pass ``store_settings`` for full backend selection (the service path), or ``db_path`` (+optional
     ``synchronous``) as a SQLite shortcut. ``config_dir`` loads the code-first Connection/Router/
-    Handler graph. ``auth_settings`` (when enabled) attaches an :class:`AuthService` and seeds the
-    built-in roles; it creates no account (ADR 0183). With unset or disabled ``auth_settings`` every
-    protected route is refused (503) unless the caller passes ``allow_no_auth=True``, the same opt-in
-    :func:`create_app` takes; beside enabled ``auth_settings`` that opt-in raises ``ValueError``.
+    Handler graph. ``auth_settings`` attaches an :class:`AuthService` and seeds the built-in roles;
+    it creates no account (ADR 0183). With no ``auth_settings`` every protected route is refused
+    (503) unless the caller passes ``allow_no_auth=True``, the same opt-in :func:`create_app` takes;
+    beside ``auth_settings`` that opt-in raises ``ValueError``.
     The store is opened via the
     backend-agnostic :func:`~messagefoundry.store.open_store`. ``api_listener`` is the engine's own
     ``(host, port)`` (from ``[api]``), reserved so no inbound listener can be wired onto the API's port
@@ -8139,10 +8137,10 @@ def create_managed_app(
     # create_app can ignore the opt-in beside an enabled service, because it is handed the service
     # already attached. Here the service attaches in the lifespan, so an app that never ran it
     # would answer as the system identity. The combination is refused instead.
-    if allow_no_auth and auth_settings is not None and auth_settings.enabled:
+    if allow_no_auth and auth_settings is not None:
         raise ValueError(
-            "create_managed_app: allow_no_auth=True was passed beside enabled auth_settings; "
-            "pass the opt-in only when sign-in is off"
+            "create_managed_app: allow_no_auth=True was passed beside auth_settings; pass the "
+            "opt-in only with no auth_settings, since settings always require sign-in"
         )
 
     @asynccontextmanager
@@ -8518,7 +8516,7 @@ def create_managed_app(
             # (the OIDC revocation guard, #1887) stops startup before any connection starts. Only
             # construction is here; initialize() and every use of the service stay below the start.
             auth: AuthService | None = None
-            if auth_settings is not None and auth_settings.enabled:
+            if auth_settings is not None:
                 # Out-of-band security-event push (#188, ASVS 6.3.5/6.3.7) — reuses the [alerts] SMTP
                 # transport, sent to each affected user's own address. The notifier is wired only when the
                 # [auth].notify_security_events kill-switch is on AND a transport can be built (SMTP
