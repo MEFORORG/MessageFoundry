@@ -1726,6 +1726,21 @@ has already swapped when that row is written. So a failed write is logged at ERR
 still answers success. It reports `degraded: true` with `audit` among its `failures`. A released
 reload carries that into its `approval.approved` row.
 
+**An audit or store outage that refuses writes answers a mapped status on at least these approval
+paths (vault BACKLOG #2255).** A refusal runs nothing, so a refusal whose own audit row fails still
+answers **409**: that is `approval.too_early` and `approval.stale_requester`. A claim, a rejection or
+a resolution whose status write the store refuses answers **503**, and nothing runs. After a
+rejection's status write, a failed `approval.rejected` row is logged and the rejection stands. A
+request whose `approval.requested` row fails is withdrawn (moved to `failed`) before the error is
+returned, so a retry cannot leave two releasable copies. Every audit row the gate fails to write is
+logged at ERROR with its detail, and raises an `audit_write_failed` alert keyed `approval:<id>`,
+carrying the lost row's action name.
+
+What this does not cover: a store that refuses READS still answers a raw 500, since the request
+row and the requester's account are read before any of this. The status move and its audit row
+are still two writes, not one transaction, so a status write whose COMMIT landed before a fault
+was reported can leave a row moved with no audit row.
+
 **A release records what happened to it (BACKLOG #1562).** The gate claims the request as
 `executing` before it runs the operation, so two approvers cannot both release it. It then settles
 the row to one of three outcomes, each with its own audit row after the `approval.release_attempted`

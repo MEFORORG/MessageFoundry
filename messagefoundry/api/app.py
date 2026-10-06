@@ -843,8 +843,8 @@ def _build_approval_gate(
         # ADR 0041 D2: a held config:deploy is re-executed here, on the second approver's release. It
         # is a NON-dry-run reload (a dry_run is never held — it swaps nothing), so propagate=True bumps
         # the cluster config version exactly like the inline path. The captured config_dir is replayed
-        # verbatim; the loader re-confines it to an allowed reload root (ConfigReloadDenied -> the
-        # gate surfaces it). The same fingerprint-bearing config_reload audit row is written so the
+        # verbatim; the loader re-confines it to an allowed reload root (ConfigReloadDenied -> 403,
+        # below). The same fingerprint-bearing config_reload audit row is written so the
         # released reload is bound to the bytes that actually loaded (defeating attribution-laundering).
         config_dir = p.get("config_dir")
         # Read BEFORE the reload (BACKLOG #1940): a KeyError raised after the swap would reach the
@@ -855,24 +855,21 @@ def _build_approval_gate(
         # the inline path reports, or dual control would be the quieter of the two.
         try:
             outcome = await engine.reload_detail(config_dir, dry_run=False, propagate=True)
-        except WiringError as exc:
-            # BACKLOG #2034: a release the engine refuses (a settings or inbound trust anchor, or a
-            # bad config) answers 422 and records the row the inline route records, rather than
-            # escaping the approve route as a 500. The gate still marks the approval failed.
-            anchor_refused = isinstance(exc.__cause__, TrustAnchorError)
-            _log.warning("released config reload refused: %s", exc)
-            await engine.store.record_audit(
-                "config_reload_failed",
-                actor=actor,
-                detail=json.dumps(
-                    {
-                        "requested": config_dir,
-                        "dry_run": False,
-                        "reason": "trust_anchor" if anchor_refused else "invalid_config",
-                    }
-                ),
+        except _RELOAD_REFUSALS as exc:
+            # BACKLOG #2034 / vault BACKLOG #2459: a release the engine refuses records the row the
+            # inline route records, with the inline route's detail text, rather than escaping the
+            # approve route as a 500. That covers a bad config or trust anchor, and a directory
+            # that vanished or left the reload roots between the hold and the release. The gate
+            # still marks the approval failed. No `client`: see _record_reload_audit.
+            #
+            # Always 422 here, never the inline 403 or 404: on the approve route those two already
+            # mean "you cannot approve your own request" and "no such approval request", and the
+            # web console words them that way. 422 is the approve route's "the released operation
+            # was refused".
+            _status, answer = await _audit_refused_reload(
+                engine, exc, actor=actor, requested=config_dir, dry_run=False
             )
-            raise ApprovalError(422, "invalid configuration") from exc
+            raise ApprovalError(422, answer) from exc
         registry = outcome.registry
         # BACKLOG #1940: never raises after the swap; see _record_reload_audit.
         failures = await _record_reload_audit(
@@ -1156,6 +1153,76 @@ async def _record_reload_audit(
         )
         return [*failed_steps, _RELOAD_AUDIT_STEP]
     return list(failed_steps)
+
+
+#: The faults ``Engine.reload_detail`` raises when a reload did NOT happen, each with its own answer
+#: and audit row (:func:`_audit_refused_reload`). The inline route and the released executor catch
+#: this one tuple, so a held reload is refused exactly as an ungated one is (vault BACKLOG #2459).
+_RELOAD_REFUSALS: tuple[type[Exception], ...] = (
+    ConfigReloadDenied,
+    FileNotFoundError,
+    WiringError,
+)
+
+
+async def _audit_refused_reload(
+    engine: Engine,
+    exc: Exception,
+    *,
+    actor: str,
+    requested: str | None,
+    dry_run: bool,
+    client: str | None = None,
+) -> tuple[int, str]:
+    """Write the audit row for a reload the engine refused, and return the status and detail to answer.
+
+    ``exc`` is one of :data:`_RELOAD_REFUSALS`. A directory outside the reload roots writes
+    ``config_reload_denied`` and answers 403. A missing directory writes ``config_reload_failed``
+    with reason ``not_found`` and answers 404. A bad graph writes ``config_reload_failed`` and
+    answers 422; its reason is ``trust_anchor`` when a trust anchor refused it inside the engine,
+    an inbound connection's CA (BACKLOG #1142) or a settings anchor (BACKLOG #2034), so one audit
+    filter sees both, and ``invalid_config`` otherwise.
+
+    The inline route and the dual-control executor share this, so a held reload whose directory
+    vanished or left the reload roots before its release is refused and recorded the way an inline
+    one is, rather than escaping the approve route as a 500 (vault BACKLOG #2459). The detail text
+    is generic on purpose: the real error is logged here, never returned, so a ``config:deploy``
+    holder cannot probe the filesystem through it.
+
+    ``client`` follows :func:`_record_reload_audit`'s rule (ADR 0150): the executor passes none.
+
+    **The row's write never raises.** A refusal changed nothing, so its answer stands whether or
+    not the row lands, and a store fault here would otherwise turn it into a raw 500 (vault BACKLOG
+    #2255). A failed write is logged at ERROR with the row's detail."""
+    detail: dict[str, object] = {"requested": requested, "dry_run": dry_run}
+    if isinstance(exc, ConfigReloadDenied):
+        action = "config_reload_denied"
+        status, answer = 403, "config directory is not an allowed reload root"
+    elif isinstance(exc, FileNotFoundError):
+        _log.warning("config reload failed (missing dir): %s", exc)
+        action, detail["reason"] = "config_reload_failed", "not_found"
+        status, answer = 404, "config directory not found"
+    else:
+        anchor_refused = isinstance(exc.__cause__, TrustAnchorError)
+        _log.warning(
+            "config reload %s: %s",
+            "refused (trust anchor)" if anchor_refused else "failed (invalid config)",
+            exc,
+        )
+        action = "config_reload_failed"
+        detail["reason"] = "trust_anchor" if anchor_refused else "invalid_config"
+        status, answer = 422, "invalid configuration"
+    row = json.dumps(detail)
+    try:
+        await engine.store.record_audit(action, actor=actor, detail=row, client=client)
+    except Exception:  # noqa: BLE001 - every store backend raises its own type; see the docstring
+        _log.exception(
+            "a refused config reload's %s audit row failed. Lost row: actor=%s detail=%s",
+            action,
+            actor,
+            row,
+        )
+    return status, answer
 
 
 #: The audit actions that record which config bytes a process ran from: a start, an applied reload,
@@ -3632,11 +3699,14 @@ def create_app(
         #
         # This row covers the UNGATED path ONLY. A dual-control purge returns 202 above and is
         # executed later by the `_purge` executor in _build_approval_gate, which never re-enters this
-        # handler and writes no connection_purge row of its own. That path is not unaudited — the
-        # gate writes approval.requested / approval.approved, and the latter's detail carries the
-        # executor's {"cancelled": N} result — but those rows identify the operation only by
-        # approval_id: the connection NAME and the SCOPE live in the pending-approval row's params,
-        # not in the audit log. So a query of action='connection_purge' answers "which outbound, at
+        # handler and writes no connection_purge row of its own. That path is not unaudited: the
+        # gate writes approval.requested and approval.release_attempted, both before the purge runs.
+        # The executor's {"cancelled": N} result is recorded only in approval.approved, which is
+        # written after the purge and whose failure is logged and paged rather than raised (BACKLOG
+        # #1940, vault BACKLOG #2255). So a gated purge's COUNT can be missing from the audit log
+        # while the release itself is still recorded. And all of those rows identify the operation
+        # only by approval_id: the connection NAME and the SCOPE live in the pending-approval row's
+        # params, not in the audit log. So a query of action='connection_purge' answers "which outbound, at
         # what scope, cancelling how many" completely for ungated purges and not at all for gated
         # ones, which still need a join back through approval_id. Closing that asymmetry is the
         # sibling gap tracked for the _purge executor; it is deliberately not fixed here.
@@ -4472,48 +4542,16 @@ def create_app(
                 req.config_dir, dry_run=req.dry_run, propagate=not req.dry_run
             )
             registry = outcome.registry
-        except ConfigReloadDenied as exc:
-            await engine.store.record_audit(
-                "config_reload_denied",
-                actor=user.username,
-                detail=json.dumps({"requested": req.config_dir, "dry_run": req.dry_run}),
-                client=client_ip(request),
-            )
-            raise HTTPException(403, "config directory is not an allowed reload root") from exc
-        except FileNotFoundError as exc:
-            _log.warning("config reload failed (missing dir): %s", exc)
-            await engine.store.record_audit(
-                "config_reload_failed",
-                actor=user.username,
-                detail=json.dumps(
-                    {"requested": req.config_dir, "dry_run": req.dry_run, "reason": "not_found"}
-                ),
-                client=client_ip(request),
-            )
-            raise HTTPException(404, "config directory not found") from exc
-        except WiringError as exc:
-            # A trust anchor refused inside the engine arrives wrapped: an inbound connection's CA
-            # (BACKLOG #1142, slice 3) or a settings anchor (BACKLOG #2034). Both record
-            # reason="trust_anchor", so one audit filter sees both.
-            anchor_refused = isinstance(exc.__cause__, TrustAnchorError)
-            _log.warning(
-                "config reload %s: %s",
-                "refused (trust anchor)" if anchor_refused else "failed (invalid config)",
+        except _RELOAD_REFUSALS as exc:
+            status, answer = await _audit_refused_reload(
+                engine,
                 exc,
-            )
-            await engine.store.record_audit(
-                "config_reload_failed",
                 actor=user.username,
-                detail=json.dumps(
-                    {
-                        "requested": req.config_dir,
-                        "dry_run": req.dry_run,
-                        "reason": "trust_anchor" if anchor_refused else "invalid_config",
-                    }
-                ),
+                requested=req.config_dir,
+                dry_run=req.dry_run,
                 client=client_ip(request),
             )
-            raise HTTPException(422, "invalid configuration") from exc
+            raise HTTPException(status, answer) from exc
         # Bind "what loaded" to a reviewable content digest (ADR 0041 D1): the prior detail recorded
         # only counts, so two reloads of the same dir with different on-disk code were
         # indistinguishable. Computed off the event loop (it reads files) and best-effort — a
