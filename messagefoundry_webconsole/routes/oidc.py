@@ -129,13 +129,14 @@ def _step_up_landing(
     if token is None:
         # A refusal. The page it renders offers the IdP leg again and never a password field. An
         # auto-retry target was staged only because it was issued, and the start leg spent that
-        # issue (#2764). A state mismatch leaves the flow staged, so its real return still continues
-        # to it; any other refusal ended the flow, so only an unlock target still continues.
+        # issue (#2764), so a fresh flow started from this page continues only to an unlock target;
+        # the page says so. (After a state mismatch the original flow is still staged and its real
+        # return would still continue -- the conservative wording errs toward "nothing will run".)
         resp = reauth_idp_response(
             deps,
             auth,
             next_,
-            continues=is_unlock_action(next_) or outcome.reason == "state_mismatch",
+            continues=is_unlock_action(next_),
             error=outcome.error,
             status_code=403,
         )

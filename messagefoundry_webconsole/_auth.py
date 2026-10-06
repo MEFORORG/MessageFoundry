@@ -862,7 +862,7 @@ def reauth_landing(identity: Identity) -> str:
 
 #: How long an issued continuation stays consumable, in seconds (vault BACKLOG #2764). Long enough
 #: to type a password and a code, or to complete the identity provider's prompt; short because an
-#: entry that lapses costs only the auto-submit. The operator lands on the console and clicks again.
+#: entry that lapses costs only the auto-submit: the re-auth ends on a page saying nothing ran.
 REAUTH_CONTINUATION_TTL_SECONDS = 300.0
 #: Bounds on the issued-continuation table. A session holds at most this many (its oldest is dropped),
 #: so a session that keeps getting refused cannot crowd out anyone else's; the table holds at most
@@ -889,34 +889,22 @@ class _IssuedContinuations:
     and nothing else. Process-local, bounded and TTL'd on the monotonic clock, with the same
     per-process caveat as the engine's single-use step-up grants.
 
-    Both levels are ordered oldest-issued first. The TTL is constant, so issue order is deadline
-    order, and pruning and eviction read from the front instead of scanning the table.
+    Sessions are ordered least recently issued or re-keyed first, which is the order eviction
+    drops them in. A re-key moves a session to the back with its deadlines unchanged, so that order
+    is NOT deadline order, and pruning walks every session rather than stopping at the first live
+    one. That walk is bounded by the session cap and costs one dict read per session.
     """
 
     def __init__(self) -> None:
         self._sessions: OrderedDict[str, OrderedDict[str, float]] = OrderedDict()
 
     def _prune(self, now: float) -> None:
-        """Drop whole sessions from the front while their newest entry has lapsed."""
-        while self._sessions:
-            session_hash, entries = next(iter(self._sessions.items()))
-            if entries and next(reversed(entries.values())) > now:
-                return
+        """Drop every session whose newest entry (its last; entries are in issue order) lapsed."""
+        lapsed = [
+            h for h, entries in self._sessions.items() if next(reversed(entries.values())) <= now
+        ]
+        for session_hash in lapsed:
             del self._sessions[session_hash]
-
-    def _deadline(self, token: str | None, next_path: str, *, pop: bool) -> float | None:
-        if not token:
-            return None
-        session_hash = hash_token(token)
-        entries = self._sessions.get(session_hash)
-        if entries is None:
-            return None
-        if not pop:
-            return entries.get(next_path)
-        deadline = entries.pop(next_path, None)
-        if not entries:
-            del self._sessions[session_hash]
-        return deadline
 
     def issue(self, token: str, next_path: str) -> None:
         now = time.monotonic()
@@ -933,12 +921,21 @@ class _IssuedContinuations:
 
     def issued(self, token: str | None, next_path: str) -> bool:
         """Whether a live entry exists for this session and ``next_path``. Does not consume it."""
-        deadline = self._deadline(token, next_path, pop=False)
+        entries = self._sessions.get(hash_token(token)) if token else None
+        deadline = entries.get(next_path) if entries else None
         return deadline is not None and deadline > time.monotonic()
 
     def consume(self, token: str | None, next_path: str) -> bool:
         """Pop the entry for this session and ``next_path``; whether it was live (single use)."""
-        deadline = self._deadline(token, next_path, pop=True)
+        if not token:
+            return False
+        session_hash = hash_token(token)
+        entries = self._sessions.get(session_hash)
+        if entries is None:
+            return False
+        deadline = entries.pop(next_path, None)
+        if not entries:
+            del self._sessions[session_hash]
         return deadline is not None and deadline > time.monotonic()
 
     def rekey(self, old_token: str | None, new_token: str | None) -> None:
@@ -996,6 +993,8 @@ def _issue_continuation(request: Request, next_path: str) -> None:
     if (
         token
         and request.method == "POST"
+        # GET /ui/reauth answers 422 past its cap, so a longer entry could never be consumed.
+        and len(next_path) <= _REAUTH_NEXT_MAX
         and is_safe_ui_action(next_path)
         and _request_is_same_origin(request)
     ):

@@ -363,5 +363,8 @@ they never auto-submit, so they need no record.
 
 **Consequence.** A continuation the record does not hold (it lapsed, the process restarted, it was
 evicted, or a rotation the console did not see moved the token, as the federated callback does for
-the session's other entries) costs the operator one more click on the action, and never runs
-anything the session did not submit.
+the session's other entries) costs the operator one more click on the action, and for an ADR 0077
+action-bound lane a second re-authentication, because no grant is minted for an entry the record
+does not hold. It never runs anything the session did not submit. The federated callback cannot
+yet name a dropped action: when the start leg finds nothing issued it stages the console landing,
+and the callback's landing page does not say that nothing ran.

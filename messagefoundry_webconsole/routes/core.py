@@ -1433,7 +1433,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         token = session_token(request)
         # Vault BACKLOG #2764: an auto-retry action continues after the confirmation only when a
         # step-up gate issued it to THIS session. Any other `next` still gets the form, which names
-        # the action and says nothing will run; the POST then lands on the console.
+        # the action and says nothing will run; the POST then ends on a page saying nothing ran.
         continues = continues_after_reauth(action, token, next_)
         identity = await auth.identity_for_token(token) if auth is not None else None
         if auth is None or identity is None:
@@ -1651,15 +1651,16 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         #    fresh window; the operator then submits the body-carrying POST (incl. a create-user
         #    password) once, never crossing /ui/reauth (the stateless confirm-after-step-up path).
         #  - a body-less POST action the console issued to this session: auto-retry it via the
-        #    same-origin submit form, spending the issue so it auto-submits once (#2764). Consumed
-        #    under the pre-rotation token, which is the key the entry still sits under; the
-        #    session's other issued entries then follow the rotation.
+        #    same-origin submit form, spending the issue so it auto-submits once (#2764).
         #  - any other body-less POST action: a page that says nothing ran, so an operator whose
         #    entry lapsed (TTL, restart, eviction) does not read the landing as the action done.
+        # The issue is spent under the pre-rotation token, the key it still sits under, and then
+        # the session's OTHER issued entries follow the rotation -- before any branch returns, so
+        # an unlock re-auth in one tab does not strand an action another tab is confirming.
+        issued = not action.unlock and consume_continuation(pre_rotation, next_)
+        rekey_continuations(pre_rotation, token)
         if is_unlock_action(next_):
             return _keep_session(RedirectResponse(next_, status_code=303), token)
-        issued = consume_continuation(pre_rotation, next_)
-        rekey_continuations(pre_rotation, token)
         if issued:
             return _keep_session(HTMLResponse(pages.reauth_continue(next_, action.label)), token)
         return _keep_session(

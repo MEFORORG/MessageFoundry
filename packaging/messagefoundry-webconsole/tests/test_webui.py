@@ -3281,7 +3281,7 @@ def _nothing_ran(r: httpx.Response, label: str) -> bool:
         and "Nothing ran" in r.text
         and label in r.text
         and "data-autosubmit" not in r.text
-        and 'href="/ui"' in r.text
+        and '<a href="/ui">Return to the console</a>' in r.text
     )
 
 
@@ -3374,6 +3374,48 @@ async def test_a_sessions_other_continuations_follow_its_rotation(engine: Engine
         assert c.cookies.get("mf_session") != before  # the password leg rotated the session
         tab_b = await _reauth(c, _REPLAY_ONE)
         assert tab_b.status_code == 200 and f'action="{_REPLAY_ONE}"' in tab_b.text
+
+
+async def test_an_unlock_reauth_in_one_tab_does_not_strand_another_tabs_action(
+    engine: Engine,
+) -> None:
+    """The unlock branch returns its 303 too, and the password leg rotated the session on the way.
+    The other tab's issued action must have followed that rotation before the branch returned."""
+    service = await _stale_window_service(engine)
+    await _add(service, "boss", Role.ADMINISTRATOR)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "boss")
+        assert (await c.post(_REPLAY_ALL, headers=_SFS_SAME)).status_code == 303
+        unlock = await _reauth(c, "/ui/users/new")
+        assert unlock.status_code == 303 and unlock.headers["location"] == "/ui/users/new"
+        tab_a = await _reauth(c, _REPLAY_ALL)
+        assert tab_a.status_code == 200 and "data-autosubmit" in tab_a.text
+
+
+def test_the_issued_table_prunes_lapsed_sessions_and_evicts_the_least_recent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prune drops a session whose newest entry lapsed even when a re-key moved it behind a live
+    one, and the session cap drops the least recently issued session, not the newest."""
+    from messagefoundry_webconsole import _auth
+
+    clock = [1000.0]
+    monkeypatch.setattr(_auth.time, "monotonic", lambda: clock[0])
+    table = _auth._IssuedContinuations()
+    table.issue("a", "/ui/x")  # deadline 1300
+    clock[0] = 1100.0
+    table.issue("b", "/ui/x")  # deadline 1400
+    clock[0] = 1150.0
+    table.rekey("a", "a2")  # a2 now sits BEHIND b, still with deadline 1300
+    clock[0] = 1350.0
+    table.issue("c", "/ui/x")  # prunes: a2 lapsed although it is not at the front
+    assert hash_token("a2") not in table._sessions
+    assert table.issued("b", "/ui/x")
+    cap = _auth._REAUTH_CONTINUATION_SESSIONS_MAX
+    for n in range(cap):
+        table.issue(f"s{n}", "/ui/x")
+    assert not table.issued("b", "/ui/x")  # the least recently issued went first
+    assert table.issued(f"s{cap - 1}", "/ui/x")
 
 
 async def test_a_same_site_refusal_issues_no_continuation(engine: Engine) -> None:
