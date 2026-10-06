@@ -1325,7 +1325,14 @@ def make_registry_anchor_preflight(
     """The engine's ``registry_preflight`` for ``serve``: :func:`run_anchor_preflight` over a graph's
     per-connection inbound CAs (:func:`registry_anchor_specs`), at the first load and at every real
     reload. A refusal is re-raised as ``WiringError``, which the reload route answers with 422 and
-    the first load with a refused start. Dormant when no inbound names a CA."""
+    the first load with a refused start. Dormant when no inbound names a CA.
+
+    The ``WiringError`` is always caused by a :class:`TrustAnchorError`, as the settings preflight's
+    is (:func:`make_settings_anchor_preflight`), so the reload routes audit ``reason="trust_anchor"``
+    for both. An unreadable CA (``OSError``) and a ``ValueError``, such as a blank ``tls_ca_pin``,
+    are wrapped in one first, keeping their text. Before BACKLOG #2183 they were the cause
+    themselves, and the routes audited ``invalid_config``."""
+    from messagefoundry.config.wiring import WiringError
 
     async def preflight(registry: Registry, env_values: Mapping[str, Any]) -> None:
         try:
@@ -1334,11 +1341,14 @@ def make_registry_anchor_preflight(
             if not specs:
                 return
             await run_anchor_preflight(specs, store, enforcing=enforcing)
-        except (TrustAnchorError, OSError, ValueError) as exc:
-            # ValueError too: an env()-supplied path with a NUL in it raises one from the read, and
-            # it must reach the route as a refused config, not an unaudited 500.
-            from messagefoundry.config.wiring import WiringError
-
+        except TrustAnchorError as exc:
             raise WiringError(f"an inbound trust anchor was refused: {exc}") from exc
+        except (OSError, ValueError) as exc:
+            # ValueError too: an env()-supplied path with a NUL in it raises one from the read, and
+            # a blank tls_ca_pin raises one, and each must reach the route as a refused anchor, not
+            # an unaudited 500. Wrapped as the settings preflight wraps it, with the text unchanged.
+            refused = TrustAnchorError(str(exc))
+            refused.__cause__ = exc
+            raise WiringError(f"an inbound trust anchor was refused: {refused}") from refused
 
     return preflight

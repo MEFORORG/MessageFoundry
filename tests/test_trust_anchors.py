@@ -1374,8 +1374,11 @@ async def test_a_nul_in_an_inbound_ca_path_is_a_refused_config_not_a_crash(
         f"outbound('OUT', File(directory={str(tmp_path / 'out')!r}))\n" + _GRAPH_TAIL,
         encoding="utf-8",
     )
-    with pytest.raises(WiringError, match="an inbound trust anchor was refused"):
+    with pytest.raises(WiringError, match="an inbound trust anchor was refused") as err:
         await ta.make_registry_anchor_preflight(store, enforcing=True)(load_config(cfg), {})
+    # BACKLOG #2183: the cause is an anchor refusal, as the settings preflight's is.
+    assert isinstance(err.value.__cause__, TrustAnchorError)
+    assert isinstance(err.value.__cause__.__cause__, ValueError)
 
 
 async def test_the_reload_route_audits_an_inbound_anchor_refusal_as_trust_anchor(
@@ -2062,3 +2065,59 @@ async def test_the_preflight_refuses_an_encrypted_anchor_as_the_consumer_does(
     assert str(central.value) == str(consumer.value)
     assert "encrypted PEM block" in str(central.value)
     assert "pem_refused" in {r["event"] for r in await _rows(store, "api_client")}
+
+
+# --- BACKLOG #2183: an unreadable inbound CA audits as trust_anchor, as a settings anchor does ------
+
+
+async def test_the_registry_preflight_refuses_an_unreadable_ca_as_an_anchor(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    """The registry twin of the settings test above. Red under: the OSError as the direct cause,
+    which the reload routes read as invalid_config. The text keeps the read error."""
+    from messagefoundry.config.wiring import WiringError, load_config
+
+    cfg = tmp_path / "cfg"
+    _one_listener_graph(cfg, tmp_path / "gone.pem")
+    with pytest.raises(WiringError, match="an inbound trust anchor was refused") as err:
+        await ta.make_registry_anchor_preflight(store, enforcing=True)(load_config(cfg), {})
+    assert isinstance(err.value.__cause__, TrustAnchorError)
+    assert isinstance(err.value.__cause__.__cause__, FileNotFoundError)
+    assert "gone.pem" in str(err.value)
+
+
+async def test_the_reload_route_audits_an_unreadable_inbound_ca_as_trust_anchor(
+    tmp_path: Path,
+) -> None:
+    """The direct /config/reload route. The control is the route's own invalid_config row for a
+    graph that declares nothing, so the route still tells the two apart."""
+    import httpx
+
+    from messagefoundry.api import create_app
+    from messagefoundry.pipeline import Engine
+
+    cfg = tmp_path / "cfg"
+    _one_listener_graph(cfg, tmp_path / "gone.pem")
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    (empty / "cfg.py").write_text("x = 1  # declares no connections\n", encoding="utf-8")
+
+    store = await MessageStore.open(tmp_path / "e.db")
+    engine = Engine(
+        store,
+        registry_preflight=ta.make_registry_anchor_preflight(store, enforcing=True),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        transport = httpx.ASGITransport(app=create_app(engine, allow_no_auth=True))
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+            for target in (cfg, empty):
+                r = await client.post("/config/reload", json={"config_dir": str(target)})
+                assert r.status_code == 422, r.text
+        rows = await store.list_audit(action="config_reload_failed", limit=10)
+        reasons = {
+            json.loads(r["detail"])["requested"]: json.loads(r["detail"])["reason"] for r in rows
+        }
+        assert reasons == {str(cfg): "trust_anchor", str(empty): "invalid_config"}
+    finally:
+        await engine.stop()
