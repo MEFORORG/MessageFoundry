@@ -642,3 +642,9 @@ advisory-only property as their keystone, and section 10 restated it. The 2026-0
 already found the record grading 8.2.4 partial, so a grade may rest on other grounds too. This
 amendment re-grades nothing. The vault record for those three requirements must be re-read
 against the shipped behaviour.
+
+**Who decided.** This paragraph reports what the maintainer-internal ledger records. Vault
+BACKLOG #2620 was filed on 2026-10-01 from that day's security architecture review, which the row
+records as owner-approved. The row carries the verdict "build" and asks for the new-address check
+in the PHI-read gates and the paced-write gate, and not in the base gate. No file in this public
+tree records the approval itself, so nothing here quotes the owner.

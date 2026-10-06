@@ -2320,6 +2320,17 @@ alone:
    write.** A dual-stack client that alternates between its IPv4 and IPv6 addresses, or an IPv6
    privacy address that rotates, asks again at each change. Each re-anchor starts the dedupe over,
    so each change also writes a row and sends a notice.
+   **Re-verification is paced, and a correct password is charged like a wrong one.**
+   `POST /me/reauth` and the console's `POST /ui/reauth` draw the per-actor ceremony budget
+   ([the route-to-limiter map](#route--limiter-map)): by default 10 ceremonies per user in a
+   rolling 60 s, sized by `[auth].login_rate_limit_per_ip` and `login_rate_limit_window_seconds`.
+   So on a first deployment a client that must re-verify more often than that would spend it.
+   While it is spent, a password re-verification through either route would be refused with 429.
+   Until the session re-verifies, its requests from the new address would still get the refusals
+   above, so it would read no message and make none of those writes. Where the changing address
+   belongs to a reverse proxy, declare that proxy in `[api].trusted_proxies`, so the engine
+   compares the address the proxy forwards. Failing that, turning the signal off is the
+   [named loosening](SECURITY-LOOSENING.md#authadmin_new_ip_step_up--false--a-new-client-address-mid-session-goes-unchallenged).
    **The base gate (`require`) still never asks, deliberately.** The monitoring polls ride it, and
    an operator whose address changes behind a NAT pool, or behind a proxy not listed in
    `[api].trusted_proxies`, would otherwise be refused on every poll until a step-up. So a token
