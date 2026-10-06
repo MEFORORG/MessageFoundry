@@ -562,12 +562,11 @@ Do not restate it as one. §6 names what would flip it.
   the `fed.idp_revocation` arms in `tests/test_verify_federation.py`.
 
   **THE LAST OF THOSE LIMITS WAS CLOSED UNDER BACKLOG #2131. THE TWO PARAGRAPHS ABOVE ARE KEPT AS
-  THE RECORD.** `messagefoundry check` now carries a required `oidc-revocation` leg. It builds the
-  opener `AuthService` builds and reads the same guards through
-  `verify/federation.py:idp_revocation_result`, so `check` and `verify` share one status mapping.
-  It fails where the engine would refuse, so the gate refuses what `serve` refuses. Where the
-  anchor file is not on the machine running `check`, the leg does not fail on that alone;
-  `idp_revocation_result` says how it decides there. The same item moved `initialize()` and the
+  THE RECORD.** `messagefoundry check` now carries a required `oidc-revocation` leg. It reads the
+  same guards through `verify/federation.py:idp_revocation_result`, so `check` and `verify` share
+  one status mapping. It fails where the engine would refuse, so the gate refuses what `serve`
+  refuses. It reads no anchor, because the anchor decides neither leg's refusal and its file, ACL
+  and path belong to the host; `idp_revocation_result` says what that leaves MANUAL. The same item moved `initialize()` and the
   notice gate before `engine.start()` too. Both rows read `MEFOR_TLS_REVOCATION_ATTESTED` from
   their own environment; `_revocation_row` records why that cannot move a status, and
   `tests/test_oidc_revocation_check_leg.py::test_the_attestation_env_never_moves_the_status` pins

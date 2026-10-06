@@ -22,7 +22,6 @@ passing one).
 
 from __future__ import annotations
 
-from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -465,35 +464,33 @@ def _revocation_row(
 def idp_revocation_result(settings: ServiceSettings) -> CheckResult:
     """``fed.idp_revocation`` on its own, for ``messagefoundry check`` (BACKLOG #2131).
 
-    It builds the opener as ``fed.idp_tls`` does and hands it to :func:`_revocation_row`, so the
-    guards' decisions become a status in one place. The caller checks ``[auth].oidc_enabled``
-    first: with federation off the engine builds no opener.
+    It hands an opener to :func:`_revocation_row`, so the guards' decisions become a status in one
+    place. The caller checks ``[auth].oidc_enabled`` first: with federation off the engine builds
+    no opener.
 
-    It differs from ``verify``'s row only where the context does not build. ``verify`` reports that
-    on ``fed.idp_tls`` and skips this row. ``check`` has no such row, so this one carries it: a
-    present file the engine refuses, or a build that broke, fails it as the engine would refuse.
-
-    **An anchor file that is not on this machine does not fail it on its own.** ``check`` runs
-    where the host's files may not be, such as CI, and ``build-check`` reads no file for the same
-    reason. The anchor cannot change either leg's revocation decision, so the row decides without
-    it and says so. Settings load already refuses a CRL path that is not a file."""
-    built = _idp_opener(settings)
-    ca = settings.auth.oidc_tls_ca_cert_file
-    absent = ""
-    if isinstance(built, CheckResult) and ca and not Path(ca).is_file():
-        absent = (
-            f" [the anchor {ca} is not on this machine, so this was decided without it; run "
-            "`messagefoundry verify --section federation` on the host to check the anchor]"
-        )
-        built = _idp_opener(settings, anchor=False)
-    if isinstance(built, CheckResult):
+    **It reads no anchor.** A leg's decision needs only the hosts, the posture and whether the
+    context checks a CRL, and the anchor decides none of them. Whether the anchor loads, and its
+    ACL and path, are facts about the host ``serve`` runs on, not the machine running ``check``,
+    which may be CI. ``verify``'s ``fed.idp_tls`` row reports them on the host. So the opener here
+    loads the CRL file alone. Where that fails with an anchor configured, the failure may be one
+    the anchor would prevent, such as a CRL file bundling the anchor's CA, so the row is MANUAL.
+    With no anchor, this context is the engine's, so the failure is the engine's refusal."""
+    built = _idp_opener(settings, anchor=False)
+    if not isinstance(built, CheckResult):
+        return _revocation_row(settings, built)
+    if built.status is Status.FAIL and settings.auth.oidc_tls_ca_cert_file:
         return CheckResult(
             *_REVOCATION_ROW,
-            built.status,
-            f"the engine refuses to start: the IdP TLS context does not build ({built.detail})",
+            Status.MANUAL,
+            f"the CRL file does not load without [auth].oidc_tls_ca_cert_file, which this row "
+            f"does not read ({built.detail}). With the anchor the legs would cross on the CRL if "
+            "it loads: run `messagefoundry verify --section federation` on the host",
         )
-    row = _revocation_row(settings, built)
-    return replace(row, detail=row.detail + absent)
+    return CheckResult(
+        *_REVOCATION_ROW,
+        built.status,
+        f"the engine refuses to start: the IdP TLS context does not build ({built.detail})",
+    )
 
 
 def _read(path: str, rid: str, title: str) -> tuple[bytes | None, CheckResult | None]:

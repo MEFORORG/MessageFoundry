@@ -3322,8 +3322,8 @@ def _check_oidc_revocation(
     The decision is :func:`~messagefoundry.verify.federation.idp_revocation_result`, which reads
     the engine's own guards (:func:`~messagefoundry.auth.service.idp_revocation_guards`) and maps
     them to a status in the one place ``verify``'s ``fed.idp_revocation`` row does. That function
-    says how it decides where the anchor file is not on this machine, and how the
-    ``MEFOR_TLS_REVOCATION_ATTESTED`` read affects it.
+    says why it reads no anchor, and :func:`~messagefoundry.verify.federation._revocation_row` how
+    the ``MEFOR_TLS_REVOCATION_ATTESTED`` read affects the status.
 
     FAIL or ERROR fails this leg. MANUAL passes with the row's text, because the engine starts and
     a person must confirm what crosses.

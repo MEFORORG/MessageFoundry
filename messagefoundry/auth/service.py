@@ -4134,10 +4134,11 @@ class AuthService:
         Refusals are audited under the staged session's account wherever the flow names one, so they
         appear in that person's security events rather than under an anonymous actor.
 
-        The session is re-anchored to the callback's address when the callback has one. The success
-        ``auth.reauth`` row also records the start leg's address as ``start_client`` and whether the
-        two are different hosts as ``client_moved`` (BACKLOG #2160); refusal rows carry neither. A
-        move is recorded, never refused. Behind a proxy the engine does not trust, both legs carry
+        The session is re-anchored to the callback's address when the callback has one. The
+        ``auth.reauth`` row a completed step-up writes, including one whose rotation lost the
+        session, also records the start leg's address as ``start_client`` and whether the two are
+        different hosts as ``client_moved`` (BACKLOG #2160). The refusal rows above carry neither.
+        A move is recorded, never refused. Behind a proxy the engine does not trust, both legs carry
         the proxy's address, so ``client_moved`` reads false there.
 
         Not padded to a deadline, unlike the sign-in callback: the caller already holds a session,

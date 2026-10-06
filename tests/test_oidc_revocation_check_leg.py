@@ -23,6 +23,19 @@ from messagefoundry.config.settings import SecurityEnforcement, ServiceSettings
 from messagefoundry.config.tls_policy import TLS_REVOCATION_ATTESTED_ENV
 from messagefoundry.verify.federation import idp_revocation_result
 from messagefoundry.verify.model import Status
+from tests.test_checks_gate_parity import _scrub_mefor_env
+
+
+@pytest.fixture(autouse=True)
+def _isolated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Read only what each test sets. An exported MEFOR_* variable would override the file, or
+    turn the no-file SKIP into an environment read, and a messagefoundry.toml in the working
+    directory could be found by the upward search."""
+    _scrub_mefor_env(monkeypatch)
+    empty = tmp_path / "cwd"
+    empty.mkdir()
+    monkeypatch.chdir(empty)
+
 
 _OFF_BOX = {
     "oidc_token_endpoint": '"https://idp.example.invalid/token"',
@@ -88,51 +101,57 @@ def test_a_warn_posture_passes_the_gate_as_manual(tmp_path: Path) -> None:
     assert result.detail.startswith("MANUAL:"), result.detail
 
 
-def _missing(tmp_path: Path, name: str) -> str:
-    """A TOML string naming a file that does not exist, as a CI runner sees a host-only path."""
-    return f'"{(tmp_path / name).as_posix()}"'
+def _file(tmp_path: Path, name: str, body: str | None) -> str:
+    """A TOML string naming ``name``, written with ``body``, or left absent when ``body`` is None,
+    as a CI runner sees a host-only path. Synthetic content only."""
+    path = tmp_path / name
+    if body is not None:
+        path.write_text(body, encoding="utf-8")
+    return f'"{path.as_posix()}"'
 
 
-def test_a_missing_anchor_does_not_hide_the_refusal(tmp_path: Path) -> None:
-    """``check`` runs where the host's files may not be, such as CI. The anchor cannot change
-    either leg's revocation decision, so the refusal is still decided and still fails."""
-    toml = _toml(tmp_path, oidc_tls_ca_cert_file=_missing(tmp_path, "ca.pem"))
-    result = _check_oidc_revocation(tmp_path, service_config=toml)
-    assert result.required and not result.ok and not result.skipped
-    assert "refuses to start" in result.detail
-    assert "is not on this machine" in result.detail
-
-
-def test_a_missing_anchor_alone_does_not_fail_the_gate(tmp_path: Path) -> None:
-    """The control for the arm above: the same missing file with on-box legs passes, so a file
-    absent on this machine is not by itself a failure. The line still names it."""
-    toml = _toml(tmp_path, **_LOOPBACK, oidc_tls_ca_cert_file=_missing(tmp_path, "ca.pem"))
-    result = _check_oidc_revocation(tmp_path, service_config=toml)
-    assert result.required and result.ok and not result.skipped
-    assert result.detail.startswith("PASS:"), result.detail
-    assert "is not on this machine" in result.detail
-
-
-def test_a_present_anchor_the_engine_refuses_fails_the_gate(tmp_path: Path) -> None:
-    """A file that IS here and that the engine refuses is not the absent-file case: serve refuses
-    to build the opener, so the gate must fail even with on-box legs."""
-    ca = tmp_path / "ca.pem"
-    ca.write_text("not a certificate\n", encoding="utf-8")
-    toml = _toml(tmp_path, **_LOOPBACK, oidc_tls_ca_cert_file=f'"{ca.as_posix()}"')
-    result = _check_oidc_revocation(tmp_path, service_config=toml)
-    assert result.required and not result.ok and not result.skipped
-    assert "does not build" in result.detail
+@pytest.mark.parametrize("body", [None, "not a certificate"], ids=["absent", "unloadable"])
+def test_the_leg_reads_no_anchor(tmp_path: Path, body: str | None) -> None:
+    """The anchor decides neither leg's revocation refusal. Whether it loads, and its ACL and path,
+    are facts about the host serve runs on, which verify's fed.idp_tls reports there. So an anchor
+    absent or unloadable on the machine running check neither fails on-box legs nor hides the
+    refusal of off-box ones."""
+    anchor = _file(tmp_path, "ca.pem", body)
+    on_box = _check_oidc_revocation(
+        tmp_path, service_config=_toml(tmp_path, **_LOOPBACK, oidc_tls_ca_cert_file=anchor)
+    )
+    assert on_box.required and on_box.ok and not on_box.skipped
+    assert on_box.detail.startswith("PASS:"), on_box.detail
+    off_box = _check_oidc_revocation(
+        tmp_path, service_config=_toml(tmp_path, oidc_tls_ca_cert_file=anchor)
+    )
+    assert off_box.required and not off_box.ok and not off_box.skipped
+    assert "refuses to start" in off_box.detail
 
 
 def test_a_crl_file_the_engine_refuses_fails_the_gate(tmp_path: Path) -> None:
     """Settings load refuses a CRL path that is not a file. One that is a file but holds no CRL
-    loads, and the engine then refuses to build the opener, so the gate fails too."""
-    crl = tmp_path / "idp.crl"
-    crl.write_text("not a CRL\n", encoding="utf-8")
-    toml = _toml(tmp_path, **_LOOPBACK, oidc_tls_crl_file=f'"{crl.as_posix()}"')
-    result = _check_oidc_revocation(tmp_path, service_config=toml)
+    loads, and with no anchor this context is the engine's own, so the gate fails as serve would."""
+    crl = _file(tmp_path, "idp.crl", "not a CRL")
+    result = _check_oidc_revocation(
+        tmp_path, service_config=_toml(tmp_path, **_LOOPBACK, oidc_tls_crl_file=crl)
+    )
     assert result.required and not result.ok and not result.skipped
     assert "CRL file" in result.detail
+
+
+def test_a_crl_that_fails_without_its_anchor_is_manual(tmp_path: Path) -> None:
+    """With an anchor configured, a CRL refusal may be one the anchor would prevent, such as a CRL
+    file bundling the anchor's CA. This row reads no anchor, so a person must confirm it."""
+    toml = _toml(
+        tmp_path,
+        oidc_tls_ca_cert_file=_file(tmp_path, "ca.pem", None),
+        oidc_tls_crl_file=_file(tmp_path, "idp.crl", "not a CRL"),
+    )
+    result = _check_oidc_revocation(tmp_path, service_config=toml)
+    assert result.required and result.ok and not result.skipped
+    assert result.detail.startswith("MANUAL:"), result.detail
+    assert "verify --section federation" in result.detail
 
 
 def test_federation_off_passes_without_a_guard(tmp_path: Path) -> None:
@@ -231,3 +250,7 @@ def test_the_attestation_env_never_moves_the_status(
     }
     shape = "loopback" if "127.0.0.1" in legs["oidc_token_endpoint"] else "off-box"
     assert without.status is expected[(shape, enforcement)]
+    if (shape, enforcement) == ("off-box", SecurityEnforcement.WARN):
+        # The positive control: the variable reached the guard, as its wording moved. Without it
+        # the equal statuses above would also pass if the guard stopped reading the variable.
+        assert without.detail != with_env.detail
