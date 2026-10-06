@@ -341,22 +341,26 @@ async def test_an_engine_reload_refuses_a_substituted_outbound_ca(
     store: MessageStore, tmp_path: Path, judged: None
 ) -> None:
     """The reload twin: the engine runs the same preflight, so a substituted outbound CA refuses
-    the reload and nothing goes live."""
+    the reload and the running graph stays. The first load is the start, so it comes first."""
     from messagefoundry.pipeline import Engine
 
     ca = _ca(tmp_path)
     cfg = tmp_path / "cfg"
     _graph(cfg, _dest("rest", ca, pin=_sha(ca)))
-    ca.write_bytes(_block(b"substitute"))
     engine = Engine(
         store,
         registry_preflight=ta.make_registry_anchor_preflight(store, enforcing=True),
         egress_settings=EgressSettings(deny_by_default=False),
     )
     try:
+        await engine.reload_detail(cfg)
+        runner = engine.registry_runner
+        assert runner is not None
+        running = runner.registry
+        ca.write_bytes(_block(b"substitute"))
         with pytest.raises(WiringError, match="outbound connection 'OUT' tls_ca_file"):
             await engine.reload_detail(cfg)
-        assert engine.registry_runner is None
+        assert runner.registry is running
     finally:
         await engine.stop()
 
@@ -686,3 +690,83 @@ def test_a_malformed_pin_is_refused_at_load(factory: str, pin: str) -> None:
     with pytest.raises((ValueError, WiringError), match="must be a SHA-256 hex digest"):
         _FACTORIES[factory](tls_ca_file="/org/ca.pem", tls_ca_pin=pin)
     _FACTORIES[factory](tls_ca_file="/org/ca.pem", tls_ca_pin=env("ca_pin"))
+
+
+# --- code review, round 2 repairs ----------------------------------------------------------------
+
+
+async def test_a_repeated_lane_refusal_writes_no_new_rows(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """A scheduled poller retries its bind every tick. The same refusal again is raised from memory,
+    so the audit table does not grow and push a quiet anchor's baseline out of the look-back. A
+    changed file is checked and audited again. Red under: the memory removed."""
+    ca = _ca(tmp_path)
+    check = ta.make_lane_anchor_check(store, enforcing=True)
+    settings = {"tls": True, "tls_ca_file": str(ca), "tls_ca_pin": "00" * 32}
+    for _ in range(3):
+        with pytest.raises(TrustAnchorError, match=_PIN_MISMATCH):
+            await check("inbound", "IB_FTPS", settings)
+    events = [r["event"] for r in await _rows(store, "inbound:IB_FTPS")]
+    assert events.count("pin_mismatch") == 1, events
+    ca.write_bytes(_block(b"swapped"))
+    with pytest.raises(TrustAnchorError, match=_PIN_MISMATCH):
+        await check("inbound", "IB_FTPS", settings)
+    events = [r["event"] for r in await _rows(store, "inbound:IB_FTPS")]
+    assert events.count("pin_mismatch") == 2 and "changed" in events, events
+
+
+async def test_a_connection_test_checks_the_ca_before_it_dials(
+    store: MessageStore, tmp_path: Path, judged: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review finding 3: the Test Connection route builds a fresh connector and dials it, so it must
+    check the CA first, or a lane failed by its pin would test as reachable. Red under: the route's
+    ``check_test_anchor`` call removed."""
+    from messagefoundry.api.app import _ANCHOR_REFUSED_DETAIL, _run_connection_test
+    from messagefoundry.transports.rest import RestDestination
+
+    async def reachable(_self: Any) -> None:
+        return None
+
+    monkeypatch.setattr(RestDestination, "test_connection", reachable)
+    ca = _ca(tmp_path)
+    cfg = tmp_path / "cfg"
+    _two_outbound_graph(cfg, _dest("rest", ca, pin="00" * 32))
+    engine = _engine(store)
+    try:
+        runner = await _start_like_serve(engine, cfg)
+        result = await _run_connection_test(runner, "OUT", "outbound")
+        assert (result.success, result.detail) == (False, _ANCHOR_REFUSED_DETAIL)
+        good = await _run_connection_test(runner, "OB_OK", "outbound")
+        assert good.detail != _ANCHOR_REFUSED_DETAIL
+    finally:
+        await engine.stop()
+
+
+def test_a_ca_behind_an_http_ech_sidecar_is_unread() -> None:
+    """Review finding 4: an ECH sidecar on http:// takes both hops over cleartext loopback and does
+    the TLS itself, so the CA verifies nothing. An https:// sidecar is a TLS hop, so it may read it."""
+    base = {"url": "https://partner.example.org/api", "ech_egress": True}
+    assert ta.unread_ca_reason({**base, "ech_sidecar": "http://127.0.0.1:8123"}) is not None
+    assert ta.unread_ca_reason({**base, "ech_sidecar": "https://127.0.0.1:8123"}) is None
+    assert ta.unread_ca_reason({**base, "ech_egress": False}) is None
+
+
+async def test_a_first_load_by_reload_leaves_the_lanes_to_the_runner(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """Review finding 5: an engine started with no graph takes its first one by reload. That load is
+    the start, so a refused outbound CA fails its lane rather than the load, and is audited once.
+    Red under: that path calling the preflight with the reload scope."""
+    ca = _ca(tmp_path)
+    cfg = tmp_path / "cfg"
+    _two_outbound_graph(cfg, _dest("rest", ca, pin="00" * 32))
+    engine = _engine(store)
+    try:
+        await engine.reload_detail(cfg)
+        runner = engine.registry_runner
+        assert runner.degraded_outbound()["OUT"].startswith(_REFUSED_OUT)
+        events = [r["event"] for r in await _rows(store, "outbound:OUT")]
+        assert events.count("pin_mismatch") == 1, events
+    finally:
+        await engine.stop()

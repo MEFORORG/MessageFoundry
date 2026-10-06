@@ -2035,8 +2035,12 @@ class Engine:
         A no-op when none was configured. Public for the same reason as :meth:`guard_registry`: the
         managed app's first load reaches ``add_registry`` directly, and passes ``at_start=True``.
         The start leaves the lane CAs to the runner's lane check (vault BACKLOG #2371)."""
-        if self._registry_preflight is not None:
-            await self._registry_preflight(registry, self._env_values, at_start=at_start)
+        if self._registry_preflight is None:
+            return
+        if at_start:
+            await self._registry_preflight(registry, self._env_values, at_start=True)
+        else:
+            await self._registry_preflight(registry, self._env_values)
 
     async def preflight_settings(self) -> None:
         """Run the engine's settings preflight; raises ``WiringError`` to refuse. A no-op when none
@@ -2211,8 +2215,9 @@ class Engine:
         runner = self._registry_runner
         if not dry_run:
             # The graph this process will run, so after the shard filter. Before anything is swapped,
-            # so a refusal leaves the live graph as it was (BACKLOG #1142, slice 3).
-            await self.preflight_registry(registry)
+            # so a refusal leaves the live graph as it was (BACKLOG #1142, slice 3). With no runner
+            # yet this load is the start, so the lane CAs are left to the runner (vault #2371).
+            await self.preflight_registry(registry, at_start=runner is None)
         if dry_run:
             # Validate against THIS environment without swapping: build-check every connector (which
             # resolves env() refs against this instance's values and raises on a missing key or bad

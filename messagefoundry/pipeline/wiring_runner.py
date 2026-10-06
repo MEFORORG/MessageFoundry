@@ -2441,6 +2441,31 @@ class RegistryRunner:
             )
         return simulate
 
+    async def check_test_anchor(self, name: str) -> None:
+        """Check the dialling CA a connection test is about to read (vault BACKLOG #2371). The route
+        awaits it before :meth:`build_test_connector`, which is synchronous, so a test never dials
+        with a CA the lane check would refuse. Raises :class:`WiringError` from the refusal, as
+        that method wraps a build failure, so the route's anchor arm reports it. The same name
+        order: an inbound wins over an outbound."""
+        if self._lane_anchor_check is None:
+            return
+        ic = self.registry.inbound.get(name)
+        oc = self.registry.outbound.get(name)
+        try:
+            if ic is not None:
+                if ic.spec.type is ConnectorType.REMOTEFILE and ic.spec.settings.get("tls_ca_file"):
+                    cfg = _source_config(
+                        ic, self._inbound_bind_host, self._env_values, self._trust_anchor_policy
+                    )
+                    await self._check_lane_anchor("inbound", name, cfg.settings)
+            elif oc is not None:
+                dest = _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress)
+                await self._check_lane_anchor("outbound", name, dest.settings)
+        except WiringError:
+            raise
+        except Exception as exc:
+            raise WiringError(f"connector build failed: {exc}") from exc
+
     def build_test_connector(self, name: str) -> tuple[str, SourceConnector | DestinationConnector]:
         """Build a **fresh** connector for the named connection so it can be reachability-tested —
         never the live one in ``_sources``/``_destinations`` (probing the live connector would disturb
@@ -2697,6 +2722,7 @@ class RegistryRunner:
             or name in self._sources
             or not ic.deployed
             or ic.spec.type is not ConnectorType.REMOTEFILE
+            or not ic.spec.settings.get("tls_ca_file")  # an SFTP poller, or FTPS with no CA
         ):
             return
         source_cfg = _source_config(

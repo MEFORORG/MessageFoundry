@@ -1093,7 +1093,8 @@ _OUTBOUND_LABEL = "outbound:{}"
 def _token_hop_reads_ca(settings: Mapping[str, Any]) -> bool:
     """Whether a SMART or OAuth2 token hop is on, which reads ``tls_ca_file`` whatever the data hop
     does (``docs/CONNECTIONS.md``, "Pinning a private CA per connection"). Imported here, not at the
-    top: both transports import this module."""
+    top: the ``transports`` package imports ``mllp`` and ``dicom``, which import this module at
+    their top, so a top-level import here would meet a partly built module."""
     from messagefoundry.transports.http_auth import oauth2_auth_configured
     from messagefoundry.transports.smart import smart_auth_configured
 
@@ -1104,9 +1105,10 @@ def unread_ca_reason(settings: Mapping[str, Any]) -> str | None:
     """Why a dialling connection would never read its ``tls_ca_file``, or ``None`` when it reads
     it or the settings cannot tell yet (vault BACKLOG #2371).
 
-    The four switches that build no verifying context: ``tls`` or ``use_tls`` off, ``tls_verify``
-    off, and on the HTTP family ``verify_tls`` off or an ``http://`` url, unless a token hop reads
-    the CA. An ``env()`` value not yet resolved reads as unknown, so the load passes it and the
+    The switches that build no verifying context: ``tls`` or ``use_tls`` off, ``tls_verify`` off,
+    ``ech_egress`` through an ``http://`` sidecar, and on the HTTP family ``verify_tls`` off or an
+    ``http://`` url, unless a token hop reads the CA. The ECH sidecar takes both hops over cleartext
+    loopback and verifies the server itself (ADR 0139). An ``env()`` value not yet resolved reads as unknown, so the load passes it and the
     check after resolution decides. Each caller refuses a pin beside an unread CA and checks no
     file there: a pin nothing checks reads as pinned while nothing is."""
     for key in ("tls", "use_tls"):
@@ -1114,14 +1116,20 @@ def unread_ca_reason(settings: Mapping[str, Any]) -> str | None:
             return f"{key} is off, so the hop builds no TLS context"
     if "tls_verify" in settings and not settings["tls_verify"]:
         return "tls_verify=False verifies no server certificate"
+    if settings.get("ech_egress") and _is_http_url(settings.get("ech_sidecar")):
+        return "ech_egress sends both hops to an http:// sidecar, which does the TLS itself"
     if _token_hop_reads_ca(settings):
         return None
     if "verify_tls" in settings and not settings["verify_tls"]:
         return "verify_tls=False verifies no server certificate, and no token hop reads it"
-    url = settings.get("url")
-    if isinstance(url, str) and url.strip().lower().startswith("http://"):
+    if _is_http_url(settings.get("url")):
         return "the url is http://, so the hop has no TLS, and no token hop reads it"
     return None
+
+
+def _is_http_url(value: object) -> bool:
+    """A literal ``http://`` url. An unresolved ``env()`` value is not one yet."""
+    return isinstance(value, str) and value.strip().lower().startswith("http://")
 
 
 def outbound_anchor_spec(
@@ -1241,6 +1249,8 @@ _CONNECTION_ANCHOR_KEYS = (
     "tls_verify",
     "verify_tls",
     "url",
+    "ech_egress",
+    "ech_sidecar",
     "smart_enabled",
     "smart_token_url",
     "oauth2_enabled",
@@ -1603,11 +1613,36 @@ def make_lane_anchor_check(store: Store, *, enforcing: bool) -> LaneAnchorCheck:
 
     It raises :class:`TrustAnchorError` for a refused or unreadable file, and ``ValueError`` for a
     blank or unread ``tls_ca_pin``. Each names the connection. A lane with no CA it reads is a
-    no-op: no store call, no audit row."""
+    no-op: no store call, no audit row.
+
+    **A repeat of the last refusal writes no rows.** A scheduled poller retries its bind at every
+    window tick, and each audited refusal would add rows. Enough of them would push a quiet
+    anchor's baseline out of :func:`_last_fingerprint`'s look-back, and its next swap would read as
+    a first observation. So a refusal whose file, pin and verdict match the last one for that label
+    is raised again from memory. Any change in them is checked and audited in full."""
+    refused: dict[str, tuple[tuple[object, ...], str]] = {}
+
+    def state(spec: AnchorSpec) -> tuple[object, ...]:
+        try:
+            v = evaluate_anchor(spec)
+        except OSError as exc:
+            return (spec.path, spec.pin, "unreadable", exc.errno)
+        return (spec.path, spec.pin, v.fingerprint, v.acl_ok, v.pin_ok, v.path_ok)
 
     async def check(direction: str, name: str, settings: Mapping[str, Any]) -> None:
         spec = lane_anchor_spec(direction, name, settings)
-        if spec is not None:
+        if spec is None:
+            refused.pop(f"{direction}:{name}", None)
+            return
+        now = await asyncio.to_thread(state, spec)
+        prior = refused.pop(spec.label, None)
+        if prior is not None and prior[0] == now:
+            refused[spec.label] = prior
+            raise TrustAnchorError(prior[1])
+        try:
             await _preflight_connection(store, spec, enforcing=enforcing)
+        except TrustAnchorError as exc:
+            refused[spec.label] = (now, str(exc))
+            raise
 
     return check

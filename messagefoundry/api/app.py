@@ -1992,6 +1992,8 @@ async def _run_connection_test(
         )
 
     try:
+        # vault BACKLOG #2371: the dialling CA first, as a lane build checks it.
+        await rr.check_test_anchor(name)
         _direction, connector = rr.build_test_connector(name)
     except WiringError as exc:
         # This catch is EXHAUSTIVE only because build_test_connector normalizes every build failure to

@@ -3019,7 +3019,7 @@ outbound(
 | What if `verify_tls = false`? | The data hop ignores it, since a verify-off hop trusts nothing. A token hop still reads it, as the row above says. |
 | Does it cover SOAP mutual TLS? | Yes. The client-certificate opener verifies the server against the same file. |
 | Does it apply on a loopback hop? | Yes. Only the instance `[tls]` anchor exempts loopback. A connection's own CA does not. |
-| What if the file is missing? | The integrity check below refuses it, naming the connection and the path. At start that fails the connection's own lane; at a reload it refuses the reload. `messagefoundry check` does not run that check. It builds every connection in one pass, and the build fails with an error that names the setting and, where the build knows it, the connection. So one missing file fails that whole pass. |
+| What if the file is missing? | The integrity check below refuses it, naming the connection and the path. At start that fails the connection's own lane, except on `FhirLookup()`, where it refuses the start. At a reload it refuses the reload. `messagefoundry check` does not run that check. It builds every connection in one pass, and the build fails with an error that names the setting and, where the build knows it, the connection. So one missing file fails that whole pass. |
 | What if it is blank? | On these six factories, and on `Email()` and `Direct()`, a blank literal is refused at load. A blank `env()` value is refused when it resolves, naming the setting, the connection and the environment key (vault BACKLOG #2370). |
 | When is it refused as unread? | On `Ftp(tls=False)`, which has no TLS, and on `DICOMweb(verify_tls=False)`, which has no token hop. On the others, a token hop can still read it. |
 | What if it is unset? | The hop is built exactly as before, from the instance `[tls]` block or the OS store. |
@@ -3062,7 +3062,7 @@ poller. A `deployed = false` connection is not checked, since it is never built.
 **A CA the hop never reads is not checked, and a pin beside it is refused at load.** That is a CA
 behind `use_tls = false` or `tls_verify = false`. On `Rest()`, `Soap()`, `FHIR()`, `DICOMweb()` and
 `FhirLookup()` it is also a CA behind `verify_tls = false` or an `http://` url, unless a SMART or
-OAuth2 token hop reads it. A pin there would read as pinned while nothing checks it.
+OAuth2 token hop reads it, and a CA behind `ech_egress` through an `http://` sidecar. A pin there would read as pinned while nothing checks it.
 
 **Why a matching pin is no escape here.** On an inbound listener, a matching pin lets a CA load whose
 permissions the engine could not read. That works because the listener loads the exact bytes the
@@ -3077,8 +3077,9 @@ load, such as one holding a `TRUSTED CERTIFICATE` block.
 `tls_ca_pin` with no `tls_ca_file` is refused at load, since nothing would check it. So is a pin that
 is empty or whitespace; leave it out for no pin. On the eight factories above, a literal pin that
 is not 64 hex characters is refused at load too, and an `env()` pin once it resolves. On `MLLP()`
-and `DICOM()` a pin with no `tls_ca_file`, or without `tls = true`, is refused when the connection
-is built instead, and a malformed one when the check runs.
+and `DICOM()` a pin with no `tls_ca_file` is refused when the connection is built, and a malformed
+one when the check runs. On an outbound `MLLP()` or `DICOM()`, a literal pin beside a `tls_ca_file` with `tls = false` is
+refused at load, as a pin beside any CA the hop never reads is.
 
 On an inbound listener the same key means something different. On `Http()`, and on an inbound
 `MLLP()` or `DICOM()`, it is the CA a **calling client's** certificate must chain to.

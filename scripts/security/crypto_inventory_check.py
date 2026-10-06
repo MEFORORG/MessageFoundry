@@ -947,9 +947,12 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # The reload preflight also reaches anchor_cadata's cadata= trial load (BACKLOG #2025), but
     # through asyncio.to_thread, a reference this scanner does not follow as a call.
     # BACKLOG #1167 (ASVS 11.2.4): the config-provenance drift compare, via fingerprint_matches.
+    # Vault BACKLOG #2371: the SHA-256 of a dialling CA file, via make_lane_anchor_check. It
+    # fingerprints the file to tell a repeated refusal from a changed one. A digest, not a key.
     "messagefoundry/api/app.py": frozenset(
         {
             "compare:via messagefoundry.config.fingerprint",
+            "hash:via messagefoundry.auth.trust_anchors",
             "tls_context:via messagefoundry.config.tls_policy",
         }
     ),
