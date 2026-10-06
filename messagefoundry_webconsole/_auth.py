@@ -350,8 +350,21 @@ def require_ui(
     activity: bool = True,
     mfa_refusal: Callable[[Request], HTTPException] | None = None,
     pending_refusal: PendingRefusal | None = None,
+    new_address_check: bool = True,
 ) -> Callable[[Request], Awaitable[Identity]]:
     """Authenticate a /ui request from the session cookie and assert ``permissions``.
+
+    **A PHI read (``phi=True``) or a write (any non-GET) from a host the session has not verified
+    from is sent to ``/ui/reauth``** (vault BACKLOG #2620), the cookie twin of the refusal
+    ``require_phi_read`` and ``require_paced`` give. A PHI page continues back to itself, query
+    included, so each is registered as a query-tolerant unlock continuation beside its route; a
+    write lands on ``/ui`` afterwards (``/ui/account`` for a session without ``monitoring:read``),
+    because a write's body cannot be carried through the re-auth. :func:`_new_address_continuation`
+    decides. A re-auth from the new address re-anchors the session. The check runs once, before
+    both budgets. A must-change session is not asked: ``/ui/reauth`` sends it back to its
+    confinement page, so a refusal would loop. The step-up factories pass
+    ``new_address_check=False``: they ask the same question themselves, with the continuation their
+    route needs, and asking here first would send the operator to ``/ui`` instead.
 
     ``mfa_refusal`` changes only WHERE the ASVS 6.3.3 gate sends a pending session, never WHETHER it
     refuses or records the refusal. The step-up factories pass it so a pending session lands on
@@ -490,31 +503,51 @@ def require_ui(
             # posture, where a browser has to get its login redirect instead. Above the budget: a
             # read that will not be served must not spend the actor's PHI-read quota.
             enforce_phi_read_hop(request)
-            if not auth.allow_phi_read(identity.user_id):
-                raise HTTPException(
-                    status.HTTP_429_TOO_MANY_REQUESTS,
-                    "too many requests; please slow down",
-                    headers={"Retry-After": "10"},
-                )
-        # BACKLOG #287: the console reaches the handlers IN-PROCESS -- it holds no HTTP client -- so
-        # a /ui write never passes through the engine's `_enforce_admin_write_pacing`. Without this
-        # the product's only pacing floor was absent on the one surface a human actually uses. Same
-        # NON-GET rule as the engine: a GET must stay free because the console's nav polls on a timer,
-        # and charging those would throttle an idle operator. This is a separate budget from the PHI
-        # one above by design -- that quota measures PHI reads, and administration must not spend it.
-        if request.method != "GET":
+        write = request.method != "GET"
+        if write:
             # PROVENANCE BEFORE SPEND, and the order is the security property. The routes call
             # assert_same_origin inline, which runs AFTER this dependency -- so charging first would
             # let an attacker's page spend a victim's budget using the victim's SameSite cookie, and
             # throttle their console from off-origin. Re-asserting here is idempotent (the inline
             # call still stands) and makes a cross-site write cost the attacker nothing.
             assert_same_origin(request)
-            if not auth.allow_admin_write(identity.user_id):
-                raise HTTPException(
-                    status.HTTP_429_TOO_MANY_REQUESTS,
-                    "too many requests; please slow down",
-                    headers={"Retry-After": "10"},
-                )
+        # Vault BACKLOG #2620: require_phi_read's and require_paced's new-address refusal on this
+        # plane, asked once for a PHI read or a write. After provenance, so a cross-site page cannot
+        # make the engine write an audit row or send a notice; before both charges below, so a
+        # refused request spends nothing. Not for a must-change session: /ui/reauth sends it back to
+        # its confinement page, so a refusal would loop. Such a session reaches this point only on
+        # the password page, whose JSON twin /me/password is neither paced nor asked.
+        if new_address_check and not identity.must_change_password and (phi or write):
+            landing = (
+                WRITE_REAUTH_LANDING
+                if identity.has(Permission.MONITORING_READ)
+                else ACCOUNT_REAUTH_LANDING
+            )
+            await _refuse_from_new_address(
+                auth, request, next_path=_new_address_continuation(request, landing=landing)
+            )
+        if phi and not auth.allow_phi_read(identity.user_id):
+            raise HTTPException(
+                status.HTTP_429_TOO_MANY_REQUESTS,
+                "too many requests; please slow down",
+                headers={"Retry-After": "10"},
+            )
+        # BACKLOG #287: the console reaches the handlers IN-PROCESS -- it holds no HTTP client -- so
+        # a /ui write never passes through the engine's `_enforce_admin_write_pacing`. Without this
+        # the product's only pacing floor was absent on the one surface a human actually uses. Same
+        # NON-GET rule as the engine: a GET must stay free because the console's nav polls on a timer,
+        # and charging those would throttle an idle operator. This is a separate budget from the PHI
+        # one above by design -- that quota measures PHI reads, and administration must not spend it.
+        if not write:
+            return identity
+        # Its own `if`, not `write and ...`: tests/test_security_doc_rate_limits.py reads this exact
+        # test line to plant its mutations.
+        if not auth.allow_admin_write(identity.user_id):
+            raise HTTPException(
+                status.HTTP_429_TOO_MANY_REQUESTS,
+                "too many requests; please slow down",
+                headers={"Retry-After": "10"},
+            )
         return identity
 
     return mark_route_gate(dependency)
@@ -699,6 +732,34 @@ register_ui_action(r"^/ui/dead-letters/[^/?#]+(/[^/?#]+)?/replay$", Permission.M
 # per-channel pattern above (it has no `/replay` suffix), so it needs its own allow-list entry.
 register_ui_action(r"^/ui/dead-letters/replay-all$", Permission.MESSAGES_REPLAY)
 
+#: Where ``/ui/reauth`` sends an operator whose WRITE was refused for a new address (vault BACKLOG
+#: #2620). A write's body cannot ride the re-auth, and most of these writes are not registered
+#: continuations, so the re-auth lands on the dashboard and the operator clicks again. Registered as
+#: an unlock page so ``/ui/reauth`` accepts it; ``/ui`` serves GET only, so this is no POST gadget.
+WRITE_REAUTH_LANDING = "/ui"
+register_ui_action(r"^/ui$", None, auto_retry=False, unlock=True)
+#: The landing for a session without ``monitoring:read``, which ``/ui`` would refuse: a custom role
+#: may hold a write permission without it (ADR 0045). Every signed-in session may load this page.
+ACCOUNT_REAUTH_LANDING = "/ui/account"
+register_ui_action(r"^/ui/account$", None, auto_retry=False, unlock=True)
+#: ``GET /ui/reauth``'s own cap on ``next`` (its ``max_length``). A longer continuation would be
+#: answered 422 there, with no re-auth form.
+_REAUTH_NEXT_MAX = 512
+
+
+def _new_address_continuation(request: Request, *, landing: str) -> str:
+    """The ``next`` for a request refused for a new address (vault BACKLOG #2620).
+
+    A GET comes back to itself, query included, so a filtered or deferred list does not return as
+    a broader read than the operator asked for. A write, or a GET whose whole target ``/ui/reauth``
+    would not take (not a registered unlock page, or past :data:`_REAUTH_NEXT_MAX`), goes to
+    ``landing``. A query is never dropped to make a target fit."""
+    if request.method == "GET":
+        target = request.url.path + (f"?{request.url.query}" if request.url.query else "")
+        if len(target) <= _REAUTH_NEXT_MAX and is_unlock_action(target):
+            return target
+    return landing
+
 
 def is_safe_ui_action(next_path: str | None) -> bool:
     """Whether ``next_path`` is a same-origin /ui action the re-auth flow may auto-retry.
@@ -771,6 +832,20 @@ def _reauth_redirect(request: Request, next_path: str | None = None) -> HTTPExce
     """
     nxt = quote(next_path if next_path is not None else request.url.path, safe="/")
     return HTTPException(status.HTTP_303_SEE_OTHER, headers={"Location": f"/ui/reauth?next={nxt}"})
+
+
+async def _refuse_from_new_address(
+    auth: AuthService, request: Request, *, next_path: str | None
+) -> None:
+    """Send the browser to ``/ui/reauth`` when this request comes from a host its session has not
+    verified from (vault BACKLOG #2620). The cookie twin of ``api.security``'s refusal of the same
+    name; :func:`require_ui` says which requests ask. ``next_path`` is as for
+    :func:`_reauth_redirect`. Records the signal (``auth.admin_action_new_ip`` and a notice on a
+    first sighting) the way the step-up factories do."""
+    if await auth.flag_new_client_ip(
+        session_token(request), client_ip(request), path=request.url.path
+    ):
+        raise _reauth_redirect(request, next_path)
 
 
 def _reauth_refusal(
@@ -853,7 +928,12 @@ def require_ui_step_up(
     # destination". It was not the same refusal: that flag also switched off the audit row, the gate's
     # place above the permission loop, and its place before the admin-write and PHI charges. The JSON
     # twin, require_step_up, keeps all three. Only the destination was ever meant to change.
-    base = require_ui(*permissions, phi=phi, mfa_refusal=_reauth_refusal(reauth_next))
+    base = require_ui(
+        *permissions,
+        phi=phi,
+        mfa_refusal=_reauth_refusal(reauth_next),
+        new_address_check=False,
+    )
 
     async def dependency(request: Request) -> Identity:
         identity = await base(request)  # cookie auth + MFA gate + permission (+ must-change gate)
@@ -891,7 +971,7 @@ def require_ui_reauth_only(
     """
     # allow_mfa_pending: a genuine exemption, not a re-route. These gate the ENROLLMENT path, and
     # an un-enrolled user can never satisfy a gate standing in front of the route that enrolls them.
-    base = require_ui(*permissions, allow_mfa_pending=True)
+    base = require_ui(*permissions, allow_mfa_pending=True, new_address_check=False)
 
     async def dependency(request: Request) -> Identity:
         identity = await base(request)  # cookie auth + permission (+ must-change gate)
@@ -939,7 +1019,9 @@ def require_ui_step_up_action(
     ``api.security.require_step_up_action``)."""
     # mfa_refusal, NOT allow_mfa_pending: the base's gate refuses and audits a pending session, and
     # the hook only points it at /ui/reauth with the continuation. See require_ui_step_up for why.
-    base = require_ui(*permissions, mfa_refusal=_reauth_refusal(reauth_next))
+    base = require_ui(
+        *permissions, mfa_refusal=_reauth_refusal(reauth_next), new_address_check=False
+    )
 
     async def dependency(request: Request) -> Identity:
         identity = await base(request)  # cookie auth + MFA gate + permission (+ must-change gate)
@@ -990,7 +1072,12 @@ def require_ui_reauth_only_action(
     # which can never satisfy a gate standing in front of the route that enrolls it, or that ends
     # a session it does not recognise. An account that HAS a factor is refused by refuse_pending
     # (#1951), inside the base so that the refusal spends no budget (#1973).
-    base = require_ui(*permissions, allow_mfa_pending=True, pending_refusal=refuse_pending)
+    base = require_ui(
+        *permissions,
+        allow_mfa_pending=True,
+        pending_refusal=refuse_pending,
+        new_address_check=False,
+    )
 
     async def dependency(request: Request) -> Identity:
         # cookie auth + permission (+ must-change gate) + the pending refusal above

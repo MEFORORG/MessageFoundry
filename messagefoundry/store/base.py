@@ -68,6 +68,7 @@ from messagefoundry.store.store import (
     AlertInstance,
     AlertSummary,
     AuditAppend,
+    AuditVerdict,
     CapturedResponse,
     ChannelScopeSource,
     ClaimedHeads,
@@ -1762,7 +1763,7 @@ class AuditStore(Protocol):
         *,
         expected_anchor: tuple[int, str] | None = None,
         expected_prefix: tuple[int, str] | None = None,
-    ) -> tuple[bool, str | None]: ...
+    ) -> AuditVerdict: ...
 
     async def roll_audit_key_epoch(self) -> tuple[bool, str]:
         """``rotate-key``'s audit step (BACKLOG #1904, ADR 0193): open a range of the audit chain under
@@ -1887,9 +1888,23 @@ class AuthStore(Protocol):
         ...
 
     async def set_user_username(
-        self, user_id: str, username: str, *, now: float | None = None
-    ) -> None:
+        self, user_id: str, username: str, *, expected_username: str, now: float | None = None
+    ) -> bool:
         """Refresh the **cached** username on a directory-backed row (BACKLOG #1532).
+
+        **A COMPARE-AND-SET ON THE OLD NAME (BACKLOG #2290).** The write lands only while the row
+        still holds ``expected_username``, the name the caller read before it decided to rename.
+        Returns ``True`` only when that row was updated. ``False`` means nothing was written: the
+        row is gone, another caller changed its name first, or another row holds ``username``. The
+        caller re-reads to tell those apart.
+
+        Two refreshes of one row can run at once, a sign-in and a reconciler pass. Both read the old
+        name, so without the compare both would write, and both would audit and notify one rename.
+        With it the second write matches no row. SQLite serialises writers. PostgreSQL at READ
+        COMMITTED, and SQL Server under its row lock, re-check a blocked UPDATE's ``WHERE`` against
+        the row the winner committed. That last step rests on each backend's documented locking, not
+        on a measurement here: the concurrent test runs on SQLite, and the live PostgreSQL and SQL
+        Server legs exercise the stale-name case in sequence.
 
         **This is a cache refresh, not a rename operation, and the distinction decides who may call
         it.** Since BACKLOG #1471 a directory login identifies its row by ``directory_object_id``, so
@@ -1923,7 +1938,9 @@ class AuthStore(Protocol):
         implementation MAY still raise its own integrity class under concurrency.** It must not be
         relied on not to. The residual is absorbed at the call site
         (``AuthService._refresh_cached_username``) by MRO name, the way the ADR 0068 section 4
-        duplicate-label race and the BACKLOG #1256 federated-subject bind already are.
+        duplicate-label race and the BACKLOG #1256 federated-subject bind already are. The
+        compare-and-set above does not change this: it settles two writers of the SAME row, and this
+        race is between two rows wanting one name.
 
         Local accounts are out of scope by construction -- nothing routes a local row here -- and the
         engine has no other writer of this column after ``create_user``.

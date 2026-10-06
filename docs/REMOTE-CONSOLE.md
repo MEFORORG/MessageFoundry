@@ -228,6 +228,10 @@ account is not exempt from the engine's second factor
   [`SECURITY.md`](SECURITY.md).
 - Keep `[auth].admin_new_ip_step_up` at its default (`true`, since BACKLOG #288). It forces a fresh
   step-up when an admin action arrives from a new client IP; turning it off is a named loosening.
+  Since vault BACKLOG #2620 a PHI page or a console write from a new address also goes to
+  `/ui/reauth` first, so an operator whose address changes re-authenticates there.
+  [SECURITY.md](SECURITY.md#administrative-interface-defense-in-depth-wp-l3-13-asvs-842) item 6
+  lists the gates.
 
 ---
 
@@ -360,7 +364,7 @@ mTLS here is **transport authentication only** unless you also populate
 | Engine won't start: `refusing to serve … on non-loopback host` | An off-loopback `[security].listen_address` without an operator certificate on the JSON API. The engine would serve the placeholder there too, and refuses it for the same reason. Same fix as above. |
 | Engine won't start: `refusing to serve the API with in-process TLS on non-loopback host … performs NO certificate revocation check` | The [ADR 0078](adr/0078-certificate-revocation-posture.md) revocation gate on Option A. Set `MEFOR_TLS_REVOCATION_ATTESTED=1` in the **service environment** (not the TOML), or move to Option B and let the proxy do revocation. This gate reads neither the data label nor `[security].enforcement`, so a synthetic/lab box and a `warn`-dialled box hit it too. |
 | Engine won't start: `refusing to serve on a … PHI instance … behind an upstream TLS terminator … without: [api].proxy_intra_service_auth …` | The Posture-B attestation gate on Option B. Declare **both** `[api].proxy_intra_service_auth` (`mtls`/`network`/`shared_secret`) and `[api].proxy_tls_min_version` (`1.2`/`1.3`) — see Option B's block. It fires on a PHI instance under `enforcement = enforce` with an off-loopback bind; the loopback-behind-a-proxy variant warns instead. |
-| Signed in, but every route returns `403` with `X-MFA-Required: 1` | `[security].require_mfa` is on (the default) and this account hasn't enrolled a factor. Enrol TOTP first at `/ui/account`. A local account the requirement covers cannot register a passkey until it holds TOTP: the engine answers `enrol an authenticator app first`. A directory account may enrol either ([the order](SECURITY.md#webauthn-passkeys-wp-14b-adr-0068)). The browser session is confined to `/ui/mfa` until then. |
+| Signed in, but every route returns `403` with `X-MFA-Required: 1` | `[security].require_mfa` is on (the default) and this account hasn't enrolled a factor. Enrol TOTP first at `/ui/account`. A local account the requirement covers cannot register a passkey until it holds TOTP: the engine answers `enrol an authenticator app first`. A directory account may enrol either ([the order](SECURITY.md#webauthn-passkeys-wp-14b-adr-0068)). Until then, the console answers most pages with a redirect, usually to `/ui/mfa`. That page sends an account with no factor on to `/ui/account` to enrol. The account and enrolment pages serve the session meanwhile. |
 
 The dashboard's live views take updates over the same-origin **`/ws/stats` WebSocket** and fall back
 to a ~5s fragment poll whenever that socket is closed or unavailable

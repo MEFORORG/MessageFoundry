@@ -1105,10 +1105,11 @@ class Engine:
         backends; it is not done here. Read a break as *"at least* a break"."""
         expected_prefix = await self._load_audit_anchor()
         try:
-            ok, msg = await self.store.verify_audit_chain(expected_prefix=expected_prefix)
+            verdict = await self.store.verify_audit_chain(expected_prefix=expected_prefix)
         except Exception as exc:  # never let a verify failure crash startup
             log.warning("startup audit-chain verification could not run: %s", safe_exc(exc))
             return
+        ok, msg = verdict
         # Say what the pass COVERED beside the verdict: an anchored pass and a bare one read identically
         # otherwise, and only one of them has ruled out a truncated tail.
         coverage = (
@@ -1121,6 +1122,18 @@ class Engine:
             log.info("startup audit-chain verification: %s (%s)", msg, coverage)
             return
         reason = msg or "audit chain verification failed"
+        if getattr(verdict, "key_unavailable", False):
+            # Vault BACKLOG #2725: unlike `audit-verify`'s exit 4, this stays a chain-break alert.
+            # An engine holds no key only under the audited keyless opt-out, where a chain whose
+            # first row names a key is the anomaly, and "not checked" would let a forged genesis row
+            # silence this alert for every other edit. The store's text tells an operator to
+            # re-run with the engine's settings, which from inside the engine says nothing, so the
+            # alert carries its own.
+            reason = (
+                "audit chain broken: its first row names a store key, but this engine holds none. "
+                "An engine runs with no key only under the audited keyless opt-out, where a chain "
+                "never names one: either the chain was altered, or the engine lost its key"
+            )
         # verify_audit_chain folds both verdicts into one (ok, message) and reports a chain break FIRST,
         # so the marker is the only thing that separates them without walking the log a second time.
         truncated = AUDIT_PREFIX_BREAK_MARKER in reason
@@ -1853,6 +1866,12 @@ class Engine:
                     reserved_bindings=self._reserved_bindings,
                     posture=self._hop_posture,
                     trust_anchor_policy=self._trust_anchor_policy,
+                    # The running engine's own escape, so the toggle never refuses a cleartext
+                    # listener this engine already accepted (vault BACKLOG #2622 item 1).
+                    allow_insecure_bind=self._allow_insecure_bind,
+                    # And the runner's own view of which listeners it binds, so a toggle is not
+                    # refused for one it leaves down. Taken on the loop, before the worker thread.
+                    exposure_gated=binds_listener,
                 )
 
             connections_edit.upsert_connection(cfg_dir, match, validate=validate)
@@ -1869,6 +1888,10 @@ class Engine:
             before = None
             if isinstance(loaded_fp, str):
                 before, _reason = await self.fingerprint_bundle(cfg_dir)
+            # Vault BACKLOG #2622 item 1: the validate callback reads this from the worker thread, so
+            # the runner's listening set is snapshotted here, on the loop. None = the offline test.
+            live = self._registry_runner
+            binds_listener = live.listener_bind_predicate() if live is not None else None
             await asyncio.to_thread(_write)
 
             # Reflect it live, in place (cosmetic field only — no connector rebuild, no reload).
@@ -2148,6 +2171,10 @@ class Engine:
                 fifo_claim_batch=self._fifo_claim_batch,
                 inbound_bind_host=self._inbound_bind_host,
                 reserved_bindings=self._reserved_bindings,
+                # build_check now runs the inbound exposure gates (vault BACKLOG #2622 item 1), so
+                # the throwaway checker needs the engine's escape or a dry run refuses what a real
+                # reload accepts.
+                allow_insecure_bind=self._allow_insecure_bind,
                 delivery_defaults=self._delivery_defaults,
                 ordering_default=self._ordering_default,
                 internal_error_default=self._internal_error_default,

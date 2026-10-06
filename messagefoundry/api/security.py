@@ -2,7 +2,7 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """FastAPI authentication + authorization dependencies (deny-by-default).
 
-``require(*permissions)`` is a dependency factory applied to every protected route. Once an enabled
+``require(*permissions)`` is a dependency factory applied to every protected route. Once an
 :class:`AuthService` is wired (the ``serve`` path) it enforces the bearer token plus the listed
 permissions. When **no** AuthService is attached the behaviour is **fail-closed**: the route is
 denied unless the app was explicitly built with ``allow_no_auth=True`` (the in-process embedding /
@@ -365,12 +365,24 @@ def client_ip(conn: Request | WebSocket) -> str | None:
     return conn.client.host if conn.client else None
 
 
-def _password_change_required(deadline: float | None) -> str:
-    """The 403 detail for a must-change session, naming the credential's deadline when it has one."""
+def _password_change_required(deadline: float | None, *, suffix: str = "") -> str:
+    """The 403 detail for a must-change session, naming the credential's deadline when it has one.
+
+    ``suffix`` names the next step the session can take (the enrol-first step), appended.
+
+    A deadline already passed is stated in the past tense with the one remedy left, and no
+    ``suffix``: no step the session takes can revive the credential (BACKLOG #2298). The session
+    check ends such a session before this runs, so it is reached only when the deadline passes
+    between that check and this read. Strictly after, as the sign-in gate compares."""
     when = None if deadline is None else deadline_utc(deadline)
     if when is None:
-        return "password change required"
-    return f"password change required; the temporary password stops working at {when}"
+        return "password change required" + suffix
+    if deadline is not None and time.time() > deadline:
+        return (
+            f"password change required; the temporary password stopped working at {when};"
+            " ask an administrator to reset it"
+        )
+    return f"password change required; the temporary password stops working at {when}" + suffix
 
 
 # --- Answering before the request body is read (vault BACKLOG #2739) ---------------------------------
@@ -788,9 +800,9 @@ def require(
                 raise HTTPException(
                     status.HTTP_403_FORBIDDEN,
                     _password_change_required(
-                        await pending_credential_deadline_for(auth, identity.user_id)
-                    )
-                    + (_ENROL_FIRST_SUFFIX if enrol_first else ""),
+                        await pending_credential_deadline_for(auth, identity.user_id),
+                        suffix=_ENROL_FIRST_SUFFIX if enrol_first else "",
+                    ),
                 )
         # ASVS 6.3.3 — MFA is an ACCESS gate, not only a step-up gate. Ordering is load-bearing in
         # BOTH directions. must_change stays FIRST: a fresh account (a new user) is
@@ -852,21 +864,58 @@ def require(
     return _gate(dependency, _authenticate_session_before_body)
 
 
+async def refuse_from_new_address(request: Request) -> None:
+    """Refuse a request whose session was last verified from another host (vault BACKLOG #2620).
+
+    The step-up gates already asked this. The PHI reads and the paced writes did not, so on a
+    first deployment a bearer token replayed from a second address would have read message bodies
+    and started or stopped connections with no signal. Callers: :func:`require_phi_read`,
+    :func:`require_paced` and the HTTP reveal path in ``api/app.py`` (``_admit_reveal``). It gives
+    them the step-up gates' refusal: 403 + ``X-Step-Up-Required: 1``, cleared by a
+    ``POST /me/reauth`` from the new address, which re-anchors the session. A first sighting writes
+    ``auth.admin_action_new_ip`` and a notice, deduped and capped per session as
+    :meth:`AuthService.flag_new_client_ip` says.
+
+    It is NOT in :func:`require`, deliberately: the base gate carries the monitoring polls, and an
+    operator whose address changes behind a NAT pool would be refused on every one until a step-up.
+
+    Costs one session read per request while ``[auth].admin_new_ip_step_up`` is on. The gate has
+    already read the session through :func:`require`, but the identity it returns does not carry
+    the anchor address. A no-op with auth off or absent."""
+    auth = get_auth(request)
+    if auth is None or not auth.enabled:
+        return
+    if await auth.flag_new_client_ip(
+        bearer_token(request), client_ip(request), path=request.url.path
+    ):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "step-up re-verification required; POST /me/reauth then retry",
+            headers={"X-Step-Up-Required": "1"},
+        )
+
+
 def require_paced(*permissions: Permission) -> Callable[[Request], Awaitable[Identity]]:
     """Like :func:`require`, plus per-actor anti-automation PACING on the state-changing admin
-    surface (BACKLOG #193, ASVS 2.4.2) — but WITHOUT the MFA / step-up gates. For the mutating admin
+    surface (BACKLOG #193, ASVS 2.4.2) — but WITHOUT the MFA / step-up window. For the mutating admin
     routes that warrant paced throttling yet not a full step-up re-proof, for example connection
     start/stop/restart and statistics reset. docs/SECURITY.md lists the set. A
     non-GET request from an actor over the per-actor rate is refused early with 429 + Retry-After: 1
     (logged, not silent) before the identity is returned. Reuses the SAME #193 limiter as
     :func:`require_step_up` via :func:`_enforce_admin_write_pacing`, so pacing coverage is uniform
-    across both gates. The embedding/no-auth path is unaffected (no per-actor identity to key on)."""
+    across both gates. The embedding/no-auth path is unaffected (no per-actor identity to key on).
+
+    A request from a host the session has not verified from is refused with the step-up answer
+    (:func:`refuse_from_new_address`, vault BACKLOG #2620). That runs BEFORE the pacing charge, so
+    a refusal here spends none of the holder's write budget (the BACKLOG #1973 rule the console's
+    gate states). The step-up gates still pace before they ask, so a refusal there does."""
     base = require(*permissions)
 
     async def dependency(request: Request) -> Identity:
         identity = await base(request)
         auth = get_auth(request)
         if auth is not None and auth.enabled:
+            await refuse_from_new_address(request)
             _enforce_admin_write_pacing(request, auth, identity)
         return identity
 
@@ -1116,7 +1165,11 @@ def require_phi_read(*permissions: Permission) -> Callable[[Request], Awaitable[
     returns 429. No throttle on the embedding/no-auth path (there's no per-actor identity to key on).
 
     It also enforces the #200 API PHI-read DATA-PATH guard (:func:`enforce_phi_read_hop`) before any
-    identity work, so a production-PHI instance serving over an insecure hop refuses to emit PHI."""
+    identity work, so a production-PHI instance serving over an insecure hop refuses to emit PHI.
+
+    And it refuses a read from a host the session has not verified from, with the step-up answer
+    (:func:`refuse_from_new_address`, vault BACKLOG #2620), before the budget is charged: a read
+    that will not be served must not spend the holder's quota."""
     base = require(*permissions)
     authenticate = _authentication_of(base)
 
@@ -1128,6 +1181,7 @@ def require_phi_read(*permissions: Permission) -> Callable[[Request], Awaitable[
     async def dependency(request: Request) -> Identity:
         enforce_phi_read_hop(request)
         identity = await base(request)
+        await refuse_from_new_address(request)
         enforce_phi_read_pacing(request, identity)
         return identity
 
@@ -1374,8 +1428,8 @@ async def optional_identity(request: Request) -> Identity | None:
     ``GET /ai/policy``) that must answer even to a tokenless client, while still reporting the
     caller's RBAC when a valid token is present.
 
-    Returns the full-access system identity when auth is disabled-with-``allow_no_auth`` (embedding/
-    dev); ``None`` when auth is unconfigured/fail-closed or the token is missing/invalid. The
+    Returns the full-access system identity when no service is attached and ``allow_no_auth`` is
+    set (embedding/dev); ``None`` when auth is unconfigured/fail-closed or the token is missing/invalid. The
     ``must_change_password`` gate is intentionally *not* applied — this surfaces non-sensitive policy,
     not PHI. The ASVS 6.3.3 **MFA access gate is excluded for the same reason, deliberately**: this
     resolver answers tokenless callers by contract, so a second-factor gate here could only ever

@@ -88,7 +88,7 @@ use the table below alongside them when planning.
 | Windows-service deployment via NSSM | ✅ Built — see [SERVICE.md](SERVICE.md) |
 | **Native transport TLS** (API + MLLP) | ✅ Built — in-process API TLS (HTTPS/WSS) + per-connection MLLP-over-TLS, ≥TLS 1.2, opt-in mTLS, and a **fail-closed off-loopback bind guard** (a non-loopback bind without TLS is refused). Raw TCP/X12 stay plaintext (loopback/proxy). See [DEPLOYMENT.md](DEPLOYMENT.md). |
 | **Native MFA** (TOTP and passkeys, local and directory accounts) | ✅ Built — RFC 6238 TOTP + single-use recovery codes; `[security].require_mfa` enforces a second factor as an access gate on every authorized route; while it is on, a directory session that proved no factor owes one under either `require_mfa_scope` value (BACKLOG #1144). See [SECURITY.md](SECURITY.md#multi-factor-authentication-totp-wp-14). See [SECURITY.md](SECURITY.md). |
-| **Off-box log + audit forwarding** | ✅ Built — `[logging].forward_*` ships operational logs + PHI-redacted audit rows to a syslog/SIEM collector, over **native TLS** when you set `forward_protocol = "tls"` (RFC 5425, ADR 0080; port 6514, CA anchor via `forward_tls_*`). Residual: the transport **default** is UDP, so TLS is a per-deployment opt-in — set it, or front the collector with a local TLS-forwarding agent. See [PHI.md](PHI.md) §7. |
+| **Off-box log + audit forwarding** | ✅ Built — `[logging].forward_*` ships operational logs + audit rows, both with only best-effort PHI redaction, to a syslog/SIEM collector, over **native TLS** when you set `forward_protocol = "tls"` (RFC 5425, ADR 0080; port 6514, CA anchor via `forward_tls_*`). Residual: the transport **default** is UDP, so TLS is a per-deployment opt-in — set it, or front the collector with a local TLS-forwarding agent. See [PHI.md](PHI.md) §7. |
 | **Active-passive HA / failover** | ✅ Built (Track B) — opt-in leader/standby cluster on a **shared server-DB** store (PostgreSQL or SQL Server): only the leader runs the graph, self-fencing leadership lease, immediate on-promotion recovery. Single-node stays the byte-identical default. See [CLUSTERING.md](CLUSTERING.md) + §14. |
 
 ### Experimental or not yet built — **do not depend on these for a production pilot**
@@ -331,7 +331,10 @@ engine writes, such as a File connection's, to `NT SERVICE\MessageFoundry` by na
 ### 4.5 Provision the first administrator
 
 Auth is **enabled by default**, and **the engine creates no account on its own**. Until you create the
-first Administrator, nobody can sign in. Do it once per store, at the host:
+first Administrator, nobody can manage the engine. At the shipped posture a start with no Administrator
+is refused. If a start goes ahead without one, a Windows sign-in (Kerberos), where configured, can
+still create a directory account, but that account holds no role. Create the
+Administrator once per store, at the host:
 
 1. Set the store key in your shell, the same `MEFOR_STORE_ENCRYPTION_KEY` the service runs with,
    unless it comes from `[store].encryption_key_file`, which the command reads too. Do not generate a
@@ -462,12 +465,23 @@ out. The remaining transport gaps include **raw TCP and X12**, which have no nat
 - [ ] Run **`messagefoundry audit-verify`** periodically (the audit log is tamper-*evident*, not
       tamper-*proof*), and set `[retention]` windows — they are **off by default (kept forever)**.
 - [ ] **Have that scheduled job branch on the exit code, not just on nonzero.** `1` is a broken
-      chain, `2` is "the `--db` path is not an audit database" (absent, zero-byte, or no `audit_log`
-      table — a `touch` in an install script or a failed copy leaves exactly that, and the verifier
-      refuses it rather than creating one), and `3` is a clean walk over an **empty** log. Treating
-      `2` or `3` as a tamper alarm pages someone for a misconfiguration; treating either as a pass
-      leaves the real log unchecked. Add `--allow-empty` only where an empty log is expected.
-      Exit codes and their reasoning: [`SECURITY.md`](SECURITY.md) "Tamper-evidence".
+      chain, `2` is "could not start" (for example the `--db` path is not an audit database: absent,
+      zero-byte, or no `audit_log` table — a `touch` in an install script or a failed copy leaves
+      exactly that, and the verifier refuses it rather than creating one), `3` is a clean walk over
+      an **empty** log, and `4` means the chain's first row names a key that this shell does not
+      hold, so nothing was checked against the key. Run the job with the settings and environment
+      the engine runs with, the key or the keyless opt-out included: the verify reads them to decide
+      between `1` and `4`. Treating `2` or `3` as a tamper alarm pages someone for a
+      misconfiguration. **Treat `4` as a possible tamper, not as a misconfiguration.** A `4` from a
+      job that exited `0` before is a sign the first row was changed: run it again with the
+      engine's settings and key before deciding it is a missing key. Treating any of `2`, `3` or
+      `4` as a pass leaves the real log unchecked. A `WARNING` on stderr with exit `0` says the
+      chain is keyless while this shell's settings require a key. Give the job the engine's
+      settings and key; do not clear the warning with the keyless opt-out unless the engine runs
+      under it. A job that moves from `4` to `0` with that warning is as suspect as one that moves
+      from `0` to `4`. Add `--allow-empty` only
+      where an empty log is expected. Exit codes and their reasoning: [`SECURITY.md`](SECURITY.md)
+      "Tamper-evidence".
 - [ ] **Seal the audit DB across any gap in custody, with an anchor.** A bare `audit-verify` is clean
       after the *newest* rows are deleted — the surviving prefix still chains — so on its own it is
       blind to the attack it is run for. **`messagefoundry audit-anchor`** prints `COUNT:HEAD` (no PHI,
@@ -745,9 +759,9 @@ message, and confirm the **"wiring started"** banner in `service.out.log`.
 
 **Log management:** logs land under `<DataDir>\logs` via NSSM. Configure rotation, keep the level at
 `INFO` or above (DEBUG can leak PHI — §6), treat `service.out/err.log` as **potential-PHI artifacts**
-(ACL them; don't copy these raw files off-box — `[logging].forward_*` forwards a PHI-redacted
-stream to your collector instead), and include them in your retention
-policy.
+(ACL them; don't copy these raw files off-box — `[logging].forward_*` sends the collector a copy
+instead), and include them in your retention policy. The forwarded copy passes the same best-effort
+redaction filters as these files, so treat the collector's copy as potential PHI too.
 
 **Graceful drain for maintenance:** `Stop-Service MessageFoundry` reaches the engine as Ctrl+C,
 through NSSM. That, or Ctrl+C on a foreground `serve`, makes the ASGI lifespan call `engine.stop()`

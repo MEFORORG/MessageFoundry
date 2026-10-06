@@ -130,8 +130,8 @@ def test_security_section_is_canonical(tmp_path: Path) -> None:
         "security.allow_unencrypted_phi = true\n"
         "security.production_instance = false\n",
     )
-    # Sign-in has no switch any more (vault BACKLOG #2719), so a loaded config always has it on.
-    assert s.auth.enabled is True and s.auth.require_mfa is False
+    # Sign-in has no switch any more (vault BACKLOG #2719, #2825), so there is none to read.
+    assert s.auth.require_mfa is False
     assert s.egress.deny_by_default is True
     assert s.api.serve_ui is True
     assert s.retention.messages_days == 45 and s.retention.allow_unbounded_phi is True
@@ -193,7 +193,7 @@ def test_the_sign_in_switch_is_refused_as_removed_in_every_form(tmp_path: Path) 
         with pytest.raises(ValueError, match="was REMOVED"):
             _load(tmp_path, "", environ={var: "false"})
     # CONTROL: the same loader accepts the switch beside it, so the refusal is about this key.
-    assert _load(tmp_path, "security.require_mfa = true\n").auth.enabled is True
+    assert _load(tmp_path, "security.require_mfa = true\n").auth.require_mfa is True
 
 
 def test_web_console_on_by_default(tmp_path: Path) -> None:
@@ -321,7 +321,7 @@ def test_secure_defaults_applied(tmp_path: Path) -> None:
     # ...and an ENTIRELY absent [security] section resolves to the secure internal posture (byte-identical
     # to pre-ADR-0118: auth on, MFA on, loopback bind).
     s = _load(tmp_path, "")
-    assert s.auth.enabled is True and s.auth.require_mfa is True
+    assert s.auth.require_mfa is True
     assert s.api.host == "127.0.0.1" and s.api.is_loopback is True
     assert s.security.local_access_only is True
 

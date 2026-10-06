@@ -61,7 +61,7 @@ appmod._assert_security_notice_is_deliverable = _boom  # type: ignore[assignment
 app = create_managed_app(
     db_path=Path(sys.argv[1]) / "probe.db",
     poll_interval=0.05,
-    auth_settings=AuthSettings(enabled=True),
+    auth_settings=AuthSettings(),
     egress_settings=EgressSettings(),
 )
 
