@@ -2838,7 +2838,7 @@ class AuthSettings(_Section):
     # DEFAULT ON since BACKLOG #288 (owner ruling 2026-09-26, ASVS 8.2.4). It used to default off,
     # with an exposure-time advisory asking an off-loopback operator to turn it on; the hardened path
     # is now the shipped path. Setting it false is a LOOSENING -- `security_loosenings()` names it
-    # whenever auth is on -- because it removes the only mid-session address signal.
+    # -- because it removes the only mid-session address signal.
     admin_new_ip_step_up: bool = True
 
     # Local-password policy — ASVS 5.0-aligned (WP-3): length-first, no mandatory composition.
@@ -3111,7 +3111,7 @@ class AuthSettings(_Section):
     # lockout: bounds password-spray + argon2 CPU-burn. In-process only; an exposed/multi-host
     # deployment must also front the API with a proxy/WAF limiter. 0 disables a limit, and a window
     # of 0 or less disables both. A count above its default, a window below it, and each off value is
-    # a LOOSENING that `security_loosenings()` names while auth is on (BACKLOG #1131); so are the
+    # a LOOSENING that `security_loosenings()` names (BACKLOG #1131); so are the
     # PHI-read, admin-write, session-cap and OIDC flow-cache limits below.
     login_rate_limit_enabled: bool = True
     login_rate_limit_per_ip: int = 10  # max attempts per client IP per window
@@ -7196,10 +7196,9 @@ def security_loosenings(
     interpreter (vault BACKLOG #2701), and
     ``[store].schema_management = auto`` on a server backend (#305). It is NOT yet
     an exhaustive registry of every security-relevant switch in every section; ``[store]``/``[auth]``
-    carry others (``encrypt``, ``trust_server_certificate``, ``enabled``, ``ad_tls_verify``,
+    carry others (``encrypt``, ``trust_server_certificate``, ``ad_tls_verify``,
     ``oidc_require_mfa_claim``, ``password_check_breached``) that are not reported here. Most are
-    gated elsewhere. ``enabled`` has no config key: ``serve`` always requires sign-in (vault BACKLOG
-    #2719). ``oidc_require_mfa_claim`` has no serve-time refusal of its own: turned off, it mints
+    gated elsewhere. ``oidc_require_mfa_claim`` has no serve-time refusal of its own: turned off, it mints
     every OIDC session with no factor met, and while ``require_mfa`` is on that session owes an
     engine factor. The parenthetical list above is enumerated in the floor test's exemption set so
     the gap is a written decision that a new switch cannot silently join. That set also holds at

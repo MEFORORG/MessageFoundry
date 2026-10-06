@@ -182,6 +182,13 @@ async def test_an_attached_service_cannot_be_opened(tmp_path: Path) -> None:
             create_app(engine, auth=service, allow_no_auth=True)
         async with _client(create_app(engine, auth=service)) as c:
             assert (await c.get(_PROTECTED)).status_code == 401
+        # Past both factory refusals: the flag set after a service is attached, as an embedder's own
+        # lifespan could. The request-time checks still answer a tokenless caller with no identity.
+        flagged = create_app(engine, auth=service)
+        flagged.state.allow_no_auth = True
+        async with _client(flagged) as c:
+            assert (await c.get(_PROTECTED)).status_code == 401
+            assert (await c.get(_ALWAYS_ANSWERS)).json()["version"] is None
         # The control: the opt-in with no service attached is the open mode.
         async with _client(create_app(engine, allow_no_auth=True)) as c:
             assert (await c.get(_PROTECTED)).status_code == 200

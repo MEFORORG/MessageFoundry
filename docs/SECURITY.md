@@ -855,7 +855,7 @@ route handler only when all of them pass.
 3. **The `require*()` deny-by-default ladder.** Its first two rungs, the 503 and the 401, answer
    before the request body is read; [Enforcement model](#enforcement-model) says how. The ladder
    runs in this order: **503** `authentication is not configured`
-   when no enabled `AuthService` is attached and `allow_no_auth` was not set (the fail-closed embedding
+   when no `AuthService` is attached and `allow_no_auth` was not set (the fail-closed embedding
    guard, SYS-1) → **401** when the bearer token resolves to no identity → **403** `password change
    required` when the identity is flagged `must_change_password` and the path is not must-change
    exempt (`_MUST_CHANGE_EXEMPT_PATHS`; at least `/auth/logout`, `/auth/me`, `/auth/mfa-verify` and

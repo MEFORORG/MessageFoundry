@@ -8831,8 +8831,8 @@ def create_managed_app(
                 # connection_stopped/queue_buildup still drains; bounded by the transport timeouts.
                 await notifier.aclose()
 
-    # Unset or disabled auth_settings no longer select the open mode: only the caller's opt-in,
-    # checked at the top, does (vault BACKLOG #2611).
+    # Settings never select the open mode: only the caller's opt-in, checked at the top, does
+    # (vault BACKLOG #2611, #2825).
     return create_app(
         lifespan=lifespan,
         # Build the opt-in uploaded-logs store in the SERVE path too (previously only the direct/test

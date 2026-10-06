@@ -72,14 +72,14 @@ section reference.
 | | `[store].allow_unmarked_ciphertext` | `false` (an unmarked value in an encrypted column is refused) |
 | | `[auth].ad_session_recheck_seconds` | `300` s (*conditional* — a loosening only once `ad_enabled`) |
 | | `[auth].ad_allow_insecure_ldap` | `false` (*conditional* — a loosening only while a plain bind is live; loads only under `enforcement = warn`. See its entry below) |
-| | `[auth].admin_new_ip_step_up` | `true` (*conditional* — a loosening only while auth is on) |
-| | `[auth].login_rate_limit_enabled`, `login_rate_limit_per_ip`, `login_rate_limit_global`, `login_rate_limit_window_seconds` | `true` / `10` / `60` / `60` s (*conditional* — a loosening only while auth is on; `false`, a count of `0` or above its default, or a window below `60` s is named, and `0` or a window of `0` or less turns a limit off) |
-| | `[auth].lockout_minutes`, `lockout_threshold`, `lockout_max_minutes` | `15` / `5` / `1440` (*conditional* — a loosening only while auth is on; minutes below `15` or a ceiling below `1440` is named, and so is a threshold above `5`; minutes of `0` or less means no lock ever holds) |
-| | `[auth].phi_read_rate_limit_enabled`, `phi_read_rate_limit_per_actor`, `phi_read_rate_limit_window_seconds` | `true` / `120` / `60` s (*conditional* — a loosening only while auth is on; `false`, a count of `0` or above `120`, or a window below `60` s) |
-| | `[auth].admin_write_rate_limit_enabled`, `admin_write_rate_limit_per_actor`, `admin_write_rate_limit_window_seconds`, `admin_write_min_interval_seconds` | `true` / `12` / `15` s / `0.15` s (*conditional* — a loosening only while auth is on; `false`, a count of `0` or above `12`, a window below `15` s, or a gap below `0.15` s) |
-| | `[auth].mfa_verify_min_elapsed_seconds`, `oidc_callback_min_elapsed_seconds` | `1.0` s / `1.0` s (*conditional* — a loosening only while auth is on, and the second only with OIDC on; a floor below `1.0` s, and `0` turns it off) |
-| | `[auth].max_sessions_per_user` | `5` (*conditional* — a loosening only while auth is on; `0` or less means unlimited, and so is named, as is any cap above `5`) |
-| | `[auth].oidc_flow_cache_max` | `512` (*conditional* — a loosening only while auth and OIDC are on; a cap above `512`. `0` or less refuses every flow, which is stricter) |
+| | `[auth].admin_new_ip_step_up` | `true` |
+| | `[auth].login_rate_limit_enabled`, `login_rate_limit_per_ip`, `login_rate_limit_global`, `login_rate_limit_window_seconds` | `true` / `10` / `60` / `60` s (`false`, a count of `0` or above its default, or a window below `60` s is named, and `0` or a window of `0` or less turns a limit off) |
+| | `[auth].lockout_minutes`, `lockout_threshold`, `lockout_max_minutes` | `15` / `5` / `1440` (minutes below `15` or a ceiling below `1440` is named, and so is a threshold above `5`; minutes of `0` or less means no lock ever holds) |
+| | `[auth].phi_read_rate_limit_enabled`, `phi_read_rate_limit_per_actor`, `phi_read_rate_limit_window_seconds` | `true` / `120` / `60` s (`false`, a count of `0` or above `120`, or a window below `60` s) |
+| | `[auth].admin_write_rate_limit_enabled`, `admin_write_rate_limit_per_actor`, `admin_write_rate_limit_window_seconds`, `admin_write_min_interval_seconds` | `true` / `12` / `15` s / `0.15` s (`false`, a count of `0` or above `12`, a window below `15` s, or a gap below `0.15` s) |
+| | `[auth].mfa_verify_min_elapsed_seconds`, `oidc_callback_min_elapsed_seconds` | `1.0` s / `1.0` s (*conditional* — the second a loosening only with OIDC on; a floor below `1.0` s, and `0` turns it off) |
+| | `[auth].max_sessions_per_user` | `5` (`0` or less means unlimited, and so is named, as is any cap above `5`) |
+| | `[auth].oidc_flow_cache_max` | `512` (*conditional* — a loosening only while OIDC is on; a cap above `512`. `0` or less refuses every flow, which is stricter) |
 | | `[api].trusted_proxies` | `[]` (entries covering every address, such as `0.0.0.0/0` or `::/0`, trust `X-Forwarded-For` from every peer, as the refused `*` would) |
 | | `[secret_rotation].enforce_store_key_expiry` | `true` (a calendar-overdue store DEK refuses to start) |
 | | `[api].plaintext_upstream_hop_acknowledged` | `false` (*conditional* — a loosening only while `[api].tls_terminated_upstream` is set with no `[api].tls_cert_file`, the one topology where the engine serves the proxy-to-engine hop in plaintext) |
