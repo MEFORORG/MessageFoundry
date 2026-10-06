@@ -11,12 +11,20 @@ Splitting is done from the message's own MSH-1/MSH-2 separators rather than assu
 defaults, so messages using non-standard encoding characters render correctly. MSH-1
 (the field separator) and MSH-2 (the encoding characters) are represented as literal
 single-value fields, matching how operators expect to see them.
+
+The tree is bounded by :data:`MAX_TREE_NODES` and :data:`MAX_TREE_VALUE_CHARS`. The byte and segment
+caps do not bound it: one field made of component separators is one segment and a few bytes per
+node, so a body under the 16 MiB cap could otherwise build millions of nodes; and each node carries
+its own raw text, so one large field is held again at every level it nests (vault BACKLOG #2762).
+Past either cap, or the byte and segment caps, :func:`parse_tree` raises
+:class:`ParseTreeTooLargeError` instead of building on.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from messagefoundry.parsing._builtin_hl7 import _extract_separators
 from messagefoundry.parsing.peek import (
     DEFAULT_MAX_MESSAGE_BYTES,
     DEFAULT_MAX_SEGMENTS,
@@ -25,7 +33,34 @@ from messagefoundry.parsing.peek import (
     normalize,
 )
 
-__all__ = ["TreeNode", "parse_tree"]
+__all__ = [
+    "MAX_TREE_NODES",
+    "MAX_TREE_VALUE_CHARS",
+    "ParseTreeTooLargeError",
+    "TreeNode",
+    "parse_tree",
+]
+
+#: The most nodes :func:`parse_tree` builds for one message. 2,000 segments of 20 simple fields is
+#: about 42,000 nodes; a message near the 10,000-segment cap can pass it, and gets the raw view. At
+#: the cap the tree builds in a fraction of a second and renders in under one (measured 2026-10-06),
+#: and a page of this many list items is already past what an operator can read.
+MAX_TREE_NODES = 100_000
+
+#: The most characters of node labels and values the tree holds. A node keeps its own raw text, so
+#: one field is held again as its repetition, component and subcomponent, and every label repeats
+#: the segment id, whose length nothing else bounds: a body of a few large fields, or one long
+#: segment id over many fields, stays under :data:`MAX_TREE_NODES` and still builds and renders many
+#: times its own size. An embedded document of up to about 2 MiB in one OBX-5 fits, held twice. The
+#: worst case at the cap, every character one that HTML escapes to five (``"``), rendered about
+#: 24 MB of page in under two seconds (measured 2026-10-06, off the event loop).
+MAX_TREE_VALUE_CHARS = 4 * 1024 * 1024
+
+
+class ParseTreeTooLargeError(HL7PeekError):
+    """The message is too large to render as a tree: past a tree cap, or the byte or segment cap.
+    A subclass of :class:`HL7PeekError` so a caller that only knows that error still degrades to
+    "no tree". The text carries limits and counts only, never message content."""
 
 
 @dataclass
@@ -42,87 +77,131 @@ class TreeNode:
     children: list[TreeNode] = field(default_factory=list)
 
 
-def parse_tree(raw: str | bytes) -> list[TreeNode]:
+def parse_tree(
+    raw: str | bytes,
+    *,
+    max_nodes: int = MAX_TREE_NODES,
+    max_value_chars: int = MAX_TREE_VALUE_CHARS,
+) -> list[TreeNode]:
     """Build a list of segment :class:`TreeNode` from ``raw``.
 
     Raises :class:`HL7PeekError` only when there is no parseable MSH to derive separators
-    from; otherwise it returns the best-effort structure of whatever is present.
+    from, and its subclass :class:`ParseTreeTooLargeError` when the message is too large to
+    render; otherwise it returns the best-effort structure of whatever is present.
     """
     text = normalize(raw).strip("\r")
     if not text:
         raise HL7PeekError("empty message")
-    enforce_size_limits(
-        text, max_bytes=DEFAULT_MAX_MESSAGE_BYTES, max_segments=DEFAULT_MAX_SEGMENTS
-    )
-    segments = [s for s in text.split("\r") if s]
-    if not segments or not segments[0].startswith("MSH"):
+    # Before the size checks, so a large non-HL7 body reads as "not HL7" rather than "too large".
+    if not text.startswith("MSH"):
         raise HL7PeekError("message does not start with an MSH segment")
+    try:
+        enforce_size_limits(
+            text, max_bytes=DEFAULT_MAX_MESSAGE_BYTES, max_segments=DEFAULT_MAX_SEGMENTS
+        )
+    except HL7PeekError as exc:
+        raise ParseTreeTooLargeError(str(exc)) from exc
+    segments = [s for s in text.split("\r") if s]
 
-    field_sep, comp_sep, rep_sep, sub_sep = _separators(segments[0])
-    return [_segment_node(seg, field_sep, comp_sep, rep_sep, sub_sep) for seg in segments]
+    builder = _TreeBuilder(_separators(segments[0]), max_nodes, max_value_chars)
+    return [builder.segment(seg) for seg in segments]
 
 
 def _separators(msh: str) -> tuple[str, str, str, str]:
-    """Derive (field, component, repetition, subcomponent) separators from the MSH line."""
-    field_sep = msh[3] if len(msh) > 3 else "|"
-    enc = msh[4:8] if len(msh) > 4 else "^~\\&"
-    comp_sep = enc[0] if len(enc) > 0 else "^"
-    rep_sep = enc[1] if len(enc) > 1 else "~"
-    sub_sep = enc[3] if len(enc) > 3 else "&"
+    """Derive (field, component, repetition, subcomponent) separators from the MSH line.
+
+    Read the way the parser reads them (:func:`_extract_separators`): MSH-2 ends at the next field
+    separator, so ``MSH|^~|A`` declares only a component and a repetition separator and ``A`` is
+    MSH-3. A fixed ``msh[4:8]`` slice took ``A`` as the subcomponent separator there. A header too
+    short for the parser to read keeps the defaults, so the viewer still shows it."""
+    if len(msh) < 5:
+        return (msh[3] if len(msh) > 3 else "|"), "^", "~", "&"
+    field_sep, comp_sep, rep_sep, sub_sep, _escape = _extract_separators(msh)
     return field_sep, comp_sep, rep_sep, sub_sep
 
 
-def _segment_node(
-    segment: str, field_sep: str, comp_sep: str, rep_sep: str, sub_sep: str
-) -> TreeNode:
-    parts = segment.split(field_sep)
-    seg_id = parts[0]
-    node = TreeNode(label=seg_id)
+class _TreeBuilder:
+    """Builds the nodes for one message, counting nodes and value characters against the caps.
 
-    if seg_id == "MSH":
-        # MSH-1 is the field separator itself; MSH-2 the encoding chars. Render them as
-        # literal fields and number the rest from 3 so paths line up with the spec.
-        node.children.append(TreeNode(label="MSH-1", value=field_sep))
-        if len(parts) > 1:
-            node.children.append(TreeNode(label="MSH-2", value=parts[1]))
-        raw_fields = parts[2:]
-        start_index = 3
-    else:
-        raw_fields = parts[1:]
-        start_index = 1
+    Every node is counted as it is made, and every split is checked first: a split into more parts
+    than the nodes left would pass the cap whatever follows, so it is refused before the list of
+    parts is allocated."""
 
-    for offset, raw_field in enumerate(raw_fields):
-        fld_index = start_index + offset
-        node.children.append(
-            _field_node(f"{seg_id}-{fld_index}", raw_field, comp_sep, rep_sep, sub_sep)
+    def __init__(
+        self, separators: tuple[str, str, str, str], max_nodes: int, max_value_chars: int
+    ) -> None:
+        self._field_sep, self._comp_sep, self._rep_sep, self._sub_sep = separators
+        self._max_nodes = max_nodes
+        self._max_value_chars = max_value_chars
+        self._nodes_left = max_nodes
+        self._chars_left = max_value_chars
+
+    def _too_many_nodes(self) -> ParseTreeTooLargeError:
+        return ParseTreeTooLargeError(
+            f"the parse tree is too large to render (more than {self._max_nodes:,} nodes)"
         )
-    return node
 
+    def _node(self, label: str, value: str = "") -> TreeNode:
+        self._nodes_left -= 1
+        self._chars_left -= len(label) + len(value)
+        if self._nodes_left < 0:
+            raise self._too_many_nodes()
+        if self._chars_left < 0:
+            raise ParseTreeTooLargeError(
+                "the parse tree is too large to render (more than "
+                f"{self._max_value_chars:,} characters of labels and values)"
+            )
+        return TreeNode(label=label, value=value)
 
-def _field_node(label: str, raw_field: str, comp_sep: str, rep_sep: str, sub_sep: str) -> TreeNode:
-    repetitions = raw_field.split(rep_sep)
-    if len(repetitions) > 1:
-        node = TreeNode(label=label, value=raw_field)
-        for i, rep in enumerate(repetitions, start=1):
-            node.children.append(_components_node(f"{label}[{i}]", rep, comp_sep, sub_sep))
-        return node
-    return _components_node(label, raw_field, comp_sep, sub_sep)
+    def _split(self, value: str, sep: str) -> list[str]:
+        # A split into count + 1 parts builds at least count + 1 nodes (the node that holds the
+        # value, or the segment node for a segment's id), so this refuses only what must exceed.
+        if value.count(sep) >= self._nodes_left:
+            raise self._too_many_nodes()
+        return value.split(sep)
 
+    def segment(self, segment: str) -> TreeNode:
+        parts = self._split(segment, self._field_sep)
+        seg_id = parts[0]
+        node = self._node(seg_id)
 
-def _components_node(label: str, raw_value: str, comp_sep: str, sub_sep: str) -> TreeNode:
-    components = raw_value.split(comp_sep)
-    if len(components) <= 1 and sub_sep not in raw_value:
-        # Atomic field/repetition: a single leaf carrying the value. (A lone component
-        # that itself has subcomponents, e.g. ``a&b&c``, still expands below.)
-        return TreeNode(label=label, value=raw_value)
-    node = TreeNode(label=label, value=raw_value)
-    for ci, comp in enumerate(components, start=1):
-        subs = comp.split(sub_sep)
-        if len(subs) <= 1:
-            node.children.append(TreeNode(label=f"{label}.{ci}", value=comp))
+        if seg_id == "MSH":
+            # MSH-1 is the field separator itself; MSH-2 the encoding chars. Render them as
+            # literal fields and number the rest from 3 so paths line up with the spec.
+            node.children.append(self._node("MSH-1", self._field_sep))
+            if len(parts) > 1:
+                node.children.append(self._node("MSH-2", parts[1]))
+            raw_fields = parts[2:]
+            start_index = 3
         else:
-            comp_node = TreeNode(label=f"{label}.{ci}", value=comp)
-            for si, sub in enumerate(subs, start=1):
-                comp_node.children.append(TreeNode(label=f"{label}.{ci}.{si}", value=sub))
+            raw_fields = parts[1:]
+            start_index = 1
+
+        for offset, raw_field in enumerate(raw_fields):
+            node.children.append(self._field(f"{seg_id}-{start_index + offset}", raw_field))
+        return node
+
+    def _field(self, label: str, raw_field: str) -> TreeNode:
+        repetitions = self._split(raw_field, self._rep_sep)
+        if len(repetitions) > 1:
+            node = self._node(label, raw_field)
+            for i, rep in enumerate(repetitions, start=1):
+                node.children.append(self._components(f"{label}[{i}]", rep))
+            return node
+        return self._components(label, raw_field)
+
+    def _components(self, label: str, raw_value: str) -> TreeNode:
+        components = self._split(raw_value, self._comp_sep)
+        if len(components) <= 1 and self._sub_sep not in raw_value:
+            # Atomic field/repetition: a single leaf carrying the value. (A lone component
+            # that itself has subcomponents, e.g. ``a&b&c``, still expands below.)
+            return self._node(label, raw_value)
+        node = self._node(label, raw_value)
+        for ci, comp in enumerate(components, start=1):
+            subs = self._split(comp, self._sub_sep)
+            comp_node = self._node(f"{label}.{ci}", comp)
+            if len(subs) > 1:
+                for si, sub in enumerate(subs, start=1):
+                    comp_node.children.append(self._node(f"{label}.{ci}.{si}", sub))
             node.children.append(comp_node)
-    return node
+        return node
