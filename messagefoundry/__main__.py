@@ -2080,7 +2080,8 @@ def _serve(args: argparse.Namespace) -> int:
     # below reads `enforcing`, and `enforce` is the shipped default on dev and staging as much as on
     # prod, so all three REFUSE on stock defaults. It downgrades to an advisory warning only under
     # enforcement = warn. No instance is exempt and none stays quiet: a dev or loopback instance is
-    # a PHI instance too, and this gate reads no synthetic or dev condition. Lock it down with
+    # a PHI instance too, since every instance carries patient data (BACKLOG #1279, ADR 0186), and
+    # this gate reads no synthetic or dev condition. Lock it down with
     # [security].block_unlisted_outbound or per-transport [egress].allowed_* lists.
     #
     # [egress] declares EIGHT allowed_* DESTINATION lists and every one is enforced downstream by
@@ -2170,7 +2171,8 @@ def _serve(args: argparse.Namespace) -> int:
     # partially-configured instance that the gate above lets start. This used to be an in-place flip of a false model
     # default; since vault BACKLOG #2605 the model default is true, so every entry point gets deny
     # and this block only announces the posture, or audits the explicit opt-out. No instance is
-    # exempt: a dev, loopback or staging instance is held to it exactly as a production one is.
+    # exempt: every instance carries patient data (BACKLOG #1279, ADR 0186), so a dev, loopback or
+    # staging instance is held to it exactly as a production one is.
     if not deny_written:
         # configure_logging has not run yet (root lastResort drops < WARNING), so announce on stderr
         # like the sibling posture gates rather than logging.info.
