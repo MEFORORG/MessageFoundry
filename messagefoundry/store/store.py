@@ -11148,10 +11148,10 @@ class MessageStore:
         """Open (still-``pending``, unexpired) approval requests, newest-first."""
         async with self._read() as db:
             cur = await db.execute(
-                # No requester_user_id here: the approver queue shows the DISPLAY label, and the
-                # authorization key is read through get_pending_approval on the approve path.
-                "SELECT id, operation, params, requester, requested_at, status, approver, decided_at,"
-                " expires_at FROM pending_approvals"
+                # requester_user_id is projected only so the queue can tell a caller a request is
+                # their own (BACKLOG #2460). The refusals still read it through get_pending_approval.
+                "SELECT id, operation, params, requester, requester_user_id, requested_at, status,"
+                " approver, decided_at, expires_at FROM pending_approvals"
                 " WHERE status = 'pending' AND (expires_at IS NULL OR expires_at > ?)"
                 " ORDER BY requested_at DESC LIMIT ?",
                 (now, limit),
@@ -11163,8 +11163,8 @@ class MessageStore:
         order: the Store protocol says why. Same projection as :meth:`list_pending_approvals`."""
         async with self._read() as db:
             cur = await db.execute(
-                "SELECT id, operation, params, requester, requested_at, status, approver, decided_at,"
-                " expires_at FROM pending_approvals"
+                "SELECT id, operation, params, requester, requester_user_id, requested_at, status,"
+                " approver, decided_at, expires_at FROM pending_approvals"
                 " WHERE status = 'interrupted'"
                 " ORDER BY requested_at ASC LIMIT ?",
                 (limit,),

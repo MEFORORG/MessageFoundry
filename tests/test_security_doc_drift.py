@@ -91,9 +91,11 @@ _H_CONTEXT = "### Contextual and environmental security inputs (ASVS 8.1.3 / 8.1
 # BACKLOG #2443 (ASVS 14.2.6, owner ruling R12) added three /ui routes and no JSON route: the
 # per-item reason reveals GET /ui/events/{event_id}/reason, /ui/alerts/{alert_id}/reason and
 # /ui/connection/{name}/events/{event_id}/reason. The JSON reveal is a query parameter.
+# BACKLOG #2460 added one /ui route and no JSON route: POST /ui/approvals/{approval_id}/resolve/
+# {outcome}, the console's resolve of an interrupted release.
 _ROUTES_DEFAULT = 115
 _ROUTES_WITH_DOCS = 119
-_ROUTES_WITH_UI = 239
+_ROUTES_WITH_UI = 240
 
 #: The ``/ui`` routes that legitimately carry no gate: the sign-in, re-auth and second-factor entry
 #: points. The three ``/ui/reauth*`` routes authenticate the session cookie MANUALLY — a gate

@@ -983,7 +983,7 @@ under `create_app()` (they sum to 99, not 96, because BOTH `/messages/export` ro
 | `FILES_BROWSE` | `files:browse` | **PHI** | 4 | `GET /uploads` (metadata), `GET /uploads/{id}/messages` (bulk decrypt+split), `POST /uploads/{id}/resend` |
 | `FILES_DELETE` | `files:delete` | | 1 | `DELETE /uploads/{id}` — destructive, audited cleanup |
 | `FILES_ACCESS_ANY` | `files:access_any` | **PHI** | 0 | no route — an **object-level** override (ASVS 8.2.2), enforced in the uploaded-files handler bodies rather than at a gate (the console calls those handlers directly over the seam, so a gate would not cover it). Uploaded files are **owner-only**: without this, `files:browse`/`files:delete` reach only what the caller uploaded; with it, every uploader's. It is not a capability of its own — the holder still needs `files:browse` / `files:delete` for the route. Never assignable to a custom role |
-| `APPROVALS_APPROVE` | `approvals:approve` | | 4 | `GET /approvals`, `POST /approvals/{id}/approve`, `/reject`, `/resolve` (dual control, ASVS 2.3.5). The console's Approvals page, `/ui/approvals`, reaches the first three (BACKLOG #1982). Never assignable to a custom role |
+| `APPROVALS_APPROVE` | `approvals:approve` | | 4 | `GET /approvals`, `POST /approvals/{id}/approve`, `/reject`, `/resolve` (dual control, ASVS 2.3.5). The console's Approvals page, `/ui/approvals`, reaches all four (BACKLOG #1982, #2460). Never assignable to a custom role |
 
 `config:validate` and `code:edit` have **no API endpoint yet**; they are defined so
 the Deployment/Coding roles are complete and those endpoints can be gated the moment they land, without
@@ -1372,6 +1372,7 @@ inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bu
 | `GET` | `/ui/approvals` | `approvals:approve` | `require_ui` |
 | `POST` | `/ui/approvals/{approval_id}/approve` | `approvals:approve` | `require_ui` — paces the write like `require_paced`; the requester can never approve their own request |
 | `POST` | `/ui/approvals/{approval_id}/reject` | `approvals:approve` | `require_ui` |
+| `POST` | `/ui/approvals/{approval_id}/resolve/{outcome}` | `approvals:approve` | `require_ui_step_up` — the fresh step-up the JSON resolve asks for; the requester can never resolve their own request (BACKLOG #2460) |
 | `GET` | `/ui/audit` | `audit:read` | `require_ui` |
 | `GET` | `/ui/cluster` | `monitoring:read` | `require_ui` |
 | `POST` | `/ui/cluster/force-stepdown` | `cluster:control` | `require_ui_step_up` |
@@ -1597,7 +1598,8 @@ else would need its own authorization rule stated here.
    (BACKLOG #1982), which mirror `POST /approvals/{approval_id}/approve` and `/reject`
    (`require_paced`, a floor `require_ui` charges too). They are flagged because
    `POST /approvals/{approval_id}/resolve`, same method and permission, carries `require_step_up`.
-   The console does not offer the resolve, so that step-up has no console route to be missing from.
+   The console's own resolve route, `POST /ui/approvals/{approval_id}/resolve/{outcome}` (BACKLOG
+   #2460), takes `require_ui_step_up`, so that step-up is not missing from it.
 
 Differences 4 and 5 are derived and pinned: a `/ui` route that is weaker than **any** JSON route holding
 the same permission set on the same method reds CI until it is listed here.
@@ -1700,7 +1702,13 @@ server-side, not a client confirmation). On release the captured operation is **
 `approval.approved` by the checker); `POST /approvals/{id}/reject` declines it (`approval.rejected`), and
 a request older than `[approvals].expiry_hours` can no longer be approved. Approvers see the open queue
 at `GET /approvals`, or on the console's **Approvals** page (`/ui/approvals`, BACKLOG #1982), which
-offers Approve and Reject on each pending request and lists `interrupted` releases read-only.
+offers Approve and Reject on each pending request and the resolve on each `interrupted` release.
+Each queued request carries `caller_is_requester`, compared on the user id as the refusals are
+(BACKLOG #2460). On the requester's own pending request the page offers only Withdraw, a reject;
+on their own interrupted release it offers nothing. Each queued request also carries the `params`
+its hold captured (BACKLOG #2458), so an approver sees what a release would re-run. What they may
+carry is stated on `PendingApprovalInfo` in `api/models.py`; only an Administrator holds
+`approvals:approve`, so no channel scope masks them.
 
 **A repeat of an open request files nothing (vault BACKLOG #2445).** When the same requester asks
 for the same operation with identical captured parameters while their earlier request is still
@@ -1784,7 +1792,8 @@ and when it was cut off. Once the operator has checked, `POST /approvals/{id}/re
 the row to the matching `resolved_*` status (owner ruling 2026-09-26). The resolve:
 
 - needs `approvals:approve` **and a fresh step-up** (`require_step_up`), which approve and reject do
-  not ask for;
+  not ask for. The console's resolve asks for the same (see the /ui route map). A stale window
+  lands the operator back on the page to choose again; the outcome is never re-posted for them;
 - refuses the original requester with **403**, keyed on the user id like the self-approval refusal. The
   approver who released the request may resolve it;
 - **never runs the operation again**, whichever outcome is chosen. If the effects are missing, request
@@ -1829,7 +1838,7 @@ keystroke-level model for user performance time with interactive systems", *Comm
 
 To release a request a person must at least see it and decide (M), pick out that one request (P), and
 submit (K). That is about **2.53 s**, even with the request on screen the instant it exists. The
-console's Approvals page has an Approve button beside each request, and that is exactly this path: see
+console's Approvals page has an Approve button beside each request another user raised, and that is exactly this path: see
 it, point at the button, click. From an HTTP tool, `POST /approvals/{id}/approve`, the person must carry
 the request's 32-character id into the command. Pointing at it costs P, and typing
 it costs 32 K, about 2.56 s, so the bound holds either way. The default sits about 20% below 2.53 s,
