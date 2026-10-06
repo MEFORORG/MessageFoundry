@@ -1726,6 +1726,15 @@ has already swapped when that row is written. So a failed write is logged at ERR
 still answers success. It reports `degraded: true` with `audit` among its `failures`. A released
 reload carries that into its `approval.approved` row.
 
+**An audit or store outage never answers a raw 500 on an approval route (vault BACKLOG #2255).**
+A refusal runs nothing, so a refusal whose own audit row fails still answers **409**: that is
+`approval.too_early` and `approval.stale_requester`. A claim, a rejection or a resolution whose
+status write the store refuses answers **503**, and nothing runs. After a rejection's status write,
+a failed `approval.rejected` row is logged and the rejection stands. Every audit row the gate fails
+to write is logged at ERROR with its detail, and raises an `audit_write_failed` alert keyed
+`approval:<id>`, carrying the lost row's action name. The status move and its audit row are still
+two writes, not one transaction.
+
 **A release records what happened to it (BACKLOG #1562).** The gate claims the request as
 `executing` before it runs the operation, so two approvers cannot both release it. It then settles
 the row to one of three outcomes, each with its own audit row after the `approval.release_attempted`

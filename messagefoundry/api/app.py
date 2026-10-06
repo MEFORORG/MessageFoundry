@@ -3689,11 +3689,14 @@ def create_app(
         #
         # This row covers the UNGATED path ONLY. A dual-control purge returns 202 above and is
         # executed later by the `_purge` executor in _build_approval_gate, which never re-enters this
-        # handler and writes no connection_purge row of its own. That path is not unaudited — the
-        # gate writes approval.requested / approval.approved, and the latter's detail carries the
-        # executor's {"cancelled": N} result — but those rows identify the operation only by
-        # approval_id: the connection NAME and the SCOPE live in the pending-approval row's params,
-        # not in the audit log. So a query of action='connection_purge' answers "which outbound, at
+        # handler and writes no connection_purge row of its own. That path is not unaudited: the
+        # gate writes approval.requested and approval.release_attempted, both before the purge runs.
+        # The executor's {"cancelled": N} result is recorded only in approval.approved, which is
+        # written after the purge and whose failure is logged and paged rather than raised (BACKLOG
+        # #1940, vault BACKLOG #2255). So a gated purge's COUNT can be missing from the audit log
+        # while the release itself is still recorded. And all of those rows identify the operation
+        # only by approval_id: the connection NAME and the SCOPE live in the pending-approval row's
+        # params, not in the audit log. So a query of action='connection_purge' answers "which outbound, at
         # what scope, cancelling how many" completely for ungated purges and not at all for gated
         # ones, which still need a join back through approval_id. Closing that asymmetry is the
         # sibling gap tracked for the _purge executor; it is deliberately not fixed here.
