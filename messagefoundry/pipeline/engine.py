@@ -1969,7 +1969,9 @@ class Engine:
         from messagefoundry.config.fingerprint import config_fingerprint_detail
 
         try:
-            return await asyncio.to_thread(config_fingerprint_detail, path), None
+            # A lambda, and not the bare function: the crypto inventory scanner follows a call it
+            # can see and not a function passed as a value, so this keeps the hash on its record.
+            return await asyncio.to_thread(lambda: config_fingerprint_detail(path)), None
         except (OSError, ValueError) as exc:
             reason = safe_exc(exc)
             log.warning("config fingerprint failed for %s: %s", path, reason)
