@@ -964,6 +964,20 @@ class _DirectoryLoginRefused(Exception):
         self.reason = reason
 
 
+class _DirectoryAccountConflict(Exception):
+    """A directory login lost the first-sight create race to a row it may not adopt (BACKLOG #2697).
+
+    Raised by :meth:`AuthService._upsert_ad_user` when its INSERT met the username index and the row
+    that won is LOCAL, or carries a different immutable id. Caught by
+    :meth:`AuthService._complete_ad_login`, which renders it as the conflict refusals it already
+    makes before the resolver runs: an ``account conflict`` outcome, audited with ``reason``.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 class _BindingChangedMidLogin(Exception):
     """An admin changed the account's federated binding while this login was still in flight.
 
@@ -2457,21 +2471,37 @@ class AuthService:
             await self._store.revoke_user_sessions(user_id)
         else:
             user_id = uuid4().hex
-            await self._store.create_user(
-                user_id=user_id,
-                username=username,
-                auth_provider=AuthProvider.LOCAL.value,
-                display_name=display_name,
-                # Seeds `notify_email` too (see `store.seed_notify_email`), which is the column the
-                # PHI security-notice start gate reads.
-                email=notify_email,
-                # No hash yet, deliberately: an account with no credential cannot be signed into, so
-                # the window before `set_password` below admits nobody. The flag is therefore
-                # unobservable until that write, which is what actually decides it.
-                password_hash=None,
-                must_change_password=True,
-                password_generated=False,
-            )
+            try:
+                await self._store.create_user(
+                    user_id=user_id,
+                    username=username,
+                    auth_provider=AuthProvider.LOCAL.value,
+                    display_name=display_name,
+                    # Seeds `notify_email` too (see `store.seed_notify_email`), which is the column
+                    # the PHI security-notice start gate reads.
+                    email=notify_email,
+                    # No hash yet, deliberately: an account with no credential cannot be signed into,
+                    # so the window before `set_password` below admits nobody. The flag is therefore
+                    # unobservable until that write, which is what actually decides it.
+                    password_hash=None,
+                    must_change_password=True,
+                    password_generated=False,
+                )
+            except Exception as exc:
+                if not _is_integrity_refusal(exc):
+                    raise
+                # BACKLOG #2697: another run, or a directory sign-in, took the name after the read
+                # above. Refused rather than repaired in place: a re-run reads the row and takes the
+                # repair branch, so `_existing_row_refusal`'s rules (#2288) stay in one place. This
+                # INSERT was the run's first write, so nothing was written. A refusal with no row
+                # holding the name is some other fault and re-raises untouched.
+                if await self._store.get_user_by_username(username) is None:
+                    raise
+                raise FirstAdministratorRefused(
+                    "an account with that username was created while this command ran, so this run "
+                    "wrote nothing. Run the command again: it then reads that account and either "
+                    "completes it or says why it cannot"
+                ) from exc
         await self._seed_roles()
         # ADR 0197 Amendment A (N-A): the step is consumed FIRST, before the credential or the
         # secret is written, so a code this row already spent (an interrupted earlier run in the
@@ -4398,6 +4428,16 @@ class AuthService:
             user = await self._upsert_ad_user(
                 principal, by_name=existing, federated=federated, client=client
             )
+        except _DirectoryAccountConflict as exc:
+            # BACKLOG #2697: a concurrent create took the name, and the row that won is not this
+            # principal's. The same refusal the two conflict branches above make, in their shape.
+            await self._audit(
+                "auth.login_failed",
+                actor=principal.username,
+                detail=_json({"provider": "ad", "reason": exc.reason}),
+                client=client,
+            )
+            return LoginOutcome(ok=False, error="account conflict", reason=exc.reason)
         except _DirectoryLoginRefused as exc:
             # The resolver refused before it wrote anything. Rendered here rather than there so the
             # audit row carries the caller's ``client`` and every directory refusal in this method
@@ -4711,6 +4751,11 @@ class AuthService:
         one (vault BACKLOG #2609, which is what ``federated`` is for), before any write. See the gate
         below the id-keyed lookup for why the condition is signalled from here rather than checked
         on the returned record.
+
+        A first sign-in that loses the create race to a concurrent one adopts the row that won
+        (BACKLOG #2697), after the same conflict and eligibility checks the caller makes on a row it
+        read. Raises :class:`_DirectoryAccountConflict` when that row is LOCAL or carries a different
+        immutable id.
         """
         if by_name is not None and by_name.directory_object_id != principal.directory_object_id:
             # Defensive, and deliberately a RAISE rather than a silent re-read. The caller's check is
@@ -4741,8 +4786,32 @@ class AuthService:
             if refusal is not None:
                 raise _DirectoryLoginRefused(refusal)
         if existing is None:
-            user_id = await self._create_directory_row(principal, client=client)
-        else:
+            try:
+                user_id = await self._create_directory_row(principal, client=client)
+            except Exception as exc:
+                if not _is_integrity_refusal(exc):
+                    raise
+                # BACKLOG #2697. A CONCURRENT FIRST SIGN-IN TOOK THE NAME BETWEEN THE READS ABOVE AND
+                # THIS INSERT. Two sign-ins of one person at once is ordinary, so the loser adopts the
+                # winner's row rather than failing. The username index is the only one that can fire
+                # here: `directory_object_id` carries no UNIQUE index on any backend. So the name is
+                # what is re-read, and a refusal with no row holding it is some other fault.
+                winner = await self._store.get_user_by_username(principal.username)
+                if winner is None:
+                    raise
+                # The checks `_complete_ad_login` makes on a row it read by name, in its order. That
+                # read ran before the winner existed, so nothing has asked them of this row yet.
+                if winner.auth_provider != AuthProvider.AD.value:
+                    raise _DirectoryAccountConflict("local_account_conflict") from exc
+                if winner.directory_object_id != principal.directory_object_id:
+                    raise _DirectoryAccountConflict(DIRECTORY_IDENTITY_CONFLICT) from exc
+                # BACKLOG #1637 / #1638: the eligibility gate stays before the first write, for the
+                # adopted row as for one the reads found. The winner may already be disabled.
+                refusal = _directory_login_refusal(winner, time.time(), federated=federated)
+                if refusal is not None:
+                    raise _DirectoryLoginRefused(refusal) from exc
+                existing = winner
+        if existing is not None:
             user_id = existing.id
             if principal.username != existing.username:
                 # BACKLOG #1532. Reachable only through the id-keyed lookup above: a name-keyed hit

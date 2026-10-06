@@ -6780,6 +6780,16 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # Refused before the prompt already; one that changed since is refused the same way.
         _emit_error(f"{_sentence(exc)} {_NOTHING_PROVISIONED}", as_json=args.json)
         return 2
+    except sqlite3.IntegrityError as exc:
+        # BACKLOG #2697. Ahead of the arm below, which it subclasses: a write the store refused is
+        # not a path that is not a database. A lost username race arrives as the refusal above; this
+        # is whatever integrity refusal the service did not name. Exit 1, this command's refusal.
+        return _emit_error(
+            f"the store refused one of this command's writes ({exc}), so no Administrator was "
+            "provisioned. Run the command again: it completes a partly written account or says "
+            "why it cannot",
+            as_json=args.json,
+        )
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
 
