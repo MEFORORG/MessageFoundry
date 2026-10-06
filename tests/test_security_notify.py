@@ -256,6 +256,83 @@ def test_a_directory_rename_renders_its_own_subject_and_both_names() -> None:
     assert "None" not in bare and "username:" not in bare
 
 
+def test_a_dropped_name_is_logged_not_silent(caplog: pytest.LogCaptureFixture) -> None:
+    """BACKLOG #2291: the renderer leaves a missing name out of the mail, and says so in the log.
+    The one sender always passes both names, so a gap is a sender defect the mail cannot report.
+    The full event is the control: it logs nothing."""
+    with caplog.at_level(logging.WARNING, logger=_NOTIFY_LOGGER):
+        _build_body(
+            SecurityEvent(
+                USERNAME_CHANGED,
+                username="jdoe-new",
+                email="j@example.org",
+                detail={"old_username": "jdoe", "new_username": "jdoe-new", "source": "directory"},
+            )
+        )
+        assert [r for r in caplog.records if r.name == _NOTIFY_LOGGER] == []
+        _build_body(
+            SecurityEvent(
+                USERNAME_CHANGED,
+                username="jdoe-new",
+                email="j@example.org",
+                detail={"new_username": "jdoe-new", "source": "directory"},
+            )
+        )
+    [record] = [r for r in caplog.records if r.name == _NOTIFY_LOGGER]
+    assert record.levelno == logging.WARNING
+    assert "old_username" in record.getMessage()
+    assert "jdoe-new" in record.getMessage()
+
+
+@pytest.mark.parametrize(
+    ("event_type", "detail"),
+    [
+        (EMAIL_CHANGED, {"new_email": "new@example.org", "source": "directory"}),
+        (
+            USERNAME_CHANGED,
+            {"old_username": "jdoe", "new_username": "jdoe-new", "source": "directory"},
+        ),
+    ],
+    ids=["email", "username"],
+)
+def test_a_directory_notice_says_what_its_address_means_and_drops_if_this_was_you(
+    event_type: str, detail: dict[str, Any]
+) -> None:
+    """BACKLOG #2291. The directory made the change, so the holder did not, and the address on the
+    notice is the sign-in that copied it down, not where it was made. "Source IP" would read as the
+    address of whoever made it, and "if this was you" cannot apply."""
+    body = _build_body(
+        SecurityEvent(
+            event_type,
+            username="jdoe-new",
+            email="j@example.org",
+            client_ip="10.0.0.9",
+            detail=detail,
+        )
+    )
+    assert "Source IP" not in body
+    assert "picked up this change when your account signed in from 10.0.0.9." in body
+    assert "If this was you" not in body
+    assert "If you did not expect this change, contact your MessageFoundry administrator." in body
+
+
+def test_a_console_email_change_keeps_its_source_ip_line_and_closing() -> None:
+    """Control for the test above: the directory wording is scoped to directory events. A console
+    change keeps the plain address line and the holder's own closing."""
+    body = _build_body(
+        SecurityEvent(
+            EMAIL_CHANGED,
+            username="bob",
+            email="old@example.org",
+            client_ip="10.0.0.9",
+            detail={"new_email": "new@example.org"},
+        )
+    )
+    assert "Source IP: 10.0.0.9" in body
+    assert "picked up this change" not in body
+    assert "If this was you, no action is needed." in body
+
+
 def test_body_names_a_moved_notification_address_as_such() -> None:
     """BACKLOG #1139, ADR 0182 Amendment A: an administrator moving the NOTIFICATION address sends
     this notice to the old one, and it is the last that address gets. It must say which address

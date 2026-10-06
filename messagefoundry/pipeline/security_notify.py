@@ -47,6 +47,7 @@ from messagefoundry.auth.notifications import (
 from messagefoundry.config.secretprovider import SecretProvider, resolve_connector_secret
 from messagefoundry.config.settings import AlertsSettings
 from messagefoundry.config.tls_policy import TrustAnchorPolicy, warn_smtp_verification_off
+from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.pipeline.alert_sinks import (
     ALERTS_SMTP_CELL,
     _BackgroundDispatcher,
@@ -223,6 +224,10 @@ def _build_body(event: SecurityEvent) -> str:
     set_by_admin = (
         event.event_type == NOTIFY_EMAIL_SET and event.detail.get("set_by") == "administrator"
     )
+    # BACKLOG #1139, #2291: the directory made this change, not the holder and not the console.
+    from_directory = event.event_type in (EMAIL_CHANGED, USERNAME_CHANGED) and (
+        event.detail.get("source") == "directory"
+    )
     if moved_by_admin:
         description = (
             "An administrator changed the address that receives security notices for your account."
@@ -319,14 +324,20 @@ def _build_body(event: SecurityEvent) -> str:
     if event.event_type == USERNAME_CHANGED:
         # BACKLOG #2017. Both names, so a holder who did not expect the change can tell which
         # account it was and what it is called now. A name the event lacks is left out rather than
-        # printed as "None".
+        # printed as "None", and the gap is logged (BACKLOG #2291): the one sender always passes
+        # both, so a missing one is a sender defect the holder's mail cannot report.
         for label, key in (("Previous username", "old_username"), ("New username", "new_username")):
             name = event.detail.get(key)
             if name:
                 lines.append(f"{label}: {name}")
-    if event.event_type in (EMAIL_CHANGED, USERNAME_CHANGED) and (
-        event.detail.get("source") == "directory"
-    ):
+            else:
+                log.warning(
+                    "security notice %s for %s carries no %s, so that line was left out of it",
+                    USERNAME_CHANGED,
+                    scrub_log_argument(event.username),
+                    key,
+                )
+    if from_directory:
         # BACKLOG #1139. Say WHERE the change came from, because it changes what the reader can do
         # about it: a directory-driven change is not editable in the console, so "contact your
         # administrator" is the only action, and an unexplained change the holder cannot find a
@@ -385,7 +396,15 @@ def _build_body(event: SecurityEvent) -> str:
                     "That was your last recovery code. Enroll a new authenticator to generate more, "
                     "or you will need an administrator to reset your second factor."
                 )
-    if event.client_ip:
+    if event.client_ip and from_directory:
+        # BACKLOG #2291. The directory made this change, so the address is not where it was made.
+        # The only sender passing one is the account's own directory sign-in, which copied the
+        # change down, and a bare "Source IP" line would read as the address of whoever made it.
+        lines.append(
+            f"MessageFoundry picked up this change when your account signed in from "
+            f"{event.client_ip}."
+        )
+    elif event.client_ip:
         lines.append(f"Source IP: {event.client_ip}")
     if lock_closing is not None:
         closing = lock_closing
@@ -411,6 +430,7 @@ def _build_body(event: SecurityEvent) -> str:
     elif (
         moved_by_admin
         or set_by_admin
+        or from_directory
         or event.event_type
         in (
             ACCOUNT_CREATED,
@@ -419,9 +439,9 @@ def _build_body(event: SecurityEvent) -> str:
             FEDERATED_IDENTITY_UNBOUND,
         )
     ):
-        # A directory rename is an administrator's act, so "if this was you" cannot apply to it.
-        # Nor to a federated link or unlink: both routes refuse an administrator changing their
-        # own account's binding.
+        # A directory rename or email change is an administrator's act, so "if this was you"
+        # cannot apply to it (the email half is BACKLOG #2291). Nor to a federated link or unlink:
+        # both routes refuse an administrator changing their own account's binding.
         closing = "If you did not expect this change, contact your MessageFoundry administrator."
     else:
         closing = "If this was you, no action is needed. If not, contact your MessageFoundry administrator."

@@ -5370,7 +5370,7 @@ class AuthService:
         until an operator removes the row holding the name. See the comment on that branch.
         """
 
-        async def _refuse(held_by: str | None, detected: str) -> None:
+        async def _refuse(held_by: str | None, detected: str, holds: str) -> None:
             # A DIFFERENT ROW ALREADY HOLDS THE NAME. Two accounts cannot share one; refusing the
             # write is the only safe move, and it is audited rather than logged-and-forgotten because
             # an operator has to resolve it. The likely cause is a stale row for a departed operator
@@ -5400,9 +5400,14 @@ class AuthService:
             # the whole point of absorbing the race; the discriminator is recorded because an operator
             # reading a run of these wants to know whether they are looking at one stale row or at
             # concurrent writers, and those want different fixes.
+            #
+            # ``holds`` is the name the row holds as this method read it, not the caller's
+            # ``old_username`` (BACKLOG #2291). The reconciler captured that at plan time, and a
+            # sign-in may have renamed the row since, so it can name an account that no longer
+            # exists. The audit actor and this warning both use the name an operator would find.
             await self._audit(
                 "auth.ad_username_refresh_conflict",
-                actor=old_username,
+                actor=holds,
                 detail=_json(
                     {
                         "user_id": user_id,
@@ -5418,28 +5423,43 @@ class AuthService:
                 "another account (%s). The stored name is left as-is, and this account will be "
                 "refused at its next sign-in (directory_identity_conflict) until the stale row is "
                 "removed; the session it holds now survives only to the absolute cap (BACKLOG #1532)",
-                old_username,
+                scrub_log_argument(holds),
                 detected,
             )
 
-        if held is not None and held.id != user_id:
-            await _refuse(held.id, "pre_check")
-            return
         # BACKLOG #2017. The row as it stands, read before the write, because the caller's
         # ``old_username`` can be stale by now: the reconciler captured it when it planned, and a
-        # directory sign-in may have renamed the row since. Three things follow from that read.
+        # directory sign-in may have renamed the row since. Four things follow from that read.
         #
         # A row that already carries the new name has nothing to change, so it gets no second audit
         # row and no second notice. The notice names the name the row actually had, not the plan's.
-        # And the write below compares on this name (BACKLOG #2290), so a refresh that read it just
-        # before another refresh of this row wrote cannot write as well.
+        # The write below compares on this name (BACKLOG #2290), so a refresh that read it just
+        # before another refresh of this row wrote cannot write as well. And every refusal audits
+        # under this name (BACKLOG #2291), so the read comes BEFORE the ``held`` pre-check.
+        #
+        # WHY THE READ STAYS ON THE LOGIN PATH TOO (BACKLOG #2291 step 4). That caller already holds
+        # ``existing``, so the read costs it one ``SELECT``. It runs only on a sign-in that carries a
+        # new name, so about once per directory rename, not once per sign-in. Keeping one read site
+        # for both callers keeps them on one path, which is the point of this method; the
+        # post-write read-back the item also counted went with BACKLOG #2290.
         before = await self._store.get_user(user_id)
         if before is None:
             # Deleted between the plan and the apply. Refused as a write that finds the row gone is
-            # refused below, without an UPDATE that can only match nothing.
-            await _refuse(user_id, "row_gone")
+            # refused below, without an UPDATE that can only match nothing. With no row there is
+            # no name it holds, so the caller's is the last one known for it.
+            await _refuse(user_id, "row_gone", old_username)
+            return
+        if held is not None and held.id != user_id:
+            await _refuse(held.id, "pre_check", before.username)
             return
         if before.username == new_username:
+            # Another caller applied this rename first, in sequence (BACKLOG #2291). Nothing is
+            # wrong, so INFO: the line shows why no audit row or notice followed.
+            _log.info(
+                "AD account %s already holds its directory name, so the rename refresh wrote "
+                "nothing and sends no second audit row or notice (BACKLOG #2291)",
+                user_id,
+            )
             return
         try:
             # BACKLOG #2290. A compare-and-set on the name just read, so of two refreshes of this
@@ -5492,7 +5512,7 @@ class AuthService:
             # Re-read rather than guess who won: this is an error path, the cost is irrelevant, and an
             # audit row naming the holder is what makes the collision actionable.
             winner = await self._store.get_user_by_username(new_username)
-            await _refuse(winner.id if winner is not None else None, "write_race")
+            await _refuse(winner.id if winner is not None else None, "write_race", before.username)
             return
         # AUDIT SUCCESS ONLY ON A WRITE THAT LANDED. The UPDATE can match zero rows and raise
         # nothing, so an unconditional success audit would report a rename that did not happen. An
@@ -5516,10 +5536,12 @@ class AuthService:
         if not written:
             after = await self._store.get_user(user_id)
             if after is None:
-                await _refuse(user_id, "row_gone")
+                await _refuse(user_id, "row_gone", before.username)
             elif after.username == before.username:
                 holder = await self._store.get_user_by_username(new_username)
-                await _refuse(holder.id if holder is not None else None, "write_noop")
+                await _refuse(
+                    holder.id if holder is not None else None, "write_noop", before.username
+                )
             else:
                 _log.info(
                     "AD account %s: another refresh already changed the stored name (now %s), "

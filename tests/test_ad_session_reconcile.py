@@ -1772,7 +1772,9 @@ async def test_a_rename_that_writes_nothing_sends_no_notice(shape: str) -> None:
         await store.close()
 
 
-async def test_a_rename_already_applied_by_another_caller_is_not_told_twice() -> None:
+async def test_a_rename_already_applied_by_another_caller_is_not_told_twice(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """The reconciler plans a rename, a directory sign-in applies it first, then the plan applies.
 
     The pre-read finds the new name already in place and returns before any write, so the holder
@@ -1791,6 +1793,7 @@ async def test_a_rename_already_applied_by_another_caller_is_not_told_twice() ->
         held = await store.get_user_by_username("jdoe-married")
         assert held is not None and held.id == user_id
 
+        caplog.set_level(logging.INFO, logger="messagefoundry.auth.service")
         await service._refresh_cached_username(
             user_id=user_id, old_username="jdoe", new_username="jdoe-married", held=held
         )
@@ -1799,6 +1802,13 @@ async def test_a_rename_already_applied_by_another_caller_is_not_told_twice() ->
         assert not [
             a for a in await store.list_audit() if a["action"] == "auth.ad_username_refreshed"
         ]
+        # BACKLOG #2291: the skip says why at INFO, so it is visible without reading as a fault.
+        skipped = [
+            r
+            for r in caplog.records
+            if r.name == "messagefoundry.auth.service" and "BACKLOG #2291" in r.getMessage()
+        ]
+        assert [r.levelno for r in skipped] == [logging.INFO], "the skipped rename was silent"
     finally:
         await store.close()
 
@@ -1847,6 +1857,80 @@ async def test_a_row_deleted_before_the_apply_is_refused_without_a_write_or_a_no
             if a["action"] == "auth.ad_username_refresh_conflict"
         ]
         assert json.loads(conflict["detail"])["detected"] == "row_gone"
+        # No row is left to hold a name, so the caller's is the last one known (BACKLOG #2291).
+        assert conflict["actor"] == "jdoe"
+        assert not [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("shape", ["pre_check", "write_race", "write_noop", "row_gone"])
+async def test_a_refused_rename_is_audited_under_the_name_the_row_holds(shape: str) -> None:
+    """BACKLOG #2291. The caller's ``old_username`` is the reconciler's plan-time name, and a
+    sign-in can rename the row before the plan applies. A refusal audited under the plan's name
+    would name an account that no longer exists, so every refusal names what the row holds.
+
+    The row is renamed to ``jdoe-interim`` first and the refresh is passed the stale ``jdoe``.
+    One case per way the refresh refuses after it has read the row; each is asserted to have
+    refused, so none passes by never reaching the branch."""
+    store, _ldap, service, notifier, user_id = await _renamed_service()
+    try:
+        assert await store.set_user_username(user_id, "jdoe-interim", expected_username="jdoe")
+        held: UserRecord | None = None
+        if shape == "pre_check":
+            await store.create_user(
+                user_id="holder-row",
+                username="jdoe-married",
+                auth_provider="ad",
+                password_generated=False,
+            )
+            held = await store.get_user_by_username("jdoe-married")
+        elif shape == "write_race":
+
+            async def _lose(*a: object, **kw: object) -> bool:
+                await store.create_user(
+                    user_id="winner",
+                    username="jdoe-married",
+                    auth_provider="ad",
+                    password_generated=False,
+                )
+                raise sqlite3.IntegrityError("UNIQUE constraint failed: users.username")
+
+            store.set_user_username = _lose  # type: ignore[method-assign]
+        elif shape == "write_noop":
+
+            async def _match_nothing(*a: object, **kw: object) -> bool:
+                await store.create_user(
+                    user_id="squatter",
+                    username="jdoe-married",
+                    auth_provider="ad",
+                    password_generated=False,
+                )
+                return False
+
+            store.set_user_username = _match_nothing  # type: ignore[method-assign]
+        else:
+            delete_user = store.delete_user
+
+            async def _row_deleted(*a: object, **kw: object) -> bool:
+                await delete_user(user_id)
+                return False
+
+            store.set_user_username = _row_deleted  # type: ignore[method-assign]
+
+        await service._refresh_cached_username(
+            user_id=user_id, old_username="jdoe", new_username="jdoe-married", held=held
+        )
+
+        [conflict] = [
+            a
+            for a in await store.list_audit()
+            if a["action"] == "auth.ad_username_refresh_conflict"
+        ]
+        assert json.loads(conflict["detail"])["detected"] == shape
+        assert conflict["actor"] == "jdoe-interim", (
+            f"a {shape} refusal audited the caller's stale name, not the one the row held"
+        )
         assert not [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
     finally:
         await store.close()
