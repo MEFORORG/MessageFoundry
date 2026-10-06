@@ -33,6 +33,15 @@ TRACE_REDACTED = "‹redacted›"  # ‹redacted›
 _reveal = False
 
 
+# What ``str.format`` raises on a malformed template, each one measured (vault BACKLOG #2789): a
+# missing slot (``IndexError``/``KeyError``), a bad spec or conversion (``ValueError``), an attribute
+# or index the value lacks (``"{0.x}"`` gives ``AttributeError``, ``"{0[k]}"`` on a str gives
+# ``TypeError``), a width too wide to allocate (``"{:>9999999999999}"`` gives ``MemoryError``), and a
+# template that is not a str at all (``AttributeError``: it has no ``format``). The format runs before
+# ``_logger.debug`` decides anything, so it fails at every log level, INFO included.
+_FORMAT_FAILURES = (AttributeError, IndexError, KeyError, MemoryError, TypeError, ValueError)
+
+
 def log_note(template: str, /, *values: object) -> None:
     """Emit a diagnostic line to the ``messagefoundry.diagnostics`` DEBUG log (Corepoint ``EnvLogText``).
 
@@ -43,8 +52,14 @@ def log_note(template: str, /, *values: object) -> None:
     shown: tuple[object, ...] = values if _reveal else tuple(TRACE_REDACTED for _ in values)
     try:
         _logger.debug(template.format(*shown))
-    except (IndexError, KeyError, ValueError):
-        _logger.debug("log_note: could not format %r with %d value(s)", template, len(values))
+    except _FORMAT_FAILURES as exc:
+        # The type name only: an exception's text can quote a slot or a revealed value.
+        _logger.debug(
+            "log_note: could not format %r with %d value(s): %s",
+            template,
+            len(values),
+            type(exc).__name__,
+        )
 
 
 def checkpoint(msg: Message, label: str = "") -> None:
