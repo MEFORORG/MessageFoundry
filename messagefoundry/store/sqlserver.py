@@ -10305,11 +10305,14 @@ class SqlServerStore:
         top = "TOP (1) " if top_only else ""
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
-                # `top_only` cancels the true FIFO head, so the tiebreak after next_attempt_at must match
-                # the claim's seq-only order, NOT created_at (no longer the ordering key; ADR 0059).
+                # `top_only` cancels the true FIFO head, so it orders by the claim's seq-only key alone
+                # (ADR 0059), even while that head is backing off. Not next_attempt_at first: mark_failed
+                # pushes a failed head's next_attempt_at past the younger rows behind it, so that key
+                # would pick a healthy younger row and leave the head blocking the lane (vault BACKLOG
+                # #2754).
                 await cur.execute(
                     f"SELECT {top}id, message_id FROM queue WHERE {' AND '.join(where)}"
-                    " ORDER BY next_attempt_at, seq",
+                    " ORDER BY seq",
                     tuple(params),
                 )
                 rows = [(r[0], r[1]) for r in await cur.fetchall()]
