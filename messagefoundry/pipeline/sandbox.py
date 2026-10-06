@@ -521,12 +521,14 @@ def _reap_process_tree(proc: subprocess.Popen[bytes], job: int | None) -> None:
 
 
 class SandboxSessionClosed(SandboxError):
-    """A dispatch reached a session that was already closed, so no Router or Handler ran.
+    """A dispatch reached a session that was already closed, so that dispatch did not run.
 
-    The one :class:`SandboxError` that says nothing about the message: the engine closes a session
-    when a reload replaces its worker, and a router or transform worker may have resolved that session
-    just before. The runner retries it on the session it resolves now, or re-pends the row, and never
-    dead-letters it as a Router or Handler fault (vault BACKLOG #2772)."""
+    It says nothing about the message: the engine closes a session when a reload replaces its worker,
+    and a router or transform worker may have resolved that session just before. An earlier dispatch
+    on the same session may have run (``route_only`` runs the Router, then each ``accepts=``
+    predicate), which is safe to repeat because Routers are pure. The runner retries on a fresh
+    session or re-pends the row, and never dead-letters it as a Router or Handler fault (vault
+    BACKLOG #2772)."""
 
 
 class SandboxSession:

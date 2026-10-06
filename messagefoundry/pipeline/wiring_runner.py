@@ -4145,7 +4145,8 @@ class RegistryRunner:
         """Drop every sandbox session and close its worker, off the loop: each ``close()`` waits on
         a process. A no-op unless ``[sandbox].mode=subprocess`` spawned any. The next dispatch on an
         inbound makes a fresh session, whose worker loads the config as it is then. A dispatch already
-        holding a closed session is retried by :meth:`_off_loop_sandboxed`, never dead-lettered."""
+        holding a closed session is retried or re-pended by :meth:`_off_loop_sandboxed`, never
+        dead-lettered as a Router or Handler fault."""
         if not self._sandbox_sessions:
             return
         sessions = list(self._sandbox_sessions.values())
@@ -4192,32 +4193,41 @@ class RegistryRunner:
         return session
 
     async def _off_loop_sandboxed[T](
-        self, name: str, fn: Callable[..., T], /, *args: Any, **kwargs: Any
+        self, name: str, fn: Callable[..., T], registry: Registry, /, *args: Any, **kwargs: Any
     ) -> T:
-        """``fn(*args, sandbox=<inbound name's session>, **kwargs)`` in a thread, run once more on a
-        fresh session when a reload closed the one resolved (vault BACKLOG #2772).
+        """``fn(registry, *args, sandbox=<inbound name's session>, **kwargs)`` in a thread, which a
+        reload that closes the session mid-call never turns into a dead-letter (vault BACKLOG #2772).
 
         A reload closes every session (:meth:`_close_sandbox_sessions`) while the router and transform
         workers keep running. A worker resolves its session here, on the loop, and dispatches from the
-        thread, so the close can land in between, and :class:`SandboxSessionClosed` then says nothing
-        about the message: no Router or Handler ran. The retry resolves a session again, whose worker
-        loads the graph being served now. Routers and Handlers are pure, so a re-run is the
-        at-least-once re-derivation the pipeline already relies on.
+        thread, so the close can land in between and raise :class:`SandboxSessionClosed`. The
+        dispatch that raised did not run. ``route_only`` dispatches more than once on one session (the
+        Router, then each ``accepts=`` predicate), so the Router itself may already have run; that is
+        safe to run again because Routers and Handlers are pure.
 
-        A second close inside the same call (another reload, or a failed reload's rollback) is raised.
-        So is the first one while the runner stops, because shutdown closes the sessions after it has
-        cancelled the workers and nothing would reap a worker started now. The caller lets the
+        The retry happens only when ``registry`` is still the one being served, which is the case
+        after a failed reload's rollback. Otherwise every argument the caller built (``registry``, the
+        inbound, the run context) belongs to the old graph while a fresh session's worker would load
+        the new one, so the exception is raised instead, as it is while the runner stops (shutdown
+        closes the sessions after cancelling the workers, and nothing would reap a worker started
+        then). Raising also starts no session for an inbound the reload removed. The caller lets the
         exception past its internal-error policy to the worker's fault arm, which re-pends the row
-        (per-lane #1611, pooled ADR 0070 T17); it is never a dead-letter."""
+        (per-lane #1611, pooled ADR 0070 T17), and the next claim reads the registry, the inbound and
+        the session afresh. Either way the message is not dead-lettered for the close."""
         try:
-            return await asyncio.to_thread(fn, *args, sandbox=self._sandbox_for(name), **kwargs)
+            return await asyncio.to_thread(
+                fn, registry, *args, sandbox=self._sandbox_for(name), **kwargs
+            )
         except SandboxSessionClosed:
-            if self._stop.is_set():
+            if self._stop.is_set() or self.registry is not registry:
                 raise
             log.info(
-                "inbound %r: a reload recycled its sandbox worker mid-dispatch; retrying", name
+                "inbound %r: its sandbox worker was recycled mid-dispatch; retrying",
+                name,
             )
-            return await asyncio.to_thread(fn, *args, sandbox=self._sandbox_for(name), **kwargs)
+            return await asyncio.to_thread(
+                fn, registry, *args, sandbox=self._sandbox_for(name), **kwargs
+            )
 
     async def stop(
         self,
@@ -7664,8 +7674,9 @@ class RegistryRunner:
                     return _ItemOutcome.PROCESSED, None
                 # else: ineligible per-message → fall through to the split path verbatim.
         except SandboxSessionClosed:
-            # Not a Router or Handler fault: none ran (see _off_loop_sandboxed). Raised past the
-            # internal-error policy to the caller's fault arm, which re-pends the row.
+            # Not a Router or Handler fault: the dispatch that raised did not run (see
+            # _off_loop_sandboxed). Raised past the internal-error policy to the caller's fault arm,
+            # which re-pends the row.
             raise
         except Exception as exc:
             # Router code error (incl. an unknown handler name) OR — on the inline fast-path —
@@ -8123,8 +8134,9 @@ class RegistryRunner:
                         run_context=transform_rc,
                     )
         except SandboxSessionClosed:
-            # Not a Handler fault: no Handler ran (see _off_loop_sandboxed). Raised, so the caller
-            # takes it as INFRA and re-pends the row, like the store-read fault above.
+            # Not a Handler fault: the dispatch that raised did not run (see _off_loop_sandboxed).
+            # Raised, so the caller takes it as INFRA and re-pends the row, like the store-read fault
+            # above.
             raise
         except Exception as exc:
             # Handler/transform code error (incl. an unknown outbound name). CONTENT: captured as
