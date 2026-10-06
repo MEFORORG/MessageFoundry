@@ -669,7 +669,13 @@ class UploadStore:
 
         Raises :class:`UploadTooLargeError` if it exceeds ``max_bytes``, :class:`UploadContentError`
         on a disallowed extension / content mismatch (ASVS 5.2.2), or :class:`UploadQuotaError` when
-        the uploader's file-count or aggregate-byte quota would be exceeded (ASVS 5.2.4)."""
+        the uploader's file-count or aggregate-byte quota would be exceeded (ASVS 5.2.4).
+
+        **A cancellation that reaches ``save`` after the pair landed removes it (BACKLOG #2262).**
+        The caller writes ``upload.create`` only once this returns. A kept pair would be stored with
+        no creation row, while the client was told the upload failed and may well retry it. A
+        removal the filesystem refuses is logged at ERROR. This covers ``save`` only. A caller
+        cancelled in its own audit write, after this returned, still keeps the file."""
         if not uploader_id:
             raise ValueError("uploader_id is required (an upload with no owner id is unreachable)")
         # Only the cheap size check runs on the loop; the sha256, the whole-file split, the cipher, and
@@ -686,8 +692,11 @@ class UploadStore:
         validate_upload_content(display, data)
         ctype = content_type or content_type_for(display)
         file_id = secrets.token_hex(16)
+        # Set by the write thread once the sidecar lands; read only after that thread has finished.
+        landed = False
 
         def _build_and_write(in_flight: tuple[int, int]) -> UploadedFileMeta:
+            nonlocal landed
             # Per-uploader quota (ASVS 5.2.4): scan the uploader's existing sidecars and refuse BEFORE
             # writing when this file would exceed their file-count or aggregate-byte cap. Runs in the same
             # off-loop thread as the write, and the caller holds _quota_lock across BOTH, so no second
@@ -750,6 +759,7 @@ class UploadStore:
                     with contextlib.suppress(OSError):
                         blob_path.unlink(missing_ok=True)
                     raise
+            landed = True
             return meta
 
         # One critical section per process: quota check + write. See _quota_lock in __init__.
@@ -758,20 +768,58 @@ class UploadStore:
         # _build_and_write. UploadQuotaError carries the argument for why that order counts every
         # sibling upload. The reservation is released only once the file is on disk (or the write
         # fails), which is what the argument needs.
-        async with self._quota_lock:
-            reserved = await self._reserve_across_shards(
-                uploader_id=uploader_id, uploader=uploader, size=len(data)
-            )
-            try:
-                in_flight = (
-                    await self._ledger.upload_quota_in_flight(uploader_id)
-                    if self._ledger is not None
-                    else (0, 0)
+        #
+        # The cancel handler sits OUTSIDE the lock so it also catches a cancellation that lands in
+        # the release await, after the write returned. A disk scan between the release and the
+        # removal over-counts the pair, which can refuse a sibling but never admits one too many.
+        # A release cut short by a cancellation is not retried here; what then happens to the
+        # reservation is stated once, in _release_across_shards.
+        try:
+            async with self._quota_lock:
+                reserved = await self._reserve_across_shards(
+                    uploader_id=uploader_id, uploader=uploader, size=len(data)
                 )
-                return await _to_thread_to_completion(_build_and_write, in_flight)
-            finally:
-                if reserved:
-                    await self._release_across_shards(uploader_id=uploader_id, size=len(data))
+                try:
+                    in_flight = (
+                        await self._ledger.upload_quota_in_flight(uploader_id)
+                        if self._ledger is not None
+                        else (0, 0)
+                    )
+                    return await _to_thread_to_completion(_build_and_write, in_flight)
+                finally:
+                    if reserved:
+                        await self._release_across_shards(uploader_id=uploader_id, size=len(data))
+        except asyncio.CancelledError:
+            if landed:
+                # Cancel-resistant, like the write. A request deadline is delivered through anyio
+                # task groups, which cancel again at every await, and a plain to_thread job that
+                # is cancelled before a worker picks it up never runs at all. A cleanup failure
+                # must not replace the cancellation, so it is logged and the cancel raised.
+                try:
+                    await _to_thread_to_completion(self._discard_cancelled_sync, file_id)
+                except Exception:  # noqa: BLE001 — logged; the cancellation is what propagates
+                    _log.error("could not remove cancelled upload %s", file_id, exc_info=True)
+            raise
+
+    def _discard_cancelled_sync(self, file_id: str) -> None:
+        """Remove a pair whose save was cancelled after it landed (BACKLOG #2262; see :meth:`save`).
+
+        Body first, then the sidecar, as :meth:`delete` and :meth:`prune_expired` do. The sidecar is
+        the listing key, so it stays until the body is gone, and the orphan sweep never sees a body
+        with no sidecar. A refused body unlink keeps the whole pair, listed and billed. A refused
+        sidecar unlink leaves a listed sidecar with no body, which the retention prune clears. The
+        log names the ``file_id`` only, because the filename can carry PHI."""
+        blob_path, meta_path = self._paths(file_id)
+        try:
+            blob_path.unlink(missing_ok=True)
+            meta_path.unlink(missing_ok=True)
+        except OSError as exc:
+            _log.error(
+                "upload %s was cancelled after its file landed and was not fully removed; what "
+                "remains has no upload.create audit row: %s",
+                file_id,
+                exc,
+            )
 
     async def _reserve_across_shards(self, *, uploader_id: str, uploader: str, size: int) -> bool:
         """Take this uploader's cross-shard in-flight reservation; return whether one is held.
