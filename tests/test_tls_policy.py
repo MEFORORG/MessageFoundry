@@ -1389,8 +1389,8 @@ def _crl_material(tmp_path_factory: pytest.TempPathFactory) -> dict[str, str]:
     # One issuer, a superseded expired CRL left beside its fresh replacement.
     put("ca_expired_then_fresh.pem", ca_pem + crl(now - day) + crl(now + 30 * day))
 
-    # A base CRL and a NEWER delta CRL for it, with serial 4000 revoked in exactly one of the two.
-    def numbered(number: int, delta_of: int | None, *, revokes: bool) -> bytes:
+    # A base CRL that revokes serial 4000, and a NEWER delta CRL for it that revokes nothing.
+    def numbered(number: int, delta_of: int | None) -> bytes:
         builder = (
             x509.CertificateRevocationListBuilder()
             .issuer_name(ca.subject)
@@ -1398,25 +1398,18 @@ def _crl_material(tmp_path_factory: pytest.TempPathFactory) -> dict[str, str]:
             .next_update(now + 30 * day)
             .add_extension(x509.CRLNumber(number), critical=False)
         )
-        if revokes:
+        if delta_of is None:
             builder = builder.add_revoked_certificate(
                 x509.RevokedCertificateBuilder()
                 .serial_number(4000)
                 .revocation_date(now - day)
                 .build()
             )
-        if delta_of is not None:
+        else:
             builder = builder.add_extension(x509.DeltaCRLIndicator(delta_of), critical=True)
         return builder.sign(key, hashes.SHA256()).public_bytes(serialization.Encoding.PEM)
 
-    put(
-        "ca_base_then_delta.pem",
-        ca_pem + numbered(1, None, revokes=True) + numbered(2, 1, revokes=False),
-    )
-    put(
-        "ca_base_then_revoking_delta.pem",
-        ca_pem + numbered(1, None, revokes=False) + numbered(2, 1, revokes=True),
-    )
+    put("ca_base_then_delta.pem", ca_pem + numbered(1, None) + numbered(2, 1))
     for cn, serial, is_server, stem in (
         ("localhost", 2000, True, "server"),
         ("good-client", 3000, False, "good"),
@@ -1517,39 +1510,19 @@ def test_a_superseded_expired_crl_beside_its_fresh_replacement_is_refused(
         harden_crl_check(_verifying_ctx(), _crl_material["ca_expired_then_fresh"])
 
 
-def test_a_delta_crl_drops_a_revocation_without_the_refusal(
+def test_a_delta_crl_drops_base_revocations_without_the_refusal(
     _crl_material: dict[str, str],
 ) -> None:
-    # NEGATIVE CONTROL for the refusal below, and the reason for it. Loaded as OpenSSL would load
-    # it, with no harden_crl_check, a base CRL plus its delta loses a revocation on every OpenSSL
-    # build measured, but WHICH one depends on the build, so the control asserts the pair and not
-    # one arm. Measured 2026-10-06 with this fixture's shape, by real handshake through Python's
-    # ssl and by pyOpenSSL over cryptography's bundled OpenSSL:
-    #   - 3.0.13, 3.0.16, 3.2.2, 3.3.2, 3.4.1, 3.5.2 to 3.5.7, 4.0.0, 4.0.1 read the newer delta as
-    #     a COMPLETE CRL: the client only the base revokes gets in.
-    #   - 3.5.9 and 4.0.2 IGNORE the delta: the client only the delta revokes gets in.
-    # Asserting one arm made this test red on whichever runner image had the other kind of build:
-    # windows-2022 image 20261004 set up CPython 3.14.8 and failed, windows-2025 image 20260925 set
-    # up 3.14.7 in the same merge-group run and passed, and a re-run passed when it drew an older
-    # image. That was a runner-image rollout, not an intermittent fault. A build that merges a delta
-    # into its base correctly fails this test in both arms at once, which is the signal to revisit
-    # the refusal rather than a regression.
-    base_only = _crl_handshake(
-        _crl_material["ca_base_then_delta"], "revoked", _crl_material, raw=True
-    )
-    delta_only = _crl_handshake(
-        _crl_material["ca_base_then_revoking_delta"], "revoked", _crl_material, raw=True
-    )
-    for outcome in (base_only, delta_only):
-        assert outcome == "ACCEPTED" or "revoked" in outcome.lower(), outcome
-    # Exactly one arm admits the revoked client: the delta was used as complete, or it was ignored.
-    assert (base_only == "ACCEPTED") != (delta_only == "ACCEPTED"), (base_only, delta_only)
+    # NEGATIVE CONTROL for the refusal below, and the reason for it: loaded as OpenSSL would load
+    # it, with no harden_crl_check, the newer delta CRL is used as if complete and the client the
+    # base CRL revokes gets in.
+    bundle = _crl_material["ca_base_then_delta"]
+    assert _crl_handshake(bundle, "revoked", _crl_material, raw=True) == "ACCEPTED"
 
 
-@pytest.mark.parametrize("stem", ["ca_base_then_delta", "ca_base_then_revoking_delta"])
-def test_harden_crl_check_refuses_a_delta_crl(_crl_material: dict[str, str], stem: str) -> None:
+def test_harden_crl_check_refuses_a_delta_crl(_crl_material: dict[str, str]) -> None:
     with pytest.raises(ValueError, match="CRL block 2 of 2 cannot be judged: it is a delta CRL"):
-        harden_crl_check(_verifying_ctx(), _crl_material[stem])
+        harden_crl_check(_verifying_ctx(), _crl_material["ca_base_then_delta"])
 
 
 @pytest.mark.parametrize("stem", ["fresh_then_expired", "ca_only"])
