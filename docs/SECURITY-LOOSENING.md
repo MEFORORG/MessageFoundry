@@ -760,8 +760,8 @@ This section is kept rather than deleted, because the claim it used to make is t
 > trail either way. The load refuses `*` for this reason, but an entry of `0.0.0.0/0` or `::/0` loads and
 > does the same thing for its address family, so it is named instead. So are ranges whose union covers a
 > whole family, such as the two `/1` halves of `0.0.0.0/0` listed separately. The check parses each
-> entry the way uvicorn does, strictly. An entry with host bits set, such as `10.1.2.3/0`, loads here but
-> becomes a literal in uvicorn that matches no peer, so it is not this loosening.
+> entry the way uvicorn does, strictly. An entry with host bits set, such as `10.1.2.3/0`, would become a
+> literal in uvicorn that matches no peer, so the load refuses it ([BACKLOG #2488](BACKLOG.md)).
 - **What you lose:** uvicorn trusts `X-Forwarded-For` from every peer the entries cover, so any client can
   declare its own source address. That poisons the audit source address, the per-address sign-in limit and
   the new-client-IP step-up signal. With `[security].allowed_client_networks` set, the load already

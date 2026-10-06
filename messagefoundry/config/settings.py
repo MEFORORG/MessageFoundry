@@ -1172,6 +1172,39 @@ def request_host_is_browser_origin(
     return loopback and not trusted_proxies and not tls_terminated_upstream
 
 
+def _trusted_proxy_refusal(entry: str, exc: ValueError) -> str:
+    """The message for an ``[api].trusted_proxies`` entry that a strict ``ip_network`` refuses.
+
+    A host-bits CIDR such as ``10.0.0.1/24`` gets its own message naming the single proxy address
+    first, then the network it spans (BACKLOG #2488). The address is the host part AS WRITTEN, so
+    an IPv6 zone survives: uvicorn compares a scoped peer with a host entry's zone, and ``fe80::1``
+    never matches ``fe80::1%eth0``. A network entry is matched by prefix alone, zone or not. The network is named, never recommended, because every host inside a
+    trusted range may set its own source address."""
+    try:
+        network = ipaddress.ip_network(entry, strict=False)
+    except ValueError:
+        return (
+            f"[api].trusted_proxies entry {entry!r} is not a valid IP address or CIDR network: "
+            f"{exc} (uvicorn would silently treat it as a literal that never matches, "
+            "collapsing every client source IP to the proxy)"
+        )
+    if network.prefixlen == 0:
+        spans = (
+            f"It spans '{network}', which would trust every peer of its address family, as the "
+            "refused '*' does."
+        )
+    else:
+        spans = (
+            f"It spans the network '{network}'. Trust that range only if every host in it is a "
+            "proxy, since each one may set its own source address."
+        )
+    return (
+        f"[api].trusted_proxies entry {entry!r} has host bits set. uvicorn parses a CIDR strictly, "
+        "so it would treat this entry as a literal that never matches, collapsing every client "
+        f"source IP to the proxy. List the proxy's own address {entry.partition('/')[0]!r}. {spans}"
+    )
+
+
 class ApiSettings(_Section):
     host: str = "127.0.0.1"  # Phase 1 = localhost only
     port: int = 8765
@@ -1426,6 +1459,9 @@ class ApiSettings(_Section):
         #           still satisfies the tls_terminated_upstream pairing check below while trusting
         #           nothing — quietly collapsing every client to the proxy address and degrading the
         #           audit source IP, the per-IP login limiter, and the new-client-IP step-up signal.
+        # A host-bits CIDR such as 10.0.0.1/24 fails the same way: uvicorn parses an entry holding
+        # "/" with a STRICT ip_network, so it too becomes a literal that matches no peer. Parse
+        # strictly here for that reason (BACKLOG #2488).
         for entry in v:
             if entry == "*":
                 raise ValueError(
@@ -1435,13 +1471,9 @@ class ApiSettings(_Section):
                     "proxy's exact address(es) instead."
                 )
             try:
-                ipaddress.ip_network(entry, strict=False)
+                ipaddress.ip_network(entry)
             except ValueError as exc:
-                raise ValueError(
-                    f"[api].trusted_proxies entry {entry!r} is not a valid IP address or CIDR network: "
-                    f"{exc} (uvicorn would silently treat it as a literal that never matches, "
-                    "collapsing every client source IP to the proxy)"
-                ) from exc
+                raise ValueError(_trusted_proxy_refusal(entry, exc)) from exc
         return v
 
     @field_validator("tls_client_cert_identities", mode="before")
@@ -7550,10 +7582,10 @@ def security_loosenings(
     # BACKLOG #1131: trusted_proxies ranges covering every peer of a family (0.0.0.0/0, ::/0, or
     # ranges whose union is that) make uvicorn trust X-Forwarded-For from all of them, which is what
     # the refused "*" does. The load still accepts them; naming them is the fix. Parsed STRICTLY, as
-    # uvicorn's _TrustedHosts parses them (__main__ hands it the list verbatim): "10.1.2.3/0" loads
-    # here (the validator is not strict) but fails uvicorn's strict parse and becomes a literal that
-    # matches nothing, so it trusts no peer and is not this loosening. Not gated on sign-in: a forged
-    # source address poisons the audit trail either way.
+    # uvicorn's _TrustedHosts parses them (__main__ hands it the list verbatim). A host-bits entry
+    # such as "10.1.2.3/0" would be a literal that matches nothing there, and the validator now
+    # refuses it at load (BACKLOG #2488), so it never reaches this check. Not gated on sign-in: a
+    # forged source address poisons the audit trail either way.
     # CodeQL's name heuristic reads `trusted_proxies` as a secret (main's alert 209 is that source on
     # an INFO line). The entries reach the serve WARNING and stdout below; no flow is reported today,
     # but a refactor of the helper may raise one. The ranges are quoted on purpose: they are the
