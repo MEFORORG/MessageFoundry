@@ -1835,7 +1835,7 @@ def _serve(args: argparse.Namespace) -> int:
     # declared upstream TLS terminator. The full rationale (why not `serve_ui`, why deliberately
     # narrow) sits at the MFA-at-exposure gate that is its first consumer. Defined ONCE: a second copy
     # is exactly how the ASVS 11.7.1 and 6.3.3 arms once disagreed about the same boot (#326).
-    instance_exposed = not settings.api.is_loopback or settings.api.tls_terminated_upstream
+    instance_exposed = not settings.api.host_is_browser_origin
 
     # Fail closed: `serve` always requires sign-in, on every bind (vault BACKLOG #2719). With auth
     # disabled the API would answer every request as a full-privilege system identity. This arm used
