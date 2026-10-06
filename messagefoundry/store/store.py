@@ -11465,9 +11465,12 @@ class MessageStore:
         return UserRecord.from_mapping(dict(row)) if row else None
 
     async def set_user_username(
-        self, user_id: str, username: str, *, now: float | None = None
-    ) -> None:
+        self, user_id: str, username: str, *, expected_username: str, now: float | None = None
+    ) -> bool:
         # BACKLOG #1532. Cache refresh for a directory-reported rename -- see AuthStore.
+        # BACKLOG #2290: `username=?` on the old name makes it a compare-and-set; AuthStore says why
+        # a second refresh of the same row then writes nothing. The rest of this comment is about
+        # the OTHER race, two rows wanting one name, which the compare does not touch.
         # The NOT EXISTS clause makes a SEQUENTIALLY taken name a no-op instead of the IntegrityError
         # that UNIQUE(username) would otherwise raise on a background pass.
         #
@@ -11492,12 +11495,13 @@ class MessageStore:
         # backend alike -- this store must not be the reason that handler looks unnecessary.
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
-            await self._db.execute(
-                "UPDATE users SET username=?, updated_at=? WHERE id=? AND NOT EXISTS "
+            cur = await self._db.execute(
+                "UPDATE users SET username=?, updated_at=? WHERE id=? AND username=? AND NOT EXISTS "
                 "(SELECT 1 FROM users other WHERE other.username=? AND other.id<>?)",
-                (username, now, user_id, username, user_id),
+                (username, now, user_id, expected_username, username, user_id),
             )
             await self._commit()
+            return int(cur.rowcount) > 0
 
     async def list_users(self) -> list[UserRecord]:
         async with self._read() as db:

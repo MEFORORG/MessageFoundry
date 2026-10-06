@@ -7487,9 +7487,12 @@ class PostgresStore:
         return UserRecord.from_mapping(dict(d)) if d else None
 
     async def set_user_username(
-        self, user_id: str, username: str, *, now: float | None = None
-    ) -> None:
+        self, user_id: str, username: str, *, expected_username: str, now: float | None = None
+    ) -> bool:
         # BACKLOG #1532. Cache refresh for a directory-reported rename -- see AuthStore.
+        # BACKLOG #2290: `username=$4` on the old name makes it a compare-and-set; AuthStore says
+        # why a second refresh of the same row then writes nothing. Everything below is about the
+        # OTHER race, two rows wanting one name, which the compare does not touch.
         # The NOT EXISTS clause makes a SEQUENTIALLY taken name a no-op rather than the
         # UniqueViolationError that UNIQUE(username) would raise on a background pass.
         #
@@ -7524,13 +7527,16 @@ class PostgresStore:
         # bind already are. At 60% per contended pair that absorb is load-bearing, not defensive.
         # Do not restore the stronger claim here.
         now = time.time() if now is None else now
-        await self._execute(
-            "UPDATE users SET username=$1, updated_at=$2 WHERE id=$3 AND NOT EXISTS "
+        # `_execute` returns the row count from asyncpg's status tag (BACKLOG #2283).
+        written = await self._execute(
+            "UPDATE users SET username=$1, updated_at=$2 WHERE id=$3 AND username=$4 AND NOT EXISTS "
             "(SELECT 1 FROM users other WHERE other.username=$1 AND other.id<>$3)",
             username,
             now,
             user_id,
+            expected_username,
         )
+        return written > 0
 
     async def get_user_by_federated_subject(self, issuer: str, subject: str) -> UserRecord | None:
         # BACKLOG #1256. Both columns, never `subject` alone -- a subject is unique only within its
