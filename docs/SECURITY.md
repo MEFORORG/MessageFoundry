@@ -1725,7 +1725,9 @@ before the change is refused at release with **409** and an `approval.no_longer_
 the approver, whose `reason` says which (`approvals_disabled` or `operation_not_gated`). Nothing
 runs. The request stays pending until an approver rejects it or it expires. The refusal's wording
 tells the approver to reject it and, if the operation is still needed, to run it again, which now
-runs it without a second approver.
+runs it without a second approver. `GET /approvals` marks such a request `gated: false`, read from
+the same settings test at listing time, and the console's Approvals page offers it only Reject,
+with that advice beside it.
 
 **Each state change and its audit row are one write (vault BACKLOG #2255).** The store
 moves the request and appends its audit row in one transaction, so the two commit or roll back

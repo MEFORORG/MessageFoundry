@@ -404,6 +404,9 @@ class ApprovalGate:
             "status": str(r["status"]),
             "approver": (None if r["approver"] is None else str(r["approver"])),
             "decided_at": (None if r["decided_at"] is None else float(r["decided_at"])),
+            # The same test approve() refuses on (approval.no_longer_gated), so a page can stop
+            # offering a release the gate would refuse. Read now, like the refusal it predicts.
+            "gated": self._gated(str(r["operation"])),
         }
 
     async def approve(

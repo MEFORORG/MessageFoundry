@@ -22,6 +22,10 @@ hand-built POST either way.
 **Each row shows the parameters its hold captured** (BACKLOG #2458), so an approver sees what a
 release would do. A ``None`` reads as the scope it means, such as all inbound connections.
 
+**A pending row whose operation dual control no longer gates offers no Approve.** The engine marks
+it ``gated`` False, from the same test its release refusal uses, so the page offers Reject and says
+why, rather than a button the gate answers with 409.
+
 Every value goes through the escaping ``el`` builder.
 """
 
@@ -53,8 +57,8 @@ _INTRO = (
     "Actions held for a second approver (dual control). A different user holding approvals:approve "
     "releases or rejects each one. Approving runs the held operation now, as it was requested. The "
     "requester cannot approve their own request, and may reject it to withdraw it. With dual "
-    "control off nothing new is held, and requests held before it was turned off stay here until "
-    "they expire."
+    "control off nothing new is held. A request held before it was turned off for its operation "
+    "can no longer be approved: reject it, or it stays here until it expires."
 )
 
 # The post-action notices, keyed by the redirect's ?m= code. An allow-list, so the query string can
@@ -82,6 +86,12 @@ _INTERRUPTED_NOTE = (
 )
 
 _OWN_REQUEST = "Your request. A different approver decides it."
+
+# Mirrors the engine's approval.no_longer_gated refusal, so the advice is the same either way.
+_NOT_GATED = (
+    "Dual control no longer applies to this operation, so it cannot be approved. Reject it; if it "
+    "is still needed, run it again, without a second approver."
+)
 
 # What a None parameter means for the operations that hold one: the broadest scope, not "nothing".
 # Any other None reads "not set".
@@ -176,12 +186,17 @@ def _params(a: PendingApprovalInfo) -> Markup:
 
 def _pending_row(a: PendingApprovalInfo) -> list[object]:
     base = f"{_PAGE}/{_seg(a.id)}"
-    # BACKLOG #2460: Approve is not offered where the gate would refuse it: to the requester, and
-    # on a row whose params are unreadable.
+    # BACKLOG #2460: Approve is not offered where the gate would refuse it: to the requester, on a
+    # row whose operation dual control no longer gates, and on a row whose params are unreadable.
     if a.caller_is_requester:
         controls = [
             _post_button(f"{base}/reject", "Withdraw"),
             el("span", _OWN_REQUEST, class_="muted"),
+        ]
+    elif not a.gated:
+        controls = [
+            _post_button(f"{base}/reject", "Reject"),
+            el("span", _NOT_GATED, class_="muted"),
         ]
     elif a.params is None:
         controls = [

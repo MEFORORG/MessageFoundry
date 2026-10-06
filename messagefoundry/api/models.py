@@ -512,7 +512,13 @@ class PendingApprovalInfo(BaseModel):
 
     ``caller_is_requester`` is True when the caller raised this request, compared on the immutable
     user id as the self-approval refusal is (BACKLOG #2460, #1540). The engine refuses that caller's
-    approve and resolve whatever this says; it lets a page stop offering them."""
+    approve and resolve whatever this says; it lets a page stop offering them.
+
+    ``gated`` is False when dual control no longer gates this request's operation: ``[approvals].enabled``
+    is off, or the operation has left ``[approvals].operations``. The engine then refuses a
+    ``pending`` request's approve with 409 (``approval.no_longer_gated``) whatever this says; it lets
+    a page offer only the reject. It reads the settings at listing time, and it does not affect the
+    resolve of an ``interrupted`` row."""
 
     id: str
     operation: str
@@ -525,6 +531,7 @@ class PendingApprovalInfo(BaseModel):
     approver: str | None = None
     decided_at: float | None = None
     caller_is_requester: bool = False
+    gated: bool = True
 
 
 class ApprovalList(BaseModel):

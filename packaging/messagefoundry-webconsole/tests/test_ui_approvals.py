@@ -116,6 +116,46 @@ async def test_the_requester_cannot_approve_their_own_hold(engine: Engine) -> No
     assert await engine.store.list_audit(action="approval.approved") == []
 
 
+async def test_a_hold_dual_control_no_longer_gates_offers_only_reject(engine: Engine) -> None:
+    """Held while dual control was on, listed after it was turned off: the engine marks the row
+    ``gated`` False and the page offers Reject, with why, but no Approve the gate would refuse."""
+    service, _maker, _checker = await _two_approvers(engine)
+    async with _client(engine, service, _ON) as maker:
+        await cookie_login(maker, "maker")
+        approval_id = await _hold(maker)
+    async with _client(engine, service, ApprovalsSettings(enabled=False)) as checker:
+        await cookie_login(checker, "checker")
+        listing = await checker.get("/ui/approvals")
+        assert approval_id in listing.text
+        assert f'action="/ui/approvals/{approval_id}/approve"' not in listing.text
+        assert f'action="/ui/approvals/{approval_id}/reject"' in listing.text
+        assert "Dual control no longer applies to this operation" in listing.text
+        # The reject still clears it.
+        r = await checker.post(f"/ui/approvals/{approval_id}/reject", headers=SAME_ORIGIN)
+    assert r.status_code == 303
+    assert await _status(engine, approval_id) == "rejected"
+
+
+def test_an_ungated_row_offers_no_approve() -> None:
+    """The page reads ``gated`` alone; a gated row of the same shape still offers Approve."""
+    row = PendingApprovalInfo(
+        id="b" * 32,
+        operation="dead_letter_replay",
+        label="Replay",
+        params={"channel_id": "ch1"},
+        requester="maker",
+        requested_at=time.time(),
+    )
+    gated = str(pages.approvals_page(ApprovalList(approvals=[row])))
+    ungated = str(
+        pages.approvals_page(ApprovalList(approvals=[row.model_copy(update={"gated": False})]))
+    )
+    assert f'action="/ui/approvals/{"b" * 32}/approve"' in gated
+    assert f'action="/ui/approvals/{"b" * 32}/approve"' not in ungated
+    assert f'action="/ui/approvals/{"b" * 32}/reject"' in ungated
+    assert "Dual control no longer applies" in ungated and "Dual control no longer" not in gated
+
+
 async def test_a_second_approver_releases_the_hold(engine: Engine) -> None:
     service, _maker, _checker = await _two_approvers(engine)
     async with _client(engine, service, _ON) as maker, _client(engine, service, _ON) as checker:
