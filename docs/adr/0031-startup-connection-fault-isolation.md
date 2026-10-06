@@ -316,8 +316,14 @@ Context above names: feed #21's downstream cert should not stop the other 20.
      §4's reload self-heal does not apply to it. A config change rebuilds it, and the reload
      checks it then. An operator start, or a restart, checks and builds it too.
 
-   So a bad CA on an idle lane never refuses a reload, a DR activation or a follower convergence.
-   Each idle lane is checked when it is built, under rule 1.
+   So the pin, permission and path checks of an idle lane never refuse a reload, a DR activation
+   or a follower convergence. Each idle lane is checked when it is built, under rule 1. **One
+   limit:** a reload's build check builds every deployed connection, and `MLLP()`, `Ftp()`,
+   `Email()` and `Direct()` read their CA file as they are built. So a CA file one of those
+   cannot read or load still refuses the reload, audited as `invalid_config`, on any deployed
+   lane, idle or not. **A second limit, which predates #2371:** the runner takes its DR threshold
+   when it is built, and a DR activation reloads the runner it has. So a lane the activation is
+   meant to park is checked as a running one.
 3. **An inbound listener CA refused at start refuses the start. This records existing behaviour;
    it is not a new decision.** BACKLOG #1142 slice 3 shipped it (engine PR 1535, `29ab2e60b8`):
    the start preflight checks every inbound CA that requires a peer certificate, before any

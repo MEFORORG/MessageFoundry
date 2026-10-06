@@ -82,6 +82,8 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
      ``auto_start=False`` lane not running, one below a DR threshold, a poller outside its
      schedule window, or a lane its CA failed whose config has not changed. A reload leaves that
      last kind failed. A config change or an operator start builds it, and checks it then.
+     Only these checks skip an idle lane. A reload's build check still builds every deployed
+     connector, and those that read the file as they are built refuse one they cannot load.
 
    **Not covered: the checked bytes are not the loaded bytes here.** These hops build their
    context from the path, with ``cafile=``, after the check. So a file swapped between the check

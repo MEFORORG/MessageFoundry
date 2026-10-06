@@ -3053,7 +3053,7 @@ checks.
 | An operator start (`POST /connections/{name}/start`), such as of an `auto_start = false` lane | That connection only. |
 | Start, for a `FhirLookup()` | The whole start. A lookup has no lane of its own to fail. |
 | A reload, for a lane it builds or keeps running, and for a `FhirLookup()` | The whole reload, before anything changes. |
-| A reload, for an idle lane | Nothing. The reload does not read its CA. An idle lane is one below a DR threshold, an `auto_start = false` lane not running, an `Ftp()` poller outside its schedule window, or a lane its CA refused whose config has not changed. The reload leaves that last kind failed: fixing the file alone does not heal it on a reload. A config change, an operator start or a restart builds it, and checks it then. |
+| A reload, for an idle lane | Nothing. The reload does not read its CA. An idle lane is one below a DR threshold, an `auto_start = false` lane not running, an `Ftp()` poller outside its schedule window, or a lane its CA refused whose config has not changed. The reload leaves that last kind failed: fixing the file alone does not heal it on a reload. A config change, an operator start or a restart builds it, and checks it then. Only the pin, permission and path checks are skipped: a reload's build check still builds every deployed `MLLP()`, `Ftp()`, `Email()` and `Direct()`, which read the file as they are built, so a file they cannot load still refuses the reload. |
 
 | What the check finds | What happens |
 |---|---|

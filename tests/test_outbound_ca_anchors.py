@@ -345,7 +345,10 @@ async def test_an_engine_reload_refuses_a_substituted_outbound_ca(
     store: MessageStore, tmp_path: Path, judged: None
 ) -> None:
     """The reload twin: a running lane is one the reload keeps, so its substituted CA refuses
-    the reload and the running graph stays. The first load is the start, so it comes first."""
+    the reload and the running graph stays. The first load is the start, so it comes first.
+    Review round 3, finding 1: a retried reload is refused again, not let through because the
+    first refusal marked the lane failed. Restoring the file lets the reload through."""
+    good = _block(b"partner-ca")
     ca = _ca(tmp_path)
     cfg = tmp_path / "cfg"
     _graph(cfg, _dest("rest", ca, pin=_sha(ca)))
@@ -356,9 +359,13 @@ async def test_an_engine_reload_refuses_a_substituted_outbound_ca(
         assert runner is not None
         running = runner.registry
         ca.write_bytes(_block(b"substitute"))
-        with pytest.raises(WiringError, match="outbound connection 'OUT' tls_ca_file"):
-            await engine.reload_detail(cfg)
-        assert runner.registry is running
+        for _ in range(2):
+            with pytest.raises(WiringError, match="outbound connection 'OUT' tls_ca_file"):
+                await engine.reload_detail(cfg)
+            assert runner.registry is running
+        ca.write_bytes(good)
+        await engine.reload_detail(cfg)
+        assert not runner.degraded_outbound()
     finally:
         await engine.stop()
 
@@ -581,8 +588,39 @@ async def test_a_refused_ftps_poller_ca_fails_that_inbound_at_start(
         assert runner.degraded_inbound()["IB_FTPS"].startswith(refused)
         assert not runner.inbound_running("IB_FTPS")
         assert len(await _rows(store, "inbound:IB_FTPS")) == len(rows)
+        # Review round 3, finding 8: an operator start refused by the CA records the failure, so
+        # the poller reads failed and not stopped. Cleared first, to see it written again.
+        runner._failed.pop(("inbound", "IB_FTPS"))
         with pytest.raises(TrustAnchorError, match=_PIN_MISMATCH):
             await runner.start_inbound("IB_FTPS")
+        assert runner.degraded_inbound()["IB_FTPS"].startswith(refused)
+    finally:
+        await engine.stop()
+
+
+async def test_a_refused_lane_parked_and_unparked_is_checked_again(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """Review round 3, finding 2: parking a lane its CA refused clears its failed record, so the
+    reload that brings it back must check it, not keep a failure it no longer records. Red under:
+    the kept failure ignoring the failed record."""
+    ca = _ca(tmp_path)
+    cfg = tmp_path / "cfg"
+    _two_outbound_graph(cfg, _dest("rest", ca, pin="00" * 32))
+    engine = _engine(store)
+    feed = cfg / "feed.py"
+    on = feed.read_text(encoding="utf-8")
+    try:
+        runner = await _start_like_serve(engine, cfg)
+        assert runner.degraded_outbound()["OUT"].startswith(_REFUSED_OUT)
+        off = on.replace("))\noutbound('OB_OK'", "), auto_start=False)\noutbound('OB_OK'")
+        assert off != on
+        feed.write_text(off, encoding="utf-8")
+        await engine.reload_detail(cfg)
+        assert "OUT" not in runner.degraded_outbound()
+        feed.write_text(on, encoding="utf-8")
+        with pytest.raises(WiringError, match=_PIN_MISMATCH):
+            await engine.reload_detail(cfg)
     finally:
         await engine.stop()
 
