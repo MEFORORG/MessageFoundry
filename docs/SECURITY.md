@@ -1948,12 +1948,13 @@ directory would clear the MFA gate with its passkey until the reconciliation pas
 `finish_webauthn_assertion` uses the same lookup and refuses the same answers. It asks after the
 second-step lock and the `[auth].mfa_verify_min_elapsed_seconds` floor, and before it takes the
 challenge. That includes a row with no directory object id, refused without a lookup as on the code
-leg, so such an account cannot clear the MFA gate with a passkey either. After a confirmed lookup
+leg, so such an account cannot clear the MFA gate by verifying a passkey either. After a confirmed lookup
 the leg reads the session, the account and its lock again. A refusal checks
 no assertion, leaves the challenge in flight, leaves the sign count alone, and charges nothing to
 the lockout. It is audited as `auth.webauthn_failed` with
-`reason=directory_unconfirmed` and the lookup's outcome. `POST /ui/reauth/webauthn` answers
-**400** with the same words the other legs use.
+`reason=directory_unconfirmed` and the lookup's outcome. For that refusal
+`POST /ui/reauth/webauthn` answers **400** with the same words the other legs use. A session or
+account gone after the lookup answers **401**.
 
 **The password re-bind says the same when the directory could not judge the password (BACKLOG
 #2027).** That covers at least a row with no directory object id, no enabled entry for the row's
@@ -1982,7 +1983,7 @@ recovery code. A session that still owes its factor could not clear it with a co
 it could not renew its window. The same outage blocks the password re-bind and the IdP step-up leg, so a
 directory operator would have no way to open a window until the directory returned. The passkey leg
 asks the directory too (BACKLOG #2239), so a directory session that still owes its factor could not
-clear it with a passkey either. Local accounts are not
+clear it by verifying a passkey either. Local accounts are not
 refused, so a local administrator keeps step-up through the outage. Each attempt costs one directory
 lookup: a service bind and a search, plus a group search. The route's rate limiter paces it while
 `[auth].login_rate_limit_enabled` is on; with it off, nothing does. A directory that accepts connections but never answers
