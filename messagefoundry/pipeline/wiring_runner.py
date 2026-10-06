@@ -2460,7 +2460,9 @@ class RegistryRunner:
             # a listener that was serving as failed (BACKLOG #1142).
             with active_hop_posture(self._hop_posture):
                 if ic is not None:
-                    source_cfg = _source_config(ic, self._inbound_bind_host, self._env_values)
+                    source_cfg = _source_config(
+                        ic, self._inbound_bind_host, self._env_values, self._trust_anchor_policy
+                    )
                     return "in", build_source(source_cfg, egress=self._egress)
                 if oc is not None:
                     dest_cfg = _dest_config(
@@ -3120,7 +3122,9 @@ class RegistryRunner:
         # bind race. The external case (another process holds the port) can't be known statically; the
         # source.start() bind below classifies that OSError into the same PortConflictError.
         self._guard_port_conflict(ic)
-        source_cfg = _source_config(ic, self._inbound_bind_host, self._env_values)
+        source_cfg = _source_config(
+            ic, self._inbound_bind_host, self._env_values, self._trust_anchor_policy
+        )
         # Exposed-gate (ADR 0002 §0 / ADR 0025 §9): refuse a non-loopback MLLP or DICOM SCP listener
         # without TLS at start, and a non-loopback raw-TCP/X12 listener (plaintext-only — no TLS option)
         # at start (cleartext PHI on the wire). Each guard no-ops for the other's type.
@@ -8677,9 +8681,14 @@ def _hl7_batch_timestamp(created_at: float | None) -> str:
     return time.strftime("%Y%m%d%H%M%S", time.gmtime(created_at))
 
 
-def _source_config(ic: InboundConnection, bind_host: str, env_values: Mapping[str, Any]) -> Source:
+def _source_config(
+    ic: InboundConnection,
+    bind_host: str,
+    env_values: Mapping[str, Any],
+    trust_anchor_policy: TrustAnchorPolicy | None = None,
+) -> Source:
     # Resolve any env() references first (a missing value raises WiringError here, before bind).
-    settings = resolve_env_settings(ic.spec.settings, env_values)
+    settings = resolve_env_settings(ic.spec.settings, env_values, connection=ic.name)
     # Owner ruling 2026-09-24: the hop attestation is the connection's typed field, never a transport
     # setting, so the loosening report and the gate read the same thing. Refuse the raw keys, then
     # mirror a declared pair for the settings-driven seams, as _dest_config does for cleartext_accepted.
@@ -8718,6 +8727,8 @@ def _source_config(ic: InboundConnection, bind_host: str, env_values: Mapping[st
         # branch is reachable from config. Default off -> byte-identical.
         tls_revocation_attested=ic.tls_revocation_attested,
         tls_revocation_attested_reason=ic.tls_revocation_attested_reason,
+        # Vault BACKLOG #2370: the FTPS poller verifies its server under [tls], as the outbound does.
+        trust_anchor_policy=trust_anchor_policy or TrustAnchorPolicy(),
     )
 
 
@@ -8787,7 +8798,9 @@ def _fhir_lookup_settings(
     a lookup's record cannot be mistaken for an outbound of the same name. The one builder for both
     the live executor and the check build, so the two cannot differ. The egress allowlist check runs
     in :class:`~messagefoundry.transports.fhir.FhirLookupExecutor` itself."""
-    settings = resolve_env_settings(spec.settings, env_values)
+    settings = resolve_env_settings(
+        spec.settings, env_values, connection=fhir_lookup_record_name(spec.name)
+    )
     _apply_egress_proxy_default(settings, egress)
     _mirror_declarations(
         settings,
@@ -8819,7 +8832,7 @@ def _dest_config(
     # typed signing config (ASVS 4.1.5, ADR 0018) from the resolved sign_* settings. None = signing
     # off (every existing outbound unchanged). The connector loads the key + mints the signature; this
     # is the single choke point feeding start/check/dry-run, so a bad key fails loud at all three.
-    settings = resolve_env_settings(oc.spec.settings, env_values)
+    settings = resolve_env_settings(oc.spec.settings, env_values, connection=oc.name)
     # ADR 0126: merge the site-wide forward-proxy default (a per-connection proxy wins). This is the one
     # choke point feeding start/check/dry-run, so the same effective proxy is built at all three.
     _apply_egress_proxy_default(settings, egress)
@@ -9009,7 +9022,7 @@ def _build_check_connectors(
     for ic in registry.inbound.values():
         if not ic.deployed:
             continue
-        source_cfg = _source_config(ic, inbound_bind_host, env_values)
+        source_cfg = _source_config(ic, inbound_bind_host, env_values, trust_anchor_policy)
         # ADR 0154 D4's cross-registry arm: reply_from's target must exist, be deployed, capture
         # responses, and resolve to a lane that can actually serve concurrent callers.
         check_http_sync_reply(ic, registry, delivery=delivery)

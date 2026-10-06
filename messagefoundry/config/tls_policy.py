@@ -53,7 +53,7 @@ import urllib.request
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
 logger = logging.getLogger(__name__)
@@ -102,6 +102,7 @@ __all__ = [
     "warn_smtp_verification_off",
     "smtp_login_approved",
     "build_verifying_client_context",
+    "CaFileUnreadable",
     "cleartext_acceptance_audit_sink",
     "context_checks_revocation",
     "current_hop_posture",
@@ -2580,6 +2581,9 @@ class TrustAnchor:
     #: :func:`resolve_trust_anchor`, so a loopback hop carries ``None`` even when the instance
     #: configures one.
     crl_file: str | None = None
+    #: Where ``cafile`` came from, for a refusal to name: ``[tls].internal_ca_file``, or a
+    #: connection's ``tls_ca_file`` with its name (vault BACKLOG #2370). Not part of equality.
+    cafile_setting: str | None = field(default=None, compare=False)
 
     @property
     def narrows(self) -> bool:
@@ -2610,8 +2614,12 @@ def resolve_trust_anchor(
     connection_ca_file: str | None,
     host: str,
     policy: TrustAnchorPolicy,
+    connection: str | None = None,
 ) -> TrustAnchor:
     """Resolve the client trust anchor for an outbound hop to ``host`` (#190, ADR 0093 — PURE).
+
+    ``connection`` names the connection in a refusal of an unreadable ``tls_ca_file`` (vault
+    BACKLOG #2370). It chooses nothing.
 
     Precedence (load-bearing):
 
@@ -2640,15 +2648,49 @@ def resolve_trust_anchor(
     crl = None if is_loopback_hop_host(host) else policy.crl_file
     if connection_ca_file is not None:
         # Per-connection pin wins verbatim (single-anchor, no OS roots — the historical behaviour).
-        return TrustAnchor(cafile=connection_ca_file, load_system_roots=False, crl_file=crl)
+        return TrustAnchor(
+            cafile=connection_ca_file,
+            load_system_roots=False,
+            crl_file=crl,
+            cafile_setting=(
+                f"tls_ca_file of connection {connection!r}" if connection else "tls_ca_file"
+            ),
+        )
     if policy.mode == "system" or policy.internal_ca_file is None or is_loopback_hop_host(host):
         # Unchanged trust store: OS roots only (byte-identical default / loopback exemption).
         return TrustAnchor(cafile=None, load_system_roots=True, crl_file=crl)
-    if policy.mode == "pinned":
-        # ONLY the internal CA — the forward_tls_ca_file template (no public bundle).
-        return TrustAnchor(cafile=policy.internal_ca_file, load_system_roots=False, crl_file=crl)
-    # augment: OS roots + the internal CA.
-    return TrustAnchor(cafile=policy.internal_ca_file, load_system_roots=True, crl_file=crl)
+    # pinned: ONLY the internal CA, the forward_tls_ca_file template. augment: OS roots + it.
+    return TrustAnchor(
+        cafile=policy.internal_ca_file,
+        load_system_roots=policy.mode != "pinned",
+        crl_file=crl,
+        cafile_setting="[tls].internal_ca_file",
+    )
+
+
+class CaFileUnreadable(OSError, ValueError):
+    """A trust anchor's CA file could not be read, named by the setting that set it (BACKLOG #2370).
+
+    Both bases on purpose. It was a bare ``FileNotFoundError`` before, so a caller catching
+    ``OSError`` still catches it. The load seams surface a ``ValueError`` as a configuration
+    refusal, so it now reads as one too, with the setting and connection in the text."""
+
+
+@contextmanager
+def _naming_the_ca_setting(anchor: TrustAnchor) -> Iterator[None]:
+    """Turn an unreadable ``anchor.cafile`` into :class:`CaFileUnreadable` naming its setting.
+
+    An :class:`ssl.SSLError` (a file that reads but holds no usable PEM) passes through unchanged:
+    it is an :class:`OSError` too, but not the missing-file case this names."""
+    try:
+        yield
+    except ssl.SSLError:
+        raise
+    except OSError as exc:
+        setting = anchor.cafile_setting or "the CA file setting"
+        raise CaFileUnreadable(
+            f"{setting} names {anchor.cafile!r}, which cannot be read: {exc.strerror or exc}"
+        ) from exc
 
 
 def build_verifying_client_context(
@@ -2667,10 +2709,12 @@ def build_verifying_client_context(
         ctx = ssl.create_default_context(purpose)
         if anchor.cafile is not None:
             # augment: keep the OS default roots loaded above and add the internal CA on top.
-            ctx.load_verify_locations(cafile=anchor.cafile)
+            with _naming_the_ca_setting(anchor):
+                ctx.load_verify_locations(cafile=anchor.cafile)
     else:
         # pinned / per-connection: ONLY this CA (no load_default_certs), matching forward_tls_ca_file.
-        ctx = ssl.create_default_context(purpose, cafile=anchor.cafile)
+        with _naming_the_ca_setting(anchor):
+            ctx = ssl.create_default_context(purpose, cafile=anchor.cafile)
     # BACKLOG #299: the CRL loads LAST, once the trust store is final -- harden_crl_check asserts the
     # CRL actually landed in that store, and a later load_verify_locations would make the assertion
     # answer for a different store than the one the handshake uses.
@@ -2723,7 +2767,8 @@ def build_anchored_https_handler(
         handler = build_asserted_https_handler(connector=connector)
         ctx = urllib_handler_context(handler, connector=connector)
         if anchor.cafile is not None:
-            ctx.load_verify_locations(cafile=anchor.cafile)
+            with _naming_the_ca_setting(anchor):
+                ctx.load_verify_locations(cafile=anchor.cafile)
         # BACKLOG #299: `system` mode plus a CRL narrows without naming a CA, so this arm now runs with
         # `cafile is None`. load_verify_locations rejects an all-None call, hence the guard above; the
         # CRL still loads last, against the final trust store.
@@ -2882,6 +2927,7 @@ def build_smtp_tls_context(
             connection_ca_file=ca_file,
             host=host,
             policy=trust_anchor_policy if trust_anchor_policy is not None else TrustAnchorPolicy(),
+            connection=name or None,
         )
         ctx = build_verifying_client_context(anchor)
     else:
