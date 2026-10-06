@@ -4436,12 +4436,14 @@ governed by the posture-keyed cleartext refusal (ADR 0092). It is **not** applie
 context (`build_api_ssl_context`), which verifies **client** certs for opt-in mTLS (ADR 0083) — a
 different trust role. With no `[tls]` block the built SSL context is byte-identical to before.
 
-A connection's own `tls_ca_file` is checked at start and at every reload (vault BACKLOG #2371), as an
-inbound listener's CA is: an optional `tls_ca_pin`, a refusal under `enforce` for a file another
-account could replace, and an `auth.trust_anchor` row when the file changes. One gap remains. The hop
-reads the file again by path when it builds its context, so a file swapped after the check would be
-trusted until that connection is built again, by a restart or by a reload that changes its config.
-A matching pin is no escape for a file whose permissions the engine cannot read. [CONNECTIONS.md](CONNECTIONS.md#the-engine-checks-the-file-at-every-start-and-reload-tls_ca_pin)
+A connection's own `tls_ca_file` is checked as an inbound listener's CA is (vault BACKLOG #2371): an
+optional `tls_ca_pin`, a refusal under `enforce` for a file another account could replace, and an
+`auth.trust_anchor` row when the file changes. A refused CA fails only its own connection at start,
+or at an operator start of that connection, and refuses a whole reload ([ADR 0031](adr/0031-startup-connection-fault-isolation.md),
+amended 2026-10-06). One gap remains. The hop reads the file again by path when it builds its
+context, so a file swapped after the check would be trusted until that connection is built again.
+A matching pin is no escape for a file whose permissions the engine cannot read.
+[CONNECTIONS.md](CONNECTIONS.md#the-engine-checks-the-file-at-every-start-and-reload-tls_ca_pin)
 states the checks once. `[tls].internal_ca_file` takes none of these checks yet.
 
 ### PHI data-plane integrity residuals — scope-outs (#190, ADR 0093)

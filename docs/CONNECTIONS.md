@@ -1228,7 +1228,7 @@ poll/write shape against a remote server, selected by an internal `protocol` set
 | `tls` | both | `false` | **`Ftp` only** — `true` selects **FTPS** (explicit TLS); `false` is plain FTP. An FTPS **upload** to an off-box host is **refused on a stock instance** unless `[tls].crl_file` reaches the hop or the connection declares `tls_revocation_attested` with a reason (BACKLOG #2193). The inbound FTPS poll has no such gate |
 | `tls_allow_expired` | both | `false` | **`Ftp` only** — honour an FTPS server cert whose validity period has lapsed while still verifying the chain, and the hostname too unless a hand-built spec sets `tls_check_hostname = false` (#129, ADR 0094). Same contract as the [MLLP `tls_allow_expired` row](#mllp--mllp): **no posture gate and no escape variable covers it**. It is reported, in both directions, by the per-build WARNING, `messagefoundry check` and `security_loosenings()`; CORRECTED 2026-10-01, this row said no loosening register covered it, and the inbound poller was in fact listed nowhere until then. The FTPS *upload* has a revocation gate since BACKLOG #2193. The inbound FTPS poll has **none**. It loads `[tls].crl_file` when one is set (vault BACKLOG #2370), but without one an expired *and* revoked partner certificate crosses there with nothing refusing it. Put the connection name and a removal date in your own risk register |
 | `tls_ca_file` | both | — | **`Ftp` only, FTPS** (#1180) — pins this hop to one private CA. See [Pinning a private CA per connection](#pinning-a-private-ca-per-connection-tls_ca_file) |
-| `tls_ca_pin` | both | — | **`Ftp` only, FTPS** (vault BACKLOG #2371) — the SHA-256 of `tls_ca_file`; a mismatch refuses the start or reload. See [The engine checks the file at every start and reload](#the-engine-checks-the-file-at-every-start-and-reload-tls_ca_pin) |
+| `tls_ca_pin` | both | — | **`Ftp` only, FTPS** (vault BACKLOG #2371) — the SHA-256 of `tls_ca_file`; a mismatch is refused. See [The engine checks the file at every start and reload](#the-engine-checks-the-file-at-every-start-and-reload-tls_ca_pin) |
 | `pattern` | in | `*.hl7` | filename glob to pick up |
 | `poll_seconds` | in | `5.0` | poll interval. It is also the **settle window**: a file is read only once it lists at the same size as at the last poll that saw it (BACKLOG #2071), so every file waits at least one poll. The gate is always on and has no setting. It reads the listed size alone, so it cannot see a same-size rewrite, nor anything on a server that lists every file at size 0. |
 | `min_age_seconds` | in | `0.0` | **accepted but not honoured on a remote source today** — the connector never reads it (a remote directory listing carries no reliable mtime). Only `File(...)` implements it; the settle gate on `poll_seconds` above, and the partner's own write-then-rename, are what guard against partial reads here. |
@@ -1371,7 +1371,7 @@ one.
 | `verify_tls` | `true` | TLS cert verification. `false` is MITM-able and is **refused at construction** for a non-loopback host. `MEFOR_ALLOW_INSECURE_TLS` relaxes it to a loud warning **only while `[security].enforcement` is not `enforce`** — the escape is **clamped** (#200, ADR 0092 decision 2) and is therefore **inert on the shipped default**, where the refusal stands with the variable set. `cleartext_accepted` does **not** reach this hop (it has TLS — it is encrypted-but-unauthenticated, not cleartext), and a hop secured by other means is [attested](#attesting-a-hop-secure-tls_hop_attested) instead. A **loopback** URL is allowed unchanged, which is what makes this usable in a lab |
 | `tls_allow_expired` | `false` | **(#129, ADR 0094)** tolerate an **expired** server cert while chain + hostname stay verified — the narrow alternative to `verify_tls=false`. Same contract as the [MLLP row](#mllp--mllp): **no posture gate and no escape variable**. It **is reported**: a WARNING at each build, a `tls-allow-expired` line in `messagefoundry check` and a `security_loosenings()` entry, and so `GET /security/posture` (CORRECTED 2026-10-01: this row said `security_loosenings()` never reports it, stale since BACKLOG #333) |
 | `tls_ca_file` | — | **(#1180)** pins this hop to one private CA. See [Pinning a private CA per connection](#pinning-a-private-ca-per-connection-tls_ca_file) |
-| `tls_ca_pin` | — | (vault BACKLOG #2371) the SHA-256 of `tls_ca_file`; a mismatch refuses the start or reload. See [The engine checks the file at every start and reload](#the-engine-checks-the-file-at-every-start-and-reload-tls_ca_pin) |
+| `tls_ca_pin` | — | (vault BACKLOG #2371) the SHA-256 of `tls_ca_file`; a mismatch is refused. See [The engine checks the file at every start and reload](#the-engine-checks-the-file-at-every-start-and-reload-tls_ca_pin) |
 | `encoding` | `utf-8` | request-body charset |
 
 **Delivery semantics.** A **2xx** is delivered. **5xx / 408 / 429 / connection / DNS / TLS / timeout**
@@ -1898,7 +1898,7 @@ follow-on and is **not** built.
 | `verify_tls` | `true` | TLS cert verification — the same posture-keyed cell as [REST](#rest--rest): `false` is **refused at construction** off loopback, and the `MEFOR_ALLOW_INSECURE_TLS` escape is **clamped inert** while `[security].enforcement = enforce` (the shipped default) |
 | `tls_allow_expired` | `false` | **(#129, ADR 0094)** tolerate an **expired** server cert with chain + hostname still verified. **No posture gate and no escape variable**. It **is reported**: a WARNING at each build, a `tls-allow-expired` line in `messagefoundry check` and a `security_loosenings()` entry, and so `GET /security/posture` (CORRECTED 2026-10-01: this row said `security_loosenings()` never reports it, stale since BACKLOG #333) — see the [MLLP row](#mllp--mllp) |
 | `tls_ca_file` | — | **(#1180)** pins this hop to one private CA. See [Pinning a private CA per connection](#pinning-a-private-ca-per-connection-tls_ca_file) |
-| `tls_ca_pin` | — | (vault BACKLOG #2371) the SHA-256 of `tls_ca_file`; a mismatch refuses the start or reload. See [The engine checks the file at every start and reload](#the-engine-checks-the-file-at-every-start-and-reload-tls_ca_pin) |
+| `tls_ca_pin` | — | (vault BACKLOG #2371) the SHA-256 of `tls_ca_file`; a mismatch is refused. See [The engine checks the file at every start and reload](#the-engine-checks-the-file-at-every-start-and-reload-tls_ca_pin) |
 | `encoding` | `utf-8` | envelope charset |
 
 **Fault & delivery semantics.** The response is inspected for a SOAP `Fault` (which can arrive as an HTTP
@@ -2222,7 +2222,7 @@ source (`Http()`, File, a `Loopback` re-ingress) as a `RawMessage`.
 | `verify_tls` | `true` | TLS cert verification — the same posture-keyed cell as [REST](#rest--rest): `false` is **refused at construction** off loopback, and the `MEFOR_ALLOW_INSECURE_TLS` escape is **clamped inert** while `[security].enforcement = enforce` (the shipped default) |
 | `tls_allow_expired` | `false` | **(#129, ADR 0094)** tolerate an **expired** server cert with chain + hostname still verified. **No posture gate and no escape variable**. It **is reported**: a WARNING at each build, a `tls-allow-expired` line in `messagefoundry check` and a `security_loosenings()` entry, and so `GET /security/posture` (CORRECTED 2026-10-01: this row said `security_loosenings()` never reports it, stale since BACKLOG #333) — see the [MLLP row](#mllp--mllp) |
 | `tls_ca_file` | — | **(#1180)** pins this hop to one private CA; `FhirLookup()` takes it too. See [Pinning a private CA per connection](#pinning-a-private-ca-per-connection-tls_ca_file) |
-| `tls_ca_pin` | — | (vault BACKLOG #2371) the SHA-256 of `tls_ca_file`; a mismatch refuses the start or reload. See [The engine checks the file at every start and reload](#the-engine-checks-the-file-at-every-start-and-reload-tls_ca_pin) |
+| `tls_ca_pin` | — | (vault BACKLOG #2371) the SHA-256 of `tls_ca_file`; a mismatch is refused. See [The engine checks the file at every start and reload](#the-engine-checks-the-file-at-every-start-and-reload-tls_ca_pin) |
 | `encoding` | `utf-8` | body charset |
 | `capture_response` | `false` | capture the server reply (assigned resource / `OperationOutcome`) as a response artifact (ADR 0013) |
 | `reingress_to` | — | route the captured reply into this `Loopback` inbound (implies capture) |
@@ -2641,7 +2641,7 @@ behind the console's "Test Connection"). Egress is gated by `[egress].allowed_tc
 | `timeout_seconds` | `30.0` | ACSE/DIMSE/network timeout |
 | `connect_timeout` | `10.0` | association-request (TCP connect) timeout |
 | `tls` / `tls_ca_file` / `tls_cert_file` / `tls_key_file` | `false` / — | **DICOM-over-TLS**: verify the peer's server cert (`tls_ca_file` pins the anchor); `tls_cert_file`/`tls_key_file` opt into **mTLS**. There is **no `tls_verify=false`** on this connector — chain and hostname are always verified. Since BACKLOG #2193 it carries the **revocation gate** MLLP/REST/SOAP/FHIR/DICOMweb/EMAIL carry: `tls=true` to an off-box PACS **is refused on a stock instance** unless `[tls].crl_file` reaches the hop or the connection declares `tls_revocation_attested` with a reason (CORRECTED 2026-10-04: this row said the hop had no revocation gate and was not refused) |
-| `tls_ca_pin` | — | (vault BACKLOG #2371) the SHA-256 of `tls_ca_file`; a mismatch refuses the start or reload. See [The engine checks the file at every start and reload](#the-engine-checks-the-file-at-every-start-and-reload-tls_ca_pin) |
+| `tls_ca_pin` | — | (vault BACKLOG #2371) the SHA-256 of `tls_ca_file`; a mismatch is refused. See [The engine checks the file at every start and reload](#the-engine-checks-the-file-at-every-start-and-reload-tls_ca_pin) |
 | `tls_allow_expired` | `false` | **(#129, ADR 0094)** tolerate an **expired** PACS certificate with chain + hostname still verified. Combined with a `tls_revocation_attested` declaration, this hop can be pinned to a certificate that is **both expired and revoked** with nothing in the engine refusing it — **no posture gate and no escape variable**. It **is reported**: a WARNING at each build, a `tls-allow-expired` line in `messagefoundry check` and a `security_loosenings()` entry, and so `GET /security/posture` (CORRECTED 2026-10-01: this row said `security_loosenings()` never reports it, stale since BACKLOG #333) (see the [MLLP row](#mllp--mllp)) |
 | `tls_key_password` | `None` → unencrypted key | passphrase for a PKCS#8-encrypted mTLS-client `tls_key_file` (`env()`-sourced); it must meet the [wrap floor](#encrypted-private-keys-must-meet-the-wrap-floor). Same fail-fast semantics as the inbound SCP (no/wrong passphrase raises at construction, never a TTY hang). |
 
@@ -2683,7 +2683,7 @@ handling. It needs **no `[dicom]` extra** (the object is opaque bytes).
 | `timeout_seconds` | `30.0` | request timeout |
 | `verify_tls` | `true` | TLS cert verification — the same posture-keyed cell as [REST](#rest--rest): `false` is **refused at construction** off loopback, and the `MEFOR_ALLOW_INSECURE_TLS` escape is **clamped inert** while `[security].enforcement = enforce` (the shipped default). **`DICOMweb()` has no `tls_allow_expired`** — it reuses the REST client but does not read that setting, so a DICOMweb hop always enforces certificate expiry |
 | `tls_ca_file` | — | **(#1180)** pins this hop to one private CA. See [Pinning a private CA per connection](#pinning-a-private-ca-per-connection-tls_ca_file) |
-| `tls_ca_pin` | — | (vault BACKLOG #2371) the SHA-256 of `tls_ca_file`; a mismatch refuses the start or reload. See [The engine checks the file at every start and reload](#the-engine-checks-the-file-at-every-start-and-reload-tls_ca_pin) |
+| `tls_ca_pin` | — | (vault BACKLOG #2371) the SHA-256 of `tls_ca_file`; a mismatch is refused. See [The engine checks the file at every start and reload](#the-engine-checks-the-file-at-every-start-and-reload-tls_ca_pin) |
 | `capture_response` | `false` | capture the STOW-RS `dicom+json` response as a reply (ADR 0013) |
 
 **Status classification.** A 2xx whose `dicom+json` body carries a per-instance **FailedSOPSequence**
@@ -3019,8 +3019,8 @@ outbound(
 | What if `verify_tls = false`? | The data hop ignores it, since a verify-off hop trusts nothing. A token hop still reads it, as the row above says. |
 | Does it cover SOAP mutual TLS? | Yes. The client-certificate opener verifies the server against the same file. |
 | Does it apply on a loopback hop? | Yes. Only the instance `[tls]` anchor exempts loopback. A connection's own CA does not. |
-| What if the file is missing? | A start or reload is refused by the integrity check below, before any connection is built. That refusal names the connection and the path. `messagefoundry check` does not run that check. It builds every connection in one pass, and the build fails with an error that names the setting and, where the build knows it, the connection. So one missing file fails that whole pass. |
-| What if it is blank? | On these six factories a blank literal is refused at load. A blank `env()` value is refused when it resolves, naming the setting, the connection and the environment key (vault BACKLOG #2370). |
+| What if the file is missing? | The integrity check below refuses it, naming the connection and the path. At start that fails the connection's own lane; at a reload it refuses the reload. `messagefoundry check` does not run that check. It builds every connection in one pass, and the build fails with an error that names the setting and, where the build knows it, the connection. So one missing file fails that whole pass. |
+| What if it is blank? | On these six factories, and on `Email()` and `Direct()`, a blank literal is refused at load. A blank `env()` value is refused when it resolves, naming the setting, the connection and the environment key (vault BACKLOG #2370). |
 | When is it refused as unread? | On `Ftp(tls=False)`, which has no TLS, and on `DICOMweb(verify_tls=False)`, which has no token hop. On the others, a token hop can still read it. |
 | What if it is unset? | The hop is built exactly as before, from the instance `[tls]` block or the OS store. |
 
@@ -3030,40 +3030,55 @@ replace it chooses which CA the hop trusts.
 
 ### The engine checks the file at every start and reload (`tls_ca_pin`)
 
-The engine checks an outbound `tls_ca_file` at start and at every reload, as it checks an inbound
-listener's CA (vault BACKLOG #2371). `tls_ca_pin` is optional. It is the file's SHA-256 in hex, with
-`:` separators allowed. Every factory that takes `tls_ca_file` for an outbound hop takes it:
-`Rest()`, `FHIR()`, `Soap()`, `DICOMweb()`, `FhirLookup()`, `Ftp()`, `Email()`, `Direct()`, and an
-outbound `MLLP()` or `DICOM()` with `tls = true`. An inbound `Ftp()` poller dials out too, so its CA
-takes the same checks.
+The engine checks the `tls_ca_file` of each connection that dials out (vault BACKLOG #2371).
+`tls_ca_pin` is optional. It is the file's SHA-256 in hex, with `:` separators allowed. Every
+factory that takes `tls_ca_file` for an outbound hop takes it: `Rest()`, `FHIR()`, `Soap()`,
+`DICOMweb()`, `FhirLookup()`, `Ftp()`, `Email()`, `Direct()`, and an outbound `MLLP()` or
+`DICOM()` with `tls = true`. An inbound `Ftp()` poller dials out too, so its CA takes the same
+checks.
+
+**When the check runs, and what a refusal stops.** This follows
+[ADR 0031](adr/0031-startup-connection-fault-isolation.md), as amended on 2026-10-06.
+
+| When | What a refused file stops |
+|---|---|
+| Start, for an outbound or an `Ftp()` poller | That connection only. It reads `failed`, and the rest of the graph comes up. |
+| An operator start (`POST /connections/{name}/start`), such as of an `auto_start = false` lane | That connection only. |
+| Start, for a `FhirLookup()` | The whole start. A lookup has no lane of its own to fail. |
+| Every reload | The whole reload, before anything changes. |
 
 | What the check finds | What happens |
 |---|---|
-| `tls_ca_pin` is set and the file's SHA-256 does not match it | The start or reload is refused, whatever `[security].enforcement` says. |
+| `tls_ca_pin` is set and the file's SHA-256 does not match it | Refused, whatever `[security].enforcement` says. |
 | An account other than the owner can write the file, or replace it through a folder on its path | Refused under `[security].enforcement = enforce`. A WARNING under `warn`. |
 | The engine cannot read the file's permissions or its path | Refused under `enforce`, **even with a matching pin**. A WARNING under `warn`. Move the file into a folder whose permissions the engine can read. |
-| The file cannot be read at all | The start or reload is refused. |
+| The file cannot be read at all | Refused, naming the connection and the path. |
 | The file's SHA-256 differs from the one the last check saw | An `auth.trust_anchor` audit row with `event` set to `changed`. |
 
 Each check writes its `auth.trust_anchor` rows under `outbound:<connection name>`,
 `fhir_lookup:<name>` for a `FhirLookup()`, or `inbound:<connection name>` for an inbound `Ftp()`
-poller. `Email()` and `Direct()` with `use_tls = false` read no CA, so theirs is not checked. One refused file refuses the whole start or reload, not
-only its own connection. A `deployed = false` connection is not checked, since it is never built.
+poller. A `deployed = false` connection is not checked, since it is never built.
+
+**A CA the hop never reads is not checked, and a pin beside it is refused at load.** That is a CA
+behind `use_tls = false` or `tls_verify = false`. On `Rest()`, `Soap()`, `FHIR()`, `DICOMweb()` and
+`FhirLookup()` it is also a CA behind `verify_tls = false` or an `http://` url, unless a SMART or
+OAuth2 token hop reads it. A pin there would read as pinned while nothing checks it.
 
 **Why a matching pin is no escape here.** On an inbound listener, a matching pin lets a CA load whose
 permissions the engine could not read. That works because the listener loads the exact bytes the
-check read. An outbound hop does not, yet. It reads the file again by path when it builds its TLS
+check read. A dialling hop does not, yet. It reads the file again by path when it builds its TLS
 context, after the check. So a file swapped between the check and the build would be trusted
 unchecked until that connection is built again. A restart rebuilds it. A reload rebuilds it only
-when its config changed. A later reload checks and audits the file on disk, not the bytes the
-live hop loaded, and a `changed` row does not mean the hop now trusts the new file. A lane started
-later, such as one with `auto_start = false`, reads the file with no check. A pin would vouch for
-bytes the hop never loaded. For the same reason the check does not refuse a file the hop itself can load, such as one
-holding a `TRUSTED CERTIFICATE` block.
+when its config changed. A later reload checks and audits the file on disk, not the bytes the live
+hop loaded. So a `changed` row does not mean the hop now trusts the new file. A pin would vouch for
+bytes the hop never loaded. For the same reason the check does not refuse a file the hop itself can
+load, such as one holding a `TRUSTED CERTIFICATE` block.
 
-`tls_ca_pin` with no `tls_ca_file` is refused at load, since nothing would check it. So is a pin
-that is empty or whitespace; leave it out for no pin. On `MLLP()` and `DICOM()` both are refused
-when the connection is built instead, and so is a pin without `tls = true`.
+`tls_ca_pin` with no `tls_ca_file` is refused at load, since nothing would check it. So is a pin that
+is empty or whitespace; leave it out for no pin. On the eight factories above, a literal pin that
+is not 64 hex characters is refused at load too, and an `env()` pin once it resolves. On `MLLP()`
+and `DICOM()` a pin with no `tls_ca_file`, or without `tls = true`, is refused when the connection
+is built instead, and a malformed one when the check runs.
 
 On an inbound listener the same key means something different. On `Http()`, and on an inbound
 `MLLP()` or `DICOM()`, it is the CA a **calling client's** certificate must chain to.

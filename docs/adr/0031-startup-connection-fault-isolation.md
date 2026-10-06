@@ -283,3 +283,39 @@ before apart from the create-on-write WARNING. The FILE default path's syscall c
 is the common one). `_RemoteClient.ensure_dir` now reports whether it created — a module-private
 contract with two implementations. No new schema and no new dependency; a refusal rides the existing
 `_failed`/`failed` surfacing and the `connection_stopped` alert.
+
+## Amendment (2026-10-06, vault BACKLOG #2371) — where a refused trust anchor lands
+
+**Status:** Accepted (Manager decision for #2371, which keeps this ADR). Built in the same change.
+
+**Context.** Vault BACKLOG #2371 checks the `tls_ca_file` of each connection that dials out: an
+optional `tls_ca_pin`, a refusal under `[security].enforcement = enforce` for a file another
+account could replace, and an `auth.trust_anchor` audit row. Its first build ran those checks in
+the start preflight, so one refused outbound CA refused the whole start. That is the case the
+Context above names: feed #21's downstream cert should not stop the other 20.
+
+**Decision.** Three rules. The checks themselves are stated once, in
+[`auth/trust_anchors.py`](../../messagefoundry/auth/trust_anchors.py), module item 9.
+
+1. **At start, a refused outbound, `Ftp` poller or `FhirLookup` CA is a lane degrade under §1,
+   with one exception.** The runner checks an outbound's CA inside `_start_outbound`'s isolation
+   `try`, and an `Ftp` poller's before it binds. A refusal fails that lane only, with the
+   `auth.trust_anchor` row, and §2 and §3 apply. The operator start path checks it too:
+   `_ensure_destination_built` for an outbound, and `start_inbound` for a poller. The exception is
+   a **`FhirLookup`**. Its executor is built graph-wide, which §1 leaves to the backstop, so its
+   refused CA still refuses the start.
+2. **At reload, any refused CA refuses the reload**, as §4 already says. The engine's reload
+   preflight checks every one before the swap, so the reload's own builds do not check again.
+3. **An inbound listener CA refused at start refuses the start. This records existing behaviour;
+   it is not a new decision.** BACKLOG #1142 slice 3 shipped it (engine PR 1535, `29ab2e60b8`):
+   the start preflight checks every inbound CA that requires a peer certificate, before any
+   listener binds. Nothing recorded it here until now.
+
+**Engine-refusal, not an ADR 0031 lane degrade, for rule 3.** It is recorded rather than changed
+because #2371 did not set out to move it. Whether an inbound listener's CA should degrade its lane
+instead is a separate question, not asked here.
+
+**Consequences.** A start with a broken outbound CA comes up degraded, and the lane reads `failed`
+with a `TrustAnchorError` reason. The next reload is refused until the file is fixed, since a
+reload checks every CA. A lane DR-parked or left down by `auto_start = false` is not checked at
+start; it is checked when an operator starts it.
