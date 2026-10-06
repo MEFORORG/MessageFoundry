@@ -1232,17 +1232,24 @@ async def test_an_unguarded_encode_stores_no_character_of_the_message(
         reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
     )
     await runner.start()
+    await runner._destinations["file_out"].aclose()
     runner._destinations["file_out"] = _BareEncoder()
-    (inbox / "a.hl7").write_bytes(ADT.replace("JANE", "JANŘ").encode("utf-8"))
+    # U+015A: its bare hex, 15a, holds a letter, so no decimal position can match it.
+    (inbox / "a.hl7").write_bytes(ADT.replace("JANE", "JANŚ").encode("utf-8"))
     try:
         await _until_stat(store, OutboxStatus.DEAD.value, 1)
     finally:
         await runner.stop()
-    cur = await store._db.execute("SELECT last_error FROM queue WHERE last_error IS NOT NULL")
-    errors = " ".join(store._cipher.decrypt(r["last_error"]) for r in await cur.fetchall())
-    assert "UnicodeEncodeError: 'ascii' codec cannot encode at position" in errors
-    for form in (*_escapes("Ř"), "JAN"):
-        assert form not in errors, f"a character of the message reached last_error as {form!r}"
+    cur = await store._db.execute("SELECT message_id, last_error FROM queue WHERE stage='outbound'")
+    [row] = await cur.fetchall()
+    stored = {
+        "last_error": store._cipher.decrypt(row["last_error"]),
+        "events": " ".join(e["detail"] or "" for e in await store.events_for(row["message_id"])),
+    }
+    for where, text in stored.items():
+        assert "UnicodeEncodeError: 'ascii' codec cannot encode at position" in text, where
+        for form in (*_escapes("Ś"), "JAN"):
+            assert form not in text, f"a character of the message reached {where} as {form!r}"
 
 
 class _RecordingAlertSink:

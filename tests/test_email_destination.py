@@ -1520,14 +1520,18 @@ async def test_a_subject_fault_is_not_reported_as_the_body(wire: _WireCapture) -
     whole build, subject included, and blame the body for a subject fault.
 
     Load refuses every subject a header cannot encode, so the subject is set after construction
-    here, as a build path that skipped the load check would leave it. It escapes as its own error,
-    which the delivery worker stores through ``safe_exc``."""
+    here, as a build path that skipped the load check would leave it. Every row would fail the same
+    way, so it is a configuration fault, which stops the lane rather than dead-lettering each row."""
     dest = _body_dest(wire.port, "utf-8")
     dest.subject = f"Referral {_LONE_SURROGATE} note"
-    with pytest.raises(UnicodeEncodeError) as ei:
+    with pytest.raises(NegativeAckError) as ei:
         await dest.send(PAYLOAD)
-    assert "could not be encoded" not in str(ei.value)
-    stored = safe_exc(ei.value)
+    exc = ei.value
+    assert "header (subject or sender)" in str(exc)
+    assert "the message could not be encoded" not in str(exc)
+    assert exc.config_fault is True and exc.permanent is True
+    assert exc.__cause__ is None and exc.__context__ is None
+    stored = safe_exc(exc)
     for form in _escapes(_LONE_SURROGATE):
         assert form not in stored, f"the subject character reached the stored error as {form!r}"
     assert wire.connections == 0

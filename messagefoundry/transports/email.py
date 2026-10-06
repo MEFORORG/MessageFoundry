@@ -501,18 +501,30 @@ class EmailDestination(DestinationConnector):
         # permanent and content-free instead (see its docstring).
         encode_wire_body(payload, self.encoding, transport=f"Email {self.host}:{self.port}")
         msg = EmailMessage()
-        msg["Subject"] = self.subject
-        self._envelope.address(msg)
+        # The headers and the body get separate arms, so a header fault is never reported as the
+        # body's (vault BACKLOG #3033). Load refuses a subject or sender a header cannot encode, so
+        # this arm is a backstop for one that got past that. Every row would fail the same way, so it
+        # is the connection's fault: config_fault stops the lane and keeps the queue rather than
+        # dead-lettering each message as a bad body.
+        failure = ""
+        try:
+            msg["Subject"] = self.subject
+            self._envelope.address(msg)
+        except UnicodeError as exc:
+            failure = type(exc).__name__
+        if failure:
+            raise NegativeAckError(
+                f"Email {self.host}:{self.port}: a configured header (subject or sender) could not "
+                f"be encoded ({failure})",
+                code="encoding",
+                permanent=True,
+                config_fault=True,
+            )
         # Backstop for set_content()'s own encode, in Direct's shape (see `encode_wire_body`). Python
         # 3.15 encodes there with the email package's OUTPUT charset (euc-jp and shift_jis become
         # iso-2022-jp), not the name the guard checked, so a body can pass the guard and still fail.
         # Keep only the type name and raise outside the handler, so neither chain link holds the
         # error whose `.object` is the whole payload.
-        #
-        # It wraps set_content() alone, so a header fault is never reported as the body's (vault
-        # BACKLOG #3033). The subject and sender are refused at load if a header could not encode
-        # them; one that got past that escapes as its own error, which safe_exc renders content-free.
-        failure = ""
         try:
             # The Handler-produced payload IS the body (content-agnostic — an HL7 string, a JSON/XML
             # report, plain text); rendering it human-readable is the Handler's job, not the transport's.

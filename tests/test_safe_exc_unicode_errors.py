@@ -16,7 +16,8 @@ from messagefoundry.redaction import safe_exc
 from tests.test_encode_wire_body import _escapes
 
 #: Synthetic. Distinctive enough that a substring scan of the output cannot miss them.
-_CHAR = "Ř"  # R with caron: not ASCII, not latin-1
+#: Its bare hex, ``15a``, holds a letter, so no decimal position in the output can match it.
+_CHAR = "Ś"  # S with acute: not ASCII, not latin-1
 _BYTE = 0xFE  # never valid in UTF-8
 _PREFIX = "PID|1||ZZQ"
 _TEXT = f"{_PREFIX}{_CHAR}X"
@@ -53,9 +54,9 @@ def _assert_no_content(text: str) -> None:
 def test_the_unguarded_text_does_leak() -> None:
     """POSITIVE CONTROL for the instrument: ``str()`` of each error carries what the scans below
     look for. A scan that could not find it here proves nothing by finding nothing later."""
-    assert "\\u0158" in str(_encode_error())
+    assert "\\u015a" in str(_encode_error())
     assert "0xfe" in str(_decode_error(_PREFIX.encode() + bytes([_BYTE])))
-    assert "\\u0158" in str(_translate_error())
+    assert "\\u015a" in str(_translate_error())
 
 
 def test_an_encode_error_names_codec_and_position_and_never_the_character() -> None:
@@ -125,3 +126,55 @@ def test_an_encoding_attribute_not_shaped_like_a_codec_is_dropped() -> None:
     text = safe_exc(exc)
     _assert_no_content(text)
     assert "codec" not in text and f"position {_POSITION}" in text
+
+
+def test_an_encoding_attribute_naming_no_codec_is_dropped() -> None:
+    # Shaped like a codec name, but no codec answers to it: an identifier someone set there.
+    exc = UnicodeEncodeError("ascii", _TEXT, _POSITION, _POSITION + 1, "ordinal not in range(128)")
+    exc.encoding = "MRN123456789"
+    text = safe_exc(exc)
+    assert "MRN" not in text and "123456789" not in text
+    assert "codec" not in text and f"position {_POSITION}" in text
+
+
+def test_a_reason_that_quotes_the_input_is_dropped() -> None:
+    """The stdlib idna codec puts the offending character INTO ``.reason``, so a reason is kept
+    only from a fixed list. Measured on Python 3.14: ``Invalid character '\\ue000'``."""
+    with pytest.raises(UnicodeError) as caught:
+        f"doe{_CHAR}jane.example".encode("idna")
+    text = safe_exc(caught.value)
+    _assert_no_content(text)
+    for form in _escapes(""):
+        assert form not in text, f"the reason leaked the character as {form!r}: {text!r}"
+    assert "doe" not in text and "jane" not in text
+
+
+def test_a_punycode_round_trip_reason_naming_the_label_is_dropped() -> None:
+    label = b"xn--" + "doeﬁjane".encode("punycode")
+    with pytest.raises(UnicodeError) as caught:
+        label.decode("idna")
+    assert "doe" in str(caught.value), "the probe must quote the label, or it tests nothing"
+    text = safe_exc(caught.value)
+    assert "doe" not in text and "jane" not in text, text
+
+
+def test_an_unlisted_reason_is_dropped_and_a_listed_one_kept() -> None:
+    kept = UnicodeEncodeError("ascii", _TEXT, _POSITION, _POSITION + 1, "surrogates not allowed")
+    dropped = UnicodeEncodeError("ascii", _TEXT, _POSITION, _POSITION + 1, f"bad {_CHAR}")
+    assert safe_exc(kept).endswith(": surrogates not allowed")
+    assert (
+        safe_exc(dropped)
+        == f"UnicodeEncodeError: 'ascii' codec cannot encode at position {_POSITION}"
+    )
+
+
+class _RaisingReason(UnicodeEncodeError):
+    @property
+    def reason(self) -> str:  # type: ignore[override]
+        raise ValueError("unreadable")
+
+
+def test_an_attribute_that_raises_falls_back_to_the_class_name() -> None:
+    """``safe_exc`` runs inside other handlers' except arms, so it must not raise in their place."""
+    exc = _RaisingReason("ascii", _TEXT, _POSITION, _POSITION + 1, "ordinal not in range(128)")
+    assert safe_exc(exc) == "_RaisingReason"
