@@ -43,7 +43,12 @@ from messagefoundry.config.settings import (
     ReferenceSettings,
 )
 from messagefoundry.config.tls_policy import HopPosture, active_hop_posture, current_hop_posture
-from messagefoundry.config.wiring import ReferenceSpec, WiringError, resolve_env_settings
+from messagefoundry.config.wiring import (
+    ReferenceSpec,
+    WiringError,
+    refuse_unresolved_hop_flags,
+    resolve_env_settings,
+)
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.store import Store
@@ -394,7 +399,9 @@ class ReferenceSyncRunner:
         return result
 
     async def _sync_one(self, spec: ReferenceSpec) -> None:
-        # Resolve env() refs in the source settings against this instance's environment.
+        # Resolve env() refs in the source settings against this instance's environment. A hop-policy
+        # flag is refused first, while still raw, as build_check does (vault BACKLOG #2232).
+        refuse_unresolved_hop_flags(spec.source.settings, f"reference set {spec.name!r}")
         settings = resolve_env_settings(spec.source.settings, self._env_values)
         kind = spec.source.kind
         if kind == "file":

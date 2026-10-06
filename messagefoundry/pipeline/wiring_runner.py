@@ -63,7 +63,6 @@ from messagefoundry.config.models import (
     Schedule,
     Source,
     StallThreshold,
-    flag_from_settings,
 )
 from messagefoundry.config.run_context import RunContext, run_contexts
 from messagefoundry.config.settings import (
@@ -94,9 +93,11 @@ from messagefoundry.config.wiring import (
     apply_sync_reply_capture_implication,
     bindings_overlap,
     inbound_binding_conflicts,
+    refuse_unresolved_hop_flags,
     resolve_env_settings,
     resolve_listener_binding,
     resolved_encoding_problems,
+    settings_hop_attestation,
 )
 from messagefoundry.connection_names import fhir_lookup_record_name, inbound_record_name
 from messagefoundry.fhirsearch import FhirSearchParams
@@ -2008,6 +2009,7 @@ class RegistryRunner:
             return None
         resolved: dict[str, dict[str, Any]] = {}
         for name, spec in self.registry.lookups.items():
+            refuse_unresolved_hop_flags(spec.settings, f"database lookup {name!r}")
             resolved[name] = resolve_env_settings(spec.settings, self._env_values)
         # #200 (ADR 0092): stamp the derived posture around the live executor build so the DSN's
         # weakened-TLS refusal (_build_dsn → _weakened_tls_permitted) keys on THIS instance's posture,
@@ -8801,6 +8803,9 @@ def _fhir_lookup_settings(
     a lookup's record cannot be mistaken for an outbound of the same name. The one builder for both
     the live executor and the check build, so the two cannot differ. The egress allowlist check runs
     in :class:`~messagefoundry.transports.fhir.FhirLookupExecutor` itself."""
+    where = f"fhir lookup {spec.name!r}"
+    # Before env() resolves, so a post-factory env() flag cannot resolve "false" to True (#2232).
+    refuse_unresolved_hop_flags(spec.settings, where)
     settings = resolve_env_settings(
         spec.settings, env_values, connection=fhir_lookup_record_name(spec.name)
     )
@@ -8816,12 +8821,10 @@ def _fhir_lookup_settings(
     # A lookup's hop attestation still lives in its settings, so a raw one written after the factory
     # ran could pair with the typed acceptance. The attestation wins in the disposition, so the hop
     # would cross with no WARN or audit record while the report listed it as accepted. Refuse it here,
-    # as the factory does, since this is the one builder both executor paths use.
-    try:
-        attested = flag_from_settings(settings, "tls_hop_attested")
-    except ValueError as exc:
-        raise WiringError(f"fhir lookup {spec.name!r}: {exc}") from exc
-    _refuse_attested_and_accepted(f"fhir lookup {spec.name!r}", attested, spec.cleartext_accepted)
+    # as the factory does, since this is the one builder both executor paths use. The pair is checked
+    # together, as FhirLookupSpec does, so a raw flag with no reason is refused here too.
+    attested = settings_hop_attestation(settings, where)
+    _refuse_attested_and_accepted(where, attested, spec.cleartext_accepted)
     return settings
 
 
@@ -9094,6 +9097,7 @@ def _build_check_connectors(
             )
     resolved_lookups: dict[str, dict[str, Any]] = {}
     for lname, lspec in registry.lookups.items():
+        refuse_unresolved_hop_flags(lspec.settings, f"database lookup {lname!r}")
         resolved_lookups[lname] = resolve_env_settings(lspec.settings, env_values)
     if resolved_lookups:
         # Construct (and discard) the executor: validates each DSN (TLS/auth) without opening a pool.
@@ -9105,6 +9109,8 @@ def _build_check_connectors(
     # values do not resolve here is left to its sync, as before, so one unprovisioned set does not
     # refuse the whole graph.
     for rname, rspec in registry.references.items():
+        # Every source kind, and before the unresolved-env skip below: this refusal needs no value.
+        refuse_unresolved_hop_flags(rspec.source.settings, f"reference set {rname!r}")
         if rspec.source.kind != "database":
             continue
         try:

@@ -653,6 +653,30 @@ def revocation_attestation_from_settings(
     )
 
 
+#: ``(flag, reason, connection)``, as the two declaration readers return a declaration.
+_Declaration = tuple[bool, str | None, str | None]
+
+
+def hop_declarations_from_settings(
+    s: Mapping[str, Any], error: type[ValueError]
+) -> tuple[bool, _Declaration, _Declaration]:
+    """The three hop-policy flags a credential seam reads, strictly (vault BACKLOG #2232).
+
+    Returns ``(tls_hop_attested, cleartext acceptance, revocation attestation)``. A flag that is not
+    a real ``bool`` raises ``error``, the calling seam's own refusal type, naming the connection the
+    runner mirrored into ``s``. One body, so the Digest, OAuth2 and SMART seams raise alike."""
+    try:
+        return (
+            flag_from_settings(s, "tls_hop_attested"),
+            cleartext_acceptance_from_settings(s),
+            revocation_attestation_from_settings(s),
+        )
+    except ValueError as exc:
+        connection = s.get(MIRRORED_CONNECTION_SETTING)
+        prefix = hop_name_prefix(None if connection is None else str(connection))
+        raise error(f"{prefix}{exc}") from exc
+
+
 def smart_auth_configured(s: Mapping[str, Any]) -> bool:
     """Whether a settings mapping has SMART Backend Services auth turned ON.
 
@@ -696,8 +720,7 @@ def token_provider_from_settings(
     # ADR 0153: the same per-connection declaration the delivery hop carries, mirrored into these
     # resolved settings by the runner's _dest_config (with the connection name, so the acceptance audit
     # record names the declaration). Read exactly as the OAuth2 sibling does.
-    accepted = cleartext_acceptance_from_settings(s)
-    revocation = revocation_attestation_from_settings(s)
+    attested, accepted, revocation = hop_declarations_from_settings(s, SmartAuthError)
     token_url = str(s.get("smart_token_url") or "")
     return SmartBackendTokenProvider(
         token_url=token_url,
@@ -714,7 +737,7 @@ def token_provider_from_settings(
         timeout_seconds=float(s.get("smart_timeout_seconds", _DEFAULT_TOKEN_TIMEOUT)),
         # #200: the per-connection insecure-hop attestation keys the posture-keyed cleartext refusal in
         # __init__ (read from settings exactly as _dest_config / the OAuth2 provider do).
-        attested=flag_from_settings(s, "tls_hop_attested"),
+        attested=attested,
         # #1498 (ADR 0173 §4.3): the revocation attestation `_dest_config` mirrors from the connection's
         # top-level declaration. A DIFFERENT claim from `attested` above, so it gets its own key.
         revocation_attested=revocation[0],

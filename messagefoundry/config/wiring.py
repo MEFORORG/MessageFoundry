@@ -76,7 +76,7 @@ from messagefoundry.config.models import (
     _check_hop_attestation,
     _check_revocation_attestation,
     check_db_connect_timeout,
-    hop_attestation_from_settings,
+    flag_from_settings,
 )
 from messagefoundry.config.send_snapshot import snapshot_on_send_active
 from messagefoundry.connection_names import (
@@ -611,6 +611,41 @@ def _hop_attestation_entries(where: str, attested: bool, reason: str | None) -> 
     return {"tls_hop_attested": True, "tls_hop_attested_reason": reason} if attested else {}
 
 
+def settings_hop_attestation(settings: Mapping[str, Any], where: str) -> bool:
+    """Validate the attestation pair a settings carrier holds, by the factory's own rule.
+
+    For ``FhirLookupSpec`` and the lookup settings builder, whose ``settings`` stay mutable after
+    the factory ran. The pair is checked together, with the same string-type and control-character
+    rules as :func:`_hop_attestation_entries`, because it IS that function. Absent or ``None`` reads
+    as not attested."""
+    attested = settings.get("tls_hop_attested")
+    attested = False if attested is None else attested
+    _hop_attestation_entries(where, attested, settings.get("tls_hop_attested_reason"))
+    return attested is True
+
+
+#: The hop-policy flags a settings carrier may hold (vault BACKLOG #2232). A ``FhirLookup``,
+#: ``DatabaseLookup`` or ``DatabaseRef`` keeps its settings in a mutable dict, so a config module
+#: can write any of these past the factory.
+HOP_POLICY_FLAGS = ("tls_hop_attested", "cleartext_accepted", "tls_revocation_attested")
+
+
+def refuse_unresolved_hop_flags(settings: Mapping[str, Any], where: str) -> None:
+    """Refuse a hop-policy flag in a settings carrier that is not ``None`` or a real ``bool``.
+
+    Runs on the RAW settings, before ``env()`` resolves (vault BACKLOG #2232). The factories already
+    refuse an ``env()`` flag. A reference written into the dict after them would resolve through its
+    own cast, and ``env(..., cast=bool)`` turns the string ``"false"`` into ``True``. So the flag is
+    refused while it is still an :class:`EnvRef`, at every place a carrier is read at load."""
+    for key in HOP_POLICY_FLAGS:
+        try:
+            flag_from_settings(settings, key)
+        except ValueError as exc:
+            raise WiringError(
+                f"{where}: {exc} (an env() reference is not accepted on a hop-policy flag)"
+            ) from exc
+
+
 def _refuse_attested_and_accepted(where: str, attested: bool, accepted: bool) -> None:
     """Refuse a declaration that claims its hop is both secure and not secure.
 
@@ -917,10 +952,11 @@ class FhirLookupSpec:
             _check_revocation_attestation(
                 self.tls_revocation_attested, self.tls_revocation_attested_reason
             )
-            # The pair, not the flag alone: a spec built directly must not attest without a reason.
-            attested = hop_attestation_from_settings(self.settings)
         except ValueError as exc:
             raise WiringError(f"fhir lookup {self.name!r}: {exc}") from exc
+        # The pair, by the factory's own rule, so a spec built directly cannot attest without a
+        # reason or with one that would forge a WARNING line.
+        attested = settings_hop_attestation(self.settings, f"fhir lookup {self.name!r}")
         # The factory refuses both claims at once, and a spec built directly must not hold them either.
         # `wiring_runner._fhir_lookup_settings` checks again, since `settings` is mutable (ADR 0092).
         _refuse_attested_and_accepted(
@@ -5044,20 +5080,28 @@ def attested_secure_hops(registry: Registry) -> list[tuple[str, str]]:
     ``DatabaseLookup`` and a ``DatabaseRef`` reference source, whose executors read those settings. Names
     other than an outbound's are prefixed with their table, because each table is its own namespace.
 
+    It fails toward listing (vault BACKLOG #2232). Every carrier is listed unless its flag is ``None``
+    or ``False``, so a value the report cannot read, such as an ``env()`` reference written into a
+    lookup's settings after its factory ran, is listed rather than missed. The load-time check
+    (:func:`refuse_unresolved_hop_flags`) refuses that value, but this report can run without it.
+
     Pure: it reads the loaded graph and touches nothing else."""
 
     def _reason(value: object) -> str:
         return str(value) if value else "(none recorded)"
 
+    def _listed(flag: object) -> bool:
+        return flag is not None and flag is not False
+
     out = [
         (inbound_record_name(ic.name), _reason(ic.tls_hop_attested_reason))
         for ic in registry.inbound.values()
-        if ic.tls_hop_attested
+        if _listed(ic.tls_hop_attested)
     ]
     out += [
         (oc.name, _reason(oc.tls_hop_attested_reason))
         for oc in registry.outbound.values()
-        if oc.tls_hop_attested
+        if _listed(oc.tls_hop_attested)
     ]
     settings_carriers: list[tuple[str, Mapping[str, Any]]] = [
         *((fhir_lookup_record_name(s.name), s.settings) for s in registry.fhir_lookups.values()),
@@ -5067,9 +5111,7 @@ def attested_secure_hops(registry: Registry) -> list[tuple[str, str]]:
     out += [
         (name, _reason(settings.get("tls_hop_attested_reason")))
         for name, settings in settings_carriers
-        # `is True`, the value the strict gate reader honours (vault BACKLOG #2232). Not that reader itself:
-        # a report must not raise, and the gate already refuses any other value.
-        if settings.get("tls_hop_attested") is True
+        if _listed(settings.get("tls_hop_attested"))
     ]
     return sorted(out)
 

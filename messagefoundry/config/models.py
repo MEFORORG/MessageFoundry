@@ -255,17 +255,20 @@ def _check_hop_attestation(attested: bool, reason: str | None) -> None:
 
 
 def hop_attestation_from_settings(settings: Mapping[str, Any]) -> bool:
-    """Read and load-validate the insecure-hop attestation pair out of a raw settings mapping
-    (BACKLOG #1666), for the two DB cells that have no :class:`Source`/:class:`Destination` model to
-    carry it: the ``db_lookup`` executor and the SQL-backed reference source.
+    """Read and load-validate the insecure-hop attestation pair out of a resolved settings mapping
+    (BACKLOG #1666), for the carriers that have no :class:`Source`/:class:`Destination` model to hold
+    it: the ``db_lookup`` executor, the SQL-backed reference source and the ``FhirLookup`` read
+    executor.
 
     Same three fail-loud rules as :func:`_check_hop_attestation` — this is that validator with the
-    mapping read in front of it, so the two cells cannot drift from the modelled ones or each other.
+    mapping read in front of it, so these carriers cannot drift from the modelled ones or each other.
 
-    A mapping is the ONLY carrier for those cells. ``DatabaseLookup()`` and ``DatabaseRef()`` write the
-    pair into it from their own ``tls_hop_attested`` parameters (owner ruling 2026-09-24), and
-    ``config.wiring.attested_secure_hops`` reads the same mapping, so the loosening report names every
-    attestation this reader honours."""
+    ``DatabaseLookup()``, ``DatabaseRef()`` and ``FhirLookup()`` write the pair into the mapping from
+    their own ``tls_hop_attested`` parameters (owner ruling 2026-09-24). The mapping stays mutable, so
+    this reader can meet a value no factory wrote. ``config.wiring.attested_secure_hops`` lists every
+    flag that is not ``None`` or ``False``, which covers every value this reader honours, and
+    ``config.wiring.refuse_unresolved_hop_flags`` refuses a non-bool flag at load, before ``env()``
+    resolves (vault BACKLOG #2232)."""
     attested = flag_from_settings(settings, "tls_hop_attested")
     reason = settings.get("tls_hop_attested_reason")
     _check_hop_attestation(attested, None if reason is None else str(reason))

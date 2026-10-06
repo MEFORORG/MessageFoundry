@@ -14,12 +14,19 @@ code-first ``tls_hop_attested`` factories did too. Two gaps remained, both pinne
   factories would have been honoured on a truthy string.
 
 One strict reader, ``models.flag_from_settings``, now serves the seams that gate a hop, and the
-shared flag-with-reason check refuses a non-bool flag at load, naming the key. The loosening report
-``attested_secure_hops`` reads ``is True`` instead, because a report must not raise.
+shared flag-with-reason check refuses a non-bool flag at load, naming the key.
+
+A strict reader AFTER ``env()`` resolves is not enough. A ``FhirLookup``, ``DatabaseLookup`` or
+``DatabaseRef`` keeps its settings in a mutable dict, and ``env(..., cast=bool)`` written there after
+the factory resolves ``"false"`` to a real ``True``. So ``wiring.refuse_unresolved_hop_flags`` refuses
+any raw flag that is not ``None`` or a real bool, an ``EnvRef`` included, at every place a carrier is
+read at load. The loosening report ``attested_secure_hops`` must not raise, so it fails toward
+listing: any flag that is not ``None`` or ``False`` is listed.
 """
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -30,9 +37,11 @@ from messagefoundry.config.models import (
     hop_attestation_from_settings,
     require_flag,
 )
-from messagefoundry.config.settings import EgressSettings
+from messagefoundry.config.settings import EgressSettings, ReferenceSettings
+from messagefoundry.config.tls_policy import MIRRORED_CONNECTION_SETTING
 from messagefoundry.config.wiring import (
     MLLP,
+    DatabaseLookupSpec,
     FhirLookupSpec,
     Ftp,
     Registry,
@@ -43,8 +52,14 @@ from messagefoundry.config.wiring import (
     build_outbound_connection,
     env,
     load_config,
+    refuse_unresolved_hop_flags,
 )
-from messagefoundry.pipeline.wiring_runner import _fhir_lookup_settings
+from messagefoundry.pipeline.reference_sync import ReferenceSyncRunner
+from messagefoundry.pipeline.wiring_runner import (
+    RegistryRunner,
+    _fhir_lookup_settings,
+    build_check_registry,
+)
 from messagefoundry.transports.http_auth import (
     digest_handler_from_settings,
     oauth2_cc_provider_from_settings,
@@ -52,6 +67,7 @@ from messagefoundry.transports.http_auth import (
 from messagefoundry.transports.remotefile import _anon_ftp_guard
 from messagefoundry.transports.rest import HttpAuthError, cleartext_acceptance_from_settings
 from messagefoundry.transports.smart import (
+    SmartAuthError,
     revocation_attestation_from_settings,
     token_provider_from_settings,
 )
@@ -288,12 +304,219 @@ def test_the_lookup_settings_builder_refuses_a_string_written_after_the_factory(
         _fhir_lookup_settings(spec, {}, EgressSettings())
 
 
-def test_the_attested_report_lists_only_a_real_true() -> None:
+# --- a flag written into a settings carrier after its factory (review of PR 2075) -----------
+# `env("att", cast=bool)` resolves the environment value "false" to True, because bool("false") is
+# True. The strict reader then sees a real bool and honours it. So the raw flag is refused before
+# env() resolves, at each place a carrier is read at load.
+
+#: The environment value an operator writes to switch the flag OFF.
+_ENV_OFF = {"att": "false"}
+
+_CARRIER_MODULE = (
+    "from messagefoundry import DatabaseLookup, DatabaseRef, FhirLookup, Reference\n"
+    'FhirLookup("epic", url="https://fhir.example.org/fhir")\n'
+    'DatabaseLookup("clar", server="db.example.org", database="d")\n'
+    'Reference("codes", source=DatabaseRef(server="db.example.org", database="d", '
+    'statement="SELECT code FROM t", key_column="code"))\n'
+)
+
+_CARRIERS = ("fhir lookup 'epic'", "database lookup 'clar'", "reference set 'codes'")
+
+
+def _carriers(tmp_path: Path) -> Registry:
+    (tmp_path / "carriers.py").write_text(_CARRIER_MODULE, encoding="utf-8")
+    return load_config(tmp_path, allow_empty=True)
+
+
+def _carrier_settings(reg: Registry, carrier: str) -> dict[str, Any]:
+    if carrier == "fhir lookup 'epic'":
+        return reg.fhir_lookups["epic"].settings
+    if carrier == "database lookup 'clar'":
+        return reg.lookups["clar"].settings
+    return reg.references["codes"].source.settings
+
+
+def _write_env_flag(settings: dict[str, Any], key: str) -> None:
+    settings[key] = env("att", cast=bool)
+    settings[REASON_KEY[key]] = REASON
+
+
+@pytest.mark.parametrize("key", FLAGS)
+@pytest.mark.parametrize("carrier", _CARRIERS)
+def test_build_check_refuses_an_env_flag_written_after_the_factory(
+    tmp_path: Path, carrier: str, key: str
+) -> None:
+    reg = _carriers(tmp_path)
+    _write_env_flag(_carrier_settings(reg, carrier), key)
+    with pytest.raises(WiringError, match=rf"{carrier}: {key} must be true or false, not EnvRef"):
+        build_check_registry(
+            reg,
+            inbound_bind_host="127.0.0.1",
+            env_values=_ENV_OFF,
+            egress=EgressSettings(deny_by_default=False),
+        )
+
+
+def test_build_check_refuses_an_unresolvable_env_flag_on_a_reference_too(tmp_path: Path) -> None:
+    # A reference source whose env() values do not resolve is left to its sync. The flag refusal
+    # needs no value, so it must run before that skip.
+    reg = _carriers(tmp_path)
+    _write_env_flag(_carrier_settings(reg, "reference set 'codes'"), "tls_hop_attested")
+    with pytest.raises(WiringError, match=r"reference set 'codes': tls_hop_attested must be"):
+        build_check_registry(
+            reg,
+            inbound_bind_host="127.0.0.1",
+            env_values={},
+            egress=EgressSettings(deny_by_default=False),
+        )
+
+
+@pytest.mark.parametrize("key", FLAGS)
+def test_the_lookup_settings_builder_refuses_an_env_flag(tmp_path: Path, key: str) -> None:
+    # The one builder both FhirLookup executor paths use (live start/reload and build_check).
+    spec = _carriers(tmp_path).fhir_lookups["epic"]
+    _write_env_flag(spec.settings, key)
+    with pytest.raises(WiringError, match=rf"fhir lookup 'epic': {key} must be true or false"):
+        _fhir_lookup_settings(spec, _ENV_OFF, EgressSettings())
+
+
+@pytest.mark.parametrize("key", FLAGS)
+def test_the_live_db_lookup_executor_build_refuses_an_env_flag(tmp_path: Path, key: str) -> None:
+    reg = _carriers(tmp_path)
+    _write_env_flag(reg.lookups["clar"].settings, key)
+    store: Any = object()  # never reached: the refusal comes before any executor exists
+    runner = RegistryRunner(
+        reg, store, env_values=_ENV_OFF, egress=EgressSettings(deny_by_default=False)
+    )
+    with pytest.raises(WiringError, match=rf"database lookup 'clar': {key} must be true or false"):
+        runner._build_lookup_executor()
+
+
+@pytest.mark.parametrize("key", FLAGS)
+def test_the_reference_sync_refuses_an_env_flag(tmp_path: Path, key: str) -> None:
+    spec = _carriers(tmp_path).references["codes"]
+    _write_env_flag(spec.source.settings, key)
+    store: Any = object()  # never reached: the refusal comes before the dial and the snapshot
+    runner = ReferenceSyncRunner(
+        store,
+        lambda: [spec],
+        ReferenceSettings(),
+        env_values=_ENV_OFF,
+        egress=EgressSettings(deny_by_default=False),
+    )
+    with pytest.raises(WiringError, match=rf"reference set 'codes': {key} must be true or false"):
+        asyncio.run(runner._sync_one(spec))
+
+
+def test_a_real_bool_or_none_written_after_the_factory_passes_the_raw_check(
+    tmp_path: Path,
+) -> None:
+    # Control arm: the refusal keys on the type, so the same write with a real bool is not refused.
+    settings = _carrier_settings(_carriers(tmp_path), "database lookup 'clar'")
+    for value in (True, False, None):
+        for key in FLAGS:
+            settings[key] = value
+        refuse_unresolved_hop_flags(settings, "database lookup 'clar'")
+
+
+# --- the report fails toward listing --------------------------------------------------------
+
+
+def test_the_attested_report_lists_any_flag_that_is_not_none_or_false() -> None:
     reg = Registry()
     reg.add_fhir_lookup(
         FhirLookupSpec("ON", {"tls_hop_attested": True, "tls_hop_attested_reason": REASON})
     )
-    off = FhirLookupSpec("OFF", {})
-    off.settings["tls_hop_attested"] = "false"  # written past the spec; the gate refuses it
-    reg.add_fhir_lookup(off)
-    assert [name for name, _ in attested_secure_hops(reg)] == ["fhir_lookup:ON"]
+    as_string = FhirLookupSpec("STR", {})
+    as_string.settings["tls_hop_attested"] = "false"  # past the spec; the load check refuses it
+    reg.add_fhir_lookup(as_string)
+    reg.add_lookup(
+        DatabaseLookupSpec(
+            "ENV", {"tls_hop_attested": env("att", cast=bool), "tls_hop_attested_reason": REASON}
+        )
+    )
+    reg.add_lookup(DatabaseLookupSpec("OFF", {"tls_hop_attested": False}))
+    reg.add_lookup(DatabaseLookupSpec("NONE", {"tls_hop_attested": None}))
+    reg.add_fhir_lookup(FhirLookupSpec("ABSENT", {}))
+    assert [name for name, _ in attested_secure_hops(reg)] == [
+        "db_lookup:ENV",
+        "fhir_lookup:ON",
+        "fhir_lookup:STR",
+    ]
+
+
+# --- the spec and the builder check the reason by the factory's rule ------------------------
+
+
+@pytest.mark.parametrize(
+    ("reason", "refusal"),
+    [
+        ("ok\nWARNING forged", "must not contain control characters"),
+        (5, "tls_hop_attested_reason must be a string, not int"),
+    ],
+    ids=["control-character", "not-a-string"],
+)
+def test_a_directly_built_fhir_lookup_spec_checks_the_reason_like_the_factory(
+    reason: object, refusal: str
+) -> None:
+    with pytest.raises(WiringError, match=rf"fhir lookup 'LK': .*{refusal}"):
+        FhirLookupSpec("LK", {"tls_hop_attested": True, "tls_hop_attested_reason": reason})
+
+
+def test_the_lookup_settings_builder_refuses_a_flag_with_no_reason() -> None:
+    # The pair, not the flag alone: a flag set after the spec was built, with no reason, would
+    # otherwise attest the hop with nothing for the audit record to say.
+    spec = FhirLookupSpec("LK", {"url": "https://fhir.example.org/fhir"})
+    spec.settings["tls_hop_attested"] = True
+    with pytest.raises(
+        WiringError,
+        match="fhir lookup 'LK': tls_hop_attested=true requires tls_hop_attested_reason",
+    ):
+        _fhir_lookup_settings(spec, {}, EgressSettings())
+
+
+# --- each credential seam raises its own refusal type, naming the connection ----------------
+
+
+def test_the_oauth2_seam_raises_http_auth_error_naming_the_connection() -> None:
+    settings = {
+        "oauth2_token_url": "https://auth.example.com/token",
+        "oauth2_client_id": "c",
+        "oauth2_client_secret": "s",
+        "tls_hop_attested": "false",
+        MIRRORED_CONNECTION_SETTING: "OB_X",
+    }
+    with pytest.raises(
+        HttpAuthError, match=r"^connection 'OB_X'; tls_hop_attested must be true or false"
+    ):
+        oauth2_cc_provider_from_settings(settings)
+
+
+def test_the_smart_seam_raises_smart_auth_error_naming_the_connection() -> None:
+    settings = {
+        "smart_token_url": "https://auth.example.com/token",
+        "smart_client_id": "c",
+        "smart_private_key": "not-read-before-the-flag",
+        "tls_revocation_attested": "false",
+        MIRRORED_CONNECTION_SETTING: "OB_X",
+    }
+    with pytest.raises(
+        SmartAuthError, match=r"^connection 'OB_X'; tls_revocation_attested must be true or false"
+    ):
+        token_provider_from_settings(settings)
+
+
+def test_the_digest_seam_names_the_connection() -> None:
+    with pytest.raises(
+        HttpAuthError, match=r"^connection 'OB_X'; tls_hop_attested must be true or false"
+    ):
+        digest_handler_from_settings(
+            {
+                "http_auth": "digest",
+                "http_auth_user": "u",
+                "http_auth_password": "p",
+                "tls_hop_attested": "false",
+                MIRRORED_CONNECTION_SETTING: "OB_X",
+            },
+            url="http://api.example.com/x",
+        )
