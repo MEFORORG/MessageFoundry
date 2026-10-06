@@ -1021,6 +1021,14 @@ async def test_approval_transition_audit_contract(store) -> None:
     await _assert_transition_audit_contract(store)
 
 
+async def test_approval_repeat_request_contract(store) -> None:
+    """vault BACKLOG #2445 on the Postgres backend: a repeat request joins the open one, and
+    concurrent repeats file one request between them."""
+    from tests._pending_approval_store_contract import _assert_repeat_request_contract
+
+    await _assert_repeat_request_contract(store)
+
+
 async def test_approval_release_outcome_contract(store) -> None:
     """BACKLOG #1562: a release is ``executing`` until settled to ``approved``, ``failed`` or
     ``interrupted``, each through a ``from_status``-guarded update this backend's SQL performs."""

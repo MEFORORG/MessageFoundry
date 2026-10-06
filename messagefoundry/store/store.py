@@ -3996,6 +3996,16 @@ def seed_notify_email(email: str | None) -> str | None:
     return email.strip() or None if email is not None else None
 
 
+#: The open request a repeat joins (vault BACKLOG #2445): same operation, same captured params, same
+#: requester id, still ``pending`` and unexpired at the repeat's time. Binds four ``?``: operation,
+#: params, requester_user_id, now. The Store protocol's ``create_pending_approval`` says why the
+#: requester is part of the match.
+_SQLITE_OPEN_REPEAT = (
+    "operation = ? AND params = ? AND requester_user_id = ? AND status = 'pending'"
+    " AND (expires_at IS NULL OR expires_at > ?)"
+)
+
+
 @dataclass(frozen=True, slots=True)
 class AuditAppend:
     """One audit row a write appends in its OWN transaction, on all three backends (BACKLOG #2100).
@@ -11056,40 +11066,70 @@ class MessageStore:
         requested_at: float,
         expires_at: float | None,
         audit: AuditAppend | None = None,
+        on_repeat: Callable[[str], AuditAppend] | None = None,
     ) -> str:
         """Persist a high-value action awaiting a distinct second approver (dual-control, 2.3.5).
-        The Store protocol states the ``audit`` contract and what is returned."""
-        now = time.time()
-        async with _writer_guard(self._db, self._lock):
-            await self._db.execute(
+        The Store protocol states the ``audit`` and ``on_repeat`` contract and what is returned."""
+        values = (
+            approval_id,
+            operation,
+            params,
+            requester,
+            requester_user_id,
+            requested_at,
+            expires_at,
+        )
+        if on_repeat is None:
+            sql = (
                 "INSERT INTO pending_approvals "
                 "(id, operation, params, requester, requester_user_id, requested_at, status,"
-                " expires_at) VALUES (?,?,?,?,?,?,'pending',?)",
-                (
-                    approval_id,
-                    operation,
-                    params,
-                    requester,
-                    requester_user_id,
-                    requested_at,
-                    expires_at,
-                ),
+                " expires_at) VALUES (?,?,?,?,?,?,'pending',?)"
             )
-            if audit is not None:
+            args: tuple[Any, ...] = values
+        else:
+            # vault BACKLOG #2445. ONE statement, so its read and its write cannot be split: it
+            # takes SQLite's file-level write lock before it reads, which holds against another
+            # connection to the file too, where the in-process lock does not reach.
+            sql = (
+                "INSERT INTO pending_approvals "
+                "(id, operation, params, requester, requester_user_id, requested_at, status,"
+                " expires_at) SELECT ?,?,?,?,?,?,'pending',? WHERE NOT EXISTS ("
+                f"SELECT 1 FROM pending_approvals WHERE {_SQLITE_OPEN_REPEAT})"
+            )
+            args = values + (operation, params, requester_user_id, requested_at)
+        now = time.time()
+        held = approval_id
+        append = audit
+        async with _writer_guard(self._db, self._lock):
+            cur = await self._db.execute(sql, args)
+            if on_repeat is not None and cur.rowcount == 0:
+                # The INSERT opened this connection's write transaction, so this read is the
+                # authoritative one. Oldest first: that is the request every earlier caller got.
+                found = await self._db.execute(
+                    f"SELECT id FROM pending_approvals WHERE {_SQLITE_OPEN_REPEAT}"
+                    " ORDER BY requested_at ASC LIMIT 1",
+                    (operation, params, requester_user_id, requested_at),
+                )
+                row = await found.fetchone()
+                if row is None:  # the INSERT's own NOT EXISTS matched one, under the write lock
+                    raise RuntimeError("pending_approvals: a repeat matched no open request")
+                held = str(row["id"])
+                append = on_repeat(held)
+            if append is not None:
                 # vault BACKLOG #2255. Before the one commit, so a failed append rolls the request
                 # back and no releasable row is left without its approval.requested row.
                 appended = await self._append_audit_row(
-                    audit.action,
-                    actor=audit.actor,
+                    append.action,
+                    actor=append.actor,
                     channel_id=None,
-                    detail=audit.detail,
-                    client=audit.client,
+                    detail=append.detail,
+                    client=append.client,
                     now=now,
                 )
             await self._commit()
-        if audit is not None:
-            audit.tee(ts=now, row=appended)
-        return approval_id
+        if append is not None:
+            append.tee(ts=now, row=appended)
+        return held
 
     async def get_pending_approval(self, approval_id: str) -> aiosqlite.Row | None:
         async with self._read() as db:

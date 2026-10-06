@@ -481,6 +481,8 @@ _CONTEXTUAL_TOKENS = frozenset(
         # the hold-age FLOOR beside that ceiling (ASVS 2.4.2, BACKLOG #287)
         "min_dwell_seconds",
         "approval.too_early",
+        # a repeat of an open hold joins it rather than filing a second (vault BACKLOG #2445)
+        "approval.request_repeated",
         # observable outcomes
         "X-MessageFoundry-Denied",
         "client-network",

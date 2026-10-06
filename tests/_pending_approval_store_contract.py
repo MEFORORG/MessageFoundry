@@ -182,6 +182,80 @@ async def _assert_transition_audit_contract(store: Any) -> None:
         )
 
 
+# --- vault BACKLOG #2445: a repeat request joins the open one ---------------------------------------
+
+
+async def _assert_repeat_request_contract(store: Any) -> None:
+    """``create_pending_approval(on_repeat=...)`` files ONE request for one requester, operation and
+    params while it is open, on this backend's own SQL, including when the repeats race.
+
+    The params carry a fresh nonce, so rows other tests leave in a shared server table cannot
+    match, and the cleanup rejects every row this body files."""
+    from uuid import uuid4
+
+    from messagefoundry.store.store import AuditAppend
+
+    params = json.dumps({"contract_repeat": uuid4().hex})
+    filed: set[str] = set()
+
+    def requested(for_id: str) -> Any:
+        return AuditAppend(
+            "approval.requested", actor=_REQUESTER, detail=json.dumps({"approval_id": for_id})
+        )
+
+    def repeated(existing: str) -> Any:
+        return AuditAppend(
+            "approval.request_repeated",
+            actor=_REQUESTER,
+            detail=json.dumps({"approval_id": existing}),
+        )
+
+    async def request(*, requester_user_id: str = _REQUESTER_ID, now: float = 1_000.0) -> str:
+        approval_id = uuid4().hex
+        held = str(
+            await store.create_pending_approval(
+                approval_id=approval_id,
+                operation="dead_letter_replay",
+                params=params,
+                requester=_REQUESTER,
+                requester_user_id=requester_user_id,
+                requested_at=now,
+                expires_at=now + 60.0,
+                audit=requested(approval_id),
+                on_repeat=repeated,
+            )
+        )
+        filed.add(held)
+        return held
+
+    try:
+        first = await request()
+        assert await request() == first
+        # The race: every concurrent repeat joins one request. A backend whose check and insert are
+        # not one serialized step files more than one here.
+        raced = await asyncio.gather(*(request() for _ in range(6)))
+        assert set(raced) == {first}
+        assert len(await _audit_rows_for(store, "approval.requested", first)) == 1
+        assert len(await _audit_rows_for(store, "approval.request_repeated", first)) == 7
+
+        # Another requester, or the same one after the request expired, files a new one.
+        other = await request(requester_user_id="contract-other-requester-id")
+        assert other != first
+        later = await request(now=1_061.0)
+        assert later not in (first, other)
+
+        # Once the open request is decided, a repeat files a new one too.
+        assert await store.decide_pending_approval(
+            later, status="rejected", approver=_APPROVER, decided_at=1_062.0
+        )
+        assert await request(now=1_063.0) not in (first, other, later)
+    finally:
+        for approval_id in filed:
+            await store.decide_pending_approval(
+                approval_id, status="rejected", approver="contract-cleanup", decided_at=1_100.0
+            )
+
+
 # --- BACKLOG #1562: the release outcome ------------------------------------------------------------
 
 _APPROVER = "contract-approver-name"
@@ -237,8 +311,15 @@ def _gate(store: Any, execute: Callable[[Mapping[str, Any]], Awaitable[dict[str,
 
 
 async def _request(gate: Any) -> str:
+    """A fresh request. The params carry a nonce, so a repeat never joins an open request another
+    test left in a shared server table (vault BACKLOG #2445); the executors ignore it."""
+    from uuid import uuid4
+
     approval_id = await gate.guard(
-        "dead_letter_replay", {}, requester=_REQUESTER, requester_user_id=_REQUESTER_ID
+        "dead_letter_replay",
+        {"contract_nonce": uuid4().hex},
+        requester=_REQUESTER,
+        requester_user_id=_REQUESTER_ID,
     )
     assert approval_id is not None
     return str(approval_id)

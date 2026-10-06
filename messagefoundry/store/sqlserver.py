@@ -11130,9 +11130,10 @@ class SqlServerStore:
         requested_at: float,
         expires_at: float | None,
         audit: AuditAppend | None = None,
+        on_repeat: Callable[[str], AuditAppend] | None = None,
     ) -> str:
         """Persist a high-value action awaiting a distinct second approver (dual-control, 2.3.5).
-        The Store protocol states the ``audit`` contract and what is returned."""
+        The Store protocol states the ``audit`` and ``on_repeat`` contract and what is returned."""
         sql = (
             "INSERT INTO pending_approvals "
             "(id, operation, params, requester, requester_user_id, requested_at, status, expires_at)"
@@ -11147,34 +11148,64 @@ class SqlServerStore:
             requested_at,
             expires_at,
         )
-        if audit is None:
+        if audit is None and on_repeat is None:
             await self._execute(sql, args)
             return approval_id
+        # vault BACKLOG #2445: the open request a repeat joins. Oldest first: that is the request
+        # every earlier caller got.
+        match = (
+            "SELECT TOP (1) id FROM pending_approvals WHERE operation = ? AND params = ?"
+            " AND requester_user_id = ? AND status = 'pending'"
+            " AND (expires_at IS NULL OR expires_at > ?) ORDER BY requested_at ASC"
+        )
+        match_args = (operation, params, requester_user_id, requested_at)
         now = time.time()
+        held = approval_id
+        append = audit
         # vault BACKLOG #2255. The audit row joins the INSERT's transaction, so a failed append
-        # rolls the request back. The INSERT opens that transaction, which the applock inside the
-        # append needs. Same lock order as `record_audit`: the in-process gate, then the connection.
+        # rolls the request back. Same lock order as `record_audit`: the in-process gate, then the
+        # connection.
         async with self._audit_lock:  # noqa: SIM117
             async with self._acquire() as conn:
                 try:
                     async with self._cursor(conn) as cur:
-                        await cur.execute(sql, args)
-                        appended = await self._append_audit_row(
-                            cur,
-                            audit.action,
-                            actor=audit.actor,
-                            channel_id=None,
-                            detail=audit.detail,
-                            client=audit.client,
-                            now=now,
+                        if on_repeat is not None:
+                            # The first read OPENS the transaction the applock needs, and is not
+                            # trusted. Under the audit applock, which every request takes anyway
+                            # for its own row and which is re-entrant per transaction, the second
+                            # read sees every request committed before it, so two repeats cannot
+                            # both find none and both insert.
+                            await cur.execute(match, match_args)
+                            await cur.fetchall()
+                            await self._applock(cur, _AUDIT_APPEND_LOCK)
+                            await cur.execute(match, match_args)
+                            found = await cur.fetchone()
+                            if found is not None:
+                                held = str(found[0])
+                                append = on_repeat(held)
+                        if held == approval_id:
+                            await cur.execute(sql, args)
+                        appended = (
+                            None
+                            if append is None
+                            else await self._append_audit_row(
+                                cur,
+                                append.action,
+                                actor=append.actor,
+                                channel_id=None,
+                                detail=append.detail,
+                                client=append.client,
+                                now=now,
+                            )
                         )
                         await self._commit(conn)
                 except Exception:
                     # BACKLOG #1940: see _rollback_or_discard.
                     await self._rollback_or_discard(conn)
                     raise
-        audit.tee(ts=now, row=appended)
-        return approval_id
+        if append is not None and appended is not None:
+            append.tee(ts=now, row=appended)
+        return held
 
     async def get_pending_approval(self, approval_id: str) -> dict[str, Any] | None:
         return await self._fetchone(

@@ -267,7 +267,22 @@ class ApprovalGate:
         return ``None`` — the endpoint executes inline exactly as before.
 
         ``requester_user_id`` is the requester's immutable ``users.id`` and is what
-        :meth:`approve` compares; ``requester`` is the display/audit label (BACKLOG #1540)."""
+        :meth:`approve` compares; ``requester`` is the display/audit label (BACKLOG #1540).
+
+        **A repeat files nothing (vault BACKLOG #2445).** When the same requester already has an
+        OPEN request for this operation with identical captured params, that request's id is
+        returned, so the endpoint answers the same 202. An ``approval.request_repeated`` row names
+        the requester and the request they were pointed at. This covers a retried IDE promote, a
+        double click in the web console, an API client that retries, and two such calls racing:
+        the store makes the check and the insert one serialized step.
+
+        **A different requester gets their own request.** The requester of record is the person
+        whose authority :meth:`approve` re-checks (ASVS 8.3.2), and the executors attribute their
+        rows to the name captured in the params. Folding a second person into the first one's
+        request would let their ask ride on someone else's standing, and point their 202 at a
+        request they do not own and could release as its checker. An approver sees both requests,
+        each with its own requester. Two of the three gated operations capture the requester in
+        their params already, so for them the params would differ anyway."""
         if not self._gated(operation):
             return None
         # Enforce the write half of the invariant here, matching `create_upload`'s guard on
@@ -283,10 +298,21 @@ class ApprovalGate:
             None if self._settings.expiry_hours == 0 else now + self._settings.expiry_hours * 3600.0
         )
         detail = json.dumps({"approval_id": approval_id, "operation": operation})
+        repeat_of: list[str] = []
+
+        def _repeat(existing: str) -> AuditAppend:
+            repeat_of.append(existing)
+            return AuditAppend(
+                "approval.request_repeated",
+                actor=requester,
+                detail=json.dumps({"approval_id": existing, "operation": operation}),
+                client=client,  # ADR 0150: the requester's own address
+            )
+
         try:
             # vault BACKLOG #2255: the request and its approval.requested row are one write, so no
             # releasable request exists without the row that says who asked for it.
-            await self._store.create_pending_approval(
+            held = await self._store.create_pending_approval(
                 approval_id=approval_id,
                 operation=operation,
                 params=json.dumps(dict(params), sort_keys=True),
@@ -300,21 +326,35 @@ class ApprovalGate:
                     detail=detail,
                     client=client,  # ADR 0150: the requester's own address
                 ),
+                on_repeat=_repeat,
             )
         except Exception:
             # Still raised, so the caller is told the request was not held. Nothing was written,
             # so a retry cannot leave two releasable copies. Logged and paged, since the error
-            # alone reaches only this caller.
-            log.exception(
-                "approval %s: the request and its approval.requested audit row failed to write, so "
-                "nothing is held. Lost detail: actor=%s %s",
-                approval_id,
-                requester,
-                detail,
+            # alone reaches only this caller. A repeat's lost row is keyed on the request it named.
+            lost_id, action = (
+                (repeat_of[-1], "approval.request_repeated")
+                if repeat_of
+                else (approval_id, "approval.requested")
             )
-            self._alert_lost_audit(approval_id, "approval.requested")
+            log.exception(
+                "approval %s: the request and its %s audit row failed to write, so nothing new is "
+                "held. Lost detail: actor=%s operation=%s",
+                lost_id,
+                action,
+                requester,
+                operation,
+            )
+            self._alert_lost_audit(lost_id, action)
             raise
-        return approval_id
+        if held != approval_id:
+            log.info(
+                "approval %s: a repeat %s request by %s joined it; nothing new is held",
+                held,
+                operation,
+                requester,
+            )
+        return held
 
     async def list_pending(self) -> list[dict[str, Any]]:
         """Requests awaiting a second approver: ``pending`` and unexpired."""

@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Collection, Iterable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -1712,13 +1712,24 @@ class AuditStore(Protocol):
         requested_at: float,
         expires_at: float | None,
         audit: AuditAppend | None = None,
+        on_repeat: Callable[[str], AuditAppend] | None = None,
     ) -> str:
         """Persist a high-value action awaiting a distinct second approver (dual-control, 2.3.5).
-        Returns the id of the row that holds the request: ``approval_id``.
+        Returns the id of the row that holds the request: ``approval_id``, or an open request's id
+        when ``on_repeat`` joins this one to it.
 
         ``audit``, when given, is appended to the audit chain in the SAME transaction as the INSERT,
         so the request and its ``approval.requested`` row commit or roll back together, then teed
         off-box (vault BACKLOG #2255). Its timestamp is the store's own clock.
+
+        ``on_repeat``, when given, makes a repeat file nothing (vault BACKLOG #2445). If an OPEN
+        request matches -- the same ``operation``, the same ``params`` text, the same
+        ``requester_user_id``, still ``pending`` and unexpired at ``requested_at`` -- no row is
+        inserted, ``audit`` is not written, and ``on_repeat(<that request's id>)`` is appended
+        instead, in the same transaction; that id is returned. The oldest match wins. The check and
+        the insert are one serialized step on every backend, so two concurrent repeats file one
+        request between them. The match includes the requester because the requester of record is
+        whose authority the release re-checks; ``ApprovalGate.guard`` says more.
 
         ``requester_user_id`` is the **authorization key** and ``requester`` is the display label
         (BACKLOG #1540). :meth:`~messagefoundry.api.approvals.ApprovalGate.approve` is the source of

@@ -25,6 +25,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   no release row. The resolve no longer writes `approval.resolve_attempted`; its `approval.resolved`
   row goes with the move. After an operation has run, an outcome that cannot be written with its row
   is written alone, so the request never stays `executing` for that reason. (vault `BACKLOG #2255`)
+- **A repeat of an open dual-control request no longer files a second one.** When the same
+  requester asks again for the same operation with the same parameters while the first request is
+  pending, the route answers the same 202 with the first request's id and writes an
+  `approval.request_repeated` audit row. Concurrent repeats file one request between them, on all
+  three store backends. A different requester still gets a request of their own. (vault
+  `BACKLOG #2445`)
 
 ## [0.5.1] — 2026-10-01 — Early Access
 
