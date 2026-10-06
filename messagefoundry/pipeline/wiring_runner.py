@@ -219,10 +219,11 @@ disambiguate the pair), so every per-connection map that can hold an entry for e
 is keyed by ``(Direction, name)`` rather than by the bare name."""
 
 type _LaneFault = Literal["credential", "configuration"]
-# A batch member its frame refused: (outbox row id, the content-free error the store keeps, the
-# refusal itself, whose class name and code the log line reads).
-type _RefusedMember = tuple[str, str, NegativeAckError]
 """A connection fault that STOPs an outbound lane and keeps its queue (#109, BACKLOG #2083)."""
+
+type _RefusedMember = tuple[str, str, NegativeAckError]
+"""A batch member its frame refused: its outbox row id, the content-free error the store keeps, and
+the refusal, with no traceback, whose class name and code the log line reads (BACKLOG #3043)."""
 
 
 log = logging.getLogger(__name__)
@@ -481,9 +482,12 @@ class _WorkerFaultLog:
 # BACKLOG #3043: how long one (connection, refusal code) pair stays quiet after it writes its
 # permanent-refusal WARNING. See _RefusalLog.
 _REFUSAL_LOG_WINDOW_SECONDS = 60.0
-# Past this many (connection, code) pairs, a written line first forgets every pair whose window has
-# closed. The codes are mostly fixed words, but some come from the peer (an HTTP status, a SQLSTATE,
-# a DICOM status), so the pairs are bounded only by what peers send.
+# Most lines all pairs together write in one window. Some codes come from the peer (an HTTP status, a
+# SQLSTATE, a DICOM status), so a peer that varies its code would otherwise get one line per code.
+_REFUSAL_LOG_MAX_LINES_PER_WINDOW = 100
+# Past this many (connection, code) pairs, a written line first forgets the pairs whose window has
+# closed and that hold no count. The next forget waits until the table doubles, so the cost stays
+# amortized when nothing can be forgotten.
 _REFUSAL_LOG_MAX_PAIRS = 4096
 
 
@@ -506,23 +510,45 @@ class _RefusalLog:
     that store record and its disposition, not one log line per message: a delivered message writes
     no per-message log line either. So the store stays the complete record. A count still held when
     the runner tears down is not written; teardown starts a fresh log, so the first refusal after a
-    restart or a promotion logs again.
+    restart or a promotion logs again. Nothing flushes a held count when a burst simply ends: it is
+    written only by the pair's next line. The first line's "counted, not logged" says so.
+
+    All pairs together write at most :data:`_REFUSAL_LOG_MAX_LINES_PER_WINDOW` lines a window. A
+    pair over that cap is counted as held, so a peer cycling its code cannot turn the throttle off.
+
+    Not :class:`messagefoundry.transports.admission.RefusalLog`: that one reports one running total
+    across every key, counts one per call, and keeps no per-key count. This line has to say how many
+    ROWS of one pair went unlogged, and a refused batch is many rows.
 
     Mutable, shared by every delivery worker of one runner. Safe without a lock: :meth:`warning`
     reads and writes the state with no ``await`` between."""
 
-    __slots__ = ("_clock", "_state", "_window")
+    __slots__ = (
+        "_clock",
+        "_lines",
+        "_lines_since",
+        "_max_lines",
+        "_prune_at",
+        "_state",
+        "_window",
+    )
 
     def __init__(
         self,
         *,
         window: float = _REFUSAL_LOG_WINDOW_SECONDS,
         clock: Callable[[], float] = time.monotonic,
+        max_lines: int = _REFUSAL_LOG_MAX_LINES_PER_WINDOW,
+        max_pairs: int = _REFUSAL_LOG_MAX_PAIRS,
     ) -> None:
         self._window = window
         self._clock = clock
+        self._max_lines = max_lines
+        self._prune_at = max_pairs
         # (connection, code) -> (when its last line was written, rows held back since then)
         self._state: dict[tuple[str, str], tuple[float, int]] = {}
+        self._lines = 0  # lines written, across all pairs, since _lines_since
+        self._lines_since = -math.inf
 
     def warning(
         self, name: str, exc: NegativeAckError, rows: int, message: str, *args: object
@@ -536,11 +562,19 @@ class _RefusalLog:
         key = (name, code)
         now = self._clock()
         last, held = self._state.get(key, (-math.inf, 0))
-        if now - last < self._window:
+        if now - self._lines_since >= self._window:
+            self._lines, self._lines_since = 0, now
+        if now - last < self._window or self._lines >= self._max_lines:
+            # A pair held by the cross-pair cap keeps `last`, so its next line is not delayed.
             self._state[key] = (last, held + rows)
             return
-        if len(self._state) >= _REFUSAL_LOG_MAX_PAIRS:
-            self._state = {k: v for k, v in self._state.items() if now - v[0] < self._window}
+        if len(self._state) >= self._prune_at:
+            # Forget only what carries nothing: a closed window AND no held count.
+            self._state = {
+                k: v for k, v in self._state.items() if v[1] or now - v[0] < self._window
+            }
+            self._prune_at = max(self._prune_at, 2 * len(self._state))
+        self._lines += 1
         self._state[key] = (now, 0)
         message += " (%s, code %r)"
         args = (*args, type(exc).__name__, code)
@@ -7042,9 +7076,7 @@ class RegistryRunner:
             # shadow branch below, so a simulate outbound records the same dispositions. The split
             # writes nothing; the refused members are dead-lettered after this try, on every path.
             if _frames(connector):
-                kept, members, refused = self._split_unframeable_members(
-                    name, connector, items, hydrated
-                )
+                kept, members, refused = self._split_unframeable_members(connector, items, hydrated)
             else:
                 kept, members = list(items), list[Message | str](hydrated)
             ids = [it.id for it in kept]
@@ -7137,7 +7169,6 @@ class RegistryRunner:
 
     def _split_unframeable_members(
         self,
-        name: str,
         connector: DestinationConnector,
         items: Sequence[OutboxItem],
         payloads: Sequence[str],
@@ -7158,7 +7189,9 @@ class RegistryRunner:
             except NegativeAckError as exc:
                 if not exc.permanent or self._lane_stopping_fault(exc) is not None:
                     raise
-                refused.append((item.id, safe_exc(exc), exc))
+                # No traceback: it would hold this frame, and with it every hydrated payload of
+                # the batch, in a cycle until the collector ran.
+                refused.append((item.id, safe_exc(exc), exc.with_traceback(None)))
             else:
                 kept.append(item)
                 kept_payloads.append(payload)
@@ -7176,7 +7209,7 @@ class RegistryRunner:
                 exc,
                 1,
                 "delivery worker %r: batch member %s refused permanently, its frame cannot "
-                "carry it; dead-lettered alone, the rest of the batch goes on",
+                "carry it; dead-lettered alone, apart from the rest of its batch",
                 name,
                 outbox_id,
             )

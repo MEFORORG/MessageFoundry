@@ -191,6 +191,7 @@ async def test_a_refusal_whose_text_echoes_the_payload_logs_none_of_it(
     runner, inbox, _ = _file_runner(store, tmp_path, caplog)
     await runner.start()
     dest = _Refuses()
+    await runner._destinations[OUT].aclose()  # the File connector start() built
     runner._destinations[OUT] = cast(DestinationConnector, dest)
     (inbox / "a.hl7").write_bytes(_adt(1).encode("utf-8"))
     try:
@@ -211,6 +212,7 @@ async def test_the_warning_is_throttled_per_connection_and_code_and_reports_what
     now = [1000.0]
     runner._refusal_log = _RefusalLog(window=60.0, clock=lambda: now[0])
     await runner.start()
+    await runner._destinations[OUT].aclose()  # the File connector start() built
     runner._destinations[OUT] = cast(DestinationConnector, _Refuses())
     try:
         for n in (1, 2, 3):
@@ -271,7 +273,7 @@ def test_the_throttle_keys_on_connection_and_code_and_counts_rows(
 class _CodelessRefusal(NegativeAckError):
     """A connector's subclass that never called the base initialiser, so it has no ``code``."""
 
-    def __init__(self) -> None:  # noqa: D107 -- deliberately skips super().__init__
+    def __init__(self) -> None:  # deliberately skips NegativeAckError.__init__
         Exception.__init__(self, f"refused {TOKEN}")
         self.permanent = True
 
@@ -390,3 +392,36 @@ async def test_a_refused_member_sent_back_with_its_batch_is_not_logged_as_dead_l
     assert rec.sent == [] and await store.count_dead() == 0
     assert (await store.pending_depth(OUT))[0] == 3  # the whole batch went back, member 2 too
     assert _refusal_lines(caplog) == []
+
+
+def test_the_cross_pair_cap_holds_a_peer_that_cycles_its_code(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A peer can vary its code (an HTTP status, a DICOM status). Past the cap the pair is counted,
+    # not logged, and keeps no delay: its next line, in the next window, reports what it held.
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    now = [0.0]
+    refusals = _RefusalLog(window=60.0, clock=lambda: now[0], max_lines=3)
+    for status in range(500, 510):
+        refusals.warning("a", _nak(str(status)), 1, "refused on %s", "a")
+    assert len(caplog.records) == 3
+    now[0] = 60.0
+    refusals.warning("a", _nak("509"), 1, "refused on %s", "a")
+    assert "(1 more row(s) refused with this code" in caplog.records[-1].getMessage()
+
+
+def test_the_table_forgets_only_pairs_that_carry_nothing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    now = [0.0]
+    refusals = _RefusalLog(window=60.0, clock=lambda: now[0], max_pairs=3)
+    refusals.warning("a", _nak("AR"), 1, "refused on %s", "a")
+    refusals.warning("a", _nak("AR"), 5, "refused on %s", "a")  # held: 5 rows
+    refusals.warning("b", _nak("AR"), 1, "refused on %s", "b")
+    refusals.warning("c", _nak("AR"), 1, "refused on %s", "c")
+    now[0] = 60.0  # every window has closed; the table is full, so this line prunes
+    refusals.warning("d", _nak("AR"), 1, "refused on %s", "d")
+    assert set(refusals._state) == {("a", "AR"), ("d", "AR")}  # b and c held nothing
+    refusals.warning("a", _nak("AR"), 1, "refused on %s", "a")
+    assert "(5 more row(s) refused with this code" in caplog.records[-1].getMessage()
