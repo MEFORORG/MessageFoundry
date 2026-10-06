@@ -410,11 +410,18 @@ create form has no password field and shows the credential once.
 
 **If no credential can be generated, nothing changes.** A site context-word list
 (`[auth].password_extra_context_words`) broad enough that no generated credential clears the policy
-makes account creation and both resets answer 503. Each generates the credential before it writes
-anything, so the account, its factors and its sessions are untouched, and the single-use step-up
-grant the route spent is given back. The engine tries the generator once at start and logs an ERROR
-if it fails, and `messagefoundry verify` reports the same as `auth.credential_generation`. Neither
-refuses to start.
+makes account creation and both resets answer 503. The web console answers 503 too. Each generates
+the credential before it touches the account, so the account, its factors and its sessions are
+untouched. On the two resets, the single-use step-up grant the route spent is given back.
+
+Each refusal writes one `auth.credential_issue_refused` audit row (BACKLOG #2359). The acting
+administrator is the actor. The detail's `op` names the operation: `create`, `password_reset` or
+`mfa_reset`. The detail also names the target `username`, plus `user_id` on a reset and the
+requested `roles` on a create. It is a separate action on purpose. A refusal issued nothing, so it
+must never read as a `user.created` or `auth.password_reset` row.
+
+The engine tries the generator once at start and logs an ERROR if it fails, and
+`messagefoundry verify` reports the same as `auth.credential_generation`. Neither refuses to start.
 
 **The factor reset issues one too.** `POST /users/{user_id}/reset-mfa` on a local account writes a
 generated credential **first**, then clears the TOTP key, the recovery codes and every passkey and
@@ -456,8 +463,18 @@ requirement off the order is as before: rotate, then enrol if you choose.
 The reset can refuse, with a 503 whose detail names `password_extra_context_words`. It does so when
 no generated password clears the policy after repeated tries. That means the site's context words
 refuse nearly every random string, and so nearly every passphrase too. The account keeps its
-password. Remove the site's short or common terms, or replace them with longer ones. Then restart
-the engine and retry, because it reads `[auth]` only at start and a `/config/reload` does not.
+password. To fix it:
+
+1. Remove the site's short or common terms, or replace them with longer ones.
+2. Make the change where the list is set. `MEFOR_AUTH_PASSWORD_EXTRA_CONTEXT_WORDS` overrides the
+   TOML key when both are set.
+3. Restart **every** engine process: each engine shard and each cluster node. Each builds its
+   password policy once, at start, and a `/config/reload` does not re-read `[auth]`. A process left
+   running keeps refusing.
+4. Retry the create or the reset.
+
+The ERROR log line and the 503 detail give the same advice, from one string in the code.
+`tests/test_generated_credential_failure.py` pins it.
 
 **Anti-automation (ASVS 2.4.2).** A per-actor human-timing *pacing floor* on sensitive authenticated
 writes is **built** (BACKLOG #193). **Two** JSON-API gate families charge it, drawing **one bucket per
@@ -3542,8 +3559,14 @@ Local passwords follow an **ASVS 5.0-aligned** policy (WP-3): **min length 15**,
 character-class composition** (the `require_*` class flags are opt-in, default off — ASVS forbids
 mandatory composition), plus **offline breached/common-password screening** (a bundled offline
 corpus, no live HIBP call) and a fixed **context-word deny-list**, enumerated in full below, which a
-site may extend with its own terms. Enforced
-identically on create-user and change-password; tune via `[auth]` (see
+site may extend with its own terms. The policy screens at least these passwords:
+
+- a password a person chooses, at change-password and when the first Administrator is provisioned;
+- each credential the engine generates, for account creation, the password reset and the factor
+  reset.
+
+A generated credential skips one screen, the breach check. A random string of at least 192 bits
+cannot be in a corpus of human-chosen passwords. Tune via `[auth]` (see
 [CONFIGURATION.md](CONFIGURATION.md)). AD passwords are governed by Active Directory.
 
 **The context-word deny-list, in full.** A local password is refused if it *contains* any of these

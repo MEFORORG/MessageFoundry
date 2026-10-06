@@ -3416,6 +3416,41 @@ async def test_create_user_duplicate_rerenders_without_password(engine: Engine) 
         assert PW not in r.text  # ...the password is NEVER echoed back
 
 
+async def test_a_refused_create_on_the_console_answers_503(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2359: when no credential can be generated, the create form re-renders with the
+    refusal and a 503, as the JSON API answers, and no account is written."""
+    from types import SimpleNamespace
+
+    from messagefoundry.auth import service as service_module
+
+    service = AuthService(
+        engine.store,
+        AuthSettings(
+            require_mfa=False,
+            admin_write_min_interval_seconds=0,
+            password_extra_context_words=["globex"],
+        ),
+    )
+    await service.initialize()
+    async with _boss_client(engine, service) as c:
+        monkeypatch.setattr(
+            service_module,
+            "secrets",
+            SimpleNamespace(token_urlsafe=lambda n=None: "zq-globex-" + "v" * 40),
+        )
+        r = await _post_pairs(
+            c,
+            "/ui/users",
+            [("username", "newop"), ("email", "newop@example.test"), ("roles", "viewer")],
+        )
+        assert r.status_code == 503 and "password_extra_context_words" in r.text
+        assert await service.store.get_user_by_username("newop") is None
+        refused = await service.store.list_audit(action="auth.credential_issue_refused", limit=10)
+        assert [json.loads(row["detail"])["op"] for row in refused] == ["create"]
+
+
 async def test_create_user_a_posted_password_is_never_the_credential(engine: Engine) -> None:
     """ADR 0197 Amendment A, AC-A2: the create form has no password field, and a ``password`` a
     caller posts anyway is ignored. The account gets a generated credential; the posted one does not
@@ -4354,7 +4389,13 @@ async def test_a_refused_issue_on_the_console_keeps_the_account_and_the_grant(
             SimpleNamespace(token_urlsafe=lambda n=None: "zq-globex-" + "v" * 40),
         )
         r = await c.post(f"/ui/users/{uid}/{action}", headers={"Sec-Fetch-Site": "same-origin"})
-        assert r.status_code == 400 and "password_extra_context_words" in r.text
+        # BACKLOG #2359: a server-side refusal stays a 503 on the console, as on the JSON API, and
+        # the service's one audit row is the console's too.
+        assert r.status_code == 503 and "password_extra_context_words" in r.text
+        refused = await service.store.list_audit(action="auth.credential_issue_refused", limit=10)
+        assert len(refused) == 1, "one refusal, one audit row"
+        expected_op = {"reset-mfa": "mfa_reset", "reset-password": "password_reset"}[action]
+        assert json.loads(refused[0]["detail"])["op"] == expected_op
         after = await service.store.get_user(uid)
         assert after == before, "a refused issue changed the account"
         monkeypatch.undo()
