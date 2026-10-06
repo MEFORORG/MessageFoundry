@@ -1020,6 +1020,56 @@ def _posture_loosenings(
 _RELOAD_AUDIT_STEP = "audit"
 
 
+@dataclass(frozen=True, slots=True)
+class _LoadedConfig:
+    """What the engine reports as loaded, as an audit row names it: the directory, the engine
+    shard, the connection counts and the ADR 0041 D1 fingerprint.
+
+    The start takes one with :meth:`read` right after its first load, and both its comparison and
+    its ``config_loaded`` row use that one (vault BACKLOG #2838). A cluster convergence reload can
+    swap the graph before the row is written, and a live read at the write would then name the
+    reloaded graph as the one the start loaded. When the start cannot take one, its row uses
+    :data:`_UNKNOWN_LOADED`, which names nothing, rather than a live read."""
+
+    directory: str | None
+    shard: str | None
+    inbound: int | None
+    outbound: int | None
+    fingerprint: Mapping[str, object] | None
+    #: The graph object itself. An applied reload swaps it for a new one before it rebinds the
+    #: fingerprint, so comparing it by identity sees a reload still in flight.
+    registry: Registry | None
+
+    @classmethod
+    def read(cls, engine: Engine) -> _LoadedConfig:
+        """The engine's live state now. A reload rebinds the fingerprint rather than editing it, and
+        the copy keeps the snapshot safe even if that changes."""
+        rr = engine.registry_runner
+        directory = engine.running_config_dir
+        fingerprint = engine.loaded_config_fingerprint
+        return cls(
+            directory=str(directory) if directory else None,
+            shard=rr.registry.shard_id if rr else None,
+            inbound=len(rr.registry.inbound) if rr else 0,
+            outbound=len(rr.registry.outbound) if rr else 0,
+            fingerprint=dict(fingerprint) if fingerprint is not None else None,
+            registry=rr.registry if rr else None,
+        )
+
+    def swapped(self, engine: Engine) -> bool:
+        """Whether the engine's graph is no longer the one this snapshot read: a reload has
+        swapped it, or is part way through doing so."""
+        rr = engine.registry_runner
+        return (rr.registry if rr else None) is not self.registry
+
+
+#: The snapshot a start's row names when the start could not take its own (vault BACKLOG #2838):
+#: every field ``None``, so the row claims no directory, count or digest.
+_UNKNOWN_LOADED = _LoadedConfig(
+    directory=None, shard=None, inbound=None, outbound=None, fingerprint=None, registry=None
+)
+
+
 async def _record_reload_audit(
     engine: Engine,
     *,
@@ -1028,6 +1078,7 @@ async def _record_reload_audit(
     client: str | None = None,
     failed_steps: Sequence[str] = (),
     extra: Mapping[str, object] | None = None,
+    loaded: _LoadedConfig | None = None,
 ) -> list[str]:
     """Write the ``config_reload`` audit row with the ADR 0041 D1 content fingerprint of what loaded.
 
@@ -1037,9 +1088,15 @@ async def _record_reload_audit(
 
     Shared by the inline reload endpoint and the dual-control executor so a held-then-approved reload
     records the same fingerprint-bearing row as an ungated one. The fingerprint is the engine's
-    :attr:`~Engine.loaded_config_fingerprint`, the digest it took of the bytes it loaded, so the row
-    and ``GET /config/provenance`` always name one digest. When the engine could not take one, the row
-    is written without it.
+    :attr:`~Engine.loaded_config_fingerprint`, the digest it took of the bytes it loaded, so a reload's
+    row and ``GET /config/provenance`` name one digest. A start row a reload superseded names the
+    start's digest instead (vault BACKLOG #2838). When the engine could not take one, the row is
+    written without it.
+
+    ``loaded`` is what the row names as loaded: the directory, shard, counts and fingerprint. A
+    reload leaves it ``None``, and the row reads them live, at the write. The start always passes
+    one: the snapshot it took at its first load, or :data:`_UNKNOWN_LOADED` when it could not take
+    one (vault BACKLOG #2838); see :class:`_LoadedConfig`.
 
     ``client`` (ADR 0150) is the address of the actor named in the row. The inline endpoint passes the
     requester's own address. The dual-control executor deliberately does NOT: there the row's ``actor``
@@ -1063,19 +1120,18 @@ async def _record_reload_audit(
     A cancellation still propagates: it is not a failure of this helper."""
     detail: str | None = None
     try:
-        rr = engine.registry_runner
-        directory = engine.running_config_dir
+        state = loaded if loaded is not None else _LoadedConfig.read(engine)
         detail = json.dumps(
             {
-                "dir": str(directory) if directory else None,
-                "shard": rr.registry.shard_id if rr else None,
+                "dir": state.directory,
+                "shard": state.shard,
                 "node": engine.coordinator.node_id,
-                "inbound": len(rr.registry.inbound) if rr else 0,
-                "outbound": len(rr.registry.outbound) if rr else 0,
+                "inbound": state.inbound,
+                "outbound": state.outbound,
                 "dry_run": False,
                 **({"degraded": True, "failed_steps": list(failed_steps)} if failed_steps else {}),
                 **(extra or {}),
-                **(engine.loaded_config_fingerprint or {}),
+                **(state.fingerprint or {}),
             }
         )
         await engine.store.record_audit(action, actor=actor, detail=detail, client=client)
@@ -1113,7 +1169,8 @@ _CONFIG_BASELINE_WINDOW = 50
 #: The detail key that marks a config row whose digest this process never checked against the
 #: store's baseline (vault BACKLOG #2597): a start whose baseline read failed or that took no digest,
 #: and any flag toggle that process writes. A later start passes over such a row to the last checked
-#: one, so the change the unchecked start could not see is still reported.
+#: one, so the change the unchecked start could not see is still reported. A start row that a reload
+#: superseded before it was written carries it too (vault BACKLOG #2838): its digest is no baseline.
 _BASELINE_UNCHECKED = "baseline_unchecked"
 
 #: What a start's ``config_loaded`` row records as ``comparison``.
@@ -1303,6 +1360,7 @@ async def _record_start_audit(
     fingerprint_failed: bool = False,
     outcome: _StartOutcome | None = None,
     comparison: _StartConfigComparison | None = None,
+    loaded: _LoadedConfig | None,
 ) -> None:
     """Write the start's ``config_loaded`` row through :func:`_record_reload_audit` (vault BACKLOG
     #2597), so a restart records which code and which posture the engine started with.
@@ -1315,7 +1373,23 @@ async def _record_start_audit(
 
     ``outcome`` and ``comparison`` are :func:`_compare_start_config`'s result. The row records
     the outcome as ``comparison``, and ``previous_fingerprint`` and ``changed``, both ``None`` when
-    no comparison was made. The caller raises the alert, through :func:`_raise_config_changed`."""
+    no comparison was made. The caller raises the alert, through :func:`_raise_config_changed`.
+
+    ``loaded`` is the snapshot the caller took at the first load and compared (vault BACKLOG
+    #2838). The row names that, so the digest it records is the one the comparison used. When the
+    caller could not take one, ``loaded`` is ``None``. The row then claims nothing: it carries
+    :data:`_UNKNOWN_LOADED` with no live read, since a reload may already have swapped the graph,
+    and ``loosenings`` ``None`` for the same reason. It is degraded with the ``start_snapshot``
+    step and marked :data:`_BASELINE_UNCHECKED`, whatever ``outcome`` says.
+
+    A reload can swap the graph before the row is written: on a clustered node, ``engine.start()``
+    runs the convergence loop. The row then still names the start's graph, but it marks itself
+    ``superseded`` and :data:`_BASELINE_UNCHECKED`, even when the reload loaded the same bytes.
+    Without that, it would be the store's newest baseline while naming a digest no node runs, and
+    the next start on the reloaded bytes would raise a false ``config_changed``. Its
+    ``loosenings`` are ``None``, since the reader sees only the live graph and could not say which
+    of the two they describe. A fault in that swap check marks the row degraded with the
+    ``start_swap_check`` step, unchecked and with ``None`` loosenings, and never ``superseded``."""
     switches: list[str] | None
     try:
         pairs, _scope = _posture_loosenings(
@@ -1329,15 +1403,43 @@ async def _record_start_audit(
     except Exception:  # noqa: BLE001 - a start must not fail on its own audit row (step 5)
         _log.exception("the start's loosenings list could not be read; config_loaded records None")
         switches = None
+    # After the loosenings read, so a swap that read could have seen is caught; nothing awaits
+    # between here and the row's detail. A reload that swaps the graph later is not caught.
+    superseded = swap_unknown = False
+    if loaded is not None:
+        try:
+            superseded = loaded.swapped(engine)
+        except Exception as exc:  # noqa: BLE001 - step 5; a swap it cannot rule out is no baseline
+            _log.warning(
+                "the start could not tell whether a reload swapped its graph (%s); its "
+                "config_loaded row is degraded and is no baseline",
+                type(exc).__name__,
+            )
+            swap_unknown = True
+        if superseded:
+            _log.warning(
+                "a config reload applied before the start's config_loaded row was written; the "
+                "row names the graph this start loaded and is marked superseded"
+            )
+    # The loosenings describe the live graph, so they stand only when it is the start's.
+    untrusted = superseded or swap_unknown or loaded is None
+    if untrusted:
+        switches = None
     await _record_reload_audit(
         engine,
         actor="system",
         action="config_loaded",
-        failed_steps=["config_fingerprint"] if fingerprint_failed else [],
+        loaded=loaded if loaded is not None else _UNKNOWN_LOADED,
+        failed_steps=[
+            *(["config_fingerprint"] if fingerprint_failed else []),
+            *(["start_snapshot"] if loaded is None else []),
+            *(["start_swap_check"] if swap_unknown else []),
+        ],
         extra={
             "loosenings": switches,
             "comparison": outcome,
-            **({_BASELINE_UNCHECKED: True} if outcome in _UNCHECKED_OUTCOMES else {}),
+            **({"superseded": True} if superseded else {}),
+            **({_BASELINE_UNCHECKED: True} if untrusted or outcome in _UNCHECKED_OUTCOMES else {}),
             "previous_fingerprint": comparison.previous_fingerprint if comparison else None,
             "changed": comparison.changed if comparison else None,
         },
@@ -8472,6 +8574,7 @@ def create_managed_app(
         start_fingerprint_failure: str | None = None
         start_outcome: _StartOutcome | None = None
         start_config: _StartConfigComparison | None = None
+        start_loaded: _LoadedConfig | None = None
         if config_dir is not None:
             # The first graph load, under the same teardown discipline as the preflights above: a
             # refusal here (a bad config, the shard guard, or the BACKLOG #1182 static-credential
@@ -8496,12 +8599,23 @@ def create_managed_app(
                 # route has a baseline from the start on (vault BACKLOG #2597). Never raises on an
                 # unreadable bundle: it leaves the baseline empty and the start goes on.
                 start_fingerprint_failure = await engine.capture_start_provenance()
-                # Before engine.start(), so no reload can have moved the baseline yet, and against
-                # this snapshot, so a later one cannot change what this start is said to have
-                # loaded. Bounded and never raises: it costs only the comparison (vault BACKLOG
-                # #2597, step 5).
+                # One snapshot of what this load put live, taken before engine.start() can spawn a
+                # convergence reload. The comparison below and the config_loaded row both use it,
+                # so neither can name a graph this start did not load (vault BACKLOG #2838).
+                # Audit only, so it never refuses a start (#2597 step 5): without it the start
+                # checks nothing, as one with no digest does, and its row names no graph.
+                try:
+                    start_loaded = _LoadedConfig.read(engine)
+                except Exception as exc:  # noqa: BLE001 - see the comment above
+                    _log.warning(
+                        "the start could not take its config snapshot (%s); it checks no config "
+                        "change, and its config_loaded row will name no graph",
+                        type(exc).__name__,
+                    )
+                # Bounded and never raises: it costs only the comparison (vault BACKLOG #2597,
+                # step 5).
                 start_outcome, start_config = await _compare_start_config(
-                    engine, engine.loaded_config_fingerprint
+                    engine, start_loaded.fingerprint if start_loaded is not None else None
                 )
                 # This process cannot vouch for a config it never checked: its flag rows say so.
                 engine.config_baseline_unchecked = start_outcome in _UNCHECKED_OUTCOMES
@@ -8674,6 +8788,7 @@ def create_managed_app(
                     fingerprint_failed=start_fingerprint_failure is not None,
                     outcome=start_outcome,
                     comparison=start_config,
+                    loaded=start_loaded,
                 )
             # The auth_settings test adds nothing at runtime; it narrows the type for the reads below.
             if auth is not None and auth_settings is not None:
