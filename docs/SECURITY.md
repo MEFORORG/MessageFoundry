@@ -1780,7 +1780,8 @@ and the floor. The 409 carries `Retry-After` with the remaining wait in whole se
 raises an `approval_too_early` alert keyed `approval:<id>`, carrying the operation key and a fixed
 reason (BACKLOG #287). An age below zero is a clock behind, not a fast approver, and raises no alert. The request stays **pending**, and nothing retries it: the approver approves again. The
 check is inside the approval gate itself, so every release path meets it. Setting the floor to `0`
-removes it. When requests expire, a floor as long as the expiry window is refused at startup, because
+removes it. A floor below the default, or `0`, can be named as a loosening (see
+[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md)). When requests expire, a floor as long as the expiry window is refused at startup, because
 no request could ever be approved.
 
 **Where the default comes from.** It is **provisional**, and it comes from published human-timing
@@ -4142,8 +4143,9 @@ ships off. Each named value reaches the `serve` loosening warning, `messagefound
 `GET /security/posture`; see [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) for the table of values.
 The BACKLOG #2301 time floors are named the same way: `admin_write_min_interval_seconds`,
 `mfa_verify_min_elapsed_seconds` and, with OIDC on, `oidc_callback_min_elapsed_seconds`, each when
-below its default, and as off at `0`. The dual-control `[approvals].min_dwell_seconds` floor is not
-named yet.
+below its default, and as off at `0`. The `[approvals].min_dwell_seconds` floor and
+`[approvals].expiry_hours` can be named too (BACKLOG #2489);
+[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) says when.
 
 **Throttle observability.** A rate-limited auth attempt is written to the rotating general log at
 WARNING with a route label and the client address, deliberately **not** to the hash-chained
