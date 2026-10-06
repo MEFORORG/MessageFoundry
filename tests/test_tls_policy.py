@@ -1516,23 +1516,56 @@ def test_a_superseded_expired_crl_beside_its_fresh_replacement_is_refused(
 _X509_V_FLAG_EXTENDED_CRL_SUPPORT = 0x1000
 
 #: The first release on each OpenSSL branch that never scores a delta CRL as a complete one
-#: (openssl/openssl PR 31044, issue 31040; on 3.5 it is commit 6cbbf4c167d9). Read from each
-#: branch's release tags. Before it, get_crl_score skipped its delta check unless extended CRL
-#: support was on. 3.1 to 3.3 have no fixed release. 4.1 forked after the fix: 4.1.0-alpha1 has it.
-#: A pre-release snapshot reports its target patch number, so this judges one by that.
+#: (openssl/openssl issue 31040, landed by cherry-pick from PR 31044; on 3.5 it is commit
+#: 6cbbf4c167d9). Read from each branch's release tags. Before it, get_crl_score reached its delta
+#: check only with extended CRL support on, and even then not for a reason-scoped delta. 3.1 to 3.3
+#: have no fixed release. 4.1 forked after the fix: 4.1.0-alpha1 has it.
 _DELTA_SCORING_FIX = {(3, 0): 22, (3, 4): 7, (3, 5): 8, (3, 6): 4, (4, 0): 2}
 
 
-def _release_has_the_delta_scoring_fix() -> bool:
+def _release_has_the_delta_scoring_fix(
+    info: tuple[int, int, int, int, int] = ssl.OPENSSL_VERSION_INFO,
+    text: str = ssl.OPENSSL_VERSION,
+) -> bool:
     """True when the linked OpenSSL's version is at or past the upstream fix.
 
     False says only that the VERSION predates it: a vendor can backport the fix without a new
-    number. So this may only ever demand the fixed behaviour, never the old one."""
-    major, minor, _, patch, _ = ssl.OPENSSL_VERSION_INFO
+    number. So this may only ever demand the fixed behaviour, never the old one. A ``-dev``
+    snapshot reports its target patch number whether or not it holds the fix, so it is False."""
+    if "-dev" in text:
+        return False
+    major, minor, _, patch, _ = info
     first = _DELTA_SCORING_FIX.get((major, minor))
     if first is not None:
         return patch >= first
     return (major, minor) > (4, 0)
+
+
+@pytest.mark.parametrize(
+    ("info", "text", "fixed"),
+    [
+        ((3, 0, 0, 21, 0), "OpenSSL 3.0.21", False),
+        ((3, 0, 0, 22, 0), "OpenSSL 3.0.22", True),
+        ((3, 3, 0, 7, 0), "OpenSSL 3.3.7", False),
+        ((3, 4, 0, 6, 0), "OpenSSL 3.4.6", False),
+        ((3, 4, 0, 7, 0), "OpenSSL 3.4.7", True),
+        ((3, 5, 0, 7, 0), "OpenSSL 3.5.7", False),
+        ((3, 5, 0, 8, 0), "OpenSSL 3.5.8", True),
+        ((3, 6, 0, 3, 0), "OpenSSL 3.6.3", False),
+        ((3, 6, 0, 4, 0), "OpenSSL 3.6.4", True),
+        ((4, 0, 0, 1, 0), "OpenSSL 4.0.1", False),
+        ((4, 0, 0, 2, 0), "OpenSSL 4.0.2", True),
+        ((4, 1, 0, 0, 0), "OpenSSL 4.1.0", True),
+        ((3, 5, 0, 8, 0), "OpenSSL 3.5.8-dev", False),
+        ((1, 1, 1, 23, 15), "OpenSSL 1.1.1w", False),
+    ],
+)
+def test_the_delta_scoring_fix_table_matches_the_release_tags(
+    info: tuple[int, int, int, int, int], text: str, fixed: bool
+) -> None:
+    # Each row is a release tag read for the fix. A gap in the table shows here on every runner,
+    # not only on one that links the missing release.
+    assert _release_has_the_delta_scoring_fix(info, text) is fixed
 
 
 @pytest.mark.parametrize(
