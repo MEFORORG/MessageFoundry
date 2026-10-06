@@ -27,6 +27,7 @@ import errno
 import functools
 import json
 import logging
+import math
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import CancelledError as FutureCancelledError
@@ -472,6 +473,64 @@ class _WorkerFaultLog:
                 count_label=_WORKER_RUN_COUNT,
                 stacklevel=3,
             )
+
+
+# BACKLOG #3043: how long one (connection, refusal code) pair stays quiet after it writes its
+# permanent-refusal WARNING. See _RefusalLog.
+_REFUSAL_LOG_WINDOW_SECONDS = 60.0
+
+
+class _RefusalLog:
+    """The WARNING a permanent refusal writes when the delivery worker dead-letters it, throttled per
+    (connection, refusal code) (BACKLOG #3043).
+
+    **What the line may carry.** The connection, the row and message ids, the exception's class name
+    and its ``code``. Never ``str(exc)`` or ``safe_exc(exc)``: a partner's reject text (MSA-3, an HTTP
+    body) can echo the message, and ``safe_exc`` scrubs HL7 shapes, not every connector's content.
+    The full detail already goes to the secured store's ``last_error`` and the dead event.
+
+    **Why throttle.** A lane whose charset or frame refuses every message would write one line per
+    message. The first refusal of a pair always logs. Later ones inside
+    :data:`_REFUSAL_LOG_WINDOW_SECONDS` are counted, and the next line the pair writes reports that
+    count. This throttles only the log line. Every refused row is still dead-lettered with its own
+    event, status and count, which is what the count-and-log invariant asks for, so the store, not
+    this log, stays the complete record. A count still held when the engine stops is never written.
+
+    Mutable, shared by every delivery worker of one runner. Safe without a lock: :meth:`warning`
+    reads and writes the state with no ``await`` between."""
+
+    __slots__ = ("_clock", "_state", "_window")
+
+    def __init__(
+        self,
+        *,
+        window: float = _REFUSAL_LOG_WINDOW_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._window = window
+        self._clock = clock
+        # (connection, code) -> (when its last line was written, refusals held back since then)
+        self._state: dict[tuple[str, str], tuple[float, int]] = {}
+
+    def warning(self, name: str, exc: NegativeAckError, message: str, *args: object) -> None:
+        """Log ``message % args`` at WARNING, followed by ``exc``'s class name and code, unless the
+        pair ``(name, exc.code)`` logged inside the window. A line written after a held-back run
+        also reports how many it held."""
+        key = (name, exc.code)
+        now = self._clock()
+        last, held = self._state.get(key, (-math.inf, 0))
+        if now - last < self._window:
+            self._state[key] = (last, held + 1)
+            return
+        self._state[key] = (now, 0)
+        message += " (%s, code %r)"
+        args = (*args, type(exc).__name__, exc.code)
+        if held:
+            message += (
+                " (%d more with this code on this connection went unlogged since its last line)"
+            )
+            args = (*args, held)
+        log.warning(message, *args, stacklevel=2)
 
 
 # A queue_buildup alert re-fires at most this often per connection while the lane stays over threshold,
@@ -1301,6 +1360,8 @@ class RegistryRunner:
         # so a bad value fails loud at construction, mirroring the infra_fault_policy assert above.
         assert credential_fault_policy in ("stop", "dead_letter")
         self._credential_fault_policy = credential_fault_policy
+        # BACKLOG #3043: the content-free WARNING a permanent refusal writes when it dead-letters.
+        self._refusal_log = _RefusalLog()
         # #147 (ADR 0095): per-connection active-window scheduler. `_schedule_clock` is injectable for
         # deterministic tests (returns an AWARE UTC datetime); `_schedule_tick` is the reconcile
         # granularity. `_schedule_workers` holds one cooperatively-cancellable task per SCHEDULED
@@ -6688,6 +6749,17 @@ class RegistryRunner:
                 await self._stop_lane_retaining(name, [item.id], exc, fault)
                 return _ItemOutcome.STOPPED, None
             if exc.permanent:
+                # BACKLOG #3043: this arm used to dead-letter with no log line at all. Class name
+                # and code only, never the text: see _RefusalLog for why, and for the throttle.
+                self._refusal_log.warning(
+                    name,
+                    exc,
+                    "delivery worker %r: outbox row %s (message %s) refused permanently; "
+                    "dead-lettered",
+                    name,
+                    item.id,
+                    item.message_id,
+                )
                 await self.store.dead_letter_now(item.id, safe_exc(exc))
             else:
                 retry_until = await self._mark_failed_and_arm(name, item.id, safe_exc(exc), retry)
@@ -6978,6 +7050,16 @@ class RegistryRunner:
                 await self._stop_lane_retaining(name, ids, exc, fault)
                 return _ItemOutcome.STOPPED, None
             if exc.permanent:
+                # BACKLOG #3043, the batch twin of the single-row line.
+                self._refusal_log.warning(
+                    name,
+                    exc,
+                    "delivery worker %r: a batch of %d (head outbox row %s) refused permanently; "
+                    "dead-lettered",
+                    name,
+                    len(ids),
+                    ids[0] if ids else head.id,
+                )
                 await self.store.dead_letter_batch(ids, safe_exc(exc))
             else:
                 retry_until = await self._mark_batch_failed_and_arm(name, ids, safe_exc(exc), retry)
@@ -7049,12 +7131,15 @@ class RegistryRunner:
             except NegativeAckError as exc:
                 if not exc.permanent or self._lane_stopping_fault(exc) is not None:
                     raise
-                log.warning(
-                    "delivery worker %r: batch member %s cannot be framed (%s); dead-lettered "
-                    "alone, the rest of the batch goes on",
+                # Throttled with the other permanent-refusal lines (BACKLOG #3043): a frame that
+                # refuses every member would otherwise write one line per member.
+                self._refusal_log.warning(
+                    name,
+                    exc,
+                    "delivery worker %r: batch member %s refused permanently, its frame cannot "
+                    "carry it; dead-lettered alone, the rest of the batch goes on",
                     name,
                     item.id,
-                    exc.code,
                 )
                 refused.append((item.id, safe_exc(exc)))
             else:
