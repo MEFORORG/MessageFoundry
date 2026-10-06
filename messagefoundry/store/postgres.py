@@ -7183,20 +7183,14 @@ class PostgresStore:
         on_repeat: Callable[[str], AuditAppend] | None = None,
     ) -> str:
         """Persist a high-value action awaiting a distinct second approver (dual-control, 2.3.5).
-        The Store protocol states the ``audit`` and ``on_repeat`` contract and what is returned."""
-        if on_repeat is not None:
-            return await self._create_or_join_pending_approval(
-                approval_id=approval_id,
-                operation=operation,
-                params=params,
-                requester=requester,
-                requester_user_id=requester_user_id,
-                requested_at=requested_at,
-                expires_at=expires_at,
-                audit=audit,
-                on_repeat=on_repeat,
-            )
-        sql = (
+        The Store protocol states the ``audit`` and ``on_repeat`` contract and what is returned.
+
+        With ``on_repeat`` the open-request read runs under the audit-chain advisory lock (vault
+        BACKLOG #2445), because READ COMMITTED lets two transactions both find none and both insert.
+        Every request takes that lock anyway, for its audit row, and it is re-entrant within a
+        transaction, so this adds no lock and no lock order. Each later statement sees every request
+        committed before it."""
+        insert = (
             "INSERT INTO pending_approvals "
             "(id, operation, params, requester, requester_user_id, requested_at, status, expires_at)"
             " VALUES ($1,$2,$3,$4,$5,$6,'pending',$7)"
@@ -7210,89 +7204,49 @@ class PostgresStore:
             requested_at,
             expires_at,
         )
-        if audit is None:
-            await self._execute(sql, *args)
+        if audit is None and on_repeat is None:
+            await self._execute(insert, *args)
             return approval_id
         now = time.time()
+        held, append = approval_id, audit
         # vault BACKLOG #2255. The audit row joins the INSERT's transaction, so a failed append
         # rolls the request back. `record=False` as `_execute` passes: not a pipeline borrow.
         async with self._timed_acquire(record=False) as conn, conn.transaction():
-            await conn.execute(sql, *args)
-            appended = await self._append_audit_row(
-                conn,
-                audit.action,
-                actor=audit.actor,
-                channel_id=None,
-                detail=audit.detail,
-                client=audit.client,
-                now=now,
-            )
-        audit.tee(ts=now, row=appended)
-        return approval_id
-
-    async def _create_or_join_pending_approval(
-        self,
-        *,
-        approval_id: str,
-        operation: str,
-        params: str,
-        requester: str,
-        requester_user_id: str,
-        requested_at: float,
-        expires_at: float | None,
-        audit: AuditAppend | None,
-        on_repeat: Callable[[str], AuditAppend],
-    ) -> str:
-        """:meth:`create_pending_approval` when a repeat joins an open request (vault BACKLOG #2445).
-
-        READ COMMITTED lets two transactions both find no open request and both insert one, so the
-        read runs under the audit-chain advisory lock. Every request takes that lock anyway, for its
-        audit row, and the lock is re-entrant within a transaction, so this adds no new lock and no
-        new lock order. Each statement after it sees every request committed before it."""
-        now = time.time()
-        async with self._timed_acquire(record=False) as conn, conn.transaction():
-            await self._advisory_lock(conn, _LOCK_CLASS_AUDIT, _AUDIT_LOCK)
-            existing = await conn.fetchval(
-                "SELECT id FROM pending_approvals WHERE operation = $1 AND params = $2"
-                " AND requester_user_id = $3 AND status = 'pending'"
-                " AND (expires_at IS NULL OR expires_at > $4)"
-                " ORDER BY requested_at ASC LIMIT 1",
-                operation,
-                params,
-                requester_user_id,
-                requested_at,
-            )
-            held = approval_id if existing is None else str(existing)
-            append = audit if existing is None else on_repeat(held)
-            if existing is None:
-                await conn.execute(
-                    "INSERT INTO pending_approvals "
-                    "(id, operation, params, requester, requester_user_id, requested_at, status,"
-                    " expires_at) VALUES ($1,$2,$3,$4,$5,$6,'pending',$7)",
-                    approval_id,
+            existing = None
+            if on_repeat is not None:
+                await self._advisory_lock(conn, _LOCK_CLASS_AUDIT, _AUDIT_LOCK)
+                existing = await conn.fetchval(
+                    "SELECT id FROM pending_approvals WHERE operation = $1 AND params = $2"
+                    " AND requester_user_id = $3 AND status = 'pending'"
+                    " AND (expires_at IS NULL OR expires_at > $4)"
+                    " ORDER BY requested_at ASC LIMIT 1",
                     operation,
                     params,
-                    requester,
                     requester_user_id,
                     requested_at,
-                    expires_at,
                 )
-            appended = (
-                None
-                if append is None
-                else await self._append_audit_row(
-                    conn,
-                    append.action,
-                    actor=append.actor,
-                    channel_id=None,
-                    detail=append.detail,
-                    client=append.client,
-                    now=now,
-                )
-            )
+            if existing is None:
+                await conn.execute(insert, *args)
+            elif on_repeat is not None:  # always, since `existing` is read only with on_repeat
+                held = str(existing)
+                append = on_repeat(held)
+            appended = None if append is None else await self._append_audit(conn, append, now)
         if append is not None and appended is not None:
             append.tee(ts=now, row=appended)
         return held
+
+    async def _append_audit(self, conn: Any, audit: AuditAppend, now: float) -> AppendedAuditRow:
+        """:meth:`_append_audit_row` for an :class:`AuditAppend` a write carries into its own
+        transaction on ``conn`` (BACKLOG #2100). The caller commits, then tees."""
+        return await self._append_audit_row(
+            conn,
+            audit.action,
+            actor=audit.actor,
+            channel_id=None,
+            detail=audit.detail,
+            client=audit.client,
+            now=now,
+        )
 
     async def get_pending_approval(self, approval_id: str) -> Row | None:
         row: Row | None = await self._fetchone(
@@ -7352,19 +7306,7 @@ class PostgresStore:
             moved = _rowcount(await conn.execute(sql, *args)) > 0
             # Inside the transaction, so a failed append rolls the transition back. A transition
             # that matched no row writes no audit row.
-            appended = (
-                await self._append_audit_row(
-                    conn,
-                    audit.action,
-                    actor=audit.actor,
-                    channel_id=None,
-                    detail=audit.detail,
-                    client=audit.client,
-                    now=now,
-                )
-                if moved
-                else None
-            )
+            appended = await self._append_audit(conn, audit, now) if moved else None
         if appended is not None:
             audit.tee(ts=now, row=appended)
         return moved

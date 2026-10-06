@@ -4462,8 +4462,8 @@ def create_app(
         gate: ApprovalGate | None = Depends(_get_gate),
     ) -> ApprovalResolveResult:
         """Record what an ``interrupted`` release did: ``effects_applied`` or ``effects_not_applied``
-        (BACKLOG #1562 part B). Audited as ``approval.resolve_attempted`` before the row moves and
-        ``approval.resolved`` after; the operation is never re-run. The
+        (BACKLOG #1562 part B). Audited as ``approval.resolved``, written with the move in one
+        transaction (vault BACKLOG #2255); the operation is never re-run. The
         requester cannot resolve their own request, and a row not ``interrupted`` answers 409."""
         if gate is None:
             raise HTTPException(503, "approval workflow is not available")

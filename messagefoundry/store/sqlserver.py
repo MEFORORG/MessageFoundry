@@ -139,6 +139,7 @@ from messagefoundry.store.store import (
     LOCKOUT_COLUMNS,
     MESSAGE_EVENT_KINDS,
     NOT_DEPLOYED_EVENT,
+    OPEN_REPEAT_WHERE,
     PASSTHROUGH_MARKER_HANDLER,
     PASSWORD_CHANGE_LOCKOUT_CLEAR,
     REINGRESS_TARGET_PREFIX,
@@ -11154,9 +11155,8 @@ class SqlServerStore:
         # vault BACKLOG #2445: the open request a repeat joins. Oldest first: that is the request
         # every earlier caller got.
         match = (
-            "SELECT TOP (1) id FROM pending_approvals WHERE operation = ? AND params = ?"
-            " AND requester_user_id = ? AND status = 'pending'"
-            " AND (expires_at IS NULL OR expires_at > ?) ORDER BY requested_at ASC"
+            f"SELECT TOP (1) id FROM pending_approvals WHERE {OPEN_REPEAT_WHERE}"
+            " ORDER BY requested_at ASC"
         )
         match_args = (operation, params, requester_user_id, requested_at)
         now = time.time()
@@ -11186,17 +11186,7 @@ class SqlServerStore:
                         if held == approval_id:
                             await cur.execute(sql, args)
                         appended = (
-                            None
-                            if append is None
-                            else await self._append_audit_row(
-                                cur,
-                                append.action,
-                                actor=append.actor,
-                                channel_id=None,
-                                detail=append.detail,
-                                client=append.client,
-                                now=now,
-                            )
+                            None if append is None else await self._append_audit(cur, append, now)
                         )
                         await self._commit(conn)
                 except Exception:
@@ -11206,6 +11196,20 @@ class SqlServerStore:
         if append is not None and appended is not None:
             append.tee(ts=now, row=appended)
         return held
+
+    async def _append_audit(self, cur: Any, audit: AuditAppend, now: float) -> AppendedAuditRow:
+        """:meth:`_append_audit_row` for an :class:`AuditAppend` a write carries into its own
+        transaction on ``cur`` (BACKLOG #2100). The caller holds ``_audit_lock``, commits, then
+        tees."""
+        return await self._append_audit_row(
+            cur,
+            audit.action,
+            actor=audit.actor,
+            channel_id=None,
+            detail=audit.detail,
+            client=audit.client,
+            now=now,
+        )
 
     async def get_pending_approval(self, approval_id: str) -> dict[str, Any] | None:
         return await self._fetchone(
@@ -11277,15 +11281,7 @@ class SqlServerStore:
                         moved = int(cur.rowcount) > 0
                         if moved:
                             # Before the one commit, so a failed append rolls the transition back.
-                            appended = await self._append_audit_row(
-                                cur,
-                                audit.action,
-                                actor=audit.actor,
-                                channel_id=None,
-                                detail=audit.detail,
-                                client=audit.client,
-                                now=now,
-                            )
+                            appended = await self._append_audit(cur, audit, now)
                         await self._commit(conn)
                 except Exception:
                     # BACKLOG #1940: see _rollback_or_discard.

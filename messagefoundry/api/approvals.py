@@ -543,24 +543,21 @@ class ApprovalGate:
         # reject, moves nothing and writes no row. A fault answers 503 and nothing has run. A
         # claim whose COMMIT landed before the fault was reported can still leave the row
         # 'executing' with nothing run; nothing moves a row out of 'executing' yet (#1562).
+        attempted = AuditAppend(
+            "approval.release_attempted",
+            actor=approver,
+            detail=json.dumps(
+                {"approval_id": approval_id, "operation": operation, "requester": requester}
+            ),
+            client=client,  # ADR 0150: the approver's address, matching this row's actor
+        )
         claim = asyncio.ensure_future(
             self._store.decide_pending_approval(
                 approval_id,
                 status="executing",
                 approver=approver,
                 decided_at=self._clock(),
-                audit=AuditAppend(
-                    "approval.release_attempted",
-                    actor=approver,
-                    detail=json.dumps(
-                        {
-                            "approval_id": approval_id,
-                            "operation": operation,
-                            "requester": requester,
-                        }
-                    ),
-                    client=client,  # ADR 0150: the approver's address, matching this row's actor
-                ),
+                audit=attempted,
             )
         )
         try:
@@ -590,7 +587,7 @@ class ApprovalGate:
                 approval_id,
                 exc,
                 what="claim",
-                action="approval.release_attempted",
+                action=attempted.action,
                 retry=(
                     "The operation did not run. If the request still reads pending, approve it "
                     "again once the store accepts writes"
