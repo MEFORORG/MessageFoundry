@@ -2060,6 +2060,20 @@ class AuthStore(Protocol):
         self, user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
     ) -> bool: ...
 
+    # ADR 0171 Amendment B (BACKLOG #2226), for `admin-reset-totp`: swaps an ENABLED enrolment's
+    # secret, recovery codes and step high-water mark in ONE UPDATE, with TOTP on throughout, so the
+    # account never passes through zero factors. Conditional on TOTP being on; returns whether it
+    # wrote, and a caller must refuse on False.
+    async def replace_totp_enrolment(
+        self,
+        user_id: str,
+        *,
+        secret: str,
+        recovery_code_hashes: list[str],
+        step: int,
+        now: float | None = None,
+    ) -> bool: ...
+
     async def disable_totp(self, user_id: str, *, now: float | None = None) -> None: ...
 
     async def get_recovery_code_hashes(self, user_id: str) -> list[str]: ...

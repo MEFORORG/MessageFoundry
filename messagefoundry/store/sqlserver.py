@@ -11367,6 +11367,32 @@ class SqlServerStore:
         )
         return bool(rows)
 
+    async def replace_totp_enrolment(
+        self,
+        user_id: str,
+        *,
+        secret: str,
+        recovery_code_hashes: list[str],
+        step: int,
+        now: float | None = None,
+    ) -> bool:
+        """See the SQLite twin (ADR 0171 Amendment B). The OUTPUT rowset says whether it wrote."""
+        now = time.time() if now is None else now
+        rows = await self._execute_output(
+            "UPDATE users SET totp_secret=?, totp_enrolled_at=?, totp_recovery_codes=?,"
+            " last_totp_step=?, updated_at=? OUTPUT inserted.id"
+            " WHERE id=? AND totp_enabled=1 AND totp_secret IS NOT NULL",
+            (
+                self._cipher.encrypt(secret, aad=cell_aad("users", "totp_secret", user_id)),
+                now,
+                json.dumps(recovery_code_hashes),
+                step,
+                now,
+                user_id,
+            ),
+        )
+        return bool(rows)
+
     async def disable_totp(self, user_id: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
         await self._execute(

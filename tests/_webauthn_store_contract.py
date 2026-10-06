@@ -208,4 +208,27 @@ async def _assert_totp_contract(store: Any) -> None:
     assert await store.get_recovery_code_hashes("totp-u1") == []
     assert await store.enable_totp("missing-user", recovery_code_hashes=[], now=9.0) is False
 
+    # replace_totp_enrolment (ADR 0171 Amendment B, BACKLOG #2226): conditional on TOTP being ON, so
+    # it can never turn TOTP on for an account without it.
+    # The old seed reversed: a different valid base32 seed, without a second key-shaped literal.
+    new_seed = "JBSWY3DPEHPK3PXP"[::-1]
+    replaced: dict[str, Any] = {"secret": new_seed, "recovery_code_hashes": ["n1"]}
+    assert await store.replace_totp_enrolment("totp-u1", step=200, now=10.0, **replaced) is False
+    user = await store.get_user("totp-u1")
+    assert user is not None and user.totp_enabled is False
+    assert await store.get_totp_secret("totp-u1") is None
+    # On an enabled row it swaps the seed, the codes and the step in one write, with TOTP still on.
+    await store.set_totp_secret("totp-u1", secret="JBSWY3DPEHPK3PXP", now=11.0)
+    assert await store.enable_totp("totp-u1", recovery_code_hashes=["o1", "o2"], now=12.0) is True
+    assert await store.consume_totp_step("totp-u1", 300) is True  # the old seed's history
+    assert await store.replace_totp_enrolment("totp-u1", step=200, now=13.0, **replaced) is True
+    user = await store.get_user("totp-u1")
+    assert user is not None and user.totp_enabled is True
+    assert await store.get_totp_secret("totp-u1") == new_seed
+    assert await store.get_recovery_code_hashes("totp-u1") == ["n1"]
+    # The high-water mark is the proving code's step, not the old seed's: 200 is spent, 201 is not.
+    assert await store.consume_totp_step("totp-u1", 200) is False
+    assert await store.consume_totp_step("totp-u1", 201) is True
+    assert await store.replace_totp_enrolment("missing-user", step=1, now=14.0, **replaced) is False
+
     await store.delete_user("totp-u1")

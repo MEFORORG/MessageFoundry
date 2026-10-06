@@ -7640,6 +7640,29 @@ class PostgresStore:
         )
         return written > 0
 
+    async def replace_totp_enrolment(
+        self,
+        user_id: str,
+        *,
+        secret: str,
+        recovery_code_hashes: list[str],
+        step: int,
+        now: float | None = None,
+    ) -> bool:
+        """See the SQLite twin (ADR 0171 Amendment B). The row count says whether it wrote."""
+        now = time.time() if now is None else now
+        written = await self._execute(
+            "UPDATE users SET totp_secret=$1, totp_enrolled_at=$2, totp_recovery_codes=$3,"
+            " last_totp_step=$4, updated_at=$2"
+            " WHERE id=$5 AND totp_enabled=TRUE AND totp_secret IS NOT NULL",
+            self._enc(secret, aad=cell_aad("users", "totp_secret", user_id)),
+            now,
+            json.dumps(recovery_code_hashes),
+            step,
+            user_id,
+        )
+        return written > 0
+
     async def disable_totp(self, user_id: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
         await self._execute(

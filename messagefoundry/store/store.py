@@ -11674,6 +11674,41 @@ class MessageStore:
             await self._commit()
         return written
 
+    async def replace_totp_enrolment(
+        self,
+        user_id: str,
+        *,
+        secret: str,
+        recovery_code_hashes: list[str],
+        step: int,
+        now: float | None = None,
+    ) -> bool:
+        """Swap an ENABLED TOTP enrolment for a new secret in one UPDATE, and return whether it
+        wrote (ADR 0171 Amendment B, BACKLOG #2226).
+
+        The secret, the recovery codes and the step high-water mark change together, and TOTP stays
+        on throughout, so no reader ever sees the account without a factor. ``step`` is the step of
+        the code that proved the new secret, so that code is spent. The write matches only a row
+        where TOTP is on, so it can never turn TOTP on for an account that did not have it."""
+        now = time.time() if now is None else now
+        async with _writer_guard(self._db, self._lock):
+            cur = await self._db.execute(
+                "UPDATE users SET totp_secret=?, totp_enrolled_at=?, totp_recovery_codes=?,"
+                " last_totp_step=?, updated_at=?"
+                " WHERE id=? AND totp_enabled=1 AND totp_secret IS NOT NULL",
+                (
+                    self._enc(secret, aad=cell_aad("users", "totp_secret", user_id)),
+                    now,
+                    json.dumps(recovery_code_hashes),
+                    step,
+                    now,
+                    user_id,
+                ),
+            )
+            written = cur.rowcount > 0
+            await self._commit()
+        return written
+
     async def disable_totp(self, user_id: str, *, now: float | None = None) -> None:
         """Clear a user's TOTP enrollment entirely (secret, enabled flag, recovery codes)."""
         now = time.time() if now is None else now
