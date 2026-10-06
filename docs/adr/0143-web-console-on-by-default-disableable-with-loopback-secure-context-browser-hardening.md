@@ -225,30 +225,43 @@ record.
 ## Cross-reference (2026-10-05) -- the console exposure flags count `[api].trusted_proxies` (BACKLOG #2218)
 
 Section 3's "Exposed bind" bullet names three exposed cases. Engine PR 1717 (merged 2026-09-27
-Central) added a fourth: a non-empty `[api].trusted_proxies` on a loopback bind. `serve` reads it in
-both console flags. `console_exposed` drives the auto-degrade. `ui_exposed` drives the ASVS 8.4.2
-pointer and the `[auth].admin_new_ip_step_up` advisory. Both now read
-`not settings.api.host_is_browser_origin`.
+Central) added a fourth: a non-empty `[api].trusted_proxies` on a loopback bind. In `serve`, both
+console flags now read `not settings.api.host_is_browser_origin`. That property wraps
+`request_host_is_browser_origin` in `messagefoundry/config/settings.py`.
 
-**Why the console flags count it.** Settings accept `trusted_proxies` on a loopback bind only with
-`tls_terminated_upstream` or an operator `tls_cert_file` (BACKLOG #2055). So a set list declares a
-proxy in front of the engine, and the browser reaches the console through it, from off the box.
-Section 3 makes the default-on console a local-loopback convenience, so off the box it must be asked
-for by name. The two advisories are written for an off-box console, so they apply here too.
+- `console_exposed` drives the auto-degrade of a default-on console.
+- `ui_exposed` also reads `serve_ui`, so only an explicitly enabled console reaches it. It prints the
+  ASVS 8.4.2 pointer. It adds the new-IP warning only when `[auth].admin_new_ip_step_up` is off,
+  which is not the default.
 
-**It refuses nothing new.** The auto-degrade serves JSON-only with a warning and exits 0, and the
-advisories never refuse. So counting this posture turns no config into a start failure, which is the
-property section 3 exists to keep.
+So one boot gets the degrade or the advisories, never both.
 
-**ADR 0068 gives a second, separate reason for the same rule.** Behind a proxy the request `Host` may
-be forwarded and client-controlled, so it cannot anchor the passkey rp_id (its 2026-09-28
-amendment, BACKLOG #2220). Both ADRs use one predicate, `request_host_is_browser_origin` in
-`messagefoundry/config/settings.py`, so the two cannot drift apart.
+Why the console flags count it: `ApiSettings._check_tls_cert_dependency` refuses `trusted_proxies`
+unless a terminator or an operator certificate is also set (BACKLOG #2055). So on a loopback bind,
+the list declares a proxy in front of the engine. The engine then expects browsers to arrive through
+that proxy, from off the box. Section 3 makes the default-on console a local-loopback convenience, so
+in this posture the console must be asked for by name. The rule reads config, not the request. An
+operator browsing to the loopback address on the box itself also gets JSON-only, unless the console
+was enabled explicitly.
 
-**What this note does not change.** The refusing arms read `instance_exposed`, and the 2026-08-04
-cross-reference above still describes it: an off-loopback bind or `tls_terminated_upstream`. It does
-not count `trusted_proxies`. So a site that deployed a loopback bind behind a re-encrypting proxy (an
-operator certificate and no declared terminator) would get the console degrade and both advisories.
-It would not get the MFA-at-exposure refusal, the dual-control warning or the in-use-memory
-declaration gate. Counting that posture there is vault BACKLOG #2251, still open. Section 3 is left
-as written and dated by this note.
+It adds no start failure. In this posture the auto-degrade keeps the engine serving JSON-only with a
+warning, and the advisories only print. The same posture does get request-time refusals: the `/ui`
+origin checks stop trusting the forwarded `Host` (BACKLOG #2217). Those belong to ADR 0068, not to
+this ADR.
+
+ADR 0068 uses the same predicate for a different rule. Its 2026-09-28 amendment (BACKLOG #2220)
+refuses to take the passkey rp_id from a forwarded `Host`, for phishing resistance. That reason does
+not by itself decide whether a console counts as exposed, which is why this note gives its own. In
+`serve` the two rules read one property, so they agree. An app factory's caller can still pass an
+explicit `webauthn_rp_from_request`, which overrides the predicate there.
+
+The 2026-08-04 cross-reference above scopes `ui_exposed` to "/ui-specific origin/TLS refusals and
+browser-console advisories". Today no refusal reads it. It gates the two advisories only, and the
+off-loopback `/ui` refusals read the bind and `exposure_protected` directly.
+
+**`instance_exposed` does not count this posture yet.** The MFA-at-exposure refusal, the dual-control
+warning and the in-use-memory declaration gate all read it. The 2026-08-04 cross-reference above
+defines it: an off-loopback bind or `tls_terminated_upstream`. A loopback bind behind a re-encrypting
+proxy has an operator certificate and no declared terminator. A site that deployed one would get the
+console signals above, and none of those three gates. Vault BACKLOG #2251 would count it there, and
+is still open. Section 3 is left as written and dated by this note.
