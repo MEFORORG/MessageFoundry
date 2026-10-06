@@ -864,6 +864,43 @@ def require(
     return _gate(dependency, _authenticate_session_before_body)
 
 
+#: The step-up refusal's detail for a session whose step-up is a password or directory re-proof.
+#: Clients and tests read it, so it stays byte-for-byte what it was before BACKLOG #2158.
+_STEP_UP_DETAIL = "step-up re-verification required; POST /me/reauth then retry"
+#: The same refusal for an ``oidc`` session. ``POST /me/reauth`` refuses such a session (BACKLOG
+#: #296), so naming it would send the client to a second 403. This names the leg built for that
+#: session, the web console's IdP step-up, much as ``POST /me/reauth``'s own refusal does. It
+#: promises no JSON retry: that leg runs in a browser and re-keys the session it steps up, so a
+#: bearer client cannot finish it (docs/SECURITY.md says which gates such a client can never
+#: pass). It does not name ``POST /auth/mfa-verify``, although a TOTP code there does stamp the
+#: window for an account that holds one: whether it should is BACKLOG #2142's open question.
+_IDP_STEP_UP_DETAIL = (
+    "step-up re-verification required; this session steps up at the identity provider, in a"
+    " browser, through the web console at /ui/reauth, not with a password"
+)
+#: Set to ``idp`` on an ``oidc`` session's step-up refusal, so a client can branch on a header
+#: rather than parse the detail. Absent on every other refusal.
+_STEP_UP_VIA_HEADER = "X-Step-Up-Via"
+
+
+async def _step_up_refusal(
+    auth: AuthService, token: str | None, action: str | None = None
+) -> HTTPException:
+    """The 403 every JSON step-up gate raises, for the session that holds ``token``.
+
+    One place for the step-up raise sites (BACKLOG #2158), at least the four ``require_step_up*``
+    and ``require_reauth_only*`` factories and :func:`refuse_from_new_address`. It reads the
+    session only on the refusal path, so a request that passes pays nothing for it. ``action`` adds
+    ``X-Step-Up-Action`` for the per-action gates (ADR 0077)."""
+    headers = {"X-Step-Up-Required": "1"}
+    if action is not None:
+        headers["X-Step-Up-Action"] = action
+    if await auth.session_steps_up_at_idp(token):
+        headers[_STEP_UP_VIA_HEADER] = "idp"
+        return HTTPException(status.HTTP_403_FORBIDDEN, _IDP_STEP_UP_DETAIL, headers=headers)
+    return HTTPException(status.HTTP_403_FORBIDDEN, _STEP_UP_DETAIL, headers=headers)
+
+
 async def refuse_from_new_address(request: Request) -> None:
     """Refuse a request whose session was last verified from another host (vault BACKLOG #2620).
 
@@ -872,27 +909,24 @@ async def refuse_from_new_address(request: Request) -> None:
     and started or stopped connections with no signal. Callers: :func:`require_phi_read`,
     :func:`require_paced` and the HTTP reveal path in ``api/app.py`` (``_admit_reveal``). It gives
     them the step-up gates' refusal: 403 + ``X-Step-Up-Required: 1``, cleared by a
-    ``POST /me/reauth`` from the new address, which re-anchors the session. A first sighting writes
+    ``POST /me/reauth`` from the new address, which re-anchors the session. An ``oidc`` session is
+    sent to the IdP step-up instead (:func:`_step_up_refusal`). A first sighting writes
     ``auth.admin_action_new_ip`` and a notice, deduped and capped per session as
     :meth:`AuthService.flag_new_client_ip` says.
 
     It is NOT in :func:`require`, deliberately: the base gate carries the monitoring polls, and an
     operator whose address changes behind a NAT pool would be refused on every one until a step-up.
 
-    Costs one session read per request while ``[auth].admin_new_ip_step_up`` is on. The gate has
+    Costs one session read per request while ``[auth].admin_new_ip_step_up`` is on, and one more
+    on a refusal, to pick its wording. The gate has
     already read the session through :func:`require`, but the identity it returns does not carry
     the anchor address. A no-op with auth off or absent."""
     auth = get_auth(request)
     if auth is None or not auth.enabled:
         return
-    if await auth.flag_new_client_ip(
-        bearer_token(request), client_ip(request), path=request.url.path
-    ):
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            "step-up re-verification required; POST /me/reauth then retry",
-            headers={"X-Step-Up-Required": "1"},
-        )
+    token = bearer_token(request)
+    if await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path):
+        raise await _step_up_refusal(auth, token)
 
 
 def require_paced(*permissions: Permission) -> Callable[[Request], Awaitable[Identity]]:
@@ -1241,8 +1275,9 @@ def require_step_up(*permissions: Permission) -> Callable[[Request], Awaitable[I
     or with a code at ``POST /auth/mfa-verify`` (``verify_mfa`` stamps the window), or at their
     console twins -- within ``[auth].step_up_max_age_seconds``. A directory login opens no window
     (BACKLOG #1144). Gates the highly sensitive admin / replay / config flows; a stale session is
-    refused with 403 (the console then prompts to re-authenticate and retries). The
-    embedding/no-auth path is unaffected (there is no session to step up)."""
+    refused with 403 (the console then prompts to re-authenticate and retries). An ``oidc``
+    session's refusal names the IdP leg instead of ``POST /me/reauth`` (:func:`_step_up_refusal`).
+    The embedding/no-auth path is unaffected (there is no session to step up)."""
     base = require(*permissions)
 
     async def dependency(request: Request) -> Identity:
@@ -1267,11 +1302,7 @@ def require_step_up(*permissions: Permission) -> Callable[[Request], Awaitable[I
             # successful POST /me/reauth re-anchors the session to the new IP, so this then clears.
             new_ip = await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
             if new_ip or not await auth.has_recent_step_up(token):
-                raise HTTPException(
-                    status.HTTP_403_FORBIDDEN,
-                    "step-up re-verification required; POST /me/reauth then retry",
-                    headers={"X-Step-Up-Required": "1"},
-                )
+                raise await _step_up_refusal(auth, token)
         return identity
 
     return _gate(dependency, _authentication_of(base))
@@ -1283,7 +1314,8 @@ def require_reauth_only(*permissions: Permission) -> Callable[[Request], Awaitab
     Used by the MFA *enrollment* endpoints: a user enrolling their first second factor (or a
     ``require_mfa`` administrator who has not enrolled yet) cannot satisfy an MFA gate, so a
     :func:`require_step_up` there would deadlock. Re-proving the password still defends a stolen
-    session from silently enrolling an attacker-controlled authenticator (WP-14).
+    session from silently enrolling an attacker-controlled authenticator (WP-14). An ``oidc``
+    session re-proves at the IdP instead, and its refusal says so (:func:`_step_up_refusal`).
 
     ``mfa_gate=False`` extends that same deadlock carve-out to the ASVS 6.3.3 ACCESS gate now applied
     by :func:`require`: without it the enrollment routes would sit behind a factor the caller does
@@ -1299,11 +1331,7 @@ def require_reauth_only(*permissions: Permission) -> Callable[[Request], Awaitab
             # intentionally skipped here (enrollment would otherwise deadlock — see the docstring).
             new_ip = await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
             if new_ip or not await auth.has_recent_step_up(token):
-                raise HTTPException(
-                    status.HTTP_403_FORBIDDEN,
-                    "step-up re-verification required; POST /me/reauth then retry",
-                    headers={"X-Step-Up-Required": "1"},
-                )
+                raise await _step_up_refusal(auth, token)
         return identity
 
     return _gate(dependency, _authentication_of(base))
@@ -1337,8 +1365,9 @@ def require_step_up_action(
     hijacked session inside the login window can neither satisfy MFA it lacks nor reuse a broad window.
 
     On a stale/missing grant it 403s with ``X-Step-Up-Required`` **and** ``X-Step-Up-Action: <action>``,
-    so the console echoes the action back as ``POST /me/reauth {"purpose": …}``. When the org opts out
-    it falls back to the legacy session-window behaviour."""
+    so the console echoes the action back as ``POST /me/reauth {"purpose": …}``. An ``oidc`` session
+    is told the IdP leg instead (:func:`_step_up_refusal`). When the org opts out it falls back to
+    the legacy session-window behaviour."""
     base = require(*permissions)
 
     async def dependency(request: Request) -> Identity:
@@ -1370,11 +1399,7 @@ def require_step_up_action(
             # forced-step-up (the grant is only popped when we actually reach the action check).
             new_ip = await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
             if new_ip or not await _action_step_up_ok(auth, token, action):
-                raise HTTPException(
-                    status.HTTP_403_FORBIDDEN,
-                    "step-up re-verification required; POST /me/reauth then retry",
-                    headers={"X-Step-Up-Required": "1", "X-Step-Up-Action": action},
-                )
+                raise await _step_up_refusal(auth, token, action)
         return identity
 
     return _gate(dependency, _authentication_of(base))
@@ -1388,7 +1413,8 @@ def require_reauth_only_action(
     enroll/confirm) a required-but-unenrolled session must still be able to reach
     (an MFA gate there would deadlock — WP-14). Re-proving the password still defends a hijacked session
     from binding an attacker authenticator, and now that proof is tied to *this* action, not the login
-    window (ADR 0077). Same ``X-Step-Up-Action`` header + org opt-out as :func:`require_step_up_action`.
+    window (ADR 0077). Same ``X-Step-Up-Action`` header + org opt-out as :func:`require_step_up_action`,
+    and the same IdP wording for an ``oidc`` session (:func:`_step_up_refusal`).
 
     Carries the same ``mfa_gate=False`` opt-out as :func:`require_reauth_only`, for the same reason;
     the session-terminate routes use it too. A pending session on an account that HAS a factor is
@@ -1414,11 +1440,7 @@ def require_reauth_only_action(
                     headers={"X-MFA-Required": "1"},
                 )
             if new_ip or not await _action_step_up_ok(auth, token, action):
-                raise HTTPException(
-                    status.HTTP_403_FORBIDDEN,
-                    "step-up re-verification required; POST /me/reauth then retry",
-                    headers={"X-Step-Up-Required": "1", "X-Step-Up-Action": action},
-                )
+                raise await _step_up_refusal(auth, token, action)
         return identity
 
     return _gate(dependency, _authentication_of(base))

@@ -749,8 +749,8 @@ def _purge_in_scope(identity: Identity) -> bool:
 def _requester_identity_resolver(app: FastAPI) -> IdentityResolver:
     """The approval gate's way to re-read a requester's CURRENT identity at release (ASVS 8.3.2).
 
-    Late-bound through ``app.state`` on purpose: the managed lifespan builds the gate before it
-    attaches the auth service, so capturing the service at build time would capture ``None``. With no
+    Late-bound through ``app.state`` on purpose: ``create_app`` builds the gate before it attaches
+    the auth service, so capturing the service at build time would capture ``None``. With no
     auth service bound it answers ``None``, and the gate then refuses the release (fail closed)."""
 
     async def _resolve(user_id: str) -> Identity | None:
@@ -8937,8 +8937,8 @@ def create_managed_app(
         # exit: uvicorn refused correctly, printed 'Exiting.', and then hung forever.
         try:
             # BACKLOG #1923: CONSTRUCTED before engine.start(), so a refusal its constructor raises
-            # (the OIDC revocation guard, #1887) stops startup before any connection starts. Only
-            # construction is here; initialize() and every use of the service stay below the start.
+            # (the OIDC revocation guard, #1887) stops startup before any connection starts.
+            # BACKLOG #2131 moved initialize() and the notice gate up here too, below.
             auth: AuthService | None = None
             if auth_settings is not None:
                 # Out-of-band security-event push (#188, ASVS 6.3.5/6.3.7) — reuses the [alerts] SMTP
@@ -8976,6 +8976,20 @@ def create_managed_app(
                 # Started only once the service is built, so a constructor refusal starts no task.
                 if security_notifier is not None:
                     security_notifier.start()
+                # BACKLOG #2131: before engine.start() for #1923's reason. On a first run no
+                # enabled Administrator exists yet, and the gate's refusal must stop startup before
+                # any connection starts rather than after. Both touch only the store: initialize()
+                # seeds the built-in roles and the gate reads the users. A refusal here also comes
+                # before the start's opt-in audit-chain walk, so that walk cannot alert on such a
+                # start. Everything else that uses the service stays below the start.
+                await auth.initialize()
+                app.state.auth = auth
+                await _assert_security_notice_is_deliverable(
+                    store,
+                    auth_settings=auth_settings,
+                    alerts_settings=alerts_settings,
+                    security_settings=security_settings,
+                )
             await engine.start()
             # #144 (ADR 0128): inject the connection-control callback INTO the notifier (the sink never imports
             # RegistryRunner). A rule's control_action then auto-remediates via restart_inbound/restart_outbound;
@@ -9022,7 +9036,7 @@ def create_managed_app(
             app.state.approval_gate = _build_approval_gate(
                 engine,
                 approvals_settings or ApprovalsSettings(),
-                # ASVS 8.3.2: late-bound, because the auth service is attached further down.
+                # ASVS 8.3.2: late-bound through app.state, as create_app's own gate must be.
                 resolve_identity=_requester_identity_resolver(app),
                 alert_sink=notifier,  # None -> the gate's own LoggingAlertSink default
                 outliving=app.state.outliving_operations,
@@ -9072,6 +9086,9 @@ def create_managed_app(
             # The start's config_loaded row (vault BACKLOG #2597), as early as its readers allow: the
             # last stash the loosenings reader needs is the one above, and the graph is already
             # serving, so a later startup step that aborts must not leave the start unrecorded.
+            # It stays after engine.start() (BACKLOG #2131): its superseded check exists for the
+            # reload the start may run. So a start the notice gate refuses writes no row; it served
+            # no graph.
             if config_dir is not None:
                 await _record_start_audit(
                     app,
@@ -9083,14 +9100,6 @@ def create_managed_app(
                 )
             # The auth_settings test adds nothing at runtime; it narrows the type for the reads below.
             if auth is not None and auth_settings is not None:
-                await auth.initialize()
-                app.state.auth = auth
-                await _assert_security_notice_is_deliverable(
-                    store,
-                    auth_settings=auth_settings,
-                    alerts_settings=alerts_settings,
-                    security_settings=security_settings,
-                )
                 # ADR 0197 Amendment A, AC-A9: name every account still lockable with no way past a
                 # sign-in lock. It warns and audits and NEVER refuses to start: an account-level fact
                 # must not get a site-wide veto, so even a failure of the census itself is logged
