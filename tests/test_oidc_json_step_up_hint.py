@@ -195,6 +195,8 @@ async def test_an_oidc_session_from_a_new_address_is_told_the_idp_leg_at_every_g
     actions = _actions()
     refused = await _refusals(engine, service, token, ROAMED)
     assert [site for site, _ in refused] == list(actions), "a gate was skipped"
+    # Count guard: an empty walk must fail rather than pass the absence assertion below.
+    assert len(refused) >= 7, len(refused)
     # Every site that missed, named at once, rather than only the first one the loop meets.
     missed = [site for site, r in refused if r.headers.get("X-Step-Up-Via") != "idp"]
     assert missed == [], missed
