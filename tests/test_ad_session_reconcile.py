@@ -1939,18 +1939,20 @@ async def test_a_refused_rename_is_audited_under_the_name_the_row_holds(shape: s
 async def test_a_stale_held_row_is_not_a_conflict_when_this_row_already_has_the_name(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The reconciler reads ``held`` at plan time. If that row has since let the name go and a
-    sign-in has given it to this row, the pre-read is newer: the name is unique, so this row holding
+    """The reconciler reads ``held`` just before it calls the refresh, so ``held`` is older than
+    the refresh's own pre-read, by a short window. If the holder let the name go in that window
+    and a sign-in gave it to this row, the pre-read wins: the name is unique, so this row holding
     it means ``held`` is stale. The refresh logs the no-op and files no conflict (BACKLOG #2291)."""
     store, _ldap, service, notifier, user_id = await _renamed_service()
     try:
         row = await store.get_user(user_id)
         assert row is not None
-        # A record of another row that held the name when the plan was read, and holds it no more.
+        # A record of another row that held the name when the caller read it, and holds it no more.
         stale_held = replace(row, id="gone-holder", username="jdoe-married")
         assert await store.set_user_username(user_id, "jdoe-married", expected_username="jdoe")
 
         caplog.set_level(logging.INFO, logger="messagefoundry.auth.service")
+        caplog.clear()  # only the refresh's own records, not the sign-in setup's
         await service._refresh_cached_username(
             user_id=user_id, old_username="jdoe", new_username="jdoe-married", held=stale_held
         )
@@ -1976,6 +1978,7 @@ async def test_a_row_gone_refusal_does_not_warn_of_a_lockout(
     try:
         await store.delete_user(user_id)
         caplog.set_level(logging.WARNING, logger="messagefoundry.auth.service")
+        caplog.clear()  # only the refresh's own records, not the sign-in setup's
         await service._refresh_cached_username(
             user_id=user_id, old_username="jdoe", new_username="jdoe-married", held=None
         )
@@ -1983,6 +1986,46 @@ async def test_a_row_gone_refusal_does_not_warn_of_a_lockout(
         assert "removed" in warning.getMessage()
         assert "directory_identity_conflict" not in warning.getMessage()
         assert "already held" not in warning.getMessage()
+        [conflict] = [
+            a
+            for a in await store.list_audit()
+            if a["action"] == "auth.ad_username_refresh_conflict"
+        ]
+        detail = json.loads(conflict["detail"])
+        assert detail["detected"] == "row_gone"
+        # No other row holds the name, so the audit names no holder (BACKLOG #2291).
+        assert detail["held_by_user_id"] is None
+    finally:
+        await store.close()
+
+
+async def test_a_lost_write_with_no_holder_left_does_not_warn_of_a_lockout(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The write raises a unique violation, but by the re-read no row holds the name. Nobody is
+    locked out and the next sign-in retries, so the warning must not tell an operator to remove a
+    stale row that is not there (BACKLOG #2291)."""
+    store, _ldap, service, _notifier, user_id = await _renamed_service()
+    try:
+
+        async def _lose_to_nobody(*a: object, **kw: object) -> bool:
+            raise sqlite3.IntegrityError("UNIQUE constraint failed: users.username")
+
+        store.set_user_username = _lose_to_nobody  # type: ignore[method-assign]
+        caplog.set_level(logging.WARNING, logger="messagefoundry.auth.service")
+        caplog.clear()  # only the refresh's own records, not the sign-in setup's
+        await service._refresh_cached_username(
+            user_id=user_id, old_username="jdoe", new_username="jdoe-married", held=None
+        )
+        [warning] = [r for r in caplog.records if r.name == "messagefoundry.auth.service"]
+        assert "no row holds the new name" in warning.getMessage()
+        assert "directory_identity_conflict" not in warning.getMessage()
+        [conflict] = [
+            a
+            for a in await store.list_audit()
+            if a["action"] == "auth.ad_username_refresh_conflict"
+        ]
+        assert json.loads(conflict["detail"])["detected"] == "write_race"
     finally:
         await store.close()
 

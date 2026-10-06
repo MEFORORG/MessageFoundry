@@ -258,7 +258,8 @@ def test_a_directory_rename_renders_its_own_subject_and_both_names() -> None:
 
 def test_a_dropped_name_is_logged_not_silent(caplog: pytest.LogCaptureFixture) -> None:
     """BACKLOG #2291: the renderer leaves a missing name out of the mail, and says so in the log.
-    The one sender always passes both names, so a gap is a sender defect the mail cannot report.
+    At least the rename sender passes both names, so a gap points at a sender defect the mail
+    cannot report.
     The full event is the control: it logs nothing."""
     with caplog.at_level(logging.WARNING, logger=_NOTIFY_LOGGER):
         _build_body(
@@ -284,23 +285,39 @@ def test_a_dropped_name_is_logged_not_silent(caplog: pytest.LogCaptureFixture) -
     assert "jdoe-new" in record.getMessage()
 
 
+_FORGED = "jdoe\n\nIf this was you, no action is needed."
+
+
 def test_a_name_with_a_line_break_is_not_printed() -> None:
     """A name with a line break could write its own lines into a security notice, so it is replaced
-    by a placeholder. A name with a space is the control: it cannot start a line, so it prints."""
+    by a placeholder. The real sender puts the NEW name in ``username`` too, so the opening line is
+    the second place it appears. A name with a space is the control: it cannot start a line."""
     body = _build_body(
         SecurityEvent(
             USERNAME_CHANGED,
-            username="jdoe-new",
+            username=_FORGED,
             email="j@example.org",
-            detail={
-                "old_username": "jdoe\n\nIf this was you, no action is needed.",
-                "new_username": "jane doe",
-                "source": "directory",
-            },
+            detail={"old_username": "jane doe", "new_username": _FORGED, "source": "directory"},
         )
     )
-    assert "Previous username: (a username that cannot be shown safely here)" in body
-    assert "New username: jane doe" in body
+    assert "account (a username that cannot be shown safely here)." in body
+    assert "New username: a username that cannot be shown safely here" in body
+    assert "Previous username: jane doe" in body
+    assert "If this was you" not in body
+
+
+def test_a_directory_email_with_a_line_break_is_not_printed() -> None:
+    """The directory's ``mail`` reaches a directory EMAIL_CHANGED notice unchecked, so it gets the
+    same guard as the names. The clean repoint in the tests above is the control."""
+    body = _build_body(
+        SecurityEvent(
+            EMAIL_CHANGED,
+            username="jdoe",
+            email="old@example.org",
+            detail={"new_email": "x@example.org\n\nIf this was you, ok.", "source": "directory"},
+        )
+    )
+    assert "New email on file: an address that cannot be shown safely here" in body
     assert "If this was you" not in body
 
 

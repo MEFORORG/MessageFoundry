@@ -5431,6 +5431,18 @@ class AuthService:
                     scrub_log_argument(holds),
                 )
                 return
+            if held_by is None:
+                # The write lost to another writer, but the re-read found no row holding the name
+                # now. Nothing is locked out, and the next sign-in or pass copies the name down
+                # again, so the lockout warning below would be false (BACKLOG #2291).
+                _log.warning(
+                    "AD account %s was renamed in the directory but the write lost to another "
+                    "writer (detected %s), and no row holds the new name now; nothing was written, "
+                    "and the next sign-in or reconcile pass retries it (BACKLOG #2291)",
+                    scrub_log_argument(holds),
+                    detected,
+                )
+                return
             _log.warning(
                 "AD account %s was renamed in the directory but the new name is already held by "
                 "another account (id %s, detected %s). The stored name is left as-is, and this "
@@ -5463,8 +5475,9 @@ class AuthService:
         if before is None:
             # Deleted between the plan and the apply. Refused as a write that finds the row gone is
             # refused below, without an UPDATE that can only match nothing. With no row there is
-            # no name it holds, so the caller's is the last one known for it.
-            await _refuse(user_id, "row_gone", old_username)
+            # no name it holds, so the caller's is the last one known for it. No holder either:
+            # ``held_by_user_id`` is None, since the audit's ``user_id`` already names the row.
+            await _refuse(None, "row_gone", old_username)
             return
         if before.username == new_username:
             # Another caller applied this rename first, in sequence (BACKLOG #2291). Nothing is
@@ -5556,7 +5569,7 @@ class AuthService:
         if not written:
             after = await self._store.get_user(user_id)
             if after is None:
-                await _refuse(user_id, "row_gone", before.username)
+                await _refuse(None, "row_gone", before.username)
             elif after.username == before.username:
                 holder = await self._store.get_user_by_username(new_username)
                 await _refuse(

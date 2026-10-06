@@ -213,6 +213,17 @@ def _lock_lines(event: SecurityEvent) -> tuple[str | None, list[str], str | None
     return None, [], None
 
 
+def _shown(text: str, what: str) -> str:
+    """``text`` when every character in it is printable, else a placeholder naming ``what``.
+
+    A value carrying a line break could write its own lines into a notice, such as a false "If this
+    was you" closing (BACKLOG #2291). A directory supplies the username and the email on a
+    directory notice, so neither is shaped by this engine. An ASCII space is printable and passes:
+    it cannot start a line, and a directory name may hold one. Other space characters, such as a
+    no-break space, fail ``isprintable`` and show the placeholder, which is the safe side."""
+    return text if text.isprintable() else f"{what} that cannot be shown safely here"
+
+
 def _build_body(event: SecurityEvent) -> str:
     """A short, PHI-free notice. The recipient is the account owner, so naming their own account /
     source IP / new email is appropriate; no message data or secrets ever appear here."""
@@ -250,7 +261,9 @@ def _build_body(event: SecurityEvent) -> str:
     elif event.event_type == TEMPORARY_CREDENTIAL_EXPIRING:
         opening = f"A reminder about your MessageFoundry account ({event.username})."
     else:
-        opening = f"A security-relevant change occurred on your MessageFoundry account ({event.username})."
+        # Through ``_shown``: on a directory rename this is the directory's new name (BACKLOG #2291).
+        account = _shown(event.username, "a username")
+        opening = f"A security-relevant change occurred on your MessageFoundry account ({account})."
     lines = [opening, "", lock_description or description]
     failed = event.detail.get("failed_attempts")
     if event.event_type in (ACCOUNT_LOCKED, LOGIN_AFTER_FAILURES) and failed:
@@ -313,10 +326,11 @@ def _build_body(event: SecurityEvent) -> str:
         if new_email and moved_by_admin:
             # Other notices from the same save still come here, so "later changes", not "later
             # notices".
-            lines.append(f"New notification address: {new_email}")
+            lines.append(f"New notification address: {_shown(str(new_email), 'an address')}")
             lines.append("Notices about later changes go to the new address, not to this one.")
         elif new_email:
-            lines.append(f"New email on file: {new_email}")
+            # A directory notice carries the directory's ``mail`` here, unchecked (BACKLOG #2291).
+            lines.append(f"New email on file: {_shown(str(new_email), 'an address')}")
         else:
             lines.append(
                 "The email address on the account profile was removed. This notice went to the "
@@ -325,20 +339,13 @@ def _build_body(event: SecurityEvent) -> str:
     if event.event_type == USERNAME_CHANGED:
         # BACKLOG #2017. Both names, so a holder who did not expect the change can tell which
         # account it was and what it is called now. A name the event lacks is left out rather than
-        # printed as "None", and the gap is logged (BACKLOG #2291): the sender in
-        # ``auth/service.py`` passes both, so a missing one is a sender defect the holder's mail
-        # cannot report.
-        #
-        # Printed only when every character is printable: a name carrying a line break could
-        # otherwise write its own lines into this notice. Unlike the issuer's ``Account:`` line
-        # above, a space is let through, because a directory account name may hold one and a
-        # space cannot start a new line.
+        # printed as "None", and the gap is logged (BACKLOG #2291): at least the sender in
+        # ``_refresh_cached_username`` passes both, so a missing one points at a sender defect the
+        # holder's mail cannot report. Each name goes through ``_shown``.
         for label, key in (("Previous username", "old_username"), ("New username", "new_username")):
             name = str(event.detail.get(key) or "")
-            if name.isprintable() and name:
-                lines.append(f"{label}: {name}")
-            elif name:
-                lines.append(f"{label}: (a username that cannot be shown safely here)")
+            if name:
+                lines.append(f"{label}: {_shown(name, 'a username')}")
             else:
                 log.warning(
                     "security notice %s for %s carries no %s, so that line was left out of it",
@@ -407,11 +414,13 @@ def _build_body(event: SecurityEvent) -> str:
                 )
     if event.client_ip and from_directory:
         # BACKLOG #2291. The directory made this change, so the address is not where it was made,
-        # and a bare "Source IP" line would read as the address of whoever made it. The sender that
-        # passes one today is a directory sign-in to this account, in ``_upsert_ad_user``, which
-        # copies the change down BEFORE the sign-in is finished: a later step can still refuse it,
-        # or it can still owe a second factor. So the line says a sign-in was under way, never that
-        # one succeeded. A new sender passing any other kind of address must change this line.
+        # and a bare "Source IP" line would read as the address of whoever made it. Measured
+        # 2026-10-06, the directory notices that pass an address come from ``_upsert_ad_user``, on
+        # a directory sign-in to this account, which copies the change down BEFORE the sign-in is
+        # finished: a later step can still refuse it, or it can still owe a second factor. So the
+        # line says a sign-in was under way, never that one succeeded. Nothing on the event says
+        # the address came from a sign-in, so a new sender passing another kind of address on a
+        # directory event would make this line false; such a sender must change it.
         lines.append(
             f"MessageFoundry picked up this change during a sign-in to your account from "
             f"{event.client_ip}."
