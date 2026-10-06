@@ -1362,8 +1362,10 @@ class ApiSettings(_Section):
 
     @property
     def is_loopback(self) -> bool:
-        """Whether the API binds a loopback host — i.e. is **not** exposed off-box, so the exposed-bind
-        TLS gate and the MFA-at-exposure advisory (``serve``) don't apply. The host set is
+        """Whether the API binds a loopback host, so the exposed-bind TLS gate (``serve``) does not
+        apply. It is not the whole exposure test: ``serve``'s MFA-at-exposure, dual-control and ADR 0152
+        arms read :attr:`host_is_browser_origin`, which also counts a declared or trusted proxy in front
+        of a loopback bind (vault BACKLOG #2251). The host set is
         :data:`_LOOPBACK_HOSTS`, shared with the ``[security]`` desugar so one definition serves every
         off-box decision."""
         return self.host in _LOOPBACK_HOSTS
@@ -1371,8 +1373,10 @@ class ApiSettings(_Section):
     @property
     def host_is_browser_origin(self) -> bool:
         """:func:`request_host_is_browser_origin` for this config. False means the browser reaches the
-        engine off-box or through a proxy, which is also what ``serve``'s console exposure checks
-        test (BACKLOG #2218)."""
+        engine off-box or through a proxy. ``serve`` reads it for the console exposure checks
+        (BACKLOG #2218) and as ``instance_exposed``, the single exposure test its refusing arms read:
+        MFA-at-exposure, dual-control and the ADR 0152 declaration (vault BACKLOG #2251). A change to
+        :func:`request_host_is_browser_origin` therefore moves those security refusals too."""
         return request_host_is_browser_origin(
             loopback=self.is_loopback,
             trusted_proxies=self.trusted_proxies,
