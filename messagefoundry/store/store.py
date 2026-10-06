@@ -11218,15 +11218,19 @@ class MessageStore:
             audit.tee(ts=now, row=appended)
         return moved
 
-    async def list_executing_approvals(self, *, limit: int = 1000) -> list[aiosqlite.Row]:
+    async def list_executing_approvals(
+        self, *, claim_owner: str | None = None, limit: int = 1000
+    ) -> list[aiosqlite.Row]:
         """Released requests still claimed as ``executing``, oldest claim first (BACKLOG #1562).
-        The Store protocol says who reads it and why."""
+        The Store protocol says who reads it, why, and what ``claim_owner`` filters."""
+        owned = "" if claim_owner is None else " AND (claim_owner = ? OR claim_owner IS NULL)"
+        args = (limit,) if claim_owner is None else (claim_owner, limit)
         async with self._read() as db:
             cur = await db.execute(
                 "SELECT id, operation, requester, approver, decided_at, claim_owner"
-                " FROM pending_approvals WHERE status = 'executing'"
+                f" FROM pending_approvals WHERE status = 'executing'{owned}"
                 " ORDER BY decided_at ASC LIMIT ?",
-                (limit,),
+                args,
             )
             return list(await cur.fetchall())
 

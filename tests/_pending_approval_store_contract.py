@@ -704,15 +704,22 @@ async def _assert_restart_reconcile_contract(store: Any) -> None:
     mine = await _claimed_directly(store, claim_owner=mine_owner, claimed_at=5_000.0)
     sibling = await _claimed_directly(store, claim_owner=sibling_owner, claimed_at=5_001.0)
     legacy = await _claimed_directly(store, claim_owner=None, claimed_at=5_002.0)
+    # Every row a reconcile here moves, including rows another test left with no owner, so the
+    # cleanup below resolves them all rather than leaving them at the head of the listing.
+    swept: set[str] = set()
     try:
         listed = {str(r["id"]): r for r in await store.list_executing_approvals()}
         assert str(listed[mine]["claim_owner"]) == mine_owner
         assert str(listed[sibling]["claim_owner"]) == sibling_owner
         assert listed[legacy]["claim_owner"] is None
         assert float(listed[mine]["decided_at"]) == 5_000.0
+        # The owner filter runs in this backend's SQL: own rows and unowned ones, never a sibling's.
+        owned = {str(r["id"]) for r in await store.list_executing_approvals(claim_owner=mine_owner)}
+        assert mine in owned and legacy in owned and sibling not in owned
 
         restarted = _gate(store, _never_runs, claim_owner=mine_owner)
         found = await restarted.reconcile_after_restart()
+        swept.update(found.interrupted)
         # Subsets, not equality: the server legs share one table, and another test may have left a
         # row with no owner behind.
         assert mine in found.interrupted and legacy in found.interrupted
@@ -735,6 +742,7 @@ async def _assert_restart_reconcile_contract(store: Any) -> None:
 
         # A second start moves nothing more and writes no second row.
         again = await restarted.reconcile_after_restart()
+        swept.update(again.interrupted)
         assert mine not in again.interrupted and legacy not in again.interrupted
         assert len(await _resolved_rows(store, mine, "approval.interrupted")) == 1
 
@@ -750,7 +758,7 @@ async def _assert_restart_reconcile_contract(store: Any) -> None:
         assert out["status"] == "resolved_not_applied" and out["approved_by"] == _APPROVER
     finally:
         # Leave nothing executing or interrupted behind on a shared server table.
-        for approval_id in (mine, sibling, legacy):
+        for approval_id in {mine, sibling, legacy} | swept:
             for from_status in ("executing", "interrupted"):
                 await store.decide_pending_approval(
                     approval_id,

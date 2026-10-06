@@ -1791,8 +1791,13 @@ class AuditStore(Protocol):
         and the owner is what keeps one process from settling a sibling's live release."""
         ...
 
-    async def list_executing_approvals(self, *, limit: int = 1000) -> Sequence[Row]:
+    async def list_executing_approvals(
+        self, *, claim_owner: str | None = None, limit: int = 1000
+    ) -> Sequence[Row]:
         """Released requests still claimed as ``executing``, OLDEST claim first (BACKLOG #1562).
+
+        ``claim_owner``, when given, keeps only the rows that owner claimed and the rows with no
+        owner, filtered in SQL so other owners' rows cannot push them past ``limit``.
 
         Projects ``id``, ``operation``, ``requester``, ``approver``, ``decided_at`` (when it was
         claimed) and ``claim_owner``. Read at startup by ``ApprovalGate.reconcile_after_restart``,

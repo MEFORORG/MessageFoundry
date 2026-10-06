@@ -187,14 +187,17 @@ class ApprovalGate:
         resolve_identity: IdentityResolver | None = None,
         alert_sink: AlertSink | None = None,
         clock: Callable[[], float] = time.time,
-        claim_owner: str = DEFAULT_CLAIM_OWNER,
+        claim_owner: str | Callable[[], str] = DEFAULT_CLAIM_OWNER,
     ) -> None:
         self._store = store
         self._settings = settings
         # Written on every claim, and read back by reconcile_after_restart (BACKLOG #1562). It must
         # be the same across a restart of this engine process and differ between processes that
-        # share the store; the API wiring passes Engine.instance_identity.
-        self._claim_owner = claim_owner
+        # share the store; the API wiring passes Engine.instance_identity. A callable is read on
+        # first use and then fixed, so an app built before its engine has loaded a sharded graph
+        # still claims under the shard's name, and the owner never changes mid-life.
+        self._claim_owner_source = claim_owner
+        self._claim_owner_value = claim_owner if isinstance(claim_owner, str) else None
         self._ops: dict[str, _Operation] = {}
         # Wall-clock seconds, injectable so a test can drive the expiry ceiling and the dwell floor.
         self._clock = clock
@@ -225,6 +228,14 @@ class ApprovalGate:
 
     def _forget(self, task: asyncio.Future[Any]) -> None:
         self._inflight.pop(task, None)
+
+    @property
+    def claim_owner(self) -> str:
+        """The claim owner this gate writes and reconciles under (BACKLOG #1562)."""
+        if self._claim_owner_value is None:
+            source = self._claim_owner_source
+            self._claim_owner_value = source if isinstance(source, str) else source()
+        return self._claim_owner_value
 
     async def drain(self, timeout: float = DRAIN_TIMEOUT_SECONDS) -> list[str]:
         """Wait up to ``timeout`` seconds for outcome writes still running (BACKLOG #2087).
@@ -262,9 +273,13 @@ class ApprovalGate:
     async def reconcile_after_restart(self) -> RestartReconciliation:
         """Move this process's leftover ``executing`` rows to ``interrupted`` (BACKLOG #1562).
 
-        Call it once at startup, before the API serves approvals. A row this process claimed in its
-        previous life and never settled is a release whose outcome is unknown: the process died
-        mid-run, or both of :meth:`_settle`'s writes failed. Each such row moves to ``interrupted``
+        Call it once at startup, before the API serves approvals, and once per engine process: a
+        second app over the same engine would take this process's live releases for leftovers. A
+        row this process claimed in its previous life and never settled is a release whose outcome
+        the gate never recorded. At least three things leave one: the process died mid-run, both of
+        :meth:`_settle`'s writes failed (the operation ran), or a claim committed but its reply was
+        lost (nothing ran). The audit trail may say which; the status does not, so each such row
+        moves to ``interrupted``
         with an ``approval.interrupted`` audit row in the SAME write (vault BACKLOG #2255), whose
         ``reason`` is ``engine_restart``. Nothing re-runs: an operator records what happened through
         :meth:`resolve_interrupted`, exactly as for a release cut off by a cancel.
@@ -282,25 +297,13 @@ class ApprovalGate:
         A move that fails is logged and skipped. The row stays ``executing`` and the next start
         tries again; writing the status alone would leave an ``interrupted`` row with no audit row
         saying why. A failed READ raises, for the caller to log."""
-        rows = await self._store.list_executing_approvals()
+        me = self.claim_owner
         interrupted: list[str] = []
         unsettled: list[str] = []
-        foreign: list[str] = []
-        for row in rows:
+        # Filtered in SQL, so other owners' stranded rows cannot push ours past the read's cap.
+        for row in await self._store.list_executing_approvals(claim_owner=me):
             approval_id = str(row["id"])
             owner = row["claim_owner"]
-            if owner is not None and str(owner) != self._claim_owner:
-                foreign.append(approval_id)
-                log.warning(
-                    "approval %s: still 'executing' under claim owner %s since %s. This process "
-                    "is %s, so it leaves the row alone; it moves to 'interrupted' when that owner "
-                    "restarts",
-                    approval_id,
-                    owner,
-                    row["decided_at"],
-                    self._claim_owner,
-                )
-                continue
             approver = None if row["approver"] is None else str(row["approver"])
             detail = json.dumps(
                 {
@@ -335,6 +338,26 @@ class ApprovalGate:
                 continue
             if moved:
                 interrupted.append(approval_id)
+            else:
+                log.info(
+                    "approval %s: settled by another caller between the read and the move",
+                    approval_id,
+                )
+        foreign: list[str] = []
+        for row in await self._store.list_executing_approvals():
+            owner = row["claim_owner"]
+            if owner is None or str(owner) == me:
+                continue  # a row of ours whose move failed, already logged above
+            foreign.append(str(row["id"]))
+            log.warning(
+                "approval %s: still 'executing' under claim owner %s since %s. This process is "
+                "%s, so it leaves the row alone; it moves to 'interrupted' only when an engine "
+                "with that owner starts, which an unpinned cluster node never does",
+                row["id"],
+                owner,
+                row["decided_at"],
+                me,
+            )
         if interrupted:
             log.warning(
                 "approvals: %d release(s) this process claimed before it restarted never recorded "
@@ -670,7 +693,7 @@ class ApprovalGate:
                 approver=approver,
                 decided_at=self._clock(),
                 audit=attempted,
-                claim_owner=self._claim_owner,
+                claim_owner=self.claim_owner,
             )
         )
         try:
@@ -889,8 +912,8 @@ class ApprovalGate:
             )
             moved = await self._settle_status_only(approval_id, status=status, approver=approver)
             if moved is False:
-                # Nothing else moves a row out of 'executing' while this process runs (the restart
-                # reconcile runs only before its first claim), so the likeliest reason is that
+                # Nothing else should move a row out of 'executing' while this process runs (the
+                # restart reconcile runs once, before its first claim), so the likeliest cause:
                 # the combined write COMMITTED and only its reply was lost: its row is then already
                 # in the log, and writing another would duplicate the outcome with a false flag.
                 log.error(

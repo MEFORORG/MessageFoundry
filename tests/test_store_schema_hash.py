@@ -185,12 +185,12 @@ def test_pending_approvals_claim_owner_present_on_all_backends() -> None:
         "messagefoundry.store.sqlserver", reason="requires the sqlserver extra (aioodbc)"
     )
     assert any(
-        "CREATE TABLE pending_approvals" in s and "claim_owner NVARCHAR(256) NULL" in s
+        "CREATE TABLE pending_approvals" in s and "claim_owner NVARCHAR(512) NULL" in s
         for s in sqlserver._SCHEMA
     )
     assert any(
         "COL_LENGTH('pending_approvals','claim_owner')" in s
-        and "ADD claim_owner NVARCHAR(256) NULL" in s
+        and "ADD claim_owner NVARCHAR(512) NULL" in s
         for s in sqlserver._SCHEMA
     )
 

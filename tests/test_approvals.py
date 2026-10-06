@@ -1757,6 +1757,17 @@ async def _probe_rows(db_path: Path) -> list[Any]:
         await store.close()
 
 
+async def test_the_claim_owner_is_read_on_first_use_and_then_fixed(engine: Engine) -> None:
+    """An app built before its engine holds a sharded graph still claims under the shard's name,
+    and a later change (the runner gone at stop) cannot move the owner mid-life."""
+    identity = ["engine"]
+    gate = ApprovalGate(engine.store, ON, claim_owner=lambda: identity[0])
+    identity[0] = "shard:a"  # the graph arrives after the gate was built
+    assert gate.claim_owner == "shard:a"
+    identity[0] = "engine"
+    assert gate.claim_owner == "shard:a"
+
+
 def _managed(db_path: Path) -> Any:
     from messagefoundry.api import create_managed_app
 
@@ -1892,7 +1903,7 @@ async def _first_life_leaves_two_rows(db_path: Path) -> tuple[str, str]:
 
     first = _managed(db_path)
     async with first.router.lifespan_context(first):
-        assert first.state.approval_gate._claim_owner == "engine"
+        assert first.state.approval_gate.claim_owner == "engine"
         store = first.state.engine.store
         now = time.time()
         mine = await _claimed_directly(store, claim_owner="engine", claimed_at=now)

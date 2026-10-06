@@ -1047,8 +1047,8 @@ class Engine:
         :meth:`_owned_lanes` scopes recovery by), and ``None`` for a lone engine that owns its store.
 
         A cluster node's id is the same after a restart only when ``[cluster].node_id`` is pinned.
-        The shard id is known once :meth:`start` has loaded the graph. Read by the approval gate to
-        mark the releases it claims (BACKLOG #1562)."""
+        The shard id is known once the engine holds its graph (:meth:`start` or ``add_registry``).
+        Read by the approval gate to mark the releases it claims (BACKLOG #1562)."""
         if self._coordinator.is_clustered():
             return f"node:{self._coordinator.node_id}"
         runner = self._registry_runner

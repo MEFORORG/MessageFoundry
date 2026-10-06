@@ -1798,11 +1798,13 @@ the row to the matching `resolved_*` status (owner ruling 2026-09-26). The resol
 `GET /approvals` lists at most 100 `interrupted` rows, oldest request first, so the requests that
 have waited longest are never the ones cut off.
 
-**A restart settles its own leftover releases (BACKLOG #1562).** A process that dies mid-operation
-leaves its row at `executing`. So does a release whose outcome write fails twice: if the operation
-ran but the move from `executing` to `approved` fails even when written alone, the error is logged
-and the release still succeeds, because an error would invite a new request that runs it twice. The
-gate still tries to write the `approval.approved` audit row.
+**A restart settles its own leftover releases (BACKLOG #1562).** At least three things leave a
+row at `executing`. A process can die mid-operation. A release's outcome write can fail twice: if
+the operation ran but the move from `executing` to `approved` fails even when written alone, the
+error is logged and the release still succeeds, because an error would invite a new request that
+runs it twice. The gate still tries to write the `approval.approved` audit row. And a claim can
+commit after its reply was lost, so nothing ran. The status cannot tell these apart; the audit
+trail sometimes can, so read it before resolving.
 
 The claim records which engine process owns the release, in the row's `claim_owner` column. At its
 next start, before the API serves an approval, that process moves each `executing` row it owns to
@@ -1826,7 +1828,8 @@ claim time. If that owner never returns, as with an unpinned cluster node, the r
 one. `GET /approvals` does not list `executing` rows, so that WARNING is the place to find one. A
 row claimed before the column existed has no owner, and the first process to start treats it as its
 own. Two plain `serve` processes over one store would share the `engine` owner; that layout is
-unsupported anyway.
+unsupported anyway. For the same reason, build one app per engine: a second app over the same
+engine runs the reconcile again and would take the first one's live releases for leftovers.
 
 **A request must also be old enough before it can be approved (ASVS 2.4.2).** The expiry is a
 ceiling. `[approvals].min_dwell_seconds` is the floor, default **2 s**. An approve that arrives sooner

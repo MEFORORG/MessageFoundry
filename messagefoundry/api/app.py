@@ -832,9 +832,9 @@ def _build_approval_gate(
         settings,
         resolve_identity=resolve_identity,
         alert_sink=alert_sink,
-        # BACKLOG #1562: read here, so the managed lifespan builds the gate after engine.start(),
-        # which is when a shard id is known. An embedder of a sharded engine starts it first.
-        claim_owner=engine.instance_identity or DEFAULT_CLAIM_OWNER,
+        # BACKLOG #1562: read on the gate's first claim or reconcile, not here, because the shard
+        # id is known only once the engine holds its graph.
+        claim_owner=lambda: engine.instance_identity or DEFAULT_CLAIM_OWNER,
     )
 
     async def _replay(p: Mapping[str, Any]) -> dict[str, Any]:
@@ -9224,21 +9224,18 @@ def create_managed_app(
         finally:
             # BACKLOG #2087: every step before engine.stop() sits in this try, so a cancel delivered
             # to the lifespan mid-teardown, or a step that raises, still stops the engine. Without
-            # it the store's non-daemon worker keeps the process alive.
+            # it the store's non-daemon worker keeps the process alive. The three store-reading tasks
+            # are cancelled first, before any await, so a step that raises or a cancel cannot leave
+            # one running when engine.stop() closes the store.
+            background = [t for t in (reconciler, reaper, credential_reminder) if t is not None]
+            for task in background:
+                task.cancel()
             try:
                 if upload_retention_runner is not None:
                     await upload_retention_runner.stop()
-                if reconciler is not None:
-                    reconciler.cancel()
-                    await asyncio.gather(reconciler, return_exceptions=True)
-                if reaper is not None:
-                    reaper.cancel()
-                    # gather(return_exceptions): absorbs both our cancellation AND any exception a
-                    # previously-died reaper stored, so it can't skip the steps below (review M-33).
-                    await asyncio.gather(reaper, return_exceptions=True)
-                if credential_reminder is not None:
-                    credential_reminder.cancel()
-                    await asyncio.gather(credential_reminder, return_exceptions=True)
+                # gather(return_exceptions): absorbs both our cancellation AND any exception a
+                # previously-died task stored, so it can't skip the steps below (review M-33).
+                await asyncio.gather(*background, return_exceptions=True)
                 # BACKLOG #2087: let approval outcome writes still running land before the store closes.
                 await _drain_approval_gate(app)
                 # M-5 (BACKLOG #1640): flush the open summary-access window before the store closes.

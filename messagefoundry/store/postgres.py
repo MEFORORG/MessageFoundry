@@ -7319,13 +7319,24 @@ class PostgresStore:
             audit.tee(ts=now, row=appended)
         return moved
 
-    async def list_executing_approvals(self, *, limit: int = 1000) -> Sequence[Row]:
+    async def list_executing_approvals(
+        self, *, claim_owner: str | None = None, limit: int = 1000
+    ) -> Sequence[Row]:
         """Released requests still claimed as ``executing``, oldest claim first (BACKLOG #1562).
-        The Store protocol says who reads it and why."""
+        The Store protocol says who reads it, why, and what ``claim_owner`` filters."""
+        if claim_owner is None:
+            return await self._fetchall(
+                "SELECT id, operation, requester, approver, decided_at, claim_owner"
+                " FROM pending_approvals WHERE status = 'executing'"
+                " ORDER BY decided_at ASC LIMIT $1",
+                limit,
+            )
         return await self._fetchall(
             "SELECT id, operation, requester, approver, decided_at, claim_owner"
             " FROM pending_approvals WHERE status = 'executing'"
-            " ORDER BY decided_at ASC LIMIT $1",
+            " AND (claim_owner = $1 OR claim_owner IS NULL)"
+            " ORDER BY decided_at ASC LIMIT $2",
+            claim_owner,
             limit,
         )
 
