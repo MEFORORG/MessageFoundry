@@ -810,6 +810,30 @@ async def test_list_audit_filter_is_parameterized_against_injection(store: Messa
     assert len(await store.list_audit()) == 3
 
 
+async def test_list_audit_keyset_pages_and_count_audit(store: MessageStore) -> None:
+    """Vault BACKLOG #2776: ``before_id`` pages the trail newest first with no row lost or repeated,
+    under the filters, and ``count_audit`` counts what ``list_audit`` would return, capped at
+    ``limit``. A ``bob`` row between the ``alice`` rows proves the cursor runs under the filter."""
+    for i in range(7):
+        await store.record_audit("message_view", actor="alice", detail="{}", now=100.0 + i)
+        await store.record_audit("message_view", actor="bob", detail="{}", now=100.5 + i)
+    whole = [r["id"] for r in await store.list_audit(actor="alice", limit=100)]
+    assert len(whole) == 7 and whole == sorted(whole, reverse=True)
+    paged: list[int] = []
+    before: int | None = None
+    while page := await store.list_audit(actor="alice", limit=3, before_id=before):
+        assert len(page) <= 3
+        paged += [r["id"] for r in page]
+        before = page[-1]["id"]
+    assert paged == whole
+    assert [r["id"] for r in await store.list_audit(actor="alice", before_id=whole[2])] == whole[3:]
+    assert await store.count_audit(actor="alice", limit=100) == 7
+    assert await store.count_audit(actor="alice", limit=5) == 5
+    assert await store.count_audit(actor="alice", limit=100, before_id=whole[2]) == 4
+    assert await store.count_audit(actor="alice'; DROP TABLE audit_log; --", limit=100) == 0
+    assert await store.count_audit(limit=100) == 14
+
+
 async def test_connection_metrics_respects_since_window(store: MessageStore) -> None:
     await store.enqueue_message(channel_id="c1", raw="x", deliveries=[("d1", "p1")], now=10.0)
     item = (await store.claim_ready(now=10.0))[0]

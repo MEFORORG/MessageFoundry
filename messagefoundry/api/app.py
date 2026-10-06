@@ -7514,12 +7514,15 @@ def create_app(
                 close_code=1013,  # try again later
             )
             return
+        # Take the slot BEFORE the first await past the check (vault BACKLOG #2775). accept() waits for
+        # the handshake to finish, so counting after it let every handshake that reached the check
+        # before any accept() returned pass the cap. No await sits between the check and this line,
+        # and the `finally` below gives the slot back on every path, an accept() that raises included.
+        state.ws_count = getattr(state, "ws_count", 0) + 1
         auth: AuthService | None = getattr(state, "auth", None)
         # Server-rendered connections fragment for the browser dashboard, installed by the web console
         # in the serve_ui path. Absent → counts-only push (see the send loop below).
         ui_connections_render = getattr(state, "ui_connections_render", None)
-        await websocket.accept()
-        state.ws_count = getattr(state, "ws_count", 0) + 1
 
         async def _reauthorize() -> Identity | None:
             """Re-validate the open socket's session (revocation/expiry/disable/downgrade/password-
@@ -7541,6 +7544,7 @@ def create_app(
             return current
 
         try:
+            await websocket.accept()
             # Re-check BEFORE the first push: a token revoked between the handshake authorize and
             # accept() must not get even one frame (close the pre-first-send window — SEC-018).
             current = await _reauthorize()
