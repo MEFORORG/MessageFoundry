@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""PKI helpers (BACKLOG #71/#72): PKCS#12 import, read-only cert inventory, self-signed dev certs.
+"""PKI helpers (BACKLOG #71/#72): PKCS#12 import, read-only cert inventory, self-signed placeholders.
 
 The single first-party home for the ``cryptography`` PKI primitives the ``cert`` CLI group relies on —
 so *all* of that command's crypto lives in one inventoried module (ASVS 11.1.3), and neither
@@ -580,8 +580,8 @@ def make_self_signed(cn: str, sans: list[str], days: int) -> tuple[bytes, bytes]
     **The pair is a PLACEHOLDER TO BE REPLACED, not an endorsed production terminator.** A
     self-signed certificate has no chain of trust: strictly better than cleartext, strictly worse
     than an operator-supplied chain. Its callers include the engine's own API listener, which
-    serves one on first run when no ``[api].tls_cert_file`` is set (``messagefoundry.api.tls``,
-    ADR 0172), and the ``cert self-signed`` CLI verb.
+    serves one on first run when no ``[api].tls_cert_file`` is set and no upstream terminator is
+    declared (``messagefoundry.api.tls``, ADR 0172), and the ``cert self-signed`` CLI verb.
 
     **An IP literal becomes an** ``iPAddress`` **entry, not a** ``DNSName``. Hostname verification for
     an IP-literal URL matches only against ``iPAddress``; a DNS entry spelling the same characters

@@ -1,5 +1,5 @@
 Point the extension at the **engine** you will promote to. The engine is a headless service (run it
-with `messagefoundry serve` or from the Console) — the IDE talks to it over a localhost HTTP API.
+with `messagefoundry serve`) — the IDE talks to it over a localhost HTTPS API.
 
 - `messagefoundry.engineUrl` — the engine API URL (default `https://127.0.0.1:8765`).
 - `messagefoundry.environments` — named targets (DEV/PROD/…) when you promote to more than one engine.

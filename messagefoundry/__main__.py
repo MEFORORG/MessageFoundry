@@ -779,9 +779,9 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
 
     cert_self_signed = cert_sub.add_parser(
         "self-signed",
-        help="mint a self-signed EC P-256 cert+key (cert.pem / key.pem) as a TLS PLACEHOLDER to "
-        "replace with an operator-supplied chain (no chain of trust: better than cleartext, worse "
-        "than a trusted chain); key.pem is written 0600 and refuses to overwrite an existing key",
+        help="mint a self-signed EC P-256 cert+key (cert.pem / key.pem) as a TLS PLACEHOLDER (no "
+        "chain of trust: better than cleartext, worse than an operator-supplied chain, so replace "
+        "it); key.pem is written 0600 and refuses to overwrite an existing key",
     )
     cert_self_signed.add_argument(
         "--cn", required=True, help="certificate common name (also added as a DNS SAN)"
@@ -5448,13 +5448,20 @@ def _cert_inventory(args: argparse.Namespace) -> int:
     return 1 if had_error else 0
 
 
+#: What `cert self-signed` says its pair is, in the console note and the --json `note` alike, so
+#: the two cannot drift. BACKLOG #1276, owner override 2026-08-16; the same wording as api/tls.py.
+_SELF_SIGNED_PLACEHOLDER_NOTE = (
+    "self-signed, so no chain of trust: better than cleartext, worse than an operator-supplied "
+    "chain. A placeholder to replace, not an endorsed production terminator"
+)
+
+
 def _cert_self_signed(args: argparse.Namespace) -> int:
     """`cert self-signed` — mint a self-signed EC P-256 cert+key, a TLS PLACEHOLDER.
 
     Writes cert.pem + key.pem to ``--out-dir``; key.pem is written by :func:`_write_private_key`,
-    which refuses to overwrite. Prints a note that the pair is a placeholder to be replaced, not an
-    endorsed production terminator: a self-signed cert has no chain of trust, so it is strictly
-    better than cleartext and strictly worse than an operator-supplied chain (ADR 0172)."""
+    which refuses to overwrite it (cert.pem has no such guard). Prints
+    :data:`_SELF_SIGNED_PLACEHOLDER_NOTE` (ADR 0172)."""
     from messagefoundry import pki
 
     if args.days <= 0:
@@ -5488,8 +5495,7 @@ def _cert_self_signed(args: argparse.Namespace) -> int:
         "cn": args.cn,
         "sans": dns,
         "days": args.days,
-        "note": "placeholder to replace with an operator-supplied chain — self-signed, no chain "
-        "of trust",
+        "note": _SELF_SIGNED_PLACEHOLDER_NOTE,
     }
     if args.json:
         _print_json(result, compact=True)
@@ -5498,10 +5504,7 @@ def _cert_self_signed(args: argparse.Namespace) -> int:
         _safe_print(f"  cert: {cert_path}")
         _safe_print(f"  key:  {key_path} (private; 0600)")
         _safe_print(f"  CN={args.cn}  SAN(DNS)={', '.join(dns)}  valid {args.days} day(s)")
-        _safe_print(
-            "  NOTE: self-signed — no chain of trust. It is better than cleartext and worse than an "
-            "operator-supplied chain: a placeholder to replace, not an endorsed production terminator."
-        )
+        _safe_print(f"  NOTE: {_SELF_SIGNED_PLACEHOLDER_NOTE}.")
     return 0
 
 
