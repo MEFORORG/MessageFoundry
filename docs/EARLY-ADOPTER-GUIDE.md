@@ -472,11 +472,14 @@ out. The remaining transport gaps include **raw TCP and X12**, which have no nat
       hold, so nothing was checked against the key. Run the job with the settings and environment
       the engine runs with, the key or the keyless opt-out included: the verify reads them to decide
       between `1` and `4`. Treating `2` or `3` as a tamper alarm pages someone for a
-      misconfiguration. **Do not treat `4` that way.** A `4` from a job that exited `0` before is a
-      sign the first row was changed: run it again with the engine's settings and key before
-      deciding it is a missing key. Treating any of `2`, `3` or `4` as a pass leaves the real log
-      unchecked. A `WARNING` on stderr with exit `0` says the chain is keyless while this shell's
-      settings require a key; fix the job's settings before it matters. Add `--allow-empty` only
+      misconfiguration. **Treat `4` as a possible tamper, not as a misconfiguration.** A `4` from a
+      job that exited `0` before is a sign the first row was changed: run it again with the
+      engine's settings and key before deciding it is a missing key. Treating any of `2`, `3` or
+      `4` as a pass leaves the real log unchecked. A `WARNING` on stderr with exit `0` says the
+      chain is keyless while this shell's settings require a key. Give the job the engine's
+      settings and key; do not clear the warning with the keyless opt-out unless the engine runs
+      under it. A job that moves from `4` to `0` with that warning is as suspect as one that moves
+      from `0` to `4`. Add `--allow-empty` only
       where an empty log is expected. Exit codes and their reasoning: [`SECURITY.md`](SECURITY.md)
       "Tamper-evidence".
 - [ ] **Seal the audit DB across any gap in custody, with an anchor.** A bare `audit-verify` is clean

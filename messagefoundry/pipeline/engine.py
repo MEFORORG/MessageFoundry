@@ -1126,8 +1126,9 @@ class Engine:
             # Vault BACKLOG #2725: unlike `audit-verify`'s exit 4, this stays a chain-break alert.
             # An engine holds no key only under the audited keyless opt-out, where a chain whose
             # first row names a key is the anomaly, and "not checked" would let a forged genesis row
-            # silence this alert for every other edit. The store's text says "not a finding", so
-            # the alert carries its own.
+            # silence this alert for every other edit. The store's text tells an operator to
+            # re-run with the engine's settings, which from inside the engine says nothing, so the
+            # alert carries its own.
             reason = (
                 "audit chain broken: its first row names a store key, but this engine holds none. "
                 "An engine runs with no key only under the audited keyless opt-out, where a chain "

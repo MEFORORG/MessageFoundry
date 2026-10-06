@@ -7160,7 +7160,10 @@ def _audit_verify(args: argparse.Namespace) -> int:
         cli.setdefault("store", {})["path"] = args.db
     try:
         settings = load_settings(config_path=args.service_config, cli=cli)
-    except (FileNotFoundError, ValueError, ValidationError) as exc:
+    except (OSError, ValueError, ValidationError) as exc:
+        # OSError, not only FileNotFoundError (vault BACKLOG #2725): a directory or an unreadable
+        # file named by --service-config reached the dispatch floor and exited 1, a broken chain's
+        # code. Its text names the path, not the file's content.
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
@@ -7245,9 +7248,11 @@ def _audit_verify(args: argparse.Namespace) -> int:
         # now, while the chain is clean. The exit stays 0: the chain did verify. Content-free.
         print(
             "WARNING: the audit chain is keyless (its first row names no key, and it was checked "
-            "as plain SHA-256), but this shell's settings require a store key. Either the store "
-            "runs keyless under other settings, or the key is missing here. Run this check with "
-            "the settings and key the engine runs with.",
+            "as plain SHA-256), but this shell's settings require a store key. Causes include at "
+            "least: the store runs keyless under other settings, the key is missing here, or the "
+            "chain was rewritten as keyless, which a keyless check cannot see. Run this check with "
+            "the settings and key the engine runs with; if the engine holds a key, that run "
+            "decides it.",
             file=sys.stderr,
         )
     if count:

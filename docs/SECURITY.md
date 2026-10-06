@@ -4164,21 +4164,22 @@ was true until the keyed-from mark was removed. Verify the chain with
 reordered by someone who could not recompute the chain. Run it with the key settings and environment
 the engine runs with, which under `cipher_provider = "vault_transit"` include the Transit settings
 listed under `cipher_provider` in [CONFIGURATION.md](CONFIGURATION.md). A keyed chain cannot be
-verified without them. With no store key configured, the verify prints a `NOT CHECKED` line saying
-the chain's first row names a key and no key is configured, and exits 4. Under `vault_transit` with the Transit
-settings missing, or with a key file it cannot read, it stops while the store opens, before it reads
-the chain, and exits 2. With the key,
-exit 0 also means every row is keyed. With no key, which only the keyless store mode allows, exit 0
-covers a keyless chain and says no more than the paragraph above. A store that has a key and opens
+verified without them. With no store key available, on a chain whose first row names a key,
+the verify prints a `NOT CHECKED` line and exits 4, unless the shell's settings allow running
+keyless (see below). Under `vault_transit` with the Transit settings missing, or with a key file it
+cannot read, it stops while the store opens, before it reads the chain, and exits 2. With the key,
+exit 0 also means every row is keyed. With no key, exit 0 covers a keyless chain and says no more
+than the paragraph above. That holds whatever the shell's settings say; where they require a key,
+a `WARNING` comes with it. A store that has a key and opens
 onto keyless rows fails the verify, and is also reported as
 [`audit_chain_unkeyed`](SECURITY-LOOSENING.md#audit_chain_unkeyed--the-store-has-a-key-but-its-audit-chain-is-keyless).
 **A scheduled job reads the exit code and nothing else, so these five are kept distinct:**
 
 | Exit | Meaning |
 |---|---|
-| `0` | A clean walk over at least one row. |
+| `0` | A clean walk over at least one row. A keyless chain in a shell whose settings require a key also prints a `WARNING` on stderr; a job that reads only the code does not see it. |
 | `1` | The chain did not verify. It covers at least a broken chain, a mismatch with `--expected-anchor`, a chain checked with a key that is not the chain's, and a chain that names a key in a shell that holds no key and whose settings allow the store to run keyless. Those print a `FAIL` line that says which. An error the command does not classify, such as a malformed key or a Transit outage part way through the walk, also exits 1 and prints no `FAIL` line, so by the code alone a job cannot tell it from a broken chain. |
-| `2` | The command could not start. It covers at least an absent path, a zero-byte file, a file carrying no `audit_log` table, a path that is not a SQLite database at all, settings that fail validation, and a store key the settings name that cannot be resolved. A `--service-config` path that raises an operating-system error, such as a directory named as the file, is not among them: it exits 1 with no `FAIL` line, only a last-resort line on stderr. That is the same on `main` before this change. |
+| `2` | The command could not start. It covers at least an absent path, a zero-byte file, a file carrying no `audit_log` table, a path that is not a SQLite database at all, settings that cannot be read or fail validation (a `--service-config` path that is a directory or unreadable included, which exited 1 before vault BACKLOG #2725), and a store key the settings name that cannot be resolved. |
 | `3` | A clean walk over an **empty** log. |
 | `4` | The chain's first row names a key, this shell holds no key, and its settings do not allow the store to run keyless. No row was checked against its MAC. This is not a pass. The first row may have been changed to name a key, so a 4 from a job that used to exit 0 is a sign of tampering until a run with the engine's settings and key says otherwise. |
 
@@ -4203,11 +4204,15 @@ was, and a row hash passes as long as it is non-empty text.
 settings and key the engine runs with.
 
 **A keyless store verified from a shell whose settings require a key is the setup where this goes
-wrong.** There, a writer who rewrites the first row to name a key turns every later edit into a 4,
-where `main` reported 1. So the verify warns before any tamper: when a keyless chain verifies clean
-in a shell whose settings forbid keyless running, it exits 0 and prints a `WARNING` on stderr naming
-the mismatch. The warning quotes no row. Run the job with the settings the engine runs with, and the
-warning and the downgrade both go away. Exit 3
+wrong.** There, a writer who rewrites the first row to name a key turns every later edit into a 4.
+Before vault BACKLOG #2725 the same edit exited 1. So when a keyless chain verifies clean in a shell
+whose settings forbid keyless running, the verify exits 0 and prints a `WARNING` on stderr naming
+the mismatch. The warning quotes no row. It is a sign, not a diagnosis: a clean keyless walk cannot
+tell a store that runs keyless from a keyed chain rewritten as keyless. A job that moves from 4 to 0
+with this warning is as suspect as one that moves from 0 to 4. Run the job with the settings and key
+the engine runs with: a keyless store then passes without the warning, and a keyed chain rewritten
+as keyless fails with exit 1. Do not clear the warning by giving the job the keyless opt-out unless
+the engine runs under it too. Exit 3
 exists because "there was nothing to verify" is not a
 pass; pass `--allow-empty` to accept it as one on an instance that has not logged anything yet, or
 pass an expected anchor of `0:`, which asserts the same thing and is checked. `audit-anchor` keeps

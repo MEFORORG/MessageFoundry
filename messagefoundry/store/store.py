@@ -2596,10 +2596,11 @@ def verify_audit_rows(
     # recomputed, so the walk compares each stored hash with itself rather than mis-flag every keyed
     # row as tampered. It still runs, because a break that needs no key is still a break (#2725).
     key_unavailable = not capable and genesis_key is not None
-    # Range rows are checked whenever the first row names a key: a range row's digest and link need
-    # no key to recompute. So a walk with none catches an edit inside a closed range only while that
-    # range row is left as it was. A writer who also recomputes the digest it carries, or renames
-    # the row, is not seen here: the MACs and handover tags that would show it need the key.
+    # Range rows are checked whenever this process holds a key or the first row names one. A range
+    # row's digest and link need no key to recompute, so a walk with none catches an edit inside a
+    # closed range only while that range row is left as it was. A writer who also recomputes the
+    # digest it carries, or renames the row, is not seen here: the MACs and handover tags that
+    # would show it need the key.
     ranged = capable or key_unavailable
     #: (walk position, row id, reason). The position is the sequence number that row should hold.
     breaks: list[tuple[int, Any, str | None]] = []
@@ -2775,10 +2776,10 @@ def verify_audit_rows(
         # break, and outranks "could not check".
         return AuditVerdict(
             False,
-            f"audit chain not checked: its first row names audit key {genesis_key!r}, and no "
-            "store encryption key/MAC is configured in this process, so no row MAC was "
-            f"recomputed. Only checks that need no key ran over its {count} row(s) (the sequence "
-            "numbers and key-range digests"
+            "audit chain not checked: its first row names a store key, and no store "
+            "encryption key/MAC is available in this process, so no row MAC was recomputed. Only "
+            f"checks that need no key ran over its {count} row(s) (at least the sequence numbers, "
+            "that each row hash is non-empty text, and any key-range digests"
             + (
                 ", and the expected anchor"
                 if expected_anchor is not None or expected_prefix is not None
@@ -2790,7 +2791,10 @@ def verify_audit_rows(
             key_unavailable=True,
         )
     return AuditVerdict(
-        True, f"verified {count} audit row(s)", keyless_walk=not capable and genesis_key is None
+        # Past the not-checked return, a process with no key has walked a chain naming none.
+        True,
+        f"verified {count} audit row(s)",
+        keyless_walk=not capable,
     )
 
 

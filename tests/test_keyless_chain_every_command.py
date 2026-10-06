@@ -352,9 +352,12 @@ def test_audit_verify_exits_4_on_a_keyed_chain_with_no_key(
     db = shell / "keyed.db"
     _keyed_chain(db, generate_key())
     rc = main(["audit-verify", "--db", str(db)])
-    out = capsys.readouterr().out
+    captured = capsys.readouterr()
+    out = captured.out
     assert rc == 4, out
-    assert out.startswith("NOT CHECKED: ") and "first row names audit key" in out, out
+    assert out.startswith("NOT CHECKED: ") and "first row names a store key" in out, out
+    assert "audit key '" not in out, "the line quoted the key id a writer controls"
+    assert "WARNING" not in captured.err, captured.err
     assert "no store encryption key/MAC" in out and "may have been changed" in out, out
     assert "it is keyed" not in out and "not a finding" not in out, out
     assert "FAIL" not in out and "broken at" not in out, out
@@ -611,7 +614,82 @@ def test_a_key_error_raised_after_the_open_is_not_reported_as_could_not_start(
     rc = main(["audit-verify", "--db", str(db)])
     capsys.readouterr()
     assert rc != 2, "a key error after the open was reported as could-not-start"
-    assert rc == 1  # the dispatch floor
+    assert rc != 0
+
+
+_FORGE_GENESIS = (
+    "UPDATE audit_log SET action = 'audit.key_epoch', "
+    """detail = '{"genesis": 1, "key_id": "forged"}' WHERE seq = 1"""
+)
+
+
+def test_the_weaker_setup_is_pinned_a_keyless_store_from_a_shell_that_requires_a_key(
+    shell: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The setup vault BACKLOG #2725 made weaker, pinned so it cannot widen unseen. A keyless store,
+    verified from a shell whose settings require a key and that holds none. Clean: exit 0 with the
+    WARNING. A writer then rewrites the first row to name a key and edits another row: exit 4,
+    where it was 1 before, and no WARNING."""
+    db = shell / "keyless.db"
+    _keyless_chain(db)
+    assert main(["audit-verify", "--db", str(db)]) == 0
+    assert "WARNING: the audit chain is keyless" in capsys.readouterr().err
+    _write(db, _FORGE_GENESIS)
+    _write(db, _EDIT_ROW_2)
+    rc = main(["audit-verify", "--db", str(db)])
+    captured = capsys.readouterr()
+    assert rc == 4, captured.out
+    assert "may have been changed" in captured.out and "WARNING" not in captured.err
+
+
+def test_a_keyed_chain_rewritten_as_keyless_warns_with_no_key_and_fails_with_it(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A keyed chain that a writer with no key rewrites as keyless: row 1 made ordinary, a row
+    edited, every hash recomputed as plain SHA-256. From a shell with no key it now passes, exit 0,
+    and the WARNING is the only sign, so it must fire and must name the rewrite as a cause. With the
+    engine's key the same chain fails, exit 1."""
+    from messagefoundry.store.store import _audit_row_mac
+
+    key = generate_key()
+    db = shell / "rewritten.db"
+    _keyed_chain(db, key)
+    with contextlib.closing(sqlite3.connect(db)) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            "UPDATE audit_log SET action = 'seed', detail = NULL, actor = 'test' WHERE seq = 1"
+        )
+        conn.execute(_EDIT_ROW_2)
+        prev = ""
+        for row in conn.execute("SELECT * FROM audit_log ORDER BY seq").fetchall():
+            digest = _audit_row_mac(dict(row), prev, None, None)
+            assert digest is not None
+            conn.execute("UPDATE audit_log SET row_hash = ? WHERE seq = ?", (digest, row["seq"]))
+            prev = digest
+        conn.commit()
+
+    assert main(["audit-verify", "--db", str(db)]) == 0
+    err = capsys.readouterr().err
+    assert "WARNING: the audit chain is keyless" in err and "rewritten as keyless" in err, err
+
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key)
+    assert main(["audit-verify", "--db", str(db)]) == 1
+    assert capsys.readouterr().out.startswith("FAIL: ")
+
+
+def test_a_service_config_that_cannot_be_read_exits_2(
+    shell: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A directory named as `--service-config` raises an OS error on load. It reached the dispatch
+    floor and exited 1, a broken chain's code. It is "could not start": exit 2."""
+    db = shell / "keyless.db"
+    _keyless_chain(db)
+    folder = shell / "a-folder"
+    folder.mkdir()
+    rc = main(["audit-verify", "--db", str(db), "--service-config", str(folder)])
+    captured = capsys.readouterr()
+    assert rc == 2, (captured.out, captured.err)
+    assert captured.err.startswith("error: "), captured.err
 
 
 # --- the source guard ----------------------------------------------------------------------------------
