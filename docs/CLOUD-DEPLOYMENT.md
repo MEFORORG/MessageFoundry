@@ -336,7 +336,7 @@ TLS-terminating collector).
    ([`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §1.2, posture B). Run
    `messagefoundry store provision-schema` as the provisioning role before the first start. The
    engine runs no schema DDL and refuses to start until it has (BACKLOG #305).
-2. **Build a config-baked image** (`FROM messagefoundry:<version>; COPY --chown=10001:10001 config /config`)
+2. **Build a config-baked image** (`FROM messagefoundry:<version>; COPY config /config`, root-owned files)
    and push it to your private registry.
 3. **Create the Secret** ([`docker/k8s/secret.example.yaml`](../docker/k8s/secret.example.yaml)) with
    `store-encryption-key`, `store-password`, and the API TLS cert/key (and optional `api-tls-key-password`).

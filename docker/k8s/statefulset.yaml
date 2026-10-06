@@ -8,12 +8,14 @@
 # block), the "k8s-preferred" pattern
 # and the right home for mTLS + OCSP-must-staple revocation.
 #
-# CONFIG IS BAKED INTO THE IMAGE, not mounted: a ConfigMap/projected volume mounts root-owned, but the
-# engine (uid 10001) refuses a config dir owned by another uid (_assert_safe_config_source — it executes
-# the *.py as the service account). Build an adopter image:
+# CONFIG IS BAKED INTO THE IMAGE, not mounted, to match ADR 0017's immutable, byte-identical
+# multi-instance model. The engine (uid 10001) refuses a config dir or module owned by any uid other than
+# root or its own, or writable by group/world (_assert_safe_config_source -- it executes the *.py as the
+# service account). Root-owned is the safer owner: the engine's account cannot rewrite it. Build an
+# adopter image (COPY writes root-owned files; run chmod -R a+rX,go-w on it in the build context first):
 #     FROM messagefoundry:<version>
-#     COPY --chown=10001:10001 config /config
-# and set image: below to it. This also matches ADR 0017's immutable, byte-identical multi-instance model.
+#     COPY config /config
+# and set image: below to it.
 #
 # Single replica: the default SQLite store is single-writer. For multi-node HA use the Postgres/SQL Server
 # store backend + the built leader election (docs/CLUSTERING.md) — out of scope for this baseline manifest.
@@ -72,7 +74,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: engine
-          # REPLACE with your config-baked image (FROM messagefoundry:<version>; COPY --chown=10001:10001 config /config).
+          # REPLACE with your config-baked image (FROM messagefoundry:<version>; COPY config /config).
           image: REPLACE_WITH_YOUR_CONFIG_BAKED_IMAGE
           args: ["serve", "--config", "/config", "--env", "prod"]
           securityContext:

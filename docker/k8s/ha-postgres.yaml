@@ -22,11 +22,11 @@
 # per-source leader_gate, but the supervisor never starts its runner on a standby — pipeline/cluster.py:
 # "only the leader binds them"). Exactly one writer at a time; no second concurrent writer (#396).
 #
-# CONFIG IS BAKED INTO THE IMAGE (same rule as statefulset.yaml): the engine (uid 10001) refuses a config
-# dir owned by another uid, so a ConfigMap/projected mount (root-owned) is rejected. Build an adopter
-# image and set image: below to it:
+# CONFIG IS BAKED INTO THE IMAGE (same rule as statefulset.yaml): the engine (uid 10001) trusts a config
+# owner that is root or itself, and root-owned is the safer of the two. Build an adopter image (COPY
+# writes root-owned files; run chmod -R a+rX,go-w on it in the build context first) and set image: below:
 #     FROM messagefoundry:<version>
-#     COPY --chown=10001:10001 config /config
+#     COPY config /config
 # The same baked image deploys to all 3 replicas (ADR 0017 same-commit-everywhere).
 ---
 # Headless governing Service — stable in-cluster DNS for the API control/read plane (up on EVERY node).
@@ -159,7 +159,7 @@ spec:
               app: mefor-engine-ha
       containers:
         - name: engine
-          # REPLACE with your config-baked image (FROM messagefoundry:<version>; COPY --chown=10001:10001 config /config).
+          # REPLACE with your config-baked image (FROM messagefoundry:<version>; COPY config /config).
           # Use the messagefoundry:sqlserver base ONLY if you switch [store].backend to sqlserver or use
           # the DATABASE / db_lookup connectors; the Postgres store needs only the slim default.
           image: REPLACE_WITH_YOUR_CONFIG_BAKED_IMAGE
