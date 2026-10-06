@@ -53,7 +53,7 @@ from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
 from functools import partial
 from time import perf_counter
 from types import MappingProxyType
-from typing import Any, Final
+from typing import Any, Final, assert_never
 from uuid import uuid4
 
 from messagefoundry.config.models import RetryPolicy
@@ -134,6 +134,7 @@ from messagefoundry.store.store import (
     _SESSION_CAP_RANK_NOT_AHEAD_SQL,
     _SESSION_LIVE_SQL,
     _SESSION_NOT_AHEAD_SQL,
+    _SQL_ADMIN_GUARD_COUNTS,
     AUDIT_KEY_EPOCH_ACTION,
     FULL_AUTHENTICATION_LOCKOUT_CLEAR,
     LOCKOUT_COLUMNS,
@@ -144,6 +145,7 @@ from messagefoundry.store.store import (
     REINGRESS_TARGET_PREFIX,
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
+    AdminRemoval,
     AlertInstance,
     AlertSummary,
     AppendedAuditRow,
@@ -1507,6 +1509,9 @@ _SCHEMA_LOCK = "mefor:schema_init"
 # read-tail-then-INSERT in record_audit is only atomic if EVERY appender, in EVERY engine-shard
 # process, queues on the same name.
 _AUDIT_APPEND_LOCK = "mefor:audit_append"
+# Vault BACKLOG #2779: the last-administrator guard's lock, the T-SQL analog of the Postgres
+# store's. Every guarded removal in every engine-shard process queues on this one name.
+_ADMIN_GUARD_LOCK = "mefor:last_admin"
 #: The cluster coordinator's own tables (``nodes``, ``leader_lease``, ``cluster_config``), stated ONCE
 #: here and run from two places: the store's ``_SCHEMA`` batch below (ahead of the claim procs, whose
 #: bodies name ``leader_lease``), and
@@ -11643,22 +11648,77 @@ class SqlServerStore:
     async def delete_user(self, user_id: str) -> None:
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
-                await cur.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
-                await cur.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
-                await cur.execute("DELETE FROM webauthn_credentials WHERE user_id=?", (user_id,))
-                # vault BACKLOG #2145: the account's known sign-in addresses go with it.
-                await cur.execute("DELETE FROM known_login_addresses WHERE user_id=?", (user_id,))
-                # BACKLOG #1233, verbatim with the SQLite and Postgres bodies: presets are
-                # owner-scoped by Identity.user_id (#1225) with no FK cascade, so without this the
-                # rows outlive the account carrying PHI-shaped `criteria` (ADR 0136) that no owner can
-                # reach or purge. This leg is CI-only, so an asymmetry between the three backends
-                # surfaces first in CI rather than here.
-                await cur.execute("DELETE FROM search_presets WHERE owner_user_id=?", (user_id,))
-                await cur.execute("DELETE FROM users WHERE id=?", (user_id,))
+                await self._delete_user_rows(cur, user_id)
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()
                 raise
+
+    async def remove_unless_last_admin(
+        self,
+        user_id: str,
+        change: AdminRemoval,
+        *,
+        admin_role_id: str,
+        role_ids: Sequence[str] = (),
+        assigned_by: str | None = None,
+        now: float | None = None,
+    ) -> bool:
+        """The last-administrator guard and its write in one transaction (vault BACKLOG #2779); see
+        ``AuthStore``. Takes ``_ADMIN_GUARD_LOCK`` before the read, so under RCSI the read sees
+        whatever an earlier holder committed before releasing it."""
+        now = time.time() if now is None else now
+        async with self._acquire() as conn:
+            try:
+                async with self._cursor(conn) as cur:
+                    if change.takes_role(admin_role_id, role_ids):
+                        # Only a change that can empty the set queues on the lock. This read OPENS
+                        # THE TRANSACTION the applock attaches to, as in record_audit: the
+                        # autocommit=False pool begins one only on a statement that touches a
+                        # table, and `@LockOwner='Transaction'` needs one open. Value discarded.
+                        await cur.execute("SELECT TOP (1) id FROM users WHERE id=?", (user_id,))
+                        await cur.fetchall()
+                        await self._applock(cur, _ADMIN_GUARD_LOCK)
+                        await cur.execute(
+                            _SQL_ADMIN_GUARD_COUNTS, (user_id, user_id, admin_role_id)
+                        )
+                        target, others = await cur.fetchone() or (0, 0)
+                        if target and not others:
+                            await conn.rollback()  # nothing written; releases the applock
+                            return False
+                    if change is AdminRemoval.DISABLE:
+                        await cur.execute(
+                            "UPDATE users SET disabled=1, updated_at=? WHERE id=?", (now, user_id)
+                        )
+                    elif change is AdminRemoval.DELETE:
+                        await self._delete_user_rows(cur, user_id)
+                    elif change is AdminRemoval.SET_ROLES:
+                        await self._replace_user_roles(cur, user_id, role_ids, assigned_by, now)
+                    else:
+                        assert_never(change)
+                    await self._commit(conn)
+            except Exception:
+                # BACKLOG #1940: a failed rollback must not hand the open transaction, and the
+                # applock it owns, to the next borrower of this pooled connection.
+                await self._rollback_or_discard(conn)
+                raise
+        return True
+
+    @staticmethod
+    async def _delete_user_rows(cur: Any, user_id: str) -> None:
+        """Delete the account and every row keyed to it, inside the caller's transaction."""
+        await cur.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
+        await cur.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+        await cur.execute("DELETE FROM webauthn_credentials WHERE user_id=?", (user_id,))
+        # vault BACKLOG #2145: the account's known sign-in addresses go with it.
+        await cur.execute("DELETE FROM known_login_addresses WHERE user_id=?", (user_id,))
+        # BACKLOG #1233, verbatim with the SQLite and Postgres bodies: presets are
+        # owner-scoped by Identity.user_id (#1225) with no FK cascade, so without this the
+        # rows outlive the account carrying PHI-shaped `criteria` (ADR 0136) that no owner can
+        # reach or purge. This leg is CI-only, so an asymmetry between the three backends
+        # surfaces first in CI rather than here.
+        await cur.execute("DELETE FROM search_presets WHERE owner_user_id=?", (user_id,))
+        await cur.execute("DELETE FROM users WHERE id=?", (user_id,))
 
     async def record_login_success(self, user_id: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
@@ -11815,17 +11875,24 @@ class SqlServerStore:
         now = time.time() if now is None else now
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
-                await cur.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
-                for role_id in role_ids:
-                    await cur.execute(
-                        "INSERT INTO user_roles (user_id, role_id, assigned_at, assigned_by)"
-                        " VALUES (?,?,?,?)",
-                        (user_id, role_id, now, assigned_by),
-                    )
+                await self._replace_user_roles(cur, user_id, role_ids, assigned_by, now)
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()
                 raise
+
+    @staticmethod
+    async def _replace_user_roles(
+        cur: Any, user_id: str, role_ids: Sequence[str], assigned_by: str | None, now: float
+    ) -> None:
+        """Replace the account's role rows, inside the caller's transaction."""
+        await cur.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
+        for role_id in role_ids:
+            await cur.execute(
+                "INSERT INTO user_roles (user_id, role_id, assigned_at, assigned_by)"
+                " VALUES (?,?,?,?)",
+                (user_id, role_id, now, assigned_by),
+            )
 
     async def set_user_channel_scope(
         self,

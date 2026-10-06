@@ -950,6 +950,21 @@ async def test_auth_users_roles_sessions(store) -> None:
     assert await store.get_user_role_ids("u1") == []
 
 
+async def test_last_admin_guard_contract(store) -> None:
+    """Vault BACKLOG #2779 on Postgres: the guarded removal refuses only the last administrator."""
+    from tests._last_admin_store_contract import assert_last_admin_contract
+
+    await assert_last_admin_contract(store)
+
+
+async def test_concurrent_admin_removals_leave_one(store) -> None:
+    """Vault BACKLOG #2779 on Postgres: two removals on two pooled connections, at once. The
+    advisory lock is what serializes them; one is refused."""
+    from tests._last_admin_store_contract import assert_concurrent_removals_leave_one
+
+    await assert_concurrent_removals_leave_one(store)
+
+
 async def test_roles_permissions_contract(store) -> None:
     """ADR 0045 custom-roles store contract on the real Postgres backend (parity with SQLite):
     the additive ``roles.permissions`` column round-trips a custom role's JSON, ``get_role`` exposes

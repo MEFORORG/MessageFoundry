@@ -119,6 +119,7 @@ from messagefoundry.store.crypto import MARKER_PREFIX, CipherError
 from messagefoundry.store.store import (
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
+    AdminRemoval,
     AuditAppend,
     ChannelScopeSource,
     FederatedUnbind,
@@ -789,6 +790,11 @@ class FirstAdministratorRefused(RuntimeError):
     """:meth:`AuthService.provision_first_administrator` declined. The message is operator-facing."""
 
 
+class LastAdministratorRefused(RuntimeError):
+    """An administrator's change would have left no enabled administrator (vault BACKLOG #2779).
+    Raised before anything is written. The message is the operator-facing refusal."""
+
+
 class TemporaryPasswordUnavailable(RuntimeError):
     """No generated temporary password cleared the active policy. It points at the site's context
     words, the one setting that can make a random string fail the screen nearly every time."""
@@ -1366,6 +1372,9 @@ _REFUSED_OUTCOMES: dict[DirectoryAnswer, reconcile.ProbeOutcome] = {
     DirectoryAnswer.NOT_FOUND: reconcile.ProbeOutcome.ABSENT,
     DirectoryAnswer.DISABLED: reconcile.ProbeOutcome.DISABLED,
     DirectoryAnswer.UNDETERMINED: reconcile.ProbeOutcome.UNDETERMINED,
+    # Vault BACKLOG #2778. Fail closed: no entry is provably this account, so its sessions end
+    # after the strikes, as for a missing one. A wave of these is not held the way UNDETERMINED is.
+    DirectoryAnswer.AMBIGUOUS: reconcile.ProbeOutcome.ABSENT,
 }
 
 
@@ -5387,9 +5396,10 @@ class AuthService:
             # ONLY AN ID-KEYED PROBE MAY REPORT A RENAME. A rename is evidence of a rename only when
             # the question asked cannot be answered by a different principal, and the name-keyed
             # fallback's question can be: `_find_user` searches
-            # `(|(sAMAccountName=<name>)(userPrincipalName=<name>@<domain>))` and takes entries[0], so
-            # an account that sets its own UPN to the victim's `<name>@<domain>` matches the same
-            # filter. On a pass where the directory returns that entry first, the probe would report
+            # `(|(sAMAccountName=<name>)(userPrincipalName=<name>@<domain>))`, so an account that
+            # sets its own UPN to the victim's `<name>@<domain>` matches the same filter. Since vault
+            # BACKLOG #2778 two matches are refused as AMBIGUOUS, but a directory where the victim's
+            # own entry is gone answers with the attacker's entry alone. Then the probe would report
             # the attacker's `sAMAccountName` as this row's new name -- and the refresh would write it
             # onto the victim's row, moving the ONLY key an unbound login path has onto the attacker's
             # label. Their next sign-in then resolves to the victim's `user_id` (both ids are NULL, so
@@ -9746,14 +9756,30 @@ class AuthService:
         writer stored cannot block an unrelated save. Any other value is checked before anything is
         written (:func:`_require_single_mailbox`), so a refusal leaves the whole save undone. Raises
         :class:`InvalidNotifyEmail` for it.
+
+        **Disabling the last enabled administrator is refused (vault BACKLOG #2779)**, with
+        :class:`LastAdministratorRefused`. The guard is the disable write itself: the store checks
+        and writes in one transaction (``remove_unless_last_admin``). That write stays after the
+        profile write and before its audit row, so a later failure cannot leave an unaudited
+        lock-out. A read up front refuses the ordinary case before anything is written. Only a
+        removal racing this one gets past that read; then the profile edit has landed, so it is
+        still audited and announced, with ``disable_refused`` on the audit row, and the refusal is
+        raised after that.
         """
         before = await self._store.get_user(user_id)  # capture old email/disabled for notifications
+        if before is not None:
+            # The stored spelling of the id. A store whose id column compares case-insensitively
+            # (SQL Server) finds the row from a different spelling, and the early read below
+            # compares ids in Python, so it must be given the one the store holds.
+            user_id = before.id
         stored_notify = ((before.notify_email if before is not None else None) or "").strip()
         new_notify: str | None = None
         if notify_email is not None and (
             not notify_email.strip() or notify_email.strip() != stored_notify
         ):
             new_notify = _require_single_mailbox(notify_email)
+        if disabled and await self.is_last_enabled_admin(user_id):
+            raise LastAdministratorRefused("cannot disable the last administrator")
         await self._store.update_user_profile(user_id, display_name=display_name, email=email)
         # The profile write above never names `notify_email`: it is the same call `_upsert_ad_user`
         # makes, and on a directory account `email` is the directory's.
@@ -9785,11 +9811,19 @@ class AuthService:
                     email=new_notify,
                     detail={"set_by": "administrator"},
                 )
-        if disabled is not None:
-            await self._store.set_user_disabled(user_id, disabled=disabled)
-            if disabled:
+        refused = False
+        if disabled:
+            refused = not await self._store.remove_unless_last_admin(
+                user_id, AdminRemoval.DISABLE, admin_role_id=Role.ADMINISTRATOR.value
+            )
+            if not refused:
                 await self._store.revoke_user_sessions(user_id)
-        await self._audit("user.updated", actor=actor, detail=_json({"user_id": user_id}))
+        elif disabled is not None:
+            await self._store.set_user_disabled(user_id, disabled=False)
+        updated: dict[str, Any] = {"user_id": user_id}
+        if refused:
+            updated["disable_refused"] = True
+        await self._audit("user.updated", actor=actor, detail=_json(updated))
         # The rest of this save's notices go where the account's notices went before it, so a move
         # in the same save cannot take them away from the previous holder. An account that had no
         # address is the exception: the one this save set is then the only one reachable.
@@ -9819,18 +9853,36 @@ class AuthService:
                     email=notice_to,
                     detail={"new_email": email},
                 )
-            if disabled and not before.disabled:
+            if disabled and not refused and not before.disabled:
                 await self._notify_security(
                     ACCOUNT_DISABLED, username=before.username, email=notice_to
                 )
+        if refused:
+            raise LastAdministratorRefused("cannot disable the last administrator")
 
     async def delete_user(self, user_id: str, *, actor: str) -> None:
-        await self._store.delete_user(user_id)
+        """Delete an account. Raises :class:`LastAdministratorRefused`, having written nothing, when
+        it is the last enabled administrator; the check and the delete are one store transaction
+        (vault BACKLOG #2779)."""
+        if not await self._store.remove_unless_last_admin(
+            user_id, AdminRemoval.DELETE, admin_role_id=Role.ADMINISTRATOR.value
+        ):
+            raise LastAdministratorRefused("cannot delete the last administrator")
         await self._audit("user.deleted", actor=actor, detail=_json({"user_id": user_id}))
 
     async def set_roles(self, user_id: str, roles: Sequence[str], *, actor: str) -> None:
+        """Replace an account's roles. Raises :class:`LastAdministratorRefused`, having written
+        nothing, when that would take Administrator from the last enabled administrator; the check
+        and the write are one store transaction (vault BACKLOG #2779). Self-target is allowed."""
         user = await self._store.get_user(user_id)  # for the notification address
-        await self._store.set_user_roles(user_id, roles, assigned_by=actor)
+        if not await self._store.remove_unless_last_admin(
+            user_id,
+            AdminRemoval.SET_ROLES,
+            admin_role_id=Role.ADMINISTRATOR.value,
+            role_ids=list(roles),
+            assigned_by=actor,
+        ):
+            raise LastAdministratorRefused("cannot remove the last administrator")
         await self._store.revoke_user_sessions(user_id)  # re-resolve permissions on next login
         await self._audit(
             "user.roles_changed",
@@ -10517,9 +10569,14 @@ class AuthService:
     async def is_last_enabled_admin(self, user_id: str) -> bool:
         """True iff ``user_id`` is an enabled administrator and the only one remaining.
 
-        Guards the role-removal path so the deployment can never be left with no usable admin
-        account. Nothing regenerates one: since ADR 0183 the way back is ``provision-admin`` at the
-        host.
+        Nothing regenerates a lost administrator: since ADR 0183 the way back is ``provision-admin``
+        at the host.
+
+        **A READ, NOT THE GUARD (vault BACKLOG #2779).** Asked in one await and acted on in the next,
+        it let two concurrent removals each see two administrators and both pass. The guard is now
+        the store's ``remove_unless_last_admin``, which :meth:`update_user`, :meth:`delete_user` and
+        :meth:`set_roles` call. :meth:`update_user` also asks this first, only so the ordinary
+        refusal comes before its profile write; never let it stand in for the guarded write.
         """
         admins: set[str] = set()
         for user in await self._store.list_users():
