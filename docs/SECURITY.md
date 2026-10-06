@@ -4288,9 +4288,8 @@ the verify prints a `NOT CHECKED` line and exits 4, unless the shell's settings 
 keyless (see below). Under `vault_transit` with the Transit settings missing, or with a key file it
 cannot read, it stops while the store opens, before it reads the chain, and exits 2. With the key,
 exit 0 also means every row is keyed. With no key, exit 0 covers a keyless chain and says no more
-than the paragraph above, and only where the shell's settings allow the store to run keyless.
-Where they require a key, a keyless chain that walks clean exits 4 with a `WARNING` (vault BACKLOG
-#3054). A store that has a key and opens
+than the paragraph above. It does so only where the shell's settings allow the store to run
+keyless; exit 4 below covers the rest. A store that has a key and opens
 onto keyless rows fails the verify, and is also reported as
 [`audit_chain_unkeyed`](SECURITY-LOOSENING.md#audit_chain_unkeyed--the-store-has-a-key-but-its-audit-chain-is-keyless).
 **A scheduled job reads the exit code and nothing else, so these five are kept distinct:**
@@ -4301,7 +4300,7 @@ onto keyless rows fails the verify, and is also reported as
 | `1` | The chain did not verify. It covers at least a broken chain, a mismatch with `--expected-anchor`, a chain checked with a key that is not the chain's, and a chain that names a key in a shell that holds no key and whose settings allow the store to run keyless. Those print a `FAIL` line that says which. An error the command does not classify, such as a malformed key or a Transit outage part way through the walk, also exits 1 and prints no `FAIL` line, so by the code alone a job cannot tell it from a broken chain. |
 | `2` | The command could not start. It covers at least an absent path, a zero-byte file, a file carrying no `audit_log` table, a path that is not a SQLite database at all, settings that cannot be read or fail validation (a `--service-config` path that is a directory or unreadable included, which exited 1 before vault BACKLOG #2725), a store key the settings name that cannot be resolved, and an empty log in a shell that holds no key and whose settings require one. |
 | `3` | A clean walk over an **empty** log. |
-| `4` | This shell holds no key and its settings do not allow the store to run keyless, so no row was checked against a key. Either the chain's first row names a key, or the chain is keyless and walked clean as plain SHA-256; the second also prints a `WARNING` on stderr, and exited 0 before vault BACKLOG #3054. Both print a `NOT CHECKED` line. This is not a pass. In this setup 4 is the steady state, so the job can never report a pass: give it the engine's key, or the keyless opt-out the engine runs under. A 4 from a job that used to exit 0 means the job lost the key or the opt-out it ran with. Nothing in the database can cause that move, so find out what changed the job before trusting its next result. |
+| `4` | This shell holds no key and its settings do not allow the store to run keyless, so no row was checked against a key. It prints a `NOT CHECKED` line. It covers at least a chain whose first row names a key, and a keyless chain that walked clean as plain SHA-256. The second also prints a `WARNING` on stderr. This is not a pass. The paragraph on the setup where this goes wrong, below, says why the keyless case exits 4 and what a move from 0 to 4 means. |
 
 For exit 2 the verifier refuses each case rather than creating or migrating the evidence it was asked
 to check, and it opens read-only so it cannot write to that file either way. It never spends `1` on
@@ -4314,8 +4313,7 @@ though, the chain's own first row says whether the chain is keyed, and a writer 
 So the verify reads the shell's settings too. Where they allow the store to run keyless (the
 audited opt-out), a chain that names a key exits 1. That includes a store keyed under the opt-out
 and verified from a shell missing its key, and the `FAIL` line names both explanations. Run the job
-with the settings and environment the engine runs with, the opt-out included, or the job sits at 4
-on a keyless store and never reports a pass. Without a key
+with the settings and environment the engine runs with, the opt-out included. Without a key
 the verify still makes the checks that need none: at least the sequence numbers, each key-range
 row's digest and link, and an expected anchor if one is passed. A break there exits 1, not 4. A
 range row's digest catches an edit inside its range only while the range row itself is left as it
@@ -4326,15 +4324,20 @@ settings and key the engine runs with.
 **A keyless store verified from a shell whose settings require a key is the setup where this goes
 wrong.** There, a writer who rewrites the first row to name a key turns every later edit into a 4.
 Before vault BACKLOG #2725 the same edit exited 1. So since vault BACKLOG #3054 a keyless chain that
-walks clean in a shell whose settings forbid keyless running also exits 4. It prints a `NOT
-CHECKED` line, and a `WARNING` on stderr naming the mismatch. Neither quotes a row. In this setup 4
-is the steady state, so that rewrite no longer moves a job off a passing code.
+walks clean in a shell whose settings forbid keyless running also exits 4. The settings say the
+check is keyed, and a plain SHA-256 walk is not that. It prints a `NOT CHECKED` line, and a
+`WARNING` on stderr naming the mismatch. Neither quotes a row. In this setup 4 is the steady state,
+so that rewrite no longer moves a job off a passing code. A job there can never report a pass:
+give it the engine's key, or the keyless opt-out the engine runs under.
 The warning is a sign, not a diagnosis: a clean keyless walk cannot tell a store that runs keyless
 from a keyed chain rewritten as keyless. Run the job with the settings and key the engine runs
 with: a keyless store then passes with exit 0 and no warning, and a keyed chain rewritten as
 keyless fails with exit 1. Do not clear the 4 by giving the job the keyless opt-out unless the
-engine runs under it too. An empty log in this setup is refused while the store opens, with exit
-2, because no row says whether its chain would be keyed. Exit 3
+engine runs under it too. A job that moves from 0 to 4 has at least one of these causes: it lost
+the key it ran with, it lost the opt-out, or it moved from a build before #3054. Nothing in the
+database alone causes that move, so find out what changed the job. An empty log in this setup is
+refused while the store opens, with exit 2, because no row says whether its chain would be keyed.
+Exit 3
 exists because "there was nothing to verify" is not a
 pass; pass `--allow-empty` to accept it as one on an instance that has not logged anything yet, or
 pass an expected anchor of `0:`, which asserts the same thing and is checked. `audit-anchor` keeps

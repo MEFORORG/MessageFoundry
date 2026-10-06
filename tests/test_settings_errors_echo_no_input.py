@@ -509,10 +509,12 @@ def test_a_refusal_through_load_settings_echoes_no_secret(
 def test_a_cli_command_that_prints_str_exc_echoes_no_secret(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """``audit-verify`` prints ``str(exc)`` for a settings failure, not ``settings_error_detail``.
+    """``rotate-key`` prints ``str(exc)`` for a settings failure, not ``settings_error_detail``.
 
-    ``serve`` and ``supervise`` render through ``settings_error_detail`` already; commands like this
-    one were the remaining exposure, and the model-level wrap is what covers them.
+    ``serve``, ``supervise``, ``audit-anchor`` and ``audit-verify`` render through
+    ``settings_error_detail``; commands like this one are the remaining exposure, and the
+    model-level wrap is what covers them. This test used ``audit-verify`` until vault BACKLOG #3054
+    moved it onto the renderer, which would have left it with no ``str(exc)`` path to test.
     """
     monkeypatch.chdir(tmp_path)
     for name, value in _env(MEFOR_AUTH_OIDC_TOKEN_ENDPOINT="http://idp.example/token").items():
@@ -520,7 +522,7 @@ def test_a_cli_command_that_prints_str_exc_echoes_no_secret(
     cfg = tmp_path / "messagefoundry.toml"
     cfg.write_text("", encoding="utf-8")
 
-    assert main(["audit-verify", "--service-config", str(cfg)]) == 2
+    assert main(["rotate-key", "--service-config", str(cfg)]) == 2
     captured = capsys.readouterr()
     output = captured.out + captured.err
     assert "must be an https URL" in output  # the control: this run reached the refusal

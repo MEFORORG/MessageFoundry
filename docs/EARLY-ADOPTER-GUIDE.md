@@ -473,13 +473,10 @@ out. The remaining transport gaps include **raw TCP and X12**, which have no nat
       runs with, the key or the keyless opt-out included: the verify reads them to decide between
       `0`, `1` and `4`. Treating `2` or `3` as a tamper alarm pages someone for a
       misconfiguration. **Never treat `4` as a pass.** A job with neither the key nor the opt-out
-      exits `4` on every run, a keyless chain that walks clean included (with a `WARNING` on
-      stderr; that exited `0` before vault BACKLOG #3054), so it can never report a pass. Give it
-      the engine's settings and key; do not clear the `4` with the keyless opt-out unless the
-      engine runs under it. A `4` from a job that exited `0` before means the job lost the key or
-      the opt-out it ran with, since nothing in the database can cause that move: find out what
-      changed the job, then re-run it with the engine's settings and key. Treating any of `2`, `3`
-      or `4` as a pass leaves the real log unchecked. Add `--allow-empty` only
+      can never exit `0`, even on a clean keyless chain. Give it the engine's settings and key. Do
+      not clear the `4` with the keyless opt-out unless the engine runs under it. A job that moves
+      from `0` to `4` changed, not the database: find out what changed it. Treating any of `2`,
+      `3` or `4` as a pass leaves the real log unchecked. Add `--allow-empty` only
       where an empty log is expected. Exit codes and their reasoning: [`SECURITY.md`](SECURITY.md)
       "Tamper-evidence".
 - [ ] **Seal the audit DB across any gap in custody, with an anchor.** A bare `audit-verify` is clean

@@ -1669,6 +1669,9 @@ def _load_service_settings(
 ) -> tuple[ServiceSettings | None, str | None]:
     """Load the service settings for a BOOT-PATH command, returning ``(settings, detail)``.
 
+    ``audit-anchor`` and ``audit-verify`` load through it too (BACKLOG #2094, vault BACKLOG #3054):
+    their output is meant to be safe to keep in a ticket, which is the same reason it renders.
+
     Exactly one side is non-``None``. The PAIR rather than a printed line, because that is the
     shape :func:`messagefoundry.verify.runner._load_settings` already has for the same load, and
     its caller needs the string for a report row rather than for a stream. Both callers here
@@ -7165,7 +7168,8 @@ def _audit_verify(args: argparse.Namespace) -> int:
     )
     if refused is not None:
         return refused
-    # Decides exit 4 against exit 1 below. The open computes the same verdict inline, because the
+    # Decides exit 4 against exit 1, and against exit 0 for a keyless walk (#3054), below. The open
+    # computes the same verdict inline, because the
     # #1916 source guard reads that call's argument, so the two cannot be one expression.
     keyless_refusal = keyless_opt_out_refusal(settings.store, settings.security)
 
@@ -7227,31 +7231,36 @@ def _audit_verify(args: argparse.Namespace) -> int:
     if not ok:
         print("FAIL: " + (message or ""))
         return 1
-    # A clean walk by a shell that holds no key, whose settings require one (vault BACKLOG #2725,
-    # #3054). Content-free either way: neither line quotes a row.
-    if verdict.keyless_walk and keyless_refusal is not None and count:
-        # EXIT 4, NOT 0 (#3054). The settings say verification is keyed, and this was a plain SHA-256
-        # walk that anyone who can write the log can recompute, so the chain was not checked to the
-        # standard they set. A job that reads only the code never sees the WARNING, and 0 would let
-        # a site sit in the one setup where a rewritten first row turns later tampering from 1 into
-        # 4 (#2725). Here 4 is the steady state, so that rewrite changes nothing a job can see.
+    if verdict.keyless_walk and keyless_refusal is not None:
+        # EXIT 4, NOT 0 (vault BACKLOG #3054). A clean walk by a shell that holds no key, whose
+        # settings require one. They say verification is keyed, and this was a plain SHA-256 walk
+        # anyone who can write the log can recompute, so it was not checked to their standard. A job
+        # reading only the code never sees the WARNING, and 0 would let a site sit in the one setup
+        # where a rewritten first row turns later tampering from 1 into 4 (#2725). Here 4 is the
+        # steady state. The decision reads only the flag: the row count is a second query, which a
+        # writer can change after the walk. Content-free: neither line quotes a row.
         print(
-            f"NOT CHECKED: walked {count} audit row(s) as a keyless chain (plain SHA-256), but this "
-            "shell's settings require a store key, so the chain was not checked to that standard"
+            f"NOT CHECKED: this shell holds no store key and its settings require one, so the audit "
+            f"chain was not checked against a key ({message}, as plain SHA-256)"
         )
+        # The count picks the WARNING's wording only. An empty log has no first row to name a key or
+        # not (#3054); the open refuses one first (#1916, exit 2), so only a log emptied after the
+        # open gets the second wording.
         print(
-            "WARNING: the audit chain is keyless (its first row names no key, and it was checked "
-            "as plain SHA-256), but this shell's settings require a store key. Causes include at "
-            "least: the store runs keyless under other settings, the key is missing here, or the "
-            "chain was rewritten as keyless, which a keyless check cannot see. Run this check with "
-            "the settings and key the engine runs with; if the engine holds a key, that run "
-            "decides it.",
+            (
+                "WARNING: the audit chain is keyless (its first row names no key, and it was "
+                "checked as plain SHA-256), but this shell's settings require a store key. Causes "
+                "include at least: the store runs keyless under other settings, the key is missing "
+                "here, or the chain was rewritten as keyless, which a keyless check cannot see."
+                if count
+                else "WARNING: the audit log is empty, so no row shows whether its chain is keyed, "
+                "and this shell's settings require a store key."
+            )
+            + " Run this check with the settings and key the engine runs with; if the engine holds "
+            "a key, that run decides it.",
             file=sys.stderr,
         )
         return 4
-    # An EMPTY log in that setup falls through to the empty-log exit below with no keyless WARNING:
-    # it has no first row to name a key or not (#3054). The open refuses it first (#1916, exit 2),
-    # so only a log emptied between the open and the walk gets here.
     print("OK: " + (message or ""))
     if count:
         return 0

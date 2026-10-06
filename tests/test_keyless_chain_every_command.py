@@ -575,15 +575,15 @@ def test_a_keyless_chain_passing_where_the_settings_require_a_key_exits_4(
 
 
 @pytest.mark.parametrize("allow_empty", [False, True])
-def test_an_empty_log_where_the_settings_require_a_key_says_it_has_no_first_row(
+def test_an_empty_log_where_the_settings_require_a_key_names_no_first_row(
     allow_empty: bool,
     shell: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Vault BACKLOG #3054, item 3. An EMPTY log has no first row, so nothing may say its first row
-    names no key. It gets the empty log's own warning and exit: 3, or 0 with --allow-empty. Nothing
-    was walked, and a key would check nothing more.
+    """Vault BACKLOG #3054, item 3. An EMPTY log has no first row, so the WARNING must not say its
+    first row names no key; it says the log is empty. The exit is still 4, --allow-empty or not:
+    this setup never reports a pass.
 
     The open refuses this state first, exit 2 (#1916): an empty log with no key and no opt-out is a
     keyless chain about to start. So the verify sees it only for a log emptied between the open and
@@ -603,10 +603,10 @@ def test_an_empty_log_where_the_settings_require_a_key_says_it_has_no_first_row(
     monkeypatch.setattr(store_base, "_refuse_to_start_a_keyless_chain", _no_refusal)
     rc = main(argv)
     captured = capsys.readouterr()
-    assert rc == (0 if allow_empty else 3), (captured.out, captured.err)
-    assert captured.out.startswith("OK: verified 0 audit row(s)"), captured.out
+    assert rc == 4, (captured.out, captured.err)
+    assert captured.out.startswith("NOT CHECKED: "), captured.out
     assert "first row" not in captured.out + captured.err, captured.err
-    assert "the audit log is empty" in captured.err, captured.err
+    assert "WARNING: the audit log is empty, so no row shows" in captured.err, captured.err
 
 
 def test_a_keyless_chain_under_the_opt_out_does_not_warn(
