@@ -411,7 +411,7 @@ class ResealResult:
 
     The counts use different units. ``resealed`` counts VALUES: each body or sidecar it rewrites
     adds one. ``skipped`` counts UPLOADS: a pair adds at most one, whichever half failed (BACKLOG
-    #2322). An unreadable body leaves its sidecar unread and unsealed, and that is still one upload."""
+    #2322)."""
 
     resealed: int = 0
     skipped: int = 0
@@ -1181,7 +1181,7 @@ class UploadStore:
                 skipped += 1
                 _log.warning("uploaded file %s: skipped, its id fails the path guard", fid)
                 continue
-            had_plaintext = False
+            had_plaintext = pair_skipped = False
             # The sidecar carries the AAD kind "meta"; the body carries "body" (see _encrypt_meta /
             # _encrypt_blob). Re-binding the SAME cell AAD is what keeps a re-sealed value readable.
             # Body FIRST, as save() writes it: the sidecar is the listing key, and a keyed store
@@ -1198,21 +1198,22 @@ class UploadStore:
                         if handle.read(len(active)) == active:
                             continue  # already under the active key in the active format
                     stored = path.read_text(encoding="utf-8")
-                    had_plaintext |= bool(stored) and not stored.startswith(MARKER_PREFIX)
                 except (OSError, UnicodeDecodeError) as exc:
                     # A half-deleted pair or an unreadable file. Counted and named, never silent:
                     # this file is still under the OLD key and the operator must not retire it yet.
-                    skipped += 1
+                    pair_skipped = True
                     _log.warning("uploaded file %s (%s): skipped, unreadable: %s", fid, kind, exc)
-                    if kind == "body" and isinstance(exc, FileNotFoundError):
-                        # A body that is GONE has nothing left to refuse, and no re-run brings it
-                        # back. Sealing its sidecar keeps the pair decryptable after the old key
-                        # goes, so `prune_expired` can still remove it at expiry.
-                        continue
-                    # A body that is present but unreadable ends the pair here, so its sidecar is
-                    # not sealed over a body this pass never sealed (BACKLOG #2322). The sidecar is
-                    # the last kind, so either way the pair counts once in `skipped`.
-                    break
+                    continue
+                plaintext = bool(stored) and not stored.startswith(MARKER_PREFIX)
+                if plaintext and pair_skipped:
+                    # BACKLOG #2322: the body was not sealed, so a PLAINTEXT sidecar stays as it is.
+                    # A keyed store refuses it, so the upload is unlisted; sealing it would list an
+                    # upload whose body is unusable, and would seal a planted lone sidecar too. A
+                    # sidecar under a retired key is listed already, so it is still re-sealed: left
+                    # behind, it would drop out of reach of prune_expired once that key goes.
+                    _log.warning("uploaded file %s (meta): left unsealed, its body was not", fid)
+                    continue
+                had_plaintext |= plaintext
                 aad = cell_aad("uploaded_file", kind, fid)
                 # A CipherError here means a prior key was not supplied. It PROPAGATES, before any
                 # write, so the operator is told to supply it rather than losing the file.
@@ -1222,7 +1223,10 @@ class UploadStore:
                 # one is read, roughly doubling peak memory for no reason.
                 del stored
                 resealed += 1
-            sealed_plaintext += had_plaintext
+            # Once per pair, whichever half failed. A skipped pair is not readable yet, so its
+            # sealed plaintext half did not turn it "from refused into readable".
+            skipped += pair_skipped
+            sealed_plaintext += had_plaintext and not pair_skipped
         if resealed or skipped:
             _log.info(
                 "re-sealed %d uploaded-file value(s) under the active key, sealing %d plaintext "

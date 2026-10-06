@@ -1077,9 +1077,10 @@ async def test_a_refused_plaintext_upload_answers_423_and_hides_it_from_non_owne
       holder gets the same 404 as an absent id, and the override holder gets 423 with the fix.
     * A refused BODY behind a readable sidecar reaches the owner as 423 on browse and on resend.
       A reseal that crashes part way does not leave that shape, because it seals the body first.
-      Nor does a reseal that SKIPS an unreadable body, which leaves the sidecar too (BACKLOG
-      #2322). A body swapped in behind a real sidecar still can. Not 409: resend already spends 409
-      on "inbound not running".
+      A reseal that SKIPS an unreadable body leaves a plaintext sidecar too (BACKLOG #2322), but
+      still re-seals one under a retired key, so dropping that key afterwards can. So can a body
+      swapped in behind a real sidecar. Not 409: resend already spends 409 on "inbound not
+      running".
     * No body names the file."""
     pytest.importorskip("psutil")
     from messagefoundry.api import create_app
