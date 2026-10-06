@@ -7965,9 +7965,9 @@ def _without_clears(plan: ReconcilePlan) -> ReconcilePlan:
 
     So where :func:`_is_sole_reconciler` sees another reconciler, a clear is missed instead. The
     trip and the hold still page, from each process that sees them, and an operator resolves the
-    instance by hand. That test does not see every reconciler on the store; the cases it misses
-    are stated once, in ``AuthService._mark_reconcile_clears``. Matched by field name, so a flag a
-    later item adds is covered without an edit here."""
+    instance by hand. That test does not see every reconciler on the store; the code names at
+    least the cases it misses in ``AuthService._mark_reconcile_clears``. Matched by field name, so
+    a flag a later item adds is covered without an edit here."""
     cleared: dict[str, Any] = {f.name: False for f in fields(plan) if f.name.endswith("_clear")}
     return replace(plan, **cleared)
 

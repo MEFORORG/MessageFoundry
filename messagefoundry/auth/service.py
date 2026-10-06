@@ -5320,14 +5320,15 @@ class AuthService:
 
         * Both need an answer on record, from this process, for every signed-in account the pass
           did not just revoke. A probe that could not reach the directory leaves none.
-        * The hold is clear when, on top of that, the pass did not hold, no answer it got is
-          undetermined, and at least one answer it got read the attribute (PRESENT or DISABLED, ADR
-          0195's readable answer, counted in ``plan.readable``). Both read THIS pass: an answer on
-          record from an earlier pass, or one that found no entry (ABSENT), says nothing about
-          whether the attribute is readable now. An account the pass just revoked counts too. A
-          lone undetermined answer revokes only because no hold engaged, and a restarted process
-          has lost the latch that may still have held it. The undetermined test does not rest on
-          this node's hysteresis latch, which another node on the store may not share.
+        * The hold is clear when, on top of that, the pass did not hold and three tests pass.
+          None of those answers is undetermined; this is the record, across the rotation. No
+          account the pass just revoked read undetermined either: a lone undetermined answer
+          revokes only because no hold engaged, and a restarted process has lost the latch that
+          may still have held it. And at least one probe of THIS pass read the attribute (PRESENT
+          or DISABLED, ADR 0195's readable answer, ``plan.readable``). An answer from an earlier
+          pass, or one that found no entry (ABSENT), says nothing about whether it is readable
+          now. The undetermined tests do not rest on this node's hysteresis latch, which another
+          node on the store may not share.
         * The breaker is clear when the pass was not aborted, none of those answers is undetermined,
           every one of those accounts carries no strike, and every account still signed in since
           the last trip has been read again by a pass that was not aborted, and was not held there.
@@ -5339,11 +5340,12 @@ class AuthService:
 
         ``users`` is this pass's candidate set, and a clear rests on reading every one of them.
 
-        **This is one process's evidence, and the instances are the store's.** On a ``[cluster]``
-        node, or in an engine that runs more than one engine shard, the lifespan task raises no
-        inverse; ``api/app.py::_without_clears`` says why. That gate does not see every reconciler
-        on the store. The cases it misses are stated once, in the next paragraph, and the other
-        sites point here.
+        **This is one process's evidence, and the instances are the store's.** Where
+        ``api/app.py::_is_sole_reconciler`` says another reconciler may run, at least on a
+        ``[cluster]`` node or in an engine that runs more than one engine shard, the lifespan task
+        raises no inverse; ``api/app.py::_without_clears`` says why. That gate does not see every
+        reconciler on the store. The code states what it misses here, in the next paragraph, and
+        the other code sites point here; ``docs/CONFIGURATION.md`` tells operators.
 
         **The usual cost is a missed clear, with one reconciler on the store.** An account that
         never answers keeps both instances open while it is signed in. So does a hold, for the
@@ -5355,7 +5357,10 @@ class AuthService:
         multi-shard engine on the same store. It cannot see the others, and ``serve`` records a
         second engine on one store as unguarded (the engine shard guard's comment in
         ``__main__.py``). And a pass judges only accounts that hold a session, so a trip or hold
-        whose accounts have all signed out, or reached the session cap, clears on the rest.
+        whose accounts have all left the candidate set clears on the rest. At least these take an
+        account out: it signs out or reaches the session cap, the reconciler revokes it, an
+        operator disables it locally, or its row is deleted. So a pass that revokes a lone
+        undetermined account releases no hold, and the next pass, which no longer sees it, can.
         """
         undetermined = reconcile.ProbeOutcome.UNDETERMINED
         revoked = {r.user_id for r in plan.revocations}
@@ -5365,8 +5370,8 @@ class AuthService:
         hold_clear = (
             settled
             and not plan.hold
+            and undetermined not in (self._reconcile_outcomes.get(uid) for uid in revoked)
             and plan.readable > 0
-            and undetermined not in plan.outcomes.values()
         )
         breaker_clear = (
             settled

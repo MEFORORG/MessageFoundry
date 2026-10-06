@@ -1219,8 +1219,8 @@ async def _marked(
 
 
 async def test_the_clear_predicate_control_reads_both_clear() -> None:
-    """The control for the four tests below: on these inputs both clears hold, so each red there is
-    the one clause that test changes."""
+    """The control for the ``_marked`` tests below: on these inputs both clears hold, so each red
+    there is the one clause that test changes."""
     plan = ReconcilePlan(probed=2, readable=2, outcomes={"a": PRESENT, "b": PRESENT})
     assert await _marked(plan, {"a": PRESENT, "b": PRESENT}) == (True, True)
 
@@ -1369,7 +1369,7 @@ class _PlanAuth:
 async def test_a_process_that_may_share_its_store_pages_but_resolves_nothing(
     sole: bool, expected: set[str]
 ) -> None:
-    """Finding 1. One node's clear rests on its own records and its own view of the directory,
+    """BACKLOG #2136. One node's clear rests on its own records and its own view of the directory,
     while the instance it would resolve is the store's. So a cluster node or an engine shard still
     pages a hold, and raises no inverse."""
     plan = ReconcilePlan(
