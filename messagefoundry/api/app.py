@@ -42,11 +42,11 @@ import shutil
 import time
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
-from typing import Annotated, Any, Literal, NoReturn, TypeVar
+from typing import Annotated, Any, Final, Literal, NoReturn, TypeVar
 from uuid import uuid4
 
 from fastapi import (
@@ -353,6 +353,7 @@ from messagefoundry.pipeline.alerts import (
 )
 from messagefoundry.pipeline.cert_expiry import MonitoredCert
 from messagefoundry.pipeline.cluster import (
+    ClusterCoordinator,
     StepdownLockTimeout,
     StepdownReleaseUnconfirmed,
     build_coordinator,
@@ -7983,7 +7984,14 @@ async def _session_reaper(
             _log.exception("session reaper: purge failed; will retry next interval")
 
 
-async def _directory_reconciler(auth: AuthService, interval: float, sink: AlertSink) -> None:
+async def _directory_reconciler(
+    auth: AuthService,
+    interval: float,
+    sink: AlertSink,
+    *,
+    sole_reconciler: bool,
+    alert_state: Store | None,
+) -> None:
     """Re-resolve directory principals holding live sessions, revoking those AD has disabled or
     deleted (ADR 0079 mechanism 2). Created only when AD is wired and
     ``[auth].ad_session_recheck_seconds`` is non-zero (it defaults to 300).
@@ -7995,12 +8003,29 @@ async def _directory_reconciler(auth: AuthService, interval: float, sink: AlertS
     Each finished pass is turned into alerts here, by :func:`_alert_reconcile_plan`. The alerting
     lives in this task and never in ``auth/``, which does not import the pipeline's sinks.
 
+    With ``sole_reconciler`` False no inverse is raised; :func:`_without_clears` says why, and
+    :func:`_is_sole_reconciler` decides it. ``alert_state`` is the store the sink records alert
+    instances in, or None where nothing records them; :func:`_without_inherited_clears` reads it.
+    Both are required, so a new caller has to decide them.
+
     A transient failure must not kill the loop for the process lifetime (that would silently disable
     the control until restart) — log and retry next interval, the session-reaper precedent."""
+    # BACKLOG #2136. The ids of the reconcile instances open before this process's first pass, read
+    # just before that pass. None until a read succeeds, and every clear is dropped until then. An
+    # instance a pass of this process opened while the read kept failing then counts as inherited:
+    # a missed clear, never a false one.
+    inherited: frozenset[int] | None = None if alert_state is not None else frozenset()
     while True:
         await asyncio.sleep(interval)
         try:
+            if inherited is None and alert_state is not None:
+                found = await _open_reconcile_instances(alert_state)
+                inherited = None if found is None else frozenset(found)
             plan = await auth.reconcile_directory_sessions()
+            if not sole_reconciler or inherited is None:
+                plan = _without_clears(plan)
+            elif alert_state is not None:
+                plan = await _without_inherited_clears(plan, alert_state, inherited)
             # Inside the try: a sink that breaks its never-raise contract must not kill the loop.
             _alert_reconcile_plan(plan, auth, sink)
         except asyncio.CancelledError:
@@ -8019,8 +8044,21 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     alert. A whole-directory outage aborts too, but it is audited as ``auth.ad_reconcile_skipped``
     and pages nothing: the accounts are fine, the directory is not, and the pass is fail-open.
 
-    Reads the RETURNED plan, so it sees only a pass that finished. A pass that raised part-way has
-    already audited the revocations it applied; those rows stand, and no alert is raised for them."""
+    Reads the RETURNED plan, so it sees only a pass that finished. A failed write of the pass's own
+    held, aborted, skipped or unkeyed-binding row no longer ends the pass (BACKLOG #2137): the
+    service logs it at ERROR and returns the plan, so these alerts still fire. A pass that raised
+    part-way for another reason, such as inside one revocation, has already audited the revocations
+    it applied before that point; those rows stand, and no alert is raised for them.
+
+    Each standing alert also gets its inverse, which pages nobody and resolves the open instance
+    (BACKLOG #2136): ``ad_reconcile_breaker_cleared`` and ``ad_reconcile_hold_released``. The auth
+    service decides when a pass is evidence of a clear (``plan.breaker_clear``, ``plan.hold_clear``;
+    see ``AuthService._mark_reconcile_clears``), so the alert and the service read one predicate.
+    An outage or a pass with no signed-in account sets neither. The inverse is raised on EVERY pass
+    that sets its flag, not once per clear: resolving is an idempotent update, and a resolve the
+    notifier failed to write is retried that way. A process clears only what it watched open, so a
+    fresh process resolves neither alert an earlier run left open (:func:`_without_inherited_clears`
+    drops that clear); ``_mark_reconcile_clears`` states that rule once."""
     if plan.directory_outage:
         return
     if plan.aborted is not None:
@@ -8036,14 +8074,122 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
         for revocation in plan.revocations:
             sink.ad_session_revoked(revocation.username, reason=revocation.reason)
     if plan.hold:
-        # LAST, matching the auth service's order: a sink that raises here cannot suppress the
-        # breaker's or a revocation's alert for the same pass.
+        # After the breaker and the revocations, matching the auth service's order: a sink that
+        # raises here cannot suppress the breaker's or a revocation's alert for the same pass.
         sink.ad_reconcile_held(
             "directory-reconciler",
             reason=HOLD_REASON,
             undetermined=plan.undetermined,
             detail=auth.directory_reconcile_hold or HOLD_REASON,
         )
+    # The inverses LAST: they page nobody, so a sink raising on one cannot cost a page above.
+    if plan.breaker_clear:
+        sink.ad_reconcile_breaker_cleared("directory-reconciler")
+    if plan.hold_clear:
+        sink.ad_reconcile_hold_released("directory-reconciler")
+
+
+def _without_clears(plan: ReconcilePlan) -> ReconcilePlan:
+    """The plan with every ``*_clear`` flag set False, so it resolves no alert instance.
+
+    BACKLOG #2136. The evidence for a clear is this process's
+    own: its strike and outcome records, and its own view of the directory. The instance it would
+    resolve is shared by every process on the store. Where more than one reconciler runs, one
+    process can read clean while another's condition still stands, and resolving on that would
+    clear a breaker or a hold that is still in force. There is no shared state to decide it from:
+    the strike and outcome records are process-local by design, and the instance row carries no
+    node. A leader gate does not reach it either. An engine shard runs no ``[cluster]`` lease, so
+    each one reads as leader, and a ``[cluster]`` standby still runs its own reconciler and can
+    open the instance a leader would then clear.
+
+    So where :func:`_is_sole_reconciler` sees another reconciler, a clear is missed instead. The
+    trip and the hold still page, from each process that sees them, and an operator resolves the
+    instance by hand. That test does not see every reconciler on the store; the code names at
+    least the cases it misses in ``AuthService._mark_reconcile_clears``. Matched by field name, so
+    a flag a later item adds is covered without an edit here."""
+    cleared: dict[str, Any] = {f.name: False for f in fields(plan) if f.name.endswith("_clear")}
+    return replace(plan, **cleared)
+
+
+#: Each ``*_clear`` flag on a plan, and the alert instance its inverse resolves (BACKLOG #2136).
+_RECONCILE_CLEAR_RESOLVES: Final[Mapping[str, str]] = {
+    "breaker_clear": "ad_reconcile_aborted",
+    "hold_clear": "ad_reconcile_held",
+}
+
+
+async def _open_reconcile_instances(store: Store) -> dict[int, str] | None:
+    """``id -> event_type`` of the open or acknowledged reconcile alert instances, or None when the
+    read failed, which is logged.
+
+    Catches ``Exception``, on purpose and only around this one read. Its failures are no closed
+    family: each backend's driver errors, the engine's own ``RuntimeError``, aiosqlite's
+    ``ValueError`` on a closed connection, and a cipher error opening a stored ``reason``. One
+    that escaped would cost the pass's pages, or the whole pass, through the loop's own catch. Any
+    failure here only drops a clear, which is a missed clear, never a false one."""
+    try:
+        rows = await store.list_active_alert_instances(allowed_channels=["directory-reconciler"])
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        _log.warning(
+            "directory reconcile: alert state could not be read (%s), so this pass resolves no "
+            "reconcile alert",
+            type(exc).__name__,
+        )
+        return None
+    resolvable = set(_RECONCILE_CLEAR_RESOLVES.values())
+    return {row.id: row.event_type for row in rows if row.event_type in resolvable}
+
+
+async def _without_inherited_clears(
+    plan: ReconcilePlan,
+    store: Store,
+    inherited: frozenset[int],
+) -> ReconcilePlan:
+    """The plan with each clear dropped whose instance this process did not watch open (BACKLOG
+    #2136).
+
+    ``inherited`` holds the instances already open before this process's first pass. Each alert has
+    one instance row, so a trip or a hold of this process's own folds into an earlier run's open
+    row, and the auth service's evidence covers only the accounts this process saw. The earlier
+    run's accounts may have left across the restart. So while an inherited row is still open, its
+    clear is dropped and an operator resolves it. Once an operator has, the next trip or hold opens
+    a new row, and that one is this process's own. ``AuthService._mark_reconcile_clears`` states
+    the rule this keeps. A flag this map does not name is dropped too, and so is every flag when
+    the read fails: a missed clear, never a false one."""
+    named = set(_RECONCILE_CLEAR_RESOLVES)
+    flags = {f.name: getattr(plan, f.name) for f in fields(plan) if f.name.endswith("_clear")}
+    if not any(flags.values()):
+        return plan
+    now_open = await _open_reconcile_instances(store)
+    if now_open is None:
+        return _without_clears(plan)
+    stale = {event for row_id, event in now_open.items() if row_id in inherited}
+    kept: dict[str, Any] = {
+        flag: value and flag in named and _RECONCILE_CLEAR_RESOLVES[flag] not in stale
+        for flag, value in flags.items()
+    }
+    return replace(plan, **kept)
+
+
+def _is_sole_reconciler(
+    coordinator: ClusterCoordinator,
+    registry_filter: object | None,
+    runner: RegistryRunner | None,
+) -> bool:
+    """Whether this process can be the only directory reconciler on its store (BACKLOG #2136).
+
+    Not on a ``[cluster]`` node. A ``serve --shard`` process, which passes a registry filter, is
+    alone only when its loaded graph pins no shard universe: ``all_shard_ids`` is set when the
+    config names two or more shards, and a reload cannot change it (ADR 0073). So ``supervise``
+    over an untagged config, which runs one ``--shard`` child, still resolves. A shard with no
+    graph loaded is not presumed alone."""
+    if coordinator.is_clustered():
+        return False
+    if registry_filter is None:
+        return True
+    return runner is not None and runner.registry.all_shard_ids is None
 
 
 _INITIAL_CREDENTIAL_MAX_LEAD = 24 * 3600.0  # warn at most this long before the deadline
@@ -8895,6 +9041,12 @@ def create_managed_app(
                             auth,
                             auth_settings.ad_session_recheck_seconds,
                             notifier or LoggingAlertSink(),
+                            # BACKLOG #2136. After engine.start(), so the graph is loaded.
+                            sole_reconciler=_is_sole_reconciler(
+                                coordinator, registry_filter, engine.registry_runner
+                            ),
+                            # The store the notifier records instances in; none without one.
+                            alert_state=store if notifier is not None else None,
                         )
                     )
             yield

@@ -3278,8 +3278,8 @@ the pass will not enforce, which is not benign. **The cost:** a directory
 disable or demotion no longer ends that row's sessions within one interval, only at their expiry.
 Removing the binding (`DELETE /users/{user_id}/federated-identity`) returns the row to the pass.
 
-Four safety properties, because the lookup still returns one indistinguishable "not found" for
-*deleted*, *moved out of the search base* and *the search base was never right*:
+The pass has these safety properties, because the lookup still returns one indistinguishable "not
+found" for *deleted*, *moved out of the search base* and *the search base was never right*:
 
 - **Fail-OPEN.** An unreachable domain controller revokes **nothing** and does not even accrue a strike.
   A fail-closed re-check would turn a directory blip into a total console outage during exactly the
@@ -3292,8 +3292,13 @@ Four safety properties, because the lookup still returns one indistinguishable "
   attribute on another account. Otherwise it holds every undetermined account: no revocation, strike
   count reset to 0. The rest of the estate is reconciled as usual. Each pass that holds audits
   `auth.ad_reconcile_held` and raises the `ad_reconcile_held` alert. Once more than one has been seen, the hold stays until no
-  signed-in account reads undetermined, so attrition cannot release the last one. Held accounts are left out of the population the breaker
-  below judges, and a pass it aborts still writes the held row. The rule is fixed, with no setting
+  signed-in account reads undetermined. So within one engine process, attrition cannot release the
+  last one. The hold's latch does not survive a restart, though. If sessions end until one held
+  account is left, and the engine then restarts, the restarted engine knows only that one. It
+  treats it as a lone undetermined account. So when a pass also reads the attribute on another
+  account, the engine strikes the formerly held account. It revokes that account once its strikes
+  reach `ad_session_recheck_strikes` (2 at the default). Held accounts are left out of
+  the population the breaker below judges, and a pass it aborts still writes the held row. The rule is fixed, with no setting
   and no floor. **The cost:**
   two genuinely disabled accounts whose attribute the bind account cannot read keep their sessions to
   the absolute cap.
@@ -3306,6 +3311,9 @@ Four safety properties, because the lookup still returns one indistinguishable "
   raises no alert. Both thresholds
   must be exceeded — the floor alone would sign out a five-person site, the proportion alone would fire
   on a genuine 3-of-3 offboarding — so it trips only on a change that is simultaneously large and broad.
+
+When the hold's and the breaker's alerts resolve themselves, and where they never do, is stated
+once, in [CONFIGURATION.md](CONFIGURATION.md#when-the-reconcilers-two-alerts-resolve-themselves).
 
 Revocation is therefore bounded by *interval × strikes* (10 minutes at the recommended 300 s), not
 immediate, and one LDAP bind per signed-in directory user per pass is the cost —

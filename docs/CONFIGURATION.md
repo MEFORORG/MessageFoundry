@@ -712,6 +712,49 @@ document ([SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md)).
 > console Users page), not in this file. Federated logins reuse the **same** AD-group→role mapping —
 > the role source is on-prem AD, never a token claim ([ADR 0142](adr/0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md)).
 
+#### When the reconciler's two alerts resolve themselves
+
+The session reconciler's `ad_reconcile_aborted` (the breaker) and `ad_reconcile_held` (the hold)
+alerts resolve on their own when a pass is evidence the condition has gone (BACKLOG #2136). This
+needs alert state ([ADR 0044](adr/0044-operator-alert-state.md)). The pass must have an answer, from
+this engine process, for every signed-in directory account it did not just revoke.
+
+**An engine process resolves only an alert it watched open.** It resolves the breaker only after a
+pass of its own tripped, and the hold only after a pass of its own held. It never resolves an
+alert that was already open when it started, even after it trips or holds itself. A restart
+forgets which accounts were behind a trip or a hold, and it cannot see the accounts that sign out
+while the engine is down. So an operator resolves an alert the last run left open. After that, the
+engine resolves the next trip or hold on its own.
+
+- The hold resolves when no answer is undetermined and this pass read `userAccountControl` at
+  least once. An account the pass just revoked still counts as an answer here.
+- An engine can also give up resolving the hold. That happens when an account whose last answer
+  was undetermined leaves, unless the engine has released a hold and has not held since. The
+  reconciler may revoke it, or its sessions may end some other way. The engine then resolves no
+  hold until its next restart.
+- The breaker resolves when the pass did not abort, no answer is undetermined, no account carries a
+  strike, and every account signed in at the last trip that is still signed in has read clean.
+  So the breaker's alert stays open while a hold stands.
+- An engine gives up resolving the breaker when an account signed in at the last trip leaves before
+  it reads clean. Reading clean means a pass that did not abort found the account present and
+  enabled. A held read, or one that adds a strike, does not count. The reconciler revoking the
+  account counts as leaving. The engine then resolves no trip until its
+  next restart. The engine logs a warning when it gives up either resolve.
+
+A pass judges only accounts that hold a session, and nothing reads an account again once it has
+left. An account leaves at least when it signs out, reaches the session cap, is revoked by the
+reconciler, is disabled locally, or is deleted. The two give-up rules above stop an alert resolving
+on the accounts that remain. The cost is a missed resolve when an account leaves for an ordinary
+reason, such as a sign-out, while the evidence is still pending.
+
+**They never resolve themselves on a `[cluster]` node or in an engine that runs more than one engine
+shard.** Another engine's reconciler may still hold the condition there, so an operator resolves the
+alert. A directory outage, a pass with nobody signed in, an account that never answers, and
+`ad_session_recheck_seconds = 0` resolve nothing either.
+
+At least one case can still resolve falsely. An engine that declares neither `[cluster]` nor more
+than one engine shard trusts its own evidence, whatever else shares its store.
+
 ### `[ai]` — AI coding assistance policy
 Implemented (see [AI.md](AI.md)). Controls the IDE AI assistant across the **OFF→PHI-safe** range;
 the policy is centrally governed and **posture-clamped**. `mode`/`data_scope` plus the active

@@ -4331,9 +4331,10 @@ _ALERT_EVENT_TYPES = frozenset(
         # recorded one. Keyed `config:<12 hex>`, which no connection can be named, so it is not in
         # _ALERT_CONTROL_EVENT_TYPES below.
         "config_changed",
-        # NOTE: the INVERSE events (leadership_lost / dr_released / intake_resumed) are
-        # auto-resolve-only (alert_sinks _AUTO_RESOLVE), NOT rule-targetable alert types -- a
-        # step-down, a fail-back or a resumed intake needs no page.
+        # NOTE: the INVERSE events (leadership_lost / dr_released / intake_resumed /
+        # ad_reconcile_breaker_cleared / ad_reconcile_hold_released) are auto-resolve-only
+        # (alert_sinks _AUTO_RESOLVE), NOT rule-targetable alert types -- a step-down, a fail-back,
+        # a resumed intake or a cleared reconcile alert needs no page.
     }
 )
 #: The transport names a rule may route to; mirror ``AlertTransport.name``.

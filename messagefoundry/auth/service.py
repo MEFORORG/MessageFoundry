@@ -20,6 +20,7 @@ import logging
 import math
 import os
 import secrets
+import sqlite3
 import time
 import unicodedata
 import urllib.request
@@ -28,6 +29,7 @@ from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from enum import Enum
+from functools import cache
 from types import MappingProxyType
 from typing import Any, Final, Literal, TypeVar
 from uuid import uuid4
@@ -111,7 +113,7 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.credential import constant_time_equal
-from messagefoundry.store.base import AdminStore
+from messagefoundry.store.base import AdminStore, store_driver_errors
 from messagefoundry.store.crypto import MARKER_PREFIX, CipherError
 from messagefoundry.store.store import (
     SCOPE_SOURCE_AD,
@@ -140,6 +142,32 @@ _log = logging.getLogger(__name__)
 _FACTOR_CEREMONIES: Final = frozenset(
     {"mfa_enroll_confirm", "mfa_verify", "webauthn_enroll", "webauthn_assert"}
 )
+
+
+@cache
+def _audit_write_errors() -> tuple[type[Exception], ...]:
+    """What a refused audit write raises, at least on the store backends and key modes named here
+    (BACKLOG #2137).
+
+    The drivers' own errors, plus the two that :func:`~messagefoundry.store.base.store_driver_errors`
+    asks a caller to add: ``RuntimeError`` for the engine's own refusals (the acquire timeout, a
+    keyless audit append) and ``OSError`` for a connection lost at the socket. And ``CipherError``,
+    which a ``vault_transit`` store raises when Transit cannot compute the audit-chain MAC (ADR
+    0138). Built on first use, because naming a server driver imports it; an ``AuthService`` that
+    runs the reconciler builds it at construction, so that import never runs on the event loop in
+    the middle of a store incident."""
+    return (RuntimeError, OSError, CipherError, *store_driver_errors())
+
+
+#: The classes inside :func:`_audit_write_errors` that a reconciler audit write raises rather than
+#: passes over (BACKLOG #2137). ``RuntimeError`` has to stay in that catch,
+#: because the store raises it for its own refusals; ``NotImplementedError`` and ``RecursionError``
+#: are its subclasses that never mean one. ``sqlite3.ProgrammingError`` is a bad statement or bind:
+#: the SQLite store reaches sqlite3 through aiosqlite, which refuses a closed connection with its
+#: own ``ValueError`` first. pyodbc's ``ProgrammingError`` stays caught, because pyodbc raises it
+#: for a closed connection too, and raising that would cost the pass's alerts, the harm BACKLOG
+#: #2137 removed.
+_AUDIT_WRITE_DEFECTS: Final = (NotImplementedError, RecursionError, sqlite3.ProgrammingError)
 
 
 def _warn_if_corpus_unreadable(path: str | None) -> None:
@@ -296,6 +324,13 @@ def _host_key(address: str) -> str:
 #: the one row that says the session's cap is now reached, or write nothing because the address is a
 #: repeat or the cap was already reached.
 _NewIpFlag = Literal["audit", "audit_cap_reached", "repeat", "over_cap"]
+#: `AuthService._reconcile_hold_standing`: whether this process may resolve a hold (BACKLOG #2136).
+_HoldStanding = Literal["fresh", "held", "forfeit", "settled"]
+#: The standings under which a pass may resolve the durable hold instance.
+_HOLD_RELEASABLE: Final[frozenset[_HoldStanding]] = frozenset({"held", "settled"})
+#: `AuthService._reconcile_breaker_standing`: whether this process may resolve a trip (BACKLOG
+#: #2136). Only ``"tripped"`` may.
+_BreakerStanding = Literal["fresh", "tripped", "forfeit"]
 
 
 # Bounds on the per-session re-proof failure counts (BACKLOG #1138). A count is NEVER evicted while
@@ -2075,6 +2110,17 @@ class AuthService:
         self._reconcile_last_probed: dict[str, float] = {}
         #: Latched mass-revoke circuit-breaker trip, cleared by the next clean pass.
         self._reconcile_alert: str | None = None
+        #: user_ids a breaker trip has not yet seen read PRESENT on a pass that was not aborted
+        #: (BACKLOG #2136). `_mark_reconcile_clears` reports no breaker clear while one is signed in.
+        self._reconcile_unconfirmed: set[str] = set()
+        #: Whether THIS process may resolve the durable ``ad_reconcile_aborted`` instance (BACKLOG
+        #: #2136), on the rule `_mark_reconcile_clears` states for both alerts: a process clears
+        #: only what it watched open. ``"fresh"``: no pass here has tripped, so it resolves no
+        #: trip, whatever an earlier run left open. ``"tripped"``: a pass here tripped, so a clear
+        #: it then sees is of a trip it watched. ``"forfeit"``: an account signed in at a trip left
+        #: before a pass here read it clean (`_forfeit_clears_on_attrition`), so it resolves no
+        #: trip until it restarts. Only `_advance_breaker_standing` moves it.
+        self._reconcile_breaker_standing: _BreakerStanding = "fresh"
         #: user_id -> the outcome of that candidate's latest probe that reached the directory (ADR
         #: 0195 rule item 3). The undetermined-wave hold counts UNDETERMINED entries here across the
         #: probe rotation, so two unreadable accounts sampled on different passes are still two.
@@ -2088,9 +2134,29 @@ class AuthService:
         #: message above: it is released as soon as the pruned outcome record holds no UNDETERMINED
         #: entry, including on a pass with no candidates, where the message deliberately stays.
         self._reconcile_hold_latched = False
+        #: Whether THIS process may resolve the durable ``ad_reconcile_held`` instance (BACKLOG
+        #: #2136). The instance outlives the process and the latch does not, so a fresh process
+        #: cannot tell whether an earlier run's latch was still holding an account.
+        #: ``"fresh"``: no pass here has held, so it resolves no hold. ``"held"``: a pass here held,
+        #: so a release it then sees is its own. ``"forfeit"``: an undetermined account left the
+        #: candidate set before a release, by revocation or otherwise, and nothing re-reads it, so
+        #: it resolves no hold until it restarts. ``"settled"``: a pass here found the hold gone
+        #: with an answer from this process on record for every signed-in account, so its records
+        #: now cover what an earlier run held, and no pass here has held since. Only
+        #: `_advance_hold_standing` moves it.
+        self._reconcile_hold_standing: _HoldStanding = "fresh"
         #: user_ids of bound id-less rows the reconciler has already reported as skipped (BACKLOG
         #: #2027), so each is logged and audited once per process rather than once per pass.
         self._reconcile_unkeyed_reported: set[str] = set()
+        #: user_ids whose skip report the store refused, in the order of their latest refusal, oldest
+        #: first: a dict used as an ordered set (BACKLOG #2137). Refused accounts go last, the
+        #: longest-refused first, so a row the store keeps refusing starves neither the reports
+        #: behind it nor another refused row.
+        self._reconcile_unkeyed_refused: dict[str, None] = {}
+        if self.directory_reconcile_enabled:
+            # Built now, at startup, so a reconciler's first refused audit write does not import
+            # the server drivers on the event loop (see `_audit_write_errors`).
+            _audit_write_errors()
         # Advisory, NON-STICKY federated-IdP health (ADR 0142 AC-8) — see the oidc_available docstring.
         self._oidc_unavailable_reason: str | None = None
         self._oidc_client_auth: oidc.ClientAuthentication | None = None
@@ -5208,6 +5274,9 @@ class AuthService:
                 continue
             candidates.append((user.id, user.username))
             users[user.id] = user
+        # Before the prunes, which drop the outcomes it reads. And before the no-candidate return
+        # below, so a pass with nobody signed in still records who left.
+        self._forfeit_clears_on_attrition(users)
         reconcile.prune_ledger(self._reconcile_strikes, users, rank=float)
         reconcile.prune_ledger(self._reconcile_last_probed, users, rank=float)
         reconcile.prune_ledger(self._reconcile_outcomes, users, rank=reconcile.outcome_rank)
@@ -5287,12 +5356,32 @@ class AuthService:
         self._reconcile_strikes.update(plan.strikes)
         self._reconcile_outcomes.update(plan.outcomes)
         self._reconcile_hold_latched = plan.latched
+        if plan.hold:
+            self._advance_hold_standing("held")
+        # BACKLOG #2136. A trip makes every candidate unconfirmed until a pass that is not aborted
+        # reads it clean, PRESENT, so a probe sample that missed the accounts behind the trip is no
+        # clear. Only PRESENT confirms. A held account's probe judged neither its roles nor its
+        # scope, and its strike went back to 0. An ABSENT, DISABLED or lone undetermined read is a
+        # strike, and the strike ledger forgets it once the account leaves. So each of those stays
+        # unconfirmed, and its leaving forfeits the clear. An account that left has already been
+        # dropped from the set (`_forfeit_clears_on_attrition`). Kept as it stood before this pass,
+        # for the revocation loop below.
+        unconfirmed = frozenset(self._reconcile_unconfirmed)
+        if plan.aborted is None:
+            present = reconcile.ProbeOutcome.PRESENT
+            self._reconcile_unconfirmed.difference_update(
+                uid for uid, outcome in plan.outcomes.items() if outcome is present
+            )
+        elif not plan.directory_outage:
+            self._reconcile_unconfirmed = set(users)
+            self._advance_breaker_standing("tripped")
         if plan.aborted is not None:
             await self._abort_reconcile_pass(plan)
             if not plan.directory_outage:
                 # A held pass writes its own row even when the breaker also aborts it (ADR 0195 rule
                 # item 9). An outage judged nothing, so it leaves the hold's message alone.
                 await self._record_reconcile_hold(plan)
+                plan = self._mark_reconcile_clears(plan, users)
             await self._report_unkeyed_bindings(unkeyed, still_unkeyed=still_unkeyed)
             return plan
 
@@ -5306,6 +5395,17 @@ class AuthService:
             )
         applied: list[reconcile.SessionRevocation] = []
         for revocation in plan.revocations:
+            if (
+                self._reconcile_outcomes.get(revocation.user_id)
+                is reconcile.ProbeOutcome.UNDETERMINED
+            ):
+                # BEFORE the sessions go, so a pass that raises part-way cannot lose it (BACKLOG
+                # #2136): the next pass no longer sees this account.
+                self._advance_hold_standing("forfeit")
+            if revocation.user_id in unconfirmed:
+                # The same, for the breaker. The account was signed in at the trip and has not read
+                # clean since. It is about to leave, so nothing will read it clean again.
+                self._advance_breaker_standing("forfeit")
             if await self._apply_reconcile_revocation(revocation):
                 applied.append(revocation)
         for refresh in plan.renames:
@@ -5325,14 +5425,197 @@ class AuthService:
                 held=await self._store.get_user_by_username(refresh.new_username),
             )
         # ADR 0195. After the revocations, so a held-row audit write that fails cannot stop a
-        # genuine disable or demotion in the same pass from being applied.
+        # genuine disable or demotion in the same pass from being applied. And that failure is
+        # logged rather than raised (BACKLOG #2137), so the pass still returns its plan and the
+        # lifespan task still raises an alert for each revocation above and for the hold.
         await self._record_reconcile_hold(plan)
         # BACKLOG #2027. Reported LAST, on every exit, so an audit write that keeps failing costs
-        # only this report and never stops the probes and revocations above from running.
+        # only this report and never stops the probes and revocations above from running. A
+        # failed write is logged, not raised (BACKLOG #2137), for the same reason as the hold's.
         await self._report_unkeyed_bindings(unkeyed, still_unkeyed=still_unkeyed)
         # What the pass DID, which is what the caller alerts on: a scope revocation skipped at apply
-        # time (ADR 0198) was audited as nothing, so it must page as nothing too.
-        return replace(plan, revocations=tuple(applied))
+        # time (ADR 0198) was audited as nothing, so it must page as nothing too. Marked after that,
+        # so the account a skipped revocation left signed in still counts toward the evidence.
+        return self._mark_reconcile_clears(replace(plan, revocations=tuple(applied)), users)
+
+    def _mark_reconcile_clears(
+        self, plan: reconcile.ReconcilePlan, users: Mapping[str, UserRecord]
+    ) -> reconcile.ReconcilePlan:
+        """Say on the plan whether this pass is EVIDENCE that each standing condition has cleared.
+
+        BACKLOG #2136. The lifespan task resolves the durable ``ad_reconcile_aborted`` and
+        ``ad_reconcile_held`` alert instances on these, on every pass that sets them. Those
+        instances outlive the process, and the strike and outcome records and the hold's latch
+        here do not. So "not aborted" or "not held" is not enough: after a restart, or before the
+        probe budget has reached every account, a pass can read clear while the condition stands.
+
+        **The rule for both alerts, and the one statement of it: a process clears only what it
+        watched open.** A restart forgets which accounts were behind a trip or a hold, and an
+        account that leaves across it is not seen to leave. Two layers keep the rule.
+
+        * Here: a pass marks a trip clear only after a pass of this process tripped, and a hold
+          clear only after one held (``_reconcile_breaker_standing``,
+          ``_reconcile_hold_standing``), and then only on a pass that passes the tests below.
+        * In the lifespan task: ``api/app.py::_without_inherited_clears`` drops a clear while the
+          instance it would resolve is one that was already open when the task first read alert
+          state. Each alert has one instance row, so a trip or hold of this process's own folds
+          into an earlier run's open instance, and resolving that would rest on accounts the
+          earlier run saw and this process never did.
+
+        So a fresh process never resolves an instance an earlier run left open, however clean its
+        estate reads, and that instance stays open for an operator. Within one process, an account
+        behind either alert that leaves before it reads clean forfeits that clear until a restart
+        (`_forfeit_clears_on_attrition`).
+
+        * Both need an answer on record, from this process, for every signed-in account the pass
+          did not just revoke. A probe that could not reach the directory leaves none.
+        * The hold is clear when, on top of that, the pass did not hold and these tests pass.
+          None of those answers is undetermined; this is the record, across the rotation. No
+          account the pass just revoked read undetermined either. At least one probe of THIS pass
+          read the attribute (PRESENT or DISABLED, ADR 0195's readable answer, ``plan.readable``):
+          an answer from an earlier pass, or one that found no entry (ABSENT), says nothing about
+          whether it is readable now. And ``_reconcile_hold_standing`` is ``"held"`` or
+          ``"settled"``: a pass here held, and has not forfeited.
+        * A restart also loses the hysteresis latch. A lone undetermined account beside readable
+          ones revokes only because no hold engaged, and an earlier run's latch may still have
+          held it. Revoking an undetermined account first forfeits the release until a restart,
+          because nothing re-reads the account. The forfeit is recorded before the sessions go, so
+          a pass that raises part-way keeps it. Leaving any other way forfeits on the same rule
+          (`_forfeit_clears_on_attrition`). Once a pass here has found the hold gone
+          (``"settled"``), every signed-in account had an answer from this process. Its latch then
+          covers what an earlier run held, and a later lone revocation is ADR 0195's own, until a
+          pass here holds again.
+        * The breaker is clear when the pass was not aborted, none of those answers is undetermined,
+          every one of those accounts carries no strike, and every account still signed in since
+          the last trip has read PRESENT on a pass that was not aborted.
+          A pending strike is a revocation the breaker has not judged yet, so it says nothing
+          either way. A held account's probe judged neither its roles nor its scope, and a trip
+          on role or scope changes leaves no strike, so a probe sample that missed or held the
+          accounts behind a trip proves nothing. And ``_reconcile_breaker_standing`` is
+          ``"tripped"``: a pass here tripped, and has not forfeited.
+
+        ``users`` is this pass's candidate set, and a clear rests on reading every one of them.
+
+        **This is one process's evidence, and the instances are the store's.** Where
+        ``api/app.py::_is_sole_reconciler`` says another reconciler may run, at least on a
+        ``[cluster]`` node or in an engine that runs more than one engine shard, the lifespan task
+        raises no inverse; ``api/app.py::_without_clears`` says why. That gate does not see every
+        reconciler on the store. The code states what it misses here, in the next paragraph, and
+        the other code sites point here; ``docs/CONFIGURATION.md`` tells operators.
+
+        **The usual cost is a missed clear, with one reconciler on the store.** An account that
+        never answers keeps both instances open while it is signed in. So does a hold, for the
+        breaker's instance. So does a reconciler that is switched off, and so does every cluster
+        or multi-shard engine. A fresh process keeps both instances an earlier run left open, and
+        a forfeited one keeps the instance it forfeited (`_forfeit_clears_on_attrition` says
+        when). An operator resolves those by hand. **At least this case can still clear
+        falsely.** Any engine that declares neither ``[cluster]`` nor more than one shard clears
+        on its own evidence, whatever else shares its store: two plain ``serve`` processes, two
+        one-shard ``supervise`` fleets, or a plain engine beside a cluster node or a multi-shard
+        engine on the same store. It cannot see the others, and ``serve`` records a second engine
+        on one store as unguarded (the engine shard guard's comment in ``__main__.py``).
+        """
+        undetermined = reconcile.ProbeOutcome.UNDETERMINED
+        revoked = {r.user_id for r in plan.revocations}
+        revoked_undetermined = undetermined in (self._reconcile_outcomes.get(u) for u in revoked)
+        ids = [uid for uid in users if uid not in revoked]
+        outcomes = [self._reconcile_outcomes.get(uid) for uid in ids]
+        settled = bool(ids) and None not in outcomes and undetermined not in outcomes
+        hold_clear = (
+            settled
+            and not plan.hold
+            and not revoked_undetermined
+            and plan.readable > 0
+            and self._reconcile_hold_standing in _HOLD_RELEASABLE
+        )
+        if hold_clear:
+            self._advance_hold_standing("settled")
+        breaker_clear = (
+            settled
+            and plan.aborted is None
+            and self._reconcile_breaker_standing == "tripped"
+            and all(self._reconcile_strikes.get(uid, 0) == 0 for uid in ids)
+            and self._reconcile_unconfirmed.isdisjoint(ids)
+        )
+        return replace(plan, breaker_clear=breaker_clear, hold_clear=hold_clear)
+
+    def _forfeit_clears_on_attrition(self, users: Mapping[str, UserRecord]) -> None:
+        """Give up a clear when an account behind it leaves the candidate set (BACKLOG #2136).
+
+        **The one statement of the attrition forfeit; the other sites point here.** A pass judges
+        only accounts that hold a session, and nothing reads one again once it has left. So when
+        the accounts behind a trip or a hold leave, the next pass would read clear on the rest
+        while the fault stands. Every account a wrong search base strikes is one that cannot sign
+        back in, so its sessions only drain. This turns that false clear into a missed one.
+
+        * An account a trip left unconfirmed forfeits the breaker's clear until a restart. The
+          reconciler revoking such an account forfeits it too, in the pass's revocation loop, before
+          its sessions go.
+        * An account whose last answer was undetermined forfeits the hold's release, on the same
+          rule as revoking one: unless this process has settled and has not held since.
+
+        At least these take an account out: it signs out or reaches the session cap, the reconciler
+        revokes it, an operator disables it locally, or its row is deleted. The cost is a missed
+        clear when an account leaves for an ordinary reason while the evidence is pending. A trip
+        marks every candidate unconfirmed, healthy ones too, so a sign-out during a long trip
+        forfeits its clear. This is one process's memory: what leaves across a restart is not seen
+        here. The rule in `_mark_reconcile_clears` covers that case, because a fresh process
+        resolves nothing an earlier run left open.
+        """
+        if not self._reconcile_unconfirmed <= users.keys():
+            self._advance_breaker_standing("forfeit")
+        self._reconcile_unconfirmed.intersection_update(users)
+        undetermined = reconcile.ProbeOutcome.UNDETERMINED
+        if any(
+            outcome is undetermined
+            for user_id, outcome in self._reconcile_outcomes.items()
+            if user_id not in users
+        ):
+            self._advance_hold_standing("forfeit")
+
+    def _advance_breaker_standing(self, event: _BreakerStanding) -> None:
+        """Move ``_reconcile_breaker_standing`` on ``event`` (BACKLOG #2136), the only place it moves.
+
+        ``"tripped"``: a pass here tripped, so this process watched a trip open. It moves a fresh
+        process to ``"tripped"``. ``"forfeit"``: an account signed in at a trip is about to be
+        revoked, or has left, before a pass read it clean; see
+        :meth:`_forfeit_clears_on_attrition`. ``"forfeit"`` is never left. The warning is said
+        aloud because the in-process breaker message still clears on the next pass that is not
+        aborted, while the durable instance stays open for an operator.
+        """
+        current = self._reconcile_breaker_standing
+        if event == "tripped" and current == "fresh":
+            self._reconcile_breaker_standing = "tripped"
+        elif event == "forfeit" and current != "forfeit":
+            self._reconcile_breaker_standing = "forfeit"
+            _log.warning(
+                "directory reconcile: an account signed in at the last breaker trip left before a "
+                "pass read it clean, so this process will not resolve ad_reconcile_aborted itself "
+                "until it restarts; an operator resolves it once the directory reads clean"
+            )
+
+    def _advance_hold_standing(self, event: _HoldStanding) -> None:
+        """Move ``_reconcile_hold_standing`` on ``event`` (BACKLOG #2136), the only place it moves.
+
+        ``"held"``: a pass here held. That moves a fresh process to ``"held"``, and a settled one
+        back to it, because this hold's accounts can still leave before it releases.
+        ``"forfeit"``: an undetermined account is about to be revoked, or has left; see
+        :meth:`_forfeit_clears_on_attrition`. It forfeits unless this process has settled.
+        ``"settled"``: a pass here found the hold gone. ``"forfeit"`` is never left.
+        """
+        current = self._reconcile_hold_standing
+        if event == "held" and current in ("fresh", "settled"):
+            self._reconcile_hold_standing = "held"
+        elif event == "forfeit" and current not in ("settled", "forfeit"):
+            self._reconcile_hold_standing = "forfeit"
+            _log.warning(
+                "directory reconcile: an account whose userAccountControl read undetermined left "
+                "before this process released a hold, so it will not resolve ad_reconcile_held "
+                "itself "
+                "until it restarts; an operator resolves it once the attribute reads clean"
+            )
+        elif event == "settled" and current in _HOLD_RELEASABLE:
+            self._reconcile_hold_standing = "settled"
 
     async def _refresh_cached_username(
         self,
@@ -5655,9 +5938,18 @@ class AuthService:
         and this loop has no administrator behind it.
         """
         self._reconcile_unkeyed_reported &= still_unkeyed
-        for user in unkeyed:
-            if user.id in self._reconcile_unkeyed_reported:
-                continue
+        refused = self._reconcile_unkeyed_refused
+        for user_id in [uid for uid in refused if uid not in still_unkeyed]:
+            del refused[user_id]
+        # An account the store has not refused goes first (-1), so one row it keeps refusing cannot
+        # starve the rest. Refused accounts follow, the longest-refused first, so two rows the store
+        # keeps refusing take turns. sorted() is stable, so the rest keep list_users' order.
+        turn = {uid: i for i, uid in enumerate(refused)}
+        pending = sorted(
+            (u for u in unkeyed if u.id not in self._reconcile_unkeyed_reported),
+            key=lambda u: turn.get(u.id, -1),
+        )
+        for user in pending:
             _log.warning(
                 "directory reconcile: %s carries a federated binding but no directory object id, "
                 "so it is not probed by name and a directory disable will not end its sessions "
@@ -5666,9 +5958,8 @@ class AuthService:
                 user.username,
                 user.id,
             )
-            await self._audit(
+            written = await self._audit_reconciler_row(
                 "auth.ad_reconcile_binding_unkeyed",
-                actor="<reconciler>",
                 detail=_json(
                     {
                         "reason": DIRECTORY_OBJECT_ID_MISSING,
@@ -5678,6 +5969,13 @@ class AuthService:
                 ),
             )
             # Marked only once the audit row is written, so a failed write is retried next pass.
+            if not written:
+                # Stop at the first refusal: one ERROR and one WARNING per pass, and no second
+                # acquire timeout behind a store that is refusing every write.
+                refused.pop(user.id, None)  # re-inserted at the end: refused most recently
+                refused[user.id] = None
+                break
+            refused.pop(user.id, None)
             self._reconcile_unkeyed_reported.add(user.id)
 
     async def _record_reconcile_hold(self, plan: reconcile.ReconcilePlan) -> None:
@@ -5692,7 +5990,8 @@ class AuthService:
         Written once per pass that holds, like the breaker's row, so the audit log shows how long it
         lasted. The counts are all it carries: the held accounts' own sign-ins are refused and
         audited on their own rows. The message is latched before the row is written, so a failing
-        audit write still leaves the operator-visible condition set.
+        audit write still leaves the operator-visible condition set. That failure is logged and not
+        raised (BACKLOG #2137; see :meth:`_audit_reconciler_row`).
         """
         if not plan.hold:
             if self._reconcile_hold_alert is not None:
@@ -5710,9 +6009,8 @@ class AuthService:
             f"account can read userAccountControl on every account in [auth].ad_user_search_base."
         )
         _log.error("directory reconcile: %s", self._reconcile_hold_alert)
-        await self._audit(
+        await self._audit_reconciler_row(
             "auth.ad_reconcile_held",
-            actor="<reconciler>",
             detail=_json(
                 {
                     "reason": reconcile.HOLD_REASON,
@@ -5733,9 +6031,8 @@ class AuthService:
                 "session was revoked (fail-open).",
                 plan.probed,
             )
-            await self._audit(
+            await self._audit_reconciler_row(
                 "auth.ad_reconcile_skipped",
-                actor="<reconciler>",
                 detail=_json({"reason": plan.aborted, "probed": plan.probed}),
             )
             return
@@ -5754,9 +6051,10 @@ class AuthService:
             f"ad_bind_dn service account's read rights."
         )
         _log.error("directory reconcile: %s", self._reconcile_alert)
-        await self._audit(
+        # Latched above, before the write, as the hold's message is: a failed write is logged and
+        # not raised, so the breaker's alert still fires and its status still shows (BACKLOG #2137).
+        await self._audit_reconciler_row(
             "auth.ad_reconcile_aborted",
-            actor="<reconciler>",
             detail=_json(
                 {
                     "reason": plan.aborted,
@@ -5766,6 +6064,33 @@ class AuthService:
                 }
             ),
         )
+
+    async def _audit_reconciler_row(self, action: str, *, detail: str) -> bool:
+        """Write one of the reconcile pass's own rows, and say whether it was written.
+
+        BACKLOG #2137. These rows are the held row, the breaker's aborted row, the outage's skipped
+        row and the unkeyed-binding report. Each is written after the pass's revocations, or on a
+        pass that applies none. **A failed write here does not end the pass.** If
+        it raised, the pass would return no plan, and the lifespan task would raise no alert for
+        the revocations already applied, nor for the hold or the breaker. So a store refusal is
+        logged at ERROR, naming the action, and the pass goes on. The log line is then the only
+        record of that row. A per-revocation audit write is not routed through here: that one
+        still raises.
+
+        A defect is raised, not passed over (:data:`_AUDIT_WRITE_DEFECTS`).
+        """
+        try:
+            await self._audit(action, actor="<reconciler>", detail=detail)
+        except _AUDIT_WRITE_DEFECTS:
+            raise
+        except _audit_write_errors():
+            _log.exception(
+                "directory reconcile: the %s audit row could not be written; the pass goes on, "
+                "so its alerts still fire",
+                action,
+            )
+            return False
+        return True
 
     async def _apply_reconcile_revocation(self, revocation: reconcile.SessionRevocation) -> bool:
         """Apply one planned revocation: persist a role re-diff (when that is why), drop the user's

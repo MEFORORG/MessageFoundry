@@ -318,7 +318,9 @@ async def test_the_lifespan_reconciler_task_raises_the_alerts() -> None:
         revocations=(SessionRevocation("u1", "alice", reason="directory_absent"),), probed=1
     )
     auth = _FakeAuth(plan)
-    task = asyncio.create_task(_directory_reconciler(auth, 0.001, sink))  # type: ignore[arg-type]
+    task = asyncio.create_task(
+        _directory_reconciler(auth, 0.001, sink, sole_reconciler=True, alert_state=None)  # type: ignore[arg-type]
+    )
     try:
         for _ in range(500):
             if sink.events:
@@ -417,7 +419,9 @@ async def test_the_reconciler_loop_survives_a_raising_sink() -> None:
         revocations=(SessionRevocation("u1", "alice", reason="directory_absent"),), probed=1
     )
     auth = _FakeAuth(plan)
-    task = asyncio.create_task(_directory_reconciler(auth, 0.001, sink))  # type: ignore[arg-type]
+    task = asyncio.create_task(
+        _directory_reconciler(auth, 0.001, sink, sole_reconciler=True, alert_state=None)  # type: ignore[arg-type]
+    )
     try:
         for _ in range(500):
             if auth.passes >= 3:
