@@ -508,7 +508,11 @@ class PendingApprovalInfo(BaseModel):
 
     ``params`` are the parameters the hold captured, which a release re-runs (BACKLOG #2458), so an
     approver sees what it releases. They are operation metadata, never a message body; ``None``
-    means the stored row could not be read as a JSON object."""
+    means the stored row could not be read as a JSON object.
+
+    ``caller_is_requester`` is True when the caller raised this request, compared on the immutable
+    user id as the self-approval refusal is (BACKLOG #2460, #1540). The engine refuses that caller's
+    approve and resolve whatever this says; it lets a page stop offering them."""
 
     id: str
     operation: str
@@ -520,17 +524,23 @@ class PendingApprovalInfo(BaseModel):
     status: Literal["pending", "interrupted"] = "pending"
     approver: str | None = None
     decided_at: float | None = None
+    caller_is_requester: bool = False
 
 
 class ApprovalList(BaseModel):
     approvals: list[PendingApprovalInfo]
 
 
+#: What an operator may record for an ``interrupted`` release. One alias, so the JSON body, the
+#: console's resolve path and its buttons cannot disagree (BACKLOG #2460).
+ResolveOutcome = Literal["effects_applied", "effects_not_applied"]
+
+
 class ApprovalResolveRequest(RequestModel):
     """What an operator found an ``interrupted`` release did (BACKLOG #1562 part B). The operation is
     never re-run, whichever is chosen."""
 
-    outcome: Literal["effects_applied", "effects_not_applied"]
+    outcome: ResolveOutcome
 
 
 class ApprovalResolveResult(BaseModel):
@@ -541,7 +551,7 @@ class ApprovalResolveResult(BaseModel):
     requested_by: str
     approved_by: str | None = None
     resolved_by: str
-    outcome: Literal["effects_applied", "effects_not_applied"]
+    outcome: ResolveOutcome
     status: Literal["resolved_applied", "resolved_not_applied"]
 
 

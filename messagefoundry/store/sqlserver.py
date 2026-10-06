@@ -11127,9 +11127,9 @@ class SqlServerStore:
     async def list_pending_approvals(self, *, now: float, limit: int = 100) -> list[dict[str, Any]]:
         """Open (still-``pending``, unexpired) approval requests, newest-first."""
         return await self._fetchall(
-            # No requester_user_id here — see the SQLite twin.
-            "SELECT TOP (?) id, operation, params, requester, requested_at, status, approver,"
-            " decided_at, expires_at FROM pending_approvals"
+            # requester_user_id: see the SQLite twin (BACKLOG #2460).
+            "SELECT TOP (?) id, operation, params, requester, requester_user_id, requested_at,"
+            " status, approver, decided_at, expires_at FROM pending_approvals"
             " WHERE status = 'pending' AND (expires_at IS NULL OR expires_at > ?)"
             " ORDER BY requested_at DESC",
             (limit, now),
@@ -11139,8 +11139,8 @@ class SqlServerStore:
         """Released requests cut off mid-run, oldest-first (BACKLOG #1562). No expiry filter, and the
         order: the Store protocol says why."""
         return await self._fetchall(
-            "SELECT TOP (?) id, operation, params, requester, requested_at, status, approver,"
-            " decided_at, expires_at FROM pending_approvals"
+            "SELECT TOP (?) id, operation, params, requester, requester_user_id, requested_at,"
+            " status, approver, decided_at, expires_at FROM pending_approvals"
             " WHERE status = 'interrupted'"
             " ORDER BY requested_at ASC",
             (limit,),

@@ -164,6 +164,30 @@ async def test_the_queue_shows_the_params_a_hold_captured(engine: Engine) -> Non
     }
 
 
+async def test_the_queue_marks_the_callers_own_requests_by_user_id(engine: Engine) -> None:
+    """BACKLOG #2460: ``caller_is_requester`` is keyed on the immutable id, as the refusal is
+    (#1540), so a rename does not unmark the requester and a new holder of the name is not marked."""
+    service = await _service(engine)
+    maker_id = await _add(service, "maker", Role.ADMINISTRATOR)
+    await _add(service, "checker", Role.ADMINISTRATOR)
+    async with _client(engine, service, ON) as c:
+        maker = await _token(c, "maker")
+        approval_id = (await _request_replay(c, maker)).json()["approval_id"]
+
+        async def _mark(headers: dict[str, str]) -> bool:
+            listed = (await c.get("/approvals", headers=headers)).json()
+            row = next(a for a in listed["approvals"] if a["id"] == approval_id)
+            return bool(row["caller_is_requester"])
+
+        assert await _mark(maker) is True
+        assert await _mark(await _token(c, "checker")) is False
+        # Rename the requester (same session) and give the freed name to somebody else.
+        assert await engine.store.set_user_username(maker_id, "maker2", expected_username="maker")
+        await _add(service, "maker", Role.ADMINISTRATOR)
+        assert await _mark(maker) is True
+        assert await _mark(await _token(c, "maker")) is False
+
+
 async def test_a_row_whose_params_do_not_parse_is_listed_without_them(engine: Engine) -> None:
     """One damaged row must not take the queue down; it is listed with ``params`` None."""
     service = await _service(engine)
@@ -1211,7 +1235,7 @@ async def test_a_row_cut_off_between_the_two_reads_is_listed_once(engine: Engine
         cut_off = (await gate.list_interrupted())[0]
         stale = {**cut_off, "status": "pending", "approver": None, "decided_at": None}
 
-        async def _stale_pending() -> list[dict[str, Any]]:
+        async def _stale_pending(**_: Any) -> list[dict[str, Any]]:
             return [stale]
 
         gate.list_pending = _stale_pending  # type: ignore[method-assign]

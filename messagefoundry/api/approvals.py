@@ -308,19 +308,26 @@ class ApprovalGate:
         )
         return approval_id
 
-    async def list_pending(self) -> list[dict[str, Any]]:
-        """Requests awaiting a second approver: ``pending`` and unexpired."""
+    async def list_pending(self, *, caller_user_id: str | None = None) -> list[dict[str, Any]]:
+        """Requests awaiting a second approver: ``pending`` and unexpired. ``caller_user_id`` marks
+        the caller's own requests (``caller_is_requester``)."""
         rows = await self._store.list_pending_approvals(now=self._clock())
-        return [self._queue_entry(r) for r in rows]
+        return [self._queue_entry(r, caller_user_id) for r in rows]
 
-    async def list_interrupted(self) -> list[dict[str, Any]]:
+    async def list_interrupted(self, *, caller_user_id: str | None = None) -> list[dict[str, Any]]:
         """Releases cut off mid-run and awaiting an operator's record of what happened
-        (:meth:`resolve_interrupted`). They do not expire."""
+        (:meth:`resolve_interrupted`). They do not expire. ``caller_user_id`` as for
+        :meth:`list_pending`."""
         rows = await self._store.list_interrupted_approvals()
-        return [self._queue_entry(r) for r in rows]
+        return [self._queue_entry(r, caller_user_id) for r in rows]
 
-    def _queue_entry(self, r: Any) -> dict[str, Any]:
+    def _queue_entry(self, r: Any, caller_user_id: str | None) -> dict[str, Any]:
         return {
+            # BACKLOG #2460: keyed on the immutable id, like the refusals it predicts (#1540), so a
+            # page can hide Approve from the requester. A row with no id never matches; approve
+            # refuses it anyway.
+            "caller_is_requester": bool(caller_user_id)
+            and str(r["requester_user_id"] or "") == caller_user_id,
             "id": str(r["id"]),
             "operation": str(r["operation"]),
             "label": self._label(str(r["operation"])),

@@ -8,13 +8,15 @@ each ``pending`` one, through the same engine handlers as ``POST /approvals/{id}
 ``/reject``, so the gate's own refusals (self-approval, too new, expired, requester no longer
 authorized) stay the engine's to make.
 
-**An ``interrupted`` row gets no buttons.** Its release was cut off while the operation ran, so the
-engine answers approve and reject with 409. Recording what it did is the resolve step, which asks for
-a fresh step-up and is not built here; the page says where to do it instead.
+**An ``interrupted`` row offers the resolve, never approve or reject** (BACKLOG #2460). Its release
+was cut off while the operation ran, so the engine answers approve and reject with 409. The resolve
+records whether its effects were applied, through the same handler as
+``POST /approvals/{id}/resolve``, and its route asks for the same fresh step-up.
 
-**No button is hidden from the requester.** The list carries the requester's NAME, and a name is not
-the key the self-approval refusal uses (BACKLOG #1540: names are mutable, user ids are not). Hiding
-the button by name would be wrong in both directions, so the engine refuses and this page shows why.
+**The requester is offered neither Approve nor the resolve** (BACKLOG #2460). The engine marks each
+row ``caller_is_requester`` by comparing user ids, the key its refusals use (BACKLOG #1540), so the
+page never has to compare names, which are mutable. The requester still gets Withdraw, a reject the
+gate allows them. The engine refuses a hand-built POST either way.
 
 **Each row shows the parameters its hold captured** (BACKLOG #2458), so an approver sees what a
 release would do: which connection a replay or purge names, its scope, a reload's config directory.
@@ -27,7 +29,12 @@ from __future__ import annotations
 
 import json
 
-from messagefoundry.api.models import ApprovalDecisionResult, ApprovalList, PendingApprovalInfo
+from messagefoundry.api.models import (
+    ApprovalDecisionResult,
+    ApprovalList,
+    PendingApprovalInfo,
+    ResolveOutcome,
+)
 
 from .._html import Markup, el, page, register_nav, rows_table
 from ._common import _seg
@@ -54,14 +61,26 @@ _INTRO = (
 # select a sentence but never supply one.
 _NOTICES: dict[str, str] = {
     "rejected": "Request rejected. The held operation did not run.",
+    "effects_applied": "Recorded: the interrupted release's effects were applied. Nothing was re-run.",
+    "effects_not_applied": (
+        "Recorded: the interrupted release's effects were not applied. Nothing was re-run."
+    ),
+}
+
+# The resolve buttons, one per ResolveOutcome; a test pins that every outcome has one.
+_RESOLVE_LABELS: dict[ResolveOutcome, str] = {
+    "effects_applied": "Effects applied",
+    "effects_not_applied": "Effects not applied",
 }
 
 _INTERRUPTED_NOTE = (
     "These releases were cut off while the operation ran, so it may have done none, some or all of "
-    "its work. Nothing re-runs them. Check the operation's own effects, then record what you found "
-    "through the engine API's resolve call for that row's id, which asks for a fresh step-up. This "
-    "page does not offer that step."
+    "its work. Nothing re-runs them. Check the operation's own effects, then record what you found. "
+    "Recording asks you to confirm your password again if you have not done so recently. The "
+    "requester cannot record their own."
 )
+
+_OWN_REQUEST = "Your request. A different approver decides it."
 
 # Guidance for a refusal, keyed by the status the engine raised. The engine's own message follows it
 # verbatim, because one status covers several causes (a 409 is at least already decided, expired,
@@ -69,8 +88,8 @@ _INTERRUPTED_NOTE = (
 _REFUSALS: dict[int, tuple[str, str]] = {
     403: (
         "Not released",
-        "The engine refused this approver. A requester can never approve their own request; a "
-        "different user holding approvals:approve must release it.",
+        "The engine refused this approver. A requester can never approve their own request, or "
+        "record what its interrupted release did; a different user holding approvals:approve must.",
     ),
     404: ("No such request", "No approval request has this id."),
     409: (
@@ -124,12 +143,13 @@ def _params(a: PendingApprovalInfo) -> Markup:
 
 def _pending_row(a: PendingApprovalInfo) -> list[object]:
     base = f"{_PAGE}/{_seg(a.id)}"
-    actions = el(
-        "div",
-        _post_button(f"{base}/approve", "Approve"),
-        _post_button(f"{base}/reject", "Reject"),
-        class_="ctls",
+    # BACKLOG #2460: the gate would refuse the requester's approve, so it is not offered to them.
+    controls = (
+        [_post_button(f"{base}/reject", "Withdraw"), el("span", _OWN_REQUEST, class_="muted")]
+        if a.caller_is_requester
+        else [_post_button(f"{base}/approve", "Approve"), _post_button(f"{base}/reject", "Reject")]
     )
+    actions = el("div", *controls, class_="ctls")
     return [
         _ts(a.requested_at),
         a.label,
@@ -142,6 +162,16 @@ def _pending_row(a: PendingApprovalInfo) -> list[object]:
 
 
 def _interrupted_row(a: PendingApprovalInfo) -> list[object]:
+    if a.caller_is_requester:
+        actions = el("span", _OWN_REQUEST, class_="muted")
+    else:
+        # BACKLOG #2460: the outcome rides the path, so /ui/reauth can re-POST it after a step-up.
+        base = f"{_PAGE}/{_seg(a.id)}/resolve"
+        actions = el(
+            "div",
+            *(_post_button(f"{base}/{o}", label) for o, label in _RESOLVE_LABELS.items()),
+            class_="ctls",
+        )
     return [
         _ts(a.requested_at),
         a.label,
@@ -150,12 +180,14 @@ def _interrupted_row(a: PendingApprovalInfo) -> list[object]:
         a.approver or "—",
         _when(a.decided_at),
         el("code", a.id),
+        actions,
     ]
 
 
 def approvals_page(listing: ApprovalList, *, notice: str = "") -> Markup:
-    """The open requests: ``pending`` ones with Approve and Reject, then ``interrupted`` ones
-    read-only. ``notice`` is a redirect's ``?m=`` code and selects from :data:`_NOTICES` only."""
+    """The open requests: ``pending`` ones with Approve and Reject, then ``interrupted`` ones with
+    the resolve. The caller's own requests offer only Withdraw. ``notice`` is a redirect's ``?m=``
+    code and selects from :data:`_NOTICES` only."""
     pending = [a for a in listing.approvals if a.status == "pending"]
     interrupted = [a for a in listing.approvals if a.status == "interrupted"]
     parts: list[object] = [el("h1", "Approvals"), el("p", _INTRO, class_="muted")]
@@ -185,6 +217,7 @@ def approvals_page(listing: ApprovalList, *, notice: str = "") -> Markup:
                     "Released by",
                     "Cut off",
                     "Id",
+                    "Record",
                 ],
                 [_interrupted_row(a) for a in interrupted],
             )

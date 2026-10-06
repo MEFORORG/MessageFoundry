@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""The console's Approvals page: list, approve and reject a dual-control hold (BACKLOG #1982).
+"""The console's Approvals page: list, approve and reject a dual-control hold (BACKLOG #1982), and
+resolve an interrupted release (BACKLOG #2460).
 
 Every hold here is a REAL one, raised through the console's own dead-letter replay by a signed-in
 user, so the self-approval refusal is measured against the user id the gate recorded, not a forged
@@ -12,16 +13,22 @@ from __future__ import annotations
 
 import re
 import time
+from typing import get_args
 from uuid import uuid4
 
 import httpx
 from _ui_clients import SAME_ORIGIN, auth_service, cookie_login, provision
 
 from messagefoundry.api import create_app
-from messagefoundry.api.models import ApprovalDecisionResult, ApprovalList, PendingApprovalInfo
+from messagefoundry.api.models import (
+    ApprovalDecisionResult,
+    ApprovalList,
+    PendingApprovalInfo,
+    ResolveOutcome,
+)
 from messagefoundry.auth import Role
 from messagefoundry.auth.service import AuthService
-from messagefoundry.config.settings import ApprovalsSettings
+from messagefoundry.config.settings import ApprovalsSettings, AuthSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry_webconsole import pages
 
@@ -66,10 +73,11 @@ async def _status(engine: Engine, approval_id: str) -> str:
 
 async def test_the_page_lists_a_hold_with_both_buttons(engine: Engine) -> None:
     service, _maker, _checker = await _two_approvers(engine)
-    async with _client(engine, service, _ON) as maker:
+    async with _client(engine, service, _ON) as maker, _client(engine, service, _ON) as checker:
         await cookie_login(maker, "maker")
+        await cookie_login(checker, "checker")
         approval_id = await _hold(maker)
-        r = await maker.get("/ui/approvals")
+        r = await checker.get("/ui/approvals")
     assert r.status_code == 200
     assert approval_id in r.text
     assert "Replay dead-lettered deliveries" in r.text
@@ -88,6 +96,12 @@ async def test_the_requester_cannot_approve_their_own_hold(engine: Engine) -> No
     async with _client(engine, service, _ON) as maker:
         await cookie_login(maker, "maker")
         approval_id = await _hold(maker)
+        # BACKLOG #2460: the requester's own row offers Withdraw, not Approve.
+        listing = await maker.get("/ui/approvals")
+        assert f'action="/ui/approvals/{approval_id}/approve"' not in listing.text
+        assert f'action="/ui/approvals/{approval_id}/reject"' in listing.text
+        assert "Withdraw" in listing.text and "A different approver decides it." in listing.text
+        # A hand-built POST is still the engine's to refuse.
         r = await maker.post(f"/ui/approvals/{approval_id}/approve", headers=SAME_ORIGIN)
     # A page, not a 500, carrying the gate's own refusal.
     assert r.status_code == 403
@@ -172,7 +186,7 @@ async def test_an_operator_without_approvals_approve_is_refused(engine: Engine) 
         await cookie_login(op, "op")
         approval_id = await _hold(admin)
         assert (await op.get("/ui/approvals")).status_code == 403
-        for verb in ("approve", "reject"):
+        for verb in ("approve", "reject", "resolve/effects_applied"):
             r = await op.post(f"/ui/approvals/{approval_id}/{verb}", headers=SAME_ORIGIN)
             assert r.status_code == 403
     assert await _status(engine, approval_id) == "pending"
@@ -223,8 +237,8 @@ async def test_an_unknown_id_is_a_404_page_and_a_malformed_one_is_refused(engine
     assert malformed.status_code == 422
 
 
-async def test_an_interrupted_release_is_listed_without_buttons(engine: Engine) -> None:
-    service, maker_id, _checker = await _two_approvers(engine)
+async def _interrupted(engine: Engine, maker_id: str) -> str:
+    """An ``interrupted`` row raised by ``maker``, built through the store's own transitions."""
     approval_id = uuid4().hex
     await engine.store.create_pending_approval(
         approval_id=approval_id,
@@ -246,17 +260,102 @@ async def test_an_interrupted_release_is_listed_without_buttons(engine: Engine) 
         decided_at=now,
         from_status="executing",
     )
+    return approval_id
+
+
+def _resolve(approval_id: str, outcome: str = "effects_applied") -> str:
+    return f"/ui/approvals/{approval_id}/resolve/{outcome}"
+
+
+async def test_an_interrupted_release_offers_the_resolve_and_not_approve(engine: Engine) -> None:
+    service, maker_id, _checker = await _two_approvers(engine)
+    approval_id = await _interrupted(engine, maker_id)
     async with _client(engine, service, _ON) as checker:
         await cookie_login(checker, "checker")
         r = await checker.get("/ui/approvals")
         assert r.status_code == 200
         assert "Interrupted releases" in r.text
         assert approval_id in r.text
-        assert f"/ui/approvals/{approval_id}/" not in r.text
+        assert f'action="{_resolve(approval_id)}"' in r.text
+        assert f'action="{_resolve(approval_id, "effects_not_applied")}"' in r.text
+        assert f"/ui/approvals/{approval_id}/approve" not in r.text
+        assert f"/ui/approvals/{approval_id}/reject" not in r.text
         assert "No request is waiting for a second approver." in r.text
         # A hand-made POST gets the gate's 409 as a page, as the page's note predicts.
         forced = await checker.post(f"/ui/approvals/{approval_id}/approve", headers=SAME_ORIGIN)
     assert forced.status_code == 409
+    assert await _status(engine, approval_id) == "interrupted"
+
+
+async def test_a_second_approver_resolves_an_interrupted_release(engine: Engine) -> None:
+    """BACKLOG #2460 (a): the console records what an interrupted release did, never re-running it."""
+    service, maker_id, _checker = await _two_approvers(engine)
+    for outcome, status, notice in (
+        ("effects_applied", "resolved_applied", "effects were applied"),
+        ("effects_not_applied", "resolved_not_applied", "effects were not applied"),
+    ):
+        approval_id = await _interrupted(engine, maker_id)
+        async with _client(engine, service, _ON) as checker:
+            await cookie_login(checker, "checker")
+            r = await checker.post(_resolve(approval_id, outcome), headers=SAME_ORIGIN)
+            assert r.status_code == 303, r.text
+            landed = await checker.get(r.headers["location"])
+            assert notice in landed.text
+            assert approval_id not in landed.text  # resolved rows leave the open queue
+            again = await checker.post(_resolve(approval_id, outcome), headers=SAME_ORIGIN)
+            assert again.status_code == 409
+        assert await _status(engine, approval_id) == status
+    resolved = await engine.store.list_audit(action="approval.resolved")
+    assert [row["actor"] for row in resolved] == ["checker", "checker"]
+    assert await engine.store.list_audit(action="approval.approved") == []
+
+
+async def test_the_requester_is_not_offered_and_cannot_resolve(engine: Engine) -> None:
+    service, maker_id, _checker = await _two_approvers(engine)
+    approval_id = await _interrupted(engine, maker_id)
+    async with _client(engine, service, _ON) as maker:
+        await cookie_login(maker, "maker")
+        listing = await maker.get("/ui/approvals")
+        assert approval_id in listing.text
+        assert f"/ui/approvals/{approval_id}/resolve/" not in listing.text
+        assert "A different approver decides it." in listing.text
+        r = await maker.post(_resolve(approval_id), headers=SAME_ORIGIN)
+    assert r.status_code == 403
+    assert "Not released" in r.text
+    assert await _status(engine, approval_id) == "interrupted"
+
+
+async def test_a_stale_step_up_window_resolves_nothing(engine: Engine) -> None:
+    """The resolve route asks for the fresh step-up the JSON resolve does. A stale window is sent to
+    /ui/reauth with the resolve as its continuation, and the STORE shows nothing was recorded."""
+    stale = AuthService(
+        engine.store,
+        AuthSettings(
+            admin_write_min_interval_seconds=0, require_mfa=False, step_up_max_age_seconds=-1
+        ),
+    )
+    await stale.initialize()
+    maker_id = await provision(stale, "maker", [Role.ADMINISTRATOR.value])
+    await provision(stale, "checker", [Role.ADMINISTRATOR.value])
+    approval_id = await _interrupted(engine, maker_id)
+    async with _client(engine, stale, _ON) as checker:
+        await cookie_login(checker, "checker")
+        r = await checker.post(_resolve(approval_id), headers=SAME_ORIGIN)
+    assert r.status_code == 303
+    assert r.headers["location"] == f"/ui/reauth?next={_resolve(approval_id)}"
+    assert await _status(engine, approval_id) == "interrupted"
+    assert await engine.store.list_audit(action="approval.resolve_attempted") == []
+
+
+async def test_a_bad_resolve_is_refused(engine: Engine) -> None:
+    service, maker_id, _checker = await _two_approvers(engine)
+    approval_id = await _interrupted(engine, maker_id)
+    async with _client(engine, service, _ON) as checker:
+        await cookie_login(checker, "checker")
+        cross = await checker.post(_resolve(approval_id), headers={"Sec-Fetch-Site": "cross-site"})
+        unknown_outcome = await checker.post(_resolve(approval_id, "maybe"), headers=SAME_ORIGIN)
+    assert cross.status_code == 403
+    assert unknown_outcome.status_code == 422
     assert await _status(engine, approval_id) == "interrupted"
 
 
@@ -276,6 +375,15 @@ def test_the_page_escapes_what_it_renders() -> None:
     # Captured params are escaped like every other value (BACKLOG #2458).
     assert "<i>dir</i>" not in html and "config_dir: &lt;i&gt;dir&lt;/i&gt;" in html
     assert "<u>all</u>" not in html
+
+
+def test_every_resolve_outcome_has_a_button_and_a_notice() -> None:
+    # One ResolveOutcome alias drives the route, its continuation pattern and these two tables.
+    from messagefoundry_webconsole.pages import approvals as page_module
+
+    outcomes = set(get_args(ResolveOutcome))
+    assert set(page_module._RESOLVE_LABELS) == outcomes
+    assert outcomes <= set(page_module._NOTICES)
 
 
 def test_params_that_did_not_parse_or_are_empty_say_so() -> None:

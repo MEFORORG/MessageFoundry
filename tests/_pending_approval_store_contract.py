@@ -70,12 +70,13 @@ async def _assert_pending_approval_contract(store: Any) -> None:
         # The two must not be the same value; keying on an id that is really a name fixes nothing.
         assert str(row["requester_user_id"]) != str(row["requester"])
 
-        # The pending queue projects the display label only -- the id is read on the approve path via
-        # get_pending_approval. Pinned so a backend adding it to this projection is a deliberate act.
+        # The pending queue projects the label AND the id, so it can tell a caller the request is
+        # their own (BACKLOG #2460). Compare the values, for the reason the read above gives.
         listed = await store.list_pending_approvals(now=1_001.0)
         mine = [r for r in listed if str(r["id"]) == approval_id]
         assert len(mine) == 1
         assert str(mine[0]["requester"]) == _REQUESTER
+        assert str(mine[0]["requester_user_id"]) == _REQUESTER_ID
     finally:
         # Leave the table as it was found; the server legs share one database across tests.
         await store.decide_pending_approval(
@@ -327,6 +328,7 @@ async def _assert_interrupted_resolution_contract(store: Any) -> None:
         assert len(listed) == 1
         assert str(listed[0]["status"]) == "interrupted"
         assert str(listed[0]["approver"]) == _APPROVER
+        assert str(listed[0]["requester_user_id"]) == _REQUESTER_ID  # BACKLOG #2460
         assert listed[0]["decided_at"] is not None
         pending = await store.list_pending_approvals(now=float(listed[0]["requested_at"]))
         assert all(str(r["id"]) != approval_id for r in pending)
