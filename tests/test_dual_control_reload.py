@@ -400,6 +400,76 @@ async def test_a_released_reload_refuses_a_swapped_settings_anchor(
         await engine.stop()
 
 
+# --- vault BACKLOG #2459: a released reload is refused like an inline one, never a 500 ----------
+
+
+async def _hold_then_release(
+    engine: Engine, service: AuthService, body: dict[str, Any], between: Any = None
+) -> tuple[str, httpx.Response]:
+    """Hold a reload as one admin, run ``between``, then release it as another."""
+    await _add(service, "op", Role.ADMINISTRATOR)
+    await _add(service, "approver", Role.ADMINISTRATOR)
+    # raise_app_exceptions=False, so the pre-fix 500 arrives as a response rather than a raise.
+    async with _client(engine, service, GATED, raise_app_exceptions=False) as c:
+        op, admin = await _token(c, "op"), await _token(c, "approver")
+        held = await c.post("/config/reload", json=body, headers=op)
+        assert held.status_code == 202, held.text
+        approval_id = held.json()["approval_id"]
+        if between is not None:
+            between()
+        return approval_id, await c.post(f"/approvals/{approval_id}/approve", headers=admin)
+
+
+async def test_a_released_reload_whose_config_dir_vanished_answers_404_and_records_it(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """Before vault BACKLOG #2459 the executor caught WiringError only, so a directory removed
+    between the hold and the release raised FileNotFoundError out of the approve route as a 500,
+    with no config_reload_failed row. It now answers 404 and records the row the inline route
+    records, and the gate marks the request failed."""
+    import shutil
+
+    service = await _service(engine)
+    live = engine.registry_runner
+    before = live.registry if live is not None else None
+    approval_id, r = await _hold_then_release(
+        engine, service, {}, between=lambda: shutil.rmtree(tmp_path / "cfg")
+    )
+    assert r.status_code == 404, r.text
+    assert r.json()["detail"] == "config directory not found"
+    rr = engine.registry_runner
+    assert (rr.registry if rr is not None else None) is before  # nothing swapped
+    failed = [
+        json.loads(row["detail"])
+        for row in await engine.store.list_audit(action="config_reload_failed")
+    ]
+    assert failed == [{"requested": None, "dry_run": False, "reason": "not_found"}]
+    row = await engine.store.get_pending_approval(approval_id)
+    assert row is not None and str(row["status"]) == "failed"
+    assert len(await engine.store.list_audit(action="approval.failed")) == 1
+
+
+async def test_a_released_reload_outside_the_reload_roots_answers_403_and_records_it(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """The guard holds a reload before the engine resolves its directory, so a held request can name
+    a directory outside the reload roots. Before vault BACKLOG #2459 its release raised
+    ConfigReloadDenied as a 500. It now answers the inline route's 403 and its denied row."""
+    elsewhere = tmp_path / "elsewhere"
+    _write_valid_config(elsewhere, tmp_path / "in2", tmp_path / "out2")
+    service = await _service(engine)
+    approval_id, r = await _hold_then_release(engine, service, {"config_dir": str(elsewhere)})
+    assert r.status_code == 403, r.text
+    assert r.json()["detail"] == "config directory is not an allowed reload root"
+    denied = [
+        json.loads(row["detail"])
+        for row in await engine.store.list_audit(action="config_reload_denied")
+    ]
+    assert denied == [{"requested": str(elsewhere), "dry_run": False}]
+    row = await engine.store.get_pending_approval(approval_id)
+    assert row is not None and str(row["status"]) == "failed"
+
+
 # --- BACKLOG #2183: a released reload audits an unreadable inbound CA as trust_anchor -------------
 
 
