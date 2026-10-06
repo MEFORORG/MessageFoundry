@@ -2576,9 +2576,17 @@ class RegistryRunner:
         here. The refusal happens AFTER the stop, deliberately: the fail-closed outcome is a lane
         left PAUSED, so the pause is taken first and then stands. And this door is reachable with no
         operator at all — an alert rule's ``control_action`` can auto-fire ``restart_outbound``
-        (#144) on ``connection_stopped``, the very signal a log-failure halt raises."""
+        (#144) on ``connection_stopped``, the very signal a log-failure halt raises.
+
+        A DR-parked lane is left parked, with no stop half (:meth:`_hold_dr_parked_outbound`)."""
         async with self._reload_lock:
             self._require_owned_destination(name)
+            if ("outbound", name) in self._filtered:
+                # DR-parked: no stop half. A stop drops the engine-park marker and re-arms a
+                # quiescence the parked worker never signals again, so the lane read "stopping"
+                # for good and no reload lifted it (vault BACKLOG #3067).
+                self._hold_dr_parked_outbound(name)
+                return
             self._stop_outbound_unsafe(name)
             if not self._outbound_start_permitted(name):
                 return
@@ -2626,9 +2634,9 @@ class RegistryRunner:
                 self._wake_lane(Stage.OUTBOUND, name)
 
     def _park_outbound_lane(self, name: str) -> None:
-        """Record ``name``'s delivery lane as DELIBERATELY DOWN — the state both the ``auto_start=False``
-        boot gate (#115) and the ``deployed=False`` gate (#233, ADR 0111) must leave behind (each also on
-        the reload that re-evaluates it). The two differ in what they do NEXT, not here: a start-disabled
+        """Record ``name``'s delivery lane as DELIBERATELY DOWN — the state the ``auto_start=False``
+        boot gate (#115), the ``deployed=False`` gate (#233, ADR 0111) and a DR park of a never-started
+        lane (vault BACKLOG #3067) must leave behind (each also on the reload that re-evaluates it). The two differ in what they do NEXT, not here: a start-disabled
         lane still gets a delivery worker (parked at the pause gate, ready for an operator start), a
         not-deployed lane gets none at all.
 
@@ -2658,6 +2666,22 @@ class RegistryRunner:
             # per_lane: the delivery worker blocks at its loop-top pause gate until start_outbound sets
             # this (a cleared Event is the gate; setdefault creates it cleared, clear() is for a re-park).
             self._outbound_resume.setdefault(name, asyncio.Event()).clear()
+
+    def _hold_dr_parked_outbound(self, name: str) -> None:
+        """Answer a request to bring up an outbound the DR run-profile parks: keep it parked, and
+        mark it as an ENGINE park so the reload that runs with the profile off lifts it.
+
+        The lane is already paused (:meth:`_dr_park_outbound` parks it, or an operator or the
+        calendar paused it first) and it has no connector, so resuming it now would charge every
+        held row a failed attempt (vault BACKLOG #3067). Marking it ``_gate_parked`` turns the
+        request into a deferred start: :meth:`_unpark_outbound_lane` honours it on that reload,
+        including for a lane an operator or the calendar paused before the profile came on."""
+        self._gate_parked.add(name)
+        log.warning(
+            "outbound %r is parked by the DR run-profile, so it stays down and its rows stay "
+            "held; the first reload after POST /dr/release brings it up",
+            name,
+        )
 
     def engine_parked_outbounds(self) -> frozenset[str]:
         """The outbounds the ENGINE holds down by design: those the DR run-profile parks, and those
@@ -2776,8 +2800,9 @@ class RegistryRunner:
 
     async def _start_outbound_unsafe(self, name: str) -> None:
         """start_outbound body without the reload lock. RESUMES delivery for a paused outbound, BUILDING
-        its connector first if the lane has none (a start-disabled / DR-parked / failed lane is
-        connector-less — see :meth:`_ensure_destination_built`). A connector that IS live is kept WARM (a
+        its connector first if the lane has none (a start-disabled or failed lane is connector-less —
+        see :meth:`_ensure_destination_built`). A DR-parked lane is NOT resumed: it has no connector
+        until the profile is off, so it stays parked (:meth:`_hold_dr_parked_outbound`). A connector that IS live is kept WARM (a
         pause never tore down ``_destinations``), so a plain resume/restart never rebuilds it. Idempotent
         for a name that isn't paused.
 
@@ -2791,13 +2816,8 @@ class RegistryRunner:
         if ("outbound", name) in self._filtered:
             # DR-parked (#61, ADR 0048): _ensure_destination_built built nothing, so resuming would
             # charge every held row a failed attempt on a connector-less lane until a finite
-            # max_attempts dead-lettered it (vault BACKLOG #3067). The park lifts on the reload that
-            # runs with the profile off; until then the lane stays parked and its rows held.
-            log.warning(
-                "outbound %r is parked by the DR run-profile; not resumed. A reload after "
-                "POST /dr/release brings it up",
-                name,
-            )
+            # max_attempts dead-lettered it (vault BACKLOG #3067).
+            self._hold_dr_parked_outbound(name)
             return
         self._outbound_paused.discard(name)
         self._schedule_parked.discard(name)
@@ -2892,6 +2912,11 @@ class RegistryRunner:
             or not self._deployed(name, "outbound")
             or not self._auto_start_enabled(name, "outbound")
         ):
+            return
+        if ("outbound", name) in self._filtered:
+            # The DR run-profile parks it too. The calendar's pause becomes the engine's park, so
+            # the reload with the profile off lifts it (vault BACKLOG #3067).
+            self._hold_dr_parked_outbound(name)
             return
         log.info(
             "schedule: outbound connection %r no longer has a schedule — resuming the lane its "

@@ -86,7 +86,16 @@ def _write_graph(cfg: Path, tmp_path: Path, inbound: str) -> None:
     )
 
 
-def _write_tiered_graph(cfg: Path, tmp_path: Path) -> None:
+# A schedule that is never active: the calendar parks OB_NORM_ADT for good. Two windows cover the
+# whole day, so no minute is left open, and invert makes being inside one mean down.
+_NEVER = (
+    "Schedule(invert=True, windows=["
+    "ActiveWindow(days=[0, 1, 2, 3, 4, 5, 6], start=time(0, 0), end=time(23, 59)), "
+    "ActiveWindow(days=[0, 1, 2, 3, 4, 5, 6], start=time(23, 59), end=time(0, 0))])"
+)
+
+
+def _write_tiered_graph(cfg: Path, tmp_path: Path, *, norm_schedule: str | None = None) -> None:
     """One critical and one normal MLLP inbound, each with an outbound of the same tier."""
     cfg.mkdir(parents=True, exist_ok=True)
     out_crit, out_norm = tmp_path / "out-crit", tmp_path / "out-norm"
@@ -95,12 +104,14 @@ def _write_tiered_graph(cfg: Path, tmp_path: Path) -> None:
     crit_port, norm_port = _free_ports(2)
     (cfg / "cfg.py").write_text(
         "from messagefoundry import inbound, outbound, router, handler, Send, File, MLLP\n"
-        "from messagefoundry.config.models import Priority\n"
+        "from datetime import time\n"
+        "from messagefoundry.config.models import ActiveWindow, Priority, Schedule\n"
         f"inbound({_CRIT!r}, MLLP(port={crit_port}), router='r', priority=Priority.CRITICAL)\n"
         f"inbound({_NORM!r}, MLLP(port={norm_port}), router='r', priority=Priority.NORMAL)\n"
         f"outbound('OB_CRIT_ADT', File(directory={str(out_crit)!r}), "
         "priority=Priority.CRITICAL)\n"
-        f"outbound('OB_NORM_ADT', File(directory={str(out_norm)!r}), priority=Priority.NORMAL)\n"
+        f"outbound('OB_NORM_ADT', File(directory={str(out_norm)!r}), priority=Priority.NORMAL"
+        f"{f', schedule={norm_schedule}' if norm_schedule else ''})\n"
         "@router('r')\n"
         "def route(msg):\n"
         "    return ['h']\n"
@@ -116,6 +127,7 @@ class _Box(NamedTuple):
     live: Path
     staging: Path
     tiered: Path
+    scheduled: Path
 
 
 @pytest.fixture
@@ -126,15 +138,17 @@ async def box(tmp_path: Path) -> AsyncIterator[_Box]:
     live = tmp_path / "live"
     staging = tmp_path / "staging"
     tiered = tmp_path / "tiered"
+    scheduled = tmp_path / "scheduled"
     _write_graph(live, tmp_path, "IB_LIVE_ADT")
     _write_graph(staging, tmp_path, "IB_STAGING_ADT")
     _write_tiered_graph(tiered, tmp_path)
+    _write_tiered_graph(scheduled, tmp_path, norm_schedule=_NEVER)
     store, archive, ss = await _seed(tmp_path)
     engine = Engine(
         store,
         poll_interval=0.05,
         config_dir=live,
-        config_reload_roots=[str(staging), str(tiered)],
+        config_reload_roots=[str(staging), str(tiered), str(scheduled)],
         store_settings=ss,
         dr_settings=DrSettings(enabled=True, activate=False, seed_archive=archive),
         egress_settings=EgressSettings(deny_by_default=False),
@@ -144,7 +158,7 @@ async def box(tmp_path: Path) -> AsyncIterator[_Box]:
     # so do it here, or every release would wait out its whole drain timeout on that one row.
     await store.dead_letter_missing_destinations(set())
     try:
-        yield _Box(engine, live, staging, tiered)
+        yield _Box(engine, live, staging, tiered, scheduled)
     finally:
         await engine.stop()
 
@@ -287,7 +301,8 @@ async def test_a_row_on_a_parked_outbound_is_held_and_drains_after_release(box: 
     assert (await _norm_row(engine, message_id))["attempts"] == 0
 
     started = time.monotonic()
-    await coord.release(actor="alice")
+    released = await coord.release(actor="alice")
+    assert released.drained is True and released.held_on_parked_outbounds == 1
     assert time.monotonic() - started < 10.0  # the drain did not wait on the held row
     (row,) = await engine.store.list_audit(action="dr.release")
     detail = json.loads(row["detail"])
@@ -300,6 +315,71 @@ async def test_a_row_on_a_parked_outbound_is_held_and_drains_after_release(box: 
 
     await _until(norm_delivered)
     assert any((box.tiered.parent / "out-norm").iterdir())  # a file reached the target
+
+
+async def _assert_delivers_after_release(engine: Engine, box: _Box, message_id: str) -> None:
+    rr = engine.registry_runner
+    assert rr is not None
+    coord = engine.dr_coordinator
+    assert coord is not None
+    await coord.release(actor="alice")
+    await engine.reload_detail(box.tiered)
+
+    async def norm_delivered() -> bool:
+        return (await _norm_row(engine, message_id))["status"] == "done"
+
+    await _until(norm_delivered)
+    assert rr.outbound_status("OB_NORM_ADT") == "running"
+
+
+async def test_a_restarted_dr_parked_outbound_comes_up_after_release(box: _Box) -> None:
+    """Red at 638136f79a: the restart's stop half dropped the engine-park marker and its start
+    half kept the lane parked, so no reload lifted it; it read "stopping" and held its row until
+    an operator started it."""
+    engine = box.engine
+    await engine.reload_detail(box.tiered)
+    rr = engine.registry_runner
+    assert rr is not None
+    coord = engine.dr_coordinator
+    assert coord is not None
+    await coord.activate(actor="alice")
+    message_id = await engine.store.enqueue_message(
+        channel_id=_CRIT, raw=ADT, deliveries=[("OB_NORM_ADT", ADT)], now=time.time()
+    )
+
+    await rr.restart_outbound("OB_NORM_ADT")
+    await asyncio.sleep(0.3)
+    assert rr.outbound_status("OB_NORM_ADT") == "stopped"  # parked, and never "stopping"
+    assert (await _norm_row(engine, message_id))["attempts"] == 0
+
+    await _assert_delivers_after_release(engine, box, message_id)
+
+
+async def test_a_calendar_parked_outbound_unscheduled_under_dr_comes_up_after_release(
+    box: _Box,
+) -> None:
+    """A reload under the profile removes the schedule of a lane the calendar parked. Red at
+    638136f79a: the unscheduled resume met the DR park, left the lane paused with no engine-park
+    marker, and no later reload lifted it."""
+    engine = box.engine
+    await engine.reload_detail(box.scheduled)
+    rr = engine.registry_runner
+    assert rr is not None
+
+    async def calendar_parked() -> bool:
+        return not rr.outbound_running("OB_NORM_ADT")
+
+    await _until(calendar_parked)  # control: the calendar holds it down
+    message_id = await engine.store.enqueue_message(
+        channel_id=_CRIT, raw=ADT, deliveries=[("OB_NORM_ADT", ADT)], now=time.time()
+    )
+    coord = engine.dr_coordinator
+    assert coord is not None
+    await coord.activate(actor="alice")
+    await engine.reload_detail(box.tiered)  # the same graph with the schedule gone
+    assert (await _norm_row(engine, message_id))["attempts"] == 0
+
+    await _assert_delivers_after_release(engine, box, message_id)
 
 
 async def test_a_release_drain_that_times_out_is_not_recorded_as_drained(

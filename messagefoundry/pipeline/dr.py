@@ -113,6 +113,8 @@ class DrResult:
     verify_status: str | None = None  # the restore-verify result (PASS), activate only
     seed_segment: str | None = None  # the new audit-chain segment marker's own row hash digest
     vip_hook_ran: bool = False  # whether the optional takeover/release hook was invoked
+    drained: bool | None = None  # release only: every drainable row drained (vault BACKLOG #3067)
+    held_on_parked_outbounds: int | None = None  # release only: rows held on parked outbounds
 
 
 class DrCoordinator:
@@ -368,13 +370,16 @@ class DrCoordinator:
                 ),
                 now=now,
             )
+            drained = bool(outcome["drained"])
+            raw_held = outcome.get("held_on_parked_outbounds", 0)
+            held = raw_held if isinstance(raw_held, int) else 0
             log.warning(
                 "DR released by %s: VIP handed back, intake unbound, drained=%s, rows held on "
                 "parked outbounds=%s — the recovered primary resumes (cross-store reconciliation is "
                 "operator-verified per the runbook)",
                 actor,
-                outcome["drained"],
-                outcome.get("held_on_parked_outbounds", 0),
+                drained,
+                held,
             )
             # #145: the inverse — auto-resolves the open dr_activated instance (no page on a clean fail-back).
             self._alert_dr("dr_released")
@@ -383,6 +388,8 @@ class DrCoordinator:
                 active=False,
                 threshold=self._settings.priority_threshold.value,
                 vip_hook_ran=hook_ran,
+                drained=drained,
+                held_on_parked_outbounds=held,
             )
 
     # --- internals -----------------------------------------------------------

@@ -7443,6 +7443,8 @@ def create_app(
             active=result.active,
             threshold=result.threshold,
             vip_hook_ran=result.vip_hook_ran,
+            drained=result.drained,
+            held_on_parked_outbounds=result.held_on_parked_outbounds,
         )
 
     @app.post("/status/integrity-check", response_model=IntegrityResult)
