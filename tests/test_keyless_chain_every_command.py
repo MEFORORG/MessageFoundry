@@ -701,6 +701,9 @@ def test_a_keyed_chain_rewritten_as_keyless_warns_with_no_key_and_fails_with_it(
     key = generate_key()
     db = shell / "rewritten.db"
     _keyed_chain(db, key)
+    # The intact keyed chain sits at 4 in this shell, so the rewrite is a move from 4 to 5 (#3054).
+    assert main(["audit-verify", "--db", str(db)]) == 4
+    capsys.readouterr()
     with contextlib.closing(sqlite3.connect(db)) as conn:
         conn.row_factory = sqlite3.Row
         conn.execute(

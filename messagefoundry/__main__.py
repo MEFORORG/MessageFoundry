@@ -912,9 +912,9 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         help="exit 0 instead of 3 when the audit log verifies clean but holds no rows. Without it "
         "an empty log is a distinct exit code, so a scheduled job cannot read 'there was nothing "
         "to verify' as a pass (exit 1 stays a BROKEN CHAIN, exit 2 'could not open the store', "
-        "exit 4 'the chain's first row names a key and this shell holds none', exit 5 'the chain is "
-        "keyless, this shell holds no key, and its settings require one'). It does not apply in that "
-        "last setup: an empty log there exits 2 or 5",
+        "exit 4 'this shell holds no key while its settings require one, and the chain's first "
+        "row names a key', exit 5 'the same shell, and the chain is keyless'). It does not apply "
+        "in that shell: an empty log there exits 2 or 5",
     )
     # ONE mutually-exclusive group: the two flags carry the same value in two transports, and argparse
     # refusing both is better than silently letting one win.
@@ -7169,9 +7169,9 @@ def _audit_verify(args: argparse.Namespace) -> int:
     )
     if refused is not None:
         return refused
-    # Decides exit 4 against exit 1, and exit 5 against exit 0 for a keyless walk (#3054), below. The open
-    # computes the same verdict inline, because the
-    # #1916 source guard reads that call's argument, so the two cannot be one expression.
+    # Decides exit 4 against exit 1, and exit 5 against exit 0 for a keyless walk (#3054), below.
+    # The open computes the same verdict inline, because the #1916 source guard reads that call's
+    # argument, so the two cannot be one expression.
     keyless_refusal = keyless_opt_out_refusal(settings.store, settings.security)
 
     async def run() -> tuple[AuditVerdict, int]:
@@ -7186,8 +7186,10 @@ def _audit_verify(args: argparse.Namespace) -> int:
         )
         try:
             verdict = await store.verify_audit_chain(expected_anchor=expected_anchor)
-            if not verdict[0]:
-                return verdict, -1  # a FAIL exits 1 or 4 whatever the count; don't query for it
+            if not verdict[0] or (verdict.keyless_walk and keyless_refusal is not None):
+                # A FAIL exits 1 or 4, and a keyless walk here exits 5, whatever the count; so
+                # don't query for it.
+                return verdict, -1
             # The row count decides the empty-log exit below. Ask the store for an integer rather
             # than pattern-matching "verified 0 " out of a human-readable message.
             count, _head = await store.audit_anchor()

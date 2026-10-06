@@ -4301,7 +4301,7 @@ onto keyless rows fails the verify, and is also reported as
 | `2` | The command could not start. It covers at least an absent path, a zero-byte file, a file carrying no `audit_log` table, a path that is not a SQLite database at all, settings that cannot be read or fail validation (a `--service-config` path that is a directory or unreadable included, which exited 1 before vault BACKLOG #2725), a store key the settings name that cannot be resolved, and an empty log in a shell that holds no key and whose settings require one. |
 | `3` | A clean walk over an **empty** log. |
 | `4` | The chain's first row names a key, this shell holds no key, and its settings do not allow the store to run keyless. No row was checked against its MAC. It prints a `NOT CHECKED` line. This is not a pass. |
-| `5` | The chain is keyless and walked clean as plain SHA-256, but this shell holds no key and its settings require one, so it was not checked to their standard. It prints a `NOT CHECKED` line and a `WARNING` on stderr. This is not a pass. Before vault BACKLOG #3054 it exited 0. The paragraph on the setup where this goes wrong, below, says what a move from 5 to 4 means. |
+| `5` | The chain is keyless and walked clean as plain SHA-256. This shell holds no key, and its settings require one. So the chain was not checked to their standard. It prints a `NOT CHECKED` line and a `WARNING` on stderr. This is not a pass. Before vault BACKLOG #3054 it exited 0. The paragraph on the setup where this goes wrong, below, says what a move between 4 and 5 means. |
 
 For exit 2 the verifier refuses each case rather than creating or migrating the evidence it was asked
 to check, and it opens read-only so it cannot write to that file either way. It never spends `1` on
@@ -4330,16 +4330,20 @@ walks clean in a shell whose settings forbid keyless running exits 5, not 0. The
 check is keyed, and a plain SHA-256 walk is not that. It prints a `NOT CHECKED` line, and a
 `WARNING` on stderr naming the mismatch. Neither quotes a row. In this setup 5 is the steady state,
 and a matching `--expected-anchor` does not change it. **A move from 5 to 4 means the first row was
-changed to name a key.** Treat it as a sign of tampering until a run with the engine's settings and
-key says otherwise. A job in this setup can never report a pass: give it the engine's key, or the
-keyless opt-out the engine runs under.
+changed to name a key.** On a keyed store the same shell sits at 4, and **a move from 4 to 5 means
+the chain was rewritten as keyless.** Treat either move as a sign of tampering until a run with the
+engine's settings and key says otherwise. The split catches only a writer who changes whether the
+first row names a key: one who rewrites a keyless chain as plain SHA-256 stays at 5. A job in this
+setup can never report a pass: give it the engine's key, or the keyless opt-out the engine runs
+under.
 The warning is a sign, not a diagnosis: a clean keyless walk cannot tell a store that runs keyless
 from a keyed chain rewritten as keyless. Run the job with the settings and key the engine runs
 with: a keyless store then passes with exit 0 and no warning, and a keyed chain rewritten as
 keyless fails with exit 1. Do not clear the 5 by giving the job the keyless opt-out unless the
-engine runs under it too. A job that moves from 0 to 5 lost the opt-out it ran with, or moved from
-a build before #3054. One that moves from 0 to 4 lost, at least, the key it ran with. Neither move
-comes from the database alone, so find out what changed the job. An empty log in this setup
+engine runs under it too. A job that moves from 0 to 4 or 5 has at least one of these causes: it
+lost the key it ran with, it lost the opt-out, or it moved from a build before #3054. Neither move
+comes from the database alone, but the database may have changed too. So find out what changed the
+job, then re-run it with the engine's settings and key. An empty log in this setup
 exits 2. The store open refuses it for every command, the read-only verify included, because the
 handle's next append would start a keyless chain (BACKLOG #1916). A log emptied after the open has
 no first row naming a key, so it exits 5. Exit 3
@@ -4348,7 +4352,7 @@ pass; pass `--allow-empty` to accept it as one on an instance that has not logge
 pass an expected anchor of `0:`, which asserts the same thing and is checked. `audit-anchor` keeps
 exit 0 on an empty log — sealing a fresh instance as `0:` is the point of it — but refuses the same
 non-audit-database paths and an unresolvable key with exit 2. It needs no key to read a keyed chain's
-anchor, so it has no exit 4. A clean verify does **not** mean nothing was removed: deleting the *newest*
+anchor, so it has no exit 4 or 5: it exits 0 on a chain the verify reports as 5. A clean verify does **not** mean nothing was removed: deleting the *newest*
 rows leaves a prefix that still chains cleanly, so a bare verify is clean after a tail-truncation.
 The sequence number does not change that: it shows a row missing from the middle, not rows missing
 from the end. A log emptied altogether is the same case, since the next start writes a new genesis
