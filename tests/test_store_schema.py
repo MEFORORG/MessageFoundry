@@ -576,12 +576,19 @@ def _no_at_rest_env(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.mark.usefixtures("_no_at_rest_env")
 @pytest.mark.parametrize("command", ["audit-verify", "audit-anchor"])
 def test_the_audit_commands_read_a_store_this_build_refuses(
-    tmp_path: Path, command: str, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    command: str,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """They open read-only, so the audit log of an incompatible store can still be verified and
     anchored, and the store is not touched."""
     from messagefoundry.__main__ import main
+    from tests._phi_gate_provisions import setenv_at_rest_opt_out
 
+    # The store is keyless, so verify it under the opt-out a keyless engine runs with: in a shell
+    # whose settings require a key, a keyless chain exits 4 (vault BACKLOG #3054).
+    setenv_at_rest_opt_out(monkeypatch)
     db = tmp_path / "incompatible.db"
     _incompatible_store(db)
     before = db.read_bytes()

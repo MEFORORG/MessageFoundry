@@ -912,7 +912,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         help="exit 0 instead of 3 when the audit log verifies clean but holds no rows. Without it "
         "an empty log is a distinct exit code, so a scheduled job cannot read 'there was nothing "
         "to verify' as a pass (exit 1 stays a BROKEN CHAIN, exit 2 'could not open the store', "
-        "exit 4 'the chain is keyed and this shell holds no key, so it was not checked')",
+        "exit 4 'this shell holds no store key while its settings require one, so the chain was not "
+        "checked against a key')",
     )
     # ONE mutually-exclusive group: the two flags carry the same value in two transports, and argparse
     # refusing both is better than silently letting one win.
@@ -7123,9 +7124,7 @@ def _refuse_a_store_that_is_not_an_audit_log(
 
 
 def _audit_verify(args: argparse.Namespace) -> int:
-    from pydantic import ValidationError
-
-    from messagefoundry.config.settings import StoreBackend, keyless_opt_out_refusal, load_settings
+    from messagefoundry.config.settings import StoreBackend, keyless_opt_out_refusal
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import (
         KeylessAuditChainRefused,
@@ -7144,13 +7143,13 @@ def _audit_verify(args: argparse.Namespace) -> int:
     cli: dict[str, dict[str, object]] = {}
     if args.db is not None:
         cli.setdefault("store", {})["path"] = args.db
-    try:
-        settings = load_settings(config_path=args.service_config, cli=cli)
-    except (OSError, ValueError, ValidationError) as exc:
-        # OSError, not only FileNotFoundError (vault BACKLOG #2725): a directory or an unreadable
-        # file named by --service-config reached the dispatch floor and exited 1, a broken chain's
-        # code. Its text names the path, not the file's content.
-        print(f"error: {exc}", file=sys.stderr)
+    settings, detail = _load_service_settings(args.service_config, cli=cli)
+    if settings is None:
+        # Through `_load_service_settings`, as `audit-anchor` loads them (vault BACKLOG #3054). It
+        # RENDERS a `ValidationError` rather than stringifying it, whose `input_value=` would echo a
+        # configured secret, and its catch covers the `OSError` of a directory named as the file,
+        # which reached the dispatch floor and exited 1 before #2725. Exit 2: could not start.
+        _emit_error(detail or "could not load the service settings", as_json=False)
         return 2
 
     # A SQLite store was once CREATED (or schema-migrated) on open: a compliance job pointed at a
@@ -7225,13 +7224,21 @@ def _audit_verify(args: argparse.Namespace) -> int:
             "names one. Either the chain was altered, or this shell lacks the key the store runs "
             "with"
         )
-    print(("OK: " if ok else "FAIL: ") + (message or ""))
     if not ok:
+        print("FAIL: " + (message or ""))
         return 1
-    if verdict.keyless_walk and keyless_refusal is not None:
-        # Vault BACKLOG #2725. A keyless chain passed, in a shell whose settings require a key. That
-        # is the setup where a rewritten first row turns later tampering into exit 4, so it is said
-        # now, while the chain is clean. The exit stays 0: the chain did verify. Content-free.
+    # A clean walk by a shell that holds no key, whose settings require one (vault BACKLOG #2725,
+    # #3054). Content-free either way: neither line quotes a row.
+    if verdict.keyless_walk and keyless_refusal is not None and count:
+        # EXIT 4, NOT 0 (#3054). The settings say verification is keyed, and this was a plain SHA-256
+        # walk that anyone who can write the log can recompute, so the chain was not checked to the
+        # standard they set. A job that reads only the code never sees the WARNING, and 0 would let
+        # a site sit in the one setup where a rewritten first row turns later tampering from 1 into
+        # 4 (#2725). Here 4 is the steady state, so that rewrite changes nothing a job can see.
+        print(
+            f"NOT CHECKED: walked {count} audit row(s) as a keyless chain (plain SHA-256), but this "
+            "shell's settings require a store key, so the chain was not checked to that standard"
+        )
         print(
             "WARNING: the audit chain is keyless (its first row names no key, and it was checked "
             "as plain SHA-256), but this shell's settings require a store key. Causes include at "
@@ -7241,6 +7248,11 @@ def _audit_verify(args: argparse.Namespace) -> int:
             "decides it.",
             file=sys.stderr,
         )
+        return 4
+    # An EMPTY log in that setup falls through to the empty-log exit below with no keyless WARNING:
+    # it has no first row to name a key or not (#3054). The open refuses it first (#1916, exit 2),
+    # so only a log emptied between the open and the walk gets here.
+    print("OK: " + (message or ""))
     if count:
         return 0
 
