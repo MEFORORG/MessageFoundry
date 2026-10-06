@@ -3129,10 +3129,13 @@ def test_the_bundle_prints_nothing_its_own_passes_hid(monkeypatch: pytest.Monkey
 
     The full probe behind ``redact_log_line``'s comment ran 822,616 lines; this is the slice that
     found the defect, plus a seeded structured corpus. Two other arms keep it honest. The layer must
-    hide something, or it is dead weight. And the shared pass ALONE must still print something the
-    own copy hid, on the fold-head lines: that is the measured reason the copy stays, and it is the
-    control showing this comparison can fail."""
-    corpus = [*_fold_head_two_label_lines(), *_structured_lines(3000), *_REVIEW_SHAPES]
+    hide something, or it is dead weight. And the shared pass ALONE (the own patterns disabled) must
+    still print something the own copy hid ON THE FOLD-HEAD LINES: that is the measured reason the
+    copy stays, and it is the control showing this comparison can fail. That arm reads the fold-head
+    slice only, because the shared pass alone also prints on some ASCII structured lines, and those
+    would keep it green after the fold-head residual closed."""
+    fold_head = _fold_head_two_label_lines()
+    corpus = [*fold_head, *_structured_lines(3000), *_REVIEW_SHAPES]
     shipped = [redact_log_line(line) for line in corpus]
     with monkeypatch.context() as patch:
         patch.setattr(redact_mod, "scrub_credentials", lambda text, *, placeholder: text)
@@ -3145,7 +3148,8 @@ def test_the_bundle_prints_nothing_its_own_passes_hid(monkeypatch: pytest.Monkey
     weaker = _newly_printed(corpus, own_only, shipped)
     assert not weaker, f"{len(weaker)} lines print a value the own passes hid, first {weaker[:3]}"
     assert _newly_printed(corpus, shipped, own_only), "the second layer hid nothing on this corpus"
-    assert _newly_printed(corpus, own_only, shared_only), (
+    n = len(fold_head)
+    assert _newly_printed(fold_head, own_only[:n], shared_only[:n]), (
         "the shared pass alone no longer prints anything the bundle's own copy hid. If secretscrub "
         "closed the fold-head residual, BACKLOG #2694's remainder may be ready: try deleting the "
         "copy in support/redact.py and re-run the probe described above redact_log_line."

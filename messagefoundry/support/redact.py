@@ -492,7 +492,7 @@ _LEADING_TS = re.compile(r"^\s*\d{4}[-/]\d{2}[-/]\d{2}(?:[ T]\d{2}:\d{2}:\d{2}(?
 # ``1ef846c04c``, over 822,616 synthetic lines: 568,320 two-label lines (every keyword as a first label,
 # with ASCII and fold-character prefixes, ten separators, every keyword as a second label, six value
 # shapes), plus the seeded corpora in ``tests/test_log_redaction_secret_domain.py``. The shared pass
-# alone printed a value the copy hid on 11,888 lines.
+# alone, called where the copy ran (before the PHI pass), printed a value the copy hid on 11,888 lines.
 #
 # EVERY ONE OF THEM HAD A FIRST LABEL WITH A FOLD-CHARACTER HEAD, such as ``<U+212A>_password=``.
 # ``secretscrub`` folds case globally, so it reads that label; this copy folds only its keywords, so
@@ -514,20 +514,29 @@ _LEADING_TS = re.compile(r"^\s*\d{4}[-/]\d{2}[-/]\d{2}(?:[ T]\d{2}:\d{2}:\d{2}(?
 #   the reader loses which credential it was. Split there, the shared pass cannot read across a value
 #   this module's own passes redacted. It can still read across the PHI pass's lowercase marker, which
 #   is not split on. A line that ARRIVES holding the placeholder text is not split at all, so a value
-#   written as ``<fold>_password=[REDACTED]<secret>`` cannot cut its own label off.
+#   written as ``<fold>_password=[REDACTED]<secret>`` cannot cut its own label off. The cost is that
+#   such a line, which includes store error text this function already redacted once, can lose a
+#   label again; its values stay hidden. Telling an inserted placeholder from a logged one would mean
+#   changing the text the first layer and the PHI pass see, which is what keeps them unchanged.
 #
-# Over the same corpus the pair printed nothing this copy alone hid: 0 lines. The other way, it hid a
-# value on 325,287 lines where this copy printed one. Control: with ``_KEY_MATERIAL`` dropped from both
-# layers, the same probe found 214,387 lines, so it can fail.
+# Over the same corpus, in ONE pass, the pair printed nothing this copy alone hid: 0 lines. The other
+# way, it hid a value on 325,287 lines where this copy printed one. Control: with ``_KEY_MATERIAL``
+# dropped from both layers, the same probe found 214,387 lines, so it can fail.
 # ``test_the_bundle_prints_nothing_its_own_passes_hid`` keeps a smaller copy of that differential live.
+#
+# TWO PASSES ARE NOT COVERED BY THAT ZERO. Store error text runs through this function, then the
+# write-time filter, then this function again in the bundle. Over the same corpus that path printed a
+# value the old path hid on 1 line, and hid one the old path printed on 6,107. On that line both
+# single passes print the value; only the old second pass hid it, by reading past it.
 #
 # THIS IS HALF OF #2694 AND NOT ALL OF IT. A word added to ``secretscrub`` now reaches every caller of
 # this function -- at least the support archive, ``GET /logs/tail`` and the store error text the
 # PostgreSQL, SQL Server and privilege checks build with it. It shares ``scrub_credentials`` only;
 # the URL query-string filter is still the write-time chain's alone.
-# ``test_a_word_added_to_the_shared_vocabulary_reaches_both_surfaces`` proves that. A word added
-# only to the copy above still misses the write-time filters. The copy can go once ``secretscrub``
-# closes the fold-head residual above, and this module's tests will say when by going red.
+# ``test_a_word_added_to_the_shared_vocabulary_reaches_both_surfaces`` proves it for this function
+# and the write-time pass; the caller list is read off the call graph. A word added only to the copy
+# above still misses the write-time filters. The copy can go once ``secretscrub`` closes the fold-head
+# residual above, and that test file's fold-head control arm will say when by going red.
 def redact_log_line(line: str) -> str:
     """Return ``line`` with PHI/secret patterns replaced by a redaction placeholder.
 
@@ -538,7 +547,8 @@ def redact_log_line(line: str) -> str:
     JSON, DICOM tag dumps and XML (BACKLOG #1711) — so bundled logs match the
     stored-error PHI coverage (DELTA-07). Then the write-time credential vocabulary
     (:func:`messagefoundry.secretscrub.scrub_credentials`) runs over the text between the placeholders
-    so far (BACKLOG #2694). A final long-base64 sweep catches any residual key/token run.
+    so far, or over the whole line when the line arrived holding the placeholder text (BACKLOG
+    #2694). A final long-base64 sweep catches any residual key/token run.
     The leading log timestamp is carved off first so the engine's date pass doesn't scrub it. This errs
     toward over-redaction (e.g. a capitalized two-word phrase in ordinary log text may be scrubbed) —
     the correct trade-off for a file that leaves the box."""
