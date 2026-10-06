@@ -1019,7 +1019,8 @@ async def resolve_client_cert_identity(request: Request) -> Identity | None:
     subject/SAN to an account id (:func:`client_cert_principal_under_issuer`), and resolves that id
     to an Identity. Returns ``None`` — DENY-BY-DEFAULT — when cert-identity is unconfigured, auth is
     disabled, no cert is presented, the issuer is not listed, the subject is unmapped/spoofed under its
-    issuer, or the mapped account is unknown/disabled."""
+    issuer, or the mapped account is unknown/disabled, or is a directory account the directory does
+    not confirm on this request (BACKLOG #2316, :meth:`AuthService.identity_for_cert_user_id`)."""
     cert_map: Mapping[str, Mapping[str, str]] = (
         getattr(request.app.state, "tls_client_cert_identities", {}) or {}
     )
