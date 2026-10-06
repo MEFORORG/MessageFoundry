@@ -228,15 +228,21 @@ async def test_a_sign_in_refused_after_the_sync_still_raises_the_alert(
 
 class _RaisingSink(_Sink):
     def administrator_granted(self, name: str, *, via: str, granted_by: str) -> None:
+        super().administrator_granted(name, via=via, granted_by=granted_by)
         raise RuntimeError("sink broke its never-raise contract")
 
 
 async def test_a_sink_that_raises_does_not_break_the_sign_in(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """RED when: the try/except in ``alert_administrator_granted`` goes. The sign-in must still
-    succeed: a 500 here would leave the role written and the retry gaining nothing to page on."""
+    succeed: a 500 here would leave the role written and the retry gaining nothing to page on. The
+    sink must actually have been called and raised, or the 200 proves nothing."""
     service = await _service(engine, monkeypatch, frozenset({ADMINS}))
-    async with _client(engine, service, _RaisingSink()) as c:
-        r = await _negotiate(c)
-        assert r.status_code == 200, r.text
+    sink = _RaisingSink()
+    with caplog.at_level("ERROR", logger="messagefoundry.api.security"):
+        async with _client(engine, service, sink) as c:
+            r = await _negotiate(c)
+            assert r.status_code == 200, r.text
+    assert sink.events == [_GRANT]
+    assert any("failed to emit" in rec.getMessage() for rec in caplog.records)

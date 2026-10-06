@@ -4315,7 +4315,8 @@ _ALERT_EVENT_TYPES = frozenset(
         # [approvals].min_dwell_seconds floor. Keyed `approval:<id>`, which no connection can be named.
         "approval_too_early",
         # BACKLOG #315: a release by an approver account changed after the request, and an
-        # Administrator grant through the console API.
+        # Administrator grant through the console API or, since vault BACKLOG #2610, by a directory
+        # sign-in's role sync (granted_by `<directory>`).
         "approval_approver_provenance",
         "administrator_granted",
         # ADR 0079 mechanism 2: the directory reconciler's two audited outcomes, each routable apart:

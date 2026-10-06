@@ -57,8 +57,9 @@ def alert_sink_for(state: Any) -> AlertSink:
 
 
 #: ``granted_by`` on the ``administrator_granted`` alert a directory sign-in raises (vault BACKLOG
-#: #2610): no administrator acted, the directory's group membership did. The angle brackets keep it
-#: out of the username space, as the ``<kerberos>`` audit actor's do.
+#: #2610): no administrator acted, the directory's group membership did. It is a fixed marker, styled
+#: like the ``<kerberos>`` audit actor. No username check reserves it, so an account literally named
+#: ``<directory>`` would read the same in this field; the alert's ``via`` names the route either way.
 DIRECTORY_GRANTED_BY = "<directory>"
 
 

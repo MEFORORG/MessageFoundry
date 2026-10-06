@@ -4,9 +4,9 @@
 
 ``GET /ui/sso`` and the ``/ui/oidc`` callback complete a directory sign-in exactly as the engine's
 ``POST /auth/negotiate`` does, so each must raise ``administrator_granted`` when the sign-in's role
-sync newly gives the account the Administrator role, and raise nothing when it already held it. The
-engine route, the non-admin control and the refused-after-sync case are in
-``tests/test_directory_sign_in_admin_alert.py``.
+sync newly gives the account the Administrator role, raise it when the sign-in is refused after the
+role write, and raise nothing when it already held it. The engine route, the non-admin control and
+the engine's refused-after-sync case are in ``tests/test_directory_sign_in_admin_alert.py``.
 """
 
 from __future__ import annotations
@@ -111,13 +111,27 @@ def _client(engine: Engine, service: AuthService, sink: _Sink) -> httpx.AsyncCli
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t")
 
 
-async def _sso(engine: Engine, monkeypatch: pytest.MonkeyPatch, *, held: Role | None) -> _Sink:
+async def _sso(
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    held: Role | None,
+    bind_lands_mid_login: bool = False,
+) -> _Sink:
+    """``bind_lands_mid_login`` makes the mint fail after the role write, as in :func:`_oidc`."""
     service = await _service(engine, held=held, bind=False)
     monkeypatch.setattr("messagefoundry.auth.service.kerberos_principal", lambda _t, _s: "jdoe")
+    if bind_lands_mid_login:
+
+        async def _bind_landed(*_a: object, **_k: object) -> str:
+            raise _BindingChangedMidLogin
+
+        monkeypatch.setattr(service, "_issue_session", _bind_landed)
     sink = _Sink()
     async with _client(engine, service, sink) as c:
         r = await c.get("/ui/sso", headers={"Authorization": "Negotiate c3BuZWdvLXRva2Vu"})
-    assert r.status_code == 303 and r.headers["location"] == "/ui", r.headers
+    expected = "/ui/login?e=sso_failed" if bind_lands_mid_login else "/ui"
+    assert r.status_code == 303 and r.headers["location"] == expected, r.headers
     return sink
 
 
@@ -184,6 +198,16 @@ async def test_ui_sso_by_an_existing_administrator_raises_none(
 ) -> None:
     sink = await _sso(engine, monkeypatch, held=Role.ADMINISTRATOR)
     assert sink.events == []
+
+
+async def test_ui_sso_refused_after_the_role_write_still_raises_the_alert(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the alert call moves below the ``if not outcome.ok`` redirect. The role was written
+    before the mint failed, and a later sign-in gains nothing, so this refusal is the one chance to
+    page."""
+    sink = await _sso(engine, monkeypatch, held=Role.OPERATOR, bind_lands_mid_login=True)
+    assert sink.events == [_grant("directory_sign_in_sso")]
 
 
 async def test_ui_oidc_that_newly_grants_administrator_raises_one_alert(
