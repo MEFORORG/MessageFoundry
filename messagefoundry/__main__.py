@@ -5071,10 +5071,13 @@ def _init(args: argparse.Namespace) -> int:
 
 def _service(args: argparse.Namespace) -> int:
     """Control the engine's Windows service (ADR 0088). ``status`` queries state (no elevation);
-    ``start``/``stop`` elevate once via UAC; ``install`` runs scripts/service/install-service.ps1
-    elevated. The engine can't stop/start its *own* hosting service through the API, so this is a
-    local, out-of-band CLI over the Windows SCM. Off Windows the actions are no-ops (return 1) and
-    ``status`` prints ``unavailable``."""
+    ``start``/``stop`` elevate once via UAC and wait for the elevated ``net`` command; ``install``
+    runs scripts/service/install-service.ps1 elevated. The engine can't stop/start its *own* hosting
+    service through the API, so this is a local, out-of-band CLI over the Windows SCM. Off Windows
+    the actions are no-ops (return 1) and ``status`` prints ``unavailable``.
+
+    A declined UAC prompt or a failed elevation exits 1 with the reason on stderr, so a wrapper
+    script never reads a refused action as success (vault BACKLOG #2787)."""
     from messagefoundry import service as svc
 
     action = args.action
@@ -5098,28 +5101,45 @@ def _service(args: argparse.Namespace) -> int:
             )
             return 2
         try:
-            started = svc.install_service(str(script), args.env)
+            launched = svc.install_service(str(script), args.env)
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
-        if not started:
+        if launched is svc.ServiceControlOutcome.DISPATCHED:
+            print(f"launched the elevated installer for environment {args.env!r}")
+            return 0
+        if launched is svc.ServiceControlOutcome.UNSUPPORTED:
             print("error: `service install` is Windows-only", file=sys.stderr)
-            return 1
-        print(f"launched the elevated installer for environment {args.env!r}")
-        return 0
+        else:
+            print(
+                "error: the elevated installer did not launch: the UAC prompt was declined or the "
+                "launch failed; nothing was installed",
+                file=sys.stderr,
+            )
+        return 1
     # start / stop
     try:
-        started = svc.control_service(action, args.name)
+        outcome = svc.control_service_ex(action, args.name)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    if not started:
+    if outcome is svc.ServiceControlOutcome.DISPATCHED:
+        print(f"elevated `net {action}` of service {args.name!r} completed")
+        return 0
+    if outcome is svc.ServiceControlOutcome.UNSUPPORTED:
         print(f"error: `service {action}` is Windows-only", file=sys.stderr)
-        return 1
-    print(
-        f"requested elevated `{action}` of service {args.name!r}; poll `service status` for state"
-    )
-    return 0
+    elif outcome is svc.ServiceControlOutcome.CANCELLED:
+        print(
+            f"error: the UAC prompt was declined; `service {action}` of {args.name!r} did not run",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"error: `service {action}` of {args.name!r} failed: elevation failed or `net {action}` "
+            "exited non-zero; check `service status`",
+            file=sys.stderr,
+        )
+    return 1
 
 
 def _gen_key(_args: argparse.Namespace) -> int:

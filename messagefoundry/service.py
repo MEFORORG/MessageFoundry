@@ -12,7 +12,8 @@ Elevated actions come in two forms: :func:`control_service` is fire-and-forget (
 process is detached, output isn't captured) — poll :func:`service_state` to observe the result;
 :func:`control_service_ex` (ADR 0113) waits on the elevated child and returns a
 :class:`ServiceControlOutcome` that distinguishes a cancelled UAC prompt from a failure, for the
-tray service-manager. Both elevate the same ``net`` command; neither elevates user-writable code.
+tray service-manager and the ``service start``/``stop`` CLI. Both elevate the same ``net`` command;
+neither elevates user-writable code.
 
 **Every** program either form hands to the OS is an absolute system-directory path, resolved by
 :func:`messagefoundry.service_status._system_exe`, whose docstring is the one place that explains
@@ -161,14 +162,14 @@ def control_service(action: str, name: str) -> bool:
 
 
 class ServiceControlOutcome(Enum):
-    """The result of an :func:`control_service_ex` elevation attempt.
+    """The result of a :func:`control_service_ex` or :func:`install_service` elevation attempt.
 
     Unlike :func:`control_service` (fire-and-forget, ``bool``), this distinguishes a user-cancelled
     UAC prompt from a genuine failure — the tray service-manager needs it to render an honest
     "action cancelled" vs "action failed" (ADR 0113 §4).
     """
 
-    DISPATCHED = "dispatched"  # the elevated command ran and exited 0
+    DISPATCHED = "dispatched"  # the elevated command ran and exited 0 (install: it was launched)
     CANCELLED = "cancelled"  # the user dismissed the UAC prompt (ERROR_CANCELLED 1223)
     FAILED = "failed"  # elevation failed, or the elevated command exited non-zero
     UNSUPPORTED = "unsupported"  # not Windows — a no-op
@@ -176,6 +177,8 @@ class ServiceControlOutcome(Enum):
 
 # ShellExecuteEx / process constants.
 _ERROR_CANCELLED = 1223
+# ShellExecuteW returns a value above this on success, and an error code at or below it otherwise.
+_SHELLEXECUTE_OK = 32
 _SEE_MASK_NOCLOSEPROCESS = 0x00000040  # populate hProcess so we can wait + read the exit code
 _SW_HIDE = 0
 _WAIT_TIMEOUT_MS = 60_000  # NSSM's graceful stop (~15s) + a start; generous
@@ -312,11 +315,19 @@ def _install_params(script_path: str, environment: str) -> str:
     return f'-NoExit -ExecutionPolicy Bypass -File "{script_path}" -Environment "{environment}"'
 
 
-def install_service(script_path: str, environment: str) -> bool:
+def install_service(script_path: str, environment: str) -> ServiceControlOutcome:
     """Run the install script elevated in a *visible* PowerShell window (one-time setup, so the
     operator can read the output / 'next steps' and any errors). ``environment`` is the active
-    environment the service runs as (ADR 0017 — install-service.ps1 requires it). Returns False off
-    Windows. Raises :class:`ValueError` for an unsafe environment name (it runs elevated).
+    environment the service runs as (ADR 0017 — install-service.ps1 requires it). Raises
+    :class:`ValueError` for an unsafe environment name (it runs elevated).
+
+    Returns :data:`~ServiceControlOutcome.UNSUPPORTED` off Windows,
+    :data:`~ServiceControlOutcome.FAILED` when the elevated launch did not happen, and
+    :data:`~ServiceControlOutcome.DISPATCHED` when the
+    installer window was launched -- not waited on: the window stays open (``-NoExit``) for the
+    operator, so the installer's own result is read there. ``ShellExecuteW`` reports a declined UAC
+    prompt and a failed launch through the same return range, so this does not tell them apart
+    (vault BACKLOG #2787).
 
     The image is the system directory's ``WindowsPowerShell\\v1.0\\powershell.exe`` — Windows
     PowerShell 5.1, the host the installer is written for (:func:`_system_exe`). Starting the child
@@ -324,8 +335,8 @@ def install_service(script_path: str, environment: str) -> bool:
     ``$PSScriptRoot`` rather than from the working directory."""
     params = _install_params(script_path, environment)  # validates env on every platform
     if sys.platform != "win32":
-        return False
-    ctypes.windll.shell32.ShellExecuteW(
+        return ServiceControlOutcome.UNSUPPORTED
+    launched = ctypes.windll.shell32.ShellExecuteW(
         None,
         "runas",
         _system_exe("WindowsPowerShell", "v1.0", "powershell.exe"),
@@ -333,4 +344,9 @@ def install_service(script_path: str, environment: str) -> bool:
         _system_dir(),
         1,
     )
-    return True
+    # The documented ShellExecute contract: a value above 32 is success, and 32 or less is an error
+    # code, which a declined UAC prompt is as well. The value was discarded before, so a refused
+    # launch read as a launched one (vault BACKLOG #2787).
+    if launched > _SHELLEXECUTE_OK:
+        return ServiceControlOutcome.DISPATCHED
+    return ServiceControlOutcome.FAILED
