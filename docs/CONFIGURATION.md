@@ -718,11 +718,15 @@ alerts resolve on their own when a pass is evidence the condition has gone (BACK
 needs alert state ([ADR 0044](adr/0044-operator-alert-state.md)). The pass must have an answer, from
 this engine process, for every signed-in directory account it did not just revoke.
 
+**An engine process resolves only an alert it watched open.** It resolves the breaker only after a
+pass of its own tripped, and the hold only after a pass of its own held. A restart forgets which
+accounts were behind a trip or a hold, and it cannot see the accounts that sign out while the
+engine is down. So a restarted engine leaves open both alerts its last run left open, however clean
+the directory reads. An operator resolves them, unless the restarted engine trips or holds itself
+and then sees that clear.
+
 - The hold resolves when no answer is undetermined and this pass read `userAccountControl` at
   least once. An account the pass just revoked still counts as an answer here.
-- The hold also needs this engine process to have held accounts itself since it started. A
-  restart forgets which accounts a hold covered. So a restarted engine leaves its last run's hold
-  open until it holds and releases accounts of its own. Until then, an operator resolves it.
 - An engine can also give up resolving the hold. That happens when an account whose last answer
   was undetermined leaves, unless the engine has released a hold and has not held since. The
   reconciler may revoke it, or its sessions may end some other way. The engine then resolves no
@@ -746,13 +750,8 @@ shard.** Another engine's reconciler may still hold the condition there, so an o
 alert. A directory outage, a pass with nobody signed in, an account that never answers, and
 `ad_session_recheck_seconds = 0` resolve nothing either.
 
-At least two cases can still resolve falsely:
-
-- An engine that declares neither `[cluster]` nor more than one engine shard trusts its own
-  evidence, whatever else shares its store.
-- An engine remembers who left only while it runs. A trip whose accounts leave across a restart
-  can resolve on the accounts that remain. The hold does not, because a restarted engine leaves its
-  last run's hold open.
+At least one case can still resolve falsely. An engine that declares neither `[cluster]` nor more
+than one engine shard trusts its own evidence, whatever else shares its store.
 
 ### `[ai]` — AI coding assistance policy
 Implemented (see [AI.md](AI.md)). Controls the IDE AI assistant across the **OFF→PHI-safe** range;

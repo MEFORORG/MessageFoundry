@@ -7917,9 +7917,10 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     service decides when a pass is evidence of a clear (``plan.breaker_clear``, ``plan.hold_clear``;
     see ``AuthService._mark_reconcile_clears``), so the alert and the service read one predicate.
     An outage or a pass with no signed-in account sets neither. The inverse is raised on EVERY pass
-    that sets its flag, not once per clear: resolving is an idempotent update, a resolve the
-    notifier failed to write is retried that way, and a fresh process can resolve a trip its last
-    run left open. A hold's release has a further test, stated in ``_mark_reconcile_clears``."""
+    that sets its flag, not once per clear: resolving is an idempotent update, and a resolve the
+    notifier failed to write is retried that way. A process clears only what it watched open, so a
+    fresh process resolves neither alert an earlier run left open; ``_mark_reconcile_clears``
+    states that rule once."""
     if plan.directory_outage:
         return
     if plan.aborted is not None:

@@ -51,7 +51,7 @@ from messagefoundry.auth.reconcile import (
     ReconcilePlan,
     SessionRevocation,
 )
-from messagefoundry.auth.service import AuthService, _HoldStanding
+from messagefoundry.auth.service import AuthService, _BreakerStanding, _HoldStanding
 from messagefoundry.config.settings import (
     _ALERT_EVENT_TYPES,
     AuthSettings,
@@ -929,7 +929,7 @@ async def test_the_durable_held_instance_stays_open_while_held_and_resolves_on_r
             assert await _open_alerts(store) == {HELD}
         directory.uac.update({"u1": ENABLED, "u2": ENABLED})
         plan = await _alerted_pass(service, sink)
-        assert plan.hold_clear and plan.breaker_clear
+        assert plan.hold_clear and not plan.breaker_clear  # this process never tripped
         assert await _open_alerts(store) == set()
 
 
@@ -1232,13 +1232,13 @@ def _held_before(service: AuthService) -> AuthService:
     return service
 
 
-async def test_a_fresh_process_resolves_a_trip_its_last_run_left_open_but_not_a_hold(
+async def test_a_fresh_process_resolves_neither_alert_its_last_run_left_open(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The breaker has no latch to lose, so a clean pass from a fresh process resolves the trip,
-    though never on an outage. The hold's latch did not survive the restart, and this process has
-    not latched one, so it cannot tell whether the last run's latch still held an account. The
-    hold's instance stays open for an operator."""
+    """A process clears only what it watched open (``AuthService._mark_reconcile_clears``). This
+    one has watched neither: its records start empty, so it cannot tell which accounts were behind
+    the last run's trip or hold, or whether they are still signed in. A clean estate is still no
+    evidence, and both instances stay open for an operator."""
     async with _signed_in_estate(monkeypatch, ["jdoe", "asmith"]) as estate:
         directory, _service, store, _tokens = estate
         await _left_open_by_an_earlier_run(store)
@@ -1251,16 +1251,68 @@ async def test_a_fresh_process_resolves_a_trip_its_last_run_left_open_but_not_a_
         directory.down = False
         for _ in range(2):  # not a matter of waiting another pass
             plan = await _alerted_pass(service, sink)
-            assert plan.breaker_clear and not plan.hold_clear
-            assert await _open_alerts(store) == {HELD}
+            assert plan.aborted is None and plan.readable == 2
+            assert not plan.breaker_clear, "a fresh process resolved a trip it never watched"
+            assert not plan.hold_clear
+            assert await _open_alerts(store) == {ABORTED, HELD}
+
+
+async def test_a_trip_whose_accounts_leave_across_a_restart_stays_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The restart form of the Lander's driven case. Ten of twelve accounts read absent and the
+    breaker trips. The engine restarts, and the ten sessions end, so the restarted process never
+    sees those accounts and has nothing to forfeit on. The two that remain read clean. Nothing was
+    fixed, so the trip must stay open."""
+    names = ["ok1", "ok2"] + [f"gone{i}" for i in range(10)]
+    async with _signed_in_estate(monkeypatch, names) as (directory, last_run, store, _tokens):
+        sink = NotifierAlertSink([], store=store)
+        for name in names[2:]:
+            directory.delete(name)
+        await _alerted_pass(last_run, sink)  # strike 1
+        assert (await _alerted_pass(last_run, sink)).aborted == "mass_revoke_breaker"
+        assert await _open_alerts(store) == {ABORTED}
+        service = _fresh_process(store)
+        await service.initialize()
+        await _expire(store, names[2:])
+        for _ in range(2):  # not a matter of waiting another pass
+            plan = await _alerted_pass(service, sink)
+            assert plan.aborted is None and plan.readable == 2
+            assert not plan.breaker_clear, "the trip resolved once its accounts left over a restart"
+            assert await _open_alerts(store) == {ABORTED}
+
+
+async def test_a_fresh_process_resolves_a_trip_once_a_pass_of_its_own_has_tripped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The control for the two tests above. A fresh process leaves the last run's trip open, then
+    a pass of its own trips. It watched that trip, so once the directory reads clean it resolves
+    the instance."""
+    names = ["ok1", "ok2"] + [f"gone{i}" for i in range(10)]
+    async with _signed_in_estate(monkeypatch, names) as (directory, _service, store, _tokens):
+        await _left_open_by_an_earlier_run(store)
+        service = _fresh_process(store)
+        await service.initialize()
+        sink = NotifierAlertSink([], store=store)
+        assert not (await _alerted_pass(service, sink)).breaker_clear
+        saved = dict(directory.ids)
+        for name in names[2:]:
+            directory.delete(name)
+        await _alerted_pass(service, sink)  # strike 1
+        assert (await _alerted_pass(service, sink)).aborted == "mass_revoke_breaker"
+        directory.ids.update(saved)  # the search base is fixed
+        plan = await _alerted_pass(service, sink)
+        assert plan.aborted is None and plan.breaker_clear
+        assert await _open_alerts(store) == {HELD}
 
 
 async def test_a_fresh_process_resolves_a_hold_once_it_has_latched_and_released_its_own(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The control for the test above. A fresh process leaves the last run's hold open, then a wave
-    of its own latches, and when that wave reads clean again this process saw the lift itself, so
-    it resolves the instance."""
+    """The hold's control for ``test_a_fresh_process_resolves_neither_alert_its_last_run_left_open``.
+    A fresh process leaves the last run's hold open, then a wave of its own latches, and when that
+    wave reads clean again this process saw the lift itself, so it resolves the instance. It never
+    tripped, so the last run's trip stays open."""
     names = ["u1", "u2", "ok1"]
     async with _signed_in_estate(monkeypatch, names) as (directory, _service, store, _tokens):
         await _left_open_by_an_earlier_run(store)
@@ -1268,14 +1320,14 @@ async def test_a_fresh_process_resolves_a_hold_once_it_has_latched_and_released_
         await service.initialize()
         sink = NotifierAlertSink([], store=store)
         assert not (await _alerted_pass(service, sink)).hold_clear
-        assert await _open_alerts(store) == {HELD}
+        assert await _open_alerts(store) == {ABORTED, HELD}
         directory.uac.update({"u1": ABSENT, "u2": ABSENT})
         held = await _alerted_pass(service, sink)
         assert held.hold and held.latched and not held.hold_clear
         directory.uac.update({"u1": ENABLED, "u2": ENABLED})
         released = await _alerted_pass(service, sink)
-        assert not released.hold and released.hold_clear
-        assert await _open_alerts(store) == set()
+        assert not released.hold and released.hold_clear and not released.breaker_clear
+        assert await _open_alerts(store) == {ABORTED}
 
 
 async def test_a_fresh_process_against_a_still_bad_search_base_keeps_the_trip_open(
@@ -1373,9 +1425,9 @@ async def test_a_fresh_process_does_not_release_a_hold_on_a_pass_that_revoked_an
     """A restart loses the hysteresis latch. A lone undetermined account beside readable ones is
     then not held, and at the strike threshold the pass revokes it. Its answer is the hold's own
     condition, which the lost latch may still have been holding, so that pass releases no hold.
-    The breaker judged the revocation, so the trip resolves. The next pass no longer sees the
-    revoked account and reads the rest clean, and it still releases no hold: nothing re-read the
-    account the lost latch may have held.
+    This process never tripped, so the last run's trip stays open throughout. The next pass no
+    longer sees the revoked account and reads the rest clean, and it still releases no hold:
+    nothing re-read the account the lost latch may have held.
 
     ``held``: a process whose own pass held before can see its latch lift before every account has
     an answer from it, so the revocation forfeits the release there too. ``settled``: once a pass
@@ -1394,13 +1446,14 @@ async def test_a_fresh_process_does_not_release_a_hold_on_a_pass_that_revoked_an
         second = await _alerted_pass(service, sink)
         assert second.aborted is None and not second.hold
         assert [r.reason for r in second.revocations] == ["directory_undetermined"]
-        assert second.breaker_clear and not second.hold_clear
-        open_now = await _open_alerts(store)
-        assert HELD in open_now and ABORTED not in open_now
+        assert not second.breaker_clear and not second.hold_clear
+        assert {ABORTED, HELD} <= await _open_alerts(store)
         third = await _alerted_pass(service, sink)
         assert third.aborted is None and not third.hold and third.readable == 2
         assert third.hold_clear is released, "the release did not follow the standing"
-        assert (HELD in await _open_alerts(store)) is not released
+        assert not third.breaker_clear
+        open_now = await _open_alerts(store)
+        assert ABORTED in open_now and (HELD in open_now) is not released
 
 
 # --- the clear predicate, clause by clause, and the sole-reconciler gate --------------------------
@@ -1422,14 +1475,17 @@ async def _marked(
     *,
     strikes: dict[str, int] | None = None,
     standing: _HoldStanding = "held",
+    breaker: _BreakerStanding = "tripped",
 ) -> tuple[bool, bool]:
     """``(breaker_clear, hold_clear)`` for ``plan``, with these records on file for exactly these
-    signed-in accounts and nothing unconfirmed, on a process whose own pass held before. Every
-    other input is held clean, so a test changes the one input whose clause it pins."""
+    signed-in accounts and nothing unconfirmed, on a process whose own passes held and tripped
+    before. Every other input is held clean, so a test changes the one input whose clause it
+    pins."""
     store = await MessageStore.open(":memory:")
     try:
         service = _fresh_process(store)
         service._reconcile_hold_standing = standing
+        service._reconcile_breaker_standing = breaker
         service._reconcile_outcomes = dict(outcomes)
         service._reconcile_strikes = dict.fromkeys(outcomes, 0) | (strikes or {})
         service._reconcile_unconfirmed = set()
@@ -1504,12 +1560,51 @@ async def test_an_undetermined_answer_this_pass_revoked_still_blocks_the_hold_cl
 async def test_a_process_whose_own_pass_has_not_held_releases_no_hold() -> None:
     """``_reconcile_hold_standing``: a fresh process cannot tell whether the latch an earlier run
     kept was still holding an account, and a forfeited one revoked an account such a latch may
-    have held. The control's inputs, and the breaker still clears: it has no latch to lose."""
+    have held. The control's inputs, so only the hold changes."""
     plan = ReconcilePlan(probed=2, readable=2, outcomes={"a": PRESENT, "b": PRESENT})
     record = {"a": PRESENT, "b": PRESENT}
     assert await _marked(plan, record, standing="fresh") == (True, False)
     assert await _marked(plan, record, standing="forfeit") == (True, False)
     assert await _marked(plan, record, standing="settled") == (True, True)
+
+
+async def test_a_process_whose_own_pass_has_not_tripped_resolves_no_trip() -> None:
+    """``_reconcile_breaker_standing``, the same rule for the breaker: a process clears only what
+    it watched open. A fresh process cannot tell which accounts were behind an earlier run's trip,
+    or whether they left across the restart, and a forfeited one let such an account go unread.
+    The control's inputs, so only the breaker changes."""
+    plan = ReconcilePlan(probed=2, readable=2, outcomes={"a": PRESENT, "b": PRESENT})
+    record = {"a": PRESENT, "b": PRESENT}
+    assert await _marked(plan, record, breaker="fresh") == (False, True)
+    assert await _marked(plan, record, breaker="forfeit") == (False, True)
+    assert await _marked(plan, record, breaker="tripped") == (True, True)
+
+
+@pytest.mark.parametrize(
+    ("start", "event", "end"),
+    [
+        ("fresh", "tripped", "tripped"),
+        ("fresh", "forfeit", "forfeit"),
+        ("tripped", "tripped", "tripped"),
+        ("tripped", "forfeit", "forfeit"),
+        ("forfeit", "tripped", "forfeit"),
+        ("forfeit", "forfeit", "forfeit"),
+    ],
+)
+async def test_the_breaker_standing_never_leaves_a_forfeit(
+    start: _BreakerStanding, event: _BreakerStanding, end: _BreakerStanding
+) -> None:
+    """A forfeit is never left, not even by a later trip. A new trip lands on the instance the
+    forfeit kept open, and the account the forfeit gave up on is still unread, so resolving it
+    would rest on the rest of the estate again."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _fresh_process(store)
+        service._reconcile_breaker_standing = start
+        service._advance_breaker_standing(event)
+        assert service._reconcile_breaker_standing == end
+    finally:
+        await store.close()
 
 
 @pytest.mark.parametrize(
