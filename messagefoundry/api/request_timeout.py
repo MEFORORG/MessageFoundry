@@ -17,6 +17,12 @@ directly. It is registered inside :class:`~messagefoundry.api.client_networks.Cl
 (a refused address is rejected before it can occupy a deadline) and outside everything that builds a
 response, so the deadline covers auth dependencies, the body cap and the route alike.
 
+**The deadline ends the response, and on three routes not the work.** DR activate, DR release and
+config reload run their operation through :class:`~messagefoundry.api.outlive.OutlivingOperations`,
+so cancelling the handler here leaves the operation running to its own outcome row rather than half
+done (vault BACKLOG #2751-#2753). At least the approval gate's outcome writes shield themselves the
+same way; anything a route does not shield is cancelled with the handler.
+
 Being outside the app's ``_security_headers`` middleware, the refusal sets the baseline response
 headers itself rather than shipping a 503 with none of them — the same reason
 ``ClientNetworkMiddleware`` carries its own ``_DENIAL_HEADERS``. That hand-copy is now a belt to

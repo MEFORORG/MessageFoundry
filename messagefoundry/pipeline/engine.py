@@ -111,6 +111,15 @@ __all__ = ["Engine", "ConfigReloadDenied", "ReloadOutcome", "ReloadStepFailure"]
 
 log = logging.getLogger(__name__)
 
+#: How long a DR release waits for the staged queue to drain before it hands back anyway, leaving
+#: the rest queued (vault BACKLOG #2752). Kept well under the API's 120 s request deadline
+#: (``api/request_timeout.py``) with room for the release hook's default 30 s bound and the
+#: listener stops before it, so in the default configuration the caller who asked for the release
+#: is the one told how it ended. The release itself outlives a caller the deadline cuts off
+#: (``api/outlive.py``), so this bound decides what the caller hears, never whether the hand-back
+#: completes. ``tests/test_dr_outlive_deadline.py`` pins the ordering.
+DR_RELEASE_DRAIN_TIMEOUT_SECONDS = 60.0
+
 
 class ConfigReloadDenied(Exception):
     """A /config/reload target lies outside the allowed reload roots (RCE guard).
@@ -796,45 +805,64 @@ class Engine:
             else:
                 await self.preflight_settings()  # reload_detail runs it on the branch above (#2034)
                 await rr.reload(rr.registry)
-        except Exception:
+        except BaseException:
             # A refused reload (BACKLOG #2034: a settings trust anchor, say) applied no DR profile, so
             # the latch goes back too. Left set, the next operator reload would park the feeds below
-            # the threshold on a box the DR coordinator reports as not active.
+            # the threshold on a box the DR coordinator reports as not active. BaseException, not
+            # Exception (vault BACKLOG #2751): a cancelled reload rolls its intake back to the
+            # previous graph (RegistryRunner.reload), so the latch has to follow it there too.
             self._dr_active = was_active
             raise
 
-    async def _dr_release_drain(self) -> None:
+    async def _dr_release_drain(self) -> int | None:
         """Engine callback the DR coordinator runs to FAIL BACK (#61, ADR 0048): unbind all inbound
         listeners (stop accepting new intake), drain the staged queue to completion (every NOT-DONE row
         delivered or dead-lettered), then latch the run-profile OFF. Within the DR store at-least-once +
         idempotency make the drain safe; cross-store reconciliation is operator-verified per the runbook.
-        Returns only once intake is unbound and the pipeline is drained (no dual-accept window)."""
+        Returns only once intake is unbound and the drain has ended (no dual-accept window).
+
+        Returns the staged-queue depth left when the drain ended: ``0`` when it drained, more when
+        it gave up at its bound with rows still queued (vault BACKLOG #2752, finding D-V1). The
+        coordinator records that number on the ``dr.release`` row rather than claiming a drain."""
         rr = self._registry_runner
-        if rr is not None:
+        if rr is None:
+            # No graph, so nothing to unbind and no worker to drain with. Report what is queued.
+            depth: int | None = await self.store.in_pipeline_depth()
+        else:
             for name in list(rr.registry.inbound):
                 await rr.stop_inbound(
                     name
                 )  # unbind every listener — no new intake during fail-back
             rr.notify_work()  # wake every stage so the workers drain the residual backlog promptly
-            await self._drain_pipeline()
+            depth = await self._drain_pipeline()
         self._dr_active = False
+        return depth
 
-    async def _drain_pipeline(self, *, timeout: float = 120.0, poll: float = 0.1) -> None:
+    async def _drain_pipeline(self, *, timeout: float | None = None, poll: float = 0.1) -> int:
         """Wait until the staged queue is fully drained (no NOT-DONE rows across ingress/routed/outbound)
-        — the fail-back hand-back gate (#61, ADR 0048). Bounded by ``timeout`` so a permanently-stuck row
-        (a retry-forever head against a dead peer) doesn't hang the release forever; on timeout it returns
-        (the remaining rows stay queued + replayable, and the runbook reconciliation accounts for them)."""
-        elapsed = 0.0
-        while elapsed < timeout:
-            if await self.store.in_pipeline_depth() == 0:
-                return
+        — the fail-back hand-back gate (#61, ADR 0048). Bounded by ``timeout`` (default
+        :data:`DR_RELEASE_DRAIN_TIMEOUT_SECONDS`, read at call time) so a permanently-stuck row (a
+        retry-forever head against a dead peer) doesn't hang the release forever; on timeout it returns
+        (the remaining rows stay queued + replayable, and the runbook reconciliation accounts for them).
+
+        Returns the depth left, ``0`` when drained. The bound is wall-clock time, measured on the
+        monotonic clock: it used to count only sleep ticks, so each depth query's own time ran past
+        it (vault BACKLOG #2752)."""
+        bound = DR_RELEASE_DRAIN_TIMEOUT_SECONDS if timeout is None else timeout
+        deadline = time.monotonic() + bound
+        while True:
+            depth = await self.store.in_pipeline_depth()
+            if depth == 0 or time.monotonic() >= deadline:
+                break
             await asyncio.sleep(poll)
-            elapsed += poll
-        log.warning(
-            "DR release: staged queue not fully drained within %.0fs; remaining rows stay queued + "
-            "replayable (the fail-back reconciliation runbook accounts for them)",
-            timeout,
-        )
+        if depth:
+            log.warning(
+                "DR release: staged queue not fully drained within %.0fs; %d row(s) stay queued + "
+                "replayable (the fail-back reconciliation runbook accounts for them)",
+                bound,
+                depth,
+            )
+        return depth
 
     def add_registry(self, registry: Registry) -> RegistryRunner:
         """Run a code-first Connection/Router/Handler graph (one runner for the whole graph)."""
