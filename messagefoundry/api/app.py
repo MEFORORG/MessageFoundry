@@ -876,8 +876,8 @@ def _build_approval_gate(
                 # and the web console words them that way. 422 is the approve route's "the released
                 # operation was refused".
                 #
-                # The row alone cannot say the release ran it (actor is the requester either way),
-                # so this line marks it. The type name only: _audit_refused_reload logs the rest.
+                # The row names the requester either way and differs from an inline one only by its
+                # NULL client, so this line names the release too. Type name only, never the text.
                 _log.warning("released config reload refused: %s", type(exc).__name__)
                 _status, answer = await _audit_refused_reload(
                     engine, exc, actor=actor, requested=config_dir, dry_run=False

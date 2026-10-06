@@ -507,20 +507,18 @@ async def test_a_refused_release_whose_audit_row_fails_still_answers_422(
 
 async def test_a_refused_release_is_refused_and_recorded_inside_the_outliving_operation(
     engine: Engine,
-    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Vault BACKLOG #2753 made a released reload outlive the approve request; vault BACKLOG #2459
-    gave its refusal the inline route's row and answer. Batch 197 merged the two, so pin that the
-    refusal is handled INSIDE the outliving operation: a timed-out approve must not cut off the
-    refusal's row. The operation itself must end in the 422, not in the raw FileNotFoundError."""
-    import shutil
-
+    gave its refusal the inline route's row and answer. Batch 197 merged the two. This pins the
+    structure that lets a refusal's row survive a timed-out approve, without timing one out: the
+    outliving operation itself ends in the 422, not in the raw FileNotFoundError, and the refusal
+    row is already written when it ends."""
     from messagefoundry.api.approvals import ApprovalError
     from messagefoundry.api.outlive import OutlivingOperations
 
-    ended: list[tuple[str, BaseException | None]] = []
+    ended: list[tuple[str, BaseException | None, int]] = []
     real_run = OutlivingOperations.run
 
     async def _spy(self: OutlivingOperations, coro: Any, label: str) -> Any:
@@ -528,28 +526,43 @@ async def test_a_refused_release_is_refused_and_recorded_inside_the_outliving_op
             try:
                 result = await coro
             except BaseException as exc:
-                ended.append((label, exc))
+                rows = await engine.store.list_audit(action="config_reload_failed")
+                ended.append((label, exc, len(rows)))
                 raise
-            ended.append((label, None))
+            ended.append((label, None, -1))
             return result
 
         return await real_run(self, _watched(), label)
+
+    secret_dir = "missing-config-dir-text"
+
+    async def _refuse(*_args: Any, **_kwargs: Any) -> Any:
+        raise FileNotFoundError(f"config directory not found: {secret_dir}")
 
     monkeypatch.setattr(OutlivingOperations, "run", _spy)
     service = await _service(engine)
     with caplog.at_level(logging.WARNING, logger="messagefoundry.api.app"):
         _approval_id, r = await _hold_then_release(
-            engine, service, {}, between=lambda: shutil.rmtree(tmp_path / "cfg")
+            engine,
+            service,
+            {},
+            between=lambda: monkeypatch.setattr(engine, "reload_detail", _refuse),
         )
     assert r.status_code == 422, r.text
-    released = [exc for label, exc in ended if label == "released config reload"]
+    released = [(exc, rows) for label, exc, rows in ended if label == "released config reload"]
     assert len(released) == 1
-    assert isinstance(released[0], ApprovalError) and released[0].status == 422
-    assert len(await engine.store.list_audit(action="config_reload_failed")) == 1
-    assert any(
-        "released config reload refused: FileNotFoundError" in rec.getMessage()
+    exc, rows_when_it_ended = released[0]
+    assert isinstance(exc, ApprovalError) and exc.status == 422
+    assert rows_when_it_ended == 1  # written inside the operation, not after it
+    marks = [
+        rec
         for rec in caplog.records
-    )
+        if rec.getMessage().startswith("released config reload refused")
+    ]
+    assert len(marks) == 1
+    assert marks[0].levelno == logging.WARNING
+    # The marker names the type only, never the exception text.
+    assert marks[0].getMessage() == "released config reload refused: FileNotFoundError"
 
 
 # --- BACKLOG #2183: a released reload audits an unreadable inbound CA as trust_anchor -------------
