@@ -3946,8 +3946,12 @@ session. Each refusal is also audited, so a campaign is visible in the audit log
 writes `auth.account_locked`, but the mail is **throttled by time** (ADR 0197): at most one per lock
 kind per account per 24 hours, and always one for the first lock after a quiet day. Each mail names
 the lock and its cycle count, and writes its own `auth.lock_notice` row, which is what the throttle
-reads. A sign-in lock notice on a TOTP-enrolled local account tells the owner to sign in with the
-password and the code together; a second-step notice says which factor was right and, **if the
+reads. With a relay wired, that read and the mail run in a background task (BACKLOG #2216). The
+refusal writes `auth.account_locked` first and does not wait for the task. So a large audit log would
+not push a refused sign-in past its padded slot. The task is queued per account and lock kind within
+one API process. Two locks of one kind landing together there would send one mail. A sign-in lock
+notice on a TOTP-enrolled local account tells the owner to sign in with the password and the code
+together; a second-step notice says which factor was right and, **if the
 attempts were not the owner's**, to get a password reset or `admin-unlock` and replace that factor.
 **Current lock state is shown to administrators only** (BACKLOG #1131). `GET /users` carries a
 `lock_state` object per account with both locks: whether each is live now, when it ends, its
@@ -4285,6 +4289,13 @@ stays broken, or recovers and breaks again, is reported only by that first line.
 The `auth.lock_notice` row is written when the notice is handed to the relay, as `mailed: true`. So
 when the relay's queue is full, or the send fails, a lock notice is lost with no audit row and, now,
 no log line. The account holder is not told, and nothing says so.
+
+**Residual: the background task adds one way to lose a notice** (BACKLOG #2216). At shutdown the
+engine waits about two seconds for pending notices. A notice still pending then is cut off, and may be
+neither mailed nor recorded. A failed `auth.lock_notice` row write also changes: it used to fail
+the request, and now it is logged instead. The mail goes before its row, so that failure costs at
+most a duplicate mail at the next lock. Each such line names no account and no lock. It still tells
+a `logs:view` reader when some notice failed.
 
 **Client attribution ([ADR 0150](adr/0150-client-address-on-audit-entries.md)).** Every row also
 carries a `client` column — the caller's network address, stamped at write time from the request via
