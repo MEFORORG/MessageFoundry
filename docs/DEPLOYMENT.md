@@ -342,18 +342,20 @@ the management API, and it does not inherit the API's auth: harden it deliberate
   body. A delivery that dead-letters captures no reply, so a caller still waiting gets a fixed-JSON
   `502` without the partner's status or body. Most partner `4xx` statuses dead-letter the delivery
   at once.
-  `check_http_sync_reply` refuses a `reply_from` it cannot serve safely, for example one whose outbound
-  does not capture its response or would retry forever; see
+  `check_http_sync_reply` refuses a `reply_from` it cannot serve safely. Examples are an outbound
+  that does not capture its response, and one that would retry forever. See
   [CONNECTIONS.md](CONNECTIONS.md#http-web-service-listener--http-inbound-only-adr-0023).
 - **Off loopback, a peer control is required, and TLS alone is not one.** `check_http_tls_exposure`
   checks only that **TLS is on**. `check_http_intake_auth` runs beside it each time the engine starts
   the connection, and again at `messagefoundry check`. Under the default `[security].enforcement =
   enforce` it refuses to start an off-loopback `Http()` that has no effective peer control. Under
-  `warn` it only logs a warning, and the listener then accepts a POST from any peer that can reach it,
-  so configure a control anyway. Three things count as an effective control. One is `api_key` or `bearer` with a key, and
-  another is `mtls_subject` with a CA and a subject list. The third is a `source_ip_allowlist` whose
-  every entry is /8 or narrower for IPv4, or /32 or narrower for IPv6. `tls_ca_file` alone does not
-  count, because it accepts any certificate that CA ever signed.
+  `warn` it only logs a warning. The listener then accepts a POST from any peer that can reach it, so
+  configure a control anyway. What counts depends on `intake_auth`. With `api_key` or `bearer` it is
+  the key, and with `mtls_subject` it is a CA plus a subject list. Once `intake_auth` names a mode,
+  only that mode is judged, and the allow-list is not consulted. With `intake_auth = none`, the
+  default, a `source_ip_allowlist` counts when every entry is /8 or narrower for IPv4, or /32 or
+  narrower for IPv6. `tls_ca_file` alone does not count, because it accepts any certificate that CA
+  ever signed.
   `--allow-insecure-bind` does not waive this gate.
 
 ---

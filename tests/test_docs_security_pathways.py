@@ -24,6 +24,7 @@ import inspect
 import itertools
 import logging
 import re
+import subprocess
 import textwrap
 import typing
 from collections.abc import Callable
@@ -48,7 +49,7 @@ from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.config.wiring import Http, WiringError
 from messagefoundry.pipeline.wiring_runner import check_inbound_revocation
 from messagefoundry.store.store import LockoutCounter, UserRecord, lockout_escalates
-from tests._sign_in_claim import SIGN_IN_CLAIM
+from tests._sign_in_claim import SIGN_IN_CLAIM, SIGN_IN_VERB
 
 _ROOT = Path(__file__).resolve().parent.parent
 _DOC = _ROOT / "docs" / "SECURITY.md"
@@ -3108,6 +3109,10 @@ def test_the_thirteenth_sweep_probes_the_code_the_docs_now_state(
     gate(True, intake_auth="bearer", intake_api_key="k")
     gate(True, intake_auth="mtls_subject", tls_ca_file="ca.pem", intake_client_subjects=["CN:p"])
     gate(True, source_ip_allowlist=["10.0.0.0/8", "2001:db8::/32"])
+    # Once intake_auth names a mode, only that mode is judged: a narrow allow-list does not rescue
+    # a key mode with no key (docs/DEPLOYMENT.md says the allow-list is then not consulted).
+    with pytest.raises(WiringError):
+        gate(True, intake_auth="bearer", intake_api_key="", source_ip_allowlist=["10.0.0.0/24"])
     assert (
         "allow_insecure_bind"
         not in inspect.signature(wiring_runner.check_http_intake_auth).parameters
@@ -3229,6 +3234,12 @@ def test_the_thirteenth_sweep_probes_the_code_the_docs_now_state(
     assert [
         r.value for r, p in BUILTIN_ROLE_PERMISSIONS.items() if Permission.USERS_MANAGE in p
     ] == [Role.ADMINISTRATOR.value]
+    # ...and no custom role can hold it either: the write-time validator refuses it.
+    from messagefoundry.auth import permissions as permissions_module
+
+    assert Permission.USERS_MANAGE in permissions_module.CUSTOM_ROLE_FORBIDDEN_PERMISSIONS
+    with pytest.raises(permissions_module.CustomRoleError, match="not assignable"):
+        permissions_module.validate_custom_role_permissions([Permission.USERS_MANAGE.value])
     assert "FEDERATED_SUBJECT_NOT_BOUND" in {
         n.id for n in ast.walk(_service_func("_authenticate_oidc")) if isinstance(n, ast.Name)
     }, "_authenticate_oidc no longer refuses a federated identity bound to no account"
@@ -3306,6 +3317,15 @@ def test_the_thirteenth_sweep_deployment_states_the_built_intake_auth(scope: str
         assert "`check_http_intake_auth`" in flat, (
             f"docs/DEPLOYMENT.md's intake {scope} must name the peer-control gate"
         )
+    if scope == "caveat":
+        # The controls are not "any of three": once intake_auth names a mode the allow-list is not
+        # consulted (the probe above refuses a keyless bearer behind a narrow allow-list).
+        assert not re.search(r"\bthree things count\b", flat, re.I), (
+            "the caveat counts the controls as any one of three again"
+        )
+        assert any(
+            re.search(r"allow-?list", c, re.I) and re.search(r"not consulted", c) for c in clauses
+        ), "the caveat must say the allow-list is not consulted once intake_auth names a mode"
 
 
 def test_the_thirteenth_sweep_loosening_note_binds_no_user_at_sign_in() -> None:
@@ -3317,11 +3337,8 @@ def test_the_thirteenth_sweep_loosening_note_binds_no_user_at_sign_in() -> None:
     section = doc[start : doc.index("\n### ", start + 1)]
     clauses = [c for c in _clauses(section) if "password" in c]
     assert clauses, "the cleartext-LDAP section names no password, so this check reads nothing"
-    at_sign_in = [
-        c
-        for c in clauses
-        if re.search(r"\bsign(?:s|ed|ing)? in\b|\blog(?:s|ged|ging)? (?:in|on)\b", c, re.I)
-    ]
+    # The shared verb pattern, so "sign-in", "signin" and "login" are read too.
+    at_sign_in = [c for c in clauses if SIGN_IN_VERB.search(c)]
     assert not at_sign_in, (
         f"docs/SECURITY-LOOSENING.md says a user's sign-in binds a password again: {at_sign_in}"
     )
@@ -3388,6 +3405,41 @@ def test_the_thirteenth_sweep_no_doc_says_nobody_can_sign_in_before_provisioning
         f"{name} must say, where it provisions the first Administrator, that a Windows sign-in "
         "before then holds no role"
     )
+    # The Kerberos note must not read as the default path. At the shipped posture a start with no
+    # Administrator is refused, so a sign-in "before then" happens only if a start goes ahead.
+    unconditional = [c for c in clauses if "Kerberos" in c and re.search(r"\bbefore then\b", c)]
+    assert not unconditional, (
+        f"{name} says a Windows sign-in can come before provisioning with no condition: "
+        f"{unconditional}"
+    )
+
+
+#: Dated records keep what they said on the day: the released changelog, its fragments, ADRs and
+#: the archive. Everything else tracked as Markdown is a shipped page and is scanned.
+_DATED_RECORDS = ("CHANGELOG.md", "changelog.d/", "docs/adr/", "docs/archive/")
+
+
+def test_the_thirteenth_sweep_no_shipped_page_says_nobody_can_sign_in() -> None:
+    """The six docs above carry the provisioning passage; this reads every other tracked page too,
+    so a new page cannot bring the claim back unchecked. The IDE extension's TypeScript strings are
+    outside it: they are not Markdown, and they are a filed follow-up of their own."""
+    out = subprocess.run(
+        ["git", "-C", str(_ROOT), "ls-files", "-z", "--", "*.md"], check=True, capture_output=True
+    ).stdout.decode("utf-8")
+    pages = [rel for rel in out.split("\0") if rel and not rel.startswith(_DATED_RECORDS)]
+    assert len(pages) >= 150, (
+        f"only {len(pages)} tracked pages found, floor 150; re-derive the list"
+    )
+    assert set(_PROVISIONING_DOCS) <= set(pages), "control: the six named docs are in the scan"
+    hits = [
+        f"{rel}: {c[:120]}"
+        for rel in pages
+        # Through _doc, the reader every prose check in this file uses: this is a claim about
+        # pages, not about source, so it is not a source probe.
+        for c in _clauses(_doc(rel))
+        if SIGN_IN_CLAIM.search(c)
+    ]
+    assert not hits, f"a shipped page says nobody can sign in again: {hits}"
 
 
 def test_the_thirteenth_sweep_second_round_probes_reply_logging_and_opt_in() -> None:
@@ -3585,7 +3637,9 @@ def test_the_thirteenth_sweep_no_doc_calls_the_forwarded_copy_phi_free(
         f"{name} has {len(forwarded)} clause(s) about the off-box copy, floor {subject_floor}: "
         "this check reads too little to clear it"
     )
-    phi_free = [c for c in forwarded if _FORWARDED_PHI_FREE.search(c) and "best-effort" not in c]
+    # No exemption for a clause that also says "best-effort" somewhere: "the copy is PHI-free once
+    # the best-effort filters have run" is the retracted claim with one word added.
+    phi_free = [c for c in forwarded if _FORWARDED_PHI_FREE.search(c)]
     assert not phi_free, f"{name} presents the forwarded log copy as PHI-free again: {phi_free}"
     if name == "docs/EARLY-ADOPTER-GUIDE.md":
         assert any("collector" in c and "potential PHI" in c for c in forwarded), (
