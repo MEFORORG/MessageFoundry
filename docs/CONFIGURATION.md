@@ -719,15 +719,21 @@ needs alert state ([ADR 0044](adr/0044-operator-alert-state.md)). The pass must 
 this engine process, for every signed-in directory account it did not just revoke.
 
 - The hold resolves when no answer is undetermined and at least one read `userAccountControl`.
-- The breaker resolves when the pass did not abort, no account carries a strike, and every account
-  signed in at the last trip has been read again, and not held, since.
+- The breaker resolves when the pass did not abort, no answer is undetermined, no account carries a
+  strike, and every account still signed in since the last trip has been read again, and not held.
+  So the breaker's alert stays open while a hold stands.
 
 **They never resolve themselves on a `[cluster]` node or in an engine that runs more than one engine
 shard.** Another engine's reconciler may still hold the condition there, so an operator resolves the
 alert. A directory outage, a pass with nobody signed in, an account that never answers, and
-`ad_session_recheck_seconds = 0` resolve nothing either. One case can still resolve falsely: an
-engine that declares neither `[cluster]` nor more than one engine shard trusts its own evidence,
-whatever else shares its store.
+`ad_session_recheck_seconds = 0` resolve nothing either.
+
+At least two cases can still resolve falsely:
+
+- An engine that declares neither `[cluster]` nor more than one engine shard trusts its own
+  evidence, whatever else shares its store.
+- A pass judges only accounts that hold a session. A trip or hold whose accounts have all signed out,
+  or reached the session cap, resolves on the accounts that remain.
 
 ### `[ai]` — AI coding assistance policy
 Implemented (see [AI.md](AI.md)). Controls the IDE AI assistant across the **OFF→PHI-safe** range;

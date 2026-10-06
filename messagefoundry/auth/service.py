@@ -2106,11 +2106,11 @@ class AuthService:
         #: user_ids of bound id-less rows the reconciler has already reported as skipped (BACKLOG
         #: #2027), so each is logged and audited once per process rather than once per pass.
         self._reconcile_unkeyed_reported: set[str] = set()
-        #: user_id -> when the store last refused that account's skip report, as a count of
-        #: refusals (BACKLOG #2137). Refused accounts go last, the longest-refused first, so a row
-        #: the store keeps refusing starves neither the reports behind it nor another refused row.
-        self._reconcile_unkeyed_refused: dict[str, int] = {}
-        self._reconcile_unkeyed_refusals = 0
+        #: user_ids whose skip report the store refused, in the order of their latest refusal, oldest
+        #: first: a dict used as an ordered set (BACKLOG #2137). Refused accounts go last, the
+        #: longest-refused first, so a row the store keeps refusing starves neither the reports
+        #: behind it nor another refused row.
+        self._reconcile_unkeyed_refused: dict[str, None] = {}
         if self.directory_reconcile_enabled:
             # Built now, at startup, so a reconciler's first refused audit write does not import
             # the server drivers on the event loop (see `_audit_write_errors`).
@@ -5325,13 +5325,14 @@ class AuthService:
           0195's readable answer). The undetermined test does not rest on this node's hysteresis
           latch, which another node on the store may not share. An estate that reads only ABSENT
           found no entry, so it says nothing about whether the attribute is readable now.
-        * The breaker is clear when the pass was not aborted, every one of those accounts carries no
-          strike, at least one of them did not read undetermined, and every account signed in at
-          the last trip has been read again since by a pass that was not aborted, and was not held
-          there. A pending strike is a revocation the breaker has not judged yet, so it says
-          nothing either way. A pass of held accounts only cannot trip the breaker at all. And a
-          trip on role or scope changes leaves no strike, so a later probe sample that missed those
-          accounts, or held them, proves nothing.
+        * The breaker is clear when the pass was not aborted, none of those answers is undetermined,
+          every one of those accounts carries no strike, and every account still signed in since
+          the last trip has been read again by a pass that was not aborted, and was not held there.
+          A pending strike is a revocation the breaker has not judged yet, so it says nothing
+          either way. A held account's probe judged neither its roles nor its scope, and a trip
+          on role or scope changes leaves no strike, so a probe sample that missed or held the
+          accounts behind a trip proves nothing. The undetermined test covers that after a
+          restart too, when this process has no record of the trip.
 
         ``users`` is this pass's candidate set, and a clear rests on reading every one of them.
 
@@ -5339,32 +5340,28 @@ class AuthService:
         reconciler may share the store, the lifespan task raises no inverse; the reason is stated
         once, at ``api/app.py::_without_clears``.
 
-        **The cost is a missed clear, with one reconciler on the store.** An account that never
-        answers keeps both instances open while it is signed in. So does a reconciler that is
-        switched off, and so does every cluster or multi-shard engine. An operator resolves those
-        by hand. **At least one case can still clear falsely: any engine that declares neither
-        ``[cluster]`` nor more than one shard clears on its own evidence, whatever else shares its
-        store.** That covers two plain ``serve`` processes, two one-shard ``supervise`` fleets, and
-        a plain engine beside a cluster node or a multi-shard engine on the same store. It cannot
-        see the others, and ``serve`` records a second engine on one store as unguarded (the engine
-        shard guard's comment in ``__main__.py``).
+        **The usual cost is a missed clear, with one reconciler on the store.** An account that
+        never answers keeps both instances open while it is signed in. So does a hold, for the
+        breaker's instance. So does a reconciler that is switched off, and so does every cluster
+        or multi-shard engine. An operator resolves those by hand. **At least two cases can still
+        clear falsely.** Any engine that declares neither ``[cluster]`` nor more than one shard
+        clears on its own evidence, whatever else shares its store: two plain ``serve`` processes,
+        two one-shard ``supervise`` fleets, or a plain engine beside a cluster node or a
+        multi-shard engine on the same store. It cannot see the others, and ``serve`` records a
+        second engine on one store as unguarded (the engine shard guard's comment in
+        ``__main__.py``). And a pass judges only accounts that hold a session, so a trip or hold
+        whose accounts have all signed out, or reached the session cap, clears on the rest.
         """
         undetermined = reconcile.ProbeOutcome.UNDETERMINED
         readable = (reconcile.ProbeOutcome.PRESENT, reconcile.ProbeOutcome.DISABLED)
         revoked = {r.user_id for r in plan.revocations}
         ids = [uid for uid in users if uid not in revoked]
         outcomes = [self._reconcile_outcomes.get(uid) for uid in ids]
-        covered = bool(ids) and None not in outcomes
-        hold_clear = (
-            covered
-            and not plan.hold
-            and undetermined not in outcomes
-            and any(o in readable for o in outcomes)
-        )
+        settled = bool(ids) and None not in outcomes and undetermined not in outcomes
+        hold_clear = settled and not plan.hold and any(o in readable for o in outcomes)
         breaker_clear = (
-            covered
+            settled
             and plan.aborted is None
-            and any(o is not undetermined for o in outcomes)
             and all(self._reconcile_strikes.get(uid, 0) == 0 for uid in ids)
             and self._reconcile_unconfirmed.isdisjoint(ids)
         )
@@ -5618,10 +5615,11 @@ class AuthService:
             del refused[user_id]
         # An account the store has not refused goes first (-1), so one row it keeps refusing cannot
         # starve the rest. Refused accounts follow, the longest-refused first, so two rows the store
-        # keeps refusing take turns. sorted() is stable, so ties keep list_users' order.
+        # keeps refusing take turns. sorted() is stable, so the rest keep list_users' order.
+        turn = {uid: i for i, uid in enumerate(refused)}
         pending = sorted(
             (u for u in unkeyed if u.id not in self._reconcile_unkeyed_reported),
-            key=lambda u: refused.get(u.id, -1),
+            key=lambda u: turn.get(u.id, -1),
         )
         for user in pending:
             _log.warning(
@@ -5646,8 +5644,8 @@ class AuthService:
             if not written:
                 # Stop at the first refusal: one ERROR and one WARNING per pass, as `main` logged,
                 # and no second acquire timeout behind a store that is refusing every write.
-                self._reconcile_unkeyed_refusals += 1
-                refused[user.id] = self._reconcile_unkeyed_refusals
+                refused.pop(user.id, None)  # re-inserted at the end: refused most recently
+                refused[user.id] = None
                 break
             refused.pop(user.id, None)
             self._reconcile_unkeyed_reported.add(user.id)

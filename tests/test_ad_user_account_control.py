@@ -1115,6 +1115,25 @@ async def test_a_fresh_process_does_not_release_a_hold_its_budget_has_not_reache
         assert HELD in await _open_alerts(store)
 
 
+async def test_a_fresh_process_does_not_clear_a_trip_on_a_pass_that_held_accounts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A restart forgets which accounts were behind the last trip. A held account's roles and
+    scope were not judged, and its strike went back to 0, so a fresh process's pass that holds two
+    accounts and reads the other two clean is no evidence the trip has gone."""
+    names = ["n1", "n2", "n3", "n4"]
+    async with _signed_in_estate(monkeypatch, names) as (directory, _service, store, _tokens):
+        await _left_open_by_an_earlier_run(store)
+        directory.uac.update({"n1": ABSENT, "n2": ABSENT})
+        service = _fresh_process(store)
+        await service.initialize()
+        sink = NotifierAlertSink([], store=store)
+        plan = await _alerted_pass(service, sink)
+        assert plan.aborted is None and plan.hold and len(plan.held) == 2
+        assert not plan.breaker_clear
+        assert ABORTED in await _open_alerts(store)
+
+
 # --- the Lander's review of PR 2036 --------------------------------------------------------------
 #
 # Finding 3: each clause of the clear predicate is pinned by a test that turns red when it goes.
@@ -1157,7 +1176,7 @@ async def test_the_clear_predicate_control_reads_both_clear() -> None:
 
 
 async def test_an_estate_that_reads_only_undetermined_is_no_breaker_clear() -> None:
-    """``any(o is not undetermined ...)``: a pass of held accounts only cannot trip the breaker at
+    """``undetermined not in outcomes``: a pass of held accounts only cannot trip the breaker at
     all, so it says nothing about whether the breaker is still tripped."""
     plan = ReconcilePlan(probed=2)
     assert await _marked(plan, {"a": UNDETERMINED, "b": UNDETERMINED}) == (False, False)
@@ -1167,9 +1186,10 @@ async def test_an_undetermined_answer_on_record_is_no_hold_clear_even_when_the_p
     None
 ):
     """``undetermined not in outcomes``: this node's pass did not hold, but an undetermined answer
-    on record is the hold's own condition, which another node's latch may still be holding on."""
+    on record is the hold's own condition, which another node's latch may still be holding on. It
+    keeps the breaker open too: that account's roles and scope were not judged."""
     plan = ReconcilePlan(probed=2)
-    assert await _marked(plan, {"a": PRESENT, "b": UNDETERMINED}) == (True, False)
+    assert await _marked(plan, {"a": PRESENT, "b": UNDETERMINED}) == (False, False)
 
 
 async def test_a_hold_clear_needs_one_answer_that_read_the_attribute() -> None:
