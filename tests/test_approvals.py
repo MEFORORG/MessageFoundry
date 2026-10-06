@@ -1136,6 +1136,14 @@ async def test_interrupted_resolution_store_contract(engine: Engine) -> None:
     await _assert_interrupted_resolution_contract(engine.store)
 
 
+async def test_restart_reconcile_store_contract(engine: Engine) -> None:
+    """The SQLite leg of the shared restart-reconcile contract (BACKLOG #1562); the server legs run
+    the same body."""
+    from tests._pending_approval_store_contract import _assert_restart_reconcile_contract
+
+    await _assert_restart_reconcile_contract(engine.store)
+
+
 def _app_client(
     engine: Engine, service: AuthService, runs: list[str]
 ) -> tuple[ApprovalGate, httpx.AsyncClient]:
@@ -1821,3 +1829,144 @@ async def test_a_drain_failure_does_not_skip_engine_stop(tmp_path: Path) -> None
         if real_stop and "stop" not in calls:
             await real_stop[0]()
     assert calls == ["drain", "stop"]
+
+
+# --- BACKLOG #1562: the claim owner and the startup reconcile ---------------------------------------
+
+
+def _fake_engine(
+    *, clustered: str | None = None, shard: str | None = None, runner: bool = True
+) -> Any:
+    """Only the two attributes approval_claim_owner reads."""
+    from types import SimpleNamespace
+
+    from messagefoundry.pipeline.cluster import NullCoordinator
+
+    coordinator: Any = (
+        NullCoordinator()
+        if clustered is None
+        else SimpleNamespace(is_clustered=lambda: True, node_id=clustered)
+    )
+    registry_runner = SimpleNamespace(registry=SimpleNamespace(shard_id=shard)) if runner else None
+    return SimpleNamespace(coordinator=coordinator, registry_runner=registry_runner)
+
+
+def test_the_claim_owner_names_the_engine_process() -> None:
+    """Stable across a restart of the same process, distinct between processes over one store."""
+    from messagefoundry.api.app import approval_claim_owner
+
+    assert approval_claim_owner(_fake_engine()) == "engine"
+    assert approval_claim_owner(_fake_engine(runner=False)) == "engine"
+    assert approval_claim_owner(_fake_engine(shard="a")) == "shard:a"
+    assert approval_claim_owner(_fake_engine(shard="b")) == "shard:b"
+    assert approval_claim_owner(_fake_engine(clustered="node-1")) == "node:node-1"
+    # The cluster wins over a shard id; serve refuses that combination anyway (ADR 0073).
+    assert approval_claim_owner(_fake_engine(clustered="node-1", shard="a")) == "node:node-1"
+
+
+def _managed(db_path: Path) -> Any:
+    from messagefoundry.api import create_managed_app
+
+    return create_managed_app(
+        db_path=db_path, egress_settings=EgressSettings(deny_by_default=False)
+    )
+
+
+async def _first_life_leaves_two_rows(db_path: Path) -> tuple[str, str]:
+    """A first life of the engine that claims two releases and never settles them: one its own,
+    one carrying a sibling's owner."""
+    from tests._pending_approval_store_contract import _claimed_directly
+
+    first = _managed(db_path)
+    async with first.router.lifespan_context(first):
+        assert first.state.approval_gate._claim_owner == "engine"
+        store = first.state.engine.store
+        now = time.time()
+        mine = await _claimed_directly(store, claim_owner="engine", claimed_at=now)
+        theirs = await _claimed_directly(store, claim_owner="shard:elsewhere", claimed_at=now)
+    return mine, theirs
+
+
+async def test_a_restart_marks_its_own_leftover_release_interrupted(tmp_path: Path) -> None:
+    db_path = tmp_path / "restart.db"
+    mine, theirs = await _first_life_leaves_two_rows(db_path)
+    second = _managed(db_path)
+    async with second.router.lifespan_context(second):
+        store = second.state.engine.store
+        assert await _status_of(second.state.engine, mine) == "interrupted"
+        assert await _status_of(second.state.engine, theirs) == "executing"
+        rows = await store.list_audit(action="approval.interrupted")
+        assert [json.loads(str(r["detail"]))["approval_id"] for r in rows] == [mine]
+        assert json.loads(str(rows[0]["detail"]))["reason"] == "engine_restart"
+
+
+async def test_the_restart_assertion_can_fail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Control: with the reconcile neutralised the same row stays 'executing', so the test above
+    measures the lifespan's call and not a row that was never left executing."""
+    db_path = tmp_path / "unreconciled.db"
+    mine, _theirs = await _first_life_leaves_two_rows(db_path)
+
+    async def _nothing(self: ApprovalGate) -> Any:
+        return None
+
+    monkeypatch.setattr(ApprovalGate, "reconcile_after_restart", _nothing)
+    second = _managed(db_path)
+    async with second.router.lifespan_context(second):
+        assert await _status_of(second.state.engine, mine) == "executing"
+
+
+async def test_a_failed_reconcile_does_not_stop_the_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def _boom(self: ApprovalGate) -> Any:
+        raise OSError("PROBE: store unreachable")
+
+    monkeypatch.setattr(ApprovalGate, "reconcile_after_restart", _boom)
+    app = _managed(tmp_path / "boom.db")
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.api.app"):
+        async with app.router.lifespan_context(app):
+            assert app.state.engine is not None
+    assert any("startup reconcile" in r.getMessage() for r in caplog.records)
+
+
+async def test_the_embedded_app_reconciles_at_start(engine: Engine) -> None:
+    """create_app(engine=...) gives the app a lifespan that runs the gate's start step too."""
+    from tests._pending_approval_store_contract import _claimed_directly
+
+    mine = await _claimed_directly(engine.store, claim_owner="engine", claimed_at=time.time())
+    app = create_app(engine, approvals=ON)
+    async with app.router.lifespan_context(app):
+        assert await _status_of(engine, mine) == "interrupted"
+
+
+async def test_a_reconcile_that_cannot_move_a_row_leaves_it_for_the_next_start(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A failed move is logged and skipped, never written as a bare status: the row stays
+    'executing' with no audit row, and a later start moves it with its row."""
+    from tests._pending_approval_store_contract import _claimed_directly
+
+    mine = await _claimed_directly(engine.store, claim_owner="engine", claimed_at=time.time())
+
+    class _Refusing:
+        def __init__(self, store: Any) -> None:
+            self._store = store
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._store, name)
+
+        async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
+            raise OSError("store unreachable")
+
+    gate = ApprovalGate(_Refusing(engine.store), ON)
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.api.approvals"):
+        found = await gate.reconcile_after_restart()
+    assert found.unsettled == (mine,) and found.interrupted == ()
+    assert await _status_of(engine, mine) == "executing"
+    assert await engine.store.list_audit(action="approval.interrupted") == []
+    assert any(mine in r.getMessage() for r in caplog.records)
+    later = await ApprovalGate(engine.store, ON).reconcile_after_restart()
+    assert later.interrupted == (mine,)
+    assert await _status_of(engine, mine) == "interrupted"

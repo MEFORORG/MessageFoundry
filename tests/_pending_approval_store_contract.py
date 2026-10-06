@@ -24,6 +24,10 @@ real gate runs over each real store here. Only the two account reads are stubbed
 
 The third half is the **resolution** contract (BACKLOG #1562 part B): ``list_interrupted_approvals``
 and the ``from_status="interrupted"`` guard a resolve writes through, again backend SQL.
+
+The fourth half is the **restart reconcile** contract (BACKLOG #1562): the claim writes the
+``claim_owner`` column, ``list_executing_approvals`` reads it back, and a gate at startup moves only
+its own ``executing`` rows (and unowned ones) to ``interrupted``, never a sibling's.
 """
 
 from __future__ import annotations
@@ -298,15 +302,25 @@ async def _resolve(_user_id: str) -> Any:
     return _AnyPermission()
 
 
-def _gate(store: Any, execute: Callable[[Mapping[str, Any]], Awaitable[dict[str, Any]]]) -> Any:
-    from messagefoundry.api.approvals import ApprovalGate
+def _gate(
+    store: Any,
+    execute: Callable[[Mapping[str, Any]], Awaitable[dict[str, Any]]],
+    *,
+    claim_owner: str | None = None,
+) -> Any:
+    from messagefoundry.api.approvals import DEFAULT_CLAIM_OWNER, ApprovalGate
     from messagefoundry.auth.permissions import Permission
     from messagefoundry.config.settings import ApprovalsSettings
 
     settings = ApprovalsSettings(
         enabled=True, operations=["dead_letter_replay"], min_dwell_seconds=0.0
     )
-    gate = ApprovalGate(_StandingStore(store), settings, resolve_identity=_resolve)
+    gate = ApprovalGate(
+        _StandingStore(store),
+        settings,
+        resolve_identity=_resolve,
+        claim_owner=claim_owner or DEFAULT_CLAIM_OWNER,
+    )
     gate.register(
         "dead_letter_replay", "contract op", execute, permission=Permission.MESSAGES_REPLAY
     )
@@ -618,3 +632,133 @@ async def _assert_interrupted_listing_is_oldest_first(store: Any) -> None:
                 decided_at=3_000.0,
                 from_status="interrupted",
             )
+
+
+# --- BACKLOG #1562: the claim owner, and the startup reconcile it makes safe ----------------------
+
+
+async def _executing_row(store: Any, approval_id: str) -> Any | None:
+    mine = [r for r in await store.list_executing_approvals() if str(r["id"]) == approval_id]
+    assert len(mine) <= 1
+    return mine[0] if mine else None
+
+
+async def _claimed_directly(store: Any, *, claim_owner: str | None, claimed_at: float) -> str:
+    """A row left ``executing`` the way a process that died mid-run leaves it: claimed through the
+    store's own guarded update, and never settled."""
+    from uuid import uuid4
+
+    approval_id = uuid4().hex
+    await store.create_pending_approval(
+        approval_id=approval_id,
+        operation="dead_letter_replay",
+        params=json.dumps({"contract_nonce": approval_id}),
+        requester=_REQUESTER,
+        requester_user_id=_REQUESTER_ID,
+        requested_at=claimed_at - 1.0,
+        expires_at=None,
+    )
+    assert await store.decide_pending_approval(
+        approval_id,
+        status="executing",
+        approver=_APPROVER,
+        decided_at=claimed_at,
+        claim_owner=claim_owner,
+    )
+    return approval_id
+
+
+async def _assert_claim_records_its_owner(store: Any) -> None:
+    """The claim writes the gate's owner in the same update that moves the row to ``executing``,
+    and ``list_executing_approvals`` reads it back. The settled row leaves that listing."""
+    from uuid import uuid4
+
+    owner = f"contract-owner-{uuid4().hex}"
+    seen: list[Any] = []
+    approval_id = ""
+
+    async def _observes(_p: Mapping[str, Any]) -> dict[str, Any]:
+        row = await _executing_row(store, approval_id)
+        seen.append(None if row is None else row["claim_owner"])
+        return {"ran": True}
+
+    gate = _gate(store, _observes, claim_owner=owner)
+    approval_id = await _request(gate)
+    assert await _executing_row(store, approval_id) is None, "a pending row is not executing"
+    await gate.approve(approval_id, approver=_APPROVER, approver_user_id=_APPROVER_ID)
+    assert seen == [owner]
+    assert await _status(store, approval_id) == "approved"
+    assert await _executing_row(store, approval_id) is None
+
+
+async def _never_runs(_p: Mapping[str, Any]) -> dict[str, Any]:
+    raise AssertionError("a restart reconcile must never run an operation")
+
+
+async def _assert_restart_reconcile_contract(store: Any) -> None:
+    """At startup a gate moves the ``executing`` rows it owns, and rows with no owner, to
+    ``interrupted`` with an ``approval.interrupted`` row in the same write. A row another owner
+    holds is left ``executing``: that owner may be a live sibling still running it."""
+    from uuid import uuid4
+
+    await _assert_claim_records_its_owner(store)
+
+    mine_owner, sibling_owner = f"contract-me-{uuid4().hex}", f"contract-sib-{uuid4().hex}"
+    mine = await _claimed_directly(store, claim_owner=mine_owner, claimed_at=5_000.0)
+    sibling = await _claimed_directly(store, claim_owner=sibling_owner, claimed_at=5_001.0)
+    legacy = await _claimed_directly(store, claim_owner=None, claimed_at=5_002.0)
+    try:
+        listed = {str(r["id"]): r for r in await store.list_executing_approvals()}
+        assert str(listed[mine]["claim_owner"]) == mine_owner
+        assert str(listed[sibling]["claim_owner"]) == sibling_owner
+        assert listed[legacy]["claim_owner"] is None
+        assert float(listed[mine]["decided_at"]) == 5_000.0
+
+        restarted = _gate(store, _never_runs, claim_owner=mine_owner)
+        found = await restarted.reconcile_after_restart()
+        # Subsets, not equality: the server legs share one table, and another test may have left a
+        # row with no owner behind.
+        assert mine in found.interrupted and legacy in found.interrupted
+        assert sibling in found.foreign and sibling not in found.interrupted
+        assert found.unsettled == ()
+        assert await _status(store, mine) == "interrupted"
+        assert await _status(store, legacy) == "interrupted"
+        assert await _status(store, sibling) == "executing", "a sibling's live release was moved"
+
+        for approval_id, owner in ((mine, mine_owner), (legacy, None)):
+            rows = await _resolved_rows(store, approval_id, "approval.interrupted")
+            assert len(rows) == 1
+            assert str(rows[0]["actor"]) == "system"
+            detail = json.loads(str(rows[0]["detail"]))
+            assert detail["reason"] == "engine_restart" and detail["recorded"] is True
+            assert detail["claim_owner"] == owner and detail["approver"] == _APPROVER
+            row = await store.get_pending_approval(approval_id)
+            assert row is not None and str(row["approver"]) == _APPROVER
+        assert await _resolved_rows(store, sibling, "approval.interrupted") == []
+
+        # A second start moves nothing more and writes no second row.
+        again = await restarted.reconcile_after_restart()
+        assert mine not in again.interrupted and legacy not in again.interrupted
+        assert len(await _resolved_rows(store, mine, "approval.interrupted")) == 1
+
+        # The sibling settles its own row when IT restarts.
+        sibling_gate = _gate(store, _never_runs, claim_owner=sibling_owner)
+        assert sibling in (await sibling_gate.reconcile_after_restart()).interrupted
+        assert await _status(store, sibling) == "interrupted"
+
+        # The reconciled row takes the ordinary resolve path; nothing re-runs.
+        out = await restarted.resolve_interrupted(
+            mine, outcome="effects_not_applied", resolver=_RESOLVER, resolver_user_id=_RESOLVER_ID
+        )
+        assert out["status"] == "resolved_not_applied" and out["approved_by"] == _APPROVER
+    finally:
+        # Leave nothing executing or interrupted behind on a shared server table.
+        for approval_id in (mine, sibling, legacy):
+            for from_status in ("executing", "interrupted"):
+                await store.decide_pending_approval(
+                    approval_id,
+                    status="resolved_not_applied",
+                    approver=_APPROVER,
+                    decided_at=6_000.0,
+                    from_status=from_status,
+                )

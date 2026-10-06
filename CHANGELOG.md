@@ -7,6 +7,15 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- **An engine that restarts settles the dual-control releases it left `executing`.** The claim now
+  records which engine process owns the release, in a new `pending_approvals.claim_owner` column on
+  all three store backends. At its next start, before the API serves an approval, that process moves
+  each `executing` row it owns to `interrupted` with an `approval.interrupted` audit row, `reason`
+  `engine_restart`, in the same write. Nothing re-runs; resolve the row as for any interrupted
+  release. A row another engine shard or cluster node owns is left alone and logged at WARNING. A
+  cluster node keeps its owner across a restart only when `[cluster].node_id` is pinned. This also
+  gives a row left `executing` by a twice-failed outcome write a way out. (vault `BACKLOG #1562`,
+  `BACKLOG #2087`)
 - **A held config reload whose directory vanished, or that named a directory outside the reload
   roots, is refused on release instead of answering 500.** The approve route answers 422 with the
   inline route's detail, and writes the `config_reload_failed` or `config_reload_denied` row the

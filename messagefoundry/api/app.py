@@ -68,7 +68,12 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from messagefoundry import __version__
 from messagefoundry.api._ui_seam import ENGINE_UI_SEAM, CoreHandlers, UiDeps
-from messagefoundry.api.approvals import ApprovalError, ApprovalGate, IdentityResolver
+from messagefoundry.api.approvals import (
+    DEFAULT_CLAIM_OWNER,
+    ApprovalError,
+    ApprovalGate,
+    IdentityResolver,
+)
 from messagefoundry.api.auth_routes import add_auth_routes
 from messagefoundry.api.client_networks import ClientNetworkMiddleware
 from messagefoundry.api.field_authz import (
@@ -761,6 +766,60 @@ def _requester_identity_resolver(app: FastAPI) -> IdentityResolver:
     return _resolve
 
 
+def approval_claim_owner(engine: Engine) -> str:
+    """The claim owner this engine process writes on an approval it releases (BACKLOG #1562).
+
+    It must be the same after a restart of this process and differ from every sibling over the same
+    store (ADR 0063: engine shards share one store; so do cluster nodes). At its next start the
+    process moves only the ``executing`` rows carrying its own owner to ``interrupted``.
+
+    - A cluster node is ``node:<node_id>``. That id is stable only when ``[cluster].node_id`` is
+      pinned. Unpinned it is ``host:pid:hex``, new on every start, so a node's earlier claims read
+      as another owner's and are left alone: safe, but they stay ``executing``.
+    - An engine shard of a multi-shard config is ``shard:<id>``, the ``serve --shard`` name.
+    - Anything else is :data:`DEFAULT_CLAIM_OWNER`. One engine owns its store then.
+
+    Read when the gate is built. The managed lifespan builds it after ``engine.start()`` has loaded
+    the graph, which is where the shard id comes from; an embedder of a sharded engine starts the
+    engine before it calls :func:`create_app`."""
+    coordinator = engine.coordinator
+    if coordinator.is_clustered():
+        return f"node:{coordinator.node_id}"
+    runner = engine.registry_runner
+    shard = runner.registry.shard_id if runner is not None else None
+    if shard is not None:
+        return f"shard:{shard}"
+    return DEFAULT_CLAIM_OWNER
+
+
+async def _reconcile_approvals_after_restart(gate: ApprovalGate) -> None:
+    """Run :meth:`ApprovalGate.reconcile_after_restart` and never fail the start on it.
+
+    A store that cannot answer here leaves this process's leftover rows ``executing``, which is what
+    they were before; the next start tries again. Refusing to start would cost more than that."""
+    try:
+        await gate.reconcile_after_restart()
+    except Exception:
+        _log.exception(
+            "approval gate: the startup reconcile of 'executing' releases failed; they stay "
+            "'executing' until a later start"
+        )
+
+
+@asynccontextmanager
+async def _embedded_approvals_lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """The lifespan :func:`create_app` gives an app built around a caller's engine.
+
+    The caller starts and stops the engine; this runs only the approval gate's own steps, which the
+    managed lifespan runs too. At start, :meth:`ApprovalGate.reconcile_after_restart`, before the
+    app serves an approval. A caller that passes its own ``lifespan`` replaces this one and runs
+    these steps itself, with the engine's store open."""
+    gate: ApprovalGate | None = getattr(app.state, "approval_gate", None)
+    if gate is not None:
+        await _reconcile_approvals_after_restart(gate)
+    yield
+
+
 def _build_approval_gate(
     engine: Engine,
     settings: ApprovalsSettings,
@@ -776,7 +835,11 @@ def _build_approval_gate(
     pair in step with the route that raises the request: the route checks at request time, the gate
     at release, and a divergence would let one of the two pass what the other refuses."""
     gate = ApprovalGate(
-        engine.store, settings, resolve_identity=resolve_identity, alert_sink=alert_sink
+        engine.store,
+        settings,
+        resolve_identity=resolve_identity,
+        alert_sink=alert_sink,
+        claim_owner=approval_claim_owner(engine),
     )
 
     async def _replay(p: Mapping[str, Any]) -> dict[str, Any]:
@@ -2253,6 +2316,11 @@ def create_app(
     # whose X-Forwarded-Proto is not trusted or not sent, that scheme is http, so the redirect would
     # point the client at an http:// URL. A trailing-slash miss is now a 404.
     # tests/test_api_redirect_slashes.py pins that no route ends in "/" and no mount redirects.
+    if engine is not None and lifespan is None:
+        # The embedded path: the caller owns the engine, and this app still owns its approval
+        # gate's start and stop (BACKLOG #1562). A caller passing its own lifespan runs those
+        # steps itself; _embedded_approvals_lifespan names them.
+        lifespan = _embedded_approvals_lifespan
     app = FastAPI(
         title="MessageFoundry",
         version=__version__,
@@ -8987,6 +9055,9 @@ def create_managed_app(
                 resolve_identity=_requester_identity_resolver(app),
                 alert_sink=notifier,  # None -> the gate's own LoggingAlertSink default
             )
+            # BACKLOG #1562: before the API serves an approval, so no claim of this life can be
+            # mistaken for a leftover of the last one.
+            await _reconcile_approvals_after_restart(app.state.approval_gate)
             # ASVS 5.2.4: age-based retention prune for the uploaded-logs surface. Owned by this lifespan
             # (started here, stopped in the finally) — the runner pattern of cert_expiry, but wired where the
             # UploadStore lives (built in create_app from store_settings). None when [store].uploads_dir is

@@ -1045,6 +1045,14 @@ async def test_interrupted_approval_resolution_contract(store) -> None:
     await _assert_interrupted_resolution_contract(store)
 
 
+async def test_restart_reconcile_contract(store) -> None:
+    """BACKLOG #1562: the claim writes this backend's ``claim_owner`` column, and a restarted gate
+    moves only its own ``executing`` rows (and unowned ones) to ``interrupted``."""
+    from tests._pending_approval_store_contract import _assert_restart_reconcile_contract
+
+    await _assert_restart_reconcile_contract(store)
+
+
 async def test_directory_identity_store_contract(store) -> None:
     """BACKLOG #1471 ``get_user_by_directory_object_id`` on the real Postgres backend.
 

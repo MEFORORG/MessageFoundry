@@ -169,6 +169,43 @@ def test_pending_approvals_requester_user_id_present_on_all_backends() -> None:
     )
 
 
+def test_pending_approvals_claim_owner_present_on_all_backends() -> None:
+    # BACKLOG #1562: the startup reconcile keys on this column to tell this process's leftover
+    # releases from a sibling's live ones, on every backend, in the fresh-DB CREATE TABLE and as a
+    # guarded ADD for an existing DB. The round trip is _pending_approval_store_contract.py's.
+    import inspect
+
+    from messagefoundry.store import store as sqlite_store
+
+    assert "claim_owner  TEXT" in sqlite_store._SCHEMA
+    migrate_src = inspect.getsource(sqlite_store.MessageStore._migrate)
+    assert "ALTER TABLE pending_approvals ADD COLUMN claim_owner TEXT" in migrate_src
+
+    sqlserver = pytest.importorskip(
+        "messagefoundry.store.sqlserver", reason="requires the sqlserver extra (aioodbc)"
+    )
+    assert any(
+        "CREATE TABLE pending_approvals" in s and "claim_owner NVARCHAR(256) NULL" in s
+        for s in sqlserver._SCHEMA
+    )
+    assert any(
+        "COL_LENGTH('pending_approvals','claim_owner')" in s
+        and "ADD claim_owner NVARCHAR(256) NULL" in s
+        for s in sqlserver._SCHEMA
+    )
+
+    postgres = pytest.importorskip(
+        "messagefoundry.store.postgres", reason="requires the postgres extra (asyncpg)"
+    )
+    assert any(
+        "CREATE TABLE IF NOT EXISTS pending_approvals" in s and "claim_owner  TEXT" in s
+        for s in postgres._SCHEMA
+    )
+    assert "ALTER TABLE pending_approvals ADD COLUMN IF NOT EXISTS claim_owner TEXT" in (
+        postgres._SCHEMA
+    )
+
+
 def test_known_login_addresses_table_present_on_all_backends() -> None:
     # vault BACKLOG #2145: the first-seen sign-in address record must exist in ALL THREE backend
     # schemas, keyed (user_id, address) so the signal's one read is a primary-key lookup. On the

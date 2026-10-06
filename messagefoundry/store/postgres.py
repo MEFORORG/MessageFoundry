@@ -652,13 +652,18 @@ _SCHEMA: list[str] = [
         status       TEXT NOT NULL DEFAULT 'pending',
         approver     TEXT,
         decided_at   DOUBLE PRECISION,
-        expires_at   DOUBLE PRECISION
+        expires_at   DOUBLE PRECISION,
+        -- BACKLOG #1562: the engine process that claimed the release. See the Store protocol's
+        -- decide_pending_approval.
+        claim_owner  TEXT
     )""",
     # BACKLOG #1540: the immutable requester id for a pre-existing pending_approvals table; a no-op on
     # a fresh DB (the CREATE above has it). Lives in _SCHEMA (hash-gated, ADR 0064) so it runs once
     # per schema version rather than taking ACCESS EXCLUSIVE on every open, and so adding it moves
     # _schema_hash() automatically — no _MIGRATION_REV bump is needed or wanted.
     "ALTER TABLE pending_approvals ADD COLUMN IF NOT EXISTS requester_user_id TEXT",
+    # BACKLOG #1562: the claim owner for a pre-existing table, in _SCHEMA for the reason above.
+    "ALTER TABLE pending_approvals ADD COLUMN IF NOT EXISTS claim_owner TEXT",
     "CREATE INDEX IF NOT EXISTS ix_pending_approvals_status"
     " ON pending_approvals(status, requested_at)",
     """CREATE TABLE IF NOT EXISTS users (
@@ -7290,16 +7295,17 @@ class PostgresStore:
         decided_at: float,
         from_status: str = "pending",
         audit: AuditAppend | None = None,
+        claim_owner: str | None = None,
     ) -> bool:
         """Atomically move a request in ``from_status`` to ``status``.
         Returns ``True`` iff this call made the transition — guards against a double decision.
         The SQLite twin documents why the guard is a parameter (ASVS 2.3.3); the Store protocol
-        states the ``audit`` contract (vault BACKLOG #2255)."""
+        states the ``audit`` and ``claim_owner`` contracts (vault BACKLOG #2255, BACKLOG #1562)."""
         sql = (
-            "UPDATE pending_approvals SET status = $1, approver = $2, decided_at = $3"
-            " WHERE id = $4 AND status = $5"
+            "UPDATE pending_approvals SET status = $1, approver = $2, decided_at = $3,"
+            " claim_owner = COALESCE($6, claim_owner) WHERE id = $4 AND status = $5"
         )
-        args = (status, approver, decided_at, approval_id, from_status)
+        args = (status, approver, decided_at, approval_id, from_status, claim_owner)
         if audit is None:
             result = await self._pool.execute(sql, *args)
             return _rowcount(result) > 0
@@ -7312,6 +7318,16 @@ class PostgresStore:
         if appended is not None:
             audit.tee(ts=now, row=appended)
         return moved
+
+    async def list_executing_approvals(self, *, limit: int = 1000) -> Sequence[Row]:
+        """Released requests still claimed as ``executing``, oldest claim first (BACKLOG #1562).
+        The Store protocol says who reads it and why."""
+        return await self._fetchall(
+            "SELECT id, operation, requester, approver, decided_at, claim_owner"
+            " FROM pending_approvals WHERE status = 'executing'"
+            " ORDER BY decided_at ASC LIMIT $1",
+            limit,
+        )
 
     # --- per-key AES-GCM invocation bound (ASVS 11.3.4) ----------------------
 
