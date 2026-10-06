@@ -4,10 +4,22 @@
 
 ``messagefoundry supervise`` discovers the shard ids declared in a config dir (see
 :mod:`messagefoundry.pipeline.sharding`) and spawns ONE ``messagefoundry serve --shard <id>``
-subprocess per shard, each with its own SQLite db file (``<stem>_<id>.db``) and its own API port
-(``<base>+offset``). It then **monitors** the children on the asyncio loop, **restarts** any that
-exit unexpectedly, and on a shutdown signal **stops them all cleanly**: ask, wait
-``terminate_grace`` seconds, then force whatever is still running.
+subprocess per shard, each on its own API port (``<base>+offset``). More than one engine shard must
+share ONE server-DB store (ADR 0063, :func:`~messagefoundry.pipeline.sharding.require_unified_store`),
+so the per-shard ``--db`` path (``<stem>_<id>.db``, the SQLite ``[store].path``) is not read by any
+store a multi-shard fleet can run on; a single shard keeps the bare base path. It then **monitors**
+the children on the asyncio loop, **restarts** any that exit unexpectedly, and on a shutdown signal
+**stops them all cleanly**: ask, wait ``terminate_grace`` seconds, then force whatever is still
+running.
+
+Restarts back off (vault BACKLOG #2773). A child that exits within ``stable_uptime`` seconds of its
+start is a FAST exit: each one in a row doubles the delay before the next launch, from
+``restart_backoff_initial`` up to ``restart_backoff_max``, and ``crash_loop_limit`` of them in a row
+trip the crash-loop breaker: it logs at ERROR and stops every shard, and ``supervise`` exits 1 so the
+service manager sees the failure (see :meth:`Supervisor._watch` for why all of them). A child that
+ran for ``stable_uptime`` resets both. Without this a start-up failure neither config load reproduces (a
+store that cannot be reached, a port in use, a ``serve`` gate refusing) would relaunch in a tight
+loop, each pass a full interpreter start and config load.
 
 Why a supervisor (and not just N hand-run ``serve`` commands): an operator tags connections with a
 shard name and runs one command; the supervisor turns the shard discovery into a fixed, reproducible
@@ -20,19 +32,20 @@ asyncio (no blocking the loop, cooperative cancellation). Each shard has a watch
 its child's exit against the stop event and relaunches on a crash, so either :meth:`Supervisor.stop`
 or a cancellation ends the watchers and the supervisor then drains the children.
 
-Deferred (noted for follow-up, not built here): restart backoff / crash-loop breaker, per-shard
-structured logging aggregation, graceful in-flight drain on restart, and a shared single-db
-multi-shard mode (the MVP is one SQLite file per shard).
+Deferred (noted for follow-up, not built here): per-shard structured logging aggregation and
+graceful in-flight drain on restart.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import signal
 import subprocess
 import sys
+import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -48,6 +61,15 @@ logger = logging.getLogger(__name__)
 
 #: How long (seconds) to wait for a child to exit after a terminate() before escalating to kill().
 DEFAULT_TERMINATE_GRACE = 10.0
+
+#: Restart backoff (vault BACKLOG #2773): the delay before relaunching after the first fast exit, and
+#: the cap the doubling stops at. Ten fast exits in a row span about four minutes of retrying.
+DEFAULT_RESTART_BACKOFF_INITIAL = 1.0
+DEFAULT_RESTART_BACKOFF_MAX = 60.0
+#: A child that ran at least this long (seconds) was not crash-looping: its exit resets the backoff.
+DEFAULT_STABLE_UPTIME = 60.0
+#: This many fast exits in a row trip the crash-loop breaker, and the shard is not relaunched again.
+DEFAULT_CRASH_LOOP_LIMIT = 10
 
 
 @dataclass(frozen=True)
@@ -261,33 +283,60 @@ class Supervisor:
     unexpectedly-exited child is relaunched (the operator runtime sets it True; a one-shot smoke may
     set it False). ``terminate_grace`` is the seconds to wait after the stop request before forcing
     the child.
+
+    The restart backoff and crash-loop breaker are the module docstring's; their knobs are
+    ``restart_backoff_initial``, ``restart_backoff_max``, ``stable_uptime`` and
+    ``crash_loop_limit``. ``clock`` (monotonic seconds) times each child's uptime and ``sleep``
+    waits out a delay; both are injectable so a test can run a crash loop without real time.
     """
 
     specs: Sequence[ShardSpec]
     spawn: SpawnFn = _default_spawn
     restart: bool = True
     terminate_grace: float = DEFAULT_TERMINATE_GRACE
+    restart_backoff_initial: float = DEFAULT_RESTART_BACKOFF_INITIAL
+    restart_backoff_max: float = DEFAULT_RESTART_BACKOFF_MAX
+    stable_uptime: float = DEFAULT_STABLE_UPTIME
+    crash_loop_limit: int = DEFAULT_CRASH_LOOP_LIMIT
+    clock: Callable[[], float] = time.monotonic
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
     _children: dict[str, _Child] = field(default_factory=dict, init=False)
     _stopping: asyncio.Event = field(default_factory=asyncio.Event, init=False)
-    #: Per-shard restart counters — exposed for tests/observability (no backoff policy yet; deferred).
+    #: Per-shard restart counters, exposed for tests and observability.
     restarts: dict[str, int] = field(default_factory=dict, init=False)
+    #: Shards that tripped the crash-loop breaker in the current :meth:`run`, which then stopped.
+    crash_looped: set[str] = field(default_factory=set, init=False)
+
+    def __post_init__(self) -> None:
+        # Each of these would switch the protection off quietly: a limit of 0 trips on the first
+        # exit even after a long stable run, a negative or NaN stable_uptime never counts an exit as
+        # fast, and a negative or NaN delay relaunches at once.
+        if self.crash_loop_limit < 1:
+            raise ValueError(f"crash_loop_limit must be at least 1, got {self.crash_loop_limit}")
+        for knob in ("restart_backoff_initial", "restart_backoff_max", "stable_uptime"):
+            value = getattr(self, knob)
+            if not (math.isfinite(value) and value >= 0):
+                raise ValueError(f"{knob} must be a finite number of seconds >= 0, got {value!r}")
 
     async def run(self) -> None:
         """Spawn every shard, then watch them until cancelled or :meth:`stop` is called.
 
         Each shard runs under its own watcher task that relaunches it on an unexpected exit (when
         ``restart``). Either route drains all children cleanly: :meth:`stop` ends the watchers so
-        ``gather`` returns and the ``else`` branch drains, and a cancellation takes the branch above.
+        ``gather`` returns and the ``else`` branch drains, and a cancellation or a watcher that
+        raised takes the branch above, so no failure leaves sibling shards running undrained.
         """
         self._stopping.clear()
+        self.crash_looped.clear()
         watchers = [
             asyncio.create_task(self._watch(spec), name=f"shard:{spec.shard}")
             for spec in self.specs
         ]
         try:
             await asyncio.gather(*watchers)
-        except asyncio.CancelledError:
-            # Cooperative shutdown: signal the watchers to stop relaunching, then drain the children.
+        except BaseException:
+            # Cooperative shutdown, or one watcher raised: signal the others to stop relaunching,
+            # then drain every child before the exception goes on.
             self._stopping.set()
             for w in watchers:
                 w.cancel()
@@ -298,40 +347,99 @@ class Supervisor:
             await self._terminate_all()
 
     async def _watch(self, spec: ShardSpec) -> None:
-        """Keep one shard alive: spawn it, await exit OR a stop request, relaunch on a crash.
+        """Keep one shard alive: spawn it, await exit OR a stop request, relaunch on a crash after
+        the backoff, and give up once the crash-loop breaker trips.
 
         The wait races the child's exit against ``_stopping``, so :meth:`stop` alone ends this
         watcher — awaiting the exit on its own left ``run``'s ``gather`` blocked until something
-        cancelled it, and the event woke nobody.
+        cancelled it, and the event woke nobody. The backoff delay races it the same way.
+
+        Under ``restart``, a launch that raises ``OSError`` (no memory for a process, no file
+        handles, the interpreter missing mid-upgrade) counts as a fast exit, so it backs off and trips
+        the breaker like any other start-up failure rather than ending the whole supervisor.
+
+        A tripped breaker stops the WHOLE supervisor, not just this shard, so :func:`supervise`
+        exits 1 and the service manager sees the failure. Each engine shard owns a share of the
+        outbound lanes, so a fleet with one shard missing would keep accepting rows that nothing
+        drains while still reading as up.
         """
+        fast_exits = 0  # consecutive exits within stable_uptime of their start
         while not self._stopping.is_set():
-            child = _Child(spec, await self.spawn(spec))
-            self._children[spec.shard] = child
-            logger.info(
-                "shard %r started (pid=%s, port=%d)", spec.shard, child.process.pid, spec.port
-            )
-            exited = asyncio.ensure_future(child.process.wait())
-            stopping = asyncio.ensure_future(self._stopping.wait())
+            started = self.clock()
             try:
-                await asyncio.wait({exited, stopping}, return_when=asyncio.FIRST_COMPLETED)
-            finally:
-                # Both are cancelled on EVERY exit path, this watcher's own cancellation included,
-                # so neither outlives the loop iteration — no abandoned cleanup task, no shield.
-                exited.cancel()
-                stopping.cancel()
+                process = await self.spawn(spec)
+            except OSError as exc:
+                if not self.restart:
+                    raise
+                rc: int | str = f"launch failed ({exc})"
+            else:
+                self._children[spec.shard] = _Child(spec, process)
+                logger.info(
+                    "shard %r started (pid=%s, port=%d)", spec.shard, process.pid, spec.port
+                )
+                exit_rc = await self._unless_stopped(process.wait())
+                if exit_rc is None:
+                    return  # shutdown — leave the child for _terminate_all to drain
+                rc = exit_rc
+                if not self.restart:
+                    logger.info("shard %r exited rc=%s (restart disabled)", spec.shard, rc)
+                    return
             if self._stopping.is_set():
-                return  # shutdown — leave the child for _terminate_all to drain
-            rc = exited.result()
-            if not self.restart:
-                logger.info("shard %r exited rc=%s (restart disabled)", spec.shard, rc)
+                return  # a launch that failed during shutdown is not a crash
+            uptime = self.clock() - started
+            fast_exits = fast_exits + 1 if uptime < self.stable_uptime else 0
+            if fast_exits >= self.crash_loop_limit:
+                self.crash_looped.add(spec.shard)
+                logger.error(
+                    "shard %r exited rc=%s %d times in a row, each within %gs of starting: "
+                    "crash loop, stopping every engine shard. Fix the cause and restart the supervisor.",
+                    spec.shard,
+                    rc,
+                    fast_exits,
+                    self.stable_uptime,
+                )
+                self.stop()
                 return
-            self.restarts[spec.shard] = self.restarts.get(spec.shard, 0) + 1
+            # The exponent is capped so a very large crash_loop_limit cannot overflow the float
+            # before min() caps the delay; 2**32 seconds is past any restart_backoff_max anyway.
+            delay = min(
+                self.restart_backoff_max,
+                self.restart_backoff_initial * float(2 ** min(max(fast_exits - 1, 0), 32)),
+            )
             logger.warning(
-                "shard %r exited rc=%s — restarting (restart #%d)",
+                "shard %r exited rc=%s after %.1fs; restarting in %gs (restart #%d)",
                 spec.shard,
                 rc,
-                self.restarts[spec.shard],
+                uptime,
+                delay,
+                self.restarts.get(spec.shard, 0) + 1,
             )
+            if delay > 0:
+                await self._unless_stopped(self.sleep(delay))
+            if self._stopping.is_set():
+                return
+            # Counted once the delay is over, so a stop during it does not record a restart that
+            # never ran.
+            self.restarts[spec.shard] = self.restarts.get(spec.shard, 0) + 1
+
+    async def _unless_stopped[T](self, aw: Awaitable[T]) -> T | None:
+        """Await ``aw`` unless a stop request comes first: its result, or ``None`` on a stop.
+
+        Both waits are cancelled on EVERY exit path, the caller's own cancellation included, so
+        neither outlives the call — no abandoned cleanup task, no shield. ``aw`` finishing with an
+        exception raises it here rather than leaving it unretrieved."""
+        task = asyncio.ensure_future(aw)
+        stopping = asyncio.ensure_future(self._stopping.wait())
+        try:
+            await asyncio.wait({task, stopping}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            task.cancel()
+            stopping.cancel()
+        if self._stopping.is_set():
+            if task.done() and not task.cancelled():
+                task.exception()  # retrieved, so a failure racing the stop is not logged as lost
+            return None
+        return task.result()
 
     def stop(self) -> None:
         """Signal a cooperative shutdown (idempotent). The watchers stop relaunching and return, so
@@ -399,7 +507,8 @@ async def supervise(
     """Discover shards from ``config`` and run a :class:`Supervisor` until interrupted.
 
     Installs SIGINT/SIGTERM handlers (when ``install_signal_handlers``) that trigger a clean drain.
-    Returns 0 on a clean shutdown, 2 on a config/discovery error.
+    Returns 0 on a clean shutdown, 1 when an engine shard tripped the crash-loop breaker (which stops
+    them all), and 2 on a config/discovery error.
     """
     from messagefoundry.config.wiring import WiringError
 
@@ -447,6 +556,13 @@ async def supervise(
     except KeyboardInterrupt:  # pragma: no cover - interactive Ctrl-C on Windows
         runner.cancel()
         await asyncio.gather(runner, return_exceptions=True)
+    # A tripped crash-loop breaker stopped the fleet; that is not a clean shutdown.
+    if supervisor.crash_looped:
+        logger.error(
+            "supervise: engine shard(s) %s stopped by the crash-loop breaker",
+            ", ".join(sorted(supervisor.crash_looped)),
+        )
+        return 1
     return 0
 
 

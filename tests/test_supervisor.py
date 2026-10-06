@@ -208,6 +208,10 @@ def _spec(shard: str, port: int = 8765) -> ShardSpec:
     return ShardSpec(shard=shard, db_path=f"{shard}.db", port=port, argv=("python", shard))
 
 
+async def _no_wait(delay: float) -> None:
+    """A backoff sleep that returns at once, for tests that are not about the delay."""
+
+
 @pytest.mark.asyncio
 async def test_spawns_one_child_per_shard_then_stops_cleanly() -> None:
     spawned: list[_FakeProcess] = []
@@ -245,7 +249,13 @@ async def test_restarts_a_crashed_child() -> None:
         spawned.append(p)
         return p
 
-    sup = Supervisor([_spec("a")], spawn=_spawner(spawn), restart=True, terminate_grace=2.0)
+    sup = Supervisor(
+        [_spec("a")],
+        spawn=_spawner(spawn),
+        restart=True,
+        terminate_grace=2.0,
+        sleep=_no_wait,  # the restart backoff has its own tests below
+    )
     run = asyncio.create_task(sup.run())
     while not spawned:
         await asyncio.sleep(0)
@@ -469,6 +479,216 @@ async def test_terminate_escalates_to_kill_after_grace() -> None:
     with pytest.raises(asyncio.CancelledError):
         await run
     assert proc.terminated and proc.killed  # escalated to kill after the grace elapsed
+
+
+# --- vault BACKLOG #2773: restart backoff and the crash-loop breaker -------------------------------
+
+
+class _FakeTime:
+    """An injected clock and sleep. ``sleep`` records each delay and moves the clock past it at once,
+    so a crash loop runs in no real time and its delays can be read back exactly."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.delays: list[float] = []
+
+    def clock(self) -> float:
+        return self.now
+
+    async def sleep(self, delay: float) -> None:
+        self.delays.append(delay)
+        self.now += delay
+
+
+def _exiting_at_once(
+    time_: _FakeTime, uptimes: list[float], spawned: list[_FakeProcess]
+) -> Callable[[ShardSpec], Awaitable[_FakeProcess]]:
+    """A spawn whose children exit with rc=3 as soon as they start, the Nth one after running for
+    ``uptimes[N]`` seconds of the fake clock (0 once the list runs out)."""
+
+    async def spawn(spec: ShardSpec) -> _FakeProcess:
+        p = _FakeProcess()
+        time_.now += uptimes[len(spawned)] if len(spawned) < len(uptimes) else 0.0
+        spawned.append(p)
+        p.finish(3)
+        return p
+
+    return spawn
+
+
+async def test_a_child_that_exits_at_once_backs_off_then_trips_the_breaker(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Each fast exit doubles the delay up to the cap, and the fifth in a row stops the relaunching.
+    The supervisor then ends on its own, because its only watcher has, and the ERROR line says why."""
+    time_ = _FakeTime()
+    spawned: list[_FakeProcess] = []
+    sup = Supervisor(
+        [_spec("a")],
+        spawn=_spawner(_exiting_at_once(time_, [], spawned)),
+        restart_backoff_initial=1.0,
+        restart_backoff_max=4.0,
+        stable_uptime=60.0,
+        crash_loop_limit=5,
+        clock=time_.clock,
+        sleep=time_.sleep,
+    )
+    with caplog.at_level(logging.WARNING, logger=supervisor_mod.__name__):
+        await asyncio.wait_for(sup.run(), timeout=5.0)
+
+    assert time_.delays == [1.0, 2.0, 4.0, 4.0]  # doubling, capped at restart_backoff_max
+    assert len(spawned) == 5  # the fifth fast exit tripped the breaker; no sixth launch
+    assert sup.crash_looped == {"a"}
+    assert sup.restarts["a"] == 4
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1 and "crash loop" in errors[0].getMessage()
+
+
+async def test_a_stable_run_resets_the_backoff_and_the_breaker() -> None:
+    """The third child runs for longer than ``stable_uptime``. Its exit resets the count, so the
+    breaker (limit 3) trips at the sixth exit and not the third, and the delay starts over."""
+    time_ = _FakeTime()
+    spawned: list[_FakeProcess] = []
+    sup = Supervisor(
+        [_spec("a")],
+        spawn=_spawner(_exiting_at_once(time_, [0.0, 0.0, 120.0], spawned)),
+        restart_backoff_initial=1.0,
+        restart_backoff_max=60.0,
+        stable_uptime=60.0,
+        crash_loop_limit=3,
+        clock=time_.clock,
+        sleep=time_.sleep,
+    )
+    await asyncio.wait_for(sup.run(), timeout=5.0)
+
+    assert len(spawned) == 6
+    assert time_.delays == [1.0, 2.0, 1.0, 1.0, 2.0]
+    assert sup.crash_looped == {"a"}
+    assert sup.restarts["a"] == 5
+
+
+async def test_stop_during_the_backoff_ends_the_watcher_without_a_relaunch() -> None:
+    """The delay races the stop request, as the child's exit does, so a supervisor told to stop while
+    a shard is backing off returns at once instead of sleeping the delay out and relaunching."""
+    spawned: list[_FakeProcess] = []
+    asleep = asyncio.Event()
+
+    async def sleep_forever(delay: float) -> None:
+        asleep.set()
+        await asyncio.Event().wait()
+
+    async def spawn(spec: ShardSpec) -> _FakeProcess:
+        p = _FakeProcess()
+        spawned.append(p)
+        return p
+
+    sup = Supervisor([_spec("a")], spawn=_spawner(spawn), sleep=sleep_forever)
+    run = asyncio.create_task(sup.run())
+    while not spawned:
+        await asyncio.sleep(0)
+    spawned[0].finish(1)
+    await asyncio.wait_for(asleep.wait(), timeout=2.0)
+
+    sup.stop()
+    await asyncio.wait_for(run, timeout=2.0)
+    assert len(spawned) == 1
+    assert sup.crash_looped == set()
+    assert "a" not in sup.restarts  # the relaunch never ran, so it is not counted
+
+
+async def test_a_launch_that_raises_counts_as_a_fast_exit() -> None:
+    """A spawn that raises OSError backs off and trips the breaker like a child that exits at once.
+    The breaker then stops the whole supervisor, and the healthy sibling is drained, not orphaned."""
+    time_ = _FakeTime()
+    attempts: list[str] = []
+    healthy: list[_FakeProcess] = []
+
+    async def spawn(spec: ShardSpec) -> _FakeProcess:
+        if spec.shard == "a":
+            attempts.append(spec.shard)
+            raise OSError("no file handles")
+        p = _FakeProcess()
+        healthy.append(p)
+        return p
+
+    sup = Supervisor(
+        [_spec("a"), _spec("b", 8766)],
+        spawn=_spawner(spawn),
+        crash_loop_limit=3,
+        clock=time_.clock,
+        sleep=time_.sleep,
+    )
+    await asyncio.wait_for(sup.run(), timeout=5.0)  # ends on its own: the breaker stopped it
+    assert sup.crash_looped == {"a"}
+    assert len(attempts) == 3
+    assert time_.delays == [1.0, 2.0]
+    assert len(healthy) == 1 and healthy[0].terminated  # the sibling was drained
+
+
+async def test_a_watcher_that_raises_still_drains_the_other_shards() -> None:
+    """With restart off, a launch failure is not counted; it propagates. run() must still ask the
+    sibling shard to stop before the exception goes on, rather than leave it running."""
+    healthy: list[_FakeProcess] = []
+
+    async def spawn(spec: ShardSpec) -> _FakeProcess:
+        if spec.shard == "a":
+            await asyncio.sleep(0)  # let b start first
+            raise OSError("no file handles")
+        p = _FakeProcess()
+        healthy.append(p)
+        return p
+
+    sup = Supervisor([_spec("a"), _spec("b", 8766)], spawn=_spawner(spawn), restart=False)
+    with pytest.raises(OSError, match="no file handles"):
+        await asyncio.wait_for(sup.run(), timeout=5.0)
+    assert len(healthy) == 1 and healthy[0].terminated
+
+
+@pytest.mark.parametrize(
+    ("knob", "value"),
+    [
+        ("crash_loop_limit", 0),
+        ("stable_uptime", -1.0),
+        ("stable_uptime", float("nan")),
+        ("restart_backoff_initial", -1.0),
+        ("restart_backoff_max", float("nan")),
+    ],
+)
+def test_a_setting_that_would_switch_the_protection_off_is_refused(knob: str, value: float) -> None:
+    with pytest.raises(ValueError, match=knob):
+        Supervisor([_spec("a")], **{knob: value})  # type: ignore[arg-type]  # one knob per case
+
+
+async def test_supervise_exits_nonzero_when_every_shard_crash_loops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fleet whose every shard tripped the breaker is not a clean shutdown, so supervise must not
+    return the clean-shutdown 0 for it."""
+    time_ = _FakeTime()
+    spawned: list[_FakeProcess] = []
+    real = Supervisor
+
+    def _supervisor(specs: list[ShardSpec]) -> Supervisor:
+        return real(
+            specs,
+            spawn=_spawner(_exiting_at_once(time_, [], spawned)),
+            crash_loop_limit=2,
+            clock=time_.clock,
+            sleep=time_.sleep,
+        )
+
+    async def _loads(config: str) -> None:
+        return None
+
+    monkeypatch.setattr(supervisor_mod, "discover_shard_specs", lambda *a, **k: [_spec("a")])
+    monkeypatch.setattr(supervisor_mod, "preflight_shard_config", _loads)
+    monkeypatch.setattr(supervisor_mod, "Supervisor", _supervisor)
+
+    code = await asyncio.wait_for(
+        supervise("cfg", install_signal_handlers=False, **_DISCOVERY), timeout=5.0
+    )
+    assert code == 1
+    assert len(spawned) == 2
 
 
 # --- the pre-flight: a config must load the way an engine shard will load it (vault BACKLOG #2587) -------

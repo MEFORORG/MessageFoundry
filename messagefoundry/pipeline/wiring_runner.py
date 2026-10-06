@@ -6455,6 +6455,12 @@ class RegistryRunner:
                 exc_info=True,
             )
 
+    def _lane_may_deliver(self, name: str) -> bool:
+        """The two conditions :meth:`_delivery_worker`'s loop-top gates refuse a claim on (the #122
+        halt and the operator pause), as one predicate for its per-item re-check (#2771). A new
+        loop-top gate belongs here as well, or a claimed batch keeps sending under it."""
+        return not self._delivery_halted and name not in self._outbound_paused
+
     async def _delivery_worker(self, name: str) -> None:
         # B11: was the previous wait a wake (.set() — herd) or a poll-interval timeout (idle)? Seeds
         # False so the first claim at startup classifies as idle-poll, not a spurious wake.
@@ -6553,11 +6559,32 @@ class RegistryRunner:
                     woken = await self._wait_for_work(wait_ev)
                     continue
                 for i, item in enumerate(items):
-                    # BACKLOG #82: pace this lane's egress BEFORE the send seam so ONE hook covers both
-                    # the single-message and the batch body (below) — a paced batch counts as one
-                    # interval. Sits between claim and send (outside the produce→complete transaction),
-                    # so it delays without reordering; cancellable via the loop's CancelledError.
-                    await self._pace_outbound(name)
+                    # #2771: the two loop-top gates, re-asked PER ITEM, before the pacing wait and
+                    # again after it. An UNORDERED claim holds up to claim_limit rows, and a paced lane
+                    # spends most of its time in the wait for its NEXT row, so asking only at the loop
+                    # top let a lane the operator had paused, or one the #122 log-unwritable halt had
+                    # taken down, send the rest of its batch first. That includes a FIFO head claimed
+                    # just before a pause, which now goes back unsent.
+                    if self._lane_may_deliver(name):
+                        # BACKLOG #82: pace this lane's egress BEFORE the send seam so ONE hook covers
+                        # both the single-message and the batch body (below) — a paced batch counts as
+                        # one interval. Sits between claim and send (outside the produce→complete
+                        # transaction), so it delays without reordering; cancellable via the loop's
+                        # CancelledError.
+                        await self._pace_outbound(name)
+                    if not self._lane_may_deliver(name):
+                        if not self._coordinator.is_leader():
+                            # As a STOPPED item does on leadership loss: the unfenced release is not
+                            # this node's to make (the rows are the successor's promotion recovery),
+                            # and parking at the pause gate would signal quiescence over them.
+                            return
+                        # Unsent, so release_claimed (no attempt spent, seq kept), and then the loop
+                        # top signals quiescence and parks or returns. Not _release_tail_on_stop,
+                        # which swallows a failure: this worker lives on, so a failed release must
+                        # take the except arm's re-pend rather than reach a quiescence signal with the
+                        # rows still INFLIGHT.
+                        await self.store.release_claimed(claimed[i:])
+                        break
                     # #134 (ADR 0082): a batching outbound coalesces this claimed head + the lane's next
                     # due rows into ONE BHS…BTS envelope; the plain path delivers one message per send.
                     batch_cfg = self._batch.get(name)
