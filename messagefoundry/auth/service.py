@@ -5178,6 +5178,13 @@ class AuthService:
                 # passes keeps its "already reported" mark and is not reported again on its next
                 # sign-in.
                 still_unkeyed.add(user.id)
+            # Deliberately WITHOUT the idle timeout (BACKLOG #2283). An idle row can come back: a
+            # backward clock step or a raised idle setting makes the validator accept it again. So
+            # an account holding only idle rows is still probed, and a disabled one keeps accruing
+            # strikes. An idle filter would also let a forward step of more than the idle window
+            # empty the candidates, and the prunes below would drop every strike and the hold. The
+            # read still filters on absolute expiry, so a step past the absolute lifetime does
+            # that today. That predates BACKLOG #2283, and #2283 leaves it open.
             if not await self._store.list_sessions(user.id):
                 continue
             if is_unkeyed:
@@ -5807,10 +5814,10 @@ class AuthService:
             await self._store.mark_session_mfa_verified(token_hash)
         if supersedes_hash is not None:
             await self._supersede_session_hash(supersedes_hash, client=client)
-        await self._enforce_session_cap(user_id)
+        await self._enforce_session_cap(user_id, client=client)
         return token
 
-    async def _enforce_session_cap(self, user_id: str) -> None:
+    async def _enforce_session_cap(self, user_id: str, *, client: str | None = None) -> None:
         """Apply ``[auth].max_sessions_per_user`` to one user (AUTH-SESS-CAP).
 
         Runs after a sign-in mints a row, and again after a ceremony in ``_FACTOR_CEREMONIES``
@@ -5829,9 +5836,21 @@ class AuthService:
         fully signed-in device by signing in over and over (BACKLOG #2076). A pending sign-in gets
         no shorter life: a user who must enrol a factor does it on that session.
 
+        That caller can still push the real user's own pending sign-in out of the pending group,
+        and that stands (BACKLOG #2283). Until the factor is proven the two sign-ins are the same
+        to the engine, so no rank can favour one. The user loses a half-finished sign-in and signs
+        in again, while the caller holding the password gains no access from it.
+
         The price is a bound of twice the cap. If the user later stops owing a factor (MFA turned
         off, the last factor removed, a role change under the administrators scope), the pending
         rows count as full ones until the next cap run, which then keeps the newest ``cap``.
+
+        **A run that revoked anything is audited (BACKLOG #2283):** one ``auth.session_revoked`` row
+        with scope ``cap`` and the count, under the owner's name and with the address of the
+        sign-in or ceremony that ran the cap, as the supersession row is. So it lands in that
+        user's own security-event feed. A count, not hashes, as the other
+        multi-session revocations record it. The count includes lapsed rows the cap ended, which
+        the validator already refused; the store returns one count for both.
         """
         cap = self._settings.max_sessions_per_user
         if not cap or cap <= 0:
@@ -5840,12 +5859,19 @@ class AuthService:
         # A user row that has gone owes nothing more; splitting is then the closed choice, since it
         # can only protect full sessions.
         split = True if user is None else await self._unverified_session_owes_factor(user)
-        await self._store.enforce_session_cap(
+        revoked = await self._store.enforce_session_cap(
             user_id,
             keep=cap,
             idle_seconds=self.session_idle_seconds,
             split_mfa_pending=split,
         )
+        if revoked > 0:
+            await self._audit(
+                "auth.session_revoked",
+                actor=user.username if user is not None else None,
+                detail=_json({"scope": "cap", "count": revoked, "cap": cap}),
+                client=client,
+            )
 
     @property
     def session_idle_seconds(self) -> float:
@@ -6000,23 +6026,35 @@ class AuthService:
             # The session just joined the full ones, so the cap runs again (BACKLOG #2076). With
             # `cap` full sessions already live, the oldest of those goes, never the one just
             # completed: its fresh stamp ranks it newest.
-            await self._enforce_session_cap_after_elevation(rotated)
+            await self._enforce_session_cap_after_elevation(rotated, client=client)
         return Elevation(token=rotated, recovery_codes=recovery_codes)
 
-    async def _enforce_session_cap_after_elevation(self, token: str) -> None:
+    async def _enforce_session_cap_after_elevation(
+        self, token: str, *, client: str | None = None
+    ) -> None:
         """Run the cap for the owner of a session that has ALREADY been rotated.
 
         A failure here is logged, never raised. The old token is gone by now, and the ceremony has
         committed its own writes (an enabled factor, stored recovery codes, a consumed code), so an
         exception would strand the user with neither token and lose recovery codes they never saw.
         Skipping one cap run costs at most one session over the cap until the next sign-in runs it.
+
+        **The catch is broad on purpose (BACKLOG #2283).** Every call inside is a store read or
+        write, and each backend raises its own driver's errors, which ``auth/`` may not import, as
+        the first-seen login-address read says. A cancellation is not an ``Exception``, so it still
+        propagates.
         """
         try:
             session = await self._store.get_session(hash_token(token))
             if session is not None:
-                await self._enforce_session_cap(session.user_id)
-        except Exception:
-            _log.exception("session cap after a completed second factor failed; skipped this run")
+                await self._enforce_session_cap(session.user_id, client=client)
+        except Exception:  # noqa: BLE001 -- driver errors vary by backend; see the docstring
+            # The run may have revoked sessions before its audit write failed, so the log does not
+            # claim the run was skipped (BACKLOG #2283).
+            _log.exception(
+                "session cap after a completed second factor failed; it may not have run, or its"
+                " audit row may be missing"
+            )
 
     async def identity_for_token(
         self, token: str | None, *, activity: bool = True
@@ -9672,7 +9710,9 @@ class AuthService:
         return False
 
     async def _revoke_ad_sessions(self) -> int:
-        """Revoke every live session held by a directory account. Returns the number revoked.
+        """Revoke every unrevoked session held by an enabled directory account, lapsed ones
+        included. Returns the number revoked, which is the ``sessions_revoked`` the two map audit
+        rows record; it counts rows, not live sessions.
 
         BACKLOG #1154 (ASVS 8.3.2). The two AD map setters below are authorization-value mutators:
         the group maps resolve to role sets and to channel scope, which is exactly what an
@@ -9688,8 +9728,9 @@ class AuthService:
         mapping and an added one change an outcome, so the affected set is not derivable from the
         entries alone. Local accounts read neither map and are left alone.
 
-        Enumerates the way the reconciler does -- ``list_users`` filtered on provider and disabled,
-        then ``list_sessions`` -- so this needs no schema change on any backend. Unlike the
+        Enumerates with ``list_users`` filtered on provider and disabled, then revokes each
+        account's unrevoked rows, so this needs no schema change on any backend. The count it
+        returns includes rows already past their limits, which the revoke ends too. Unlike the
         reconciler this is NOT counted against the mass-revoke breaker: that breaker exists to catch
         a directory the engine cannot read, and this is an administrator's own step-up-gated edit.
         """
@@ -9697,8 +9738,11 @@ class AuthService:
         for user in await self._store.list_users():
             if user.auth_provider != AuthProvider.AD.value or user.disabled:
                 continue
-            if not await self._store.list_sessions(user.id):
-                continue
+            # Unconditional (BACKLOG #2283). It used to revoke only when ``list_sessions`` found a
+            # row, and that read filters on the wall clock: after a forward clock step past the
+            # absolute lifetime it found none, and those rows would come back on the old mapping
+            # once the clock was set right. ``revoke_user_sessions`` matches every unrevoked row,
+            # whatever the clock says, and costs one statement where the read cost one too.
             revoked += await self._store.revoke_user_sessions(user.id)
         return revoked
 
