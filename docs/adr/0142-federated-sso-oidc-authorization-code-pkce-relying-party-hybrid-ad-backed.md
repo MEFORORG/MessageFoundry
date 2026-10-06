@@ -519,8 +519,9 @@ B.1 left the verification of what comes back to the build. These are its criteri
   IdP clock (BACKLOG #2143). The session SHALL store the sign-in's verified `auth_time` as the IdP
   stated it, rotation SHALL carry it, and a step-up that passes every check SHALL replace it with
   its own in the statement that stamps `reauth_at`. An `oidc` session holding none SHALL be refused
-  with `step_up_idp_auth_time_missing`. Neither of those two refusals SHALL tell the operator to
-  try again, because a retry on the same session cannot pass. *Amended 2026-10-06:* this criterion's residual read "an IdP that ignores `max_age=0` still passes when its
+  with `step_up_idp_auth_time_missing`, whose text SHALL NOT tell the operator to try again,
+  because a retry on the same session cannot pass. *Amended 2026-10-06:* this criterion's residual
+  read "an IdP that ignores `max_age=0` still passes when its
   last sign-in for the user is within that skew of the request", with storing the sign-in's IdP
   `auth_time` named as the fix and not built. It would now pass only when the user signed in at the
   IdP again after the stored value, inside that skew.

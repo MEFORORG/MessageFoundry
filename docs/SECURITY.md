@@ -3129,9 +3129,13 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
     Both values are IdP clock, so no skew applies. An IdP that ignores `max_age=0` and answers from
     the sign-in, or replays the last step-up's answer, is then refused even inside the skew, as
     `step_up_idp_auth_time_not_later`. An `oidc` session with no stored value, which is a row
-    written before the column existed, is refused as `step_up_idp_auth_time_missing`. Neither
-    clears on a retry against the same session, so both refusals tell the operator to sign in
-    again; `step_up_not_fresh` stays the engine-clock test's reason. **Residual:** an IdP that ignores `max_age=0` still
+    written before the column existed, is refused as `step_up_idp_auth_time_missing`. A retry on
+    that session cannot pass, so its refusal tells the operator to sign in again. A
+    `step_up_idp_auth_time_not_later` refusal can clear on a retry, once the IdP answers with a
+    later `auth_time`: after a step-up in the same second on an IdP that reports whole seconds,
+    or once a stepped-back IdP clock catches up. So its text offers a retry first, then a new
+    sign-in.
+    `step_up_not_fresh` stays the engine-clock test's reason. **Residual:** an IdP that ignores `max_age=0` still
     passes in one case. The user signed in at the IdP again after the session's stored `auth_time`,
     and that sign-in is within the skew of the request. **Cost:** an IdP clock that
     steps back, or IdP nodes whose clocks disagree, would refuse a real re-authentication until

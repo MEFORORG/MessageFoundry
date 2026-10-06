@@ -628,8 +628,10 @@ DIRECTORY_ROLES_DEMOTED = "directory_roles_demoted"
 STEP_UP_NOT_FRESH = "step_up_not_fresh"
 STEP_UP_SUBJECT_MISMATCH = "step_up_subject_mismatch"
 #: The IdP-clock freshness test's two refusals (BACKLOG #2143), kept apart from the engine-clock
-#: :data:`STEP_UP_NOT_FRESH`. Neither clears on a retry against the same session: the session holds
-#: no IdP ``auth_time`` to compare, or the IdP answered with one no later than the one it holds.
+#: :data:`STEP_UP_NOT_FRESH`. MISSING never clears on a retry against the same session, which holds
+#: no IdP ``auth_time`` to compare. NOT_LATER clears once the IdP answers with a later one: a retry
+#: after a step-up in the same second on an IdP that reports whole seconds, or once a stepped-back
+#: IdP clock catches up. It does not clear while the IdP keeps answering from an earlier sign-in.
 STEP_UP_IDP_AUTH_TIME_MISSING = "step_up_idp_auth_time_missing"
 STEP_UP_IDP_AUTH_TIME_NOT_LATER = "step_up_idp_auth_time_not_later"
 FLOW_PURPOSE_MISMATCH = "flow_purpose_mismatch"
@@ -651,16 +653,18 @@ _STEP_UP_ERRORS: Final[Mapping[str, str]] = MappingProxyType(
             "The identity provider signed in a different account from the one this session belongs"
             " to. Sign in at the provider as yourself, then try again."
         ),
-        # No "try again" on the two below: a retry on this session cannot pass. A new sign-in
-        # stores a new IdP auth_time, which is what the next step-up is compared with.
+        # A new sign-in stores a new IdP auth_time, which is what the next step-up is compared
+        # with. MISSING says only that, because a retry on this session cannot pass. NOT_LATER
+        # offers a retry first, because a later IdP answer can pass it (see the reasons above).
         STEP_UP_IDP_AUTH_TIME_MISSING: (
             "This session holds no sign-in time from the identity provider, so the provider cannot"
             " confirm it's you here. Sign out, then sign in again."
         ),
         STEP_UP_IDP_AUTH_TIME_NOT_LATER: (
             "The identity provider's answer is no newer than this session's last confirmation, so"
-            " it could not confirm it's you. Sign out, then sign in again. If this repeats, the"
-            " provider is ignoring max_age=0 and prompt=login."
+            " it could not confirm it's you. Wait a moment, then try again. If it repeats, sign out,"
+            " then sign in again. If it still repeats, the provider is ignoring max_age=0 and"
+            " prompt=login."
         ),
         "session_gone": "Your session ended. Sign in again.",
         "state_unknown": "The confirmation expired. Try again.",

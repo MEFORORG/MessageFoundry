@@ -572,19 +572,22 @@ async def test_an_oidc_session_with_no_stored_auth_time_is_refused(
 
 
 def test_the_idp_clock_refusals_have_their_own_reasons_and_say_sign_in_again() -> None:
-    """BACKLOG #2143. RED when: the IdP-clock refusals fold back into ``step_up_not_fresh``, or
-    their text says to try again. A retry on the same session cannot pass either of them, so the
-    text sends the operator to sign in again. The engine-clock refusal keeps its own text."""
+    """BACKLOG #2143. RED when: the IdP-clock refusals fold back into ``step_up_not_fresh``, or the
+    missing-value text offers a retry. A retry on a session holding no IdP ``auth_time`` cannot
+    pass, so that text sends the operator to sign in again and nowhere else. The not-later text may
+    offer a retry, which a later IdP answer can pass, but must also name the new sign-in. The
+    engine-clock refusal keeps its own text."""
     from messagefoundry.auth.service import _STEP_UP_ERRORS
 
-    reasons = {STEP_UP_NOT_FRESH, STEP_UP_IDP_AUTH_TIME_MISSING, STEP_UP_IDP_AUTH_TIME_NOT_LATER}
-    assert len(reasons) == 3, reasons
+    assert STEP_UP_NOT_FRESH == "step_up_not_fresh"
     assert STEP_UP_IDP_AUTH_TIME_MISSING == "step_up_idp_auth_time_missing"
     assert STEP_UP_IDP_AUTH_TIME_NOT_LATER == "step_up_idp_auth_time_not_later"
-    for reason in (STEP_UP_IDP_AUTH_TIME_MISSING, STEP_UP_IDP_AUTH_TIME_NOT_LATER):
-        text = _STEP_UP_ERRORS[reason]
-        assert "sign in again" in text.lower(), text
-        assert "try again" not in text.lower(), text
+    missing = _STEP_UP_ERRORS[STEP_UP_IDP_AUTH_TIME_MISSING].lower()
+    assert "sign in again" in missing, missing
+    for retry_word in ("try", "retry", "again later", "in a moment"):
+        assert retry_word not in missing, (retry_word, missing)
+    not_later = _STEP_UP_ERRORS[STEP_UP_IDP_AUTH_TIME_NOT_LATER].lower()
+    assert "sign in again" in not_later and "max_age=0" in not_later, not_later
     assert "Try again" in _STEP_UP_ERRORS[STEP_UP_NOT_FRESH]
 
 
