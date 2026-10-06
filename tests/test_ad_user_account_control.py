@@ -969,6 +969,45 @@ async def test_a_trip_on_role_changes_is_not_cleared_by_a_sample_that_missed_the
         assert (await _pass(service)).aborted == "mass_revoke_breaker"
 
 
+async def test_a_trip_on_role_changes_is_not_cleared_by_a_pass_that_held_those_accounts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A held probe judged neither roles nor scope, and its strike went back to 0. So the pass
+    after a role-change trip that holds the two accounts behind it, and reads the other two clean,
+    is not aborted and still no evidence the trip has gone. The next readable pass trips again."""
+    names = ["n1", "n2", "n3", "n4"]
+    async with _signed_in_estate(monkeypatch, names, ad_session_revoke_max=0) as estate:
+        directory, service, store, _tokens = estate
+        for name in ("n1", "n2"):  # roles the directory no longer grants
+            await store.set_user_roles(await _id(store, name), [Role.VIEWER.value])
+        assert (await _pass(service)).aborted == "mass_revoke_breaker"
+        directory.uac.update({"n1": ABSENT, "n2": ABSENT})
+        held = await _pass(service)
+        assert held.aborted is None and held.hold and len(held.held) == 2
+        assert not held.breaker_clear, "a held account counted as read again"
+        directory.uac.update({"n1": ENABLED, "n2": ENABLED})
+        assert (await _pass(service)).aborted == "mass_revoke_breaker"
+
+
+async def test_an_estate_that_reads_only_absent_does_not_release_a_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No account read ``userAccountControl``: the searches found no entry at all. That is no
+    evidence the read right the hold is about has come back, so the open hold stays open."""
+    async with _signed_in_estate(monkeypatch, ["jdoe", "asmith"]) as estate:
+        directory, _service, store, _tokens = estate
+        await _left_open_by_an_earlier_run(store)
+        directory.delete("jdoe")
+        directory.delete("asmith")
+        service = _fresh_process(store)
+        await service.initialize()
+        sink = NotifierAlertSink([], store=store)
+        plan = await _alerted_pass(service, sink)
+        assert plan.aborted is None and not plan.hold and plan.revocations == ()
+        assert not plan.hold_clear
+        assert await _open_alerts(store) == {ABORTED, HELD}
+
+
 async def test_a_resolve_the_store_failed_to_write_is_retried_on_the_next_pass(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1131,6 +1170,16 @@ async def test_an_undetermined_answer_on_record_is_no_hold_clear_even_when_the_p
     on record is the hold's own condition, which another node's latch may still be holding on."""
     plan = ReconcilePlan(probed=2)
     assert await _marked(plan, {"a": PRESENT, "b": UNDETERMINED}) == (True, False)
+
+
+async def test_a_hold_clear_needs_one_answer_that_read_the_attribute() -> None:
+    """``any(o in readable ...)``: ABSENT answers alone found no entry, so they say nothing about
+    the attribute the hold is about. A DISABLED answer did read it, so it counts."""
+    plan = ReconcilePlan(probed=2)
+    gone = {"a": ABSENT_OUTCOME, "b": ABSENT_OUTCOME}
+    assert await _marked(plan, gone, strikes={"a": 1, "b": 1}) == (False, False)
+    disabled = {"a": ProbeOutcome.DISABLED, "b": ABSENT_OUTCOME}
+    assert await _marked(plan, disabled, strikes={"a": 1, "b": 1}) == (False, True)
 
 
 async def test_an_account_this_pass_revoked_does_not_hold_the_breaker_open() -> None:

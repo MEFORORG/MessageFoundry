@@ -3209,6 +3209,8 @@ Four safety properties, because the lookup still returns one indistinguishable "
   raises no alert. Both thresholds
   must be exceeded — the floor alone would sign out a five-person site, the proportion alone would fire
   on a genuine 3-of-3 offboarding — so it trips only on a change that is simultaneously large and broad.
+- **When the hold's and the breaker's alerts resolve themselves, and where they never do**, is
+  stated once, in [CONFIGURATION.md](CONFIGURATION.md#when-the-reconcilers-two-alerts-resolve-themselves).
 
 Revocation is therefore bounded by *interval × strikes* (10 minutes at the recommended 300 s), not
 immediate, and one LDAP bind per signed-in directory user per pass is the cost —

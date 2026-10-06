@@ -1320,6 +1320,33 @@ async def test_one_skip_report_the_store_keeps_refusing_does_not_starve_the_rest
         await store.close()
 
 
+async def test_two_skip_reports_the_store_keeps_refusing_take_turns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both accounts stay refused. Once both have been refused, the one refused longest ago goes
+    first, so neither is starved: list order alone would retry the same account every pass."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _two_unkeyed_bindings(store)
+        real_record = store.record_audit
+        attempts: list[str] = []
+
+        async def failing(action: str, **kwargs: Any) -> None:
+            if action == "auth.ad_reconcile_binding_unkeyed":
+                attempts.append(json.loads(kwargs["detail"])["username"])
+                raise sqlite3.OperationalError("synthetic: these rows are refused")
+            await real_record(action, **kwargs)
+
+        monkeypatch.setattr(store, "record_audit", failing)
+        for _ in range(6):
+            await service.reconcile_directory_sessions()
+        first, second = attempts[:2]
+        assert {first, second} == {"legacy1", "legacy2"}
+        assert attempts == [first, second] * 3, "one refused account starved the other"
+    finally:
+        await store.close()
+
+
 @pytest.mark.parametrize("defect", [NotImplementedError, RecursionError, sqlite3.ProgrammingError])
 async def test_a_defect_in_a_reconciler_audit_write_is_raised_not_passed_over(
     monkeypatch: pytest.MonkeyPatch, defect: type[Exception]
