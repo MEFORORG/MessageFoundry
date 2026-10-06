@@ -62,7 +62,13 @@ from ..pages.admin import (
 )
 from ._common import _form_pairs
 
-register_ui_action(r"^/ui/users/new$", Permission.USERS_MANAGE, auto_retry=False, unlock=True)
+register_ui_action(
+    r"^/ui/users/new$",
+    Permission.USERS_MANAGE,
+    auto_retry=False,
+    unlock=True,
+    label="Open the create-user form",
+)
 # BACKLOG #1737: the user-detail page is the unlock continuation for the body-carrying
 # POST /ui/users/{id}/update, whose JSON twin (PATCH /users/{id}) is bound to admin_user_update. The
 # POST path itself can never be the continuation -- a body-carrying action is deliberately in neither
@@ -80,6 +86,7 @@ register_ui_action(
     auto_retry=False,
     unlock=True,
     action=STEP_UP_ACTION_ADMIN_USER_UPDATE,
+    label="Open a user's account settings",
 )
 # BACKLOG #1148 (ASVS 7.5.1): the two RESET lanes are split out and TAGGED. Combined and untagged,
 # /ui/reauth minted nothing for them, so the browser path -- the only operator surface that ships --
@@ -90,16 +97,21 @@ register_ui_action(
     r"^/ui/users/[^/?#]+/reset-password$",
     Permission.USERS_MANAGE,
     action=STEP_UP_ACTION_ADMIN_RESET_PASSWORD,
+    label="Reset a user's password",
 )
 register_ui_action(
     r"^/ui/users/[^/?#]+/reset-mfa$",
     Permission.USERS_MANAGE,
     action=STEP_UP_ACTION_ADMIN_RESET_MFA,
+    label="Reset a user's second factor",
 )
+# Two entries rather than one alternation, so each names its own action on /ui/reauth (#2764).
 register_ui_action(
-    r"^/ui/users/[^/?#]+/(revoke-sessions|delete)$",
+    r"^/ui/users/[^/?#]+/revoke-sessions$",
     Permission.USERS_MANAGE,
+    label="Sign out all of a user's sessions",
 )
+register_ui_action(r"^/ui/users/[^/?#]+/delete$", Permission.USERS_MANAGE, label="Delete a user")
 # BACKLOG #1143 / #295 (ADR 0184 slice B): the federated-identity screen. Its two POSTs are
 # action-bound to admin_federated_identity, like their JSON twins, and NEITHER is registered: the link
 # POST carries a body, and an unlink is never auto-re-POSTed across a re-auth. Each stale POST maps
@@ -113,6 +125,7 @@ register_ui_action(
     auto_retry=False,
     unlock=True,
     action=STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY,
+    label="Manage a user's federated identity",
 )
 register_ui_action(
     r"^/ui/users/[^/?#]+/federated-identity/unlink-confirm$",
@@ -120,14 +133,33 @@ register_ui_action(
     auto_retry=False,
     unlock=True,
     action=STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY,
+    label="Open the federated identity unlink confirmation",
 )
 
-register_ui_action(r"^/ui/roles/new$", Permission.USERS_MANAGE, auto_retry=False, unlock=True)
 register_ui_action(
-    r"^/ui/roles/[^/?#]+/edit$", Permission.USERS_MANAGE, auto_retry=False, unlock=True
+    r"^/ui/roles/new$",
+    Permission.USERS_MANAGE,
+    auto_retry=False,
+    unlock=True,
+    label="Open the create-role form",
 )
-register_ui_action(r"^/ui/roles/custom/[^/?#]+/delete$", Permission.USERS_MANAGE)
-register_ui_action(r"^/ui/ad-groups$", Permission.USERS_MANAGE, auto_retry=False, unlock=True)
+register_ui_action(
+    r"^/ui/roles/[^/?#]+/edit$",
+    Permission.USERS_MANAGE,
+    auto_retry=False,
+    unlock=True,
+    label="Edit a role",
+)
+register_ui_action(
+    r"^/ui/roles/custom/[^/?#]+/delete$", Permission.USERS_MANAGE, label="Delete a custom role"
+)
+register_ui_action(
+    r"^/ui/ad-groups$",
+    Permission.USERS_MANAGE,
+    auto_retry=False,
+    unlock=True,
+    label="Open the AD group mappings",
+)
 
 
 def register(app: FastAPI, deps: UiDeps) -> None:

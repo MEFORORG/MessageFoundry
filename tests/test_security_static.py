@@ -598,7 +598,10 @@ _UNSCANNABLE_RE_PATTERNS = {
     # literals would restore static scannability and lose that property. The shapes are bounded and
     # non-catastrophic by inspection: one BOUNDED prefix repetition ``{0,6}`` (deliberately bounded --
     # unbounded it is quadratic on attacker-influenceable log text), then a literal alternation, then
-    # a negated character class. No nested quantifier and no overlapping alternation.
+    # a negated character class. That was the whole shape when this entry was written, with no nested
+    # quantifier and no overlapping alternation. IT IS NOT THE SHAPE NOW: the fragments spliced in
+    # since nest quantifiers and start several branches on the same quote. What keeps them linear is
+    # argued below, fragment by fragment, and not by this sentence.
     #
     # ``_CREDENTIAL_KV`` gained three spliced value fragments under BACKLOG #1685, and the clause above
     # covers them all. Every repetition they add is DETERMINISTIC -- there is exactly one parse of any
@@ -608,8 +611,9 @@ _UNSCANNABLE_RE_PATTERNS = {
     #   position, because ``[^}]`` excludes the single character ``\}\}`` needs. The quantifier is
     #   POSSESSIVE, which this scanner reads as the mitigation rather than the shape, and correctly:
     #   it is what stops the walk retrying on a brace that never closes.
-    # * ``_QUOTED_VALUE`` is ``'[^'\r\n]*+'|"[^"\r\n]*+"`` -- a negated class that excludes its own
-    #   closer, possessive for the same reason.
+    # * the plain quoted value ``'[^'\r\n]*+'|"[^"\r\n]*+"`` -- a negated class that excludes its own
+    #   closer, possessive for the same reason. It is now the fast path inside ``_KV_QUOTED_VALUE``
+    #   rather than a constant of its own.
     # * ``_ODBC_BRACED_OVERRUN`` is ``\{[^\r\n]*`` -- one unbounded repetition of a negated class,
     #   quantified nowhere and inside no quantified group.
     #
@@ -618,11 +622,23 @@ _UNSCANNABLE_RE_PATTERNS = {
     # faster (plain line 2.18 against 2.27 us; the 6 KB adversarial run naming every family 359
     # against 357 us). The one regression is a 6 KB line whose value opens "{" and never closes, at 83
     # against 25 us -- two linear walks rather than one, recorded in full in the module's docstring.
+    #
+    # Every label pattern's PLAIN value class became a spliced fragment too, under the label-swallow
+    # fix that also finished BACKLOG #1685's remainder: ``_PLAIN_VALUE`` and its three siblings, built
+    # on ``_NOT_AT_QUOTED_LABEL`` / ``_NOT_BEFORE_QUOTED_LABEL``, plus ``_GUARDED_QUOTED_VALUE`` and
+    # ``_GUARDED_BRACED_VALUE``. That is why ``_AUTH_SCHEME`` joins this list. Every repetition they
+    # add is possessive (``++``, ``*+``, ``\s*+``) or bounded (``{1,6}``), and none sits under an
+    # unbounded greedy quantifier. ``support/redact.py`` spells the same fragments with literal
+    # keywords, so ITS copies stay resolvable, and this scanner reads them there; that is the scanned
+    # twin of every expression below. ``_KV_QUOTED_VALUE`` (``_CREDENTIAL_KV``'s quoted value, which
+    # runs on past a later label's opening quote) is written as plain concatenation in both files for
+    # that reason: built by a helper, the bundle copy fell out of this scan.
     "messagefoundry/secretscrub.py": (
-        "'(?i)\\\\b(' + _LABEL_PREFIX + '(?:' + _alternation(_TOKEN_WORDS) + '))\\\\b\\\\s*[:=]\\\\s*(?:(?:bearer|basic|digest)\\\\s+)?[\\'\\\\\"]?[^\\\\s\\'\\\\\"]+'",
-        "'\\\\b(' + re.escape(_ENV_PREFIX) + '[A-Z0-9_]+)\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*[\\'\\\\\"]?[^\\\\s\\'\\\\\"]+[\\'\\\\\"]?'",
-        "'(?i)\\\\b(' + _LABEL_PREFIX + '(?:' + _alternation(_CREDENTIAL_WORDS) + '))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*(?:' + _ODBC_BRACED + '|' + _QUOTED_VALUE + '|' + _ODBC_BRACED_OVERRUN + '|[\\'\\\\\"]?[^\\\\s\\'\\\\\";,&]+)'",
-        "'(?i)\\\\b(' + _LABEL_PREFIX + '(?:' + _alternation(_KEY_MATERIAL_WORDS) + '))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*[\\'\\\\\"]?[^\\\\s\\'\\\\\";&]+'",
+        "'(?i)\\\\b(' + _LABEL_PREFIX + '(?:' + _alternation(_TOKEN_WORDS) + '))\\\\b\\\\s*[:=]\\\\s*(?:(?:bearer|basic|digest)\\\\s+)?(?:' + _GUARDED_QUOTED_VALUE + '|' + _PLAIN_VALUE + ')'",
+        "'(?i)\\\\b(bearer)\\\\s+(?=[\\'\\\\\"]?[^\\\\s\\'\\\\\",;]{4})' + _PLAIN_SCHEME_VALUE",
+        "'\\\\b(' + re.escape(_ENV_PREFIX) + '[A-Z0-9_]+)\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*(?:' + _GUARDED_BRACED_NO_SPACE + f'(?![^{_PLAIN_TERMINATORS}])' + '[\\'\\\\\"]?|' + _GUARDED_BRACED_VALUE + f'(?![^{_PLAIN_TERMINATORS}])' + '|(?=' + _GUARDED_QUOTED_VALUE + ')[\\'\\\\\"][^\\\\s\\'\\\\\"]++[\\'\\\\\"]|' + _GUARDED_QUOTED_VALUE + '|' + _PLAIN_VALUE + '[\\'\\\\\"]?)'",
+        "'(?i)\\\\b(' + _LABEL_PREFIX + '(?:' + _alternation(_CREDENTIAL_WORDS) + '))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*(?:' + _ODBC_BRACED + '|' + _KV_QUOTED_VALUE + '|' + _ODBC_BRACED_OVERRUN + '|' + _PLAIN_KV_VALUE + ')'",
+        "'(?i)\\\\b(' + _LABEL_PREFIX + '(?:' + _alternation(_KEY_MATERIAL_WORDS) + '))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*(?:' + _GUARDED_BRACED_VALUE + f'(?![^{_KEY_TERMINATORS}])|' + _GUARDED_QUOTED_VALUE + '|' + _PLAIN_KEY_VALUE + ')'",
     ),
     "messagefoundry/parsing/_builtin_hl7.py": ("f'{e}\\\\.({prefixes})(?!{e})'",),  # ASVS 1.3.3
     # ADR 0030 §4h: the site-code prefix is no longer a literal in the anonymizer — it is EXTERNALIZED

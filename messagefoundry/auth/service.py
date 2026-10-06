@@ -692,8 +692,10 @@ class Elevation:
       (password re-auth only, BACKLOG #1138) the session is revoked because it spent its re-proof
       budget, in which case the proof was wrong or never checked; or (any ceremony, BACKLOG #2298)
       the session was ended because its temporary password lapsed, with the proof checked or not,
-      as that ``auth.temp_password_expired`` row records. Fails CLOSED: no token is handed
-      back. Held apart from a wrong proof so a route answers 401 rather than re-prompting on a
+      as that ``auth.temp_password_expired`` row records; or (``confirm_mfa_enrollment`` only,
+      BACKLOG #2224) the proof was good but turning TOTP on matched no row, so the confirm ended
+      the session it had just rotated, as its ``auth.mfa_enroll_refused`` row records. Fails
+      CLOSED: no token is handed back. Held apart from a wrong proof so a route answers 401 rather than re-prompting on a
       session that no longer exists. The ``auth.reauth`` row's ``session_revoked`` says which.
 
     ``recovery_codes`` is populated only by :meth:`AuthService.confirm_mfa_enrollment` (shown once).
@@ -2666,7 +2668,17 @@ class AuthService:
                 totp.generate_recovery_codes(self._settings.mfa_recovery_code_count)
             )
             hashes = [await self._argon2(hash_password, c) for c in plain_codes]
-            await self._store.enable_totp(user_id, recovery_code_hashes=hashes)
+            # Conditional (BACKLOG #2224): a factor clear by another run's repair branch, or another
+            # run that enabled TOTP first, since the secret was staged above makes it match no row.
+            # Refused before the role, so the row stays roleless and a re-run completes it.
+            if not await self._store.enable_totp(user_id, recovery_code_hashes=hashes):
+                raise FirstAdministratorRefused(
+                    "the authenticator enrolment was changed while this command ran, so this run "
+                    "did not turn TOTP on and granted no role; remove the authenticator entry it "
+                    "showed. "
+                    "If another provision-admin run is in progress, let it finish. Then run the "
+                    "command again"
+                )
         if notify_email is not None:
             # Unconditional rather than fresh-path-only, because the invariant "the supplied address
             # always lands" is simpler than the case analysis. On the fresh path `create_user` already
@@ -8520,7 +8532,10 @@ class AuthService:
         Returns an :class:`Elevation` whose ``recovery_codes`` carry the plaintext codes; a wrong code
         (or a time-step already consumed -- single-use, BACKLOG #1021) elevates nothing and carries
         none. A good code on a session revoked before the rotation returns ``session_lost`` with MFA
-        still OFF (BACKLOG #1902), so a lost session never leaves MFA on with codes nobody saw.
+        still OFF (BACKLOG #1902), so a lost session never leaves MFA on with codes nobody saw. So
+        does a good code whose activation matches no row, because a reset cleared the staged secret
+        or a second confirm enabled first (BACKLOG #2224). That confirm ends the session it rotated,
+        hands back no codes, and audits ``auth.mfa_enroll_refused``.
 
         This is one of the two legs that turn an MFA-pending session into an MFA-satisfied one for a
         FIRST enrolment, so it rotates for the same reason ``verify_mfa`` does: without it a pre-MFA
@@ -8572,9 +8587,36 @@ class AuthService:
             client=client,
             recovery_codes=tuple(plain),
         )
-        if not elevation.ok:
+        if elevation.token is None:  # not ``ok``, spelled so mypy narrows the token below
             return elevation
-        await self._store.enable_totp(identity.user_id, recovery_code_hashes=hashes)
+        if not await self._store.enable_totp(identity.user_id, recovery_code_hashes=hashes):
+            # BACKLOG #2224: the conditional enable matched no row, because an administrator's
+            # reset cleared the staged secret inside the rotation window, or a second confirm
+            # enabled TOTP first. This confirm turns nothing on and its codes are dropped. The
+            # rotated session was stamped MFA-verified against a factor that is gone or not this
+            # ceremony's, so it is ended rather than handed back: ``session_lost``, the same
+            # fail-closed answer as a session revoked before the rotation.
+            #
+            # Known cost: ``_elevated`` already ran the session cap for the rotated session, so
+            # at the cap that run may have ended the account's oldest full session, and it stays
+            # ended. The order is #1902's, rotate first and enable last, and is kept.
+            await self._store.revoke_session(hash_token(elevation.token))
+            # The reason is the row's state read AFTER the refusal, not the write's own verdict,
+            # so a later write can blur it; it is a pointer for an operator, not a proof.
+            after = await self._store.get_user(identity.user_id)
+            if after is None:
+                reason = "account_gone"
+            elif after.totp_enabled:
+                reason = "already_enabled"
+            else:
+                reason = "secret_cleared"
+            await self._audit(
+                "auth.mfa_enroll_refused",
+                actor=identity.username,
+                detail=_json({"reason": reason, "session_ended": True}),
+                client=client,
+            )
+            return Elevation(session_lost=True)
         await self._audit("auth.mfa_enrolled", actor=identity.username, client=client)
         # ADR 0197 Amendment A: enrolment now comes BEFORE the first rotation, so whoever intercepts
         # an issued credential can enrol their own authenticator without rotating. The notice to a

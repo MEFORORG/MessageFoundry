@@ -224,6 +224,7 @@ from messagefoundry.store.store import (
     roll_audit_key_range,
     rotation_factor_term,
     should_record_event,
+    totp_enable_term,
     verify_audit_rows,
 )
 from messagefoundry.support.redact import redact_log_line
@@ -7615,15 +7616,17 @@ class PostgresStore:
 
     async def enable_totp(
         self, user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
-    ) -> None:
+    ) -> bool:
         now = time.time() if now is None else now
-        await self._execute(
+        # Conditional, and the count says whether it wrote: see ``totp_enable_term`` (#2224).
+        written = await self._execute(
             "UPDATE users SET totp_enabled=TRUE, totp_enrolled_at=$1, totp_recovery_codes=$2,"
-            " updated_at=$1 WHERE id=$3",
+            f" updated_at=$1 WHERE id=$3{totp_enable_term('FALSE')}",
             now,
             json.dumps(recovery_code_hashes),
             user_id,
         )
+        return written > 0
 
     async def disable_totp(self, user_id: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now

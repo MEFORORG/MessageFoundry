@@ -413,6 +413,18 @@ async def test_message_events_all_records_routine(tmp_path: Path) -> None:
         await store.close()
 
 
+@pytest.fixture
+def keyless_verify(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Settings that let the store run keyless, for a CLI test that verifies a KEYLESS chain.
+
+    Since vault BACKLOG #3054 a keyless chain that walks clean exits 5, not 0, in a shell whose
+    settings require a store key: it was not checked to the standard they set. These tests seed a
+    keyless store, which only a keyless engine writes, so they verify it as that engine would, under
+    the audited opt-out. `tests/test_keyless_chain_every_command.py` pins the exit-5 arm."""
+    setenv_at_rest_opt_out(monkeypatch)
+
+
+@pytest.mark.usefixtures("keyless_verify")
 def test_audit_verify_cli(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     db = tmp_path / "cli.db"
 
@@ -584,6 +596,7 @@ def _truncate_audit_tail(db: Path, keep: int) -> None:
     asyncio.run(_atruncate_audit_tail(db, keep))
 
 
+@pytest.mark.usefixtures("keyless_verify")
 def test_audit_anchor_cli_prints_count_and_head(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -784,6 +797,62 @@ def test_audit_anchor_settings_refusal_is_json_on_stdout_under_json(
     _assert_no_canary(as_text.err)
 
 
+@pytest.mark.parametrize(("make_settings", "names"), _BAD_SETTINGS)
+def test_audit_verify_settings_refusal_echoes_no_configured_value(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    make_settings: Callable[[Path], Path],
+    names: str,
+) -> None:
+    """`audit-verify` refuses each bad-settings shape with exit 2 and an `error:` line, as
+    `audit-anchor` does, and quotes no value from the file. Not discriminating on its own for the
+    validation shape: since BACKLOG #296 the settings models hide their input, so `str(exc)` never
+    carried this canary either. The test below is the one that tells the two renderings apart."""
+    settings = make_settings(tmp_path)
+    assert main(["audit-verify", "--service-config", str(settings)]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("error: ") and names in captured.err, captured.err
+    _assert_no_canary(captured.out + captured.err)
+
+
+def test_audit_verify_renders_a_settings_error_rather_than_stringifying_it(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3054, item 7. `audit-verify` printed `str(exc)` for a settings failure. That is
+    safe only while every `ValidationError` the load raises comes from a model that hides its input
+    (#296). It now loads as `audit-anchor` does, through `_load_service_settings`, which renders the
+    error by location and message and never stringifies it.
+
+    The load is made to raise a `ValidationError` from a model that does NOT hide its input, with a
+    secret-shaped value as that input. The control shows `str(exc)` would carry it; the command's
+    output must not."""
+    from pydantic import BaseModel, ValidationError
+
+    from messagefoundry.config import settings as settings_module
+
+    class _Echoing(BaseModel):
+        port: int
+
+    try:
+        _Echoing.model_validate({"port": _SETTINGS_CANARY})
+    except ValidationError as exc:
+        echoing = exc
+    else:  # pragma: no cover - the fixture is broken if this validates
+        pytest.fail("the fixture value validated")
+    assert _SETTINGS_CANARY[:8] in str(echoing), "control: str(exc) must carry the canary"
+
+    def _raise(**_kwargs: object) -> object:
+        raise echoing
+
+    monkeypatch.setattr(settings_module, "load_settings", _raise)
+    assert main(["audit-verify", "--db", str(tmp_path / "unused.db")]) == 2
+    captured = capsys.readouterr()
+    _assert_no_canary(captured.out + captured.err)
+    assert captured.err.startswith("error: port: "), captured.err
+
+
+@pytest.mark.usefixtures("keyless_verify")
 def test_expected_anchor_detects_a_truncated_tail(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -841,6 +910,7 @@ def test_expected_anchor_accepts_the_empty_log_anchor(
     assert main(["audit-verify", "--db", str(db), "--expected-anchor", "0:"]) == 0
 
 
+@pytest.mark.usefixtures("keyless_verify")
 def test_expected_anchor_file_round_trips(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -903,6 +973,7 @@ def test_expected_anchor_file_refuses_a_utf16_file_without_crashing(
     assert "UTF-8" in err  # names the actual requirement, not just the exception
 
 
+@pytest.mark.usefixtures("keyless_verify")
 def test_expected_anchor_file_accepts_a_utf8_bom(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -922,6 +993,7 @@ def test_expected_anchor_file_accepts_a_utf8_bom(
     assert "OK" in capsys.readouterr().out
 
 
+@pytest.mark.usefixtures("keyless_verify")
 def test_expected_anchor_accepts_an_uppercased_head(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1040,6 +1112,7 @@ def test_an_anchor_goes_stale_on_the_next_appended_row(
     assert "truncated or rewritten" in capsys.readouterr().out
 
 
+@pytest.mark.usefixtures("keyless_verify")
 def test_expected_anchor_detects_a_same_count_tail_replacement(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1084,6 +1157,7 @@ def test_expected_anchor_detects_a_same_count_tail_replacement(
     assert "truncated or rewritten" in capsys.readouterr().out
 
 
+@pytest.mark.usefixtures("keyless_verify")
 def test_the_rekey_audit_command_is_gone(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
