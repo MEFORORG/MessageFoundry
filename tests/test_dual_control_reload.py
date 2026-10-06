@@ -398,3 +398,67 @@ async def test_a_released_reload_refuses_a_swapped_settings_anchor(
         assert "pin_mismatch" in events
     finally:
         await engine.stop()
+
+
+# --- BACKLOG #2183: a released reload audits an unreadable inbound CA as trust_anchor -------------
+
+
+async def test_a_released_reload_audits_an_unreadable_inbound_ca_as_trust_anchor(
+    tmp_path: Path,
+) -> None:
+    """The held-reload half of BACKLOG #2183. The inbound CA preflight raised its WiringError
+    straight from the OSError, so the release audited invalid_config while a settings anchor's
+    audited trust_anchor. The control is a release of the File graph first, which goes live."""
+    cfg = tmp_path / "cfg"
+    _write_valid_config(cfg, tmp_path / "in", tmp_path / "out")
+    store = await MessageStore.open(tmp_path / "dc.db")
+    engine = Engine(
+        store,
+        poll_interval=0.02,
+        config_dir=cfg,
+        registry_preflight=ta.make_registry_anchor_preflight(store, enforcing=True),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        service = await _service(engine)
+        await _add(service, "op", Role.ADMINISTRATOR)
+        await _add(service, "approver", Role.ADMINISTRATOR)
+        app = create_app(engine, auth=service, approvals=GATED)
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            op, admin = await _token(c, "op"), await _token(c, "approver")
+
+            async def hold_and_release() -> httpx.Response:
+                held = await c.post("/config/reload", json={}, headers=op)
+                assert held.status_code == 202, held.text
+                approval_id = held.json()["approval_id"]
+                return await c.post(f"/approvals/{approval_id}/approve", headers=admin)
+
+            ok = await hold_and_release()  # the control: a graph with no inbound CA goes live
+            assert ok.status_code == 200, ok.text
+            live = engine.registry_runner
+            assert live is not None
+            before = live.registry
+
+            gone = str(tmp_path / "gone.pem")
+            (cfg / "cfg.py").write_text(
+                "from messagefoundry import MLLP, File, Send, handler, inbound, outbound, router\n"
+                f"inbound('ADT_IN', MLLP(port=21575, tls=True, tls_cert_file={gone!r}, "
+                f"tls_ca_file={gone!r}), router='r')\n"
+                f"outbound('OUT', File(directory={str(tmp_path / 'out')!r}))\n"
+                "@router('r')\n"
+                "def route(msg):\n"
+                "    return ['h']\n"
+                "@handler('h')\n"
+                "def handle(msg):\n"
+                "    return Send('OUT', msg)\n",
+                encoding="utf-8",
+            )
+            refused = await hold_and_release()
+            assert refused.status_code == 422, refused.text
+            assert engine.registry_runner is live and live.registry is before  # nothing swapped
+        rows = await store.list_audit(limit=100)
+        failed = [json.loads(r["detail"]) for r in rows if r["action"] == "config_reload_failed"]
+        assert failed == [{"requested": None, "dry_run": False, "reason": "trust_anchor"}]
+    finally:
+        await engine.stop()

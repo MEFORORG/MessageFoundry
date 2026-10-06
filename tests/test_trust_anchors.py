@@ -21,7 +21,7 @@ from pydantic import BaseModel
 
 from messagefoundry.api.tls import build_api_ssl_context
 from messagefoundry.auth import trust_anchors as ta
-from messagefoundry.auth.anchor_path import PathVerdict
+from messagefoundry.auth.anchor_path import DIRECTORY, ChainFinding, PathVerdict
 from messagefoundry.auth.trust_anchors import (
     AUDIT_ACTION,
     AnchorSpec,
@@ -1374,8 +1374,11 @@ async def test_a_nul_in_an_inbound_ca_path_is_a_refused_config_not_a_crash(
         f"outbound('OUT', File(directory={str(tmp_path / 'out')!r}))\n" + _GRAPH_TAIL,
         encoding="utf-8",
     )
-    with pytest.raises(WiringError, match="an inbound trust anchor was refused"):
+    with pytest.raises(WiringError, match="an inbound trust anchor was refused") as err:
         await ta.make_registry_anchor_preflight(store, enforcing=True)(load_config(cfg), {})
+    # BACKLOG #2183: the cause is an anchor refusal, as the settings preflight's is.
+    assert isinstance(err.value.__cause__, TrustAnchorError)
+    assert isinstance(err.value.__cause__.__cause__, ValueError)
 
 
 async def test_the_reload_route_audits_an_inbound_anchor_refusal_as_trust_anchor(
@@ -1901,3 +1904,347 @@ def test_a_blank_pin_without_mtls_fails_its_own_lane_not_the_graph() -> None:
     assert ta.connection_anchor_spec("PLAIN", plain) is None
     with pytest.raises(ValueError, match="MLLP listener: tls_ca_pin is set but empty"):
         _mllp_ssl_context(plain, server=True)
+
+
+# --- BACKLOG #2358: a path in a refusal or a log line is quoted with repr -------------------------
+#
+# Engine PR 1744 rewrote one refusal and dropped its ``!r``, and most of the others never had it. A
+# newline or an escape byte in a configured anchor path then reached the refusal, and every log line
+# that carries it, raw: a refusal could be split into a second, forged-looking line. ``repr`` escapes
+# both. The fix commands keep their own shell quoting (``_ps_quote``, ``shlex.quote``) unchanged.
+
+_CONTROL_PATH = "C:/anchors/evil\nFORGED: line\x1b[31m.pem"
+
+
+def _quoted(text: str) -> None:
+    """``text`` names the control-character path only in its escaped form."""
+    assert repr(_CONTROL_PATH) in text, text
+    assert "\x1b" not in text and "\nFORGED" not in text, text
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        pytest.param(b"", id="no PEM block"),
+        pytest.param(b"-----BEGIN TRUSTED CERTIFICATE-----\nAAAA\n", id="TRUSTED block"),
+        pytest.param(
+            b"-----BEGIN CERTIFICATE-----\n\xff\n-----END CERTIFICATE-----\n", id="non-ASCII"
+        ),
+        pytest.param(
+            b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n", id="TLS refuses"
+        ),
+    ],
+)
+def test_a_pem_shape_refusal_quotes_the_path(data: bytes) -> None:
+    spec = AnchorSpec("api_client", "[api].tls_client_ca_file", _CONTROL_PATH, None)
+    with pytest.raises(TrustAnchorError) as err:
+        ta.anchor_cadata(data, spec)
+    _quoted(str(err.value))
+
+
+def test_the_verdict_refusals_quote_the_path() -> None:
+    """The pin, file, path and indeterminate messages. The control is the pin message, which kept
+    its ``!r`` through PR 1744."""
+    spec = AnchorSpec("t", "[api].tls_client_ca_file", _CONTROL_PATH, None)
+    finding = ChainFinding(_CONTROL_PATH, DIRECTORY, True, "Users can delete entries", ("S-1-1-0",))
+    unsure = ChainFinding(_CONTROL_PATH, DIRECTORY, False, "access denied")
+    insecure = ta.AnchorVerdict(
+        "ab" * 32,
+        acl_ok=False,
+        pin_ok=False,
+        path_ok=False,
+        path_check=PathVerdict(False, (finding,)),
+    )
+    unknown = ta.AnchorVerdict(
+        "ab" * 32, acl_ok=None, pin_ok=None, path_ok=None, path_check=PathVerdict(None, (unsure,))
+    )
+    _quoted(ta._pin_mismatch_message(spec, insecure))
+    # The prose lines only: the fix lines below them are commands, quoted for their shell.
+    _quoted(ta._acl_message(spec).split("\n")[0])
+    path_lines = ta._path_message(spec, insecure).split("\n")
+    _quoted(path_lines[0])
+    _quoted(path_lines[1])
+    assert path_lines[1].startswith(f"  {DIRECTORY} ")
+    _quoted(ta._indeterminate_message(spec, unknown))
+    assert len(ta._indeterminate_message(spec, unknown).split("\n")) == 3  # header, file, finding
+
+
+def test_an_unreadable_inbound_ca_refusal_quotes_the_path() -> None:
+    settings = {"tls": True, "tls_ca_file": _CONTROL_PATH}
+    with pytest.raises(TrustAnchorError, match="could not read the trust anchor") as err:
+        ta.inbound_ca_cadata("ADT_IN", settings, enforcing=True)
+    _quoted(str(err.value))
+
+
+def test_the_dacl_read_log_quotes_the_path(caplog: pytest.LogCaptureFixture) -> None:
+    """The DACL read cannot answer for a path that cannot exist. On Windows icacls echoes the path
+    in its own error text, so that text is quoted as well."""
+    with caplog.at_level("WARNING", logger=ta.log.name):
+        assert dacl_is_owner_only(_CONTROL_PATH) is None
+    (record,) = [r for r in caplog.records if r.name == ta.log.name]
+    _quoted(record.getMessage())
+
+
+def test_a_chain_walk_reason_quotes_the_path() -> None:
+    """The reasons anchor_path builds reach the same refusals, so they quote the path too."""
+    from messagefoundry.auth import anchor_path as ap
+
+    def unreadable(_p: str) -> tuple[str, str | None]:
+        raise OSError(13, "denied")
+
+    _chain, cause = ap.windows_chain("C:\\evil\nFORGED line\x1b[31m.pem", "C:\\", unreadable)
+    assert cause is not None and repr("C:\\evil\nFORGED line\x1b[31m.pem") in cause
+    assert "\x1b" not in cause and "\nFORGED" not in cause
+
+    def a_file(_p: str) -> tuple[str, str | None]:
+        return ap.FILE, None
+
+    _chain, cause = ap.windows_chain("C:\\evil\nFORGED\x1b\\ca.pem", "C:\\", a_file)
+    assert cause is not None and cause.endswith("is not a directory")
+    assert "\x1b" not in cause and "\nFORGED" not in cause
+
+
+async def test_the_restart_required_log_quotes_the_path(
+    store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    spec = AnchorSpec("ad", "[auth].ad_tls_ca_cert_file", _CONTROL_PATH, None)
+    ta._LOADED[(spec.label, spec.path)] = "00" * 32
+    with caplog.at_level("WARNING", logger=ta.log.name):
+        await ta._report_restart_required([spec], store, seen={"ad": "ab" * 32})
+    (record,) = [r for r in caplog.records if r.name == ta.log.name]
+    _quoted(record.getMessage())
+
+
+# --- BACKLOG #2270: an encrypted PEM block refuses before OpenSSL can ask for a password -----------
+#
+# Why a header inside a block must never reach OpenSSL, and what was measured, is in
+# anchor_cadata's docstring. Every refusal test here swaps in _NoTlsLoad, so a regression fails at
+# once instead of waiting on a password. The one exception is the control below it, which needs
+# the real load to show that OpenSSL skips a header outside a block.
+
+_ENCRYPTED = b"Proc-Type: 4,ENCRYPTED\nDEK-Info: AES-256-CBC,00112233445566778899AABBCCDDEEFF\n\n"
+_BEGIN_CERT = b"-----BEGIN CERTIFICATE-----\n"
+
+
+def _with_headers(headers: bytes) -> bytes:
+    return _real_ca("crl-test-ca")[0].replace(_BEGIN_CERT, _BEGIN_CERT + headers)
+
+
+def _begin_past_a_long_line(end_line: bytes) -> Any:
+    """Code review round 2's measured bypasses of a line-based check. The BEGIN sits after 254
+    bytes of one line, where OpenSSL reads it and anchor_cadata's own line loop does not, and the
+    line after it looked like an END line to that check. With the real load, each shape did not
+    return within 15 seconds."""
+    second = _real_ca("second-ca")[0].replace(_BEGIN_CERT, b"")  # the body and its END line
+    return lambda: (
+        _real_ca("crl-test-ca")[0] + b"#" * 254 + _BEGIN_CERT + end_line + _ENCRYPTED + second
+    )
+
+
+def _byte_order_mark_before_the_block() -> bytes:
+    return b"\xef\xbb\xbf" + _with_headers(_ENCRYPTED)
+
+
+def _encrypted_key_beside_the_certificate() -> bytes:
+    """Manager decision: a key block refuses too, though cadata= loads the certificate beside it.
+    A trust anchor has no use for a key, and the header is refused in a block of any label."""
+    label = b"RSA PRIVATE" + b" KEY"  # split, so the secret scanner does not read a real key
+    key = b"-----BEGIN " + label + b"-----\n" + _ENCRYPTED + b"AAAA\n-----END " + label + b"-----\n"
+    return _real_ca("crl-test-ca")[0] + key
+
+
+class _NoTlsLoad:
+    """Stands in for the ssl module: a refusal must come before OpenSSL is handed the text."""
+
+    PROTOCOL_TLS_CLIENT = ssl.PROTOCOL_TLS_CLIENT
+    SSLError = ssl.SSLError
+
+    @staticmethod
+    def SSLContext(_protocol: object) -> Any:
+        raise AssertionError("the TLS library was handed an encrypted block")
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        pytest.param(lambda: _with_headers(_ENCRYPTED), id="Proc-Type and DEK-Info"),
+        pytest.param(
+            lambda: _with_headers(b"DEK-Info: AES-256-CBC,00112233445566778899AABBCCDDEEFF\n\n"),
+            id="DEK-Info",
+        ),
+        pytest.param(lambda: _with_headers(b"proc-type: 4,ENCRYPTED\n\n"), id="lower case"),
+        pytest.param(lambda: _with_headers(b"  Proc-Type: 4,ENCRYPTED\n\n"), id="leading space"),
+        pytest.param(_begin_past_a_long_line(b"-----END X\xff\n"), id="long line, non-ASCII END"),
+        pytest.param(
+            _begin_past_a_long_line(b"\xef-----END X\n"), id="long line, stray byte before END"
+        ),
+        pytest.param(_byte_order_mark_before_the_block, id="byte-order mark"),
+        pytest.param(_encrypted_key_beside_the_certificate, id="encrypted key block"),
+    ],
+)
+def test_an_encrypted_pem_block_refuses_before_the_tls_load(
+    monkeypatch: pytest.MonkeyPatch, shape: Any
+) -> None:
+    spec = AnchorSpec("api_client", "[api].tls_client_ca_file", "ca.pem", None)
+    monkeypatch.setattr(ta, "ssl", _NoTlsLoad)
+    with pytest.raises(TrustAnchorError, match="holds a PEM block with an encryption header"):
+        ta.anchor_cadata(shape(), spec)
+
+
+def test_an_encryption_header_outside_a_block_still_passes() -> None:
+    """The control: OpenSSL skips every line outside a block, so the same text in a comment above
+    the certificate loads, and the shape check passes it too."""
+    data = b"Proc-Type: 4,ENCRYPTED\n" + _real_ca("crl-test-ca")[0]
+    ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).load_verify_locations(cadata=data.decode())
+    spec = AnchorSpec("api_client", "[api].tls_client_ca_file", "ca.pem", None)
+    assert ta.anchor_cadata(data, spec) == data.decode()
+
+
+async def test_the_preflight_refuses_an_encrypted_anchor_as_the_consumer_does(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = _pem(tmp_path, _with_headers(_ENCRYPTED))
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    monkeypatch.setattr(ta, "ssl", _NoTlsLoad)
+    spec = AnchorSpec("api_client", "[api].tls_client_ca_file", str(p), None)
+    with pytest.raises(TrustAnchorError) as central:
+        await run_anchor_preflight([spec], store, enforcing=True)
+    with pytest.raises(TrustAnchorError) as consumer:
+        ta.verified_anchor_cadata(spec, enforcing=True)
+    assert str(central.value) == str(consumer.value)
+    assert "encryption header" in str(central.value)
+    assert "pem_refused" in {r["event"] for r in await _rows(store, "api_client")}
+
+
+# --- BACKLOG #2183: an unreadable inbound CA audits as trust_anchor, as a settings anchor does ------
+
+
+async def test_the_registry_preflight_refuses_an_unreadable_ca_as_an_anchor(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    """The registry twin of the settings test above. Red under: the OSError as the direct cause,
+    which the reload routes read as invalid_config. The text keeps the read error."""
+    from messagefoundry.config.wiring import WiringError, load_config
+
+    cfg = tmp_path / "cfg"
+    _one_listener_graph(cfg, tmp_path / "gone.pem")
+    with pytest.raises(WiringError, match="an inbound trust anchor was refused") as err:
+        await ta.make_registry_anchor_preflight(store, enforcing=True)(load_config(cfg), {})
+    assert isinstance(err.value.__cause__, TrustAnchorError)
+    assert isinstance(err.value.__cause__.__cause__, FileNotFoundError)
+    assert "gone.pem" in str(err.value)
+
+
+async def test_the_reload_route_audits_an_unreadable_inbound_ca_as_trust_anchor(
+    tmp_path: Path,
+) -> None:
+    """The direct /config/reload route. The control is the route's own invalid_config row for a
+    graph that declares nothing, so the route still tells the two apart."""
+    import httpx
+
+    from messagefoundry.api import create_app
+    from messagefoundry.pipeline import Engine
+
+    cfg = tmp_path / "cfg"
+    _one_listener_graph(cfg, tmp_path / "gone.pem")
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    (empty / "cfg.py").write_text("x = 1  # declares no connections\n", encoding="utf-8")
+
+    store = await MessageStore.open(tmp_path / "e.db")
+    engine = Engine(
+        store,
+        registry_preflight=ta.make_registry_anchor_preflight(store, enforcing=True),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        transport = httpx.ASGITransport(app=create_app(engine, allow_no_auth=True))
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+            for target in (cfg, empty):
+                r = await client.post("/config/reload", json={"config_dir": str(target)})
+                assert r.status_code == 422, r.text
+        rows = await store.list_audit(action="config_reload_failed", limit=10)
+        reasons = {
+            json.loads(r["detail"])["requested"]: json.loads(r["detail"])["reason"] for r in rows
+        }
+        assert reasons == {str(cfg): "trust_anchor", str(empty): "invalid_config"}
+    finally:
+        await engine.stop()
+
+
+# --- BACKLOG #2269: a set anchor path that nothing loads still refuses when it cannot load ---------
+#
+# Manager decision, recorded in docs/CONFIGURATION.md: keep the refusal. The preflight checks every
+# anchor path that is set, whether or not a consumer uses it, as refuse_an_unread_ca_pin already
+# refuses a pin nothing reads. It fails closed, and unsetting the path is the way out.
+
+
+def _ad_off(ca: str) -> dict[str, Any]:
+    return {"ad_tls_ca_cert_file": ca}
+
+
+def _ad_on_plain_ldap(ca: str) -> dict[str, Any]:
+    return {
+        "ad_enabled": True,
+        "ad_server": "ldap://dc1.example.com",
+        "ad_allow_insecure_ldap": True,
+        "ad_domain": "example.com",
+        "ad_user_search_base": "DC=example,DC=com",
+        "ad_bind_dn": "CN=svc,DC=example,DC=com",
+        "ad_bind_password": "not-a-real-password",
+        "ad_tls_ca_cert_file": ca,
+    }
+
+
+def _oidc_off(ca: str) -> dict[str, Any]:
+    return {"oidc_tls_ca_cert_file": ca}
+
+
+@pytest.mark.parametrize(
+    "unused",
+    [
+        pytest.param(_ad_off, id="AD off"),
+        pytest.param(_ad_on_plain_ldap, id="AD on plain ldap"),
+        pytest.param(_oidc_off, id="OIDC off"),
+    ],
+)
+async def test_a_set_anchor_nothing_loads_refuses_at_start_and_reload(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unused: Any
+) -> None:
+    """Red under: the preflight skipping an anchor no consumer loads. The start refuses through the
+    managed app's lifespan, and a reload through the engine's settings preflight, for a file that
+    cannot load (a CRL alone) and for a file that is missing. The control: the same settings with
+    the path unset collect no anchor, so nothing is checked."""
+    from messagefoundry.api.app import create_managed_app
+    from messagefoundry.config.wiring import WiringError
+
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    crl = tmp_path / "crl-only.pem"
+    crl.write_bytes(_crl_only())
+    specs = collect_anchor_specs(AuthSettings(**unused(str(crl))), ApiSettings())
+    assert len(specs) == 1
+    cfg = tmp_path / "cfg"
+    _file_graph(cfg)
+    app = create_managed_app(
+        db_path=tmp_path / "m.db",
+        config_dir=cfg,
+        trust_anchor_specs=specs,
+        allow_no_auth=True,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    with pytest.raises(TrustAnchorError, match="the TLS library cannot load the trust anchor"):
+        async with app.router.lifespan_context(app):
+            pass
+
+    for path in (crl, tmp_path / "gone.pem"):
+        (spec,) = collect_anchor_specs(AuthSettings(**unused(str(path))), ApiSettings())
+        preflight = ta.make_settings_anchor_preflight([spec], store, enforcing=True)
+        assert preflight is not None
+        with pytest.raises(WiringError, match="a settings trust anchor was refused") as err:
+            await preflight()
+        assert isinstance(err.value.__cause__, TrustAnchorError)
+
+    unset = {k: v for k, v in unused(str(crl)).items() if not k.endswith("_tls_ca_cert_file")}
+    assert collect_anchor_specs(AuthSettings(**unset), ApiSettings()) == []
