@@ -531,10 +531,12 @@ FEDERATED_BINDING_CHANGED = "federated_binding_changed"
 #: never checked and nothing is charged to the lockout. Carried on ``Elevation.idp_step_up_required``.
 IDP_STEP_UP_REQUIRED = "idp_step_up_required"
 
-#: The closed-set reason :meth:`AuthService.verify_mfa` refuses a directory account with when the
-#: directory does not confirm it is present and enabled (BACKLOG #2023). Written into the
-#: ``auth.mfa_failed`` audit row beside the probe's outcome, and carried on
-#: ``Elevation.directory_unconfirmed``. The code is never checked and nothing is charged.
+#: The closed-set reason :meth:`AuthService.verify_mfa` (BACKLOG #2023) and
+#: :meth:`AuthService.finish_webauthn_assertion` (BACKLOG #2239) refuse a directory account with
+#: when the directory does not confirm it is present and enabled. Written into the
+#: ``auth.mfa_failed`` or ``auth.webauthn_failed`` audit row beside the probe's outcome, and carried
+#: on ``Elevation.directory_unconfirmed``. The code or assertion is never checked and nothing is
+#: charged.
 DIRECTORY_UNCONFIRMED = "directory_unconfirmed"
 
 #: The closed-set reasons the federated step-up leg refuses with (BACKLOG #296), on the
@@ -660,11 +662,13 @@ class Elevation:
     #: no directory id (BACKLOG #2027). Set by :meth:`AuthService.reauth` when the directory re-bind
     #: could not judge the password, for at least these causes: no directory, no enabled entry for
     #: the row's id, an unreachable one, a row with no id, or an entry that is not provably the
-    #: row's own (BACKLOG #2027). Either way the proof was never checked and nothing was charged. It
-    #: qualifies the wrong-proof state: the token still authenticates, and the caller must say the
-    #: directory could not confirm the account rather than call the code or the password wrong. The
-    #: cause goes to the audit row (``reason`` on ``auth.reauth``, ``outcome`` on
-    #: ``auth.mfa_failed``) and never to the caller.
+    #: row's own (BACKLOG #2027). Set by :meth:`AuthService.finish_webauthn_assertion` on the same
+    #: answers as ``verify_mfa`` (BACKLOG #2239). In every case the proof was never checked and
+    #: nothing was charged. It qualifies the wrong-proof state: the token still authenticates, and
+    #: the caller must say the directory could not confirm the account rather than call the code,
+    #: the password or the passkey wrong. The cause goes to the audit row (``reason`` on
+    #: ``auth.reauth``, ``outcome`` on ``auth.mfa_failed`` or ``auth.webauthn_failed``) and never
+    #: to the caller.
     directory_unconfirmed: bool = False
 
     @property
@@ -8131,8 +8135,9 @@ class AuthService:
 
     async def _directory_step_up_refusal(self, user: UserRecord) -> str | None:
         """Why the directory cannot vouch for directory account ``user`` before :meth:`verify_mfa`
-        renews its step-up window, or ``None`` when it can (BACKLOG #2023). Called only for an AD
-        row; a local account is never asked.
+        renews its step-up window (BACKLOG #2023) or :meth:`finish_webauthn_assertion` marks its
+        factor met (BACKLOG #2239), or ``None`` when it can. Called only for an AD row; a local
+        account is never asked.
 
         Without this, an account disabled in the directory kept renewing its window with a good code
         until the reconciliation pass revoked its sessions. The engine row's ``disabled`` flag is
@@ -8631,7 +8636,11 @@ class AuthService:
         route's ``allow_reauth_attempt`` gate + cookie-holder-only reachability + these audits.
 
         A successful assertion DOES clear the failure counter (BACKLOG #1638). That is the other
-        direction and the divergence does not cover it — see the call site."""
+        direction and the divergence does not cover it — see the call site.
+
+        **A directory account must be confirmed by the directory first** (BACKLOG #2239), through
+        the same :meth:`_directory_step_up_refusal` :meth:`verify_mfa` asks. A refusal returns
+        ``directory_unconfirmed`` and spends neither the challenge nor the sign count."""
         if not token:
             return Elevation()
         session = await self._store.get_session(hash_token(token))
@@ -8658,6 +8667,42 @@ class AuthService:
             session, user, now, event="auth.webauthn_failed", client=client
         ):
             return Elevation()
+        if user.auth_provider == AuthProvider.AD.value:
+            # BACKLOG #2239: a good assertion below marks the factor met, so a DIRECTORY account
+            # must still be in the directory first, as verify_mfa asks (#2023). Without this an
+            # account disabled in the directory would clear the MFA gate with its passkey until the
+            # reconciler revoked it. Asked before the challenge is popped and before the sign count
+            # moves, so a refusal leaves the ceremony in flight and charges nothing; assertion
+            # failures feed no lockout here anyway (ADR 0068).
+            refusal = await self._directory_step_up_refusal(user)
+            if refusal is not None:
+                await self._audit(
+                    "auth.webauthn_failed",
+                    actor=user.username,
+                    detail=_json({"reason": DIRECTORY_UNCONFIRMED, "outcome": refusal}),
+                    client=client,
+                )
+                return Elevation(directory_unconfirmed=True)
+            # The lookup was a network round trip, so read the session, the account and its lock
+            # again, as verify_mfa does. A revocation, a disable or a second-step lock that landed
+            # meanwhile must stop this assertion before it marks the factor or clears the counters.
+            # A session or account gone meanwhile is ``session_lost``: the token no longer
+            # authenticates, so the caller must not report a wrong passkey.
+            session = await self._store.get_session(hash_token(token))
+            if session is None or session.revoked_at is not None:
+                return Elevation(session_lost=True)
+            user = await self._store.get_user(session.user_id)
+            if user is None or user.disabled:
+                return Elevation(session_lost=True)
+            now = time.time()
+            if user.second_step_locked(now):
+                await self._audit(
+                    "auth.webauthn_failed",
+                    actor=user.username,
+                    detail=LOCKED_REFUSAL_DETAIL,
+                    client=client,
+                )
+                return Elevation()
         pending = self._webauthn_challenges.pop((hash_token(token), "assert"))
         if pending is None or pending.user_id != user.id:
             await self._audit(

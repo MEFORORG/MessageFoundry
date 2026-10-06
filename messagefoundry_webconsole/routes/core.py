@@ -83,9 +83,10 @@ _CLEAR_SITE_DATA_LOGIN_CODES = frozenset({"expired", "loggedout", "pwchanged"})
 #: truncated to a count. The reports are attacker-influenceable, so the log line is bounded.
 _CSP_REPORT_SUMMARY_MAX = 5
 
-#: What the MFA gate and the re-auth form say when ``verify_mfa`` or ``reauth`` refused a directory
-#: account the directory did not confirm (BACKLOG #2023, #2027). The code or password was never
-#: checked, so "invalid code" or "incorrect password" would be false.
+#: What the MFA gate and the re-auth form say when ``verify_mfa``, ``reauth`` or
+#: ``finish_webauthn_assertion`` refused a directory account the directory did not confirm (BACKLOG
+#: #2023, #2027, #2239). The code, password or passkey was never checked, so "invalid code",
+#: "incorrect password" or "passkey verification failed" would be false.
 _DIRECTORY_UNCONFIRMED_ERROR = (
     "The directory could not confirm your account. Try again later, or ask an administrator."
 )
@@ -1648,9 +1649,14 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if elevation.session_lost:
             return JSONResponse({"ok": False, "error": "session expired"}, status_code=401)
         if elevation.token is None:
-            return JSONResponse(
-                {"ok": False, "error": "passkey verification failed"}, status_code=400
+            # BACKLOG #2239: the directory could not vouch for a directory account, so the
+            # assertion was never checked and "verification failed" would be false.
+            error = (
+                _DIRECTORY_UNCONFIRMED_ERROR
+                if _directory_unconfirmed(elevation)
+                else "passkey verification failed"
             )
+            return JSONResponse({"ok": False, "error": error}, status_code=400)
         # The assertion re-keyed the session (ASVS 7.2.4). The new cookie rides this JSON response,
         # because the page's next request is the POST /ui/reauth password leg — it would otherwise
         # present the retired token and be refused on a correct password.

@@ -70,6 +70,11 @@ this line.**
   now a read-only property that is always true, so the console's sign-in checks hold whenever a
   service is attached. The console code is unchanged; the supported engine UI seam moved because
   the property is now part of the contract the seam digest reads. (vault BACKLOG #2825)
+- **The passkey leg says when the directory could not confirm the account.** The engine refuses
+  a directory account's passkey assertion when the directory does not confirm the account. The
+  console's `POST /ui/reauth/webauthn` now shows the directory message for that refusal, in the
+  same words the code and password legs use, not "passkey verification failed", because the
+  passkey was never checked. No seam change. (vault BACKLOG #2239)
 
 ## [0.4.0] — 2026-10-01 — Early Access
 
