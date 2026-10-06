@@ -20,7 +20,7 @@ from messagefoundry.api.security import deadline_utc
 from messagefoundry.auth import Role, totp
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.ldap import AdPrincipal
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import AuthService, CurrentPasswordCheck
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.config.settings import AiSettings, AuthSettings, EgressSettings, StoreSettings
@@ -1796,15 +1796,14 @@ async def test_ad_session_maps_groups_and_grants_permission(engine: Engine) -> N
         assert (await c.get("/auth/providers", headers=h)).json()["ad"] is False
 
 
-async def test_disabled_auth_fails_closed_unless_opted_in(engine: Engine) -> None:
-    # SYS-1: disabled auth no longer silently opens routes — it fails closed by default...
-    service = AuthService(engine.store, AuthSettings(enabled=False))
-    transport = httpx.ASGITransport(app=create_app(engine, auth=service))
+async def test_no_auth_fails_closed_unless_opted_in(engine: Engine) -> None:
+    # SYS-1: an app with no auth service does not silently open routes — it fails closed by default...
+    transport = httpx.ASGITransport(app=create_app(engine))
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         assert (await c.get("/stats")).status_code == 503
-    # ...unless the embedding/served path opts in explicitly (`serve` does this when sign-in is
-    # off, after __main__'s start-up refusals; neither factory does it by omission).
-    transport = httpx.ASGITransport(app=create_app(engine, auth=service, allow_no_auth=True))
+    # ...unless an embedder or a test opts in explicitly (`serve` never does; neither factory does it
+    # by omission).
+    transport = httpx.ASGITransport(app=create_app(engine, allow_no_auth=True))
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         assert (await c.get("/stats")).status_code == 200
 
@@ -2532,7 +2531,10 @@ async def test_a_session_opened_before_the_deadline_cannot_rotate_the_lapsed_cre
 ) -> None:
     # The session is opened BEFORE the deadline, then the deadline passes under it. The sign-in gate
     # alone would let that session rotate the lapsed credential, so the temporary password would
-    # outlive its deadline through a session minted a second earlier.
+    # outlive its deadline through a session minted a second earlier. Since BACKLOG #2298 the gate
+    # ends that session before the route runs, so the refusal is the 401 of a session that is gone;
+    # the route's own 403 is left for a deadline that passes inside the request (the test after the
+    # next one).
     service = await _service(engine, _expiring_service_settings())
     hal_id = await create_local_user_chosen(
         service,
@@ -2554,8 +2556,7 @@ async def test_a_session_opened_before_the_deadline_cannot_rotate_the_lapsed_cre
             headers=_auth(token),
             json={"current_password": PW, "new_password": PW + "-rotated"},
         )
-        assert lapsed.status_code == 403, lapsed.text
-        assert "temporary password has expired" in lapsed.json()["detail"]
+        assert lapsed.status_code == 401, lapsed.text
         # Nothing rotated: the account still carries the lapsed temporary credential.
         user = await engine.store.get_user(hal_id)
         assert user is not None and user.must_change_password is True
@@ -2563,13 +2564,21 @@ async def test_a_session_opened_before_the_deadline_cannot_rotate_the_lapsed_cre
         # Audited under the sign-in gate's own action, so one query finds both refusals.
         rows = [dict(r) for r in await engine.store.list_audit(action="auth.temp_password_expired")]
         assert len(rows) == 1 and rows[0]["actor"] == "hal"
-        assert '"password_change"' in rows[0]["detail"]
-        assert '"password_checked": false' in rows[0]["detail"]
+        assert '"at": "session"' in rows[0]["detail"]
+        # The session is ended, so a retry writes no second row.
+        retry = await c.post(
+            "/me/password",
+            headers=_auth(token),
+            json={"current_password": PW, "new_password": PW + "-rotated"},
+        )
+        assert retry.status_code == 401
+        assert len(await engine.store.list_audit(action="auth.temp_password_expired")) == 1
 
 
 async def test_a_wrong_password_past_the_deadline_charges_no_lockout(engine: Engine) -> None:
     # The deadline is checked BEFORE the password, so a guess that could not succeed anyway costs
     # the account nothing. Moving the check after the verify turns this red: the guess would count.
+    # Since BACKLOG #2298 that check is the gate's, which ends the session before the route runs.
     service = await _service(engine, _expiring_service_settings())
     jo_id = await create_local_user_chosen(
         service,
@@ -2589,12 +2598,12 @@ async def test_a_wrong_password_past_the_deadline_charges_no_lockout(engine: Eng
             headers=_auth(token),
             json={"current_password": "not-the-password-at-all", "new_password": PW + "-x"},
         )
-        assert lapsed.status_code == 403 and "has expired" in lapsed.json()["detail"]
+        assert lapsed.status_code == 401
     user = await engine.store.get_user(jo_id)
     assert user is not None and user.failed_attempts == 0
     assert await engine.store.list_audit(action="auth.password_change_failed") == []
     rows = [dict(r) for r in await engine.store.list_audit(action="auth.temp_password_expired")]
-    assert len(rows) == 1 and '"password_checked": false' in rows[0]["detail"]
+    assert len(rows) == 1 and '"at": "session"' in rows[0]["detail"]
 
 
 async def test_the_deadline_is_asked_again_after_the_password_is_verified(
@@ -2630,10 +2639,58 @@ async def test_the_deadline_is_asked_again_after_the_password_is_verified(
         )
         assert lapsed.status_code == 403, lapsed.text
         assert "temporary password has expired" in lapsed.json()["detail"]
+        # BACKLOG #2298: the refusal ended the session, so a retry is refused at the gate and
+        # writes no second row.
+        retry = await c.post(
+            "/me/password",
+            headers=_auth(token),
+            json={"current_password": PW, "new_password": PW + "-rotated"},
+        )
+        assert retry.status_code == 401
     user = await engine.store.get_user(kit_id)
     assert user is not None and user.must_change_password is True
     rows = [dict(r) for r in await engine.store.list_audit(action="auth.temp_password_expired")]
     assert len(rows) == 1 and '"password_checked": true' in rows[0]["detail"]
+    session = await engine.store.get_session(hash_token(token))
+    assert session is not None and session.revoked_at is not None
+
+
+async def test_the_rotation_asks_the_deadline_before_the_password_and_ends_the_session(
+    engine: Engine,
+) -> None:
+    """RED when: the rotation's first ask moves after the verify, or stops ending the session.
+
+    Called on the service directly, as a request does that passed its gate before the deadline. A
+    wrong guess that could not succeed anyway costs the account nothing (BACKLOG #2009), and the
+    session is ended with the answer (BACKLOG #2298)."""
+    service = await _service(engine, _expiring_service_settings())
+    lu_id = await create_local_user_chosen(
+        service,
+        username="lu",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=["viewer"],
+        actor="t",
+    )
+    await _move_deadline_to(engine, lu_id, time.time() + 30)
+    outcome = await service.login("lu", PW)
+    assert outcome.ok and outcome.token is not None
+    identity = await service.identity_for_token(outcome.token)
+    assert identity is not None
+    await _move_deadline_to(engine, lu_id, time.time() - 1)
+    check = await service.verify_current_password(
+        identity, "not-the-password-at-all", token=outcome.token
+    )
+    assert check is CurrentPasswordCheck.EXPIRED
+    user = await engine.store.get_user(lu_id)
+    assert user is not None and user.failed_attempts == 0
+    assert await engine.store.list_audit(action="auth.password_change_failed") == []
+    session = await engine.store.get_session(hash_token(outcome.token))
+    assert session is not None and session.revoked_at is not None
+    rows = [dict(r) for r in await engine.store.list_audit(action="auth.temp_password_expired")]
+    assert len(rows) == 1 and '"password_checked": false' in rows[0]["detail"]
+    assert '"at": "password_change"' in rows[0]["detail"]
 
 
 async def test_a_session_rotates_the_temporary_credential_before_its_deadline(
@@ -2663,6 +2720,29 @@ async def test_a_session_rotates_the_temporary_credential_before_its_deadline(
         user = await engine.store.get_user(ida_id)
         assert user is not None and user.must_change_password is False
         assert await engine.store.list_audit(action="auth.temp_password_expired") == []
+
+
+def test_the_must_change_refusal_states_a_passed_deadline_as_passed() -> None:
+    """RED when: ``require()``'s must-change refusal states a past deadline as if it were ahead.
+
+    BACKLOG #2298 (ASVS 6.4.5). Both tenses keep the leading text clients match on."""
+    from messagefoundry.api.security import _password_change_required, deadline_utc
+
+    ahead, passed = time.time() + 3600, time.time() - 1
+    assert _password_change_required(ahead) == (
+        f"password change required; the temporary password stops working at {deadline_utc(ahead)}"
+    )
+    assert _password_change_required(passed) == (
+        "password change required; the temporary password stopped working at"
+        f" {deadline_utc(passed)}; ask an administrator to reset it"
+    )
+    assert _password_change_required(None) == "password change required"
+    # The enrol-first step is appended while the credential lives, and dropped once it has lapsed:
+    # enrolling cannot revive it.
+    step = "; enrol an authenticator app first"
+    assert _password_change_required(ahead, suffix=step).endswith(step)
+    assert _password_change_required(None, suffix=step) == "password change required" + step
+    assert _password_change_required(passed, suffix=step) == _password_change_required(passed)
 
 
 # --- BACKLOG #2096: POST /auth/login ends the token the client names, before the cap -----------

@@ -474,7 +474,7 @@ def windows_chain(
         root = drive + "\\"
         why = volume_cause(root)
         if why is not None:
-            return chain, f"'{root}': {why}"
+            return chain, f"{root!r}: {why}"
         add(root, DIRECTORY)
         parts = [c for c in rest.split("\\") if c]
         cur = root
@@ -486,7 +486,7 @@ def windows_chain(
             try:
                 kind, target = probe(child)
             except OSError as exc:
-                return chain, f"'{child}' could not be read: {exc.strerror or exc}"
+                return chain, f"{child!r} could not be read: {exc.strerror or exc}"
             if kind == LINK:
                 add(child, LINK)
                 hops += 1
@@ -494,7 +494,7 @@ def windows_chain(
                     return chain, f"the path passes through more than {MAX_LINK_HOPS} links"
                 spliced_target = _strip_win_prefix(target or "")
                 if not spliced_target:
-                    return chain, f"the link '{child}' points at a path this check does not read"
+                    return chain, f"the link {child!r} points at a path this check does not read"
                 if spliced_target.startswith("\\") and not spliced_target.startswith("\\\\"):
                     spliced_target = drive + spliced_target  # rooted, no drive: the link's drive
                 if not (ntpath.isabs(spliced_target) or spliced_target.startswith("\\\\")):
@@ -505,7 +505,7 @@ def windows_chain(
                 break
             add(child, kind)
             if kind != DIRECTORY and i != len(parts) - 1:
-                return chain, f"'{child}' is not a directory"
+                return chain, f"{child!r} is not a directory"
             cur = child
         if not spliced:
             return chain, None
@@ -663,7 +663,7 @@ def posix_path_verdict(
                     LINK,
                     True,
                     f"it is owned by uid {child_st.uid}, not root or the engine, and sits in "
-                    f"'{cur}', which others can write to",
+                    f"{cur!r}, which others can write to",
                     owner=True,
                 )
             )

@@ -15,10 +15,13 @@ written carelessly — a session's ``mfa_verified_at`` column can be correct whi
 from __future__ import annotations
 
 import ast
+import asyncio
 import json
+import time
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import cast
 
 import httpx
 import pytest
@@ -33,6 +36,7 @@ from messagefoundry.auth.service import STEP_UP_ACTION_SESSION_TERMINATE, AuthSe
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry.store import MessageStore
 from messagefoundry.store.store import WebAuthnCredential
 from tests._admin_account import create_admin, create_local_user_chosen
 
@@ -1146,3 +1150,274 @@ async def test_the_directory_login_outcome_reports_the_debt_it_created(engine: E
     lax = await _service(engine, AuthSettings(login_rate_limit_enabled=False, require_mfa=False))
     off = await lax._complete_ad_login(_principal("aduser7"), None, mfa_verified=False)
     assert off.ok and off.mfa_required is False
+
+
+# --- BACKLOG #2298 (ASVS 6.4.1): a lapsed temporary credential cannot finish the factor step -------
+
+
+async def _reset_with_a_factor(
+    service: AuthService, monkeypatch: pytest.MonkeyPatch, t0: float
+) -> tuple[str, str, str]:
+    """A reset account that keeps its TOTP factor, signed in with the temporary password BEFORE its
+    deadline. Returns ``(user id, secret, that must-change session's token)``. One wrong code is
+    recorded first, so a later success that zeroes the counter shows up as a changed count."""
+    user_id = await _add(service, "vic", Role.VIEWER)
+    pin_totp_clock(monkeypatch, t0)
+    secret, _ = await _enroll_totp_out_of_band(service, "vic", now=t0)
+    temp = (await service.admin_reset_password(user_id, actor="test")).password
+    outcome = await service.login("vic", temp)
+    assert outcome.ok and outcome.token is not None and outcome.must_change_password
+    assert not (await service.verify_mfa(outcome.token, "000000")).ok
+    user = await service.store.get_user(user_id)
+    assert user is not None and user.second_step_failed_attempts == 1
+    return user_id, secret, outcome.token
+
+
+async def _lapse(engine: Engine, service: AuthService, user_id: str) -> None:
+    """Move the stored stamp so the temporary credential's deadline was one second ago."""
+    hours = service._settings.initial_password_expiry_hours
+    db = cast(MessageStore, engine.store)._db  # the fixture's store is the SQLite one
+    await db.execute(
+        "UPDATE users SET password_changed_at=? WHERE id=?",
+        (time.time() - hours * 3600 - 1, user_id),
+    )
+    await db.commit()
+
+
+async def _assert_not_elevated(engine: Engine, user_id: str, token: str) -> None:
+    """The refused attempt marked no factor, re-keyed nothing and zeroed no counter."""
+    session = await engine.store.get_session(hash_token(token))
+    assert session is not None, "the session was re-keyed"
+    assert session.revoked_at is not None and session.mfa_verified_at is None
+    user = await engine.store.get_user(user_id)
+    assert user is not None and user.second_step_failed_attempts == 1
+
+
+async def _expired_rows(engine: Engine) -> list[dict[str, object]]:
+    return [dict(r) for r in await engine.store.list_audit(action="auth.temp_password_expired")]
+
+
+async def test_a_factor_attempt_one_second_past_the_deadline_is_refused(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: ``identity_for_token`` stops asking the deadline.
+
+    The session was opened before the deadline and the code is right. Before #2298 the attempt
+    re-keyed the session and zeroed the failure counter, although the credential no longer signs
+    in. The control is ``test_a_reset_account_with_a_factor_proves_it_and_then_rotates``."""
+    service = await _service(engine)
+    t1 = 1_000_000.0 + totp.DEFAULT_PERIOD
+    user_id, secret, tok = await _reset_with_a_factor(service, monkeypatch, 1_000_000.0)
+    await _lapse(engine, service, user_id)
+    pin_totp_clock(monkeypatch, t1)
+    async with _client(engine, service) as c:
+        r = await c.post(
+            "/auth/mfa-verify", json={"code": totp.totp(secret, now=t1)}, headers=_auth(tok)
+        )
+        assert r.status_code == 401, r.text
+        await _assert_not_elevated(engine, user_id, tok)
+        rows = await _expired_rows(engine)
+        assert len(rows) == 1 and rows[0]["actor"] == "vic"
+        assert '"at": "session"' in str(rows[0]["detail"])
+        # The session is ended, so a retry is refused before any check and writes no second row.
+        again = await c.post(
+            "/auth/mfa-verify", json={"code": totp.totp(secret, now=t1)}, headers=_auth(tok)
+        )
+        assert again.status_code == 401
+        assert len(await _expired_rows(engine)) == 1
+
+
+async def test_verify_mfa_refuses_a_lapsed_session_that_passed_the_gate_before_the_deadline(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: ``verify_mfa`` drops its own ask of the deadline.
+
+    Called directly, as a request does that passed its gate before the deadline and then waited in
+    the account's queue past it. The ask comes before the code, so the right code is not spent."""
+    service = await _service(engine)
+    t1 = 1_000_000.0 + totp.DEFAULT_PERIOD
+    user_id, secret, tok = await _reset_with_a_factor(service, monkeypatch, 1_000_000.0)
+    await _lapse(engine, service, user_id)
+    pin_totp_clock(monkeypatch, t1)
+    elevation = await service.verify_mfa(tok, totp.totp(secret, now=t1), client="192.0.2.7")
+    assert elevation.session_lost and not elevation.ok
+    await _assert_not_elevated(engine, user_id, tok)
+    rows = await _expired_rows(engine)
+    assert len(rows) == 1 and rows[0]["client"] == "192.0.2.7"
+    assert '"at": "mfa_verify"' in str(rows[0]["detail"])
+    assert '"factor_checked": false' in str(rows[0]["detail"])
+    assert await engine.store.list_audit(action="auth.mfa_verified") == []
+
+
+async def test_verify_mfa_asks_the_deadline_again_after_a_good_code(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the second ask, after the code is verified, is dropped.
+
+    The deadline passes during the verify itself, as it can during a recovery-code walk. The code
+    was right, and still nothing may mark the factor, zero the counter or re-key the session."""
+    service = await _service(engine)
+    t1 = 1_000_000.0 + totp.DEFAULT_PERIOD
+    user_id, secret, tok = await _reset_with_a_factor(service, monkeypatch, 1_000_000.0)
+    real_verify = service._verify_second_factor
+
+    async def _slow_verify(*args: object, **kwargs: object) -> bool:
+        ok = await real_verify(*args, **kwargs)  # type: ignore[arg-type]
+        await _lapse(engine, service, user_id)
+        return ok
+
+    monkeypatch.setattr(service, "_verify_second_factor", _slow_verify)
+    pin_totp_clock(monkeypatch, t1)
+    elevation = await service.verify_mfa(tok, totp.totp(secret, now=t1))
+    assert elevation.session_lost and not elevation.ok
+    await _assert_not_elevated(engine, user_id, tok)
+    rows = await _expired_rows(engine)
+    assert len(rows) == 1 and '"factor_checked": true' in str(rows[0]["detail"])
+
+
+async def test_a_session_resolves_up_to_its_deadline_and_not_after(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the session-level ask is dropped.
+
+    The control half: before the deadline the must-change session resolves and is left alone. The
+    boundary itself is pinned by the next test."""
+    service = await _service(engine)
+    user_id, _secret, tok = await _reset_with_a_factor(service, monkeypatch, 1_000_000.0)
+    before = await service.identity_for_token(tok)
+    assert before is not None and before.must_change_password
+    assert await _expired_rows(engine) == []
+    await _lapse(engine, service, user_id)
+    assert await service.identity_for_token(tok, activity=False) is None
+    session = await engine.store.get_session(hash_token(tok))
+    assert session is not None and session.revoked_at is not None
+    assert len(await _expired_rows(engine)) == 1
+
+
+async def test_the_deadline_test_is_strictly_after_like_the_sign_in_gate(engine: Engine) -> None:
+    """RED when: ``_credential_lapsed`` reads the deadline as inclusive, or ignores the flag.
+
+    The sign-in gate compares ``now > deadline``, so the credential still works AT the instant the
+    administrator was told. A session check that disagreed would end a session the gate admits."""
+    service = await _service(engine)
+    user_id = await _add(service, "vic", Role.VIEWER)
+    chosen = await service.store.get_user(user_id)
+    assert chosen is not None and not chosen.must_change_password
+    await service.admin_reset_password(user_id, actor="test")
+    user = await service.store.get_user(user_id)
+    assert user is not None and user.must_change_password
+    deadline = service.initial_credential_deadline(user.password_changed_at)
+    assert deadline is not None
+    assert service._credential_lapsed(user, deadline) is False
+    assert service._credential_lapsed(user, deadline + 0.001) is True
+    # A password the holder chose has no deadline to pass.
+    assert service._credential_lapsed(chosen, deadline + 0.001) is False
+
+
+async def test_no_ceremony_rekeys_a_session_whose_temporary_password_lapsed(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: ``_elevated_hash`` re-keys a lapsed session.
+
+    The enrol-first leg (ADR 0197 Amendment A): a must-change account with no factor confirms an
+    authenticator. Called on the service directly, as a request does that passed its gate before
+    the deadline; confirming hashes the recovery codes, which takes long enough for the deadline to
+    pass. A factor bound then would outlive the administrator's next reset, which keeps factors."""
+    service = await _service(engine)
+    user_id = await _add(service, "vic", Role.VIEWER)
+    temp = (await service.admin_reset_password(user_id, actor="test")).password
+    outcome = await service.login("vic", temp)
+    assert outcome.ok and outcome.token is not None and outcome.must_change_password
+    identity = await service.identity_for_token(outcome.token)
+    assert identity is not None
+    t0 = 1_000_000.0
+    pin_totp_clock(monkeypatch, t0)
+    enrollment = await service.begin_mfa_enrollment(identity)
+    await _lapse(engine, service, user_id)
+    elevation = await service.confirm_mfa_enrollment(
+        identity, totp.totp(enrollment.secret, now=t0), token=outcome.token, client="192.0.2.8"
+    )
+    assert elevation.session_lost and not elevation.ok and elevation.recovery_codes == ()
+    user = await engine.store.get_user(user_id)
+    assert user is not None and not user.totp_enabled, "a lapsed session turned MFA on"
+    session = await engine.store.get_session(hash_token(outcome.token))
+    assert session is not None and session.revoked_at is not None
+    rows = await _expired_rows(engine)
+    assert len(rows) == 1 and '"at": "mfa_enroll_confirm"' in str(rows[0]["detail"])
+    assert rows[0]["client"] == "192.0.2.8"
+
+
+async def test_a_passkey_assertion_that_straddles_the_deadline_marks_nothing(
+    engine: Engine,
+) -> None:
+    """RED when: ``finish_webauthn_assertion`` drops its deadline ask before its writes.
+
+    The passkey leg of /ui/mfa. Called on the service directly, as a request does that passed its
+    gate before the deadline. The assertion is good, and still nothing marks the factor, records
+    the sign-in or re-keys the session."""
+    pytest.importorskip("webauthn")
+    from webauthn.helpers import base64url_to_bytes
+
+    from tests._soft_webauthn import SoftAuthenticator
+
+    rp, origin = "t", "http://t"
+    service = await _service(
+        engine,
+        AuthSettings(
+            require_mfa=False, mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False
+        ),
+    )
+    user_id = await _add(service, "vic", Role.VIEWER)
+    setup = await service.login("vic", PW)
+    assert setup.ok and setup.token is not None
+    identity = await service.identity_for_token(setup.token)
+    assert identity is not None
+    soft = SoftAuthenticator(rp_id=rp, origin=origin)
+    options = json.loads(
+        await service.begin_webauthn_registration(
+            identity, token=setup.token, rp_id=rp, rp_name="MessageFoundry"
+        )
+    )
+    enrolled = await service.finish_webauthn_registration(
+        identity,
+        soft.create_response(base64url_to_bytes(options["challenge"]), transports=["usb"]),
+        label="key",
+        token=setup.token,
+        rp_id=rp,
+        origin=origin,
+    )
+    assert enrolled.ok
+    temp = (await service.admin_reset_password(user_id, actor="test")).password
+    out = await service.login("vic", temp)
+    assert out.ok and out.token is not None and out.must_change_password and out.mfa_required
+    challenge = await service.begin_webauthn_assertion(out.token, rp_id=rp)
+    assert challenge is not None
+    response = soft.get_response(base64url_to_bytes(json.loads(challenge)["challenge"]))
+    await _lapse(engine, service, user_id)
+    elevation = await service.finish_webauthn_assertion(
+        out.token, response, rp_id=rp, origin=origin
+    )
+    assert elevation.session_lost and not elevation.ok
+    session = await engine.store.get_session(hash_token(out.token))
+    assert session is not None and session.revoked_at is not None
+    assert session.mfa_verified_at is None
+    assert await engine.store.list_audit(action="auth.webauthn_verified") == []
+    rows = await _expired_rows(engine)
+    assert len(rows) == 1 and '"at": "webauthn_assert"' in str(rows[0]["detail"])
+
+
+async def test_racing_presentations_of_a_lapsed_session_write_one_row(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: ``_end_lapsed_session`` audits without knowing it ended the row.
+
+    Parallel requests from one browser after the deadline (a page, its nav poll, the socket) each
+    find the session unrevoked. The atomic revoke lets exactly one of them write the row."""
+    service = await _service(engine)
+    user_id, _secret, tok = await _reset_with_a_factor(service, monkeypatch, 1_000_000.0)
+    await _lapse(engine, service, user_id)
+    results = await asyncio.gather(
+        *(service.identity_for_token(tok, activity=False) for _ in range(4))
+    )
+    assert results == [None, None, None, None]
+    assert len(await _expired_rows(engine)) == 1

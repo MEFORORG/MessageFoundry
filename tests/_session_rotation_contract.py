@@ -129,3 +129,79 @@ async def assert_session_rotation_contract(store: Any, *, user_id: str = "rot-u1
 
     # --- an unknown hash ------------------------------------------------------------------------
     assert await store.rotate_session(_h(), new_token_hash=_h()) is False
+
+
+async def assert_session_supersession_contract(store: Any, *, user_id: str = "sup-u1") -> None:
+    """Drive ``supersede_session`` through its contract on any backend (BACKLOG #2146).
+
+    It is the login supersession's revoke-and-return operation. Why it is safe against a concurrent
+    ``rotate_session`` is ``AuthStore.supersede_session``'s docstring to say. This contract drives
+    the two one after the other, in both orders, and pins what each order must leave behind.
+    """
+    now = time.time()
+    await store.create_user(
+        user_id=user_id,
+        username=f"sup-{user_id}",
+        auth_provider="local",
+        display_name=None,
+        email=None,
+        password_hash="h",
+        now=now,
+        password_generated=False,
+    )
+    expires = now + 1234.5
+
+    # --- the happy path: revoked, and the row comes back as the revoke found it ------------------
+    live = _h()
+    await store.create_session(
+        token_hash=live,
+        user_id=user_id,
+        expires_at=expires,
+        client="10.1.2.3",
+        now=now,
+        auth_mechanism="oidc",
+    )
+    await store.mark_session_mfa_verified(live, now=now + 1)
+    before = await store.get_session(live)
+    assert before is not None
+    ended = await store.supersede_session(live, now=now + 5)
+    assert ended is not None, "an unrevoked row must be revoked and returned"
+    # Every column, so a backend whose RETURNING / OUTPUT mapping drops one cannot pass: the
+    # optional columns are read with .get(), and a missing one would come back as None.
+    assert ended.token_hash == live
+    assert ended.user_id == user_id
+    assert ended.created_at == before.created_at
+    assert ended.expires_at == before.expires_at
+    assert ended.last_used_at == before.last_used_at, (
+        "the liveness columns must come back as the revoke found them"
+    )
+    assert ended.client == "10.1.2.3"
+    assert ended.reauth_at == before.reauth_at and ended.reauth_at is not None
+    assert ended.mfa_verified_at == now + 1
+    assert ended.auth_mechanism == "oidc"
+    assert ended.revoked_at == now + 5
+    stored = await store.get_session(live)
+    assert stored is not None and stored.revoked_at == now + 5, "the revoke was not persisted"
+
+    # --- the serialisation point: a rotation after the supersession fails closed ---------------
+    assert await store.rotate_session(live, new_token_hash=_h()) is False, (
+        "a superseded session must not be re-keyable, or a step-up racing the sign-in revives it"
+    )
+
+    # --- already revoked: nothing written, nothing returned ------------------------------------
+    assert await store.supersede_session(live, now=now + 9) is None
+    again = await store.get_session(live)
+    assert again is not None and again.revoked_at == now + 5, "a second revoke moved revoked_at"
+
+    # --- an unknown hash ------------------------------------------------------------------------
+    assert await store.supersede_session(_h(), now=now) is None
+
+    # --- the other order: a rotation that committed first leaves the old hash naming nothing ----
+    old, new = _h(), _h()
+    await store.create_session(token_hash=old, user_id=user_id, expires_at=expires, now=now)
+    assert await store.rotate_session(old, new_token_hash=new) is True
+    assert await store.supersede_session(old, now=now) is None
+    survivor = await store.get_session(new)
+    assert survivor is not None and survivor.revoked_at is None, (
+        "superseding a retired hash must not touch the session that now carries another hash"
+    )

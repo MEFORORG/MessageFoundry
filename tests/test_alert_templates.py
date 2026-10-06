@@ -78,6 +78,25 @@ def test_escaped_braces_are_literal() -> None:
     assert s.email_body_template is not None
 
 
+_SURROGATE_TEMPLATE = "[{severity}] \ud800 {type}"
+
+
+@pytest.mark.parametrize(
+    "field", ["email_subject_template", "email_body_template", "email_html_template"]
+)
+def test_a_lone_surrogate_in_a_template_is_refused_at_config_load(field: str) -> None:
+    # Before vault BACKLOG #2842 it loaded, then every alert email raised UnicodeEncodeError at
+    # build. The refusal names the setting.
+    with pytest.raises(ValidationError, match=f"\\[alerts\\]\\.{field}: holds a lone surrogate"):
+        AlertsSettings.model_validate({field: _SURROGATE_TEMPLATE})
+
+
+def test_the_lone_surrogate_refusal_does_not_quote_the_template() -> None:
+    with pytest.raises(ValueError, match="lone surrogate") as caught:
+        validate_alert_template(_SURROGATE_TEMPLATE, where="x")
+    assert _SURROGATE_TEMPLATE not in str(caught.value)
+
+
 def test_validate_alert_template_direct() -> None:
     validate_alert_template("{severity} {type} {connection}", where="x")  # ok
     with pytest.raises(ValueError, match="unknown / PHI-unsafe"):

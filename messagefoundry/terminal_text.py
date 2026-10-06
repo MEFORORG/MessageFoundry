@@ -64,7 +64,7 @@ from __future__ import annotations
 import re
 import unicodedata
 
-from messagefoundry.controlchars import CONTROL_CATEGORIES
+from messagefoundry.controlchars import CONTROL_CATEGORIES, json_unicode_escape
 
 __all__ = ["CONTROL_CATEGORIES", "escape_for_terminal", "escape_json_for_terminal"]
 
@@ -173,10 +173,11 @@ def _json_escaped(match: re.Match[str]) -> str:
     code = ord(match.group())
     if code == 0x0D:
         return "\n"  # in valid JSON a CR is whitespace between tokens, so a newline means the same
-    if code <= 0xFFFF:
-        return f"\\u{code:04x}"
-    code -= 0x10000
-    return f"\\u{0xD800 + (code >> 10):04x}\\u{0xDC00 + (code & 0x3FF):04x}"
+    # A lone surrogate keeps JSON's own ``\udc80`` here, unlike the log's spelling, so Python's
+    # ``json`` reads back the same code point. Text holds one only after a ``surrogateescape`` or
+    # ``surrogatepass`` decode, which the one caller does not use. A strict decoder would refuse
+    # it, and an adjacent high and low pair would read back as one astral character.
+    return json_unicode_escape(code)
 
 
 def escape_json_for_terminal(text: str) -> str:

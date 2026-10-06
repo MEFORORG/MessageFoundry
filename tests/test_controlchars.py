@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 import functools
+import json
 import re
 import warnings
 from pathlib import Path
@@ -22,10 +23,34 @@ import pytest
 from messagefoundry.controlchars import (
     _is_control_char,
     has_control_char,
+    has_lone_surrogate,
     scrub_control_chars,
     scrub_log_argument,
     strip_control_chars,
 )
+
+
+@pytest.mark.parametrize("code", [0xD800, 0xDBFF, 0xDC00, 0xDFFF])
+def test_a_surrogate_is_caught_by_its_own_test_and_not_the_control_one(code: int) -> None:
+    # vault BACKLOG #2842: the two tests are separate, and a mail header needs both.
+    text = f"a{chr(code)}b"
+    assert has_lone_surrogate(text) is True
+    assert has_control_char(text) is False
+
+
+@pytest.mark.parametrize(
+    "codes", [(), (0x70,), (0xE9,), (0x60A3,), (0xD7FF,), (0xE000,), (0x1F600,)]
+)
+def test_encodable_text_holds_no_lone_surrogate(codes: tuple[int, ...]) -> None:
+    # Each side of the surrogate block, and an astral code point, which a str holds as ONE code
+    # point rather than as a UTF-16 pair.
+    assert has_lone_surrogate("".join(map(chr, codes))) is False
+
+
+def test_an_adjacent_high_and_low_surrogate_pair_is_still_caught() -> None:
+    # A surrogatepass decode can leave a pair as two code points. Strict UTF-8 cannot write either.
+    assert has_lone_surrogate(chr(0xD83D) + chr(0xDE00)) is True
+
 
 #: The set the predicate is defined to catch. Written independently of the implementation, so this
 #: is a second opinion rather than a restatement of the same expression.
@@ -329,3 +354,66 @@ def test_the_detector_fires_on_each_spelling(source: str, kind: str) -> None:
 )
 def test_the_detector_does_not_fire_on_a_different_set(source: str) -> None:
     assert _rederivations(source) == []
+
+
+def _strict_json(document: str) -> object:
+    """``json.loads``, refusing what a strict decoder such as jiter, or I-JSON (RFC 7493), refuses
+    and Python accepts: an unpaired surrogate escape. Checked on the decoded value, because Python
+    pairs a valid high and low escape into one character and leaves an unpaired one as a surrogate."""
+    value = json.loads(document)
+    assert not has_lone_surrogate(json.dumps(value, ensure_ascii=False)), document
+    return value
+
+
+def test_a_json_document_survives_the_scrub_and_decodes_unchanged() -> None:
+    """Vault BACKLOG #3012. Every escape the scrub writes is valid inside a JSON string, so a
+    document from plain ``json.dumps(..., ensure_ascii=False)`` still parses after it, for a strict
+    decoder too, and decodes to the text that went in."""
+    # Every BMP code point but the surrogates, then astral samples: a tag character (Cf), a
+    # private-use one (Co), the last code point, and two printable ones that must stay raw.
+    text = "".join(map(chr, (*range(0xD800), *range(0xE000, 0x10000))))
+    text += "".join(map(chr, (0xE0001, 0xF0000, 0x10FFFF, 0x1F600, 0x20000)))
+    document = json.dumps({"actor": text}, ensure_ascii=False)
+    scrubbed = scrub_control_chars(document)
+    # CONTROL: the scrub really rewrote characters inside the string, so the parse is not vacuous.
+    assert chr(0x7F) in document and chr(0x7F) not in scrubbed
+    assert chr(0xE0001) in document and chr(0xE0001) not in scrubbed
+    assert _strict_json(scrubbed) == {"actor": text}
+
+
+def test_the_old_spelling_was_not_json() -> None:
+    """The control for the test above: Python's ``ascii`` spelling, used before #3012, is not JSON
+    for DEL, C1, the soft hyphen and an astral code point, so those samples discriminate."""
+    for code in (0x7F, 0x85, 0xAD, 0xE0001):
+        with pytest.raises(json.JSONDecodeError):
+            json.loads('"' + ascii(chr(code))[1:-1] + '"')
+
+
+@pytest.mark.parametrize("code", [0xD800, 0xDBFF, 0xDC00, 0xDCFF, 0xDFFF])
+def test_a_lone_surrogate_is_spelled_as_visible_text_a_strict_decoder_accepts(code: int) -> None:
+    """JSON's own ``\\udcff`` alone is refused by a strict decoder, so the log doubles the
+    backslash: six visible characters every decoder reads as text, naming the code point."""
+    document = scrub_control_chars(json.dumps(f"a{chr(code)}b", ensure_ascii=False))
+    assert document == f'"a\\\\u{code:04x}b"'
+    assert _strict_json(document) == f"a\\u{code:04x}b"
+    # CONTROL: JSON's own spelling fails the strict check, so the check above can fail.
+    with pytest.raises(AssertionError):
+        _strict_json(f'"a\\u{code:04x}b"')
+
+
+def test_an_adjacent_lone_high_and_low_surrogate_do_not_decode_as_one_character() -> None:
+    """``str`` can hold U+D83D then U+DE00 as two code points. Spelled as JSON escapes they would
+    decode as U+1F600, a character the text never held. As text, each stays its own."""
+    document = scrub_control_chars(json.dumps(chr(0xD83D) + chr(0xDE00), ensure_ascii=False))
+    assert _strict_json(document) == "\\ud83d\\ude00"
+
+
+def test_an_astral_code_point_is_a_surrogate_pair_that_decodes_as_itself() -> None:
+    escaped = scrub_control_chars(chr(0xE0001))
+    assert escaped == "\\udb40\\udc01"
+    assert _strict_json(f'"{escaped}"') == chr(0xE0001)
+
+
+def test_plain_non_ascii_is_left_raw() -> None:
+    plain = "".join(chr(c) for c in (0xE9, 0xA0, 0x5F20, 0x1F600, 0x20000))
+    assert scrub_control_chars(plain) == plain

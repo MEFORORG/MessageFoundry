@@ -454,7 +454,7 @@ def test_the_static_client_secret_hop_leaves_the_inventory_under_private_key_jwt
     ec_key: ec.EllipticCurvePrivateKey,
 ) -> None:
     def names(auth: dict[str, Any]) -> set[str]:
-        settings = _service_settings({**auth, "enabled": True})
+        settings = _service_settings(auth)
         return {h.name for h in static_credential_hops(registry=None, settings=settings)}
 
     # The control: under the default method the hop is reported.
@@ -467,7 +467,6 @@ def test_the_key_reference_is_the_one_handed_to_the_secret_provider() -> None:
         oidc_token_endpoint_auth_method="private_key_jwt",
         oidc_client_private_key_ref="kv/mf#oidc-key",
         oidc_client_assertion_algorithm="ES256",
-        enabled=True,
     )
     settings = _service_settings(auth, secrets={"provider": "vault"})
     assert "kv/mf#oidc-key" in resolved_secret_refs(settings)

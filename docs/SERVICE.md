@@ -125,8 +125,10 @@ Under `[security].enforcement = "warn"` the same condition only prints a warning
 
 ### Provision the first administrator before you start the service
 
-The engine creates no account on its own, so a new store has nobody who can sign in. The install
-script registers the service but does not start it. Before the first start, create the first
+The engine creates no account on its own, so on a new store nobody can manage the engine. If a start
+goes ahead without an Administrator, a Windows sign-in (Kerberos) can still create a directory
+account, but that account holds no role. The install script registers the service but does not start
+it. Before the first start, create the first
 Administrator from an elevated shell on the host:
 
 1. Set `MEFOR_STORE_ENCRYPTION_KEY` in that shell to the key the service runs with, unless the key

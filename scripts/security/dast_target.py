@@ -106,7 +106,7 @@ def _scan_password() -> str:
     return secrets.token_urlsafe(24)
 
 
-def _auth_settings(*, enabled: bool = True) -> AuthSettings:
+def _auth_settings() -> AuthSettings:
     """The scan posture. Every relaxation here is PRINTED in the receipt, because a reader must be able
     to tell what was and was not exercised.
 
@@ -114,7 +114,6 @@ def _auth_settings(*, enabled: bool = True) -> AuthSettings:
     account on its FIRST failed attempt — and the negative pass makes a great many of those.
     """
     return AuthSettings(
-        enabled=enabled,
         require_mfa=False,
         login_rate_limit_enabled=False,
         phi_read_rate_limit_enabled=False,
@@ -203,12 +202,10 @@ async def dast_target(
     ``canary`` injects a REAL defect through supported configuration and provisioning only — nothing
     under ``messagefoundry/`` is patched, so the injection survives any refactor of ``require()``:
 
-    * ``"open-auth"`` — authentication bypass. CRITICAL AND COUNTERINTUITIVE: ``allow_no_auth`` is
-      honoured only when ``auth is None or not auth.enabled`` (messagefoundry/api/security.py), so
-      passing ``allow_no_auth=True`` alongside an ENABLED AuthService is SILENTLY IGNORED and the
-      canary reports zero findings — indistinguishable from a blind scanner. The app must therefore be
-      built against a second, DISABLED service. Users are still created against the enabled service so
-      the store is byte-identical to a real run.
+    * ``"open-auth"`` — authentication bypass. ``allow_no_auth`` opens an app only when NO
+      AuthService is attached, and ``create_app`` refuses it beside one (vault BACKLOG #2825), so
+      the canary app is built with no service. Users are still created against the service so the
+      store is byte-identical to a real run.
     * ``"bfla"`` — broken function-level authorization, injected by provisioning the low-privilege
       identity with the ADMINISTRATOR role while the sweep's expectation set stays the VIEWER
       permission set. Authentication is untouched, which is precisely why this cannot be caught by the
@@ -241,11 +238,7 @@ async def dast_target(
         # surface the scan itself created, and reporting it beside the real anonymous set, is noise at
         # best and a fabricated finding at worst.
         if canary == "open-auth":
-            open_service = AuthService(engine.store, _auth_settings(enabled=False))
-            await open_service.initialize()
-            app = create_app(
-                engine, auth=open_service, expose_docs=False, serve_ui=False, allow_no_auth=True
-            )
+            app = create_app(engine, expose_docs=False, serve_ui=False, allow_no_auth=True)
         else:
             app = create_app(engine, auth=service, expose_docs=False, serve_ui=False)
 

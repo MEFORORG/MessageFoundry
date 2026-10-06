@@ -399,8 +399,6 @@ def check_credential_generation(auth: AuthSettings) -> CheckResult:
     from messagefoundry.auth.service import credential_generation_problem
 
     rid, title = "auth.credential_generation", "Temporary credentials can be issued"
-    if not auth.enabled:
-        return CheckResult(rid, title, Status.SKIP, "sign-in is off, so no credential is issued")
     problem = credential_generation_problem(PasswordPolicy.from_settings(auth))
     if problem is not None:
         return CheckResult(rid, title, Status.FAIL, problem)

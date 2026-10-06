@@ -37,6 +37,8 @@ Constraints in play (CLAUDE.md and test-enforced invariants, verbatim where quot
   re-proof — a stolen pre-MFA cookie must never bind an attacker's authenticator.
 - `flag_new_client_ip` stays **advisory + step-up-forcing only** — it never becomes an authorization
   input (the 8.1.3/8.1.4/8.2.4 N/A keystone in the ASVS L3 assessment).
+  *Overtaken 2026-10-05 (vault BACKLOG #2620): the signal now refuses PHI reads and paced writes
+  from a new address, so this bullet no longer holds as written. See the amendment of that date.*
 - Additive only: the PySide6 console stays; shipped JSON endpoints keep their shapes.
 
 ## Decision
@@ -244,7 +246,8 @@ changed their applicability — 6.7.2 (challenge nonce: first-party 64-byte sing
 challenges) and 6.5.7 (UV authenticator-local + secondary) → applicable → Pass; 6.7.1
 (assertion-verification certificate storage) stays N/A (attestation=none by policy — no attestation
 certificates are consumed or stored); 8.1.3/8.1.4/8.2.4 stay N/A (`flag_new_client_ip`
-advisory-only, restated).
+advisory-only, restated). *Overtaken 2026-10-05: the signal is no longer advisory-only; see the
+amendment of that date.*
 
 ## Acceptance Criteria
 
@@ -590,6 +593,8 @@ Two of the old reasons no longer hold. The "N/A keystone" was never a grade the 
 BACKLOG #1153 found 8.2.4 graded partial, not N/A. The NAT churn is real, but the signal only
 forces a step-up and never denies, and an operator on a rotating egress pool can turn it off. Off
 is now a named loosening in `security_loosenings()`, so that choice is visible at every start.
+*Overtaken 2026-10-05: on the PHI reads and paced writes the signal now refuses until a
+re-verification; see the amendment of that date.*
 
 The off-loopback advisory stays. It now fires only when an operator has turned the signal off.
 
@@ -608,3 +613,38 @@ it would defeat the phishing resistance, whether or not that proxy also terminat
 So a ceremony may take its rp_id from the request URL only on a loopback bind with neither
 `tls_terminated_upstream` nor `trusted_proxies` set. Section 7 is left as written and dated
 by this amendment.
+
+## Amendment (2026-10-05) -- the new-address signal refuses PHI reads and paced writes (vault BACKLOG #2620)
+
+**Status:** Behaviour changed. `flag_new_client_ip` used to force a fresh step-up only at the
+step-up gates. While `[auth].admin_new_ip_step_up` is on, as it is by default, more gates now
+refuse a request from a host the session has not verified from. They include at least the PHI
+reads, the HTTP `reveal` reads, the paced writes, and the console's PHI pages and writes.
+[SECURITY.md](../SECURITY.md#administrative-interface-defense-in-depth-wp-l3-13-asvs-842) item 6
+is the source of record for the gate list and its exceptions.
+
+The JSON gates answer 403 with `X-Step-Up-Required: 1`. The console sends the browser to
+`/ui/reauth` with a 303. Only a re-verification from the new address lifts the refusal; a fresh
+step-up window from the old address does not. The JSON base gate, `require`, still never asks,
+so the monitoring polls are not refused. With the knob off, none of this applies.
+
+**Two sentences in this ADR no longer hold as written.** The Context bullet calls the signal
+"advisory" and says it "never becomes an authorization input". It now decides whether a PHI read
+or a paced write goes ahead. The 2026-09-26 amendment says the signal "only forces a step-up and
+never denies". On these gates it denies until the session re-verifies. Both are left as written,
+marked, and dated by this amendment.
+
+**What still holds.** The signal never changes an RBAC allow or deny. It is still
+step-up-forcing in the sense item 6 uses: a re-verification from the new address ends it.
+
+**The keystone named for 8.1.3, 8.1.4 and 8.2.4 has changed.** The Context bullet named the
+advisory-only property as their keystone, and section 10 restated it. The 2026-09-26 amendment
+already found the record grading 8.2.4 partial, so a grade may rest on other grounds too. This
+amendment re-grades nothing. The vault record for those three requirements must be re-read
+against the shipped behaviour.
+
+**Who decided.** This paragraph reports what the maintainer-internal ledger records. Vault
+BACKLOG #2620 was filed on 2026-10-01 from that day's security architecture review, which the row
+records as owner-approved. The row carries the verdict "build" and asks for the new-address check
+in the PHI-read gates and the paced-write gate, and not in the base gate. No file in this public
+tree records the approval itself, so nothing here quotes the owner.

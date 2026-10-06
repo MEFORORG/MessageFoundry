@@ -18,6 +18,9 @@ Also pinned: ``provision-admin`` refuses BEFORE writing when the opened store ca
 (a keyed chain opened from a shell with no key and a stale opt-out used to write the account and then
 crash on the audit row), and every command that opens a keyed store onto keyless rows says so.
 
+Also pinned (vault BACKLOG #2725): ``audit-verify`` exits 4, not a broken chain's 1, on a keyed chain
+in a shell that holds no key, and 2 when the key the settings name does not resolve.
+
 Severity is conditional (CLAUDE.md section 0): zero deployments, so this is what a first deployment
 would have inherited.
 """
@@ -27,6 +30,7 @@ from __future__ import annotations
 import argparse
 import ast
 import asyncio
+import contextlib
 import json
 import logging
 import sqlite3
@@ -302,6 +306,390 @@ def test_a_command_that_opens_a_keyed_store_onto_keyless_rows_reports_them(
     assert rc == 0
     assert reports and "audit-verify" in reports[0] and "rekey-audit" not in reports[0]
     assert main(["audit-verify", "--db", str(db)]) == 1, "a keyed verify must report the chain"
+
+
+# --- vault BACKLOG #2725: a keyed chain with no key in this shell exits 4, not 1 ---------------------
+#
+# `audit-verify` spent exit 1, a broken chain's code, on a keyed chain verified in a shell that holds
+# no key. A scheduled job reads the code and nothing else, so it would have reported tampering on an
+# intact log. Measured on the unfixed code: exit 1 with "FAIL: audit chain is keyed ... but no store
+# encryption key/MAC is configured to verify it". A key the settings name but that does not resolve
+# went to the dispatch floor, also exit 1.
+
+
+def _keyed_chain(db: Path, key: str) -> None:
+    """A keyed chain of three rows: the genesis row the keyed open writes, then two actions."""
+
+    async def build() -> None:
+        cipher = make_cipher(key)
+        store = await MessageStore.open(db, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
+        try:
+            await store.record_audit("first", actor="test")
+            await store.record_audit("second", actor="test")
+        finally:
+            await store.close()
+
+    asyncio.run(build())
+
+
+def _write(db: Path, statement: str) -> None:
+    """One out-of-band statement by a writer that holds no key."""
+    with contextlib.closing(sqlite3.connect(db)) as conn:
+        conn.execute(statement)
+        conn.commit()
+
+
+_EDIT_ROW_2 = "UPDATE audit_log SET actor = 'someone_else' WHERE seq = 2"
+_DELETE_ROW_2 = "DELETE FROM audit_log WHERE seq = 2"
+
+
+def test_audit_verify_exits_4_on_a_keyed_chain_with_no_key(
+    shell: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The item's case: an intact keyed chain, and a shell with no key. Exit 4, and a line that says
+    what the walk knows: the first row names a key, none is available, so it was NOT CHECKED. It
+    must not claim the chain is keyed, call it broken, or call the result a pass."""
+    db = shell / "keyed.db"
+    _keyed_chain(db, generate_key())
+    rc = main(["audit-verify", "--db", str(db)])
+    captured = capsys.readouterr()
+    out = captured.out
+    assert rc == 4, out
+    assert out.startswith("NOT CHECKED: ") and "first row names a store key" in out, out
+    assert "audit key '" not in out, "the line quoted the key id a writer controls"
+    assert "WARNING" not in captured.err, captured.err
+    assert "no store encryption key/MAC" in out and "may have been changed" in out, out
+    assert "it is keyed" not in out and "not a finding" not in out, out
+    assert "FAIL" not in out and "broken at" not in out, out
+
+
+@pytest.mark.parametrize(
+    ("change", "expected"),
+    [(None, 0), (_EDIT_ROW_2, 1), (_DELETE_ROW_2, 1)],
+    ids=["intact", "edited-row", "deleted-row"],
+)
+def test_audit_verify_with_the_key_keeps_0_and_1(
+    change: str | None,
+    expected: int,
+    shell: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Controls: with the key, an intact chain exits 0 and a tampered one exits 1. A process that
+    holds a key can never be told its chain is unchecked, whatever the database holds."""
+    key = generate_key()
+    db = shell / "keyed.db"
+    _keyed_chain(db, key)
+    if change is not None:
+        _write(db, change)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key)
+    rc = main(["audit-verify", "--db", str(db)])
+    out = capsys.readouterr().out
+    assert rc == expected, out
+    assert "NOT CHECKED" not in out, out
+
+
+def test_audit_verify_with_the_wrong_key_exits_1(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A key is held, just not the chain's. That is a finding about this chain and this key, so it
+    stays exit 1: a shell that holds a key never gets the "not checked" code."""
+    db = shell / "keyed.db"
+    _keyed_chain(db, generate_key())
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
+    rc = main(["audit-verify", "--db", str(db)])
+    out = capsys.readouterr().out
+    assert rc == 1, out
+    assert out.startswith("FAIL: "), out
+
+
+def test_a_break_that_needs_no_key_exits_1_with_no_key(
+    shell: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Tampering that a shell with no key CAN see still exits 1, not 4: a row missing from the middle
+    (its sequence numbers stop matching), a row whose hash was blanked, and a tail cut off after an
+    anchor was taken."""
+    db = shell / "keyed.db"
+    _keyed_chain(db, generate_key())
+    _write(db, _DELETE_ROW_2)
+    assert main(["audit-verify", "--db", str(db)]) == 1
+    assert "broken at seq=2" in capsys.readouterr().out
+
+    db = shell / "blanked.db"
+    _keyed_chain(db, generate_key())
+    _write(db, "UPDATE audit_log SET row_hash = '' WHERE seq = 3")
+    assert main(["audit-verify", "--db", str(db)]) == 1
+    assert "broken at seq=3" in capsys.readouterr().out
+
+    db = shell / "anchored.db"
+    _keyed_chain(db, generate_key())
+    assert main(["audit-anchor", "--db", str(db), "--json"]) == 0
+    anchor = json.loads(capsys.readouterr().out)["anchor"]
+    assert main(["audit-verify", "--db", str(db), "--expected-anchor", anchor]) == 4  # the control
+    capsys.readouterr()
+    _write(db, "DELETE FROM audit_log WHERE seq = 3")
+    assert main(["audit-verify", "--db", str(db), "--expected-anchor", anchor]) == 1
+    assert "diverges from recorded anchor" in capsys.readouterr().out
+
+
+def test_an_edit_a_shell_with_no_key_cannot_see_is_still_not_a_pass(
+    shell: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The limit, pinned so nobody reads 4 as clean: an edited row's content shows only in its MAC,
+    which needs the key. With no key the result is 4, "not checked", and never 0."""
+    db = shell / "keyed.db"
+    _keyed_chain(db, generate_key())
+    _write(db, _EDIT_ROW_2)
+    assert main(["audit-verify", "--db", str(db)]) == 4
+    assert "NOT CHECKED" in capsys.readouterr().out
+
+
+def test_an_edit_inside_a_closed_key_range_exits_1_with_no_key(
+    shell: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A rotated chain: a range under one key, closed by a range row that carries its digest. The
+    digest needs no key, so a shell with no key still sees an edit inside that range and exits 1.
+    The control is the same chain untouched, which exits 4."""
+    from tests.test_audit_key_rotation import _open, _rotate, _seed
+
+    first, second = generate_key(), generate_key()
+    db = shell / "rotated.db"
+
+    async def build() -> None:
+        store = await _open(db, first)
+        try:
+            await _seed(store, "under-first", 2)
+        finally:
+            await store.close()
+        await _rotate(db, first, second)
+
+    asyncio.run(build())
+    assert main(["audit-verify", "--db", str(db)]) == 4  # the control
+    capsys.readouterr()
+    _write(db, _EDIT_ROW_2)
+    assert main(["audit-verify", "--db", str(db)]) == 1
+    assert "does not match the range it closes" in capsys.readouterr().out
+
+
+def test_under_the_keyless_opt_out_a_chain_naming_a_key_exits_1(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The review's attack on exit 4. A deliberately keyless store, anchored. Someone edits a row
+    and rewrites row 1 as a genesis row naming a key, leaving every stored hash alone, so the anchor
+    still matches. Where the settings allow running keyless a chain naming a key is the anomaly, so
+    it stays a broken chain, exit 1, and never "not checked". The control is the edit alone."""
+    _opt_out(monkeypatch)
+    db = shell / "keyless.db"
+
+    async def seed() -> None:
+        store = await MessageStore.open(db)
+        try:
+            for i in range(3):
+                await store.record_audit(f"act{i}", actor="test")
+        finally:
+            await store.close()
+
+    asyncio.run(seed())
+    assert main(["audit-anchor", "--db", str(db), "--json"]) == 0
+    anchor = json.loads(capsys.readouterr().out)["anchor"]
+    _write(db, _EDIT_ROW_2)
+    argv = ["audit-verify", "--db", str(db), "--expected-anchor", anchor]
+    assert main(argv) == 1  # the control
+    capsys.readouterr()
+    _write(
+        db,
+        "UPDATE audit_log SET action = 'audit.key_epoch', "
+        """detail = '{"genesis": 1, "key_id": "forged"}' WHERE seq = 1""",
+    )
+    rc = main(argv)
+    out = capsys.readouterr().out
+    assert rc == 1, out
+    assert out.startswith("FAIL: audit chain broken") and "run keyless" in out, out
+
+
+@pytest.mark.parametrize("command", ["audit-verify", "audit-anchor"])
+def test_a_key_that_does_not_resolve_exits_2(
+    command: str, shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A key the settings name that cannot be resolved stops the open before it reads a row: here
+    `vault_transit` with no Transit key named. Exit 2, could not start, as `rotate-key` and
+    `provision-admin` exit on the same errors. It used to reach the dispatch floor and exit 1."""
+    db = shell / "keyed.db"
+    _keyed_chain(db, generate_key())
+    monkeypatch.setenv("MEFOR_STORE_CIPHER_PROVIDER", "vault_transit")
+    rc = main(_argv(command, db, shell))
+    captured = capsys.readouterr()
+    assert rc == 2, (captured.out, captured.err)
+    text = json.loads(captured.out)["error"] if command == "audit-anchor" else captured.err
+    assert "MEFOR_STORE_TRANSIT_KEY" in text, text
+
+
+def test_the_verdict_keeps_its_flag_through_a_copy() -> None:
+    """`AuditVerdict` is a tuple with one extra field, so a copy or a pickle must carry the field."""
+    import copy
+    import pickle
+
+    from messagefoundry.store.store import AuditVerdict
+
+    verdict = AuditVerdict(False, "m", key_unavailable=True)
+    for clone in (copy.copy(verdict), copy.deepcopy(verdict), pickle.loads(pickle.dumps(verdict))):
+        assert tuple(clone) == (False, "m") and clone.key_unavailable
+    assert not AuditVerdict(True, "m", key_unavailable=True).key_unavailable  # only with not-ok
+    clean = AuditVerdict(True, "m", keyless_walk=True)
+    assert pickle.loads(pickle.dumps(clean)).keyless_walk
+    assert not AuditVerdict(False, "m", keyless_walk=True).keyless_walk  # only with ok
+
+
+def _keyless_chain(db: Path) -> None:
+    """A keyless chain of three rows, as a store with no key writes it. One actor value is distinctive
+    so a test can show the warning never quotes a row."""
+
+    async def seed() -> None:
+        store = await MessageStore.open(db)
+        try:
+            for i in range(3):
+                await store.record_audit(f"act{i}", actor="row-content-marker")
+        finally:
+            await store.close()
+
+    asyncio.run(seed())
+
+
+def test_a_keyless_chain_passing_where_the_settings_require_a_key_warns(
+    shell: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A keyless chain verifies clean, exit 0, in a shell whose settings forbid keyless running.
+    That is the setup where a rewritten first row would turn later tampering into exit 4, so it
+    warns now, while the chain is still clean. The exit stays 0, and the warning quotes no row."""
+    db = shell / "keyless.db"
+    _keyless_chain(db)
+    rc = main(["audit-verify", "--db", str(db)])
+    captured = capsys.readouterr()
+    assert rc == 0, (captured.out, captured.err)
+    assert captured.out.startswith("OK: "), captured.out
+    assert "WARNING: the audit chain is keyless" in captured.err, captured.err
+    assert "require a store key" in captured.err, captured.err
+    assert "row-content-marker" not in captured.out + captured.err
+
+
+def test_a_keyless_chain_under_the_opt_out_does_not_warn(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Control for the warning: the same keyless chain, under the audited keyless opt-out, is what
+    the settings say to expect. Exit 0 and no warning. A keyed chain verified with its key is the
+    other control: it is not a keyless walk, so it does not warn either."""
+    db = shell / "keyless.db"
+    _keyless_chain(db)
+    _opt_out(monkeypatch)
+    assert main(["audit-verify", "--db", str(db)]) == 0
+    assert "WARNING" not in capsys.readouterr().err
+
+    monkeypatch.delenv("MEFOR_SECURITY_ALLOW_UNENCRYPTED_PHI")
+    monkeypatch.delenv("MEFOR_SECURITY_ALLOW_UNENCRYPTED_PHI_UNDER_STRICT_ENFORCEMENT")
+    key = generate_key()
+    keyed = shell / "keyed.db"
+    _keyed_chain(keyed, key)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key)
+    assert main(["audit-verify", "--db", str(keyed)]) == 0
+    assert "WARNING" not in capsys.readouterr().err
+
+
+def test_a_key_error_raised_after_the_open_is_not_reported_as_could_not_start(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Pins where the exit-2 key arm sits: around the OPEN only. Once rows are read, a key error is
+    not "could not start", because a row's content might be what raised it. Here the verify itself
+    raises the key error. Catching key errors around the whole run would turn this into exit 2."""
+    from messagefoundry.store.keyprovider import KeyProviderError
+
+    db = shell / "keyed.db"
+    key = generate_key()
+    _keyed_chain(db, key)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key)
+
+    async def raising(self: MessageStore, **kwargs: object) -> object:
+        raise KeyProviderError("raised after the open")
+
+    monkeypatch.setattr(MessageStore, "verify_audit_chain", raising)
+    rc = main(["audit-verify", "--db", str(db)])
+    capsys.readouterr()
+    assert rc != 2, "a key error after the open was reported as could-not-start"
+    assert rc != 0
+
+
+_FORGE_GENESIS = (
+    "UPDATE audit_log SET action = 'audit.key_epoch', "
+    """detail = '{"genesis": 1, "key_id": "forged"}' WHERE seq = 1"""
+)
+
+
+def test_the_weaker_setup_is_pinned_a_keyless_store_from_a_shell_that_requires_a_key(
+    shell: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The setup vault BACKLOG #2725 made weaker, pinned so it cannot widen unseen. A keyless store,
+    verified from a shell whose settings require a key and that holds none. Clean: exit 0 with the
+    WARNING. A writer then rewrites the first row to name a key and edits another row: exit 4,
+    where it was 1 before, and no WARNING."""
+    db = shell / "keyless.db"
+    _keyless_chain(db)
+    assert main(["audit-verify", "--db", str(db)]) == 0
+    assert "WARNING: the audit chain is keyless" in capsys.readouterr().err
+    _write(db, _FORGE_GENESIS)
+    _write(db, _EDIT_ROW_2)
+    rc = main(["audit-verify", "--db", str(db)])
+    captured = capsys.readouterr()
+    assert rc == 4, captured.out
+    assert "may have been changed" in captured.out and "WARNING" not in captured.err
+
+
+def test_a_keyed_chain_rewritten_as_keyless_warns_with_no_key_and_fails_with_it(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A keyed chain that a writer with no key rewrites as keyless: row 1 made ordinary, a row
+    edited, every hash recomputed as plain SHA-256. From a shell with no key it now passes, exit 0,
+    and the WARNING is the only sign, so it must fire and must name the rewrite as a cause. With the
+    engine's key the same chain fails, exit 1."""
+    from messagefoundry.store.store import _audit_row_mac
+
+    key = generate_key()
+    db = shell / "rewritten.db"
+    _keyed_chain(db, key)
+    with contextlib.closing(sqlite3.connect(db)) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            "UPDATE audit_log SET action = 'seed', detail = NULL, actor = 'test' WHERE seq = 1"
+        )
+        conn.execute(_EDIT_ROW_2)
+        prev = ""
+        for row in conn.execute("SELECT * FROM audit_log ORDER BY seq").fetchall():
+            digest = _audit_row_mac(dict(row), prev, None, None)
+            assert digest is not None
+            conn.execute("UPDATE audit_log SET row_hash = ? WHERE seq = ?", (digest, row["seq"]))
+            prev = digest
+        conn.commit()
+
+    assert main(["audit-verify", "--db", str(db)]) == 0
+    err = capsys.readouterr().err
+    assert "WARNING: the audit chain is keyless" in err and "rewritten as keyless" in err, err
+
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key)
+    assert main(["audit-verify", "--db", str(db)]) == 1
+    assert capsys.readouterr().out.startswith("FAIL: ")
+
+
+def test_a_service_config_that_cannot_be_read_exits_2(
+    shell: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A directory named as `--service-config` raises an OS error on load. It reached the dispatch
+    floor and exited 1, a broken chain's code. It is "could not start": exit 2."""
+    db = shell / "keyless.db"
+    _keyless_chain(db)
+    folder = shell / "a-folder"
+    folder.mkdir()
+    rc = main(["audit-verify", "--db", str(db), "--service-config", str(folder)])
+    captured = capsys.readouterr()
+    assert rc == 2, (captured.out, captured.err)
+    assert captured.err.startswith("error: "), captured.err
 
 
 # --- the source guard ----------------------------------------------------------------------------------

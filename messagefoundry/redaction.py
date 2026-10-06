@@ -24,9 +24,12 @@ labels, and XML elements with the same vocabulary (:func:`_redact_structured`, B
 
 Residuals, at least these, and this module claims no completeness: an adversarially-crafted
 *single-token* or non-name-shaped identifier, a **headerless** custom-delimiter fragment (no MSH, so
-nothing declares its delimiters), and the structured shapes the section comment above
-:func:`_redact_structured` lists. For all of them, the "never put PHI in an exception message"
-convention remains the control.
+nothing declares its delimiters), a custom-delimiter fragment whose declaring MSH sits past the
+clamp's cut (which falls before :data:`_REDACT_WINDOW`, and further back after its walks), so the
+clamp drops the header the sniff needs and the fragment in the kept head survives (BACKLOG #1848,
+accepted below under :data:`_CUT_CHARS`), and the structured shapes the
+section comment above :func:`_redact_structured` lists. For all of them, the "never put PHI in an
+exception message" convention remains the control.
 
 A **file name is exactly the first of those residuals**, which is why :func:`safe_name` exists beside
 the heuristic rather than inside it: a partner names a drop ``MRN123456789_ADT.hl7`` or
@@ -237,10 +240,10 @@ _DATE_RUN = re.compile(
 #: names through the multi-pass pipelines (the store runs :func:`safe_exc` then :func:`safe_text`, and
 #: the support bundle re-redacts). An exact-phrase list for the Title-case arm would also keep a real
 #: patient named exactly like a phrase. So ``Open Console`` became ``Console not opened`` in the tray
-#: (PR 1621), and ``Read Field``, ``Python Soap``, ``Vault Transit`` and ``Backend Services`` are
-#: reworded on a separate branch. At least ``Test Bench``, ``Always On``, ``Anthropic Messages``,
-#: ``CA/Browser Forum`` and ``Else If`` still sit in engine messages and are scrubbed from them, which
-#: is over-redaction until they are reworded too.
+#: (PR 1621), and PR 1726 reworded the engine messages carrying ``Read Field``, ``Vault Transit``,
+#: ``Backend Services``, ``Test Bench``, ``Always On``, ``Anthropic Messages``, ``CA/Browser Forum``
+#: and ``Else If``. ``tests/test_engine_text_survives_the_name_run.py`` fails on a new run of either
+#: arm in at least the message shapes it scans; its docstring names the ones it does not.
 _NAME_RUN = re.compile(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}\b|\b[A-Z]{2,}(?:\s+[A-Z]{2,}){1,3}\b")
 #: The one name-run token that is kept: an ``MRN`` label that ENDS a run. ``INVALID MRN 12345678`` is
 #: ordinary partner negative-acknowledgment text, the run takes ``INVALID MRN``, and without its label
@@ -592,8 +595,16 @@ _REDACT_WINDOW = 64 * 1024
 #: work.** :func:`_sniff_delimiters` reads the WHOLE text, so a clamp that drops the ``MSH`` declaring
 #: a feed's real delimiters leaves the separator-aware pass nothing to read, and a run inside the head
 #: that :func:`redact` scrubs unclamped survives. The dependency is not on a span, so no amount of
-#: looking back from the cut finds it. It is a known open gap, recorded here and on the corpus arm in
-#: ``tests/test_redaction.py`` that also cannot reach it -- not a pattern this register covers.
+#: looking back from the cut finds it.
+#:
+#: **It is ACCEPTED as a residual, not fixed (BACKLOG #1848).** Running :func:`_sniff_delimiters` over
+#: the whole text before the clamp would close it, and would undo #1576: the sniff then reads
+#: everything a peer sends. Measured here on 16 MB, the sniff alone cost 0.67 s on a header every
+#: eleven characters and 0.16 s on near-miss headers, against the 50 ms budget the #1437 arms hold. A
+#: cheaper bounded sniff was not measured, and a cap on the headers read would let a peer bury the
+#: real one behind decoys. Keeping the first segment whatever the cut would special-case a register
+#: that has none. Strict xfails in ``tests/test_redaction.py`` assert the fragment IS scrubbed, so they
+#: fail loudly the day someone closes the gap; the corpus arm there cannot reach the shape at all.
 #:
 #: **The structured passes (BACKLOG #1711) mostly answer "yes", and need no walk.** Each is
 #: label-anchored and treats a region that never closes as running to the end of the text, so a cut
@@ -1035,7 +1046,9 @@ _JSON_BARE_CONTINUATION = re.compile(r"""(?:[ \t]++[^\s{}\[\](),:"']++(?!\())*+"
 #: re-applied to its own output at the store chokepoint, where that would erase the only sign the text
 #: was cut. Anchored at ``\Z`` so only a note last in the text is spared: a peer that writes the
 #: literal mid-payload ends nothing early, and a trailing one carries no PHI. :func:`safe_text`'s
-#: ``…(+N chars)`` count is not here because a second :func:`safe_text` re-truncates past it anyway.
+#: ``…(+N chars)`` count is not here. Before BACKLOG #1797 a second :func:`safe_text` always cut past
+#: it. Since then a first result can be shorter than its limit, so a second call can keep the count
+#: and a further pass can read it as a value; :func:`safe_text` lists that among its exceptions.
 _TRAILING_NOTES = re.compile(r"[\n ]\[redaction bound: dropped [0-9_]+ more chars unscanned\]\Z")
 
 
@@ -1746,6 +1759,68 @@ def _redact_flat(text: str, *, widened: bool, credentials: bool) -> str:
     return _NAME_RUN.sub(_name_run_replacement if has_label else _REDACTED, scrubbed)
 
 
+def _whole_token_prefix(text: str, limit: int) -> int:
+    """Length of the longest prefix of ``text``, at most ``limit`` characters, that ends on a whole
+    token. ``text`` must be longer than ``limit``.
+
+    **``text[:limit]`` cut an identifier in half and kept its head (BACKLOG #1797).** The bound runs
+    after :func:`redact`, so it cuts whatever the redactor did not recognise. A bare identifier in prose
+    is one such thing, and a driver message was measured rendered as ``...The duplicate key value is
+    (4242``. A partial identifier still narrows who it names, and it looks redacted. So the cut goes
+    back to the last :data:`_CUT_CHARS` boundary, and the token straddling ``limit`` is dropped whole.
+    A single token longer than ``limit`` leaves nothing, the same choice :func:`_clamp` makes for a
+    window with no whitespace in it. The price is a long leading URL, path or JSON body, which now
+    leaves only the exception type and the count.
+
+    **This drops a split token; it does not recognise one.** Residuals, at least these: an identifier
+    that ends before ``limit`` is kept, exactly as before, and one written with spaces in it (an SSN
+    as ``123 45 6789``, a phone number) keeps every token before the straddling one. The first is the
+    other half of #1797, and it waits on an owner decision about the posture of the arbitrary-text
+    sites rather than on another pattern here.
+
+    Linear in ``limit``: :func:`_last_cut` searches back from ``limit`` only, and ``limit`` is the
+    answer's size, which is already bounded."""
+    # Searching through index ``limit`` itself, so a bound that falls ON whitespace splits nothing and
+    # keeps everything before it. -1 when there is no whitespace at all, which keeps nothing.
+    end = max(_last_cut(text, limit + 1), 0)
+    return len(text[:end].rstrip(_CUT_CHARS))
+
+
+#: The count note :func:`safe_text` writes, as the text before and after its number. One spelling, so
+#: :func:`_clear_of_own_notes` reads the note the code writes.
+_COUNT_OPENER = "…(+"
+_COUNT_CLOSER = " chars)"
+#: The first and last words of :func:`_clamp_marker`'s note, derived from it for the same reason.
+_BOUND_OPENER = _clamp_marker(0).split(" ")[0]
+_BOUND_CLOSER = " " + _clamp_marker(0).rsplit(" ", 1)[1]
+
+
+def _clear_of_own_notes(text: str, kept: int) -> int:
+    """``kept`` moved back so the kept head ends before this module's own notes, never inside one.
+
+    The store calls :func:`safe_text` again on a value an emit site already bounded, so the input can
+    end in this module's notes. The whole-token cut sees the space inside a note as a boundary, so it
+    kept ``…(+150`` and then wrote its own note after it: ``…(+150…(+7 chars)``, two counts glued
+    together. So a bound note the cut would split goes whole. Then a count note the cut would split,
+    or that the head would end on, goes whole too, so the result ends in one count. That count still
+    covers every character held back. No opener holds whitespace, so a cut never splits an opener.
+
+    Residuals, at least these. Only the last opener of each kind before the cut is read. One a peer
+    wrote, with no closer after it, moves the cut back as far as itself, possibly to nothing. That
+    drops more and never keeps more. A count note the scrubber already rewrote (the BACKLOG #2079 case
+    :func:`safe_text` names) no longer holds its opener, so it is not recognised. Linear in ``kept``:
+    each search is bounded by it."""
+    start = text.rfind(_BOUND_OPENER, 0, kept)
+    if start != -1 and text.find(_BOUND_CLOSER, start, kept) == -1:
+        kept = len(text[:start].rstrip(_CUT_CHARS))
+    start = text.rfind(_COUNT_OPENER, 0, kept)
+    if start != -1 and (
+        text.find(_COUNT_CLOSER, start, kept) == -1 or text.endswith(_COUNT_CLOSER, start, kept)
+    ):
+        kept = len(text[:start].rstrip(_CUT_CHARS))
+    return kept
+
+
 def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
     """A PHI-redacted, length-bounded rendering of a free-text diagnostic string — the string analog of
     :func:`safe_exc`, for error/detail text that isn't an exception object (joined strict-validation
@@ -1761,8 +1836,12 @@ def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
     ``redact(text[:limit])`` — the module docstring says why that form leaks the name it was meant to
     catch.
 
+    **``limit`` cuts at a whole token too, never inside one (BACKLOG #1797).** A token straddling the
+    limit is dropped whole, so a one-token identifier the redactor missed is never kept as its head
+    (:func:`_whole_token_prefix`, which names what that does not cover).
+
     The two counts stay separate and each is exactly true: ``(+N chars)`` is redacted text this call
-    held back, and the bound note is raw characters no pattern ever looked at. One total would add a
+    held back, every character of it, and the bound note is raw characters no pattern ever looked at. One total would add a
     redacted length to an unredacted one and report a number that is neither. Nothing is dropped in the
     ordinary case, so the ordinary result is byte-identical to its pre-#1576 self.
 
@@ -1771,13 +1850,15 @@ def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
     credential backstop can reach an ``@`` on a further pass that was past its bound on the first,
     once another pass shortened the text in between (:func:`_redact_flat`; the gap between two spans
     it scrubbed itself is no longer one, BACKLOG #2312); an unquoted DICOM label value can take the truncation note with it; and
-    (BACKLOG #2079) a kept operator string under a JSON ``name``/``address`` that ``limit`` cuts is left
-    unterminated, which a further pass scrubs, so ``"IB_ACME_ADT…(+N chars)`` becomes ``"[redacted]``
-    and loses the note that the text was cut."""
+    (BACKLOG #2079) a JSON ``name``/``address`` key that ``limit`` leaves last has the count read as its
+    value by a further pass, so ``{"name":…(+316 chars)`` becomes ``{"name":…([redacted] [redacted])``
+    and loses how much was cut. Before BACKLOG #1797 the limit cut the kept string itself and left it
+    unterminated, which a further pass scrubbed the same way."""
     head, dropped = _clamp(text, _REDACT_WINDOW)
     message = redact(head).strip()
     if len(message) > limit:
-        message = f"{message[:limit]}…(+{len(message) - limit} chars)"
+        kept = _clear_of_own_notes(message, _whole_token_prefix(message, limit))
+        message = f"{message[:kept]}{_COUNT_OPENER}{len(message) - kept}{_COUNT_CLOSER}"
     if dropped:
         message = f"{message} {_clamp_marker(dropped)}"
     return message

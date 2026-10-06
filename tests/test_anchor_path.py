@@ -869,7 +869,8 @@ def test_path_none_refuses_at_enforce_unless_a_pin_matches(
     with pytest.raises(TrustAnchorError) as err:
         ta.enforce_anchor(spec, enforcing=True)
     text = str(err.value)
-    assert "could not settle" in text and "directory 'C:\\x': access denied" in text
+    # The finding's path is quoted with repr (BACKLOG #2358), so its backslash is escaped.
+    assert "could not settle" in text and "directory 'C:\\\\x': access denied" in text
     assert "move the anchor" in text and "set [x].pin to" in text
     assert hashlib.sha256(p.read_bytes()).hexdigest() in text
     assert "enforce refuses to start" in text and text.isascii()

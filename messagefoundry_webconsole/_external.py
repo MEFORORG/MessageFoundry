@@ -22,6 +22,7 @@ Two failure modes drove the details, both from the 3.7.3 research:
 
 from __future__ import annotations
 
+import ipaddress
 from urllib.parse import urlsplit
 
 #: Schemes we will render an interstitial for. Anything else (``javascript:``, ``data:``, ``file:``)
@@ -66,11 +67,26 @@ def _matches_domain(host: str, domain: str) -> bool:
     """``host`` is ``domain`` or a subdomain of it — matched on a LABEL boundary.
 
     ``evilhospital.example`` must not match ``hospital.example``. A plain ``endswith`` says it does.
+    An IPv4 entry, which ``[security]`` accepts in its canonical form, matches only that address:
+    an address has no subdomains (vault BACKLOG #2843).
     """
     domain = domain.strip().lower().lstrip(".")
     if not domain or not host:
         return False
+    if _is_ipv4(domain):
+        return host == domain
     return host == domain or host.endswith("." + domain)
+
+
+def _is_ipv4(entry: str) -> bool:
+    """Whether ``entry`` is an IPv4 address. Stdlib rather than the engine's
+    ``messagefoundry.domainshape``: this package is versioned apart from the engine, and the UI
+    seam digest does not cover that module, so importing it could fail against an older engine."""
+    try:
+        ipaddress.IPv4Address(entry)
+    except ValueError:
+        return False
+    return True
 
 
 def is_external(url: str, organization_domains: list[str] | tuple[str, ...]) -> bool:

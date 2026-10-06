@@ -72,6 +72,7 @@ from typing import (
     NoReturn,
     NotRequired,
     Protocol,
+    Self,
     TypedDict,
     cast,
     runtime_checkable,
@@ -2505,6 +2506,44 @@ _AUDIT_NO_GENESIS: Final = (
 )
 
 
+class AuditVerdict(tuple[bool, str | None]):
+    """``(ok, message)`` from :func:`verify_audit_rows`, still unpacked as a pair by every caller.
+
+    ``key_unavailable`` is the one structured fact a pair cannot carry (vault BACKLOG #2725): the
+    chain is keyed and this process holds no keying secret, so no row MAC was recomputed. It is set
+    only with ``ok`` false, and only by a process that holds no key, so nothing a database holds can
+    set it for a verifier that has the key. For a process that holds no key, though, the chain's own
+    first row decides it: such a caller must not read it as "unchecked" where its settings say the
+    store runs keyless, because there a chain naming a key is itself the anomaly. A caller that
+    reads exit codes tells it apart from a broken chain by this flag, never by the message text.
+
+    ``keyless_walk`` says a clean verdict came from a process that holds no key, over a chain whose
+    first row names none: a plain SHA-256 walk, which anyone who can write the log can recompute.
+    It is set only with ``ok`` true. A caller whose settings require a key uses it to say the chain
+    it just passed is keyless, before any tamper makes that matter.
+
+    ``==`` and ``hash`` are the tuple's and ignore both flags; ``__reduce__`` keeps them through a
+    copy."""
+
+    key_unavailable: bool
+    keyless_walk: bool
+
+    def __new__(
+        cls,
+        ok: bool,
+        message: str | None,
+        key_unavailable: bool = False,
+        keyless_walk: bool = False,
+    ) -> Self:
+        verdict = super().__new__(cls, (ok, message))
+        verdict.key_unavailable = key_unavailable and not ok
+        verdict.keyless_walk = keyless_walk and ok
+        return verdict
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (type(self), (self[0], self[1], self.key_unavailable, self.keyless_walk))
+
+
 def verify_audit_rows(
     rows: Sequence[Mapping[str, Any]],
     *,
@@ -2513,7 +2552,7 @@ def verify_audit_rows(
     capable: bool,
     expected_anchor: tuple[int, str] | None = None,
     expected_prefix: tuple[int, str] | None = None,
-) -> tuple[bool, str | None]:
+) -> AuditVerdict:
     """Recompute the audit chain over ``rows`` (all of ``audit_log``, in ``seq`` order) -- the ONE
     walk all three backends' ``verify_audit_chain`` run, so the rule cannot drift between them.
 
@@ -2521,8 +2560,14 @@ def verify_audit_rows(
     BACKLOG #2594): **a process that holds a key requires every row keyed, from the first.** Row 1
     must be a genesis row naming its key, and each row is checked under the key of its own range
     (BACKLOG #1904, ADR 0193). No row in the database can switch that off: a keyless row is a reported
-    break. A process that holds no key walks a keyless chain as plain SHA-256, and reports a chain
-    whose genesis row names a key as one it cannot verify.
+    break. A process that holds no key walks a keyless chain as plain SHA-256. A chain whose genesis
+    row names a key it cannot verify, but it still makes the checks below that need no key: at least
+    the sequence numbers, that every row carries a hash, each key-range row's digest and link, and
+    any anchor or prefix. A break there is reported as a break. If none is found it returns not-ok
+    with ``key_unavailable`` set (vault BACKLOG #2725), which is not a verdict on the chain. No row
+    MAC and no handover tag was checked. Without a key it cannot tell a keyed chain from a keyless
+    one whose first row was rewritten to name a key, so a caller treats that result as unchecked,
+    never as a pass, and see :class:`AuditVerdict` for where it must not read it that way at all.
 
     Every row's ``seq`` must equal its position: 1 for the first row, then rising by one. A missing,
     repeated or renumbered row is reported at the position where the numbers stop matching.
@@ -2547,14 +2592,16 @@ def verify_audit_rows(
     # keyed chain read as keyless.
     opening = next((r for r in rows if _strict_int(r["seq"]) == 1), None)
     genesis_key = _audit_genesis_key(opening) if opening is not None else None
-    if not capable and genesis_key is not None:
-        # A keyed chain and no key/MAC in hand (opened without the DEK or the vault):
-        # unverifiable. Report honestly rather than mis-flag every keyed row as tampered.
-        return (
-            False,
-            f"audit chain is keyed (its genesis row names audit key {genesis_key!r}) but no store "
-            "encryption key/MAC is configured to verify it",
-        )
+    # A keyed chain and no key/MAC in hand (opened without the DEK or the vault). No row MAC can be
+    # recomputed, so the walk compares each stored hash with itself rather than mis-flag every keyed
+    # row as tampered. It still runs, because a break that needs no key is still a break (#2725).
+    key_unavailable = not capable and genesis_key is not None
+    # Range rows are checked whenever this process holds a key or the first row names one. A range
+    # row's digest and link need no key to recompute, so a walk with none catches an edit inside a
+    # closed range only while that range row is left as it was. A writer who also recomputes the
+    # digest it carries, or renames the row, is not seen here: the MACs and handover tags that
+    # would show it need the key.
+    ranged = capable or key_unavailable
     #: (walk position, row id, reason). The position is the sequence number that row should hold.
     breaks: list[tuple[int, Any, str | None]] = []
     prev: Any = ""
@@ -2582,14 +2629,14 @@ def verify_audit_rows(
                     "repeated or renumbered",
                 )
             )
-        if capable and pos == 1:
+        if ranged and pos == 1:
             range_from_id = rid
             if genesis_key is None:
                 breaks.append((pos, rid, _AUDIT_NO_GENESIS))
             else:
                 range_key = genesis_key
                 seen_keys.add(genesis_key)
-        elif capable and r["action"] == AUDIT_KEY_EPOCH_ACTION:
+        elif ranged and r["action"] == AUDIT_KEY_EPOCH_ACTION:
             parsed = parse_audit_epoch(r["detail"])
             if parsed is None:
                 breaks.append((pos, rid, "malformed audit key-range row"))
@@ -2621,20 +2668,28 @@ def verify_audit_rows(
                 range_prev = prev  # the link below the range, which must outlive its key
         key: bytes | None = None
         mac: AuditMacFn | None = None
-        held = True
+        held = not key_unavailable
         if capable:
             secret = _audit_secret_for(range_key, mac_keys, mac_fn)
             if secret is None:
                 held = False  # proved by the closing range row's digest instead (checked below)
             else:
                 key, mac = secret
-        expected = _audit_row_mac(r, prev, key, mac) if held else r["row_hash"]
+        stored = r["row_hash"]
+        # Not held: the stored hash is compared with itself. The only check left is that it is a
+        # non-empty text value; an empty or non-text one is never a MAC (#2725). Any other text
+        # passes, whether or not it is a real MAC: that needs the key.
+        expected = (
+            _audit_row_mac(r, prev, key, mac)
+            if held
+            else (stored if isinstance(stored, str) and stored else None)
+        )
         # Bind the compare first so it is ALWAYS evaluated: folding it behind a known-break test
         # would short-circuit the comparator once a break is known.
         mac_ok = hmac.compare_digest(audit_mac_bytes(r["row_hash"]), audit_mac_bytes(expected))
         if seq_ok and not (mac_ok and expected is not None):
             breaks.append((pos, rid, None))
-        if capable:
+        if ranged:
             range_digest.update(_audit_digest_line(r))
         # Chain from the STORED hash (not `expected`) so a divergence is reported once, at its own
         # row, instead of cascading a false break onto every successor.
@@ -2695,8 +2750,10 @@ def verify_audit_rows(
     count = len(rows)
     if breaks:
         first_pos, first_id, reason = min(breaks, key=lambda b: (b[0], b[2] is not None))
-        return False, f"audit chain broken at seq={first_pos}, row id={first_id}" + (
-            f" ({reason})" if reason else ""
+        return AuditVerdict(
+            False,
+            f"audit chain broken at seq={first_pos}, row id={first_id}"
+            + (f" ({reason})" if reason else ""),
         )
     if expected_anchor is not None:
         exp_count, exp_head = expected_anchor
@@ -2705,7 +2762,7 @@ def verify_audit_rows(
         # the row count.
         head_ok = hmac.compare_digest(audit_mac_bytes(prev), audit_mac_bytes(exp_head))
         if count < exp_count or not head_ok:
-            return (
+            return AuditVerdict(
                 False,
                 f"audit log diverges from recorded anchor (have {count} row(s) head {prev[:12]!r}, "
                 f"expected {exp_count} head {exp_head[:12]!r}) — truncated or rewritten",
@@ -2713,8 +2770,32 @@ def verify_audit_rows(
     if expected_prefix is not None:
         ok, msg = audit_prefix_verdict(expected_prefix, prefix_head, count)
         if not ok:
-            return False, msg
-    return True, f"verified {count} audit row(s)"
+            return AuditVerdict(False, msg)
+    if key_unavailable:
+        # Last, after every check that needs no key has passed: a break those checks found is a
+        # break, and outranks "could not check".
+        return AuditVerdict(
+            False,
+            "audit chain not checked: its first row names a store key, and no store "
+            "encryption key/MAC is available in this process, so no row MAC was recomputed. Only "
+            f"checks that need no key ran over its {count} row(s) (at least the sequence numbers, "
+            "that each row hash is non-empty text, and any key-range digests"
+            + (
+                ", and the expected anchor"
+                if expected_anchor is not None or expected_prefix is not None
+                else ""
+            )
+            + "), and they found no break. That is not a pass: the first row may have been "
+            "changed to name a key, and any row's content may have been changed, which only the "
+            "key shows. Re-run with the settings and key the engine runs with",
+            key_unavailable=True,
+        )
+    return AuditVerdict(
+        # Past the not-checked return, a process with no key has walked a chain naming none.
+        True,
+        f"verified {count} audit row(s)",
+        keyless_walk=not capable,
+    )
 
 
 class AuditRangeHost(Protocol):
@@ -8845,7 +8926,7 @@ class MessageStore:
             )
             enc_detail = (
                 self._enc(
-                    safe_text(detail)[:200],
+                    safe_text(detail, limit=200),  # whole: a slice cuts its note (#1797)
                     aad=cell_aad("response", "detail", message_id, dest, seq),
                 )
                 if detail
@@ -10411,7 +10492,7 @@ class MessageStore:
         # autoincrement, unknown here, so cell_aad can't use it (ASVS 11.3.3).
         reason_enc = (
             self._enc(
-                safe_text(reason)[:200],
+                safe_text(reason, limit=200),  # whole: a slice cuts its note (#1797)
                 aad=cell_aad("connection_event", "reason", connection, now, kind),
             )
             if reason
@@ -10511,7 +10592,7 @@ class MessageStore:
         # both the INSERT and the re-fire UPDATE that never sees the autoincrement id (ASVS 11.3.3).
         reason_enc = (
             self._enc(
-                safe_text(reason)[:200],
+                safe_text(reason, limit=200),  # whole: a slice cuts its note (#1797)
                 aad=cell_aad("alert_instance", "reason", event_type, connection),
             )
             if reason
@@ -11252,7 +11333,7 @@ class MessageStore:
         *,
         expected_anchor: tuple[int, str] | None = None,
         expected_prefix: tuple[int, str] | None = None,
-    ) -> tuple[bool, str | None]:
+    ) -> AuditVerdict:
         """Recompute the audit hash-chain in order; returns ``(ok, message)``.
 
         A mismatch means a row was inserted, edited, or reordered out-of-band (AUDIT-INTEGRITY).
@@ -11384,9 +11465,12 @@ class MessageStore:
         return UserRecord.from_mapping(dict(row)) if row else None
 
     async def set_user_username(
-        self, user_id: str, username: str, *, now: float | None = None
-    ) -> None:
+        self, user_id: str, username: str, *, expected_username: str, now: float | None = None
+    ) -> bool:
         # BACKLOG #1532. Cache refresh for a directory-reported rename -- see AuthStore.
+        # BACKLOG #2290: `username=?` on the old name makes it a compare-and-set; AuthStore says why
+        # a second refresh of the same row then writes nothing. The rest of this comment is about
+        # the OTHER race, two rows wanting one name, which the compare does not touch.
         # The NOT EXISTS clause makes a SEQUENTIALLY taken name a no-op instead of the IntegrityError
         # that UNIQUE(username) would otherwise raise on a background pass.
         #
@@ -11411,12 +11495,13 @@ class MessageStore:
         # backend alike -- this store must not be the reason that handler looks unnecessary.
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
-            await self._db.execute(
-                "UPDATE users SET username=?, updated_at=? WHERE id=? AND NOT EXISTS "
+            cur = await self._db.execute(
+                "UPDATE users SET username=?, updated_at=? WHERE id=? AND username=? AND NOT EXISTS "
                 "(SELECT 1 FROM users other WHERE other.username=? AND other.id<>?)",
-                (username, now, user_id, username, user_id),
+                (username, now, user_id, expected_username, username, user_id),
             )
             await self._commit()
+            return int(cur.rowcount) > 0
 
     async def list_users(self) -> list[UserRecord]:
         async with self._read() as db:
@@ -12315,13 +12400,13 @@ class MessageStore:
         async with self._read() as db:
             if idle_seconds is None:
                 cur = await db.execute(
-                    "SELECT * FROM sessions WHERE user_id=? AND revoked_at IS NULL AND expires_at > ?"
+                    "SELECT * FROM sessions WHERE user_id=? AND revoked_at IS NULL AND expires_at >= ?"
                     " ORDER BY last_used_at DESC",
                     (user_id, now),
                 )
             else:
                 cur = await db.execute(
-                    "SELECT * FROM sessions WHERE user_id=? AND revoked_at IS NULL AND expires_at > ?"
+                    "SELECT * FROM sessions WHERE user_id=? AND revoked_at IS NULL AND expires_at >= ?"
                     " AND ? - last_used_at <= ? ORDER BY last_used_at DESC",
                     (user_id, now, now, float(idle_seconds)),
                 )
@@ -12381,6 +12466,29 @@ class MessageStore:
             )
             await self._commit()
 
+    async def supersede_session(self, token_hash: str, *, now: float) -> SessionRecord | None:
+        """Revoke, then read the row back in the SAME transaction (BACKLOG #2146). See
+        :meth:`AuthStore.supersede_session`.
+
+        Two statements here rather than one ``UPDATE ... RETURNING``, because ``RETURNING`` needs
+        SQLite 3.35 and a Linux Python can link an older system library. They are still one unit:
+        the writer lock orders them against every in-process writer, ``rotate_session`` included,
+        and the write lock the ``UPDATE`` takes holds until the commit, so no other process can
+        re-key the row between them."""
+        async with _writer_guard(self._db, self._lock):
+            cur = await self._db.execute(
+                "UPDATE sessions SET revoked_at=? WHERE token_hash=? AND revoked_at IS NULL",
+                (now, token_hash),
+            )
+            row = None
+            if cur.rowcount:
+                cur = await self._db.execute(
+                    "SELECT * FROM sessions WHERE token_hash=?", (token_hash,)
+                )
+                row = await cur.fetchone()
+            await self._commit()
+        return SessionRecord.from_mapping(dict(row)) if row else None
+
     async def revoke_user_sessions(
         self, user_id: str, *, except_token_hash: str | None = None, now: float | None = None
     ) -> int:
@@ -12405,12 +12513,12 @@ class MessageStore:
         idle_seconds: float,
         split_mfa_pending: bool,
         now: float | None = None,
-    ) -> None:
+    ) -> int:
         """Keep a user's ``keep`` newest LIVE sessions (per group) and revoke the other unrevoked
-        ones that are not stamped ahead of ``now`` (AUTH-SESS-CAP). See
+        ones that are not stamped ahead of ``now`` (AUTH-SESS-CAP). Returns the count revoked. See
         :meth:`AuthStore.enforce_session_cap`."""
         if keep <= 0:
-            return
+            return 0
         now = time.time() if now is None else now
         per_group = (user_id, *_session_live_params(now, idle_seconds), now, keep)
         groups = len(_session_cap_groups(split_mfa_pending))
@@ -12418,13 +12526,14 @@ class MessageStore:
             # The statement is spelled at the call, not built in a local, because
             # `tests/test_writer_txn_is_the_only_begin.py` cannot read a local and pins how many it
             # cannot read.
-            await self._db.execute(
+            cur = await self._db.execute(
                 "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL"
                 f" AND {_SESSION_NOT_AHEAD_SQL} AND {_SESSION_CAP_RANK_NOT_AHEAD_SQL}"
                 f"{_sqlite_session_cap_keep_sql(split_mfa_pending)}",
                 (now, user_id, now, now, now, *(per_group * groups)),
             )
             await self._commit()
+            return int(cur.rowcount)
 
     async def purge_expired_sessions(
         self, *, now: float | None = None, idle_seconds: float | None = None

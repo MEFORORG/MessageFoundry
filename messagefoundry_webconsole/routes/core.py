@@ -83,9 +83,10 @@ _CLEAR_SITE_DATA_LOGIN_CODES = frozenset({"expired", "loggedout", "pwchanged"})
 #: truncated to a count. The reports are attacker-influenceable, so the log line is bounded.
 _CSP_REPORT_SUMMARY_MAX = 5
 
-#: What the MFA gate and the re-auth form say when ``verify_mfa`` or ``reauth`` refused a directory
-#: account the directory did not confirm (BACKLOG #2023, #2027). The code or password was never
-#: checked, so "invalid code" or "incorrect password" would be false.
+#: What the MFA gate and the re-auth form say when ``verify_mfa``, ``reauth`` or
+#: ``finish_webauthn_assertion`` refused a directory account the directory did not confirm (BACKLOG
+#: #2023, #2027, #2239). The code, password or passkey was never checked, so "invalid code",
+#: "incorrect password" or "passkey verification failed" would be false.
 _DIRECTORY_UNCONFIRMED_ERROR = (
     "The directory could not confirm your account. Try again later, or ask an administrator."
 )
@@ -179,6 +180,40 @@ class _MsgFilters(TypedDict):
 # step-up to this /edit page, so the operator re-submits inside a fresh window (mirrors /ui/users).
 register_ui_action(
     r"^/ui/messages/[^/?#]+/edit$", Permission.MESSAGES_EDIT, auto_retry=False, unlock=True
+)
+
+# The PHI pages `require_ui(..., phi=True)` gates, as unlock continuations (vault BACKLOG #2620).
+# That gate sends a read from a host the session has not verified from to /ui/reauth, carrying the
+# page's own target, and /ui/reauth acts only on a registered continuation: without these the
+# operator would land on /ui with the session still anchored elsewhere.
+# QUERY-TOLERANT, for the reason `_auth.is_unlock_action` sets out: a filtered or deferred list must
+# come back filtered or deferred, not as a broader read than the operator asked for. Each route's
+# own Query bounds still judge the query. Every path here serves GET only. The message pattern
+# excludes `search`, which routes/search.py registers with its own flags, so the first-match lookup
+# never depends on import order. The reveal routes are registered in monitoring.py.
+register_ui_action(
+    r"^/ui/messages(\?[^#]*)?$", Permission.MESSAGES_READ, auto_retry=False, unlock=True
+)
+register_ui_action(
+    r"^/ui/messages/(?!search(?:$|[/?#]))[^/?#]+(/(summary|body|errors|parse-tree))?(\?[^#]*)?$",
+    Permission.MESSAGES_VIEW_RAW,
+    auto_retry=False,
+    unlock=True,
+)
+register_ui_action(
+    r"^/ui/messages/[^/?#]+/attachments/[^/?#]+(\?[^#]*)?$",
+    Permission.MESSAGES_VIEW_RAW,
+    auto_retry=False,
+    unlock=True,
+)
+register_ui_action(
+    r"^/ui/dead-letters(\?[^#]*)?$", Permission.MESSAGES_READ, auto_retry=False, unlock=True
+)
+register_ui_action(
+    r"^/ui/connection/[^/?#]+/events/[^/?#]+/reason(\?[^#]*)?$",
+    Permission.MESSAGES_VIEW_SUMMARY,
+    auto_retry=False,
+    unlock=True,
 )
 
 # Resend to an ALTERNATE outbound (ADR 0090 §§1-8, BACKLOG #123/#1500). The GET confirm page is the
@@ -1614,9 +1649,14 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if elevation.session_lost:
             return JSONResponse({"ok": False, "error": "session expired"}, status_code=401)
         if elevation.token is None:
-            return JSONResponse(
-                {"ok": False, "error": "passkey verification failed"}, status_code=400
+            # BACKLOG #2239: the directory could not vouch for a directory account, so the
+            # assertion was never checked and "verification failed" would be false.
+            error = (
+                _DIRECTORY_UNCONFIRMED_ERROR
+                if _directory_unconfirmed(elevation)
+                else "passkey verification failed"
             )
+            return JSONResponse({"ok": False, "error": error}, status_code=400)
         # The assertion re-keyed the session (ASVS 7.2.4). The new cookie rides this JSON response,
         # because the page's next request is the POST /ui/reauth password leg — it would otherwise
         # present the retired token and be refused on a correct password.

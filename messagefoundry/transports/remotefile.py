@@ -110,6 +110,7 @@ from messagefoundry.transports.base import (
     NegativeAckError,
     SourceConnector,
     SourceStartupError,
+    encode_wire_body,
     intake_open,
     positive_cap,
     register_destination,
@@ -1994,7 +1995,15 @@ class RemoteFileDestination(DestinationConnector):
         # server. The remote path limit is the partner's and is not known here, so there is no
         # directory budget; a server refusal is classified by its own reply.
         name = render_filename(self._filename_template, payload, fallback=_FALLBACK_NAME)
-        data = payload.encode(self._encoding)
+        # The shared helper, not a bare .encode(): a UnicodeEncodeError names a character of the
+        # message and carries the WHOLE payload on `.object`. The helper raises a permanent,
+        # content-free NegativeAckError with the chain severed (#1920), before any I/O. It is not a
+        # _RemoteError, so send() lets it through unchanged and the row dead-letters.
+        data = encode_wire_body(
+            payload,
+            self._encoding,
+            transport=f"REMOTEFILE upload to {_redact(self._host, self._remote_dir)}",
+        )
         self._prepare_remote_dir()
         # With overwrite off, list for free names BEFORE anything is written (the #1936 rule).
         candidates = [] if self._overwrite else self._unique(name)

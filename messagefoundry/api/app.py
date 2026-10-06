@@ -12,12 +12,12 @@ be driven two ways:
 * :func:`create_managed_app(...)` — own the engine via an ASGI lifespan (the CLI server,
   and anything driven by a synchronous test client).
 
-Authentication + RBAC are enforced whenever an enabled :class:`AuthService` is attached. The
-``serve`` path always attaches one: it refuses to start with sign-in off, on every bind (vault
-BACKLOG #2719). With **no** enabled auth attached, both factories are **fail-closed**: every
+Authentication + RBAC are enforced whenever an :class:`AuthService` is attached, and no setting
+turns an attached service off (vault BACKLOG #2825). The ``serve`` path always attaches one, on every
+bind (vault BACKLOG #2719). With **no** auth attached, both factories are **fail-closed**: every
 protected route is refused (503) unless the caller passes ``allow_no_auth=True``, in which case
-requests run as the full-access system identity (SYS-1). Only embedders and tests pass it;
-``serve`` never does.
+requests run as the full-access system identity (SYS-1). Both factories refuse that opt-in beside
+an auth service or auth settings. Only embedders and tests pass it; ``serve`` never does.
 
 The API binds localhost by default and
 always serves TLS (ADR 0172): an operator-supplied certificate wins if configured, otherwise the
@@ -42,11 +42,11 @@ import shutil
 import time
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
-from typing import Annotated, Any, Literal, NoReturn, TypeVar
+from typing import Annotated, Any, Final, Literal, NoReturn, TypeVar
 from uuid import uuid4
 
 from fastapi import (
@@ -219,6 +219,7 @@ from messagefoundry.api.security import (
     optional_identity,
     pending_credential_deadline,
     public_route,
+    refuse_from_new_address,
     refuse_undeclared_route,
     require,
     require_paced,
@@ -352,6 +353,7 @@ from messagefoundry.pipeline.alerts import (
 )
 from messagefoundry.pipeline.cert_expiry import MonitoredCert
 from messagefoundry.pipeline.cluster import (
+    ClusterCoordinator,
     StepdownLockTimeout,
     StepdownReleaseUnconfirmed,
     build_coordinator,
@@ -1019,6 +1021,56 @@ def _posture_loosenings(
 _RELOAD_AUDIT_STEP = "audit"
 
 
+@dataclass(frozen=True, slots=True)
+class _LoadedConfig:
+    """What the engine reports as loaded, as an audit row names it: the directory, the engine
+    shard, the connection counts and the ADR 0041 D1 fingerprint.
+
+    The start takes one with :meth:`read` right after its first load, and both its comparison and
+    its ``config_loaded`` row use that one (vault BACKLOG #2838). A cluster convergence reload can
+    swap the graph before the row is written, and a live read at the write would then name the
+    reloaded graph as the one the start loaded. When the start cannot take one, its row uses
+    :data:`_UNKNOWN_LOADED`, which names nothing, rather than a live read."""
+
+    directory: str | None
+    shard: str | None
+    inbound: int | None
+    outbound: int | None
+    fingerprint: Mapping[str, object] | None
+    #: The graph object itself. An applied reload swaps it for a new one before it rebinds the
+    #: fingerprint, so comparing it by identity sees a reload still in flight.
+    registry: Registry | None
+
+    @classmethod
+    def read(cls, engine: Engine) -> _LoadedConfig:
+        """The engine's live state now. A reload rebinds the fingerprint rather than editing it, and
+        the copy keeps the snapshot safe even if that changes."""
+        rr = engine.registry_runner
+        directory = engine.running_config_dir
+        fingerprint = engine.loaded_config_fingerprint
+        return cls(
+            directory=str(directory) if directory else None,
+            shard=rr.registry.shard_id if rr else None,
+            inbound=len(rr.registry.inbound) if rr else 0,
+            outbound=len(rr.registry.outbound) if rr else 0,
+            fingerprint=dict(fingerprint) if fingerprint is not None else None,
+            registry=rr.registry if rr else None,
+        )
+
+    def swapped(self, engine: Engine) -> bool:
+        """Whether the engine's graph is no longer the one this snapshot read: a reload has
+        swapped it, or is part way through doing so."""
+        rr = engine.registry_runner
+        return (rr.registry if rr else None) is not self.registry
+
+
+#: The snapshot a start's row names when the start could not take its own (vault BACKLOG #2838):
+#: every field ``None``, so the row claims no directory, count or digest.
+_UNKNOWN_LOADED = _LoadedConfig(
+    directory=None, shard=None, inbound=None, outbound=None, fingerprint=None, registry=None
+)
+
+
 async def _record_reload_audit(
     engine: Engine,
     *,
@@ -1027,6 +1079,7 @@ async def _record_reload_audit(
     client: str | None = None,
     failed_steps: Sequence[str] = (),
     extra: Mapping[str, object] | None = None,
+    loaded: _LoadedConfig | None = None,
 ) -> list[str]:
     """Write the ``config_reload`` audit row with the ADR 0041 D1 content fingerprint of what loaded.
 
@@ -1036,9 +1089,15 @@ async def _record_reload_audit(
 
     Shared by the inline reload endpoint and the dual-control executor so a held-then-approved reload
     records the same fingerprint-bearing row as an ungated one. The fingerprint is the engine's
-    :attr:`~Engine.loaded_config_fingerprint`, the digest it took of the bytes it loaded, so the row
-    and ``GET /config/provenance`` always name one digest. When the engine could not take one, the row
-    is written without it.
+    :attr:`~Engine.loaded_config_fingerprint`, the digest it took of the bytes it loaded, so a reload's
+    row and ``GET /config/provenance`` name one digest. A start row a reload superseded names the
+    start's digest instead (vault BACKLOG #2838). When the engine could not take one, the row is
+    written without it.
+
+    ``loaded`` is what the row names as loaded: the directory, shard, counts and fingerprint. A
+    reload leaves it ``None``, and the row reads them live, at the write. The start always passes
+    one: the snapshot it took at its first load, or :data:`_UNKNOWN_LOADED` when it could not take
+    one (vault BACKLOG #2838); see :class:`_LoadedConfig`.
 
     ``client`` (ADR 0150) is the address of the actor named in the row. The inline endpoint passes the
     requester's own address. The dual-control executor deliberately does NOT: there the row's ``actor``
@@ -1062,19 +1121,18 @@ async def _record_reload_audit(
     A cancellation still propagates: it is not a failure of this helper."""
     detail: str | None = None
     try:
-        rr = engine.registry_runner
-        directory = engine.running_config_dir
+        state = loaded if loaded is not None else _LoadedConfig.read(engine)
         detail = json.dumps(
             {
-                "dir": str(directory) if directory else None,
-                "shard": rr.registry.shard_id if rr else None,
+                "dir": state.directory,
+                "shard": state.shard,
                 "node": engine.coordinator.node_id,
-                "inbound": len(rr.registry.inbound) if rr else 0,
-                "outbound": len(rr.registry.outbound) if rr else 0,
+                "inbound": state.inbound,
+                "outbound": state.outbound,
                 "dry_run": False,
                 **({"degraded": True, "failed_steps": list(failed_steps)} if failed_steps else {}),
                 **(extra or {}),
-                **(engine.loaded_config_fingerprint or {}),
+                **(state.fingerprint or {}),
             }
         )
         await engine.store.record_audit(action, actor=actor, detail=detail, client=client)
@@ -1112,7 +1170,8 @@ _CONFIG_BASELINE_WINDOW = 50
 #: The detail key that marks a config row whose digest this process never checked against the
 #: store's baseline (vault BACKLOG #2597): a start whose baseline read failed or that took no digest,
 #: and any flag toggle that process writes. A later start passes over such a row to the last checked
-#: one, so the change the unchecked start could not see is still reported.
+#: one, so the change the unchecked start could not see is still reported. A start row that a reload
+#: superseded before it was written carries it too (vault BACKLOG #2838): its digest is no baseline.
 _BASELINE_UNCHECKED = "baseline_unchecked"
 
 #: What a start's ``config_loaded`` row records as ``comparison``.
@@ -1302,6 +1361,7 @@ async def _record_start_audit(
     fingerprint_failed: bool = False,
     outcome: _StartOutcome | None = None,
     comparison: _StartConfigComparison | None = None,
+    loaded: _LoadedConfig | None,
 ) -> None:
     """Write the start's ``config_loaded`` row through :func:`_record_reload_audit` (vault BACKLOG
     #2597), so a restart records which code and which posture the engine started with.
@@ -1314,7 +1374,23 @@ async def _record_start_audit(
 
     ``outcome`` and ``comparison`` are :func:`_compare_start_config`'s result. The row records
     the outcome as ``comparison``, and ``previous_fingerprint`` and ``changed``, both ``None`` when
-    no comparison was made. The caller raises the alert, through :func:`_raise_config_changed`."""
+    no comparison was made. The caller raises the alert, through :func:`_raise_config_changed`.
+
+    ``loaded`` is the snapshot the caller took at the first load and compared (vault BACKLOG
+    #2838). The row names that, so the digest it records is the one the comparison used. When the
+    caller could not take one, ``loaded`` is ``None``. The row then claims nothing: it carries
+    :data:`_UNKNOWN_LOADED` with no live read, since a reload may already have swapped the graph,
+    and ``loosenings`` ``None`` for the same reason. It is degraded with the ``start_snapshot``
+    step and marked :data:`_BASELINE_UNCHECKED`, whatever ``outcome`` says.
+
+    A reload can swap the graph before the row is written: on a clustered node, ``engine.start()``
+    runs the convergence loop. The row then still names the start's graph, but it marks itself
+    ``superseded`` and :data:`_BASELINE_UNCHECKED`, even when the reload loaded the same bytes.
+    Without that, it would be the store's newest baseline while naming a digest no node runs, and
+    the next start on the reloaded bytes would raise a false ``config_changed``. Its
+    ``loosenings`` are ``None``, since the reader sees only the live graph and could not say which
+    of the two they describe. A fault in that swap check marks the row degraded with the
+    ``start_swap_check`` step, unchecked and with ``None`` loosenings, and never ``superseded``."""
     switches: list[str] | None
     try:
         pairs, _scope = _posture_loosenings(
@@ -1328,15 +1404,43 @@ async def _record_start_audit(
     except Exception:  # noqa: BLE001 - a start must not fail on its own audit row (step 5)
         _log.exception("the start's loosenings list could not be read; config_loaded records None")
         switches = None
+    # After the loosenings read, so a swap that read could have seen is caught; nothing awaits
+    # between here and the row's detail. A reload that swaps the graph later is not caught.
+    superseded = swap_unknown = False
+    if loaded is not None:
+        try:
+            superseded = loaded.swapped(engine)
+        except Exception as exc:  # noqa: BLE001 - step 5; a swap it cannot rule out is no baseline
+            _log.warning(
+                "the start could not tell whether a reload swapped its graph (%s); its "
+                "config_loaded row is degraded and is no baseline",
+                type(exc).__name__,
+            )
+            swap_unknown = True
+        if superseded:
+            _log.warning(
+                "a config reload applied before the start's config_loaded row was written; the "
+                "row names the graph this start loaded and is marked superseded"
+            )
+    # The loosenings describe the live graph, so they stand only when it is the start's.
+    untrusted = superseded or swap_unknown or loaded is None
+    if untrusted:
+        switches = None
     await _record_reload_audit(
         engine,
         actor="system",
         action="config_loaded",
-        failed_steps=["config_fingerprint"] if fingerprint_failed else [],
+        loaded=loaded if loaded is not None else _UNKNOWN_LOADED,
+        failed_steps=[
+            *(["config_fingerprint"] if fingerprint_failed else []),
+            *(["start_snapshot"] if loaded is None else []),
+            *(["start_swap_check"] if swap_unknown else []),
+        ],
         extra={
             "loosenings": switches,
             "comparison": outcome,
-            **({_BASELINE_UNCHECKED: True} if outcome in _UNCHECKED_OUTCOMES else {}),
+            **({"superseded": True} if superseded else {}),
+            **({_BASELINE_UNCHECKED: True} if untrusted or outcome in _UNCHECKED_OUTCOMES else {}),
             "previous_fingerprint": comparison.previous_fingerprint if comparison else None,
             "changed": comparison.changed if comparison else None,
         },
@@ -2057,6 +2161,13 @@ def create_app(
     log_dir: str | None = None,
     configured_log_level: str | None = None,
 ) -> FastAPI:
+    # The open mode is the opt-in with no service, and nothing else (vault BACKLOG #2825). Beside a
+    # service the opt-in would leave a live open-mode flag on a signed-in app, so it is refused.
+    if allow_no_auth and auth is not None:
+        raise ValueError(
+            "create_app: allow_no_auth=True was passed beside an auth service; pass the opt-in "
+            "only with no service, since a service always requires sign-in"
+        )
     # The interactive docs (/docs, /redoc) and the OpenAPI schema (/openapi.json) are off by
     # default: they widen the attack surface and disclose the schema, which matters the moment the
     # API binds off-loopback. Opt in with [api] expose_docs = true. See docs/PHI.md §10.
@@ -2411,8 +2522,9 @@ def create_app(
         request: Request, identity: Identity | None = Depends(optional_identity)
     ) -> Health:
         # Liveness is always answerable (tokenless), but the build version is fingerprinting info, so
-        # it is disclosed only to an authenticated caller (WP-L3-07 / ASVS 13.4.6). When auth is
-        # disabled-with-allow_no_auth, optional_identity returns the system identity → version shown.
+        # it is disclosed only to an authenticated caller (WP-L3-07 / ASVS 13.4.6). On an app built
+        # with allow_no_auth=True and no service, optional_identity returns the system identity, so
+        # the version is shown.
         #
         # observed_client is echoed ONLY when [security].allowed_client_networks is in use, so the
         # default deployment's /health payload is byte-identical. This route is EXEMPT from the network
@@ -3115,25 +3227,27 @@ def create_app(
         engine: Engine, identity: Identity, name: str, client: str | None
     ) -> tuple[RegistryRunner, Literal["in", "out"]]:
         """The runner, and which side of its registry holds ``name``, checked against the caller's channel scope
-        BEFORE its existence is (BACKLOG #2551).
+        BEFORE its existence is (BACKLOG #2551, #2640).
 
-        A channel-scoped caller gets one answer, :func:`_deny_connection`, for an inbound outside its
-        scope, for any outbound (an outbound spans channels), and for a name that exists nowhere. Had
-        the 404 come first, on a first deployment such a caller could tell which names exist by
-        probing. An unscoped caller, or a scoped one naming a channel in its own scope, still gets
-        404 for an unknown name. An inbound wins when a name is both, as on the control routes.
-        Raises 503 when the engine has no runner."""
+        A channel-scoped caller reaches only an inbound in its own scope. Every other name gets one
+        answer, :func:`_deny_connection`: an inbound outside its scope, any outbound (an outbound spans
+        channels), and a name that exists nowhere, even one listed in its own scope. Had any of these
+        answered 404, on a first deployment such a caller could tell which names exist by probing.
+        Only an unscoped caller gets 404 for an unknown name. An inbound wins when a name is both, as
+        on the control routes. With no runner the scope is still checked first, so a scoped caller
+        gets the 503 only for a name its scope lists, which tells it nothing it does not know."""
         rr = engine.registry_runner
         if rr is None:
+            await _control_guard(engine, identity, name, client)
             raise HTTPException(503, "engine not started")
         if name in rr.registry.inbound:
             await _control_guard(engine, identity, name, client)  # inbound is per-channel
             return rr, "in"
+        if identity.allowed_channels is not None:
+            # An outbound, or a miss: the answer an out-of-scope inbound gets (BACKLOG #2640).
+            await _deny_connection(engine, identity, name, client)
         if name in rr.registry.outbound:
-            if identity.allowed_channels is not None:
-                await _deny_connection(engine, identity, name, client)
             return rr, "out"
-        await _control_guard(engine, identity, name, client)
         raise HTTPException(404, f"no such connection: {name}")
 
     async def _dual_role_control(
@@ -3150,8 +3264,10 @@ def create_app(
         (stopping an inbound halts intake, its delivery keeps draining). A shared outbound → a
         channel-scoped user is denied (an outbound spans channels; mirrors purge), else
         ``rr.<action>_outbound`` (stopping an outbound PAUSES delivery, retaining the queue). A name that
-        is neither still runs the per-channel guard first, so a scoped user gets a 403 for an out-of-scope
-        name rather than learning it doesn't exist, then 404. Returns ``{"name", "running"}``.
+        is neither gets 404 from an unscoped user. A channel-scoped user gets the audited out-of-scope
+        403 for it, even when its own scope lists the name, so no answer tells it which names exist
+        (BACKLOG #2551, #2640). With no runner no name exists: a scoped user gets the 403 for a name
+        outside its scope, and every other caller gets 404. Returns ``{"name", "running"}``.
 
         ``role`` disambiguates a name declared as BOTH an inbound and an outbound: ``"source"`` targets
         only the inbound, ``"destination"`` only the outbound. ``None`` (the bare-name JSON/legacy
@@ -3178,11 +3294,12 @@ def create_app(
                 engine, identity, name, action, role="source", running=running, client=client
             )
             return {"name": name, "running": running}
+        if rr is not None and identity.allowed_channels is not None:
+            # Past the inbound arm, a channel-scoped user can reach nothing: a shared outbound spans
+            # channels (mirrors purge), and a miss gets the same refusal so that no answer tells an
+            # outbound, an unknown name and an out-of-scope inbound apart (BACKLOG #2551, #2640).
+            await _deny_connection(engine, identity, name, client)
         if rr is not None and want_out and name in rr.registry.outbound:
-            # A shared outbound spans channels, so a channel-scoped user can't control one (mirrors purge).
-            # The refusal is the one an unknown name gets, so it names no outbound (BACKLOG #2551).
-            if identity.allowed_channels is not None:
-                await _deny_connection(engine, identity, name, client)
             try:
                 if action == "start":
                     await rr.start_outbound(name)
@@ -3204,8 +3321,8 @@ def create_app(
                 engine, identity, name, action, role="destination", running=running, client=client
             )
             return {"name": name, "running": running}
-        # Neither an inbound nor an outbound (or no runner). Run the per-channel guard first so a scoped
-        # user is 403'd for a name outside their scope (don't disclose existence), then 404.
+        # With a runner, only an unscoped user reaches here. With none, no name exists, so a 404
+        # after the scope check tells a scoped user nothing its own scope does not.
         await _control_guard(engine, identity, name, client)
         raise HTTPException(404, f"no such connection: {name}")
 
@@ -3603,8 +3720,9 @@ def create_app(
         ``GET /connections/{name}/metadata``. A caller without that permission is refused,
         and the refusal is audited as
         ``auth.permission_denied`` like every other one (ASVS 16.3.2). Over HTTP the reveal is
-        also a PHI read: it takes the serve-hop refusal and the per-actor PHI budget. The web
-        console's reveal routes already charged both through ``require_ui(..., phi=True)`` before
+        also a PHI read: it takes the serve-hop refusal, the new-address refusal (vault BACKLOG
+        #2620) and the per-actor PHI budget. The web console's reveal routes already took all three
+        through ``require_ui(..., phi=True)`` before
         calling in-process, so a ``/ui`` route is not charged twice. That skip reads the matched
         route, so a future ``/ui`` route passing ``reveal`` must carry ``phi=True`` itself."""
         if reveal is None:
@@ -3621,6 +3739,9 @@ def create_app(
             raise HTTPException(403, "a reveal needs messages:view_summary")
         if not (_matched_route_path(request) or "").startswith("/ui/"):
             enforce_phi_read_hop(request)
+            # Vault BACKLOG #2620: a PHI read, so it refuses a new address as require_phi_read
+            # does, before the budget. The /ui twins asked in require_ui's phi=True arm.
+            await refuse_from_new_address(request)
             enforce_phi_read_pacing(request, identity)
 
     async def _redact_reasons(
@@ -7694,13 +7815,19 @@ async def _assert_security_notice_is_deliverable(
     store (AC-11). An Administrator with no address is the other half; ``provision-admin`` refuses
     there, so it names the offline setter ``admin-set-notify-email`` and the audited waiver (AC-16).
 
-    **It is also where a skipped gate still says that nobody can sign in (AC-12).** With sign-in
-    required, notices off or waived in writing, and no enabled Administrator, the engine starts and
-    routes HL7 but no one can reach the console. That is logged as ONE WARNING naming
+    **It is also where a skipped gate still says that no enabled Administrator exists (AC-12).** With
+    sign-in required, notices off or waived in writing, and no enabled Administrator, the engine
+    starts and routes HL7, but no enabled account holds the role that manages users and roles. A
+    Windows sign-in can still create a directory account, with no role on a new store (BACKLOG
+    #1133), so the line must not say that nobody can sign in. That is logged as ONE WARNING naming
     ``provision-admin``. Under ``warn`` the refusal's own WARNING already says it, so nothing more is
-    logged. With sign-in not required no Administrator is needed and nothing is logged. It stays a
-    warning rather than a refusal on purpose: NSSM restarts a service at boot with nobody present,
-    and an operator who chose ``warn`` or the waiver chose to keep HL7 flowing.
+    logged. It stays a warning rather than a refusal on purpose: NSSM restarts a service at boot with
+    nobody present, and an operator who chose ``warn`` or the waiver chose to keep HL7 flowing.
+
+    **Sign-in off returns first, and only an embedding reaches that arm.** ``serve`` refuses to start
+    with sign-in off on any bind, and no config key turns it off (vault BACKLOG #2719). So the early
+    return below serves an app an embedder or a test builds in code, which needs no Administrator and
+    logs nothing. It is not a deployable way to start without one.
 
     **Why deliverability rather than "require an email at creation".** A fix resting on an OPERATOR
     ACTION cannot cover the accounts a directory owns; a startup assertion about the state of the
@@ -7718,8 +7845,6 @@ async def _assert_security_notice_is_deliverable(
     which is a different and much larger change.
     """
     auth_settings = auth_settings or AuthSettings()
-    if not auth_settings.enabled:
-        return  # sign-in is not required, so no Administrator is needed to reach the engine
     alerts = alerts_settings or AlertsSettings()
     # The two preconditions of the deliverability question. Either one false skips the refusal: the
     # transport gate already governs notices off, and the waiver is the audited, in-writing opt-out.
@@ -7744,13 +7869,15 @@ async def _assert_security_notice_is_deliverable(
         # file, and is left as it is.
         where = str(Path(store.path).resolve()) if Path(store.path).is_file() else store.path
         detail = (
-            "no enabled Administrator exists in this store, so nobody can sign in, and every "
-            "out-of-band security notice about the most privileged accounts would reach nobody. The "
-            f"engine creates no account on its own. {_PROVISION_ADMIN_HINT.format(store=where)}."
+            "no enabled Administrator exists in this store, so no enabled account holds the role "
+            "that manages users and roles, and every out-of-band security notice about the most "
+            "privileged accounts would reach nobody. The engine creates no account on its own. "
+            f"{_PROVISION_ADMIN_HINT.format(store=where)}."
         )
         if not gated:
-            # AC-12: the gate is skipped, so this is the one line that says the console is unreachable.
-            _log.warning("the engine is starting with no way to sign in: %s", detail)
+            # AC-12: the gate is skipped, so this is the one line that says no enabled Administrator
+            # exists. The detail states the fact once; the prefix says only why the start goes on.
+            _log.warning("the engine is starting with the notice gate skipped: %s", detail)
             return
     else:
         detail = (
@@ -7770,27 +7897,101 @@ async def _assert_security_notice_is_deliverable(
 
 
 _SESSION_REAP_INTERVAL = 3600.0  # purge expired/idle sessions hourly to bound the sessions table
+# How long the reaper waits after start before its first pass, so time sync has run and an engine
+# that restarts often still purges.
+_SESSION_REAP_FIRST_DELAY = 300.0
+# How far the wall clock may run ahead of the monotonic clock between two readings before the
+# reaper skips the pass as a clock step. Above what clock discipline slews in an hour (chrony's
+# maximum slew rate is about 300 s an hour). Each pass that runs also purges as of this much before
+# its own reading, so a step under it cannot delete a row the validator would still accept.
+_SESSION_REAP_STEP_TOLERANCE = 600.0
 
 
-async def _session_reaper(store: Store, *, idle_seconds: float | None = None) -> None:
-    """Drop expired session rows (immediately, then on an interval) until the task is cancelled.
-    With ``idle_seconds`` given, idle-expired rows go too (BACKLOG #2096); the lifespan passes the
-    idle timeout the validator uses.
+async def _session_reaper(
+    store: Store,
+    *,
+    idle_seconds: float | None = None,
+    wall: Callable[[], float] | None = None,
+    mono: Callable[[], float] | None = None,
+) -> None:
+    """Drop expired session rows, first ``_SESSION_REAP_FIRST_DELAY`` after start and then every
+    ``_SESSION_REAP_INTERVAL``, until the task is cancelled. With ``idle_seconds`` given,
+    idle-expired rows go too (BACKLOG #2096); the lifespan passes the idle timeout the validator
+    uses.
+
+    **The reaper skips a pass when the wall clock has jumped forward (BACKLOG #2283).** The purge
+    judges expiry and idleness by the wall clock, and its deletes cannot be undone. Run just after
+    a forward step, it would delete every session as idle, though setting the clock right would
+    have made them valid again. So each pass compares how far the wall clock moved since the
+    previous reading with how far the monotonic clock moved. When the wall clock ran ahead by more
+    than ``_SESSION_REAP_STEP_TOLERANCE``, the pass deletes nothing and logs a warning. The next
+    pass compares against this one, so a step that persists for a whole interval is then trusted
+    and purged by. A host that slept can also trip it, which costs one skipped pass. A host whose
+    clock steps forward by more than the tolerance every interval never purges, and the warning
+    each pass is what says so.
+
+    **A pass that runs purges as of ``_SESSION_REAP_STEP_TOLERANCE`` before its own reading.** A
+    forward step of ``x`` seconds that the guard lets through would make a purge at the reading
+    delete every row unused for more than ``idle_seconds - x`` real seconds, and every row with
+    less than ``x`` seconds of absolute life left. With an idle window of 10 minutes or less, a step
+    under the tolerance would then delete every session nobody used during it (BACKLOG #2283).
+    Purging as of the earlier instant cancels any ONE step the guard lets through, at any idle
+    setting: a row goes only once the validator would refuse it at the true time. Steps that each
+    pass the guard but add up across passes to more than the tolerance are not cancelled. The cost
+    is that a lapsed row waits up to that much longer for a pass to delete it, and the validator
+    refuses it meanwhile.
+
+    **The first reading is a baseline, not a pass.** A wrong clock is likeliest at start-up, before
+    time sync has run, and a first pass would have nothing to compare it with. So the reaper reads
+    both clocks and waits ``_SESSION_REAP_FIRST_DELAY`` before it purges. Rows that expired before
+    a restart wait that much longer; the validator refuses them meanwhile.
+
+    This guards only the purge. The validator revokes a session it refuses on presentation, by the
+    same wall clock, so a forward step still ends every session that is USED during it.
+
+    ``wall`` and ``mono`` default to ``time.time`` and ``time.monotonic``, read at each pass rather
+    than bound at import, so a test that patches ``time`` reaches the reaper too.
 
     A transient store error must not kill the reaper for the process lifetime (it would let the
     sessions table grow unbounded, and its stored exception could later abort lifespan shutdown) —
     log and retry next interval (review M-33)."""
+
+    def _clocks() -> tuple[float, float]:
+        return (wall or time.time)(), (mono or time.monotonic)()
+
+    previous = _clocks()
+    delay = _SESSION_REAP_FIRST_DELAY
     while True:
+        await asyncio.sleep(delay)
+        delay = _SESSION_REAP_INTERVAL
+        now, ticks = _clocks()
+        ahead = (now - previous[0]) - (ticks - previous[1])
+        previous = (now, ticks)
+        if ahead > _SESSION_REAP_STEP_TOLERANCE:
+            _log.warning(
+                "session reaper: the wall clock ran %.0fs ahead of the monotonic clock since the "
+                "last reading, so this pass deleted nothing; the next pass purges if the clock holds",
+                ahead,
+            )
+            continue
         try:
-            await store.purge_expired_sessions(idle_seconds=idle_seconds)
+            await store.purge_expired_sessions(
+                now=now - _SESSION_REAP_STEP_TOLERANCE, idle_seconds=idle_seconds
+            )
         except asyncio.CancelledError:
             raise
         except Exception:
             _log.exception("session reaper: purge failed; will retry next interval")
-        await asyncio.sleep(_SESSION_REAP_INTERVAL)
 
 
-async def _directory_reconciler(auth: AuthService, interval: float, sink: AlertSink) -> None:
+async def _directory_reconciler(
+    auth: AuthService,
+    interval: float,
+    sink: AlertSink,
+    *,
+    sole_reconciler: bool,
+    alert_state: Store | None,
+) -> None:
     """Re-resolve directory principals holding live sessions, revoking those AD has disabled or
     deleted (ADR 0079 mechanism 2). Created only when AD is wired and
     ``[auth].ad_session_recheck_seconds`` is non-zero (it defaults to 300).
@@ -7802,12 +8003,29 @@ async def _directory_reconciler(auth: AuthService, interval: float, sink: AlertS
     Each finished pass is turned into alerts here, by :func:`_alert_reconcile_plan`. The alerting
     lives in this task and never in ``auth/``, which does not import the pipeline's sinks.
 
+    With ``sole_reconciler`` False no inverse is raised; :func:`_without_clears` says why, and
+    :func:`_is_sole_reconciler` decides it. ``alert_state`` is the store the sink records alert
+    instances in, or None where nothing records them; :func:`_without_inherited_clears` reads it.
+    Both are required, so a new caller has to decide them.
+
     A transient failure must not kill the loop for the process lifetime (that would silently disable
     the control until restart) — log and retry next interval, the session-reaper precedent."""
+    # BACKLOG #2136. The ids of the reconcile instances open before this process's first pass, read
+    # just before that pass. None until a read succeeds, and every clear is dropped until then. An
+    # instance a pass of this process opened while the read kept failing then counts as inherited:
+    # a missed clear, never a false one.
+    inherited: frozenset[int] | None = None if alert_state is not None else frozenset()
     while True:
         await asyncio.sleep(interval)
         try:
+            if inherited is None and alert_state is not None:
+                found = await _open_reconcile_instances(alert_state)
+                inherited = None if found is None else frozenset(found)
             plan = await auth.reconcile_directory_sessions()
+            if not sole_reconciler or inherited is None:
+                plan = _without_clears(plan)
+            elif alert_state is not None:
+                plan = await _without_inherited_clears(plan, alert_state, inherited)
             # Inside the try: a sink that breaks its never-raise contract must not kill the loop.
             _alert_reconcile_plan(plan, auth, sink)
         except asyncio.CancelledError:
@@ -7826,8 +8044,21 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     alert. A whole-directory outage aborts too, but it is audited as ``auth.ad_reconcile_skipped``
     and pages nothing: the accounts are fine, the directory is not, and the pass is fail-open.
 
-    Reads the RETURNED plan, so it sees only a pass that finished. A pass that raised part-way has
-    already audited the revocations it applied; those rows stand, and no alert is raised for them."""
+    Reads the RETURNED plan, so it sees only a pass that finished. A failed write of the pass's own
+    held, aborted, skipped or unkeyed-binding row no longer ends the pass (BACKLOG #2137): the
+    service logs it at ERROR and returns the plan, so these alerts still fire. A pass that raised
+    part-way for another reason, such as inside one revocation, has already audited the revocations
+    it applied before that point; those rows stand, and no alert is raised for them.
+
+    Each standing alert also gets its inverse, which pages nobody and resolves the open instance
+    (BACKLOG #2136): ``ad_reconcile_breaker_cleared`` and ``ad_reconcile_hold_released``. The auth
+    service decides when a pass is evidence of a clear (``plan.breaker_clear``, ``plan.hold_clear``;
+    see ``AuthService._mark_reconcile_clears``), so the alert and the service read one predicate.
+    An outage or a pass with no signed-in account sets neither. The inverse is raised on EVERY pass
+    that sets its flag, not once per clear: resolving is an idempotent update, and a resolve the
+    notifier failed to write is retried that way. A process clears only what it watched open, so a
+    fresh process resolves neither alert an earlier run left open (:func:`_without_inherited_clears`
+    drops that clear); ``_mark_reconcile_clears`` states that rule once."""
     if plan.directory_outage:
         return
     if plan.aborted is not None:
@@ -7843,14 +8074,122 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
         for revocation in plan.revocations:
             sink.ad_session_revoked(revocation.username, reason=revocation.reason)
     if plan.hold:
-        # LAST, matching the auth service's order: a sink that raises here cannot suppress the
-        # breaker's or a revocation's alert for the same pass.
+        # After the breaker and the revocations, matching the auth service's order: a sink that
+        # raises here cannot suppress the breaker's or a revocation's alert for the same pass.
         sink.ad_reconcile_held(
             "directory-reconciler",
             reason=HOLD_REASON,
             undetermined=plan.undetermined,
             detail=auth.directory_reconcile_hold or HOLD_REASON,
         )
+    # The inverses LAST: they page nobody, so a sink raising on one cannot cost a page above.
+    if plan.breaker_clear:
+        sink.ad_reconcile_breaker_cleared("directory-reconciler")
+    if plan.hold_clear:
+        sink.ad_reconcile_hold_released("directory-reconciler")
+
+
+def _without_clears(plan: ReconcilePlan) -> ReconcilePlan:
+    """The plan with every ``*_clear`` flag set False, so it resolves no alert instance.
+
+    BACKLOG #2136. The evidence for a clear is this process's
+    own: its strike and outcome records, and its own view of the directory. The instance it would
+    resolve is shared by every process on the store. Where more than one reconciler runs, one
+    process can read clean while another's condition still stands, and resolving on that would
+    clear a breaker or a hold that is still in force. There is no shared state to decide it from:
+    the strike and outcome records are process-local by design, and the instance row carries no
+    node. A leader gate does not reach it either. An engine shard runs no ``[cluster]`` lease, so
+    each one reads as leader, and a ``[cluster]`` standby still runs its own reconciler and can
+    open the instance a leader would then clear.
+
+    So where :func:`_is_sole_reconciler` sees another reconciler, a clear is missed instead. The
+    trip and the hold still page, from each process that sees them, and an operator resolves the
+    instance by hand. That test does not see every reconciler on the store; the code names at
+    least the cases it misses in ``AuthService._mark_reconcile_clears``. Matched by field name, so
+    a flag a later item adds is covered without an edit here."""
+    cleared: dict[str, Any] = {f.name: False for f in fields(plan) if f.name.endswith("_clear")}
+    return replace(plan, **cleared)
+
+
+#: Each ``*_clear`` flag on a plan, and the alert instance its inverse resolves (BACKLOG #2136).
+_RECONCILE_CLEAR_RESOLVES: Final[Mapping[str, str]] = {
+    "breaker_clear": "ad_reconcile_aborted",
+    "hold_clear": "ad_reconcile_held",
+}
+
+
+async def _open_reconcile_instances(store: Store) -> dict[int, str] | None:
+    """``id -> event_type`` of the open or acknowledged reconcile alert instances, or None when the
+    read failed, which is logged.
+
+    Catches ``Exception``, on purpose and only around this one read. Its failures are no closed
+    family: each backend's driver errors, the engine's own ``RuntimeError``, aiosqlite's
+    ``ValueError`` on a closed connection, and a cipher error opening a stored ``reason``. One
+    that escaped would cost the pass's pages, or the whole pass, through the loop's own catch. Any
+    failure here only drops a clear, which is a missed clear, never a false one."""
+    try:
+        rows = await store.list_active_alert_instances(allowed_channels=["directory-reconciler"])
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        _log.warning(
+            "directory reconcile: alert state could not be read (%s), so this pass resolves no "
+            "reconcile alert",
+            type(exc).__name__,
+        )
+        return None
+    resolvable = set(_RECONCILE_CLEAR_RESOLVES.values())
+    return {row.id: row.event_type for row in rows if row.event_type in resolvable}
+
+
+async def _without_inherited_clears(
+    plan: ReconcilePlan,
+    store: Store,
+    inherited: frozenset[int],
+) -> ReconcilePlan:
+    """The plan with each clear dropped whose instance this process did not watch open (BACKLOG
+    #2136).
+
+    ``inherited`` holds the instances already open before this process's first pass. Each alert has
+    one instance row, so a trip or a hold of this process's own folds into an earlier run's open
+    row, and the auth service's evidence covers only the accounts this process saw. The earlier
+    run's accounts may have left across the restart. So while an inherited row is still open, its
+    clear is dropped and an operator resolves it. Once an operator has, the next trip or hold opens
+    a new row, and that one is this process's own. ``AuthService._mark_reconcile_clears`` states
+    the rule this keeps. A flag this map does not name is dropped too, and so is every flag when
+    the read fails: a missed clear, never a false one."""
+    named = set(_RECONCILE_CLEAR_RESOLVES)
+    flags = {f.name: getattr(plan, f.name) for f in fields(plan) if f.name.endswith("_clear")}
+    if not any(flags.values()):
+        return plan
+    now_open = await _open_reconcile_instances(store)
+    if now_open is None:
+        return _without_clears(plan)
+    stale = {event for row_id, event in now_open.items() if row_id in inherited}
+    kept: dict[str, Any] = {
+        flag: value and flag in named and _RECONCILE_CLEAR_RESOLVES[flag] not in stale
+        for flag, value in flags.items()
+    }
+    return replace(plan, **kept)
+
+
+def _is_sole_reconciler(
+    coordinator: ClusterCoordinator,
+    registry_filter: object | None,
+    runner: RegistryRunner | None,
+) -> bool:
+    """Whether this process can be the only directory reconciler on its store (BACKLOG #2136).
+
+    Not on a ``[cluster]`` node. A ``serve --shard`` process, which passes a registry filter, is
+    alone only when its loaded graph pins no shard universe: ``all_shard_ids`` is set when the
+    config names two or more shards, and a reload cannot change it (ADR 0073). So ``supervise``
+    over an untagged config, which runs one ``--shard`` child, still resolves. A shard with no
+    graph loaded is not presumed alone."""
+    if coordinator.is_clustered():
+        return False
+    if registry_filter is None:
+        return True
+    return runner is not None and runner.registry.all_shard_ids is None
 
 
 _INITIAL_CREDENTIAL_MAX_LEAD = 24 * 3600.0  # warn at most this long before the deadline
@@ -8043,10 +8382,10 @@ def create_managed_app(
 
     Pass ``store_settings`` for full backend selection (the service path), or ``db_path`` (+optional
     ``synchronous``) as a SQLite shortcut. ``config_dir`` loads the code-first Connection/Router/
-    Handler graph. ``auth_settings`` (when enabled) attaches an :class:`AuthService` and seeds the
-    built-in roles; it creates no account (ADR 0183). With unset or disabled ``auth_settings`` every
-    protected route is refused (503) unless the caller passes ``allow_no_auth=True``, the same opt-in
-    :func:`create_app` takes; beside enabled ``auth_settings`` that opt-in raises ``ValueError``.
+    Handler graph. ``auth_settings`` attaches an :class:`AuthService` and seeds the built-in roles;
+    it creates no account (ADR 0183). With no ``auth_settings`` every protected route is refused
+    (503) unless the caller passes ``allow_no_auth=True``, the same opt-in :func:`create_app` takes;
+    beside ``auth_settings`` that opt-in raises ``ValueError``.
     The store is opened via the
     backend-agnostic :func:`~messagefoundry.store.open_store`. ``api_listener`` is the engine's own
     ``(host, port)`` (from ``[api]``), reserved so no inbound listener can be wired onto the API's port
@@ -8064,13 +8403,12 @@ def create_managed_app(
             raise ValueError("create_managed_app requires either store_settings or db_path")
         store_settings = sqlite_settings(db_path, synchronous=synchronous)
     resolved = store_settings
-    # create_app can ignore the opt-in beside an enabled service, because it is handed the service
-    # already attached. Here the service attaches in the lifespan, so an app that never ran it
-    # would answer as the system identity. The combination is refused instead.
-    if allow_no_auth and auth_settings is not None and auth_settings.enabled:
+    # The open mode is the opt-in with no service (vault BACKLOG #2825), the rule create_app holds.
+    # Checked here and not left to create_app: the service attaches only in the lifespan.
+    if allow_no_auth and auth_settings is not None:
         raise ValueError(
-            "create_managed_app: allow_no_auth=True was passed beside enabled auth_settings; "
-            "pass the opt-in only when sign-in is off"
+            "create_managed_app: allow_no_auth=True was passed beside auth_settings; pass the "
+            "opt-in only with no auth_settings, since settings always require sign-in"
         )
 
     @asynccontextmanager
@@ -8382,6 +8720,7 @@ def create_managed_app(
         start_fingerprint_failure: str | None = None
         start_outcome: _StartOutcome | None = None
         start_config: _StartConfigComparison | None = None
+        start_loaded: _LoadedConfig | None = None
         if config_dir is not None:
             # The first graph load, under the same teardown discipline as the preflights above: a
             # refusal here (a bad config, the shard guard, or the BACKLOG #1182 static-credential
@@ -8406,12 +8745,23 @@ def create_managed_app(
                 # route has a baseline from the start on (vault BACKLOG #2597). Never raises on an
                 # unreadable bundle: it leaves the baseline empty and the start goes on.
                 start_fingerprint_failure = await engine.capture_start_provenance()
-                # Before engine.start(), so no reload can have moved the baseline yet, and against
-                # this snapshot, so a later one cannot change what this start is said to have
-                # loaded. Bounded and never raises: it costs only the comparison (vault BACKLOG
-                # #2597, step 5).
+                # One snapshot of what this load put live, taken before engine.start() can spawn a
+                # convergence reload. The comparison below and the config_loaded row both use it,
+                # so neither can name a graph this start did not load (vault BACKLOG #2838).
+                # Audit only, so it never refuses a start (#2597 step 5): without it the start
+                # checks nothing, as one with no digest does, and its row names no graph.
+                try:
+                    start_loaded = _LoadedConfig.read(engine)
+                except Exception as exc:  # noqa: BLE001 - see the comment above
+                    _log.warning(
+                        "the start could not take its config snapshot (%s); it checks no config "
+                        "change, and its config_loaded row will name no graph",
+                        type(exc).__name__,
+                    )
+                # Bounded and never raises: it costs only the comparison (vault BACKLOG #2597,
+                # step 5).
                 start_outcome, start_config = await _compare_start_config(
-                    engine, engine.loaded_config_fingerprint
+                    engine, start_loaded.fingerprint if start_loaded is not None else None
                 )
                 # This process cannot vouch for a config it never checked: its flag rows say so.
                 engine.config_baseline_unchecked = start_outcome in _UNCHECKED_OUTCOMES
@@ -8446,7 +8796,7 @@ def create_managed_app(
             # (the OIDC revocation guard, #1887) stops startup before any connection starts. Only
             # construction is here; initialize() and every use of the service stay below the start.
             auth: AuthService | None = None
-            if auth_settings is not None and auth_settings.enabled:
+            if auth_settings is not None:
                 # Out-of-band security-event push (#188, ASVS 6.3.5/6.3.7) — reuses the [alerts] SMTP
                 # transport, sent to each affected user's own address. The notifier is wired only when the
                 # [auth].notify_security_events kill-switch is on AND a transport can be built (SMTP
@@ -8569,10 +8919,9 @@ def create_managed_app(
                 )
                 upload_retention_runner.start()
             # Back the COMPLETE loosening list on GET /security/posture: [auth] carries posture switches
-            # (ad_session_recheck_seconds) that security_loosenings() must see. Stashed here, OUTSIDE the
-            # `enabled` guard below, deliberately — a settings object that exists but is disabled is still
-            # the resolved settings, and stashing it only on the enabled path would make the route silently
-            # fall back to AuthSettings() defaults and report a subset. Mirrors store_settings above.
+            # (ad_session_recheck_seconds) that security_loosenings() must see. Without the stash the
+            # route would fall back to AuthSettings() defaults and report a subset. Mirrors
+            # store_settings above.
             if auth_settings is not None:
                 app.state.auth_settings = auth_settings
             # The start's config_loaded row (vault BACKLOG #2597), as early as its readers allow: the
@@ -8585,6 +8934,7 @@ def create_managed_app(
                     fingerprint_failed=start_fingerprint_failure is not None,
                     outcome=start_outcome,
                     comparison=start_config,
+                    loaded=start_loaded,
                 )
             # The auth_settings test adds nothing at runtime; it narrows the type for the reads below.
             if auth is not None and auth_settings is not None:
@@ -8691,6 +9041,12 @@ def create_managed_app(
                             auth,
                             auth_settings.ad_session_recheck_seconds,
                             notifier or LoggingAlertSink(),
+                            # BACKLOG #2136. After engine.start(), so the graph is loaded.
+                            sole_reconciler=_is_sole_reconciler(
+                                coordinator, registry_filter, engine.registry_runner
+                            ),
+                            # The store the notifier records instances in; none without one.
+                            alert_state=store if notifier is not None else None,
                         )
                     )
             yield
@@ -8755,8 +9111,8 @@ def create_managed_app(
                 # connection_stopped/queue_buildup still drains; bounded by the transport timeouts.
                 await notifier.aclose()
 
-    # Unset or disabled auth_settings no longer select the open mode: only the caller's opt-in,
-    # checked at the top, does (vault BACKLOG #2611).
+    # Settings never select the open mode: only the caller's opt-in, checked at the top, does
+    # (vault BACKLOG #2611, #2825).
     return create_app(
         lifespan=lifespan,
         # Build the opt-in uploaded-logs store in the SERVE path too (previously only the direct/test

@@ -13,6 +13,7 @@ Each test names the mutation that must turn it RED.
 from __future__ import annotations
 
 import asyncio
+import time
 from uuid import uuid4
 
 import httpx
@@ -1197,6 +1198,32 @@ async def test_the_reauth_password_leg_says_the_directory_could_not_confirm_the_
         assert ("Incorrect password." in r.text) is not unconfirmed
 
 
+@pytest.mark.parametrize("unconfirmed", [True, False], ids=["directory-refused", "bad-assertion"])
+async def test_the_passkey_leg_says_the_directory_could_not_confirm_the_account(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, unconfirmed: bool
+) -> None:
+    """BACKLOG #2239: the passkey leg asks the directory before it checks a directory account's
+    assertion, so a refusal never judged the passkey and must not say it failed. The service-level
+    refusal is pinned in tests/test_passkey_directory_recheck.py; here the answer is stubbed.
+
+    RED when: /ui/reauth/webauthn drops the directory_unconfirmed branch (the refused arm then reads
+    "passkey verification failed"), or applies it to an ordinary failed assertion (the control)."""
+    service = await _service(engine, require_mfa=False)
+    await _add(service, "op", Role.OPERATOR)
+
+    async def _refused(token: str | None, response_json: str, **_kwargs: object) -> Elevation:
+        return Elevation(directory_unconfirmed=unconfirmed)
+
+    async with _client(engine, service) as c:
+        assert (await _login(c)).status_code == 303
+        monkeypatch.setattr(service, "finish_webauthn_assertion", _refused)
+        r = await c.post("/ui/reauth/webauthn", json={"response": {}}, headers=SAME_ORIGIN)
+        assert r.status_code == 400
+        error = r.json()["error"]
+        assert (_DIRECTORY_UNCONFIRMED_TEXT in error) is unconfirmed
+        assert (error == "passkey verification failed") is not unconfirmed
+
+
 # --- the temporary credential's deadline on the factor and password pages (BACKLOG #2009) ------
 
 
@@ -1252,8 +1279,9 @@ async def test_the_factor_page_states_no_deadline_for_a_password_the_holder_chos
 def test_the_factor_page_builder_states_the_deadline_only_when_given_one() -> None:
     from messagefoundry_webconsole.pages import account as pages
 
+    # Relative to now: since BACKLOG #2298 a deadline already passed is stated as passed.
     assert "stops working at" in str(
-        pages.mfa_gate(totp_enrolled=True, credential_expires_at=1.8e9)
+        pages.mfa_gate(totp_enrolled=True, credential_expires_at=time.time() + 3600)
     )
     assert "stops working" not in str(pages.mfa_gate(totp_enrolled=True))
     # A deadline past what the clock can render drops the sentence instead of raising: this page is
@@ -1263,13 +1291,28 @@ def test_the_factor_page_builder_states_the_deadline_only_when_given_one() -> No
     )
 
 
+def test_the_factor_page_states_a_passed_deadline_as_passed() -> None:
+    """RED when: /ui/mfa tells a holder a lapsed password "stops working" at a past instant.
+
+    BACKLOG #2298 (ASVS 6.4.5). One second past the deadline the sentence is in the past tense,
+    names the one remedy left, and no longer promises a password change after this step."""
+    from messagefoundry_webconsole.pages import account as pages
+
+    passed = time.time() - 1
+    text = str(pages.mfa_gate(totp_enrolled=True, credential_expires_at=passed))
+    assert f"Your temporary password stopped working at {_console_stamp(passed)}." in text
+    assert "Ask an administrator to reset it." in text
+    assert "stops working" not in text and "After this step" not in text
+
+
 async def test_the_password_page_refuses_to_rotate_a_credential_past_its_deadline(
     engine: Engine,
 ) -> None:
     """RED when: a cookie session opened before the deadline still rotates the lapsed password.
 
-    The /ui twin of the JSON refusal: the page delegates to POST /me/password, so the refusal reaches
-    it as that route's 403, and the holder reads why and what to do next.
+    Since BACKLOG #2298 the gate ends that session before the page runs, so the browser lands on
+    sign-in, where the lapsed password is refused. The route's own refusal stays for a deadline
+    that passes inside the request.
     """
     service = await _service(engine, require_mfa=False)
     user_id = await _add(service, "op", Role.OPERATOR)
@@ -1282,10 +1325,87 @@ async def test_the_password_page_refuses_to_rotate_a_credential_past_its_deadlin
         )
         await engine.store._db.commit()
         r = await _change_password(c, current=temp)
-        assert r.status_code == 403, r.text
-        assert "temporary password has expired" in r.text
+        assert r.status_code == 303 and r.headers["location"] == "/ui/login?e=expired", r.text
     user = await service.store.get_user(user_id)
     assert user is not None and user.must_change_password is True
+
+
+async def test_the_password_page_states_a_deadline_that_passed_during_the_request(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the console's re-render of the route's in-request refusal loses its text or tense,
+    or the refusal leaves the session alive.
+
+    The deadline passes while the current password is being verified, so the gate admitted the
+    request and the route's own 403 answers it. The page re-renders why, in the past tense, and the
+    session is already ended (BACKLOG #2298)."""
+    service = await _service(engine, require_mfa=False)
+    user_id = await _add(service, "op", Role.OPERATOR)
+    temp = await _reset(service)
+    real_reproof = service._reproof
+
+    async def _slow_reproof(*args: object, **kwargs: object) -> object:
+        proof = await real_reproof(*args, **kwargs)  # type: ignore[arg-type]
+        await engine.store._db.execute(
+            "UPDATE users SET password_changed_at=? WHERE id=?", (1.0, user_id)
+        )
+        await engine.store._db.commit()
+        return proof
+
+    async with _client(engine, service) as c:
+        r = await c.post("/ui/login", data={"username": "op", "password": temp})
+        assert r.status_code == 303 and r.headers["location"] == _PASSWORD
+        tok = c.cookies.get("mf_session")
+        assert tok is not None
+        monkeypatch.setattr(service, "_reproof", _slow_reproof)
+        r = await _change_password(c, current=temp)
+        assert r.status_code == 403, r.text
+        assert "temporary password has expired" in r.text
+        assert "Your temporary password stopped working at" in r.text
+        assert "stops working" not in r.text
+    session = await engine.store.get_session(hash_token(tok))
+    assert session is not None and session.revoked_at is not None
+    user = await service.store.get_user(user_id)
+    assert user is not None and user.must_change_password is True
+
+
+async def test_the_factor_page_ends_a_session_whose_temporary_password_lapsed(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: /ui/mfa still serves a session whose temporary credential lapsed.
+
+    BACKLOG #2298 (ASVS 6.4.1). The session was opened before the deadline and the code is right.
+    The page and its submit both resolve the session first (``identity_for_token``), so both land
+    on sign-in, and nothing marks the factor or re-keys the cookie."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    _pin_totp_clock(monkeypatch, 1_000_000.0)
+    secret = await _enroll_totp(service)
+    user = await service.store.get_user_by_username("op")
+    assert user is not None
+    issued = await service.admin_reset_password(user.id, actor="test")
+    async with _client(engine, service) as c:
+        r = await c.post("/ui/login", data={"username": "op", "password": issued.password})
+        assert r.status_code == 303 and r.headers["location"] == "/ui/mfa"
+        tok = c.cookies.get("mf_session")
+        assert tok is not None
+        await engine.store._db.execute(
+            "UPDATE users SET password_changed_at=? WHERE id=?", (1.0, user.id)
+        )
+        await engine.store._db.commit()
+        t1 = 1_000_000.0 + totp.DEFAULT_PERIOD
+        _pin_totp_clock(monkeypatch, t1)
+        # The page first: it resolves the session by hand, and only the session check stops it.
+        page = await c.get("/ui/mfa")
+        assert page.status_code == 303 and page.headers["location"] == "/ui/login?e=expired"
+        r = await c.post("/ui/mfa", data={"code": totp.totp(secret, now=t1)})
+        assert r.status_code == 303 and r.headers["location"] == "/ui/login?e=expired"
+    session = await engine.store.get_session(hash_token(tok))
+    assert session is not None, "the session was re-keyed"
+    assert session.revoked_at is not None and session.mfa_verified_at is None
+    assert await engine.store.list_audit(action="auth.mfa_verified") == []
+    rows = await engine.store.list_audit(action="auth.temp_password_expired")
+    assert len(rows) == 1
 
 
 async def test_the_enrol_first_notice_offers_a_passkey_only_where_one_is_accepted(

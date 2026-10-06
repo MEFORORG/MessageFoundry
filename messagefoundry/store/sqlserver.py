@@ -148,6 +148,7 @@ from messagefoundry.store.store import (
     AlertSummary,
     AppendedAuditRow,
     AuditAppend,
+    AuditVerdict,
     CapturedResponse,
     ChannelScopeSource,
     ClaimAbortPhase,
@@ -4512,6 +4513,26 @@ class SqlServerStore:
                 raise
         return rows
 
+    async def _execute_output(self, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
+        """Run one write that carries an ``OUTPUT`` clause, commit it as a durable write, and return
+        the rows it output (BACKLOG #2283).
+
+        For a write whose caller needs to know what it changed. The rowset holds whatever
+        ``cursor.rowcount`` would, and a session-wide ``SET NOCOUNT ON`` cannot hide it, while the
+        count can come back ``-1`` for a zero-match UPDATE. ``_fetchall`` would not do: it commits
+        as a READ. The rows are drained before the commit, and ``_cursor`` frees the statement
+        handle the ``OUTPUT`` clause leaves open."""
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await cur.execute(sql, params)
+                columns = [c[0] for c in cur.description]
+                rows = await cur.fetchall()
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        return [dict(zip(columns, row)) for row in rows]  # noqa: B905
+
     def _event_stmt(
         self,
         message_id: str,
@@ -6132,7 +6153,7 @@ class SqlServerStore:
                 )
                 enc_detail = (
                     self._enc(
-                        safe_text(detail)[:200],
+                        safe_text(detail, limit=200),  # whole: a slice cuts its note (#1797)
                         aad=cell_aad("response", "detail", message_id, dest, seq),
                     )
                     if detail
@@ -6221,7 +6242,7 @@ class SqlServerStore:
         # Bound to (connection, ts, kind) — the id is IDENTITY, unknown here (ASVS 11.3.3).
         reason_enc = (
             self._enc(
-                safe_text(reason)[:200],
+                safe_text(reason, limit=200),  # whole: a slice cuts its note (#1797)
                 aad=cell_aad("connection_event", "reason", connection, now, kind),
             )
             if reason
@@ -6448,7 +6469,7 @@ class SqlServerStore:
         # both the UPDATE and the INSERT that never sees the IDENTITY id (ASVS 11.3.3).
         reason_enc = (
             self._enc(
-                safe_text(reason)[:200],
+                safe_text(reason, limit=200),  # whole: a slice cuts its note (#1797)
                 aad=cell_aad("alert_instance", "reason", event_type, connection),
             )
             if reason
@@ -10966,7 +10987,7 @@ class SqlServerStore:
         *,
         expected_anchor: tuple[int, str] | None = None,
         expected_prefix: tuple[int, str] | None = None,
-    ) -> tuple[bool, str | None]:
+    ) -> AuditVerdict:
         """Recompute the audit hash-chain in order; returns (ok, message) — see the SQLite store.
 
         Re-walking can't catch tail-truncation (the surviving prefix still verifies); pass
@@ -11869,9 +11890,15 @@ class SqlServerStore:
         return int(count) > 0
 
     async def set_user_username(
-        self, user_id: str, username: str, *, now: float | None = None
-    ) -> None:
+        self, user_id: str, username: str, *, expected_username: str, now: float | None = None
+    ) -> bool:
         # BACKLOG #1532. Cache refresh for a directory-reported rename -- see AuthStore.
+        # BACKLOG #2290: `username=?` on the old name makes it a compare-and-set; AuthStore says
+        # why a second refresh of the same row then writes nothing. The answer comes from `OUTPUT
+        # inserted.id`, never `cursor.rowcount`: a session-wide `SET NOCOUNT ON` can report -1 for
+        # a write that did land, and a lost audit of a real rename is the wrong way to fail (see
+        # `_execute_output`). The rest of this comment is about the OTHER race, two rows wanting
+        # one name, which the compare does not touch.
         # The NOT EXISTS clause makes a SEQUENTIALLY taken name a no-op rather than the pyodbc
         # IntegrityError that UNIQUE(username) would raise on a background pass.
         #
@@ -11899,11 +11926,13 @@ class SqlServerStore:
         # exactly as it does on SQLite and PostgreSQL. The divergence is real for the id column and
         # imaginary for this one, which is why the cross-backend case arm runs on all three.
         now = time.time() if now is None else now
-        await self._execute(
-            "UPDATE users SET username=?, updated_at=? WHERE id=? AND NOT EXISTS "
-            "(SELECT 1 FROM users other WHERE other.username=? AND other.id<>?)",
-            (username, now, user_id, username, user_id),
+        written = await self._execute_output(
+            "UPDATE users SET username=?, updated_at=? OUTPUT inserted.id"
+            " WHERE id=? AND username=? AND NOT EXISTS"
+            " (SELECT 1 FROM users other WHERE other.username=? AND other.id<>?)",
+            (username, now, user_id, expected_username, username, user_id),
         )
+        return bool(written)
 
     async def set_user_federated_subject(
         self,
@@ -12158,13 +12187,13 @@ class SqlServerStore:
         now = time.time() if now is None else now
         if idle_seconds is None:
             rows = await self._fetchall(
-                "SELECT * FROM sessions WHERE user_id=? AND revoked_at IS NULL AND expires_at > ?"
+                "SELECT * FROM sessions WHERE user_id=? AND revoked_at IS NULL AND expires_at >= ?"
                 " ORDER BY last_used_at DESC",
                 (user_id, now),
             )
         else:
             rows = await self._fetchall(
-                "SELECT * FROM sessions WHERE user_id=? AND revoked_at IS NULL AND expires_at > ?"
+                "SELECT * FROM sessions WHERE user_id=? AND revoked_at IS NULL AND expires_at >= ?"
                 " AND ? - last_used_at <= ? ORDER BY last_used_at DESC",
                 (user_id, now, now, float(idle_seconds)),
             )
@@ -12196,21 +12225,18 @@ class SqlServerStore:
     async def rotate_session(self, token_hash: str, *, new_token_hash: str) -> bool:
         """Re-key a live session in place (ASVS 7.2.4). See :meth:`AuthStore.rotate_session`.
 
-        Hand-rolled rather than via ``self._execute``, which discards the cursor: this op's whole
-        contract is its rowcount. ``token_hash`` is ``NVARCHAR(64)`` and a hex digest is exactly 64
-        chars, so the clustered-PK row move is width-safe."""
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                await cur.execute(
-                    "UPDATE sessions SET token_hash=? WHERE token_hash=? AND revoked_at IS NULL",
-                    (new_token_hash, token_hash),
-                )
-                count = cur.rowcount
-                await self._commit(conn)
-            except Exception:
-                await conn.rollback()
-                raise
-        return bool(count)
+        This op's whole contract is whether a row was re-keyed, so it reads an ``OUTPUT`` rowset and
+        never ``cursor.rowcount`` (BACKLOG #2283). A session-wide ``SET NOCOUNT ON`` can leave the
+        count at ``-1`` for a zero-match UPDATE, and ``bool(-1)`` would report a revoked session
+        as re-keyed; ``_exec_terminal`` reads its fence the same way for the same reason.
+        ``token_hash`` is ``NVARCHAR(64)`` and a hex digest is exactly 64 chars, so the
+        clustered-PK row move is width-safe."""
+        rows = await self._execute_output(
+            "UPDATE sessions SET token_hash=? OUTPUT inserted.token_hash"
+            " WHERE token_hash=? AND revoked_at IS NULL",
+            (new_token_hash, token_hash),
+        )
+        return bool(rows)
 
     async def revoke_session(self, token_hash: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
@@ -12219,25 +12245,36 @@ class SqlServerStore:
             (now, token_hash),
         )
 
+    async def supersede_session(self, token_hash: str, *, now: float) -> SessionRecord | None:
+        """Revoke and return in one statement (BACKLOG #2146). See :meth:`AuthStore.supersede_session`.
+
+        Through ``_execute_output`` rather than ``_fetchone``, which commits as a READ, while this is
+        a durable write (BACKLOG #2283)."""
+        rows = await self._execute_output(
+            "UPDATE sessions SET revoked_at=? OUTPUT inserted.*"
+            " WHERE token_hash=? AND revoked_at IS NULL",
+            (now, token_hash),
+        )
+        return SessionRecord.from_mapping(rows[0]) if rows else None
+
     async def revoke_user_sessions(
         self, user_id: str, *, except_token_hash: str | None = None, now: float | None = None
     ) -> int:
-        """Revoke a user's active sessions (all, or all but ``except_token_hash``). Returns the count."""
+        """Revoke a user's active sessions (all, or all but ``except_token_hash``). Returns the count.
+
+        Counted from an ``OUTPUT`` rowset, as ``rotate_session`` is (BACKLOG #2283). The count is
+        audited and returned to the API caller, and ``cursor.rowcount`` under a session-wide
+        ``SET NOCOUNT ON`` would report ``-1``. The rowset is one row per session of one user."""
         now = time.time() if now is None else now
-        sql = "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL"
+        sql = (
+            "UPDATE sessions SET revoked_at=? OUTPUT inserted.token_hash"
+            " WHERE user_id=? AND revoked_at IS NULL"
+        )
         params: list[Any] = [now, user_id]
         if except_token_hash is not None:
             sql += " AND token_hash != ?"
             params.append(except_token_hash)
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                await cur.execute(sql, tuple(params))
-                count = cur.rowcount
-                await self._commit(conn)
-            except Exception:
-                await conn.rollback()
-                raise
-        return int(count) if count is not None else 0
+        return len(await self._execute_output(sql, tuple(params)))
 
     async def enforce_session_cap(
         self,
@@ -12247,22 +12284,28 @@ class SqlServerStore:
         idle_seconds: float,
         split_mfa_pending: bool,
         now: float | None = None,
-    ) -> None:
+    ) -> int:
         """Keep a user's ``keep`` newest LIVE sessions (per group) and revoke the other unrevoked
         ones that are not stamped ahead of ``now`` (AUTH-SESS-CAP). See
         :meth:`AuthStore.enforce_session_cap`. ``TOP (?)`` binds before the subquery's WHERE, so
-        each group's parameters lead with ``keep``."""
+        each group's parameters lead with ``keep``.
+
+        Returns the count revoked, read from an ``OUTPUT`` rowset as ``revoke_user_sessions``
+        reads its own: the count is audited, and ``cursor.rowcount`` under a session-wide
+        ``SET NOCOUNT ON`` would report ``-1`` (BACKLOG #2283)."""
         if keep <= 0:
-            return
+            return 0
         now = time.time() if now is None else now
         per_group = (keep, user_id, *_session_live_params(now, idle_seconds), now)
         groups = len(_session_cap_groups(split_mfa_pending))
-        await self._execute(
-            "UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL"
+        rows = await self._execute_output(
+            "UPDATE sessions SET revoked_at=? OUTPUT inserted.token_hash"
+            " WHERE user_id=? AND revoked_at IS NULL"
             f" AND {_SESSION_NOT_AHEAD_SQL} AND {_SESSION_CAP_RANK_NOT_AHEAD_SQL}"
             f"{_mssql_session_cap_keep_sql(split_mfa_pending)}",
             (now, user_id, now, now, now, *(per_group * groups)),
         )
+        return len(rows)
 
     async def purge_expired_sessions(
         self, *, now: float | None = None, idle_seconds: float | None = None
@@ -12274,15 +12317,12 @@ class SqlServerStore:
         else:
             sql = "DELETE FROM sessions WHERE expires_at < ? OR ? - last_used_at > ?"
             params = (now, now, float(idle_seconds))
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                await cur.execute(sql, params)
-                count = cur.rowcount
-                await self._commit(conn)
-            except Exception:
-                await conn.rollback()
-                raise
-        return int(count) if count is not None else 0
+        # Through `_execute`, which owns the borrow, commit and rollback and returns the driver's
+        # count, rather than a hand-rolled copy of it (BACKLOG #2283). Unlike `rotate_session` and
+        # `revoke_user_sessions` this keeps the driver's count, which a session-wide SET NOCOUNT ON
+        # can turn to -1: the reaper ignores it and decides nothing on it, and an OUTPUT rowset
+        # would carry every purged row back each pass for a number nobody acts on.
+        return await self._execute(sql, params)
 
     async def stats(self) -> dict[str, int]:
         rows = await self._fetchall(

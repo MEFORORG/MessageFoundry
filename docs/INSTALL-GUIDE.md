@@ -348,8 +348,10 @@ by `env("…")` in the graph, and `MEFOR_<SECTION>_<KEY>` for service settings. 
 
 ## 7. Step 5 — Run / deploy an instance
 
-The engine creates no account on its own, so an instance has no one who can sign in until you create
-the first Administrator. Do that once per store, at the host, before the first start:
+The engine creates no account on its own, so nobody can manage a new instance until you create the
+first Administrator. If a start goes ahead without one, a Windows sign-in (Kerberos) can still create a
+directory account, but that account holds no role. Create the Administrator once per store, at the
+host, before the first start:
 
 1. Set the instance's store key in your shell (`MEFOR_STORE_ENCRYPTION_KEY`, or
    `[store].encryption_key_file`). Use the key the instance will run with; do not generate a new one.

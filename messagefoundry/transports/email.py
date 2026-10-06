@@ -9,6 +9,9 @@ plain-text SMTP message to a configured server and maps the outcome onto the eng
   capture, exactly like File).
 - **connect/EHLO/STARTTLS/AUTH/send failure** (``smtplib.SMTPException`` / ``OSError`` /
   ``TimeoutError``) → :class:`DeliveryError` (transient — the staged queue retries with backoff).
+- **a body that cannot be encoded for the configured ``encoding``** maps to the permanent, content-free
+  :class:`~messagefoundry.transports.base.NegativeAckError` that
+  :func:`~messagefoundry.transports.base.encode_wire_body` raises (dead-lettered, never retried).
 
 Standard library only (``smtplib`` + ``email.message``) — no new dependency (ADR 0029 §"What this
 must not break"; CLAUDE.md §7). The synchronous SMTP core is **lifted** from
@@ -69,11 +72,14 @@ from messagefoundry.config.tls_policy import (
     build_smtp_tls_context,
     smtp_login_approved,
 )
-from messagefoundry.controlchars import has_control_char
+from messagefoundry.controlchars import has_control_char, has_lone_surrogate
+from messagefoundry.domainshape import domain_shape_problem
 from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
     DestinationConnector,
+    NegativeAckError,
+    encode_wire_body,
     register_destination,
 )
 from messagefoundry.transports.mllp import InsecureHopGuard
@@ -142,14 +148,10 @@ _LOCAL_ATEXT = frozenset(string.ascii_letters + string.digits + "#$&'*+-^_`{}~")
 #: SEPARATOR). ``policy.default`` refuses a header value holding one, so a subject or sender with
 #: one would fail every send. The shared ``controlchars`` alphabet is deliberately blind to them.
 _UNICODE_LINE_BREAKS = frozenset("\u0085\u2028\u2029")
-#: The RFC 5321 size limits: a local part of 64 octets, and 254 for the whole address.
+#: The RFC 5321 size limits: a local part of 64 octets, and 254 for the whole address. The address
+#: limit holds the domain to 252 characters, so the shared rule's 253 never binds here.
 _MAX_LOCAL = 64
 _MAX_ADDRESS = 254
-#: What a recipient's domain may hold: a hostname. Matching an allowlist entry also needs this.
-_DOMAIN_TEXT = frozenset(string.ascii_letters + string.digits + "-.")
-#: The RFC 1035 limit on one label of a domain. The whole domain needs no limit of its own here:
-#: :data:`_MAX_ADDRESS` already holds it to 252 characters, under the 253 that RFC allows.
-_MAX_LABEL = 63
 
 
 def envelope_address_problem(address: str) -> str | None:
@@ -162,15 +164,11 @@ def envelope_address_problem(address: str) -> str | None:
     The ``[egress]`` recipient-domain check calls this, and so does :func:`checked_envelope`, which
     also applies it to the sender, which is ``MAIL FROM``. The text names no part of the address.
 
-    Hostname-shaped means labels of letters, digits and hyphens, 1 to 63 characters each, none
-    starting or ending with a hyphen. So an empty label, and a leading or trailing dot, are refused.
-    The last label must start with a letter. RFC 5321 section 4.1.3 writes an IP address only as a
-    bracketed address literal, which the character test already refuses, so a bare dotted quad
-    names no mail domain (vault BACKLOG #2911, a Manager decision under the owner's driver rule).
-    An all-digits test would not be enough: ``inet_aton`` reads ``10.0.0.0x1`` and ``0x7f000001``
-    as IPv4 addresses too. No public top-level domain starts with a digit, so the letter test
-    refuses every such form and no public domain. A private DNS name whose last label starts with
-    a digit is refused too."""
+    Hostname-shaped is :func:`~messagefoundry.domainshape.domain_shape_problem`, the one rule the
+    ``[egress]`` and ``[security]`` domain lists also apply at load (vault BACKLOG #2843). Its
+    docstring says what it refuses. RFC 5321 section 4.1.3 writes an IP address only as a bracketed
+    address literal, which that rule's character test refuses, so a bare dotted quad names no mail
+    domain either, and the rule refuses it (vault BACKLOG #2911)."""
     if parseaddr(address)[1] != address:
         return "does not read back as the same address"
     local, at, domain = address.rpartition("@")
@@ -183,20 +181,8 @@ def envelope_address_problem(address: str) -> str | None:
     if local.startswith("-"):
         # A leading hyphen reads as an option to some local delivery programs.
         return "has a local part that starts with a hyphen"
-    if not domain.isascii():
-        return "has a non-ASCII domain; write it in its ASCII xn-- form"
-    if set(domain) - _DOMAIN_TEXT:
-        return "has a domain that is not a host name"
-    labels = domain.split(".")
-    if not all(labels):
-        return "has a domain with an empty label, or a dot at its start or end"
-    if any(len(label) > _MAX_LABEL for label in labels):
-        return f"has a domain label longer than {_MAX_LABEL} characters"
-    if any(label[0] == "-" or label[-1] == "-" for label in labels):
-        return "has a domain label that starts or ends with a hyphen"
-    if labels[-1][0] not in string.ascii_letters:
-        return "has a domain whose last label does not start with a letter, as in an IP address"
-    return None
+    problem = domain_shape_problem(domain)
+    return None if problem is None else f"has {problem}"
 
 
 def _holds_control_char(value: str) -> bool:
@@ -326,6 +312,10 @@ class EmailDestination(DestinationConnector):
             # send, where it dead-letters as an internal error. Refuse it here, at load.
             if _holds_control_char(value):
                 raise ValueError(f"Email destination '{name}' holds a control character")
+        # Why: has_lone_surrogate (vault BACKLOG #2842). The sender needs no such check: the address
+        # rule below already refuses any non-ASCII sender.
+        if has_lone_surrogate(self.subject):
+            raise ValueError("Email destination 'subject' holds a lone surrogate")
         # Each recipient gets the rule the [egress] check applies, held here too so no build path
         # that skips that check can put an unchecked mailbox on the RCPT line. The sender is MAIL
         # FROM, where bounces go, so it gets the same rule (vault BACKLOG #2841). The headers are
@@ -506,6 +496,10 @@ class EmailDestination(DestinationConnector):
         return None
 
     def _build_message(self, payload: str) -> EmailMessage:
+        # set_content() below encodes with a bare str.encode(charset), whose UnicodeEncodeError names
+        # a character of the message and holds the whole payload on `.object`. The shared helper fails
+        # permanent and content-free instead (see its docstring). _send backs up the second encode.
+        encode_wire_body(payload, self.encoding, transport=f"Email {self.host}:{self.port}")
         msg = EmailMessage()
         msg["Subject"] = self.subject
         self._envelope.address(msg)
@@ -537,7 +531,24 @@ class EmailDestination(DestinationConnector):
             # Zero-I/O send-time backstop at the byte crossing (the tcp/x12/dicom pattern): re-assert the
             # captured cleartext decision so a reload can't route PHI around the construction-only gate.
             self._hop_guard.assert_send()
-        msg = self._build_message(payload)
+        # Backstop for set_content()'s own encode, in Direct's shape (see `encode_wire_body`). Python
+        # 3.15 encodes there with the email package's OUTPUT charset (euc-jp and shift_jis become
+        # iso-2022-jp), not the name the guard checked, so a body can pass the guard and still fail.
+        # Keep only the type name and raise outside the handler, so neither chain link holds the
+        # error whose `.object` is the whole payload.
+        msg: EmailMessage | None = None
+        failure = ""
+        try:
+            msg = self._build_message(payload)
+        except UnicodeError as exc:
+            failure = type(exc).__name__
+        if msg is None:
+            raise NegativeAckError(
+                f"Email {self.host}:{self.port}: the message could not be encoded for "
+                f"{self.encoding!r} ({failure})",
+                code="encoding",
+                permanent=True,
+            )
         try:
             with self._connect() as smtp:
                 if self.username is not None:

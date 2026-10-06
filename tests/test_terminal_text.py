@@ -166,6 +166,17 @@ def test_the_json_escape_changes_no_value_and_leaves_plain_json_alone() -> None:
     assert escape_json_for_terminal("[1,\r\n2]") == "[1,\n\n2]"
 
 
+@pytest.mark.parametrize("code", [0xD800, 0xDBFF, 0xDC80, 0xDFFF])
+def test_the_json_escape_spells_a_lone_surrogate_as_json_not_as_the_logs_text(code: int) -> None:
+    # JSON's own single backslash, so Python's json reads back the same code point. The log
+    # scrub doubles the backslash instead (controlchars._log_escape); that spelling here would
+    # read back as six characters of text. This pins the terminal side of that difference;
+    # tests/test_controlchars.py pins the log side.
+    escaped = escape_json_for_terminal('{"a":"' + chr(code) + '"}')
+    assert escaped == '{"a":"\\u' + f"{code:04x}" + '"}'
+    assert json.loads(escaped)["a"] == chr(code)
+
+
 # --- harness command line ----------------------------------------------------------
 
 

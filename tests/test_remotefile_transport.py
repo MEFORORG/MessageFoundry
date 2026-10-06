@@ -18,6 +18,7 @@ import ipaddress
 import logging
 import posixpath
 import ssl
+import traceback
 from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
@@ -41,6 +42,7 @@ from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 from messagefoundry.config.wiring import Ftp, Sftp, WiringError
 from messagefoundry.keywrap import KeyWrapRefused
+from messagefoundry.redaction import safe_exc
 from messagefoundry.transports import build_destination, build_source, remotefile
 from messagefoundry.transports.base import (
     DeliveryError,
@@ -65,6 +67,13 @@ from messagefoundry.transports.remotefile import (
     _SftpClient,
 )
 from tests._approved_key_wrap import approved_pkcs8_pem
+from tests.test_encode_wire_body import (
+    CJK_CHAR,
+    PAYLOAD,
+    SECRET_CHAR,
+    _assert_content_free,
+    _escapes,
+)
 
 #: Small chunk for the fake client, so a test body is delivered in several pieces without needing a
 #: multi-MiB fixture. The shipped chunk size is asserted separately, below.
@@ -178,15 +187,17 @@ def _install_client(monkeypatch: pytest.MonkeyPatch, client: _FakeClient) -> Non
 
 
 def _dest(
-    monkeypatch: pytest.MonkeyPatch, client: _FakeClient, **over: Any
+    monkeypatch: pytest.MonkeyPatch, client: _FakeClient, *, protocol: str = "sftp", **over: Any
 ) -> RemoteFileDestination:
+    """``protocol`` is ``sftp``, ``ftps`` or ``ftp``. The client is faked, so it only changes which
+    factory builds the settings."""
     _install_client(monkeypatch, client)
     base: dict[str, Any] = dict(host="sftp.example.com", remote_dir="/in")  # noqa: C408
     base.update(over)
+    spec = Sftp(**base) if protocol == "sftp" else Ftp(tls=protocol == "ftps", **base)
+    assert spec.settings["protocol"] == protocol
     d = build_destination(
-        Destination(
-            name="OB_REMOTE", type=ConnectorType.REMOTEFILE, settings=Sftp(**base).settings
-        ),
+        Destination(name="OB_REMOTE", type=ConnectorType.REMOTEFILE, settings=spec.settings),
         egress=EgressSettings(deny_by_default=False),
     )
     assert isinstance(d, RemoteFileDestination)
@@ -424,6 +435,94 @@ async def test_destination_cleans_temp_after_a_connection_fault_on_rename(
     with pytest.raises(NegativeAckError):
         await dest.send("x")
     assert any(op == "remove" for op, _ in client.ops)
+
+
+# --- an unencodable payload fails content-free (see encode_wire_body) ------------------------------
+
+#: Synthetic. The marker must not be reachable from the raised error by the routes tested below.
+_BODY_MARKER = "ZZSYNTHMARKER42"
+_NON_ASCII_BODY = f"{PAYLOAD}NTE|1||{_BODY_MARKER}\r"
+_LONE_SURROGATE = "\ud800"
+#: At least the three outbound protocols shipped today. They share one _upload, and the client is
+#: faked, so the protocol only changes which settings build the destination.
+_PROTOCOLS = ["sftp", "ftps", "ftp"]
+
+
+@pytest.mark.parametrize("protocol", _PROTOCOLS)
+@pytest.mark.parametrize(
+    ("encoding", "payload"),
+    [
+        ("us-ascii", _NON_ASCII_BODY),
+        ("latin-1", _NON_ASCII_BODY),
+        # The shipped default: utf-8 refuses only a lone surrogate. This pins the helper on the
+        # default codec; it does not claim such a payload can reach send() past the store.
+        ("utf-8", _NON_ASCII_BODY + _LONE_SURROGATE),
+    ],
+    ids=["us-ascii", "latin-1", "utf-8-lone-surrogate"],
+)
+async def test_an_unencodable_payload_is_a_permanent_content_free_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    protocol: str,
+    encoding: str,
+    payload: str,
+) -> None:
+    """Classified as Direct classifies it. The refusal crosses ``asyncio.to_thread`` and
+    ``send``'s ``_RemoteError`` arm unchanged. Nothing of the message reaches the text, the repr,
+    ``safe_exc`` (what the delivery worker stores in ``queue.last_error`` and
+    ``message_events.detail``), the formatted traceback, the chain read by attribute, or a log
+    record. Frame LOCALS still hold the payload, as on every connector; this does not test them.
+
+    Before the fix ``_upload`` raised a bare UnicodeEncodeError: its text named the offending
+    character and its ``.object`` held the whole payload. It escaped as itself, so the raises
+    fails."""
+    client = _FakeClient()
+    dest = _dest(monkeypatch, client, protocol=protocol, filename="msg.hl7", encoding=encoding)
+    with caplog.at_level(logging.DEBUG), pytest.raises(NegativeAckError) as ei:
+        await dest.send(payload)
+    exc = ei.value
+    _assert_content_free(exc, encoding=encoding)
+    # One line at a time, minus the File lines: a checkout path may itself hold "e9" or an accent.
+    frames = "".join(traceback.format_exception(exc)).splitlines()
+    surfaces = {
+        "str": str(exc),
+        "repr": repr(exc),
+        "stored error": safe_exc(exc),
+        "traceback": "\n".join(line for line in frames if not line.lstrip().startswith("File ")),
+        "log": caplog.text,
+    }
+    for where, text in surfaces.items():
+        assert _BODY_MARKER not in text, f"message content reached the {where}"
+        for ch in (SECRET_CHAR, CJK_CHAR, _LONE_SURROGATE):
+            for form in _escapes(ch):
+                assert form not in text, f"a message character reached the {where} as {form!r}"
+    # The same bytes never encode on a retry, so the row dead-letters on the first attempt. A bad
+    # MESSAGE, so neither flag may stop the whole lane.
+    assert exc.permanent is True and exc.code == "encoding"
+    assert exc.credential_fault is False and exc.config_fault is False
+    # Refused before any I/O: nothing listed, created, stored or left behind on the partner.
+    assert client.ops == [] and client.dirs == [] and client.list_calls == 0
+    assert client.files == {}
+
+
+@pytest.mark.parametrize("protocol", _PROTOCOLS)
+@pytest.mark.parametrize(
+    ("encoding", "payload"),
+    [
+        ("utf-8", _NON_ASCII_BODY),
+        ("latin-1", _NON_ASCII_BODY.replace(CJK_CHAR, "")),
+    ],
+    ids=["utf-8", "latin-1"],
+)
+async def test_an_encodable_payload_still_uploads(
+    monkeypatch: pytest.MonkeyPatch, protocol: str, encoding: str, payload: str
+) -> None:
+    """POSITIVE CONTROL. A guard that refused every non-ASCII payload would pass the test above. The
+    guard keys on the codec: latin-1 carries the e-acute it can encode."""
+    client = _FakeClient()
+    dest = _dest(monkeypatch, client, protocol=protocol, filename="msg.hl7", encoding=encoding)
+    await dest.send(payload)
+    assert client.files == {"/in/msg.hl7": payload.encode(encoding)}
 
 
 # === source ==================================================================

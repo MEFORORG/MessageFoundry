@@ -73,6 +73,7 @@ from messagefoundry.config.tls_policy import (
     build_smtp_tls_context,
     smtp_login_approved,
 )
+from messagefoundry.controlchars import has_lone_surrogate
 from messagefoundry.keywrap import key_wrap_refusal
 from messagefoundry.transports.base import (
     DeliveryError,
@@ -244,6 +245,10 @@ class DirectDestination(DestinationConnector):
         self._envelope = checked_envelope("Direct destination", sender, s.get("recipients"))
         self.recipients = list(self._envelope.recipients)
         self.subject = str(s.get("subject", ""))
+        # The Email destination's rule. _probe_build below does not catch every surrogate; the
+        # has_lone_surrogate docstring says which (vault BACKLOG #2842).
+        if has_lone_surrogate(self.subject):
+            raise ValueError("Direct destination 'subject' holds a lone surrogate")
         username = s.get("username")
         password = s.get("password")
         self.username: str | None = str(username) if username else None

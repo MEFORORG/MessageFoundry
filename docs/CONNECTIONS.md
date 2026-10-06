@@ -1238,7 +1238,7 @@ poll/write shape against a remote server, selected by an internal `protocol` set
 | `processed_subdir` / `error_subdir` | in | `.processed` / `.error` | where read / failed files go |
 | `filename` | out | `{MSH-10}.hl7` | upload name (supports `{HL7-path}` placeholders, sanitized to a **single safe filename** exactly as `File(...)`) |
 | `overwrite` | out | `false` | overwrite vs. uniquify a name collision (never a silent clobber). Left `false`, each upload first **lists** `remote_dir` to find a free name, so the account needs list permission there, and `POST /connections/{name}/test` checks it. A listing that fails writes nothing and is retried; `RemoteFileDestination._unique` states the rule (BACKLOG #1936). Any entry of the same name counts as a collision, a symlink or a directory as well as a file (BACKLOG #2082). On a write-only drop directory, only `true` delivers. It replaces any file of the same name, so pair it with a `filename` that is unique per message. |
-| `encoding` | out | `utf-8` | charset the payload is encoded with before upload (the **source** hands the retrieved bytes to the pipeline and never uses it) |
+| `encoding` | out | `utf-8` | charset the payload is encoded with before upload (the **source** hands the retrieved bytes to the pipeline and never uses it). A payload that cannot be encoded in it is a permanent `encoding` refusal. On a live send it dead-letters on the first attempt, before anything is sent, and is never retried. The error names the charset, never the content. |
 
 - **Unencrypted, RSA-2048 or larger (BACKLOG #1352).** An encrypted `private_key`, or any
   `key_password`, is refused at construction: paramiko opens an encrypted key only through MD5
@@ -1376,6 +1376,41 @@ one.
 raise `DeliveryError`, so the lane **retries** with backoff. **Other 4xx** (and a refused **3xx
 redirect**) raise a permanent `NegativeAckError`, so the message **dead-letters immediately** rather
 than blocking the FIFO lane on a request the endpoint will never accept.
+
+**A 2xx reply over the byte bound (vault BACKLOG #2180).** The engine keeps at most 16 MiB of a reply
+body. A retry after a 2xx would send again a request the partner has already answered, so on these
+four destinations an over-size body does not cause a re-send. What happens instead depends on
+whether the engine needs the body (owner ruling 2026-10-05). This table is the one place that lists
+the four HTTP destinations, and their own sections point here.
+
+| Destination | Write | `capture_response` | An over-size body after a 2xx |
+|---|---|---|---|
+| REST | any | off | **delivered**: nothing looks inside the body, so it is dropped and a WARNING names the connection |
+| REST | any | on | **permanent refusal**, code `reply-too-large`: the reply would be stored and may be passed on, so the message dead-letters once |
+| SOAP | any | off or on | **permanent refusal**: a `Fault` can sit inside a 2xx body, so the engine cannot tell the outcome |
+| DICOMweb | any | off or on | **permanent refusal**: a `FailedSOPSequence` can sit inside a 2xx body |
+| FHIR | an update the engine sends as a transaction | off or on | **permanent refusal**: the engine reads that reply for the entry's own status, so it cannot tell the outcome |
+| FHIR | any other write | off | **delivered**, with the same WARNING |
+| FHIR | any other write | on | **permanent refusal**: the reply would be stored and may be passed on, as for REST |
+
+**Which rows the ruling itself covers.** The owner ruling of 2026-10-05 names the principle: judge
+an over-size body after a 2xx by who reads it. It does not name the FHIR rows that refuse. Refusing
+them is a reading of that ruling made when this was built (BACKLOG #2180), and the owner may reverse
+that reading. It covers every FHIR write with `capture_response` on, and an update the engine sends
+as a transaction with it off. The ruling's own wording puts FHIR on the delivered side, which is
+what the one remaining FHIR row does: any other write, with `capture_response` off.
+
+"An update the engine sends as a transaction" is `conditional="if-match"`, or `interaction="update"`
+with no `conditional`, each with the default `update_url_form`. Every other FHIR write is in the
+last two rows. That is at least a create, `conditional="conditional-update"` or `"if-none-exist"`
+under `interaction="create"` or `"update"`, an update in the path form, and a `transaction` or
+`batch` `Bundle` a Handler built. The engine does not read the reply to a Handler's own `Bundle` for
+its entry statuses.
+
+A message that dead-letters this way got a 2xx, but the engine could not read the reply. The partner
+may have applied it. On SOAP, on DICOMweb, and on a FHIR update sent as a transaction, the unread
+body may instead have held a rejection. Its stored error carries the code `reply-too-large`. Check the partner's own record before you replay it. A
+reply that is cut short or misframed after a 2xx is a separate case, and the lane still retries it.
 
 **Security.** Redirects are **refused** (a 3xx can't divert PHI to another host — ASVS 15.3.2), the URL
 scheme is constrained to `http`/`https`, and the outbound host is gated by the fail-closed
@@ -1869,7 +1904,8 @@ request is rejected; a retry won't help). A **Receiver/Server** fault → `Deliv
 unrecognized fault is treated as permanent (so a rejected request can't loop the lane). With no fault, the
 HTTP status decides (2xx delivered, 5xx retry, other 4xx / refused 3xx dead-letter); a connection/timeout
 error retries. Fault bodies are **not** echoed into errors/logs (they may carry PHI) — only the fault role
-+ HTTP status.
++ HTTP status. A 2xx whose body is over the byte bound cannot be inspected, so it is a permanent refusal
+and is not sent again: see *A 2xx reply over the byte bound* under REST.
 
 **Security & idempotency.** Same hardening as REST (redirects refused, scheme constrained, host gated by
 `[egress].allowed_http`, secrets via `env()`). Delivery is **at-least-once**, so a retry **re-sends** —
@@ -2015,7 +2051,7 @@ report, plain text); this connector delivers it to `host:port` from `sender` to 
 | `password` | str / `env()` / None | `None` | SMTP `AUTH` password — `env()` only. AUTH is sent **over TLS only**; a cleartext-credential config is refused. |
 | `use_tls` | bool | `True` | STARTTLS by default. `False` puts the message **body** (PHI) on the wire in the clear, so it is doubly gated. **The opt-in** is one of exactly two things you can actually set: `MEFOR_ALLOW_INSECURE_TLS` (process-global — it weakens *every* connector in the process, and it is read through the **clamped** check, so it cannot relax an enforcing production-PHI hop), or this connection's `cleartext_accepted = true` with its mandatory `cleartext_reason` (per-hop, audited — see [Declaring a cleartext hop](#declaring-a-cleartext-hop-cleartext_accepted), and prefer it). **And** the hop then goes through the shared authority (#200, ADR 0092 as amended by ADR 0153): loopback ALLOWs, a `cleartext_accepted` hop **WARNs + audits** (never a silent allow), a non-enforcing instance WARNs, everything else REFUSES — **no data label relaxes it**. A connection whose hop is secured by other means can [attest it](#attesting-a-hop-secure-tls_hop_attested) instead, which ALLOWs it. SMTP AUTH over cleartext stays refused OUTRIGHT, by any route. Matches the raw-TCP / X12 / plaintext-DICOM / anonymous-FTP cleartext egress paths. |
 | `timeout_seconds` | float | `30.0` | |
-| `encoding` | str | `"utf-8"` | |
+| `encoding` | str | `"utf-8"` | The body's charset. A body that cannot be encoded in it is a permanent `encoding` refusal. It dead-letters on the first attempt and is never retried. The error names the charset, never the content. |
 
 The egress host is **gated by `[egress].allowed_smtp`** — add the host or the destination is refused at
 config load/reload. On a **PHI** instance (every built-in env name by default,
@@ -2224,6 +2260,9 @@ What a site needs to know:
 - If a server answers 2xx while the entry's own `response.status` failed, the message is classified on
   that entry status, like any other HTTP status. An entry status that does not read as an HTTP code is
   logged as a warning, and the 2xx reply counts as delivered.
+- A reply body over the byte bound is not kept, so the engine cannot see the entry's status. The
+  update is then a permanent refusal, code `reply-too-large`, in either capture mode, and it is not
+  sent again. It is not recorded as delivered. See *A 2xx reply over the byte bound* under REST.
 - `capture_response_headers` still captures `ETag`, `Location` and `Last-Modified`. They come from the
   entry, which describes the updated resource, and an entry field hides a reply header of the same
   name. They keep the entry's formats: `Last-Modified` is a FHIR instant, not an HTTP-date, and
@@ -2300,7 +2339,8 @@ never an error). On an error status the HTTP code decides, refined by the `Opera
 4xx whose `issue.code` is in the FHIR **transient** IssueType group (`lock-error`/`throttled`/`timeout`/
 `incomplete`), or `408`/`429` → retry; any other 4xx / refused 3xx → **dead-letter**. The HTTP status wins
 when in doubt (a 5xx stays transient). `OperationOutcome`/reply bodies are **not** echoed into errors/logs
-(they may carry PHI) — only the HTTP status + a redacted URL.
+(they may carry PHI) — only the HTTP status + a redacted URL. For a 2xx whose body is over the byte bound,
+see *A 2xx reply over the byte bound* under REST.
 
 **Security & idempotency.** Same hardening as REST (redirects refused, scheme constrained, host gated by
 `[egress].allowed_http`, cleartext-credential refusal, optional detached-JWS signing, secrets via `env()`).
@@ -2479,6 +2519,8 @@ The **bind interface** is the service-level `[inbound].bind_host` (or a per-conn
 >
 > **CAUTION: `calling_ae_allowlist` does not satisfy this gate on its own (BACKLOG #316).** It used to: the three controls were counted as co-equal. But a Calling AE Title is a string the caller asserts about **itself** in the association request — no key, no signature, nothing to verify — and AE Titles are published in conformance statements and visible in any capture. An SCP whose only control was an AE-title list was reachable by anyone who could route to it and knew one string, while passing a check named "fail-closed peer controls". **Keep it — it is still enforced at association time and is a genuinely useful filter** (it catches a misrouted sender and pins intent). It simply has to be **paired** with `source_ip_allowlist` or mTLS off-loopback.
 >
+> **CAUTION: a `source_ip_allowlist` counts only when it is narrow (vault BACKLOG #2622).** Every entry must meet the HTTP intake gate's prefix floors, applied by the same function; [DEPLOYMENT.md](DEPLOYMENT.md) states them. So `["0.0.0.0/0"]` or `["::/0"]` does not count, and one too-wide entry stops the whole list counting. With no mTLS, an SCP with such a list is refused at construction like one with no list. **mTLS still counts by presence:** `tls` + `tls_ca_file` admits any client certificate that CA signed, with no subject binding. The HTTP gate refuses that shape; this gate does not yet.
+>
 > **WARNING: the construction gate counts controls, so the wrong spelling passes it.** Set
 > `calling_ae_allowlist` (AE titles are attacker-chosen strings on an unauthenticated association —
 > trivially spoofable) plus a `[inbound].source_ip_allowlist` in `messagefoundry.toml` and the SCP
@@ -2640,7 +2682,9 @@ handling. It needs **no `[dicom]` extra** (the object is opaque bytes).
 
 **Status classification.** A 2xx whose `dicom+json` body carries a per-instance **FailedSOPSequence**
 (`00081198`) → the instance was rejected → permanent dead-letter; a 409 (all instances failed) / other 4xx /
-a refused 3xx → permanent; 5xx / 408 / 429 / connection-timeout → transient retry. **PHI:** the response can
+a refused 3xx → permanent; 5xx / 408 / 429 / connection-timeout → transient retry. A 2xx whose body is
+over the byte bound cannot be checked for a FailedSOPSequence, so it is a permanent refusal and is not sent
+again: see *A 2xx reply over the byte bound* under REST. **PHI:** the response can
 name patient/study identifiers, so it is never logged — only the HTTP status and a redacted URL are.
 
 ```python
@@ -3326,6 +3370,15 @@ Facts that are easy to get wrong, stated plainly first:
   `_fetchall` / `_fetchone` / `_execute` helpers, which were routed through the same chokepoint for
   that reason. Take the scope as written; the two backends reach it differently and this setting is
   not a statement about every code path that can touch a pool.
+
+  **Two Postgres session writes wait without the bound, on purpose (BACKLOG #2283).**
+  `rotate_session` and `revoke_user_sessions` mostly run after their caller's own change has
+  committed: a password reset, a disable, a role change, a completed second factor. Nothing retries
+  them, so they wait for a free connection rather than fail after that change. Callers with no
+  earlier write, such as "sign out everywhere else", wait the same way. On SQL Server both stay
+  bounded, because `_acquire` is that backend's sole borrow site. There, at the limit, the request
+  fails after the change has committed. A revoke then leaves the account's other sessions
+  unrevoked. A rotation leaves the session on its old token, now carrying the factor it just proved.
 
   **Behaviour at the store-pool acquire limit.** The borrow raises `StoreAcquireTimeout` with a
   numeric, PHI-free message naming the backend and the knob. It is an ordinary `Exception`, so it

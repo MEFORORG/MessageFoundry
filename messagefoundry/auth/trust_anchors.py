@@ -57,6 +57,14 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
    the DICOM SCP) gets the same checks. The connector loads its CA through
    :func:`inbound_ca_cadata` when it builds its context, and :func:`registry_anchor_specs` feeds the
    audited preflight each time a graph is loaded.
+8. **A changed settings anchor takes a restart, and a reload says so** (BACKLOG #2185). The three
+   settings anchors above are loaded once, when their consumer is built, and no reload rebuilds
+   one. A reload still re-checks each file. :func:`verified_anchor_cadata` records the fingerprint
+   of the bytes it hands each consumer. When the bytes on disk differ from those, the settings
+   preflight logs a WARNING and audits a ``restart_required`` row. It does so on every reload whose
+   anchor check passes, until the engine restarts. Item 3's ``changed`` row cannot do this job. It
+   compares with the last AUDITED fingerprint, so it goes quiet after one reload while the
+   consumers still trust the start-time bytes.
 """
 
 from __future__ import annotations
@@ -97,7 +105,9 @@ log = logging.getLogger(__name__)
 #: ``acl_indeterminate`` (the ACL could not be determined, BACKLOG #1142), ``path_insecure`` and
 #: ``path_indeterminate`` (the path check, BACKLOG #1142 directory arm), and ``pem_refused`` (the
 #: file is not text the TLS library loads as trust anchors: no PEM block or a TRUSTED CERTIFICATE
-#: block since BACKLOG #1142 slice 3, and anything its ``cadata=`` load refuses since #2025).
+#: block since BACKLOG #1142 slice 3, and anything its ``cadata=`` load refuses since #2025), and
+#: ``restart_required`` (a reload found a settings anchor whose bytes differ from the ones its
+#: consumer loaded, BACKLOG #2185).
 AUDIT_ACTION = "auth.trust_anchor"
 
 
@@ -163,8 +173,27 @@ _UTF8_BOM = b"\xef\xbb\xbf"
 _PEM_BEGIN = b"-----BEGIN "
 _PEM_END = b"-----END "
 _PEM_TRUSTED = b"-----BEGIN TRUSTED CERTIFICATE-----"
+#: The RFC 1421 headers of an encrypted PEM block, lower-cased (BACKLOG #2270, :func:`anchor_cadata`).
+_PEM_ENCRYPTION_HEADERS = ("proc-type:", "dek-info:")
 #: The source-location tail CPython appends to an ``ssl.SSLError`` message, dropped from a refusal.
 _SSL_WHERE = re.compile(r"\s*\(_ssl\.c:\d+\)$")
+
+
+def _has_encryption_header(text: str) -> bool:
+    """Whether an RFC 1421 encryption header name appears anywhere after the first ``-----BEGIN ``
+    in ``text``, the exact text the TLS load is handed (BACKLOG #2270).
+
+    It models no block structure, on purpose. OpenSSL finds a BEGIN in 254-byte pieces of a long
+    line, and ends a block where its own reader says, so a line model here disagrees with it at the
+    edges. A code review measured two such bypasses of an earlier line-based check, each ending in
+    a ``cadata=`` load that did not return. Every header OpenSSL could act on follows a BEGIN it
+    read, and that BEGIN is in the text verbatim. So this errs wide: a header name in a comment
+    between two blocks refuses too. A base64 body holds no ``:``, so no certificate line matches."""
+    begin = text.find("-----BEGIN ")
+    if begin < 0:
+        return False
+    tail = text[begin:].lower()
+    return any(header in tail for header in _PEM_ENCRYPTION_HEADERS)
 
 
 def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
@@ -205,8 +234,24 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
     the verdict is OpenSSL's own. Measured on CPython 3.14.6 / OpenSSL 3.5.7: a lone ``X509 CRL``
     block refuses, and a well-formed CRL beside a certificate, in either order, loads the one
     certificate and no CRL, so that file still passes. The throwaway context is discarded. It checks
-    that the text loads, not that a certificate in it is a CA; a leaf still loads here."""
+    that the text loads, not that a certificate in it is a CA; a leaf still loads here.
+
+    **An encryption header inside a block refuses, before that load** (BACKLOG #2270). A
+    ``Proc-Type: 4,ENCRYPTED`` header sends OpenSSL to its password callback, and ``cadata=`` sets
+    none, so OpenSSL falls back to its default one, which reads the terminal. The POSIX TTY run the
+    row asked for was NOT done: the box this was built on is Windows. What was measured there, on
+    CPython 3.14.6 / OpenSSL 3.5.7 in a child process with stdin on the null device: the
+    ``cadata=`` load of a certificate block carrying ``Proc-Type: 4,ENCRYPTED`` and ``DEK-Info:``
+    did not return within 20 seconds and was killed, while ``cafile=`` on the same bytes refused at
+    once with ``PEM lib``. So a start or a reload could hang on this file. A CA certificate never
+    carries an RFC 1421 encryption header, so ``Proc-Type:`` and ``DEK-Info:`` both refuse, in any
+    case, anywhere after the first BEGIN of the text the load would get, and OpenSSL is never
+    handed that text (:func:`_has_encryption_header`). That is wider than the hang: an encrypted
+    private-key block beside a certificate loads through ``cadata=``, and refuses here, because a
+    trust anchor has no use for a key, and so does the header name in a comment between two
+    blocks. The same header in a comment above the first block still passes."""
     kept: list[bytes] = []
+
     inside = False
     blocks = 0
     fresh = True  # the first line, or the line after an END line: where OpenSSL drops a BOM
@@ -215,7 +260,7 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
         fresh = False
         if line.startswith(_PEM_TRUSTED):
             raise TrustAnchorError(
-                f"{spec.setting}: the trust anchor '{spec.path}' holds an OpenSSL trusted-certificate block, "
+                f"{spec.setting}: the trust anchor {spec.path!r} holds an OpenSSL trusted-certificate block, "
                 "which the engine does not load. Re-export each certificate in it as a plain "
                 "CERTIFICATE block; openssl x509 -in <one cert> -out <plain.pem> converts one "
                 "certificate per run"
@@ -230,22 +275,30 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
             fresh = True
     if not blocks:
         raise TrustAnchorError(
-            f"{spec.setting}: the trust anchor '{spec.path}' holds no PEM block, so it names no "
+            f"{spec.setting}: the trust anchor {spec.path!r} holds no PEM block, so it names no "
             "certificate to trust"
         )
     try:
         text = b"".join(kept).decode("ascii")
     except UnicodeDecodeError as exc:
         raise TrustAnchorError(
-            f"{spec.setting}: the trust anchor '{spec.path}' has a non-ASCII byte inside a PEM "
+            f"{spec.setting}: the trust anchor {spec.path!r} has a non-ASCII byte inside a PEM "
             "block, so it is not a readable certificate"
         ) from exc
+    if _has_encryption_header(text):
+        raise TrustAnchorError(
+            f"{spec.setting}: the trust anchor {spec.path!r} holds a PEM block with an encryption "
+            "header (Proc-Type or DEK-Info), such as an encrypted certificate or private key. A "
+            "trust anchor needs only plain CERTIFICATE blocks, and loading an encrypted one can make "
+            "the TLS library wait for a password. Remove the encrypted block, or export the CA "
+            "certificate as a plain CERTIFICATE block"
+        )
     try:
         ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).load_verify_locations(cadata=text)
     except ssl.SSLError as exc:
         why = _SSL_WHERE.sub("", str(exc))
         raise TrustAnchorError(
-            f"{spec.setting}: the TLS library cannot load the trust anchor '{spec.path}' ({why}). "
+            f"{spec.setting}: the TLS library cannot load the trust anchor {spec.path!r} ({why}). "
             "Every PEM block in it must be well-formed, and at least one must be a plain "
             "CERTIFICATE block. A file holding only a CRL names no certificate to trust; a hop "
             "that checks revocation reads its CRL from its own CRL setting"
@@ -573,6 +626,7 @@ def dacl_is_owner_only(path: str | os.PathLike[str]) -> bool | None:
     * POSIX: no group- or other-WRITE bit (``mode & 0o022 == 0``).
     * Windows: read the DACL with ``icacls <path>`` (no modifying flags) and flag any broad-group ACE
       that grants a write-capable right."""
+    name = os.fspath(path)  # the one string icacls or stat checks, and every log line names
     if os.name == "nt":
         try:
             # icacls is pinned to its absolute System32 path and invoked without a shell; the path is
@@ -583,7 +637,7 @@ def dacl_is_owner_only(path: str | os.PathLike[str]) -> bool | None:
             # icacls.exe printing a clean DACL would turn a group-writable anchor into an accepted
             # one (BACKLOG #1769).
             result = subprocess.run(  # nosec B603 B607
-                [_system_exe("icacls.exe"), os.fspath(path)],
+                [_system_exe("icacls.exe"), name],
                 check=False,
                 capture_output=True,
                 # icacls writes the OEM code page to a pipe. Decoding it with the default ANSI code
@@ -595,32 +649,32 @@ def dacl_is_owner_only(path: str | os.PathLike[str]) -> bool | None:
                 errors="replace",
             )
         except OSError as exc:
-            log.warning("icacls could not read the DACL of %s: %s", path, exc)
+            log.warning("icacls could not read the DACL of %r: %s", name, exc)
             return None
         if result.stdout is None:
-            log.warning("icacls returned no readable output for %s", path)
+            log.warning("icacls returned no readable output for %r", name)
             return None
         if result.returncode != 0:
             log.warning(
-                "icacls could not read the DACL of %s (exit %s): %s",
-                path,
+                "icacls could not read the DACL of %r (exit %s): %r",
+                name,
                 result.returncode,
                 (result.stderr or result.stdout or "").strip(),
             )
             return None
-        parsed = owner_only_from_icacls(result.stdout, anchor_path=os.fspath(path))
+        parsed = owner_only_from_icacls(result.stdout, anchor_path=name)
         if parsed is None:
             log.warning(
-                "icacls exited 0 for %s but its output carried no readable ACE, granted write to a "
+                "icacls exited 0 for %r but its output carried no readable ACE, granted write to a "
                 "bare principal name it does not recognise, or granted write on a first line whose "
                 "path echo did not match; the DACL could not be determined",
-                path,
+                name,
             )
         return parsed
     try:
-        mode = Path(path).stat().st_mode
+        mode = Path(name).stat().st_mode
     except OSError as exc:
-        log.warning("could not stat %s to check its permissions: %s", path, exc)
+        log.warning("could not stat %r to check its permissions: %s", name, exc)
         return None
     return (mode & 0o022) == 0
 
@@ -666,7 +720,7 @@ def _acl_message(spec: AnchorSpec) -> str:
     leaves read, so an engine account that reads the anchor through that group still can. The
     rights it names are :data:`_WRITE_RIGHTS`, so the text cannot drift from the check."""
     lines = [
-        f"{spec.setting}: the trust anchor '{spec.path}' is writable by a non-owner (a group or "
+        f"{spec.setting}: the trust anchor {spec.path!r} is writable by a non-owner (a group or "
         "world principal can write it). Anyone who can modify it can substitute the CA and defeat "
         "authentication. Restrict it to owner-only write."
     ]
@@ -761,10 +815,10 @@ def _path_fix(verdict: AnchorVerdict) -> list[str]:
 
 def _path_message(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
     lines = [
-        f"{spec.setting}: the trust anchor '{spec.path}' can be replaced through its path, and "
+        f"{spec.setting}: the trust anchor {spec.path!r} can be replaced through its path, and "
         "anyone who replaces it can substitute the CA and defeat authentication:"
     ]
-    lines += [f"  {f.kind} '{f.path}': {f.reason}" for f in _findings(verdict, insecure=True)]
+    lines += [f"  {f.kind} {f.path!r}: {f.reason}" for f in _findings(verdict, insecure=True)]
     check = verdict.path_check
     if check is not None and check.engine:
         lines.append(
@@ -778,15 +832,15 @@ def _indeterminate_message(spec: AnchorSpec, verdict: AnchorVerdict) -> str:
     """What could not be read, object by object. The caller adds the outcome."""
     lines = [
         f"{spec.setting}: could not settle whether anyone else can replace the trust anchor "
-        f"'{spec.path}':"
+        f"{spec.path!r}:"
     ]
     if verdict.acl_ok is None:
         lines.append(
-            f"  file '{spec.path}': its permissions could not be read, or they grant write to a "
+            f"  file {spec.path!r}: its permissions could not be read, or they grant write to a "
             "principal the engine could not identify"
         )
     if verdict.path_ok is None:
-        lines += [f"  {f.kind} '{f.path}': {f.reason}" for f in _findings(verdict, insecure=False)]
+        lines += [f"  {f.kind} {f.path!r}: {f.reason}" for f in _findings(verdict, insecure=False)]
     return "\n".join(lines)
 
 
@@ -882,10 +936,29 @@ def verified_anchor_cadata(spec: AnchorSpec, *, enforcing: bool) -> str:
     ``cadata=`` loads no CRL from the anchor file. A CRL file is loaded separately, by
     :func:`~messagefoundry.config.tls_policy.harden_crl_check`, which refuses a load that would add a
     certificate to the trust store (BACKLOG #1890). The CRL file carries no pin or ACL check:
-    whoever can write it can change what is revoked, but not what is trusted."""
+    whoever can write it can change what is revoked, but not what is trusted.
+
+    It records the fingerprint of the bytes it returns, for :func:`loaded_fingerprint`."""
     verdict = evaluate_anchor(spec)
     _enforce_verdict(spec, verdict, enforcing=enforcing)
-    return anchor_cadata(verdict.data, spec)
+    text = anchor_cadata(verdict.data, spec)
+    _LOADED[(spec.label, spec.path)] = verdict.fingerprint
+    return text
+
+
+#: The fingerprint of the bytes :func:`verified_anchor_cadata` last handed a consumer in this
+#: process, keyed by the anchor's label and path (BACKLOG #2185). Every consumer of a settings
+#: anchor loads through that function: the API's client-CA context, the AD authenticator and the
+#: OIDC opener. So this holds the bytes each one trusts, and an anchor no consumer loaded has no
+#: entry. The path is in the key so two configurations in one process, such as two tests, never
+#: read each other's entry.
+_LOADED: dict[tuple[str, str], str] = {}
+
+
+def loaded_fingerprint(spec: AnchorSpec) -> str | None:
+    """The fingerprint of the bytes a consumer in this process last loaded for ``spec``, or ``None``
+    when no consumer loaded it. See :data:`_LOADED`."""
+    return _LOADED.get((spec.label, spec.path))
 
 
 # --- spec collection ----------------------------------------------------------------------------
@@ -1015,7 +1088,7 @@ def inbound_ca_cadata(name: str, settings: Mapping[str, Any], *, enforcing: bool
         return verified_anchor_cadata(spec, enforcing=enforcing)
     except OSError as exc:
         raise TrustAnchorError(
-            f"{spec.setting}: could not read the trust anchor '{spec.path}': {exc.strerror or exc}"
+            f"{spec.setting}: could not read the trust anchor {spec.path!r}: {exc.strerror or exc}"
         ) from exc
 
 
@@ -1113,10 +1186,10 @@ async def _record(store: Store, spec: AnchorSpec, event: str, **extra: object) -
     await store.record_audit(AUDIT_ACTION, actor=None, detail=json.dumps(detail))
 
 
-async def _preflight_one(store: Store, spec: AnchorSpec, *, enforcing: bool) -> None:
+async def _preflight_one(store: Store, spec: AnchorSpec, *, enforcing: bool) -> str:
     """Preflight one anchor: audit the observation (baseline / changed) FIRST so a change is durably
     recorded even when the anchor then fails its pin/ACL, record any violation, then enforce (which may
-    raise).
+    raise). Returns the fingerprint of the bytes it read and passed.
 
     **It applies every check a consumer applies**, the PEM shape of :func:`anchor_cadata` included
     (BACKLOG #1142, slice 3). The reload route runs this and builds no context to verify a peer
@@ -1182,11 +1255,12 @@ async def _preflight_one(store: Store, spec: AnchorSpec, *, enforcing: bool) -> 
     _enforce_verdict(spec, verdict, enforcing=enforcing)
     if shape_error is not None:
         raise shape_error
+    return verdict.fingerprint
 
 
 async def run_anchor_preflight(
     specs: Sequence[AnchorSpec], store: Store, *, enforcing: bool
-) -> None:
+) -> dict[str, str]:
     """The central load/reload preflight over every configured anchor. Called at serve startup (before
     any listener binds) and on a config reload (re-reading the on-disk PEMs, so a swapped anchor is
     caught). **Dormant when ``specs`` is empty** — it makes no store call and writes no audit row, so an
@@ -1195,9 +1269,35 @@ async def run_anchor_preflight(
     On a fatal violation (a pin mismatch, a file with no loadable PEM block, or under ``enforce`` an
     anchor another principal can replace or whose ACL or path could not be read, with no matching pin)
     it raises :class:`TrustAnchorError` after auditing it, so the caller refuses to start / refuses
-    the reload."""
+    the reload. Otherwise it returns each anchor's fingerprint, keyed by its label."""
+    return {spec.label: await _preflight_one(store, spec, enforcing=enforcing) for spec in specs}
+
+
+async def _report_restart_required(
+    specs: Sequence[AnchorSpec], store: Store, *, seen: Mapping[str, str]
+) -> None:
+    """Log and audit each settings anchor whose bytes on disk differ from the bytes its consumer
+    loaded (:func:`loaded_fingerprint`). An anchor no consumer loaded is skipped: a restart would
+    apply nothing there.
+
+    The compare is never against the audit chain. The last audited fingerprint moves to the new
+    bytes at the first reload that sees them, while the consumers still trust the old bytes. A
+    compare with it would go quiet from the second reload on (BACKLOG #2185)."""
     for spec in specs:
-        await _preflight_one(store, spec, enforcing=enforcing)
+        in_use = loaded_fingerprint(spec)
+        now = seen[spec.label]
+        if in_use is None or in_use == now:
+            continue
+        log.warning(
+            "%s: the trust anchor %r changed on disk since the engine loaded it (sha256 %s, was "
+            "%s). This reload checked the new file but does not apply it. The engine keeps "
+            "trusting the CA it loaded until it restarts. Restart the engine to apply the new CA",
+            spec.setting,
+            spec.path,
+            now,
+            in_use,
+        )
+        await _record(store, spec, "restart_required", fingerprint=now, in_use=in_use)
 
 
 def make_settings_anchor_preflight(
@@ -1213,7 +1313,14 @@ def make_settings_anchor_preflight(
     row. A refusal is re-raised as ``WiringError`` caused by a :class:`TrustAnchorError`, so the reload
     route answers 422 and audits ``reason="trust_anchor"``, as it did when it ran this itself. An
     unreadable anchor (``OSError``, or ``ValueError`` from a NUL in its path) counts as a refused
-    anchor, as it did there."""
+    anchor, as it did there.
+
+    **A reload that passes does not apply a changed anchor** (BACKLOG #2185). No reload rebuilds the
+    consumers that loaded these files, so each keeps the bytes it read at start. When this
+    preflight passes, it warns and audits ``restart_required`` for each anchor whose bytes on disk
+    differ from its consumer's (:func:`loaded_fingerprint`). That repeats on every reload until a
+    restart. The specs are frozen here, pins included, so a reload re-reads the paths and pins the
+    engine started with."""
     if not specs:
         return None
     from messagefoundry.config.wiring import WiringError
@@ -1222,7 +1329,7 @@ def make_settings_anchor_preflight(
 
     async def preflight() -> None:
         try:
-            await run_anchor_preflight(frozen, store, enforcing=enforcing)
+            seen = await run_anchor_preflight(frozen, store, enforcing=enforcing)
         except TrustAnchorError as exc:
             raise WiringError(f"a settings trust anchor was refused: {exc}") from exc
         except (OSError, ValueError) as exc:
@@ -1230,6 +1337,7 @@ def make_settings_anchor_preflight(
             unreadable = TrustAnchorError(f"a trust anchor could not be read: {exc}")
             unreadable.__cause__ = exc
             raise WiringError(f"a settings trust anchor was refused: {unreadable}") from unreadable
+        await _report_restart_required(frozen, store, seen=seen)
 
     return preflight
 
@@ -1240,7 +1348,14 @@ def make_registry_anchor_preflight(
     """The engine's ``registry_preflight`` for ``serve``: :func:`run_anchor_preflight` over a graph's
     per-connection inbound CAs (:func:`registry_anchor_specs`), at the first load and at every real
     reload. A refusal is re-raised as ``WiringError``, which the reload route answers with 422 and
-    the first load with a refused start. Dormant when no inbound names a CA."""
+    the first load with a refused start. Dormant when no inbound names a CA.
+
+    The ``WiringError`` is always caused by a :class:`TrustAnchorError`, as the settings preflight's
+    is (:func:`make_settings_anchor_preflight`), so the reload routes audit ``reason="trust_anchor"``
+    for both. An unreadable CA (``OSError``) and a ``ValueError``, such as a blank ``tls_ca_pin``,
+    are wrapped in one first, keeping their text. Before BACKLOG #2183 they were the cause
+    themselves, and the routes audited ``invalid_config``."""
+    from messagefoundry.config.wiring import WiringError
 
     async def preflight(registry: Registry, env_values: Mapping[str, Any]) -> None:
         try:
@@ -1249,11 +1364,14 @@ def make_registry_anchor_preflight(
             if not specs:
                 return
             await run_anchor_preflight(specs, store, enforcing=enforcing)
-        except (TrustAnchorError, OSError, ValueError) as exc:
-            # ValueError too: an env()-supplied path with a NUL in it raises one from the read, and
-            # it must reach the route as a refused config, not an unaudited 500.
-            from messagefoundry.config.wiring import WiringError
-
+        except TrustAnchorError as exc:
             raise WiringError(f"an inbound trust anchor was refused: {exc}") from exc
+        except (OSError, ValueError) as exc:
+            # ValueError too: an env()-supplied path with a NUL in it raises one from the read, and
+            # a blank tls_ca_pin raises one, and each must reach the route as a refused anchor, not
+            # an unaudited 500. Wrapped as the settings preflight wraps it, with the text unchanged.
+            refused = TrustAnchorError(str(exc))
+            refused.__cause__ = exc
+            raise WiringError(f"an inbound trust anchor was refused: {refused}") from refused
 
     return preflight
