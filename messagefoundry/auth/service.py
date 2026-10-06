@@ -1395,13 +1395,26 @@ def _holds_federated_binding(user: UserRecord) -> bool:
     return user.oidc_issuer is not None or user.oidc_subject is not None
 
 
+def _holds_directory_key(user: UserRecord) -> bool:
+    """Whether the reconciler may ask the directory about ``user``: it carries a
+    ``directory_object_id`` (BACKLOG #2434).
+
+    **The reconcile pass's one statement of the rule**; the sign-in, step-up and bind refusals
+    still test the column inline. A row without one is never asked about by name, so it is no
+    directory evidence: the pass reads it as UNKEYED without a lookup, and a trip or a referral
+    leaves it unmarked, because no pass can ever read it PRESENT. ``reconcile.plan_pass`` sees only
+    the UNKEYED outcome this produces, and counts what was asked from that.
+    """
+    return bool(user.directory_object_id)
+
+
 def _holds_unkeyed_federated_binding(user: UserRecord) -> bool:
     """Whether ``user`` carries a federated binding but no ``directory_object_id`` (BACKLOG #2027).
 
     Such a row's only directory key is its username, and ADR 0184 AC-5 forbids re-resolving a bound
     row by that, so the engine has no key it may ask the directory with.
     """
-    return _holds_federated_binding(user) and not user.directory_object_id
+    return _holds_federated_binding(user) and not _holds_directory_key(user)
 
 
 def _directory_login_refusal(user: UserRecord, now: float, *, federated: bool) -> str | None:
@@ -5492,7 +5505,7 @@ class AuthService:
         # unjudged, so every other account in the sample is still probed and judged.
         for user_id, _username in selected:
             user = users[user_id]
-            if user.directory_object_id:
+            if _holds_directory_key(user):
                 probes.append(await self._probe_principal(user))
             else:
                 # BACKLOG #2434, ADR 0184 amendment 2026-10-06. An id-less row is never asked about
@@ -5574,7 +5587,7 @@ class AuthService:
         unconfirmed = frozenset(self._reconcile_unconfirmed)
         # BACKLOG #2434. An id-less row is never probed, so no pass can read it PRESENT. Marked, it
         # would stay unconfirmed until its UNKEYED revocation forfeits the clear, every time.
-        keyed = {uid for uid, user in users.items() if user.directory_object_id}
+        keyed = {uid for uid, user in users.items() if _holds_directory_key(user)}
         if plan.aborted is None:
             present = reconcile.ProbeOutcome.PRESENT
             self._reconcile_unconfirmed.difference_update(
@@ -5613,11 +5626,11 @@ class AuthService:
         self._reconcile_alert = None
         if plan.unavailable:
             _log.warning(
-                "directory reconcile: %d of %d principals could not be resolved (directory "
+                "directory reconcile: %d of %d principals asked could not be resolved (directory "
                 "unreachable, or a probe raised, which is warned per account) — those sessions "
                 "were left alone (fail-open)",
                 plan.unavailable,
-                plan.probed,
+                plan.asked,
             )
         applied: list[reconcile.SessionRevocation] = []
         for revocation in plan.revocations:
@@ -6321,14 +6334,16 @@ class AuthService:
         """Record an aborted pass. Applies NOTHING — the point of the abort."""
         if plan.directory_outage:
             # Not a breaker trip: the accounts are fine, the directory is not. Loud but not latched.
+            # Counted over the probes ASKED (BACKLOG #2434): an UNKEYED row never reached the
+            # directory, so it is no part of what failed.
             _log.warning(
                 "directory reconcile: ALL %d probes failed — the directory is unreachable. No "
                 "session was revoked (fail-open).",
-                plan.probed,
+                plan.asked,
             )
             await self._audit_reconciler_row(
                 "auth.ad_reconcile_skipped",
-                detail=_json({"reason": plan.aborted, "probed": plan.probed}),
+                detail=_json({"reason": plan.aborted, "asked": plan.asked}),
             )
             return
         # Held probes were left out of the breaker's denominator (ADR 0195 rule item 7), so the

@@ -564,10 +564,15 @@ def test_an_unkeyed_probe_does_not_hide_an_outage_or_a_referral_only_pass() -> N
     unkeyed = reconcile.Probe("k", "k", reconcile.ProbeOutcome.UNKEYED)
     down = reconcile.Probe("a", "a", reconcile.ProbeOutcome.UNAVAILABLE)
     referred = reconcile.Probe("r", "r", reconcile.ProbeOutcome.REFERRED)
-    assert _plan([down, unkeyed]).aborted == "directory_unavailable"
-    assert _plan([referred, unkeyed]).aborted == reconcile.REFERRAL_ABORT
+    outage = _plan([down, unkeyed])
+    assert outage.aborted == "directory_unavailable"
+    assert (outage.probed, outage.asked) == (2, 1)
+    referral = _plan([referred, unkeyed])
+    assert referral.aborted == reconcile.REFERRAL_ABORT
+    assert (referral.probed, referral.asked) == (2, 1)
     # CONTROL: a pass of UNKEYED rows alone is judged, not read as an outage.
-    assert _plan([unkeyed]).aborted is None
+    alone = _plan([unkeyed])
+    assert alone.aborted is None and (alone.probed, alone.asked) == (1, 0)
 
 
 def test_breaker_ceiling_reports_the_larger_of_the_two_thresholds() -> None:
@@ -1450,6 +1455,85 @@ async def test_a_referral_does_not_mark_an_id_less_row_it_can_never_confirm() ->
 
         assert plan.referred == (ids["alice"],)
         assert service._reconcile_referred == {ids["alice"], ids["bob"]}
+    finally:
+        await store.close()
+
+
+async def test_a_breaker_trip_does_not_mark_an_id_less_row_or_forfeit_its_clear() -> None:
+    """BACKLOG #2434, the breaker's half of the referral test above. A trip marks every candidate
+    unconfirmed until a pass reads it PRESENT, and revoking a marked account forfeits the clear. An
+    id-less row is never probed, so marked, its UNKEYED revocation on the first clean pass would
+    forfeit the clear every time. It is left unmarked, and that pass is evidence the trip cleared.
+    """
+    names = [f"user{i:02d}" for i in range(12)]
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap(
+            {
+                **{n: _principal(n) for n in names},
+                "jdoe": replace(_principal("jdoe"), directory_object_id=None),
+            }
+        )
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        for name in [*names, "jdoe"]:
+            assert await _signed_in_ad_user(service, store, name) is not None
+        ids = {n: (await store.get_user_by_username(n)).id for n in [*names, "jdoe"]}  # type: ignore[union-attr]
+        present = {n: ldap.present.pop(n) for n in names}  # a wrong search base: nobody is found
+
+        assert (await service.reconcile_directory_sessions()).aborted is None  # strike 1
+        tripped = await service.reconcile_directory_sessions()  # strike 2: 13 revocations
+        assert tripped.aborted == "mass_revoke_breaker"
+        assert service._reconcile_unconfirmed == {ids[n] for n in names}, (
+            "the id-less row was marked by the trip"
+        )
+
+        ldap.present.update(present)  # the operator fixes the search base
+        clean = await service.reconcile_directory_sessions()
+
+        assert [(r.user_id, r.reason) for r in clean.revocations] == [
+            (ids["jdoe"], "directory_object_id_missing")
+        ]
+        assert service._reconcile_breaker_standing == "tripped", "the clear was forfeited"
+        assert clean.breaker_clear
+    finally:
+        await store.close()
+
+
+async def test_an_outage_beside_an_id_less_row_counts_only_the_probes_asked(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #2434. An id-less row is never asked, so it is no part of an outage: the pass is
+    still named one, and its warning and its ``auth.ad_reconcile_skipped`` row count the two
+    probes that failed, not the three rows the pass judged."""
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap(
+            {
+                "alice": _principal("alice"),
+                "bob": _principal("bob"),
+                "jdoe": replace(_principal("jdoe"), directory_object_id=None),
+            }
+        )
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        for name in ("alice", "bob", "jdoe"):
+            assert await _signed_in_ad_user(service, store, name) is not None
+        ldap.unreachable = {"alice", "bob"}  # the DC goes away
+
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            plan = await service.reconcile_directory_sessions()
+
+        assert plan.aborted == "directory_unavailable"
+        skipped = [
+            json.loads(a["detail"])
+            for a in await store.list_audit()
+            if a["action"] == "auth.ad_reconcile_skipped"
+        ]
+        assert skipped == [{"reason": "directory_unavailable", "asked": 2}]
+        warned = [r.getMessage() for r in caplog.records if "probes failed" in r.getMessage()]
+        assert len(warned) == 1 and "ALL 2 probes failed" in warned[0]
+        assert (plan.probed, plan.asked, plan.unavailable) == (3, 2, 2)
     finally:
         await store.close()
 

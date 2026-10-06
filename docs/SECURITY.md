@@ -3296,7 +3296,8 @@ account's entry and write its roles onto the row. No sign-in or step-up admits s
 #2027), so a session it holds is anomalous. The pass reads it as unkeyed without a lookup: it
 writes no roles, and it strikes and revokes as an absent account does, with the reason
 `directory_object_id_missing`. It is not a `userAccountControl` answer, so it never moves the ADR
-0195 hold. Such a
+0195 hold. It is never asked, so it is no part of an outage either: a pass whose every lookup fails
+still audits `auth.ad_reconcile_skipped`, and that row's `asked` count leaves it out. Such a
 row cannot take a federated binding: the bind refuses it, so every binding the bind has made since
 BACKLOG #1143 slice C sits on a row probed by its id (ADR 0184 AC-5). A binding already on an id-less
 row, made before that refusal, is **never probed by name** (BACKLOG #2027). The pass skips the row and
