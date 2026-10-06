@@ -40,7 +40,7 @@ import time
 from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from messagefoundry.controlchars import strip_control_chars
 from messagefoundry.parsing.peek import HL7PeekError, Peek
@@ -87,6 +87,12 @@ _ORPHAN_TMP_RE = re.compile(
 # ``_inflight_names``, which is an exact identity test. An hour matches the default prune cadence and
 # sits far outside any single write, which is bounded by ``max_bytes``.
 _ORPHAN_MIN_AGE_SECONDS = 3600.0
+
+# How long a cancelled save waits for a cross-shard ledger reserve or release to finish (BACKLOG
+# #2263). A healthy statement takes well under a second. The bound exists so a stuck store cannot
+# hold ``_quota_lock``, and the request's cancellation, indefinitely. Past it the call is left
+# running and its slot may leak until it goes stale.
+_LEDGER_CANCEL_WAIT_SECONDS = 5.0
 
 # Every filename a write in THIS process is currently holding: an atomic write's temp from the moment
 # it is created until its ``os.replace`` lands, and a save's blob from its own write until its sidecar
@@ -186,7 +192,12 @@ class UploadQuotaError(UploadError):
       most **N-1 files** over, one per shard mid-write, each bounded by ``max_upload_bytes``.
     * **A leaked reservation.** A process killed between reserve and release never pays back, and its
       slot narrows that uploader's budget until the row goes idle for
-      ``UPLOAD_RESERVATION_STALE_AFTER``. It errs toward refusing, not allowing.
+      ``UPLOAD_RESERVATION_STALE_AFTER``. It errs toward refusing, not allowing. A cancelled
+      ``save`` now waits for its reserve and release to finish first (BACKLOG #2263), which closes
+      the common case. At least these cancelled cases still leak: a ledger call still running at
+      ``_LEDGER_CANCEL_WAIT_SECONDS``, a reserve that raised after it may have committed, and a
+      reserve Task that ``asyncio.run``'s shutdown cancelled. Each is logged at WARNING except the
+      last.
       **IT DOES NOT SELF-HEAL UNCONDITIONALLY, and an earlier version of this line said it did.**
       The release statement sets ``since = <now>`` **unconditionally** (its own comment: "Never
       conditional: refusing a release would strand the reservation it is paying back"), so every
@@ -772,8 +783,9 @@ class UploadStore:
         # The cancel handler sits OUTSIDE the lock so it also catches a cancellation that lands in
         # the release await, after the write returned. A disk scan between the release and the
         # removal over-counts the pair, which can refuse a sibling but never admits one too many.
-        # A release cut short by a cancellation is not retried here; what then happens to the
-        # reservation is stated once, in _release_across_shards.
+        # The reserve and the release each get a bounded wait to finish before a cancellation
+        # propagates, so a cancelled save normally pays its slot back (BACKLOG #2263). The cases
+        # that still leak are listed once, in UploadQuotaError.
         try:
             async with self._quota_lock:
                 reserved = await self._reserve_across_shards(
@@ -856,13 +868,35 @@ class UploadStore:
         )
         if refusal is not None:
             raise refusal
-        ok = await self._ledger.reserve_upload_quota(
-            uploader_id,
-            files=1,
-            size_bytes=size,
-            max_files=self._max_files_per_user - observed_files,
-            max_total_bytes=self._max_total_bytes_per_user - observed_bytes,
+        # A cancellation can arrive after the store committed the reserve but before the call
+        # returned, so `save` never learns a slot is held and its release never runs (BACKLOG #2263).
+        # Finish the call, then pay back what it took before the cancellation propagates.
+        reserve = asyncio.ensure_future(
+            self._ledger.reserve_upload_quota(
+                uploader_id,
+                files=1,
+                size_bytes=size,
+                max_files=self._max_files_per_user - observed_files,
+                max_total_bytes=self._max_total_bytes_per_user - observed_bytes,
+            )
         )
+        try:
+            ok = await _wait_to_completion(
+                reserve, cancel_bound=_LEDGER_CANCEL_WAIT_SECONDS, what="reserve", who=uploader_id
+            )
+        except asyncio.CancelledError:
+            if reserve.done() and not reserve.cancelled():
+                if reserve.exception() is not None:
+                    # Unknown outcome. A blind release could pay back a sibling's slot instead.
+                    _log.warning(
+                        "the cross-shard upload reserve for %s failed while the upload was being "
+                        "cancelled; a slot it took stays held until it goes stale",
+                        uploader_id,
+                        exc_info=reserve.exception(),
+                    )
+                elif reserve.result():
+                    await self._release_across_shards(uploader_id=uploader_id, size=size)
+            raise
         if not ok:
             raise self._shard_refusal(
                 uploader=uploader, observed_files=observed_files, observed_bytes=observed_bytes
@@ -907,27 +941,47 @@ class UploadStore:
         return None
 
     async def _release_across_shards(self, *, uploader_id: str, size: int) -> None:
-        """Pay the reservation back. Never raises: the file is already written (or already failed) by
-        the time this runs, so turning a ledger blip into a failed upload would be strictly worse.
+        """Pay the reservation back. Never raises a ledger error: the file is already written (or
+        already failed) by the time this runs, so turning a ledger blip into a failed upload would be
+        strictly worse.
+
+        **A cancellation waits for the release to finish, then propagates (BACKLOG #2263).** A request
+        deadline arrives through an anyio scope that cancels again at every await, so a plain await
+        here was cut short whenever the deadline fired mid-upload, and the slot leaked. Once the
+        caller is cancelled, the wait is bounded by ``_LEDGER_CANCEL_WAIT_SECONDS``, so a stuck store
+        cannot hold ``_quota_lock`` and the cancellation indefinitely. A release still running at the
+        bound is left to finish on its own and logged.
 
         A reservation that is never released is reclaimed once the row goes stale — **but only while
         that uploader is otherwise IDLE.** This statement sets ``since = <now>`` unconditionally, so
         each later release by the same uploader restarts the staleness clock and a leaked slot can
         survive indefinitely under continued activity. See
         :meth:`messagefoundry.store.base.Store.reserve_upload_quota`."""
-        if self._ledger is None:
+        ledger = self._ledger
+        if ledger is None:
             return
-        try:
-            await self._ledger.reserve_upload_quota(
-                uploader_id, files=-1, size_bytes=-size, max_files=0, max_total_bytes=0
-            )
-        except Exception:  # noqa: BLE001 — a release failure must not fail an upload that landed
-            _log.warning(
-                "could not release the cross-shard upload reservation for %s; it will be reclaimed "
-                "when it goes stale",
-                uploader_id,
-                exc_info=True,
-            )
+
+        # The log sits inside the task, so a failure is reported in this module's words whether or
+        # not the caller is being cancelled, and the task never ends in an error of its own.
+        async def _release() -> None:
+            try:
+                await ledger.reserve_upload_quota(
+                    uploader_id, files=-1, size_bytes=-size, max_files=0, max_total_bytes=0
+                )
+            except Exception:  # noqa: BLE001 — a release failure must not fail an upload that landed
+                _log.warning(
+                    "could not release the cross-shard upload reservation for %s; it will be "
+                    "reclaimed when it goes stale",
+                    uploader_id,
+                    exc_info=True,
+                )
+
+        await _wait_to_completion(
+            asyncio.ensure_future(_release()),
+            cancel_bound=_LEDGER_CANCEL_WAIT_SECONDS,
+            what="release",
+            who=uploader_id,
+        )
 
     def _observed_sync(self, uploader_id: str) -> tuple[int, int]:
         """(file count, total bytes) already ON DISK for ``uploader_id`` — the fleet-visible half of
@@ -1489,16 +1543,60 @@ async def _to_thread_to_completion[T, A](func: Callable[[A], T], arg: A) -> T:
     it, so only the thread finishing can complete it."""
     loop = asyncio.get_running_loop()
     ctx = contextvars.copy_context()  # what to_thread passes to the thread, kept the same
-    fut = loop.run_in_executor(None, ctx.run, func, arg)
+    return await _wait_to_completion(loop.run_in_executor(None, ctx.run, func, arg))
+
+
+async def _wait_to_completion[T](
+    fut: asyncio.Future[T],
+    *,
+    cancel_bound: float | None = None,
+    what: str = "",
+    who: str = "",
+) -> T:
+    """Await ``fut``, and on a cancellation wait for it to finish before the cancellation propagates.
+
+    The shared body of :func:`_to_thread_to_completion` and the cross-shard ledger calls (BACKLOG
+    #2263). A ledger call is a coroutine, so it runs as a Task, and ``asyncio.run``'s shutdown
+    cancellation can still end it early. That leaves the reservation as a killed process would.
+
+    ``cancel_bound`` limits the wait AFTER a cancellation, in seconds; ``None`` waits as long as it
+    takes, which the bounded file write needs. A ledger call waits on the store, which may not be
+    bounded at all. A future still running at the bound is left to finish on its own, and a WARNING
+    names ``what`` and ``who``. While this waits under an anyio scope, the scope cancels again on
+    every loop pass, so the wait costs CPU and the bound also limits that."""
     try:
         return await asyncio.shield(fut)
     except asyncio.CancelledError:
+        loop = asyncio.get_running_loop()
+        deadline = None if cancel_bound is None else loop.time() + cancel_bound
         while not fut.done():
+            remaining = None if deadline is None else deadline - loop.time()
+            if remaining is not None and remaining <= 0:
+                _abandoned.add(fut)  # a Task the loop holds only weakly must not be collected
+                fut.add_done_callback(_forget_abandoned)
+                _log.warning(
+                    "the cross-shard upload %s for %s did not finish within %gs of a cancellation; "
+                    "it was left running, and a slot it holds stays held until it goes stale",
+                    what,
+                    who,
+                    cancel_bound,
+                )
+                raise
             with contextlib.suppress(asyncio.CancelledError):
-                await asyncio.wait([fut])
+                await asyncio.wait([fut], timeout=remaining)
         if not fut.cancelled():
             fut.exception()  # mark it retrieved; the cancellation is what propagates
         raise
+
+
+#: Futures :func:`_wait_to_completion` stopped waiting for, kept alive until they finish.
+_abandoned: set[asyncio.Future[Any]] = set()
+
+
+def _forget_abandoned(fut: asyncio.Future[Any]) -> None:
+    _abandoned.discard(fut)
+    if not fut.cancelled():
+        fut.exception()  # mark it retrieved; it was logged when it was left running
 
 
 def _atomic_write_text(root: Path, path: Path, text: str) -> None:
