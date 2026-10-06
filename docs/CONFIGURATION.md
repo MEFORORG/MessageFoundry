@@ -720,6 +720,11 @@ this engine process, for every signed-in directory account it did not just revok
 
 - The hold resolves when no answer is undetermined and this pass read `userAccountControl` at
   least once. An account the pass just revoked still counts as an answer here.
+- The hold also needs this engine process to have held two or more undetermined accounts at
+  once itself. A restart forgets that, so a restarted engine leaves a hold its last run left open
+  for an operator to resolve, until it holds and releases a wave of its own. An engine that
+  revokes an undetermined account before it has resolved a hold resolves no hold until it
+  restarts.
 - The breaker resolves when the pass did not abort, no answer is undetermined, no account carries a
   strike, and every account still signed in since the last trip has been read again, and not held.
   So the breaker's alert stays open while a hold stands.
@@ -735,7 +740,7 @@ At least two cases can still resolve falsely:
   evidence, whatever else shares its store.
 - A pass judges only accounts that hold a session. A trip or hold whose accounts have all left
   resolves on the accounts that remain. An account leaves at least when it signs out, reaches the
-  session cap, is revoked by the reconciler, is disabled locally, or is deleted.
+  session cap, is disabled locally, or is deleted.
 
 ### `[ai]` — AI coding assistance policy
 Implemented (see [AI.md](AI.md)). Controls the IDE AI assistant across the **OFF→PHI-safe** range;

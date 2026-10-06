@@ -324,6 +324,8 @@ def _host_key(address: str) -> str:
 #: the one row that says the session's cap is now reached, or write nothing because the address is a
 #: repeat or the cap was already reached.
 _NewIpFlag = Literal["audit", "audit_cap_reached", "repeat", "over_cap"]
+#: `AuthService._reconcile_hold_standing`: whether this process may resolve a hold (BACKLOG #2136).
+_HoldStanding = Literal["fresh", "latched", "forfeit", "settled"]
 
 
 # Bounds on the per-session re-proof failure counts (BACKLOG #1138). A count is NEVER evicted while
@@ -2103,6 +2105,16 @@ class AuthService:
         #: message above: it is released as soon as the pruned outcome record holds no UNDETERMINED
         #: entry, including on a pass with no candidates, where the message deliberately stays.
         self._reconcile_hold_latched = False
+        #: Whether THIS process may resolve the durable ``ad_reconcile_held`` instance (BACKLOG
+        #: #2136). The instance outlives the process and the latch does not, so a fresh process
+        #: cannot tell whether an earlier run's latch was still holding an account.
+        #: ``"fresh"``: no pass here has latched a hold, so it resolves none. ``"latched"``: a pass
+        #: here latched one, so a lift it then sees is its own. ``"forfeit"``: it revoked an
+        #: undetermined account first, which a lost latch may have held, so it resolves no hold
+        #: until it restarts. ``"settled"``: it resolved one on a pass that read every signed-in
+        #: account, so its records now cover what an earlier run held. Set in
+        #: `_mark_reconcile_clears`, and to ``"latched"`` where the latch is kept.
+        self._reconcile_hold_standing: _HoldStanding = "fresh"
         #: user_ids of bound id-less rows the reconciler has already reported as skipped (BACKLOG
         #: #2027), so each is logged and audited once per process rather than once per pass.
         self._reconcile_unkeyed_reported: set[str] = set()
@@ -5243,6 +5255,8 @@ class AuthService:
         self._reconcile_strikes.update(plan.strikes)
         self._reconcile_outcomes.update(plan.outcomes)
         self._reconcile_hold_latched = plan.latched
+        if plan.latched and self._reconcile_hold_standing == "fresh":
+            self._reconcile_hold_standing = "latched"  # BACKLOG #2136: this hold is this process's
         # BACKLOG #2136. A trip makes every candidate unconfirmed until a pass that is not aborted
         # reads it again, so a probe sample that missed the accounts behind the trip is no clear. A
         # held account is not read again: its probe judged neither its roles nor its scope, and its
@@ -5314,21 +5328,28 @@ class AuthService:
 
         BACKLOG #2136. The lifespan task resolves the durable ``ad_reconcile_aborted`` and
         ``ad_reconcile_held`` alert instances on these, on every pass that sets them. Those
-        instances outlive the process, and the strike and outcome records here do not. So "not
-        aborted" or "not held" is not enough: after a restart, or before the probe budget has
-        reached every account, a pass can read clear while the condition still stands.
+        instances outlive the process, and the strike and outcome records and the hold's latch
+        here do not. So "not aborted" or "not held" is not enough: after a restart, or before the
+        probe budget has reached every account, a pass can read clear while the condition stands.
 
         * Both need an answer on record, from this process, for every signed-in account the pass
           did not just revoke. A probe that could not reach the directory leaves none.
-        * The hold is clear when, on top of that, the pass did not hold and three tests pass.
+        * The hold is clear when, on top of that, the pass did not hold and four tests pass.
           None of those answers is undetermined; this is the record, across the rotation. No
-          account the pass just revoked read undetermined either: a lone undetermined answer
-          revokes only because no hold engaged, and a restarted process has lost the latch that
-          may still have held it. And at least one probe of THIS pass read the attribute (PRESENT
-          or DISABLED, ADR 0195's readable answer, ``plan.readable``). An answer from an earlier
-          pass, or one that found no entry (ABSENT), says nothing about whether it is readable
-          now. The undetermined tests do not rest on this node's hysteresis latch, which another
-          node on the store may not share.
+          account the pass just revoked read undetermined either. At least one probe of THIS pass
+          read the attribute (PRESENT or DISABLED, ADR 0195's readable answer, ``plan.readable``):
+          an answer from an earlier pass, or one that found no entry (ABSENT), says nothing about
+          whether it is readable now. And this process may vouch for the hold
+          (``_reconcile_hold_standing``): a pass here latched a hold, or this process already
+          resolved one.
+        * That last test is the restart's. A lone undetermined account beside readable ones
+          revokes only because no hold engaged, and a fresh process lacks the latch under which an
+          earlier run may still have held it. So a fresh process resolves no hold until its own pass
+          latches one, and the instance an earlier run left open stays open for an operator. A
+          process that revokes an undetermined account before it has resolved a hold forfeits:
+          it resolves none until it restarts, because nothing re-reads the account it revoked.
+          Once it has resolved one, every signed-in account has an answer from it, so its latch
+          covers what an earlier run held, and a later lone revocation is ADR 0195's own.
         * The breaker is clear when the pass was not aborted, none of those answers is undetermined,
           every one of those accounts carries no strike, and every account still signed in since
           the last trip has been read again by a pass that was not aborted, and was not held there.
@@ -5336,7 +5357,8 @@ class AuthService:
           either way. A held account's probe judged neither its roles nor its scope, and a trip
           on role or scope changes leaves no strike, so a probe sample that missed or held the
           accounts behind a trip proves nothing. The undetermined test covers that after a
-          restart too, when this process has no record of the trip.
+          restart too, when this process has no record of the trip. The breaker has no latch to
+          lose: every pass judges its revocations afresh, so a fresh process may resolve a trip.
 
         ``users`` is this pass's candidate set, and a clear rests on reading every one of them.
 
@@ -5350,29 +5372,34 @@ class AuthService:
         **The usual cost is a missed clear, with one reconciler on the store.** An account that
         never answers keeps both instances open while it is signed in. So does a hold, for the
         breaker's instance. So does a reconciler that is switched off, and so does every cluster
-        or multi-shard engine. An operator resolves those by hand. **At least two cases can still
-        clear falsely.** Any engine that declares neither ``[cluster]`` nor more than one shard
-        clears on its own evidence, whatever else shares its store: two plain ``serve`` processes,
-        two one-shard ``supervise`` fleets, or a plain engine beside a cluster node or a
-        multi-shard engine on the same store. It cannot see the others, and ``serve`` records a
-        second engine on one store as unguarded (the engine shard guard's comment in
-        ``__main__.py``). And a pass judges only accounts that hold a session, so a trip or hold
-        whose accounts have all left the candidate set clears on the rest. At least these take an
-        account out: it signs out or reaches the session cap, the reconciler revokes it, an
-        operator disables it locally, or its row is deleted. So a pass that revokes a lone
-        undetermined account releases no hold, and the next pass, which no longer sees it, can.
+        or multi-shard engine. A fresh or forfeited process keeps the hold's instance open. An
+        operator resolves those by hand. **At least two cases can still clear falsely.** Any
+        engine that declares neither ``[cluster]`` nor more than one shard clears on its own
+        evidence, whatever else shares its store: two plain ``serve`` processes, two one-shard
+        ``supervise`` fleets, or a plain engine beside a cluster node or a multi-shard engine on
+        the same store. It cannot see the others, and ``serve`` records a second engine on one
+        store as unguarded (the engine shard guard's comment in ``__main__.py``). And a pass
+        judges only accounts that hold a session, so a trip or hold whose accounts have all left
+        the candidate set clears on the rest. At least these take an account out: it signs out or
+        reaches the session cap, an operator disables it locally, or its row is deleted.
         """
         undetermined = reconcile.ProbeOutcome.UNDETERMINED
         revoked = {r.user_id for r in plan.revocations}
+        revoked_undetermined = undetermined in (self._reconcile_outcomes.get(u) for u in revoked)
+        if revoked_undetermined and self._reconcile_hold_standing != "settled":
+            self._reconcile_hold_standing = "forfeit"
         ids = [uid for uid in users if uid not in revoked]
         outcomes = [self._reconcile_outcomes.get(uid) for uid in ids]
         settled = bool(ids) and None not in outcomes and undetermined not in outcomes
         hold_clear = (
             settled
             and not plan.hold
-            and undetermined not in (self._reconcile_outcomes.get(uid) for uid in revoked)
+            and not revoked_undetermined
             and plan.readable > 0
+            and self._reconcile_hold_standing in ("latched", "settled")
         )
+        if hold_clear:
+            self._reconcile_hold_standing = "settled"
         breaker_clear = (
             settled
             and plan.aborted is None
