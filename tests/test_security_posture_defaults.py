@@ -937,8 +937,6 @@ def test_a_trust_every_peer_proxy_entry_is_a_named_loosening(entry: str) -> None
         "10.0.0.0/8",
         "::1",
         "fd00::/8",
-        # Host bits set: loads, but uvicorn's strict parse makes it a literal that trusts no peer.
-        "10.1.2.3/0",
     ],
 )
 def test_a_bounded_proxy_entry_is_not_a_loosening(entry: str) -> None:

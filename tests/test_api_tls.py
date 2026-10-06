@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 import datetime
 import errno
+import ipaddress
 import json
 import logging
 import ssl
@@ -593,14 +594,52 @@ def test_trusted_proxies_rejects_unparseable_entry(entry: str) -> None:
         ["127.0.0.1"],
         ["10.0.0.1", "10.0.0.2"],
         ["10.0.0.0/24"],
+        ["10.0.0.1/32"],  # a full-length prefix has no host bits, so it parses strictly
         ["::1"],
         ["2001:db8::/64"],
+        ["fd00::/64"],
+        ["fd00::1/128"],
     ],
 )
 def test_trusted_proxies_accepts_valid_addresses_and_networks(entries: list[str]) -> None:
     # A non-empty list must name its terminator (BACKLOG #2055), so declare one for the parse arms.
     api = ApiSettings(trusted_proxies=entries, tls_terminated_upstream=bool(entries))
     assert api.trusted_proxies == entries
+
+
+@pytest.mark.parametrize(
+    ("entry", "address", "network"),
+    [
+        ("10.0.0.1/24", "10.0.0.1", "10.0.0.0/24"),
+        ("10.1.2.3/0", "10.1.2.3", "0.0.0.0/0"),
+        ("fd00::1/64", "fd00::1", "fd00::/64"),
+    ],
+)
+def test_trusted_proxies_refuses_a_host_bits_cidr(entry: str, address: str, network: str) -> None:
+    """BACKLOG #2488: uvicorn parses an entry holding "/" with a STRICT ``ip_network``, so a
+    host-bits CIDR becomes a literal that matches no peer. The validator parsed it with
+    ``strict=False`` and let it load, which would collapse every client to the proxy address on a
+    first deployment. The refusal names both things the operator may have meant.
+
+    Mutation: put ``strict=False`` back on the validator's parse. Red: DID NOT RAISE."""
+    from uvicorn.middleware.proxy_headers import _TrustedHosts
+
+    # The premise, read from uvicorn itself: the entry matches neither its own host nor any other
+    # address in its range, while the network form the message suggests does match.
+    in_range = str(ipaddress.ip_network(network)[1])
+    assert address not in _TrustedHosts([entry])
+    assert in_range not in _TrustedHosts([entry])
+    assert in_range in _TrustedHosts([network])
+
+    with pytest.raises(ValidationError) as exc:
+        ApiSettings(trusted_proxies=["10.0.0.7", entry], tls_terminated_upstream=True)
+    message = str(exc.value)
+    assert f"[api].trusted_proxies entry {entry!r} has host bits set" in message
+    assert f"'{address}'" in message
+    assert f"'{network}'" in message
+    # Its suggestion loads.
+    ApiSettings(trusted_proxies=[network], tls_terminated_upstream=True)
+    ApiSettings(trusted_proxies=[address], tls_terminated_upstream=True)
 
 
 def test_trusted_proxies_without_a_terminator_or_an_operator_cert_is_refused() -> None:
