@@ -2499,8 +2499,9 @@ class AuthService:
                     raise
                 raise FirstAdministratorRefused(
                     "an account with that username was created while this command ran, so this run "
-                    "wrote nothing. Run the command again: it then reads that account and either "
-                    "completes it or says why it cannot"
+                    "wrote nothing. If another provision-admin run is in progress, let it finish. "
+                    "Then run the command again: it reads that account and either completes it or "
+                    "says why it cannot"
                 ) from exc
         await self._seed_roles()
         # ADR 0197 Amendment A (N-A): the step is consumed FIRST, before the credential or the
@@ -4430,7 +4431,9 @@ class AuthService:
             )
         except _DirectoryAccountConflict as exc:
             # BACKLOG #2697: a concurrent create took the name, and the row that won is not this
-            # principal's. The same refusal the two conflict branches above make, in their shape.
+            # principal's. Audited as the two conflict branches above audit. The outcome names the
+            # reason in both cases, as the federated leg's local conflict does; the local branch
+            # above names none.
             await self._audit(
                 "auth.login_failed",
                 actor=principal.username,
@@ -4800,7 +4803,13 @@ class AuthService:
                 if winner is None:
                     raise
                 # The checks `_complete_ad_login` makes on a row it read by name, in its order. That
-                # read ran before the winner existed, so nothing has asked them of this row yet.
+                # read ran before the winner existed, so nothing has asked them of this row yet. A
+                # check added there belongs here too.
+                #
+                # NOT CLOSED HERE: both sign-ins then run the caller's role resync on one new row.
+                # When the groups map to a role, each can read no prior roles and revoke the
+                # account's sessions, which can end the other's new session. That fails closed, and
+                # two sign-ins of an existing account after a group change meet the same race.
                 if winner.auth_provider != AuthProvider.AD.value:
                     raise _DirectoryAccountConflict("local_account_conflict") from exc
                 if winner.directory_object_id != principal.directory_object_id:

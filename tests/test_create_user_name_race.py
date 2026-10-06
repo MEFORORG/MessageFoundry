@@ -135,6 +135,11 @@ async def test_two_concurrent_first_sign_ins_of_one_account_make_one_row_and_bot
         assert first.ok and second.ok
         assert first.identity is not None and second.identity is not None
         assert first.identity.user_id == second.identity.user_id
+        # Signed in means a live session each, not only an ok outcome. The groups map to no role,
+        # so the role resync revokes nothing; the mapped-role case is a race the service names.
+        assert first.token is not None and second.token is not None
+        assert await service.identity_for_token(first.token) is not None
+        assert await service.identity_for_token(second.token) is not None
         assert await store.count_users() == 1
         row = await store.get_user_by_username("pfielding")
         assert row is not None and row.directory_object_id == _OBJECT_ID
@@ -263,7 +268,7 @@ async def test_a_lost_provisioning_race_is_refused_and_a_re_run_completes_the_ro
     try:
         service = AuthService(store, AuthSettings())
         _rival_takes_the_name(store, monkeypatch, auth_provider=AuthProvider.LOCAL.value)
-        with pytest.raises(FirstAdministratorRefused, match="Run the command again") as raised:
+        with pytest.raises(FirstAdministratorRefused, match="let it finish") as raised:
             await service.provision_first_administrator(
                 username="site-admin", password=_PASSWORD, actor="test", **provision_totp()
             )

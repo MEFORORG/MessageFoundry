@@ -6783,11 +6783,12 @@ def _provision_admin(args: argparse.Namespace) -> int:
     except sqlite3.IntegrityError as exc:
         # BACKLOG #2697. Ahead of the arm below, which it subclasses: a write the store refused is
         # not a path that is not a database. A lost username race arrives as the refusal above; this
-        # is whatever integrity refusal the service did not name. Exit 1, this command's refusal.
+        # is a SQLite integrity refusal the service did not name. Exit 1, this command's refusal.
+        # Any write can raise it, so the text does not say how far the run got.
         return _emit_error(
-            f"the store refused one of this command's writes ({exc}), so no Administrator was "
-            "provisioned. Run the command again: it completes a partly written account or says "
-            "why it cannot",
+            f"the store refused one of this command's writes ({exc}), so the Administrator may be "
+            "missing or incomplete. Once no other provision-admin run is in progress, run the "
+            "command again: it completes a partly written account, or says why it cannot",
             as_json=args.json,
         )
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
