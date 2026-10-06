@@ -38,6 +38,8 @@ import pytest
 from messagefoundry.api import app as app_module
 from messagefoundry.api import create_managed_app
 from messagefoundry.api.app import (
+    _RECONCILE_CLEAR_RESOLVES,
+    _REFERRAL_ALERT_SOURCE,
     _alert_reconcile_plan,
     _directory_reconciler,
     _is_sole_reconciler,
@@ -48,6 +50,7 @@ from messagefoundry.auth.ldap import DirectoryAnswer, LdapAuthenticator, _accoun
 from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.reconcile import (
     HOLD_REASON,
+    REFERRAL_ABORT,
     ProbeOutcome,
     ReconcilePlan,
     SessionRevocation,
@@ -183,6 +186,12 @@ class _Directory:
         self.uac: dict[str, Any] = dict.fromkeys(names, ENABLED)
         #: Every search raises, as an unreachable domain controller does.
         self.down = False
+        #: Every search is answered with a referral (resultCode 10), as a search base in another
+        #: domain of the forest is (BACKLOG #2538).
+        self.refer = False
+        #: Only the nested-group search is answered with a referral, as a group search base in
+        #: another domain is. The user search still answers, so only FOUND accounts are referred.
+        self.refer_groups = False
 
     def delete(self, name: str) -> None:
         """The account leaves the directory: both the name-keyed and the id-keyed search miss."""
@@ -228,7 +237,13 @@ def _install_directory(monkeypatch: pytest.MonkeyPatch, directory: _Directory) -
         def search(self, **kwargs: Any) -> bool:
             if directory.down:
                 raise ldap3.core.exceptions.LDAPSocketOpenError("synthetic: DC unreachable")
+            group_search = "member:" in str(kwargs["search_filter"])
+            if directory.refer or (directory.refer_groups and group_search):
+                self.entries = []
+                self.result = {"result": 10, "referrals": ["ldap://dc1.other.test.invalid/"]}
+                return False
             self.entries = directory.lookup(str(kwargs["search_filter"]))
+            self.result = {"result": 0}
             return True
 
         def bind(self) -> bool:
@@ -837,7 +852,14 @@ class _InverseSink(_Sink):
 
 
 #: Stands in for the auth service: the alerting reads only these two latched messages from it.
-_AUTH = SimpleNamespace(directory_reconcile_alert=None, directory_reconcile_hold=None)
+_AUTH = SimpleNamespace(
+    directory_reconcile_alert=None,
+    directory_reconcile_hold=None,
+    directory_reconcile_referral=None,
+)
+
+#: The referral's own source label (BACKLOG #2538), apart from the breaker's.
+_REFERRAL_SOURCE = _REFERRAL_ALERT_SOURCE
 
 
 def _alerted(plan: ReconcilePlan) -> list[str]:
@@ -875,6 +897,51 @@ def test_each_clear_the_service_marks_is_raised_after_the_pages_on_every_pass(
     assert _alerted(plan) == expected
 
 
+@pytest.mark.parametrize(
+    ("plan", "expected"),
+    [
+        (
+            # A referral beside an applied revocation: the revocation, then the referral's page.
+            ReconcilePlan(
+                probed=3,
+                referred=("a",),
+                revocations=(SessionRevocation("b", "bwong", reason="directory_absent"),),
+            ),
+            [("ad_session_revoked", "bwong"), ("ad_reconcile_aborted", _REFERRAL_SOURCE)],
+        ),
+        (
+            # A pass of referrals only: the referral's page alone, never the breaker's instance.
+            ReconcilePlan(probed=2, referred=("a", "b"), aborted=REFERRAL_ABORT),
+            [("ad_reconcile_aborted", _REFERRAL_SOURCE)],
+        ),
+        (
+            # A breaker trip beside a referral: one page on each instance.
+            ReconcilePlan(probed=12, referred=("a",), aborted="mass_revoke_breaker"),
+            [
+                ("ad_reconcile_aborted", "directory-reconciler"),
+                ("ad_reconcile_aborted", _REFERRAL_SOURCE),
+            ],
+        ),
+        (
+            ReconcilePlan(probed=3, breaker_clear=True, referral_clear=True),
+            [
+                ("ad_reconcile_breaker_cleared", "directory-reconciler"),
+                ("ad_reconcile_breaker_cleared", _REFERRAL_SOURCE),
+            ],
+        ),
+    ],
+    ids=["beside-a-revocation", "referrals-only", "beside-a-trip", "both-clear"],
+)
+def test_a_referral_pages_and_clears_under_its_own_source(
+    plan: ReconcilePlan, expected: list[tuple[str, str]]
+) -> None:
+    """BACKLOG #2538. The referral reuses the ``ad_reconcile_aborted`` type and its inverse, under
+    its own source label, so it never shares an instance with the breaker."""
+    sink = _InverseSink()
+    _alert_reconcile_plan(plan, _AUTH, sink)  # type: ignore[arg-type]
+    assert [(e[0], e[1]) for e in sink.events] == expected
+
+
 def test_the_inverses_resolve_their_alerts_and_are_not_rule_targetable() -> None:
     assert _AUTO_RESOLVE["ad_reconcile_breaker_cleared"] == "ad_reconcile_aborted"
     assert _AUTO_RESOLVE["ad_reconcile_hold_released"] == "ad_reconcile_held"
@@ -896,6 +963,7 @@ async def _open_alerts(store: MessageStore) -> set[tuple[str, str]]:
 
 ABORTED = ("ad_reconcile_aborted", "directory-reconciler")
 HELD = ("ad_reconcile_held", "directory-reconciler")
+REFERRAL = ("ad_reconcile_aborted", _REFERRAL_ALERT_SOURCE)
 
 
 async def _left_open_by_an_earlier_run(store: MessageStore) -> None:
@@ -1886,6 +1954,277 @@ async def test_a_process_that_may_share_its_store_pages_but_resolves_nothing(
     assert {event[0] for event in sink.events} == expected
 
 
+# --- BACKLOG #2538: a referral pages, through the real authenticator and the real notifier ------
+
+
+async def test_a_referring_search_base_pages_and_resolves_once_the_base_is_fixed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End to end: resultCode 10 on the user search, through the REAL ``LdapAuthenticator``, the
+    real service, the real notifier and the real alert-instance table. The referral opens the
+    ``ad_reconcile_aborted`` instance with reason ``directory_referral``; an ordinary outage, the
+    control, opens nothing; and a pass that reads every account clean after the fix resolves it.
+
+    RED when: the referral reaches the reconciler as a plain LdapError, so the pass reads as an
+    outage, is audited as skipped and pages nobody."""
+    async with _signed_in_estate(monkeypatch, ["jdoe", "asmith"]) as estate:
+        directory, service, store, tokens = estate
+        sink = NotifierAlertSink([], store=store)
+
+        directory.down = True  # the control: an outage pages nothing
+        assert (await _alerted_pass(service, sink)).directory_outage
+        assert await _open_alerts(store) == set()
+        directory.down = False
+
+        directory.refer = True
+        for _ in range(2):
+            plan = await _alerted_pass(service, sink)
+            assert plan.directory_referral and len(plan.referred) == 2 and plan.revocations == ()
+            assert not plan.breaker_clear and not plan.hold_clear
+        assert await _open_alerts(store) == {REFERRAL}
+        rows = [
+            json.loads(r["detail"]) for r in await _audited(store, "auth.ad_reconcile_referred")
+        ]
+        assert len(rows) == 2 and all(row["reason"] == "directory_referral" for row in rows)
+        alert = service.directory_reconcile_referral
+        assert alert is not None and "ad_user_search_base" in alert
+        for token in tokens.values():
+            assert await service.identity_for_token(token) is not None
+
+        directory.refer = False  # the base now lies in the bound controller's own domain
+        plan = await _alerted_pass(service, sink)
+        assert plan.aborted is None and plan.referral_clear
+        assert not plan.breaker_clear  # this process never tripped (BACKLOG #2136)
+        assert await _open_alerts(store) == set()
+
+
+async def test_a_referring_group_search_base_still_revokes_disabled_and_absent_accounts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End to end, through the REAL ``LdapAuthenticator``: a nested-group search base in another
+    domain refers only the accounts the user search FOUND, because a disabled or absent account
+    returns before its groups are read. Those two answers came from a clean user search, so they
+    must still revoke. The pass pages on ``ad_reconcile_aborted`` with reason
+    ``directory_referral``. The two revoked accounts were signed in at the referral and left before
+    a pass read them PRESENT, so this process forfeits the referral's clear: the instance stays
+    open for an operator even once the group base is fixed (BACKLOG #2538, the attrition rule).
+
+    RED when: any referral aborts the whole pass, so the disabled and the absent account keep their
+    sessions on a first deployment for as long as the group base is wrong. Or when the referral
+    resolves on the one account that remains."""
+    names = ["jdoe", "asmith", "bwong"]
+    groups = {"ad_group_search_base": "OU=Groups,DC=other,DC=invalid"}
+    async with _signed_in_estate(monkeypatch, names, **groups) as estate:
+        directory, service, store, tokens = estate
+        sink = NotifierAlertSink([], store=store)
+        directory.refer_groups = True
+        directory.uac["asmith"] = DISABLED
+        directory.delete("bwong")
+        first = await _alerted_pass(service, sink)
+        second = await _alerted_pass(service, sink)
+        for plan in (first, second):
+            assert plan.aborted is None and len(plan.referred) == 1
+            assert not plan.breaker_clear and not plan.hold_clear
+        assert sorted((r.username, r.reason) for r in second.revocations) == [
+            ("asmith", "directory_disabled"),
+            ("bwong", "directory_absent"),
+        ]
+        assert await _alive(service, tokens) == {"jdoe"}
+        revoked = {("ad_session_revoked", "asmith"), ("ad_session_revoked", "bwong")}
+        assert await _open_alerts(store) == {REFERRAL, *revoked}
+        rows = [
+            json.loads(r["detail"]) for r in await _audited(store, "auth.ad_reconcile_referred")
+        ]
+        assert len(rows) == 2 and all(row["aborted"] is None for row in rows)
+        alert = service.directory_reconcile_referral
+        assert alert is not None and "ad_group_search_base" in alert[:200]
+
+        directory.refer_groups = False  # the group base now lies in the bound controller's domain
+        for _ in range(2):  # not a matter of waiting another pass
+            plan = await _alerted_pass(service, sink)
+            assert plan.aborted is None and plan.referred == () and plan.readable == 1
+            assert not plan.referral_clear, "the referral resolved once its accounts were revoked"
+            assert await _open_alerts(store) == {REFERRAL, *revoked}
+        assert service._reconcile_referral_standing == "forfeit"
+
+
+async def test_a_fresh_process_does_not_resolve_a_referral_its_last_run_left_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A process clears only what it watched open (``AuthService._mark_reconcile_clears``), and the
+    referral keeps that rule (BACKLOG #2538). The instance outlives the process; the record of
+    which accounts were signed in at the referral does not, and accounts that left across the
+    restart are not seen to leave. So a fresh process resolves no referral an earlier run left
+    open, even once every account it sees reads PRESENT with no referral.
+
+    RED when: a fresh process reads every account it sees and then resolves the last run's
+    referral on them."""
+    names = ["jdoe", "asmith"]
+    groups = {"ad_group_search_base": "OU=Groups,DC=other,DC=invalid"}
+    async with _signed_in_estate(monkeypatch, names, **groups) as estate:
+        directory, last_run, store, _tokens = estate
+        sink = NotifierAlertSink([], store=store)
+        directory.refer_groups = True
+        assert (await _alerted_pass(last_run, sink)).referred
+        assert await _open_alerts(store) == {REFERRAL}
+
+        service = _fresh_process(store, **groups)
+        await service.initialize()
+        directory.uac.update(dict.fromkeys(names, DISABLED))  # one strike each, still signed in
+        plan = await _alerted_pass(service, sink)
+        assert plan.referred == () and plan.revocations == () and not plan.referral_clear
+        assert REFERRAL in await _open_alerts(store)
+
+        directory.uac.update(dict.fromkeys(names, ENABLED))
+        directory.refer_groups = False  # the group base now lies in the bound controller's domain
+        for _ in range(2):  # not a matter of waiting another pass
+            plan = await _alerted_pass(service, sink)
+            assert plan.referred == () and plan.readable == 2
+            assert not plan.referral_clear, "a fresh process resolved a referral it never watched"
+            assert await _open_alerts(store) == {REFERRAL}
+
+
+async def test_a_fresh_process_resolves_a_referral_once_a_pass_of_its_own_saw_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The control for the test above. A fresh process leaves the last run's referral open, then a
+    pass of its own is referred. It watched that referral, so once every account signed in at it
+    reads PRESENT with no referral, it resolves the instance."""
+    names = ["jdoe", "asmith"]
+    groups = {"ad_group_search_base": "OU=Groups,DC=other,DC=invalid"}
+    async with _signed_in_estate(monkeypatch, names, **groups) as estate:
+        directory, last_run, store, _tokens = estate
+        sink = NotifierAlertSink([], store=store)
+        directory.refer_groups = True
+        assert (await _alerted_pass(last_run, sink)).referred
+        service = _fresh_process(store, **groups)
+        await service.initialize()
+        assert (await _alerted_pass(service, sink)).referred
+        directory.refer_groups = False
+        plan = await _alerted_pass(service, sink)
+        assert plan.referred == () and plan.referral_clear
+        assert await _open_alerts(store) == set()
+
+
+async def test_a_referral_does_not_resolve_when_a_referred_account_signs_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Lander's question on PR 2043 (BACKLOG #2538), with 2036's attrition rule as the answer.
+    A group base in another domain refers both enabled accounts. One signs out before a pass reads
+    it again. Its user cannot sign back in while the base refers, so nothing re-reads it. Then the
+    other account reads PRESENT. That is no evidence the referral has gone for the account that
+    left, so this process forfeits the clear until it restarts, and logs that it did.
+
+    RED when: the referral clear drops the account that left and resolves on the one that
+    remains."""
+    names = ["jdoe", "asmith"]
+    groups = {"ad_group_search_base": "OU=Groups,DC=other,DC=invalid"}
+    async with _signed_in_estate(monkeypatch, names, **groups) as estate:
+        directory, service, store, _tokens = estate
+        sink = NotifierAlertSink([], store=store)
+        directory.refer_groups = True
+        assert len((await _alerted_pass(service, sink)).referred) == 2
+        await _expire(store, ["jdoe"])  # it signs out, and leaves the candidate set
+        directory.refer_groups = False
+        for _ in range(2):  # not a matter of waiting another pass
+            plan = await _alerted_pass(service, sink)
+            assert plan.aborted is None and plan.referred == () and plan.readable == 1
+            assert not plan.referral_clear, "the referral resolved once a referred account left"
+            assert await _open_alerts(store) == {REFERRAL}
+        assert service.directory_reconcile_referral is not None  # the latch is kept too
+        # Within the process, the forfeit stands even after a later referral is read clean.
+        directory.refer_groups = True
+        assert (await _alerted_pass(service, sink)).referred
+        directory.refer_groups = False
+        assert not (await _alerted_pass(service, sink)).referral_clear
+
+
+async def test_an_account_that_leaves_after_it_read_present_does_not_forfeit_the_referral(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The control for the test above. Once a pass with no referral has read an account PRESENT,
+    it is confirmed, and an ordinary sign-out after that forfeits nothing."""
+    names = ["jdoe", "asmith"]
+    settings = {
+        "ad_group_search_base": "OU=Groups,DC=other,DC=invalid",
+        "ad_session_recheck_max_users": 1,  # one probe per pass, so the two are read in turn
+    }
+    async with _signed_in_estate(monkeypatch, names, **settings) as estate:
+        directory, service, store, _tokens = estate
+        sink = NotifierAlertSink([], store=store)
+        ids = {name: await _id(store, name) for name in names}
+        directory.refer_groups = True
+        first = await _alerted_pass(service, sink)
+        assert len(first.referred) == 1
+        other = next(name for name in names if ids[name] not in first.referred)
+        directory.refer_groups = False
+        confirmed = await _alerted_pass(service, sink)  # the other account, read PRESENT
+        assert confirmed.referred == () and confirmed.readable == 1
+        assert not confirmed.referral_clear  # the referred account has not been read since
+        await _expire(store, [other])
+        plan = await _alerted_pass(service, sink)  # the referred account, read PRESENT
+        assert plan.referred == () and plan.referral_clear
+        assert await _open_alerts(store) == set()
+
+
+@pytest.mark.parametrize(
+    "answer", ["disabled", "undetermined", "absent"], ids=["disabled", "undetermined", "absent"]
+)
+async def test_only_a_present_read_confirms_an_account_behind_a_referral(
+    monkeypatch: pytest.MonkeyPatch, answer: str
+) -> None:
+    """A DISABLED, undetermined or ABSENT answer returns before the group search, so it says
+    nothing about a referring group base (BACKLOG #2538). With the base fixed, an account that
+    reads one of those beside a PRESENT one keeps the referral open. One strike each, so it stays
+    signed in and forfeits nothing. The pass that reads it PRESENT resolves the instance."""
+    names = ["jdoe", "asmith"]
+    groups = {"ad_group_search_base": "OU=Groups,DC=other,DC=invalid"}
+    async with _signed_in_estate(monkeypatch, names, **groups) as estate:
+        directory, service, store, _tokens = estate
+        sink = NotifierAlertSink([], store=store)
+        directory.refer_groups = True
+        assert len((await _alerted_pass(service, sink)).referred) == 2
+        directory.refer_groups = False
+        saved = dict(directory.ids)
+        if answer == "disabled":
+            directory.uac["jdoe"] = DISABLED
+        elif answer == "undetermined":
+            directory.uac["jdoe"] = ABSENT
+        else:
+            directory.delete("jdoe")
+        plan = await _alerted_pass(service, sink)
+        assert plan.referred == () and plan.revocations == ()
+        assert not plan.referral_clear, f"a {answer} read confirmed an account behind a referral"
+        assert await _open_alerts(store) == {REFERRAL}
+        directory.ids.update(saved)
+        directory.uac["jdoe"] = ENABLED
+        plan = await _alerted_pass(service, sink)
+        assert plan.referred == () and plan.referral_clear
+        assert await _open_alerts(store) == set()
+
+
+async def test_a_referral_pass_neither_releases_a_hold_nor_resolves_what_is_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A referral judged nothing, so like an outage it leaves the hold's message and the open held
+    instance alone, and marks no clear, even though the accounts it would have read are fine now.
+    It raises only its own aborted alert."""
+    async with _signed_in_estate(monkeypatch, ["u1", "u2", "ok1", "ok2"]) as estate:
+        directory, service, store, _tokens = estate
+        sink = NotifierAlertSink([], store=store)
+        directory.uac.update({"u1": ABSENT, "u2": ABSENT})
+        assert (await _alerted_pass(service, sink)).hold
+        held_message = service.directory_reconcile_hold
+        assert held_message is not None
+        directory.uac.update({"u1": ENABLED, "u2": ENABLED})  # would release, if it were read
+        directory.refer = True
+        plan = await _alerted_pass(service, sink)
+        assert plan.directory_referral and not plan.hold
+        assert not plan.hold_clear and not plan.breaker_clear and not plan.referral_clear
+        assert service.directory_reconcile_hold == held_message
+        assert await _open_alerts(store) == {REFERRAL, HELD}
+
+
 _BOTH_CLEAR = ReconcilePlan(probed=2, readable=2, breaker_clear=True, hold_clear=True)
 
 
@@ -1895,6 +2234,7 @@ class _ScriptedAuth:
 
     directory_reconcile_alert: str | None = None
     directory_reconcile_hold: str | None = None
+    directory_reconcile_referral: str | None = None
 
     def __init__(
         self,
@@ -1999,5 +2339,62 @@ async def test_a_failed_alert_state_read_costs_a_clear_and_never_makes_one() -> 
         await _run_reconciler(auth, store, NotifierAlertSink([], store=store), passes=4)
         assert await _open_alerts(store) == {ABORTED, HELD}
         assert not failures, "the read never failed"
+    finally:
+        await store.close()
+
+
+def test_every_clear_flag_names_the_instance_it_resolves() -> None:
+    """``_without_inherited_clears`` drops a flag its map does not name, so a ``*_clear`` flag left
+    out of the map is a clear that never fires on an engine with alert state (BACKLOG #2538)."""
+    flags = {f.name for f in dataclass_fields(ReconcilePlan) if f.name.endswith("_clear")}
+    assert set(_RECONCILE_CLEAR_RESOLVES) == flags
+    assert _RECONCILE_CLEAR_RESOLVES["referral_clear"] == (
+        _REFERRAL_ALERT_SOURCE,
+        "ad_reconcile_aborted",
+    )
+
+
+async def test_a_process_never_resolves_a_referral_an_earlier_run_left_open() -> None:
+    """The lifespan half of the rule, for the referral's own instance (BACKLOG #2538). It shares
+    the breaker's event type under its own source, so the inherited read must cover that source.
+    A pass the service marks clear leaves the inherited referral open and the breaker's own row
+    alone. Once an operator resolves it, the next referral opens a new row, and this process
+    resolves that one.
+
+    RED when: the inherited read covers only the breaker's source, so the earlier run's referral
+    resolves; or the referral's flag is missing from the map, so this process's own never does."""
+    store = await MessageStore.open(":memory:")
+    seen: list[set[tuple[str, str]]] = []
+
+    async def operator_resolves() -> None:
+        await _settle(sink)
+        seen.append(await _open_alerts(store))
+        await store.resolve_alert_instances_for(
+            event_type="ad_reconcile_aborted", connection=_REFERRAL_ALERT_SOURCE
+        )
+
+    async def referred_again() -> None:
+        await store.upsert_alert_instance(
+            event_type="ad_reconcile_aborted", connection=_REFERRAL_ALERT_SOURCE, severity="error"
+        )
+
+    try:
+        last_run = NotifierAlertSink([], store=store)
+        last_run.ad_reconcile_aborted(
+            _REFERRAL_ALERT_SOURCE, reason=REFERRAL_ABORT, probed=2, detail="referred"
+        )
+        await _settle(last_run)
+        assert await _open_alerts(store) == {REFERRAL}
+        sink = NotifierAlertSink([], store=store)
+        clear = ReconcilePlan(probed=2, readable=2, referral_clear=True)
+        none = ReconcilePlan(probed=2)
+        plans = [clear, clear, clear, none, none, clear]
+        actions: dict[int, Callable[[], Awaitable[None]]] = {
+            3: operator_resolves,
+            4: referred_again,
+        }
+        await _run_reconciler(_ScriptedAuth(plans, actions), store, sink, passes=8)
+        assert seen == [{REFERRAL}], "an inherited referral was resolved"
+        assert await _open_alerts(store) == set(), "this process's own referral stayed open"
     finally:
         await store.close()

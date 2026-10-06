@@ -3337,6 +3337,35 @@ immediate, and one LDAP bind per signed-in directory user per pass is the cost �
 `ad_session_recheck_max_users` (200) caps it, and it is zero when nobody is signed in. An off-loopback
 PHI deployment serving AD accounts gets `ad_session_recheck_seconds = 300` by default; setting it to `0` is a declared loosening, not a neutral choice.
 
+A referral is not an outage (BACKLOG #2538). A probe answered with an LDAP referral leaves that one
+account unjudged: no strike, no revocation, and no answer on record. Every other probe in the pass
+is judged as usual, so a disabled or absent account whose user search answered cleanly is still
+revoked. A pass with any referral audits `auth.ad_reconcile_referred` and raises the
+`ad_reconcile_aborted` alert with reason `directory_referral`, under its own source
+`directory-reconciler-referral`. So it is its own instance, apart from the breaker's, and
+acknowledging or suspending one does not silence the other. An `[alerts]` rule keyed on the event
+type alone matches both, and so does a source glob such as `directory-reconciler*`. To mute only
+the referral, a rule names its source exactly. The alert's text names `ad_user_search_base` and
+`ad_group_search_base`. When it resolves itself is stated once, in
+[CONFIGURATION.md](CONFIGURATION.md#when-the-reconcilers-two-alerts-resolve-themselves).
+Referred accounts stay in the mass-revoke breaker's count, as unreachable ones do. Left out, a referring group base would
+trip the breaker on any handful of genuine disables. A base in another domain of the forest
+refers on every pass. Read as an outage, it would stop revocation on a first deployment without a
+page.
+
+The two bases fail differently. A referring user search base refers every probe that searches,
+so the pass judges nothing and revokes nothing, like an outage, but it still pages. A referring
+group search base
+refers only the accounts the user search found enabled. Disables and deletions still revoke, but a
+role or channel-scope change in the directory does not reach those accounts' sessions while it
+lasts.
+
+A probe that raises something other than an LDAP error, such as a malformed entry the engine cannot
+read, fails open for that one account (BACKLOG #2241). It is logged at WARNING by name on every
+pass, and the rest of the estate is still reconciled. **The cost:** while it repeats, that account's
+sessions are never revoked by the reconciler, and no alert is raised. If it hits every probe, the
+pass reads as a directory outage.
+
 ### Session inventory & targeted revocation (WP-10)
 
 Users and admins can see and revoke individual sessions (ASVS 7.5.2 / 7.4.5):
@@ -4289,33 +4318,34 @@ the verify prints a `NOT CHECKED` line and exits 4, unless the shell's settings 
 keyless (see below). Under `vault_transit` with the Transit settings missing, or with a key file it
 cannot read, it stops while the store opens, before it reads the chain, and exits 2. With the key,
 exit 0 also means every row is keyed. With no key, exit 0 covers a keyless chain and says no more
-than the paragraph above. That holds whatever the shell's settings say; where they require a key,
-a `WARNING` comes with it. A store that has a key and opens
+than the paragraph above. It does so only where the shell's settings allow the store to run
+keyless; exit 5 below covers the rest. A store that has a key and opens
 onto keyless rows fails the verify, and is also reported as
 [`audit_chain_unkeyed`](SECURITY-LOOSENING.md#audit_chain_unkeyed--the-store-has-a-key-but-its-audit-chain-is-keyless).
-**A scheduled job reads the exit code and nothing else, so these five are kept distinct:**
+**A scheduled job reads the exit code and nothing else, so these six are kept distinct:**
 
 | Exit | Meaning |
 |---|---|
-| `0` | A clean walk over at least one row. A keyless chain in a shell whose settings require a key also prints a `WARNING` on stderr; a job that reads only the code does not see it. |
+| `0` | A clean walk, either with the key or, in a shell that holds no key, under settings that allow the store to run keyless. It covers at least one row, unless `--allow-empty` or an expected anchor of `0:` accepted an empty log (see exit `3`). |
 | `1` | The chain did not verify. It covers at least a broken chain, a mismatch with `--expected-anchor`, a chain checked with a key that is not the chain's, and a chain that names a key in a shell that holds no key and whose settings allow the store to run keyless. Those print a `FAIL` line that says which. An error the command does not classify, such as a malformed key or a Transit outage part way through the walk, also exits 1 and prints no `FAIL` line, so by the code alone a job cannot tell it from a broken chain. |
-| `2` | The command could not start. It covers at least an absent path, a zero-byte file, a file carrying no `audit_log` table, a path that is not a SQLite database at all, settings that cannot be read or fail validation (a `--service-config` path that is a directory or unreadable included, which exited 1 before vault BACKLOG #2725), and a store key the settings name that cannot be resolved. |
+| `2` | The command could not start. It covers at least an absent path, a zero-byte file, a file carrying no `audit_log` table, a path that is not a SQLite database at all, settings that cannot be read or fail validation (a `--service-config` path that is a directory or unreadable included, which exited 1 before vault BACKLOG #2725), a store key the settings name that cannot be resolved, and an empty log in a shell that holds no key and whose settings require one. |
 | `3` | A clean walk over an **empty** log. |
-| `4` | The chain's first row names a key, this shell holds no key, and its settings do not allow the store to run keyless. No row was checked against its MAC. This is not a pass. The first row may have been changed to name a key, so a 4 from a job that used to exit 0 is a sign of tampering until a run with the engine's settings and key says otherwise. |
+| `4` | The chain's first row names a key, this shell holds no key, and its settings do not allow the store to run keyless. No row was checked against its MAC. It prints a `NOT CHECKED` line. This is not a pass. |
+| `5` | The chain is keyless and walked clean as plain SHA-256. This shell holds no key, and its settings require one. So the chain was not checked to their standard. It prints a `NOT CHECKED` line and a `WARNING` on stderr. This is not a pass. Before vault BACKLOG #3054 it exited 0. The paragraph on the setup where this goes wrong, below, says what a move between 4 and 5 means. |
 
 For exit 2 the verifier refuses each case rather than creating or migrating the evidence it was asked
 to check, and it opens read-only so it cannot write to that file either way. It never spends `1` on
 any of them. A store key that cannot be resolved is refused while the store opens, before it reads
 a row.
 
-Exit 4 is decided by a flag the store's verify sets only in a process that holds no key, so nothing
-a database holds can turn a verify run with the key into a 4 (vault BACKLOG #2725). Without a key,
+Exits 4 and 5 are each decided by a flag the store's verify sets only in a process that holds no
+key, so nothing a database holds can turn a verify run with the key into either (vault BACKLOG
+#2725, #3054). Without a key,
 though, the chain's own first row says whether the chain is keyed, and a writer can rewrite that row.
 So the verify reads the shell's settings too. Where they allow the store to run keyless (the
 audited opt-out), a chain that names a key exits 1. That includes a store keyed under the opt-out
 and verified from a shell missing its key, and the `FAIL` line names both explanations. Run the job
-with the settings and environment the engine runs with, the opt-out included, or a rewritten first
-row on a keyless store reads as a 4. Without a key
+with the settings and environment the engine runs with, the opt-out included. Without a key
 the verify still makes the checks that need none: at least the sequence numbers, each key-range
 row's digest and link, and an expected anchor if one is passed. A break there exits 1, not 4. A
 range row's digest catches an edit inside its range only while the range row itself is left as it
@@ -4325,20 +4355,34 @@ settings and key the engine runs with.
 
 **A keyless store verified from a shell whose settings require a key is the setup where this goes
 wrong.** There, a writer who rewrites the first row to name a key turns every later edit into a 4.
-Before vault BACKLOG #2725 the same edit exited 1. So when a keyless chain verifies clean in a shell
-whose settings forbid keyless running, the verify exits 0 and prints a `WARNING` on stderr naming
-the mismatch. The warning quotes no row. It is a sign, not a diagnosis: a clean keyless walk cannot
-tell a store that runs keyless from a keyed chain rewritten as keyless. A job that moves from 4 to 0
-with this warning is as suspect as one that moves from 0 to 4. Run the job with the settings and key
-the engine runs with: a keyless store then passes without the warning, and a keyed chain rewritten
-as keyless fails with exit 1. Do not clear the warning by giving the job the keyless opt-out unless
-the engine runs under it too. Exit 3
+Before vault BACKLOG #2725 the same edit exited 1. So since vault BACKLOG #3054 a keyless chain that
+walks clean in a shell whose settings forbid keyless running exits 5, not 0. The settings say the
+check is keyed, and a plain SHA-256 walk is not that. It prints a `NOT CHECKED` line, and a
+`WARNING` on stderr naming the mismatch. Neither quotes a row. In this setup 5 is the steady state,
+and a matching `--expected-anchor` does not change it. **A move from 5 to 4 means the first row was
+changed to name a key.** On a keyed store the same shell sits at 4, and **a move from 4 to 5 means
+the chain was rewritten as keyless.** Treat either move as a sign of tampering until a run with the
+engine's settings and key says otherwise. The split catches only a writer who changes whether the
+first row names a key: one who rewrites a keyless chain as plain SHA-256 stays at 5. A job in this
+setup can never report a pass: give it the engine's key, or the keyless opt-out the engine runs
+under.
+The warning is a sign, not a diagnosis: a clean keyless walk cannot tell a store that runs keyless
+from a keyed chain rewritten as keyless. Run the job with the settings and key the engine runs
+with: a keyless store then passes with exit 0 and no warning, and a keyed chain rewritten as
+keyless fails with exit 1. Do not clear the 5 by giving the job the keyless opt-out unless the
+engine runs under it too. A job that moves from 0 to 4 or 5 has at least one of these causes: it
+lost the key it ran with, it lost the opt-out, or it moved from a build before #3054. Neither move
+comes from the database alone, but the database may have changed too. So find out what changed the
+job, then re-run it with the engine's settings and key. An empty log in this setup
+exits 2. The store open refuses it for every command, the read-only verify included, because the
+handle's next append would start a keyless chain (BACKLOG #1916). A log emptied after the open has
+no first row naming a key, so it exits 5. Exit 3
 exists because "there was nothing to verify" is not a
 pass; pass `--allow-empty` to accept it as one on an instance that has not logged anything yet, or
 pass an expected anchor of `0:`, which asserts the same thing and is checked. `audit-anchor` keeps
 exit 0 on an empty log — sealing a fresh instance as `0:` is the point of it — but refuses the same
 non-audit-database paths and an unresolvable key with exit 2. It needs no key to read a keyed chain's
-anchor, so it has no exit 4. A clean verify does **not** mean nothing was removed: deleting the *newest*
+anchor, so it has no exit 4 or 5: it exits 0 on a chain the verify reports as 5. A clean verify does **not** mean nothing was removed: deleting the *newest*
 rows leaves a prefix that still chains cleanly, so a bare verify is clean after a tail-truncation.
 The sequence number does not change that: it shows a row missing from the middle, not rows missing
 from the end. A log emptied altogether is the same case, since the next start writes a new genesis

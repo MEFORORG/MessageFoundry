@@ -213,8 +213,9 @@ def _read_the_checkout_as_a_clean_config_source() -> Iterator[Callable[[Path], N
     the real check over readers that report a clean owner and access list. The check still runs and
     still decides. A test of the gate asks for the real call back with
     ``real_config_source_readers``, which this fixture yields (``None`` off win32). Scoped to win32
-    because a POSIX checkout is not group/world-writable, so the Linux leg runs the real check in
-    every test. The anchor-path fixture below is scoped the same way.
+    because a POSIX checkout is not group/world-writable and is owned by the account running the
+    suite, so the Linux leg runs the real check in every test. A root run over a checkout another
+    user owns is refused, by design (vault BACKLOG #2759). The anchor-path fixture below is scoped the same way.
 
     **Only the gate's call is replaced, never ``_win32_config_source_probes`` itself.** Those readers
     are shared: ``messagefoundry.restricted_file`` reads a new file's access list back through them.

@@ -53,7 +53,7 @@ import urllib.request
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
 logger = logging.getLogger(__name__)
@@ -102,6 +102,7 @@ __all__ = [
     "warn_smtp_verification_off",
     "smtp_login_approved",
     "build_verifying_client_context",
+    "CaFileUnreadable",
     "cleartext_acceptance_audit_sink",
     "context_checks_revocation",
     "current_hop_posture",
@@ -124,6 +125,7 @@ __all__ = [
     "APPROVED_TLS12_SUITES",
     "APPROVED_TLS13_SUITES",
     "apply_operator_tls_ciphers",
+    "EngineTlsListRefused",
     "narrow_signature_algorithms",
     "narrow_tls13_suites",
     "narrow_to_approved_suites",
@@ -785,6 +787,8 @@ def validate_proxy_tls_posture(min_version: str | None, ciphers: str | None) -> 
             # require_approved_suites=False: this field DECLARES an external proxy's suite list, it
             # does not configure one of ours. See validate_tls_ciphers' docstring (BACKLOG #1317).
             validate_tls_ciphers(ciphers, require_approved_suites=False)
+        except EngineTlsListRefused:
+            raise  # the engine's own list, not the operator's declaration (BACKLOG #2484)
         except ValueError as exc:
             raise ValueError(f"[api].proxy_tls_ciphers rejected: {exc}") from exc
 
@@ -812,7 +816,8 @@ def validate_tls_ciphers(value: str, *, require_approved_suites: bool = True) ->
     probe = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     # The probe models an engine context, so the string reaches it the way it reaches every engine
     # context: through apply_operator_tls_ciphers, TLS 1.3 narrowing included. An ssl.SSLError here
-    # is the operator's string; the engine's own TLS 1.3 list fails with RuntimeError instead.
+    # is the operator's string; the engine's own lists fail with EngineTlsListRefused instead, which
+    # passes through as the ValueError it is (BACKLOG #2484).
     try:
         apply_operator_tls_ciphers(probe, value)
     except ssl.SSLError as exc:
@@ -1071,13 +1076,17 @@ def apply_connection_tls_ciphers(
     :func:`validate_tls_ciphers` speaks about a generic ``tls_ciphers`` and an operator running
     several connections needs to know WHICH one is at fault."""
     ciphers = settings.get(CONNECTION_TLS_CIPHERS_SETTING)
-    if ciphers is None:
-        narrow_to_approved_suites(ctx)
-        return
-    text = str(ciphers)
     try:
+        if ciphers is None:
+            # Raises only EngineTlsListRefused, so the unset hop is never "tls_ciphers rejected".
+            narrow_to_approved_suites(ctx)
+            return
+        text = str(ciphers)
         validate_tls_ciphers(text)
         apply_operator_tls_ciphers(ctx, text)
+    except EngineTlsListRefused as exc:
+        # The build refused the engine's list, so name the connector without blaming its string.
+        raise EngineTlsListRefused(f"{connector}: {exc}") from exc
     except (ValueError, ssl.SSLError) as exc:
         raise ValueError(f"{connector}: tls_ciphers rejected: {exc}") from exc
 
@@ -1225,9 +1234,51 @@ def narrow_to_approved_suites(ctx: ssl.SSLContext) -> None:
 
     This narrows and does not assert. Each seam still calls :func:`harden_cipher_suites` itself,
     after this, so the ASVS 12.1.2 call-site guard keeps seeing the assertion by name (ADR 0188)."""
-    ctx.set_ciphers(f"@SECLEVEL={ctx.security_level}:" + ":".join(APPROVED_TLS12_SUITES))
-    narrow_tls13_suites(ctx)
-    narrow_signature_algorithms(ctx)
+    try:
+        ctx.set_ciphers(f"@SECLEVEL={ctx.security_level}:" + ":".join(APPROVED_TLS12_SUITES))
+    except ssl.SSLError as exc:
+        raise EngineTlsListRefused(
+            f"{ssl.OPENSSL_VERSION} refused the engine's approved TLS 1.2 suites "
+            f"{APPROVED_TLS12_SUITES} (BACKLOG #2484): {exc}"
+        ) from exc
+    _narrow_tls13_and_sigalgs(ctx)
+
+
+class EngineTlsListRefused(ValueError):
+    """The linked OpenSSL refused a list the ENGINE sets on every context, not an operator string.
+
+    A :class:`ValueError`, so a seam that builds its context while the config loads reports a
+    configuration refusal at ``check``, dry-run or ``serve``. Its own class only so
+    :func:`apply_connection_tls_ciphers` and :func:`validate_proxy_tls_posture` can pass it on
+    without prefixing "tls_ciphers rejected", which would blame the operator."""
+
+
+class _NarrowerRefused(RuntimeError):
+    """What :func:`narrow_tls13_suites` and :func:`narrow_signature_algorithms` raise when there is
+    no engine list the build will take. A subclass, so the wrappers convert only that and not any
+    other :class:`RuntimeError`, such as a ``NotImplementedError``."""
+
+
+def _narrow_tls13_and_sigalgs(ctx: ssl.SSLContext) -> None:
+    """Narrow the two halves a cipher string cannot reach, and refuse as a config error if the build
+    will not take the engine's list (BACKLOG #2484).
+
+    The two narrowers raise :class:`_NarrowerRefused`, a :class:`RuntimeError`, on such a build.
+    Before #2484 only the ldap3 and hvac seam caught it. Converting here, in the two wrappers,
+    reaches every seam that calls one. The narrowers' own message names the list; this adds the
+    linked OpenSSL, because the fault is that build's.
+
+    It does not reach a context built at IMPORT. At least ``rest._NO_REDIRECT_OPENER`` and
+    ``alert_sinks._NO_REDIRECT_OPENER`` are, so on such a build the import itself fails before any
+    seam can report a refusal."""
+    try:
+        narrow_tls13_suites(ctx)
+        narrow_signature_algorithms(ctx)
+    except _NarrowerRefused as exc:
+        raise EngineTlsListRefused(
+            f"{ssl.OPENSSL_VERSION} refused a list the engine sets on every TLS context. This is "
+            f"the engine's own list, not an operator tls_ciphers string: {exc}"
+        ) from exc
 
 
 def narrow_tls13_suites(ctx: ssl.SSLContext) -> bool:
@@ -1255,14 +1306,16 @@ def narrow_tls13_suites(ctx: ssl.SSLContext) -> bool:
 
     **The return value is for callers and tests; no posture field reports it yet.** The seams drop
     it. An OpenSSL build that refuses the approved list raises :class:`RuntimeError` naming the
-    engine's list, so the failure is never reported as a fault in an operator's ``tls_ciphers``."""
+    engine's list, so the failure is never reported as a fault in an operator's ``tls_ciphers``.
+    The two wrappers that call this turn it into :class:`EngineTlsListRefused`, a config refusal
+    (BACKLOG #2484)."""
     target = getattr(ctx, "_ctx", ctx)
     if not hasattr(target, "set_ciphersuites"):
         return False  # the recorded gap described above
     try:
         target.set_ciphersuites(":".join(APPROVED_TLS13_SUITES))
     except ssl.SSLError as exc:
-        raise RuntimeError(
+        raise _NarrowerRefused(
             f"this OpenSSL build refused the engine's approved TLS 1.3 suites "
             f"{APPROVED_TLS13_SUITES} (BACKLOG #2042): {exc}"
         ) from exc
@@ -1360,7 +1413,8 @@ def narrow_signature_algorithms(ctx: ssl.SSLContext) -> bool:
     warning once per process and keeps today's behaviour, as 3.14 does (accepted by the Manager on
     BACKLOG #1171). An OpenSSL that refuses the list without ML-DSA, or a catalogue with no scheme
     left once SHA-224 is removed, raises :class:`RuntimeError`, as :func:`narrow_tls13_suites` does,
-    so the failure is never blamed on an operator's ``tls_ciphers``.
+    so the failure is never blamed on an operator's ``tls_ciphers``. The wrappers turn that into
+    :class:`EngineTlsListRefused`, as they do for the TLS 1.3 list (BACKLOG #2484).
 
     **Reach.** Every engine-built context that narrows its suites, through
     :func:`narrow_to_approved_suites` or :func:`apply_operator_tls_ciphers`, the LDAPS hop included
@@ -1385,7 +1439,7 @@ def narrow_signature_algorithms(ctx: ssl.SSLContext) -> bool:
             )
         return False
     if not names:
-        raise RuntimeError(
+        raise _NarrowerRefused(
             "OpenSSL's signature scheme catalogue has no scheme left once SHA-224 is removed, so "
             "there is no list to pin (BACKLOG #1171)"
         )
@@ -1400,7 +1454,7 @@ def narrow_signature_algorithms(ctx: ssl.SSLContext) -> bool:
     try:
         target.set_server_sigalgs(base)
     except ssl.SSLError as exc:
-        raise RuntimeError(
+        raise _NarrowerRefused(
             f"this OpenSSL build refused the engine's signature scheme list, OpenSSL's own "
             f"catalogue without SHA-224 (BACKLOG #1171): {exc}"
         ) from exc
@@ -1426,10 +1480,10 @@ def apply_operator_tls_ciphers(ctx: ssl.SSLContext, ciphers: str) -> None:
     The signature schemes are narrowed here too (:func:`narrow_signature_algorithms`), because a
     cipher string cannot reach them either.
     It does not validate. The seams validate first, at settings load or in
-    :func:`apply_connection_tls_ciphers`; :func:`validate_tls_ciphers` calls this on its own probe."""
+    :func:`apply_connection_tls_ciphers`; :func:`validate_tls_ciphers` calls this on its own probe.
+    A build that refuses the engine's own lists raises :class:`EngineTlsListRefused`."""
     ctx.set_ciphers(ciphers)
-    narrow_tls13_suites(ctx)
-    narrow_signature_algorithms(ctx)
+    _narrow_tls13_and_sigalgs(ctx)
 
 
 def _is_encrypting(cipher: Mapping[str, object]) -> bool:
@@ -1575,11 +1629,8 @@ def _narrow_library_context(ctx: ssl.SSLContext, *, connector: str, hop: str) ->
     after it, so the call-site guards see the assertion at each seam by name."""
     try:
         narrow_to_approved_suites(ctx)  # TLS 1.2, TLS 1.3 and sigalgs (BACKLOG #300, #2494)
-    except (ssl.SSLError, RuntimeError) as exc:
-        raise ValueError(
-            f"{connector}: this OpenSSL build refuses the approved suite list, so {hop} cannot "
-            f"be narrowed (BACKLOG #300): {exc}"
-        ) from exc
+    except EngineTlsListRefused as exc:  # every refusal arrives as this since BACKLOG #2484
+        raise EngineTlsListRefused(f"{connector}: {hop} cannot be narrowed. {exc}") from exc
 
 
 def _hold_to_approved_list(ctx: ssl.SSLContext, *, connector: str, hop: str) -> None:
@@ -2515,7 +2566,7 @@ class TrustAnchorPolicy:
     internal_ca_file: str | None = None
     mode: TrustAnchorMode = "system"
     #: ``[tls].crl_file``: a PEM file of CRLs applied to the OUTBOUND hops this policy
-    #: reaches (BACKLOG #299). Independent of ``mode``: revocation is orthogonal to which roots anchor
+    #: reaches (BACKLOG #299), and to the inbound FTPS poller, which dials out (BACKLOG #2370). Independent of ``mode``: revocation is orthogonal to which roots anchor
     #: the hop, so a ``system``-mode instance can still check a CRL. Loopback hops are exempt, matching
     #: the exemption ``internal_ca_file`` already has and the revocation guard's own on-box ALLOW arm.
     crl_file: str | None = None
@@ -2546,6 +2597,9 @@ class TrustAnchor:
     #: :func:`resolve_trust_anchor`, so a loopback hop carries ``None`` even when the instance
     #: configures one.
     crl_file: str | None = None
+    #: Where ``cafile`` came from, for a refusal to name: ``[tls].internal_ca_file``, or a
+    #: connection's ``tls_ca_file`` with its name (vault BACKLOG #2370). Not part of equality.
+    cafile_setting: str | None = field(default=None, compare=False)
 
     @property
     def narrows(self) -> bool:
@@ -2576,8 +2630,13 @@ def resolve_trust_anchor(
     connection_ca_file: str | None,
     host: str,
     policy: TrustAnchorPolicy,
+    connection: str | None = None,
+    setting: str = "tls_ca_file",
 ) -> TrustAnchor:
     """Resolve the client trust anchor for an outbound hop to ``host`` (#190, ADR 0093 — PURE).
+
+    ``connection`` and ``setting`` name where ``connection_ca_file`` came from, for a refusal of
+    an unreadable file (vault BACKLOG #2370). They choose nothing.
 
     Precedence (load-bearing):
 
@@ -2606,15 +2665,50 @@ def resolve_trust_anchor(
     crl = None if is_loopback_hop_host(host) else policy.crl_file
     if connection_ca_file is not None:
         # Per-connection pin wins verbatim (single-anchor, no OS roots — the historical behaviour).
-        return TrustAnchor(cafile=connection_ca_file, load_system_roots=False, crl_file=crl)
+        return TrustAnchor(
+            cafile=connection_ca_file,
+            load_system_roots=False,
+            crl_file=crl,
+            cafile_setting=f"{setting} of connection {connection!r}" if connection else setting,
+        )
     if policy.mode == "system" or policy.internal_ca_file is None or is_loopback_hop_host(host):
         # Unchanged trust store: OS roots only (byte-identical default / loopback exemption).
         return TrustAnchor(cafile=None, load_system_roots=True, crl_file=crl)
-    if policy.mode == "pinned":
-        # ONLY the internal CA — the forward_tls_ca_file template (no public bundle).
-        return TrustAnchor(cafile=policy.internal_ca_file, load_system_roots=False, crl_file=crl)
-    # augment: OS roots + the internal CA.
-    return TrustAnchor(cafile=policy.internal_ca_file, load_system_roots=True, crl_file=crl)
+    # pinned: ONLY the internal CA, the forward_tls_ca_file template. augment: OS roots + it.
+    return TrustAnchor(
+        cafile=policy.internal_ca_file,
+        load_system_roots=policy.mode != "pinned",
+        crl_file=crl,
+        cafile_setting="[tls].internal_ca_file",
+    )
+
+
+class CaFileUnreadable(OSError, ValueError):
+    """A trust anchor's CA file could not be read, named by the setting that set it (BACKLOG #2370).
+
+    Both bases on purpose. It was a bare ``FileNotFoundError`` before, so a caller catching
+    ``OSError`` still catches it. The load seams surface a ``ValueError`` as a configuration
+    refusal, so it now reads as one too, with the setting and connection in the text."""
+
+
+@contextmanager
+def _naming_the_ca_setting(anchor: TrustAnchor) -> Iterator[None]:
+    """Turn an unreadable ``anchor.cafile`` into :class:`CaFileUnreadable` naming its setting.
+
+    An :class:`ssl.SSLError` (a file that reads but holds no usable PEM) passes through unchanged:
+    it is an :class:`OSError` too, but not the missing-file case this names."""
+    try:
+        yield
+    except ssl.SSLError:
+        raise
+    except OSError as exc:
+        # No path in the text, as the bare FileNotFoundError this replaces carried none: a connection
+        # test returns this text to the caller and audits it. The setting tells the operator where.
+        # It does not make the hop path-free; a [tls].crl_file refusal still names its file.
+        setting = anchor.cafile_setting or "the CA file setting"
+        raise CaFileUnreadable(
+            f"{setting} names a CA file that cannot be read: {exc.strerror or type(exc).__name__}"
+        ) from exc
 
 
 def build_verifying_client_context(
@@ -2633,10 +2727,12 @@ def build_verifying_client_context(
         ctx = ssl.create_default_context(purpose)
         if anchor.cafile is not None:
             # augment: keep the OS default roots loaded above and add the internal CA on top.
-            ctx.load_verify_locations(cafile=anchor.cafile)
+            with _naming_the_ca_setting(anchor):
+                ctx.load_verify_locations(cafile=anchor.cafile)
     else:
         # pinned / per-connection: ONLY this CA (no load_default_certs), matching forward_tls_ca_file.
-        ctx = ssl.create_default_context(purpose, cafile=anchor.cafile)
+        with _naming_the_ca_setting(anchor):
+            ctx = ssl.create_default_context(purpose, cafile=anchor.cafile)
     # BACKLOG #299: the CRL loads LAST, once the trust store is final -- harden_crl_check asserts the
     # CRL actually landed in that store, and a later load_verify_locations would make the assertion
     # answer for a different store than the one the handshake uses.
@@ -2689,7 +2785,8 @@ def build_anchored_https_handler(
         handler = build_asserted_https_handler(connector=connector)
         ctx = urllib_handler_context(handler, connector=connector)
         if anchor.cafile is not None:
-            ctx.load_verify_locations(cafile=anchor.cafile)
+            with _naming_the_ca_setting(anchor):
+                ctx.load_verify_locations(cafile=anchor.cafile)
         # BACKLOG #299: `system` mode plus a CRL narrows without naming a CA, so this arm now runs with
         # `cafile is None`. load_verify_locations rejects an all-None call, hence the guard above; the
         # CRL still loads last, against the final trust store.
@@ -2818,8 +2915,12 @@ def build_smtp_tls_context(
     check_hostname: bool = True,
     trust_anchor_policy: TrustAnchorPolicy | None = None,
     name: str = "",
+    ca_setting: str = "tls_ca_file",
 ) -> ssl.SSLContext:
     """Build the TLS context for an outbound SMTP hop (#323) — STARTTLS or implicit ``SMTP_SSL``.
+
+    ``ca_setting`` is the key ``ca_file`` came from, for a refusal of an unreadable file to name
+    (vault BACKLOG #2370); the alerts sink passes its own.
 
     ``check_hostname=False`` on the verify path logs :func:`warn_hostname_check_off` naming ``cell``,
     ``name`` (the connection, when the caller has one) and ``host``. The Email and Direct connectors
@@ -2848,6 +2949,8 @@ def build_smtp_tls_context(
             connection_ca_file=ca_file,
             host=host,
             policy=trust_anchor_policy if trust_anchor_policy is not None else TrustAnchorPolicy(),
+            connection=name or None,
+            setting=ca_setting,
         )
         ctx = build_verifying_client_context(anchor)
     else:

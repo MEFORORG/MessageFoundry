@@ -246,6 +246,91 @@ class TestTheFourHolds:
         assert not (dest / "RESUME-HERE.md").exists()
 
 
+class TestWriteCopiesOneDocumentIn:
+    """``-Write`` exists because the desktop app's worktree guard refuses the edit tools here.
+
+    Same rule as the holds above: every refusal is paired with the case that writes, so a script
+    that refuses everything fails this class.
+    """
+
+    def draft(self, sandbox: Path, body: str = "# Handoff\n\nbody\n") -> Path:
+        f = sandbox / "draft.md"
+        f.write_bytes(body.encode("utf-8"))
+        return f
+
+    def test_write_copies_the_bytes_and_prints_the_path(self, sandbox: Path) -> None:
+        """FIRST, AND IT MUST PASS. Byte-for-byte, including a non-ASCII character and CRLF."""
+        body = "# Handoff\r\n\r\nCafé status: done\r\n"
+        src = self.draft(sandbox, body)
+        proc = run(sandbox, "-Write", "MANAGER-2026-10-06-HANDOFF-SEAT.md", "-From", str(src))
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        dest = sandbox / "coord" / "handoffs" / "MANAGER-2026-10-06-HANDOFF-SEAT.md"
+        assert dest.read_bytes() == body.encode("utf-8")
+        assert proc.stdout.strip() == str(dest)
+        assert not list((sandbox / "coord" / "handoffs").glob("*.tmp"))
+
+    def test_write_creates_a_missing_handoffs_directory(self, sandbox: Path) -> None:
+        shutil.rmtree(sandbox / "coord" / "handoffs")
+        proc = run(sandbox, "-Write", "a.md", "-From", str(self.draft(sandbox)))
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert (sandbox / "coord" / "handoffs" / "a.md").is_file()
+
+    def test_write_refuses_an_existing_name(self, sandbox: Path) -> None:
+        existing = put(sandbox, "a.md", "someone else's handoff\n")
+        proc = run(sandbox, "-Write", "a.md", "-From", str(self.draft(sandbox)))
+        assert proc.returncode == 1
+        assert "already exists" in proc.stdout
+        assert existing.read_text(encoding="utf-8") == "someone else's handoff\n"
+
+    def test_and_replace_overwrites_it(self, sandbox: Path) -> None:
+        """PAIR."""
+        existing = put(sandbox, "a.md", "old\n")
+        proc = run(
+            sandbox, "-Write", "a.md", "-From", str(self.draft(sandbox, "new\n")), "-Replace"
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert existing.read_text(encoding="utf-8") == "new\n"
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "../escape.md",
+            "sub/inner.md",
+            "sub\\inner.md",
+            "state.json",
+            "noext",
+            "doc.md:stream.md",
+            ".hidden.md",
+            "a..b.md",
+            "a.md\n",
+            "CON.md",
+            "nul.txt",
+            "com1.notes.md",
+        ],
+    )
+    def test_write_refuses_a_name_that_is_not_a_plain_document(
+        self, sandbox: Path, name: str
+    ) -> None:
+        """The good name is the first test in this class; these differ from it only in the name."""
+        proc = run(sandbox, "-Write", name, "-From", str(self.draft(sandbox)))
+        assert proc.returncode == 1, proc.stdout + proc.stderr
+        assert "REFUSED" in proc.stdout
+        assert not (sandbox / "escape.md").exists()
+        assert not list((sandbox / "coord").rglob("*.md"))
+        assert not list((sandbox / "coord").rglob("*.json"))
+
+    def test_write_refuses_a_missing_or_empty_source(self, sandbox: Path) -> None:
+        missing = run(sandbox, "-Write", "a.md", "-From", str(sandbox / "nope.md"))
+        assert missing.returncode == 1
+        assert "is not a file" in missing.stdout
+        empty = sandbox / "empty.md"
+        empty.write_bytes(b"")
+        proc = run(sandbox, "-Write", "a.md", "-From", str(empty))
+        assert proc.returncode == 1
+        assert "is empty" in proc.stdout
+        assert not (sandbox / "coord" / "handoffs" / "a.md").exists()
+
+
 class TestReportTellsEmptyFromUnlooked:
     def test_report_distinguishes_nothing_found_from_nothing_looked(self, sandbox: Path) -> None:
         """Two states with opposite fixes that render identically without this branch."""

@@ -575,8 +575,15 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
       going past a file it cannot set (an open editor, an antivirus scan) instead of stopping at the
       first one and leaving the rest on the old owner — check its summary line for skipped files.
       Setting the owner does **not** grant anyone access — pair it with the DACL recipes above.
-  - On **POSIX** hosts the loader **refuses** to load from a group/world-writable or foreign-owned
-    directory or module file.
+  - On **POSIX** hosts the loader **refuses** to load from a group/world-writable directory or module
+    file, or from one owned by any uid other than root or the engine's effective uid. When the engine
+    runs as root, only a root owner is trusted. A root-owned config that is not group/world-writable
+    is the safest layout, because the engine's own account cannot rewrite it, provided the engine
+    can still read every file. The loader checks only the directory and its `*.py`, following links,
+    so the layout also depends on at least these, which it does not check: every directory above the
+    config directory is writable only by root; a `*.py` that is a link points into such a directory;
+    the file system reports real owners and modes (a network mount may synthesize them); and the
+    other config inputs, such as `connections.toml` and `codesets/`, are locked down the same way.
   - **Dev/test escape (never set in production).** Because a default Windows checkout grants
     `BUILTIN\Users` write, set `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE=1` **and**
     `MEFOR_SECURITY_ENFORCEMENT=warn` in the same environment to downgrade the refusal to a

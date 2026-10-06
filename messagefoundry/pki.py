@@ -258,10 +258,13 @@ def judge_every_crl(pem: bytes, *, now: float) -> list[tuple[CrlFacts, CrlBlock]
     a model of OpenSSL, not a proof, so a load still counts what OpenSSL took
     (:func:`messagefoundry.config.tls_policy.crl_scratch_context`).
 
-    **A delta CRL refuses too.** The engine turns on no extended CRL support, and without it
-    OpenSSL was measured to use a newer delta CRL as if it were complete. Revocations listed only
-    in the base CRL were then dropped, and a revoked client was accepted. Give the setting base
-    CRLs only."""
+    **A delta CRL refuses too.** The engine turns on no extended or delta CRL support, so OpenSSL
+    loses a revocation from a base-plus-delta file whichever delta rule it has. The rule changed
+    upstream in openssl/openssl PR 31044, "Reject delta CRLs as complete CRL candidates", released
+    in at least 3.0.22, 3.4.7, 3.5.8, 3.6.4 and 4.0.2. Before it, OpenSSL uses a newer delta as if
+    it were complete, so revocations only the base CRL lists are dropped. After it, OpenSSL sets
+    the delta aside, so revocations only the delta lists are dropped. Give the setting base CRLs
+    only."""
     blocks = list(_crl_blocks(pem))
     if len(blocks) != pem.count(_CRL_BEGIN):
         raise ValueError(

@@ -663,6 +663,7 @@ def _mllp_ssl_context(
             connection_ca_file=str(ca) if ca else None,
             host=str(s.get("host", "127.0.0.1")),
             policy=trust_anchor_policy,
+            connection=name or None,
         )
         ctx = build_verifying_client_context(anchor)
     else:

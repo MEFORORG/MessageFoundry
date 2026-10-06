@@ -1644,7 +1644,8 @@ class TlsSettings(_Section):
     """``[tls]`` — the instance-wide client **trust-anchor and revocation** policy (#190, ADR 0093).
 
     A small, shared fallback for outbound connectors that verify a downstream *server* certificate
-    (MLLP/DICOM/FTPS today). By default the OS trust store roots verify the peer; a hospital estate
+    (MLLP/DICOM/FTPS today), and the inbound FTPS poller, which dials out too (vault BACKLOG
+    #2370). By default the OS trust store roots verify the peer; a hospital estate
     whose internal endpoints present a PRIVATE / internal-CA cert can pin that CA here once instead of
     installing it box-globally or repeating a per-connection ``tls_ca_file``. This is a CLIENT trust
     anchor — it selects WHICH roots verify the peer, it NEVER disables verification — so it composes
@@ -1662,8 +1663,8 @@ class TlsSettings(_Section):
     #   "pinned"  — ONLY the internal CA, not the public bundle (a fully-private estate; strictest,
     #               the forward_tls_ca_file template).
     trust_anchor_mode: TrustAnchorMode = "system"
-    # PEM path to a file of CRLs for OUTBOUND hops (BACKLOG #299). NOT a secret — a path,
-    # the same status as internal_ca_file. Empty (default) = no outbound revocation checking, which is
+    # PEM path to a file of CRLs for OUTBOUND hops and the FTPS poller (BACKLOG #299, #2370). NOT a
+    # secret -- a path, the same status as internal_ca_file. Empty (default) = no outbound revocation checking, which is
     # exactly the gap the #201 RevocationHopGuard refuses on an enforcing hop. Set it and every hop that
     # resolves a trust anchor loads the CRL onto its OWN context and sets VERIFY_CRL_CHECK_LEAF.
     #
@@ -4322,7 +4323,8 @@ _ALERT_EVENT_TYPES = frozenset(
         "approval_approver_provenance",
         "administrator_granted",
         # ADR 0079 mechanism 2: the directory reconciler's two audited outcomes, each routable apart:
-        # the mass-revoke breaker tripped (nothing revoked), and one principal's sessions were revoked.
+        # a pass left accounts unrevoked (the breaker tripped, or probes were referred, BACKLOG
+        # #2538), and one principal's sessions were revoked.
         "ad_reconcile_aborted",
         "ad_session_revoked",
         # ADR 0195: the reconciler held accounts whose userAccountControl it could not read.
@@ -7930,9 +7932,10 @@ def settings_error_detail(exc: Exception) -> str:
     :class:`ServiceSettings` re-raises each error with its input replaced by :data:`HIDDEN_INPUT`
     (``_InputHidingModel``), so ``str(exc)``, ``exc.errors()`` and ``exc.json()`` carry the
     placeholder, never the refused mapping. That covers
-    the ``__main__.py`` arms that still print ``str(exc)`` (at least ``audit-verify``,
-    ``rotate-key`` and the store commands behind ``_host_gated_store_settings``). ``serve`` and
-    ``supervise`` already rendered through this function, by way of ``_load_service_settings``.
+    the ``__main__.py`` arms that still print ``str(exc)`` (at least ``rotate-key`` and the store
+    commands behind ``_host_gated_store_settings``). At least ``serve``, ``supervise``,
+    ``audit-anchor`` and, since vault BACKLOG #3054, ``audit-verify`` render through this function,
+    by way of ``_load_service_settings``.
 
     THE MESSAGE IS NOT HIDDEN, AND THIS FUNCTION PRINTS IT. A validator that quotes the value it
     refused still shows it, here and in ``str(exc)``: at least the ``[backup]`` and ``[dr]``

@@ -28,7 +28,14 @@ import pytest
 
 from messagefoundry.config import wiring
 from messagefoundry.config.settings import EgressSettings
-from messagefoundry.config.tls_policy import TrustAnchorPolicy
+from messagefoundry.config.tls_policy import (
+    CaFileUnreadable,
+    TrustAnchorPolicy,
+    build_anchored_https_handler,
+    build_smtp_tls_context,
+    build_verifying_client_context,
+    resolve_trust_anchor,
+)
 from messagefoundry.config.wiring import (
     FHIR,
     ConnectionSpec,
@@ -40,13 +47,19 @@ from messagefoundry.config.wiring import (
     Rest,
     Soap,
     WiringError,
+    build_inbound_connection,
     build_outbound_connection,
     env,
     load_config,
+    resolve_env_settings,
 )
-from messagefoundry.pipeline.wiring_runner import _dest_config, _fhir_lookup_settings
+from messagefoundry.pipeline.wiring_runner import (
+    _dest_config,
+    _fhir_lookup_settings,
+    _source_config,
+)
 from messagefoundry.transports import rest
-from messagefoundry.transports.base import build_destination
+from messagefoundry.transports.base import build_destination, build_source
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.http_auth import bearer_provider_from_settings
 from messagefoundry.transports.remotefile import _ftps_ssl_context
@@ -218,12 +231,146 @@ def test_a_named_ca_is_the_ftps_hops_only_anchor(tmp_path: Path) -> None:
     assert ctx.verify_mode == ssl.CERT_REQUIRED
 
 
-def test_an_inbound_ftps_poller_reads_the_ca_without_a_policy(tmp_path: Path) -> None:
-    """The inbound FTPS source builds its client with no ``[tls]`` policy, so the CA reaches it
-    through the ``create_default_context(cafile=...)`` branch. That branch must still pin."""
+def test_a_policy_less_ftps_build_still_pins_the_ca(tmp_path: Path) -> None:
+    """A direct build with no ``[tls]`` policy takes the ``create_default_context(cafile=...)``
+    branch. The runner no longer reaches it for the poller (vault BACKLOG #2370), but it must
+    still pin."""
     ca = _ca_pem(tmp_path, "mefor-ftps-inbound-ca")
     spec = Ftp(host="ftp.internal.example.org", tls=True, remote_dir="/in", tls_ca_file=ca)
     assert _ca_subjects(_ftps_ssl_context(dict(spec.settings))) == {"mefor-ftps-inbound-ca"}
+
+
+def _poller_context(spec: ConnectionSpec, policy: TrustAnchorPolicy | None) -> ssl.SSLContext:
+    """Build an inbound FTPS poller the way the runner does: ``_source_config``, then the registry."""
+    source = build_source(
+        _source_config(
+            build_inbound_connection("IB_FTPS", spec, router="r"), "127.0.0.1", {}, policy
+        ),
+        egress=EgressSettings(deny_by_default=False),
+    )
+    ctx = source._client.tls_context  # type: ignore[attr-defined]
+    assert isinstance(ctx, ssl.SSLContext)
+    return ctx
+
+
+def test_an_inbound_ftps_poller_honours_the_instance_tls_block(tmp_path: Path) -> None:
+    """Vault BACKLOG #2370 item 4: the poller got no ``[tls]`` policy, so a pinned instance CA did
+    not reach it while it reached the FTPS destination. The control is the same build with no
+    policy, which must not carry the instance CA, so the assertion cannot pass on an empty change."""
+    spec = Ftp(host="ftp.internal.example.org", tls=True, remote_dir="/in")
+    assert _ca_subjects(_poller_context(spec, _pinned(tmp_path))) == {"mefor-instance-ca"}
+    assert "mefor-instance-ca" not in _ca_subjects(_poller_context(spec, None))
+
+
+def test_an_inbound_ftps_poller_keeps_its_own_ca_over_the_instance_one(tmp_path: Path) -> None:
+    ca = _ca_pem(tmp_path, "mefor-ftps-poller-ca")
+    spec = Ftp(host="ftp.internal.example.org", tls=True, remote_dir="/in", tls_ca_file=ca)
+    assert _ca_subjects(_poller_context(spec, _pinned(tmp_path))) == {"mefor-ftps-poller-ca"}
+
+
+# --- a blank env() value and a missing file are named refusals (vault BACKLOG #2370) ---------------
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_a_blank_env_ca_is_refused_once_resolved(blank: str) -> None:
+    """A blank literal is refused at load; a blank ``env()`` value is only known once resolved, and
+    read as unset it would trust what the hop trusts with no pin at all."""
+    spec = Rest(url="https://partner.example.org/api", tls_ca_file=env("partner_ca"))
+    with pytest.raises(WiringError) as caught:
+        _dest_config(
+            build_outbound_connection("OB_REST", spec),
+            {"partner_ca": blank},
+            trust_anchor_policy=None,
+            egress=EgressSettings(deny_by_default=False),
+        )
+    message = str(caught.value)
+    assert "'tls_ca_file' of connection 'OB_REST'" in message
+    assert "'partner_ca'" in message
+    assert "pins nothing" in message
+
+
+def test_a_blank_env_default_ca_is_refused_too() -> None:
+    with pytest.raises(WiringError, match="'tls_ca_file' of connection 'IB_FTPS'"):
+        resolve_env_settings(
+            {"tls_ca_file": env("partner_ca", default="")}, {}, connection="IB_FTPS"
+        )
+
+
+def test_a_blank_env_value_on_another_setting_is_untouched() -> None:
+    """The control: the refusal is about the CA pin, not every blank value."""
+    assert resolve_env_settings({"pattern": env("p")}, {"p": ""}) == {"pattern": ""}
+    assert resolve_env_settings({"tls_ca_file": env("c")}, {"c": "/org/ca.pem"}) == {
+        "tls_ca_file": "/org/ca.pem"
+    }
+
+
+def test_a_missing_destination_ca_file_names_the_setting_and_connection(tmp_path: Path) -> None:
+    """It was a bare FileNotFoundError that named nothing. Both bases stay catchable. The path is
+    left out, because a connection test returns this text to its caller and audits it."""
+    gone = str(tmp_path / "gone.pem")
+    with pytest.raises(CaFileUnreadable) as caught:
+        _destination_opener(Rest(url="https://partner.example.org/api", tls_ca_file=gone))
+    assert isinstance(caught.value, ValueError)
+    assert isinstance(caught.value, OSError)
+    assert isinstance(caught.value.__cause__, FileNotFoundError)
+    message = str(caught.value)
+    assert "tls_ca_file of connection 'OB' names a CA file that cannot be read" in message
+    assert "gone.pem" not in message
+
+
+def test_a_missing_ftps_ca_file_names_the_poller_in_its_namespace(tmp_path: Path) -> None:
+    spec = Ftp(
+        host="ftp.internal.example.org",
+        tls=True,
+        remote_dir="/in",
+        tls_ca_file=str(tmp_path / "gone.pem"),
+    )
+    with pytest.raises(CaFileUnreadable, match="tls_ca_file of connection 'inbound:IB_FTPS'"):
+        _poller_context(spec, TrustAnchorPolicy())
+
+
+def test_a_blank_env_ca_on_an_inbound_names_it_in_its_namespace() -> None:
+    spec = Ftp(host="ftp.internal.example.org", tls=True, remote_dir="/in", tls_ca_file=env("c"))
+    with pytest.raises(WiringError, match="of connection 'inbound:IB_FTPS'"):
+        _source_config(
+            build_inbound_connection("IB_FTPS", spec, router="r"), "127.0.0.1", {"c": ""}
+        )
+
+
+def test_a_missing_alerts_smtp_ca_names_its_own_setting(tmp_path: Path) -> None:
+    """The alerts sink has no connection; it passes its own key, so the operator is not sent
+    looking for a connection's tls_ca_file."""
+    with pytest.raises(CaFileUnreadable, match=r"^\[alerts\]\.email_tls_ca_file names"):
+        build_smtp_tls_context(
+            host="smtp.internal.example.org",
+            cell="alerts SMTP transport",
+            ca_file=str(tmp_path / "gone.pem"),
+            ca_setting="[alerts].email_tls_ca_file",
+        )
+
+
+@pytest.mark.parametrize("mode", ["pinned", "augment"])
+def test_a_missing_instance_ca_file_names_the_tls_block(mode: str, tmp_path: Path) -> None:
+    """The instance anchor goes through the same loads, so it is named as ``[tls]`` rather than as a
+    connection's setting. Both arms of the HTTP-family handler, and the plain context."""
+    policy = TrustAnchorPolicy(internal_ca_file=str(tmp_path / "gone.pem"), mode=mode)  # type: ignore[arg-type]
+    anchor = resolve_trust_anchor(connection_ca_file=None, host="10.1.2.3", policy=policy)
+    with pytest.raises(CaFileUnreadable, match=r"\[tls\]\.internal_ca_file names"):
+        build_verifying_client_context(anchor)
+    with pytest.raises(CaFileUnreadable, match=r"\[tls\]\.internal_ca_file names"):
+        build_anchored_https_handler(anchor=anchor, connector="test")
+
+
+def test_a_ca_file_that_is_not_pem_still_raises_ssl_error(tmp_path: Path) -> None:
+    """Only an unreadable file is renamed. A file that reads but holds no CA keeps its SSLError."""
+    junk = tmp_path / "junk.pem"
+    junk.write_text("not a certificate", encoding="utf-8")
+    anchor = resolve_trust_anchor(
+        connection_ca_file=str(junk), host="10.1.2.3", policy=TrustAnchorPolicy(), connection="OB"
+    )
+    with pytest.raises(ssl.SSLError) as caught:
+        build_verifying_client_context(anchor)
+    assert not isinstance(caught.value, CaFileUnreadable)
 
 
 def test_the_token_hop_reads_the_factory_ca_even_with_verify_tls_off(tmp_path: Path) -> None:

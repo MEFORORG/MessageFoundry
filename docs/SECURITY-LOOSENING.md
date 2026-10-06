@@ -817,15 +817,16 @@ This section is kept rather than deleted, because the claim it used to make is t
 - **What you lose:** the config-source check
   ([ADR 0036](adr/0036-windows-config-source-trust.md)). The engine runs every `*.py` in the config
   directory as its own account, which holds the store credentials and reads PHI. The check refuses
-  a directory or module that a broad or low-privilege principal can write, one owned by another
-  unprivileged account, and on Windows one whose access list cannot be read. With the escape
+  a directory or module that a broad or low-privilege principal can write, one owned by any
+  account other than root or the engine's own (only root when the engine runs as root), and on
+  Windows one whose access list cannot be read. With the escape
   honoured, each of those is a WARNING and the load goes on. Whoever can write there would then run
   code as the engine's account at the next start, reload or worker respawn.
 - **When acceptable:** a dev or CI checkout that is user-writable on purpose, with synthetic data.
   Never a deployment.
 - **Compensating controls:** none that substitute. Lock the directory instead:
-  `install-service.ps1 -LockConfigDir` on Windows, or on POSIX own it as the engine's account and
-  remove group and world write ([SERVICE.md](SERVICE.md)).
+  `install-service.ps1 -LockConfigDir` on Windows, or on POSIX own it as root (safest) or as the
+  engine's account and remove group and world write ([SERVICE.md](SERVICE.md)).
 - **Visibility:** each load logs a WARNING for every path it let through. `serve` and
   `GET /security/posture` name the variable while it is honoured, and both read the engine's own
   environment. `messagefoundry security show` reads the shell it runs in, which may not be the

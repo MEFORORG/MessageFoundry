@@ -90,6 +90,133 @@ _MFB64 = re.compile(r"mfb64:v1:[A-Za-z0-9+/=]+")
 # ``tls_key_password`` — two prefix segments each) and nothing in this tree comes close.
 _LABEL_PREFIX = r"(?:[A-Za-z0-9]+[._-]){0,6}"
 
+# The quoted and braced value fragments (BACKLOG #1685). ``_ODBC_BRACED`` and the overrun are
+# ``_CREDENTIAL_KV``'s only, and its quoted value is ``_KV_QUOTED_VALUE``, whose fast path is the plain
+# quoted form; no pattern uses the plain form on its own.
+# ``_MEFOR_SECRET``, ``_BEARER`` and ``_KEY_MATERIAL`` take the GUARDED forms, which refuse at least
+# the measured shapes of a closer that belongs to someone else -- a later label's quote, a quote
+# inside a DSN password -- and fall back to the plain class: ``token='abc, password='p w'`` would
+# otherwise print "p w". The guarded quoted form
+# leaves its closer in the text, as the plain classes always did, because a later pass needs it there.
+# Every guard, why the closer stays, and why ``_BEARER`` takes no brace form, are stated once, on the
+# same fragments in ``messagefoundry/secretscrub.py``.
+_ODBC_BRACED = r"\{(?:[^}]|\}\})*+\}(?!\})"
+_ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
+_GUARDED_QUOTED_VALUE = (
+    "'(?:[^'\"{\\s:=]++|(?::(?!//)|=|[^\\S\r\n])++(?!'))++(?='(?!\\s*+[:=]))"
+    '|"(?:[^\'"{\\s:=]++|(?::(?!//)|=|[^\\S\r\n])++(?!"))++(?="(?!\\s*+[:=]))'
+)
+_GUARDED_BRACED_VALUE = r"\{(?:[^}'\"\r\n]|\}\})*+\}(?!\})"
+_GUARDED_BRACED_NO_SPACE = r"\{(?:[^}'\"\s]|\}\})*+\}(?!\})"
+
+# Where an UNQUOTED value stops early: just before a credential label whose value is a closed, guarded
+# quote. Without it a plain value ran on across a separator into a LATER label and ended at that
+# label's opening quote, so the later pattern never saw its label and the quoted value went into the
+# support archive and ``GET /logs/tail``: ``api_token=x;password="v w"`` came out as
+# ``api_token=[REDACTED]"v w"``. Why it stops only there (so one pass newly prints label text, and a
+# value only in one recorded trade, though a later pass over the changed text can print more), where
+# in the label it stops (at the keyword, or at an underscored prefix right after a hard separator),
+# why the MEFOR_ branch keeps ``\b``, why it stays linear, and the residuals, are stated once, on the
+# same fragments in ``messagefoundry/secretscrub.py``. So are the OPEN DEFECTS this copy shares:
+# values a later pass newly prints, on lines with or without a ``MEFOR_`` label. This copy spells the
+# keywords the way this module's own patterns do, and folds case on them alone, for the reason given
+# at ``_BEARER``.
+_LABEL_HEAD = (
+    r"(?=(?i:[abceipst]))"
+    r"(?:(?i:pass(?:word|wd|phrase)?|pwd|secret|credential|encryption_key(?:s_retired)?|private_key"
+    r"|intake_api_key_next)\b['\"]?\s*+[:=]\s*+"
+    r"|(?i:bearer|authorization|token|session|api[_-]?key)\b\s*+[:=]\s*+"
+    r"(?:(?i:bearer|basic|digest)\s++)?"
+    r")"
+)
+_MEFOR_LABEL_HEAD = r"\b(?-i:MEFOR_[A-Z0-9_]++)\b['\"]?\s*+[:=]\s*+"
+_QUOTED_LABEL = _LABEL_HEAD + r"(?:" + _GUARDED_QUOTED_VALUE + r")"
+_MEFOR_QUOTED_LABEL = _MEFOR_LABEL_HEAD + r"(?:" + _GUARDED_QUOTED_VALUE + r")"
+_NOT_AT_QUOTED_LABEL = r"(?!" + _QUOTED_LABEL + r"|" + _MEFOR_QUOTED_LABEL + r")"
+_HARD_SEPARATOR_BEHIND = r"(?<![A-Za-z0-9._\-])"
+_NOT_BEFORE_QUOTED_LABEL = (
+    r"(?!(?:"
+    + _HARD_SEPARATOR_BEHIND
+    + r"\b(?:[A-Za-z0-9]++_){1,6})?"
+    + _QUOTED_LABEL
+    + r"|"
+    + _MEFOR_QUOTED_LABEL
+    + r")"
+)
+
+
+# ``_CREDENTIAL_KV``'s quoted value: the plain quoted form, except where the quote that would close it
+# opens a later label's value. There it takes that label and its value too, through the value's own
+# closer, so ``password='abc, private_key='p w q'`` no longer prints "p w q'". When it runs on and
+# when it falls back to the plain form's span, what that was measured to cost, and why it stays
+# linear, are stated once, on the same fragment in ``messagefoundry/secretscrub.py``. Written as plain
+# concatenation, not built by a helper, so ``tests/test_security_static.py`` can resolve this copy and
+# scan it.
+_RUN_ON_LABEL = (
+    r"(?:(?=(?i:[abceipst]))"
+    r"(?:(?i:pass(?:word|wd|phrase)?|pwd|secret|credential|encryption_key(?:s_retired)?|private_key"
+    r"|intake_api_key_next)\b[^\S\r\n]*+[:=][^\S\r\n]*+"
+    r"|(?i:bearer|authorization|token|session|api[_-]?key)\b[^\S\r\n]*+[:=][^\S\r\n]*+"
+    r"(?:(?i:bearer|basic|digest)[^\S\r\n]++)?)"
+    r"|\b(?-i:MEFOR_[A-Z0-9_]++)\b[^\S\r\n]*+[:=][^\S\r\n]*+)"
+)
+_SQ_RUN_ON_WALK = r"(?:[^'\r\nA-Za-z0-9]|(?!" + _RUN_ON_LABEL + r"')[A-Za-z0-9]++)*+"
+_DQ_RUN_ON_WALK = r"(?:[^\"\r\nA-Za-z0-9]|(?!" + _RUN_ON_LABEL + r"\")[A-Za-z0-9]++)*+"
+_RUN_ON_INNER = (
+    r"(?:[^'\"{:\r\nA-Za-z0-9\x80-\U0010ffff]|:(?!//)"
+    r"|(?!" + _RUN_ON_LABEL + r")(?-i:[A-Za-z0-9])++)*+"
+)
+_KV_QUOTED_VALUE = (
+    r"'[^'\r\n]*+(?<![:=\s])'"
+    + r"|'"
+    + _SQ_RUN_ON_WALK
+    + r"(?:"
+    + _RUN_ON_LABEL
+    + r"(?=')(?:'"
+    + _RUN_ON_INNER
+    + r"(?='(?!\s*+[:=])))?+)?+'"
+    + r"|\"[^\"\r\n]*+(?<![:=\s])\""
+    + r"|\""
+    + _DQ_RUN_ON_WALK
+    + r"(?:"
+    + _RUN_ON_LABEL
+    + r"(?=\")(?:\""
+    + _RUN_ON_INNER
+    + r"(?=\"(?!\s*+[:=])))?+)?+\""
+)
+
+# The plain value classes. Each takes its whole natural run when ``_NO_QUOTED_LABEL_AFTER`` shows no
+# stop is possible, and otherwise walks the value as tokens -- a run of letters and digits, or one
+# other character -- checking the stop in front of each run. Each pattern's terminator set is stated
+# once and spliced into all three places. Why the two paths agree, why per run agrees with per
+# character, and this copy's one gap, are stated on the same constants in
+# ``messagefoundry/secretscrub.py``.
+_NO_QUOTED_LABEL_AFTER = r"(?!\s*+[:='\"]|\s++(?i:bearer|basic|digest)\s)"
+_PLAIN_TERMINATORS = r"\s'\""  # _MEFOR_SECRET, _BEARER
+_KV_TERMINATORS = r"\s'\";,&"  # _CREDENTIAL_KV
+_KEY_TERMINATORS = r"\s'\";&"  # _KEY_MATERIAL
+_SCHEME_TERMINATORS = r"\s'\",;"  # _AUTH_SCHEME
+_PLAIN_VALUE = (
+    rf"['\"]?(?:[^{_PLAIN_TERMINATORS}]++{_NO_QUOTED_LABEL_AFTER}"
+    rf"|(?:{_NOT_AT_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_PLAIN_TERMINATORS}])"
+    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_PLAIN_TERMINATORS}])*+)"
+)
+_PLAIN_KV_VALUE = (
+    rf"['\"]?(?:[^{_KV_TERMINATORS}]++{_NO_QUOTED_LABEL_AFTER}"
+    rf"|(?:{_NOT_AT_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_KV_TERMINATORS}])"
+    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_KV_TERMINATORS}])*+)"
+)
+_PLAIN_KEY_VALUE = (
+    rf"['\"]?(?:[^{_KEY_TERMINATORS}]++{_NO_QUOTED_LABEL_AFTER}"
+    rf"|(?:{_NOT_AT_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_KEY_TERMINATORS}])"
+    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_KEY_TERMINATORS}])*+)"
+)
+_PLAIN_SCHEME_VALUE = (
+    rf"['\"]?(?:[^{_SCHEME_TERMINATORS}]++{_NO_QUOTED_LABEL_AFTER}"
+    rf"|(?:{_NOT_AT_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_SCHEME_TERMINATORS}])"
+    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_SCHEME_TERMINATORS}])*+)"
+)
+
 # WHY THE CASE FOLD IS SCOPED TO THE ALTERNATION, HERE AND IN THE TWO PATTERNS BELOW. Stated once,
 # because all three share it. A global ``(?i)`` folds the SCANNED CHARACTER CLASS as well as the
 # keywords, and the scanned class is ``_LABEL_PREFIX``. Only the credential KEYWORDS have a case to
@@ -113,8 +240,10 @@ _LABEL_PREFIX = r"(?:[A-Za-z0-9]+[._-]){0,6}"
 # because this box is shared: a sequential layout swung 30 points between two runs of one pair.
 #
 # THE OTHER TWO PATTERNS CARRYING A GLOBAL ``(?i)`` ARE LEFT ALONE, FOR DIFFERENT REASONS. Scoping
-# ``_AUTH_SCHEME`` is worth ZERO and should stay unscoped: its only case-bearing part IS the span that
-# would be scoped, and the two spellings compile to the same program. ``_DSN_PASSWORD`` would pay --
+# ``_AUTH_SCHEME`` was worth ZERO while its only case-bearing part was the scheme word. It is NOT a
+# free edit any more: the pattern now splices ``_PLAIN_SCHEME_VALUE``, whose run class and stop sit
+# under the global fold, so scoping it would change what it matches and stop its run class folding
+# U+017F, U+0130, U+0131 and U+212A. Leave it global. ``_DSN_PASSWORD`` would pay --
 # it scans two classes under its fold -- but its ``[a-z]`` classes depend on the global fold, so
 # scoping it means rewriting them, and that is still a separate change from the one it needed first.
 #
@@ -140,10 +269,12 @@ _LABEL_PREFIX = r"(?:[A-Za-z0-9]+[._-]){0,6}"
 # The ``(?:bearer|basic|digest)\s+`` group is load-bearing, not decoration: without it ``\S+`` matches
 # the AUTH SCHEME rather than the credential, so "Authorization: Bearer <tok>" redacted the word
 # "Bearer" and emitted <tok> verbatim. Making the group optional keeps the plain "token=<tok>" shape
-# working, and the value class excludes quotes so a quoted credential loses the value, not the quote.
+# working. A QUOTED value is taken whole when ``_GUARDED_QUOTED_VALUE`` allows it, and a BRACED one
+# never (the reason is at ``_CREDENTIAL_KV``); otherwise the plain class stops at the first quote.
 _BEARER = re.compile(
     r"\b(" + _LABEL_PREFIX + r"(?i:bearer|authorization|token|session|api[_-]?key))\b"
-    r"\s*[:=]\s*(?:(?i:bearer|basic|digest)\s+)?['\"]?[^\s'\"]+"
+    r"\s*[:=]\s*(?:(?i:bearer|basic|digest)\s+)?"
+    r"(?:" + _GUARDED_QUOTED_VALUE + r"|" + _PLAIN_VALUE + r")"
 )
 
 # A bare auth scheme carrying its credential with no preceding header label — "Bearer <tok>" as it
@@ -158,12 +289,36 @@ _BEARER = re.compile(
 # "ws_password_type must be 'text'". A token that is also ordinary vocabulary discriminates
 # nothing, so matching on it would redact operator diagnostics and buy no confidentiality: a labelled
 # "Authorization: Basic <cred>" is already carried by ``_BEARER``.
-_AUTH_SCHEME = re.compile(r"(?i)\b(bearer)\s+['\"]?[^\s'\",;]{4,}")
+#
+# The four-character floor is a LOOKAHEAD, so a stop that shortens the run cannot push it under the
+# floor: asked of the stopped run, ``Bearer ab:password="v w"`` would fail the floor and print "ab".
+# Where the first run is itself a quoted label the stop does refuse the match, on purpose; why is on
+# the same pattern in ``messagefoundry/secretscrub.py``.
+_AUTH_SCHEME = re.compile(r"(?i)\b(bearer)\s+(?=['\"]?[^\s'\",;]{4})" + _PLAIN_SCHEME_VALUE)
 
 # A MEFOR_* secret echoed as "MEFOR_FOO=value" or "MEFOR_FOO: value": never carry the value. The
 # optional quotes match the shape an error string produces — "(env 'MEFOR_VALUE_PW'='<value>')" — which
-# the unquoted form missed entirely.
-_MEFOR_SECRET = re.compile(r"\b(MEFOR_[A-Z0-9_]+)\b['\"]?\s*[:=]\s*['\"]?[^\s'\"]+['\"]?")
+# the unquoted form missed entirely. A quoted value is taken whole, and so is a braced one when its
+# closer ends the value, both through the guarded forms (explained at ``_CREDENTIAL_KV``). A braced
+# value with no space in it takes one quote after its closer, as the old plain class did, and one with
+# a space does not; why is on the same pattern in ``messagefoundry/secretscrub.py``.
+_MEFOR_SECRET = re.compile(
+    r"\b(MEFOR_[A-Z0-9_]+)\b['\"]?\s*[:=]\s*"
+    r"(?:"
+    + _GUARDED_BRACED_NO_SPACE
+    + rf"(?![^{_PLAIN_TERMINATORS}])"
+    + r"['\"]?|"
+    + _GUARDED_BRACED_VALUE
+    + rf"(?![^{_PLAIN_TERMINATORS}])"
+    # A non-empty quoted value with no space in it, closer and all: the span the old plain class took.
+    + r"|(?="
+    + _GUARDED_QUOTED_VALUE
+    + r")['\"][^\s'\"]++['\"]|"
+    + _GUARDED_QUOTED_VALUE
+    + r"|"
+    + _PLAIN_VALUE
+    + r"['\"]?)"
+)
 
 # A credential in a "<label>=<value>" pair: an ODBC "PWD=", a "password=" in a connection error, a
 # provider "secret=". The value class stops at the separators these actually appear inside (";" in an
@@ -189,26 +344,34 @@ _MEFOR_SECRET = re.compile(r"\b(MEFOR_[A-Z0-9_]+)\b['\"]?\s*[:=]\s*['\"]?[^\s'\"
 # possessive rather than bounded, why the BRACE form gets an overrun and the quote form does not, and
 # which residuals are left open.
 #
+# THE OTHER LABEL PATTERNS TAKE GUARDED FORMS OF THESE (BACKLOG #1685's remainder), each by a rule
+# that keeps it from printing anything its plain class used to hide. ``_MEFOR_SECRET`` and
+# ``_KEY_MATERIAL`` take a quoted value whole, and a braced one whole only when the closing "}" ends the
+# value: without that guard ``MEFOR_X={a}bc`` would redact ``{a}`` and print "bc". ``_BEARER`` takes a
+# quoted value and no braced one, because ``session=`` and ``token=`` carry dict and JSON reprs in this
+# engine's log text. Anything a guarded form refuses -- an unclosed quote, a closer that may belong to
+# a later label -- falls back to the plain class, which carries the stop and is otherwise the old one.
+#
 # THE FRAGMENTS ARE RESTATED RATHER THAN IMPORTED, which follows this module's shape rather than
-# setting it: ``_LABEL_PREFIX``, ``_BEARER``, ``_MEFOR_SECRET``, ``_CREDENTIAL_KV``, ``_KEY_MATERIAL``
-# and ``_DSN_PASSWORD`` are ALREADY stated in both files, and nothing here imports ``secretscrub``
-# today. Folding the two pattern sets into one is a real question and a separate change --
-# ``secretscrub``'s own docstring works through which markers belong to the vocabulary and which to a
-# surface -- so this fix does not settle it in passing by making one file depend on the other.
-_ODBC_BRACED = r"\{(?:[^}]|\}\})*+\}(?!\})"
-_QUOTED_VALUE = "'[^'\r\n]*+'|\"[^\"\r\n]*+\""
-_ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
-
+# setting it: ``_LABEL_PREFIX``, ``_BEARER``, ``_MEFOR_SECRET``, ``_CREDENTIAL_KV``, ``_KEY_MATERIAL``,
+# ``_DSN_PASSWORD`` and ``_NOT_BEFORE_QUOTED_LABEL`` are ALREADY stated in both files, and nothing here
+# imports ``secretscrub`` today. Folding the two pattern sets into one is a real question and a
+# separate change -- ``secretscrub``'s own docstring works through which markers belong to the
+# vocabulary and which to a surface -- so this fix does not settle it in passing by making one file
+# depend on the other. The fragments themselves sit above ``_BEARER``, because every label pattern
+# now uses them.
 _CREDENTIAL_KV = re.compile(
     r"\b(" + _LABEL_PREFIX + r"(?i:pass(?:word|wd|phrase)?|pwd|secret|credential))\b"
     r"['\"]?\s*[:=]\s*"
     r"(?:"
     + _ODBC_BRACED
     + r"|"
-    + _QUOTED_VALUE
+    + _KV_QUOTED_VALUE
     + r"|"
     + _ODBC_BRACED_OVERRUN
-    + r"|['\"]?[^\s'\";,&]+)"
+    + r"|"
+    + _PLAIN_KV_VALUE
+    + r")"
 )
 
 # Key MATERIAL in a "<label>=<value>" pair, where the label ends in a credential word neither pattern
@@ -280,7 +443,14 @@ _CREDENTIAL_KV = re.compile(
 # call — 225x. Do not re-derive this and take it.
 _KEY_MATERIAL = re.compile(
     r"\b(" + _LABEL_PREFIX + r"(?i:encryption_key(?:s_retired)?|private_key"
-    r"|intake_api_key_next))\b['\"]?\s*[:=]\s*['\"]?[^\s'\";&]+"
+    r"|intake_api_key_next))\b['\"]?\s*[:=]\s*"
+    r"(?:"
+    + _GUARDED_BRACED_VALUE
+    + rf"(?![^{_KEY_TERMINATORS}])|"
+    + _GUARDED_QUOTED_VALUE
+    + r"|"
+    + _PLAIN_KEY_VALUE
+    + r")"
 )
 
 # An inline password in a URL-shaped DSN: "postgres://user:<pw>@host/db". The scheme and the user
