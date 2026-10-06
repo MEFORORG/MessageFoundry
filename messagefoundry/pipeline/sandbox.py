@@ -473,7 +473,8 @@ def _read_frame_bytes(stream: Any) -> bytes | None:
 # whole tree. This is best-effort process hygiene, NOT the trust control — ADR 0087's codec, the
 # per-dispatch ``secrets`` id, and the unsolicited-frame check are what keep a stray grandchild frame
 # harmless — so a setup failure degrades to a single-process kill (logged) rather than wedging a feed.
-# The job and group mechanics live in :mod:`messagefoundry.proctree`, shared with the DR hook.
+# The job and group mechanics live in :mod:`messagefoundry.proctree`, shared with the DR takeover
+# hook.
 
 
 def _kill_single(proc: subprocess.Popen[bytes]) -> None:

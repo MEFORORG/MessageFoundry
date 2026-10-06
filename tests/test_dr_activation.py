@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry import proctree
 from messagefoundry.config.settings import (
     BackupSettings,
     DrActivationMode,
@@ -367,9 +368,8 @@ async def test_only_the_takeover_hook_joins_a_kill_on_close_job(tmp_path: Path) 
         await coord.release(actor="alice")
         takeover = json.loads((tmp_path / "takeover.json").read_text(encoding="utf-8"))
         release = json.loads((tmp_path / "release.json").read_text(encoding="utf-8"))
-        kill_on_close = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
         assert takeover["in_job"]
-        assert takeover["flags"] & kill_on_close
+        assert takeover["flags"] & proctree._JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
         assert os.getpid() not in takeover["pids"]
         assert not release["in_job"] or os.getpid() in release["pids"], release
     finally:

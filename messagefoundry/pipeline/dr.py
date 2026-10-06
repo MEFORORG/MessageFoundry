@@ -857,10 +857,12 @@ async def _run_command(command: str, *, stop_kills: bool = True) -> bool:
     leave the shell and whatever it started running, so an activation recorded as aborted could
     still be taking the address. So the shell starts as the root of a tree
     :mod:`messagefoundry.proctree` can kill, and a cancel kills that tree before it propagates.
-    With ``stop_kills=False`` the hook starts as it did before: in no tree of its own, so neither
-    a cancel nor the engine's own exit ends it. On Windows that matters, because a kill-on-close
-    job also ends its processes when the engine exits. A hook that finishes on its own is left
-    alone either way, including anything it left running."""
+    With ``stop_kills=False`` the hook starts as it did before, in no tree of its own, and a
+    cancel leaves it running. On Windows that also keeps it out of a kill-on-close job, which
+    would end it when the engine exits. Anything outside this code that stops the engine's
+    processes, such as a service wrapper's tree kill or a signal to the engine's process group,
+    can still end it. A hook that finishes on its own is left alone either way, including
+    anything it left running."""
     spawn = asyncio.ensure_future(
         asyncio.create_subprocess_shell(
             command,
@@ -876,13 +878,12 @@ async def _run_command(command: str, *, stop_kills: bool = True) -> bool:
         # On Windows a hook this may kill is still suspended then, so it has done nothing yet.
         proc = await asyncio.shield(spawn)
     except (asyncio.CancelledError, GeneratorExit):
-        if stop_kills:
-            spawn.add_done_callback(_kill_late_start)
+        spawn.add_done_callback(_kill_late_start if stop_kills else _leave_late_start)
         raise
     job: int | None = None
     try:
         if stop_kills:
-            job = proctree.resume_into_job(proc.pid, who="DR hook")
+            job = proctree.resume_into_job(proc.pid, who="DR takeover hook")
         await proc.wait()
     except GeneratorExit:
         if stop_kills:
@@ -952,6 +953,13 @@ def _kill_late_start(spawn: asyncio.Future[asyncio.subprocess.Process]) -> None:
     reap = spawn.get_loop().create_task(_reap_hook(proc))
     _LATE_REAPS.add(reap)
     reap.add_done_callback(_LATE_REAPS.discard)
+
+
+def _leave_late_start(spawn: asyncio.Future[asyncio.subprocess.Process]) -> None:
+    """Let a release hook whose start finished after its caller was stopped run on. A failed
+    start is read here, so asyncio does not log it as an exception nobody retrieved."""
+    if not spawn.cancelled():
+        spawn.exception()
 
 
 def _confined_archive(archive: str, seed_dir: str) -> Path | None:
