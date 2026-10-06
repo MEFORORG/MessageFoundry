@@ -2581,11 +2581,14 @@ class RegistryRunner:
         A DR-parked lane is left parked, with no stop half (:meth:`_hold_dr_parked_outbound`)."""
         async with self._reload_lock:
             self._require_owned_destination(name)
-            if ("outbound", name) in self._filtered:
+            if self._dr_parked(name):
                 # DR-parked: no stop half. A stop drops the engine-park marker and re-arms a
                 # quiescence the parked worker never signals again, so the lane read "stopping"
-                # for good and no reload lifted it (vault BACKLOG #3067).
-                self._hold_dr_parked_outbound(name)
+                # for good and no reload lifted it (vault BACKLOG #3067). The start half still
+                # runs, so the gate, the name check and the not-deployed refusal still apply.
+                if not self._outbound_start_permitted(name):
+                    return
+                await self._start_outbound_unsafe(name)
                 return
             self._stop_outbound_unsafe(name)
             if not self._outbound_start_permitted(name):
@@ -2636,9 +2639,9 @@ class RegistryRunner:
     def _park_outbound_lane(self, name: str) -> None:
         """Record ``name``'s delivery lane as DELIBERATELY DOWN — the state the ``auto_start=False``
         boot gate (#115), the ``deployed=False`` gate (#233, ADR 0111) and a DR park of a never-started
-        lane (vault BACKLOG #3067) must leave behind (each also on the reload that re-evaluates it). The two differ in what they do NEXT, not here: a start-disabled
-        lane still gets a delivery worker (parked at the pause gate, ready for an operator start), a
-        not-deployed lane gets none at all.
+        lane (vault BACKLOG #3067) must leave behind (each also on the reload that re-evaluates it).
+        They differ in what they do NEXT, not here: a start-disabled or DR-parked lane still gets a
+        delivery worker (parked at the pause gate), a not-deployed lane gets none at all.
 
         Reuses the operator-pause state rather than inventing a parallel one, so every existing consumer
         is honest with no further change: ``outbound_status`` reports ``"stopped"`` (it was reporting
@@ -2675,13 +2678,19 @@ class RegistryRunner:
         calendar paused it first) and it has no connector, so resuming it now would charge every
         held row a failed attempt (vault BACKLOG #3067). Marking it ``_gate_parked`` turns the
         request into a deferred start: :meth:`_unpark_outbound_lane` honours it on that reload,
-        including for a lane an operator or the calendar paused before the profile came on."""
-        self._gate_parked.add(name)
+        including for a lane an operator or the calendar paused before the profile came on. Only
+        a paused lane is marked, so every engine-parked lane stays paused."""
+        if name in self._outbound_paused:
+            self._gate_parked.add(name)
         log.warning(
-            "outbound %r is parked by the DR run-profile, so it stays down and its rows stay "
-            "held; the first reload after POST /dr/release brings it up",
+            "outbound %r is parked by the DR run-profile, so it stays down and its rows stay held "
+            "until a reload no longer parks it, such as the first reload after POST /dr/release",
             name,
         )
+
+    def _dr_parked(self, name: str) -> bool:
+        """Whether the DR run-profile parks outbound ``name`` this run (its ``filtered`` marker)."""
+        return ("outbound", name) in self._filtered
 
     def engine_parked_outbounds(self) -> frozenset[str]:
         """The outbounds the ENGINE holds down by design: those the DR run-profile parks, and those
@@ -2802,7 +2811,8 @@ class RegistryRunner:
         """start_outbound body without the reload lock. RESUMES delivery for a paused outbound, BUILDING
         its connector first if the lane has none (a start-disabled or failed lane is connector-less —
         see :meth:`_ensure_destination_built`). A DR-parked lane is NOT resumed: it has no connector
-        until the profile is off, so it stays parked (:meth:`_hold_dr_parked_outbound`). A connector that IS live is kept WARM (a
+        until the profile is off, so it stays parked (:meth:`_hold_dr_parked_outbound`). A connector
+        that IS live is kept WARM (a
         pause never tore down ``_destinations``), so a plain resume/restart never rebuilds it. Idempotent
         for a name that isn't paused.
 
@@ -2813,7 +2823,7 @@ class RegistryRunner:
         if not self._deployed(name, "outbound"):
             raise NotDeployedError(name)
         await self._ensure_destination_built(name)
-        if ("outbound", name) in self._filtered:
+        if self._dr_parked(name):
             # DR-parked (#61, ADR 0048): _ensure_destination_built built nothing, so resuming would
             # charge every held row a failed attempt on a connector-less lane until a finite
             # max_attempts dead-lettered it (vault BACKLOG #3067).
@@ -2913,7 +2923,7 @@ class RegistryRunner:
             or not self._auto_start_enabled(name, "outbound")
         ):
             return
-        if ("outbound", name) in self._filtered:
+        if self._dr_parked(name):
             # The DR run-profile parks it too. The calendar's pause becomes the engine's park, so
             # the reload with the profile off lifts it (vault BACKLOG #3067).
             self._hold_dr_parked_outbound(name)

@@ -370,9 +370,13 @@ class DrCoordinator:
                 ),
                 now=now,
             )
-            drained = bool(outcome["drained"])
-            raw_held = outcome.get("held_on_parked_outbounds", 0)
-            held = raw_held if isinstance(raw_held, int) else 0
+            # Only a real True counts as drained, and an unknown held count stays None rather
+            # than reading as zero rows held.
+            drained = outcome["drained"] is True
+            raw_held = outcome.get("held_on_parked_outbounds")
+            held = (
+                raw_held if isinstance(raw_held, int) and not isinstance(raw_held, bool) else None
+            )
             log.warning(
                 "DR released by %s: VIP handed back, intake unbound, drained=%s, rows held on "
                 "parked outbounds=%s — the recovered primary resumes (cross-store reconciliation is "
