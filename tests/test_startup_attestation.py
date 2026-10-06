@@ -11,6 +11,8 @@ The engine hashes its loaded ``messagefoundry`` module files against the install
 - AC-12 — an install that DECLARES itself editable is a NO-OP (no fail, no alert) so dev is never bricked.
 - AC-13 — a pass that compared NOTHING (no baseline, a stripped baseline, a shadowed package) warns,
   records and alerts, and fails closed when opted in (BACKLOG #1679).
+- AC-16 — the walk lists every file a module can be imported from, not only ``.py``, and reads deleted
+  module rows back from RECORD (vault BACKLOG #2763).
 
 The same rules also cover the web console's own distribution when the process has loaded it (BACKLOG
 #1802); that arm's tests are the last block in this file.
@@ -25,6 +27,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import importlib.machinery
 import json
 import logging
 import os
@@ -889,6 +892,341 @@ async def test_declared_editable_under_the_default_posture_stays_silent(
         assert sink.events == []
     finally:
         await store.close()
+
+
+# --- vault BACKLOG #2763: the engine walk sees every file a module can be imported from ------------
+#
+# CPython's FileFinder tries a native extension, then source, then sourceless bytecode. A walk that
+# listed only `.py` hashed the untouched source beside a planted `redaction.<ext>` and reported clean,
+# and never noticed a `.py` deleted so that a `.pyc` left beside it would run. These tests run the REAL
+# walk over a fabricated install, not a stubbed file list, because the walk is what changed.
+
+_ENGINE_PKG = "mfengine"
+_ENGINE_FILES = {
+    f"{_ENGINE_PKG}/__init__.py": b"VERSION = '1.0'\n",
+    f"{_ENGINE_PKG}/redaction.py": b"def redact(value):\n    return '***'\n",
+    f"{_ENGINE_PKG}/sub/__init__.py": b"",
+}
+#: This interpreter's own native-module suffix, so the planted file is one this platform would import.
+_EXT = importlib.machinery.EXTENSION_SUFFIXES[0]
+
+
+def _install_and_walk_engine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    extra_files: dict[str, bytes] | None = None,
+) -> Path:
+    """A clean fabricated engine install, attested by the real walk. Returns the package directory.
+
+    It carries what pip leaves behind: a compiled cache for each module, recorded with no hash. That
+    is the shape the clean-install control has to read clean, and the reason ``__pycache__`` is skipped.
+    """
+    files = {**_ENGINE_FILES, **(extra_files or {})}
+    tag = sys.implementation.cache_tag
+    caches = {
+        f"{_ENGINE_PKG}/__pycache__/__init__.{tag}.pyc": b"cache\n",
+        f"{_ENGINE_PKG}/__pycache__/redaction.{tag}.pyc": b"cache\n",
+        f"{_ENGINE_PKG}/sub/__pycache__/__init__.{tag}.pyc": b"cache\n",
+    }
+    for rel, data in caches.items():
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_bytes(data)
+    dist, loaded = _build_wheel_install(
+        tmp_path,
+        pkg=_ENGINE_PKG,
+        files=files,
+        extra_record_rows=tuple(f"{rel},," for rel in caches),
+    )
+    _patch(monkeypatch, dist, loaded, _ENGINE_PKG)
+    package_dir = tmp_path / _ENGINE_PKG
+    monkeypatch.setattr(
+        integ, "_loaded_module_files", lambda: integ._import_capable_files([str(package_dir)])
+    )
+    return package_dir
+
+
+def _drift(result: AttestationResult) -> list[tuple[str, str]]:
+    return sorted((d.path, d.reason) for d in result.drift)
+
+
+def test_a_clean_install_reads_clean_through_the_widened_walk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE CONTROL. An ordinary install -- source, its compiled caches, and a data file nobody declared
+    -- reads clean. The caches are skipped, and the data file is not walked at all: widening to the
+    import suffixes is not the whole-package scope BACKLOG #1432 declined."""
+    package_dir = _install_and_walk_engine(
+        tmp_path, monkeypatch, extra_files={f"{_ENGINE_PKG}/py.typed": b""}
+    )
+    (package_dir / "notes.txt").write_bytes(b"an operator's note, no RECORD row\n")
+
+    result = attest_engine()
+    assert result.ok, _drift(result)
+    assert result.checked == len(_ENGINE_FILES)
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [*importlib.machinery.EXTENSION_SUFFIXES, importlib.machinery.EXTENSION_SUFFIXES[-1].upper()],
+)
+def test_a_native_module_planted_beside_a_module_is_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, suffix: str
+) -> None:
+    """The import system loads it INSTEAD of the untouched ``.py`` beside it. The upper-cased arm is a
+    spelling the loader finds only where names match case-insensitively (Windows); on a case-sensitive
+    filesystem it is a planted file nothing would import, and reporting it costs nothing."""
+    package_dir = _install_and_walk_engine(tmp_path, monkeypatch)
+    (package_dir / f"redaction{suffix}").write_bytes(b"\x7fELF not really\n")
+
+    result = attest_engine()
+    assert _drift(result) == [(f"{_ENGINE_PKG}/redaction{suffix}", "missing")]
+    assert result.checked == len(_ENGINE_FILES), "the untouched source still hashes clean"
+
+
+def test_a_stray_pyc_with_its_source_deleted_is_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both halves of the shape are reported: the bytecode the import system would now run, and the
+    ``RECORD`` source row it replaced."""
+    package_dir = _install_and_walk_engine(tmp_path, monkeypatch)
+    (package_dir / "redaction.py").unlink()
+    (package_dir / "redaction.pyc").write_bytes(b"sourceless bytecode\n")
+
+    result = attest_engine()
+    assert _drift(result) == [
+        (f"{_ENGINE_PKG}/redaction.py", "missing"),
+        (f"{_ENGINE_PKG}/redaction.pyc", "missing"),
+    ]
+    assert result.checked == len(_ENGINE_FILES) - 1
+
+
+def test_a_deleted_source_file_is_drift(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The ``RECORD`` read-back stands on its own: a shipped ``.py`` that is gone is drift whether or
+    not anything was left to run in its place."""
+    package_dir = _install_and_walk_engine(tmp_path, monkeypatch)
+    (package_dir / "sub" / "__init__.py").unlink()
+
+    assert _drift(attest_engine()) == [(f"{_ENGINE_PKG}/sub/__init__.py", "missing")]
+
+
+@pytest.mark.parametrize("tampered", [False, True], ids=["matching", "mismatching"])
+def test_a_native_module_the_wheel_records_is_hash_compared(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tampered: bool
+) -> None:
+    """A wheel that ships a native module is not drift on sight: its ``RECORD`` row is the baseline,
+    exactly as for source, so only a changed one is reported."""
+    native = f"{_ENGINE_PKG}/fast{_EXT}"
+    package_dir = _install_and_walk_engine(
+        tmp_path, monkeypatch, extra_files={native: b"\x7fELF shipped\n"}
+    )
+    if tampered:
+        (package_dir / f"fast{_EXT}").write_bytes(b"\x7fELF replaced\n")
+
+    result = attest_engine()
+    assert result.checked == len(_ENGINE_FILES) + 1, "the native module is compared, not skipped"
+    assert _drift(result) == ([(native, "hash_mismatch")] if tampered else [])
+
+
+def _pre_2763_engine_pass(package_dir: Path) -> AttestationResult:
+    """The engine arm as it stood before vault BACKLOG #2763: a ``.py``-only walk, and no ``RECORD``
+    read-back. Same classifier, same install, same patched distribution."""
+    return integ._attest_distribution(
+        _ENGINE_PKG,
+        _ENGINE_PKG,
+        lambda: sorted(path.resolve() for path in package_dir.rglob("*.py") if path.is_file()),
+    )
+
+
+@pytest.mark.parametrize("shape", ["native", "sourceless", "deleted"])
+def test_each_shape_read_clean_before_the_widening(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shape: str
+) -> None:
+    """THE PAIRED ARM. Same install, same tamper, one variable: the walk. The pre-#2763 pass reports
+    each shape clean and the current one reports drift, so the widening is what detects them."""
+    package_dir = _install_and_walk_engine(tmp_path, monkeypatch)
+    if shape == "native":
+        (package_dir / f"redaction{_EXT}").write_bytes(b"\x7fELF not really\n")
+    elif shape == "sourceless":
+        (package_dir / "redaction.py").unlink()
+        (package_dir / "redaction.pyc").write_bytes(b"sourceless bytecode\n")
+    else:
+        (package_dir / "redaction.py").unlink()
+
+    assert _pre_2763_engine_pass(package_dir).ok, "the old walk must have been blind to this shape"
+    assert attest_engine().drift, "the widened walk must see it"
+
+
+def test_a_crafted_bytecode_cache_is_NOT_seen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A RESIDUAL, pinned so nobody reads this arm as closing it. ``RECORD`` carries no hash for a
+    compiled cache, so a ``__pycache__`` file whose header matches its ``.py`` would be imported with
+    no arm reading it. Recorded in ADR 0041's 2026-10-06 amendment."""
+    package_dir = _install_and_walk_engine(tmp_path, monkeypatch)
+    tag = sys.implementation.cache_tag
+    (package_dir / "__pycache__" / f"redaction.{tag}.pyc").write_bytes(b"crafted cache\n")
+
+    assert attest_engine().ok
+
+
+def _symlink(link: Path, target: Path, *, directory: bool = False) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=directory)
+    except OSError as exc:  # Windows without the symlink privilege
+        pytest.skip(f"cannot create a symlink here: {exc}")
+
+
+def test_a_recorded_module_swapped_for_an_outside_symlink_is_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The walk resolves the install root and not the file, so the link keeps its place under the
+    root and hashing it reads what an import would run. Resolving the file would move it outside the
+    root, where the comparison skips it, which is how the engine arm used to behave."""
+    package_dir = _install_and_walk_engine(tmp_path / "site", monkeypatch)
+    evil = tmp_path / "outside" / "redaction.py"
+    evil.parent.mkdir()
+    evil.write_bytes(b"def redact(value):\n    return value\n")
+    (package_dir / "redaction.py").unlink()
+    _symlink(package_dir / "redaction.py", evil)
+
+    assert _drift(attest_engine()) == [(f"{_ENGINE_PKG}/redaction.py", "hash_mismatch")]
+
+
+def test_a_native_module_planted_as_an_outside_symlink_is_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The planted file is a link to a target outside the install root. It is reported under its own
+    name, the one the import system finds."""
+    package_dir = _install_and_walk_engine(tmp_path / "site", monkeypatch)
+    evil = tmp_path / "outside" / "evil.so"
+    evil.parent.mkdir()
+    evil.write_bytes(b"\x7fELF not really\n")
+    _symlink(package_dir / f"redaction{_EXT}", evil)
+
+    assert _drift(attest_engine()) == [(f"{_ENGINE_PKG}/redaction{_EXT}", "missing")]
+
+
+def test_a_package_directory_planted_beside_a_module_is_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``FileFinder`` tries a package directory before any module suffix, so ``redaction/`` wins over
+    ``redaction.py``. A real directory is walked, and its ``__init__.py`` has no row."""
+    package_dir = _install_and_walk_engine(tmp_path, monkeypatch)
+    (package_dir / "redaction").mkdir()
+    (package_dir / "redaction" / "__init__.py").write_bytes(
+        b"def redact(value):\n    return value\n"
+    )
+
+    assert _drift(attest_engine()) == [(f"{_ENGINE_PKG}/redaction/__init__.py", "missing")]
+
+
+def test_a_package_directory_linked_in_beside_a_module_is_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The walk does not descend a linked directory, so the link itself is reported: a wheel cannot
+    carry one, so it has no row."""
+    package_dir = _install_and_walk_engine(tmp_path / "site", monkeypatch)
+    outside = tmp_path / "outside" / "redaction"
+    outside.mkdir(parents=True)
+    (outside / "__init__.py").write_bytes(b"def redact(value):\n    return value\n")
+    _symlink(package_dir / "redaction", outside, directory=True)
+
+    assert _drift(attest_engine()) == [(f"{_ENGINE_PKG}/redaction", "missing")]
+
+
+def test_a_pyc_beside_a_source_that_still_exists_is_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Inert, because source wins, and reported anyway: no supported install leaves one there."""
+    package_dir = _install_and_walk_engine(tmp_path, monkeypatch)
+    (package_dir / "redaction.pyc").write_bytes(b"bytecode beside its source\n")
+
+    assert _drift(attest_engine()) == [(f"{_ENGINE_PKG}/redaction.pyc", "missing")]
+
+
+def test_a_dangling_link_with_a_module_name_is_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A link whose target does not exist yet imports nothing today and a planted module the day the
+    target appears. A wheel cannot install a link, so it is reported now."""
+    package_dir = _install_and_walk_engine(tmp_path / "site", monkeypatch)
+    _symlink(package_dir / f"redaction{_EXT}", tmp_path / "not-yet" / "evil.so")
+
+    assert _drift(attest_engine()) == [(f"{_ENGINE_PKG}/redaction{_EXT}", "missing")]
+
+
+def test_a_directory_the_walk_cannot_list_is_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A planted package directory with list permission removed and traverse kept is still imported.
+    The walk cannot see inside it, so the directory itself is reported. Simulated at ``os.scandir``,
+    because a root test process lists the directory whatever its mode."""
+    package_dir = _install_and_walk_engine(tmp_path, monkeypatch)
+    hidden = package_dir / "redaction"
+    hidden.mkdir()
+    (hidden / "__init__.py").write_bytes(b"def redact(value):\n    return value\n")
+    real_scandir = os.scandir
+
+    def _scandir(path: str) -> object:
+        if os.fspath(path) == os.fspath(hidden):
+            raise PermissionError(13, "Permission denied", os.fspath(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", _scandir)
+
+    assert _drift(attest_engine()) == [(f"{_ENGINE_PKG}/redaction", "missing")]
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no FIFOs on this platform")
+def test_a_fifo_at_a_recorded_module_path_is_drift_and_never_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reading a FIFO blocks until a writer appears, so a FIFO at a ``RECORD`` path would stall startup
+    before any listener bound. The classifier reports it without opening it."""
+    package_dir = _install_and_walk_engine(tmp_path, monkeypatch)
+    (package_dir / "redaction.py").unlink()
+    os.mkfifo(package_dir / "redaction.py")
+    monkeypatch.setattr(
+        integ,
+        "_loaded_module_files",
+        lambda: [*integ._import_capable_files([str(package_dir)]), package_dir / "redaction.py"],
+    )
+
+    assert _drift(attest_engine()) == [(f"{_ENGINE_PKG}/redaction.py", "missing")]
+
+
+_REAL_ATTESTED_ASSET_FILES = integ._attested_asset_files
+
+
+def test_a_security_asset_swapped_for_an_outside_symlink_is_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The REAL asset lookup, anchored on a stand-in ``messagefoundry.__path__``. It resolves the root
+    and not the asset, so the link is hashed in its own place; resolving it would have moved it
+    outside the install root, where the comparison skips it and nothing reads the row back."""
+    import messagefoundry
+
+    root = tmp_path / "site"
+    _install_with_asset(root, monkeypatch, declare_asset=False)
+    monkeypatch.setattr(messagefoundry, "__path__", [str(root / "mfengine")])
+    monkeypatch.setattr(integ, "_ATTESTED_ASSETS", ("auth/data/common_passwords.txt",))
+    monkeypatch.setattr(integ, "_attested_asset_files", _REAL_ATTESTED_ASSET_FILES)
+    outside = tmp_path / "outside.txt"
+    outside.write_bytes(b"password\n")
+    (root / _ASSET).unlink()
+    _symlink(root / _ASSET, outside)
+
+    assert _drift(attest_engine()) == [(_ASSET, "hash_mismatch")]
+
+
+def test_the_real_engine_walk_lists_source_and_skips_caches() -> None:
+    """Runs against the REAL package. The walk must still find the engine's own source, and must never
+    hand a ``__pycache__`` file to the classifier, which would report every compiled cache as drift
+    on a clean install."""
+    files = integ._loaded_module_files()
+    assert Path(integ.__file__).resolve() in files
+    assert not [path for path in files if path.parent.name == "__pycache__"]
 
 
 # --- BACKLOG #1802: the web console arm -----------------------------------------------------------

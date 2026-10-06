@@ -1882,7 +1882,14 @@ D3) — a runtime in-place-tamper tripwire (`messagefoundry/integrity.py`). At s
 (there is no on-demand surface), the
 engine hashes every **loaded** first-party `messagefoundry` module file against the installed wheel's
 `*.dist-info/RECORD` baseline; on **drift** (an attested file no longer matching its RECORD hash) it records
-a hash-chained `startup_integrity` audit row and fires the `AlertSink`. It also attests a short explicit set
+a hash-chained `startup_integrity` audit row and fires the `AlertSink`. A module file is any file Python
+can import one from: source, a native extension, or a `.pyc` outside `__pycache__`. One with no RECORD
+row is drift, and so are a link or a directory the walk cannot list under the package and a shipped
+module that is gone (vault BACKLOG #2763, ADR 0041 AC-16). That is what the walk is built to catch, not
+a proof that every planted file is caught. A `.pyc` reported beside a `.py` that still exists does not run, because
+source wins, but no supported install leaves one there, so treat it as tampering. Compiled caches inside
+`__pycache__` are **not** read, so a crafted cache there is not detected; that and the other residuals
+are in the ADR 0041 2026-10-06 amendment. It also attests a short explicit set
 of shipped security **data** assets (`_ATTESTED_ASSETS` in `messagefoundry/integrity.py`, BACKLOG #1432) --
 the bundled common-password corpus and the packaged Semgrep handler rules -- because emptying one of those
 neuters a control with no engine module edited at all. When the engine has **loaded** the web

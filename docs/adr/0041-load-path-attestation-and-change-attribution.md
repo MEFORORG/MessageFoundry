@@ -366,6 +366,62 @@ fingerprint+git-HEAD covers more cheaply for now.
 > And neither arm reads `__pycache__`, because `RECORD` carries no hash for compiled caches: a crafted
 > cache whose header matches its `.py` is imported without either arm looking at it.
 
+- **AC-16** — WHEN the engine starts on a non-editable wheel install, THE SYSTEM SHALL apply AC-9 to
+  every file under the loaded `messagefoundry` package whose suffix the import system loads a module
+  from (source, this interpreter's native extension suffixes, and bytecode outside `__pycache__`),
+  SHALL hash-compare such a file that `RECORD` lists and report one it does not list as drift, SHALL
+  report as drift every link that is not a regular file and every directory it cannot list, and SHALL
+  report as drift every `RECORD` row under `messagefoundry/` for such a file that has no file. It SHALL
+  NOT attest any other file of the package beyond the declared security assets (BACKLOG #1432).
+  → `tests/test_startup_attestation.py::test_a_native_module_planted_beside_a_module_is_drift`
+  → `tests/test_startup_attestation.py::test_a_stray_pyc_with_its_source_deleted_is_drift`
+  → `tests/test_startup_attestation.py::test_a_pyc_beside_a_source_that_still_exists_is_drift`
+  → `tests/test_startup_attestation.py::test_a_deleted_source_file_is_drift`
+  → `tests/test_startup_attestation.py::test_a_native_module_the_wheel_records_is_hash_compared`
+  → `tests/test_startup_attestation.py::test_a_package_directory_planted_beside_a_module_is_drift`
+  → `tests/test_startup_attestation.py::test_a_package_directory_linked_in_beside_a_module_is_drift`
+  → `tests/test_startup_attestation.py::test_a_directory_the_walk_cannot_list_is_drift`
+  → `tests/test_startup_attestation.py::test_a_recorded_module_swapped_for_an_outside_symlink_is_drift`
+  → `tests/test_startup_attestation.py::test_a_native_module_planted_as_an_outside_symlink_is_drift`
+  → `tests/test_startup_attestation.py::test_a_security_asset_swapped_for_an_outside_symlink_is_drift`
+  → `tests/test_startup_attestation.py::test_a_clean_install_reads_clean_through_the_widened_walk`
+  → `tests/test_startup_attestation.py::test_each_shape_read_clean_before_the_widening`
+
+> **Amendment 2026-10-06 (vault BACKLOG #2763, review finding G-5) — the engine arm listed only `.py`,
+> and the import system loads more than that.** CPython's `FileFinder` tries a package directory, then
+> a native extension, then source, then sourceless bytecode. So a `redaction.<extension suffix>` planted
+> beside `redaction.py` was imported in its place while the untouched `.py` hashed clean, and a `.pyc`
+> left beside a deleted `.py` ran with nothing reported. AC-16 widens the walk to the import suffixes
+> and to linked directories, and reads the engine's module rows back from `RECORD`. A native module the
+> wheel records is hash-compared like source, so the day the wheel ships one it is not drift on sight.
+> A `.pyc` beside a `.py` that still exists is inert, because source wins; it is reported anyway, since
+> no supported install leaves one there.
+>
+> **This does not reopen BACKLOG #1432.** That ruling declined a whole-package walk because the day a
+> wheel ships a file an operator edits in place, the walk becomes a standing false positive an operator
+> mutes. Nobody configures the engine by planting a native module, leaving a sourceless `.pyc`, linking
+> a directory in or deleting a shipped module, so the reason does not reach these shapes. Data files
+> stay with the explicit asset list, and only module rows are read back, not every row. The console arm
+> keeps its whole-package scope from the 2026-09-25 amendment.
+>
+> Decided under the owner's standing rule for a clear adversarial-review recommendation, 2026-10-06.
+>
+> **The engine arm no longer resolves each file**, only the package root, the way the console arm
+> already did, and the same holds for the declared assets. So the symlink residual the 2026-09-25
+> amendment recorded for the engine arm is closed: a module or asset swapped for a symlink to a file
+> outside the install root is hashed in place and reads as `hash_mismatch`, and a planted one has no
+> row. The walk never descends a link or junction and reports one instead, so a junction loop cannot
+> stall start-up, and it reports a directory it cannot list rather than skipping it. A FIFO, device or
+> socket at a `RECORD` path is reported without being opened, and hashing streams the file.
+>
+> **Residuals, recorded rather than fixed. The list is at least these, not a complete one.** A crafted
+> `__pycache__` file is still unread by either arm, for the reason the 2026-09-25 amendment gives.
+> Bytecode planted under the config tree is vault BACKLOG #2596, and `.pth` files and other start-up
+> code in `site-packages` are vault BACKLOG #2701. A FIFO, device or socket planted under an import
+> name is not listed by the engine walk unless it sits at a `RECORD` path. The console arm's walk still
+> skips a directory it cannot list; this amendment changed only the engine arm. The D3 trust-domain
+> residual applies unchanged: an adversary who also re-seals `RECORD` passes clean.
+
 ## Options considered
 
 1. **Attribution + runtime-integrity layer on top of ADR 0036 (this) — CHOSEN.** Fills exactly the gaps
