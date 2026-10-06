@@ -4463,7 +4463,7 @@ class AuthService:
         # The password leg's three ORDER-CRITICAL steps (see :meth:`reauth`), against the hash.
         # (1) Every stamp against the OLD hash, re-anchoring the session to this client address.
         # The accepted auth_time is written in the same statement (BACKLOG #2143), so the next
-        # step-up must show a later one: this answer replayed by the IdP is then not fresh.
+        # step-up must show a later one: this answer replayed by the IdP is then refused.
         await self._store.mark_session_reauthed(
             token_hash, client=client, idp_auth_time=principal_claims.auth_time
         )

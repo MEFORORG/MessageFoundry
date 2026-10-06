@@ -921,7 +921,7 @@ _SCHEMA.extend(CLUSTER_SCHEMA)
 # BACKLOG #2143: the IdP auth_time an oidc session's step-up is compared with, for a sessions table
 # created before the column. In _SCHEMA rather than _migrate_lease_columns, so it moves the schema
 # hash itself and its catalog read is scoped to current_schema(). Pre-existing rows get NULL, which
-# the IdP step-up refuses as not fresh.
+# the IdP step-up refuses as step_up_idp_auth_time_missing.
 _SCHEMA.append(_gated_add_column("sessions", "idp_auth_time", "DOUBLE PRECISION"))
 
 # Bump when _migrate_lease_columns (the open-path migration code OUTSIDE _SCHEMA) changes behavior:

@@ -114,8 +114,8 @@ async def assert_session_rotation_contract(store: Any, *, user_id: str = "rot-u1
         "leg, which ADR 0142 Amendment B forbids (BACKLOG #296)"
     )
     assert after.idp_auth_time == before.idp_auth_time, (
-        "idp_auth_time was dropped — every later IdP step-up would be refused as not fresh "
-        "(BACKLOG #2143)"
+        "idp_auth_time was dropped — every later IdP step-up would be refused as "
+        "step_up_idp_auth_time_missing (BACKLOG #2143)"
     )
     assert await _count_sessions(store, user_id) == 1, "rotation must not leave a second row behind"
 

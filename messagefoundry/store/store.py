@@ -1708,7 +1708,8 @@ class SessionRecord:
     #: The IdP's ``auth_time`` for this session, as the IdP stated it (BACKLOG #2143): set at an
     #: ``oidc`` mint and moved forward by each IdP step-up that succeeds. The step-up requires a
     #: later one, IdP clock against IdP clock. NULL on every other session, and on an ``oidc`` row
-    #: written before the column existed, which the IdP step-up then refuses as not fresh.
+    #: written before the column existed, which the IdP step-up refuses as
+    #: ``step_up_idp_auth_time_missing``.
     idp_auth_time: float | None = None
 
     @classmethod
@@ -6481,8 +6482,8 @@ class MessageStore:
         if "auth_mechanism" not in session_cols:
             await db.execute("ALTER TABLE sessions ADD COLUMN auth_mechanism TEXT")
         # BACKLOG #2143: the IdP auth_time an oidc session's step-up is compared with. Pre-existing
-        # rows get NULL, so an oidc session minted before the column existed cannot step up at the
-        # IdP until its holder signs in again; nothing recorded the value to backfill.
+        # rows get NULL, because nothing recorded the value to backfill. The IdP step-up refuses a
+        # NULL as step_up_idp_auth_time_missing.
         if "idp_auth_time" not in session_cols:
             await db.execute("ALTER TABLE sessions ADD COLUMN idp_auth_time REAL")
         # ADR 0021 "Response Sent" rides the response table via a `kind` discriminator. A pre-existing

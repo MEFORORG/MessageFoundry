@@ -2006,7 +2006,8 @@ _SCHEMA: list[str] = [
     """IF COL_LENGTH('sessions','auth_mechanism') IS NULL
         ALTER TABLE sessions ADD auth_mechanism NVARCHAR(32) NULL""",
     # BACKLOG #2143: the IdP auth_time an oidc session's step-up is compared with. NULL on a row
-    # written before the column existed, which the IdP step-up refuses as not fresh.
+    # written before the column existed, which the IdP step-up refuses as
+    # step_up_idp_auth_time_missing.
     """IF COL_LENGTH('sessions','idp_auth_time') IS NULL
         ALTER TABLE sessions ADD idp_auth_time FLOAT NULL""",
     """IF INDEXPROPERTY(OBJECT_ID('sessions'),'ix_sessions_user','IndexID') IS NULL
