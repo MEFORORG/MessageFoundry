@@ -12,7 +12,9 @@ disagree about what a CIDR entry means:
 
 It also holds the one rule for whether a ``source_ip_allowlist`` is narrow enough to count as a
 peer control (:func:`allowlist_restricts`). The HTTP intake gate and the DICOM server's gate
-both ask it, so the two cannot disagree about what a wide entry means (vault BACKLOG #2622).
+both ask it, so the two agree on whether a list counts (vault BACKLOG #2622). What each does with a
+list that does not count is its own: the HTTP gate refuses only on an enforcing instance and warns
+otherwise, and the DICOM gate refuses on every instance.
 
 **Neutral and stdlib-only** — no engine, config, FastAPI or Qt imports — so both the transports
 (which must not import the API) and the API (which must not import the transports) can depend on it.

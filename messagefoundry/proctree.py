@@ -16,9 +16,11 @@ BACKLOG #2622).
 * **POSIX.** The child starts as the leader of its own process group (:data:`ADOPT_NEW_SESSION`),
   and :func:`kill_process_group` sends that group ``SIGKILL``.
 
-**A process can still escape**, so this is process hygiene and not a trust control. On POSIX a
-descendant that calls ``setsid`` leaves the group. Any failure to set up the job degrades to a
-single-process kill, logged.
+**A process can still escape**, so this is process hygiene and not a trust control. At least
+these escape: on POSIX a descendant that leaves the group (``setsid``, and ``sudo`` in its default
+``use_pty`` mode) or that the engine's account may not signal; on Windows, work a child hands to
+another process outside its tree (a WMI provider, Task Scheduler, a service). Any failure to set up
+the job, or to signal the group, degrades to a single-process kill, logged.
 
 Standard library only (``ctypes``), so ``pipeline/`` modules may import it.
 """
@@ -225,13 +227,15 @@ def resume_into_job(pid: int, *, who: str) -> int | None:
     rights = _PROCESS_TERMINATE | _PROCESS_SET_QUOTA | _PROCESS_SUSPEND_RESUME
     handle = open_process(rights, 0, pid)
     if not handle:
-        raise OSError(ctypes.get_last_error(), f"{who}: could not open the started process")
+        raise ctypes.WinError(ctypes.get_last_error(), f"{who}: could not open the started process")
     job: int | None = None
     try:
         job = kill_on_close_job(int(handle), who=who)
         status = resume(ctypes.c_void_p(handle))
-        if status != 0:
-            raise OSError(f"{who}: could not resume the started process (status {status:#x})")
+        if status < 0:  # NT_SUCCESS is status >= 0; print it the way Windows writes an NTSTATUS
+            raise OSError(
+                f"{who}: could not resume the started process (status {status & 0xFFFFFFFF:#010x})"
+            )
         return job
     except BaseException:
         # The child never ran, so ending the job ends only it. Without this the handle would leak.
@@ -269,6 +273,11 @@ def kill_process_group(pid: int, *, started_as_leader: bool = False) -> bool:
             return False
     try:
         os.killpg(pgid, signal.SIGKILL)
-    except OSError:
+    except OSError as exc:
+        log.warning(
+            "could not signal process group %d (%s); kill degrades to a single-process kill",
+            pgid,
+            exc.strerror or type(exc).__name__,
+        )
         return False
     return True

@@ -209,6 +209,35 @@ async def test_a_stopped_hook_leaves_no_process_behind(tmp_path: Path) -> None:
     assert _survivors(tmp_path) == []
 
 
+async def test_a_stopped_release_hook_is_left_to_finish(tmp_path: Path) -> None:
+    """``stop_kills=False``, which the release hook gets, keeps the old behaviour: a stop leaves
+    the hook running, since killing a release partway could strand the address. Both markers
+    appear. This is also the positive control for the test above: the same hook, not killed,
+    does leave survivors."""
+    task = asyncio.ensure_future(
+        dr_module._run_command(_tree_hook(tmp_path, 1.0), stop_kills=False)
+    )
+    try:
+        await _await_file(tmp_path / "started", within=30.0)
+    finally:
+        task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await _await_file(tmp_path / "child-survived", within=30.0)
+    await _await_file(tmp_path / "grandchild-survived", within=30.0)
+
+
+def test_the_configuration_page_quotes_the_reap_bound() -> None:
+    # docs/CONFIGURATION.md states how long an abort may wait past the timeout for a killed hook.
+    page = Path(__file__).resolve().parents[1] / "docs" / "CONFIGURATION.md"
+    row = next(
+        line
+        for line in page.read_text(encoding="utf-8").splitlines()
+        if line.startswith("| `takeover_timeout_seconds` |")
+    )
+    assert f"at most {dr_module._HOOK_REAP_SECONDS:g} more seconds" in row
+
+
 async def test_a_timed_out_hook_aborts_and_leaves_no_process_behind(tmp_path: Path) -> None:
     """The same, through ``activate``: the timeout records the abort, and the hook is dead by then.
 
