@@ -766,32 +766,6 @@ def _requester_identity_resolver(app: FastAPI) -> IdentityResolver:
     return _resolve
 
 
-def approval_claim_owner(engine: Engine) -> str:
-    """The claim owner this engine process writes on an approval it releases (BACKLOG #1562).
-
-    It must be the same after a restart of this process and differ from every sibling over the same
-    store (ADR 0063: engine shards share one store; so do cluster nodes). At its next start the
-    process moves only the ``executing`` rows carrying its own owner to ``interrupted``.
-
-    - A cluster node is ``node:<node_id>``. That id is stable only when ``[cluster].node_id`` is
-      pinned. Unpinned it is ``host:pid:hex``, new on every start, so a node's earlier claims read
-      as another owner's and are left alone: safe, but they stay ``executing``.
-    - An engine shard of a multi-shard config is ``shard:<id>``, the ``serve --shard`` name.
-    - Anything else is :data:`DEFAULT_CLAIM_OWNER`. One engine owns its store then.
-
-    Read when the gate is built. The managed lifespan builds it after ``engine.start()`` has loaded
-    the graph, which is where the shard id comes from; an embedder of a sharded engine starts the
-    engine before it calls :func:`create_app`."""
-    coordinator = engine.coordinator
-    if coordinator.is_clustered():
-        return f"node:{coordinator.node_id}"
-    runner = engine.registry_runner
-    shard = runner.registry.shard_id if runner is not None else None
-    if shard is not None:
-        return f"shard:{shard}"
-    return DEFAULT_CLAIM_OWNER
-
-
 async def _reconcile_approvals_after_restart(gate: ApprovalGate) -> None:
     """Run :meth:`ApprovalGate.reconcile_after_restart` and never fail the start on it.
 
@@ -811,7 +785,7 @@ async def _drain_approval_gate(app: FastAPI) -> None:
 
     A write whose caller was cancelled, such as by a request timeout, finishes on its own, and would
     otherwise meet a closed store. ``drain()`` is bounded, and a failure is logged rather than
-    raised, so the teardown still reaches ``engine.stop()``. The gate is read through getattr
+    raised, so the teardown steps after it still run. The gate is read through getattr
     because a startup that failed early may not have built one."""
     gate: ApprovalGate | None = getattr(app.state, "approval_gate", None)
     if gate is None:
@@ -831,9 +805,8 @@ async def _embedded_approvals_lifespan(app: FastAPI) -> AsyncIterator[None]:
     app serves an approval. At shutdown, :meth:`ApprovalGate.drain` (BACKLOG #2087), so a caller
     that stops its engine after the app has shut down loses no outcome write. A caller that passes
     its own ``lifespan`` replaces this one and runs these steps itself, with the store open."""
-    gate: ApprovalGate | None = getattr(app.state, "approval_gate", None)
-    if gate is not None:
-        await _reconcile_approvals_after_restart(gate)
+    # create_app installs this only beside an engine, and always builds the gate then.
+    await _reconcile_approvals_after_restart(app.state.approval_gate)
     try:
         yield
     finally:
@@ -859,7 +832,9 @@ def _build_approval_gate(
         settings,
         resolve_identity=resolve_identity,
         alert_sink=alert_sink,
-        claim_owner=approval_claim_owner(engine),
+        # BACKLOG #1562: read here, so the managed lifespan builds the gate after engine.start(),
+        # which is when a shard id is known. An embedder of a sharded engine starts it first.
+        claim_owner=engine.instance_identity or DEFAULT_CLAIM_OWNER,
     )
 
     async def _replay(p: Mapping[str, Any]) -> dict[str, Any]:
@@ -9259,8 +9234,7 @@ def create_managed_app(
                 if reaper is not None:
                     reaper.cancel()
                     # gather(return_exceptions): absorbs both our cancellation AND any exception a
-                    # previously-died reaper stored, so it can't propagate here and skip engine.stop()
-                    # (review M-33).
+                    # previously-died reaper stored, so it can't skip the steps below (review M-33).
                     await asyncio.gather(reaper, return_exceptions=True)
                 if credential_reminder is not None:
                     credential_reminder.cancel()
@@ -9274,10 +9248,10 @@ def create_managed_app(
                 # bulk census fetch.
                 #
                 # BEFORE engine.stop(), because that ends in store.close() and the emit needs the store.
-                # Guarded like the reaper above: a store error here must not skip engine.stop(), or the
-                # non-daemon aiosqlite worker keeps the process alive and a lost audit row becomes a hung
-                # service. Read directly, not through getattr: create_app always sets the auditor, so a
-                # rename should fail loudly inside this guard rather than silently skip the flush.
+                # Guarded like the reaper above, so a store error here is logged rather than raised
+                # out of the teardown. Read directly, not through getattr: create_app always sets the
+                # auditor, so a rename should fail loudly inside this guard rather than silently skip
+                # the flush.
                 try:
                     await app.state.summary_auditor.flush(store)
                 except Exception:

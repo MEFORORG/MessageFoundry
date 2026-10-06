@@ -1757,11 +1757,17 @@ async def _probe_rows(db_path: Path) -> list[Any]:
         await store.close()
 
 
-async def _run_an_orphaned_write_through_shutdown(db_path: Path, *, drained: bool) -> None:
-    """Start a slow shielded write inside the managed lifespan, cancel its caller, then shut down."""
+def _managed(db_path: Path) -> Any:
     from messagefoundry.api import create_managed_app
 
-    app = create_managed_app(db_path=db_path, egress_settings=EgressSettings(deny_by_default=False))
+    return create_managed_app(
+        db_path=db_path, egress_settings=EgressSettings(deny_by_default=False)
+    )
+
+
+async def _run_an_orphaned_write_through_shutdown(db_path: Path, *, drained: bool) -> None:
+    """Start a slow shielded write inside the managed lifespan, cancel its caller, then shut down."""
+    app = _managed(db_path)
     finished = asyncio.Event()
     # Undrained, the write is held until the lifespan has exited, so the control cannot pass by a
     # slow teardown. Drained, it sleeps briefly, and the drain has to wait for it.
@@ -1814,42 +1820,46 @@ async def test_the_drain_assertion_can_fail(tmp_path: Path) -> None:
 async def test_a_drain_failure_does_not_skip_engine_stop(tmp_path: Path) -> None:
     """The drain runs BEFORE engine.stop(), and a drain that raises must not skip the stop, or the
     store's non-daemon worker keeps the process alive."""
-    from messagefoundry.api import create_managed_app
-
-    app = create_managed_app(
-        db_path=tmp_path / "boom.db", egress_settings=EgressSettings(deny_by_default=False)
-    )
+    app = _managed(tmp_path / "boom.db")
     calls: list[str] = []
     real_stop: list[Any] = []
+
+    async def _boom(timeout: float = 0.0) -> list[str]:
+        calls.append("drain")
+        raise RuntimeError("PROBE: deliberate drain failure")
+
     try:
         async with app.router.lifespan_context(app):
-            engine = app.state.engine
-            real_stop.append(engine.stop)
-            gate: ApprovalGate = app.state.approval_gate
-
-            async def _boom(timeout: float = 0.0) -> list[str]:
-                calls.append("drain")
-                raise RuntimeError("PROBE: deliberate drain failure")
-
-            async def _spy_stop() -> None:
-                calls.append("stop")
-                await real_stop[0]()
-
-            gate.drain = _boom  # type: ignore[method-assign]
-            engine.stop = _spy_stop
+            _spy_on_teardown(app, _boom, calls, real_stop)
     finally:
         if real_stop and "stop" not in calls:
             await real_stop[0]()
     assert calls == ["drain", "stop"]
 
 
+def _spy_on_teardown(
+    app: Any, drain: Callable[..., Awaitable[list[str]]], calls: list[str], real_stop: list[Any]
+) -> None:
+    """Swap the gate's drain for ``drain`` and record engine.stop() in ``calls``. ``real_stop``
+    keeps the real stop, so the caller can still stop the engine if the teardown never did."""
+    engine = app.state.engine
+    real_stop.append(engine.stop)
+
+    async def _spy_stop() -> None:
+        calls.append("stop")
+        await real_stop[0]()
+
+    app.state.approval_gate.drain = drain
+    engine.stop = _spy_stop
+
+
 # --- BACKLOG #1562: the claim owner and the startup reconcile ---------------------------------------
 
 
-def _fake_engine(
+def _identity(
     *, clustered: str | None = None, shard: str | None = None, runner: bool = True
 ) -> Any:
-    """Only the two attributes approval_claim_owner reads."""
+    """Engine.instance_identity over a stand-in holding only the two attributes it reads."""
     from types import SimpleNamespace
 
     from messagefoundry.pipeline.cluster import NullCoordinator
@@ -1860,28 +1870,19 @@ def _fake_engine(
         else SimpleNamespace(is_clustered=lambda: True, node_id=clustered)
     )
     registry_runner = SimpleNamespace(registry=SimpleNamespace(shard_id=shard)) if runner else None
-    return SimpleNamespace(coordinator=coordinator, registry_runner=registry_runner)
+    fake = SimpleNamespace(_coordinator=coordinator, _registry_runner=registry_runner)
+    return Engine.instance_identity.fget(fake)  # type: ignore[attr-defined]
 
 
-def test_the_claim_owner_names_the_engine_process() -> None:
+def test_the_instance_identity_names_the_engine_process() -> None:
     """Stable across a restart of the same process, distinct between processes over one store."""
-    from messagefoundry.api.app import approval_claim_owner
-
-    assert approval_claim_owner(_fake_engine()) == "engine"
-    assert approval_claim_owner(_fake_engine(runner=False)) == "engine"
-    assert approval_claim_owner(_fake_engine(shard="a")) == "shard:a"
-    assert approval_claim_owner(_fake_engine(shard="b")) == "shard:b"
-    assert approval_claim_owner(_fake_engine(clustered="node-1")) == "node:node-1"
+    assert _identity() is None
+    assert _identity(runner=False) is None
+    assert _identity(shard="a") == "shard:a"
+    assert _identity(shard="b") == "shard:b"
+    assert _identity(clustered="node-1") == "node:node-1"
     # The cluster wins over a shard id; serve refuses that combination anyway (ADR 0073).
-    assert approval_claim_owner(_fake_engine(clustered="node-1", shard="a")) == "node:node-1"
-
-
-def _managed(db_path: Path) -> Any:
-    from messagefoundry.api import create_managed_app
-
-    return create_managed_app(
-        db_path=db_path, egress_settings=EgressSettings(deny_by_default=False)
-    )
+    assert _identity(clustered="node-1", shard="a") == "node:node-1"
 
 
 async def _first_life_leaves_two_rows(db_path: Path) -> tuple[str, str]:
@@ -1962,17 +1963,7 @@ async def test_a_reconcile_that_cannot_move_a_row_leaves_it_for_the_next_start(
 
     mine = await _claimed_directly(engine.store, claim_owner="engine", claimed_at=time.time())
 
-    class _Refusing:
-        def __init__(self, store: Any) -> None:
-            self._store = store
-
-        def __getattr__(self, name: str) -> Any:
-            return getattr(self._store, name)
-
-        async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
-            raise OSError("store unreachable")
-
-    gate = ApprovalGate(_Refusing(engine.store), ON)
+    gate = ApprovalGate(_AuditRefuses(engine.store, "approval.interrupted"), ON)
     with caplog.at_level(logging.ERROR, logger="messagefoundry.api.approvals"):
         found = await gate.reconcile_after_restart()
     assert found.unsettled == (mine,) and found.interrupted == ()
@@ -1995,24 +1986,15 @@ async def test_a_lifespan_cancelled_mid_drain_still_stops_the_engine(tmp_path: P
     real_stop: list[Any] = []
     entered, leave, draining = asyncio.Event(), asyncio.Event(), asyncio.Event()
 
+    async def _hangs(timeout: float = 0.0) -> list[str]:
+        calls.append("drain")
+        draining.set()
+        await asyncio.Event().wait()
+        return []
+
     async def _run() -> None:
         async with app.router.lifespan_context(app):
-            engine = app.state.engine
-            real_stop.append(engine.stop)
-            gate: ApprovalGate = app.state.approval_gate
-
-            async def _hangs(timeout: float = 0.0) -> list[str]:
-                calls.append("drain")
-                draining.set()
-                await asyncio.Event().wait()
-                return []
-
-            async def _spy_stop() -> None:
-                calls.append("stop")
-                await real_stop[0]()
-
-            gate.drain = _hangs  # type: ignore[method-assign]
-            engine.stop = _spy_stop
+            _spy_on_teardown(app, _hangs, calls, real_stop)
             entered.set()
             await leave.wait()
 

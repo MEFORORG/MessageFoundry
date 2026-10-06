@@ -193,7 +193,7 @@ class ApprovalGate:
         self._settings = settings
         # Written on every claim, and read back by reconcile_after_restart (BACKLOG #1562). It must
         # be the same across a restart of this engine process and differ between processes that
-        # share the store; the API wiring derives it (api/app.py, approval_claim_owner).
+        # share the store; the API wiring passes Engine.instance_identity.
         self._claim_owner = claim_owner
         self._ops: dict[str, _Operation] = {}
         # Wall-clock seconds, injectable so a test can drive the expiry ceiling and the dwell floor.
@@ -272,8 +272,8 @@ class ApprovalGate:
         **Only this process's rows.** Engine shards and cluster nodes share one store, so an
         ``executing`` row may be a sibling's release still running. A row moves only when its
         ``claim_owner`` is this gate's. Any other row is left alone and logged at WARNING, with its
-        owner and claim time. If that owner never comes back, the row stays ``executing``: nothing
-        here can tell a dead owner from a slow one, so nothing guesses on a timer.
+        owner and claim time. If that owner never comes back, the row stays ``executing``: the
+        gate cannot tell a dead owner from a slow one, so it does not guess on a timer.
 
         **A row with no owner is treated as this process's.** Only a claim made before the
         ``claim_owner`` column existed has none. Nothing was deployed then (CLAUDE.md section 0),

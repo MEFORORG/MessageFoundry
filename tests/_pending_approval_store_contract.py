@@ -306,9 +306,9 @@ def _gate(
     store: Any,
     execute: Callable[[Mapping[str, Any]], Awaitable[dict[str, Any]]],
     *,
-    claim_owner: str | None = None,
+    claim_owner: str = "engine",
 ) -> Any:
-    from messagefoundry.api.approvals import DEFAULT_CLAIM_OWNER, ApprovalGate
+    from messagefoundry.api.approvals import ApprovalGate
     from messagefoundry.auth.permissions import Permission
     from messagefoundry.config.settings import ApprovalsSettings
 
@@ -316,10 +316,7 @@ def _gate(
         enabled=True, operations=["dead_letter_replay"], min_dwell_seconds=0.0
     )
     gate = ApprovalGate(
-        _StandingStore(store),
-        settings,
-        resolve_identity=_resolve,
-        claim_owner=claim_owner or DEFAULT_CLAIM_OWNER,
+        _StandingStore(store), settings, resolve_identity=_resolve, claim_owner=claim_owner
     )
     gate.register(
         "dead_letter_replay", "contract op", execute, permission=Permission.MESSAGES_REPLAY
