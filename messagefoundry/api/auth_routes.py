@@ -529,7 +529,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "session ended; sign in again")
         if check is CurrentPasswordCheck.EXPIRED:
             # BACKLOG #2009 (ASVS 6.4.1): the sign-in gate's refusal, reached from a session opened
-            # before the deadline. Named rather than generic: the caller already holds a session.
+            # before the deadline. Named rather than generic: the caller held a session. The service
+            # has ended that session (BACKLOG #2298), so a retry is the gate's 401. A 403 rather than
+            # a 401 here, so the console re-renders this text instead of landing on sign-in.
             raise HTTPException(
                 status.HTTP_403_FORBIDDEN,
                 "your temporary password has expired; ask an administrator to reset it",

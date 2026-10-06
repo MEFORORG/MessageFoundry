@@ -207,6 +207,9 @@ async def _assert_username_refresh_contract(store: Any) -> None:
     path whose caller is a background loop. Each implementation therefore carries a ``NOT EXISTS``
     subquery so the collision is a **no-op**. Three hand-written SQL statements agreeing on that is
     an assertion here rather than a hope.
+
+    Since BACKLOG #2290 the write is also a compare-and-set on the old name, and it returns whether
+    it wrote. Every step asserts that answer, and step 5 is the compare itself.
     """
     await store.create_user(
         user_id="rename-me",
@@ -228,7 +231,9 @@ async def _assert_username_refresh_contract(store: Any) -> None:
     # 1. THE ORDINARY REFRESH. The row keeps its id and its binding; only the label moves. Both
     #    halves are asserted: a write that moved the row would pass a name check alone, and a write
     #    that did nothing would pass an id check alone.
-    await store.set_user_username("rename-me", "jdoe-married", now=2_000.0)
+    assert await store.set_user_username(
+        "rename-me", "jdoe-married", expected_username="jdoe", now=2_000.0
+    ), "a refresh that applied reported no write"
     moved = await store.get_user_by_username("jdoe-married")
     assert moved is not None, "the refresh did not apply"
     assert moved.id == "rename-me", "the refresh moved the row"
@@ -242,7 +247,9 @@ async def _assert_username_refresh_contract(store: Any) -> None:
     # 2. THE COLLISION IS A NO-OP, NOT AN ERROR. This is the divergence from a plain UPDATE and the
     #    only reason the subquery exists. A backend that dropped the guard would raise its own
     #    integrity class here and take the reconciler pass down with it.
-    await store.set_user_username("rename-me", "taken", now=3_000.0)
+    assert not await store.set_user_username(
+        "rename-me", "taken", expected_username="jdoe-married", now=3_000.0
+    ), "a refresh the guard refused reported a write"
     still = await store.get_user_by_directory_object_id(RENAME_GUID)
     assert still is not None and still.username == "jdoe-married", (
         "the guarded UPDATE forced a username another row holds"
@@ -262,7 +269,9 @@ async def _assert_username_refresh_contract(store: Any) -> None:
     #    separates "wrote the same value" from "did not write".
     before = await store.get_user("rename-me")
     assert before is not None
-    await store.set_user_username("rename-me", "jdoe-married", now=4_000.0)
+    assert await store.set_user_username(
+        "rename-me", "jdoe-married", expected_username="jdoe-married", now=4_000.0
+    )
     same = await store.get_user_by_username("jdoe-married")
     assert same is not None and same.id == "rename-me"
     assert same.updated_at != before.updated_at, (
@@ -272,9 +281,38 @@ async def _assert_username_refresh_contract(store: Any) -> None:
 
     # 4. AN UNKNOWN user_id TOUCHES NOTHING. The reconciler plans a pass and applies it afterwards,
     #    so a row deleted in between reaches this method; it must not become an error or, worse,
-    #    match some other row.
-    await store.set_user_username("no-such-user", "ghost", now=5_000.0)
+    #    match some other row. The expected name is one another row DOES hold, so a backend that
+    #    dropped `id=?` would rename that row and fail here, rather than matching nothing by luck.
+    assert not await store.set_user_username(
+        "no-such-user", "ghost", expected_username="taken", now=5_000.0
+    )
     assert await store.get_user_by_username("ghost") is None
+    squatter = await store.get_user("squatter")
+    assert squatter is not None and squatter.username == "taken", (
+        "an unknown id renamed another row"
+    )
+
+    # 5. A STALE EXPECTED NAME WRITES NOTHING AND SAYS SO (BACKLOG #2290). This is the
+    #    compare-and-set: two refreshes of one row both read "jdoe-married", the first moves it on,
+    #    and the second must then match no row. The name is free and the row exists, so only the
+    #    compare on the old name can stop this write; a backend that dropped it would apply the
+    #    write and return True.
+    assert await store.set_user_username(
+        "rename-me", "jdoe-wins", expected_username="jdoe-married", now=6_000.0
+    )
+    stale_before = await store.get_user("rename-me")
+    assert stale_before is not None and stale_before.username == "jdoe-wins"
+    assert not await store.set_user_username(
+        "rename-me", "jdoe-loses", expected_username="jdoe-married", now=7_000.0
+    ), "a write on a stale expected name reported success"
+    stale_after = await store.get_user("rename-me")
+    assert stale_after is not None and stale_after.username == "jdoe-wins", (
+        "a write on a stale expected name changed the row"
+    )
+    # updated_at too, for the reason step 3 gives: a name check alone cannot see a write that
+    # set a value the row already held.
+    assert stale_after.updated_at == stale_before.updated_at, "a stale write touched the row"
+    assert await store.get_user_by_username("jdoe-loses") is None
 
 
 async def _assert_username_compare_is_byte_exact(store: Any) -> None:
@@ -309,12 +347,16 @@ async def _assert_username_compare_is_byte_exact(store: Any) -> None:
     )
     # The control: a byte-identical collision IS refused, so the success below is a fact about case
     # rather than about the guard being absent.
-    await store.set_user_username("case-mover", "Alice", now=2_000.0)
+    assert not await store.set_user_username(
+        "case-mover", "Alice", expected_username="bob", now=2_000.0
+    ), "a refused byte-identical collision reported a write"
     assert (await store.get_user("case-mover")).username == "bob", (
         "the guard did not refuse a byte-identical collision"
     )
 
-    await store.set_user_username("case-mover", "alice", now=3_000.0)
+    assert await store.set_user_username(
+        "case-mover", "alice", expected_username="bob", now=3_000.0
+    ), "a rename differing only in case reported no write"
     moved = await store.get_user("case-mover")
     assert moved is not None and moved.username == "alice", (
         "a name differing only in case was refused; this backend compares byte-for-byte"

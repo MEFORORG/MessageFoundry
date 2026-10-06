@@ -88,6 +88,35 @@ def test_tls_client_cert_files_from_env_splits_on_pathsep() -> None:
     assert s.api.tls_client_cert_files == ["/certs/acme/client.pem", "/certs/globex/client.pem"]
 
 
+def test_trusted_proxies_host_bits_entry_is_refused_from_the_file(tmp_path: Path) -> None:
+    """BACKLOG #2488: the TOML form. uvicorn would read ``10.0.0.1/24`` as a literal that matches
+    no peer, so the load refuses it. It names the single address, then the network it spans."""
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.1/24"]\n',
+    )
+    with pytest.raises(ValidationError, match=re.escape("'10.0.0.1/24' has host bits set")) as exc:
+        load_settings(config_path=cfg, environ={})
+    assert "'10.0.0.0/24'" in str(exc.value) and "'10.0.0.1'" in str(exc.value)
+
+
+def test_trusted_proxies_host_bits_entry_is_refused_from_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2488: the env form. ``MEFOR_API_TRUSTED_PROXIES`` is split on the path separator
+    before the validator runs, so each split entry meets the same strict parse. IPv4 only: on
+    Linux the separator is ``:``, which would split an IPv6 entry first."""
+    monkeypatch.chdir(tmp_path)  # no ./messagefoundry.toml here
+    env = {"MEFOR_API_TLS_TERMINATED_UPSTREAM": "true"}
+    refused = os.pathsep.join(["10.0.0.7", "10.0.0.1/24"])
+    with pytest.raises(ValidationError, match=re.escape("'10.0.0.1/24' has host bits set")):
+        load_settings(environ={**env, "MEFOR_API_TRUSTED_PROXIES": refused})
+    # Control: the network it meant loads through the same path.
+    accepted = os.pathsep.join(["10.0.0.7", "10.0.0.0/24"])
+    s = load_settings(environ={**env, "MEFOR_API_TRUSTED_PROXIES": accepted})
+    assert s.api.trusted_proxies == ["10.0.0.7", "10.0.0.0/24"]
+
+
 def test_sandbox_mode_is_settable_by_env(tmp_path: Path) -> None:
     """BACKLOG #1365: ``[sandbox]`` was missing from ``_SECTIONS``, so ``MEFOR_SANDBOX_MODE`` parsed to
     a section that did not exist and was DROPPED. The identical key in the config FILE worked, so an
@@ -691,7 +720,6 @@ def test_auth_defaults_required_with_secure_policy(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     s = load_settings(environ={})
-    assert s.auth.enabled is True  # authentication required by default
     assert s.auth.password_min_length == 15 and s.auth.lockout_threshold == 5  # ASVS-aligned (WP-3)
     assert s.auth.session_idle_timeout_minutes == 30
     assert s.auth.ad_enabled is False and s.auth.kerberos_enabled is False

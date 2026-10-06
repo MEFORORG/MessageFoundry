@@ -27,10 +27,12 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry.controlchars import has_lone_surrogate
 from messagefoundry.logging_setup import build_stderr_handler, configure_logging
 from messagefoundry.store import MessageStore, audit_tee
 from messagefoundry.store.audit_tee import emit_audit_tee
 from tests._phi_gate_provisions import AT_REST_OPT_OUT_TOML
+from tests.test_logging import _decoded_from_the_log
 
 # A stand-in chain head for the direct-call cases. Shape only: a real one comes from `audit_row_hash`.
 _HASH = "a" * 64
@@ -287,6 +289,242 @@ def test_emit_audit_tee_redacts_bare_delimiter_run_without_segment(audit_capture
     line = audit_capture.messages[0]
     assert "DOE" not in line and "JANE" not in line
     assert "[redacted]" in line
+
+
+# --- the record must still be JSON after the configured handlers' filters run ---------------------
+#
+# Spelled with chr() so this file carries no raw control character of its own. One sample per
+# class, named, beside the tee; `tests/test_logging.py`'s `_LOG_ESCAPED_CLASSES` covers more code
+# points per class through the generic logger.
+_LOG_ALPHABET_SAMPLES = {
+    "del": chr(0x7F),
+    "c1_nel": chr(0x85),
+    "soft_hyphen": chr(0xAD),
+    "bidi_rlo": chr(0x202E),
+    "line_separator": chr(0x2028),
+    "lone_surrogate": chr(0xDCFF),
+    "astral_tag": chr(0xE0001),
+    "astral_private_use": chr(0xF0000),
+}
+
+
+def _as_read_back(text: str) -> str:
+    """``text`` as a collector decodes it from the tee: each character as itself, except a lone
+    surrogate, which reads back as the visible six characters ``\\udcff``."""
+    return "".join(_decoded_from_the_log(ord(ch)) for ch in text)
+
+
+def _teed_through_configured_stdout(
+    fmt: str, actor: str, detail: str, capsys
+) -> tuple[str, str, dict]:
+    """Emit one tee record through the stdout handler ``serve`` installs, with every filter on it.
+
+    Returns the physical stdout line, the inner audit document as a collector receives it, and that
+    document parsed. Inside ``_handlerless_process`` so the configured handler does not outlive the
+    test."""
+    with _handlerless_process():
+        configure_logging("INFO", fmt=fmt)
+        capsys.readouterr()  # drop anything configuring logging printed
+        emit_audit_tee(
+            action="auth.login_failed",
+            actor=actor,
+            channel_id=None,
+            detail=detail,
+            ts=1.0,
+            row_id=1,
+            seq=1,
+            row_hash=_HASH,
+        )
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if "auth.login_failed" in ln]
+    assert len(lines) == 1, lines
+    line = lines[0]
+    if fmt == "json":
+        inner = json.loads(line)["message"]
+    else:
+        inner = line.split("messagefoundry.audit: ", 1)[1]
+    return line, inner, json.loads(inner)
+
+
+@pytest.mark.parametrize("fmt", ["text", "json"])
+@pytest.mark.parametrize("kind", sorted(_LOG_ALPHABET_SAMPLES))
+def test_the_tee_parses_as_json_after_the_log_scrub(fmt: str, kind: str, capsys) -> None:
+    """The handlers' control-character scrub must leave the tee's document valid JSON.
+
+    Until vault BACKLOG #3012 it spelled part of the log alphabet as ``\\x7f`` or ``\\U000e0001``,
+    which is not JSON, so a DEL, C1, soft hyphen or astral code point in a typed sign-in name would
+    have left a collector unable to parse the record. Each character must now come back from
+    ``json.loads`` as it went in, and a lone surrogate as visible text, never as an unpaired
+    ``\\udcff`` escape, which a strict decoder refuses. The rest of the sample is ASCII, so the
+    physical line must be printable ASCII: the character travelled as an escape, never raw."""
+    char = _LOG_ALPHABET_SAMPLES[kind]
+    actor = f"user{char}name"
+    detail = f"refused {char} here"
+    line, _inner, record = _teed_through_configured_stdout(fmt, actor, detail, capsys)
+
+    assert record["actor"] == _as_read_back(actor)
+    # Through `safe_text`, which leaves these characters alone.
+    assert record["detail"] == _as_read_back(detail)
+    # Strict: Python's json decodes an unpaired surrogate escape to a surrogate; jiter refuses it.
+    assert not has_lone_surrogate(record["actor"] + record["detail"])
+    assert all(0x20 <= ord(ch) < 0x7F for ch in line), ascii(line)
+
+
+@pytest.mark.parametrize("fmt", ["text", "json"])
+@pytest.mark.parametrize(
+    ("actor", "spelled"),
+    [
+        ("alice", '"actor": "alice"'),
+        # Ordinary non-ASCII is not in the log alphabet, so it stays raw on the line.
+        (f"Jos{chr(0xE9)} {chr(0x5F20)}{chr(0x4F1F)}", f'"actor": "Jos{chr(0xE9)} {chr(0x5F20)}'),
+        # The form `ensure_ascii=True` would have broken: with the accent escaped, the name-run
+        # pattern found a word boundary before it and redacted "Ana Luc".
+        (f"Ana Luc{chr(0xED)}a", f'"actor": "Ana Luc{chr(0xED)}a"'),
+    ],
+)
+def test_a_clean_or_plain_non_ascii_actor_round_trips(
+    fmt: str, actor: str, spelled: str, capsys
+) -> None:
+    _line, inner, record = _teed_through_configured_stdout(fmt, actor, "ok", capsys)
+    assert record["actor"] == actor
+    assert spelled in inner
+
+
+@pytest.mark.parametrize("fmt", ["text", "json"])
+@pytest.mark.parametrize(
+    ("actor", "needle"),
+    [
+        # The control: nothing in front, so the filters redact what follows as they always have.
+        ("DOE JANE", "DOE"),
+        ("password=hunter2", "hunter2"),
+        # Not in the log alphabet: `ensure_ascii=True` escaped it and the name shipped.
+        (f"DOE{chr(0xA0)}JANE", "DOE"),
+        # In the log alphabet. Escaped before the filters, each escape ends in a word character,
+        # so `\b` found no boundary and the name or the credential value shipped (vault BACKLOG
+        # #3012, the first fix's defect, measured through this chain).
+        (f"{chr(0x7F)}DOE JANE", "DOE"),
+        (f"{chr(0x7F)}password=hunter2", "hunter2"),
+        (f"{chr(0x85)}DOE JANE", "DOE"),
+        (f"{chr(0x85)}password=hunter2", "hunter2"),
+        (f"{chr(0xAD)}DOE JANE", "DOE"),
+        (f"{chr(0xAD)}password=hunter2", "hunter2"),
+        (f"{chr(0x200E)}DOE JANE", "DOE"),
+        (f"{chr(0x200E)}password=hunter2", "hunter2"),
+        # Raw, this separator kept the encoded-separator pass off; escaped early, the pass ran and
+        # took the closing quote, so the record stopped parsing.
+        (f"x%7Cy%7Cz{chr(0x2028)}", None),
+    ],
+)
+def test_the_redaction_filters_fire_across_an_escaped_character(
+    fmt: str, actor: str, needle: str | None, capsys
+) -> None:
+    """The filters run before the scrub and see these characters unescaped, so they redact what
+    follows each exactly as they redact the same text with nothing in front. A C0 control is the
+    exception, because ``json.dumps`` escapes it first; the test below pins that. Synthetic values;
+    the helper's ``json.loads`` is the parse check."""
+    line, _inner, _record = _teed_through_configured_stdout(fmt, actor, "ok", capsys)
+    if needle is not None:
+        assert needle not in line, line
+
+
+class _C0Leak(Exception):
+    """The one failure the C0 xfail below expects, so a helper assert cannot satisfy it."""
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=_C0Leak,
+    reason="KNOWN RESIDUAL, not built here and older than vault BACKLOG #3012: json.dumps escapes a "
+    "C0 control before any filter runs, so a pattern that needs a word boundary or whitespace "
+    "misses the text beside it. See emit_audit_tee's docstring.",
+)
+@pytest.mark.parametrize("fmt", ["text", "json"])
+@pytest.mark.parametrize(
+    ("actor", "needle"),
+    [
+        (f"{chr(0x01)}DOE JANE", "DOE"),
+        (f"{chr(0x01)}password=hunter2", "hunter2"),
+        (f"{chr(0x09)}password=hunter2", "hunter2"),
+        (f"{chr(0x01)}05/05/1980", "1980"),
+        (f"DOE{chr(0x09)}JANE", "DOE"),
+        (f"Bearer{chr(0x09)}abcdefgh", "abcdefgh"),
+        (f"MRN{chr(0x09)}12345678", "12345678"),
+    ],
+)
+def test_a_c0_control_still_hides_text_from_the_filters(
+    fmt: str, actor: str, needle: str, capsys
+) -> None:
+    """Each case leaks only because of the C0 control: the control test asserts the same text
+    is redacted without it. When a case flips to a pass, take the marker off for it."""
+    line, _inner, _record = _teed_through_configured_stdout(fmt, actor, "ok", capsys)
+    if needle in line:
+        raise _C0Leak(line)
+
+
+@pytest.mark.parametrize("fmt", ["text", "json"])
+@pytest.mark.parametrize(
+    ("actor", "needle"),
+    [
+        ("05/05/1980", "1980"),
+        ("DOE JANE", "DOE"),
+        ("Bearer abcdefgh", "abcdefgh"),
+        ("MRN 12345678", "12345678"),
+    ],
+)
+def test_the_c0_cases_are_redacted_without_the_control(
+    fmt: str, actor: str, needle: str, capsys
+) -> None:
+    """The control for the xfail above: the same text with a space, or nothing, in place of the
+    C0 control is redacted, so the xfail measures the control and not the pattern."""
+    line, _inner, _record = _teed_through_configured_stdout(fmt, actor, "ok", capsys)
+    assert needle not in line, line
+
+
+def _tee_line(text: str) -> str:
+    (line,) = (ln for ln in text.splitlines() if "auth.login_failed" in ln)
+    return line.split("messagefoundry.audit: ", 1)[1]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=json.JSONDecodeError,
+    reason="KNOWN RESIDUAL, not built here: every handler re-filters the one shared LogRecord, so "
+    "the file handler and the forwarder re-run the chain over the first handler's escaped text, "
+    "and a field-run pass takes the closing quote. See emit_audit_tee's docstring.",
+)
+@pytest.mark.parametrize("separator", [chr(0x7F), chr(0x2028)])
+def test_a_later_handler_keeps_the_tee_json(separator: str, tmp_path: Path, capsys) -> None:
+    """The second sink must parse too. It does not yet; when it does, this flips to a failure
+    and the marker comes off. The first sink, stdout, parses, and that is asserted first, so the
+    expected failure can only come from the later sink."""
+    from messagefoundry.logging_setup import LogFile
+
+    log_path = tmp_path / "engine.log"
+    with _handlerless_process():
+        try:
+            configure_logging("INFO", fmt="text", log_file=LogFile(path=str(log_path)))
+            capsys.readouterr()
+            emit_audit_tee(
+                action="auth.login_failed",
+                actor=f"x%7Cy%7Cz{separator}",
+                channel_id=None,
+                detail="ok",
+                ts=1.0,
+                row_id=1,
+                seq=1,
+                row_hash=_HASH,
+            )
+            for handler in logging.getLogger().handlers:
+                handler.flush()
+            stdout_text = capsys.readouterr().out
+            file_text = log_path.read_text(encoding="utf-8")
+        finally:
+            for handler in list(logging.getLogger().handlers):
+                handler.close()
+    try:
+        json.loads(_tee_line(stdout_text))
+    except json.JSONDecodeError as exc:  # not the residual, so not the expected failure
+        raise AssertionError(f"the FIRST sink broke too: {stdout_text!r}") from exc
+    json.loads(_tee_line(file_text))
 
 
 def test_emit_audit_tee_is_best_effort_on_logging_failure(audit_capture, monkeypatch) -> None:

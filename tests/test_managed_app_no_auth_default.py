@@ -9,6 +9,7 @@ same route, so a 503 is a reading of the gate and never of an app that failed to
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 import httpx
@@ -17,12 +18,13 @@ from fastapi import FastAPI
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from messagefoundry.api import create_managed_app
+from messagefoundry.api import create_app, create_managed_app
 from messagefoundry.auth import Role
-from messagefoundry.config.settings import AuthSettings, EgressSettings
+from messagefoundry.config.settings import AuthSettings, EgressSettings, ServiceSettings
+from messagefoundry.pipeline import Engine
 
 # The account helpers and the peer address the API auth tests pin, imported rather than copied.
-from tests.test_api_auth import _DEFAULT_PEER, _add, _auth, _login
+from tests.test_api_auth import _DEFAULT_PEER, _add, _auth, _login, _service
 
 #: A route behind ``require(...)``. ``/health`` is the control beside it: it answers a tokenless
 #: caller through ``optional_identity`` in every mode, so it shows the app is up.
@@ -37,23 +39,19 @@ def _client(app: FastAPI) -> httpx.AsyncClient:
 
 
 @pytest.mark.parametrize(
-    ("auth_settings", "allow_no_auth", "status"),
+    ("allow_no_auth", "status"),
     [
-        pytest.param(None, False, 503, id="no-settings"),
-        pytest.param(None, True, 200, id="no-settings-opted-in"),
-        # Settings that say sign-in is off describe the instance. They are not the opt-in.
-        pytest.param(AuthSettings(enabled=False), False, 503, id="disabled-settings"),
-        pytest.param(AuthSettings(enabled=False), True, 200, id="disabled-settings-opted-in"),
+        pytest.param(False, 503, id="no-settings"),
+        pytest.param(True, 200, id="no-settings-opted-in"),
     ],
 )
-async def test_only_the_opt_in_opens_an_app_with_no_enabled_auth(
-    tmp_path: Path, auth_settings: AuthSettings | None, allow_no_auth: bool, status: int
+async def test_only_the_opt_in_opens_an_app_with_no_auth_settings(
+    tmp_path: Path, allow_no_auth: bool, status: int
 ) -> None:
-    """The opt-in decides, and the settings do not: each refusal sits beside its own control."""
+    """The opt-in decides: the refusal sits beside its own control."""
     app = create_managed_app(
         db_path=tmp_path / "managed.db",
         poll_interval=0.05,
-        auth_settings=auth_settings,
         allow_no_auth=allow_no_auth,
         egress_settings=EgressSettings(deny_by_default=False),
     )
@@ -124,7 +122,7 @@ async def test_enabled_auth_settings_refuse_an_anonymous_call_and_answer_a_signe
         assert (await c.get(_PROTECTED, headers=_auth(token))).status_code == 200
 
 
-def test_the_opt_in_beside_enabled_auth_settings_is_refused(tmp_path: Path) -> None:
+def test_the_opt_in_beside_auth_settings_is_refused(tmp_path: Path) -> None:
     """Asking for sign-in and for the open mode at once is a mistake, so the factory says so."""
     with pytest.raises(ValueError, match="allow_no_auth"):
         create_managed_app(
@@ -133,3 +131,66 @@ def test_the_opt_in_beside_enabled_auth_settings_is_refused(tmp_path: Path) -> N
             allow_no_auth=True,
             egress_settings=EgressSettings(deny_by_default=False),
         )
+
+
+# --- vault BACKLOG #2825: the opt-in with no service is the ONLY way into the open mode -------
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        pytest.param(lambda: AuthSettings.model_validate({"enabled": False}), id="auth-settings"),
+        pytest.param(
+            lambda: ServiceSettings.model_validate({"auth": {"enabled": False}}),
+            id="service-settings",
+        ),
+    ],
+)
+def test_settings_built_in_code_refuse_the_removed_sign_in_switch(
+    build: Callable[[], object],
+) -> None:
+    """No settings object can say sign-in is off, whether it came from a file or from code.
+
+    The loader already refuses ``[auth].enabled`` from a file or the environment (vault BACKLOG
+    #2719). Before vault BACKLOG #2825 settings built in code took ``enabled=False``; now they refuse
+    it loudly rather than drop it, and assigning the attribute is refused too."""
+    assert "enabled" not in AuthSettings.model_fields
+    with pytest.raises(ValueError, match="no `enabled` field"):
+        build()
+    with pytest.raises(ValueError, match="enabled"):
+        setattr(AuthSettings(), "enabled", False)  # noqa: B010 -- the name is the subject
+
+
+async def test_an_attached_service_cannot_be_opened(tmp_path: Path) -> None:
+    """An auth service, once built, always asks for a session; nothing an embedder sets turns it off.
+
+    So ``allow_no_auth=True`` opens an app only when no service is attached, and ``create_app``
+    refuses the opt-in beside one. Before vault BACKLOG #2825 a service built from settings with
+    ``enabled=False`` answered as disabled, and beside the opt-in the app served ``/stats`` to anyone
+    (200); the property was a plain attribute anyone could set."""
+    engine = await Engine.create(
+        tmp_path / "attached.db",
+        poll_interval=0.05,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        service = await _service(engine, AuthSettings(require_mfa=False))
+        assert service.enabled is True
+        with pytest.raises(AttributeError):
+            setattr(service, "enabled", False)  # noqa: B010 -- the name is the subject
+        with pytest.raises(ValueError, match="allow_no_auth"):
+            create_app(engine, auth=service, allow_no_auth=True)
+        async with _client(create_app(engine, auth=service)) as c:
+            assert (await c.get(_PROTECTED)).status_code == 401
+        # Past both factory refusals: the flag set after a service is attached, as an embedder's own
+        # lifespan could. The request-time checks still answer a tokenless caller with no identity.
+        flagged = create_app(engine, auth=service)
+        flagged.state.allow_no_auth = True
+        async with _client(flagged) as c:
+            assert (await c.get(_PROTECTED)).status_code == 401
+            assert (await c.get(_ALWAYS_ANSWERS)).json()["version"] is None
+        # The control: the opt-in with no service attached is the open mode.
+        async with _client(create_app(engine, allow_no_auth=True)) as c:
+            assert (await c.get(_PROTECTED)).status_code == 200
+    finally:
+        await engine.stop()

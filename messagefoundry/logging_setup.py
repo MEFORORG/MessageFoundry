@@ -212,6 +212,9 @@ class RedactionFilter(logging.Filter):
     through to both the stdout handler and the off-box forwarder by construction. The remaining residual
     is an adversarially-crafted *single-token* or non-name-shaped identifier, for which the "never put
     PHI in an exception message" convention remains the control (see :mod:`messagefoundry.redaction`).
+    A message escaped before it reaches this filter is another residual: the audit tee's
+    ``json.dumps`` escapes the C0 controls first, and a name or date beside one can pass. See
+    :func:`~messagefoundry.store.audit_tee.emit_audit_tee`.
 
     **EVERY FIELD IS BOUNDED BEFORE IT IS SCANNED (BACKLOG #1576).** This filter had no ceiling at all,
     and it is the worst place in the engine not to have one: a ``logging.Filter`` is synchronous by the
@@ -763,8 +766,11 @@ def _install_phi_filters(handler: logging.Handler) -> None:
     ``exc_text``, so the credential passes have a traceback to read), scrub credentials from the
     result, then scrub control chars last. Applied to **every** handler a logger carries (stdout,
     stderr, and the off-box forwarder's queue handler) so the forwarded stream is held to the same
-    PHI-safety, secret-safety and log-injection guarantees as stdout. The filters are idempotent, so
-    a record dispatched to multiple filtered handlers is safely re-scrubbed.
+    PHI-safety, secret-safety and log-injection guarantees as stdout. Every handler re-runs the
+    chain over the ONE shared record, so a later handler filters the earlier one's escaped output.
+    That second pass is NOT idempotent for every input: it can redact more than the first did, and
+    that can break a JSON document logged as a message (the audit tee; vault BACKLOG #3012 measured
+    it on the file sink and the forwarder, and BACKLOG #1199 recorded the double-redacted path).
 
     For the forwarder this means the **queue** handler, on the near side of the hand-off, and the
     socket handler behind it carries no chain of its own — see :class:`_ForwardQueueHandler`, which is
@@ -1069,7 +1075,9 @@ class _ForwardQueueHandler(logging.handlers.QueueHandler):
     * A far-side chain would re-redact an already-rendered line. On the JSON format that is a known
       framing defect (an HL7-shaped run inside the rendered object reads as a segment and is cut to
       end of line, losing the closing brace), recorded on BACKLOG #1199 as pre-existing on the
-      double-redacted audit-tee path. Filtering once, near side, does not reproduce it here.
+      double-redacted audit-tee path. Filtering near side adds no far-side pass. It does not stop
+      the near-side chain re-running over a record an earlier handler, such as stdout's, already
+      filtered; :func:`_install_phi_filters` states what that second pass can break.
 
     **The formatter is on this side too**, and the socket handler is left with an identity formatter,
     so the object on the queue is the exact line that goes on the wire. That is the strongest available

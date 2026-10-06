@@ -5,9 +5,10 @@
 When ``[auth].admin_new_ip_step_up`` is on, a step-up (sensitive admin) request arriving from a client
 address the session has not verified from is treated as higher-risk: it audits + notifies and FORCES a
 fresh step-up, which a successful ``POST /me/reauth`` from that address clears (re-anchoring the
-session). It is advisory + step-up-forcing only — it never changes an authz decision and never blocks
-the non-admin request path. It defaults ON since BACKLOG #288; turning it off, and a single-host
-loopback deployment, are no-ops (the request and the session share one address).
+session). It is step-up-forcing only — it never changes an RBAC decision. Since vault BACKLOG #2620
+the PHI reads and the paced writes refuse on it too; the base gate, which the monitoring polls ride,
+never asks. It defaults ON since BACKLOG #288; turning it off, and a single-host loopback deployment,
+are no-ops (the request and the session share one address).
 """
 
 from __future__ import annotations
@@ -653,3 +654,138 @@ async def test_new_ip_never_overrides_rbac(engine: Engine) -> None:
         # Missing permission — NOT a step-up / MFA prompt.
         assert denied.headers.get("X-Step-Up-Required") is None
         assert denied.headers.get("X-MFA-Required") is None
+
+
+# --- vault BACKLOG #2620: the PHI reads and the paced writes ask too ---------------------------
+
+
+def _new_ip_service(engine: Engine, **over: object) -> AuthService:
+    settings: dict[str, object] = {
+        "admin_write_min_interval_seconds": 0,
+        "admin_new_ip_step_up": True,
+        "require_mfa": False,
+    }
+    settings.update(over)
+    return AuthService(engine.store, AuthSettings(**settings))  # type: ignore[arg-type]
+
+
+_ADT = "MSH|^~\\&|S|F|R|RF|20260604||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
+#: The paced write's body: resetting every counter touches no message.
+_RESET_ALL: dict[str, object] = {"all": True}
+
+
+async def _seed_message(engine: Engine) -> str:
+    return await engine.store.enqueue_message(
+        channel_id="ch1",
+        raw=_ADT,
+        deliveries=[("archive", _ADT)],
+        control_id="MSG1",
+        message_type="ADT^A01",
+        source_type="file",
+    )
+
+
+def _replayed(mid: str) -> tuple[tuple[str, str, dict[str, object] | None], ...]:
+    """The architecture review's probe, widened: the message list, a raw body, the dead-letter
+    list, the log tail, and two paced writes. The connection name names no connection, so the
+    control's 404 proves the gate let the request through to the handler."""
+    return (
+        ("GET", "/messages", None),
+        ("GET", f"/messages/{mid}/raw", None),
+        ("GET", "/dead-letters", None),
+        ("GET", "/logs/tail", None),
+        ("POST", "/connections/IB_NONE/start", None),
+        ("POST", "/statistics/reset", _RESET_ALL),
+    )
+
+
+async def test_a_token_replayed_from_a_second_address_is_refused_on_phi_and_paced(
+    engine: Engine,
+) -> None:
+    """RED when: a bearer token signed in at one address reads a message body, lists messages or
+    calls a paced write from another with no step-up (vault BACKLOG #2620, the architecture
+    review's probe). The same token from the sign-in address is the control: it is never refused
+    with the step-up header. A base-gate route from the new address still answers, because the
+    monitoring polls ride it."""
+    service = _new_ip_service(engine)
+    await service.initialize()
+    await _add_admin(service, "boss")
+    mid = await _seed_message(engine)
+    async with _client_at(engine, service, "10.0.0.1") as a:
+        token = await _login_token(a)
+        for method, path, body in _replayed(mid):
+            r = await a.request(method, path, headers=_auth(token), json=body)
+            assert r.headers.get("X-Step-Up-Required") is None, (method, path, r.status_code)
+    async with _client_at(engine, service, "10.9.9.9") as b:
+        for method, path, body in _replayed(mid):
+            r = await b.request(method, path, headers=_auth(token), json=body)
+            assert r.status_code == 403, (method, path, r.status_code)
+            assert r.headers.get("X-Step-Up-Required") == "1", (method, path)
+        assert (await b.get("/connections", headers=_auth(token))).status_code == 200
+        # One row for the address, whichever gate saw it first (BACKLOG #2159's dedupe).
+        assert isinstance(engine.store, MessageStore)
+        assert await _new_ip_rows(engine.store) == ["10.9.9.9"]
+        # A re-verification from the new address re-anchors the session, and the reads pass.
+        ok = await b.post("/me/reauth", headers=_auth(token), json={"password": PW})
+        assert ok.status_code == 200
+        token = str(ok.json()["token"])
+        assert (await b.get("/messages", headers=_auth(token))).status_code == 200
+        raw = await b.get(f"/messages/{mid}/raw", headers=_auth(token))
+        assert raw.status_code == 200 and raw.json()["raw"]
+
+
+async def test_a_refusal_for_a_new_address_charges_no_budget(engine: Engine) -> None:
+    """RED when: the new-address refusal runs after the PHI-read or admin-write charge, so a stolen
+    token refused in a loop spends the holder's budget (vault BACKLOG #2620, the BACKLOG #1973
+    rule). With a budget of one, the holder still reads and writes once after the refusals."""
+    service = _new_ip_service(
+        engine, phi_read_rate_limit_per_actor=1, admin_write_rate_limit_per_actor=1
+    )
+    await service.initialize()
+    await _add_admin(service, "boss")
+    async with _client_at(engine, service, "10.0.0.1") as a:
+        token = await _login_token(a)
+    async with _client_at(engine, service, "10.9.9.9") as b:
+        for _ in range(3):
+            assert (await b.get("/messages", headers=_auth(token))).status_code == 403
+            assert (
+                await b.post("/statistics/reset", headers=_auth(token), json=_RESET_ALL)
+            ).status_code == 403
+    async with _client_at(engine, service, "10.0.0.1") as a:
+        assert (await a.get("/messages", headers=_auth(token))).status_code == 200
+        assert (
+            await a.post("/statistics/reset", headers=_auth(token), json=_RESET_ALL)
+        ).status_code == 200
+
+
+async def test_the_phi_and_paced_gates_ask_nothing_with_the_signal_off(engine: Engine) -> None:
+    """The named loosening still turns the whole check off: ``admin_new_ip_step_up = false``."""
+    service = _new_ip_service(engine, admin_new_ip_step_up=False)
+    await service.initialize()
+    await _add_admin(service, "boss")
+    async with _client_at(engine, service, "10.0.0.1") as a:
+        token = await _login_token(a)
+    async with _client_at(engine, service, "10.9.9.9") as b:
+        assert (await b.get("/messages", headers=_auth(token))).status_code == 200
+        r = await b.post("/statistics/reset", headers=_auth(token), json=_RESET_ALL)
+        assert r.status_code == 200
+    assert isinstance(engine.store, MessageStore)
+    assert await _new_ip_rows(engine.store) == []
+
+
+async def test_an_http_reveal_from_a_second_address_is_refused(engine: Engine) -> None:
+    """RED when: a ``reveal`` on a monitoring list route, a PHI read admitted by ``_admit_reveal``
+    rather than ``require_phi_read``, answers a token replayed from a new address (vault BACKLOG
+    #2620, review round 1). The same list without ``reveal`` still answers: it rides the base gate."""
+    service = _new_ip_service(engine)
+    await service.initialize()
+    await _add_admin(service, "boss")
+    async with _client_at(engine, service, "10.0.0.1") as a:
+        token = await _login_token(a)
+        control = await a.get("/events", params={"reveal": 1}, headers=_auth(token))
+        assert control.headers.get("X-Step-Up-Required") is None, control.status_code
+    async with _client_at(engine, service, "10.9.9.9") as b:
+        for path in ("/events", "/alerts/active"):
+            r = await b.get(path, params={"reveal": 1}, headers=_auth(token))
+            assert (r.status_code, r.headers.get("X-Step-Up-Required")) == (403, "1"), path
+        assert (await b.get("/events", headers=_auth(token))).status_code == 200

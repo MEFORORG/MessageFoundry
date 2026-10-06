@@ -24,6 +24,7 @@ import inspect
 import itertools
 import logging
 import re
+import subprocess
 import textwrap
 import typing
 from collections.abc import Callable
@@ -39,7 +40,14 @@ from messagefoundry.api import security as api_security
 from messagefoundry.api.security import _PHI_VIEW_PERMISSIONS, require_service_cert
 from messagefoundry.auth import service as service_module
 from messagefoundry.auth.identity import AuthProvider
-from messagefoundry.auth.permissions import Permission, Role
+from messagefoundry.auth.permissions import (
+    BUILTIN_ROLE_PERMISSIONS,
+    CUSTOM_ROLE_FORBIDDEN_PERMISSIONS,
+    CustomRoleError,
+    Permission,
+    Role,
+    validate_custom_role_permissions,
+)
 from messagefoundry.auth.policy import PasswordPolicy
 from messagefoundry.auth.service import AuthService, _directory_login_refusal
 from messagefoundry.config.models import ConnectorType, Source
@@ -48,6 +56,7 @@ from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.config.wiring import Http, WiringError
 from messagefoundry.pipeline.wiring_runner import check_inbound_revocation
 from messagefoundry.store.store import LockoutCounter, UserRecord, lockout_escalates
+from tests._sign_in_claim import SIGN_IN_ANY_TENSE, SIGN_IN_CLAIM
 
 _ROOT = Path(__file__).resolve().parent.parent
 _DOC = _ROOT / "docs" / "SECURITY.md"
@@ -3020,3 +3029,708 @@ def test_the_twelfth_sweep_loosening_note_does_not_gate_a_removed_key() -> None:
     )
     gated = [c for c in clauses if "`[auth].enabled`" in c and "serve-time refusal" in c]
     assert not gated, f"docs/SECURITY-LOOSENING.md gates the removed [auth].enabled again: {gated}"
+
+
+# The thirteenth 6.1.3 re-read (BACKLOG #1133, vault PR 2242) held the cell at partial on four more
+# sentences in shipped docs outside the three the early sweeps read, and asked whether "nobody can
+# sign in before `provision-admin`" holds for a directory sign-in. Each was checked against the code
+# before it was changed; the probe below pins what was checked, and each test after it refuses the
+# CLAIM rather than one sentence.
+
+
+def test_the_thirteenth_sweep_probes_the_code_the_docs_now_state(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The code facts the thirteenth sweep's sentences now state."""
+    from messagefoundry.auth.ldap import AdPrincipal
+    from messagefoundry.pipeline import wiring_runner
+    from messagefoundry.store.store import MessageStore
+    from messagefoundry_webconsole import _auth as console_auth
+
+    # 1. A pending browser session is redirected to /ui/mfa, not held there. The page forwards an
+    #    account with no factor to the account page, and the account page and the enrolment
+    #    factory both admit a pending session.
+    routes = _console_route_funcs()
+    assert any(
+        isinstance(n, ast.Constant) and n.value == "/ui/account?m=enroll_first"
+        for n in ast.walk(routes["GET /ui/mfa"])
+    ), "GET /ui/mfa no longer forwards an account with no factor to /ui/account"
+    for where, values in (
+        (
+            "GET /ui/account",
+            [
+                kw.value
+                for n in ast.walk(routes["GET /ui/account"])
+                if isinstance(n, ast.Call)
+                for kw in n.keywords
+                if kw.arg == "allow_mfa_pending"
+            ],
+        ),
+        (
+            "require_ui_reauth_only_action",
+            keyword_values(console_auth.require_ui_reauth_only_action, "allow_mfa_pending"),
+        ),
+    ):
+        flags = [v for v in values if isinstance(v, ast.Constant) and v.value is True]
+        assert flags, f"{where} no longer admits an MFA-pending session"
+    assert _called(routes["POST /ui/account/mfa/enroll"], "require_ui_reauth_only_action")
+
+    # 2. HTTP intake: three partner-authentication modes, no Basic, and a peer-control gate that
+    #    refuses under enforce, warns otherwise, runs at build and at check, and ignores the
+    #    cleartext escape.
+    with pytest.raises(WiringError, match="intake_auth must be one of"):
+        Http(port=8080, intake_auth="basic")  # type: ignore[arg-type]
+    exposed = {"host": "0.0.0.0", "tls": True, "tls_cert_file": "c.pem", "tls_key_file": "k.pem"}
+
+    def gate(enforcing: bool, **settings: Any) -> None:
+        wiring_runner.check_http_intake_auth(
+            Source(type=ConnectorType.HTTP, name="intake-in", settings={**exposed, **settings}),
+            "intake-in",
+            posture=HopPosture(enforcing=enforcing),
+        )
+
+    # The allow-list floors docs/DEPLOYMENT.md quotes, probed on both sides of each.
+    assert (
+        wiring_runner._INTAKE_ALLOWLIST_MIN_PREFIX_V4,
+        wiring_runner._INTAKE_ALLOWLIST_MIN_PREFIX_V6,
+    ) == (
+        8,
+        32,
+    ), "the intake allow-list floors moved; restate docs/DEPLOYMENT.md's caveat"
+    for refused in (
+        {},
+        {"tls_ca_file": "ca.pem"},
+        {"source_ip_allowlist": ["0.0.0.0/0"]},
+        {"source_ip_allowlist": ["10.0.0.0/7"]},
+        {"source_ip_allowlist": ["2001:db8::/31"]},
+    ):
+        with pytest.raises(WiringError):
+            gate(True, **refused)
+    with caplog.at_level(logging.WARNING):
+        gate(False)  # warned, not refused
+    assert any(
+        r.levelno == logging.WARNING and "no effective peer control" in r.getMessage()
+        for r in caplog.records
+    ), "check_http_intake_auth no longer warns under warn; restate docs/DEPLOYMENT.md"
+    gate(True, intake_auth="api_key", intake_api_key="k")
+    gate(True, intake_auth="bearer", intake_api_key="k")
+    gate(True, intake_auth="mtls_subject", tls_ca_file="ca.pem", intake_client_subjects=["CN:p"])
+    gate(True, source_ip_allowlist=["10.0.0.0/8", "2001:db8::/32"])
+    # Once intake_auth names a mode, only that mode is judged: a narrow allow-list does not rescue
+    # a key mode with no key (docs/DEPLOYMENT.md says the allow-list is then not consulted).
+    for incomplete in (
+        {"intake_auth": "bearer", "intake_api_key": ""},
+        {"intake_auth": "mtls_subject", "tls_ca_file": "ca.pem", "intake_client_subjects": []},
+    ):
+        with pytest.raises(WiringError):
+            gate(True, source_ip_allowlist=["10.0.0.0/24"], **incomplete)
+    assert (
+        "allow_insecure_bind"
+        not in inspect.signature(wiring_runner.check_http_intake_auth).parameters
+    )
+    for caller in (
+        wiring_runner.RegistryRunner._start_inbound_unsafe,
+        wiring_runner._build_check_connectors,
+    ):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(caller)))
+        assert _called(tree, "check_http_intake_auth"), f"{caller.__name__} lost the intake gate"
+
+    # 3. The only directory bind a user's password reaches is the step-up re-bind. Two layers. In
+    #    the LDAP client, a connection is opened only by the service-account helper and by
+    #    `authenticate` (with its timing-equaliser, which only `authenticate` calls). In the engine,
+    #    only `_reauth_ad` reaches `authenticate`; simple-bind sign-in is retired.
+    ldap_tree = ast.parse(
+        (_ROOT / "messagefoundry" / "auth" / "ldap.py").read_text(encoding="utf-8")
+    )
+    ldap_funcs = [
+        f for f in ast.walk(ldap_tree) if isinstance(f, ast.FunctionDef | ast.AsyncFunctionDef)
+    ]
+    openers = sorted({f.name for f in ldap_funcs if _called(f, "Connection")})
+    assert openers == ["_equalizing_bind", "_service_conn", "authenticate"], (
+        f"the LDAP functions that open a connection changed: {openers}. Re-derive which binds carry "
+        "a user's password before trusting docs/SECURITY-LOOSENING.md's cleartext-LDAP loss."
+    )
+    assert sorted(f.name for f in ldap_funcs if _called(f, "_equalizing_bind")) == ["authenticate"]
+    # Every reference to the name, whatever its receiver, in the engine and the console. The two
+    # api/security.py holders are a parameter of that name, unrelated to the directory.
+    sites = sorted(set(_name_reference_sites("authenticate")))
+    assert sites == [
+        ("messagefoundry/api/security.py", "_gate"),
+        ("messagefoundry/api/security.py", "require_phi_read"),
+        ("messagefoundry/auth/service.py", "AuthService"),
+    ], (
+        f"the code referring to `authenticate` changed: {sites}. Re-derive which paths bind a "
+        "directory user before trusting docs/SECURITY-LOOSENING.md's cleartext-LDAP loss."
+    )
+    service_tree = ast.parse(textwrap.dedent(inspect.getsource(AuthService)))
+    binders = sorted(
+        {
+            f.name
+            for f in ast.walk(service_tree)
+            if isinstance(f, ast.FunctionDef | ast.AsyncFunctionDef)
+            and any(isinstance(n, ast.Attribute) and n.attr == "authenticate" for n in ast.walk(f))
+        }
+    )
+    assert binders == ["_reauth_ad"], (
+        f"the AuthService methods binding a directory user changed: {binders}. Restate the "
+        "cleartext-LDAP loss in docs/SECURITY-LOOSENING.md."
+    )
+
+    # 4. With the claim gate on, the default, an OIDC session is minted as having met the factor.
+    #    The tenth sweep's probe pins the grant to the setting; this pins the default it reads.
+    assert AuthSettings.model_fields["oidc_require_mfa_claim"].default is True
+
+    # 5. On a store with no Administrator a Windows sign-in is not refused: it mints a session on a
+    #    new directory row holding no role, still owing its factor. The role map and the federated
+    #    binding are both administrator-only, so nothing grants that row a role, and an OIDC
+    #    sign-in finds no account to sign in to.
+    principal = AdPrincipal(
+        username="jdoe",
+        display_name="J Doe",
+        email="jdoe@example.org",
+        dn="CN=jdoe,DC=x",
+        groups=frozenset({"cn=mf-admins,dc=x"}),
+        directory_object_id="0f0e0d0c-0b0a-0908-0706-050403020100",
+    )
+
+    class _OneUserDirectory:
+        def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
+            return principal if username == "jdoe" else None
+
+    monkeypatch.setattr(service_module, "kerberos_principal", lambda _t, _s: "jdoe")
+
+    async def probe() -> tuple[bool, frozenset[Permission], bool, list[str], bool]:
+        store = await MessageStore.open(":memory:")
+        try:
+            settings = AuthSettings(
+                ad_enabled=True,
+                kerberos_enabled=True,
+                ad_server="ldaps://x",
+                ad_user_search_base="DC=x",
+                ad_bind_dn="CN=svc,DC=x",
+                ad_bind_password="x",
+            )
+            service = AuthService(store, settings, ldap=_OneUserDirectory())  # type: ignore[arg-type]
+            await service.initialize()
+            assert not await service.has_enabled_administrator()
+            assert list(await store.list_ad_group_role_map()) == []
+            out = await service.authenticate_kerberos(b"spnego-token")
+            assert out.identity is not None
+            row = await store.get_user_by_username("jdoe")
+            assert row is not None and row.auth_provider == AuthProvider.AD.value
+            return (
+                out.ok,
+                out.identity.permissions,
+                out.mfa_required,
+                list(await store.get_user_role_ids(row.id)),
+                await service.has_enabled_administrator(),
+            )
+        finally:
+            await store.close()
+
+    assert asyncio.run(probe()) == (True, frozenset(), True, [], False), (
+        "a Windows sign-in on a store with no Administrator changed shape; restate the "
+        "provisioning passages in docs/DEPLOYMENT.md, docs/INSTALL-GUIDE.md and docs/SERVICE.md."
+    )
+    routes_tree = ast.parse(
+        (_ROOT / "messagefoundry" / "api" / "auth_routes.py").read_text(encoding="utf-8")
+    )
+    for route in ("set_ad_group_map", "bind_user_federated_identity"):
+        func = next(
+            n
+            for n in ast.walk(routes_tree)
+            if isinstance(n, ast.AsyncFunctionDef) and n.name == route
+        )
+        assert "Permission.USERS_MANAGE" in ast.unparse(func.args), f"{route} is not admin-only now"
+    assert [
+        r.value for r, p in BUILTIN_ROLE_PERMISSIONS.items() if Permission.USERS_MANAGE in p
+    ] == [Role.ADMINISTRATOR.value]
+    # ...and no custom role can hold it either: the write-time validator refuses it.
+    assert Permission.USERS_MANAGE in CUSTOM_ROLE_FORBIDDEN_PERMISSIONS
+    with pytest.raises(CustomRoleError, match="not assignable"):
+        validate_custom_role_permissions([Permission.USERS_MANAGE.value])
+    assert "FEDERATED_SUBJECT_NOT_BOUND" in {
+        n.id for n in ast.walk(_service_func("_authenticate_oidc")) if isinstance(n, ast.Name)
+    }, "_authenticate_oidc no longer refuses a federated identity bound to no account"
+
+
+def test_the_thirteenth_sweep_remote_console_redirects_rather_than_confines() -> None:
+    """docs/REMOTE-CONSOLE.md said a pending browser session "is confined to `/ui/mfa`". The gate
+    redirects it there, the page forwards an account with no factor to `/ui/account`, and the
+    account and enrolment pages admit it (the probe above)."""
+    row = _flat(
+        next(
+            line
+            for line in _doc("docs/REMOTE-CONSOLE.md").splitlines()
+            if line.startswith("| Signed in, but every route returns `403` with `X-MFA-Required")
+        )
+    )
+    held = re.findall(
+        r"\b(?:confined|restricted|limited|locked|kept|held)\b[^.;|]*`/ui/mfa`|\bonly `/ui/mfa`",
+        row,
+        re.IGNORECASE,
+    )
+    assert not held, f"docs/REMOTE-CONSOLE.md holds a pending session at /ui/mfa again: {held}"
+    assert any("`/ui/mfa`" in c and "redirect" in c for c in _clauses(row)), (
+        "docs/REMOTE-CONSOLE.md's X-MFA-Required row must say the session is redirected to /ui/mfa."
+    )
+
+
+def _deployment_intake_scopes() -> dict[str, str]:
+    """The three places docs/DEPLOYMENT.md describes the HTTP intake listener's partner auth."""
+    doc = _doc("docs/DEPLOYMENT.md")
+    lines = doc.splitlines()
+    start = doc.index("### Caveat — accepting inbound web-service calls")
+    end = doc.index("\n## ", start)
+    return {
+        "plane row": next(x for x in lines if x.startswith("| **Inbound web service**")),
+        "caveat": doc[start:end],
+        "matrix row": next(x for x in lines if x.startswith("| **HTTP source**")),
+    }
+
+
+#: An intake claim the code contradicts: no bearer mode, no partner authentication built, or a
+#: peer control that is optional or never enforced. The last three phrasings are true under
+#: `warn`, so a clause that names `warn` may use them.
+_INTAKE_STALE = re.compile(
+    r"\bno bearer\b|bearer/basic|partner authentication[^.]*\bnot built\b"
+    r"|\bunenforced\b|\bnot enforced\b|\bneither\b[^.]*\b(?:required|enforced)\b"
+    r"|\baccepts (?:any peer|POSTs from anyone)\b|\bstarts cleanly\b",
+    re.IGNORECASE,
+)
+
+
+@pytest.mark.parametrize("scope", ["plane row", "caveat", "matrix row"])
+def test_the_thirteenth_sweep_deployment_states_the_built_intake_auth(scope: str) -> None:
+    """docs/DEPLOYMENT.md said the HTTP intake listener has no bearer or basic partner auth and
+    that neither peer control is enforced. `intake_auth` offers `api_key`, `bearer` and
+    `mtls_subject`, and `check_http_intake_auth` refuses an off-loopback listener with no
+    effective peer control under enforce (the probe above)."""
+    text = _deployment_intake_scopes()[scope]
+    clauses = _clauses(text)
+    assert len(clauses) >= 5, (
+        f"docs/DEPLOYMENT.md's intake {scope} cut into {len(clauses)} clause(s), floor 5: the scan "
+        "reads too little to clear it."
+    )
+    stale = [
+        c
+        for c in clauses
+        if (m := _INTAKE_STALE.search(c))
+        and (re.search(r"bearer|partner authentication", m.group(0), re.I) or "`warn`" not in c)
+    ]
+    assert not stale, f"docs/DEPLOYMENT.md's intake {scope} contradicts the code again: {stale}"
+    flat = _flat(text)
+    for token in ("`intake_auth`", "`api_key`", "`bearer`", "`mtls_subject`"):
+        assert token in flat, f"docs/DEPLOYMENT.md's intake {scope} must name {token}"
+    if scope != "plane row":
+        assert "`check_http_intake_auth`" in flat, (
+            f"docs/DEPLOYMENT.md's intake {scope} must name the peer-control gate"
+        )
+    if scope == "caveat":
+        # The controls are not "any of three": once intake_auth names a mode the allow-list is not
+        # consulted (the probe above refuses a keyless bearer behind a narrow allow-list).
+        assert not re.search(r"\bthree things count\b", flat, re.I), (
+            "the caveat counts the controls as any one of three again"
+        )
+        assert any(
+            re.search(r"allow-?list", c, re.I) and re.search(r"not consulted", c) for c in clauses
+        ), "the caveat must say the allow-list is not consulted once intake_auth names a mode"
+
+
+def test_the_thirteenth_sweep_loosening_note_binds_no_user_at_sign_in() -> None:
+    """docs/SECURITY-LOOSENING.md said the password of every user who signs in crosses a plain
+    `ldap://` hop. Simple-bind sign-in is retired; the step-up re-bind is the only user bind left
+    (the probe above)."""
+    doc = _doc("docs/SECURITY-LOOSENING.md")
+    start = doc.index("### `[auth].ad_allow_insecure_ldap = true`")
+    section = doc[start : doc.index("\n### ", start + 1)]
+    clauses = [c for c in _clauses(section) if "password" in c]
+    assert clauses, "the cleartext-LDAP section names no password, so this check reads nothing"
+    # The shared pattern in every tense, so "sign-in", "login", "signed in" and "logged on" are read.
+    at_sign_in = [c for c in clauses if SIGN_IN_ANY_TENSE.search(c)]
+    assert not at_sign_in, (
+        f"docs/SECURITY-LOOSENING.md says a user's sign-in binds a password again: {at_sign_in}"
+    )
+    assert any(re.search(r"\bstep(?:s|-)? ?up\b", c) for c in clauses), (
+        "the cleartext-LDAP section must say the step-up re-bind carries the user's password"
+    )
+
+
+def test_the_thirteenth_sweep_phi_qualifies_the_second_factor_for_oidc() -> None:
+    """docs/PHI.md said the engine enforces its own second factor "on any bind". With
+    `oidc_require_mfa_claim` on, the default, an OIDC session meets it on the identity provider's
+    claim (the probe above). A paragraph that says the factor applies everywhere must say so."""
+    paragraphs = [p for p in re.split(r"\n\s*\n", _doc("docs/PHI.md")) if "require_mfa`" in p]
+    assert paragraphs, "docs/PHI.md names require_mfa nowhere, so this check reads nothing"
+    universal = [
+        p
+        for p in paragraphs
+        if re.search(r"\bany bind\b|\bevery (?:sign-in|session|bind)\b", _flat(p), re.I)
+    ]
+    assert universal, "docs/PHI.md no longer says where require_mfa applies; re-derive this check"
+    bare = [_flat(p)[:120] for p in universal if "oidc_require_mfa_claim" not in p]
+    assert not bare, (
+        f"docs/PHI.md says the engine's factor applies on any bind without the OIDC claim: {bare}"
+    )
+
+
+#: Shipped docs that carried the claim, at least, with a clause floor below each one's count today.
+#: Not every carrier: the IDE extension's own strings and dated records (CHANGELOG, ADRs) are outside.
+_PROVISIONING_DOCS = {
+    "README.md": 100,
+    "docs/SECURITY.md": 2000,
+    "docs/EARLY-ADOPTER-GUIDE.md": 300,
+    "docs/DEPLOYMENT.md": 250,
+    "docs/INSTALL-GUIDE.md": 250,
+    "docs/SERVICE.md": 250,
+}
+
+
+@pytest.mark.parametrize("name", sorted(_PROVISIONING_DOCS))
+def test_the_thirteenth_sweep_no_doc_says_nobody_can_sign_in_before_provisioning(
+    name: str,
+) -> None:
+    """Six docs said nobody can sign in before `provision-admin` runs. A Windows sign-in is not
+    refused for want of an Administrator: it creates a directory row holding no role (the probe
+    above). Nobody can MANAGE the engine; somebody can sign in."""
+    clauses = _clauses(_doc(name))
+    floor = _PROVISIONING_DOCS[name]
+    assert len(clauses) >= floor, (
+        f"{name} cut into {len(clauses)} clause(s), floor {floor}: the scan reads too little to "
+        "clear it."
+    )
+    stale = [c for c in clauses if SIGN_IN_CLAIM.search(c)]
+    assert not stale, f"{name} says nobody can sign in before provisioning again: {stale}"
+    # Read in the provisioning paragraph itself: every paragraph that says the engine creates no
+    # account AND who cannot manage it must carry the Kerberos note, so a passage elsewhere cannot
+    # stand in for it. The README's quick-start line says only the first, and provisions nothing.
+    passages = [
+        flat
+        for p in re.split(r"\n\s*\n", _doc(name))
+        if "creates no account on its own" in (flat := _flat(p)) and "nobody can manage" in flat
+    ]
+    assert passages, f"{name} no longer says who cannot manage a new store; re-derive this check"
+    assert all(re.search(r"Kerberos[^.]*\.?[^.]*\bno role\b", p) for p in passages), (
+        f"{name} must say, where it provisions the first Administrator, that a Windows sign-in "
+        "before then holds no role"
+    )
+    # The Kerberos note must not read as the default path. At the shipped posture a start with no
+    # Administrator is refused, so a sign-in ahead of provisioning happens only if a start goes
+    # ahead. A clause placing it ahead of provisioning must carry that condition itself.
+    unconditional = [
+        c
+        for c in clauses
+        if "Kerberos" in c
+        and re.search(r"\b(?:before|until) (?:then|provisioning)\b", c)
+        and not re.search(r"\bgoes ahead\b|\bwarn\b|\bwaive", c)
+    ]
+    assert not unconditional, (
+        f"{name} says a Windows sign-in can come before provisioning with no condition: "
+        f"{unconditional}"
+    )
+
+
+#: Dated records keep what they said on the day: the released changelog and its fragments, each
+#: numbered ADR (the ADR index, docs/adr/README.md, is a maintained page and IS scanned), and the
+#: dated benchmark and status records. Everything else tracked as Markdown is a shipped page.
+_DATED_RECORDS = ("CHANGELOG.md", "changelog.d/", "docs/adr/0", "docs/benchmarks/")
+
+
+def test_the_thirteenth_sweep_no_shipped_page_says_nobody_can_sign_in() -> None:
+    """The six docs above carry the provisioning passage; this reads every other tracked page too,
+    so a new page cannot bring the claim back unchecked. The IDE extension's TypeScript strings are
+    outside it: they are not Markdown, and they are a filed follow-up of their own."""
+    out = subprocess.run(
+        ["git", "-C", str(_ROOT), "ls-files", "-z", "--", "*.md"], check=True, capture_output=True
+    ).stdout.decode("utf-8")
+    pages = [rel for rel in out.split("\0") if rel and not rel.startswith(_DATED_RECORDS)]
+    assert len(pages) >= 150, (
+        f"only {len(pages)} tracked pages found, floor 150; re-derive the list"
+    )
+    assert set(_PROVISIONING_DOCS) <= set(pages), "control: the six named docs are in the listing"
+    assert "docs/adr/README.md" in pages, "control: the ADR index is a page, not a dated record"
+    hits = [
+        f"{rel}: {c[:120]}"
+        # The six named docs are read by the parametrized test above with the same pattern.
+        for rel in pages
+        if rel not in _PROVISIONING_DOCS
+        # Through _doc, the reader every prose check in this file uses: this is a claim about
+        # pages, not about source, so it is not a source probe.
+        for c in _clauses(_doc(rel))
+        if SIGN_IN_CLAIM.search(c)
+    ]
+    assert not hits, f"a shipped page says nobody can sign in again: {hits}"
+
+
+def test_the_thirteenth_sweep_second_round_probes_reply_logging_and_opt_in() -> None:
+    """The code facts the thirteenth sweep's second round states: the synchronous reply is built,
+    the forwarded log copy passes the same filters as stdout, and API mTLS and log forwarding act
+    only once configured, with forwarding required at serve under enforce."""
+    from messagefoundry import logging_setup
+    from messagefoundry.config import settings as settings_module
+    from messagefoundry.pipeline import wiring_runner
+
+    # 1. The synchronous captured reply (ADR 0154 increment B).
+    assert {"reply_from", "reply_timeout"} <= set(inspect.signature(Http).parameters)
+    assert callable(wiring_runner.check_http_sync_reply)
+
+    # 1b. What the blocked turn answers (ADR 0154 D5). A reply captured as anything but accepted or
+    #     no-reply resolves `rejected`, and `rejected` is answered 502 WITH the partner's body. Only
+    #     a dead or cancelled delivery row resolves `failed`, which is answered 502 with fixed JSON.
+    from messagefoundry.pipeline import sync_reply
+    from messagefoundry.store.store import OutboxStatus
+    from messagefoundry.transports import rest, soap
+    from messagefoundry.transports.base import InboundReply, ReplyOutcome
+    from messagefoundry.transports.http_listener import HttpSource
+
+    partner = "<soap:Fault>the partner's own words</soap:Fault>"
+    listener: Any = SimpleNamespace(reply_on_empty="204", reply_on_timeout="504")
+    rejected = InboundReply(outcome=ReplyOutcome.REJECTED, body=partner)
+    assert HttpSource._reply_to_wire(listener, rejected, "m1") == (502, partner, None), (
+        "a captured rejection is no longer answered 502 with the partner's body: re-derive the "
+        "intake caveat in docs/DEPLOYMENT.md"
+    )
+    status, fixed, _ = HttpSource._reply_to_wire(
+        listener, InboundReply(outcome=ReplyOutcome.FAILED), "m1"
+    )
+    assert (status, "delivery_failed" in fixed, "partner" in fixed) == (502, True, False)
+    assert {OutboxStatus.DEAD.value} <= sync_reply._TERMINAL_ROW_STATES
+
+    async def committed(outcome: str) -> InboundReply:
+        async def correlate_response(message_id: str) -> list[SimpleNamespace]:
+            return [
+                SimpleNamespace(
+                    kind="response",
+                    destination_name="OB",
+                    response_seq=1,
+                    body=partner,
+                    outcome=outcome,
+                    headers={},
+                )
+            ]
+
+        store: Any = SimpleNamespace(correlate_response=correlate_response)
+        resolver = sync_reply.SyncReplyResolverImpl(
+            store, typing.cast(Any, None), destination="OB", timeout=1.0, content_type="text/xml"
+        )
+        return await resolver._read_committed_reply("m1", 1, 0)
+
+    for outcome in ("rejected", "unparseable"):
+        reply = asyncio.run(committed(outcome))
+        assert (reply.outcome, reply.body) == (ReplyOutcome.REJECTED, partner), outcome
+    assert asyncio.run(committed("accepted")).outcome is ReplyOutcome.REPLY
+    # The caveat's example and its "most": a capturing SOAP send returns a 2xx <Fault> as a
+    # rejected reply, and REST retries exactly two 4xx statuses and dead-letters the rest.
+    # Read from the code, not the text: some DeliveryResponse(...) call in send passes the literal
+    # outcome="rejected", so a comment or docstring naming it cannot keep this green.
+    send_tree = ast.parse(textwrap.dedent(inspect.getsource(soap.SoapDestination.send)))
+    assert any(
+        isinstance(n, ast.Call)
+        and ast.unparse(n.func).split(".")[-1] == "DeliveryResponse"
+        and any(
+            kw.arg == "outcome"
+            and isinstance(kw.value, ast.Constant)
+            and kw.value.value == "rejected"
+            for kw in n.keywords
+        )
+        for n in ast.walk(send_tree)
+    ), "SoapDestination.send no longer returns a captured <Fault> as a rejected reply"
+    retried_4xx = rest._RETRYABLE_4XX
+    assert retried_4xx == frozenset({408, 429})
+
+    # 2. Each sink handler the engine builds gets the one filter chain, read per handler: every name
+    #    bound to a handler constructor is passed to `_install_phi_filters` in the same function.
+    sinks = {"_ForwardQueueHandler", "GuardedStreamHandler", "GuardedFileHandler", "StreamHandler"}
+    tree = ast.parse(textwrap.dedent(inspect.getsource(logging_setup)))
+    built: list[tuple[str, str]] = []
+    filtered: set[tuple[str, str]] = set()
+    for f in ast.walk(tree):
+        if not isinstance(f, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        for n in ast.walk(f):
+            if (
+                isinstance(n, ast.Assign)
+                and isinstance(n.value, ast.Call)
+                and ast.unparse(n.value.func).split(".")[-1] in sinks
+            ):
+                built += [(f.name, t.id) for t in n.targets if isinstance(t, ast.Name)]
+            if isinstance(n, ast.Call) and ast.unparse(n.func) == "_install_phi_filters":
+                filtered |= {(f.name, a.id) for a in n.args if isinstance(a, ast.Name)}
+    assert len(built) >= 3, f"the forwarder, stdout and file handler builders moved: {built}"
+    unfiltered = [b for b in built if b not in filtered]
+    assert not unfiltered, f"{unfiltered} build a log sink without the PHI filter chain"
+
+    # 3. Built is not on: no client CA and no collector by default, and serve's forwarding gate
+    #    refuses the default configuration.
+    assert settings_module.ApiSettings.model_fields["tls_client_ca_file"].default is None
+    assert settings_module.LoggingSettings.model_fields["forward_host"].default is None
+    assert settings_module.forwarding_gate_refusal(settings_module.LoggingSettings()) is not None
+
+
+def test_the_thirteenth_sweep_deployment_does_not_call_the_sync_reply_unbuilt() -> None:
+    """docs/DEPLOYMENT.md's intake caveat said the synchronous downstream reply was an ADR 0013
+    follow-on, not built, respond-with-receipt only. `reply_from` builds it (the probe above), and
+    CONNECTIONS.md says it shipped with ADR 0154 increment B."""
+    caveat = _deployment_intake_scopes()["caveat"]
+    clauses = _clauses(caveat)
+    assert len(clauses) >= 5, f"the intake caveat cut into {len(clauses)} clause(s), floor 5"
+    unbuilt = [
+        c
+        for c in clauses
+        if re.search(r"synchronous|SOAP|reply", c, re.I)
+        and re.search(r"not built|follow-on|receipt only", c, re.I)
+    ]
+    assert not unbuilt, f"docs/DEPLOYMENT.md calls the synchronous reply unbuilt again: {unbuilt}"
+    flat = _flat(caveat)
+    assert "`reply_from`" in flat, (
+        "the intake caveat must name reply_from, the setting that builds the synchronous reply"
+    )
+    # ...and must not promise a partner's own body on every answer: a dead-lettered delivery is
+    # answered with fixed JSON.
+    assert "502" in flat, "the intake caveat must say a partner error reaches the caller as a 502"
+    # Nor may it say the reverse, that every 502 is fixed JSON. The caveat said "That holds only
+    # when the partner succeeds: a partner error dead-letters and the caller gets a fixed-JSON
+    # `502`, not the partner's own body". A reply captured as a rejection is delivered, not
+    # dead-lettered, and its 502 carries the partner's body (the probe above).
+    blanket = [
+        c
+        for c in clauses
+        if re.search(r"only when the partner succeeds|\ba partner error\b", c, re.I)
+        or ("fixed-JSON" in c and not re.search(r"dead-letter", c, re.I))
+    ]
+    assert not blanket, (
+        f"docs/DEPLOYMENT.md says every partner error is answered with fixed JSON again: {blanket}"
+    )
+    with_body = [
+        c
+        for c in clauses
+        if "`502`" in c and re.search(r"\breject", c, re.I) and "carries the partner's body" in c
+    ]
+    assert with_body, (
+        "the intake caveat must say a reply captured as a rejection comes back as a 502 that "
+        "carries the partner's body"
+    )
+
+
+#: The retracted claim, in each phrasing a doc gave it: the forwarded log copy, or the audit rows in
+#: it, called PHI-redacted or PHI-free outright. "PHI-redacted audit rows", "(PHI-redacted) audit"
+#: and "PHI-redacted metadata" are the phrasings the first pattern missed. "PHI-redaction filters"
+#: does not match: naming the filters is true, and calling their output PHI-redacted is the claim.
+_FORWARDED_PHI_FREE = re.compile(
+    r"PHI-(?:redacted|free)\)? (?:stream|copy|audit|metadata|rows?|logs?|evidence)"
+    r"|redacted (?:stream|copy)"
+    r"|(?:copy|stream|rows?|audit) (?:is|are) PHI-(?:redacted|free)",
+    re.IGNORECASE,
+)
+
+#: A clause about the off-box copy, under the names the docs give it.
+_OFF_BOX_COPY = re.compile(r"forward|collector|off-box|\bSIEM\b|syslog", re.IGNORECASE)
+
+
+@pytest.mark.parametrize(
+    ("name", "floor", "subject_floor"),
+    [
+        ("docs/EARLY-ADOPTER-GUIDE.md", 300, 5),
+        ("docs/PHI.md", 1000, 30),
+        ("docs/DEPLOYMENT.md", 300, 8),
+        ("docs/CONFIGURATION.md", 2000, 30),
+        ("docs/SECURITY.md", 2000, 25),
+        ("docs/CONTAINER-EXPOSURE-EVALUATION.md", 150, 6),
+    ],
+)
+def test_the_thirteenth_sweep_no_doc_calls_the_forwarded_copy_phi_free(
+    name: str, floor: int, subject_floor: int
+) -> None:
+    """docs/EARLY-ADOPTER-GUIDE.md told the reader not to copy the potential-PHI log files off-box
+    because forwarding sends "a PHI-redacted stream" instead, and docs/PHI.md's forwarder row said
+    "the forwarded copy is PHI-redacted". The forwarded copy passes the same best-effort filters as
+    stdout (the probe above), and docs/PHI.md grades the log files and the spool both "Possibly".
+
+    That correction left the same claim standing as "PHI-redacted audit rows", "(PHI-redacted)
+    audit" and "PHI-redacted metadata", here and in four more documents. The audit tee scrubs only
+    HL7-shaped spans out of a row's ``detail`` (the probe above), so a forwarded audit row is no
+    more PHI-free than a forwarded log line."""
+    clauses = _clauses(_doc(name))
+    assert len(clauses) >= floor, f"{name} cut into {len(clauses)} clause(s), floor {floor}"
+    forwarded = [c for c in clauses if _OFF_BOX_COPY.search(c)]
+    assert len(forwarded) >= subject_floor, (
+        f"{name} has {len(forwarded)} clause(s) about the off-box copy, floor {subject_floor}: "
+        "this check reads too little to clear it"
+    )
+    # No exemption for a clause that also says "best-effort" somewhere: "the copy is PHI-free once
+    # the best-effort filters have run" is the retracted claim with one word added.
+    phi_free = [c for c in forwarded if _FORWARDED_PHI_FREE.search(c)]
+    assert not phi_free, f"{name} presents the forwarded log copy as PHI-free again: {phi_free}"
+    if name == "docs/EARLY-ADOPTER-GUIDE.md":
+        assert any("collector" in c and "potential PHI" in c for c in forwarded), (
+            "the guide must say the collector's copy is potential PHI too"
+        )
+
+
+def test_the_thirteenth_sweep_phi_says_built_is_not_on() -> None:
+    """docs/PHI.md said mTLS, revocation and off-box logs are "built into the engine" with nothing
+    on what turns them on, and sent the reader to section 11 for `forward_*`, which section 7
+    documents."""
+    doc = _doc("docs/PHI.md")
+    paragraphs = [
+        _flat(p)
+        for p in re.split(r"\n\s*\n", doc)
+        if "built into the engine" in _flat(p) and "mTLS" in p and "off-box" in p
+    ]
+    assert paragraphs, "docs/PHI.md no longer says the off-loopback controls are built"
+    for p in paragraphs:
+        for token in (
+            "`[api].tls_client_ca_file`",
+            "`[logging].forward_host`",
+            "`[logging].forward_tls_crl_file`",
+        ):
+            assert token in p, f"docs/PHI.md's built-controls paragraph must name {token}"
+    clauses = _clauses(doc)
+    assert len(clauses) >= 1000, f"docs/PHI.md cut into {len(clauses)} clause(s), floor 1000"
+    # _clauses strips emphasis asterisks, so `forward_*` reads as `forward_` here.
+    forward_rows = [c for c in clauses if "`[logging].forward_`" in c]
+    assert forward_rows, "docs/PHI.md names [logging].forward_* nowhere, so this reads nothing"
+    misdirected = [c for c in forward_rows if re.search(r"§11|#11-hardening", c)]
+    assert not misdirected, f"docs/PHI.md sends forward_* to section 11 again: {misdirected}"
+
+
+def test_the_passkey_leg_asks_the_directory_and_the_doc_says_so() -> None:
+    """BACKLOG #2239. The step-up section said "the passkey leg does not ask the directory", which
+    was true until ``finish_webauthn_assertion`` gained the same directory check ``verify_mfa`` has
+    (#2023). This pins the call, then refuses the old sentence and asks for the new citation. The
+    behaviour (refused before the challenge is taken, nothing charged) is pinned in
+    ``tests/test_passkey_directory_recheck.py``, not by this AST read."""
+    assertion = _service_func("finish_webauthn_assertion")
+    assert _called(assertion, "_directory_step_up_refusal"), (
+        "finish_webauthn_assertion no longer asks the directory; the step-up section and the "
+        "passkey row say it does (BACKLOG #2239)."
+    )
+    provider_reads = sum(
+        1 for n in ast.walk(assertion) if isinstance(n, ast.Attribute) and n.attr == "auth_provider"
+    )
+    assert provider_reads == 1, (
+        f"finish_webauthn_assertion reads auth_provider {provider_reads} times; the lockout "
+        "paragraph says each second-factor leg has ONE provider branch, the directory check."
+    )
+    text = " ".join(_doc_text().split())
+    assert "the passkey leg does not ask the directory" not in text, (
+        "docs/SECURITY.md says the passkey leg does not ask the directory again; it does (#2239)."
+    )
+    assert "BACKLOG #2239" in _section(), (
+        "the pathway section no longer names the passkey leg's provider branch (BACKLOG #2239)."
+    )
+    paragraph = next(
+        (
+            " ".join(p.split())
+            for p in re.split(r"\n\s*\n", _doc_text())
+            if p.startswith("**The passkey leg asks the same question")
+        ),
+        None,
+    )
+    assert paragraph is not None, "the step-up section lost the passkey leg's directory paragraph"
+    for token in (
+        "`auth.webauthn_failed`",
+        "`reason=directory_unconfirmed`",
+        "challenge in flight",
+    ):
+        assert token in paragraph, f"the passkey leg's directory paragraph must name {token}"

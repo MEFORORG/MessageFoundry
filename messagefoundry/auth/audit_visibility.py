@@ -34,9 +34,11 @@ This module is the one place that names the hidden rows. Every API read of the t
 **Considered and left visible:** ``auth.login_after_failures`` (written only on a full sign-in, so
 nobody without both factors can cause it), the per-session re-proof cap rows (``auth.reauth`` with
 ``session_revoked`` and ``auth.password_change_failed`` with ``reason=session_revoked``, which
-describe a session and not an account lock), and ``auth.temp_password_expired`` (a separate
-password-right signal on an account whose temporary credential has already expired, outside this
-ruling).
+describe a session and not an account lock), and ``auth.temp_password_expired`` (at sign-in a
+separate password-right signal on an account whose temporary credential has already expired,
+outside this ruling; written later by a session that outlived that deadline, it carries an ``at``
+naming the leg and says whether any proof was checked, and ``"at": "session"`` means none was,
+BACKLOG #2009 and #2298).
 
 **The general log is covered too** (Manager decision 2026-09-28): ``GET /logs/tail`` serves it to
 ``logs:view``, which the Operator holds without ``users:manage``. An undeliverable lock notice writes

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""CLI cert tooling (BACKLOG #71/#72): `.pfx` import, read-only inventory, self-signed dev certs.
+"""CLI cert tooling (BACKLOG #71/#72): `.pfx` import, read-only inventory, self-signed placeholders.
 
 Driven end-to-end through `messagefoundry.__main__.main([...])` (int return codes + capsys/tmp_path),
 matching tests/test_cli.py. `.pfx` bundles are built in-memory by tests/_approved_key_wrap.py over
@@ -659,6 +659,9 @@ def test_self_signed_is_self_issued_with_san(
     assert rc == 0
     result = json.loads(capsys.readouterr().out)
     assert result["sans"] == ["dev.local", "alt.local"]
+    # BACKLOG #1276: the JSON note carries the same placeholder wording as the console note.
+    assert "placeholder" in str(result["note"]).lower()
+    assert "no chain of trust" in str(result["note"])
 
     cert = x509.load_pem_x509_certificate((out / "cert.pem").read_bytes())
     assert cert.subject == cert.issuer  # self-issued
@@ -720,13 +723,18 @@ def test_self_signed_ip_literal_lands_as_ip_address_san(
     assert facts.sans == ["127.0.0.1", "localhost", "::1"]
 
 
-def test_self_signed_human_output_warns_dev_only(
+def test_self_signed_human_output_names_it_a_placeholder(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    # BACKLOG #1276, owner override 2026-08-16: the engine serves this primitive's output on first
+    # run (ADR 0172), so the note no longer says "non-prod only". It says what the pair is: a
+    # placeholder with no chain of trust, to be replaced by an operator-supplied chain.
     out = tmp_path / "o"
     assert main(["cert", "self-signed", "--cn", "dev.local", "--out-dir", str(out)]) == 0
     printed = capsys.readouterr().out.lower()
-    assert "non-prod" in printed
+    assert "placeholder" in printed
+    assert "no chain of trust" in printed
+    assert "non-prod" not in printed
 
 
 def test_self_signed_refuses_to_overwrite_existing_key(
