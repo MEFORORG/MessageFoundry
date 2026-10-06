@@ -768,7 +768,7 @@ def _build_approval_gate(
     *,
     resolve_identity: IdentityResolver | None = None,
     alert_sink: AlertSink | None = None,
-    outliving: OutlivingOperations | None = None,
+    outliving: OutlivingOperations,
 ) -> ApprovalGate:
     """Build the approval gate and register the high-value operations dual-control can hold. Each
     executor re-runs its captured operation on approval (params are JSON, persisted at request time).
@@ -781,8 +781,7 @@ def _build_approval_gate(
         engine.store, settings, resolve_identity=resolve_identity, alert_sink=alert_sink
     )
     # A released reload runs inside the approve request, so it outlives that request's deadline the
-    # way the inline route's does (vault BACKLOG #2753). A gate built with none gets its own.
-    long_ops = outliving if outliving is not None else OutlivingOperations()
+    # way the inline route's does (vault BACKLOG #2753). Required, so the lifespan's drain sees it.
 
     async def _replay(p: Mapping[str, Any]) -> dict[str, Any]:
         # BACKLOG #1646: write the same dead_letter_replay row the inline route writes, so an
@@ -896,7 +895,7 @@ def _build_approval_gate(
 
         # A cancelled approve records 'interrupted' in the gate (#1562), and this reload goes on to
         # write its own config_reload row rather than stopping with intake half swapped.
-        return await long_ops.run(_apply(), "released config reload")
+        return await outliving.run(_apply(), "released config reload")
 
     def _replay_params_in_scope(identity: Identity, p: Mapping[str, Any]) -> bool:
         channel_id = p.get("channel_id")
@@ -7474,10 +7473,13 @@ def create_app(
                 "DR activation",
             )
         except DrActivationError as exc:
-            # The coordinator already recorded a dr_activation_aborted audit row. Map the failing phase
-            # to an HTTP status: a missing/unverified seed or a not-this-box state is the client's input
-            # (409/422); a key-unavailable / VIP-not-acquired / profile failure is an environment
-            # condition (503 — retry once the cause is fixed). Never echo a body (the message is scrubbed).
+            # For an abort, the coordinator already recorded a dr_activation_aborted audit row. Map the
+            # failing phase to an HTTP status: a missing/unverified seed or a not-this-box state is the
+            # client's input (409/422); a key-unavailable / VIP-not-acquired / profile failure is an
+            # environment condition (503 — retry once the cause is fixed). Kind "audit" is not an
+            # abort: the box IS serving and its dr.activate row could not be written, so it too is a
+            # 503 to retry, and the message says the box is active (vault BACKLOG #2751). Never echo a
+            # body (the message is scrubbed).
             status_code = {"state": 409, "seed": 422}.get(exc.kind, 503)
             raise HTTPException(status_code, str(exc)) from exc
         return DrActionResult(

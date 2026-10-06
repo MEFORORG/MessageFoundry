@@ -2287,9 +2287,11 @@ class Engine:
             try:
                 runner.build_check(registry)  # bad connector → WiringError (422), before any start
                 await runner.start()
-            except Exception:
+            except BaseException:
                 # Don't leave a half-started runner: a later reload would take the "runner exists"
                 # path and no-op the start, wedging intake. Clear it so a retry re-enters cleanly.
+                # BaseException: a cancelled start leaves the same half-started runner (vault
+                # BACKLOG #2753).
                 self._registry_runner = None
                 raise
         else:

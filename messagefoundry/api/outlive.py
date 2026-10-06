@@ -8,8 +8,9 @@ release and a config reload it is not: each stops and restarts listeners and cha
 engine reports, and a cancellation partway through would leave that state half changed with no
 outcome audit row. So those routes run the operation through :meth:`OutlivingOperations.run`. The
 deadline still ends the RESPONSE (the caller gets the middleware's 503), and the operation finishes
-on its own and writes its own outcome row. A retry meets the operation's own lock and then its
-outcome, not a half-applied state.
+on its own and writes its own outcome row. A DR retry meets the coordinator's lock and then the
+first call's outcome, not a half-applied state. A config reload retry is a second reload: it waits
+on the runner's reload lock and then runs again.
 
 It is the same shape as :func:`~messagefoundry.api.approvals._outlive_caller`, which it reuses, rather
 than an exemption from the deadline: an exempt route would hold its worker for as long as it ran,
@@ -38,11 +39,14 @@ log = logging.getLogger(__name__)
 #: How long :meth:`OutlivingOperations.drain` lets a running operation finish at shutdown before it
 #: cancels it. It shares NSSM's 15 s graceful-stop window with the upload runner's stop and the
 #: approval gate's drain, so it is short; an operation it cancels records ``interrupted``.
-DRAIN_TIMEOUT_SECONDS = 2.0
+DRAIN_TIMEOUT_SECONDS = 1.0
 
 #: How long the drain then waits for the cancelled operations' rollback arms to finish, so their
-#: interrupted rows reach the store before ``engine.stop()`` closes it.
-CANCEL_GRACE_SECONDS = 2.0
+#: interrupted rows reach the store before ``engine.stop()`` closes it. Longer than the drain itself
+#: because at least one arm waits on a process: a cancelled DR takeover hook is killed and reaped
+#: for up to ``_HOOK_REAP_SECONDS`` (5 s, ``pipeline/dr.py``) before the activation's arm writes its
+#: row.
+CANCEL_GRACE_SECONDS = 6.0
 
 
 def _log_orphan_outcome(task: asyncio.Future[Any], label: str) -> None:
