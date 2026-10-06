@@ -16,6 +16,7 @@ never the start, so those cases assert that the graph is serving.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import textwrap
 from pathlib import Path
@@ -447,26 +448,134 @@ async def test_a_start_row_records_its_comparison_outcome(
     assert rows[-1]["comparison"] == "compared" and rows[-1]["changed"] is False
 
 
+@pytest.mark.parametrize("rebound", [True, False], ids=["reload_done", "reload_in_flight"])
 async def test_a_reload_after_capture_does_not_change_the_comparison(
-    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
+    tmp_path: Path,
+    cfg: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    alerts: list[dict[str, Any]],
+    rebound: bool,
 ) -> None:
     """A reload can land between the start's capture and its row (a cluster convergence reload
-    runs once the engine starts). The comparison is of what this start loaded, not of that."""
+    runs once the engine starts). The comparison is of what this start loaded, not of that.
+
+    A reload swaps the graph first and rebinds the fingerprint later, so ``reload_in_flight``
+    swaps only the graph. The row must see that too (vault BACKLOG #2838)."""
     await _start(tmp_path, cfg)
     real_start = Engine.start
     other = {"fingerprint": "f" * 64, "scheme": FINGERPRINT_SCHEME, "files": 1}
+    swapped: list[dict[str, object] | None] = []
 
     async def _start_then_swap(self: Engine) -> None:
         await real_start(self)
-        self.loaded_config_fingerprint = dict(other)  # what a reload's swap does
+        rr = self.registry_runner
+        assert rr is not None
+        rr.registry = copy.copy(rr.registry)  # what a reload's swap does first
+        if rebound:
+            self.loaded_config_fingerprint = dict(other)  # and then, once the reload is done
+        swapped.append(self.loaded_config_fingerprint)
 
     monkeypatch.setattr(Engine, "start", _start_then_swap)
     rows = await _start(tmp_path, cfg)
+    expected = other if rebound else {"fingerprint": config_fingerprint(cfg)}
+    assert [(s or {}).get("fingerprint") for s in swapped] == [expected["fingerprint"]], (
+        "control: the swap ran before the row was written"
+    )
     assert alerts == [], "the start loaded the baseline's own bytes"
     assert rows[-1]["changed"] is False
     assert rows[-1]["previous_fingerprint"] == config_fingerprint(cfg)
-    # Control: the swap did happen, and the row names what is running at the write.
-    assert rows[-1]["fingerprint"] == other["fingerprint"]
+    # The row names the same snapshot the comparison used, not what is running at the write
+    # (vault BACKLOG #2838), and says a reload superseded it.
+    assert rows[-1]["fingerprint"] == config_fingerprint(cfg)
+    assert rows[-1]["superseded"] is True and rows[-1]["baseline_unchecked"] is True
+
+
+def _add_a_connection_pair(cfg: Path, tmp_path: Path) -> None:
+    """A second inbound and outbound, so a reload of ``cfg`` changes both counts and the digest."""
+    inbox, outdir = tmp_path / "in2", tmp_path / "out2"
+    for d in (inbox, outdir):
+        d.mkdir(parents=True, exist_ok=True)
+    with (cfg / "cfg.py").open("a", encoding="utf-8") as fh:
+        fh.write(
+            f"inbound('IB_T_ADT2', File(directory={str(inbox)!r}, pattern='*.hl7', "
+            "poll_seconds=1.0), router='r')\n"
+            f"outbound('FILE-OUT_T_ADT2', File(directory={str(outdir)!r}))\n"
+        )
+
+
+async def test_a_convergence_reload_after_capture_leaves_the_start_row_naming_the_start(
+    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
+) -> None:
+    """vault BACKLOG #2838: a sibling node reloads a changed directory, and this node's convergence
+    reload lands between its start's capture and its config_loaded row. The row names the graph
+    this start loaded: its digest and counts, and the comparison it made against them. It marks
+    itself superseded, so the next start on the reloaded bytes compares against the sibling's
+    row and raises no false config_changed."""
+    start_digest = config_fingerprint(cfg)
+    await _start(tmp_path, cfg)  # the baseline, so this start makes a real comparison
+    seen: dict[str, Any] = {}
+    real_start = Engine.start
+
+    async def _start_then_converge(self: Engine) -> None:
+        await real_start(self)
+        _add_a_connection_pair(cfg, tmp_path)  # the sibling's change, on the shared directory
+        await self._converge_reload()  # what ConfigConvergenceRunner calls on a version bump
+        # The sibling's own reload row, which its reload route writes for the same bytes.
+        assert await app_module._record_reload_audit(self, actor="sibling") == []
+        rr = self.registry_runner
+        assert rr is not None
+        seen["fingerprint"] = (self.loaded_config_fingerprint or {}).get("fingerprint")
+        seen["counts"] = (len(rr.registry.inbound), len(rr.registry.outbound))
+
+    monkeypatch.setattr(Engine, "start", _start_then_converge)
+    rows = await _start(tmp_path, cfg)
+    # Control: the reload did swap the graph before the row was written.
+    reloaded_digest = config_fingerprint(cfg)
+    assert reloaded_digest != start_digest
+    assert seen == {"fingerprint": reloaded_digest, "counts": (2, 2)}
+    row = rows[-1]
+    assert row["fingerprint"] == start_digest
+    assert (row["inbound"], row["outbound"]) == (1, 1)
+    assert row["comparison"] == "compared" and row["changed"] is False
+    assert row["previous_fingerprint"] == start_digest
+    assert row["superseded"] is True and row["baseline_unchecked"] is True
+    assert row["loosenings"] is None, "the reader sees only the reloaded graph"
+    assert alerts == []
+
+    monkeypatch.setattr(Engine, "start", real_start)
+    rows = await _start(tmp_path, cfg)
+    assert alerts == [], "the superseded row is passed over for the sibling's reload row"
+    assert rows[-1]["comparison"] == "compared"
+    assert rows[-1]["previous_fingerprint"] == reloaded_digest
+    assert "superseded" not in rows[-1], "control: an undisturbed start is not marked"
+
+
+async def test_the_reload_route_row_still_names_the_reloaded_graph(
+    tmp_path: Path, cfg: Path, alerts: list[dict[str, Any]]
+) -> None:
+    """Control for vault BACKLOG #2838: the reload route passes no snapshot, so its config_reload
+    row names what the reload put live, read at the write."""
+    start_digest = config_fingerprint(cfg)
+    app = _app(tmp_path, cfg)
+    async with app.router.lifespan_context(app), _client(app) as c:
+        _add_a_connection_pair(cfg, tmp_path)
+        r = await c.post("/config/reload", json={"config_dir": str(cfg)})
+        assert r.status_code == 200, r.text
+        engine: Engine = app.state.engine
+        rows = await engine.store.list_audit(action="config_reload")
+        start = (await _start_rows(engine))[-1]
+        live = engine.running_config_dir
+        node = engine.coordinator.node_id
+    assert len(rows) == 1
+    row = json.loads(rows[0]["detail"])
+    assert list(row)[:6] == ["dir", "shard", "node", "inbound", "outbound", "dry_run"]
+    assert (row["dir"], row["shard"], row["node"], row["dry_run"]) == (str(live), None, node, False)
+    assert row["fingerprint"] == config_fingerprint(cfg) != start_digest
+    assert (row["inbound"], row["outbound"]) == (2, 2)
+    assert "superseded" not in row and "baseline_unchecked" not in row
+    # Control: the start's own row, written before the reload, names the start's graph.
+    assert start["fingerprint"] == start_digest
+    assert (start["inbound"], start["outbound"]) == (1, 1)
 
 
 # --- the flag toggle -----------------------------------------------------------------------------

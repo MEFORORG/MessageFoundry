@@ -1241,6 +1241,11 @@ started together, can each raise it; the alert list folds them into one instance
   WARNING), and compares against the newest usable row before them. So the change the unchecked
   start could not see is reported by the next start that can read. A config reload is not marked:
   applying the directory by reload vouches for it.
+- A reload can swap the graph after a start loads it and before its `config_loaded` row is written;
+  on a cluster node, the convergence loop does this. The row still names the graph the start
+  loaded, with its comparison. It is marked `superseded` and `baseline_unchecked`, and its
+  `loosenings` is `null`, since the loosenings reader sees only the reloaded graph. A later start
+  passes over it to the reload's own row.
 - The pass-over looks through the newest 50 config rows at most. If none is usable, the start
   begins a new baseline and says at WARNING that a change made before those rows is not reported.
 
