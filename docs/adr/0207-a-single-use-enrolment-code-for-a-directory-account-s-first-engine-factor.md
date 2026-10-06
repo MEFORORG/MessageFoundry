@@ -22,9 +22,11 @@
   chain) · [`docs/SECURITY.md`](../SECURITY.md) · CLAUDE.md section 0
 
 This record names a gap in the shipped code before its fix lands. `docs/SECURITY.md` already states
-the gap as a shipped limit, and ADR 0142 Amendment C states it too, so this adds nothing a reader
-could not already find. MessageFoundry has zero deployments (CLAUDE.md section 0). Nothing below is a
-live exposure: each case is what a deploying site would meet.
+the gap as a shipped limit, and ADR 0142 Amendment C states it too. Context items 6 and 7 are first
+stated in this record. `docs/SECURITY.md` says only that the passkey finish route charges the
+console write floor, and it has no statement of item 6. MessageFoundry has zero deployments
+(CLAUDE.md section 0). Nothing below is a live exposure: each case is what a deploying site would
+meet.
 
 ---
 
@@ -32,6 +34,7 @@ live exposure: each case is what a deploying site would meet.
 
 Every fact below was read at engine `origin/main` `923277d3e9` on 2026-10-05. Items 3, 6 and 7 of
 the list below were re-read at `11495e53fa` the same day, after the Lander's review of this record.
+Items 6 and 7 were read again at `040c03f50f`, after its second review.
 Find each one by the symbol named. Line numbers are left out on purpose.
 
 ### How a directory account gets a session today
@@ -71,7 +74,8 @@ federated sign-in on a site that turned the claim gate off.
    ADR 0197 Amendment A does not reach a directory account, and the passkey path is as open as the
    TOTP path.
 6. **A TOTP begin is not inert, and the enable does not bind what the confirm verified.**
-   `begin_mfa_enrollment` refuses only an account whose TOTP is already on. Otherwise it writes a
+   `begin_mfa_enrollment` refuses an unknown account and an account whose TOTP is already on, and
+   nothing else. Otherwise it writes a
    fresh secret over whatever is staged, and `set_totp_secret` does that unconditionally on all three
    store backends. `confirm_mfa_enrollment` reads the staged secret once and verifies the code
    against it. Then it stamps and rotates the session, and only then calls `enable_totp`, which turns
@@ -80,12 +84,16 @@ federated sign-in on a site that turned the claim gate off.
    the enable, decides which authenticator the account ends up holding. The session that proved the
    first code is stamped all the same. This gap is in the shared step, so it reaches every account
    type. The Lander's review of this record says it goes to the maintainer ledger as its own row.
-7. **The passkey finish route has no attempt budget.** The engine API's `POST /me/mfa/confirm` and
-   the web console's TOTP confirm route (`ui_mfa_verify`) both draw the per-actor budget
-   (`allow_reauth_attempt`) before the service runs. The passkey finish route (`ui_webauthn_verify`)
-   draws none, and its gate is the action-less `require_ui_reauth_only`, so no single-use step-up
-   grant bounds its attempts either. Today each attempt costs a ceremony, because
-   `finish_webauthn_registration` pops the staged challenge before it verifies the response.
+7. **The passkey finish route draws the console write floor, but not the ceremony budget.** The
+   engine API's `POST /me/mfa/confirm` and the web console's TOTP confirm route (`ui_mfa_verify`)
+   both draw the per-actor ceremony budget (`allow_reauth_attempt`) before the service runs. The
+   passkey finish route (`ui_webauthn_verify`) never calls it. Its gate, the action-less
+   `require_ui_reauth_only`, is built on `require_ui`, which charges the console write floor
+   (`allow_admin_write`) on every non-GET request. So the route "still charges the floor before its
+   own checks", as `docs/SECURITY.md` says, and no single-use step-up grant bounds it. Today most
+   attempts also cost a ceremony, because `finish_webauthn_registration` pops the staged challenge
+   before it verifies the response. A call with an empty or over-long label is the exception: the
+   method refuses it before the pop, so the challenge stays staged.
 
 That is the chain BACKLOG #2609 ran end to end. Someone who holds only a directory password signs
 in by Windows SSO, re-proves the same password, and enrols an authenticator they control. They then
@@ -191,6 +199,12 @@ change.
   one this call read, and otherwise fail closed with TOTP off. Either way a begin that lands
   mid-ceremony can make a pending confirm fail, but it can no longer change which authenticator is
   enabled. This rule binds the shared step, so it holds for local accounts too, code or no code.
+- **A confirm whose enable did not take effect ends its session.** The order above stamps and
+  rotates the session before the enable. So when the enable changes no row, or fails, the rotated
+  session is already factor-satisfied on an account that holds no factor. The confirm then ends
+  that session and returns no token, as it returns `session_lost` today for a session revoked
+  mid-ceremony. It never hands the rotated token back for a retry, and it writes no enrolment row.
+  The holder signs in again and starts over.
 - **The order in `finish_webauthn_registration`.** This method writes the credential
   (`add_webauthn_credential`) before it stamps. So the code is spent before that write, not merely
   before the stamp. A check placed only before the stamp would leave the attacker's passkey bound.
@@ -200,13 +214,16 @@ change.
   code read (present, well formed, matching, not expired) run before the method pops the staged
   challenge. So a refused code costs neither the code nor the ceremony, as on the TOTP path. The
   spend runs after the response verifies and after the duplicate check, and before the credential
-  is written. Because a refused code leaves the challenge staged, the route's attempt budget
-  (section 7) is what bounds repeated tries against one ceremony.
+  is written. Because a refused code leaves the challenge staged, three things bound repeated tries
+  against one ceremony: the console write floor, the challenge's 120 second life
+  (`CHALLENGE_TTL_SECONDS`), and the ceremony budget section 7 adds. Both budgets can be switched
+  off. The ceremony budget holds only while `[auth].login_rate_limit_enabled` is on: with it off,
+  `allow_reauth_attempt` always proceeds. The challenge's life holds in every posture.
 - **One reply for every refused code.** A missing, never-issued, wrong, expired or spent code gets
-  the same client-facing reply: one status and one message. Only the audit row's `reason`
-  (section 7) tells the cases apart, so a caller learns nothing from the reply about whether a code
-  is outstanding. A `factor_present` refusal may say "prove your factor first", since the account's
-  MFA status already tells the session that.
+  the same client-facing reply: one status and one message. The audit row keeps that rule too,
+  because the account's own security-event feed returns it (section 7). So a caller learns nothing,
+  from the reply or from that feed, about whether a code is outstanding. A `factor_present` refusal
+  may say "prove your factor first", since the account's MFA status already tells the session that.
 - **Disabling the account clears an outstanding code.** `set_user_disabled` clears the digest and
   the expiry in the same statement that disables, so every caller clears it. Re-enabling the account
   inside 24 hours therefore revives nothing. The spend also refuses a disabled account on its own.
@@ -232,6 +249,10 @@ change.
   for itself. Section 6 covers that case.
 - **Refused for** a local account, an account that already holds an engine factor ("reset its MFA
   first"), a disabled account, and an unknown account.
+- **Its write is one conditional statement, like the host command's.** It sets the digest only where
+  the account is `ad`, enabled, and holds no factor. An issue whose write changes no row is refused,
+  and nothing is shown. So a disable, or a factor, that lands between the route's checks and its
+  write leaves no code on the account.
 - **Revocable.** `DELETE` on the same path clears an outstanding code, for a handover that went
   wrong. It sits behind the same gate, with its own step-up action constant.
 - **Shown once.** The reply carries the code and its expiry. The engine keeps only the digest.
@@ -293,21 +314,39 @@ problems. This command is not #2711's answer.
 
 ### 7. Audit
 
-| Audit action | Written when | Detail it carries (never the code or its digest) |
-|---|---|---|
-| `auth.enrolment_code_issued` | the route, the console, an MFA reset, or the host command issued one | the target account, the expiry, `via` (`api`, `ui`, `reset` or `host`), whether it replaced a code, whether the account is bound |
-| `auth.enrolment_code_revoked` | an Administrator cleared one | the target account |
-| `auth.enrolment_code_used` | a ceremony spent one | `ceremony`: `totp` or `webauthn` |
-| `auth.enrolment_code_refused` | a binding step refused | `reason`: `not_presented`, `none_outstanding` (no code on the account, which is also how a spent code reads), `wrong`, `expired`, or `factor_present` (the account gained a factor; prove it first) |
+| Audit action | Written when | Actor | Detail it carries (never the code or its digest) |
+|---|---|---|---|
+| `auth.enrolment_code_issued` | the route, the console, an MFA reset, or the host command issued one | the issuing Administrator, or the OS user for the host command | the target account, the expiry, `via` (`api`, `ui`, `reset` or `host`), whether it replaced a code, whether the account is bound |
+| `auth.enrolment_code_revoked` | an Administrator cleared one | the Administrator | the target account |
+| `auth.enrolment_code_used` | a ceremony spent one | the account that enrolled | `ceremony`: `totp` or `webauthn` |
+| `auth.enrolment_code_refused` | a binding step refused | the account whose session tried | `reason`: `not_presented` (the request carried no code), `code_refused` (a code was sent and refused: never issued, wrong, expired or already spent), or `factor_present` (the account gained a factor; prove it first) |
+
+**Who reads these rows.** Every audit row stays with `Permission.AUDIT_READ`, as today. All four
+actions also start `auth.`, so `GET /me/security-events` returns each to the account named as its
+actor, with its detail (`security_events_for_user` selects by actor). So the issued and revoked rows
+reach the Administrator who wrote them, and never the target. The used and refused rows reach the
+account itself, so its real holder sees every refused try on it.
+
+**The one-reply rule holds in that feed too.** The feed sits behind the MFA gate, but on a site with
+`require_mfa` off an unstamped session reaches it. So the refused row's detail does not tell the
+refused-code cases apart: one `code_refused` reason covers all four. `not_presented` tells the caller
+only what its own request held. An Administrator who needs the finer case reads it from the issued,
+used and revoked rows and the expiry they carry.
 
 The engine API's confirm route and the web console's TOTP confirm route already draw the per-actor
-budget (`allow_reauth_attempt`) on every attempt, before the service runs. The passkey finish route
-does not (Context item 7). **The build adds the same per-actor draw to `ui_webauthn_verify`, before
-the service runs**, refusing over budget as `ui_mfa_verify` does. A code nobody can guess needs no
-guess limit, so the budget is not there for the code's sake. It is there because a refused code now
-leaves the challenge staged (section 3), so without it one ceremony would take unbounded attempts,
-each writing an `auth.enrolment_code_refused` row. The service adds no counter of its own. The
-existing `MFA_ENABLED` notice still fires on success.
+ceremony budget (`allow_reauth_attempt`) on every attempt, before the service runs. The passkey
+finish route draws only the console write floor (Context item 7). **The build adds the
+ceremony-budget draw to `ui_webauthn_verify`, before the service runs**, refusing over budget as
+`ui_mfa_verify` does. A code nobody can guess needs no guess limit, so the budget is not there for
+the code's sake. Today the write floor and the challenge's 120 second life already bound the tries
+against one ceremony. What the ceremony budget adds is the bound every other credential ceremony
+already has. A refused code now leaves the challenge staged (section 3), so the tries against one
+ceremony, and the `auth.enrolment_code_refused` rows they write, then count against the same
+per-actor budget as the TOTP confirm and the step-up. A site that loosens the write floor for its
+console writes does not loosen this one. The budget holds only while
+`[auth].login_rate_limit_enabled` is on. With it off, `allow_reauth_attempt` always proceeds, and
+the write floor and the challenge's life are the bounds left. The service adds no counter of its
+own. The existing `MFA_ENABLED` notice still fires on success.
 
 ### 8. The lockout this makes deliberate
 
@@ -340,7 +379,9 @@ The tests named below are written with the build; none exists yet.
 - **AC-3** -- IF the code is not presented, wrong, expired, already spent, or issued for another
   account, THEN THE SYSTEM SHALL refuse the binding step before consuming the TOTP step or popping
   the passkey challenge, answer with one client-facing reply whatever the reason, and write
-  `auth.enrolment_code_refused` with the reason section 7 names for that case.
+  `auth.enrolment_code_refused` with the reason section 7 names for that case. The refused row SHALL
+  carry the one `code_refused` reason for a wrong, expired, spent or never-issued code, so the
+  account's own security-event feed does not tell those cases apart either.
   → `tests/test_directory_enrolment_code.py`
 - **AC-4** -- THE SYSTEM SHALL apply AC-1 to AC-3 to a passkey: `finish_webauthn_registration`
   SHALL spend the code before it writes the credential, and a refused code SHALL leave no credential
@@ -378,16 +419,25 @@ The tests named below are written with the build; none exists yet.
   → `tests/test_directory_enrolment_code.py`
 - **AC-13** -- IF a TOTP begin from another session replaces the staged secret after
   `confirm_mfa_enrollment` read the secret and verified a code against it, THEN THE SYSTEM SHALL
-  NOT enable the replacing secret. It SHALL enable the verified secret, or leave TOTP off. This
-  holds for a local account and a directory account alike, and the test must fail on the code
-  before this build.
+  NOT enable the replacing secret. It SHALL enable the verified secret, or leave TOTP off. IF the
+  enable does not take effect after the session was stamped and rotated, THEN THE SYSTEM SHALL end
+  that session and return no token, so no factor-satisfied session is left on an account with no
+  factor. This holds for a local account and a directory account alike, and the test must fail on
+  the code before this build.
   → `tests/test_directory_enrolment_code.py`
-- **AC-14** -- WHEN the web console's passkey finish route is called past the per-actor budget,
-  THE SYSTEM SHALL refuse the attempt before the service runs, as the TOTP confirm route does.
+- **AC-14** -- WHEN the web console's passkey finish route is called with the per-actor ceremony
+  budget (`allow_reauth_attempt`) refused and the console write floor not exhausted, THE SYSTEM
+  SHALL refuse the attempt before the service runs, as the TOTP confirm route does, and write no
+  credential row. The test must fail on the code before this build. A test that drives the route
+  past the write floor instead passes on today's code, so it does not meet this criterion. The
+  discriminating form already exists in `test_l4b_rate_limit_paths`
+  (`packaging/messagefoundry-webconsole/tests/test_webui.py`): it re-proves first, then replaces
+  `service.allow_reauth_attempt` with a deny and leaves the write floor alone.
   → a web console test under `packaging/messagefoundry-webconsole/tests/`
 - **AC-15** -- WHEN an account holding an outstanding code is disabled, THE SYSTEM SHALL clear the
   code. IF the account is re-enabled before that code would have expired, THEN THE SYSTEM SHALL
-  refuse the old code.
+  refuse the old code. IF a disable lands between an issue's checks and its write, THEN THE SYSTEM
+  SHALL refuse the issue and leave no code on the account.
   → `tests/test_directory_enrolment_code.py`
 
 ## Alternatives considered
@@ -457,7 +507,7 @@ ADR 0197 Amendment A's wave 1. It changes a security control, so it gets its own
 - **the engine API:** the issue and revoke routes, a code field on `POST /me/mfa/confirm`, the reset
   reply, and the MFA status reply saying a code is needed;
 - **the web console:** the issue button and one-time page, a code field on the TOTP confirm form and
-  in the passkey page script's body, the attempt budget on the passkey finish route, and the
+  in the passkey page script's body, the ceremony budget on the passkey finish route, and the
   pending-MFA notice;
 - **the CLI:** `issue-enrolment-code`, and its row in the CLI tier list;
 - **documents:** the Kerberos row of the pathway table, the "Limit: an account with no binding is
