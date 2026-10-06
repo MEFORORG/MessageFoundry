@@ -2738,6 +2738,12 @@ def test_the_must_change_refusal_states_a_passed_deadline_as_passed() -> None:
         f" {deadline_utc(passed)}; ask an administrator to reset it"
     )
     assert _password_change_required(None) == "password change required"
+    # The enrol-first step is appended while the credential lives, and dropped once it has lapsed:
+    # enrolling cannot revive it.
+    step = "; enrol an authenticator app first"
+    assert _password_change_required(ahead, suffix=step).endswith(step)
+    assert _password_change_required(None, suffix=step) == "password change required" + step
+    assert _password_change_required(passed, suffix=step) == _password_change_required(passed)
 
 
 # --- BACKLOG #2096: POST /auth/login ends the token the client names, before the cap -----------

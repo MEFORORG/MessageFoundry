@@ -1277,9 +1277,10 @@ async def test_verify_mfa_asks_the_deadline_again_after_a_good_code(
 async def test_a_session_resolves_up_to_its_deadline_and_not_after(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """RED when: the session-level ask is dropped, or reads the deadline as inclusive.
+    """RED when: the session-level ask is dropped.
 
-    The control half: before the deadline the must-change session resolves and is left alone."""
+    The control half: before the deadline the must-change session resolves and is left alone. The
+    boundary itself is pinned by the next test."""
     service = await _service(engine)
     user_id, _secret, tok = await _reset_with_a_factor(service, monkeypatch, 1_000_000.0)
     before = await service.identity_for_token(tok)
@@ -1290,3 +1291,56 @@ async def test_a_session_resolves_up_to_its_deadline_and_not_after(
     session = await engine.store.get_session(hash_token(tok))
     assert session is not None and session.revoked_at is not None
     assert len(await _expired_rows(engine)) == 1
+
+
+async def test_the_deadline_test_is_strictly_after_like_the_sign_in_gate(engine: Engine) -> None:
+    """RED when: ``_credential_lapsed`` reads the deadline as inclusive, or ignores the flag.
+
+    The sign-in gate compares ``now > deadline``, so the credential still works AT the instant the
+    administrator was told. A session check that disagreed would end a session the gate admits."""
+    service = await _service(engine)
+    user_id = await _add(service, "vic", Role.VIEWER)
+    chosen = await service.store.get_user(user_id)
+    assert chosen is not None and not chosen.must_change_password
+    await service.admin_reset_password(user_id, actor="test")
+    user = await service.store.get_user(user_id)
+    assert user is not None and user.must_change_password
+    deadline = service.initial_credential_deadline(user.password_changed_at)
+    assert deadline is not None
+    assert service._credential_lapsed(user, deadline) is False
+    assert service._credential_lapsed(user, deadline + 0.001) is True
+    # A password the holder chose has no deadline to pass.
+    assert service._credential_lapsed(chosen, deadline + 0.001) is False
+
+
+async def test_no_ceremony_rekeys_a_session_whose_temporary_password_lapsed(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: ``_elevated_hash`` re-keys a lapsed session.
+
+    The enrol-first leg (ADR 0197 Amendment A): a must-change account with no factor confirms an
+    authenticator. Called on the service directly, as a request does that passed its gate before
+    the deadline; confirming hashes the recovery codes, which takes long enough for the deadline to
+    pass. A factor bound then would outlive the administrator's next reset, which keeps factors."""
+    service = await _service(engine)
+    user_id = await _add(service, "vic", Role.VIEWER)
+    temp = (await service.admin_reset_password(user_id, actor="test")).password
+    outcome = await service.login("vic", temp)
+    assert outcome.ok and outcome.token is not None and outcome.must_change_password
+    identity = await service.identity_for_token(outcome.token)
+    assert identity is not None
+    t0 = 1_000_000.0
+    pin_totp_clock(monkeypatch, t0)
+    enrollment = await service.begin_mfa_enrollment(identity)
+    await _lapse(engine, service, user_id)
+    elevation = await service.confirm_mfa_enrollment(
+        identity, totp.totp(enrollment.secret, now=t0), token=outcome.token, client="192.0.2.8"
+    )
+    assert elevation.session_lost and not elevation.ok and elevation.recovery_codes == ()
+    user = await engine.store.get_user(user_id)
+    assert user is not None and not user.totp_enabled, "a lapsed session turned MFA on"
+    session = await engine.store.get_session(hash_token(outcome.token))
+    assert session is not None and session.revoked_at is not None
+    rows = await _expired_rows(engine)
+    assert len(rows) == 1 and '"at": "mfa_enroll_confirm"' in str(rows[0]["detail"])
+    assert rows[0]["client"] == "192.0.2.8"

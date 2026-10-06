@@ -1304,6 +1304,45 @@ async def test_the_password_page_refuses_to_rotate_a_credential_past_its_deadlin
     assert user is not None and user.must_change_password is True
 
 
+async def test_the_password_page_states_a_deadline_that_passed_during_the_request(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the console's re-render of the route's in-request refusal loses its text or tense,
+    or the refusal leaves the session alive.
+
+    The deadline passes while the current password is being verified, so the gate admitted the
+    request and the route's own 403 answers it. The page re-renders why, in the past tense, and the
+    session is already ended (BACKLOG #2298)."""
+    service = await _service(engine, require_mfa=False)
+    user_id = await _add(service, "op", Role.OPERATOR)
+    temp = await _reset(service)
+    real_reproof = service._reproof
+
+    async def _slow_reproof(*args: object, **kwargs: object) -> object:
+        proof = await real_reproof(*args, **kwargs)  # type: ignore[arg-type]
+        await engine.store._db.execute(
+            "UPDATE users SET password_changed_at=? WHERE id=?", (1.0, user_id)
+        )
+        await engine.store._db.commit()
+        return proof
+
+    async with _client(engine, service) as c:
+        r = await c.post("/ui/login", data={"username": "op", "password": temp})
+        assert r.status_code == 303 and r.headers["location"] == _PASSWORD
+        tok = c.cookies.get("mf_session")
+        assert tok is not None
+        monkeypatch.setattr(service, "_reproof", _slow_reproof)
+        r = await _change_password(c, current=temp)
+        assert r.status_code == 403, r.text
+        assert "temporary password has expired" in r.text
+        assert "Your temporary password stopped working at" in r.text
+        assert "stops working" not in r.text
+    session = await engine.store.get_session(hash_token(tok))
+    assert session is not None and session.revoked_at is not None
+    user = await service.store.get_user(user_id)
+    assert user is not None and user.must_change_password is True
+
+
 async def test_the_factor_page_ends_a_session_whose_temporary_password_lapsed(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
