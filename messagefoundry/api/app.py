@@ -5851,6 +5851,7 @@ def create_app(
             ),
             client=client_ip(request),
         )
+
         # ASVS 5.2.4: opportunistic age-based retention sweep at save time (off-loop, best-effort). A prune
         # error must never fail the upload the operator just made — it is logged and retried by the
         # periodic task. Each pruned file is audited (file_id + uploader, never content).
@@ -5865,26 +5866,32 @@ def create_app(
         # ROW, and once the actor is the system principal no address is in scope (ADR 0150 decision 4
         # rejects exactly this pairing for dual-control config reload). The owner survives as DATA in
         # `detail.uploader`, which is where it belongs.
+        #
+        # BACKLOG #2261: the request deadline can cancel this handler mid-sweep. prune_on_save then
+        # stops the sweep at its next file and still writes a row for each file it removed. Any
+        # Exception is caught, not only OSError: the upload itself has already succeeded.
+        async def _audit_prune(pruned: UploadedFileMeta) -> None:
+            await engine.store.record_audit(
+                "upload.prune",
+                actor="system",
+                detail=json.dumps(
+                    {
+                        "file_id": pruned.file_id,
+                        "uploader": pruned.uploader,
+                        # The IMMUTABLE owner key beside the display name. A prune row is a
+                        # permanent record of a deletion whose subject cannot be recovered
+                        # afterwards -- the file is gone -- and a username is reassignable
+                        # (BACKLOG #1225), so a row read later could name a different person
+                        # than it meant. UploadedFileMeta carries both deliberately
+                        # (uploads.py:116); this records both.
+                        "uploader_id": pruned.uploader_id,
+                    }
+                ),
+            )
+
         try:
-            for pruned in (await us.prune_expired()).pruned:
-                await engine.store.record_audit(
-                    "upload.prune",
-                    actor="system",
-                    detail=json.dumps(
-                        {
-                            "file_id": pruned.file_id,
-                            "uploader": pruned.uploader,
-                            # The IMMUTABLE owner key beside the display name. A prune row is a
-                            # permanent record of a deletion whose subject cannot be recovered
-                            # afterwards -- the file is gone -- and a username is reassignable
-                            # (BACKLOG #1225), so a row read later could name a different person
-                            # than it meant. UploadedFileMeta carries both deliberately
-                            # (uploads.py:116); this records both.
-                            "uploader_id": pruned.uploader_id,
-                        }
-                    ),
-                )
-        except OSError:
+            await us.prune_on_save(_audit_prune)
+        except Exception:
             _log.warning("opportunistic uploaded-logs retention prune failed", exc_info=True)
         return _upload_info(meta)
 
