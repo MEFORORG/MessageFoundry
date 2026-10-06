@@ -2387,6 +2387,9 @@ class AuthStore(Protocol):
     ) -> list[SessionRecord]:
         """A user's unrevoked sessions not past their absolute expiry, most recently used first.
 
+        A row whose ``expires_at`` equals ``now`` is listed, because the validator still accepts it
+        at that instant (``SessionRecord.is_live``), and the purge keeps it too (BACKLOG #2283).
+
         With ``idle_seconds`` given, sessions idle for longer are hidden too, so the inventory a
         user reads does not list a session the validator refuses for idleness (BACKLOG #2096).
         Callers that only ask "does this user hold any session" pass nothing, and the answer is
@@ -2414,9 +2417,10 @@ class AuthStore(Protocol):
         session to the password leg.
 
         Returns **True** when a row was re-keyed, **False** when there was none to re-key — the row
-        is gone, expired-and-purged, or ``revoked_at IS NOT NULL``. This is the one session UPDATE
-        that reports its rowcount: every other one is deliberately blind (a write against a dead hash
-        is a silent no-op), but a caller rotating a session is about to hand the new token to a user,
+        is gone, expired-and-purged, or ``revoked_at IS NOT NULL``. This and
+        :meth:`supersede_session`, which returns the row it revoked, are the single-session UPDATEs
+        that report what they changed: every other one is deliberately blind (a write against a dead
+        hash is a silent no-op), but a caller rotating a session is about to hand the new token to a user,
         so it must be able to fail closed if the session died underneath it.
         """
         ...
@@ -2436,6 +2440,24 @@ class AuthStore(Protocol):
 
     async def revoke_session(self, token_hash: str, *, now: float | None = None) -> None: ...
 
+    async def supersede_session(self, token_hash: str, *, now: float) -> SessionRecord | None:
+        """Revoke the unrevoked session ``token_hash`` names, and return its row as revoked.
+
+        Returns ``None`` when no unrevoked row has that hash, so nothing was written. A row that is
+        expired or idle is still revoked and returned. Its other columns are as the revoke found
+        them, so the caller can judge whether the session was live, and ``revoked_at`` is ``now``.
+
+        **ONE atomic operation, so it cannot interleave with :meth:`rotate_session` (BACKLOG
+        #2146).** It is one statement on Postgres and SQL Server, and one transaction on SQLite. The
+        login supersession used to read the row and then revoke it by hash, and a rotation that
+        re-keyed the row between the two left the revoke matching nothing, so the session lived on
+        under its new hash. Here the store orders the two writes on the row. If this one runs first,
+        the row is revoked and the rotation's ``revoked_at IS NULL`` guard refuses it, so the
+        rotation fails closed. If the rotation committed first, the hash names no row and this
+        returns ``None``.
+        """
+        ...
+
     async def revoke_user_sessions(
         self, user_id: str, *, except_token_hash: str | None = None, now: float | None = None
     ) -> int: ...
@@ -2448,9 +2470,14 @@ class AuthStore(Protocol):
         idle_seconds: float,
         split_mfa_pending: bool,
         now: float | None = None,
-    ) -> None:
+    ) -> int:
         """Keep a user's ``keep`` newest LIVE sessions and revoke the rest, lapsed ones included
         (AUTH-SESS-CAP, BACKLOG #1900).
+
+        Returns how many sessions it revoked, so the caller can audit the revocation (BACKLOG
+        #2283). A ``keep`` of zero or less revokes nothing and returns 0. On SQL Server the count
+        comes from an ``OUTPUT`` rowset, as ``revoke_user_sessions`` counts, so a session-wide
+        ``SET NOCOUNT ON`` cannot turn it into ``-1``.
 
         "Newest" ranks a row from when it completed its second factor (``mfa_verified_at``), or
         from its creation when it has no stamp (BACKLOG #2076). Completing MFA keeps
@@ -2497,7 +2524,13 @@ class AuthStore(Protocol):
     ) -> int:
         """Delete session rows past their absolute expiry, revoked or not, and return the count.
         With ``idle_seconds`` given, rows idle for longer are deleted too (BACKLOG #2096): the
-        validator refuses them on presentation, so keeping them only grows the table."""
+        validator refuses them on presentation, so keeping them only grows the table.
+
+        The idle variant scans the table, because its ``OR`` reaches past the expiry index, and that
+        stands on purpose (BACKLOG #2283). The scan runs once per reaper pass over a table the
+        purge itself keeps small. The alternative is an index on ``last_used_at``, and every
+        authenticated request writes that column, so the index would cost a write on each request
+        to save a scan once an hour."""
         ...
 
 

@@ -2264,9 +2264,14 @@ def test_every_store_and_auth_bool_is_reported_or_exempt() -> None:
         "ad_allow_insecure_ldap",
         # Security-relevant and gated ELSEWHERE, not by this registry — same owed note as [store].
         "enabled",  # serve refuses auth off on every bind, and no config key sets it (#2719)
-        "require_mfa",  # refused at exposure by the __main__ posture gates
+        # Not reported through THIS field: it is the desugared copy of [security].require_mfa, which
+        # a loaded config reports and the [security] floor covers. Off, it is also refused at exposure
+        # by the __main__ gates. An embedder that builds AuthSettings itself is not reported.
+        "require_mfa",
         "ad_tls_verify",  # gated by weakened_tls_escape_permitted
-        "oidc_require_mfa_claim",  # gated by the OIDC serve gate
+        # Gated by no serve-time refusal of its own: off, it mints every OIDC session with no factor
+        # met, and while require_mfa is on that session owes an engine factor at the access gate.
+        "oidc_require_mfa_claim",
         # phi_read_rate_limit_enabled and admin_write_rate_limit_enabled left this set when
         # BACKLOG #1131 (E17) began naming them; the loop below now pins that they are reported.
     }

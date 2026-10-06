@@ -17,13 +17,24 @@ uses at ``auth/oidc_http.py`` and ``auth/oidc/flow.py``.
 received messages: nothing here can drop one, because nothing here reads one. What these bounds
 refuse is a *reply* to a request the engine made.
 
-**No new dead-letter cause.** :class:`ResponseTooLargeError` subclasses
-:class:`~messagefoundry.transports.base.DeliveryError`, so an over-cap reply lands on the same
-retry-then-dead-letter path an unreadable reply has always taken (a timeout mid-read, a reset
-socket). It is deliberately **not** a permanent
-:class:`~messagefoundry.transports.base.NegativeAckError`: promoting it would fail a message
-straight to the dead-letter queue on a peer-side fault, which is a behaviour change the bound does
-not need.
+**An over-cap reply is a transient error, except after a 2xx on a delivery.**
+:class:`ResponseTooLargeError` subclasses :class:`~messagefoundry.transports.base.DeliveryError`.
+Where it surfaces inside a delivery, the worker retries the delivery and then dead-letters it,
+as it does for any reply the engine could not read (a timeout mid-read, a reset socket). A token
+endpoint's over-cap reply is one such case, when a delivery mints its bearer before it sends. At
+least a probe, the alert webhook and a ``fhir_lookup`` raise the error to their own caller
+instead, and nothing retries those.
+
+A delivery that already holds a 2xx status is different, because a retry would send again a
+request the partner answered 2xx (vault BACKLOG #2180).
+:func:`read_2xx_reply_text` reads that body and states the rule. In short, an over-cap body
+there is either dropped with a WARNING or refused for good with code :data:`REPLY_TOO_LARGE_CODE`,
+which is a dead-letter cause the bound did not have before. Each destination's ``_post`` says
+which, and ``docs/CONNECTIONS.md`` has the table. The four HTTP destinations all read their 2xx
+reply through it.
+
+**Only the byte bound is covered.** At least a reply that is truncated or misframed after a 2xx
+still retries, and so sends the request again.
 
 **A ceiling is not a completeness check, and this module once carried only the ceiling** (BACKLOG
 #1575). Bounding the read answered "did the peer send too much?" and nothing answered "did the peer
@@ -118,11 +129,12 @@ from typing import Any, Protocol, cast
 
 from messagefoundry.config.tls_policy import is_loopback_hop_host
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
-from messagefoundry.transports.base import DeliveryError
+from messagefoundry.transports.base import DeliveryError, NegativeAckError
 
 __all__ = [
     "DEFAULT_MAX_RESPONSE_BYTES",
     "MAX_TOKEN_RESPONSE_BYTES",
+    "REPLY_TOO_LARGE_CODE",
     "AmbiguousFramingError",
     "EgressReplyError",
     "LoopbackDirectProxyHandler",
@@ -137,6 +149,7 @@ __all__ = [
     "drain_bounded",
     "hop_identity",
     "is_never_proxied_host",
+    "read_2xx_reply_text",
     "read_bounded",
     "read_bounded_text",
     "read_reply_body",
@@ -204,6 +217,9 @@ class ResponseTooLargeError(EgressReplyError):
     A :class:`~messagefoundry.transports.base.DeliveryError`, therefore transient: the delivery
     worker retries it under the connection's own retry policy and dead-letters it the same way it
     dead-letters any other reply the engine could not read.
+
+    A destination that reads its 2xx reply through :func:`read_2xx_reply_text` does not let it
+    travel that far, because a retry would re-send the request.
     """
 
 
@@ -1183,3 +1199,71 @@ def read_bounded_text(
     into a plausible-looking string.
     """
     return read_bounded(reader, limit=limit, connector=connector).decode(encoding, errors="replace")
+
+
+#: The ``code`` of the permanent refusal :func:`read_2xx_reply_text` raises.
+REPLY_TOO_LARGE_CODE = "reply-too-large"
+
+
+def read_2xx_reply_text(
+    reader: _SupportsRead,
+    *,
+    limit: int = DEFAULT_MAX_RESPONSE_BYTES,
+    connector: str,
+    encoding: str,
+    body_is_needed: bool,
+) -> str:
+    """:func:`read_bounded_text` for the body of a delivery's reply, once its 2xx status is in.
+
+    Call it where the status is already known to be 2xx. In a destination's ``_post`` that is
+    inside ``with opener.open(...)``, because urllib raises every other status as an ``HTTPError``.
+    The helper checks this itself, and fails closed: unless ``reader.status`` is an integer from
+    200 to 299, an over-cap body raises as :func:`read_bounded_text` raises it. So an over-cap
+    body from a reader with another status, or with none it can show, is never recorded as
+    delivered here. An in-cap body is returned whatever the status: that is the caller's to judge.
+
+    The partner answered 2xx, so an over-cap body must not cause a re-send (vault BACKLOG #2180).
+    What it does cause depends on ``body_is_needed``, which says who reads the body. This is the
+    one place in code that states the rule:
+
+    * ``False`` -- nothing looks inside this body, so the caller can call the message delivered
+      without it. Returns ``""`` and logs a WARNING. The WARNING carries ``connector``, the
+      status and the bound, and no byte of the reply.
+    * ``True`` -- the engine needs the body to know the outcome, or passes it on. Raises a
+      permanent :class:`~messagefoundry.transports.base.NegativeAckError` with code
+      :data:`REPLY_TOO_LARGE_CODE`, so the row dead-letters once and is not sent again. A reply
+      the engine could not read is not recorded as delivered.
+
+    Which FHIR writes need the body is stated at the call in ``transports/fhir.py``.
+
+    Only the byte bound is handled here. A truncated or misframed reply still raises as
+    :func:`read_bounded_text` raises it, and is still retried.
+    """
+    try:
+        return read_bounded_text(reader, limit=limit, connector=connector, encoding=encoding)
+    except ResponseTooLargeError:
+        status = getattr(reader, "status", None)
+        if not (isinstance(status, int) and 200 <= status < 300):
+            raise
+        # A 2xx is handled below, outside the handler. The traceback reaches the frame that holds
+        # the bytes read so far, a whole bound of them, and an error raised in here would keep
+        # that frame alive on its __context__ until the worker let go of it.
+    if body_is_needed:
+        # The stored error is cut at 200 characters, so the code and "not sent again" come first
+        # and the advice last. It does not say the partner accepted the request: the body that
+        # could not be read is where a Fault, a failed-instance list or a failed entry status
+        # would be.
+        raise NegativeAckError(
+            f"{connector}: {REPLY_TOO_LARGE_CODE}, not sent again. A 2xx reply body is over the "
+            f"{limit}-byte bound and is needed here. Check the partner before a replay",
+            code=REPLY_TOO_LARGE_CODE,
+            permanent=True,
+        )
+    logger.warning(
+        "%s answered with status %s and a response body over the %d-byte bound; "
+        "the body is dropped and the message is recorded as delivered",
+        connector,
+        status,
+        limit,
+    )
+    return ""

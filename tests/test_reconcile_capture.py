@@ -20,8 +20,19 @@ import pytest
 
 from harness.reconcile import __main__ as reconcile_cli
 from harness.reconcile.capture import CaptureSink
+from messagefoundry.anon import Keyer, anonymize_checked
+from messagefoundry.anon.leak import CoverageTally
 from messagefoundry.transports.mllp import DEFAULT_MAX_FRAME_BYTES, MLLPDecoder, frame
 from tests._mllp_over_cap import send_over_cap, send_valid_then_over_cap
+
+_ANON_SALT = "capture-salt-0123456789abcdef"  # synthetic; long enough for the Keyer's floor
+# The same skip tests/test_anon_core.py carries: the leak-check loads this script by path, and an
+# installed wheel has no scripts/ tree.
+_LEAK_SCANNER = Path(__file__).resolve().parents[1] / "scripts" / "security" / "scan_forbidden.py"
+_NO_SCANNER = pytest.mark.skipif(
+    not _LEAK_SCANNER.exists(),
+    reason="leak-check needs scripts/security/scan_forbidden.py (absent on an installed wheel)",
+)
 
 
 def _message(control_id: str) -> str:
@@ -77,6 +88,42 @@ def test_capture_acks_and_writes_jsonl(tmp_path: Path) -> None:
     assert [r["control_id"] for r in records] == ["CID0001", "CID0002"]
     assert records[0]["raw"] == _message("CID0001")
     assert all(isinstance(r["received_at"], float) for r in records)
+
+
+@_NO_SCANNER
+def test_the_documented_on_report_wiring_hands_the_caller_a_coverage_report(tmp_path: Path) -> None:
+    """The ``CaptureSink`` docstring shows ``anonymize_checked`` wired with ``on_report=tally.add``.
+    The sink takes a str-to-str callable and never sees the report. So that closure is the only
+    route by which the coverage report reaches whoever shares the capture. This runs the example
+    as written. Drop ``on_report`` and the tally stays at zero messages."""
+    # The docstring is what a caller copies, so pin its wiring as well as running it here.
+    doc = CaptureSink.__doc__ or ""
+    assert "on_report=tally.add" in doc and "Keyer(salt)" in doc
+
+    out = tmp_path / "cap.jsonl"
+    Keyer(_ANON_SALT)  # the example's own first step: a weak salt raises before any drop
+    tally = CoverageTally()
+
+    async def scenario() -> CaptureSink:
+        sink = CaptureSink(
+            out,
+            ports=(0,),
+            anonymizer=lambda raw: anonymize_checked(raw, salt=_ANON_SALT, on_report=tally.add),
+        )
+        await sink.start()
+        try:
+            await _send(sink.bound_ports[0], ["CID0001", "CID0002"])
+        finally:
+            await sink.stop()
+        return sink
+
+    sink = asyncio.run(scenario())
+    assert sink.captured == 2 and sink.anon_failed == 0
+    assert "DOE" not in out.read_text(encoding="utf-8")  # the rule map did run
+    assert tally.messages == 2  # one report per message, on the clean path
+    # The report's content arrived too, not only the call: each unmapped address, once per message.
+    assert tally.counts and set(tally.counts.values()) == {2}
+    assert tally.summary().startswith("coverage: 2 message(s) reached the leak-check")
 
 
 def test_capture_records_unparseable_without_acking(tmp_path: Path) -> None:

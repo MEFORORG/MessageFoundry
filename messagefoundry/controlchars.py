@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The control-character alphabets, each written once: the C0/DEL test (BACKLOG #1253) and the
-wider log alphabet built on it (vault BACKLOG #2815).
+wider log alphabet built on it (vault BACKLOG #2815). Beside them sits :func:`has_lone_surrogate`,
+the other test a mail header value needs, which is not a control character (vault BACKLOG #2842).
 
 WHAT THIS REPLACES. ``ord(ch) < 0x20 or ord(ch) == 0x7F`` was written out seven times across six
 files -- two in ``transports/fhir.py`` and one each in ``config/codeset_edit.py``,
@@ -114,6 +115,16 @@ def _is_control_char(ch: str) -> bool:
 def has_control_char(text: str) -> bool:
     """True if ``text`` contains any C0 control character or DEL."""
     return any(_is_control_char(ch) for ch in text)
+
+
+def has_lone_surrogate(text: str) -> bool:
+    """True if ``text`` holds a surrogate code point (U+D800 to U+DFFF), which strict UTF-8 cannot
+    write. That includes each half of an adjacent pair, which ``str`` holds as two code points only
+    after a ``surrogatepass`` decode or an escape. TOML refuses one, but at least Python config and an environment value can carry one: a
+    ``surrogateescape`` decode makes U+DC80 to U+DCFF. :func:`has_control_char` passes it, so a mail
+    header needs both tests (vault BACKLOG #2842). In a header most surrogates raise
+    ``UnicodeEncodeError`` at build; U+DC80 to U+DCFF go out as a garbled ``unknown-8bit`` word."""
+    return any("\ud800" <= ch <= "\udfff" for ch in text)
 
 
 def strip_control_chars(text: str) -> str:

@@ -100,3 +100,15 @@ async def test_session_rotation_contract_sqlite(tmp_path: Path) -> None:
         await assert_session_rotation_contract(store)
     finally:
         await store.close()
+
+
+async def test_session_supersession_contract_sqlite(tmp_path: Path) -> None:
+    """SQLite leg of the BACKLOG #2146 supersede_session contract, shared with the live Postgres /
+    SQL Server suites."""
+    store = await MessageStore.open(tmp_path / "sup.db")
+    try:
+        from tests._session_rotation_contract import assert_session_supersession_contract
+
+        await assert_session_supersession_contract(store)
+    finally:
+        await store.close()

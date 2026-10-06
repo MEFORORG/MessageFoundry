@@ -80,7 +80,7 @@ The console watches for these four and tells you in the page.
 | **HTTPS transport** (`window.isSecureContext`) | A banner: the console is not served over HTTPS, so secure cookies, COOP and CSP nonces are degraded. Correctly silent on `http://127.0.0.1`, which browsers already treat as a secure context. |
 | **CSP enforcement** | A banner: this browser does not enforce Content-Security-Policy, so script-injection defenses are not being applied. The console proves this by loading one script that a conforming browser must refuse. |
 | **CSP nonce sources / script execution** | The server-rendered banner quoted above. |
-| **WebAuthn passkeys** (`window.PublicKeyCredential`) | The passkey button is disabled and the line beside it reads "This browser does not support passkeys." A passkey is never the only factor, so you can still sign in and still enroll MFA with a password and a TOTP code. |
+| **WebAuthn passkeys** (`window.PublicKeyCredential`) | The passkey button is disabled and the line beside it reads "This browser does not support passkeys." An account with no factor yet can still enroll TOTP here, and an account that also holds TOTP can still finish MFA with a TOTP code. Some accounts hold a passkey and no TOTP, at least a directory account and a local account outside `[security].require_mfa` ([the order](SECURITY.md#webauthn-passkeys-wp-14b-adr-0068)). If the engine asks such an account for its factor, it cannot answer in this browser. It cannot enroll TOTP until it does, so use a browser that supports passkeys, or ask an administrator to reset its MFA. |
 
 ### Degrades silently, with a control that still holds
 

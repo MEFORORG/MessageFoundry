@@ -632,8 +632,9 @@ def test_ad_timeout_rejects_an_unbounded_value(bad: float) -> None:
 
 @pytest.mark.parametrize("field", ["ad_connect_timeout", "ad_receive_timeout"])
 def test_ad_timeout_rejects_a_value_that_overflows_the_socket(field: str) -> None:
-    """A huge finite value raises OverflowError in socket.settimeout, which no LdapError handler
-    catches. The bound itself is accepted, so the refusal is the cap and not something else."""
+    """A huge finite value raises OverflowError in socket.settimeout. That now maps to LdapError
+    (BACKLOG #2566, tests/test_ldap_error_mapping.py), but every sign-in would still fail, so the
+    cap refuses it at load. The bound itself is accepted, so the refusal is the cap."""
     assert getattr(_ad_settings(**{field: 3600.0}), field) == 3600.0
     with pytest.raises(ValueError, match="at most 3600 seconds"):
         _ad_settings(**{field: 3600.5})

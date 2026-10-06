@@ -24,6 +24,7 @@ Pure stdlib — byte-identical with ``tee/anon/rules.py`` (parity test); no ``me
 
 from __future__ import annotations
 
+import logging
 import re
 import tomllib
 from dataclasses import dataclass
@@ -32,8 +33,10 @@ from pathlib import Path
 
 #: A whole-FIELD HL7 address: a 3-char segment id then ``-`` then a 1-based field number
 #: (``PID-5``, ``MRG-1``). Component paths (``PID-5.1``) are rejected — surrogates compose a whole
-#: field's value (ADR 0030 §3), so rules address whole fields only.
-_FIELD_PATH_RE = re.compile(r"^[A-Z][A-Z0-9]{2}-\d+$")
+#: field's value (ADR 0030 §3), so rules address whole fields only. The number is ASCII digits with
+#: no leading zero: ``PID-0`` is the segment id itself, which the tee would overwrite, and ``PID-05``
+#: or a non-ASCII digit names a field the two adapters and the leak-check would read differently.
+_FIELD_PATH_RE = re.compile(r"[A-Z][A-Z0-9]{2}-[1-9][0-9]*")
 
 
 class SurrogateKind(StrEnum):
@@ -56,7 +59,7 @@ class SurrogateKind(StrEnum):
 class RuleError(ValueError):
     """A rule the data layer refuses: a malformed ``anon.toml`` overlay, one that tries to express
     something the data layer deliberately cannot (ADR 0030 §2 — selection only, never logic), or
-    a :class:`FieldRule` built in code with an unknown kind."""
+    a :class:`FieldRule` built in code with an unknown kind or a path that is not a whole field."""
 
 
 def _coerce_kind(path: str, raw: object) -> SurrogateKind:
@@ -72,13 +75,26 @@ def _coerce_kind(path: str, raw: object) -> SurrogateKind:
         ) from None
 
 
+def _check_field_path(path: object) -> None:
+    """Refuse a path that is not a whole-field address. ``fullmatch``, so a trailing newline, a
+    lower-case segment id and a component path all fail here, for a rule built in code and for an
+    overlay key alike."""
+    if not isinstance(path, str) or _FIELD_PATH_RE.fullmatch(path) is None:
+        raise RuleError(
+            f"rule path {path!r} is not a whole-field HL7 address like 'PID-5' "
+            "(component paths and free text are rejected — selection is field-level only)"
+        )
+
+
 @dataclass(frozen=True)
 class FieldRule:
     """One rule: scrub the whole field at ``path`` with surrogate ``kind``.
 
     ``kind`` is normalized to THIS package's :class:`SurrogateKind` on construction, so a plain
     ``"drop"`` string, or the other package's member, becomes the member here. An unknown kind
-    raises :class:`RuleError` at construction, not at the first message. A rule built by the other
+    raises :class:`RuleError` at construction, not at the first message. So does a ``path`` that is
+    not a whole-field address: ``pid-29`` would match no segment and scrub nothing, and ``PID-29.1``
+    would fail inside the tee on the first message (BACKLOG #2330). A rule built by the other
     package still carries that package's member, which is why the adapters and the leak-check
     compare a kind by value rather than by identity.
     """
@@ -87,16 +103,19 @@ class FieldRule:
     kind: SurrogateKind
 
     def __post_init__(self) -> None:
+        _check_field_path(self.path)
         object.__setattr__(self, "kind", _coerce_kind(self.path, self.kind))
 
 
 # The recommended default scrub map (ADR 0030 §3). Anything NOT listed is left intact — so the
-# routing/coded fields (MSH-7/9/10/12, NK1-3 relationship, IN1-2/3/4 plan codes, DG1/AL1/PR1,
-# OBR-4 service) survive untouched and correlation + parity-diff (#14) still work.
+# routing/coded fields (MSH-7/9/10/12, NK1-3 relationship, IN1-2/3/4 plan codes, DG1/AL1, the PR1
+# codes, OBR-4 service) survive untouched and correlation + parity-diff (#14) still work.
 #
 # The DATE and location rules map these Safe Harbor date and location fields, and that is NOT Safe
 # Harbor de-identification: MSH-7 keeps the full message time, the order and accession numbers
-# (ORC-2/3, OBR-2/3) are left unmapped, and so are other date fields (BACKLOG #2248).
+# (ORC-2/3, OBR-2/3) are left unmapped (BACKLOG #2248). The date fields BACKLOG #2330 listed are
+# mapped: an event date takes DATE, and a date of birth takes DOB like PID-7. A date field outside
+# that list still has no rule, and only the coverage report names it.
 #
 # MRG fields are scrubbed with the SAME kinds as their PID counterparts (MRG-1 with PID-3, MRG-4
 # with PID-5) and keyed on the same value, so an A40 merge's old-to-new linkage is preserved across
@@ -130,16 +149,28 @@ DEFAULT_RULES: tuple[FieldRule, ...] = (
     FieldRule("NK1-5", SurrogateKind.PHONE),
     FieldRule("NK1-6", SurrogateKind.PHONE),
     FieldRule("NK1-7", SurrogateKind.PHONE),
+    FieldRule("NK1-16", SurrogateKind.DOB),  # contact's date of birth
     # GT1 — guarantor
     FieldRule("GT1-3", SurrogateKind.NAME),
     FieldRule("GT1-5", SurrogateKind.ADDRESS),
     FieldRule("GT1-6", SurrogateKind.PHONE),
     FieldRule("GT1-7", SurrogateKind.PHONE),
+    FieldRule("GT1-8", SurrogateKind.DOB),  # guarantor's date of birth
     FieldRule("GT1-12", SurrogateKind.SSN),
-    # IN1/IN2 — insurance (plan/company codes IN1-2/3/4 are KEPT by omission)
+    FieldRule("GT1-16", SurrogateKind.NAME),  # guarantor's employer, an XPN
+    FieldRule("GT1-17", SurrogateKind.ADDRESS),  # guarantor's employer address
+    FieldRule("GT1-18", SurrogateKind.PHONE),  # guarantor's employer phone
+    # IN1/IN2 — insurance (plan/company codes IN1-2/3/4 are KEPT by omission). The company's
+    # address, contact and phone, and the insured's employer, are mapped (BACKLOG #2645).
+    FieldRule("IN1-5", SurrogateKind.ADDRESS),  # insurance company address
+    FieldRule("IN1-6", SurrogateKind.NAME),  # insurance company contact person
+    FieldRule("IN1-7", SurrogateKind.PHONE),  # insurance company phone
+    FieldRule("IN1-11", SurrogateKind.NAME),  # insured's group employer name
     FieldRule("IN1-16", SurrogateKind.NAME),
+    FieldRule("IN1-18", SurrogateKind.DOB),  # insured's date of birth
     FieldRule("IN1-19", SurrogateKind.ADDRESS),
     FieldRule("IN1-36", SurrogateKind.ID),
+    FieldRule("IN1-44", SurrogateKind.ADDRESS),  # insured's employer address
     FieldRule("IN1-49", SurrogateKind.ID),
     FieldRule("IN2-2", SurrogateKind.SSN),
     FieldRule("IN2-3", SurrogateKind.FREETEXT),
@@ -162,11 +193,18 @@ DEFAULT_RULES: tuple[FieldRule, ...] = (
     FieldRule("OBR-7", SurrogateKind.DATE),  # observation date/time
     FieldRule("OBR-16", SurrogateKind.PROVIDER),
     FieldRule("OBR-32", SurrogateKind.PROVIDER),
+    FieldRule("OBR-35", SurrogateKind.PROVIDER),  # transcriptionist
     FieldRule("OBX-5", SurrogateKind.FREETEXT),
     FieldRule("OBX-14", SurrogateKind.DATE),  # observation date/time
     FieldRule("OBX-16", SurrogateKind.PROVIDER),
     # NTE — notes / comments
     FieldRule("NTE-3", SurrogateKind.FREETEXT),
+    # Event dates in the scheduling, pharmacy, procedure and financial segments (BACKLOG #2330)
+    FieldRule("AIS-4", SurrogateKind.DATE),  # appointment start date/time
+    FieldRule("RXA-3", SurrogateKind.DATE),  # administration start date/time
+    FieldRule("RXA-4", SurrogateKind.DATE),  # administration end date/time
+    FieldRule("PR1-5", SurrogateKind.DATE),  # procedure date/time
+    FieldRule("FT1-4", SurrogateKind.DATE),  # transaction date
 )
 
 
@@ -177,12 +215,11 @@ class AnonError(ValueError):
     so existing fail-closed call-site catches treat it as a drop-and-count."""
 
 
+_LOG = logging.getLogger(__name__)
+
+
 def _validate_path(path: str) -> str:
-    if not _FIELD_PATH_RE.match(path):
-        raise RuleError(
-            f"rule path {path!r} is not a whole-field HL7 address like 'PID-5' "
-            "(component paths and free text are rejected — selection is field-level only)"
-        )
+    _check_field_path(path)
     return path
 
 
@@ -200,20 +237,40 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
         keep = ["PID-13"]  # cancel a default scrub, or record a field as reviewed and left intact
         drop = ["PID-40"]  # blank the field entirely
 
-    Any other table/key, a component path, or an unknown kind raises :class:`RuleError`.
+    Any other table/key, a component path, or an unknown kind raises :class:`RuleError`. So does
+    an overlay that cannot be read or parsed: that error names the file and, for bad TOML, a line
+    and column. It quotes nothing from the file, and it chains no other exception.
 
     A ``keep`` comes back as a :attr:`SurrogateKind.KEEP` rule. The anonymizer rewrites nothing for
     it; the leak-check counts the field as DECIDED for ``require_full_coverage`` and still scans
     it for PHI shapes (BACKLOG #1710).
+
+    A keep on a :data:`DEFAULT_RULES` path turns that default scrub off. Each one is logged at
+    WARNING, by field address and kind only; :func:`kept_defaults` lists them (BACKLOG #2268).
     """
     effective: dict[str, SurrogateKind] = {r.path: r.kind for r in DEFAULT_RULES}
     if overlay is None:
         return DEFAULT_RULES
 
+    # Each arm keeps one content-free fact. A TOMLDecodeError holds the whole file on ``.doc`` and
+    # a UnicodeDecodeError holds its bytes on ``.object``, so neither may reach the refusal's chain.
+    refusal: str | None = None
     try:
         data = tomllib.loads(overlay.read_text(encoding="utf-8"))
-    except (OSError, tomllib.TOMLDecodeError) as exc:
-        raise RuleError(f"cannot read anon overlay {overlay}: {exc}") from exc
+    except tomllib.TOMLDecodeError as exc:
+        refusal = f"invalid TOML at line {exc.lineno}, column {exc.colno}"
+    except UnicodeDecodeError:  # a ValueError, not an OSError
+        refusal = "the file is not UTF-8 text"
+    except RecursionError:  # tomllib recurses on nested arrays and tables
+        refusal = "the file nests too deeply to parse"
+    except ValueError:  # at least int()'s digit limit, which tomllib lets through as it is
+        refusal = "the file holds a value the TOML parser refused"
+    except OSError as exc:
+        refusal = exc.strerror or type(exc).__name__
+    if refusal is not None:
+        # Raised AFTER the handler, so neither __cause__ nor __context__ is set. ``from None``
+        # would not do: it leaves __context__ populated (BACKLOG #2310).
+        raise RuleError(f"cannot read anon overlay {overlay}: {refusal}")
 
     unknown_top = set(data) - {"hl7"}
     if unknown_top:
@@ -242,7 +299,28 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
         effective[_validate_path(path)] = SurrogateKind.DROP
 
     # A KEEP rule is returned, not dropped: it is the record that someone decided the field.
-    return tuple(FieldRule(path, kind) for path, kind in effective.items())
+    rules = tuple(FieldRule(path, kind) for path, kind in effective.items())
+    for cancelled in kept_defaults(rules):
+        _LOG.warning(
+            "anon overlay %s keeps %s, which turns off its default %s scrub: the field is left "
+            "as captured",
+            overlay,
+            cancelled.path,
+            cancelled.kind.value,
+        )
+    return rules
+
+
+def kept_defaults(rules: tuple[FieldRule, ...]) -> tuple[FieldRule, ...]:
+    """The :data:`DEFAULT_RULES` entries that ``rules`` keeps, so their scrub no longer runs.
+
+    A keep does two jobs. It records a field as reviewed for ``require_full_coverage``, and it
+    cancels any default scrub on that path. So a keep on ``PID-5`` turns the name scrub off,
+    whatever it was added for. :func:`load_rules` logs each one, and a caller with a console of
+    its own can repeat them there. Each entry is the default rule, so it names the lost kind.
+    """
+    kept = {r.path for r in rules if r.kind == SurrogateKind.KEEP}
+    return tuple(r for r in DEFAULT_RULES if r.path in kept)
 
 
 def _as_path_list(hl7: dict[str, object], key: str) -> list[str]:
