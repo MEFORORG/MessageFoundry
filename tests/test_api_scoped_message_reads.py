@@ -7,9 +7,9 @@ route that opened a message by id with its own call could forget the channel-sco
 first deployment would hand a scoped operator another channel's message with nothing going red. This
 guard reads the CODE, so a call in a comment or docstring does not count and a real call does.
 
-The walk flags every ``.get_message(`` attribute call, whatever the receiver is named. A narrower
-match on a ``store`` receiver would miss ``s = engine.store; s.get_message(...)``, which is the
-same read.
+The walk flags any load of a ``.get_message`` attribute, called or not, and
+``getattr(..., "get_message")``, whatever the receiver is named. A narrower match on a ``store``
+receiver would miss ``s = engine.store; s.get_message(...)``, which is the same read.
 
 The guard covers ``get_message`` only. The other by-id reads (``outbox_for``, ``events_for``,
 ``attachments_for``, ``correlate_response`` and the rest) are reached today only after the scoped

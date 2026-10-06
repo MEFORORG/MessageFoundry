@@ -310,9 +310,13 @@ _QUIET_HERE = {
 #: What the scoped caller may legitimately see, and what it must never see. ``OB_X`` is the shared
 #: outbound both inbounds deliver to: docs/SECURITY.md says a scoped caller sees no shared outbound
 #: at all, so its name is a leak on these reads even though IB_A's own message goes there.
-#: ``OB_DEAD`` takes only IB_B's dead-lettered delivery. IB_B's message id is added at run time.
-_IN_SCOPE_TOKENS = ("IB_A", "CTRLAAA")
-_OUT_OF_SCOPE_TOKENS = ("IB_B", "OB_X", "OB_DEAD", "CTRLBBB")
+#: ``OB_DEAD`` takes only IB_B's dead-lettered delivery. IB_B's message ids are added at run time.
+#: The probe seeds from these names, so the self-check below reads what the probe actually uses.
+#: Nothing asserts the scoped caller SEES its in-scope data; an over-narrowed empty 200 passes.
+_IN_CHANNEL, _IN_CTRL = "IB_A", "CTRLAAA"
+_OUT_CHANNEL, _SHARED_OUT, _DEAD_OUT, _OUT_CTRL = "IB_B", "OB_X", "OB_DEAD", "CTRLBBB"
+_IN_SCOPE_TOKENS = (_IN_CHANNEL, _IN_CTRL)
+_OUT_OF_SCOPE_TOKENS = (_OUT_CHANNEL, _SHARED_OUT, _DEAD_OUT, _OUT_CTRL)
 
 
 async def _probe_user(service: AuthService, username: str, scope: list[str]) -> None:
@@ -360,23 +364,23 @@ async def test_scoped_routes_are_measured_against_a_live_app(engine: Engine) -> 
         channel: await engine.store.enqueue_message(
             channel_id=channel,
             raw=_ADT.format(ctrl=ctrl),
-            deliveries=[("OB_X", _ADT.format(ctrl=ctrl))],
+            deliveries=[(_SHARED_OUT, _ADT.format(ctrl=ctrl))],
             control_id=ctrl,
             now=time.time(),
         )
-        for channel, ctrl in (("IB_A", "CTRLAAA"), ("IB_B", "CTRLBBB"))
+        for channel, ctrl in ((_IN_CHANNEL, _IN_CTRL), (_OUT_CHANNEL, _OUT_CTRL))
     }
-    out_of_scope = (*_OUT_OF_SCOPE_TOKENS, ids["IB_B"])
     # One dead letter on IB_B, through a destination nothing else uses, so /dead-letters has a row
     # the all-channels caller sees and the scoped caller must not.
-    await engine.store.enqueue_message(
-        channel_id="IB_B",
-        raw=_ADT.format(ctrl="CTRLBBB"),
-        deliveries=[("OB_DEAD", _ADT.format(ctrl="CTRLBBB"))],
-        control_id="CTRLBBB",
+    dead_mid = await engine.store.enqueue_message(
+        channel_id=_OUT_CHANNEL,
+        raw=_ADT.format(ctrl=_OUT_CTRL),
+        deliveries=[(_DEAD_OUT, _ADT.format(ctrl=_OUT_CTRL))],
+        control_id=_OUT_CTRL,
         now=time.time(),
     )
-    (dead,) = await engine.store.claim_ready(now=time.time(), destination_name="OB_DEAD")
+    out_of_scope = (*_OUT_OF_SCOPE_TOKENS, ids[_OUT_CHANNEL], dead_mid)
+    (dead,) = await engine.store.claim_ready(now=time.time(), destination_name=_DEAD_OUT)
     await engine.store.mark_failed(dead.id, "probe", RetryPolicy(max_attempts=1), now=time.time())
     # The pacing floor is a separate control with its own tests; off here so a probe that sends
     # several writes in a row measures scope, not the throttle.
@@ -419,6 +423,12 @@ async def test_scoped_routes_are_measured_against_a_live_app(engine: Engine) -> 
             assert not leaked, f"{path} showed a channel-scoped caller {leaked}"
             if not any(m in rw.text for m in out_of_scope):
                 quiet.add(path)
+        # A count can leak where no name does: a total over the whole estate beside a narrowed page.
+        # The fixture fits on one page, so each caller's total must equal the rows it was shown.
+        for path, rows_key in (("/dead-letters", "dead_letters"), ("/messages", "messages")):
+            for headers in (s, w):
+                body = (await c.get(path, headers=headers)).json()
+                assert body["total"] == len(body[rows_key]), (path, body["total"])
         assert quiet == _QUIET_HERE.keys(), (
             "the scoped GETs this fixture cannot discriminate changed; a route that is quiet here "
             f"proves nothing about scope: {sorted(quiet)}"

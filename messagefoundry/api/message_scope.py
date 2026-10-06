@@ -13,7 +13,7 @@ which skips a refused row rather than failing the whole response. Both audit a r
 ``auth.channel_denied`` before they answer.
 
 ``tests/test_api_scoped_message_reads.py`` fails if any other module under ``messagefoundry/api/``
-calls ``.get_message(`` itself.
+loads a ``.get_message`` attribute itself, or reaches it through ``getattr``.
 
 Why 404 and not 403: a 403 would tell a scoped caller that a message exists in another channel. The
 404 detail names only the id the caller sent.

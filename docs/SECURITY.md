@@ -1680,15 +1680,22 @@ the same permission set on the same method reds CI until it is listed here.
 > **Every route of the default JSON API has a channel-scope class, and a new one fails the build
 > until it gets one (BACKLOG #2627).** `tests/test_route_channel_scope_classification.py` holds the
 > table: scoped, not channel-bearing, administrator-only, or unscoped. It does not cover routes that
-> only `serve_ui`, `oidc_enabled` or `expose_docs` register. It runs each scoped GET that takes no
-> path parameter as a scoped caller and as an all-channels caller. The POST search and export, and
-> `/ws/stats`, are not run, and `GET /status` gives no signal on its fixture. It aims each by-id
-> message route at another channel's message, which must answer 404. Those routes all open the
-> message through one helper, `messagefoundry/api/message_scope.py`, and a test fails if any other
-> API module touches the store's `get_message`. That guard does not cover the other by-id reads,
-> such as `outbox_for`, which today run only after the helper. The store reads that take
-> `allowed_channels` require it, so a caller cannot read every channel by leaving it out, and a
-> test refuses a literal `allowed_channels=None` in the API package. The table also lists at least three unscoped routes that no
+> only the flags in `ROUTE_REGISTERING_FLAGS` (`scripts/security/route_gates.py`) register.
+>
+> The test runs each scoped GET that takes no path parameter twice: as a scoped caller, and as an
+> all-channels caller for control. It also checks the `/messages` and `/dead-letters` totals. No
+> other scoped route is executed. That leaves at least the scoped POSTs, `/ws/stats` and every
+> route with a path parameter other than the by-id message routes. `GET /status` gives no signal
+> on its fixture.
+>
+> It aims each by-id message route at another channel's message, which must answer 404. Those
+> routes all open the message through one helper, `messagefoundry/api/message_scope.py`. A test
+> fails if any other API module touches the store's `get_message`. That guard does not cover the
+> other by-id reads, such as `outbox_for`, which today run only after the helper.
+>
+> The store reads that take `allowed_channels` require it, so a caller cannot read every channel by
+> leaving it out. A test refuses a literal `allowed_channels=None` on those reads under
+> `messagefoundry/api/`. The table also lists at least three unscoped routes that no
 > backlog item tracks yet: `GET /security/posture` names connections, `GET /users` returns every
 > account's channel scope to a `users:read` holder, and `POST /config/reload` acts on every
 > connection.
