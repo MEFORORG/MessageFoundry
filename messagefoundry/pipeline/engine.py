@@ -881,26 +881,26 @@ class Engine:
     ) -> tuple[bool, int]:
         """Wait until the staged queue is drained — the fail-back hand-back gate (#61, ADR 0048).
 
-        Returns ``(drained, held)``. ``held`` is the PENDING rows on outbounds the DR run-profile
-        parks: they wait for the profile to come off and cannot drain here, so the wait leaves them
-        out rather than sitting out its whole timeout on them (vault BACKLOG #3067). ``drained`` is
-        True once every other NOT-DONE row, across ingress/routed/outbound, is done. Bounded by
-        ``timeout`` so a permanently-stuck row (a retry-forever head against a dead peer) doesn't
-        hang the release forever; on timeout it returns ``drained=False`` (the remaining rows stay
-        queued + replayable, and the runbook reconciliation accounts for them)."""
+        Returns ``(drained, held)``. ``held`` is the PENDING rows on outbounds the engine parks
+        (:meth:`RegistryRunner.engine_parked_outbounds`, the DR run-profile's among them): they
+        cannot drain here, so the wait leaves them out rather than sitting out its whole timeout on
+        them (vault BACKLOG #3067). ``drained`` is True once every other NOT-DONE row, across
+        ingress/routed/outbound, is done. Bounded by ``timeout`` of wall time, the queries included,
+        so a permanently-stuck row (a retry-forever head against a dead peer) doesn't hang the
+        release forever; on timeout it returns ``drained=False`` (the remaining rows stay queued +
+        replayable, and the runbook reconciliation accounts for them)."""
         rr = self._registry_runner
-        elapsed = 0.0
+        deadline = time.monotonic() + timeout
         while True:
             held = 0
             if rr is not None:
-                for name in rr.filtered_outbound():
+                for name in rr.engine_parked_outbounds():
                     held += (await self.store.pending_depth(name))[0]
             if await self.store.in_pipeline_depth() <= held:
                 return True, held
-            if elapsed >= timeout:
+            if time.monotonic() >= deadline:
                 break
             await asyncio.sleep(poll)
-            elapsed += poll
         log.warning(
             "DR release: staged queue not fully drained within %.0fs; remaining rows stay queued + "
             "replayable (the fail-back reconciliation runbook accounts for them)",

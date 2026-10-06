@@ -364,7 +364,7 @@ class DrCoordinator:
                 _ACTION_RELEASE,
                 actor=actor,
                 detail=json.dumps(
-                    {"vip_hook_ran": hook_ran, **outcome}, sort_keys=True, default=str
+                    {**outcome, "vip_hook_ran": hook_ran}, sort_keys=True, default=str
                 ),
                 now=now,
             )

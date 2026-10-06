@@ -281,6 +281,10 @@ async def test_a_row_on_a_parked_outbound_is_held_and_drains_after_release(box: 
     assert held["status"] == "pending"
     assert held["attempts"] == 0
     assert rr.outbound_filtered("OB_NORM_ADT") is not None  # it still reads filtered, not stopped
+    # An operator start cannot lift a DR park: there is no connector to deliver through.
+    await rr.start_outbound("OB_NORM_ADT")
+    await asyncio.sleep(0.5)
+    assert (await _norm_row(engine, message_id))["attempts"] == 0
 
     started = time.monotonic()
     await coord.release(actor="alice")
@@ -295,7 +299,7 @@ async def test_a_row_on_a_parked_outbound_is_held_and_drains_after_release(box: 
         return (await _norm_row(engine, message_id))["status"] == "done"
 
     await _until(norm_delivered)
-    assert (box.tiered.parent / "out-norm").exists()
+    assert any((box.tiered.parent / "out-norm").iterdir())  # a file reached the target
 
 
 async def test_a_release_drain_that_times_out_is_not_recorded_as_drained(
