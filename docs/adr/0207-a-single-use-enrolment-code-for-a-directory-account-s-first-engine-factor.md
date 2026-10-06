@@ -1,8 +1,9 @@
 # 0207 -- A single-use enrolment code for a directory account's first engine factor
 
 - **Status:** Proposed (2026-10-05). Drafted on the owner's direction of 2026-10-05, given in
-  session to the batch 194 Manager: design this ceremony as an ADR in status Proposed, for the owner
-  to approve at merge. No code may follow until it is Accepted.
+  session to the batch 194 Manager: design this ceremony as an ADR in status Proposed. Merging this
+  record files it as Proposed and accepts nothing. The Lander merges; only the owner can move it to
+  Accepted. No code may follow until it is Accepted.
 - **Date:** 2026-10-05
 - **Related:** vault BACKLOG #2609 (its closing item 2; item 1 shipped as engine PR 1918) · vault
   BACKLOG #2711 (no host recovery when every Administrator needs an outside service) · vault BACKLOG
@@ -29,8 +30,9 @@ live exposure: each case is what a deploying site would meet.
 
 ## Context
 
-Every fact below was read at engine `origin/main` `923277d3e9` on 2026-10-05. Find each one by the
-symbol named. Line numbers are left out on purpose.
+Every fact below was read at engine `origin/main` `923277d3e9` on 2026-10-05. Items 3, 6 and 7 of
+the list below were re-read at `11495e53fa` the same day, after the Lander's review of this record.
+Find each one by the symbol named. Line numbers are left out on purpose.
 
 ### How a directory account gets a session today
 
@@ -57,7 +59,9 @@ federated sign-in on a site that turned the claim gate off.
    with none passes. That carve-out is deliberate: without it, an account with no factor could
    never enrol. The step-up gates of the TOTP begin and confirm routes and of the passkey begin
    route ask it. The web console's passkey finish route, `/ui/account/webauthn/verify`, uses the
-   action-less `require_ui_reauth_only`, which does not.
+   action-less `require_ui_reauth_only`, which does not, and `finish_webauthn_registration` does not
+   re-check either. That gap reaches a directory account under the shipped posture, because item 5
+   lets a passkey be its first factor. A local account meets it only outside that posture.
 4. `begin_mfa_enrollment` accepts a directory account on purpose (BACKLOG #1144).
    `confirm_mfa_enrollment` then stamps the session MFA-verified and rotates it.
    `finish_webauthn_registration` writes the passkey, then does the same.
@@ -66,6 +70,22 @@ federated sign-in on a site that turned the claim gate off.
    `_covered_by_requirement` holds, and that reads local accounts only. So the TOTP-first rule of
    ADR 0197 Amendment A does not reach a directory account, and the passkey path is as open as the
    TOTP path.
+6. **A TOTP begin is not inert, and the enable does not bind what the confirm verified.**
+   `begin_mfa_enrollment` refuses only an account whose TOTP is already on. Otherwise it writes a
+   fresh secret over whatever is staged, and `set_totp_secret` does that unconditionally on all three
+   store backends. `confirm_mfa_enrollment` reads the staged secret once and verifies the code
+   against it. Then it stamps and rotates the session, and only then calls `enable_totp`, which turns
+   TOTP on keyed by the account id alone. Nothing ties the secret that is enabled to the secret that
+   was verified. So a begin from another session on the same account, landing between the read and
+   the enable, decides which authenticator the account ends up holding. The session that proved the
+   first code is stamped all the same. This gap is in the shared step, so it reaches every account
+   type. The Lander's review of this record says it goes to the maintainer ledger as its own row.
+7. **The passkey finish route has no attempt budget.** The engine API's `POST /me/mfa/confirm` and
+   the web console's TOTP confirm route (`ui_mfa_verify`) both draw the per-actor budget
+   (`allow_reauth_attempt`) before the service runs. The passkey finish route (`ui_webauthn_verify`)
+   draws none, and its gate is the action-less `require_ui_reauth_only`, so no single-use step-up
+   grant bounds its attempts either. Today each attempt costs a ceremony, because
+   `finish_webauthn_registration` pops the staged challenge before it verifies the response.
 
 That is the chain BACKLOG #2609 ran end to end. Someone who holds only a directory password signs
 in by Windows SSO, re-proves the same password, and enrols an authenticator they control. They then
@@ -139,8 +159,12 @@ ways, and the service checks it on every one:
 - the JSON body the web console's passkey page script sends to `/ui/account/webauthn/verify`.
 
 The begin steps, `begin_mfa_enrollment` and `begin_webauthn_registration`, do not take or consume
-the code. A begin binds nothing. They may say early that a code will be needed, as a courtesy, the
-way `must_enrol_before_rotating` does for a password change.
+the code. A begin proves nothing, but it is not inert: a TOTP begin replaces the account's staged
+secret (Context item 6). So a code checked at the begin would not tie the factor that is later
+enabled to the person who showed the code. The check belongs at the step that writes the factor,
+and that step must also enable only the secret it verified (section 3). The begins may say early
+that a code will be needed, as a courtesy, the way `must_enrol_before_rotating` does for a password
+change.
 
 ### 3. The code
 
@@ -160,14 +184,36 @@ way `must_enrol_before_rotating` does for a password change.
   matching the account's digest and expiry. A missing or wrong code is refused here, before the TOTP
   step is consumed, so the holder does not lose that step. Then verify and consume the TOTP step.
   Then spend the code. Then stamp and rotate the session, then enable TOTP.
+- **The enable turns on only the secret that was verified.** Today it turns on whatever the column
+  holds at that later moment (Context item 6). The build binds the two: the enable writes the secret
+  this call verified, in the same statement that turns TOTP on, and only where TOTP is still off.
+  A compare-and-set is an acceptable equal: enable only where the staged secret still matches the
+  one this call read, and otherwise fail closed with TOTP off. Either way a begin that lands
+  mid-ceremony can make a pending confirm fail, but it can no longer change which authenticator is
+  enabled. This rule binds the shared step, so it holds for local accounts too, code or no code.
 - **The order in `finish_webauthn_registration`.** This method writes the credential
   (`add_webauthn_credential`) before it stamps. So the code is spent before that write, not merely
   before the stamp. A check placed only before the stamp would leave the attacker's passkey bound.
   The label and duplicate checks run before the spend, so a refusal they cause does not cost the
   code.
-- **A failure after the spend costs the code.** A session revoked mid-ceremony (BACKLOG #1902), or
-  an `enable_totp` that fails after a good rotation, leaves TOTP off and the code spent. Today a
-  plain retry recovers from that; with this ADR the holder needs a new code. On the passkey path the
+- **Where the code check sits against the challenge pop.** The factor check of section 1 and the
+  code read (present, well formed, matching, not expired) run before the method pops the staged
+  challenge. So a refused code costs neither the code nor the ceremony, as on the TOTP path. The
+  spend runs after the response verifies and after the duplicate check, and before the credential
+  is written. Because a refused code leaves the challenge staged, the route's attempt budget
+  (section 7) is what bounds repeated tries against one ceremony.
+- **One reply for every refused code.** A missing, never-issued, wrong, expired or spent code gets
+  the same client-facing reply: one status and one message. Only the audit row's `reason`
+  (section 7) tells the cases apart, so a caller learns nothing from the reply about whether a code
+  is outstanding. A `factor_present` refusal may say "prove your factor first", since the account's
+  MFA status already tells the session that.
+- **Disabling the account clears an outstanding code.** `set_user_disabled` clears the digest and
+  the expiry in the same statement that disables, so every caller clears it. Re-enabling the account
+  inside 24 hours therefore revives nothing. The spend also refuses a disabled account on its own.
+- **A failure after the spend costs the code.** A session revoked mid-ceremony (BACKLOG #1902), an
+  `enable_totp` that fails after a good rotation, or a compare-and-set enable that finds the staged
+  secret changed, leaves TOTP off and the code spent. Today a plain retry recovers from the first
+  two; with this ADR the holder needs a new code. On the passkey path the
   credential is already written, so the factor is enrolled and the holder proves it at the next
   sign-in. Both fail closed, and both are stated so nobody mistakes them for defects.
 - **Never in plaintext at rest, never in a log, never in a URL.** Each reply that carries it sends
@@ -254,10 +300,14 @@ problems. This command is not #2711's answer.
 | `auth.enrolment_code_used` | a ceremony spent one | `ceremony`: `totp` or `webauthn` |
 | `auth.enrolment_code_refused` | a binding step refused | `reason`: `not_presented`, `none_outstanding` (no code on the account, which is also how a spent code reads), `wrong`, `expired`, or `factor_present` (the account gained a factor; prove it first) |
 
-The engine API's confirm route already draws its per-actor budget (`allow_reauth_attempt`) on every
-attempt, before the service runs. The passkey finish route draws the same budget. The service adds
-no counter of its own, because a code nobody can guess needs none. The existing `MFA_ENABLED` notice
-still fires on success.
+The engine API's confirm route and the web console's TOTP confirm route already draw the per-actor
+budget (`allow_reauth_attempt`) on every attempt, before the service runs. The passkey finish route
+does not (Context item 7). **The build adds the same per-actor draw to `ui_webauthn_verify`, before
+the service runs**, refusing over budget as `ui_mfa_verify` does. A code nobody can guess needs no
+guess limit, so the budget is not there for the code's sake. It is there because a refused code now
+leaves the challenge staged (section 3), so without it one ceremony would take unbounded attempts,
+each writing an `auth.enrolment_code_refused` row. The service adds no counter of its own. The
+existing `MFA_ENABLED` notice still fires on success.
 
 ### 8. The lockout this makes deliberate
 
@@ -288,7 +338,8 @@ The tests named below are written with the build; none exists yet.
   enable TOTP, stamp the session, spend the code, and write `auth.enrolment_code_used`.
   → `tests/test_directory_enrolment_code.py`
 - **AC-3** -- IF the code is not presented, wrong, expired, already spent, or issued for another
-  account, THEN THE SYSTEM SHALL refuse the binding step before consuming the TOTP step, and write
+  account, THEN THE SYSTEM SHALL refuse the binding step before consuming the TOTP step or popping
+  the passkey challenge, answer with one client-facing reply whatever the reason, and write
   `auth.enrolment_code_refused` with the reason section 7 names for that case.
   → `tests/test_directory_enrolment_code.py`
 - **AC-4** -- THE SYSTEM SHALL apply AC-1 to AC-3 to a passkey: `finish_webauthn_registration`
@@ -325,6 +376,19 @@ The tests named below are written with the build; none exists yet.
 - **AC-12** -- WHEN an Administrator resets an enabled directory account's MFA, THE SYSTEM SHALL
   issue a code and return it once in the reset reply; for a disabled account it SHALL issue none.
   → `tests/test_directory_enrolment_code.py`
+- **AC-13** -- IF a TOTP begin from another session replaces the staged secret after
+  `confirm_mfa_enrollment` read the secret and verified a code against it, THEN THE SYSTEM SHALL
+  NOT enable the replacing secret. It SHALL enable the verified secret, or leave TOTP off. This
+  holds for a local account and a directory account alike, and the test must fail on the code
+  before this build.
+  → `tests/test_directory_enrolment_code.py`
+- **AC-14** -- WHEN the web console's passkey finish route is called past the per-actor budget,
+  THE SYSTEM SHALL refuse the attempt before the service runs, as the TOTP confirm route does.
+  → a web console test under `packaging/messagefoundry-webconsole/tests/`
+- **AC-15** -- WHEN an account holding an outstanding code is disabled, THE SYSTEM SHALL clear the
+  code. IF the account is re-enabled before that code would have expired, THEN THE SYSTEM SHALL
+  refuse the old code.
+  → `tests/test_directory_enrolment_code.py`
 
 ## Alternatives considered
 
@@ -350,9 +414,10 @@ The tests named below are written with the build; none exists yet.
 6. **A short code, hashed with Argon2.** Easier to read aloud. Rejected: a guessable code needs a
    guess limit, and ADR 0197 shows a guess limit others can trip is a lockout anyone can cause. A
    code nobody can guess needs no limit.
-7. **Take the code at the begin step, or in a route gate.** Rejected as the control. A begin binds
-   nothing, and no single route reaches both binding steps (section 2). The begin step may still
-   warn early.
+7. **Take the code at the begin step, or in a route gate.** Rejected as the control. A begin proves
+   nothing, and a later begin replaces the staged TOTP secret (Context item 6), so a code shown at
+   the begin would not tie the enabled factor to its bearer. No single route reaches both binding
+   steps either (section 2). The begin step may still warn early.
 8. **The Administrator enrols the factor for the holder.** Rejected: the Administrator would then
    see the holder's TOTP secret, so two people would hold one person's factor.
 9. **Let an Administrator issue a code for its own account.** Rejected: an Administrator with no
@@ -385,13 +450,15 @@ ADR 0197 Amendment A's wave 1. It changes a security control, so it gets its own
 - **the store:** two nullable `users` columns, and issue, spend and clear methods, on all three
   backends (`store/store.py`, `store/sqlserver.py`, `store/postgres.py`) and the `Store` protocol,
   with their migrations, which `messagefoundry store provision-schema` applies on a server store
-  (ADR 0192);
+  (ADR 0192); an `enable_totp` that binds the verified secret, and a `set_user_disabled` that clears
+  an outstanding code, on all three;
 - **the auth service:** issue, revoke and spend; both checks in both binding steps; the MFA reset;
   two new step-up actions; four audit actions; one notice kind;
 - **the engine API:** the issue and revoke routes, a code field on `POST /me/mfa/confirm`, the reset
   reply, and the MFA status reply saying a code is needed;
 - **the web console:** the issue button and one-time page, a code field on the TOTP confirm form and
-  in the passkey page script's body, and the pending-MFA notice;
+  in the passkey page script's body, the attempt budget on the passkey finish route, and the
+  pending-MFA notice;
 - **the CLI:** `issue-enrolment-code`, and its row in the CLI tier list;
 - **documents:** the Kerberos row of the pathway table, the "Limit: an account with no binding is
   unchanged" bullet, and the handover duty, all in `docs/SECURITY.md`, whose pathway rows
@@ -408,11 +475,12 @@ ADR 0197 Amendment A's wave 1. It changes a security control, so it gets its own
   directory accounts get a code in a posture where local accounts get none. Extending the code to
   them is a separate decision.
 - The passkey finish route's gate not asking `_factor_binding_is_blocked`, for local accounts.
-  Section 1 closes it for directory accounts by the step's own check. A local account outside the
-  shipped posture has the same race, and that is not decided here.
-- Vault BACKLOG #2738 item 7: a factor enrolled first-come before a bind survives a later unbind. It
-  has the same root, but closing it is a separate decision. With zero deployments, no such factor
-  exists today.
+  That gap reaches a directory account under the shipped posture (Context item 3), and section 1
+  closes it there by the step's own check. A local account meets it only outside the shipped
+  posture, and that case is not decided here.
+- Vault BACKLOG #2738 item 7: a bind clears no factor, so a factor enrolled first-come on Kerberos
+  proof before or during a bind survives the bind. It has the same root, but closing it is a
+  separate decision. With zero deployments, no such factor exists today.
 - BACKLOG #2711's step 1, the recovery shape during an outage.
 - Whether a Windows acceptor's `DOMAIN\user` name form stops Kerberos sign-in on a Windows host. A
   run against a real domain decides that, as #2609 records.
