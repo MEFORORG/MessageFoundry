@@ -4296,7 +4296,7 @@ onto keyless rows fails the verify, and is also reported as
 
 | Exit | Meaning |
 |---|---|
-| `0` | A clean walk over at least one row, either with the key or, in a shell that holds no key, under settings that allow the store to run keyless. |
+| `0` | A clean walk, either with the key or, in a shell that holds no key, under settings that allow the store to run keyless. It covers at least one row, unless `--allow-empty` or an expected anchor of `0:` accepted an empty log (see exit `3`). |
 | `1` | The chain did not verify. It covers at least a broken chain, a mismatch with `--expected-anchor`, a chain checked with a key that is not the chain's, and a chain that names a key in a shell that holds no key and whose settings allow the store to run keyless. Those print a `FAIL` line that says which. An error the command does not classify, such as a malformed key or a Transit outage part way through the walk, also exits 1 and prints no `FAIL` line, so by the code alone a job cannot tell it from a broken chain. |
 | `2` | The command could not start. It covers at least an absent path, a zero-byte file, a file carrying no `audit_log` table, a path that is not a SQLite database at all, settings that cannot be read or fail validation (a `--service-config` path that is a directory or unreadable included, which exited 1 before vault BACKLOG #2725), a store key the settings name that cannot be resolved, and an empty log in a shell that holds no key and whose settings require one. |
 | `3` | A clean walk over an **empty** log. |
@@ -4335,9 +4335,9 @@ with: a keyless store then passes with exit 0 and no warning, and a keyed chain 
 keyless fails with exit 1. Do not clear the 4 by giving the job the keyless opt-out unless the
 engine runs under it too. A job that moves from 0 to 4 has at least one of these causes: it lost
 the key it ran with, it lost the opt-out, or it moved from a build before #3054. Nothing in the
-database alone causes that move, so find out what changed the job. An empty log in this setup is
-refused while the store opens, with exit 2, because no row says whether its chain would be keyed.
-Exit 3
+database alone causes that move, so find out what changed the job. An empty log in this setup
+exits 2. The store open refuses it for every command, the read-only verify included, because the
+handle's next append would start a keyless chain (BACKLOG #1916). Exit 3
 exists because "there was nothing to verify" is not a
 pass; pass `--allow-empty` to accept it as one on an instance that has not logged anything yet, or
 pass an expected anchor of `0:`, which asserts the same thing and is checked. `audit-anchor` keeps

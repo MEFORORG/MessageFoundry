@@ -913,7 +913,7 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "an empty log is a distinct exit code, so a scheduled job cannot read 'there was nothing "
         "to verify' as a pass (exit 1 stays a BROKEN CHAIN, exit 2 'could not open the store', "
         "exit 4 'this shell holds no store key while its settings require one, so the chain was not "
-        "checked against a key')",
+        "checked against a key'). It does not apply in that setup: an empty log there exits 2 or 4",
     )
     # ONE mutually-exclusive group: the two flags carry the same value in two transports, and argparse
     # refusing both is better than silently letting one win.
@@ -1669,14 +1669,14 @@ def _load_service_settings(
 ) -> tuple[ServiceSettings | None, str | None]:
     """Load the service settings for a BOOT-PATH command, returning ``(settings, detail)``.
 
-    ``audit-anchor`` and ``audit-verify`` load through it too (BACKLOG #2094, vault BACKLOG #3054):
-    their output is meant to be safe to keep in a ticket, which is the same reason it renders.
+    It has more callers than the boot path now, at least ``audit-anchor`` and ``audit-verify``
+    (BACKLOG #2094, vault BACKLOG #3054), whose output is meant to be safe to keep in a ticket. The
+    section below on why it exists still describes the two boot-path commands it was written for.
 
     Exactly one side is non-``None``. The PAIR rather than a printed line, because that is the
     shape :func:`messagefoundry.verify.runner._load_settings` already has for the same load, and
-    its caller needs the string for a report row rather than for a stream. Both callers here
-    happen to render it identically today; what is shared is the catch and the rendering, not the
-    emitting.
+    its caller needs the string for a report row rather than for a stream. What is shared is the
+    catch and the rendering, not the emitting.
 
     THE FAILURE IS RENDERED, NEVER STRINGIFIED, for the reason
     :func:`~messagefoundry.config.settings.settings_error_detail` states in full: ``str(exc)`` on a
@@ -7237,27 +7237,21 @@ def _audit_verify(args: argparse.Namespace) -> int:
         # anyone who can write the log can recompute, so it was not checked to their standard. A job
         # reading only the code never sees the WARNING, and 0 would let a site sit in the one setup
         # where a rewritten first row turns later tampering from 1 into 4 (#2725). Here 4 is the
-        # steady state. The decision reads only the flag: the row count is a second query, which a
-        # writer can change after the walk. Content-free: neither line quotes a row.
+        # steady state. Neither the exit nor the text reads the row count: it is a second query, which
+        # a writer can change after the walk. Content-free: neither line quotes a row.
         print(
             f"NOT CHECKED: this shell holds no store key and its settings require one, so the audit "
             f"chain was not checked against a key ({message}, as plain SHA-256)"
         )
-        # The count picks the WARNING's wording only. An empty log has no first row to name a key or
-        # not (#3054); the open refuses one first (#1916, exit 2), so only a log emptied after the
-        # open gets the second wording.
+        # "No first row naming a key" rather than "its first row names no key": the open refuses an
+        # empty log here (#1916, exit 2), but one emptied after the open has no first row (#3054).
         print(
-            (
-                "WARNING: the audit chain is keyless (its first row names no key, and it was "
-                "checked as plain SHA-256), but this shell's settings require a store key. Causes "
-                "include at least: the store runs keyless under other settings, the key is missing "
-                "here, or the chain was rewritten as keyless, which a keyless check cannot see."
-                if count
-                else "WARNING: the audit log is empty, so no row shows whether its chain is keyed, "
-                "and this shell's settings require a store key."
-            )
-            + " Run this check with the settings and key the engine runs with; if the engine holds "
-            "a key, that run decides it.",
+            "WARNING: the audit chain is keyless (it has no first row naming a key, and it was "
+            "checked as plain SHA-256), but this shell's settings require a store key. Causes "
+            "include at least: the store runs keyless under other settings, the key is missing "
+            "here, or the chain was rewritten as keyless, which a keyless check cannot see. Run "
+            "this check with the settings and key the engine runs with; if the engine holds a "
+            "key, that run decides it.",
             file=sys.stderr,
         )
         return 4

@@ -7927,9 +7927,9 @@ def settings_error_detail(exc: Exception) -> str:
     (``_InputHidingModel``), so ``str(exc)``, ``exc.errors()`` and ``exc.json()`` carry the
     placeholder, never the refused mapping. That covers
     the ``__main__.py`` arms that still print ``str(exc)`` (at least ``rotate-key`` and the store
-    commands behind ``_host_gated_store_settings``). ``serve``, ``supervise``, ``audit-anchor`` and,
-    since vault BACKLOG #3054, ``audit-verify`` render through this function, by way of
-    ``_load_service_settings``.
+    commands behind ``_host_gated_store_settings``). At least ``serve``, ``supervise``,
+    ``audit-anchor`` and, since vault BACKLOG #3054, ``audit-verify`` render through this function,
+    by way of ``_load_service_settings``.
 
     THE MESSAGE IS NOT HIDDEN, AND THIS FUNCTION PRINTS IT. A validator that quotes the value it
     refused still shows it, here and in ``str(exc)``: at least the ``[backup]`` and ``[dr]``

@@ -511,7 +511,7 @@ def test_a_cli_command_that_prints_str_exc_echoes_no_secret(
 ) -> None:
     """``rotate-key`` prints ``str(exc)`` for a settings failure, not ``settings_error_detail``.
 
-    ``serve``, ``supervise``, ``audit-anchor`` and ``audit-verify`` render through
+    At least ``serve``, ``supervise``, ``audit-anchor`` and ``audit-verify`` render through
     ``settings_error_detail``; commands like this one are the remaining exposure, and the
     model-level wrap is what covers them. This test used ``audit-verify`` until vault BACKLOG #3054
     moved it onto the renderer, which would have left it with no ``str(exc)`` path to test.

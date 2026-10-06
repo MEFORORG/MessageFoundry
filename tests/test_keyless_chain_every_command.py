@@ -573,6 +573,13 @@ def test_a_keyless_chain_passing_where_the_settings_require_a_key_exits_4(
     assert "require a store key" in captured.err, captured.err
     assert "row-content-marker" not in captured.out + captured.err
 
+    # A matching anchor does not change it: the walk was still not keyed, which is what the settings
+    # require. Pinned, so a change that lets an anchor turn this into a pass is a decision, not drift.
+    assert main(["audit-anchor", "--db", str(db)]) == 0
+    anchor = capsys.readouterr().out.strip()
+    assert main(["audit-verify", "--db", str(db), "--expected-anchor", anchor]) == 4
+    assert capsys.readouterr().out.startswith("NOT CHECKED: ")
+
 
 @pytest.mark.parametrize("allow_empty", [False, True])
 def test_an_empty_log_where_the_settings_require_a_key_names_no_first_row(
@@ -582,8 +589,8 @@ def test_an_empty_log_where_the_settings_require_a_key_names_no_first_row(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Vault BACKLOG #3054, item 3. An EMPTY log has no first row, so the WARNING must not say its
-    first row names no key; it says the log is empty. The exit is still 4, --allow-empty or not:
-    this setup never reports a pass.
+    first row names no key; it says there is no first row naming one. The exit is still 4,
+    --allow-empty or not: this setup never reports a pass.
 
     The open refuses this state first, exit 2 (#1916): an empty log with no key and no opt-out is a
     keyless chain about to start. So the verify sees it only for a log emptied between the open and
@@ -605,8 +612,8 @@ def test_an_empty_log_where_the_settings_require_a_key_names_no_first_row(
     captured = capsys.readouterr()
     assert rc == 4, (captured.out, captured.err)
     assert captured.out.startswith("NOT CHECKED: "), captured.out
-    assert "first row" not in captured.out + captured.err, captured.err
-    assert "WARNING: the audit log is empty, so no row shows" in captured.err, captured.err
+    assert "first row names" not in captured.out + captured.err, captured.err
+    assert "it has no first row naming a key" in captured.err, captured.err
 
 
 def test_a_keyless_chain_under_the_opt_out_does_not_warn(
