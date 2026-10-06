@@ -139,10 +139,13 @@ async def test_the_targets_honour_the_channel_scope(store: Any) -> None:
     assert await store.list_replay_targets(allowed_channels=[]) == []
     # A filter outside the scope cannot widen it.
     assert await store.list_replay_targets(channel_id="IB_NEW", allowed_channels=["IB_OLD"]) == []
-    # None is the whole estate, and must equal the unscoped read.
-    assert await store.list_replay_targets(allowed_channels=None) == (
-        await store.list_replay_targets(allowed_channels=None)
-    )
+    # None is the whole estate: every dead pair, named, so a backend reading None as "no
+    # channels" cannot pass by comparing one read with itself (BACKLOG #2627).
+    assert await store.list_replay_targets(allowed_channels=None) == [
+        ("IB_NEW", "OB_A"),
+        ("IB_NEW", "OB_B"),
+        ("IB_OLD", "OB_OLD"),
+    ]
 
 
 async def test_with_bodies_intact_the_targets_match_the_listed_rows(store: Any) -> None:

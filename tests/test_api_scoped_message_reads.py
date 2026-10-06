@@ -11,6 +11,13 @@ The walk flags every ``.get_message(`` attribute call, whatever the receiver is 
 match on a ``store`` receiver would miss ``s = engine.store; s.get_message(...)``, which is the
 same read.
 
+The guard covers ``get_message`` only. The other by-id reads (``outbox_for``, ``events_for``,
+``attachments_for``, ``correlate_response`` and the rest) are reached today only after the scoped
+fetch, and nothing here enforces that order.
+
+A second guard refuses a literal ``allowed_channels=None`` under ``messagefoundry/api/``: the store
+keyword is required, and a route that writes None reads every channel on purpose-looking terms.
+
 A call site that cannot use the helper without changing behaviour goes in :data:`_ALLOWED` with a
 one-line reason. It is empty: all nine call sites moved.
 """
@@ -30,7 +37,10 @@ _ALLOWED: dict[tuple[str, str], str] = {}
 
 
 def _get_message_calls(tree: ast.AST) -> list[tuple[str, int]]:
-    """``(innermost enclosing function, line)`` for each ``<anything>.get_message(`` call."""
+    """``(innermost enclosing function, line)`` for each read of a ``.get_message`` attribute.
+
+    Any attribute load counts, not only a call, so ``fetch = engine.store.get_message`` is caught
+    as well as the call; so is ``getattr(x, "get_message")``."""
     found: list[tuple[str, int]] = []
 
     def visit(node: ast.AST, func: str) -> None:
@@ -39,9 +49,16 @@ def _get_message_calls(tree: ast.AST) -> list[tuple[str, int]]:
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 inner = child.name
             if (
+                isinstance(child, ast.Attribute)
+                and child.attr == "get_message"
+                and isinstance(child.ctx, ast.Load)
+            ) or (
                 isinstance(child, ast.Call)
-                and isinstance(child.func, ast.Attribute)
-                and child.func.attr == "get_message"
+                and isinstance(child.func, ast.Name)
+                and child.func.id == "getattr"
+                and any(
+                    isinstance(a, ast.Constant) and a.value == "get_message" for a in child.args
+                )
             ):
                 found.append((func, child.lineno))
             visit(child, inner)
@@ -98,6 +115,74 @@ async def route(engine, other):
     # engine.store.get_message(message_id)
     row = await engine.store.get_message("m")
     s = other
-    return await s.get_message("n")
+    fetch = s.get_message
+    return await getattr(s, "get_message")("n")
 '''
-    assert _get_message_calls(ast.parse(planted)) == [("route", 5), ("route", 7)]
+    assert _get_message_calls(ast.parse(planted)) == [("route", 5), ("route", 7), ("route", 8)]
+
+
+#: The store reads whose ``allowed_channels`` is required (store/base.py). ``Identity.build`` also
+#: takes an ``allowed_channels``, and the system identity passes None to it on purpose, so the guard
+#: looks only at these calls.
+_SCOPED_STORE_READS = frozenset(
+    {
+        "list_messages",
+        "count_messages",
+        "search_messages",
+        "list_dead",
+        "count_dead",
+        "list_replay_targets",
+        "list_connection_events",
+        "list_active_alert_instances",
+        "summarize_active_alert_instances",
+        "get_alert_instance",
+    }
+)
+
+
+def _literal_none_scopes(tree: ast.AST) -> list[int]:
+    """Lines where a scoped store read is passed ``allowed_channels=None`` as a literal."""
+    return [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in _SCOPED_STORE_READS
+        for kw in node.keywords
+        if kw.arg == "allowed_channels"
+        and isinstance(kw.value, ast.Constant)
+        and kw.value.value is None
+    ]
+
+
+def test_no_api_module_passes_a_literal_every_channel_scope() -> None:
+    """The store keyword is required so a route cannot read every channel by leaving it out. A
+    route that writes ``allowed_channels=None`` gets the same estate-wide read and still
+    type-checks. Engine-internal callers do write it; an API route takes the caller's scope
+    instead, from ``_scope(identity)`` or the identity itself."""
+    offenders = [
+        f"{path.relative_to(_API).as_posix()}:{line}"
+        for path in sorted(_API.rglob("*.py"))
+        for line in _literal_none_scopes(ast.parse(path.read_text(encoding="utf-8")))
+    ]
+    assert not offenders, f"pass the caller's channel scope, not None: {offenders}"
+
+
+def test_the_scoped_read_list_matches_the_store_protocol() -> None:
+    """The list above is the protocol's own set: every store method whose ``allowed_channels`` is a
+    required keyword, read from store/base.py, so a new scoped read joins the guard or reds here."""
+    base = _API.parent / "store" / "base.py"
+    required = {
+        fn.name
+        for fn in ast.walk(ast.parse(base.read_text(encoding="utf-8")))
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+        for arg, default in zip(fn.args.kwonlyargs, fn.args.kw_defaults, strict=True)
+        if arg.arg == "allowed_channels" and default is None
+    }
+    assert required == _SCOPED_STORE_READS
+
+
+def test_the_none_scope_walk_finds_a_planted_literal() -> None:
+    planted = "async def r(store, scope):\n    await store.list_messages(allowed_channels=None)\n"
+    assert _literal_none_scopes(ast.parse(planted)) == [2]
+    assert _literal_none_scopes(ast.parse(planted.replace("None", "scope"))) == []

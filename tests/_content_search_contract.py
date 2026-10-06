@@ -66,7 +66,7 @@ async def assert_search_select_is_capped(store: Any, monkeypatch: pytest.MonkeyP
         for kwargs, candidates in reads:
             fetched.clear()
             res = await store.search_messages(spec, **kwargs)
-            case = f"{len(candidates)} candidates, {kwargs or 'unfiltered'}"
+            case = f"{len(candidates)} candidates, {kwargs}"
             newest = candidates[::-1][: _SCAN_LIMIT + 1]
             assert fetched == [newest], case
             assert res.scanned == _SCAN_LIMIT and res.matched == 0, case

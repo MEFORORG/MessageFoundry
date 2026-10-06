@@ -37,7 +37,7 @@ The ``/ui`` routes are clients of these handlers through the console seam and ar
 
 from __future__ import annotations
 
-import re
+import functools
 import time
 
 import httpx
@@ -51,6 +51,7 @@ from messagefoundry.auth.permissions import (
     Permission,
 )
 from messagefoundry.auth.service import AuthService
+from messagefoundry.config.models import RetryPolicy
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 from scripts.security.route_gates import route_rows
@@ -225,6 +226,7 @@ ROUTES: dict[str, tuple[str, str]] = {
 }
 
 
+@functools.cache
 def _routes_of_the_app() -> dict[str, tuple[str, ...]]:
     """``"METHOD /path"`` to the permissions it requires, for every route of a default app."""
     rows: dict[str, tuple[str, ...]] = {}
@@ -302,9 +304,15 @@ _QUERY: dict[str, tuple[tuple[str, str], ...]] = {
 #: Scoped GETs on which this fixture gives the all-channels caller nothing to see, so the scoped
 #: side's silence there proves nothing. Named so the gap is visible; the test checks the set exactly.
 _QUIET_HERE = {
-    "/dead-letters": "the fixture dead-letters nothing",
     "/status": "no inbound failed to start, so there is no failed-inbound name to narrow",
 }
+
+#: What the scoped caller may legitimately see, and what it must never see. ``OB_X`` is the shared
+#: outbound both inbounds deliver to: docs/SECURITY.md says a scoped caller sees no shared outbound
+#: at all, so its name is a leak on these reads even though IB_A's own message goes there.
+#: ``OB_DEAD`` takes only IB_B's dead-lettered delivery. IB_B's message id is added at run time.
+_IN_SCOPE_TOKENS = ("IB_A", "CTRLAAA")
+_OUT_OF_SCOPE_TOKENS = ("IB_B", "OB_X", "OB_DEAD", "CTRLBBB")
 
 
 async def _probe_user(service: AuthService, username: str, scope: list[str]) -> None:
@@ -358,7 +366,18 @@ async def test_scoped_routes_are_measured_against_a_live_app(engine: Engine) -> 
         )
         for channel, ctrl in (("IB_A", "CTRLAAA"), ("IB_B", "CTRLBBB"))
     }
-    out_of_scope = ("IB_B", "OB_X", ids["IB_B"], "CTRLBBB")
+    out_of_scope = (*_OUT_OF_SCOPE_TOKENS, ids["IB_B"])
+    # One dead letter on IB_B, through a destination nothing else uses, so /dead-letters has a row
+    # the all-channels caller sees and the scoped caller must not.
+    await engine.store.enqueue_message(
+        channel_id="IB_B",
+        raw=_ADT.format(ctrl="CTRLBBB"),
+        deliveries=[("OB_DEAD", _ADT.format(ctrl="CTRLBBB"))],
+        control_id="CTRLBBB",
+        now=time.time(),
+    )
+    (dead,) = await engine.store.claim_ready(now=time.time(), destination_name="OB_DEAD")
+    await engine.store.mark_failed(dead.id, "probe", RetryPolicy(max_attempts=1), now=time.time())
     # The pacing floor is a separate control with its own tests; off here so a probe that sends
     # several writes in a row measures scope, not the throttle.
     service = AuthService(
@@ -418,23 +437,27 @@ async def test_scoped_routes_are_measured_against_a_live_app(engine: Engine) -> 
                 "{attachment_id}", "0" * 64
             )
             body = bodies.get(path.rsplit("/", 1)[-1])
+            before = await _denials_on_ib_b(engine)
             rs = await c.request(method, path, headers=s, json=body)
             assert rs.status_code == 404, (key, rs.status_code, rs.text[:300])
             assert rs.json() == {"detail": f"no such message: {ids['IB_B']}"}, key
+            # The refusal is on the record, not only answered: exactly one row for this request.
+            assert await _denials_on_ib_b(engine) == before + 1, key
             # The control: the same request from the all-channels caller is not the scope's 404. It
             # may still be refused for its own reason (no attachment, nothing to replay), never as
             # "no such message".
             rw = await c.request(method, path, headers=w, json=body)
             assert f"no such message: {ids['IB_B']}" not in rw.text, (key, rw.status_code)
 
-    # Each refusal is on the record, not only answered: one denial row per by-id route at least.
-    denials = await engine.store.list_audit(
-        limit=1000, actor="scoped", action="auth.channel_denied"
-    )
-    assert len([d for d in denials if d["channel_id"] == "IB_B"]) >= len(_by_id_message_routes())
+
+async def _denials_on_ib_b(engine: Engine) -> int:  # noqa: F811
+    rows = await engine.store.list_audit(limit=1000, actor="scoped", action="auth.channel_denied")
+    return sum(1 for r in rows if r["channel_id"] == "IB_B")
 
 
-def test_the_probe_marker_pattern_cannot_match_the_in_scope_channel() -> None:
-    """``IB_B`` is not a substring of ``IB_A``, and neither control id contains the other, so a
-    marker hit can only be the out-of-scope channel."""
-    assert not re.search("IB_B|CTRLBBB", "IB_A CTRLAAA")
+def test_the_probe_markers_cannot_match_an_in_scope_token() -> None:
+    """A marker hit must mean the out-of-scope estate. Checked on the tuples the probe uses, both
+    ways: no out-of-scope token is a substring of an in-scope one, or the reverse."""
+    for out in _OUT_OF_SCOPE_TOKENS:
+        for ok in _IN_SCOPE_TOKENS:
+            assert out not in ok and ok not in out, (out, ok)
