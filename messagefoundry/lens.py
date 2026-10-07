@@ -2672,14 +2672,18 @@ def _linear_items(func: ast.FunctionDef | ast.AsyncFunctionDef, ctx: _TypedCtx) 
     """Every statement of ``func`` in source order, as :class:`_Item` s."""
     items: list[_Item] = []
 
+    seen: Counter[str] = Counter()
+
     def visit(stmts: list[ast.stmt], path: tuple[str, ...]) -> None:
         for stmt in stmts:
             key = _stmt_key(stmt)
+            seen[key] += 1
+            nth = seen[key]  # which block with this header: a raise may not change guards
             at = len(items)
             terminal = isinstance(stmt, ast.Return | ast.Raise)
             items.append(_Item(stmt, key, path, not _is_typed_unit(stmt, ctx), at + 1, terminal))
             for label, suite, _ in _suites(stmt):
-                visit(suite, (*path, f"{key}|{label}"))
+                visit(suite, (*path, f"{key}#{nth}|{label}"))
             items[at] = items[at]._replace(end=len(items))
 
     visit(func.body, ())
@@ -2737,8 +2741,14 @@ def _refuse_shifted_code(
             raise refusal
 
 
-def _unbound_reads(func: ast.FunctionDef | ast.AsyncFunctionDef, local: set[str]) -> Counter[str]:
-    """How many reads of each handler local no earlier binding is sure to have run.
+def _unbound_reads(
+    func: ast.FunctionDef | ast.AsyncFunctionDef, local: set[str]
+) -> Counter[tuple[str, str, int]]:
+    """The read SITES of handler locals that no earlier binding is sure to have run, as a multiset.
+
+    Compared as sites rather than per-name counts (ADR 0076 G.6 rule 6): with counts, a read the base
+    already over-counts could hide a new real one. A site is :func:`_stmt_key` of the statement (or
+    the header expression) holding the read, the name, and which read of that name it is there.
 
     A binding counts for the statements after it in its own suite and inside them; one made inside a
     block does not count after the block, which over-counts and never under-counts. Compared before
@@ -2752,16 +2762,24 @@ def _unbound_reads(func: ast.FunctionDef | ast.AsyncFunctionDef, local: set[str]
         for arg in (*a.posonlyargs, *a.args, *a.kwonlyargs, a.vararg, a.kwarg)
         if arg is not None
     }
-    out: Counter[str] = Counter()
+    out: Counter[tuple[str, str, int]] = Counter()
 
     def count(node: ast.AST, defined: set[str]) -> None:
+        # A site is (the statement's key, the name, which read of it in that statement), so a moved
+        # statement keeps its sites and a read that newly loses its binding is a new site.
+        where = _stmt_key(node) if isinstance(node, ast.stmt) else ast.dump(node)
+        nth: Counter[str] = Counter()
         for n in ast.walk(node):
             if not (isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)):
                 continue
+            nth[n.id] += 1
             if n.id in local and n.id not in defined:
-                out[n.id] += 1
+                out[(where, n.id, nth[n.id])] += 1
 
-    def visit(stmts: list[ast.stmt], defined: set[str]) -> None:
+    def visit(stmts: list[ast.stmt], entry: set[str]) -> set[str]:
+        """Count the suite's reads; return the names surely bound once it falls through. A suite
+        that ends in ``return`` or ``raise`` never falls through, so it binds everything."""
+        defined = set(entry)
         for stmt in stmts:
             if not isinstance(stmt, _COMPOUND_STMT_TYPES):
                 count(stmt, defined)
@@ -2778,11 +2796,38 @@ def _unbound_reads(func: ast.FunctionDef | ast.AsyncFunctionDef, local: set[str]
                     if isinstance(node, ast.AST):
                         count(node, defined)
                         inner |= _own_scope_bindings(node)
-            for _, suite, entry in _suites(stmt):
-                visit(suite, inner | entry)
+            ends = {label: visit(suite, inner | names) for label, suite, names in _suites(stmt)}
+            defined |= _bound_after(stmt, inner, ends)
+        if stmts and isinstance(stmts[-1], ast.Return | ast.Raise):
+            return defined | local
+        return defined
 
     visit(func.body, params)
     return out
+
+
+def _bound_after(stmt: ast.stmt, header: set[str], ends: dict[str, set[str]]) -> set[str]:
+    """The names surely bound after compound ``stmt`` falls through (:func:`_unbound_reads`).
+
+    ``header`` is what is bound on entry plus the header's own bindings, and ``ends`` maps each
+    suite label (:func:`_suites`) to what is bound at its end. An ``if`` binds what every branch
+    binds, with a missing ``else`` binding nothing. A ``with`` binds what its body binds. A loop binds
+    nothing new, because its body may not run: so a For-Each index is unbound after its loop
+    (Manager decision 2026-10-07). A ``try`` binds what its body and every handler bind, plus what
+    its ``finally`` binds. A ``match``, a ``def`` and a ``class`` are judged conservatively."""
+    if isinstance(stmt, ast.If):
+        return ends.get("body", header) & ends.get("orelse", header)
+    if isinstance(stmt, ast.With | ast.AsyncWith):
+        return ends.get("body", header)
+    if isinstance(stmt, ast.Try | ast.TryStar):
+        caught = [v for k, v in ends.items() if k.startswith("handler")]
+        out = ends.get("body", header)
+        for names in caught:
+            out = out & names
+        return out | ends.get("finalbody", set())
+    if isinstance(stmt, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+        return {stmt.name}
+    return set()
 
 
 def _own_scope_bindings(node: ast.AST) -> set[str]:
@@ -2825,7 +2870,7 @@ def _refuse_new_unbound_reads(
         raise LensRewriteError(f"{what} is refused - internal: the handler was not found again")
     local = _handler_locals(before_func) | _handler_locals(after_func)
     before, after = _unbound_reads(before_func, local), _unbound_reads(after_func, local)
-    stranded = sorted(name for name in after if after[name] > before[name])
+    stranded = sorted(site[1] for site in after - before)
     if stranded:
         raise LensRewriteError(
             f"{what} is refused - it would leave a read of {stranded[0]!r} before anything binds "
@@ -3103,9 +3148,10 @@ def rewrite_source(
     # no-op returns ``src`` unchanged (already parsed above), so it skips the re-parse and stays identical.
     if result != src:
         _assert_reparses(result, module, before=src)
-        if op in ("insert_row", "insert_code_lookup"):
+        if op in ("insert_row", "insert_code_lookup", "move_row"):
             # An inserted value may name a local above its binding, or a loop index outside its
-            # loop (review of head 513797260a, finding 3). Every mode refuses.
+            # loop (review of head 513797260a, finding 3), and a move may carry an
+            # ``occurrence=i`` row out of its loop (Manager decision 2026-10-07). Every mode refuses.
             _refuse_new_unbound_reads(
                 tree, result, row, role, f"{op} at lines {line_start}-{line_end}"
             )
@@ -3184,12 +3230,13 @@ def _assert_reparses(result: str, module: str, *, before: str | None = None) -> 
             warnings.simplefilter("ignore", SyntaxWarning)
             compile(ast.parse(result), module, "exec", dont_inherit=True)
     except SyntaxError as exc:
-        if before is not None and _compile_error(before, module) is not None:
+        existing = None if before is None else _compile_error(before, module)
+        if existing is not None:
             # The module already fails to compile, so the edit is not the cause (review of head
             # 513797260a, finding 8).
             raise LensRewriteError(
-                f"{module}: the module does not compile as it stands ({exc.msg}) - fix it in the "
-                "text editor first; refused (no change made)"
+                f"{module}: the module does not compile as it stands ({existing.msg} at line "
+                f"{existing.lineno}) - fix it in the text editor first; refused (no change made)"
             ) from exc
         raise LensRewriteError(
             f"{module}: the rewrite would produce invalid Python ({exc.msg} at line {exc.lineno}) - "
@@ -3210,6 +3257,8 @@ def _compile_error(source: str, module: str) -> SyntaxError | None:
             compile(ast.parse(source), module, "exec", dont_inherit=True)
     except SyntaxError as exc:
         return exc
+    except _PARSER_REFUSALS:
+        return None  # the edit's own refusal is reported instead
     return None
 
 
@@ -3247,7 +3296,11 @@ def _apply_set_params(
                 "(list-of-sends / dynamic return editing is out of scope)"
             )
         return src
-    if row["kind"] in _MODED_KINDS and params and not _message_argument_is_msg(stmt):
+    if (
+        row["kind"] in _MODED_KINDS
+        and params
+        and not _message_argument_is_msg(stmt, _message_param(handler_node))
+    ):
         # ``set_field(other, "A", "B")`` projects exactly like ``set_field(msg, "A", "B")``, because the
         # projection drops the message argument, so an edit would keep writing to ``other`` while the
         # Steps view says ``msg`` (spike S-4's review of PR 2155). Every mode refuses.
@@ -3258,7 +3311,7 @@ def _apply_set_params(
     if row["kind"] == "send":
         for pname, node in slots.items():
             literal = isinstance(node, ast.Constant) or (
-                isinstance(node, ast.Name) and _is_free_name(node.id, scope)
+                isinstance(node, ast.Name) and node.id not in scope.locals
             )
             if pname in params and isinstance(params[pname], dict) and not literal:
                 # ``Send(pick(msg), msg)`` projects with no destination value, so a Steps edit
@@ -3288,7 +3341,13 @@ def _apply_set_params(
     return result
 
 
-def _message_argument_is_msg(stmt: ast.stmt) -> bool:
+def _message_param(func: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
+    """The name of the handler's message parameter: its first, ``msg`` by convention."""
+    args = [*func.args.posonlyargs, *func.args.args]
+    return args[0].arg if args else "msg"
+
+
+def _message_argument_is_msg(stmt: ast.stmt, msg_name: str = "msg") -> bool:
     """Whether a vocabulary call's message argument is the name ``msg``.
 
     True for a native ``msg.<method>(...)`` row, which has no message argument, and for a call whose
@@ -3303,10 +3362,10 @@ def _message_argument_is_msg(stmt: ast.stmt) -> bool:
     params = _ACTION_PARAMS.get(name) or _LOOKUP_PARAMS.get(name) or _DIAGNOSTIC_PARAMS.get(name)
     if params is None or "msg" not in params:
         return True
-    return _call_message_node(call, params) is not None
+    return _call_message_node(call, params, msg_name) is not None
 
 
-def _call_message_node(call: ast.Call, params: list[str]) -> ast.Name | None:
+def _call_message_node(call: ast.Call, params: list[str], msg_name: str = "msg") -> ast.Name | None:
     """The ``msg`` argument of a vocabulary ``call`` whose signature names ``msg``, or None when that
     argument is missing, starred, given twice, or anything but the plain name ``msg``."""
     index = params.index("msg")
@@ -3316,7 +3375,7 @@ def _call_message_node(call: ast.Call, params: list[str]) -> ast.Name | None:
     if any(isinstance(a, ast.Starred) for a in call.args[: index + 1]) or len(found) != 1:
         return None
     node = found[0]
-    return node if isinstance(node, ast.Name) and node.id == "msg" else None
+    return node if isinstance(node, ast.Name) and node.id == msg_name else None
 
 
 def _refuse_overlong_repick(result: str, repicked: str, line_start: int, line_end: int) -> None:
@@ -4222,7 +4281,7 @@ def _is_inert_value(node: ast.expr, *, reads_ok: bool, scope: _Scope) -> bool:
     if isinstance(node, ast.Name):
         if node.id in scope.code_sets:
             return False  # a CodeSet is admitted only as code_lookup's table (:func:`_table_scope`)
-        if reads_ok and node.id != "msg" and node.id in scope.locals:
+        if reads_ok and node.id != "msg" and node.id in scope.handler_locals:
             return True  # a handler local may hold message content, which a value may carry
         # Otherwise only an inert name, on the reads_ok path too: a mutable module name such as
         # ``SEEN``, an import, a builtin or an unbound name is refused everywhere (Manager decision
@@ -4378,6 +4437,9 @@ class _Scope(NamedTuple):
     numeric: frozenset[str]
     code_sets: frozenset[str] = frozenset()
     shadows: frozenset[str] = frozenset()
+    #: Names the handler itself binds that no function declares ``global``: the only names a
+    #: value may carry beyond ``inert`` (ADR 0076 G.7). A ``global`` name is module state.
+    handler_locals: frozenset[str] = frozenset()
 
 
 def _is_shadowed(name: str, scope: _Scope) -> bool:
@@ -4428,7 +4490,20 @@ def _table_scope(scope: _Scope) -> _Scope:
 _NO_NAMES = _Scope(frozenset({"msg"}), frozenset(), frozenset())
 
 #: Builtins that let a module rebind its own globals where :func:`_inert_module_literals` cannot see.
-_GLOBALS_WRITERS = frozenset({"globals", "vars", "exec", "eval", "setattr", "__import__"})
+_GLOBALS_WRITERS = frozenset(
+    {
+        "globals",
+        "vars",
+        "exec",
+        "eval",
+        "setattr",
+        "__import__",
+        "__globals__",
+        "__dict__",
+        "__builtins__",
+        "modules",
+    }
+)
 
 
 def _message_scope(
@@ -4482,15 +4557,18 @@ def _message_scope(
         frozenset(numeric),
         frozenset(code_sets),
         _module_shadows(tree),
+        frozenset(set(bound) - loop_indexes - globals_ - {"msg"}),
     )
 
 
 def _literal_kind(node: ast.expr, *, frozenset_ok: bool) -> str | None:
     """``"number"``, ``"code_set"`` or ``"other"`` for a literal of an immutable type, else None.
 
-    Admitted: a ``str``, ``int``, ``float``, ``bool`` or ``None`` constant, a sign on a number, a
-    tuple of those, ``frozenset(...)`` over a set, tuple or list of those while ``frozenset`` is the
-    builtin, and ``code_set("<literal>")``. Bytes are left out (Manager decision 2026-10-07)."""
+    Admitted, as ADR 0076 G.7 words the ceiling: a ``str``, ``int``, ``float``, ``bool`` or ``None``
+    constant, a sign on a number, a tuple of those scalars, ``frozenset(...)`` over a set, tuple or
+    list of those scalars while ``frozenset`` is the builtin, and ``code_set("<literal>")``. So
+    ``frozenset()`` with no argument, a nested tuple and a tuple holding a ``frozenset`` are refused.
+    Bytes are left out (Manager decision 2026-10-07)."""
     if isinstance(node, ast.Constant):
         if type(node.value) in (int, float):
             return "number"
@@ -4500,23 +4578,41 @@ def _literal_kind(node: ast.expr, *, frozenset_ok: bool) -> str | None:
         is_number = isinstance(operand, ast.Constant) and type(operand.value) in (int, float)
         return "number" if is_number else None
     if isinstance(node, ast.Tuple):
-        ok = all(_literal_kind(e, frozenset_ok=frozenset_ok) for e in node.elts)
-        return "other" if ok else None
+        return "other" if all(_is_scalar_literal(e) for e in node.elts) else None
     if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and not node.keywords):
         return None
     if node.func.id == "code_set":
         arg = node.args[0] if len(node.args) == 1 else None
         is_code_set = isinstance(arg, ast.Constant) and isinstance(arg.value, str)
         return "code_set" if is_code_set else None
-    if node.func.id != "frozenset" or not frozenset_ok or len(node.args) > 1:
+    if node.func.id != "frozenset" or not frozenset_ok or len(node.args) != 1:
         return None
-    if not node.args:
-        return "other"
     arg = node.args[0]
     elts_ok = isinstance(arg, ast.Set | ast.Tuple | ast.List) and all(
-        _literal_kind(e, frozenset_ok=frozenset_ok) for e in arg.elts
+        _is_scalar_literal(e) for e in arg.elts
     )
     return "other" if elts_ok else None
+
+
+def _is_scalar_literal(node: ast.expr) -> bool:
+    """A ``str``, number, ``bool`` or ``None`` constant, or a sign on a number."""
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub | ast.UAdd):
+        node = node.operand
+        return isinstance(node, ast.Constant) and type(node.value) in (int, float)
+    return isinstance(node, ast.Constant) and isinstance(node.value, _INERT_CONSTANT_TYPES)
+
+
+def _imported_from_messagefoundry(tree: ast.Module, name: str) -> bool:
+    """Whether a top-level ``from messagefoundry import <name>`` binds ``name`` unaliased. A
+    ``code_set`` capture counts only then (Manager decision 2026-10-07): a local ``def code_set`` or a
+    helper module's ``code_set`` is not the vocabulary's."""
+    return any(
+        isinstance(node, ast.ImportFrom)
+        and not node.level
+        and node.module == "messagefoundry"
+        and any(al.name == name and al.asname in (None, name) for al in node.names)
+        for node in tree.body
+    )
 
 
 def _root_name(node: ast.expr) -> str | None:
@@ -4566,8 +4662,10 @@ def _inert_module_literals(tree: ast.Module) -> dict[str, str]:
         pending.extend(ast.iter_child_nodes(node))
     mutated: set[str] = set()
     for n in ast.walk(tree):
-        if isinstance(n, ast.Name) and n.id in _GLOBALS_WRITERS:
-            return {}
+        if (isinstance(n, ast.Name) and n.id in _GLOBALS_WRITERS) or (
+            isinstance(n, ast.Attribute) and n.attr in _GLOBALS_WRITERS
+        ):
+            return {}  # ``h.__globals__[...]``, ``sys.modules[...]`` and the like
         if isinstance(n, ast.ImportFrom) and any(al.name == "*" for al in n.names):
             return {}
         root: str | None = None
@@ -4582,14 +4680,20 @@ def _inert_module_literals(tree: ast.Module) -> dict[str, str]:
         if root is not None:
             mutated.add(root)
     frozenset_ok = "frozenset" not in binds
+    code_set_ok = _imported_from_messagefoundry(tree, "code_set") and binds.get("code_set") == 1
     out: dict[str, str] = {}
     for name, found in values.items():
-        if name in mutated or name == "msg" or _is_dunder(name) or len(found) != binds.get(name):
+        # Exactly one binding (Manager decision 2026-10-07): a second one, even to a literal, is
+        # refused rather than reasoned about.
+        if name in mutated or name == "msg" or _is_dunder(name) or len(found) != 1:
+            continue
+        if binds.get(name) != 1:
             continue
         kinds = [None if v is None else _literal_kind(v, frozenset_ok=frozenset_ok) for v in found]
         if all(kinds):
             if "code_set" in kinds:
-                out[name] = "code_set"
+                if code_set_ok:
+                    out[name] = "code_set"
             else:
                 out[name] = "number" if all(k == "number" for k in kinds) else "other"
     return out
@@ -6198,7 +6302,8 @@ def _refuse_non_text_value(rendered: str, scope: _Scope) -> None:
     node = ast.parse(rendered, mode="eval").body
     text = (
         (isinstance(node, ast.Constant) and isinstance(node.value, str))
-        or isinstance(node, ast.JoinedStr | ast.Name)
+        or isinstance(node, ast.JoinedStr)
+        or (isinstance(node, ast.Name) and node.id not in scope.numeric)
         or _is_field_read(node, scope=scope)
     )
     if not text:
@@ -6314,8 +6419,42 @@ def _native_occurrence_suffix(name: str, params: dict[str, Any], scope: _Scope) 
             continue
         if kw not in allowed:
             raise LensRewriteError(f"insert_row: {name!r} does not accept a {kw!r} argument")
-        parts.append(f", {kw}={_render_insert_value(params[kw], kw, scope=scope)}")
+        rendered = _render_insert_value(params[kw], kw, scope=scope)
+        if not _is_index_value(ast.parse(rendered, mode="eval").body, scope):
+            # ``occurrence="x"`` or ``occurrence=0`` raises on every message (review of head
+            # c172beda9c, finding 2).
+            raise LensRewriteError(
+                f"parameter {kw!r}: {rendered} is not a whole number of 1 or more, a loop index, "
+                "or simple arithmetic on those - edit it as text"
+            )
+        parts.append(f", {kw}={rendered}")
     return "".join(parts)
+
+
+def _is_index_value(node: ast.expr, scope: _Scope) -> bool:
+    """Whether ``node`` is an ``occurrence``/``repetition`` value: an ``int`` literal of 1 or more,
+    a numeric name (a For-Each index above all), or ``+``, ``-`` or ``*`` over int literals and
+    numeric names. No division: it yields a float."""
+
+    def arith(n: ast.expr) -> bool:
+        if isinstance(n, ast.Constant):
+            return type(n.value) is int
+        if isinstance(n, ast.Name):
+            return n.id in scope.numeric
+        if isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.USub | ast.UAdd):
+            return arith(n.operand)
+        if isinstance(n, ast.BinOp) and isinstance(n.op, ast.Add | ast.Sub):
+            return arith(n.left) and arith(n.right)
+        if isinstance(n, ast.BinOp) and isinstance(n.op, ast.Mult):
+            # No name under ``*``, as in :func:`_is_arithmetic`.
+            return all(
+                isinstance(x, ast.Constant) and type(x.value) is int for x in (n.left, n.right)
+            )
+        return False
+
+    if isinstance(node, ast.Constant):
+        return type(node.value) is int and node.value >= 1
+    return arith(node)
 
 
 def _move_to_target(

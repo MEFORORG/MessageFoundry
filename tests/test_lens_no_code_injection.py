@@ -529,7 +529,8 @@ def test_fhir_token_admits_only_the_two_positional_form(token: str) -> None:
         _insert(params, "fhir_lookup")
 
 
-@pytest.mark.parametrize(("expr", "ok"), [("i + 1", True), ("1/3", True), ("2 ** 99", False)])
+# An occurrence is a whole number: ``1/3`` is a float (review of PR 2155).
+@pytest.mark.parametrize(("expr", "ok"), [("i + 1", True), ("1/3", False), ("2 ** 99", False)])
 def test_plain_arithmetic_in_a_numeric_field_is_admitted(expr: str, ok: bool) -> None:
     edit = {
         "line_start": _FOR + 1,
@@ -542,7 +543,7 @@ def test_plain_arithmetic_in_a_numeric_field_is_admitted(expr: str, ok: bool) ->
     if ok:
         assert f"occurrence={expr}" in rewrite_source(SOURCE, edit)
     else:
-        with pytest.raises(LensRewriteError, match=REFUSED):
+        with pytest.raises(LensRewriteError, match=f"{REFUSED}|not a whole number"):
             rewrite_source(SOURCE, edit)
 
 

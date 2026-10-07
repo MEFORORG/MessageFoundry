@@ -149,8 +149,13 @@ def h(msg):
     ids=["delete", "binding-below-use", "use-above-binding"],
 )
 def test_finding_3_typed_only_refuses_leaving_a_read_unbound(edit: dict[str, Any]) -> None:
-    assert rewrite_source(_BIND, edit) != _BIND
-    _refused(_BIND, edit, typed_only=True)
+    if edit["op"] == "delete_row":
+        assert rewrite_source(_BIND, edit) != _BIND
+        _refused(_BIND, edit, typed_only=True)
+    else:
+        # A move that strands a read is refused in every mode (Manager decision 2026-10-07).
+        for typed_only in (False, True):
+            _refused(_BIND, edit, match="before anything binds", typed_only=typed_only)
 
 
 def test_finding_3_control_an_unread_binding_still_deletes() -> None:
@@ -248,6 +253,8 @@ def test_finding_6_lookup_params_keys_must_be_hashable(expr: str, ok: bool) -> N
 _MOD = """\
 import os
 
+from messagefoundry import code_set
+
 SEEN = []
 TAGS = ("a", "b")
 LIMIT = 3
@@ -271,7 +278,7 @@ def h(msg):
     BOX["k"] = msg.field("PID-3")
     return Send("OB", msg)
 """
-_MOD_SEND = 24
+_MOD_SEND = 26
 
 
 @pytest.mark.parametrize(
@@ -303,6 +310,8 @@ def test_finding_7_only_an_unmutated_immutable_module_literal_is_inert(name: str
 # --- Manager decision 2026-10-07: a code_set capture is inert only as code_lookup's table ------
 
 _CS = """\
+from messagefoundry import code_set
+
 GENDER = code_set("gender")
 
 
@@ -325,22 +334,22 @@ def h(msg):
 def test_a_code_set_name_is_refused_outside_the_code_lookup_table(
     action: str, params: dict[str, Any]
 ) -> None:
-    edit = _edit("insert_row", 8, position="before", action=action, params=params)
+    edit = _edit("insert_row", 10, position="before", action=action, params=params)
     _refused(_CS, edit, match=REFUSED)
 
 
 def test_a_code_set_name_is_still_a_code_lookup_table() -> None:
     edit = _edit(
         "insert_row",
-        8,
+        10,
         position="before",
         action="code_lookup",
         params={"path": "PID-9", "table": {"expr": "GENDER"}},
     )
     assert 'code_lookup(msg, "PID-9", GENDER)' in rewrite_source(_CS, edit)
     # A typed code_lookup row stays typed, so typed-only still moves and deletes it.
-    assert "code_lookup" not in rewrite_source(_CS, _edit("delete_row", 7), typed_only=True)
-    moved = rewrite_source(_CS, _edit("move_row", 7, direction="up"), typed_only=True)
+    assert "code_lookup" not in rewrite_source(_CS, _edit("delete_row", 9), typed_only=True)
+    moved = rewrite_source(_CS, _edit("move_row", 9, direction="up"), typed_only=True)
     assert moved.index("code_lookup") < moved.index('msg.set("A"')
 
 
@@ -522,7 +531,7 @@ def h(msg):
 def test_r2_finding_2_a_comprehension_or_lambda_does_not_bind_for_the_handler(
     edit: dict[str, Any],
 ) -> None:
-    _refused(_COMP, edit, typed_only=True)
+    _refused(_COMP, edit, match="typed-only mode|before anything binds", typed_only=True)
 
 
 @pytest.mark.parametrize(
@@ -589,9 +598,7 @@ def test_r2_finding_7_setattr_voids_every_inert_name() -> None:
         "    dest = msg.field",
         "    setattr(sys.modules[__name__], 'OB_DEST', 1)\n    dest = msg.field",
     )
-    _refused(
-        src, _edit("set_params", 10, params={"to": {"expr": "OB_DEST"}}), match="computed by code"
-    )
+    _refused(src, _edit("set_params", 10, params={"to": {"expr": "OB_DEST"}}), match=REFUSED)
 
 
 def test_r2_finding_8_an_existing_compile_error_is_named_as_such() -> None:
@@ -621,3 +628,276 @@ def test_the_reads_ok_path_refuses_mutable_and_code_set_names(
     if action == "db_lookup":
         edit["assign_to"] = "fresh"
     _refused(_MOD, edit, match=REFUSED)
+
+
+# --- Manager decisions 2026-10-07, third set ------------------------------------------------------
+
+_ONCE = """\
+from messagefoundry import code_set
+
+TWICE = "a"
+TWICE = "b"
+ONCE = ("a", "b")
+GENDER: CodeSet = code_set("gender")
+
+
+@handler("H")
+def h(msg):
+    msg.set("A", "1")
+    return Send("OB", msg)
+"""
+
+
+@pytest.mark.parametrize(("name", "ok"), [("TWICE", False), ("ONCE", True)])
+def test_decision_a_module_name_bound_more_than_once_is_refused(name: str, ok: bool) -> None:
+    edit = _edit("set_params", 12, params={"to": {"expr": name}})
+    if ok:
+        assert f"return Send({name}, msg)" in rewrite_source(_ONCE, edit)
+    else:
+        _refused(_ONCE, edit, match=REFUSED)
+
+
+def _table(src: str, line: int) -> dict[str, Any]:
+    return _edit(
+        "insert_row",
+        line,
+        position="before",
+        action="code_lookup",
+        params={"path": "PID-8", "table": {"expr": "GENDER"}},
+    )
+
+
+def test_decision_an_annotated_code_set_capture_is_a_table() -> None:
+    assert 'code_lookup(msg, "PID-8", GENDER)' in rewrite_source(_ONCE, _table(_ONCE, 12))
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        # code_set is a local helper, not the vocabulary's
+        (
+            "from messagefoundry import code_set\n",
+            "def code_set(name):  # type: ignore\n    return {}\n",
+        ),
+        # code_set comes from another module
+        ("from messagefoundry import code_set\n", "from helpers import code_set\n"),
+        # the capture is bound twice
+        (
+            'GENDER: CodeSet = code_set("gender")\n',
+            'GENDER = code_set("a")\nGENDER = code_set("b")\n',
+        ),
+    ],
+    ids=["local-def", "helper-import", "bound-twice"],
+)
+def test_decision_a_code_set_table_needs_one_binding_from_messagefoundry(
+    change: tuple[str, str],
+) -> None:
+    src = _ONCE.replace(*change)
+    line = src.splitlines().index('    return Send("OB", msg)') + 1
+    _refused(src, _table(src, line), match=REFUSED)
+
+
+_LOOP = """\
+@handler("H")
+def h(msg):
+    for i in range(1, msg.count_segments("OBX") + 1):
+        msg.set("OBX-11", "F", occurrence=i)
+        msg.set("OBX-12", "G")
+    msg.set("A", "1")
+    return Send("OB", msg)
+"""
+
+
+@pytest.mark.parametrize("typed_only", [False, True])
+@pytest.mark.parametrize(
+    "edit",
+    [
+        _edit("move_row", 4, to_line_start=6, to_position="after"),
+        _edit(
+            "insert_row",
+            7,
+            position="before",
+            action="set_field",
+            params={"path": "OBX-3", "value": "x", "occurrence": {"expr": "i"}},
+        ),
+    ],
+    ids=["move", "insert"],
+)
+def test_decision_a_loop_index_is_read_only_inside_its_loop(
+    edit: dict[str, Any], typed_only: bool
+) -> None:
+    with pytest.raises(LensRewriteError):
+        rewrite_source(_LOOP, edit, typed_only=typed_only)
+
+
+def test_decision_control_a_loop_index_row_still_moves_inside_its_loop() -> None:
+    out = rewrite_source(_LOOP, _edit("move_row", 4, direction="down"), typed_only=True)
+    assert out.index('"OBX-12"') < out.index('"OBX-11"')
+
+
+# --- review of head c172beda9c ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("expr", ["i", "LIMIT"])
+def test_r3_finding_1_a_numeric_name_is_not_a_field_value(expr: str) -> None:
+    edit = _edit(
+        "insert_row",
+        9,
+        position="before",
+        action="set_field",
+        params={"path": "OBX-3", "value": {"expr": expr}},
+    )
+    with pytest.raises(LensRewriteError, match="not text"):
+        rewrite_source(_ARITH, edit)
+
+
+@pytest.mark.parametrize("value", ["x", {"expr": "0"}, {"expr": "'x'"}, {"expr": "1/2"}])
+def test_r3_finding_2_an_occurrence_is_a_whole_number(value: Any) -> None:
+    edit = _edit(
+        "insert_row",
+        9,
+        position="before",
+        action="set_field",
+        params={"path": "OBX-3", "value": "x", "occurrence": value},
+    )
+    with pytest.raises(LensRewriteError, match="not a whole number"):
+        rewrite_source(_ARITH, edit)
+
+
+_BRANCH = """\
+@handler("H")
+def h(msg):
+    if msg.field("A"):
+        x = msg.field("B")
+    else:
+        x = "none"
+    with open("f") as fh:
+        y = fh.read()
+    return Send("OB", msg)
+"""
+
+
+@pytest.mark.parametrize("name", ["x", "y"])
+def test_r3_finding_3_a_name_every_branch_binds_is_bound_after_the_block(name: str) -> None:
+    edit = _edit(
+        "insert_row",
+        9,
+        position="before",
+        action="set_field",
+        params={"path": "PID-3.1", "value": {"expr": name}},
+    )
+    assert f'msg.set("PID-3.1", {name})' in rewrite_source(_BRANCH, edit)
+
+
+def test_r3_finding_4_a_globals_dict_write_voids_every_inert_name() -> None:
+    src = _DEST.replace(
+        "    dest = msg.field", '    h.__globals__["OB_DEST"] = 1\n    dest = msg.field'
+    )
+    _refused(src, _edit("set_params", 10, params={"to": {"expr": "OB_DEST"}}), match=REFUSED)
+
+
+def test_r3_finding_5_a_send_to_an_imported_destination_is_still_editable() -> None:
+    src = (
+        "from ._routes import OB_ACME\n\n\n"
+        '@handler("H")\ndef h(msg):\n    return Send(OB_ACME, msg)\n'
+    )
+    edit = _edit("set_params", 6, params={"to": {"expr": '"OB_X"'}})
+    assert 'return Send("OB_X", msg)' in rewrite_source(src, edit)
+
+
+def test_r3_finding_6_a_guarded_raise_does_not_move_into_another_same_header_guard() -> None:
+    src = """\
+@handler("H")
+def h(msg):
+    if msg.field("PID-3"):
+        msg.set("B", "2")
+        raise ValueError("bad")
+    msg.set("PID-3", "X")
+    if msg.field("PID-3"):
+        msg.set("C", "3")
+    return Send("OB", msg)
+"""
+    edit = _edit("move_row", 5, to_line_start=8, to_position="after")
+    assert rewrite_source(src, edit) != src
+    _refused(src, edit, typed_only=True)
+
+
+def test_r3_finding_8_set_params_takes_the_handler_s_own_message_name() -> None:
+    src = '@handler("H")\ndef h(message):\n    set_field(message, "A", "B")\n    return []\n'
+    out = rewrite_source(src, _edit("set_params", 3, params={"value": "Z"}))
+    assert 'set_field(message, "A", "Z")' in out
+
+
+# --- ADR 0076 Amendment G, G.6 and G.7 as read on PR 2154 ---------------------------------------
+
+_GLOBAL = """\
+from messagefoundry import code_set
+
+LAB = code_set("lab")
+SEEN = []
+
+
+def keep(msg):  # type: ignore[no-untyped-def]
+    global LAB, SEEN
+
+
+@handler("H")
+def h(msg):
+    LAB = 1
+    SEEN = 2
+    msg.set("A", "1")
+    return Send("OB", msg)
+"""
+
+
+@pytest.mark.parametrize("name", ["LAB", "SEEN"])
+def test_g7_a_global_declared_name_is_not_a_handler_local(name: str) -> None:
+    edit = _edit(
+        "insert_row",
+        16,
+        position="before",
+        action="set_field",
+        params={"path": "PID-3.1", "value": {"expr": name}},
+    )
+    _refused(_GLOBAL, edit, match=REFUSED)
+
+
+@pytest.mark.parametrize(
+    ("literal", "ok"),
+    [
+        ("frozenset()", False),
+        ('("a", frozenset({"b"}))', False),
+        ('("a", ("b", "c"))', False),
+        ('frozenset({"a", "b"})', True),
+        ('("a", -1, None)', True),
+    ],
+)
+def test_g7_the_immutable_literal_ceiling(literal: str, ok: bool) -> None:
+    src = f'NAME = {literal}\n\n\n@handler("H")\ndef h(msg):\n    return Send("OB", msg)\n'
+    edit = _edit("set_params", 6, params={"to": {"expr": "NAME"}})
+    if ok:
+        assert "return Send(NAME, msg)" in rewrite_source(src, edit)
+    else:
+        _refused(src, edit, match=REFUSED)
+
+
+_ELSE = """\
+@handler("H")
+def h(msg):
+    if msg.field("C"):
+        row = db_lookup("C", "s", {"a": 1})
+    else:
+        row = db_lookup("C", "t", {"a": 1})
+        msg.set("Z", "z")
+    msg.set("A", row)
+    return Send("OB", msg)
+"""
+
+
+@pytest.mark.parametrize("typed_only", [False, True])
+def test_g6_rule_6_an_else_binding_does_not_move_below_its_use(typed_only: bool) -> None:
+    edit = _edit("move_row", 6, to_line_start=8, to_position="after")
+    with pytest.raises(LensRewriteError):
+        rewrite_source(_ELSE, edit, typed_only=typed_only)
+    if not typed_only:
+        _refused(_ELSE, edit, match="before anything binds")

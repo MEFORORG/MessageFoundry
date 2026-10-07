@@ -410,7 +410,7 @@ def test_insert_fhir_lookup_assigned_round_trips_as_lookup_row() -> None:
 
 def test_insert_code_lookup_bare_round_trips_as_lookup_row() -> None:
     # The table must be a module-level code_set capture: a name nothing binds is refused.
-    src = 'GENDER = code_set("gender")\n' + INSERT_SOURCE
+    src = 'from messagefoundry import code_set\n\nGENDER = code_set("gender")\n' + INSERT_SOURCE
     out = _insert_edit(
         src,
         parse_source(src)[0]["rows"][0],
