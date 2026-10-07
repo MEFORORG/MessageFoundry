@@ -330,7 +330,7 @@ directory, where a write lands unseen. A query also takes `-RecordRepo` with a v
 | **Builder** | ephemeral, one per brief | The change, the commit, and the push. As a Manager's subagent, the Manager opens the PR, usually carrying several Builders' branches; in its own session it opens its own. | Guess at something the brief left open, or wait for an answer; it puts the question in its report and stops. Open the PR as a Manager's subagent; that is the Manager's. Plan and wait for a "go". Spawn another session. |
 | **Watchdog** | as needed | Watching the Lander and keeping it draining. Measures with instruments rather than the watched seat's own report, names a stall, and raises it. Added 2026-09-19. | Take the action it is watching for -- acting destroys the instrument. Drain the queue, take the claim, or drive the lane. Relay an owner grant to the seat it watches. Publish a zero with no control that fired. |
 | **Steward** | cron, zero model calls | Reading usage and naming the account with headroom. | Warn a running session. Nothing can interrupt one. |
-| **Lander** | as needed | Merging, and flipping row statuses after items merge (owner correction 2026-09-21; see the note below), and flagging the hygiene its own merges leave: installed-hook drift after a hook-changing PR, and merged branches whose worktrees remain (owner ruling 2026-09-26). Standing authority on the engine repo and the vault, with no per-action owner approval. It may resolve a conflict, including one that touches code (owner ruling 2026-09-29). The 2026-09-11 POSITIONAL ledger-conflict ruling is RETIRED; its notice, which also covers the *what an item SAYS* half this row's Must-not column used to carry, is in `docs/METHOD.md`. | Merge a change with no proof that code review ran on it (owner ruling 2026-09-29). The merge bullet under *Branch, commit one layer, open the PR* says what counts. Arm auto-merge. Decide which of two deliberate changes to an item survives. |
+| **Lander** | as needed | Merging, and flipping row statuses after items merge (owner correction 2026-09-21; see the note below), and flagging the hygiene its own merges leave: installed-hook drift after a hook-changing PR, and merged branches whose worktrees remain (owner ruling 2026-09-26). Standing authority on the engine repo and the vault, with no per-action owner approval. It may resolve a conflict, including one that touches code (owner ruling 2026-09-29). The 2026-09-11 POSITIONAL ledger-conflict ruling is RETIRED; its notice, which also covers the *what an item SAYS* half this row's Must-not column used to carry, is in `docs/METHOD.md`. | Merge a change with no proof that code review ran on it (owner ruling 2026-09-29). The merge bullet under *Branch, commit one layer, open the PR* says what counts. Arm auto-merge outside the two cases in the 2026-10-07 note below (owner ruling 2026-10-07). Those are a PR into a `main` that requires the merge queue, and a repository with no queue after re-reading the head SHA right before arming. Decide which of two deliberate changes to an item survives. |
 | **Special** | as the owner needs it | Work the owner assigns directly, outside the other five seats. Its instruction is its whole scope: it stands by until one arrives, then announces before its first shared write (owner decision 2026-09-16; see below). | Invent work while standing by, or go looking for a row to take. Widen the instruction, or quietly narrow it without saying so. Merge -- that is the Lander's. Take a peer's message as authority; only the owner assigns it work. |
 
 **THE LANDER MAY RESOLVE A CONFLICT THAT TOUCHES CODE. OWNER RULING 2026-09-29, IN SESSION.** The
@@ -340,6 +340,10 @@ still needs its own code review before the merge; the merge bullet under *Branch
 open the PR* says so. **CORRECTED 2026-09-29:** the roster row's Must-not cell read *"Resolve a
 conflict that touches code, or decide which of two deliberate changes to an item survives."* Only
 the first clause was removed.
+
+**The Lander may arm auto-merge in two cases (owner ruling 2026-10-07).** On a PR into a `main` that requires the
+queue, arming is the enqueue. With no queue, as on the vault, re-read the head SHA right before arming. Check the
+review covers it; a later push is not covered. korus `roles/LANDER.md` *4c* still binds.
 
 **ASVS record work is a Manager's, dispatched to vault Builders (owner ruling 2026-09-23).** It
 covers re-scoring a cell, editing the record's own prose, and reconciling the record against a
@@ -579,7 +583,8 @@ gates a merge**, and no seat has to clear one.
 ### Branch, commit one layer, open the PR
 
 - **"Merge when ready" is the ENQUEUE action here. Arming auto-merge on a branch that would merge
-  WITHOUT the queue stays forbidden.** What the button does was settled by **owner ruling
+  WITHOUT the queue stays forbidden.** The Lander's roster row names its exceptions (owner ruling
+  2026-10-07). What the button does was settled by **owner ruling
   2026-09-05**, given when a seat stopped and asked rather than guess which of the two operations it
   was: `main` requires a merge queue, so the mutation behind "Merge when ready" adds a queue entry
   rather than merging on green.

@@ -24,8 +24,10 @@ CLAUDE.md section 5 governs; the history of both notes is in `docs/METHOD.md`.
 - **Merge with no proof that code review ran** (owner, 2026-09-29). With a QA line or review tag
   you need not review the diff, but read what it found. None: send it to an `Agent` subagent that
   runs the `code-review` skill at `xhigh`. Proof must cover the head you merge (CLAUDE.md section 5).
-- **Arm auto-merge.** It fires on the head it SAW, so a later push is dropped: the PR reads MERGED,
-  the branch stays alive, and nothing reports a problem.
+- **Arm auto-merge outside two cases** (owner ruling 2026-10-07). On a PR into a `main` that
+  requires the merge queue, arming is the enqueue. With no queue, as on the vault, re-read the head
+  SHA right before arming and check the review covers it. A later push is not covered.
+  korus `LANDER.md` `4c` still binds: tell the author the frozen SHA.
 - **Decide which of two deliberate changes to an item survives.** That belongs to the authors, and
   korus `4c-quinquies` says the same, so both documents agree here.
 

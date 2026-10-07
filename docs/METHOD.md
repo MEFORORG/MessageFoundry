@@ -316,7 +316,8 @@ nothing, which is honest. The day someone allocates it, your citation quietly st
 unrelated work. If you must gesture at unfiled work, name the subject rather than a number. Where the
 number exists but has not merged, say that in the same sentence.
 
-**Never arm auto-merge.** Enqueuing a PR and merging it are BOTH the Lander's, since the Console's
+**Never arm auto-merge**, unless you are the Lander acting under its 2026-10-07 exception in
+the CLAUDE.md section 5 roster. Enqueuing a PR and merging it are BOTH the Lander's, since the Console's
 retirement on 2026-09-10. A Manager talks to the Lander and leaves the queue to it.
 Arming a PR and then pushing to it is a silent race. Auto-merge fires on the head it saw and drops
 your later push. The PR reads MERGED, the branch stays alive, and nothing reports it.
