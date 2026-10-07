@@ -1866,13 +1866,19 @@ _SCHEMA: list[str] = [
         params NVARCHAR(MAX) NOT NULL, requester NVARCHAR(256) NOT NULL,
         requester_user_id NVARCHAR(64) NULL,
         requested_at FLOAT NOT NULL, status NVARCHAR(20) NOT NULL DEFAULT 'pending',
-        approver NVARCHAR(256) NULL, decided_at FLOAT NULL, expires_at FLOAT NULL)""",
+        approver NVARCHAR(256) NULL, decided_at FLOAT NULL, expires_at FLOAT NULL,
+        claim_owner NVARCHAR(512) NULL)""",
     # COL_LENGTH-gated ADD for a pre-existing pending_approvals table; a no-op on a fresh DB (the
     # CREATE above has it). This MUST live in _SCHEMA: `_schema_hash()` stores a content marker of
     # this batch, so an on-open migration placed anywhere else is skipped whenever the marker already
     # matches and the column never appears, with no error.
     """IF COL_LENGTH('pending_approvals','requester_user_id') IS NULL
         ALTER TABLE pending_approvals ADD requester_user_id NVARCHAR(64) NULL""",
+    # BACKLOG #1562: the engine process that claimed the release (the Store protocol's
+    # decide_pending_approval), guarded the same way and in _SCHEMA for the reason above. 512, so
+    # "node:" plus a cluster node id (nodes.node_id is NVARCHAR(256)) always fits.
+    """IF COL_LENGTH('pending_approvals','claim_owner') IS NULL
+        ALTER TABLE pending_approvals ADD claim_owner NVARCHAR(512) NULL""",
     """IF INDEXPROPERTY(OBJECT_ID('pending_approvals'),'ix_pending_approvals_status','IndexID') IS NULL
         CREATE INDEX ix_pending_approvals_status ON pending_approvals(status, requested_at)""",
     # BACKLOG #1268: `username` carries the same binary collation as every other identifier column in
@@ -11267,16 +11273,17 @@ class SqlServerStore:
         decided_at: float,
         from_status: str = "pending",
         audit: AuditAppend | None = None,
+        claim_owner: str | None = None,
     ) -> bool:
         """Atomically move a request in ``from_status`` to ``status``.
         Returns ``True`` iff this call made the transition — guards against a double decision.
         The SQLite twin documents why the guard is a parameter (ASVS 2.3.3); the Store protocol
-        states the ``audit`` contract (vault BACKLOG #2255)."""
+        states the ``audit`` and ``claim_owner`` contracts (vault BACKLOG #2255, BACKLOG #1562)."""
         sql = (
-            "UPDATE pending_approvals SET status = ?, approver = ?, decided_at = ?"
-            " WHERE id = ? AND status = ?"
+            "UPDATE pending_approvals SET status = ?, approver = ?, decided_at = ?,"
+            " claim_owner = COALESCE(?, claim_owner) WHERE id = ? AND status = ?"
         )
-        args = (status, approver, decided_at, approval_id, from_status)
+        args = (status, approver, decided_at, claim_owner, approval_id, from_status)
         if audit is None:
             async with self._acquire() as conn, self._cursor(conn) as cur:
                 try:
@@ -11309,6 +11316,27 @@ class SqlServerStore:
         if appended is not None:
             audit.tee(ts=now, row=appended)
         return moved
+
+    async def list_executing_approvals(
+        self, *, claim_owner: str | None = None, limit: int = 1000
+    ) -> list[dict[str, Any]]:
+        """Released requests still claimed as ``executing``, oldest claim first (BACKLOG #1562).
+        The Store protocol says who reads it, why, and what ``claim_owner`` filters. The owner
+        compares under BIN2, so two owners differing only in case stay two owners."""
+        if claim_owner is None:
+            return await self._fetchall(
+                "SELECT TOP (?) id, operation, requester, approver, decided_at, claim_owner"
+                " FROM pending_approvals WHERE status = 'executing'"
+                " ORDER BY decided_at ASC",
+                (limit,),
+            )
+        return await self._fetchall(
+            "SELECT TOP (?) id, operation, requester, approver, decided_at, claim_owner"
+            " FROM pending_approvals WHERE status = 'executing'"
+            " AND (claim_owner COLLATE Latin1_General_100_BIN2 = ? OR claim_owner IS NULL)"
+            " ORDER BY decided_at ASC",
+            (limit, claim_owner),
+        )
 
     async def create_user(
         self,

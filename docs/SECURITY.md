@@ -1783,7 +1783,7 @@ the row to one of three outcomes. Each move carries its own audit row, after the
 |---|---|---|
 | `approved` | The operation ran and returned | `approval.approved` |
 | `failed` | The operation raised, or the release was cancelled before it started. It did not complete | `approval.failed` |
-| `interrupted` | The release was cancelled while the operation ran, for example by the request timeout. It may have done none, some or all of its work | `approval.interrupted` |
+| `interrupted` | The release was cancelled while the operation ran, for example by the request timeout. Or the engine process that claimed it restarted before it recorded an outcome. It may have done none, some or all of its work | `approval.interrupted` (against `system`, with `reason` `engine_restart`, when a restart finds it) |
 | `resolved_applied` | An operator checked an `interrupted` release and recorded that its effects were applied | `approval.resolved` (against the resolver) |
 | `resolved_not_applied` | An operator checked an `interrupted` release and recorded that its effects were not applied | `approval.resolved` (against the resolver) |
 
@@ -1815,13 +1815,38 @@ the row to the matching `resolved_*` status (owner ruling 2026-09-26). The resol
 `GET /approvals` lists at most 100 `interrupted` rows, oldest request first, so the requests that
 have waited longest are never the ones cut off.
 
-A process that dies mid-operation leaves its row at
-`executing`. The engine does not yet reconcile those rows at startup: engine shards and cluster nodes
-share one store, and each would see the others' live releases as leftovers. If the operation ran but
-the move from `executing` to `approved` fails even when written alone, the error is logged and the
-release still succeeds, because the operation has already run and an error would invite a new
-request that runs it twice. The row may stay at `executing`, and the gate still tries to write the
-`approval.approved` audit row.
+**A restart settles its own leftover releases (BACKLOG #1562).** At least three things leave a
+row at `executing`. A process can die mid-operation. A release's outcome write can fail twice: if
+the operation ran but the move from `executing` to `approved` fails even when written alone, the
+error is logged and the release still succeeds, because an error would invite a new request that
+runs it twice. The gate still tries to write the `approval.approved` audit row. And a claim can
+commit after its reply was lost, so nothing ran. The status cannot tell these apart; the audit
+trail sometimes can, so read it before resolving.
+
+The claim records which engine process owns the release, in the row's `claim_owner` column. At its
+next start, before the API serves an approval, that process moves each `executing` row it owns to
+`interrupted`, with an `approval.interrupted` row in the same write. That row is written against
+`system` and carries `reason` `engine_restart`, the claim owner and the claim time. Nothing
+re-runs. The operator checks the effects and resolves the row as above. A move that fails is logged
+and the row stays `executing` for the next start to try again.
+
+Engine shards and cluster nodes share one store, so a process touches only its own rows: a
+sibling's `executing` row may be a live release. The owner is:
+
+| Engine | Claim owner | Same after a restart? |
+|---|---|---|
+| A plain `serve` | `engine` | Yes |
+| An engine shard of a multi-shard config | `shard:<id>`, the `serve --shard` name | Yes |
+| A `[cluster]` node | `node:<node_id>` | Only when `[cluster].node_id` is pinned |
+
+A row owned by another process is left alone and logged at WARNING at each start, with its owner and
+claim time. If that owner never returns, as with an unpinned cluster node, the row stays
+`executing`. Nothing settles it on a timer, because no check here can tell a dead owner from a slow
+one. `GET /approvals` does not list `executing` rows, so that WARNING is the place to find one. A
+row claimed before the column existed has no owner, and the first process to start treats it as its
+own. Two plain `serve` processes over one store would share the `engine` owner; that layout is
+unsupported anyway. For the same reason, build one app per engine: a second app over the same
+engine runs the reconcile again and would take the first one's live releases for leftovers.
 
 **A request must also be old enough before it can be approved (ASVS 2.4.2).** The expiry is a
 ceiling. `[approvals].min_dwell_seconds` is the floor, default **2 s**. An approve that arrives sooner

@@ -1777,6 +1777,7 @@ class AuditStore(Protocol):
         decided_at: float,
         from_status: str = "pending",
         audit: AuditAppend | None = None,
+        claim_owner: str | None = None,
     ) -> bool:
         """Move a request from ``from_status`` to ``status`` in one guarded UPDATE. ``True`` iff
         this call moved it, which is what guards a double decision.
@@ -1785,7 +1786,29 @@ class AuditStore(Protocol):
         when the row moved: a transition that matched no row writes no audit row. A failed append
         rolls the transition back, so the gate never sees a moved row without its audit row, nor
         the reverse (vault BACKLOG #2255). The row is teed off-box after the commit. Its timestamp
-        is the store's own clock, not ``decided_at``."""
+        is the store's own clock, not ``decided_at``.
+
+        ``claim_owner``, when given, is written to the row's ``claim_owner`` column in the same
+        UPDATE; ``None`` leaves the column as it is (BACKLOG #1562). The approval gate passes it on
+        the claim (``pending`` to ``executing``): it names the engine process that will run the
+        operation, so that process can recognise its own claims after a restart
+        (``ApprovalGate.reconcile_after_restart``). Engine shards and cluster nodes share one store,
+        and the owner is what keeps one process from settling a sibling's live release."""
+        ...
+
+    async def list_executing_approvals(
+        self, *, claim_owner: str | None = None, limit: int = 1000
+    ) -> Sequence[Row]:
+        """Released requests still claimed as ``executing``, OLDEST claim first (BACKLOG #1562).
+
+        ``claim_owner``, when given, keeps only the rows that owner claimed and the rows with no
+        owner, filtered in SQL so other owners' rows cannot push them past ``limit``.
+
+        Projects ``id``, ``operation``, ``requester``, ``approver``, ``decided_at`` (when it was
+        claimed) and ``claim_owner``. Read at startup by ``ApprovalGate.reconcile_after_restart``,
+        which settles the rows this process owns and reports the rest. An ``executing`` row is
+        normally short-lived, so the cap is generous; oldest first so a row stuck longest is never
+        the one past it."""
         ...
 
     async def audit_anchor(self) -> tuple[int, str]: ...

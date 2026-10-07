@@ -4760,7 +4760,11 @@ CREATE TABLE IF NOT EXISTS pending_approvals (
                                        -- not; the operation is never re-run (BACKLOG #1562)
     approver     TEXT,                 -- the distinct second user who released/declined it
     decided_at   REAL,
-    expires_at   REAL                  -- NULL = never; past this a pending request can't be approved
+    expires_at   REAL,                 -- NULL = never; past this a pending request can't be approved
+    -- BACKLOG #1562: the engine process that claimed the release ('executing'). The Store
+    -- protocol's decide_pending_approval says what it holds and who reads it. NULL on a row never
+    -- claimed, and on one claimed before the column existed.
+    claim_owner  TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_pending_approvals_status ON pending_approvals(status, requested_at);
 
@@ -6514,6 +6518,10 @@ class MessageStore:
         approval_cols = {row["name"] for row in await cur.fetchall()}
         if "requester_user_id" not in approval_cols:
             await db.execute("ALTER TABLE pending_approvals ADD COLUMN requester_user_id TEXT")
+        # BACKLOG #1562: nullable, never backfilled. A row claimed before the column existed has no
+        # recorded owner; ApprovalGate.reconcile_after_restart says how it treats one.
+        if "claim_owner" not in approval_cols:
+            await db.execute("ALTER TABLE pending_approvals ADD COLUMN claim_owner TEXT")
         await MessageStore._migrate_outbox_to_queue(db)
 
     @staticmethod
@@ -11202,6 +11210,7 @@ class MessageStore:
         decided_at: float,
         from_status: str = "pending",
         audit: AuditAppend | None = None,
+        claim_owner: str | None = None,
     ) -> bool:
         """Atomically move a request in ``from_status`` to ``status``.
         Returns ``True`` iff this call made the transition — guards against a double decision.
@@ -11213,13 +11222,14 @@ class MessageStore:
         the guard is a parameter rather than a hardcoded literal. The resolve path moves a row out of
         ``interrupted`` the same way, so two resolvers cannot both record an outcome.
 
-        ``audit``: the Store protocol states the contract (vault BACKLOG #2255)."""
+        ``audit`` and ``claim_owner``: the Store protocol states the contract (vault BACKLOG #2255,
+        BACKLOG #1562)."""
         now = time.time()
         async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
-                "UPDATE pending_approvals SET status = ?, approver = ?, decided_at = ?"
-                " WHERE id = ? AND status = ?",
-                (status, approver, decided_at, approval_id, from_status),
+                "UPDATE pending_approvals SET status = ?, approver = ?, decided_at = ?,"
+                " claim_owner = COALESCE(?, claim_owner) WHERE id = ? AND status = ?",
+                (status, approver, decided_at, claim_owner, approval_id, from_status),
             )
             moved = cur.rowcount > 0
             if moved and audit is not None:
@@ -11229,6 +11239,22 @@ class MessageStore:
         if moved and audit is not None:
             audit.tee(ts=now, row=appended)
         return moved
+
+    async def list_executing_approvals(
+        self, *, claim_owner: str | None = None, limit: int = 1000
+    ) -> list[aiosqlite.Row]:
+        """Released requests still claimed as ``executing``, oldest claim first (BACKLOG #1562).
+        The Store protocol says who reads it, why, and what ``claim_owner`` filters."""
+        owned = "" if claim_owner is None else " AND (claim_owner = ? OR claim_owner IS NULL)"
+        args = (limit,) if claim_owner is None else (claim_owner, limit)
+        async with self._read() as db:
+            cur = await db.execute(
+                "SELECT id, operation, requester, approver, decided_at, claim_owner"
+                f" FROM pending_approvals WHERE status = 'executing'{owned}"
+                " ORDER BY decided_at ASC LIMIT ?",
+                args,
+            )
+            return list(await cur.fetchall())
 
     # --- per-key AES-GCM invocation bound (ASVS 11.3.4) ----------------------
 
