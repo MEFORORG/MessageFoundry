@@ -121,6 +121,6 @@ def test_detail_has_fingerprint_and_file_count(tmp_path: Path) -> None:
     assert detail["fingerprint"] == config_fingerprint(d)
     assert detail["files"] == 5
     # vault BACKLOG #2597: the scheme tag decides whether two digests are comparable at all.
-    assert detail["scheme"] == "mefor-cfg-fp:v1"
+    assert detail["scheme"] == "mefor-cfg-fp:v2"
     # tmp_path is outside any git work tree, so provenance is omitted (not None, absent).
     assert "git_head" not in detail

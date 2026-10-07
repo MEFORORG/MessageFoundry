@@ -29,7 +29,7 @@ import json
 import logging
 import math
 import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from concurrent.futures import CancelledError as FutureCancelledError
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
@@ -190,6 +190,7 @@ from messagefoundry.store import (
     StreamingAttachmentsUnsupported,
 )
 from messagefoundry.store.base import AuditStore, pool_over_provisioned_warning
+from messagefoundry.store.crypto import CipherError
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.store.sealed_cache import point_in_time
 from messagefoundry.store.store import ConnectionEventWrite, OwnedLanes
@@ -1490,6 +1491,10 @@ class RegistryRunner:
         # worker loops (dropped in pooled mode), so the pooled adapter re-adds it, throttled per
         # (stage, lane) to _BUILDUP_CHECK_INTERVAL so it never runs a COUNT+MIN per claimed item.
         self._pooled_buildup_at: dict[str, float] = {}
+        # Vault BACKLOG #2770: the log backoff for a failing delivery alert check, per check and lane.
+        self._delivery_alert_check_runs: dict[str, FailureRun] = {}
+        # Vault BACKLOG #2756: the log backoff for a pre-send store read fault, per lane.
+        self._store_read_fault_runs: dict[str, FailureRun] = {}
         self._singleton_for_stage: dict[Stage, asyncio.Event] = {
             Stage.INGRESS: self._ingress_work,
             Stage.ROUTED: self._routed_work,
@@ -6848,8 +6853,11 @@ class RegistryRunner:
         DEAD row replayed after its message was purged reads ``None`` here and is delivered with no
         ``dynamic_headers`` rather than the headers of its first attempt. Accepted: retaining PHI past
         its window purely to serve a degraded replay is the defect 14.2.7 exists to close. Pinned by
-        test — see PHI.md §8."""
-        raw_meta = await self.store.message_metadata_json(message_id)
+        test — see PHI.md §8. A fault in the store read itself is raised as a
+        :class:`_StoreReadFault` (vault BACKLOG #2756)."""
+        raw_meta = await _read_from_store(
+            "metadata read", lambda: self.store.message_metadata_json(message_id)
+        )
         user_json = user_metadata(raw_meta)
         if not user_json:
             return None
@@ -6883,7 +6891,10 @@ class RegistryRunner:
         async def _reader(sha256: str) -> str:
             # The store read runs off the event loop (aiosqlite), chunk-by-chunk, and the pieces
             # concatenate to the exact verbatim OBX-5.5 base64 the sender sent (Approach B).
-            return "".join([chunk async for chunk in self.store.read_attachment(sha256)])
+            async def _join() -> str:
+                return "".join([chunk async for chunk in self.store.read_attachment(sha256)])
+
+            return await _read_from_store("attachment read", _join)
 
         try:
             return await reattach_documents_in_hl7(payload, _reader)
@@ -6932,7 +6943,9 @@ class RegistryRunner:
         surfaced from ``_mark_failed_and_arm``'s additive return, no store re-read), and
         ``(STOPPED, None)`` where the STOP internal-error policy halted the lane. The per_lane loop
         reads only ``outcome[0]``; ``retry_until`` is the pooled-dispatcher park signal (ADR 0066
-        §4.5). Store errors propagate to the caller's backoff."""
+        §4.5). A store READ fault before the send (a :class:`_StoreReadFault`) re-pends the row on its
+        retry backoff (vault BACKLOG #2756); any other store error propagates to the caller's
+        backoff."""
         # Connector + retry re-resolved per item so a reload can swap an outbound's
         # settings under us with at most one racing send (which fails + retries —
         # outbounds are idempotent). retry_until is the row's re-pend deadline when a send failure
@@ -6949,8 +6962,7 @@ class RegistryRunner:
             failure = self.outbound_failed(name)
             detail = f"outbound failed to start: {failure}" if failure else "outbound reloading"
             retry_until = await self._mark_failed_and_arm(name, item.id, detail, retry)
-            await self._maybe_alert_buildup(name)
-            await self._maybe_alert_stall(name)
+            await self._delivery_failure_alert_checks(name)
             return _ItemOutcome.PROCESSED, retry_until
         # L1 pre-send leadership re-check (active-passive HA). The graph runs on the leader
         # ONLY, but leadership can be lost (a self-fence) BETWEEN claiming this row and the
@@ -7005,7 +7017,8 @@ class RegistryRunner:
                 # path a re-encode refusal (permanent, code "reencode": ADR 0204, ADR 0206)
                 # dead-letters in shadow as it would live. A shadow BATCH does not: it checks each
                 # member with rewrite=False and never rewrites the envelope. A hydration failure is
-                # not a refusal, so it stays what shadow made it before, a completed delivery.
+                # not a refusal, so it stays what shadow made it before, a completed delivery. A
+                # store read fault is not a hydration failure: it re-pends, as live (vault #2756).
                 if _frames(connector):
                     try:
                         connector.check_frame(await self._hydrate_payload(item.payload))
@@ -7076,15 +7089,23 @@ class RegistryRunner:
                 )
             else:
                 retry_until = await self._mark_failed_and_arm(name, item.id, safe_exc(exc), retry)
-                await self._maybe_alert_buildup(name)
-                await self._maybe_alert_stall(name)
+                await self._delivery_failure_alert_checks(name)
+        except _StoreReadFault as exc:
+            # Vault BACKLOG #2756: a store READ the send needed failed (the document re-attach or the
+            # dynamic_headers metadata), so nothing was sent and nothing is wrong with the message.
+            # Re-pend it on the retry policy's backoff, spending an attempt so a fault that repeats
+            # on one row stays bounded by max_attempts, and run the buildup and stall checks. Not
+            # the internal-error arm, which would dead-letter (or STOP on) an unsent message, and
+            # not _note_lane_unhealthy, because the partner was never contacted.
+            retry_until = await self._mark_failed_and_arm(name, item.id, str(exc), retry)
+            self._note_store_read_fault(name, exc, 1, retry_until)
+            await self._delivery_failure_alert_checks(name)
         except DeliveryError as exc:
             # Transport failure (connect/IO/timeout/unparseable ACK) — transient; retry
             # per policy (the shipped cap is 100 attempts, then the row dead-letters into the
             # replayable DLQ — bounded, not discarded).
             retry_until = await self._mark_failed_and_arm(name, item.id, safe_exc(exc), retry)
-            await self._maybe_alert_buildup(name)
-            await self._maybe_alert_stall(name)
+            await self._delivery_failure_alert_checks(name)
             # #46: edge-trigger connection_lost (+ throttled alert) on the lane going down.
             self._note_lane_unhealthy(name, item.id, exc)
         except Exception as exc:
@@ -7128,6 +7149,7 @@ class RegistryRunner:
             # #46: a successful delivery means the lane is up — edge-trigger
             # connection_restored if it had been marked down (no-op otherwise).
             self._note_lane_healthy(name)
+            self._clear_store_read_faults(name)
             # ADR 0013: a capturing outbound returns a DeliveryResponse; persist the reply
             # AND mark the row done in ONE transaction (exactly-once capture). A non-capturing
             # outbound returns None → plain mark_done, byte-identical. The XOR (never both)
@@ -7298,8 +7320,7 @@ class RegistryRunner:
             failure = self.outbound_failed(name)
             detail = f"outbound failed to start: {failure}" if failure else "outbound reloading"
             retry_until = await self._mark_batch_failed_and_arm(name, ids, detail, retry)
-            await self._maybe_alert_buildup(name)
-            await self._maybe_alert_stall(name)
+            await self._delivery_failure_alert_checks(name)
             return _ItemOutcome.PROCESSED, retry_until
         # L1 batch twin — see the single-item path for the full rationale. Same reasoning, and the
         # stakes are higher here: mark_batch_failed decides ONE disposition from the head's
@@ -7325,6 +7346,7 @@ class RegistryRunner:
             # the envelope, so a batched streaming feed delivers full inline documents (never a raw
             # mfdoc:v1:ref: handle). Members with no handle are byte-identical; a missing attachment raises
             # a DeliveryError (caught below → the whole batch re-pends), so the peer never sees a handle.
+            # A store read fault is a _StoreReadFault and re-pends the same way (vault BACKLOG #2756).
             hydrated = [await self._hydrate_payload(it.payload) for it in items]
             # ADR 0205 rule 1, per member: one member the frame cannot carry is dead-lettered alone
             # and the rest batch, rather than all N dying on one envelope offset. It runs before the
@@ -7376,12 +7398,17 @@ class RegistryRunner:
                 )
             else:
                 retry_until = await self._mark_batch_failed_and_arm(name, ids, safe_exc(exc), retry)
-                await self._maybe_alert_buildup(name)
-                await self._maybe_alert_stall(name)
+                await self._delivery_failure_alert_checks(name)
+        except _StoreReadFault as exc:
+            # Vault BACKLOG #2756, the batch twin of the single-row arm: nothing was sent, so all N
+            # re-pend on the retry policy's backoff rather than dead-lettering through the
+            # internal-error arm below.
+            retry_until = await self._mark_batch_failed_and_arm(name, ids, str(exc), retry)
+            self._note_store_read_fault(name, exc, len(ids), retry_until)
+            await self._delivery_failure_alert_checks(name)
         except DeliveryError as exc:
             retry_until = await self._mark_batch_failed_and_arm(name, ids, safe_exc(exc), retry)
-            await self._maybe_alert_buildup(name)
-            await self._maybe_alert_stall(name)
+            await self._delivery_failure_alert_checks(name)
             self._note_lane_unhealthy(name, ids[0] if ids else head.id, exc)
         except Exception as exc:
             # A framing error (unparseable/non-HL7 head) or an internal/code error — NOT the partner's
@@ -7418,6 +7445,7 @@ class RegistryRunner:
         else:
             if ids:  # nothing was sent when every member was refused
                 self._note_lane_healthy(name)
+                self._clear_store_read_faults(name)
                 await self.store.mark_batch_done(ids)
         await self._dead_letter_refused(name, refused)
         return _ItemOutcome.PROCESSED, retry_until
@@ -8822,6 +8850,76 @@ class RegistryRunner:
             return  # oldest message hasn't stalled long enough yet
         self._fire_stall(name, age=oldest_age, now=now)
 
+    def _note_store_read_fault(
+        self, name: str, exc: _StoreReadFault, rows: int, retry_until: float | None
+    ) -> None:
+        """Log a pre-send store read fault AFTER its outcome is written, so the line says what
+        happened: re-pended, or dead-lettered at the retry cap. Through a per-lane
+        :class:`~messagefoundry.log_backoff.FailureRun`, because an UNORDERED lane can fail a whole
+        backlog fast during a store outage and a line per row would be a flood (BACKLOG #1844)."""
+        outcome = (
+            "re-pended with backoff" if retry_until is not None else "dead-lettered at the cap"
+        )
+        run = self._store_read_fault_runs.get(name, FailureRun())
+        self._store_read_fault_runs[name] = run.record(
+            log,
+            exc,
+            "delivery worker %r: %s before sending %d row(s); %s",
+            name,
+            exc,
+            rows,
+            outcome,
+            level=logging.WARNING,
+            count_label=_WORKER_RUN_COUNT,
+        )
+
+    def _clear_store_read_faults(self, name: str) -> None:
+        """Close the lane's store read fault run on a delivered send, with one recovery line."""
+        run = self._store_read_fault_runs.pop(name, None)
+        if run is not None:
+            run.clear(
+                log,
+                "delivery worker %r: pre-send store reads",
+                name,
+                level=logging.WARNING,
+                count_label=_WORKER_RUN_COUNT,
+            )
+
+    async def _delivery_failure_alert_checks(self, name: str) -> None:
+        """Run the buildup and stall checks after a delivery failure re-pended rows on ``name``
+        (vault BACKLOG #2770). Both read the store (``pending_depth``), and a read error there is a
+        DIAGNOSTIC failure: the delivery's outcome is already written and decided. Escaping, it would
+        leave the delivery body as an unhandled raise, which the pooled dispatcher counts as a T17
+        infra fault and, ten in a row, STOPs the lane with an alert naming the wrong cause. So it is
+        logged here and never reclassifies the delivery, as :meth:`_pooled_maybe_buildup` does for
+        the ingress and routed stages.
+
+        Each check is guarded on its own, so a failing buildup read does not also skip the stall
+        check. The broad catch is deliberate, as in ``_pooled_maybe_buildup``: no fault in an alert
+        check may change a delivery's outcome. It runs once per failed delivery, so a store that
+        stays degraded would write a traceback per row; each check's failures are logged through a
+        per-lane :class:`~messagefoundry.log_backoff.FailureRun` instead (BACKLOG #1844's backoff),
+        closed with one recovery line when the check next succeeds."""
+        checks = (("buildup", self._maybe_alert_buildup), ("stall", self._maybe_alert_stall))
+        for check, run in checks:
+            key = f"{check}:{name}"
+            try:
+                await run(name)
+            except Exception as exc:  # noqa: BLE001 -- a diagnostic; see the docstring
+                # Logged as a redacted stand-in carrying the original traceback: the driver's own
+                # text can quote a cell (section 9), the frames cannot.
+                stand_in = _RedactedFault(safe_exc(exc)).with_traceback(exc.__traceback__)
+                failures = self._delivery_alert_check_runs.get(key, FailureRun())
+                self._delivery_alert_check_runs[key] = failures.record(
+                    log, stand_in, "delivery %s check failed for outbound %r", check, name
+                )
+            else:
+                open_run = self._delivery_alert_check_runs.pop(key, None)
+                if open_run is not None:
+                    open_run.clear(
+                        log, "delivery %s check for outbound %r", check, name, level=logging.WARNING
+                    )
+
     async def _inflight_watch_loop(self) -> None:
         """Run :meth:`_check_inflight_strands` every ``_INFLIGHT_WATCH_INTERVAL_SECONDS`` until stop
         (BACKLOG #1611 part B). A failed tick is logged and the next one retries: this task is the only
@@ -9068,6 +9166,51 @@ class RegistryRunner:
             return True
         except TimeoutError:
             return False
+
+
+class _RedactedFault(Exception):
+    """An exception whose message is already redacted with :func:`safe_exc`, so a log line or a
+    ``last_error`` built from it carries no raw driver text, which can quote a cell (section 9)."""
+
+
+class _StoreReadFault(_RedactedFault):
+    """A store READ that a delivery needed before its send failed in the store itself: the document
+    re-attach (``read_attachment``) or the ``dynamic_headers`` metadata (``message_metadata_json``).
+    Vault BACKLOG #2756. Raised only by :func:`_read_from_store`.
+
+    The classification is by ORIGIN, at the store call, not by exception type: a driver or pool error
+    is whatever its backend raises, and aiosqlite and asyncpg both raise ``ValueError`` subclasses for
+    some of theirs, so no type list can tell them from a message fault. The delivery bodies give it
+    its own arm: re-pend on the retry backoff, spending an attempt so a fault that repeats on one row
+    is bounded by ``max_attempts``, never the internal-error arm (which would dead-letter an unsent
+    message at once). At the cap it dead-letters into the replayable DLQ like any other retry."""
+
+
+# What a store read raises for a fault in the stored MESSAGE, not in the store, and so is NOT wrapped
+# in _StoreReadFault: each keeps the arm it always reached. A missing or GC'd attachment (KeyError) and
+# a backend without streaming become a DeliveryError in _hydrate_payload; a cell that fails decryption
+# (CipherError) reaches the internal-error policy. At least one infrastructure fault also arrives as a
+# CipherError -- a Vault Transit cipher wraps an unreachable Vault in one -- and so still takes that
+# arm; telling the two apart needs the cipher to raise a distinct type.
+_STORE_READ_CONTENT_FAULTS: tuple[type[Exception], ...] = (
+    KeyError,
+    StreamingAttachmentsUnsupported,
+    CipherError,
+)
+
+
+async def _read_from_store[T](what: str, read: Callable[[], Awaitable[T]]) -> T:
+    """Run one pre-send store read, raising a :class:`_StoreReadFault` for a fault in the store
+    (vault BACKLOG #2756). The fault is raised OUTSIDE the ``except`` block, so it carries no
+    ``__context__``: the driver exception, its unredacted text and the frames holding the payload are
+    dropped with the block rather than chained on."""
+    try:
+        return await read()
+    except _STORE_READ_CONTENT_FAULTS:
+        raise
+    except Exception as exc:
+        fault = _StoreReadFault(f"store {what} failed: {safe_exc(exc)}")
+    raise fault
 
 
 def _frames(connector: object) -> bool:

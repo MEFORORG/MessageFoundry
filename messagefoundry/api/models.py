@@ -593,7 +593,7 @@ class ConfigProvenance(BaseModel):
     (or if the fingerprint could not be computed); ``drift`` is only meaningful when ``loaded`` is True."""
 
     loaded: bool
-    fingerprint: str | None = None  # content hash of the loaded bundle (scheme mefor-cfg-fp:v1)
+    fingerprint: str | None = None  # content hash of the loaded bundle (scheme mefor-cfg-fp:v2)
     git_head: str | None = None  # commit sha at load, when the config dir is a git work tree
     files: int | None = None  # number of files folded into the fingerprint
     drift: bool = False  # the on-disk config now differs from what was loaded

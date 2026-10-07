@@ -9057,10 +9057,8 @@ class MessageStore:
             if retry.max_attempts is not None and attempts >= retry.max_attempts:
                 status, next_at, event = OutboxStatus.DEAD.value, now, "dead"
             else:
-                backoff = min(
-                    retry.max_backoff_seconds,
-                    retry.backoff_seconds * (retry.backoff_multiplier ** max(attempts - 1, 0)),
-                )
+                # vault BACKLOG #2761: never overflows, so attempt 1025+ keeps the cap's pace.
+                backoff = retry.backoff_for(attempts)
                 status, next_at, event = OutboxStatus.PENDING.value, now + backoff, "failed"
             # ADR 0157 Amendment A (BACKLOG #2078, #2348), widened by owner ruling 2026-09-29: the
             # retry branch re-pends a row that is INFLIGHT or PENDING, so a late worker cannot put a
@@ -9135,10 +9133,8 @@ class MessageStore:
             if retry.max_attempts is not None and head_attempts >= retry.max_attempts:
                 status, next_at, event = OutboxStatus.DEAD.value, now, "dead"
             else:
-                backoff = min(
-                    retry.max_backoff_seconds,
-                    retry.backoff_seconds * (retry.backoff_multiplier ** max(head_attempts - 1, 0)),
-                )
+                # vault BACKLOG #2761: never overflows, so attempt 1025+ keeps the cap's pace.
+                backoff = retry.backoff_for(head_attempts)
                 status, next_at, event = OutboxStatus.PENDING.value, now + backoff, "failed"
                 rescheduled_at = next_at
             # ADR 0157 Amendment A, as mark_failed (widened 2026-09-29): on the retry branch a

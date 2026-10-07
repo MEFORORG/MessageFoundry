@@ -818,7 +818,11 @@ INVENTORY: dict[str, frozenset[str]] = {
     # weakened-TLS escape is clamped exactly as the db_lookup executor's is. Builds no context.
     "messagefoundry/pipeline/reference_sync.py": frozenset({"messagefoundry.config.tls_policy"}),
     "messagefoundry/pipeline/security_notify.py": frozenset({"messagefoundry.config.tls_policy"}),
-    "messagefoundry/pipeline/wiring_runner.py": frozenset({"messagefoundry.config.tls_policy"}),
+    # Vault BACKLOG #2756: also imports CipherError from store.crypto, only to classify a decrypt
+    # failure on the pre-send store read as a content fault. Calls no crypto itself.
+    "messagefoundry/pipeline/wiring_runner.py": frozenset(
+        {"messagefoundry.config.tls_policy", "messagefoundry.store.crypto"}
+    ),
     "messagefoundry/transports/ai_broker.py": frozenset({"messagefoundry.config.tls_policy"}),
     # Vault BACKLOG #2579: reads the cleartext-hop authority's loopback predicate
     # (is_loopback_hop_host), so a proxy handler never carries a hop that authority calls on-box.
@@ -880,7 +884,8 @@ IMPORT_ONLY: dict[str, str] = {
     ),
     "messagefoundry/pipeline/wiring_runner.py": (
         "INSTRUMENT LIMIT. Decides whether a plaintext hop is allowed (is_loopback_hop_host, "
-        "active_hop_posture): a TLS posture decision with no crypto-shaped call in it"
+        "active_hop_posture): a TLS posture decision with no crypto-shaped call in it; and names "
+        "store.crypto's CipherError only to classify a decrypt failure, calling no cipher"
     ),
     "messagefoundry/store/cipher_cells.py": (
         "builds a cell AAD with cell_aad, which is byte framing and not a primitive; the decrypt "
