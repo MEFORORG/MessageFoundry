@@ -382,8 +382,11 @@ async def test_an_operator_door_on_a_dr_parked_outbound_is_refused(box: _Box, do
     assert rr is not None
     message_id = await _activate_with_a_held_row(engine)
 
-    with pytest.raises(DrParkedError, match="release DR first"):
+    with pytest.raises(DrParkedError, match="release DR first") as refused:
         await getattr(rr, f"{door}_outbound")("OB_NORM_ADT")
+    # The API's `from None` over this error is listed SAFE in test_from_none_is_not_redaction.py
+    # because it is raised with no chain. Pin that, since `from None` would not hide one.
+    assert refused.value.__cause__ is None and refused.value.__context__ is None
     await _assert_still_parked(engine, message_id)
 
     await _assert_delivers_after_release(engine, box, message_id)
