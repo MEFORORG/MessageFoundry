@@ -1825,6 +1825,8 @@ least these paths. The alert is keyed `approval:<id>` and carries the row's acti
 
 - a refusal's row, or an outcome row written alone after its status. The log line carries the
   row's detail;
+- the `approval.approver_provenance` row a release writes after it has gone ahead. The log line
+  carries the row's detail;
 - the request or repeat write. The log line names the actor and the operation;
 - a claim, a rejection or a resolution that answers 503, and a claim whose approve was cancelled.
   The log line carries the exception, not the row's detail.
