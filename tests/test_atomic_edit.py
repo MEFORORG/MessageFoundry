@@ -497,3 +497,12 @@ def test_the_lock_file_is_owner_only(tmp_path: Path) -> None:
     with atomic_edit.edit_lock(path):
         pass
     assert stat.S_IMODE(atomic_edit.lock_path_for(path).stat().st_mode) == 0o600
+
+
+def test_the_candidate_pattern_ends_in_the_candidate_suffix() -> None:
+    """The pattern is a literal so the static regex scanner can read it; this holds its trailing
+    ``\\.edit`` to ``CANDIDATE_DIR_SUFFIX`` so the two cannot drift."""
+    import re
+
+    pattern = atomic_edit._CANDIDATE_DIR_RE.pattern
+    assert pattern.endswith(re.escape(atomic_edit.CANDIDATE_DIR_SUFFIX))
