@@ -24,7 +24,15 @@ import sqlite3
 import time
 import unicodedata
 import urllib.request
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Coroutine,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
@@ -56,6 +64,7 @@ from messagefoundry.auth.notifications import (
     ACCOUNT_DISABLED,
     ACCOUNT_LOCKED,
     ADMIN_NEW_IP,
+    DIRECTORY_SESSIONS_ENDED,
     EMAIL_CHANGED,
     FEDERATED_IDENTITY_BOUND,
     FEDERATED_IDENTITY_UNBOUND,
@@ -246,6 +255,44 @@ _DUMMY_PASSWORD_HASH = hash_password("mf-login-timing-equalizer")
 #: Cap on concurrent argon2 hashes/verifies so an unauthenticated login flood can't exhaust the
 #: thread-pool executor (and starve all login/AD/password work). Argon2 is deliberately CPU-heavy.
 _ARGON2_MAX_CONCURRENCY = max(2, min(8, os.cpu_count() or 2))
+
+#: Cap on concurrent directory probes from the mTLS certificate path (BACKLOG #2316). Each probe
+#: holds a worker thread for up to the LDAP connect and receive timeouts, so a burst of certificate
+#: requests during a slow directory must not drain the thread pool every other leg shares.
+_CERT_PROBE_MAX_CONCURRENCY = 8
+#: How long a certificate request waits for a probe slot before it is refused. Short on purpose: a
+#: full cap means the directory is slow, and a service caller retries, so queueing without a bound
+#: would only stack requests behind a stalled directory. A refusal fails closed.
+_CERT_PROBE_SLOT_WAIT_SECONDS = 2.0
+#: The refusal reason when no probe slot freed in time. Not a directory answer.
+CERT_PROBE_SATURATED = "probe_capacity_saturated"
+#: Refusals that say the directory could not be asked, not what it said about the account. The
+#: certificate path logs these once per outage rather than once per request.
+_CERT_DIRECTORY_OUTAGES = frozenset(
+    {
+        reconcile.ProbeOutcome.UNAVAILABLE.value,
+        reconcile.ProbeOutcome.REFERRED.value,
+        CERT_PROBE_SATURATED,
+    }
+)
+#: The least time between two certificate-path outage WARNINGs, so a flapping outage cannot log
+#: one WARNING and INFO pair per request.
+_CERT_OUTAGE_LOG_INTERVAL_SECONDS = 60.0
+#: The level ``_probe_principal`` logs an unexpected directory fault at. WARNING for the reconciler
+#: and step-up; the certificate path sets DEBUG in its probe task's own context (BACKLOG #2316).
+_PROBE_FAULT_LOG_LEVEL: ContextVar[int] = ContextVar(
+    "_PROBE_FAULT_LOG_LEVEL", default=logging.WARNING
+)
+#: Outcomes the directory itself gave. Any of them ends a logged outage.
+_CERT_DIRECTORY_ANSWERS = frozenset(
+    outcome.value
+    for outcome in (
+        reconcile.ProbeOutcome.PRESENT,
+        reconcile.ProbeOutcome.ABSENT,
+        reconcile.ProbeOutcome.DISABLED,
+        reconcile.ProbeOutcome.UNDETERMINED,
+    )
+)
 
 # Bound on the per-process new-client-IP dedup cache (WP-L3-13). It only debounces the audit/notify
 # side effects of the 8.4.2 signal; the step-up decision never depends on it, so eviction is harmless.
@@ -579,6 +626,10 @@ IDP_STEP_UP_REQUIRED = "idp_step_up_required"
 #: charged.
 DIRECTORY_UNCONFIRMED = "directory_unconfirmed"
 
+#: The ``auth.reauth`` reason for a directory step-up re-bind sent with an empty password (BACKLOG
+#: #2434). The directory is never asked and nothing is charged; the caller sees a refused password.
+EMPTY_PASSWORD = "empty_password"  # nosec B105 -- an audit reason slug, not a credential
+
 #: The outcome :meth:`AuthService._directory_step_up_refusal` gives a present, enabled directory
 #: account whose stored roles are not all among the roles its current groups map to (BACKLOG #2240).
 #: Audited beside :data:`DIRECTORY_UNCONFIRMED`, like the probe's own outcomes.
@@ -629,6 +680,18 @@ _T = TypeVar("_T")
 
 
 @dataclass(frozen=True)
+class RolesGained:
+    """The roles a directory sign-in's role sync NEWLY gave an account (vault BACKLOG #2610).
+
+    ``username`` is the account the sync wrote to, which is not always the name the directory
+    presented, so a caller keys on this and never on the sign-in's input. ``roles`` holds role ids
+    and is never empty: a sync that gained nothing reports no :class:`RolesGained` at all."""
+
+    username: str
+    roles: frozenset[str]
+
+
+@dataclass(frozen=True)
 class LoginOutcome:
     """Result of a login attempt. ``error`` is for logs/audit — never leak the reason to clients."""
 
@@ -651,6 +714,12 @@ class LoginOutcome:
     #: "always ``None`` on the local/AD/Kerberos paths" and stopped being true. A slug the browser
     #: layer's map does not know collapses to its generic code, which is the safe default.
     reason: str | None = None
+    #: Set only by a directory sign-in whose role sync newly gave the account a role (vault BACKLOG
+    #: #2610). ``auth/`` raises no alert (CLAUDE.md section 4), so every route that completes a
+    #: directory sign-in reads this and raises ``administrator_granted`` when Administrator is among
+    #: the roles. Set on a refused outcome too: a bind landing between the sync and the mint refuses
+    #: the session after the roles were written, and that grant happened all the same.
+    roles_gained: RolesGained | None = None
 
 
 @dataclass(frozen=True)
@@ -1377,6 +1446,19 @@ _REFUSED_OUTCOMES: dict[DirectoryAnswer, reconcile.ProbeOutcome] = {
     DirectoryAnswer.AMBIGUOUS: reconcile.ProbeOutcome.ABSENT,
 }
 
+#: The ``auth.reauth`` reason for each step-up re-bind whose lookup judged no password (BACKLOG
+#: #2434). None is counted toward the lockout. ``None`` means no lookup ran. ``_reauth_ad`` refuses
+#: an empty password before it asks, so ``None`` from a directory reads as one that could not be
+#: asked, never as ``empty_password``. The disabled and undetermined slugs are the reconciler's.
+_REBIND_REFUSALS: Final[Mapping[DirectoryAnswer | None, str]] = MappingProxyType(
+    {
+        None: "directory_unavailable",
+        DirectoryAnswer.NOT_FOUND: "not_in_directory",
+        DirectoryAnswer.DISABLED: reconcile.REVOKE_REASONS[reconcile.ProbeOutcome.DISABLED],
+        DirectoryAnswer.UNDETERMINED: reconcile.REVOKE_REASONS[reconcile.ProbeOutcome.UNDETERMINED],
+    }
+)
+
 
 #: The pair a session insert requires of a row that must hold NO federated binding (vault BACKLOG
 #: #2609). Passed as ``require_federated_subject`` by the Windows SSO mint.
@@ -1389,13 +1471,26 @@ def _holds_federated_binding(user: UserRecord) -> bool:
     return user.oidc_issuer is not None or user.oidc_subject is not None
 
 
+def _holds_directory_key(user: UserRecord) -> bool:
+    """Whether the reconciler may ask the directory about ``user``: it carries a
+    ``directory_object_id`` (BACKLOG #2434).
+
+    **The reconcile pass's one statement of the rule**; the sign-in, step-up and bind refusals
+    still test the column inline. A row without one is never asked about by name, so it is no
+    directory evidence: the pass reads it as UNKEYED without a lookup, and a trip or a referral
+    leaves it unmarked, because no pass can ever read it PRESENT. ``reconcile.plan_pass`` sees only
+    the UNKEYED outcome this produces, and counts what was asked from that.
+    """
+    return bool(user.directory_object_id)
+
+
 def _holds_unkeyed_federated_binding(user: UserRecord) -> bool:
     """Whether ``user`` carries a federated binding but no ``directory_object_id`` (BACKLOG #2027).
 
     Such a row's only directory key is its username, and ADR 0184 AC-5 forbids re-resolving a bound
     row by that, so the engine has no key it may ask the directory with.
     """
-    return _holds_federated_binding(user) and not user.directory_object_id
+    return _holds_federated_binding(user) and not _holds_directory_key(user)
 
 
 def _directory_login_refusal(user: UserRecord, now: float, *, federated: bool) -> str | None:
@@ -1473,13 +1568,13 @@ class _DirectoryRebind:
 
     ``verdict`` keeps the three answers that method documents. ``reason`` is a closed-set slug set
     whenever ``verdict`` is ``None``, naming why the directory could not judge the password
-    (BACKLOG #2027): ``not_configured``, ``directory_unavailable`` or ``not_in_directory``, and,
-    from a directory implementation that does not check the id itself,
-    ``directory_object_id_missing`` or ``directory_identity_conflict`` (``None`` whether or not
-    the bind succeeded). ``not_in_directory`` means what the IdP step-up's same slug means: no
-    ENABLED entry for the row's id, so absent, disabled, an unreadable account state, or an entry
-    that does not read the id back. The TOTP leg's audit ``outcome`` tells those apart; this leg's
-    second lookup does not."""
+    (BACKLOG #2027): ``empty_password``, ``not_configured``, ``directory_unavailable``,
+    ``not_in_directory``, ``directory_disabled`` or ``directory_undetermined``, and, from a
+    directory implementation that does not check the id itself, ``directory_object_id_missing`` or
+    ``directory_identity_conflict`` (``None`` whether or not the bind succeeded).
+    ``not_in_directory`` means no entry for the row's id, or an entry that does not read the id
+    back. Since BACKLOG #2434 a disabled entry and an unreadable account state have their own
+    slugs, read from the bind's own lookup."""
 
     verdict: bool | None
     reason: str | None = None
@@ -1498,8 +1593,8 @@ def _directory_answer_mismatch(principal: AdPrincipal, object_id: str) -> str | 
 @dataclass
 class _KeyedLock:
     """One entry of a per-account lock table, with a count of the tasks holding or awaiting it so the
-    entry can be dropped when the last one leaves. The re-proof table and the credential table both
-    use it (:func:`_hold_keyed_lock`)."""
+    entry can be dropped when the last one leaves. The re-proof table, the credential table and the
+    lock-notice table (BACKLOG #2216) each use it (:func:`_hold_keyed_lock`)."""
 
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     users: int = 0
@@ -1788,6 +1883,14 @@ def _json(obj: Any) -> str:
 #: it throttles over. See :meth:`AuthService._lock_notice_due`.
 _LOCK_NOTICE_ACTION: Final = LOCK_NOTICE_ACTION
 _LOCK_NOTICE_WINDOW_SECONDS: Final = 24 * 3600.0
+#: BACKLOG #2216: how long the API lifespan's :meth:`AuthService.drain_background` lets the
+#: service's background tasks finish at shutdown before it cancels the rest, and how long it then
+#: waits for the cancelled ones to unwind. Both are shares of the service's graceful-stop window,
+#: whose budget is stated at ``DRAIN_TIMEOUT_SECONDS`` in ``api/approvals.py``; keep the sum inside
+#: it. A task still running at the first bound is queued behind other throttle reads, or stuck on
+#: the store. A task still unwinding at the second is left to finish or fail on its own.
+_BACKGROUND_DRAIN_SECONDS: Final = 2.0
+_BACKGROUND_CANCEL_GRACE_SECONDS: Final = 0.5
 
 #: BACKLOG #2007, ASVS 6.4.5: how :meth:`AuthService._temporary_credential_issuer` finds the audit row
 #: that issued an account's current temporary password. The two issuing paths stamp
@@ -1833,6 +1936,34 @@ def _allowed_channels(user: UserRecord, roles: frozenset[Role]) -> frozenset[str
     if Role.ADMINISTRATOR in roles:
         return None
     return channel_scope.scope_channels(user.channel_scope)
+
+
+def _cert_narrowed_scope(
+    user: UserRecord, mapped: frozenset[str], *, administrator: bool
+) -> UserRecord:
+    """``user`` with the channel scope its current directory groups leave it, for one certificate
+    request (BACKLOG #2316). Writes nothing.
+
+    The rule is :func:`~messagefoundry.auth.channel_scope.decide_ad_channel_scope`, the one login
+    and the reconciler share. Only a narrowing applies, and only as far as the stored scope reaches:
+    the result is the stored channels intersected with what the groups now map to. A scope the groups
+    would widen stays as stored, because this path must not grant, so a widening still waits for a
+    sign-in to write it."""
+    decision = channel_scope.decide_ad_channel_scope(
+        channel_scope.ScopeInput(
+            stored_scope=user.channel_scope,
+            stored_source=user.channel_scope_source,
+            mapped=mapped,
+            administrator=administrator,
+        )
+    )
+    if not decision.narrows:
+        return user
+    before = channel_scope.scope_channels(user.channel_scope)
+    # A narrowing always has a bounded target: an empty set for a withdrawal, else the channels.
+    after = channel_scope.scope_channels(decision.scope_json) or frozenset()
+    reach = after if before is None else before & after
+    return replace(user, channel_scope=json.dumps(sorted(reach)))
 
 
 #: The IdP legs' OWN way across. The connection-shaped default cannot reach this opener, which
@@ -1922,9 +2053,10 @@ def _refuse_idp_revocation(
     ``[auth]`` key for one, and borrowing another hop's claim is how a flag silently widens.
 
     The API lifespan builds ``AuthService`` before ``engine.start()`` (BACKLOG #1923), so this refusal
-    comes before any connection starts. ``messagefoundry check`` still does not reach it; ADR 0173
-    AC-4 records that limit. Two more are recorded only here: when both legs refuse, only the token
-    leg is named, because it is checked first; and the WARN arm logs with no audit sink after
+    comes before any connection starts. ``messagefoundry check`` reports it in its required
+    ``oidc-revocation`` leg, through the same :func:`idp_revocation_guards` (BACKLOG #2131, ADR 0173
+    AC-4). Two limits are recorded only here: when both legs refuse, only the token leg is named,
+    because it is checked first; and the WARN arm logs with no audit sink after
     ``configure_logging`` has set the root level, so a level above WARNING would likely filter it, as
     ``logging_setup._refuse_forward_revocation`` measured for its hop."""
     for guard in idp_revocation_guards(settings, opener, posture):
@@ -2073,6 +2205,20 @@ class AuthService:
             self._ldap = None
         # Instance-scoped (one event loop per AuthService) so it never crosses loops in tests.
         self._argon2_sem = asyncio.Semaphore(_ARGON2_MAX_CONCURRENCY)
+        # BACKLOG #2316: the certificate path's directory probes, capped like argon2 above.
+        # Bounded, so a release with no matching acquire raises instead of widening the cap.
+        self._cert_probe_slots = asyncio.BoundedSemaphore(_CERT_PROBE_MAX_CONCURRENCY)
+        #: Probe tasks still running, held so none is collected while its caller has gone.
+        self._cert_probe_tasks: set[asyncio.Task[reconcile.Probe | str]] = set()
+        #: The certificate path's current outage reason, or None (`_note_cert_directory_answer`).
+        self._cert_directory_outage: str | None = None
+        #: Monotonic time of its last outage WARNING, and whether the current outage logged one.
+        self._cert_outage_warned_at: float | None = None
+        self._cert_outage_announced = False
+        #: Monotonic time of the last INFO saying the current outage changed its reason.
+        self._cert_outage_kind_noted_at: float | None = None
+        #: Configuration refusals already logged by this process.
+        self._cert_config_refusals_logged: set[str] = set()
         self._login_limiter: SlidingWindowRateLimiter | None = (
             SlidingWindowRateLimiter(
                 per_key=settings.login_rate_limit_per_ip,
@@ -2152,6 +2298,20 @@ class AuthService:
         # same caveat as the re-proof table above: engine shards serving their own API ports each
         # keep their own table, so the bound holds per process, not across them.
         self._credential_locks: dict[str, _KeyedLock] = {}
+        # BACKLOG #2216: one in-flight ACCOUNT_LOCKED notice per (user id, lock kind), so two locks of
+        # one kind landing together read the throttle one after the other and mail once. Its own table:
+        # the credential queue above is held across a sign-in's pad, and the notice runs off it. Per
+        # API process, like that queue: engine shards serving their own API ports each keep one, so
+        # two locks landing on two of them at once can still mail twice.
+        self._lock_notice_locks: dict[str, _KeyedLock] = {}
+        # BACKLOG #2216: strong references to the service's background tasks, so a running one is not
+        # garbage-collected. Each removes itself when done; drain_background() awaits the rest.
+        self._background_tasks: set[asyncio.Task[None]] = set()
+        # Set by drain_background(close=True) at shutdown. After it, a lock notice runs inline,
+        # since a task started then would outlive the drain and meet a closed store.
+        self._background_closed = False
+        # One throttle read at a time (BACKLOG #2216); see _lock_notice_held_back.
+        self._lock_notice_read_slots = asyncio.Semaphore(1)
         # Per-SESSION failed re-proofs (BACKLOG #1138): token_hash -> (failures charged to that
         # session, monotonic time of the first, the account's user id). At lockout_threshold the session is revoked, so a stolen session gets that many
         # guesses in total however often the account lock expires. Bounded (_REPROOF_SESSION_MAX,
@@ -2321,6 +2481,50 @@ class AuthService:
         API lifespan passes the notifier to the constructor and never calls this. Call it before
         the first operation that could notify; it replaces whatever channel was wired."""
         self._security_notifier = notifier
+
+    def _start_background(self, work: Coroutine[Any, Any, None]) -> None:
+        """Run ``work`` as a task this service owns (BACKLOG #2216).
+
+        The set holds a strong reference, since the event loop keeps only a weak one and a running
+        task with no other holder can be garbage-collected. ``work`` must log its own failures: the
+        task's result is read by nobody but :meth:`drain_background`."""
+        task = asyncio.create_task(work)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def close_background(self) -> None:
+        """The shutdown drain (BACKLOG #2216): :meth:`drain_background` with ``close=True`` and
+        the :data:`_BACKGROUND_DRAIN_SECONDS` bound. The API lifespan calls it; so must any app
+        that owns its engine some other way, before it stops the engine."""
+        await self.drain_background(timeout=_BACKGROUND_DRAIN_SECONDS, close=True)
+
+    async def drain_background(self, *, timeout: float | None = None, close: bool = False) -> None:
+        """Let the service's background tasks finish. With ``timeout``, cancel any still running
+        at it, and give those at most :data:`_BACKGROUND_CANCEL_GRACE_SECONDS` to unwind.
+
+        BACKLOG #2216. The API lifespan calls this at shutdown with ``close=True`` and
+        :data:`_BACKGROUND_DRAIN_SECONDS`, BEFORE the engine closes the store and before the
+        security notifier stops. A pending ``ACCOUNT_LOCKED`` notice still reads the audit log,
+        hands its mail to that notifier and writes its row. ``close`` also makes every later
+        notice run inline, so none starts after the drain and meets a closed store. A task
+        cancelled here logs a line that names no account, so a notice cut off at shutdown is on
+        record as cut off. **An app that owns its engine some other way than the managed lifespan
+        calls this itself, the same way, before it stops the engine.**
+
+        With no ``timeout`` it is a join and cancels nothing, which is what tests await instead of
+        sleeping. A task started while it waits is waited for too. Safe to call more than once."""
+        if close:
+            self._background_closed = True
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while pending := set(self._background_tasks):
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is None or remaining > 0:
+                await asyncio.wait(pending, timeout=remaining)
+                continue  # re-read the set: some finished, and new ones may have started
+            for task in pending:
+                task.cancel()
+            await asyncio.wait(pending, timeout=_BACKGROUND_CANCEL_GRACE_SECONDS)
+            return
 
     @property
     def policy(self) -> PasswordPolicy:
@@ -4201,6 +4405,13 @@ class AuthService:
         Refusals are audited under the staged session's account wherever the flow names one, so they
         appear in that person's security events rather than under an anonymous actor.
 
+        The session is re-anchored to the callback's address when the callback has one. The
+        ``auth.reauth`` row a completed step-up writes, including one whose rotation lost the
+        session, also records the start leg's address as ``start_client`` and whether the two are
+        different hosts as ``client_moved`` (BACKLOG #2160). The refusal rows above carry neither.
+        A move is recorded, never refused. Behind a proxy the engine does not trust, both legs carry
+        the proxy's address, so ``client_moved`` reads false there.
+
         Not padded to a deadline, unlike the sign-in callback: the caller already holds a session,
         and the step-up leg does not choose between accounts.
         """
@@ -4339,6 +4550,15 @@ class AuthService:
             # (3) The purpose-bound grant, against the NEW hash.
             self._grant_action_step_up(hash_token(elevation.token), purpose)
         self.clear_oidc_unavailable()
+        # BACKLOG #2160: the start leg staged its caller's address, and the session is re-anchored
+        # to the callback's above. Record whether the address moved mid-ceremony, compared as the
+        # new-address signal compares. Recorded only: refusing a move, or anchoring to the start
+        # address, would change ADR 0142 Amendment B and needs a ruling first. None when either
+        # address is unknown, since an empty string matches nothing and proves no move.
+        start_client = flow.client_ip or None
+        client_moved = (
+            not self._same_host(start_client, client) if start_client and client else None
+        )
         await self._audit(
             "auth.reauth",
             actor=user.username,
@@ -4351,6 +4571,8 @@ class AuthService:
                     "session_lost": elevation.session_lost,
                     "grant_refused": grant_refused,
                     "session_revoked": False,
+                    "start_client": start_client,
+                    "client_moved": client_moved,
                 }
             ),
             client=client,
@@ -4619,6 +4841,10 @@ class AuthService:
         role_ids = sorted(await self._store.roles_for_ad_groups(principal.groups))
         previous = set(await self._store.get_user_role_ids(user.id))
         await self._store.set_user_roles(user.id, role_ids, assigned_by="ad-sync")
+        # vault BACKLOG #2610: only a role this sync ADDED is reported, so an account that already
+        # held Administrator pages nobody on each sign-in.
+        gained = frozenset(role_ids) - previous
+        roles_gained = RolesGained(user.username, gained) if gained else None
         if set(role_ids) != previous:
             # Directory-side role change (often a downgrade): revoke the user's other live sessions
             # so stale elevated tokens don't linger until expiry (AUTH-AD-REVOKE). The new session
@@ -4708,9 +4934,10 @@ class AuthService:
                 # the account's other sessions as that sync always does. The reason is
                 # also written for a row deleted in the same window, which the guard
                 # refuses too; that row has no binding to look for.
-                return await self._refuse_directory_row(
+                refused = await self._refuse_directory_row(
                     principal.username, FEDERATED_SIGN_IN_REQUIRED, client=client
                 )
+                return replace(refused, roles_gained=roles_gained)
             await self._directory_reject_audit(
                 principal.username, "oidc", "federated_subject_unbound"
             )
@@ -4718,6 +4945,7 @@ class AuthService:
                 ok=False,
                 error="federated sign-in failed",
                 reason="federated_subject_unbound",
+                roles_gained=roles_gained,
             )
         # The password-AD and Kerberos paths must keep emitting EXACTLY {"provider","roles"}: _json is
         # json.dumps(sort_keys=True), so a null-valued key is a different stored string, not a no-op.
@@ -4765,6 +4993,7 @@ class AuthService:
             token=token,
             identity=identity,
             mfa_required=mfa_required,
+            roles_gained=roles_gained,
         )
 
     async def _sync_ad_channel_scope(
@@ -5316,13 +5545,10 @@ class AuthService:
         write ``users.username``. The fix is to stop asking a question whose answer has stopped
         meaning what the caller reads it as.
 
-        A row whose ``directory_object_id`` is NULL still probes by name. That is a **directory's**
-        property rather than a choice here: one that returns no readable ``objectGUID`` leaves every
-        row unbound, and the engine cannot key on an identifier it is never given. Such a site keeps
-        the old behaviour, rename wart included; ``auth/ldap.py`` warns once per distinct shape so an
-        operator can find out. **Except a row that carries a federated binding** (ADR 0184 AC-5,
-        BACKLOG #2027): :meth:`reconcile_directory_sessions` never hands one here, and
-        :meth:`_report_unkeyed_bindings` says why and what it costs.
+        No caller hands this a row whose ``directory_object_id`` is NULL (BACKLOG #2434). Such a row
+        would probe by name, and a name probe can read another account's entry. The step-up legs
+        refuse it first, and :meth:`reconcile_directory_sessions` reads it as UNKEYED unasked,
+        or skips it when it carries a federated binding (:meth:`_report_unkeyed_bindings`).
 
         ``probe_principal`` is the password-free service-account lookup the Kerberos path uses, with
         the reason kept. It returns the group set, so the role re-diff below costs no extra round
@@ -5331,7 +5557,7 @@ class AuthService:
         ``userAccountControl`` UNDETERMINED (ADR 0195 rule items 1 and 2). An unreadable attribute
         must never come back as UNAVAILABLE, which never revokes; that would reopen BACKLOG #1639.
         """
-        # Guarded by directory_reconcile_enabled, and by _directory_step_up_refusal (BACKLOG #2023).
+        # Guarded by directory_reconcile_enabled, and by _directory_presence (BACKLOG #2023, #2316).
         assert self._ldap is not None
         try:
             probe = await asyncio.to_thread(
@@ -5377,7 +5603,10 @@ class AuthService:
             # standing gap for one named account, not a blip. CancelledError is not an Exception.
             # The WARNING names the type only: the message can quote a directory value, which
             # ldap.py never logs. The traceback, with the message, goes to DEBUG for diagnosis.
-            _log.warning(
+            # The certificate path lowers this to DEBUG in its own task's context (BACKLOG #2316):
+            # it probes per request, not per pass, and reports the fault once as an outage.
+            _log.log(
+                _PROBE_FAULT_LOG_LEVEL.get(),
                 "directory probe of %s raised %s; read as unavailable, so this account's "
                 "sessions are not revoked and its step-up is refused while this repeats",
                 user.username,
@@ -5423,12 +5652,14 @@ class AuthService:
         * a probe that could not reach the directory contributes nothing (fail-open);
         * a probe the directory referred contributes nothing either, and the pass alerts, while
           every other account is still judged (BACKLOG #2538);
-        * a principal must come back absent, disabled or undetermined ``ad_session_recheck_strikes``
-          passes running;
+        * a principal must come back absent, disabled, undetermined or unkeyed
+          ``ad_session_recheck_strikes`` passes running;
         * a PRESENT principal whose directory groups would change its roles, or withdraw or narrow
           its channel scope, is revoked on one pass, and the scope itself is left for the next login
           to write (ADR 0198);
         * a wave of undetermined answers is held, not revoked, and alerts (ADR 0195);
+        * a row with no directory id is never asked about by name: it reads as unkeyed without a
+          lookup, so it strikes like an absent account and writes no roles (BACKLOG #2434);
         * a pass that would revoke too many at once aborts wholesale and alerts.
 
         The pass is **planned in full before anything is written**, so an abort leaves the store
@@ -5497,7 +5728,19 @@ class AuthService:
         # No early stop on a referral (BACKLOG #2538): a referral leaves only its own account
         # unjudged, so every other account in the sample is still probed and judged.
         for user_id, _username in selected:
-            probes.append(await self._probe_principal(users[user_id]))
+            user = users[user_id]
+            if _holds_directory_key(user):
+                probes.append(await self._probe_principal(user))
+            else:
+                # BACKLOG #2434, ADR 0184 amendment 2026-10-06. An id-less row is never asked about
+                # by name. A name probe could read another account's entry and write that
+                # account's roles onto this row, and no sign-in or step-up admits such a row any
+                # more, so a session it holds is anomalous. UNKEYED, unasked, writes no roles and
+                # strikes like ABSENT. Not UNDETERMINED: that would feed the ADR 0195 hold, which
+                # would hold these rows and forfeit a later hold alert's clear.
+                probes.append(
+                    reconcile.Probe(user.id, user.username, reconcile.ProbeOutcome.UNKEYED)
+                )
             self._reconcile_last_probed[user_id] = now
 
         # Resolve the role sets for the role re-diff, and the scope inputs for the scope re-diff (ADR
@@ -5566,19 +5809,22 @@ class AuthService:
         # dropped from the set (`_forfeit_clears_on_attrition`). Kept as it stood before this pass,
         # for the revocation loop below.
         unconfirmed = frozenset(self._reconcile_unconfirmed)
+        # BACKLOG #2434. An id-less row is never probed, so no pass can read it PRESENT. Marked, it
+        # would stay unconfirmed until its UNKEYED revocation forfeits the clear, every time.
+        keyed = {uid for uid, user in users.items() if _holds_directory_key(user)}
         if plan.aborted is None:
             present = reconcile.ProbeOutcome.PRESENT
             self._reconcile_unconfirmed.difference_update(
                 uid for uid, outcome in plan.outcomes.items() if outcome is present
             )
         elif not plan.judged_nothing:
-            self._reconcile_unconfirmed = set(users)
+            self._reconcile_unconfirmed = set(keyed)
             self._advance_breaker_standing("tripped")
         # BACKLOG #2538. The same for a referral, on its own record and its own standing.
         # `_mark_reconcile_clears` states why every candidate is marked and why only PRESENT
         # confirms; `_forfeit_clears_on_attrition` states the forfeit.
         if plan.referred:
-            self._reconcile_referred = set(users)
+            self._reconcile_referred = set(keyed)
             self._advance_referral_standing("referred")
         else:
             present = reconcile.ProbeOutcome.PRESENT
@@ -5604,11 +5850,11 @@ class AuthService:
         self._reconcile_alert = None
         if plan.unavailable:
             _log.warning(
-                "directory reconcile: %d of %d principals could not be resolved (directory "
+                "directory reconcile: %d of %d principals asked could not be resolved (directory "
                 "unreachable, or a probe raised, which is warned per account) — those sessions "
                 "were left alone (fail-open)",
                 plan.unavailable,
-                plan.probed,
+                plan.asked,
             )
         applied: list[reconcile.SessionRevocation] = []
         for revocation in plan.revocations:
@@ -6216,7 +6462,8 @@ class AuthService:
         convention for an account it cannot ask about, the fail-open UNAVAILABLE arm, rather than
         revoking: revoking on every pass would sign a Windows SSO holder out each interval with no
         end. The remedy is the audited admin unbind. The row is then an ordinary id-less account,
-        probed by name as any such row on that directory is.
+        which the pass reads as UNKEYED without a lookup, so its sessions end at the strike
+        threshold (BACKLOG #2434). No sign-in admits an id-less row, so nothing signs it back in.
 
         The row is left bound on purpose. Clearing a binding is an administrator's audited act,
         and this loop has no administrator behind it.
@@ -6237,8 +6484,9 @@ class AuthService:
             _log.warning(
                 "directory reconcile: %s carries a federated binding but no directory object id, "
                 "so it is not probed by name and a directory disable will not end its sessions "
-                "before they expire. Unbind it (DELETE /users/%s/federated-identity) to return it "
-                "to the reconciler.",
+                "before they expire. Unbind it (DELETE /users/%s/federated-identity) so the "
+                "reconciler ends its sessions; it cannot sign in again until it is removed and "
+                "re-created with a directory id.",
                 user.username,
                 user.id,
             )
@@ -6310,14 +6558,16 @@ class AuthService:
         """Record an aborted pass. Applies NOTHING — the point of the abort."""
         if plan.directory_outage:
             # Not a breaker trip: the accounts are fine, the directory is not. Loud but not latched.
+            # Counted over the probes ASKED (BACKLOG #2434): an UNKEYED row never reached the
+            # directory, so it is no part of what failed.
             _log.warning(
                 "directory reconcile: ALL %d probes failed — the directory is unreachable. No "
                 "session was revoked (fail-open).",
-                plan.probed,
+                plan.asked,
             )
             await self._audit_reconciler_row(
                 "auth.ad_reconcile_skipped",
-                detail=_json({"reason": plan.aborted, "probed": plan.probed}),
+                detail=_json({"reason": plan.aborted, "asked": plan.asked}),
             )
             return
         # Held probes were left out of the breaker's denominator (ADR 0195 rule item 7), so the
@@ -6511,9 +6761,20 @@ class AuthService:
         # ``account_disabled`` would be a false statement in a security notice, and the login-path
         # scope re-sync this mirrors sends no notice either. The audit row and the
         # ``ad_session_revoked`` alert record it.
+        #
+        # ACCOUNT_DISABLED only when the pass READ the disabled bit (vault BACKLOG #2140). That
+        # notice says an administrator disabled the account, which an absent account or an unreadable
+        # attribute does not establish, so every other whole-account reason, including any added
+        # later, gets the neutral DIRECTORY_SESSIONS_ENDED.
+        if revocation.role_ids is not None:
+            kind = ROLES_CHANGED
+        elif revocation.reason == reconcile.REVOKE_REASONS[reconcile.ProbeOutcome.DISABLED]:
+            kind = ACCOUNT_DISABLED
+        else:
+            kind = DIRECTORY_SESSIONS_ENDED
         if user is not None and revocation.reason != reconcile.SCOPE_CHANGED:
             await self._notify_security(
-                ACCOUNT_DISABLED if revocation.role_ids is None else ROLES_CHANGED,
+                kind,
                 username=user.username,
                 email=user.notify_email,
                 detail={"reason": revocation.reason},
@@ -6874,7 +7135,8 @@ class AuthService:
 
     async def identity_for_cert_user_id(self, user_id: str) -> Identity | None:
         """Resolve the users-row id a verified client cert maps to, or ``None`` when that account is
-        unknown or disabled — WITHOUT a bearer session (BACKLOG #2238, ADR 0083).
+        unknown, disabled, or a directory account the directory does not confirm — WITHOUT a bearer
+        session (BACKLOG #2238, #2316, ADR 0083).
 
         The mTLS map targets the row id, not the username, because a username can be released by a
         rename and taken by another row: a map keyed by name would then hand the cert to that other
@@ -6883,13 +7145,188 @@ class AuthService:
         treats it (:meth:`identity_for_token`); unlike :meth:`identity_for_user_id`, which the
         permission inspector uses and which resolves a disabled account on purpose.
 
-        No directory check, the same as the name-keyed path before it: the engine row's ``disabled``
-        flag is the one this path has always read. Asking the directory per request is a separate
-        control change, not this key change."""
+        **A DIRECTORY ACCOUNT IS ASKED ABOUT ON EVERY REQUEST, AND FAILS CLOSED (BACKLOG #2316).**
+        The engine row's ``disabled`` flag and roles are not enough for an AD row: the reconciler
+        probes only accounts holding a live session, and a certificate caller holds none, so nothing
+        ever refreshed them and a directory-side disable or group removal never reached this path.
+        So an AD row gets the same probe and the same refusals as directory step-up
+        (:meth:`_directory_presence`): anything short of a present, enabled account in the directory
+        returns ``None``. That includes an unreachable or referring directory, no directory wired,
+        and a row with no ``directory_object_id``. A local row is never probed.
+
+        **Roles NARROW rather than refuse.** The identity carries the stored roles that the
+        account's current groups still map to: never more than the row holds, because this path
+        writes nothing and must not grant, and never more than the directory now grants. So an
+        account removed from one of two mapped groups keeps the other role on its next request,
+        where step-up refuses outright. An empty result returns ``None``. The channel scope narrows
+        on the same groups, by the rule sign-in uses (:func:`_cert_narrowed_scope`), so a scope an
+        administrator set is kept when no scope-mapped group matches. Nothing is written: only a
+        sign-in, or a reconciler pass while the account holds a session, re-syncs the row.
+
+        **No cache, and a bounded wait.** A cached answer would bring back the staleness this
+        closes. Concurrent probes are capped at :data:`_CERT_PROBE_MAX_CONCURRENCY`; a request that
+        cannot get a slot within :data:`_CERT_PROBE_SLOT_WAIT_SECONDS` is refused. Refusals do not
+        log one line per request; :meth:`_note_cert_directory_answer` says what they log."""
         user = await self._store.get_user(user_id)
         if user is None or user.disabled:
             return None
-        return await self._build_identity(user)
+        if user.auth_provider != AuthProvider.AD.value:
+            return await self._build_identity(user)
+        answer = await self._cert_directory_presence(user)
+        self._note_cert_directory_answer(answer)
+        if not isinstance(answer, reconcile.Probe):
+            return None
+        # Everything below is read after the probe, as step-up does: the round trip can be seconds,
+        # and a local disable, a scope edit or a sign-in's role re-sync may have landed meanwhile.
+        # The answer vouches only for the account it asked about, so a row whose immutable id or
+        # provider moved during the round trip is refused rather than judged on another's answer.
+        asked = user
+        user = await self._store.get_user(user_id)
+        if (
+            user is None
+            or user.disabled
+            or user.auth_provider != asked.auth_provider
+            or user.directory_object_id != asked.directory_object_id
+        ):
+            return None
+        granted = await self._store.roles_for_ad_groups(answer.groups)
+        held = await self._store.get_user_role_ids(user.id)
+        kept = [role_id for role_id in held if role_id in granted]
+        if not kept:
+            return None
+        # The scope narrows on the same groups, by the rule login and the reconciler share. Its
+        # TARGET roles decide the Administrator short-circuit there; here that is the kept set.
+        administrator = Role.ADMINISTRATOR.value in kept
+        mapped = (
+            frozenset()
+            if administrator
+            else frozenset(await self._store.channels_for_ad_groups(answer.groups))
+        )
+        return await self._build_identity(
+            _cert_narrowed_scope(user, mapped, administrator=administrator), role_ids=kept
+        )
+
+    async def _cert_directory_presence(self, user: UserRecord) -> reconcile.Probe | str:
+        """:meth:`_directory_presence` under the certificate path's probe cap (BACKLOG #2316), or
+        :data:`CERT_PROBE_SATURATED` when no slot frees within the wait bound.
+
+        The slot is held until the probe itself ends, not until this caller stops waiting. The
+        probe's worker thread cannot be cancelled, so releasing on a cancelled request would let
+        the threads outnumber the cap. The probe therefore runs as its own task, shielded, and
+        releases its slot when it finishes."""
+        try:
+            async with asyncio.timeout(_CERT_PROBE_SLOT_WAIT_SECONDS):
+                await self._cert_probe_slots.acquire()
+        except TimeoutError:
+            return CERT_PROBE_SATURATED
+        try:
+            task = asyncio.create_task(self._cert_probe(user))
+        except BaseException:
+            self._cert_probe_slots.release()
+            raise
+        self._cert_probe_tasks.add(task)
+        task.add_done_callback(self._cert_probe_done)
+        return await asyncio.shield(task)
+
+    async def _cert_probe(self, user: UserRecord) -> reconcile.Probe | str:
+        # This task's own context, so the DEBUG level never reaches the reconciler or step-up. A
+        # fault on one account's entry would otherwise log a WARNING naming it on every request;
+        # the outage line below reports it once instead.
+        token = _PROBE_FAULT_LOG_LEVEL.set(logging.DEBUG)
+        try:
+            return await self._directory_presence(user)
+        except Exception:
+            # Returned, never raised: a raise from a probe whose caller was cancelled would reach
+            # the loop's exception handler through the shield, one ERROR per orphaned request.
+            # Read as an outage, which fails closed and logs by the outage rules. The traceback can
+            # quote a directory value, so it goes to DEBUG and names no account.
+            _log.debug("certificate-path directory probe raised", exc_info=True)
+            return reconcile.ProbeOutcome.UNAVAILABLE.value
+        finally:
+            _PROBE_FAULT_LOG_LEVEL.reset(token)
+
+    def _cert_probe_done(self, task: asyncio.Task[reconcile.Probe | str]) -> None:
+        self._cert_probe_slots.release()
+        self._cert_probe_tasks.discard(task)
+        if not task.cancelled():
+            # Only a BaseException that is not an Exception can end here; _cert_probe returns
+            # everything else. Retrieved so it is not also reported as never retrieved.
+            task.exception()
+
+    def _note_cert_directory_answer(self, answer: reconcile.Probe | str) -> None:
+        """Log the certificate path's directory refusals without logging one line per request.
+
+        An outage is a refusal that says the directory could not be asked: unreachable, referring,
+        a fault reading the entry, or the probe cap full. It logs one WARNING per outage and, if that
+        WARNING was logged, one INFO on the next answer the directory actually gave, whatever it
+        said about the account. WARNINGs are at least :data:`_CERT_OUTAGE_LOG_INTERVAL_SECONDS`
+        apart, so an outage that flaps (a full cap turning over, or one referring account beside a
+        healthy one) still logs about once a minute. An outage that starts inside that interval
+        logs its WARNING on its first refusal after the interval ends, so a long one is never
+        silent. A logged outage whose reason changes logs the change at INFO, at most once per
+        interval, and the closing INFO names the latest reason.
+
+        A configuration refusal (no directory wired, a row with no immutable id) asks nothing and
+        moves neither way. It logs one WARNING per reason per process instead.
+
+        The lines name no account. Every service request during an outage is refused the same way,
+        and the username is not the useful fact."""
+        outcome = answer.outcome.value if isinstance(answer, reconcile.Probe) else answer
+        if outcome in _CERT_DIRECTORY_OUTAGES:
+            now = time.monotonic()
+            latched = self._cert_directory_outage
+            self._cert_directory_outage = outcome
+            if latched is not None and self._cert_outage_announced:
+                if outcome != latched:
+                    self._note_cert_outage_kind_change(latched, outcome, now)
+                return
+            last = self._cert_outage_warned_at
+            if last is not None and now - last < _CERT_OUTAGE_LOG_INTERVAL_SECONDS:
+                if latched is None:
+                    _log.debug("certificate-path directory check returned %s again", outcome)
+                return
+            self._cert_outage_announced = True
+            self._cert_outage_warned_at = now
+            self._cert_outage_kind_noted_at = None
+            _log.warning(
+                "mTLS certificate identities for directory accounts are refused: the directory "
+                "check returned %s. Logged once until a check reaches the directory again",
+                outcome,
+            )
+        elif outcome in _CERT_DIRECTORY_ANSWERS:
+            if self._cert_directory_outage is None:
+                return
+            if self._cert_outage_announced:
+                _log.info(
+                    "mTLS certificate identities for directory accounts: the directory check "
+                    "reaches the directory again (it last returned %s)",
+                    self._cert_directory_outage,
+                )
+            self._cert_directory_outage = None
+            self._cert_outage_announced = False
+        elif outcome not in self._cert_config_refusals_logged:
+            self._cert_config_refusals_logged.add(outcome)
+            _log.warning(
+                "an mTLS certificate identity for a directory account was refused: %s. Logged "
+                "once per process for this reason",
+                outcome,
+            )
+
+    def _note_cert_outage_kind_change(self, before: str, after: str, now: float) -> None:
+        """Log that a logged certificate-path outage changed its reason, at INFO at most once per
+        :data:`_CERT_OUTAGE_LOG_INTERVAL_SECONDS` and otherwise at DEBUG. A full cap and an
+        unreachable directory can alternate request by request, and must not log a line each."""
+        last = self._cert_outage_kind_noted_at
+        if last is not None and now - last < _CERT_OUTAGE_LOG_INTERVAL_SECONDS:
+            _log.debug("certificate-path directory check now returns %s (was %s)", after, before)
+            return
+        self._cert_outage_kind_noted_at = now
+        _log.info(
+            "mTLS certificate identities for directory accounts are still refused: the directory "
+            "check now returns %s (it had returned %s)",
+            after,
+            before,
+        )
 
     async def identity_for_user_id(self, user_id: str) -> Identity | None:
         """Resolve a user id directly to its :class:`Identity` (roles + custom-role overlay), or
@@ -7033,8 +7470,15 @@ class AuthService:
             granted |= decode_custom_role_permissions(row["permissions"])
         return frozenset(granted)
 
-    async def _build_identity(self, user: UserRecord) -> Identity:
-        role_ids = await self._store.get_user_role_ids(user.id)
+    async def _build_identity(
+        self, user: UserRecord, *, role_ids: Iterable[str] | None = None
+    ) -> Identity:
+        """The account's :class:`Identity`. ``role_ids`` replaces the stored role ids when given, so
+        a caller that narrowed them (:meth:`identity_for_cert_user_id`) gets the same built-in,
+        custom-role and channel treatment as every other path."""
+        if role_ids is None:
+            role_ids = await self._store.get_user_role_ids(user.id)
+        role_ids = list(role_ids)
         roles = _roles_from_ids(role_ids)
         custom_permissions = await self._custom_permissions_for_ids(role_ids)
         provider = (
@@ -7392,8 +7836,12 @@ class AuthService:
                 verify_password, user.password_hash, password
             )
         if verdict is None:
-            # Only the directory leg answers None: it could not judge the password at all.
-            return _Reproof(ok=False, user=user, reason=reason, directory_unconfirmed=True)
+            # Only the directory leg answers None: it could not judge the password at all. An empty
+            # password is the caller's malformed submission, not a directory that could not confirm
+            # the account, so it reads as a refused password (BACKLOG #2434). Neither is charged.
+            return _Reproof(
+                ok=False, user=user, reason=reason, directory_unconfirmed=reason != EMPTY_PASSWORD
+            )
         charged = self._charge_reproof_failure(token_hash, user.id) if not verdict else 0
         # A fresh read and a fresh clock: the verify may have taken seconds, and another leg may have
         # set a lock meanwhile.
@@ -7788,13 +8236,23 @@ class AuthService:
 
         Three verdicts, because only one of the two refusals is a guess (BACKLOG #1138): ``True`` =
         bound; ``False`` = the directory REJECTED the password, which :meth:`_reproof` counts toward
-        the engine lockout; ``None`` = it could not be asked (no directory, an :class:`LdapError`)
-        or it has no such principal. Both refusals fail closed; only ``False`` is counted.
+        the engine lockout; ``None`` = it could not be asked (no directory, an :class:`LdapError`),
+        it has no enabled entry for the row, or the password was empty. Every refusal fails closed;
+        only ``False`` is counted.
 
-        The principal check matters because ``authenticate`` answers ``None`` for a missing, renamed
-        or disabled principal as well as for a wrong password. Counting that would lock the engine
-        row of a user whose every re-bind fails whatever they type, and the lock is then enforced at
-        their Kerberos and OIDC sign-in. The extra lookup runs only after a refusal. A correct
+        **AN EMPTY PASSWORD IS REFUSED FIRST, AND IS NOT A GUESS (BACKLOG #2434).** The directory
+        never judges one, since an empty simple bind is an anonymous bind. Counting it would charge
+        the account for a malformed submission. It is refused before any directory call as
+        ``empty_password``, which :meth:`_reproof_serialized` refuses like a wrong password but
+        does not charge.
+
+        **``authenticate`` says what its lookup found (BACKLOG #2434).** Its :class:`DirectoryBind`
+        tells a refused bind on an enabled entry (``False``, counted) from an absent entry
+        (``not_in_directory``), a disabled one (``directory_disabled``) and an unreadable account
+        state (``directory_undetermined``), none of them counted. Counting those would lock the
+        engine row of a user whose every re-bind fails whatever they type, and the lock is then
+        enforced at their Kerberos and OIDC sign-in. Before #2434 a second lookup after every
+        refusal told absent from present, and could not tell absent from disabled. A correct
         password the DC refuses as expired still counts, which nothing here can tell apart.
 
         **THE BIND IS KEYED BY THE ROW'S OWN OBJECT, NOT BY ITS NAME (BACKLOG #2027).** ``username``
@@ -7812,37 +8270,29 @@ class AuthService:
         Each answer is still checked against ``object_id``, for any other directory implementation:
         an answer carrying no readable id is ``None`` with reason ``directory_object_id_missing``,
         and one about another object is ``None`` with ``directory_identity_conflict``. Neither is
-        counted. A refused bind is counted once the id-keyed lookup finds the entry, because that
-        bind was judged against this account. ``object_id`` is required, so no caller can re-bind a
-        row that has none; :meth:`_reproof_serialized` refuses that row first."""
+        counted. A refused bind on an entry the id-keyed lookup found is counted, because that bind
+        was judged against this account. ``object_id`` is required, so no caller can re-bind a row
+        that has none; :meth:`_reproof_serialized` refuses that row first."""
+        if not password:
+            return _DirectoryRebind(None, EMPTY_PASSWORD)
         if self._ldap is None:
             return _DirectoryRebind(None, "not_configured")
         try:
-            principal = await asyncio.to_thread(
+            bind = await asyncio.to_thread(
                 self._ldap.authenticate, username, password, object_id=object_id
             )
         except LdapError:
             return _DirectoryRebind(None, "directory_unavailable")
-        if principal is not None:
-            mismatch = _directory_answer_mismatch(principal, object_id)
+        if bind.principal is not None:
+            mismatch = _directory_answer_mismatch(bind.principal, object_id)
             return _DirectoryRebind(None, mismatch) if mismatch else _DirectoryRebind(True)
-        try:
-            known = await asyncio.to_thread(
-                self._ldap.resolve_principal, username, object_id=object_id
-            )
-        except LdapError:
-            # ``authenticate`` also answers None where no real bind was judged (an empty password, an
-            # unfound principal's equalizing bind, a DC too busy to answer the bind), so a lookup
-            # that then fails cannot show the password was checked. Not counted, like an outage.
-            return _DirectoryRebind(None, "directory_unavailable")
-        # Found by the row's own id, so the bind that failed was judged against this account: it
-        # counts, whatever id the entry reads back. Not counting an unreadable one would let a
-        # held session send the DC unlimited guesses past the per-session cap. (LdapAuthenticator
-        # never binds such an entry, and answers None for it here, so it reaches this only through
-        # another directory implementation.)
-        return (
-            _DirectoryRebind(None, "not_in_directory") if known is None else _DirectoryRebind(False)
-        )
+        if bind.answer is DirectoryAnswer.FOUND:
+            # Found by the row's own id, so the bind that failed was judged against this account:
+            # it counts. That includes a DC too busy to answer the bind, which nothing here can
+            # tell from a wrong password.
+            return _DirectoryRebind(False)
+        # No bind was judged, so nothing is counted.
+        return _DirectoryRebind(None, _REBIND_REFUSALS[bind.answer])
 
     async def has_recent_step_up(self, token: str | None) -> bool:
         """Whether the caller's session re-verified its credential within
@@ -8876,6 +9326,26 @@ class AuthService:
         refuses even when the new role grants more. This refuses and writes nothing; the reconciler
         or the next sign-in re-syncs the roles. Channel scope is not compared here.
         """
+        answer = await self._directory_presence(user)
+        if not isinstance(answer, reconcile.Probe):
+            return answer
+        # The groups came back with the probe, so this costs store reads only. Read after the probe,
+        # so a sign-in that re-synced the roles during the round trip is judged on what it wrote.
+        held = set(await self._store.get_user_role_ids(user.id))
+        if not held <= await self._store.roles_for_ad_groups(answer.groups):
+            return DIRECTORY_ROLES_DEMOTED
+        return None
+
+    async def _directory_presence(self, user: UserRecord) -> reconcile.Probe | str:
+        """Ask the directory whether AD row ``user`` is a present, enabled account. Returns the
+        PRESENT probe, which carries the account's current groups, or the refusal reason string.
+
+        The fail-closed half :meth:`_directory_step_up_refusal` and
+        :meth:`identity_for_cert_user_id` share. Every answer short of PRESENT is a reason:
+        ``not_configured`` with no directory wired, :data:`DIRECTORY_OBJECT_ID_MISSING` for a row
+        with no immutable id (asked nothing, see the step-up docstring), and otherwise the probe's
+        own outcome value.
+        """
         if self._ldap is None:
             return "not_configured"
         if not user.directory_object_id:
@@ -8886,12 +9356,7 @@ class AuthService:
         probe = await self._probe_principal(user)
         if probe.outcome is not reconcile.ProbeOutcome.PRESENT:
             return str(probe.outcome.value)
-        # The groups came back with the probe, so this costs store reads only. Read after the probe,
-        # so a sign-in that re-synced the roles during the round trip is judged on what it wrote.
-        held = set(await self._store.get_user_role_ids(user.id))
-        if not held <= await self._store.roles_for_ad_groups(probe.groups):
-            return DIRECTORY_ROLES_DEMOTED
-        return None
+        return probe
 
     async def _verify_second_factor(
         self,
@@ -10800,7 +11265,15 @@ class AuthService:
         **``audit_detail`` MIRRORS THE ATTEMPT'S OWN ROW, never ``notice_detail``.** The failure count
         goes in the notice only. The audit row carries no more than the ``auth.login_failed``,
         ``auth.mfa_failed`` or ``auth.login_success`` row beside it. The attempt itself stays audited
-        once, by that row; this adds the event the attempt caused."""
+        once, by that row; this adds the event the attempt caused.
+
+        **AN ``ACCOUNT_LOCKED`` NOTICE WITH A NOTIFIER WIRED RUNS OFF THE REQUEST PATH (BACKLOG
+        #2216).** Its throttle reads the audit log (:meth:`_lock_notice_due`), and every caller is
+        a refusal: the sign-in's deferred rows, which must fit the write room of its padded slot,
+        and the second-step and re-proof refusals. So the throttle and the mail run as one task the
+        service owns (:meth:`_send_lock_notice`), and this returns once the ``auth.account_locked``
+        row is in. The row stays inline, since it is the record the feed reads. With no notifier
+        the throttle reads nothing and writes one row, so that arm stays inline too."""
         action = _SUSPICIOUS_LOGIN_ACTIONS[event_type]
         await self._audit(
             action,
@@ -10808,10 +11281,17 @@ class AuthService:
             detail=_json(audit_detail) if audit_detail is not None else None,
             client=client,
         )
-        if event_type == ACCOUNT_LOCKED and not await self._lock_notice_due(
-            user, str(notice_detail.get("lock", "sign_in"))
-        ):
-            return
+        if event_type == ACCOUNT_LOCKED:
+            lock = str(notice_detail.get("lock", "sign_in"))
+            if self._security_notifier is not None:
+                send = self._send_lock_notice(user, lock, client=client, detail=dict(notice_detail))
+                if self._background_closed:
+                    await send  # shutting down: a task would outlive the drain
+                else:
+                    self._start_background(send)
+                return
+            if not await self._lock_notice_due(user, lock):
+                return
         await self._notify_security(
             event_type,
             username=user.username,
@@ -10820,8 +11300,69 @@ class AuthService:
             detail=notice_detail,
         )
 
+    async def _send_lock_notice(
+        self, user: UserRecord, lock: str, *, client: str | None, detail: dict[str, Any]
+    ) -> None:
+        """Decide whether an ``ACCOUNT_LOCKED`` notice is due and send it, off the request path.
+
+        BACKLOG #2216. :meth:`_record_suspicious_login` starts this as a background task, or awaits
+        it once :meth:`drain_background` has closed the service to new ones.
+
+        **Serialized per account and lock kind** (``_lock_notice_locks``). Off the request path two
+        locks of one kind can land together, for example a sign-in lock set by a re-proof while a
+        sign-in sets it too. Each would read the throttle before the other wrote its row, and the
+        owner would get two mails. Under the lock the second reads the first's row.
+
+        **The mail goes before its ``auth.lock_notice`` row.** A row write that fails or is cut off
+        then costs at most a duplicate mail at the next lock, which the throttle already treats as
+        the cheap failure.
+
+        **Its failures are logged by exception class only, and its log lines name no account,
+        user id or lock kind.** ``GET /logs/tail`` serves the log to ``logs:view``, and a lock
+        notice is silent there by design (``LOG_SILENT_EVENT_TYPES``). A store error raised here
+        used to fail the request; now nobody would read it, so it is logged instead. A task
+        cancelled before it finishes, at shutdown, logs a line saying the notice may be neither
+        mailed nor recorded, as :func:`_write_through_cancellation` does for a refused sign-in's
+        rows. These lines still show a ``logs:view`` reader WHEN some lock's notice failed, though
+        not whose: the residual ``docs/SECURITY.md`` states."""
+        try:
+            async with _hold_keyed_lock(self._lock_notice_locks, f"{user.id}\x00{lock}"):
+                # Read once: ``attach_security_notifier`` can detach the channel while this waits.
+                # Without one, _lock_notice_due writes the no-notifier row itself.
+                wired = self._security_notifier is not None
+                if not await self._lock_notice_due(user, lock):
+                    return
+                # The mail BEFORE its row, and the row says whether the notifier took it. A
+                # cut-off or failed row write, or a refused hand-off, then costs at most a
+                # duplicate mail at the next lock, the cheap failure. The other order could leave
+                # a row saying a mail went out that never did, holding the next one back a day.
+                handed = await self._notify_security(
+                    ACCOUNT_LOCKED,
+                    username=user.username,
+                    email=user.notify_email,
+                    client=client,
+                    detail=detail,
+                )
+                if wired:
+                    await self._record_lock_notice(user, lock, handed=handed)
+        except asyncio.CancelledError:
+            _log.warning(
+                "a security notice was cancelled before it finished; it may be neither mailed "
+                "nor recorded"
+            )
+            raise
+        except Exception as exc:  # noqa: BLE001 - nobody awaits this task; log and stop
+            _log.error(
+                "a security notice failed off the request path (%s); it may be neither mailed "
+                "nor recorded",
+                type(exc).__name__,
+            )
+
     async def _lock_notice_due(self, user: UserRecord, lock: str) -> bool:
-        """Whether an ``ACCOUNT_LOCKED`` mail for this ``lock`` kind is due, and if so, record it.
+        """Whether an ``ACCOUNT_LOCKED`` mail for this ``lock`` kind is due.
+
+        With a notifier wired, the caller records a due notice AFTER the mail, through
+        :meth:`_record_lock_notice` (BACKLOG #2216). With none, this writes the row itself.
 
         ADR 0197 Decision item 7 (BACKLOG #1131): at most one mail per lock kind per account per
         :data:`_LOCK_NOTICE_WINDOW_SECONDS`, and always a mail for the first lock after a quiet window.
@@ -10846,7 +11387,11 @@ class AuthService:
         every 15 minutes, but its row says ``mailed: false``, so once an address is set the next
         lock of that kind IS mailed rather than held back by a notice nobody received. A failed read
         fails OPEN, sending the mail, and is logged: a duplicate notice is the cheap failure here, a
-        missing one the costly."""
+        missing one the costly.
+
+        **With a notifier wired this runs in :meth:`_send_lock_notice`'s task, never on a request
+        (BACKLOG #2216)**, so the read cannot overrun a refusal's padded slot however large the
+        audit log grows. Without one it runs inline and reads nothing."""
         if self._security_notifier is None:
             if self._settings.notify_security_events:
                 await self._audit(
@@ -10855,21 +11400,34 @@ class AuthService:
                     detail=_json({"lock": lock, "mailed": False, "reason": "no_notifier"}),
                 )
             return True
+        return not await self._lock_notice_held_back(user, lock)
+
+    async def _lock_notice_held_back(self, user: UserRecord, lock: str) -> bool:
+        """The throttle's READ: whether a notice of this ``lock`` kind already went out in the window.
+
+        Kept apart from the row write, so the background task can send the mail between this read
+        and :meth:`_record_lock_notice` (BACKLOG #2216). One such read runs at a time per
+        service (``_lock_notice_read_slots``). It walks every recent ``auth.lock_notice`` row of
+        every account, since the audit log has no actor index. Many locks at once would otherwise
+        fill the store's read pool, which sign-ins wait on too.
+
+        A failed read fails OPEN (``False``) and is logged by exception class alone. The line names
+        neither the account nor the notice kind (BACKLOG #1131): it runs only when a lock lands,
+        and ``GET /logs/tail`` serves the log to ``logs:view``. A traceback would carry the
+        driver's message, which can quote the bound username."""
         mailable = bool(user.notify_email)
-        now = time.time()
-        since = max(now - _LOCK_NOTICE_WINDOW_SECONDS, user.created_at)
+        since = max(time.time() - _LOCK_NOTICE_WINDOW_SECONDS, user.created_at)
         try:
-            rows = await self._store.list_audit(
-                actor=user.username, action=_LOCK_NOTICE_ACTION, since=since, limit=50
+            async with self._lock_notice_read_slots:
+                rows = await self._store.list_audit(
+                    actor=user.username, action=_LOCK_NOTICE_ACTION, since=since, limit=50
+                )
+        except Exception as exc:  # noqa: BLE001 - fails open by design, and is logged
+            _log.error(
+                "a security-notice throttle read failed (%s); the notice was sent unthrottled",
+                type(exc).__name__,
             )
-        except Exception:
-            # Names neither the account nor the notice kind (BACKLOG #1131): this line runs only
-            # when a lock lands, and ``GET /logs/tail`` serves the log to ``logs:view``. It still
-            # tells an operator the store read failed and that a notice went unthrottled.
-            _log.exception(
-                "a security-notice throttle read failed; the notice was sent unthrottled"
-            )
-            rows = []
+            return False
         for row in rows:
             try:
                 detail = json.loads(row["detail"] or "{}")
@@ -10878,13 +11436,21 @@ class AuthService:
                 continue
             # A row that mailed nothing holds back only another addressless notice.
             if kind == lock and (mailed is not False or not mailable):
-                return False
+                return True
+        return False
+
+    async def _record_lock_notice(self, user: UserRecord, lock: str, *, handed: bool) -> None:
+        """Write the ``auth.lock_notice`` row the throttle reads, after the mail.
+
+        ``mailed`` is true only when the account had an address AND the notifier took the event
+        (``handed``, BACKLOG #2019). A refused hand-off then writes ``mailed: false``, which holds
+        back no later mailable notice, so the next lock mails again rather than staying quiet for
+        a day."""
         await self._audit(
             _LOCK_NOTICE_ACTION,
             actor=user.username,
-            detail=_json({"lock": lock, "mailed": mailable}),
+            detail=_json({"lock": lock, "mailed": bool(user.notify_email) and handed}),
         )
-        return True
 
     async def _notify_security(
         self,

@@ -4903,9 +4903,12 @@ class SqlServerStore:
         metadata: str | None = None,
         now: float | None = None,
     ) -> str:
+        """Atomically persist an inbound message and its per-destination outbound rows directly -- the
+        pre-staged-pipeline single-step write, kept for tests. With ``deliveries`` the message is
+        ``ROUTED``, as on SQLite and Postgres (vault BACKLOG #2723); with none it is ``UNROUTED``."""
         now = time.time() if now is None else now
         mid = uuid4().hex
-        status = MessageStatus.RECEIVED.value if deliveries else MessageStatus.UNROUTED.value
+        status = MessageStatus.ROUTED.value if deliveries else MessageStatus.UNROUTED.value
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
@@ -9794,8 +9797,8 @@ class SqlServerStore:
     async def replay(self, message_id: str, now: float | None = None) -> int:
         """Re-queue a message's stuck/dead deliveries — or, if none are stuck, re-send the delivered
         ones. Two-mode (M-2): if any row is dead/pending, replay ONLY those (never re-fire a DONE
-        sibling); else replay the done rows. messages.status -> RECEIVED if a pending ingress/routed
-        row remains (needs re-routing), else ROUTED.
+        sibling); else replay the done rows. messages.status -> RECEIVED if a pending ingress row
+        remains (needs routing), else ROUTED -- a re-pended routed row included (vault BACKLOG #2723).
 
         A row whose body retention has ERASED is never re-queued (:data:`_REPLAYABLE_BODY`, BACKLOG
         #1560), and the ``delivered_keys`` DELETE carries the same predicate so it never drops the
@@ -9837,14 +9840,11 @@ class SqlServerStore:
                 if (
                     count
                 ):  # no rows => errored/filtered/unrouted: don't falsify it or strand it (M-2)
+                    # RECEIVED only for a pending INGRESS row; a re-pended routed row is ROUTED, or the
+                    # finalizer could never settle it (vault BACKLOG #2723; MessageStore.replay says why).
                     await cur.execute(
-                        "SELECT 1 FROM queue WHERE message_id=? AND stage IN (?, ?) AND status=?",
-                        (
-                            message_id,
-                            Stage.INGRESS.value,
-                            Stage.ROUTED.value,
-                            OutboxStatus.PENDING.value,
-                        ),
+                        "SELECT 1 FROM queue WHERE message_id=? AND stage=? AND status=?",
+                        (message_id, Stage.INGRESS.value, OutboxStatus.PENDING.value),
                     )
                     new_status = (
                         MessageStatus.RECEIVED.value
@@ -10311,11 +10311,14 @@ class SqlServerStore:
         top = "TOP (1) " if top_only else ""
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
-                # `top_only` cancels the true FIFO head, so the tiebreak after next_attempt_at must match
-                # the claim's seq-only order, NOT created_at (no longer the ordering key; ADR 0059).
+                # `top_only` cancels the true FIFO head, so it orders by the claim's seq-only key alone
+                # (ADR 0059), even while that head is backing off. Not next_attempt_at first: mark_failed
+                # pushes a failed head's next_attempt_at past the younger rows behind it, so that key
+                # would pick a healthy younger row and leave the head blocking the lane (vault BACKLOG
+                # #2754).
                 await cur.execute(
                     f"SELECT {top}id, message_id FROM queue WHERE {' AND '.join(where)}"
-                    " ORDER BY next_attempt_at, seq",
+                    " ORDER BY seq",
                     tuple(params),
                 )
                 rows = [(r[0], r[1]) for r in await cur.fetchall()]

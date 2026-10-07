@@ -98,7 +98,11 @@ def _client_with_sink(
     app uses, so the late-bound resolver is exercised rather than stubbed."""
     app = create_app(engine, auth=service, approvals=ON)
     gate = _build_approval_gate(
-        engine, ON, resolve_identity=_requester_identity_resolver(app), alert_sink=sink
+        engine,
+        ON,
+        resolve_identity=_requester_identity_resolver(app),
+        alert_sink=sink,
+        outliving=app.state.outliving_operations,
     )
     app.state.approval_gate = gate
     client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t")

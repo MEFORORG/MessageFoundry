@@ -82,17 +82,26 @@ def set_security(
 
 def _write_validated(path: Path, new_text: str, original: str | None, validate: Validate) -> None:
     """Atomically write ``new_text``, validate the file loads, and roll back to ``original`` on failure
-    (delete it if it didn't exist before)."""
+    (delete it if it didn't exist before).
+
+    The rollback runs for EVERY failure, a :class:`SecurityEditError` from the callback included.
+    It used to re-raise that type before the rollback, so a callback that refused in this module's
+    own vocabulary left the refused text on disk (vault BACKLOG #2760).
+
+    The callback owns the wording of its refusal. A whole-file ``load_settings`` failure must reach
+    here already rendered, as the ``security`` CLI's callback renders it with
+    ``settings_error_detail``: this module stays outside the settings import graph, so it cannot
+    render one, and the ``str(exc)`` below is only for an error the callback did not anticipate."""
     _atomic_write(path, new_text)
     try:
         validate(path)
-    except SecurityEditError:
-        raise
     except BaseException as exc:
         if original is None:
             path.unlink(missing_ok=True)
         else:
             _atomic_write(path, original)
+        if isinstance(exc, SecurityEditError) or not isinstance(exc, Exception):
+            raise
         raise SecurityEditError(str(exc)) from exc
     _secure_file(path)
 

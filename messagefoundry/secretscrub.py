@@ -137,7 +137,7 @@ __all__ = [
 #: What a scrubbed credential VALUE is replaced with. Matches
 #: :class:`logging_setup.CredentialQueryScrubFilter`, so one log line cannot carry two spellings of
 #: "a credential was here". A caller wanting a different marker passes ``placeholder=`` --
-#: ``support/redact.py``'s ``[REDACTED]`` is the one that will.
+#: ``support/redact.py`` passes its ``[REDACTED]``, since it calls this pass (BACKLOG #2694).
 CREDENTIAL_PLACEHOLDER = "<redacted>"
 
 #: Label tails that mean "a credential value follows". Bare ``key`` is deliberately absent: it is

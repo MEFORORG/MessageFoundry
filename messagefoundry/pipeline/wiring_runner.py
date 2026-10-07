@@ -94,6 +94,7 @@ from messagefoundry.config.wiring import (
     apply_sync_reply_capture_implication,
     bindings_overlap,
     inbound_binding_conflicts,
+    refuse_unresolved_hop_flags,
     resolve_env_settings,
     resolve_listener_binding,
     resolved_encoding_problems,
@@ -2123,6 +2124,7 @@ class RegistryRunner:
             return None
         resolved: dict[str, dict[str, Any]] = {}
         for name, spec in self.registry.lookups.items():
+            refuse_unresolved_hop_flags(spec.settings, f"database lookup {name!r}")
             resolved[name] = resolve_env_settings(spec.settings, self._env_values)
         # #200 (ADR 0092): stamp the derived posture around the live executor build so the DSN's
         # weakened-TLS refusal (_build_dsn → _weakened_tls_permitted) keys on THIS instance's posture,
@@ -5489,8 +5491,9 @@ class RegistryRunner:
         outbox rows keep draining (at-least-once preserved); (3a) once the swap has committed,
         reconcile the active-window scheduler tasks (:meth:`_reconcile_schedulers`); (4) start a
         detached report that warns with the count of rows each dropped inbound leaves waiting
-        (:meth:`_warn_stranded_by_dropped_inbounds`). If any of steps 0-3 fails the previous graph's
-        intake is restored before the error propagates, and steps 3a and 4 do not run. Restarting inbounds
+        (:meth:`_warn_stranded_by_dropped_inbounds`). If any of steps 0-3 fails, or is cancelled
+        (vault BACKLOG #2753), the previous graph's intake is restored before the error or the
+        cancellation propagates, and steps 3a and 4 do not run. Restarting inbounds
         before reconciling outbounds means a slow/hung outbound never blocks the engine's intake.
         """
         async with self._reload_lock:
@@ -5502,15 +5505,17 @@ class RegistryRunner:
             old = self.registry
             old_inbound_names = list(self._sources)
 
-            # 1. Quiesce intake: stop every inbound source so no NEW messages are accepted. Any
-            #    message already in flight completes under its arrival-time registry (snapshotted in
-            #    _make_handler), so it stays consistent even if a source's stop() returns early.
-            for name in old_inbound_names:
-                await self._stop_inbound_unsafe(
-                    name
-                )  # we hold _reload_lock — use the unsafe variant
-
             try:
+                # 1. Quiesce intake: stop every inbound source so no NEW messages are accepted. Any
+                #    message already in flight completes under its arrival-time registry (snapshotted
+                #    in _make_handler), so it stays consistent even if a source's stop() returns early.
+                #    Inside the try (vault BACKLOG #2753): a reload cut off partway through this loop
+                #    must restart the sources it had already stopped, not leave them down.
+                for name in old_inbound_names:
+                    await self._stop_inbound_unsafe(
+                        name
+                    )  # we hold _reload_lock — use the unsafe variant
+
                 # 1a. ADR 0157 Inc 2: re-pend what a RETURNED worker left in flight. HERE, and no
                 # later: step 2's listener restart re-arms inbound workers (_start_inbound_unsafe
                 # -> _ensure_inbound_workers) and step 3 respawns delivery workers, and a re-armed
@@ -5636,10 +5641,22 @@ class RegistryRunner:
                         self._ensure_inbound_workers(name)
                 # 3. Reconcile outbound connectors/workers (intake already live).
                 await self._reconcile_outbounds(old, new_registry)
-            except Exception:
+            except BaseException as exc:
                 # Roll back to the previous graph's intake so a failed reload leaves the engine
                 # accepting exactly what it did before (the realistic failure is an inbound bind).
-                log.exception("reload failed; rolling back inbound intake to the previous graph")
+                # BaseException, not Exception (vault BACKLOG #2753): a CANCELLED reload, such as one
+                # cut off by a request deadline or a shutdown, must restore intake as well. The
+                # rollback's own awaits still run, since the cancellation was delivered once and has
+                # been consumed here; it is re-raised at the end. A second cancellation during the
+                # rollback would stop it, which is the caller insisting.
+                if isinstance(exc, asyncio.CancelledError):
+                    log.warning(
+                        "reload cancelled; rolling back inbound intake to the previous graph"
+                    )
+                else:
+                    log.exception(
+                        "reload failed; rolling back inbound intake to the previous graph"
+                    )
                 self.registry = old
                 # A session made after the swap holds a worker that loaded the NEW graph. Drop it,
                 # or that worker would go on answering for a graph the engine no longer serves.
@@ -8947,6 +8964,10 @@ def _fhir_lookup_settings(
     a lookup's record cannot be mistaken for an outbound of the same name. The one builder for both
     the live executor and the check build, so the two cannot differ. The egress allowlist check runs
     in :class:`~messagefoundry.transports.fhir.FhirLookupExecutor` itself."""
+    where = f"fhir lookup {spec.name!r}"
+    # Before env() resolves, so a post-factory env() flag cannot resolve "false" to True (#2232). It
+    # checks the attestation pair as FhirLookupSpec does, so a raw flag with no reason is refused too.
+    attested = refuse_unresolved_hop_flags(spec.settings, where)
     settings = resolve_env_settings(
         spec.settings, env_values, connection=fhir_lookup_record_name(spec.name)
     )
@@ -8963,11 +8984,7 @@ def _fhir_lookup_settings(
     # ran could pair with the typed acceptance. The attestation wins in the disposition, so the hop
     # would cross with no WARN or audit record while the report listed it as accepted. Refuse it here,
     # as the factory does, since this is the one builder both executor paths use.
-    _refuse_attested_and_accepted(
-        f"fhir lookup {spec.name!r}",
-        bool(settings.get("tls_hop_attested", False)),
-        spec.cleartext_accepted,
-    )
+    _refuse_attested_and_accepted(where, attested, spec.cleartext_accepted)
     return settings
 
 
@@ -9240,6 +9257,7 @@ def _build_check_connectors(
             )
     resolved_lookups: dict[str, dict[str, Any]] = {}
     for lname, lspec in registry.lookups.items():
+        refuse_unresolved_hop_flags(lspec.settings, f"database lookup {lname!r}")
         resolved_lookups[lname] = resolve_env_settings(lspec.settings, env_values)
     if resolved_lookups:
         # Construct (and discard) the executor: validates each DSN (TLS/auth) without opening a pool.
@@ -9251,6 +9269,8 @@ def _build_check_connectors(
     # values do not resolve here is left to its sync, as before, so one unprovisioned set does not
     # refuse the whole graph.
     for rname, rspec in registry.references.items():
+        # Every source kind, and before the unresolved-env skip below: this refusal needs no value.
+        refuse_unresolved_hop_flags(rspec.source.settings, f"reference set {rname!r}")
         if rspec.source.kind != "database":
             continue
         try:

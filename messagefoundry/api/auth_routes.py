@@ -70,7 +70,8 @@ from messagefoundry.api.auth_models import (
     UserUpdateRequest,
 )
 from messagefoundry.api.security import (
-    alert_sink_for,
+    alert_administrator_granted,
+    alert_directory_administrator_granted,
     answers_before_body,
     bearer_token,
     bearer_token_dependency,
@@ -146,14 +147,9 @@ _DIRECTORY_UNCONFIRMED_DETAIL = (
 
 
 def _alert_administrator_granted(app: FastAPI, key: str, *, via: str, granted_by: str) -> None:
-    """Raise the ``administrator_granted`` alert (BACKLOG #315; why, and the key grammar, are on
-    ``AlertSink.administrator_granted``). Raised here, in the API, never from ``auth/`` (CLAUDE.md
-    section 4). Best effort: the grant already happened and is audited."""
-    try:
-        alert_sink_for(app.state).administrator_granted(key, via=via, granted_by=granted_by)
-    except Exception:  # noqa: BLE001 - a sink that breaks its never-raise contract must not 500 a
-        # user-administration call whose write is already committed and audited.
-        _log.exception("the administrator_granted alert for %r failed to emit", key)
+    """The user-administration routes' grant alert; :func:`alert_administrator_granted` says why
+    and how. ``granted_by`` is the acting administrator's username."""
+    alert_administrator_granted(app.state, key, via=via, granted_by=granted_by)
 
 
 # CSV formula injection (CWE-1236 / ASVS 1.2.10). The audit export is the ONE attacker-influenced
@@ -466,6 +462,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # X-Step-Up-Required on its first gated action and answers with POST /me/reauth, a live
         # directory re-bind.
         outcome = await service.authenticate_kerberos(token_bytes, client=_client(request))
+        alert_directory_administrator_granted(
+            request.app.state, outcome, via="directory_sign_in_negotiate"
+        )
         if not outcome.ok or outcome.token is None or outcome.identity is None:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "SSO authentication failed")
         # ASVS 7.2.4: no prior token is revoked here. /auth/login ends one only when its body names
@@ -942,6 +941,14 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # No step-up, like GET /users/{id}/channel-scope: every users:manage holder is an
         # Administrator, who already reads each lock as it happens (auth.account_locked) in the
         # audit trail with no step-up, so this read gives such a session nothing it lacked.
+        # BACKLOG #2292 (ASVS 16.3.2): on the JSON API, `require` audits this read as a users:read
+        # grant, even when lock state goes out. We judge the route permission enough. Every
+        # users:manage holder also holds audit:read. audit_visibility.audit_exclusion_for shows such
+        # a reader every auth.account_locked row. So this read shows nothing the trail hides from
+        # them. The row does not say whether lock state went out; the actor's roles at that time do.
+        # tests/test_lock_state_surface.py pins the premise and the row. With
+        # [diagnostics].audit_all_authz off, this GET writes no grant row. The web console calls
+        # this handler in-process and writes none at all, an open gap (BACKLOG #1197).
         # One instant for the whole list, so every row answers "locked now?" for the same now.
         lock_state_at = time.time() if identity.has(Permission.USERS_MANAGE) else None
         summaries: list[UserSummary] = []
