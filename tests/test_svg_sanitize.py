@@ -14,6 +14,7 @@ from __future__ import annotations
 import gzip
 import re
 import time
+import zlib
 from xml.etree.ElementTree import Element
 
 import pytest
@@ -189,10 +190,12 @@ def test_an_svg_label_on_bytes_that_are_not_markup_changes_nothing() -> None:
     assert sanitize_if_svg("image/svg+xml", pdf) is pdf
 
 
-def test_a_gzip_body_that_is_not_gzip_inside_changes_nothing() -> None:
-    # Two gzip magic bytes and junk: nothing inflates, so there is no markup to vet.
+def test_a_gzip_body_that_is_not_gzip_inside_is_refused() -> None:
+    # The gzip magic and junk. zlib keeps no output from a call that raises, so nothing can be judged,
+    # and a corrupt gzip is never served (BACKLOG #2391, the Lander's hold on PR 2158).
     gz = bytes.fromhex("1f8b0800") + b"synthetic"
-    assert sanitize_if_svg("image/svg+xml", gz) is gz
+    with pytest.raises(SvgRejected):
+        sanitize_if_svg("image/svg+xml", gz)
 
 
 # --- BACKLOG #2391: SVGZ ---------------------------------------------------------------------------
@@ -200,6 +203,30 @@ def test_a_gzip_body_that_is_not_gzip_inside_changes_nothing() -> None:
 
 def _gz(data: bytes) -> bytes:
     return gzip.compress(data, mtime=0)
+
+
+def _flip(data: bytes, at: int) -> bytes:
+    """``data`` with the byte at ``at`` inverted."""
+    out = bytearray(data)
+    out[at] ^= 0xFF
+    return bytes(out)
+
+
+def test_the_corrupt_gzip_probes_really_fail_in_zlib() -> None:
+    """Control for the refusal cases: each damaged body makes zlib raise, so the refusal is not
+    vacuous, and the undamaged one inflates."""
+    assert gzip.decompress(_gz(_HOSTILE)) == _HOSTILE
+    for damaged in (_flip(_gz(_HOSTILE), -8), _flip(_gz(_HOSTILE), -1), _flip(_gz(_HOSTILE), 12)):
+        with pytest.raises((OSError, EOFError, zlib.error)):
+            gzip.decompress(damaged)
+
+
+def test_damage_past_a_cleared_head_is_not_read() -> None:
+    """The recorded trade. A head whose first byte is not ``<`` clears the body without reading the
+    rest, so a large non-markup gzip damaged near its end is served as stored. That cannot hide an
+    SVG: a document whose first byte is not ``<`` is not one."""
+    body = _flip(_gz(b"%PDF-1.4 " + bytes(range(256)) * 2048), -8)
+    assert sanitize_if_svg("application/gzip", body) is body
 
 
 @pytest.mark.parametrize(
@@ -247,6 +274,16 @@ def test_gzip_that_does_not_inflate_to_svg_is_unchanged(inner: bytes) -> None:
         pytest.param(
             _gz(b" " * (33 * 1024 * 1024) + b'<svg onload="x"/>'), id="whitespace-past-the-bound"
         ),
+        pytest.param(_flip(_gz(_HOSTILE), -8), id="bad-crc"),
+        pytest.param(_flip(_gz(_HOSTILE), -1), id="bad-isize"),
+        pytest.param(b"\x1f\x8b" + b"synthetic junk after the magic", id="junk-after-the-magic"),
+        pytest.param(_flip(_gz(_HOSTILE), 12), id="corrupt-first-block"),
+        pytest.param(
+            _gz(b"<svg>") + _flip(_gz(b'<g onload="x"/></svg>'), -8), id="corrupt-later-member"
+        ),
+        pytest.param(_gz(b"<svg>") + b"\x00\x00" + _gz(b"</svg>"), id="nul-between-members"),
+        pytest.param(_flip(_gz(b"%PDF-1.4 synthetic"), -8), id="bad-crc-on-a-non-svg-body"),
+        pytest.param(bytes.fromhex("1f8b08"), id="header-cut-short"),
     ],
 )
 def test_gzip_markup_that_cannot_be_vetted_is_refused(body: bytes) -> None:
@@ -608,7 +645,7 @@ def test_non_svg_documents_are_returned_unchanged(label: str, data: bytes) -> No
 def test_the_pre_check_misses_no_markup_and_clears_binaries(data: bytes, expected: bool) -> None:
     """``may_be_svg`` only lets the route skip the thread hop, so a ``False`` must never hide an SVG."""
     assert may_be_svg(data) is expected
-    if not expected or data.startswith(b"\x1f\x8b"):
+    if not expected:
         assert sanitize_if_svg("image/svg+xml", data) is data
 
 

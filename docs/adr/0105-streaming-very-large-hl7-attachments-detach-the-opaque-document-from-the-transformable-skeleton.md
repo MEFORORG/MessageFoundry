@@ -666,13 +666,21 @@ real detach and the download, and fails against the sanitizer this correction re
 1. A body that starts with the gzip magic is inflated, under the same 32 MiB bound. The bound is
    applied while inflating, so a small bomb costs no more than the bound. A body may hold at most
    16 gzip members.
-2. If the first inflated byte past leading whitespace is not `<`, the body is served as stored.
-   Bytes that are only whitespace up to the bound do not clear it: a reader that inflates further
-   may find an SVG there.
-3. If they are markup but could not be read to the end, the body is refused. That covers a truncated
-   or corrupt member, trailing bytes that are not NUL padding, too many members, and markup over the
-   bound.
-4. Otherwise the inflated document is judged like plain bytes. A sanitized SVG is gzipped again, so
+2. Where the inflate reaches damage, the body is refused, whatever it holds. Step 3 says when it
+   stops early. Damage covers at least a corrupt header or
+   block, a failed CRC or length check, a member cut short, more than 16 members, and any bytes
+   after the last member other than NUL padding, which includes NUL bytes between two members.
+   zlib keeps none of a call's output when the call raises, so there is nothing to judge, and a
+   reader that skips the trailer check may still show the document. *Corrected later on
+   2026-10-07:* the first version of this correction served such a body as stored, unsanitized.
+   The Lander found it on PR 2158.
+3. The first 64 KiB is inflated first. If its first byte past leading whitespace, NUL and
+   byte-order-mark bytes is not `<`, the body is served as stored without reading the rest. Damage
+   past that head is not seen. That cannot hide an SVG, since a document whose first byte is not
+   `<` is not one. Bytes that are only that noise up to the bound do not clear the body: a reader
+   that inflates further may find an SVG there.
+4. Markup that passes the bound is refused, since it cannot be vetted.
+5. Otherwise the inflated document is judged like plain bytes. A sanitized SVG is gzipped again, so
    the served copy keeps the stored representation. The audit row says `sanitized-svg`.
 
 **Markup whose root is not `svg` but which carries an SVG element is refused.** This covers XHTML,
@@ -719,4 +727,6 @@ declares or names the SVG namespace without using it is served.
     escape byte;
   - any document the parser cannot read that has an attribute-list declaration, even one that sets
     no `xmlns`;
-  - any document whose root scan runs out of steps.
+  - any document whose root scan runs out of steps;
+  - any gzip whose damage the inflate reaches before its head clears it, such as a small damaged
+    PDF, whatever it holds.

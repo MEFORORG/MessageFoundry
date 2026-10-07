@@ -394,10 +394,15 @@ def _contains_svg(body: bytes) -> bool:
 def _gunzip_bounded(body: bytes, limit: int) -> tuple[bytes, bool]:
     """Inflate the gzip ``body``, keeping at most ``limit + 1`` bytes.
 
-    Returns the bytes inflated and whether they are the whole document. They are not when the output
-    passes ``limit``, a member is cut short or corrupt, there are more than :data:`_MAX_GZIP_MEMBERS`
-    members, or anything but NUL padding follows the last one. The bound is enforced while inflating,
-    so a small body that inflates to gigabytes costs no more than ``limit`` bytes of work."""
+    Returns the bytes inflated and whether they are the whole document; they are not only when the
+    output passes ``limit``. The bound is enforced while inflating, so a small body that inflates to
+    gigabytes costs no more than ``limit`` bytes of work.
+
+    Raises :class:`SvgRejected` for a gzip that is not sound before the bound is reached: a corrupt
+    header or block, a CRC or length check that fails, a member cut short, more than
+    :data:`_MAX_GZIP_MEMBERS` members, or anything but NUL padding after the last member. zlib keeps
+    none of a call's output when the call raises, so there is no partial document to judge, and a
+    reader that skips the trailer check could still show one. A corrupt body is never served."""
     out = bytearray()
     rest = body
     for _ in range(_MAX_GZIP_MEMBERS):
@@ -405,15 +410,21 @@ def _gunzip_bounded(body: bytes, limit: int) -> tuple[bytes, bool]:
         try:
             out += inflater.decompress(rest, limit + 1 - len(out))
         except zlib.error:
+            corrupt = True
+        else:
+            corrupt = False
+        if corrupt:
+            raise SvgRejected("gzip body is corrupt")
+        if len(out) > limit:
             return bytes(out), False
-        if len(out) > limit or not inflater.eof:
-            return bytes(out), False
+        if not inflater.eof:
+            raise SvgRejected("gzip body is cut short")
         rest = inflater.unused_data
         if not rest.strip(b"\x00"):
             return bytes(out), True
         if not rest.startswith(_GZIP_MAGIC):
-            return bytes(out), False
-    return bytes(out), False
+            raise SvgRejected("gzip body has bytes after its last member")
+    raise SvgRejected(f"gzip body has more than {_MAX_GZIP_MEMBERS} members")
 
 
 def _vet_markup(label: str | None, body: bytes) -> bytes:
@@ -432,7 +443,11 @@ def _vet_gzip(label: str | None, body: bytes) -> bytes:
 
     A body is cleared as not markup only once its first byte past leading noise is seen and is not
     ``<``. A body that inflates to nothing but whitespace within the bound has not shown that byte,
-    so it is treated as markup: a reader that inflates the rest may find an SVG there."""
+    so it is treated as markup: a reader that inflates the rest may find an SVG there. A gzip that is
+    not sound is refused by :func:`_gunzip_bounded` before anything is judged.
+
+    The head is cleared without reading the rest of the body, so damage past the head is not seen.
+    That cannot hide an SVG: a document whose first byte is not ``<`` is not one, whatever follows."""
     head, _ = _gunzip_bounded(body, _GZIP_SNIFF_BYTES)
     first = _FIRST_CONTENT_BYTE_RE.search(head)
     if first is not None and first.group() != b"<":
@@ -441,13 +456,12 @@ def _vet_gzip(label: str | None, body: bytes) -> bytes:
     first = _FIRST_CONTENT_BYTE_RE.search(inner)
     if first is not None and first.group() != b"<":
         return body
-    if first is None and (whole or not inner):
-        # Empty or only whitespace to its end, or nothing inflated at all: there is nothing to show.
-        return body
+    if first is None and whole:
+        return body  # empty, or only whitespace to its end: there is nothing to show
     if not whole:
-        # Markup that cannot be read to its end cannot be vetted, and a reader may still show the part
-        # that did inflate.
-        raise SvgRejected("gzip markup is corrupt, truncated or larger than the bound")
+        # Markup that passes the bound cannot be vetted, and a reader may still show the part that
+        # did inflate.
+        raise SvgRejected("gzip markup is larger than the bound")
     vetted = _vet_markup(label, inner)
     if vetted is inner:
         return body
