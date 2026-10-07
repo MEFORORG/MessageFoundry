@@ -277,4 +277,28 @@ async def test_a_none_the_store_did_not_turn_into_dead_writes_nothing(
     assert _exhausted_lines(caplog) == []
     await store.dead_letter_now(claimed.id, "x")
     await runner._note_retry_exhausted(OUT, exc, retry, None, [at_cap])  # really DEAD
-    assert len(_exhausted_lines(caplog)) == 1
+    (line,) = _exhausted_lines(caplog)
+    assert "unconfirmed" not in line.getMessage()
+
+
+async def test_a_failed_status_read_still_logs_and_never_raises_out_of_the_arm(
+    store: MessageStore, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The read-back is a diagnostic: a store fault there must not escape the failure arm, which
+    # would skip the alert checks and count as an infra fault against the lane.
+    caplog.set_level(logging.DEBUG, logger="messagefoundry")
+    runner = _stepped_runner(store, _Fails(), RetryPolicy(max_attempts=1, **FAST))
+    await _enqueue(store, 1)
+
+    async def broken(message_id: str) -> object:
+        raise RuntimeError(f"read failed {TOKEN}")
+
+    monkeypatch.setattr(store, "outbox_for", broken)
+    item = await store.claim_next_fifo(OUT, now=1e12)
+    assert item is not None
+    await runner._process_delivery_item(OUT, item)
+
+    assert await store.count_dead() == 1
+    (line,) = _exhausted_lines(caplog)
+    assert "unconfirmed, the status read failed (RuntimeError)" in line.getMessage()
+    _assert_no_token(caplog.records)

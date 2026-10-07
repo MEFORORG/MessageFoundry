@@ -8888,6 +8888,8 @@ class RegistryRunner:
         attempts >= max_attempts`` on the attempts the claim returned, first skips every case
         below the cap with no read. At the cap, one read of the head row's status confirms DEAD
         before the line claims it. This costs one read per dead-letter, and only on this path.
+        The read is a diagnostic, so it never raises out of the failure arm: if it fails, the line
+        still goes out and says the DEAD is unconfirmed, naming only the read's exception class.
         Throttled with the permanent-refusal line, under its own ``exhausted:`` key."""
         # An empty batch also returns None, with nothing dead-lettered.
         if retry_until is not None or retry.max_attempts is None or not rows:
@@ -8895,11 +8897,16 @@ class RegistryRunner:
         head = rows[0]  # mark_batch_failed decides from its first member
         if head.attempts < retry.max_attempts:
             return
-        if not any(
-            r["id"] == head.id and r["status"] == OutboxStatus.DEAD.value
-            for r in await self.store.outbox_for(head.message_id)
-        ):
-            return
+        unconfirmed = ""
+        try:
+            outbox = await self.store.outbox_for(head.message_id)
+        except Exception as read_exc:  # noqa: BLE001 -- a diagnostic read must not change the arm
+            unconfirmed = f"; unconfirmed, the status read failed ({type(read_exc).__name__})"
+        else:
+            if not any(
+                r["id"] == head.id and r["status"] == OutboxStatus.DEAD.value for r in outbox
+            ):
+                return
         subject_args: tuple[object, ...]
         if batch:
             subject, subject_args = "a batch of %d (head outbox row %s)", (len(rows), head.id)
@@ -8909,11 +8916,12 @@ class RegistryRunner:
             name,
             exc,
             len(rows),
-            "delivery worker %r: " + subject + " failed again and was dead-lettered at the "
-            "retry cap, after %d attempt(s)" + (" of its head" if batch else ""),
+            "delivery worker %r: " + subject + " failed and was dead-lettered at the retry cap, "
+            "after %d attempt(s)" + (" of its head" if batch else "") + "%s",
             name,
             *subject_args,
             head.attempts,
+            unconfirmed,
             exhausted=True,
             stacklevel=3,
         )
