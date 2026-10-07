@@ -300,6 +300,15 @@ from typing import Any
 #: ``TypeError``; the pinned digest refuses the pair at mount first. The digest moved because both
 #: signatures changed.
 #:
+#: Vault BACKLOG #2460 / #2458: ``CoreHandlers`` gains a required ``resolve_action`` for the
+#: console's resolve of an interrupted release, with ``ApprovalResolveRequest`` and its ``outcome``
+#: values. ``PendingApprovalInfo`` gains ``params``, ``caller_is_requester`` and ``gated``. The
+#: digest moved because the surface grew. An older console on this engine is refused at mount by the
+#: digest. A newer console on an older engine fails earlier, at import: its approvals modules import
+#: the alias ``ResolveOutcome`` from ``api.models``. The engine reports that as an installed console
+#: that failed to import (BACKLOG #1907), before any digest check runs. The digest records the
+#: alias's values, not its name, so renaming it alone would not move the digest.
+#:
 #: BACKLOG #2454: the console imports ``authorization_header`` from ``api.security``. ``GET /ui/sso``
 #: reads ``Authorization`` through it, so a repeated header is refused 400 by the same rule the
 #: engine's own reads use. The digest moved because the imported surface grew. It moved again
@@ -312,7 +321,7 @@ from typing import Any
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "2e7ba51c6149c0e1"
+ENGINE_UI_SEAM: str = "93e73faf86184b28"
 
 
 @dataclass(frozen=True, slots=True)
@@ -403,11 +412,12 @@ class CoreHandlers:
     # Dual-control approvals (ASVS 2.3.5, BACKLOG #1982): the console's Approvals page. The JSON
     # gates are require(APPROVALS_APPROVE) on the list and require_paced(APPROVALS_APPROVE) on approve
     # and reject, so each /ui route asserts approvals:approve through require_ui, which paces a /ui
-    # write the same way. The resolve of an interrupted release is not on the seam: its JSON gate is
-    # require_step_up and the console renders those rows read-only.
+    # write the same way. The resolve of an interrupted release (BACKLOG #2460) has the JSON gate
+    # require_step_up, so its /ui route takes require_ui_step_up for the same fresh re-proof.
     list_approvals: Callable[..., Awaitable[Any]]
     approve_action: Callable[..., Awaitable[Any]]
     reject_action: Callable[..., Awaitable[Any]]
+    resolve_action: Callable[..., Awaitable[Any]]
 
 
 @dataclass(frozen=True, slots=True)

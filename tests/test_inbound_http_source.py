@@ -1112,13 +1112,22 @@ def test_the_listener_baseline_has_not_drifted_from_the_api_header_floor() -> No
     from messagefoundry.api.header_floor import (
         BASELINE_SECURITY_HEADERS,
         CSP_HEADER,
-        FRAME_ANCESTORS_CSP,
+        FLOOR_CSP,
     )
 
     assert (
         *BASELINE_SECURITY_HEADERS,
-        (CSP_HEADER, FRAME_ANCESTORS_CSP),
+        (CSP_HEADER, FLOOR_CSP),
     ) == _BASELINE_RESPONSE_HEADERS
+
+
+def test_every_listener_response_names_base_uri_none() -> None:
+    """ASVS 3.4.3, BACKLOG #2341: the listener's replies carry the same base-uri decision as the API
+    floor. Asserted on the literal wire text rather than on the constant, so a change to both copies
+    at once still reds here."""
+    for status in (200, 202, 204, 400, 401, 413, 500, 504):
+        out = build_response(status, "{}" if status != 204 else "")
+        assert b"\r\nContent-Security-Policy: frame-ancestors 'none'; base-uri 'none'\r\n" in out
 
 
 def test_a_caller_supplied_header_wins_over_the_baseline() -> None:

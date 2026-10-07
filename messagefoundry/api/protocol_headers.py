@@ -4,8 +4,8 @@
 
 The header floor in :mod:`messagefoundry.api.header_floor` sees every response the ASGI app sends. It
 cannot see the ones the server writes on its own, because no app code runs for them. This module
-adds ``X-Content-Type-Options: nosniff`` and ``Content-Security-Policy: frame-ancestors 'none'`` to at
-least these:
+adds ``X-Content-Type-Options: nosniff`` and ``Content-Security-Policy: frame-ancestors 'none';
+base-uri 'none'`` (the floor's :data:`~messagefoundry.api.header_floor.FLOOR_CSP`) to at least these:
 
 * the ``400`` for a request uvicorn cannot parse (``send_400_response`` on the HTTP protocol);
 * the ``500`` when the app raised, or returned, without starting a response
@@ -81,7 +81,7 @@ from typing import Any
 from messagefoundry.api.header_floor import (
     BASELINE_SECURITY_HEADERS,
     CSP_HEADER,
-    FRAME_ANCESTORS_CSP,
+    FLOOR_CSP,
 )
 
 __all__ = [
@@ -96,10 +96,12 @@ _log = logging.getLogger(__name__)
 _NOSNIFF = "X-Content-Type-Options"
 
 #: The set the protocol layer adds. Values come from the floor's own constants so the two cannot
-#: drift. Deliberately not the whole baseline: the brief for this layer is nosniff and framing.
+#: drift. Deliberately not the whole baseline: the brief for this layer is nosniff and the floor's CSP
+#: (framing and base-uri, BACKLOG #2341). No app writer reaches these responses, so the floor's
+#: writer-decides rule has nothing to defer to here.
 PROTOCOL_SECURITY_HEADERS: tuple[tuple[str, str], ...] = (
     (_NOSNIFF, dict(BASELINE_SECURITY_HEADERS)[_NOSNIFF]),
-    (CSP_HEADER, FRAME_ANCESTORS_CSP),
+    (CSP_HEADER, FLOOR_CSP),
 )
 
 _HEADER_LINES = b"".join(

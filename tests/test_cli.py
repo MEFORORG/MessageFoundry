@@ -3217,7 +3217,8 @@ def test_admin_unlock_refuses_a_missing_store_rather_than_creating_one(
     # "no such user" -- which reads as a wrong USERNAME when the truth is a wrong DATABASE.
     monkeypatch.chdir(tmp_path)
     missing = tmp_path / "nope.db"
-    assert main(["admin-unlock", "--username", "admin", "--db", str(missing), "--json"]) == 1
+    # 2, could not start (vault BACKLOG #3110, item 4); it was 1, the code for an account refusal.
+    assert main(["admin-unlock", "--username", "admin", "--db", str(missing), "--json"]) == 2
     payload = json.loads(capsys.readouterr().out)
     assert "refusing to create one" in payload["error"]
     assert not missing.exists(), "the refusal still created the database"

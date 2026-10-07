@@ -2483,8 +2483,9 @@ class RevocationHopGuard:
     #: This hop's OWN remediation sentence, for a hop the connection-shaped default does not fit
     #: (BACKLOG #1498). The default names ``[tls].crl_file``, an egress terminator and a connection's
     #: ``tls_revocation_attested`` — **all three are inapplicable to a hop that is not a connection**:
-    #: ``[tls].crl_file`` reaches a context only through a ``Destination``'s ``TrustAnchorPolicy``, and
-    #: there is no connection to carry the flag. Telling such an operator to set one of them is a
+    #: none of the non-connection hops that pass this field (at least the IdP, the syslog forwarder
+    #: and the store) resolves a ``[tls]`` anchor, so ``[tls].crl_file`` never reaches its context,
+    #: and there is no connection to carry the flag. Telling such an operator to set one of them is a
     #: refusal whose remedy cannot be performed, which is the SDS-3.7 false-premise defect wearing a
     #: helpful voice. A non-connection hop passes the setting that actually closes its own gate.
     ways_across: str | None = None
@@ -2645,8 +2646,10 @@ class TrustAnchorPolicy:
     composes with the OS default roots for an internal hop (:data:`TrustAnchorMode`). The default
     (``internal_ca_file=None``, ``mode="system"``) is a no-op — every hop verifies against the OS trust
     store exactly as before, so a config with no ``[tls]`` block is byte-identical. Threaded from
-    ``[tls]`` onto each outbound :class:`~messagefoundry.config.models.Destination` so a connector's
-    client-verify context resolves the same anchor at both ``build_check`` and live construction."""
+    ``[tls]`` onto each :class:`~messagefoundry.config.models.Destination`, and onto each
+    :class:`~messagefoundry.config.models.Source` for the FTPS poll (vault BACKLOG #2370), so a
+    connector's client-verify context resolves the same anchor at both ``build_check`` and live
+    construction."""
 
     internal_ca_file: str | None = None
     mode: TrustAnchorMode = "system"

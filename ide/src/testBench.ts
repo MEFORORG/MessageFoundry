@@ -19,6 +19,8 @@ import { testBenchScript } from "./testBenchWebview";
 import { openChannel, postToWebview } from "./webviewMessaging";
 import {
   judgeCollectionRun,
+  heldAfterIncoming,
+  heldAfterPost,
   pickCaseDetail,
   type CaseRerun,
   type CaseRunDetail,
@@ -59,6 +61,8 @@ type Incoming =
   | { command: "saveCollection" }
   | { command: "runCollection"; name: string }
   | { command: "caseDetail"; run: number; index: number }
+  | { command: "leaveRun"; run: number }
+  | { command: "ready" }
   | { command: "deleteCollection"; name: string };
 
 function esc(s: string): string {
@@ -139,6 +143,12 @@ export class TestBench {
       await this.withCollections(() => this.runCollection(m.name));
     } else if (m.command === "caseDetail") {
       await this.showCaseDetail(m.run, m.index);
+    } else if (m.command === "ready") {
+      this.dropRun(); // a fresh page load, even one with no host render, shows no run (BACKLOG #2441)
+    } else if (m.command === "leaveRun") {
+      // The page left the run view, so its per-case values must not stay answerable (BACKLOG #2441).
+      // viewGen is NOT bumped: a newer run still in flight must still land, and renders its own view.
+      this.lastRun = heldAfterIncoming(this.lastRun, m);
     } else if (m.command === "deleteCollection") {
       await this.withCollections(() => this.deleteCollection(m.name));
     }
@@ -233,7 +243,7 @@ export class TestBench {
     const items = Object.values(map)
       .map((c) => ({ name: c.name, cases: c.cases.length }))
       .sort((a, b) => a.name.localeCompare(b.name));
-    await postToWebview(this.panel.webview, { type: "collections", items });
+    await this.post(this.panel.webview, { type: "collections", items });
   }
 
   /** Snapshot the currently-loaded rows as a named collection: input `raw` + the current deliveries. */
@@ -345,7 +355,7 @@ export class TestBench {
       });
       const run = judgeCollectionRun(coll.cases, reruns);
       this.lastRun = { id: gen, details: run.details };
-      await postToWebview(panel.webview, {
+      await this.post(panel.webview, {
         type: "collectionRun",
         name,
         run: gen,
@@ -373,7 +383,7 @@ export class TestBench {
     if (!this.panel || !detail) {
       return;
     }
-    await postToWebview(this.panel.webview, { type: "caseDetail", run, index, ...detail });
+    await this.post(this.panel.webview, { type: "caseDetail", run, index, ...detail });
   }
 
   /**
@@ -387,7 +397,7 @@ export class TestBench {
     if (!row || !this.panel) {
       return;
     }
-    await postToWebview(this.panel.webview, {
+    await this.post(this.panel.webview, {
       type: "hex",
       source: row.source,
       dump: hexdump(row.raw),
@@ -484,7 +494,7 @@ export class TestBench {
       return srcCache.get(file) ?? null;
     };
     const detail: TraceDetail = buildTraceDetail(entry, readSource);
-    await postToWebview(this.panel.webview, { type: "trace", detail });
+    await this.post(this.panel.webview, { type: "trace", detail });
   }
 
   private async showDiff(index: number): Promise<void> {
@@ -514,7 +524,7 @@ export class TestBench {
     }
     // Compute the segment/field-aware diff here (pure, in the extension host) and post the aligned
     // result; the webview only renders it. diffMessages tolerates \r / \n / \r\n itself.
-    await postToWebview(this.panel.webview, {
+    await this.post(this.panel.webview, {
       type: "detail",
       source: row.source,
       to,
@@ -538,6 +548,15 @@ export class TestBench {
       justMyCode: false, // step into the config modules (Router/Handler)
       python: pythonPath(),
     });
+  }
+
+  /**
+   * Every post to the webview goes through here. A view that replaces the run view releases the held
+   * run at the moment it is posted (BACKLOG #2441), without waiting for the webview's leaveRun.
+   */
+  private post(webview: vscode.Webview, message: { type: string } & Record<string, unknown>): PromiseLike<boolean> {
+    this.lastRun = heldAfterPost(this.lastRun, message.type);
+    return postToWebview(webview, message);
   }
 
   /** Forget the held run, and make any run still in flight hold nothing when it lands. */
