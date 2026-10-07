@@ -344,6 +344,7 @@ async def test_a_demote_stop_bounds_the_wait_on_a_hanging_retired_close(
 ) -> None:
     # ADR 0157: every DEMOTE bound is absorbed where it is set. A retired executor whose close never
     # finishes must not hold a demotion past its budget; the close is left running, not cancelled.
+    # A later SHUTDOWN must not wedge on it either: it cancels what the demotion abandoned.
     runner = await _runner(store, _registry(tmp_path, with_lookups=True))
     release = asyncio.Event()
     try:
@@ -363,11 +364,80 @@ async def test_a_demote_stop_bounds_the_wait_on_a_hanging_retired_close(
 
         await asyncio.wait_for(runner.stop(reason=TeardownReason.DEMOTE, budget_seconds=0.2), 5)
         assert not runner._running
-        assert not any(t.done() or t.cancelled() for t in pending)  # abandoned, not cancelled
+        assert not any(t.done() for t in pending)  # abandoned, not cancelled
+        assert runner._abandoned_lookup_closes == pending
         # The timeout continued the sequence rather than unwinding it.
+        assert not runner._sources and not runner._workers and not runner._destinations
+
+        await asyncio.wait_for(runner.stop(), 5)  # SHUTDOWN, with the hung close still pending
+        await asyncio.sleep(0)
+        assert all(t.cancelled() for t in pending)
+        assert not runner._abandoned_lookup_closes
+    finally:
+        release.set()
+        await runner.stop()
+
+
+async def test_a_demote_stop_waits_for_a_close_that_finishes_inside_the_budget(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = await _runner(store, _registry(tmp_path, with_lookups=True))
+    live = runner._lookup_executor
+    assert live is not None
+    finished: list[DatabaseLookupExecutor] = []
+    real = DatabaseLookupExecutor.aclose
+
+    async def slowish_aclose(self: DatabaseLookupExecutor) -> None:
+        for _ in range(20):  # a few loop turns, well inside the budget
+            await asyncio.sleep(0)
+        await real(self)
+        finished.append(self)
+
+    monkeypatch.setattr(DatabaseLookupExecutor, "aclose", slowish_aclose)
+    await asyncio.wait_for(runner.stop(reason=TeardownReason.DEMOTE, budget_seconds=5), 10)
+    assert finished == [live]
+    assert not runner._abandoned_lookup_closes
+
+
+async def test_a_hanging_live_close_is_bounded_under_demote(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = await _runner(store, _registry(tmp_path, with_lookups=True))
+    release = asyncio.Event()
+    try:
+        real = DatabaseLookupExecutor.aclose
+
+        async def hanging_aclose(self: DatabaseLookupExecutor) -> None:
+            await release.wait()
+            await real(self)
+
+        monkeypatch.setattr(DatabaseLookupExecutor, "aclose", hanging_aclose)
+        await asyncio.wait_for(runner.stop(reason=TeardownReason.DEMOTE, budget_seconds=0.2), 5)
         assert runner._lookup_executor is None
+        assert len(runner._abandoned_lookup_closes) == 1
         assert not runner._sources and not runner._workers and not runner._destinations
     finally:
         release.set()
-        await _settle_closes(runner)
         await runner.stop()
+
+
+async def test_a_raising_live_close_does_not_unwind_teardown(
+    store: MessageStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    runner = await _runner(store, _registry(tmp_path, with_lookups=True))
+
+    async def raising_aclose(self: DatabaseLookupExecutor) -> None:
+        raise RuntimeError("synthetic close failure carrying dsn=SECRET")
+
+    monkeypatch.setattr(DatabaseLookupExecutor, "aclose", raising_aclose)
+    await asyncio.wait_for(runner.stop(), 10)
+
+    assert not runner._running
+    assert runner._lookup_executor is None
+    assert not runner._sources and not runner._workers and not runner._destinations
+    logged = [r.getMessage() for r in caplog.records]
+    assert any("RuntimeError" in m for m in logged)
+    assert not any("SECRET" in m for m in logged)  # the type is logged, never the driver text

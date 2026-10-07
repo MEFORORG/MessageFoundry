@@ -738,13 +738,14 @@ class TeardownReason(StrEnum):
     """Why :meth:`RegistryRunner._teardown_unsafe` is running (ADR 0157 C6).
 
     SHUTDOWN — the historical single path (process stop, a failed start's unwind). Statement-for-
-    statement unchanged, and the ONLY value single-node SQLite can reach: the only DEMOTE caller is
+    statement unchanged except for the lookup-executor close (:meth:`_teardown_body`), and the ONLY
+    value single-node SQLite can reach: the only DEMOTE caller is
     ``Engine._stop_graph``, reachable only from ``_reconcile_graph``, which runs only under
     ``is_clustered()`` — and ``[cluster].enabled`` is rejected on SQLite at config load.
     DEMOTE — loss of leadership, racing a lease this node no longer holds. Dispatchers drain
     cooperatively BEFORE any hard cancel, and both phases are bounded. An inbound that cannot stop
-    inside the budget is ABANDONED — not awaited, and not cancelled. Teardown's wait for the lookup
-    executors to close takes the same budget and abandons the same way (:meth:`_teardown_body`)."""
+    inside the budget is ABANDONED — not awaited, and not cancelled. So is a lookup-executor close
+    (:meth:`_teardown_body`)."""
 
     SHUTDOWN = "shutdown"
     DEMOTE = "demote"
@@ -1548,9 +1549,11 @@ class RegistryRunner:
         # BACKLOG #2348: the post-reload stranded-row report runs detached, so a committed reload never
         # waits on (or is cancelled inside) its store reads. Held here so the task is not collected.
         self._reload_report_tasks: set[asyncio.Task[dict[str, int]]] = set()
-        # The lookup executor a reload retires (the old graph's on commit, the refused graph's on
-        # rollback) closes DETACHED: see :meth:`_retire_lookup_executor`. Teardown waits for these.
+        # A retired lookup executor (a reload's old or refused one, or the live one at teardown)
+        # closes DETACHED: see :meth:`_retire_lookup_executor` and :meth:`_teardown_body`.
         self._lookup_close_tasks: set[asyncio.Task[None]] = set()
+        # Closes a DEMOTE teardown gave up on. Held so they are not collected, never waited on again.
+        self._abandoned_lookup_closes: set[asyncio.Task[None]] = set()
         # B11 read-only worker-loop instrumentation: empty-claim counts (router/transform/delivery),
         # split into idle-poll re-SELECTs vs per-commit wake-fanout (the thundering herd). Surfaced via
         # /stats; default 0, so byte-identical when the connection-scale harness never reads it.
@@ -2184,26 +2187,27 @@ class RegistryRunner:
             return DatabaseLookupExecutor(resolved, egress=self._egress)
 
     def _retire_lookup_executor(self, executor: DatabaseLookupExecutor | None) -> None:
-        """Close a lookup executor a reload has stopped referencing, in a DETACHED task. Synchronous,
+        """Close a lookup executor nothing references any more, in a DETACHED task. Synchronous,
         so it cannot be interrupted between a reload's swap (or rollback) and the close being owned:
         an awaited close could be cut off by a cancellation, which would leak the pools and make a
         committed reload look cancelled, and an unbounded ``wait_closed`` behind an in-flight lookup
-        would hold ``_reload_lock``. Tracked so :meth:`_teardown_body` waits for it (bounded under
-        DEMOTE, where a close still pending is left running)."""
+        would hold ``_reload_lock``. Tracked so :meth:`_teardown_body` waits for it."""
         if executor is None:
             return
         task = asyncio.create_task(self._close_lookup_executor(executor))
         self._lookup_close_tasks.add(task)
         task.add_done_callback(self._lookup_close_tasks.discard)
+        task.add_done_callback(self._abandoned_lookup_closes.discard)
 
     @staticmethod
     async def _close_lookup_executor(executor: DatabaseLookupExecutor) -> None:
         try:
             await executor.aclose()
         # Broad on purpose: this runs as a detached task whose exception nothing else retrieves,
-        # so anything not logged here would surface only as "exception was never retrieved".
-        except Exception:
-            log.exception("could not close a retired lookup executor's pools")
+        # so anything not logged here would surface only as "exception was never retrieved". The
+        # type only, never the text: a driver error can carry DSN attributes (as at connect).
+        except Exception as exc:
+            log.warning("could not close a lookup executor's pools: %s", type(exc).__name__)
 
     def _run_lookup(
         self, connection: str, statement: str, params: Mapping[str, Any] | None
@@ -4833,7 +4837,8 @@ class RegistryRunner:
         _reload_lock) and idempotent — cleans up whatever is registered even if the runner never
         reached _running, so a half-started runner (review M-8) and a double stop() are both safe.
 
-        ``reason`` (ADR 0157 C6) selects the SOURCE + DISPATCHER phases only; every other phase, and
+        ``reason`` (ADR 0157 C6) selects the SOURCE + DISPATCHER phases and the bound on the
+        lookup-executor close wait (:meth:`_teardown_body` states it); every other phase, and
         their order, is shared. Under SHUTDOWN the executed statements are today's, verbatim.
 
         **THE INVARIANT: ``self._running = False`` must execute on every path.**
@@ -4979,14 +4984,17 @@ class RegistryRunner:
         # Run OFF the loop (each close() waits on a process) so a draining child can't wedge the loop.
         # No-op unless [sandbox].mode=subprocess actually spawned any.
         await self._close_sandbox_sessions()
-        # The live lookup executor retires like a reload's: its close joins any a reload left
-        # pending, and ONE wait covers them all, concurrently. Waited on, never cancelled: a
-        # cancelled close leaves its pools open, and the set keeps an abandoned one alive.
-        # asyncio.wait, unlike gather, does not cancel them if this teardown is itself cancelled,
-        # and a close that raises is logged by its task rather than unwinding this sequence. Under
-        # DEMOTE the wait is bounded by the budget and a timeout continues the sequence (ADR 0157:
-        # every DEMOTE bound is absorbed where it is set); under SHUTDOWN it is unbounded, as the
-        # live close always was.
+        # THE LOOKUP-EXECUTOR CLOSE, stated here once. The live executor retires like a reload's:
+        # its close joins any a reload left pending, and ONE wait covers them all, concurrently. A
+        # close that raises is logged by its task rather than unwinding this sequence. Never
+        # cancelled by the wait, since a cancelled close leaves its pools open; asyncio.wait, unlike
+        # gather, does not cancel them if this teardown is itself cancelled. Under DEMOTE the wait
+        # takes the whole budget as its timeout (so the worst-case teardown is longer than the
+        # budget), and a timeout continues the sequence (ADR 0157: every DEMOTE bound is absorbed
+        # where it is set): the closes still pending are ABANDONED, held but never waited on again,
+        # so a flapping node does not spend each later budget on the same hung close. Under
+        # SHUTDOWN the wait is unbounded, as the live close always was, and an abandoned close is
+        # cancelled: it already outlived a budget, and waiting on it would wedge the stop.
         self._retire_lookup_executor(self._lookup_executor)
         self._lookup_executor = None
         if self._lookup_close_tasks:
@@ -4994,11 +5002,21 @@ class RegistryRunner:
                 self._lookup_close_tasks, timeout=budget if demote else None
             )
             if still:
+                self._abandoned_lookup_closes |= still
+                self._lookup_close_tasks -= still
                 log.warning(
                     "teardown: %d lookup executor close(s) still pending after %.2fs; left running",
                     len(still),
                     budget,
                 )
+        if not demote and self._abandoned_lookup_closes:
+            log.warning(
+                "teardown: cancelling %d lookup executor close(s) a demotion abandoned",
+                len(self._abandoned_lookup_closes),
+            )
+            for _close_task in list(self._abandoned_lookup_closes):
+                _close_task.cancel()
+            self._abandoned_lookup_closes.clear()
         self._workers.clear()
         self._router_workers.clear()
         self._transform_workers.clear()

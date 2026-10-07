@@ -666,8 +666,7 @@ def demote_stop_budget(
 
     A STATIC duration cap on two phases — NOT a lease-anchored absolute deadline: it reads no DB clock,
     compares against no ``lease_expires_at``, makes the Windows monotonic clock load-bearing for
-    nothing, and cannot degrade to zero. Teardown's wait for the lookup executors to close takes the
-    same figure as its own timeout, so the worst-case teardown is longer than the budget.
+    nothing, and cannot degrade to zero.
 
     The renew round trip is not subtracted, and since ADR 0157 Inc 0 it no longer needs to be:
     :meth:`DbCoordinator._maintain_leadership` stamps the fence baseline BEFORE it issues the renew, so
