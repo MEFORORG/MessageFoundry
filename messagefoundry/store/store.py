@@ -11439,13 +11439,19 @@ class MessageStore:
             exclude=exclude,
             before_id=before_id,
         )
-        if limit is None:
-            sql = f"SELECT COUNT(*) FROM audit_log{where}"
-        else:
-            sql = f"SELECT COUNT(*) FROM (SELECT id FROM audit_log{where} ORDER BY id DESC LIMIT ?)"
-            params.append(limit)
+        # Each branch passes its SQL as a literal, never through a local variable: the transaction
+        # guard in tests/test_writer_txn_is_the_only_begin.py can read a literal and pins every
+        # argument it cannot read.
         async with self._read() as db:
-            cur = await db.execute(sql, params)
+            if limit is None:
+                cur = await db.execute(f"SELECT COUNT(*) FROM audit_log{where}", params)
+            else:
+                params.append(limit)
+                cur = await db.execute(
+                    f"SELECT COUNT(*) FROM (SELECT id FROM audit_log{where}"
+                    " ORDER BY id DESC LIMIT ?)",
+                    params,
+                )
             row = await cur.fetchone()
             return int(row[0]) if row is not None else 0
 
