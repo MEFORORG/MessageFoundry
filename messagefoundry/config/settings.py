@@ -396,7 +396,9 @@ class _Section(_InputHidingModel):
     # fail to start. Two further reasons the model is the wrong surface: pydantic's extra_forbidden error
     # echoes the offending VALUE and the CLI prints the exception verbatim to a log file, so a mistyped
     # SECRET key would disclose the secret; and `security show` validates SecuritySettings directly, so a
-    # forbidding model would deny an operator the very view they use to repair the typo.
+    # forbidding model would deny an operator the very view they use to repair the typo. The one
+    # exception is a REMOVED key (_refuse_removed_keys below): it is no typo, and its refusal names
+    # the fix and echoes no value.
     model_config = ConfigDict(extra="ignore")
 
     @model_validator(mode="before")
@@ -408,8 +410,8 @@ class _Section(_InputHidingModel):
         section built in code skips the loader, and ``extra="ignore"`` would drop the key, so
         ``SecuritySettings(require_sign_in=False)`` would quietly keep sign-in on. Unlike a blanket
         ``extra="forbid"``, this names only keys that were removed, and its message carries no value.
-        So ``security show`` on a file still holding one refuses with the fix in its message, and an
-        operator removes the line with ``security update`` (a ``null`` value), which this allows.
+        So ``security show`` on a file still holding one refuses with the fix in its message, and the
+        operator removes the line, by hand or with ``security set`` and a ``null`` value.
 
         Keys are checked in ``_REMOVED_KEYS`` order, so the key named is the one the loader names."""
         if isinstance(data, Mapping) and (removed := _removed_keys_for(cls)):
@@ -6691,7 +6693,7 @@ def _removed_keys_for(model: type[BaseModel]) -> dict[str, str]:
     Read through :func:`_section_models`, so a section gains the model-level refusal by being
     listed in ``_REMOVED_KEYS`` and nothing else, and a subclass of a section inherits its
     refusals. Called only when a model is built, never at import, so every name it reads exists by
-    then; a section built at import above :class:`ServiceSettings` would raise ``NameError``."""
+    then. A section built at module level anywhere above this function would raise ``NameError``."""
     sections = {name for name, m in _section_models().items() if issubclass(model, m)}
     return {
         key: _removed_key_message(section, key, reason)

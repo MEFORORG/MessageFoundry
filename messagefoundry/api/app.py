@@ -1078,9 +1078,9 @@ def _posture_loosenings(
         pairs.append(
             (
                 "allow_no_auth",
-                "no auth service is attached and the app opted in with allow_no_auth=True, so "
-                "the permission-gated API routes answer a caller with no credentials as the "
-                "system identity, and the audit trail names no person",
+                "no auth service is attached, and the app opted in with allow_no_auth=True. The "
+                "permission-gated API routes answer a caller with no credentials. The audit trail "
+                "names no person",
             )
         )
     return pairs, loosenings_scope

@@ -49,7 +49,8 @@ _EGRESS = EgressSettings(deny_by_default=False)
 def _is_auth_source(value: ast.expr | None) -> bool:
     """Whether an assigned value is one of the ways engine and console code reach the service."""
     if isinstance(value, ast.Attribute):
-        return value.attr == "auth"  # request.app.state.auth
+        # request.app.state.auth, self._auth, deps.auth_service
+        return value.attr in {"auth", "_auth", "auth_service"}
     if not isinstance(value, ast.Call):
         return False
     name = callee_name(value)
@@ -156,7 +157,7 @@ async def e(request):
     if (found := get_auth(request)) is None or not getattr(found, "enabled", True):
         return
     auth, identity = await _session_caller(request)
-    return auth.enabled or get_auth(request).enabled or self.auth.enabled
+    return auth.enabled or get_auth(request).enabled or self.auth.enabled or self._auth.enabled
 def control(dr, service):
     return dr.enabled and service.enabled and getattr(dr, "enabled", False)
 """
@@ -173,6 +174,7 @@ def test_the_scanner_finds_every_binding_form() -> None:
         "current",
         "found",
         "get_auth(request)",
+        "self._auth",
         "self.auth",
         "service",
         "svc",
@@ -183,7 +185,8 @@ def test_no_engine_or_console_code_reads_enabled_on_an_auth_service() -> None:
     """The guards mean ``auth is None``, so they say it, and a stand-in reporting false changes nothing.
 
     The control on the same walk: the service's own methods are read through these bindings in the
-    real tree, so the walk reached the files and recognised the bindings in them."""
+    real tree, so the walk reached the files and recognised the bindings in them. The walk covers
+    function bodies and the holders the positive control lists, not module or class level."""
     assert _scan()["enabled"] == set()
     assert len(_scan()["identity_for_token"]) >= 5, "control: the walk sees real auth bindings"
 
