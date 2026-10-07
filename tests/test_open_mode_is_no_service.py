@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 import functools
+import re
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -27,7 +28,9 @@ from messagefoundry.config.settings import (
     _REMOVED_KEYS,
     AuthSettings,
     EgressSettings,
+    SecuritySettings,
     ServiceSettings,
+    _removed_key_message,
     _section_models,
 )
 from messagefoundry.pipeline import Engine
@@ -65,34 +68,57 @@ def _names_auth(annotation: ast.expr | None) -> bool:
 
 
 def _auth_bound_names(func: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
-    """Names a function binds to an auth service, by annotation or by how it fetched the value."""
+    """Names a function binds to an auth service, by annotation or by how it fetched the value.
+
+    ``auth`` itself always counts, whatever bound it: the tree uses that name for the service, and
+    a tuple unpack such as ``auth, identity = await _session_caller(request)`` names no source."""
     args = func.args
     every_arg = [*args.posonlyargs, *args.args, *args.kwonlyargs]
-    bound = {a.arg for a in every_arg if _names_auth(a.annotation)}
+    bound = {"auth"} | {a.arg for a in every_arg if _names_auth(a.annotation)}
     for node in ast.walk(func):
         if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
             if _names_auth(node.annotation) or _is_auth_source(node.value):
                 bound.add(node.target.id)
         elif isinstance(node, ast.Assign) and _is_auth_source(node.value):
             bound.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        elif isinstance(node, ast.NamedExpr) and _is_auth_source(node.value):
+            bound.add(node.target.id)
     return bound
 
 
+def _holds_auth(value: ast.expr, bound: set[str]) -> str | None:
+    """The source text of ``value`` when it holds an auth service, else ``None``."""
+    if (isinstance(value, ast.Name) and value.id in bound) or _is_auth_source(value):
+        return ast.unparse(value)
+    return None
+
+
 def _reads_on_auth(source: str, attrs: frozenset[str]) -> Iterator[tuple[str, int, str]]:
-    """``(attr, line, name)`` for each read of ``<name>.<attr>`` where ``name`` holds an auth
-    service and ``attr`` is one of ``attrs``."""
+    """``(attr, line, holder)`` for each read of ``attr`` (one of ``attrs``) on an auth service.
+
+    A read is ``holder.attr`` or ``getattr(holder, "attr", ...)``, where ``holder`` is a bound name
+    or the fetch itself (``get_auth(request).attr``, ``request.app.state.auth.attr``)."""
     for func in ast.walk(ast.parse(source)):
         if not isinstance(func, ast.FunctionDef | ast.AsyncFunctionDef):
             continue
         bound = _auth_bound_names(func)
         for node in ast.walk(func):
-            if (
-                isinstance(node, ast.Attribute)
-                and node.attr in attrs
-                and isinstance(node.value, ast.Name)
-                and node.value.id in bound
+            if isinstance(node, ast.Attribute) and node.attr in attrs:
+                holder = _holds_auth(node.value, bound)
+                attr = node.attr
+            elif (
+                isinstance(node, ast.Call)
+                and callee_name(node, bare_only=True) == "getattr"
+                and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value in attrs
             ):
-                yield node.attr, node.lineno, node.value.id
+                holder = _holds_auth(node.args[0], bound)
+                attr = str(node.args[1].value)
+            else:
+                continue
+            if holder is not None:
+                yield attr, node.lineno, holder
 
 
 #: The read under test, and the control read through the same bindings.
@@ -126,18 +152,28 @@ def d(request):
     def inner():
         return current.enabled
     return inner
+async def e(request):
+    if (found := get_auth(request)) is None or not getattr(found, "enabled", True):
+        return
+    auth, identity = await _session_caller(request)
+    return auth.enabled or get_auth(request).enabled or self.auth.enabled
 def control(dr, service):
-    return dr.enabled and service.enabled
+    return dr.enabled and service.enabled and getattr(dr, "enabled", False)
 """
 
 
 def test_the_scanner_finds_every_binding_form() -> None:
-    """Positive control: each way the tree binds a service is recognised, and a same-named read on
-    something else is not. A scanner that recognised nothing would report the clean zero below."""
+    """Positive control: each way the tree binds or reaches a service is recognised, and a
+    same-named read on something else is not. A scanner that recognised nothing would report the
+    clean zero below."""
     reads = _reads_on_auth(_EVERY_BINDING_FORM, frozenset({"enabled"}))
-    assert sorted(name for _, _, name in reads) == [
+    assert sorted(holder for _, _, holder in reads) == [
+        "auth",
         "auth",
         "current",
+        "found",
+        "get_auth(request)",
+        "self.auth",
         "service",
         "svc",
     ]
@@ -167,10 +203,29 @@ def test_every_removed_key_is_refused_by_the_section_built_in_code(section: str,
     is refused by ``tests/test_settings_unknown_kwargs.py``."""
     model = _section_models()[section]
     model()  # control: the same section builds without the key
-    with pytest.raises(ValueError, match=key):
+    # The loader's own message. `[auth].enabled` alone keeps the older, more specific refusal
+    # AuthSettings carries (vault BACKLOG #2825), which runs first.
+    message = re.escape(_removed_key_message(section, key, _REMOVED_KEYS[section, key]))
+    if (section, key) == ("auth", "enabled"):
+        message = "AuthSettings has no `enabled` field"
+    with pytest.raises(ValueError, match=message):
         model.model_validate({key: False})
-    with pytest.raises(ValueError, match=key):
+    with pytest.raises(ValueError, match=message):
         ServiceSettings.model_validate({section: {key: False}})
+
+
+def test_a_subclass_of_a_section_inherits_its_refusals() -> None:
+    class _Embedded(SecuritySettings):
+        pass
+
+    with pytest.raises(ValueError, match="require_sign_in"):
+        _Embedded.model_validate({"require_sign_in": False})
+
+
+def test_the_refusal_names_the_first_removed_key_in_order() -> None:
+    """Two removed keys in one section: the model names the one the loader names, every run."""
+    with pytest.raises(ValueError, match="handles_real_patient_data"):
+        SecuritySettings.model_validate({"require_sign_in": False, "handles_real_patient_data": 1})
 
 
 # --- item 3: GET /security/posture reports the open mode ----------------------------------------

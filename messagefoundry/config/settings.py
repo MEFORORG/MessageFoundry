@@ -407,10 +407,15 @@ class _Section(_InputHidingModel):
         The loader refuses these keys from a file or the environment before any model is built. A
         section built in code skips the loader, and ``extra="ignore"`` would drop the key, so
         ``SecuritySettings(require_sign_in=False)`` would quietly keep sign-in on. Unlike a blanket
-        ``extra="forbid"``, this names only keys that were removed, and its message carries no value."""
+        ``extra="forbid"``, this names only keys that were removed, and its message carries no value.
+        So ``security show`` on a file still holding one refuses with the fix in its message, and an
+        operator removes the line with ``security update`` (a ``null`` value), which this allows.
+
+        Keys are checked in ``_REMOVED_KEYS`` order, so the key named is the one the loader names."""
         if isinstance(data, Mapping) and (removed := _removed_keys_for(cls)):
-            for key in removed.keys() & data.keys():
-                raise ValueError(removed[key])
+            for key, refusal in removed.items():
+                if key in data:
+                    raise ValueError(refusal)
         return data
 
 
@@ -6684,9 +6689,10 @@ def _removed_keys_for(model: type[BaseModel]) -> dict[str, str]:
     """``key -> refusal`` for the :data:`_REMOVED_KEYS` of the section(s) ``model`` validates.
 
     Read through :func:`_section_models`, so a section gains the model-level refusal by being
-    listed in ``_REMOVED_KEYS`` and nothing else. Called only when a model is built, never at
-    import, so every name it reads exists by then."""
-    sections = {name for name, m in _section_models().items() if m is model}
+    listed in ``_REMOVED_KEYS`` and nothing else, and a subclass of a section inherits its
+    refusals. Called only when a model is built, never at import, so every name it reads exists by
+    then; a section built at import above :class:`ServiceSettings` would raise ``NameError``."""
+    sections = {name for name, m in _section_models().items() if issubclass(model, m)}
     return {
         key: _removed_key_message(section, key, reason)
         for (section, key), reason in _REMOVED_KEYS.items()

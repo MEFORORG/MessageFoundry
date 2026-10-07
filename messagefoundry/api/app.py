@@ -986,7 +986,8 @@ def _posture_loosenings(
     remote_debug: RemoteDebugPosture,
     startup: StartupPosture,
 ) -> tuple[list[tuple[str, str]], str | None]:
-    """The active ``security_loosenings()`` entries and the scope note, read off ``state``.
+    """The active ``security_loosenings()`` entries and the scope note, read off ``state``, plus
+    the ``allow_no_auth`` open mode, which is an app opt-in rather than a setting.
 
     ``GET /security/posture`` and the start's ``config_loaded`` audit row (vault BACKLOG #2597) both
     call this, so the row records the list the route would report. ``runner`` and the two process
@@ -1078,8 +1079,8 @@ def _posture_loosenings(
             (
                 "allow_no_auth",
                 "no auth service is attached and the app opted in with allow_no_auth=True, so "
-                "every API route answers a caller with no credentials as the system identity "
-                "(the web console pages still require a session)",
+                "the permission-gated API routes answer a caller with no credentials as the "
+                "system identity, and the audit trail names no person",
             )
         )
     return pairs, loosenings_scope

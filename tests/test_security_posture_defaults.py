@@ -20,12 +20,14 @@ switch be added at an insecure value with nothing reporting it.
 from __future__ import annotations
 
 import ipaddress
+import uuid
 from pathlib import Path
 
 import httpx
 import pytest
 
 from messagefoundry.api import create_app
+from messagefoundry.auth import Role
 from messagefoundry.config.settings import (
     LOCKOUT_THRESHOLD_CEILING,
     AlertsSettings,
@@ -43,6 +45,7 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.pipeline import Engine
+from tests.test_api_auth import _DEFAULT_PEER, _add, _auth, _login, _service
 
 
 def _ad(**over: object) -> AuthSettings:
@@ -1714,18 +1717,20 @@ def test_the_revocation_attestation_is_actually_wired() -> None:
 # --- the API surface: GET /security/posture reports store + auth deviations --------------------
 
 
-#: ``_posture_body`` reaches the route through the open mode, and the route names that mode (vault
-#: BACKLOG #3062). So a quiet posture here carries that one entry and nothing else.
-_HARNESS_ONLY = ["allow_no_auth"]
-
-
 async def _posture_body(engine: Engine, **state: object) -> dict[str, object]:
-    app = create_app(engine, allow_no_auth=True)
+    """The route as a signed-in Administrator reads it. Not through the ``allow_no_auth`` open mode:
+    the route names that mode as a loosening (vault BACKLOG #3062), which no shipped instance has."""
+    service = await _service(engine)
+    username = f"admin-{uuid.uuid4().hex[:8]}"
+    await _add(service, username, Role.ADMINISTRATOR)
+    app = create_app(engine, auth=service)
     for key, value in state.items():
         setattr(app.state, key, value)
-    transport = httpx.ASGITransport(app=app)
+    transport = httpx.ASGITransport(app=app, client=_DEFAULT_PEER)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
-        resp = await client.get("/security/posture")
+        signed_in = await _login(client, username)
+        assert signed_in.status_code == 200, signed_in.text
+        resp = await client.get("/security/posture", headers=_auth(signed_in.json()["token"]))
     assert resp.status_code == 200
     body: dict[str, object] = resp.json()
     return body
@@ -1766,7 +1771,7 @@ async def test_posture_route_reports_the_plaintext_hop_acknowledgement(engine: E
     quiet = await _posture_body(
         engine, static_credential_settings=ServiceSettings(api=_terminated(ack=True, cert=True))
     )
-    assert [e["switch"] for e in quiet["loosenings"]] == _HARNESS_ONLY  # type: ignore[index,union-attr]
+    assert quiet["loosenings"] == []
 
 
 @pytest.mark.usefixtures("remote_debugging_off")
@@ -1777,7 +1782,7 @@ async def test_posture_route_reports_nothing_at_the_shipped_defaults(engine: Eng
     the console script leaves it on, and the route then names it: see
     ``tests/test_remote_debug_guard.py``."""
     body = await _posture_body(engine)
-    assert [e["switch"] for e in body["loosenings"]] == _HARNESS_ONLY  # type: ignore[index,union-attr]
+    assert body["loosenings"] == []
 
 
 # --- the ONE connection-scoped deviation (ADR 0153) --------------------------------------------
