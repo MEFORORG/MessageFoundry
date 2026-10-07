@@ -3452,6 +3452,7 @@ def create_app(
         want_out = role in (None, "destination")
         if rr is not None and want_in and name in rr.registry.inbound:
             await _control_guard(engine, identity, name, client)
+            anchor_refused = False
             try:
                 if action == "start":
                     await rr.start_inbound(name)
@@ -3466,11 +3467,14 @@ def create_app(
                 raise HTTPException(409, str(exc)) from None
             except TrustAnchorError:
                 # vault BACKLOG #2371: an Ftp poller's CA was refused. The runner recorded it failed
-                # and logged why; the action is audited, and the caller gets the fixed line.
+                # and logged why. Raised below, outside this handler, so the refusal, which names
+                # the CA's path and SHA-256, is not left on the 409's __context__.
+                anchor_refused = True
+            if anchor_refused:
                 await _record_control_audit(
                     engine, identity, name, action, role="source", running=False, client=client
                 )
-                raise HTTPException(409, _ANCHOR_REFUSED_DETAIL) from None
+                raise HTTPException(409, _ANCHOR_REFUSED_DETAIL)
             running = rr.inbound_running(name)
             await _record_control_audit(
                 engine, identity, name, action, role="source", running=running, client=client
