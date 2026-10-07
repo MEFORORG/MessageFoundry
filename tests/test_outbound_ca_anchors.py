@@ -1152,42 +1152,92 @@ def _outbound_registry(ca: Path, pin: str, **kw: Any) -> Registry:
     return reg
 
 
-async def test_removing_the_schedule_of_a_ca_refused_lane_does_not_resume_it(
-    store: MessageStore, tmp_path: Path, judged: None
-) -> None:
-    """Review #10. The calendar parked ``OUT`` while its CA kept it failed. A reload that only
-    removes the schedule must leave it failed and paused, with no connector and no second alert.
-    Red under: the resume path ignoring the kept CA failure (4b0a186bd5)."""
-    from datetime import UTC, datetime, time
+def _day_schedule() -> Any:
+    """08:00 to 17:00 UTC, every day."""
+    from datetime import time
 
     from messagefoundry.config.models import ActiveWindow, Schedule
 
-    schedule = Schedule(
-        windows=[
-            ActiveWindow(
-                days=frozenset(range(7)), start=time(8, 0), end=time(17, 0), timezone="UTC"
-            )
-        ]
+    window = ActiveWindow(
+        days=frozenset(range(7)), start=time(8, 0), end=time(17, 0), timezone="UTC"
     )
-    now = [datetime(2026, 7, 13, 9, tzinfo=UTC)]
+    return Schedule(windows=[window])
+
+
+def _at(hour: int) -> Any:
+    from datetime import UTC, datetime
+
+    return datetime(2026, 7, 13, hour, tzinfo=UTC)
+
+
+async def test_removing_the_schedule_of_a_ca_refused_lane_does_not_resume_it(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """Review round 5, finding 10. The calendar parked ``OUT`` while its refused CA kept it failed.
+    A reload that only removes the schedule leaves it failed and paused, with no connector and no
+    second alert. The positive arm: a reload that also changes its config, with the file fixed,
+    checks it, and the lane resumes. Red under the resume path ignoring the kept failure, the code
+    before this fix; and under the hold firing on every lane."""
+    good = _block(b"partner-ca")
     ca = _ca(tmp_path)
+    pin = _sha(ca)
+    ca.write_bytes(_block(b"substitute"))
+    schedule = _day_schedule()
+    now = [_at(9)]
     sink = _CountingSink()
     runner = _runner(
         store,
-        _outbound_registry(ca, "00" * 32, schedule=schedule),
+        _outbound_registry(ca, pin, schedule=schedule),
         alert_sink=sink,
         schedule_clock=lambda: now[0],
     )
     await runner.start()
     try:
         assert runner.degraded_outbound()["OUT"].startswith(_REFUSED_OUT)
-        now[0] = datetime(2026, 7, 13, 18, tzinfo=UTC)  # the window closes: the calendar parks it
+        now[0] = _at(18)  # the window closes: the calendar parks it
         await runner._reconcile_schedule("OUT", "outbound", schedule)
         assert "OUT" in runner._schedule_parked
-        await runner.reload(_outbound_registry(ca, "00" * 32))  # the schedule alone is removed
+        await runner.reload(_outbound_registry(ca, pin))  # the schedule alone is removed
         assert runner.degraded_outbound()["OUT"].startswith(_REFUSED_OUT)
         assert "OUT" in runner._outbound_paused
         assert "OUT" not in runner._destinations
+        assert sink.stopped == ["OUT"], sink.stopped
+
+        ca.write_bytes(good)
+        from messagefoundry.config.wiring import build_outbound_connection
+
+        changed = Registry()
+        spec = Rest(url="https://partner.example.org/v2", tls_ca_file=str(ca), tls_ca_pin=pin)
+        changed.add_outbound(build_outbound_connection("OUT", spec))
+        await runner.reload(changed)
+        assert "OUT" not in runner._outbound_paused
+        assert "OUT" in runner._destinations
+        assert "OUT" not in runner.degraded_outbound()
+    finally:
+        await runner.stop()
+
+
+async def test_a_window_open_on_a_ca_refused_lane_does_not_alert_again(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """Review round 5, finding 1. Each window open starts the lane, which rebuilds it and reads
+    the CA again. The refusal was alerted when the lane first failed, so a later window adds no
+    alert. Red under the operator-start build recording every refusal."""
+    schedule = _day_schedule()
+    now = [_at(9)]
+    sink = _CountingSink()
+    runner = _runner(
+        store,
+        _outbound_registry(_ca(tmp_path), "00" * 32, schedule=schedule),
+        alert_sink=sink,
+        schedule_clock=lambda: now[0],
+    )
+    await runner.start()
+    try:
+        for hour in (18, 9, 18, 9):  # two closes and two opens
+            now[0] = _at(hour)
+            await runner._reconcile_schedule("OUT", "outbound", schedule)
+        assert runner.degraded_outbound()["OUT"].startswith(_REFUSED_OUT)
         assert sink.stopped == ["OUT"], sink.stopped
     finally:
         await runner.stop()
@@ -1196,33 +1246,43 @@ async def test_removing_the_schedule_of_a_ca_refused_lane_does_not_resume_it(
 async def test_a_dr_release_checks_a_lane_whose_ca_failure_the_park_ended(
     store: MessageStore, tmp_path: Path, judged: None
 ) -> None:
-    """Review #13, DR. A DR park clears the lane's failed record, so it no longer keeps its CA
-    failure. The park's own reload reads nothing for it. The first reload after the release builds
-    it, so it checks it, and a CA still refused refuses that reload (the ADR 0031 amendment's
-    Consequences; review #2 asks whether the park should keep the failure instead)."""
+    """Review round 4, finding 2, pinned as built. A DR park clears the lane's failed record, so
+    it no longer keeps its CA failure. The park's own reload reads nothing for it. The first
+    reload after the release builds it, so it checks it, and a CA still refused refuses that
+    reload (the ADR 0031 amendment's Consequences). Recovery: fix the file and start the lane, and
+    the same graph reloads."""
     from messagefoundry.config.models import Priority
 
+    good = _block(b"partner-ca")
     ca = _ca(tmp_path)
-    reg = _outbound_registry(ca, "00" * 32, priority=Priority.LOW)
-    runner = _runner(store, reg)
+    pin = _sha(ca)
+    ca.write_bytes(_block(b"substitute"))
+    runner = _runner(store, _outbound_registry(ca, pin, priority=Priority.LOW))
     await runner.start()
     try:
         assert runner.degraded_outbound()["OUT"].startswith(_REFUSED_OUT)
         runner.set_dr_threshold(Priority.NORMAL)
-        await runner.reload(_outbound_registry(ca, "00" * 32, priority=Priority.LOW))
+        await runner.reload(_outbound_registry(ca, pin, priority=Priority.LOW))
         assert "OUT" not in runner.degraded_outbound()  # parked, and its failed record cleared
         runner.set_dr_threshold(None)
         with pytest.raises(WiringError, match=_PIN_MISMATCH):
-            await runner.reload(_outbound_registry(ca, "00" * 32, priority=Priority.LOW))
+            await runner.reload(_outbound_registry(ca, pin, priority=Priority.LOW))
+
+        ca.write_bytes(good)
+        await runner.start_outbound("OUT")
+        assert "OUT" in runner._destinations
+        await runner.reload(_outbound_registry(ca, pin, priority=Priority.LOW))
+        assert "OUT" not in runner.degraded_outbound()
     finally:
         await runner.stop()
 
 
-async def test_a_lane_mark_clears_once_its_ca_check_passes(
+async def test_a_lane_mark_clears_at_an_operator_start_whose_check_passes(
     store: MessageStore, tmp_path: Path, judged: None
 ) -> None:
-    """Review #13, the mark. An operator start whose check passes clears it. A reload whose
-    pre-check passes clears it once the reload commits. Red under either clear removed."""
+    """Review round 4, finding 13. A lane its CA refused at start is marked. Once the file is
+    fixed, an operator start checks it, builds it, and clears the mark. Red under the pass not
+    clearing it."""
     good = _block(b"partner-ca")
     ca = _ca(tmp_path)
     pin = _sha(ca)
@@ -1235,11 +1295,32 @@ async def test_a_lane_mark_clears_once_its_ca_check_passes(
         await runner.start_outbound("OUT")
         assert ("outbound", "OUT") not in runner._anchor_refused
         assert "OUT" in runner._destinations
+    finally:
+        await runner.stop()
 
-        ca.write_bytes(_block(b"substitute"))
-        runner._anchor_refused[("outbound", "OUT")] = (str(ca), pin)  # as a past refusal left it
+
+async def test_a_lane_mark_clears_when_a_changed_reload_passes_its_check(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """Review round 4, finding 13. A lane its CA refused at start is marked. A reload that
+    changes its config, with the file fixed, checks it, rebuilds it, and clears the mark once it
+    commits. Red under the commit not clearing it."""
+    from messagefoundry.config.wiring import build_outbound_connection
+
+    good = _block(b"partner-ca")
+    ca = _ca(tmp_path)
+    pin = _sha(ca)
+    ca.write_bytes(_block(b"substitute"))
+    runner = _runner(store, _outbound_registry(ca, pin))
+    await runner.start()
+    try:
+        assert ("outbound", "OUT") in runner._anchor_refused
         ca.write_bytes(good)
-        await runner.reload(_outbound_registry(ca, pin))
+        changed = Registry()
+        spec = Rest(url="https://partner.example.org/v2", tls_ca_file=str(ca), tls_ca_pin=pin)
+        changed.add_outbound(build_outbound_connection("OUT", spec))
+        await runner.reload(changed)
         assert ("outbound", "OUT") not in runner._anchor_refused
+        assert "OUT" in runner._destinations
     finally:
         await runner.stop()

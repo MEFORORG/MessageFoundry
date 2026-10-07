@@ -3071,8 +3071,9 @@ class RegistryRunner:
 
     def _holds_anchor_failure(self, name: str) -> bool:
         """Whether outbound ``name`` is down because a build refused its CA: marked, recorded
-        failed, and with no connector (vault BACKLOG #2371). Asked after a reload commits, when
-        :meth:`_keeps_anchor_failure` has already decided the lane stays failed."""
+        failed, and with no connector (vault BACKLOG #2371). A plain read of the lane's state. After
+        a reload commits it agrees with :meth:`_keeps_anchor_failure`, since a reload clears the
+        mark of every lane its pre-check passed."""
         return (
             ("outbound", name) in self._anchor_refused
             and ("outbound", name) in self._failed
@@ -3185,7 +3186,11 @@ class RegistryRunner:
         except Exception as exc:
             await self._aclose_quietly(connector, name)
             self._destinations.pop(name, None)
-            self._record_failed(name, exc, kind="outbound")
+            # vault BACKLOG #2371: a CA refusal on a lane already recorded failed is not alerted
+            # again. A calendar window open reaches here once per window, and the refusal was
+            # alerted when the lane first failed. Other build failures alert as before.
+            if not (isinstance(exc, TrustAnchorError) and ("outbound", name) in self._failed):
+                self._record_failed(name, exc, kind="outbound")
             return
         self._destinations[name] = connector
         self._failed.pop(("outbound", name), None)
@@ -3305,15 +3310,21 @@ class RegistryRunner:
         something other than the calendar also holds it down: an operator-required STOP, a #122 log
         halt, ``deployed=False`` or ``auto_start=False``. The lane then stays as that state leaves
         it, and the ordinary recovery for that state brings it up. So does a refused CA the reload
-        kept (vault BACKLOG #2371): resuming would rebuild it, alert again and unpause a lane with no
-        connector."""
+        kept (vault BACKLOG #2371): resuming would read the CA again and alert a second time. An
+        operator start, or a config change the reload checks, brings that lane up."""
         if (
             self._schedule_holds(name, "outbound")
             or self._delivery_halted
             or not self._deployed(name, "outbound")
             or not self._auto_start_enabled(name, "outbound")
-            or self._holds_anchor_failure(name)
         ):
+            return
+        if self._holds_anchor_failure(name):
+            log.info(
+                "schedule: outbound connection %r no longer has a schedule, but its tls_ca_file was "
+                "refused; start the connection once the file is fixed",
+                name,
+            )
             return
         if self._dr_parked(name):
             # The DR run-profile parks it too, so this resume is refused and the lane stays the
