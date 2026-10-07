@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-1f0ffb907379e761
+5a49b51d647866fa
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -110,6 +110,7 @@ federated_identity_view
 
 ## api.security surface (imported directly by the console, outside UiDeps)
 alert_directory_administrator_granted: (state: 'Any', outcome: 'LoginOutcome', *, via: 'str') -> 'None'
+authorization_header: (request: 'Request') -> 'str'
 client_ip: (conn: 'Request | WebSocket') -> 'str | None'
 enforce_phi_read_hop: (request: 'Request') -> 'None'
 enforce_phi_read_pacing: (request: 'Request', identity: 'Identity') -> 'None'

@@ -352,9 +352,44 @@ def _audit_all_authz(app_state: object) -> bool:
     return bool(getattr(app_state, "audit_all_authz", False))
 
 
+#: The 400 detail for a request carrying more than one ``Authorization`` header (BACKLOG #2454).
+#: A fixed string: it names the rule, never a value.
+REPEATED_AUTHORIZATION_DETAIL = "more than one Authorization header"
+
+
+def sole_authorization(conn: HTTPConnection) -> str | None:
+    """The request's one ``Authorization`` value, ``""`` when absent, ``None`` when it is repeated.
+
+    Every read of ``Authorization`` on the engine and the web console goes through here
+    (BACKLOG #2454, the mirror of #2051 at HTTP intake). Starlette's ``headers.get`` returns the
+    FIRST of two same-named lines, while a front end may have checked the LAST, so the two would
+    authenticate different credentials. A repeat is refused even when the values are identical,
+    because a proxy may still split, merge or rewrite them. Takes either plane, as
+    :func:`client_ip` does, so the WebSocket path cannot grow a second rule."""
+    values = conn.headers.getlist("Authorization")
+    if len(values) > 1:
+        return None
+    return values[0] if values else ""
+
+
+def authorization_header(request: Request) -> str:
+    """:func:`sole_authorization` for an HTTP route: a repeated header is refused with 400.
+
+    400 and not 401, as #2051 answers at intake: the request is malformed, and no credential in it
+    was compared. The header name is public here, so unlike #2051's configurable intake header the
+    refusal tells a caller nothing it did not know. This helper charges no rate limiter itself; a
+    route that consults one first, as ``POST /auth/negotiate`` does, has already charged it."""
+    value = sole_authorization(request)
+    if value is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, REPEATED_AUTHORIZATION_DETAIL)
+    return value
+
+
 def bearer_token(request: Request) -> str | None:
-    """Extract a ``Bearer`` token from the Authorization header, if present."""
-    header = request.headers.get("Authorization", "")
+    """Extract a ``Bearer`` token from the Authorization header, if present.
+
+    Raises 400 when the header is repeated (:func:`authorization_header`)."""
+    header = authorization_header(request)
     if header.startswith("Bearer "):
         return header[len("Bearer ") :].strip() or None
     return None
@@ -1488,10 +1523,15 @@ async def optional_identity(request: Request) -> Identity | None:
     not PHI. The ASVS 6.3.3 **MFA access gate is excluded for the same reason, deliberately**: this
     resolver answers tokenless callers by contract, so a second-factor gate here could only ever
     downgrade an already-public answer, never protect anything. Both consumers (``GET /health``,
-    ``GET /ai/policy``) are non-PHI."""
+    ``GET /ai/policy``) are non-PHI.
+
+    A repeated ``Authorization`` header (BACKLOG #2454) reads as no token here rather than a 400,
+    to keep the never-raises contract: the caller gets the tokenless answer, which grants nothing."""
     auth = get_auth(request)
     if auth is None:
         return _SYSTEM_IDENTITY if _allow_no_auth(request.app.state) else None
+    if sole_authorization(request) is None:
+        return None
     return await auth.identity_for_token(bearer_token(request))
 
 
@@ -1503,8 +1543,13 @@ def ws_token(websocket: WebSocket) -> str | None:
     web console does not authenticate here: a browser cannot set the header on a WebSocket
     handshake, so its same-origin handshake uses the session cookie through the console's own hook
     (``authorize_ui_ws``). When that hook declines, the route still calls this, finds no header and
-    gets ``None``."""
-    header = websocket.headers.get("Authorization", "")
+    gets ``None``.
+
+    A repeated header also gives ``None`` (BACKLOG #2454), so :func:`authorize_ws` refuses the
+    handshake: a 403 denial where the server supports one, else a 1008 policy-violation close."""
+    header = sole_authorization(websocket)
+    if header is None:
+        return None
     if header.startswith("Bearer "):
         return header[len("Bearer ") :].strip() or None
     return None

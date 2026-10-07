@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from pydantic import ValidationError
+from starlette.datastructures import Headers
 from starlette.types import Message as AsgiMessage
 from starlette.websockets import WebSocket
 
@@ -133,8 +134,9 @@ def test_ws_origin_honors_allowlist() -> None:
 
 
 def test_ws_token_is_header_only() -> None:
-    assert ws_token(SimpleNamespace(headers={"Authorization": "Bearer abc"})) == "abc"  # type: ignore[arg-type]
-    assert ws_token(SimpleNamespace(headers={})) is None  # type: ignore[arg-type]
+    # starlette's Headers, which has the getlist the repeat check reads (BACKLOG #2454).
+    assert ws_token(SimpleNamespace(headers=Headers({"Authorization": "Bearer abc"}))) == "abc"  # type: ignore[arg-type]
+    assert ws_token(SimpleNamespace(headers=Headers({}))) is None  # type: ignore[arg-type]
 
 
 async def test_security_headers_present_on_response() -> None:

@@ -73,6 +73,7 @@ from messagefoundry.api.security import (
     alert_administrator_granted,
     alert_directory_administrator_granted,
     answers_before_body,
+    authorization_header,
     bearer_token,
     bearer_token_dependency,
     client_ip,
@@ -501,7 +502,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     ) -> LoginResponse:
         if not service.allow_login_attempt(_client(request)):
             raise _rate_limited(request, "negotiate")
-        header = request.headers.get("Authorization", "")
+        header = authorization_header(request)  # 400 on a repeated header (BACKLOG #2454)
         if not header.startswith("Negotiate "):
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "missing SPNEGO token")
         try:

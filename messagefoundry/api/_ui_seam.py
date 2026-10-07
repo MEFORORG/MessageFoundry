@@ -300,12 +300,16 @@ from typing import Any
 #: ``TypeError``; the pinned digest refuses the pair at mount first. The digest moved because both
 #: signatures changed.
 #:
+#: BACKLOG #2454: the console imports ``authorization_header`` from ``api.security``. ``GET /ui/sso``
+#: reads ``Authorization`` through it, so a repeated header is refused 400 by the same rule the
+#: engine's own reads use. The digest moved because the imported surface grew.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "1f0ffb907379e761"
+ENGINE_UI_SEAM: str = "5a49b51d647866fa"
 
 
 @dataclass(frozen=True, slots=True)
