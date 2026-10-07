@@ -36,9 +36,9 @@ levels:
 - **Data plane** (inbound MLLP / TCP / X12 / DB-poll feeds) — **network-bound in any real install**
   (feeds arrive from other systems on the LAN, not `127.0.0.1`), protected by **TLS on the wire**
   (MLLP-over-TLS, built), the ingress/`[egress]` allow-lists, and your network segmentation. PHI must
-  not cross the LAN in cleartext — and can't accidentally: the bind-guard **refuses a non-loopback
-  *plaintext* MLLP bind** (ADR 0002 §0), and the API always serves TLS, with an off-loopback API bind
-  needing an operator certificate or a declared TLS-terminating proxy (§4).
+  not cross the LAN in cleartext — and can't accidentally: the bind-guards **refuse a non-loopback
+  *plaintext* listener**, at least MLLP, raw TCP and X12 (ADR 0002 §0). An off-loopback API bind needs
+  an operator certificate or a declared TLS-terminating proxy (§4).
 - **Inbound web-service listener** (a partner calling *into* MEFOR) — **built**, as the inbound
   [`Http(...)` listener](CONNECTIONS.md#http-web-service-listener--http-inbound-only-adr-0023). It is a
   distinct surface with its own controls: TLS or mTLS, `source_ip_allowlist`, and `intake_auth`, which
@@ -70,7 +70,7 @@ Which accounts the requirement covers is stated in
 | Local user reading the DB file directly | Yes | Owner-only file ACL (built, **SQLite store only** — on a server-DB store the `.mdf`/`.ldf`/tempdb permissions are the DBA's) + at-rest body encryption when a key is set (built — §3); volume encryption for the rest |
 | Stolen DB file / backup | Yes | At-rest body + `summary`/`metadata` encryption (built — §3) + required volume encryption for WAL/temp |
 | PHI in logs / CI output / shell redirects | **Yes** | "Never log bodies" rule + global log redaction (`RedactionFilter`) + `safe_exc()` chokepoint + prod-DEBUG startup guard (built — §7) |
-| Eavesdropper on the **internal LAN** (MLLP / API) | Yes | **API/WSS TLS is always on and MLLP-over-TLS is built** (Gate #4, §4) — *enable MLLP TLS per connection*; the bind-guard refuses a non-loopback plaintext MLLP bind, and an off-loopback API bind needs an operator certificate or a declared TLS-terminating proxy; + your network segmentation |
+| Eavesdropper on the **internal LAN** (MLLP / API) | Yes | **API/WSS TLS is on unless a declared proxy terminates it, and MLLP-over-TLS is built** (Gate #4, §4) — *enable MLLP TLS per connection*; the bind-guards refuse a non-loopback plaintext listener, and an off-loopback API bind needs an operator certificate or a declared TLS-terminating proxy; + your network segmentation |
 | Compromised internal host / lateral movement | Partly | Network segmentation + TLS + required auth + at-rest encryption; off-box log forwarding to your SIEM (built; set `[logging].forward_*` — [§7](#7-logging--phi-redaction)) for evidence beyond the host |
 | **Public-internet attacker** | **Out of scope by design** | MEFOR is **not** internet-facing (trust boundary above); off-loopback exposure is internal-only and TLS-required |
 | Misconfigured outbound destination | Yes | Destination allowlist (`[egress].allowed_*`, §4) |

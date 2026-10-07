@@ -86,7 +86,7 @@ use the table below alongside them when planning.
 | MLLP / TCP / File connectors; REST / SOAP / Database destinations; Database poll source | ✅ Built — see [CONNECTIONS.md](CONNECTIONS.md) |
 | Validation & load tooling (`generate`, `check`, `dryrun`, the test harness, the load harness) | ✅ Built — see §8/§9 and [LOAD-TESTING.md](LOAD-TESTING.md) |
 | Windows-service deployment via NSSM | ✅ Built — see [SERVICE.md](SERVICE.md) |
-| **Native transport TLS** (API + MLLP) | ✅ Built — in-process API TLS (HTTPS/WSS) + per-connection MLLP-over-TLS, ≥TLS 1.2, opt-in mTLS, and a **fail-closed off-loopback bind guard** (the API always serves TLS, per [ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md), but a non-loopback bind with neither an operator certificate nor a declared TLS-terminating proxy is refused). Raw TCP/X12 stay plaintext (loopback/proxy). See [DEPLOYMENT.md](DEPLOYMENT.md). |
+| **Native transport TLS** (API + MLLP) | ✅ Built — in-process API TLS (HTTPS/WSS) + per-connection MLLP-over-TLS, ≥TLS 1.2, opt-in mTLS, and a **fail-closed off-loopback bind guard** (a non-loopback bind with neither an operator certificate nor a declared TLS-terminating proxy is refused; the API's self-signed placeholder from [ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md) does not count). Raw TCP/X12 stay plaintext (loopback/proxy). See [DEPLOYMENT.md](DEPLOYMENT.md). |
 | **Native MFA** (TOTP and passkeys, local and directory accounts) | ✅ Built — RFC 6238 TOTP + single-use recovery codes; `[security].require_mfa` enforces a second factor as an access gate on every authorized route; while it is on, a directory session that proved no factor owes one under either `require_mfa_scope` value (BACKLOG #1144). See [SECURITY.md](SECURITY.md#multi-factor-authentication-totp-wp-14). See [SECURITY.md](SECURITY.md). |
 | **Off-box log + audit forwarding** | ✅ Built — `[logging].forward_*` ships operational logs + audit rows, both with only best-effort PHI redaction, to a syslog/SIEM collector, over **native TLS** when you set `forward_protocol = "tls"` (RFC 5425, ADR 0080; port 6514, CA anchor via `forward_tls_*`). The transport **default** is UDP, but under the default `[security].enforcement = enforce`, `serve` refuses to start unless forwarding runs over verified TLS (`forward_tls_ca_file`, plus a `forward_tls_crl_file` for the revocation check) to a collector on another host; a loopback collector address does not count. Under `warn` that refusal is only a warning. See [PHI.md](PHI.md) §7. |
 | **Active-passive HA / failover** | ✅ Built (Track B) — opt-in leader/standby cluster on a **shared server-DB** store (PostgreSQL or SQL Server): only the leader runs the graph, self-fencing leadership lease, immediate on-promotion recovery. Single-node stays the byte-identical default. See [CLUSTERING.md](CLUSTERING.md) + §14. |
@@ -425,12 +425,13 @@ out. The remaining transport gaps include **raw TCP and X12**, which have no nat
       `tls_min_version` ≥ 1.2, opt-in mTLS via `tls_client_ca_file`) **or** front it with a TLS terminator
       (`[api].tls_terminated_upstream = true` + `[api].trusted_proxies`, plus the required
       `[api].plaintext_upstream_hop_acknowledged = true` when no `[api].tls_cert_file` is set: the
-      proxy-to-engine hop is then plaintext and securing it is your job). The engine always serves TLS,
-      but with no operator certificate that is a self-signed placeholder, so a non-loopback bind **without**
-      an operator certificate (or a trusted terminator) is **refused at startup**. **Never use
-      `--allow-insecure-bind` for real PHI** — it is a loud dev-only escape that serves bearer tokens and
-      PHI behind that placeholder, which no trust store vouches for, so an on-path attacker can pose as
-      the engine to any client that has not pinned it.
+      proxy-to-engine hop is then plaintext and securing it is your job). Without a terminator the engine
+      serves TLS anyway, but with no operator certificate it uses a self-signed placeholder. So a
+      non-loopback bind **without** an operator certificate (or a trusted terminator) is **refused at
+      startup**. **Never use `--allow-insecure-bind` for real PHI.** It is a loud dev-only escape, and it
+      works only under `[security].enforcement = warn`. It serves bearer tokens and PHI behind that
+      placeholder, which no trust store vouches for, so an on-path attacker can pose as the engine to
+      any client that has not pinned it.
       (`serve` always requires sign-in; there is no switch that turns it off.)
 - [ ] **MLLP off-loopback requires native TLS too.** MLLP-over-TLS is built: set `tls = true` +
       `tls_cert_file`/`tls_key_file` per connection (opt-in mTLS via `tls_ca_file`; ≥ TLS 1.2). MLLP is
