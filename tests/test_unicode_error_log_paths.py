@@ -374,19 +374,128 @@ def test_two_unicode_error_keys_that_render_alike_stay_two_keys() -> None:
     _assert_encode_safe(record.getMessage())
 
 
-class _FrozenDict(dict[str, object]):
+class _HostileDict(dict[str, object]):
+    """Every override would write to the caller's own object, or raise, if the walk ran it."""
+
+    def __copy__(self) -> _HostileDict:
+        return self
+
+    def clear(self) -> None:
+        raise AssertionError("the walk ran the subclass's clear()")
+
     def __setitem__(self, key: str, value: object) -> None:
-        raise TypeError("frozen")
+        raise AssertionError("the walk ran the subclass's __setitem__()")
 
 
-def test_an_argument_that_cannot_be_rebuilt_is_withheld_never_raised() -> None:
+def test_a_dict_subclass_is_rebuilt_without_running_its_own_code() -> None:
+    err = _encode_error()
+    arg = _HostileDict(e=err)
     logger, stream = _capture()
-    logger.warning("frozen %s", _FrozenDict(e=_encode_error()))
+    logger.warning("%s", arg)
+    logger.warning("%(e)s", arg)
     out = stream.getvalue()
-    assert "frozen %s [log arguments withheld: TypeError while scanning them]" in out
+    _assert_encode_safe(out)
+    assert "caf" not in out
+    assert dict.__getitem__(arg, "e") is err  # the caller's object still holds its own error
+
+
+class _Unreprable:
+    def __repr__(self) -> str:
+        raise ValueError("no repr")
+
+
+def test_an_argument_that_cannot_be_rendered_is_withheld_alone_never_raised() -> None:
+    logger, stream = _capture()
+    logger.warning("%s / %s", RuntimeError(_encode_error(), _Unreprable()), "kept")
+    out = stream.getvalue()
+    assert "[withheld: ValueError while scanning it for a codec error] / kept" in out
+    for spelling in _CHAR_SPELLINGS:
+        assert spelling not in out
+
+
+def _cyclic_list() -> list[object]:
+    loop: list[object] = [_encode_error()]
+    loop.append(loop)
+    return loop
+
+
+def _cyclic_dict() -> dict[str, object]:
+    loop: dict[str, object] = {"e": _encode_error()}
+    loop["self"] = loop
+    return loop
+
+
+def _groups(levels: int) -> Exception:
+    group: Exception = _encode_error()
+    for n in range(levels):
+        group = ExceptionGroup(f"level {n}", [group])
+    return group
+
+
+@pytest.mark.parametrize(
+    "arg",
+    [
+        _cyclic_list(),
+        _cyclic_dict(),
+        _nested(_encode_error(), 6),
+        _nested(_nested(_encode_error(), 3), 6),
+        _groups(3),
+        _groups(8),
+        collections.UserDict(e=_encode_error()),
+        RuntimeError(_encode_error()),
+        KeyError(_encode_error()),
+        collections.deque([_encode_error()], maxlen=3),
+    ],
+    ids=[
+        "cyclic-list",
+        "cyclic-dict",
+        "six-deep",
+        "nine-deep",
+        "three-groups",
+        "eight-groups",
+        "userdict",
+        "runtime-wrap",
+        "keyerror-wrap",
+        "deque",
+    ],
+)
+@pytest.mark.parametrize("placeholder", ["%s", "%r"])
+def test_an_error_past_the_walk_or_wrapped_renders_safely(arg: object, placeholder: str) -> None:
+    # Past the depth or round a cycle the walk cannot see, so it fails closed. A wrapping
+    # exception prints its .args through str() and repr(), and a group prints its members.
+    assert "caf" in repr(arg)  # control: the raw argument carries the input
+    logger, stream = _capture()
+    logger.warning(f"got {placeholder}", arg)
+    out = stream.getvalue()
     assert "caf" not in out
     for spelling in _CHAR_SPELLINGS:
         assert spelling not in out
+
+
+def test_the_walk_fails_closed_past_five_levels_and_keeps_a_deques_bound() -> None:
+    record = logging.LogRecord(
+        "t",
+        logging.WARNING,
+        __file__,
+        1,
+        "%r %r",
+        (_nested(_encode_error(), 6), collections.deque([_encode_error()], maxlen=3)),
+        None,
+    )
+    prepare_log_record(record)
+    out = record.getMessage()
+    assert "[nested too deep to scan for a codec error]" in out
+    assert "maxlen=3" in out
+
+
+def test_a_proxy_that_fakes_its_class_renders_as_the_stdlib_renders_it() -> None:
+    # isinstance() believes a Mock(spec=dict), and dict.items() on it then raises.
+    from unittest import mock
+
+    proxy = mock.Mock(spec=dict)
+    logger, stream = _capture()
+    logger.warning("val %s %s", proxy, 5)
+    assert f"val {proxy} 5" in stream.getvalue()
 
 
 def test_a_traceback_that_cannot_be_rendered_is_withheld_never_raised(
@@ -615,18 +724,33 @@ def _is_raw(node: ast.AST, name: str) -> bool:
     )
 
 
+def _renders_the_handled_error(node: ast.Call) -> bool:
+    """``format_exc()``, ``print_exc()``, or ``sys.exc_info()``/``sys.exception()`` handed on: each
+    reaches the error being handled with no name bound to it."""
+    if callee_name(node) in _CURRENT_RENDERS:
+        return True
+    func = node.func
+    return (
+        isinstance(func, ast.Attribute)
+        and func.attr in {"exc_info", "exception"}
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "sys"
+    )
+
+
 def _raw_renders(handler: ast.ExceptHandler) -> Iterator[tuple[int, str]]:
     name = handler.name
-    assert name is not None
     for node in (n for stmt in handler.body for n in ast.walk(stmt)):
-        if isinstance(node, ast.FormattedValue) and _is_raw(node.value, name):
+        if isinstance(node, ast.Call) and _renders_the_handled_error(node):
+            yield node.lineno, "the handled error reached without its name"
+        elif name is None:
+            continue  # an unnamed arm can reach the error only through the calls above
+        elif isinstance(node, ast.FormattedValue) and _is_raw(node.value, name):
             yield node.lineno, "f-string interpolation"
         elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
             right = node.right.elts if isinstance(node.right, ast.Tuple) else [node.right]
             if any(_is_raw(r, name) for r in right):
                 yield node.lineno, "% formatting"
-        elif isinstance(node, ast.Call) and callee_name(node) in _CURRENT_RENDERS:
-            yield node.lineno, f"{callee_name(node)}() of the handled error"
         elif isinstance(node, ast.Call):
             yield from _raw_call(node, name)
         elif isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
@@ -655,11 +779,7 @@ def _scan_source(source: str, path: str) -> tuple[int, list[str]]:
     handlers = 0
     found: list[str] = []
     for node in ast.walk(ast.parse(source, path)):
-        if (
-            isinstance(node, ast.ExceptHandler)
-            and node.name
-            and _handler_names(node.type) & _UNICODE_TYPES
-        ):
+        if isinstance(node, ast.ExceptHandler) and _handler_names(node.type) & _UNICODE_TYPES:
             handlers += 1
             found.extend(f"{path}:{line}: {what}" for line, what in _raw_renders(node))
     return handlers, found
@@ -738,6 +858,16 @@ def k(b):
         b.decode()
     except UnicodeDecodeError as exc:
         text = traceback.format_exc()
+def n(b):
+    try:
+        b.decode()
+    except UnicodeDecodeError:
+        traceback.print_exc()
+def o(b):
+    try:
+        b.decode()
+    except UnicodeDecodeError:
+        text = "".join(traceback.format_exception(*sys.exc_info()))
 def m(b):
     try:
         b.decode()
@@ -767,7 +897,7 @@ def c(b):
 
 def test_the_guard_fires_on_every_planted_shape() -> None:
     handlers, found = _scan_source(_PLANTED, "planted.py")
-    assert handlers == 11
+    assert handlers == 13
     kinds = [line.split(": ", 1)[1] for line in found]
     assert kinds == [
         "f-string interpolation",
@@ -781,7 +911,9 @@ def test_the_guard_fires_on_every_planted_shape() -> None:
         "format() of the error",
         "aliased out of the handler",
         "format_exception() of the error",
-        "format_exc() of the handled error",
+        "the handled error reached without its name",  # k: format_exc()
+        "the handled error reached without its name",  # n: print_exc(), in an unnamed arm
+        "the handled error reached without its name",  # o: sys.exc_info()
         ".__str__ read",
     ], found
 

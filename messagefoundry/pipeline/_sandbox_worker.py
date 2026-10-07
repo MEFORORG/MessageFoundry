@@ -209,13 +209,17 @@ def _run_one(registry: Any, req: Any, code_sets: Any) -> tuple[bool, object, str
     except SandboxError as exc:
         return False, None, "denied", str(exc)
     except Exception as exc:  # noqa: BLE001 — a handler raise is content, reported not crashed
-        # A Unicode error's str() names the character or byte it failed on (vault BACKLOG #3185), and
-        # mode=off renders it from its attributes, so this boundary must too.
-        from messagefoundry.redaction import safe_exc
-
-        detail = safe_exc(exc) if isinstance(exc, UnicodeError) else f"{type(exc).__name__}: {exc}"
-        return False, None, "error", detail
+        return False, None, "error", _error_text(exc)
     return True, result, "", ""
+
+
+def _error_text(exc: BaseException) -> str:
+    """``Type: message`` for an error reported across the process boundary. A Unicode error's str()
+    names the character or byte it failed on (vault BACKLOG #3185), and mode=off renders it from its
+    attributes, so this boundary must too."""
+    from messagefoundry.redaction import safe_exc  # cached: logging_setup imported it at load
+
+    return safe_exc(exc) if isinstance(exc, UnicodeError) else f"{type(exc).__name__}: {exc}"
 
 
 def _respond(registry: Any, req: Any, code_sets: Any) -> bytes:
@@ -275,10 +279,10 @@ def main() -> int:
         _apply_resource_caps(boot.mem_mb)
         _install_import_guard(boot.forbidden)
     except Exception as exc:  # noqa: BLE001 — report a bootstrap failure, do not crash silently
-        # As in _run_one: a Unicode error's str() names the character or byte (vault BACKLOG #3185).
-        from messagefoundry.redaction import safe_exc
-
-        why = safe_exc(exc) if isinstance(exc, UnicodeError) else f"{type(exc).__name__}: {exc}"
+        try:
+            why = _error_text(exc)
+        except Exception:  # noqa: BLE001 — the config that just failed may have broken it; still report
+            why = type(exc).__name__
         try:  # noqa: SIM105
             _write_frame(stdout, codec.encode_bootfail(why))
         except (OSError, SandboxError):
