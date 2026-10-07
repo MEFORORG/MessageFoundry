@@ -29,14 +29,13 @@ def record_texts(record: logging.LogRecord) -> Iterable[str]:
 
 
 def assert_no_token(
-    records: Iterable[logging.LogRecord], *, skip_prefix: str | None = None
+    records: Iterable[logging.LogRecord], *, skip_message: str | None = None
 ) -> None:
-    """Fail if any record carries :data:`TOKEN`. ``skip_prefix`` names one exact message shape the
-    caller has reported elsewhere and is not testing; nothing else is skipped."""
+    """Fail if any record carries :data:`TOKEN`. ``skip_message`` names one whole message the caller
+    has reported elsewhere and is not testing; nothing else is skipped."""
     leaks = [
         f"{r.name}:{r.levelname}:{r.getMessage()}"
         for r in records
-        if not (skip_prefix and r.getMessage().startswith(skip_prefix))
-        and any(TOKEN in text for text in record_texts(r))
+        if r.getMessage() != skip_message and any(TOKEN in text for text in record_texts(r))
     ]
     assert not leaks, f"a log record carries the planted payload token: {leaks}"

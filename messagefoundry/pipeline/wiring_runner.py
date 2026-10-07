@@ -185,6 +185,7 @@ from messagefoundry.redaction import safe_exc, safe_text
 from messagefoundry.store import (
     MessageStatus,
     OutboxItem,
+    OutboxStatus,
     QueueStore,
     Stage,
     StreamingAttachmentsUnsupported,
@@ -519,7 +520,8 @@ class _RefusalLog:
 
     A transient failure that ran out a finite ``max_attempts`` writes the same line, with
     ``exhausted=True`` (BACKLOG #3108). Its pairs are keyed ``exhausted:<code>``, so they do not
-    share a window or a held count with permanent refusals of the same code.
+    share a window or a held count with permanent refusals of the same code. Both kinds do share
+    the cross-pair cap below, which bounds the whole log, not one kind of line.
 
     **What the line may carry.** The connection, the outbox row id (and the message id where the
     caller has it), the exception's class name and its ``code``. Never ``str(exc)`` or
@@ -584,6 +586,7 @@ class _RefusalLog:
         message: str,
         *args: object,
         exhausted: bool = False,
+        stacklevel: int = 2,
     ) -> None:
         """Log ``message % args`` at WARNING, followed by ``exc``'s class name and code, unless the
         pair ``(name, code)`` logged inside the window, in which case count its ``rows``. Call it
@@ -616,7 +619,7 @@ class _RefusalLog:
             args = (*args, held, "dead-lettered at the retry cap" if exhausted else "refused")
         message += "; more with this code in the next %.0f s are counted, not logged"
         args = (*args, self._window)
-        log.warning(message, *args, stacklevel=2)
+        log.warning(message, *args, stacklevel=stacklevel)
 
 
 # A queue_buildup alert re-fires at most this often per connection while the lane stays over threshold,
@@ -7098,7 +7101,7 @@ class RegistryRunner:
                 )
             else:
                 retry_until = await self._mark_failed_and_arm(name, item.id, safe_exc(exc), retry)
-                self._note_retry_exhausted(name, exc, retry, retry_until, [item])
+                await self._note_retry_exhausted(name, exc, retry, retry_until, [item])
                 await self._delivery_failure_alert_checks(name)
         except _StoreReadFault as exc:
             # Vault BACKLOG #2756: a store READ the send needed failed (the document re-attach or the
@@ -7115,7 +7118,7 @@ class RegistryRunner:
             # per policy (the shipped cap is 100 attempts, then the row dead-letters into the
             # replayable DLQ — bounded, not discarded).
             retry_until = await self._mark_failed_and_arm(name, item.id, safe_exc(exc), retry)
-            self._note_retry_exhausted(name, exc, retry, retry_until, [item])
+            await self._note_retry_exhausted(name, exc, retry, retry_until, [item])
             await self._delivery_failure_alert_checks(name)
             # #46: edge-trigger connection_lost (+ throttled alert) on the lane going down.
             self._note_lane_unhealthy(name, item.id, exc)
@@ -7410,7 +7413,7 @@ class RegistryRunner:
                 )
             else:
                 retry_until = await self._mark_batch_failed_and_arm(name, ids, safe_exc(exc), retry)
-                self._note_retry_exhausted(name, exc, retry, retry_until, kept, batch=True)
+                await self._note_retry_exhausted(name, exc, retry, retry_until, kept, batch=True)
                 await self._delivery_failure_alert_checks(name)
         except _StoreReadFault as exc:
             # Vault BACKLOG #2756, the batch twin of the single-row arm: nothing was sent, so all N
@@ -7421,7 +7424,7 @@ class RegistryRunner:
             await self._delivery_failure_alert_checks(name)
         except DeliveryError as exc:
             retry_until = await self._mark_batch_failed_and_arm(name, ids, safe_exc(exc), retry)
-            self._note_retry_exhausted(name, exc, retry, retry_until, kept, batch=True)
+            await self._note_retry_exhausted(name, exc, retry, retry_until, kept, batch=True)
             await self._delivery_failure_alert_checks(name)
             self._note_lane_unhealthy(name, ids[0] if ids else head.id, exc)
         except Exception as exc:
@@ -8864,7 +8867,7 @@ class RegistryRunner:
             return  # oldest message hasn't stalled long enough yet
         self._fire_stall(name, age=oldest_age, now=now)
 
-    def _note_retry_exhausted(
+    async def _note_retry_exhausted(
         self,
         name: str,
         exc: DeliveryError,
@@ -8879,17 +8882,23 @@ class RegistryRunner:
         just dead-lettered at a finite ``max_attempts`` (BACKLOG #3108). Before this, the store
         wrote DEAD with no log line at all. Call it AFTER that write.
 
-        The store returns ``None`` for a dead-lettered row and for a vanished one. So this also
-        applies the store's own rule, ``max_attempts is not None and attempts >= max_attempts``,
-        to the head's attempts as the claim returned them, which the store re-reads from the same
-        row: the rule tells the two apart. A row some other worker re-claimed in between would
-        carry a higher count in the store than here, so that rare race can miss a line, never
-        invent one. Throttled with the permanent-refusal line, under its own ``exhausted:`` key."""
+        The store returns ``None`` for a dead-lettered row, but also for a vanished one and, on
+        Postgres and SQL Server, for a final write the H1 epoch fence rolled back and re-pended. So
+        a ``None`` alone proves nothing. The store's own rule, ``max_attempts is not None and
+        attempts >= max_attempts`` on the attempts the claim returned, first skips every case
+        below the cap with no read. At the cap, one read of the head row's status confirms DEAD
+        before the line claims it. This costs one read per dead-letter, and only on this path.
+        Throttled with the permanent-refusal line, under its own ``exhausted:`` key."""
         # An empty batch also returns None, with nothing dead-lettered.
         if retry_until is not None or retry.max_attempts is None or not rows:
             return
         head = rows[0]  # mark_batch_failed decides from its first member
         if head.attempts < retry.max_attempts:
+            return
+        if not any(
+            r["id"] == head.id and r["status"] == OutboxStatus.DEAD.value
+            for r in await self.store.outbox_for(head.message_id)
+        ):
             return
         subject_args: tuple[object, ...]
         if batch:
@@ -8900,12 +8909,13 @@ class RegistryRunner:
             name,
             exc,
             len(rows),
-            "delivery worker %r: " + subject + " failed on every attempt; "
-            "dead-lettered after %d attempt(s), the retry cap",
+            "delivery worker %r: " + subject + " failed again and was dead-lettered at the "
+            "retry cap, after %d attempt(s)" + (" of its head" if batch else ""),
             name,
             *subject_args,
             head.attempts,
             exhausted=True,
+            stacklevel=3,
         )
 
     def _note_store_read_fault(

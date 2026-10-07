@@ -13,6 +13,7 @@ partner's reject reason can, so logging ``str(exc)`` or ``safe_exc(exc)`` would 
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 from collections.abc import AsyncIterator, Iterable
 from pathlib import Path
@@ -30,7 +31,7 @@ from messagefoundry.config.wiring import (
     Send,
 )
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, _RefusalLog
-from messagefoundry.store import MessageStatus, MessageStore, OutboxItem
+from messagefoundry.store import MessageStatus, MessageStore
 from messagefoundry.transports.base import DeliveryError, DestinationConnector, NegativeAckError
 from tests._refusal_log_capture import TOKEN, assert_no_token
 
@@ -39,6 +40,7 @@ LOGGER = "messagefoundry.pipeline.wiring_runner"
 EXHAUSTED = "the retry cap"
 # Tiny backoff, so the real worker's retry comes due at once.
 FAST = {"backoff_seconds": 0.01, "max_backoff_seconds": 0.01}
+_TRANSPORT_TEXT = f"connection reset sending {TOKEN}"
 
 
 def _adt(n: int) -> str:
@@ -68,20 +70,23 @@ class _Fails:
         assert TOKEN in payload
         if self.transient_nak:
             raise NegativeAckError(f"try later, patient {TOKEN}", code="AE", permanent=False)
-        raise DeliveryError(f"connection reset sending {TOKEN}")
+        raise DeliveryError(_TRANSPORT_TEXT)
 
     async def aclose(self) -> None:
         return None
 
 
 # Not this item's line: the DeliveryError arm's edge-triggered connection_lost alert logs
-# safe_exc(exc), which leaves this plain-text token in place. That predates #3108 and is reported
-# with it, so it is skipped here by its exact shape rather than by its logger.
-_PRE_EXISTING_ALERT = "ALERT connection_error: outbound 'file_out' connection_lost: DeliveryError:"
+# safe_exc(exc), which leaves _TRANSPORT_TEXT's token in place. That predates #3108 and is not filed
+# yet; the #3108 exit report hands it to the Manager. Skipped by its WHOLE message, so any other
+# record, that alert with any other text included, is still scanned.
+_PRE_EXISTING_ALERT = (
+    f"ALERT connection_error: outbound 'file_out' connection_lost: DeliveryError: {_TRANSPORT_TEXT}"
+)
 
 
 def _assert_no_token(records: Iterable[logging.LogRecord]) -> None:
-    assert_no_token(records, skip_prefix=_PRE_EXISTING_ALERT)
+    assert_no_token(records, skip_message=_PRE_EXISTING_ALERT)
 
 
 def _exhausted_lines(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
@@ -146,7 +151,7 @@ async def test_the_real_worker_logs_once_when_max_attempts_dead_letters_a_row(
     text = line.getMessage()
     assert repr(OUT) in text and str(msg["id"]) in text
     assert "DeliveryError" in text and "code '?'" in text
-    assert "dead-lettered after 2 attempt(s)" in text
+    assert "dead-lettered at the retry cap, after 2 attempt(s)" in text
     _assert_no_token(caplog.records)
 
 
@@ -186,7 +191,7 @@ async def test_the_line_fires_on_the_attempt_that_dead_letters_and_not_one_soone
         assert len(_exhausted_lines(caplog)) == dead  # the line and the DEAD write move together
     (line,) = _exhausted_lines(caplog)
     text = line.getMessage()
-    assert "dead-lettered after 3 attempt(s)" in text
+    assert "dead-lettered at the retry cap, after 3 attempt(s)" in text
     expected = "(NegativeAckError, code 'AE')" if transient_nak else "(DeliveryError, code '?')"
     assert expected in text
     _assert_no_token(caplog.records)
@@ -226,7 +231,7 @@ async def test_a_batch_that_runs_out_its_attempts_logs_one_line(
     (line,) = _exhausted_lines(caplog)
     text = line.getMessage()
     assert repr(OUT) in text and "a batch of 3" in text and head_ids[-1] in text
-    assert "DeliveryError" in text and "dead-lettered after 2 attempt(s)" in text
+    assert "DeliveryError" in text and "dead-lettered at the retry cap, after 2 attempt(s)" in text
     _assert_no_token(caplog.records)
 
 
@@ -249,22 +254,27 @@ def test_an_exhausted_line_does_not_share_a_window_with_a_permanent_refusal(
     )
 
 
-async def test_a_none_from_the_store_below_the_cap_is_a_vanished_row_and_writes_nothing(
+async def test_a_none_the_store_did_not_turn_into_dead_writes_nothing(
     store: MessageStore, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # mark_failed returns None for a dead-lettered row AND for one that no longer exists. The
-    # store's own rule (attempts >= max_attempts) on the claimed attempts tells the two apart.
+    # mark_failed returns None for a dead-lettered row, a vanished one, and (Postgres and SQL
+    # Server) a final write the H1 fence rolled back and re-pended. Only the first may log.
     caplog.set_level(logging.WARNING, logger=LOGGER)
     retry = RetryPolicy(max_attempts=2, **FAST)
     runner = _stepped_runner(store, _Fails(), retry)
     exc = DeliveryError("x")
+    await _enqueue(store, 1)
+    claimed = await store.claim_next_fifo(OUT, now=1e12)
+    assert claimed is not None and claimed.attempts == 1
+    at_cap = dataclasses.replace(claimed, attempts=2)  # as the store would see it on attempt 2
+    gone = dataclasses.replace(at_cap, id="gone", message_id="gone")
 
-    def row(attempts: int) -> OutboxItem:
-        return OutboxItem("r1", "m1", "c1", OUT, "payload", attempts, "outbound")
-
-    runner._note_retry_exhausted(OUT, exc, retry, None, [row(1)])  # one below the cap: vanished
-    runner._note_retry_exhausted(OUT, exc, retry, None, [], batch=True)  # an empty batch
-    runner._note_retry_exhausted(OUT, exc, retry, 123.0, [row(2)])  # re-pended: the store's word
+    await runner._note_retry_exhausted(OUT, exc, retry, None, [claimed])  # below the cap
+    await runner._note_retry_exhausted(OUT, exc, retry, None, [], batch=True)  # an empty batch
+    await runner._note_retry_exhausted(OUT, exc, retry, 123.0, [at_cap])  # re-pended: no read
+    await runner._note_retry_exhausted(OUT, exc, retry, None, [gone])  # vanished at the cap
+    await runner._note_retry_exhausted(OUT, exc, retry, None, [at_cap])  # fenced: still INFLIGHT
     assert _exhausted_lines(caplog) == []
-    runner._note_retry_exhausted(OUT, exc, retry, None, [row(2)])  # at the cap: dead-lettered
+    await store.dead_letter_now(claimed.id, "x")
+    await runner._note_retry_exhausted(OUT, exc, retry, None, [at_cap])  # really DEAD
     assert len(_exhausted_lines(caplog)) == 1
