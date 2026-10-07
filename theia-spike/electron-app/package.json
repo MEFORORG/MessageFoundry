@@ -1,0 +1,44 @@
+{
+  "private": true,
+  "name": "messagefoundry-theia-spike-electron-app",
+  "productName": "MessageFoundry Steps Spike",
+  "version": "0.0.1",
+  "description": "Spike S-3 (ADR 0208): the S-1 Steps extension in an Electron app, packaged as an unsigned per-user Windows installer. Not shipped.",
+  "license": "AGPL-3.0-or-later",
+  "author": "MessageFoundry Foundation, LLC and contributors",
+  "main": "launcher.js",
+  "theia": {
+    "target": "electron",
+    "frontend": {
+      "config": {
+        "applicationName": "MessageFoundry Steps (spike S-3)",
+        "preferences": {
+          "security.workspace.trust.enabled": false
+        }
+      }
+    }
+  },
+  "dependencies": {
+    "@messagefoundry/theia-steps-spike": "0.0.0",
+    "@theia/core": "1.76.0",
+    "@theia/editor": "1.76.0",
+    "@theia/electron": "1.76.0",
+    "@theia/filesystem": "1.76.0",
+    "@theia/monaco": "1.76.0",
+    "@theia/navigator": "1.76.0",
+    "@theia/preferences": "1.76.0",
+    "@theia/workspace": "1.76.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0",
+    "@theia/cli": "1.76.0",
+    "electron": "42.8.1",
+    "electron-builder": "26.15.3"
+  },
+  "scripts": {
+    "build": "theia build --mode production",
+    "start": "electron .",
+    "package": "electron-builder --win nsis --publish never",
+    "test:smoke": "playwright test"
+  }
+}

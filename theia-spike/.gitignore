@@ -5,3 +5,11 @@ browser-app/src-gen/
 browser-app/gen-esbuild.*.mjs
 browser-app/test-results/
 browser-app/playwright-report/
+# Spike S-3: build output, the downloaded Python and the installer never go in git.
+electron-app/lib/
+electron-app/src-gen/
+electron-app/gen-esbuild.*.mjs
+electron-app/build/
+electron-app/dist/
+electron-app/runtime-pin.json
+electron-app/test-results/

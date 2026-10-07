@@ -6,12 +6,15 @@
   "license": "AGPL-3.0-or-later",
   "workspaces": [
     "steps-extension",
-    "browser-app"
+    "browser-app",
+    "electron-app"
   ],
   "scripts": {
     "build": "npm run build --workspace @messagefoundry/theia-steps-spike && npm run build --workspace messagefoundry-theia-spike-browser-app",
     "start": "npm run start --workspace messagefoundry-theia-spike-browser-app",
-    "test:e2e": "npm run test:e2e --workspace messagefoundry-theia-spike-browser-app"
+    "test:e2e": "npm run test:e2e --workspace messagefoundry-theia-spike-browser-app",
+    "build:electron": "npm run build --workspace @messagefoundry/theia-steps-spike && npm run build --workspace messagefoundry-theia-spike-electron-app",
+    "package:electron": "npm run package --workspace messagefoundry-theia-spike-electron-app"
   },
   "devDependencies": {
     "typescript": "5.9.3"

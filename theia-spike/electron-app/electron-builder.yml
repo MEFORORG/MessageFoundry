@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Spike S-3 (ADR 0208): an UNSIGNED per-user Windows installer, on purpose. SmartScreen's response to
+# an unsigned installer is part of what S-3 measures. Run it through scripts/build-installer.ps1,
+# which stages build/payload first; this file alone does not fetch Python or build the engine wheel.
+appId: org.messagefoundry.theia-spike.steps
+productName: MessageFoundry Steps Spike
+copyright: Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
+electronVersion: 42.8.1
+# The Electron binaries npm already fetched, so packaging downloads no second copy.
+electronDist: ../node_modules/electron/dist
+directories:
+  output: dist
+  buildResources: build/resources
+# Theia's esbuild output in lib/ is self-contained apart from the native addons it copies into
+# lib/backend/native, so no node_modules folder ships and none is rebuilt.
+npmRebuild: false
+nodeGypRebuild: false
+asar: false
+files:
+  - package.json
+  - launcher.js
+  - runtime-pin.json
+  - lib/**
+  - "!**/node_modules/**"
+  - "!**/*.map"
+extraResources:
+  - from: build/payload/python
+    to: python
+  - from: build/payload/mfassets
+    to: mfassets
+  - from: build/payload/samples
+    to: samples
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+  # No certificate is configured; this stops electron-builder from treating that as an error.
+  forceCodeSigning: false
+nsis:
+  oneClick: true
+  # Per-user: installs under %LOCALAPPDATA%\Programs, writes HKCU only, and never asks to elevate.
+  perMachine: false
+  runAfterFinish: false
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  deleteAppDataOnUninstall: false
+  artifactName: MessageFoundry-Steps-Spike-${version}-unsigned-setup.${ext}
