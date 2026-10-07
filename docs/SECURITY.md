@@ -4158,6 +4158,42 @@ as long as an attacker sustains a lock that sign-in cannot pass: the second-step
 lock on any account except a local one with TOTP enrolled. Only the host-gated `admin-unlock`
 remains, which needs access to the engine host itself.
 
+**Replace a sole administrator's authenticator seed from the host.** If you suspect the TOTP seed
+has leaked, or the device holding it is lost, run `messagefoundry admin-reset-totp --username
+<name>` with the engine stopped ([ADR
+0171](adr/0171-offline-administrator-unlock-a-host-gated-cli-recovery-path-for-a-sole-administrator-lockout.md)
+Amendment B, BACKLOG #2226, owner ruling 2026-10-06). A sole administrator whose one factor is
+TOTP has at least this route, which needs neither a second administrator nor
+`[security].require_mfa = false`.
+The administrator reset refuses a self-target, and self-service removal refuses the last factor. It
+uses the same host gate as `admin-unlock`.
+
+1. The command refuses, before showing anything, at least: an unknown account, a non-Administrator,
+   a disabled account, an account with no TOTP enrolled, and an account with TOTP on but no seed
+   stored. It also refuses an Administrator who is not the only enabled one, and names another:
+   that administrator resets the account from the web console (Users, Reset MFA).
+2. It shows a new key and its `otpauth://` URI on the console only, never on stdout or stderr. The
+   URI names the new entry `<name> (replaced <date>-<time>)`, so the app lists it apart from the
+   old one. Add it as a new entry and type the code it shows.
+3. Only after a good code does it write. One transaction swaps the seed and the recovery codes,
+   ends every session of the account and writes the audit row, and it leaves TOTP on throughout.
+   So the account never has no factor, and the swap is never live unrecorded. A wrong code, a lost
+   console or a refused audit row writes nothing, and the old entry keeps working. So does a
+   removal or a new enrolment that lands while you type: the write checks the enrolment it read.
+   Follow what its message says about the new entry when it writes nothing.
+4. It shows the new recovery codes on the console once. The old entry and the old codes stop
+   working. Delete the old entry, the one you signed in with until now, from the app.
+
+The audit row is `auth.admin_totp_reset`, naming the OS user. After it, the command sends the
+account an `mfa_enabled` notice where a relay is configured. It keeps passkeys and says so when the
+account has one; remove one from the web console if its device may be compromised too. It does not
+clear a lockout; run `admin-unlock` for that. An error from the write is read back before the
+command reports it, because on a server store the error can follow the commit. Exit 3 means the
+seed was replaced, or may have been, and the message says which. The exit codes and what each
+message tells you to do are in ADR 0171 Amendment B, under "An error does not say whether the
+commit landed". Another account's authenticator is reset from the web console (Reset MFA),
+because a host-run replacement would leave the new seed with whoever ran it.
+
 > **Binding conditionality — controls 2 and 3 are one switch, not two.**
 > `[auth].login_rate_limit_enabled = false` constructs **neither** limiter: `_login_limiter` and
 > `_reauth_limiter` are both `None` and both accessors then return `True` unconditionally. They share
