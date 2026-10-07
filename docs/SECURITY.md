@@ -1766,10 +1766,23 @@ reload carries that into its `approval.approved` row.
 paths (vault BACKLOG #2255).** A refusal runs nothing, so a refusal whose own audit row fails still
 answers **409**: that is `approval.too_early` and `approval.stale_requester`. A claim, a rejection or
 a resolution that the store cannot write with its audit row answers **503**, and the request does
-not move. A request whose `approval.requested` row fails is not held at all, and the error is
-returned, so a retry cannot leave two releasable copies. Every audit row the gate fails to write is
-logged at ERROR with its detail, and raises an `audit_write_failed` alert keyed `approval:<id>`,
-carrying the lost row's action name.
+not move. A request whose `approval.requested` row fails is not held, and the call returns the
+error. Every audit row the gate fails to write is logged at ERROR with its detail, and raises an
+`audit_write_failed` alert keyed `approval:<id>`, carrying the lost row's action name.
+
+**A failed request holds nothing, unless its COMMIT landed and only the reply was lost.** The store
+writes the request and its `approval.requested` row in one transaction on all three backends. So a
+failed write leaves neither, and a retry files the only copy. The exceptions listed above, such as a
+lost COMMIT reply, can commit both while the call still fails. Then the ERROR line and the alert
+report the row as lost, though it exists. A retry still files nothing new if the repeat rule above
+catches it. That needs the same user, identical parameters, and the first request still pending and
+unexpired. The rule does not catch a retry in at least these cases, so a second request is held:
+
+- a different user sends it, or the parameters differ;
+- the first request was rejected, expired, or claimed by an approver before the retry arrived.
+
+After a rejection or an expiry, the new request is the only one that can be released. After a
+claim, the first may already have run, so releasing the second can run the operation twice.
 
 What this does not cover: a store that refuses READS still answers a raw 500, since the request
 row and the requester's account are read before any of this.

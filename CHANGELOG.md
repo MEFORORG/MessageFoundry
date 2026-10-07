@@ -34,7 +34,9 @@ All notable changes to MessageFoundry are documented here. The format follows
 - **Each approval state change and its audit row are now one write.** The request and
   `approval.requested`, the claim and `approval.release_attempted`, a rejection, each release
   outcome and a resolve each commit or roll back together, on all three store backends. A request
-  whose audit row fails is no longer written and then withdrawn: nothing is held. A rejection whose
+  whose audit row fails is no longer written and then withdrawn; it rolls back with the row. A
+  COMMIT whose reply is lost can still hold it while the call fails, and docs/SECURITY.md says when
+  a retry joins it instead of filing a second request. A rejection whose
   `approval.rejected` row fails now answers 503 and stays pending. A claim that loses a race writes
   no release row. The resolve no longer writes `approval.resolve_attempted`; its `approval.resolved`
   row goes with the move. After an operation has run, an outcome that cannot be written with its row
