@@ -9,6 +9,7 @@ import { getJson, HttpError, postJson } from "./engineClient";
 import { mustChangeProblem } from "./engineStatusModel";
 import { assertBrowsableUrl, assertTargetAllowed } from "./engineTarget";
 import { SIGN_IN_TIMEOUT_MS, signInSettled, signInSuperseding } from "./signInSession";
+import { type StepUpHost, withStepUp } from "./stepUp";
 
 const SECRET_PREFIX = "messagefoundry.token:";
 
@@ -282,4 +283,44 @@ export async function withAuth<T>(
       token = fresh;
     }
   }
+}
+
+/**
+ * {@link withAuth}, plus one step-up re-proof when the engine asks for it (ASVS 7.5.3, vault BACKLOG
+ * #2625). For a call to a step-up route, such as config reload. Since #2625 a fresh sign-in no
+ * longer opens the reload, because it takes a proof bound to its own action, so without this every
+ * promote failed. The logic lives in stepUp.ts, which the node-only unit leg tests; this supplies
+ * the masked prompt, the `POST /me/reauth` and the token cache.
+ *
+ * The password goes from the input box straight into the request body. It is not stored, cached or
+ * logged, and an error never carries it.
+ */
+export async function withStepUpAuth<T>(
+  ctx: vscode.ExtensionContext,
+  url: string,
+  call: (token: string) => Promise<T>,
+): Promise<T | undefined> {
+  const host: StepUpHost = {
+    promptPassword: async (signal) =>
+      await vscode.window.showInputBox({
+        prompt:
+          signal.action === undefined
+            ? `Re-enter your MessageFoundry password for ${url} to continue`
+            : `Re-enter your MessageFoundry password for ${url} to confirm this action (${signal.action})`,
+        password: true,
+        ignoreFocusOut: true,
+      }),
+    reauth: async (token, password, purpose) => {
+      const body: Record<string, string> = { password };
+      if (purpose !== undefined) {
+        body.purpose = purpose;
+      }
+      const reply = await postJson<{ token?: unknown }>(url, "/me/reauth", body, token);
+      return typeof reply.token === "string" ? reply.token : undefined;
+    },
+    storeToken: async (token) => {
+      await ctx.secrets.store(secretKey(url), token);
+    },
+  };
+  return await withAuth(ctx, url, (token) => withStepUp(token, call, host));
 }

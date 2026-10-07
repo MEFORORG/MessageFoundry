@@ -6,7 +6,7 @@
 // is the IDE-side guided flow, authenticated to the (auth-required) engine.
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { withAuth } from "./auth";
+import { withStepUpAuth } from "./auth";
 import { configDir, engineUrl, environments, runJson, workspaceDir, type EnvironmentTarget } from "./cli";
 import { HttpError, type Approvable } from "./engineClient";
 import { assertTargetAllowed, isLocalEngine } from "./engineTarget";
@@ -147,7 +147,7 @@ export async function promote(context: vscode.ExtensionContext): Promise<void> {
   //    the swap. Nothing on the running engine changes.
   let preflight: Approvable<ReloadResult> | undefined;
   try {
-    preflight = await withAuth(context, target.url, reload(true));
+    preflight = await withStepUpAuth(context, target.url, reload(true));
   } catch (e) {
     const hint =
       e instanceof HttpError && e.status === 422
@@ -182,7 +182,7 @@ export async function promote(context: vscode.ExtensionContext): Promise<void> {
   //    the message then says so rather than reporting a swap that has not happened.
   let result: Approvable<ReloadResult> | undefined;
   try {
-    result = await withAuth(context, target.url, reload(false));
+    result = await withStepUpAuth(context, target.url, reload(false));
   } catch (e) {
     void vscode.window.showErrorMessage(`MessageFoundry: promote failed — ${errText(e)}`);
     return;
