@@ -1017,7 +1017,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         except TemporaryPasswordUnavailable as exc:
             # ADR 0197 Amendment A: the credential is generated now, so the reset's 503 applies here
-            # too -- a site setting no generated candidate clears, raised before any write.
+            # too -- a site setting no generated candidate clears, raised before any account row is
+            # written. The console answers 503 as well.
             raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
         # Only after the create succeeded: a lost username race (409 above) granted nobody anything.
         if Role.ADMINISTRATOR.value in body.roles:
@@ -1236,16 +1237,20 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             )
             raise HTTPException(code, detail) from exc
         except TemporaryPasswordUnavailable as exc:
-            # Raised before any write, so the account is untouched; the grant the gate spent is
-            # given back, so a request that changed nothing costs no proof (ADR 0197 Amendment A,
-            # Manager decision 2026-09-29; the refund's docstring says what it can and cannot buy).
+            # Raised before the account is touched; only the refusal's audit row is written. The
+            # grant the gate spent is given back, so a request that changed nothing costs no proof
+            # (ADR 0197 Amendment A, Manager decision 2026-09-29; the refund's docstring says what
+            # it can and cannot buy).
             # It restores only the grant THIS request's gate spent, on either plane: the console
             # calls this handler in-process, in the same request, after its own gate.
             service.refund_action_step_up(STEP_UP_ACTION_ADMIN_RESET_PASSWORD)
             # A site setting, not a bad request, so a 503 like this module's other server-side
             # refusals. It is mapped rather than left to the generic handler, which says only
-            # "internal error": the message names the setting to fix, and the web console renders
-            # this detail on the user page (with its own 400, as it does for every refusal here).
+            # "internal error": the message names the setting to fix. The web console renders this
+            # detail on the user page and answers 503 too (`_refusal_status` in its admin routes).
+            # It re-raises a 404 and answers 400 for the other refusals. The service already wrote
+            # the `auth.credential_issue_refused` row, so neither surface audits it again (BACKLOG
+            # #2359).
             raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
         return PasswordResetResponse(temp_password=issued.password, expires_at=issued.expires_at)
 
@@ -1295,8 +1300,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         try:
             issued = await service.admin_reset_mfa(user_id, actor=identity.username)
         except TemporaryPasswordUnavailable as exc:
-            # As on the password reset: raised before any write, so the factors and sessions are
-            # untouched, and the spent grant is given back.
+            # As on the password reset: raised before the account is touched, so the factors and
+            # sessions are untouched, the spent grant is given back, and the console answers 503.
             service.refund_action_step_up(STEP_UP_ACTION_ADMIN_RESET_MFA)
             raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
         except ValueError as exc:

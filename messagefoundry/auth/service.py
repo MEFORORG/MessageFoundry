@@ -876,6 +876,17 @@ _RESET_GENERATION_ATTEMPTS = 64
 #: name, so the own-username clause cannot be the reason the probe fails.
 _PROBE_USERNAME = "mf-startup-credential-probe"
 
+#: What to do about a generator refusal, in one string so the ERROR log, the raised message (the 503
+#: detail) and the docs cannot drift apart (BACKLOG #2359). It names the environment variable because
+#: it overrides the TOML key, and it names every engine process because each builds its policy once,
+#: at start: a fix applied to one shard or one cluster node leaves the others refusing. No trailing
+#: period, because :func:`credential_generation_problem` appends its own sentence after it.
+SITE_TERMS_FIX_ADVICE: Final = (
+    "Check [auth].password_extra_context_words, or MEFOR_AUTH_PASSWORD_EXTRA_CONTEXT_WORDS, which "
+    "overrides it, for short or very common terms. Then restart every engine process: each engine "
+    "shard and each cluster node reads [auth] only at start, and a /config/reload does not re-read it"
+)
+
 
 def credential_generation_problem(policy: PasswordPolicy) -> str | None:
     """Try the temporary-credential generator once under ``policy`` and a synthetic username (ADR 0197
@@ -933,13 +944,11 @@ def generate_policy_password(
     length = -(-chars * 3 // 4)  # ceiling: enough bytes for `chars` characters
     # The suffixed form exists only for an opt-in character class the bare token happens to miss.
     # With every class rule off it cannot help: the bare token then fails only on a context word
-    # or the username, and the suffix keeps either one.
-    class_rules = (
-        policy.require_uppercase
-        or policy.require_lowercase
-        or policy.require_digit
-        or policy.require_symbol
-    )
+    # or the username, and the suffix keeps either one. Read from the policy, not from four field
+    # names, so a class rule added later is not skipped here (BACKLOG #2359). The suffix still
+    # covers only the four classes today: a new class it misses needs the suffix extended too, and
+    # until then the screen refuses that candidate rather than issuing it.
+    class_rules = policy.requires_character_class
     for _ in range(_RESET_GENERATION_ATTEMPTS):
         token = secrets.token_urlsafe(length)[:chars]
         # The bare token first. The suffixed form is screened like the token: a site term can sit
@@ -963,13 +972,13 @@ def generate_policy_password(
         _log.error(
             "no temporary password cleared the password policy in %d tries; the likely cause is "
             "[auth].password_extra_context_words holding so many short terms that nearly every "
-            "random string contains one, which would refuse most passphrases too",
+            "random string contains one, which would refuse most passphrases too. %s",
             _RESET_GENERATION_ATTEMPTS,
+            SITE_TERMS_FIX_ADVICE,
         )
     raise TemporaryPasswordUnavailable(
-        "could not generate a temporary password that clears the password policy; check "
-        "[auth].password_extra_context_words for short or very common terms, then restart the "
-        "engine, which reads [auth] only at start"
+        "could not generate a temporary password that clears the password policy. "
+        + SITE_TERMS_FIX_ADVICE
     )
 
 
@@ -1864,6 +1873,14 @@ _BACKGROUND_CANCEL_GRACE_SECONDS: Final = 0.5
 _ISSUE_ROW_KEYS: Final[Mapping[str, str]] = MappingProxyType(
     {"user.created": "username", "auth.password_reset": "user_id"}
 )
+#: BACKLOG #2359: the row a refused credential issue writes, when the generator raises
+#: :class:`TemporaryPasswordUnavailable` on account creation or either reset. A name of its own, and
+#: never ``user.created`` or ``auth.password_reset``: :data:`_ISSUE_ROW_KEYS` reads those two as
+#: "this administrator issued the credential", so a refusal written under either would name an issuer
+#: for a credential that was never set. Its detail's ``op`` says which of the three refused.
+CREDENTIAL_ISSUE_REFUSED_ACTION: Final = "auth.credential_issue_refused"
+#: The ``op`` values that row carries, one per issuing operation.
+CredentialIssueOp = Literal["create", "password_reset", "mfa_reset"]
 _ISSUE_ROW_EARLY_SECONDS: Final = 5.0
 _ISSUE_ROW_LATE_SECONDS: Final = 60.0
 _ISSUE_ROW_PAGE: Final = 200
@@ -9476,7 +9493,9 @@ class AuthService:
         issued: IssuedCredential | None = None
         temp_hash: str | None = None
         if user.auth_provider == AuthProvider.LOCAL.value:
-            temp = generate_policy_password(self._policy, username=user.username)
+            temp = await self._generate_issued_credential(
+                "mfa_reset", username=user.username, actor=actor, user_id=user_id
+            )
             temp_hash = await self._argon2(hash_password, temp)
             await self._store.set_password(
                 user_id,
@@ -10039,6 +10058,56 @@ class AuthService:
             {"ts": float(r["ts"]), "action": str(r["action"]), "detail": r["detail"]} for r in rows
         ]
 
+    async def _generate_issued_credential(
+        self,
+        op: CredentialIssueOp,
+        *,
+        username: str,
+        actor: str,
+        user_id: str | None = None,
+        roles: Sequence[str] | None = None,
+        client: str | None = None,
+    ) -> str:
+        """Generate the credential account creation or a reset issues, off the event loop, and audit
+        a refusal (BACKLOG #2359).
+
+        The generator is CPU-bound: a site list that makes it refuse costs up to
+        ``2 * _RESET_GENERATION_ATTEMPTS`` full policy screens. So it runs through :meth:`_argon2`,
+        in a worker thread under the same cap as the hash beside it. Each caller calls this before
+        it touches the account, so a refusal here has changed nothing.
+
+        A refusal writes one :data:`CREDENTIAL_ISSUE_REFUSED_ACTION` row, with ``op`` naming the
+        operation. It is written here, not in the routes, so the JSON API and the console both get
+        it. A refused audit write is logged and does not replace the refusal: the route must still
+        answer 503 and give back the step-up grant."""
+        try:
+            return await self._argon2(
+                lambda: generate_policy_password(self._policy, username=username)
+            )
+        except TemporaryPasswordUnavailable:
+            detail: dict[str, object] = {"op": op, "username": username}
+            if user_id is not None:
+                detail["user_id"] = user_id
+            if roles is not None:
+                detail["roles"] = list(roles)
+            try:
+                await self._audit(
+                    CREDENTIAL_ISSUE_REFUSED_ACTION,
+                    actor=actor,
+                    detail=_json(detail),
+                    client=client,
+                )
+            except _audit_write_errors():
+                # A store refusal only: a bug in the call above still raises. The refusal below is
+                # the answer either way, and the traceback says why the row is missing.
+                _log.exception(
+                    "could not write the %s audit row for a refused %s by %s",
+                    CREDENTIAL_ISSUE_REFUSED_ACTION,
+                    op,
+                    actor,
+                )
+            raise
+
     async def create_local_user(
         self,
         *,
@@ -10079,7 +10148,9 @@ class AuthService:
                 )
             email = _require_single_mailbox(email)
         user_id = uuid4().hex
-        temp = generate_policy_password(self._policy, username=username)
+        temp = await self._generate_issued_credential(
+            "create", username=username, actor=actor, roles=roles, client=client
+        )
         # Hashed before the insert so the handler below covers the store call alone.
         password_hash = await self._argon2(hash_password, temp)
         try:
@@ -10386,7 +10457,9 @@ class AuthService:
             raise ValueError("no such user")
         if user.auth_provider != AuthProvider.LOCAL.value:
             raise ValueError("only local users have a password to reset")
-        temp = generate_policy_password(self._policy, username=user.username)
+        temp = await self._generate_issued_credential(
+            "password_reset", username=user.username, actor=actor, user_id=user_id
+        )
         await self._store.set_password(
             user_id,
             password_hash=await self._argon2(hash_password, temp),
