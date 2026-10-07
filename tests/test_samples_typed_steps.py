@@ -76,7 +76,7 @@ def test_router_rows() -> None:
 def test_handler_covers_the_vocabulary() -> None:
     rows = _rows(HANDLER)
     actions = {r["action"] for r in rows if r["kind"] == "action"}
-    assert {"set_field", "copy_field", "trim_field", "convert_case", "format_date"} <= actions
+    assert {"set_field", "copy_field", "trim_field", "convert_case", "substring_field"} <= actions
     assert [r["call"] for r in rows if r["kind"] == "lookup"] == ["code_lookup"]
     assert [r["call"] for r in rows if r["kind"] == "diagnostic"] == ["log_note"]
     controls = [r for r in rows if r["kind"] == "control"]
@@ -153,12 +153,36 @@ def test_feed_transforms_a_synthetic_result() -> None:
 def test_handler_filters_and_raises() -> None:
     reg = load_config(SAMPLES)
     run = reg.handlers["steps_oru_handler"]
-    training = Message.parse(ORU_R01.replace("|P|2.5.1", "|T|2.5.1"))
-    assert training.field("MSH-11") == "T"
+    # MSH-11 carries a processing mode in its second component; the filter reads MSH-11.1.
+    training = Message.parse(ORU_R01.replace("|P|2.5.1", "|T^T|2.5.1"))
     assert run(training) == []
+    # A training message is filtered before the PID-3 check, so it is not an error.
+    training_no_id = Message.parse(
+        ORU_R01.replace("|P|2.5.1", "|T|2.5.1").replace("100^^^H^MR~200^^^H^PI", "")
+    )
+    assert run(training_no_id) == []
     no_id = Message.parse(ORU_R01.replace("100^^^H^MR~200^^^H^PI", ""))
     with pytest.raises(ValueError, match="PID-3"):
         run(no_id)
+
+
+@pytest.mark.parametrize(
+    ("pid7", "expected"),
+    [
+        ("19800101120000", "19800101"),
+        ("19800101120000-0500", "19800101"),
+        ("19800101^D", "19800101^D"),
+        ("1980", "1980"),
+        ("198003", "198003"),
+    ],
+)
+def test_birth_date_keeps_its_precision(pid7: str, expected: str) -> None:
+    # Cutting the text never invents a month or day, and never fails on the degree-of-precision part.
+    reg = load_config(SAMPLES)
+    msg = Message.parse(ORU_R01.replace("||19800101120000", f"||{pid7}"))
+    assert msg.field("PID-7") == pid7
+    reg.handlers["steps_oru_handler"](msg)
+    assert msg.field("PID-7") == expected
 
 
 def test_check_passes_and_dryrun_delivers_twice(

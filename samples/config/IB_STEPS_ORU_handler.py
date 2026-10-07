@@ -14,10 +14,10 @@ from messagefoundry import (
     code_set,
     convert_case,
     copy_field,
-    format_date,
     handler,
     log_note,
     set_field,
+    substring_field,
     trim_field,
 )
 
@@ -27,21 +27,22 @@ FACILITY_MNEMONICS = code_set("facility_mnemonics")
 
 @handler("steps_oru_handler")
 def steps_oru_handler(msg):
+    # A training message (MSH-11.1 = T, HL7 table 0103) is not delivered: filter it.
+    if msg.field("MSH-11.1") == "T":
+        return []
     # The EMR files on the first PID-3 identifier. A result without one goes to the error path.
     if msg.field("PID-3.1") is None:
         raise ValueError("PID-3 patient identifier is missing")
-    # A training message (MSH-11 = T, HL7 table 0103) is not delivered: filter it.
-    if msg.field("MSH-11") == "T":
-        return []
     # Field mapping: address the message to the receiving system.
     set_field(msg, "MSH-5", "EMR")
     set_field(msg, "MSH-6", "MAINHOSP")
     code_lookup(msg, "MSH-4.1", FACILITY_MNEMONICS)
     trim_field(msg, "PID-5.1")
     convert_case(msg, "PID-5.1", "upper")
-    # The EMR also reads the identifier from PID-2, and takes the birth date without a time.
+    # The EMR still reads the bare identifier from PID-2 (kept for backward compatibility in 2.5.1).
     copy_field(msg, "PID-3.1", "PID-2.1")
-    format_date(msg, "PID-7", "%Y%m%d")
+    # The EMR takes the birth date without a time. Cutting the text keeps a year-only date as it is.
+    substring_field(msg, "PID-7.1", 0, 8)
     # A patient with no administrative sex is sent as unknown (HL7 table 0001).
     if msg.field("PID-8") is None:
         set_field(msg, "PID-8", "U")
