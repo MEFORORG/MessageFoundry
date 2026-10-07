@@ -305,7 +305,7 @@ from typing import Any
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "d2c10db4458ce051"
+ENGINE_UI_SEAM: str = "a71d41ec7b17dd61"
 
 
 @dataclass(frozen=True, slots=True)
@@ -396,11 +396,12 @@ class CoreHandlers:
     # Dual-control approvals (ASVS 2.3.5, BACKLOG #1982): the console's Approvals page. The JSON
     # gates are require(APPROVALS_APPROVE) on the list and require_paced(APPROVALS_APPROVE) on approve
     # and reject, so each /ui route asserts approvals:approve through require_ui, which paces a /ui
-    # write the same way. The resolve of an interrupted release is not on the seam: its JSON gate is
-    # require_step_up and the console renders those rows read-only.
+    # write the same way. The resolve of an interrupted release (BACKLOG #2460) has the JSON gate
+    # require_step_up, so its /ui route takes require_ui_step_up for the same fresh re-proof.
     list_approvals: Callable[..., Awaitable[Any]]
     approve_action: Callable[..., Awaitable[Any]]
     reject_action: Callable[..., Awaitable[Any]]
+    resolve_action: Callable[..., Awaitable[Any]]
 
 
 @dataclass(frozen=True, slots=True)
