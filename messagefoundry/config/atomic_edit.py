@@ -148,15 +148,15 @@ def edit_lock(
     if key in held:
         yield
         return
-    # Read-only and readable by all: the file holds no data, a lock needs only an open handle,
-    # and an editor running as another account (an operator's CLI beside the service) must
-    # still be able to open a lock file the other one created.
+    # Read-only, because a lock needs only an open handle. Owner-only, like the files it guards:
+    # every edit leaves the edited file 0600, so an account that could not open this lock could
+    # not edit that file either, and root opens a 0600 file regardless. Wider access gains nothing.
     # O_NOFOLLOW where the platform has it: a lock path planted as a link is refused, not followed.
     # O_NONBLOCK so a lock path planted as a FIFO cannot block the open before the timeout runs.
     flags = os.O_RDONLY | os.O_CREAT | _O_BINARY
     flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
-        fd = os.open(lock_path, flags, 0o644)
+        fd = os.open(lock_path, flags, 0o600)
     except OSError as exc:
         if exc.errno != errno.ELOOP:
             raise

@@ -488,3 +488,12 @@ def test_a_lock_file_planted_as_a_link_is_refused(tmp_path: Path) -> None:
     atomic_edit.lock_path_for(path).symlink_to(target)
     with pytest.raises(TimeoutError, match="is a link"), atomic_edit.edit_lock(path):
         pass
+
+
+@posix_only
+def test_the_lock_file_is_owner_only(tmp_path: Path) -> None:
+    """Owner-only like the files it guards, which every edit leaves 0600."""
+    path = tmp_path / "messagefoundry.toml"
+    with atomic_edit.edit_lock(path):
+        pass
+    assert stat.S_IMODE(atomic_edit.lock_path_for(path).stat().st_mode) == 0o600
