@@ -39,7 +39,6 @@ from cryptography.x509.oid import NameOID
 
 from messagefoundry.config.models import ConnectorType, ContentType, Destination, Source
 from messagefoundry.config.settings import EgressSettings
-from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 from messagefoundry.config.wiring import Ftp, Sftp, WiringError
 from messagefoundry.keywrap import KeyWrapRefused
 from messagefoundry.redaction import safe_exc
@@ -1091,15 +1090,32 @@ def test_plain_ftp_with_credentials_refused_without_escape(
         )
 
 
-def test_plain_ftp_with_credentials_allowed_with_escape(
+@pytest.mark.parametrize(
+    "credential", [{"username": "u"}, {"password": "p"}], ids=["username", "password"]
+)
+def test_plain_ftp_with_credentials_refused_even_with_escape(
     escape_at_warn: None,
-    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    credential: dict[str, str],
 ) -> None:
-    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
-    dest = build_destination(
-        _ftp_dest(username="u", password="p"), egress=EgressSettings(deny_by_default=False)
-    )
-    assert isinstance(dest, RemoteFileDestination)  # builds (warns), not refused
+    """Vault BACKLOG #2636: absolute, as SMTP refuses a cleartext credential. The escape on a warn
+    posture used to release it with a WARNING; now it is refused in both directions, and the
+    connector logs no WARNING of any wording before the refusal."""
+    remotefile_log = "messagefoundry.transports.remotefile"
+    settings = _ftp_dest(**credential).settings
+    with caplog.at_level(logging.WARNING, logger=remotefile_log):
+        with pytest.raises(ValueError, match="CLEARTEXT") as out:
+            RemoteFileDestination(
+                Destination(name="OB_RF", type=ConnectorType.REMOTEFILE, settings=dict(settings))
+            )
+        with pytest.raises(ValueError, match="CLEARTEXT") as inb:
+            RemoteFileSource(
+                Source(name="IB_RF", type=ConnectorType.REMOTEFILE, settings=dict(settings))
+            )
+    for refusal in (out.value, inb.value):
+        assert "MEFOR_ALLOW_INSECURE_TLS" not in str(refusal)  # no escape is offered
+    assert "'OB_RF'" in str(out.value) and "'inbound:IB_RF'" in str(inb.value)
+    assert not [r for r in caplog.records if r.name == remotefile_log]
 
 
 def test_plain_ftp_without_credentials_is_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2519,10 +2535,10 @@ def test_a_refused_credential_is_still_a_credential_fault(
 
 
 def _scripted_plain_ftp(monkeypatch: pytest.MonkeyPatch, *, refuse_at: str, reply: str) -> None:
-    """Make ``ftplib.FTP`` a :class:`_ScriptedFtp`, for plain FTP under the insecure escape."""
+    """Make ``ftplib.FTP`` a :class:`_ScriptedFtp`, for a plain-FTP session. No escape: a built
+    plain-ftp hop is anonymous (vault BACKLOG #2636), and :func:`_plain_client` skips the build."""
     import ftplib as _ftplib
 
-    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
     _ScriptedFtp.instances = []
 
     class _Plain(_ScriptedFtp):
@@ -2631,7 +2647,8 @@ _CONFIG_FAULTS = [
     pytest.param(
         "ftps", "prot_p", "536 Requested PROT level not supported by mechanism.", id="prot-p"
     ),
-    pytest.param("plain", "login", _TLS_DEMANDS[0], id="tls-demand"),
+    # ProFTPD's TLSRequired reply, sent to any login: the plain arm below logs in anonymously.
+    pytest.param("plain", "login", _TLS_DEMANDS[1], id="tls-demand"),
 ]
 
 
@@ -2643,14 +2660,14 @@ def _config_fault_dest(
         _scripted_ftps(monkeypatch, refuse_at=refuse_at, reply=reply)
     else:
         _scripted_plain_ftp(monkeypatch, refuse_at=refuse_at, reply=reply)
-    # A credentialed plain-ftp hop needs the escape on a warn posture (vault BACKLOG #2354). FTPS
-    # needs no escape, so it keeps the default (unstamped) posture.
-    posture = HopPosture(enforcing=False) if kind == "plain" else None
-    with active_hop_posture(posture):
-        return build_destination(
-            _ftp_dest(tls=kind == "ftps", username="u", password="p", filename="m.hl7", **over),
-            egress=EgressSettings(deny_by_default=False),
-        )
+    # A credentialed plain-ftp hop is refused outright (vault BACKLOG #2636), so the plain session
+    # is anonymous, scripted with a TLS demand a server sends to any login. FTPS keeps its
+    # credential. Both keep the default (unstamped) posture.
+    credential = {"username": "u", "password": "p"} if kind == "ftps" else {}
+    return build_destination(
+        _ftp_dest(tls=kind == "ftps", filename="m.hl7", **credential, **over),
+        egress=EgressSettings(deny_by_default=False),
+    )
 
 
 @pytest.mark.parametrize(("kind", "refuse_at", "reply"), _CONFIG_FAULTS)

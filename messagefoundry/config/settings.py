@@ -441,7 +441,8 @@ def weakened_tls_escape_permitted(posture: HopPosture | None) -> bool:
     here so the blunt escape can no longer silence an **enforcing** refusal (matching the
     ``--allow-insecure-bind`` API-bind clamp). That is **at least** the engine<->store TLS gate
     (:func:`~messagefoundry.store.sqlserver.connection_string` / ``store.postgres._build_ssl``), the MLLP
-    and FTPS ``tls_verify=false`` contexts and the credentialed plain-``ftp`` guard, **and — since #329 —**
+    and the anonymous FTPS ``tls_verify=false`` context (a credential on FTPS verify-off or on plain
+    ``ftp`` is refused outright, vault BACKLOG #2636), **and — since #329 —**
     the LDAPS ``ad_tls_verify=false`` bind (:mod:`messagefoundry.auth.ldap`), the SFTP unknown-host-key
     acceptance (:mod:`messagefoundry.transports.remotefile`), and the webhook-alert-sink and AI-broker
     cleartext-``http`` hops. Pass the construction-time
