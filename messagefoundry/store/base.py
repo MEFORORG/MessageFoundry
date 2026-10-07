@@ -65,6 +65,7 @@ from messagefoundry.store.privilege import (
 )
 from messagefoundry.store.store import (
     UPLOAD_RESERVATION_STALE_AFTER,
+    AdminRemoval,
     AlertInstance,
     AlertSummary,
     AuditAppend,
@@ -2044,7 +2045,12 @@ class AuthStore(Protocol):
     ) -> None: ...
 
     # Also deletes the account's ``known_login_addresses`` rows (vault BACKLOG #2145).
-    async def delete_user(self, user_id: str) -> None: ...
+    async def delete_user(self, user_id: str) -> None:
+        """Delete an account and every row keyed to it. **Unguarded:** it does not refuse the last
+        enabled administrator. An administrator's delete goes through
+        :meth:`remove_unless_last_admin` with ``DELETE`` (vault BACKLOG #2779); use this only where
+        the account cannot hold Administrator."""
+        ...
 
     # --- The first-seen sign-in address baseline (BACKLOG #288, vault BACKLOG #2145) ---
     # One row per (account id, host key). The caller folds the address to its host key; the store
@@ -2224,6 +2230,37 @@ class AuthStore(Protocol):
         assigned_by: str | None = None,
         now: float | None = None,
     ) -> None: ...
+
+    async def remove_unless_last_admin(
+        self,
+        user_id: str,
+        change: AdminRemoval,
+        *,
+        admin_role_id: str,
+        role_ids: Sequence[str] = (),
+        assigned_by: str | None = None,
+        now: float | None = None,
+    ) -> bool:
+        """Apply ``change`` to ``user_id`` unless it would leave no enabled administrator (vault
+        BACKLOG #2779).
+
+        One transaction re-reads the enabled accounts holding ``admin_role_id`` and refuses, writing
+        nothing and returning ``False``, when ``user_id`` is one of them, no other is, and the
+        change takes the role away (:meth:`AdminRemoval.takes_role`). The ids are compared in SQL,
+        so the guard matches an id exactly as the write does. Otherwise it writes and returns ``True``:
+        ``DISABLE`` sets ``disabled``, ``DELETE`` is :meth:`delete_user`, ``SET_ROLES`` is
+        :meth:`set_user_roles` with ``role_ids`` and ``assigned_by``.
+
+        **Every call is serialized against every other call on the same database**, not only in
+        this process: the server backends take a transaction-scoped lock before the read, because
+        each engine shard serves its own API over one unified store (ADR 0063). So two removals
+        that each see two administrators cannot both pass, which a check in one await and a write
+        in the next allowed. Writes that only ADD administrators need no lock: they cannot empty
+        the set. The directory-driven role writes (the AD sign-in sync and the session reconciler)
+        do not come through here and were never guarded: they take roles on the directory's word.
+        ``DISABLE`` and ``SET_ROLES`` leave the account's sessions for the caller to revoke after;
+        ``DELETE``, like :meth:`delete_user`, removes them with the account."""
+        ...
 
     async def set_user_channel_scope(
         self,

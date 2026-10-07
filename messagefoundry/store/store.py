@@ -74,6 +74,7 @@ from typing import (
     Protocol,
     Self,
     TypedDict,
+    assert_never,
     cast,
     runtime_checkable,
 )
@@ -1443,6 +1444,37 @@ class DbStatus:
 ChannelScopeSource = Literal["ad", "manual"]
 SCOPE_SOURCE_AD: Final[ChannelScopeSource] = "ad"
 SCOPE_SOURCE_MANUAL: Final[ChannelScopeSource] = "manual"
+
+
+class AdminRemoval(StrEnum):
+    """A change that can take the Administrator role away from one account (vault BACKLOG #2779).
+
+    ``remove_unless_last_admin`` applies one, on every backend, and refuses it when it would leave
+    no enabled administrator."""
+
+    DISABLE = "disable"
+    DELETE = "delete"
+    SET_ROLES = "set_roles"
+
+    def takes_role(self, admin_role_id: str, role_ids: Sequence[str]) -> bool:
+        """Whether the account lacks ``admin_role_id`` once this change is applied. Disabling and
+        deleting always take it; a role write takes it unless ``role_ids`` names it."""
+        return self is not AdminRemoval.SET_ROLES or admin_role_id not in role_ids
+
+
+#: The last-administrator guard's read (vault BACKLOG #2779): among enabled accounts holding the
+#: role, how many are the target and how many are not. Binds: user id, user id, role id. The ids
+#: are compared in SQL rather than in Python so the guard matches ids exactly as the write's
+#: ``WHERE id=?`` does, under the database's own collation. SQL Server runs it as is; Postgres
+#: carries a ``$n``/boolean twin. One more copy of "enabled administrator" beside the service's
+#: enumerations (``AuthService.has_notifiable_admin`` lists them); a condition added to one belongs
+#: in all.
+_SQL_ADMIN_GUARD_COUNTS = (
+    "SELECT COALESCE(SUM(CASE WHEN u.id = ? THEN 1 ELSE 0 END), 0),"
+    " COALESCE(SUM(CASE WHEN u.id <> ? THEN 1 ELSE 0 END), 0)"
+    " FROM users u JOIN user_roles r ON r.user_id = u.id"
+    " WHERE r.role_id = ? AND u.disabled = 0"
+)
 
 #: The compare-and-set behind ``withdraw_ad_channel_scope`` on SQLite. Postgres carries a ``$n``
 #: twin and SQL Server a collation-pinned one. Binds: new source, now, user id, the expected scope,
@@ -11976,19 +12008,60 @@ class MessageStore:
 
     async def delete_user(self, user_id: str) -> None:
         async with _writer_txn(self._db, self._lock):
-            await self._db.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
-            await self._db.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
-            await self._db.execute("DELETE FROM webauthn_credentials WHERE user_id=?", (user_id,))
-            # vault BACKLOG #2145: the account's known sign-in addresses go with it.
-            await self._db.execute("DELETE FROM known_login_addresses WHERE user_id=?", (user_id,))
-            # BACKLOG #1233: presets are owner-scoped by Identity.user_id (#1225) and there is no
-            # FK cascade on this table, so without this DELETE the rows outlive the account —
-            # PHI-shaped `criteria` (ADR 0136) persisting with no owner able to reach or purge it,
-            # and counted by nothing. `owner` holds the user_id, not the username, which is what
-            # makes this a single keyed DELETE rather than a name lookup.
-            await self._db.execute("DELETE FROM search_presets WHERE owner_user_id=?", (user_id,))
-            await self._db.execute("DELETE FROM users WHERE id=?", (user_id,))
+            await self._delete_user_rows(user_id)
             await self._commit()
+
+    async def remove_unless_last_admin(
+        self,
+        user_id: str,
+        change: AdminRemoval,
+        *,
+        admin_role_id: str,
+        role_ids: Sequence[str] = (),
+        assigned_by: str | None = None,
+        now: float | None = None,
+    ) -> bool:
+        """The last-administrator guard and its write in one transaction (vault BACKLOG #2779); see
+        ``AuthStore``. The writer lock serializes it against every other writer in this process,
+        which is every writer this file has."""
+        now = time.time() if now is None else now
+        async with _writer_txn(self._db, self._lock):
+            if change.takes_role(admin_role_id, role_ids):
+                cur = await self._db.execute(
+                    _SQL_ADMIN_GUARD_COUNTS, (user_id, user_id, admin_role_id)
+                )
+                target, others = await cur.fetchone() or (0, 0)
+                if target and not others:
+                    await self._db.rollback()
+                    return False
+            if change is AdminRemoval.DISABLE:
+                await self._db.execute(
+                    "UPDATE users SET disabled=1, updated_at=? WHERE id=?", (now, user_id)
+                )
+            elif change is AdminRemoval.DELETE:
+                await self._delete_user_rows(user_id)
+            elif change is AdminRemoval.SET_ROLES:
+                await self._replace_user_roles(user_id, role_ids, assigned_by=assigned_by, now=now)
+            else:
+                assert_never(change)
+            await self._commit()
+        return True
+
+    async def _delete_user_rows(self, user_id: str) -> None:
+        """Delete the account and every row keyed to it. Commits nothing: the caller holds the
+        writer transaction."""
+        await self._db.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
+        await self._db.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+        await self._db.execute("DELETE FROM webauthn_credentials WHERE user_id=?", (user_id,))
+        # vault BACKLOG #2145: the account's known sign-in addresses go with it.
+        await self._db.execute("DELETE FROM known_login_addresses WHERE user_id=?", (user_id,))
+        # BACKLOG #1233: presets are owner-scoped by Identity.user_id (#1225) and there is no
+        # FK cascade on this table, so without this DELETE the rows outlive the account —
+        # PHI-shaped `criteria` (ADR 0136) persisting with no owner able to reach or purge it,
+        # and counted by nothing. `owner` holds the user_id, not the username, which is what
+        # makes this a single keyed DELETE rather than a name lookup.
+        await self._db.execute("DELETE FROM search_presets WHERE owner_user_id=?", (user_id,))
+        await self._db.execute("DELETE FROM users WHERE id=?", (user_id,))
 
     async def record_login_success(self, user_id: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
@@ -12245,14 +12318,21 @@ class MessageStore:
     ) -> None:
         now = time.time() if now is None else now
         async with _writer_txn(self._db, self._lock):
-            await self._db.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
-            for role_id in role_ids:
-                await self._db.execute(
-                    "INSERT INTO user_roles (user_id, role_id, assigned_at, assigned_by)"
-                    " VALUES (?,?,?,?)",
-                    (user_id, role_id, now, assigned_by),
-                )
+            await self._replace_user_roles(user_id, role_ids, assigned_by=assigned_by, now=now)
             await self._commit()
+
+    async def _replace_user_roles(
+        self, user_id: str, role_ids: Sequence[str], *, assigned_by: str | None, now: float
+    ) -> None:
+        """Replace the account's role rows. Commits nothing: the caller holds the writer
+        transaction."""
+        await self._db.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
+        for role_id in role_ids:
+            await self._db.execute(
+                "INSERT INTO user_roles (user_id, role_id, assigned_at, assigned_by)"
+                " VALUES (?,?,?,?)",
+                (user_id, role_id, now, assigned_by),
+            )
 
     async def set_user_channel_scope(
         self,
