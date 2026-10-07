@@ -356,11 +356,12 @@ yet a queue entry, so the same window opens.
 1. Arm only once required checks are green. On the engine, `gh pr merge <N> --match-head-commit
    <sha>` then enqueues directly, with no deferred window. On the vault, add `--auto` and the
    merge-method flag, because gh refuses a no-queue merge without one when no terminal is attached.
-2. Pin the head you re-read. If you updated the branch, wait for the new head, and confirm it adds
-   only a clean merge of `main`. Post the pinned SHA on the PR as a comment. On both paths, gh
-   2.93.0 sends it as `expectedHeadOid` to `enablePullRequestAutoMerge`. GitHub's schema describes
-   that field only as *"The expected head OID of the pull request."* Nothing documented says
-   GitHub checks it again at merge time.
+2. Pin the full 40-character SHA of the head you re-read, since gh refuses a short one. If you
+   updated the branch, wait for the new head, and confirm it adds only a clean merge of `main`.
+   Post the pinned SHA on the PR as a comment. On both paths, gh 2.93.0 sends it as
+   `expectedHeadOid` to `enablePullRequestAutoMerge`. GitHub's schema describes that field only as
+   *"The expected head OID of the pull request."* Nothing documented says GitHub checks it again
+   at merge time.
 3. After the merge, compare the PR's `headRefOid` to the latest SHA you posted. If they differ by
    more than a clean merge of `main`, read what merged, because a queue may have merged the earlier
    head. If unreviewed content landed, revert it and send it to code review. This check is the
