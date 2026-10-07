@@ -549,6 +549,7 @@ def test_a_group_subclass_printing_its_members_renders_from_its_message() -> Non
     logger.warning("%s", by_args)
     out = stream.getvalue()
     assert "_LoudGroup: batch (1 sub-exceptions)" in out
+    assert "_ArgsGroup: batch (1 sub-exceptions)" in out
     assert "caf" not in out
 
 

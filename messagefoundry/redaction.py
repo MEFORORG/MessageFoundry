@@ -2355,7 +2355,7 @@ def _walk(arg: Any, kind: type[Any], depth: int, seen: dict[int, tuple[Any, Any]
         return _safe_mapping(arg, kind, depth + 1, seen)
     if issubclass(kind, _ARG_VIEWS):  # an OrderedDict's views subclass these, in C
         fresh = _safe_items(list(arg), depth + 1, seen)
-        return arg if fresh is None else fresh
+        return arg if fresh is None else tuple(fresh)  # hashable, as the view was
     for base in _ARG_SEQUENCES:
         if issubclass(kind, base):
             # A snapshot, except of a tuple: a list changed mid-walk must not reach the copy unscanned.
