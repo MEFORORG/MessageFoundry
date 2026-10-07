@@ -78,6 +78,7 @@ section reference.
 | | `[auth].phi_read_rate_limit_enabled`, `phi_read_rate_limit_per_actor`, `phi_read_rate_limit_window_seconds` | `true` / `120` / `60` s (`false`, a count of `0` or above `120`, or a window below `60` s) |
 | | `[auth].admin_write_rate_limit_enabled`, `admin_write_rate_limit_per_actor`, `admin_write_rate_limit_window_seconds`, `admin_write_min_interval_seconds` | `true` / `12` / `15` s / `0.15` s (`false`, a count of `0` or above `12`, a window below `15` s, or a gap below `0.15` s) |
 | | `[auth].mfa_verify_min_elapsed_seconds`, `oidc_callback_min_elapsed_seconds` | `1.0` s / `1.0` s (*conditional* — the second a loosening only with OIDC on; a floor below `1.0` s, and `0` turns it off) |
+| | `[auth].oidc_callback_floor_exempt_amr` | `[]` (*conditional* — a loosening only with OIDC on and the callback floor on; any value listed) |
 | | `[auth].max_sessions_per_user` | `5` (`0` or less means unlimited, and so is named, as is any cap above `5`) |
 | | `[auth].oidc_flow_cache_max` | `512` (*conditional* — a loosening only while OIDC is on; a cap above `512`. `0` or less refuses every flow, which is stricter) |
 | | `[approvals].min_dwell_seconds`, `expiry_hours` | `2.0` s / `72` h (*conditional* — a loosening only while `[approvals].enabled` holds at least one operation; a floor below `2.0` s or an expiry above `72` h, and `0` turns either off) |
@@ -99,6 +100,7 @@ section reference.
 `[auth].ad_allow_insecure_ldap`, `[auth].admin_new_ip_step_up`, the four `[auth].login_rate_limit_*` keys, the three `[auth].lockout_*`
 keys, the three named `[auth].phi_read_rate_limit_*` keys, the four `[auth].admin_write_*` keys,
 `[auth].mfa_verify_min_elapsed_seconds`, `[auth].oidc_callback_min_elapsed_seconds`,
+`[auth].oidc_callback_floor_exempt_amr`,
 `[auth].max_sessions_per_user`, `[auth].oidc_flow_cache_max`,
 `[approvals].min_dwell_seconds`, `[approvals].expiry_hours`,
 `[secret_rotation].enforce_store_key_expiry`, `[api].trusted_proxies` and
@@ -746,6 +748,28 @@ This section is kept rather than deleted, because the claim it used to make is t
   audit rows with `reason=too_early` (under `auth.mfa_failed`, `auth.webauthn_failed`,
   `auth.login_failed` and `auth.reauth`).
 - **Reversible:** yes, immediately — restore `1.0` (or delete the line) and restart.
+
+### `[auth].oidc_callback_floor_exempt_amr` set — a callback whose `amr` names a listed value skips the federated floor
+> Named while `[auth].oidc_enabled` is on and `oidc_callback_min_elapsed_seconds` is above `0`
+> ([BACKLOG #2388](BACKLOG.md), ASVS 2.4.2). Any value listed is named, and the entry quotes none.
+> The setting exists for an identity provider that re-authenticates with no human step, such as
+> integrated Windows sign-in or a client certificate. Such a provider answers every step-up faster
+> than the floor, so without it every step-up is refused.
+- **What you lose:** the callback floor, for every sign-in and step-up whose signature-verified `amr`
+  names a listed value. Such a flow may complete at machine speed. The `amr` proves a device or a
+  stored credential answered the identity provider. It does not prove a person acted. The floor
+  still holds for every other `amr`, which is why this is narrower than setting
+  `oidc_callback_min_elapsed_seconds` to `0`. An opted-in site also redeems a too-early step-up's
+  code before it refuses it, because only the exchange yields the `amr`.
+- **When acceptable:** at a site whose identity provider signs people in with no prompt, where
+  turning the whole floor off is the only other way to make step-up work. List only the methods
+  that provider really uses with no human step.
+- **Compensating controls:** keep `oidc_callback_min_elapsed_seconds` at its default, so every other
+  method stays floored. Each exempted pass records the matched values as `callback_floor_exempt_amr`,
+  under `evidence` on a sign-in's `auth.login_success` row and on a step-up's `auth.reauth` row, so
+  review those rows. Load refuses a value `oidc_mfa_amr_values` also accepts while the claim gate is
+  on, since that value would exempt every token the gate admits by it.
+- **Reversible:** yes, immediately — empty the list (or delete the line) and restart.
 
 ### `[auth].max_sessions_per_user` of `0` or above `5` — more live sessions per user
 > No sign-in condition applies ([BACKLOG #1131](BACKLOG.md), ASVS 7.1.2). `0` or less means unlimited, so it
@@ -1453,7 +1477,7 @@ chapter was not part of the verification above.
 | `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` (config-source check downgraded to a warning) | V13 Configuration | **CM-5** Access Restrictions for Change · **SI-7** Software, Firmware, and Information Integrity | §164.312(c)(1) Integrity |
 | `[auth].admin_new_ip_step_up` (mid-session new-address step-up) | V8 Authorization (adaptive, 8.2.4) · V6 Authentication | **AC-2(12)** Account Monitoring for Atypical Usage · **IA-11** Re-authentication | §164.312(d) Person or Entity Authentication · §164.308(a)(5)(ii)(C) Log-in Monitoring |
 | `[auth].login_rate_limit_*`, `[auth].lockout_minutes`, `[auth].lockout_threshold`, `[auth].lockout_max_minutes` (sign-in limits and account lockout) | V6 Authentication (6.1.1) | **AC-7** Unsuccessful Logon Attempts | §164.312(d) Person or Entity Authentication · §164.308(a)(5)(ii)(C) Log-in Monitoring |
-| `[auth].phi_read_rate_limit_*`, `[auth].admin_write_*`, `[auth].mfa_verify_min_elapsed_seconds`, `[auth].oidc_callback_min_elapsed_seconds` (PHI-read and admin-write pacing, second-step time floors) | V2 Validation and Business Logic (anti-automation, 2.4.1 / 2.4.2) | **SC-5** Denial-of-Service Protection | §164.312(a)(1) Access Control |
+| `[auth].phi_read_rate_limit_*`, `[auth].admin_write_*`, `[auth].mfa_verify_min_elapsed_seconds`, `[auth].oidc_callback_min_elapsed_seconds`, `[auth].oidc_callback_floor_exempt_amr` (PHI-read and admin-write pacing, second-step time floors and the federated floor's exemption) | V2 Validation and Business Logic (anti-automation, 2.4.1 / 2.4.2) | **SC-5** Denial-of-Service Protection | §164.312(a)(1) Access Control |
 | `[auth].max_sessions_per_user` (concurrent-session cap) | V7 Session Management (7.1.2) | **AC-10** Concurrent Session Control | §164.312(a)(1) Access Control |
 | `[auth].oidc_flow_cache_max` (pending federated sign-in bound) | V2 Validation and Business Logic (anti-automation) | **SC-5** Denial-of-Service Protection | §164.312(d) Person or Entity Authentication |
 | `[api].trusted_proxies` (trust-every-peer forwarded header) | V13 Configuration · V16 Security Logging and Error Handling | **AU-3** Content of Audit Records · **SC-7** Boundary Protection | §164.312(b) Audit Controls |

@@ -18,6 +18,7 @@ from messagefoundry.auth.oidc.claims import (
     ClaimsError,
     FederatedPrincipal,
     OidcClaimPolicy,
+    accepted_claim_values,
     validate_id_token,
 )
 from messagefoundry.auth.oidc.client_auth import (
@@ -69,6 +70,7 @@ __all__ = [
     "PendingFlow",
     "PrivateKeyJwtClientAuth",
     "TokenRefusedError",
+    "accepted_claim_values",
     "build_authorization_url",
     "exchange_code",
     "generate_pkce",

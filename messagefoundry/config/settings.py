@@ -3173,6 +3173,16 @@ class AuthSettings(_Section):
     # default reuses mfa_verify_min_elapsed_seconds' derivation (a new prompt and one submit, 1.43 s
     # by the keystroke-level model, less a margin). 0 turns it off; it must be shorter than the TTL.
     oidc_callback_min_elapsed_seconds: float = Field(default=1.0, ge=0, allow_inf_nan=False)
+    # BACKLOG #2388: the amr values that mark a re-authentication with no human step, such as
+    # integrated Windows sign-in or a client certificate. Such an IdP answers a step-up faster than
+    # the floor above on every try, so every step-up would be refused. A callback whose
+    # signature-verified amr names one of these values skips that floor, and only that one. Empty
+    # (the default) exempts nothing, and the step-up floor then refuses before the code exchange,
+    # as it always has. A non-empty list is a LOOSENING: it proves a device or a stored credential
+    # answered, not that a person acted. security_loosenings() names it while OIDC and the floor
+    # are both on. A value oidc_mfa_amr_values also accepts is refused at load while the claim
+    # gate is on: every token the gate admits by it would skip the floor, the floor off in effect.
+    oidc_callback_floor_exempt_amr: list[str] = Field(default_factory=list)
     oidc_flow_cache_max: int = 512  # reject-when-full (never evict — that is a login DoS)
     oidc_session_max_hours: int | None = None  # G2: cap below id_token.exp if tighter is wanted
     # ASVS 6.8.4 / 7.6.1, BACKLOG #296 / #1150: the most time, in seconds, that may pass between the
@@ -3391,7 +3401,12 @@ class AuthSettings(_Section):
             return [item.strip() for item in v.split(",") if item.strip()]
         return v
 
-    @field_validator("oidc_mfa_amr_values", "oidc_required_acr_values", mode="before")
+    @field_validator(
+        "oidc_mfa_amr_values",
+        "oidc_required_acr_values",
+        "oidc_callback_floor_exempt_amr",  # BACKLOG #2388: a blank must never match a blank amr
+        mode="before",
+    )
     @classmethod
     def _split_oidc_claim_value_lists(cls, v: object) -> object:
         # The env string form, as _split_oidc_lists reads it, and BACKLOG #2325: the TOML list form
@@ -3814,6 +3829,19 @@ class AuthSettings(_Section):
             raise ValueError(
                 "oidc_require_mfa_claim=true needs at least one of oidc_mfa_amr_values / "
                 "oidc_required_acr_values (an MFA gate that can never match is refused)"
+            )
+        # BACKLOG #2388: an exempt amr names a sign-in with NO human step, and an MFA amr names one
+        # with a human factor. A value on both lists would exempt every token the gate admits by
+        # it, which is the floor turned off while the loosening entry says it is narrower than
+        # that. Refused rather than quietly dropped. The text quotes no configured value.
+        if self.oidc_require_mfa_claim and (
+            set(self.oidc_callback_floor_exempt_amr) & set(self.oidc_mfa_amr_values)
+        ):
+            raise ValueError(
+                "oidc_callback_floor_exempt_amr names a value oidc_mfa_amr_values accepts as MFA, "
+                "so every sign-in the claim gate admits by that value would skip "
+                "oidc_callback_min_elapsed_seconds. List only the amr values that mark a sign-in "
+                "with no human step"
             )
 
         # BACKLOG #2032: `oidc_acr_values` is only a REQUEST. It rides the authorization URL, and
@@ -7040,6 +7068,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
       ``mfa_verify_min_elapsed_seconds``, ``oidc_callback_min_elapsed_seconds``) refuse an action that
       comes sooner than the floor and skip the check at 0 or less, so a floor below its default is
       looser and 0 is off. A higher floor is stricter, and is not named.
+    * ``oidc_callback_floor_exempt_amr`` (BACKLOG #2388) skips the federated floor for a matching
+      ``amr``, so any value listed is looser, named while that floor is on.
 
     ``[approvals].min_dwell_seconds``, the dual-control approval floor, is another time floor of the
     same kind. It lives in its own section, so :func:`_approvals_loosenings` names it, read the same
@@ -7353,6 +7383,19 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                 "so a scripted flow may complete at machine speed"
             ),
         )
+        # BACKLOG #2388: the amr exemption from that floor. Named only while the floor is on, as a
+        # part of a limiter is named only while the limiter is built. The text quotes no value.
+        exempt = auth.oidc_callback_floor_exempt_amr
+        if any(v.strip() for v in exempt) and (auth.oidc_callback_min_elapsed_seconds > 0):
+            out.append(
+                (
+                    "oidc_callback_floor_exempt_amr",
+                    "a federated callback whose verified amr names one of these values skips the "
+                    "least time between its start and its callback, so such a sign-in or step-up "
+                    "may complete at machine speed. The amr proves a device or a stored credential "
+                    "answered the identity provider, not that a person acted",
+                )
+            )
 
     # --- concurrent sessions (ASVS 7.1.2). 0 or less means unlimited, so a negative cap is off too.
     sessions = auth.max_sessions_per_user

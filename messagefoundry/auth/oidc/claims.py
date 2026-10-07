@@ -370,8 +370,9 @@ def _require_number(claims: Mapping[str, object], field_name: str, _reason: str)
     return number
 
 
-def _accepted_claim_values(configured: Sequence[str]) -> frozenset[str]:
-    """The configured values the MFA gate may match: strings that are not blank (BACKLOG #2325).
+def accepted_claim_values(configured: Sequence[str]) -> frozenset[str]:
+    """The configured values a claim may match: strings that are not blank (BACKLOG #2325). The MFA
+    gate reads it, and so does the callback-floor exemption (BACKLOG #2388).
 
     Settings load already strips both lists and drops blanks, so this guards the other constructors
     (the offline verifier, tests, a future caller). A "" in either list would otherwise accept a token
@@ -393,8 +394,8 @@ def _check_mfa_gate(
     if not policy.require_mfa_claim:
         return amr, acr_str
 
-    accepted_amr = _accepted_claim_values(policy.mfa_amr_values)
-    accepted_acr = _accepted_claim_values(policy.required_acr_values)
+    accepted_amr = accepted_claim_values(policy.mfa_amr_values)
+    accepted_acr = accepted_claim_values(policy.required_acr_values)
     amr_ok = bool(accepted_amr & set(amr))
     acr_ok = acr_str is not None and acr_str in accepted_acr
     if not (amr_ok or acr_ok):

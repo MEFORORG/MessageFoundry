@@ -4148,7 +4148,14 @@ class AuthService:
         # case this floor exists for. An IdP clock that runs ahead can make an older sign-on look
         # fresh; the refusal then clears once the skew has passed, and it never lets a flow through.
         signed_in_during_flow = principal_claims.auth_time >= math.floor(flow.issued_at)
-        if signed_in_during_flow and arrived_too_early:
+        # BACKLOG #2388: an IdP that re-authenticates with no human step (an amr the operator named
+        # in oidc_callback_floor_exempt_amr) is exempt. Recorded on the success row, below.
+        floor_exempt_amr = (
+            self._oidc_callback_floor_exemption(principal_claims.amr)
+            if signed_in_during_flow and arrived_too_early
+            else ()
+        )
+        if signed_in_during_flow and arrived_too_early and not floor_exempt_amr:
             # With the client address, as the token_refused arm records it: a run of these is
             # automation, and the operator needs to see where it comes from.
             await self._audit(
@@ -4322,18 +4329,22 @@ class AuthService:
         # neither list left non-empty, and _check_mfa_gate ignores a blank value from any other
         # constructor. So a principal reaching this line carried a non-blank configured amr or acr.
         mfa_verified = self._settings.oidc_require_mfa_claim
+        evidence: dict[str, object] = {
+            "amr": list(principal_claims.amr),
+            "acr": principal_claims.acr,
+            "sub": principal_claims.subject,
+            "mfa_verified": mfa_verified,
+        }
+        if floor_exempt_amr:
+            # BACKLOG #2388: present only when the exemption let a too-early callback through.
+            evidence["callback_floor_exempt_amr"] = list(floor_exempt_amr)
         return await self._complete_ad_login(
             principal,
             client,
             mfa_verified=mfa_verified,
             session_mechanism=SessionMechanism.OIDC,
             mech="oidc",
-            evidence={
-                "amr": list(principal_claims.amr),
-                "acr": principal_claims.acr,
-                "sub": principal_claims.subject,
-                "mfa_verified": mfa_verified,
-            },
+            evidence=evidence,
             max_expires_at=max_expires_at,
             federated_subject=(principal_claims.issuer, principal_claims.subject),
             # BACKLOG #2143: the RAW verified auth_time, not the clamped value the cap above uses.
@@ -4421,6 +4432,19 @@ class AuthService:
         flows = self._oidc_flows
         return floor > 0 and flows is not None and flows.age(flow) < floor
 
+    def _oidc_callback_floor_exemption(self, amr: Sequence[str]) -> tuple[str, ...]:
+        """The ``[auth].oidc_callback_floor_exempt_amr`` values a signature-verified ``amr`` carries,
+        sorted (BACKLOG #2388). Empty means the callback floor applies.
+
+        It returns configured values only, never the token's own, so the result is a closed set
+        an audit row may carry. A blank or non-string value matches nothing, whoever built the
+        settings, by the same rule the MFA gate applies."""
+        return tuple(sorted(self._oidc_callback_floor_exempt_values() & set(amr)))
+
+    def _oidc_callback_floor_exempt_values(self) -> frozenset[str]:
+        """``[auth].oidc_callback_floor_exempt_amr`` as the values that can match (BACKLOG #2388)."""
+        return oidc.accepted_claim_values(self._settings.oidc_callback_floor_exempt_amr)
+
     def oidc_flow_is_step_up(self, flow_id: str) -> bool:
         """Whether the live flow behind this cookie is a step-up flow, WITHOUT consuming it.
 
@@ -4480,7 +4504,10 @@ class AuthService:
 
         Checks, in order, each failing CLOSED with nothing elevated: the flow exists and ``state``
         matches; it is a step-up flow; the callback is not too soon after the flow started (BACKLOG
-        #2301); the code exchange and the whole claims ladder pass (the nonce, the pinned issuer,
+        #2301), a check that moves after the exchange when ``oidc_callback_floor_exempt_amr`` is set,
+        because only the exchange yields the ``amr`` it exempts by (BACKLOG #2388), so a too-early
+        callback whose exchange fails is then refused with that failure's reason, not ``too_early``;
+        the code exchange and the whole claims ladder pass (the nonce, the pinned issuer,
         ``auth_time`` present and within ``oidc_max_age_seconds``, and the MFA claim when that gate
         is on); the session is still live by every test :meth:`identity_for_token` applies, and
         still an OIDC session; the account is enabled and still a directory account; the token's
@@ -4523,7 +4550,11 @@ class AuthService:
         # BACKLOG #2301 (ASVS 2.4.2): max_age=0 and prompt=login make the person authenticate at the
         # IdP, so a step-up callback faster than a person can do that is refused. Before the code is
         # redeemed, so the refused flow spends nothing at the token endpoint.
-        if self._oidc_callback_too_early(flow):
+        # BACKLOG #2388: with oidc_callback_floor_exempt_amr set, the exemption needs the verified
+        # amr, which only the exchange yields, so an opted-in site pays for the exchange and the
+        # refusal waits for it below. With the list empty (the default) nothing changes here.
+        arrived_too_early = self._oidc_callback_too_early(flow)
+        if arrived_too_early and not self._oidc_callback_floor_exempt_values():
             return await self._step_up_refused(
                 TOO_EARLY, actor=actor, client=client, return_to=return_to
             )
@@ -4546,6 +4577,14 @@ class AuthService:
             self.mark_oidc_unavailable(type(exc).__name__)
             return await self._step_up_refused(
                 "idp_unavailable", actor=actor, client=client, return_to=return_to
+            )
+        floor_exempt_amr = (
+            self._oidc_callback_floor_exemption(principal_claims.amr) if arrived_too_early else ()
+        )
+        if arrived_too_early and not floor_exempt_amr:
+            # The opted-in site's too-early callback whose amr names no exempt value (BACKLOG #2388).
+            return await self._step_up_refused(
+                TOO_EARLY, actor=actor, client=client, return_to=return_to
             )
         now = time.time()
         session = await self._store.get_session(token_hash)
@@ -4681,24 +4720,22 @@ class AuthService:
         client_moved = (
             not self._same_host(start_client, client) if start_client and client else None
         )
-        await self._audit(
-            "auth.reauth",
-            actor=user.username,
-            detail=_json(
-                {
-                    "ok": elevation.ok,
-                    "provider": AuthProvider.AD.value,
-                    "mech": "oidc",
-                    "purpose": purpose,
-                    "session_lost": elevation.session_lost,
-                    "grant_refused": grant_refused,
-                    "session_revoked": False,
-                    "start_client": start_client,
-                    "client_moved": client_moved,
-                }
-            ),
-            client=client,
-        )
+        detail: dict[str, object] = {
+            "ok": elevation.ok,
+            "provider": AuthProvider.AD.value,
+            "mech": "oidc",
+            "purpose": purpose,
+            "session_lost": elevation.session_lost,
+            "grant_refused": grant_refused,
+            "session_revoked": False,
+            "start_client": start_client,
+            "client_moved": client_moved,
+        }
+        if floor_exempt_amr:
+            # BACKLOG #2388: present only when the exemption let a too-early callback through, and
+            # holding only configured values, never the token's own.
+            detail["callback_floor_exempt_amr"] = list(floor_exempt_amr)
+        await self._audit("auth.reauth", actor=user.username, detail=_json(detail), client=client)
         return OidcStepUp(elevation=elevation, return_to=return_to)
 
     async def _step_up_actor(self, flow: PendingFlow) -> str:

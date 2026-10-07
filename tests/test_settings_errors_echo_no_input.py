@@ -208,6 +208,11 @@ _AUTH_CASES: dict[str, tuple[dict[str, Any], dict[str, Any], str]] = {
         {},
         "the claim gate reads no acr while it is off",
     ),
+    "floor_exempt_amr_is_an_mfa_amr": (
+        _auth(oidc_callback_floor_exempt_amr=["mfa"]),
+        {},
+        "oidc_mfa_amr_values accepts as MFA",
+    ),
     "redirect_path": (_auth(oidc_redirect_path="/elsewhere"), {}, "oidc_redirect_path is fixed"),
     "strip_domain_unchecked": (
         _auth(oidc_username_strip_domain=True, ad_domain=_DROP),
