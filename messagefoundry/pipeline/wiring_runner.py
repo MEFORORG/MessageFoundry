@@ -1143,10 +1143,9 @@ class RegistryRunner:
         # ADR 0087 (#197) opt-in Router/Handler subprocess isolation. None or mode=off → in-process,
         # byte-identical, zero overhead (no session ever constructed). mode=subprocess → one PERSISTENT
         # worker child per inbound, built lazily on first dispatch (off the loop, inside the worker
-        # thread) and closed at stop(). The (config_dir, env) source lets the child re-load the SAME
-        # message graph to look a Router/Handler up by name; None config_dir (embedding) can't isolate,
-        # so _sandbox_for degrades to in-process. Read ONCE at construction (a /config/reload does NOT
-        # re-read it — restart to change, exactly like claim_mode).
+        # thread) and closed at stop(). Where the child re-loads the graph from is _sandbox_for's
+        # rule; this (config_dir, env) source is its fallback. The policy is read ONCE at
+        # construction (a /config/reload does NOT re-read it — restart to change, like claim_mode).
         self._sandbox_policy = sandbox_policy
         self._sandbox_config_source = sandbox_config_source
         self._sandbox_sessions: dict[str, SandboxSession] = {}
@@ -4298,22 +4297,26 @@ class RegistryRunner:
         """The persistent sandbox worker for inbound ``name`` (ADR 0087), or ``None`` to run in-process.
 
         Returns ``None`` — the byte-identical in-process path — unless ``[sandbox].mode=subprocess``
-        AND a config source is available. **An embedded runner with no config dir cannot isolate** —
-        the child re-loads the graph from ``(config_dir, env)`` to look a function up by name, so with
-        no config dir it degrades to in-process. That degradation is **silent**: a library embedder
-        that asked for ``subprocess`` gets the in-process path and nothing says so. Every ``serve``
-        route carries a config dir. The :class:`SandboxSession` object is created
+        AND a config dir is known. The child re-loads the graph to look a function up by name, from
+        ``Registry.source_dir`` (the directory the served graph came from), else the constructor's
+        ``sandbox_config_source``. Every registry swap closes the sessions, so a reload from another
+        root moves the children with it (vault BACKLOG #3094). **A graph built in code with no
+        config dir cannot isolate**, and degrades to in-process. That degradation is **silent**: a
+        library embedder that asked for ``subprocess`` gets the in-process path and nothing says so.
+        Every ``serve`` route carries a config dir. The :class:`SandboxSession` object is created
         here (cheap; loop-safe) but the child subprocess is spawned lazily inside the worker thread on
         first dispatch, so this never blocks the event loop. Sessions are reused per inbound and reaped
         at :meth:`stop`."""
         policy = self._sandbox_policy
         if policy is None or policy.mode is SandboxMode.OFF:
             return None
-        cfg_dir = self._sandbox_config_source[0] if self._sandbox_config_source else None
-        if cfg_dir is None:
-            return None
         session = self._sandbox_sessions.get(name)
         if session is None:
+            cfg_dir = self.registry.source_dir or (
+                self._sandbox_config_source[0] if self._sandbox_config_source else None
+            )
+            if cfg_dir is None:
+                return None
             env = self._sandbox_config_source[1] if self._sandbox_config_source else None
             # The engine's code-set tables travel once per spawn in the boot frame (not per dispatch),
             # so the child serves exactly what mode=off would rather than its own re-read of codesets/.

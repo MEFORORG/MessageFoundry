@@ -1512,7 +1512,7 @@ class Engine:
                 self.store,
                 self._backup_settings,
                 store_settings=self._store_settings,
-                config_dir=self.config_dir,
+                config_dir=lambda: self.running_config_dir,
                 engine_version=self._engine_version,
                 instance=self._active_environment or "",
                 alert_sink=self._alert_sink,
