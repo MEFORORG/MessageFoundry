@@ -520,8 +520,10 @@ def test_a_withheld_message_takes_its_arguments_with_it() -> None:
 
 def test_dict_views_holding_a_unicode_error_render_safely() -> None:
     errors = {"e": _encode_error()}
+    ordered = collections.OrderedDict(e=_encode_error())
     logger, stream = _capture()
     logger.warning("%s %s %r", errors.values(), errors.items(), errors.keys())
+    logger.warning("%s %r", ordered.values(), [ordered.items()])
     out = stream.getvalue()
     _assert_encode_safe(out)
     assert "caf" not in out
@@ -532,9 +534,19 @@ class _LoudGroup(ExceptionGroup[Exception]):
         return f"{self.message}: {self.exceptions!r}"
 
 
+class _ArgsGroup(ExceptionGroup[Exception]):
+    def __str__(self) -> str:
+        return repr(self.args)
+
+
 def test_a_group_subclass_printing_its_members_renders_from_its_message() -> None:
+    members: list[Exception] = [ValueError("x")]
+    by_args = _ArgsGroup("batch", members)
+    members.append(_encode_error())  # in .args, the caller's own list, and not in .exceptions
+    assert "caf" in str(by_args)  # control
     logger, stream = _capture()
     logger.warning("%s", _LoudGroup("batch", [_encode_error()]))
+    logger.warning("%s", by_args)
     out = stream.getvalue()
     assert "_LoudGroup: batch (1 sub-exceptions)" in out
     assert "caf" not in out

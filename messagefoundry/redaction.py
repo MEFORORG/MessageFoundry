@@ -2339,7 +2339,9 @@ def _walk(arg: Any, kind: type[Any], depth: int, seen: dict[int, tuple[Any, Any]
         # Its str() and repr() print its members, and a subclass may print them its own way, so a
         # group holding an error is rendered from its message and member count alone.
         members = _GROUP_MEMBERS.__get__(arg)
-        if _safe_items(members, depth + 1, seen) is None:
+        # Both: a subclass may print its .args, and the caller's list in .args can differ from them.
+        held = _safe_items(members, depth + 1, seen) is not None
+        if not held and _safe_items(_EXC_ARGS.__get__(arg), depth + 1, seen) is None:
             return arg
         message = safe_text(_GROUP_MESSAGE.__get__(arg))
         return _SafeText(f"{kind.__name__}: {message} ({len(members)} sub-exceptions)")
@@ -2351,12 +2353,13 @@ def _walk(arg: Any, kind: type[Any], depth: int, seen: dict[int, tuple[Any, Any]
         return _SafeText(f"{kind.__name__}({', '.join(map(repr, fresh))})")
     if issubclass(kind, _ARG_MAPPINGS):
         return _safe_mapping(arg, kind, depth + 1, seen)
-    if kind in _ARG_VIEWS:  # read through the dict; a view cannot be subclassed
+    if issubclass(kind, _ARG_VIEWS):  # an OrderedDict's views subclass these, in C
         fresh = _safe_items(list(arg), depth + 1, seen)
         return arg if fresh is None else fresh
     for base in _ARG_SEQUENCES:
         if issubclass(kind, base):
-            items = arg if kind is tuple or kind is list else list(base.__iter__(arg))
+            # A snapshot, except of a tuple: a list changed mid-walk must not reach the copy unscanned.
+            items = arg if kind is tuple else list(base.__iter__(arg))
             fresh = _safe_items(items, depth + 1, seen)
             if fresh is None:
                 return arg
