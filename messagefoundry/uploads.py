@@ -46,7 +46,7 @@ from messagefoundry.controlchars import strip_control_chars
 from messagefoundry.parsing.peek import HL7PeekError, Peek
 from messagefoundry.parsing.sniff import _looks_like_hl7, _lstrip_bom_ws
 from messagefoundry.parsing.split import split_batch
-from messagefoundry.redaction import safe_exc
+from messagefoundry.redaction import codec_safe_str
 from messagefoundry.store.content_search import SearchSpec, row_matches
 from messagefoundry.store.crypto import (
     MARKER_PREFIX,
@@ -642,7 +642,9 @@ class UploadStore:
                 _log.warning("uploaded-file sidecar %s: cipher declined it: %s", fid, exc)
             except (OSError, UnicodeDecodeError) as exc:
                 # The bytes never reached the cipher — unreadable file, or not valid UTF-8.
-                _log.warning("uploaded-file sidecar %s: unreadable on disk: %s", fid, safe_exc(exc))
+                _log.warning(
+                    "uploaded-file sidecar %s: unreadable on disk: %s", fid, codec_safe_str(exc)
+                )
             except (ValueError, TypeError, KeyError) as exc:
                 # Decrypted, but the JSON is malformed or a field will not coerce. Type only.
                 _log.warning(
@@ -1044,7 +1046,10 @@ class UploadStore:
                     # this file is still under the OLD key and the operator must not retire it yet.
                     skipped += 1
                     _log.warning(
-                        "uploaded file %s (%s): skipped, unreadable: %s", fid, kind, safe_exc(exc)
+                        "uploaded file %s (%s): skipped, unreadable: %s",
+                        fid,
+                        kind,
+                        codec_safe_str(exc),
                     )
                     continue
                 aad = cell_aad("uploaded_file", kind, fid)

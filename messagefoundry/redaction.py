@@ -70,7 +70,8 @@ import json
 import logging
 import pkgutil
 import re
-from collections.abc import Callable, Mapping
+import traceback
+from collections.abc import Callable
 from datetime import UTC, datetime
 from functools import lru_cache
 from string import ascii_lowercase, ascii_uppercase, whitespace
@@ -79,6 +80,7 @@ from typing import Any
 
 __all__ = [
     "clamp_untrusted",
+    "codec_safe_str",
     "json_loads_or_refusal",
     "log_timestamp",
     "prepare_log_record",
@@ -2187,8 +2189,6 @@ def safe_traceback(ei: ExcInfo) -> str:
 
     ``TracebackException._str`` is the stdlib's private name for that line. Python is pinned at 3.14
     or later, and ``tests/test_unicode_error_log_paths.py`` fails if the name stops being read."""
-    import traceback  # here, not at the top: lens and code_sets import this module and rarely log
-
     value, tb = ei[1], ei[2]
     # `type(None)` and None are what the stdlib's own print_exception passes for an empty exc_info.
     te = traceback.TracebackException(type(value), value, tb, compact=True)  # type: ignore[arg-type]
@@ -2208,35 +2208,57 @@ def safe_traceback(ei: ExcInfo) -> str:
     return "".join(te.format()).removesuffix("\n")
 
 
-def _safe_arg(arg: object) -> object:
-    return safe_exc(arg) if isinstance(arg, UnicodeError) else arg
+def codec_safe_str(exc: BaseException) -> str:
+    """``str(exc)``, except that a ``UnicodeError`` renders as :func:`safe_exc` renders it.
+
+    For an arm that catches a Unicode error beside an ``OSError`` or a ``TOMLDecodeError``, whose
+    text an operator reads to fix a path or a file. :func:`safe_exc` would redact and cut that path,
+    and only the Unicode error carries message content (vault BACKLOG #3185)."""
+    return safe_exc(exc) if isinstance(exc, UnicodeError) else str(exc)
+
+
+#: The builtin containers a log argument is walked through, and how deep. A ``UnicodeError`` inside
+#: one renders through ``repr``, which prints ``.object``, the whole input. The record's own ``args``
+#: tuple is the first level.
+_ARG_CONTAINERS = (tuple, list, set, frozenset, dict)
+_ARG_DEPTH = 5
+
+
+def _safe_arg(arg: Any, depth: int = 0) -> Any:
+    """``arg`` with each ``UnicodeError`` in it replaced by :func:`safe_exc` text, or ``arg`` itself
+    when nothing was replaced. Only the exact builtin containers are walked, and only so deep."""
+    if isinstance(arg, UnicodeError):
+        return safe_exc(arg)
+    kind = type(arg)
+    # The type test first: truth-testing an arbitrary object runs its own code.
+    if kind not in _ARG_CONTAINERS or depth >= _ARG_DEPTH or not arg:
+        return arg
+    if kind is dict:
+        values = [_safe_arg(v, depth + 1) for v in arg.values()]
+        changed = any(n is not o for n, o in zip(values, arg.values(), strict=True))
+        return dict(zip(arg, values, strict=True)) if changed else arg
+    items = [_safe_arg(a, depth + 1) for a in arg]
+    return kind(items) if any(n is not o for n, o in zip(items, arg, strict=True)) else arg
 
 
 def prepare_log_record(record: logging.LogRecord) -> None:
     """The first step of every log filter chain here, the engine's and the tray's (vault BACKLOG
     #3185). One function, so the two chains cannot drift apart (the defect BACKLOG #1478 records).
 
-    It renders ``exc_info`` into ``exc_text`` through :func:`safe_traceback` and clears ``exc_info``
-    unconditionally, so no formatter can re-render the raw exception past the scrub. It then replaces
-    a ``UnicodeError`` that is the record's ``msg`` or one of its ``args`` with :func:`safe_exc`'s
-    text. ``log.warning("unreadable: %s", exc)`` renders ``str(exc)``, which names the character or
-    byte the codec failed on, and ``%r`` renders ``.object``, the whole input. A single mapping
-    argument, the ``%(name)s`` form, is walked by value. Args with nothing to replace are left as
-    they are."""
-    if not record.exc_text and record.exc_info:
+    It renders ``exc_info`` through :func:`safe_traceback` and clears it, so no formatter can
+    re-render the raw exception past the scrub. A set ``exc_info`` always wins over a set
+    ``exc_text``: the pair means a formatter outside this chain cached the stdlib's own rendering.
+
+    It then replaces each ``UnicodeError`` in the record's ``msg`` and ``args`` with
+    :func:`safe_exc`'s text, inside builtin containers too. ``log.warning("unreadable: %s", exc)``
+    renders ``str(exc)``, which names the character or byte the codec failed on, and ``%r`` or a
+    container renders ``repr(exc)``, which prints ``.object``, the whole input. Args with nothing to
+    replace are left as the same object."""
+    if record.exc_info:
         record.exc_text = safe_traceback(record.exc_info)
     record.exc_info = None
-    if isinstance(record.msg, UnicodeError):
-        record.msg = safe_exc(record.msg)
-    # Every record passes here, so the common case is one exact-type test and a plain loop.
-    args = record.args
-    if type(args) is tuple:
-        for arg in args:
-            if isinstance(arg, UnicodeError):
-                record.args = tuple(_safe_arg(a) for a in args)
-                break
-    elif isinstance(args, Mapping) and any(isinstance(v, UnicodeError) for v in args.values()):
-        record.args = {k: _safe_arg(v) for k, v in args.items()}
+    record.msg = _safe_arg(record.msg)
+    record.args = _safe_arg(record.args)
 
 
 def json_loads_or_refusal(raw: str | bytes) -> tuple[Any, str | None]:

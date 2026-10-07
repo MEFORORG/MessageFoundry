@@ -74,7 +74,7 @@ from messagefoundry.config.wiring import (
     build_outbound_connection,
     parse_env_setting,
 )
-from messagefoundry.redaction import safe_exc
+from messagefoundry.redaction import codec_safe_str
 
 #: The file an engine config dir may carry alongside its ``*.py`` modules.
 CONNECTIONS_FILE_NAME = "connections.toml"
@@ -241,7 +241,7 @@ def load_connections_file(path: Path, registry: Registry) -> None:
         with open(path, "rb") as handle:
             data = tomllib.load(handle)
     except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
-        unreadable: str | None = f"cannot read {path.name}: {safe_exc(exc)}"
+        unreadable: str | None = f"cannot read {path.name}: {codec_safe_str(exc)}"
     else:
         unreadable = None
     if unreadable is not None:

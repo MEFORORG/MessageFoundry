@@ -5697,7 +5697,7 @@ def _resolve_expected_anchor(args: argparse.Namespace) -> tuple[int, str] | None
     # itself, because the engine's `[integrity].audit_anchor_file` startup check consumes the SAME
     # artifact (BACKLOG #328). A copy here would be the one place a later hardening -- of the refusals,
     # the encoding handling, or the byte bound -- could reach the CLI and miss the engine.
-    from messagefoundry.redaction import safe_exc
+    from messagefoundry.redaction import codec_safe_str
     from messagefoundry.store.store import parse_audit_anchor, read_audit_anchor_file
 
     raw: str | None
@@ -5712,7 +5712,7 @@ def _resolve_expected_anchor(args: argparse.Namespace) -> tuple[int, str] | None
             # writes UTF-16LE, so this is the likely file, not an exotic one.
             print(
                 f"error: cannot read --expected-anchor-file {args.expected_anchor_file!r}: "
-                f"{safe_exc(exc)}. "
+                f"{codec_safe_str(exc)}. "
                 "It must be a UTF-8 text file holding the COUNT:HEAD line; PowerShell 5.1's '>' "
                 "writes UTF-16 — pipe to 'Set-Content -Encoding utf8' there.",
                 file=sys.stderr,

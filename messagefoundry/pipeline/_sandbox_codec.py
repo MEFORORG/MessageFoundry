@@ -176,8 +176,8 @@ def decode_frame(body: bytes) -> tuple[dict[str, Any], list[str]]:
 
     The refusal is raised OUTSIDE the handler (BACKLOG #2085): a frame carries message bodies, and
     the caught ``JSONDecodeError``/``UnicodeDecodeError`` holds the text it failed on. Only its
-    rendered text is kept, through ``safe_exc``: a class and a position, and for a decode error its
-    codec, never the offending byte (vault BACKLOG #3185)."""
+    rendered text is kept, through ``safe_exc``: redacted and bounded, and for a decode error a class,
+    codec and position with never the offending byte (vault BACKLOG #3185)."""
     try:
         if len(body) < _LEN.size:
             raise SandboxCodecError("truncated sandbox frame (no header length)")
@@ -848,7 +848,7 @@ def _enc_item(item: object, blobs: _Blobs) -> dict[str, Any]:
         try:
             text = item.message if isinstance(item.message, str) else item.message.encode()
         except (AttributeError, TypeError, ValueError) as exc:
-            raise SandboxCodecError(f"Send message is not encodable: {exc}") from exc
+            raise SandboxCodecError(f"Send message is not encodable: {safe_exc(exc)}") from exc
         if not isinstance(text, str):
             raise SandboxCodecError(
                 f"Send message encoded to {type(text).__name__}, expected a str"

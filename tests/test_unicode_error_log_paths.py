@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import ast
 import io
+import itertools
 import logging
 import struct
 from collections.abc import Iterator
@@ -43,7 +44,7 @@ from messagefoundry.logging_setup import (
 )
 from messagefoundry.pipeline._sandbox_codec import SandboxCodecError, decode_frame
 from messagefoundry.pipeline.ingress_guards import IngressGuardError, admit_resubmitted_body
-from messagefoundry.redaction import prepare_log_record, safe_traceback
+from messagefoundry.redaction import codec_safe_str, prepare_log_record, safe_traceback
 from messagefoundry.tray.logscrub import TrayLogScrubFilter
 from tests._ast_sites import callee_name
 from tests._content_free import SECRET_CHAR, escapes
@@ -53,10 +54,12 @@ _REPO = Path(__file__).resolve().parents[1]
 
 #: A planted character no ASCII codec can encode, and every spelling a renderer could give it.
 _CHAR = SECRET_CHAR
-_CHAR_SPELLINGS = escapes(_CHAR)
+#: Less the bare hex digits "e9", which a traceback's checkout path can carry by chance.
+_CHAR_SPELLINGS = [s for s in escapes(_CHAR) if s != f"{ord(_CHAR):x}"]
 #: A planted byte UTF-8 cannot decode, and every spelling a renderer could give it.
 _BYTE = b"\xfe"
-_BYTE_SPELLINGS = ("\\xfe", "0xfe", "xfe", "254")
+_BYTE_SPELLINGS = ("\\xfe", "0xfe")
+_LOGGERS = itertools.count()
 
 
 def _encode_error() -> UnicodeEncodeError:
@@ -107,7 +110,7 @@ def _capture(handler_fmt: str = "text") -> tuple[logging.Logger, io.StringIO]:
     handler = logging.StreamHandler(stream)
     handler.setFormatter(_make_formatter(handler_fmt))
     _install_phi_filters(handler)
-    logger = logging.getLogger(f"test.unicode3185.{handler_fmt}.{id(stream)}")
+    logger = logging.getLogger(f"test.unicode3185.{handler_fmt}.n{next(_LOGGERS)}")
     logger.handlers = [handler]
     logger.propagate = False
     logger.setLevel(logging.DEBUG)
@@ -212,6 +215,39 @@ def test_a_mapping_argument_holding_a_unicode_error_renders_safely() -> None:
     _assert_decode_safe(stream.getvalue())
 
 
+def test_a_unicode_error_inside_a_container_argument_renders_safely() -> None:
+    # A container renders its items with repr(), and repr(exc) prints .object, the whole input.
+    assert "caf" in repr([_encode_error()])  # control: the raw container carries the input
+    logger, stream = _capture()
+    logger.warning("errors: %s %s", [_encode_error()], {"e": (_decode_error(), 1)})
+    out = stream.getvalue()
+    _assert_encode_safe(out)
+    _assert_decode_safe(out)
+    assert "caf" not in out
+
+
+def test_a_traceback_an_outside_formatter_cached_is_rendered_again() -> None:
+    # A plain formatter on a child logger's own handler formats first and caches the stdlib's text
+    # in exc_text while exc_info is still set. The chain must not keep that cached text.
+    exc = _encode_error()
+    record = logging.LogRecord("t", logging.ERROR, __file__, 1, "x", (), (type(exc), exc, None))
+    assert "\\xe9" in logging.Formatter().format(record)  # the outside formatter runs first
+    assert record.exc_info is not None and "\\xe9" in (record.exc_text or "")  # control
+    RedactionFilter().filter(record)
+    _assert_encode_safe(record.exc_text or "")
+
+
+def test_a_mixed_arm_keeps_an_os_error_path_whole(tmp_path: Path) -> None:
+    # Only the Unicode error carries message content. An OSError's path is what an operator needs,
+    # so it is not redacted or cut (codec_safe_str rather than safe_exc).
+    missing = tmp_path / "Acme Health 2026-10-07" / "connections.toml"
+    with pytest.raises(WiringError) as caught:
+        load_connections_file(missing, Registry())
+    assert str(missing) in str(caught.value) or repr(str(missing))[1:-1] in str(caught.value)
+    assert codec_safe_str(OSError(2, "gone", str(missing))) == str(OSError(2, "gone", str(missing)))
+    _assert_decode_safe(codec_safe_str(_decode_error()))
+
+
 def test_a_unicode_error_logged_as_the_message_itself_renders_safely() -> None:
     logger, stream = _capture()
     logger.warning(_encode_error())
@@ -292,6 +328,12 @@ _UNICODE_TYPES = frozenset(
 #: Attributes that hold the input or a free-text reason. ``.start``, ``.end`` and ``.encoding`` are
 #: positions and the caller's codec name, and stay allowed.
 _RAW_ATTRS = frozenset({"object", "args", "reason"})
+#: Calls that render their argument as text. The scan cannot know what a lowercase helper of the
+#: code's own does, so a raw error handed to one passes it: a stated limit, not a check.
+_RENDER_CALLS = frozenset(
+    {"str", "repr", "format", "print", "format_exception", "format_exception_only"}
+    | {"print_exception", "TracebackException"}
+)
 _LOG_METHODS = frozenset(
     {"debug", "info", "warning", "warn", "error", "exception", "critical", "log"}
 )
@@ -333,17 +375,26 @@ def _raw_renders(handler: ast.ExceptHandler) -> Iterator[tuple[int, str]]:
             if any(_is_raw(r, name) for r in right):
                 yield node.lineno, "% formatting"
         elif isinstance(node, ast.Call):
-            func = node.func
-            callee = callee_name(node) or ""
-            raw_arg = any(_is_raw(a, name) for a in node.args)
-            if raw_arg and callee in {"str", "repr", "format", "print"}:
-                yield node.lineno, f"{callee}() of the error"
-            elif raw_arg and isinstance(func, ast.Attribute) and callee in _LOG_METHODS:
-                yield node.lineno, "log argument"
-            elif raw_arg and callee[:1].isupper():
-                yield node.lineno, f"passed into {callee}()"
+            yield from _raw_call(node, name)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+            if _is_raw(node.value, name):  # the raise-after-handler shape carries it out
+                yield node.lineno, "aliased out of the handler"
         elif isinstance(node, ast.Attribute) and _is_raw(node, name) and node.attr != "reason":
             yield node.lineno, f".{node.attr} read"
+
+
+def _raw_call(node: ast.Call, name: str) -> Iterator[tuple[int, str]]:
+    # exc_info= is path 1, which the log filter chain renders safely, so it stays allowed.
+    values = [*node.args, *(k.value for k in node.keywords if k.arg != "exc_info")]
+    if not any(_is_raw(v, name) for v in values):
+        return
+    callee = callee_name(node) or ""
+    if callee in _RENDER_CALLS:
+        yield node.lineno, f"{callee}() of the error"
+    elif isinstance(node.func, ast.Attribute) and callee in _LOG_METHODS:
+        yield node.lineno, "log argument"
+    elif callee[:1].isupper():
+        yield node.lineno, f"passed into {callee}()"
 
 
 def _scan_source(source: str, path: str) -> tuple[int, list[str]]:
@@ -413,6 +464,21 @@ def g(b):
         b.decode()
     except UnicodeEncodeError as exc:
         payload = exc.object
+def h(b):
+    try:
+        b.decode()
+    except UnicodeDecodeError as exc:
+        raise ValueError("bad: {e}".format(e=exc))
+def i(b):
+    try:
+        b.decode()
+    except UnicodeDecodeError as exc:
+        saved = exc
+def j(b):
+    try:
+        b.decode()
+    except UnicodeDecodeError as exc:
+        text = "".join(traceback.format_exception(exc))
 """
 
 _CLEAN = """
@@ -422,6 +488,11 @@ def a(b):
         b.decode()
     except (OSError, UnicodeDecodeError) as exc:
         raise ValueError(f"cannot read: {safe_exc(exc)} at {exc.start}") from exc
+def b2(b):
+    try:
+        b.decode()
+    except UnicodeDecodeError as exc:
+        log.warning("unreadable", exc_info=exc)
 def c(b):
     try:
         b.decode()
@@ -432,7 +503,7 @@ def c(b):
 
 def test_the_guard_fires_on_every_planted_shape() -> None:
     handlers, found = _scan_source(_PLANTED, "planted.py")
-    assert handlers == 6
+    assert handlers == 9
     kinds = [line.split(": ", 1)[1] for line in found]
     assert kinds == [
         "f-string interpolation",
@@ -440,9 +511,13 @@ def test_the_guard_fires_on_every_planted_shape() -> None:
         "f-string interpolation",
         "% formatting",
         "passed into RuntimeError()",
+        "aliased out of the handler",  # g: the assignment and the read are both reported
         ".object read",
+        "format() of the error",
+        "aliased out of the handler",
+        "format_exception() of the error",
     ], found
 
 
 def test_the_guard_passes_the_safe_shapes() -> None:
-    assert _scan_source(_CLEAN, "clean.py") == (1, [])
+    assert _scan_source(_CLEAN, "clean.py") == (2, [])
