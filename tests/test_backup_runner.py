@@ -679,6 +679,71 @@ async def test_server_db_skip_when_config_only_disabled(tmp_path, key_b64) -> No
     await store.close()
 
 
+# --- config bundle: a config editor's lock file and candidates are not config (vault BACKLOG #2782) ---
+
+
+async def test_add_config_dir_skips_edit_candidates_and_the_lock(
+    tmp_path, key_b64, monkeypatch
+) -> None:
+    """A candidate an edit is validating may be gone by the time the walk adds it, which used to fail
+    the pass; a killed editor's leftover candidate and the lock file are not config either."""
+    from messagefoundry.config import atomic_edit
+
+    store = await _store_with_rows(tmp_path / "msg.db", key_b64)
+    cfg = tmp_path / "config"
+    (cfg / "codesets").mkdir(parents=True)
+    (cfg / "feed.py").write_text("# router")
+    (cfg / "connections.toml").write_text("# live")
+    (cfg / atomic_edit.LOCK_FILE_NAME).write_text("")
+    live = cfg / f".connections.toml.abc12345{atomic_edit.CANDIDATE_DIR_SUFFIX}"
+    live.mkdir()
+    (live / "connections.toml").write_text("# candidate")
+    stale = cfg / "codesets" / f".diets.csv.zz998877{atomic_edit.CANDIDATE_DIR_SUFFIX}"
+    stale.mkdir()
+    (stale / "diets.csv").write_text("code,value\n")
+    # An operator's own hidden directory that only shares the suffix is config, and is archived.
+    golden = cfg / "fixtures" / ".golden.edit"
+    golden.mkdir(parents=True)
+    (golden / "a01.hl7").write_text("MSH|^~\\&|")
+
+    # The edit finishes after the walk listed its candidate: the directory is gone by its add.
+    real_add = tarfile.TarFile.add
+    vanished: list[Path] = []
+
+    def add(self: tarfile.TarFile, name: object, *args: object, **kwargs: object) -> None:
+        if live in Path(str(name)).parents:
+            shutil.rmtree(live, ignore_errors=True)
+            vanished.append(Path(str(name)))
+        real_add(self, name, *args, **kwargs)  # type: ignore[arg-type]
+
+    try:
+        monkeypatch.setattr(tarfile.TarFile, "add", add)
+        runner = BackupRunner(
+            store,
+            _settings(tmp_path / "b", key_b64),
+            store_settings=_store_settings(tmp_path / "msg.db", key_b64),
+            config_dir=cfg,
+        )
+        result = await runner.run_once(now=1.0)
+        assert result is not None and result.verify is not None and result.verify.status == "PASS"
+
+        import base64
+
+        with open(result.archive_path, "rb") as src:
+            names = _member_names(_decrypt_to_bytes(src, base64.b64decode(key_b64)))
+        config_names = sorted(n for n in names if n.startswith("config/"))
+        assert config_names == [
+            "config/connections.toml",
+            "config/feed.py",
+            "config/fixtures/.golden.edit/a01.hl7",
+        ]
+        assert stale.is_dir(), "control: the leftover was present for the whole pass"
+        assert vanished == [], "the walk never tried to add the candidate"
+    finally:
+        # Closed on every path: an open store's worker threads keep the test process alive.
+        await store.close()
+
+
 # --- config bundle: a symlink out of the config dir is excluded (no host-file smuggling) ---
 
 

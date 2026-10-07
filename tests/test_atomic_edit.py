@@ -434,3 +434,57 @@ def test_a_candidate_error_names_the_live_file(tmp_path: Path) -> None:
     ob["settings"] = {"host": "127.0.0.1", "port": 2702}
     connections_edit.upsert_connection(tmp_path, ob, validate=check)
     assert sources == [str(tmp_path / "connections.toml")] * 2
+
+
+def test_a_stale_candidate_is_removed_and_a_fresh_one_kept(tmp_path: Path) -> None:
+    """A killed editor's leftover candidate goes at the next edit of that file; one young enough to
+    be a live edit (on a file system that could not lock) is left alone."""
+    path = tmp_path / "messagefoundry.toml"
+    path.write_text(SETTINGS_TOML, encoding="utf-8")
+    stale = tmp_path / f".messagefoundry.toml.old12345{atomic_edit.CANDIDATE_DIR_SUFFIX}"
+    fresh = tmp_path / f".messagefoundry.toml.new12345{atomic_edit.CANDIDATE_DIR_SUFFIX}"
+    other = tmp_path / f".connections.toml.old12345{atomic_edit.CANDIDATE_DIR_SUFFIX}"
+    # A sibling file whose name extends this one's: the prefix alone would match its candidates.
+    sibling = tmp_path / f".messagefoundry.toml.bak.old12345{atomic_edit.CANDIDATE_DIR_SUFFIX}"
+    for leftover in (stale, fresh, other, sibling):
+        leftover.mkdir()
+        (leftover / "x").write_text("x", encoding="utf-8")
+    long_ago = os.stat(path).st_mtime - 3600
+    os.utime(stale, (long_ago, long_ago))
+    os.utime(other, (long_ago, long_ago))
+    os.utime(sibling, (long_ago, long_ago))
+    security_edit.set_security(path, {"require_mfa": False}, validate=_noop)
+    assert not stale.exists()
+    assert fresh.is_dir(), "a young candidate may be a live edit"
+    assert other.is_dir(), "another file's candidate is that file's editor's to clear"
+    assert sibling.is_dir(), "a sibling whose name extends this one's is another file"
+
+
+def test_the_candidate_name_rule_matches_the_real_mkdtemp(tmp_path: Path) -> None:
+    """The backup skip and the stale sweep both read candidates by name, so the rule is pinned to
+    the directory the edit really creates, not to a hand-written example."""
+    path = tmp_path / "messagefoundry.toml"
+    path.write_text(SETTINGS_TOML, encoding="utf-8")
+    seen: list[str] = []
+
+    def check(candidate: Path) -> None:
+        seen.append(candidate.parent.name)
+
+    security_edit.set_security(path, {"require_mfa": False}, validate=check)
+    assert len(seen) == 1
+    assert atomic_edit.is_candidate_dir_name(seen[0], of=path.name)
+    assert not atomic_edit.is_candidate_dir_name(seen[0], of="connections.toml")
+    # An operator's own hidden directories that only share the suffix are not candidates.
+    for name in (".edit", ".golden.edit", ".fixtures.v2.edit"):
+        assert not atomic_edit.is_candidate_dir_name(name), name
+
+
+@posix_only
+def test_a_lock_file_planted_as_a_link_is_refused(tmp_path: Path) -> None:
+    path = tmp_path / "messagefoundry.toml"
+    path.write_text(SETTINGS_TOML, encoding="utf-8")
+    target = tmp_path / "elsewhere"
+    target.write_text("", encoding="utf-8")
+    atomic_edit.lock_path_for(path).symlink_to(target)
+    with pytest.raises(TimeoutError, match="is a link"), atomic_edit.edit_lock(path):
+        pass
