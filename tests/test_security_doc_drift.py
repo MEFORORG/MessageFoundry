@@ -93,10 +93,10 @@ _H_CONTEXT = "### Contextual and environmental security inputs (ASVS 8.1.3 / 8.1
 # /ui/connection/{name}/events/{event_id}/reason. The JSON reveal is a query parameter.
 # BACKLOG #2460 added one /ui route and no JSON route: POST /ui/approvals/{approval_id}/resolve/
 # {outcome}, the console's resolve of an interrupted release.
+# Vault BACKLOG #2625 added one /ui route and no JSON route: GET /ui/messages/{message_id}/resend-done.
 # BACKLOG #2331 added one JSON route: GET /users/{user_id}/federated-identity, users:manage.
 _ROUTES_DEFAULT = 116
 _ROUTES_WITH_DOCS = 120
-# Vault BACKLOG #2625 added one console route: GET /ui/messages/{message_id}/resend-done.
 _ROUTES_WITH_UI = 242
 
 #: The ``/ui`` routes that legitimately carry no gate: the sign-in, re-auth and second-factor entry
