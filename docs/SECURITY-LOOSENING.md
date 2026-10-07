@@ -766,7 +766,7 @@ This section is kept rather than deleted, because the claim it used to make is t
   that provider really uses with no human step.
 - **Compensating controls:** keep `oidc_callback_min_elapsed_seconds` at its default, so every other
   method stays floored. Each exempted pass records the matched values as `callback_floor_exempt_amr`,
-  under `evidence` on a sign-in's `auth.login_success` row and on a step-up's `auth.reauth` row, so
+  under `evidence` on a sign-in's `auth.login_success` row and at the top of a step-up's `auth.reauth` row, so
   review those rows. Load refuses a value `oidc_mfa_amr_values` also accepts while the claim gate is
   on, since that value would exempt every token the gate admits by it.
 - **Reversible:** yes, immediately — empty the list (or delete the line) and restart.

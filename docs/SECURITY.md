@@ -627,7 +627,10 @@ below that, at 1 s, because M is an average and some people are faster. The comm
   refused at load while the claim gate is on. Each exempted pass records the matched values as
   `callback_floor_exempt_amr`: under `evidence` on the `auth.login_success` row of a sign-in, and at
   the top of the `auth.reauth` row of a step-up. With the list set, a too-early step-up's code is
-  redeemed before the refusal, because only the exchange yields the `amr`.
+  redeemed before the refusal, because only the exchange yields the `amr`. The exemption lifts
+  only the floor. While `oidc_require_mfa_claim` is on, the token must still carry another `amr`
+  in `oidc_mfa_amr_values` or an `acr` in `oidc_required_acr_values`, so an IdP that sends only
+  the exempt value is refused as `mfa_claim_missing`.
 - The MFA floor compares two wall-clock readings, as the approval dwell does. A clock step backward
   refuses a good code until the clocks agree again. A step forward lets a code through early.
 - The response hides the reason, but the audit row names it. The account holder's own security
@@ -4022,7 +4025,7 @@ nothing to match is refused. `_check_mfa_gate` also ignores a blank configured v
 - A requested class that `oidc_required_acr_values` does not list. `messagefoundry check` notes it
   (`_check_oidc_auth_params` in `checks.py`).
 
-This paragraph was read against engine commit `b2d2b908f0` with the BACKLOG #2325 change applied.
+This paragraph was read against engine commit `f1b813bce6` with the BACKLOG #2325 change applied.
 The key's row is in the `[auth]` table of
 [CONFIGURATION.md](CONFIGURATION.md#auth--authentication--rbac).
 
