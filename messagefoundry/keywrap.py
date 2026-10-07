@@ -33,7 +33,8 @@ does not list (:func:`pkcs12_wrap_refusal`). The MAC rule holds whether or not t
 encrypted; only a bundle with clear bags and no MAC at all derives nothing from a password, and it
 passes. SSH keys cannot reach an approved derivation at all,
 so the SFTP connector refuses an encrypted one outright (:func:`ssh_key_encrypted`). A database
-driver's own client key (libpq ``sslkey``) is checked as a key file before the driver opens it.
+driver's own client key is checked as a key file before the driver opens it, when ``odbc_params``
+names it with ``sslkey``; a key libpq finds by itself (``PGSSLKEY``, its default path) is not.
 
 What this does NOT check, so a reader does not assume it: the content cipher inside PBES2 (that is a
 cipher question, not a derivation one), the inside of a PKCS#12 part that is itself encrypted

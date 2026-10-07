@@ -522,7 +522,9 @@ def _refuse_weak_driver_key(named: Mapping[str, Any], *, connection: str | None 
 
     ``named`` maps each keyword, in the form :func:`_odbc_keyword_name` gives, to its value. The
     builder has already refused a keyword given twice, so the copy read here is the copy the driver
-    reads."""
+    reads. It has also refused ``pqopt``, so psqlODBC cannot be handed a second key there. A key the
+    driver finds without ``sslkey`` (libpq's ``PGSSLKEY`` or its default path) is not checked
+    (BACKLOG #2423)."""
     key_path = named.get("sslkey")
     if not key_path:
         return

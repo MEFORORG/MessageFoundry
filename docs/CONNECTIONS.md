@@ -2895,9 +2895,13 @@ Or skip PKCS#12 and give the certificate and key as PEM files.
 native API client's key. An encrypted key there is refused; supply it unencrypted and protect the
 file or secret store instead. The SFTP key must also be RSA-2048 or larger.
 
-**A database driver's client key** (`sslkey` in a generic `Database(...)`'s `odbc_params`, with
-`sslpassword` for its passphrase) is checked the same way before the connection string reaches the
-driver. The driver still decrypts it.
+**A database driver's client key named by `sslkey`** in a generic `Database(...)`'s `odbc_params`
+(with `sslpassword` for its passphrase) is checked the same way before the connection string reaches
+the driver. The driver still decrypts it. That keyword is the only key the engine checks. psqlODBC's
+`pqopt`, which could name a second key, is refused on this dialect. A key the driver finds by itself
+is not checked. With no `sslkey`, libpq reads the service's `PGSSLKEY` environment variable, or else
+its default key file: `%APPDATA%\postgresql\postgresql.key` on Windows, `~/.postgresql/postgresql.key`
+elsewhere. Name the key with `sslkey`, or keep a weakly wrapped key out of those places.
 
 ## Declaring a cleartext hop (`cleartext_accepted`)
 

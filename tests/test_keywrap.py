@@ -968,6 +968,31 @@ def test_a_database_driver_key_needs_its_sslpassword_and_passes_when_approved(
     assert "sslkey=" not in _odbc(tmp_path, None, None)
 
 
+@pytest.mark.parametrize("spelling", ["pqopt", "PQOPT", "PqOpt"])
+def test_a_driver_key_passed_through_pqopt_is_refused(
+    tmp_path: Path, material: Material, spelling: str
+) -> None:
+    # BACKLOG #2423. psqlODBC hands pqopt to libpq whole, so a key named there would reach the
+    # driver without the wrap check. pqopt is refused outright, before any key file is read. The
+    # control is the same weak key under bare sslkey, which the wrap check refuses.
+    from messagefoundry.transports.database import _build_odbc_dsn
+
+    weak = _write(tmp_path, "client.key", material.wraps["best-available-2048"])
+    settings = {
+        "dialect": "generic",
+        "odbc_driver": "PostgreSQL Unicode",
+        "server": "db.test",
+        "odbc_params": {"SSLmode": "verify-full", spelling: f"sslkey={weak}"},
+    }
+    with pytest.raises(ValueError, match="must not set") as refused:
+        _build_odbc_dsn(settings)
+    assert not isinstance(refused.value, KeyWrapRefused)
+    assert weak not in str(refused.value)
+    settings["odbc_params"] = {"SSLmode": "verify-full", "sslkey": weak, "sslpassword": _PASSPHRASE}
+    with pytest.raises(KeyWrapRefused, match="2048 iterations"):
+        _build_odbc_dsn(settings)
+
+
 @pytest.mark.parametrize("keyword", ["sslkey", "sslpassword"])
 def test_a_driver_key_keyword_given_twice_in_different_case_is_refused(
     tmp_path: Path, material: Material, keyword: str
