@@ -552,7 +552,10 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    key, then drop the retired key. `rotate-key` also opens a new range of the audit chain under the new
    key and verifies the chain first; do not drop the retired key until it has printed its audit line
    without an error ([ADR 0193](adr/0193-audit-chain-key-ranges-survive-a-store-key-rotation.md),
-   BACKLOG #1904). The same command re-seals the uploaded-file store, and on a first key-enable it
+   BACKLOG #1904). Keep the retired key through the engine's first start after the rotation too: the
+   secret-rotation watcher's fingerprints are keyed off the store key, and that start re-keys them.
+   With the retired key in hand, a secret changed in the same window still reads as rotated; without
+   it the watcher keeps each secret's older date and logs a warning (BACKLOG #2242). The same command re-seals the uploaded-file store, and on a first key-enable it
    seals the plaintext uploads a keyed store refuses until then (BACKLOG #1169). An undecryptable
    value (corrupt blob / missing key) is contained —
    the row is dead-lettered, never crashes a worker.

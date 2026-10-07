@@ -39,10 +39,12 @@ _AD = "MEFOR_AUTH_AD_BIND_PASSWORD"
 _OLD = "2020-01-01"
 _VALUE = "test-only-bind-password"  # nosec B105 - a test value, never a real credential
 _UTC = datetime.UTC
-_TODAY = datetime.datetime.now(tz=_UTC).date()
+# A fixed clock for the reconcile, so a run across UTC midnight cannot flake the date asserts.
+_NOW = datetime.datetime(2026, 6, 15, 12, 0, tzinfo=_UTC)
+_TODAY = _NOW.date()
 
 
-async def _seed_under(path: Path, dek: str) -> None:
+async def _seed_under(path: Path, dek: str, *, last_rotated: str = _OLD) -> None:
     """A keyed store holding an AD-password stamp from 2020, fingerprinted under ``dek``."""
     store = await MessageStore.open(path, cipher=make_cipher(dek))
     try:
@@ -52,7 +54,7 @@ async def _seed_under(path: Path, dek: str) -> None:
             _AD,
             fingerprint=sr._keyed_fingerprint(fp_key, _VALUE),
             tracked_since=_OLD,
-            last_rotated=_OLD,
+            last_rotated=last_rotated,
         )
     finally:
         await store.close()
@@ -70,6 +72,7 @@ async def _reconcile_after_rotation(
             SecretRotationSettings(),
             dek_key_id=store.cipher_info().active_key_id,
             enforcement=SecurityEnforcement.WARN,
+            now=_NOW.timestamp(),
             env_values={_AD: value},
             prior_fingerprint_keys=rotation_fingerprint_keys(store.cipher()),
         )
@@ -113,6 +116,16 @@ async def test_with_the_prior_dek_dropped_the_age_is_kept_and_the_gap_is_logged(
     assert stamps[_AD].last_rotated == datetime.date.fromisoformat(_OLD)
     assert "no longer configured" in caplog.text and _AD in caplog.text
     assert _VALUE not in caplog.text
+
+
+async def test_a_malformed_stored_date_on_a_rekey_reads_as_rotated_not_a_failure(
+    tmp_path: Path,
+) -> None:
+    """The row is writable out of band. A date that does not parse must not fail the reconcile."""
+    path, a, b = tmp_path / "malformed.db", generate_key(), generate_key()
+    await _seed_under(path, a, last_rotated="not-a-date")
+    stamps, _stored = await _reconcile_after_rotation(path, retired=(a,), value=_VALUE, new_dek=b)
+    assert stamps[_AD].last_rotated == _TODAY
 
 
 async def test_control_a_changed_secret_under_the_same_dek_reads_as_rotated(

@@ -8145,7 +8145,9 @@ def _rotate_key(args: argparse.Namespace) -> int:
         from messagefoundry.pipeline.secret_rotation import fingerprints_equal
         from messagefoundry.store.store import SecretRotationMetaStore
 
-        store = await open_store(settings.store)
+        # BACKLOG #2109: in vault_transit mode the Transit key-type check runs inside this open, not
+        # at resolve_active_key above, so its refusal needs the same clean exit 2.
+        store = await _open_store_or_refuse_the_key(open_store(settings.store))
         try:
             count = await store.reencrypt_to_active()
             # BACKLOG #1169: the uploaded-file store is the OTHER surface this cipher covers, and it
@@ -8211,9 +8213,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
     except (NotImplementedError, StoreNotFoundError) as exc:  # #1780: no store there
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    except _key_unresolved() as exc:
-        # BACKLOG #2109: in vault_transit mode the Transit key-type check runs here, inside
-        # open_store, not at resolve_active_key above. It is raised before any row is touched.
+    except _StoreKeyUnresolved as exc:  # #2109: the open refused the key; nothing was changed
         print(f"error: cannot open the store for rotation: {exc}", file=sys.stderr)
         return 2
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
@@ -9403,7 +9403,8 @@ async def _open_store_or_refuse_the_key(opening: Awaitable[Store]) -> Store:
     """Await a store open, turning a key that cannot be resolved into :class:`_StoreKeyUnresolved`.
 
     For ``audit-verify`` and ``audit-anchor``, where the dispatch floor's exit 1 is a broken chain's
-    code. Only the OPEN is wrapped: ``open_store`` resolves the key before the backend reads a row,
+    code, and for ``rotate-key``, where it is an aborted rotation's (BACKLOG #2109). Only the OPEN
+    is wrapped: ``open_store`` resolves the key before the backend reads a row,
     so nothing a database holds can turn a finding into "could not start". A malformed key raises
     ``ValueError``, which is not caught, because the open raises ``ValueError`` for other reasons too.
     """

@@ -209,35 +209,42 @@ def _keyed_fingerprint(key: bytes, value: str) -> str:
 
 
 def _rekeyed(
-    stored: str, value: str, current_key: bytes, prior_keys: Collection[bytes]
+    stored: str, value: str, current_id: str, prior_keys: Mapping[str, bytes]
 ) -> bool | None:
-    """Whether a ``stored`` fingerprint that differs from ``value``'s under ``current_key`` is a
-    RE-KEY rather than a rotation (BACKLOG #2242).
+    """Whether a ``stored`` fingerprint that differs from ``value``'s under the current key (id
+    ``current_id``) is a RE-KEY rather than a rotation (BACKLOG #2242). ``prior_keys`` maps each
+    retired fingerprint key's id to the key.
 
-    ``True`` when ``stored`` is ``value``'s fingerprint under one of ``prior_keys``: the secret is the
-    same and only the DEK-derived key moved.
-
-    ``None`` when the key that made ``stored`` is not in hand, which happens once the retired DEK is
-    dropped: nothing can tell whether the secret changed. The caller keeps the older date. That
-    direction can only over-report an age; resetting the clock instead is what lifted every overdue
-    refusal on a DEK rotation.
+    ``True`` when ``stored`` is ``value``'s fingerprint under the prior key it names: the secret is
+    the same and only the DEK-derived key moved.
 
     ``False`` when the key that made ``stored`` is in hand and ``value`` does not match under it: a
-    real rotation, including one made together with a DEK rotation."""
-    stored_bytes = _fingerprint_bytes(stored)
-    current_id = _fingerprint_key_id(current_key)
-    # The key ids are non-secret (stored beside the MAC), so a plain lookup is fine for them; the
-    # MACs themselves go through compare_digest, as everywhere in this module (ASVS 11.2.4).
-    in_hand = {current_id}
-    for key in prior_keys:
-        key_id = _fingerprint_key_id(key)
-        if key_id == current_id:
-            continue
-        in_hand.add(key_id)
-        if hmac.compare_digest(stored_bytes, _fingerprint_bytes(_keyed_fingerprint(key, value))):
-            return True
+    real rotation, including one made together with a DEK rotation.
+
+    ``None`` when the key that made ``stored`` is not in hand, which happens once the retired DEK is
+    dropped, or when ``stored`` names no key: nothing can tell whether the secret changed. The caller
+    keeps the older date. That direction can only over-report an age; resetting the clock instead is
+    what lifted every overdue refusal on a DEK rotation."""
+    # The key id is non-secret (stored beside the MAC), so a plain lookup is fine for it; the MAC
+    # goes through compare_digest, as everywhere in this module (ASVS 11.2.4).
     stored_id, sep, _mac = stored.partition(":")
-    return None if not sep or stored_id not in in_hand else False
+    if sep and stored_id == current_id:
+        return False
+    key = prior_keys.get(stored_id) if sep else None
+    if key is None:
+        return None
+    return hmac.compare_digest(
+        _fingerprint_bytes(stored), _fingerprint_bytes(_keyed_fingerprint(key, value))
+    )
+
+
+def _parsed_date(text: str) -> datetime.date | None:
+    """``text`` as an ISO date, or ``None`` when it is not one. ``secret_rotation_meta`` is writable
+    out of band, and one malformed date must not fail the reconcile for every class."""
+    try:
+        return datetime.date.fromisoformat(text)
+    except ValueError:
+        return None
 
 
 def held_env_secret_values(environ: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -365,7 +372,11 @@ async def reconcile_rotation_meta(
             (_DEK_CLASS_ID, _DEK_LABEL, dek_key_id, settings.store_key_max_age_days, None)
         )
     fp_key = meta_store.secret_rotation_fingerprint_key()
+    current_id = ""
+    prior_keys: dict[str, bytes] = {}
     if fp_key is not None:
+        current_id = _fingerprint_key_id(fp_key)
+        prior_keys = {_fingerprint_key_id(k): k for k in prior_fingerprint_keys}
         held: dict[str, str] = dict(held_env_secret_values(env_values))
         if extra_values:  # per-Connection env() credentials the engine resolved (same mechanism)
             held.update(extra_values)
@@ -376,6 +387,7 @@ async def reconcile_rotation_meta(
             classes.append((class_id, label, fingerprint, settings.secret_max_age_days, held_value))
 
     stamps: dict[str, SecretStamp] = {}
+    undecided: list[str] = []  # re-keyed with the prior key not in hand (BACKLOG #2242)
     for class_id, label, fingerprint, max_age, value in classes:
         prior = stored.get(class_id)
         if prior is None:
@@ -395,26 +407,18 @@ async def reconcile_rotation_meta(
             tracked_since = datetime.date.fromisoformat(prior.tracked_since)
             rekeyed = (
                 False
-                if value is None or fp_key is None
-                else _rekeyed(prior.fingerprint, value, fp_key, prior_fingerprint_keys)
+                if value is None  # the DEK row: its fingerprint is its key-id, never re-keyed
+                else _rekeyed(prior.fingerprint, value, current_id, prior_keys)
             )
-            if rekeyed is False:
-                last_rotated = today  # rotation auto-detected → reset the clock
+            kept = _parsed_date(prior.last_rotated) if rekeyed is not False else None
+            if kept is None:
+                last_rotated = today  # rotation auto-detected, so reset the clock
             else:
                 # BACKLOG #2242: the fingerprint key moved with the DEK. Re-fingerprint under the
                 # current key and keep the age, or a DEK rotation would reset every class's clock.
-                last_rotated = datetime.date.fromisoformat(prior.last_rotated)
+                last_rotated = kept
                 if rekeyed is None:
-                    log.warning(
-                        "secret rotation: %s was fingerprinted under a store key that is no longer "
-                        "configured, so a change to it cannot be told from the store key's own "
-                        "rotation. Its last-rotated date (%s) is kept, so a change made at the same "
-                        "time is not detected. Keeping the prior key in "
-                        "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED for the first start after rotate-key "
-                        "avoids this.",
-                        class_id,
-                        prior.last_rotated,
-                    )
+                    undecided.append(class_id)
             changed = True
         else:
             tracked_since = datetime.date.fromisoformat(prior.tracked_since)
@@ -434,6 +438,17 @@ async def reconcile_rotation_meta(
             tracked_since=tracked_since,
             last_rotated=last_rotated,
             max_age_days=max_age,
+        )
+    if undecided:
+        # One line for the lot: a graph with many connector credentials would otherwise log one
+        # warning per credential on the same start. Ids only, never a value.
+        log.warning(
+            "secret rotation: %d secret(s) were fingerprinted under a store key that is no longer "
+            "configured, so a change made with the store key's rotation cannot be detected: %s. "
+            "Their last-rotated dates are kept. Keeping the prior key in "
+            "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED for the first start after rotate-key avoids this.",
+            len(undecided),
+            ", ".join(undecided),
         )
 
     _maybe_escalate_dek(
