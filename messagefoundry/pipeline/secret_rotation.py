@@ -460,14 +460,15 @@ async def reconcile_rotation_meta(
         )
     if undecided:
         # One line for the lot: a graph with many connector credentials would otherwise log one
-        # warning per credential on the same start. Ids only, never a value.
+        # warning per credential on the same start. The COUNT only: a class id names a secret (for a
+        # Connection credential it is the env() key), and nothing derived from the secret-bearing
+        # tuples reaches the general log -- CodeQL's clear-text-logging rule flags exactly that.
         log.warning(
             "secret rotation: %d secret(s) were fingerprinted under a store key that is no longer "
-            "configured, so a change made with the store key's rotation cannot be detected: %s. "
+            "configured, so a change made with the store key's rotation cannot be detected. "
             "Their last-rotated dates are kept. Keeping the prior key in "
             "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED for the first start after rotate-key avoids this.",
             len(undecided),
-            ", ".join(undecided),
         )
 
     _maybe_escalate_dek(

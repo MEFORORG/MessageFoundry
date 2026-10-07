@@ -114,7 +114,11 @@ async def test_with_the_prior_dek_dropped_the_age_is_kept_and_the_gap_is_logged(
     with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.secret_rotation"):
         stamps, _stored = await _reconcile_after_rotation(path, retired=(), value=_VALUE, new_dek=b)
     assert stamps[_AD].last_rotated == datetime.date.fromisoformat(_OLD)
-    assert "no longer configured" in caplog.text and _AD in caplog.text
+    warned = [r for r in caplog.records if "no longer configured" in r.getMessage()]
+    assert len(warned) == 1
+    assert warned[0].getMessage().startswith("secret rotation: 1 secret(s) were fingerprinted")
+    # The count only: neither the class id (it names the secret) nor the value reaches the log.
+    assert _AD not in caplog.text
     assert _VALUE not in caplog.text
 
 
