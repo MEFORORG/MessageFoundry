@@ -11,6 +11,7 @@ key that is not a full DN. Every directory value below is synthetic.
 
 from __future__ import annotations
 
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -256,6 +257,34 @@ def test_distinct_groups_keep_distinct_canonical_forms(one: str, other: str) -> 
     assert a.strip().lower() != b.strip().lower()
     for key in (a, b):
         assert key.isascii() and key.isprintable() and key == key.lower(), key
+
+
+#: Inputs of about 50,000 characters shaped to make a backtracking parser slow. The first three
+#: target the attribute type, which a nested-quantifier regex checked before this item's ReDoS fix.
+#: Each case is ``id: (text, valid)``; the id keeps a 50,000-character string out of the test name.
+_PATHOLOGICAL_DNS = {
+    "oid-failing-at-its-end": ("1" + ".1" * 25_000 + "x=v,DC=example", False),
+    "oid-valid": ("1" + ".1" * 25_000 + "=v,DC=example", True),
+    "descr-failing-at-its-end": ("a" * 50_000 + "!=v,DC=example", False),
+    "padding-only": ("CN=" + " " * 50_000 + ",DC=example", False),
+    "escaped-spaces": ("CN=" + "\\ " * 25_000 + "a,DC=example", True),
+    "half-hex-escapes": ("CN=" + "\\2" * 25_000 + ",DC=example", True),
+    "many-rdns": ("CN=a" + ",DC=x" * 10_000, True),
+    "huge-multi-valued-rdn": ("CN=a" + "+OU=b" * 10_000 + ",DC=x", True),
+}
+
+
+@pytest.mark.parametrize(
+    ("text", "valid"), list(_PATHOLOGICAL_DNS.values()), ids=list(_PATHOLOGICAL_DNS)
+)
+def test_a_pathological_dn_is_judged_in_linear_time(text: str, valid: bool) -> None:
+    """Group DNs come from operator config and from the directory, so the parser must not
+    backtrack on either. The bound is loose for a slow runner; a linear pass takes milliseconds."""
+    started = time.perf_counter()
+    result = canonical_group_dn(text)
+    elapsed = time.perf_counter() - started
+    assert (result is not None) is valid
+    assert elapsed < 1.0, f"{elapsed:.3f}s for {len(text)} characters"
 
 
 def test_resolve_groups_counts_a_dropped_dn_at_debug(caplog: pytest.LogCaptureFixture) -> None:

@@ -456,9 +456,23 @@ def _cn_of(dn: str) -> str | None:
 _GROUP_DN_MIN_RDNS = 2
 
 
-#: An attribute type: a name (RFC 4512 ``descr``) or a dotted OID.
-_DN_ATTR_TYPE = re.compile(r"[A-Za-z][A-Za-z0-9-]*|[0-9]+(?:\.[0-9]+)*")
+_ASCII_LETTERS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
+_ASCII_DIGITS = frozenset("0123456789")
+_DESCR_REST = _ASCII_LETTERS | _ASCII_DIGITS | {"-"}
 _HEX = frozenset("0123456789abcdefABCDEF")
+
+
+def _is_dn_attr_type(name: str) -> bool:
+    """Whether ``name`` is an attribute type: a name (RFC 4512 ``descr``) or a dotted OID.
+
+    A character loop rather than a regex, so the parser holds no quantified group a static ReDoS
+    scan must clear (BACKLOG #2610). ASCII only, as ``[0-9]`` was: ``str.isdigit`` would admit
+    other scripts' digits."""
+    if name[:1] in _ASCII_LETTERS:
+        return all(ch in _DESCR_REST for ch in name[1:])
+    return all(part and all(ch in _ASCII_DIGITS for ch in part) for part in name.split("."))
+
+
 #: Characters a canonical value escapes with a backslash wherever they appear (RFC 4514 section 2.4).
 _DN_ESCAPED = frozenset('\\"+,;<>')
 #: The one padding token: an unescaped space at either end of a value (RFC 4514 section 3). Only a
@@ -563,7 +577,7 @@ def canonical_group_dn(text: str) -> str | None:
                 return None  # a separator before any "="
             if ch == "=":
                 name = text[start:i].strip()
-                if not _DN_ATTR_TYPE.fullmatch(name):
+                if not _is_dn_attr_type(name):
                     return None
                 attr, tokens = name.lower(), []
             i += 1
