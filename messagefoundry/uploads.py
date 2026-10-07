@@ -96,6 +96,13 @@ _ORPHAN_MIN_AGE_SECONDS = 3600.0
 # logged and left running (UploadStore._leave_running).
 _LEDGER_CANCEL_WAIT_SECONDS = 5.0
 
+# How often a save that holds a cross-shard reservation touches the ledger row, so a slow save keeps
+# its slot past ``store.base.UPLOAD_RESERVATION_STALE_AFTER`` (300 s) instead of having it reclaimed
+# by a sibling shard's reserve (BACKLOG #2648). A third of that window, so the row goes stale only
+# after two touches in a row are missed. Written out rather than imported to keep this module a
+# leaf; a test pins the ratio.
+_RESERVATION_HEARTBEAT_SECONDS = 100.0
+
 # How much of a refused plaintext sidecar the quota reads to find the uploader it bills (BACKLOG
 # #2322). A sidecar the engine wrote is a few hundred bytes. Past this the owner counts as unknown.
 _UNSEALABLE_OWNER_READ_LIMIT = 64 * 1024
@@ -215,9 +222,17 @@ class UploadQuotaError(UploadError):
       *subsequent* release by the same uploader pushes the staleness clock forward. **It self-heals
       only while that uploader is otherwise IDLE.** A uploader who keeps uploading successfully can
       hold a leaked slot indefinitely, and the reserve path's own staleness reset never fires for it.
-    * **A reclaimed live reservation.** If one uploader keeps reservations continuously outstanding
-      for longer than that window, the staleness reset zeroes a row that was legitimately non-zero,
-      which restores the N-1 bound above for that window. Never worse than the pre-#1112 behaviour.
+    * **A reclaimed live reservation (BACKLOG #2648).** The store reclaims a row with no activity
+      for ``UPLOAD_RESERVATION_STALE_AFTER``, and it cannot tell a dead holder from a slow one.
+      Every applied reserve moves the row's clock, and a live save touches it every
+      ``_RESERVATION_HEARTBEAT_SECONDS`` (:meth:`UploadStore._start_heartbeat`), so a slow save
+      keeps its slot. A live slot is still reclaimed when its holder lands no touch for the whole
+      window while it is alive: a suspended process or VM, an event loop starved for minutes, or
+      a store this shard cannot reach while a sibling can. A sibling then counts neither that file
+      nor its slot, and the holder's later release erases a sibling's slot, so the undercount
+      lasts until the ledger next drains to zero. That restores the N-1 bound above while it
+      lasts, never worse than the pre-#1112 behaviour. The window is accepted: closing it needs
+      one ledger row per reservation, a store-contract change across three backends.
 
     The ledger is checked and paid back around the write, not in the same transaction as it, because
     the body lives on the filesystem rather than in the store. The ordering above is what stands in
@@ -566,6 +581,9 @@ class UploadStore:
         # Ledger calls a cancelled save stopped waiting for (BACKLOG #2263), held until they finish:
         # the loop holds a Task only weakly. See _leave_running.
         self._stragglers: set[asyncio.Future[Any]] = set()
+        # Live saves' reservation heartbeats (BACKLOG #2648), held for the same reason. Each ends
+        # once its save sets the stop Event. See _start_heartbeat.
+        self._heartbeats: set[asyncio.Future[None]] = set()
         # Body name -> ((mtime_ns, size), decodes as text). Checking a body means reading it whole,
         # and every save's quota scan asks, so a body that has not changed is not read twice.
         self._body_checks: dict[str, tuple[tuple[int, int], bool]] = {}
@@ -971,6 +989,9 @@ class UploadStore:
                 reserved = await self._reserve_across_shards(
                     uploader_id=uploader_id, uploader=uploader, size=len(data)
                 )
+                stop_heartbeat = asyncio.Event()
+                if reserved:
+                    self._start_heartbeat(uploader_id, stop_heartbeat)
                 try:
                     in_flight = (
                         await self._ledger.upload_quota_in_flight(uploader_id)
@@ -979,6 +1000,7 @@ class UploadStore:
                     )
                     return await _to_thread_to_completion(_build_and_write, in_flight)
                 finally:
+                    stop_heartbeat.set()
                     if reserved:
                         await self._release_across_shards(uploader_id=uploader_id, size=len(data))
         except asyncio.CancelledError:
@@ -1098,6 +1120,35 @@ class UploadStore:
             )
             return False
         return reserve.result()
+
+    def _start_heartbeat(self, uploader_id: str, stop: asyncio.Event) -> None:
+        """Touch this save's ledger row every ``_RESERVATION_HEARTBEAT_SECONDS`` until ``stop`` is
+        set, so a slow save keeps its slot (BACKLOG #2648; :class:`UploadQuotaError` states the
+        residual). The touch is a release of zero files and zero bytes: it changes no count and only
+        moves the row's clock. So a touch that lands after the save's release is harmless, and
+        ``stop`` is a signal, never a wait. A failed touch is logged and the next one tried."""
+        ledger = self._ledger
+        if ledger is None:
+            return
+
+        async def _beat() -> None:
+            while not stop.is_set():
+                try:
+                    await asyncio.wait_for(stop.wait(), _RESERVATION_HEARTBEAT_SECONDS)
+                except TimeoutError:
+                    try:
+                        await ledger.reserve_upload_quota(uploader_id, files=0, size_bytes=0)
+                    except Exception:  # noqa: BLE001 — a missed touch must not fail the upload
+                        _log.warning(
+                            "could not refresh the cross-shard upload reservation for %s; it may "
+                            "be reclaimed if the upload outlasts the staleness window",
+                            uploader_id,
+                            exc_info=True,
+                        )
+
+        task = asyncio.ensure_future(_beat())
+        self._heartbeats.add(task)
+        task.add_done_callback(self._heartbeats.discard)
 
     def _leave_running(
         self, fut: asyncio.Future[Any], *, what: str, uploader_id: str, size: int

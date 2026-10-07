@@ -39,6 +39,8 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry import uploads as uploads_mod
+from messagefoundry.store.base import UPLOAD_RESERVATION_STALE_AFTER
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
 from messagefoundry.uploads import UploadedFileMeta, UploadQuotaError, UploadStore
@@ -232,6 +234,103 @@ def test_a_leaked_reservation_is_reclaimed_once_it_goes_stale(tmp_path: Path) ->
             await store.close()
 
     asyncio.run(_run())
+
+
+def test_a_live_reserve_joining_an_old_row_is_not_reclaimed_with_it(tmp_path: Path) -> None:
+    """BACKLOG #2648. Shard A's slot leaked, then shard B reserved and is mid-write. A reserve that
+    arrives once A's slot is past the window but B's is not must still count B. The reserve used
+    to keep the row's old clock when it joined a non-zero row, so the reset dropped B's live slot
+    along with A's leaked one, and shard C counted neither B's file nor B's slot."""
+
+    async def _run() -> None:
+        store = await MessageStore.open(tmp_path / "engine.db")
+        try:
+
+            async def _reserve(stale_after: float = UPLOAD_RESERVATION_STALE_AFTER) -> bool:
+                return await store.reserve_upload_quota(
+                    "u-alice",
+                    files=1,
+                    size_bytes=10,
+                    max_files=10,
+                    max_total_bytes=1000,
+                    stale_after=stale_after,
+                )
+
+            assert await _reserve()  # shard A, never released
+            await asyncio.sleep(0.3)
+            assert await _reserve()  # shard B, mid-write
+            # Shard C: A's slot is twice the window old, B's is well inside it.
+            assert await _reserve(stale_after=0.15)
+            # B's reserve moved the clock, so nothing was reclaimed: A's leaked slot stays while the
+            # row is active (it clears once the uploader is idle), and B's live slot is counted.
+            assert await store.upload_quota_in_flight("u-alice") == (3, 30)
+        finally:
+            await store.close()
+
+    asyncio.run(_run())
+
+
+@pytest.mark.parametrize(("heartbeat", "reclaimed"), [(0.05, False), (3600.0, True)])
+def test_a_slow_save_keeps_its_slot_past_the_staleness_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, heartbeat: float, reclaimed: bool
+) -> None:
+    """BACKLOG #2648. Shard A's save is held mid-write for twice the staleness window, and then a
+    sibling shard reserves against a budget of one file. With the heartbeat the sibling sees A's
+    slot and is refused. The 3600 s arm is the control: no touch lands in time, the store reclaims
+    A's live slot, and the sibling's reserve applies, which is the double-book this closes."""
+    monkeypatch.setattr(uploads_mod, "_RESERVATION_HEARTBEAT_SECONDS", heartbeat)
+
+    async def _run() -> bool:
+        store = await MessageStore.open(tmp_path / "engine.db")
+        try:
+            uploads = UploadStore(
+                tmp_path / "uploads",
+                make_cipher(generate_key()),
+                max_bytes=4096,
+                max_files_per_user=1,
+                store=store,
+            )
+            entered, gate = threading.Event(), threading.Event()
+            real_encrypt = uploads._encrypt_blob
+
+            def _held(data: bytes, file_id: str) -> str:
+                entered.set()
+                gate.wait(timeout=30)
+                return real_encrypt(data, file_id)
+
+            uploads._encrypt_blob = _held  # type: ignore[method-assign]
+            save = asyncio.ensure_future(
+                uploads.save(
+                    data=b"slow\n", filename="a.txt", uploader="alice", uploader_id="u-alice"
+                )
+            )
+            assert await asyncio.to_thread(entered.wait, 30), "the save never reached its write"
+            await asyncio.sleep(0.3)
+            try:
+                applied = await store.reserve_upload_quota(
+                    "u-alice",
+                    files=1,
+                    size_bytes=5,
+                    max_files=1,
+                    max_total_bytes=4096,
+                    stale_after=0.15,
+                )
+            finally:
+                gate.set()
+            await save
+            if uploads._heartbeats:
+                await asyncio.wait(set(uploads._heartbeats), timeout=10)
+            return applied
+        finally:
+            await store.close()
+
+    assert asyncio.run(_run()) is reclaimed
+
+
+def test_the_heartbeat_fits_three_times_inside_the_staleness_window() -> None:
+    """The heartbeat interval is written out in ``uploads`` to keep that module a leaf. Pin it to
+    the store's window, so a change to either cannot leave a live save reclaimable."""
+    assert uploads_mod._RESERVATION_HEARTBEAT_SECONDS * 3 <= UPLOAD_RESERVATION_STALE_AFTER
 
 
 def test_an_unbound_upload_store_still_enforces_the_in_process_budget(tmp_path: Path) -> None:
