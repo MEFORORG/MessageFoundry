@@ -70,17 +70,194 @@ async def _assert_pending_approval_contract(store: Any) -> None:
         # The two must not be the same value; keying on an id that is really a name fixes nothing.
         assert str(row["requester_user_id"]) != str(row["requester"])
 
-        # The pending queue projects the display label only -- the id is read on the approve path via
-        # get_pending_approval. Pinned so a backend adding it to this projection is a deliberate act.
+        # The pending queue projects the label AND the id, so it can tell a caller the request is
+        # their own (BACKLOG #2460). Compare the values, for the reason the read above gives.
         listed = await store.list_pending_approvals(now=1_001.0)
         mine = [r for r in listed if str(r["id"]) == approval_id]
         assert len(mine) == 1
         assert str(mine[0]["requester"]) == _REQUESTER
+        assert str(mine[0]["requester_user_id"]) == _REQUESTER_ID
     finally:
         # Leave the table as it was found; the server legs share one database across tests.
         await store.decide_pending_approval(
             approval_id, status="rejected", approver="contract-cleanup", decided_at=1_002.0
         )
+
+
+# --- vault BACKLOG #2255: a transition and its audit row are one write -----------------------------
+
+
+class _AppendFails(Exception):
+    pass
+
+
+async def _audit_rows_for(store: Any, action: str, approval_id: str) -> list[Any]:
+    return [
+        r
+        for r in await store.list_audit(action=action, limit=500)
+        if json.loads(str(r["detail"])).get("approval_id") == approval_id
+    ]
+
+
+async def _assert_transition_audit_contract(store: Any) -> None:
+    """``create_pending_approval`` and ``decide_pending_approval`` append their ``audit`` row in the
+    SAME transaction, on this backend's own SQL.
+
+    The fault is injected at the append every audit write on every backend goes through, so the
+    rollback asserted here is the backend's own, not a wrapper declining to call it. Each backend's
+    ``_append_audit_row`` takes a different first argument, hence the catch-all signature."""
+    from uuid import uuid4
+
+    from messagefoundry.store.store import AuditAppend
+
+    approval_id, lost_id = uuid4().hex, uuid4().hex
+
+    def row(action: str, for_id: str = approval_id) -> Any:
+        return AuditAppend(action, actor=_APPROVER, detail=json.dumps({"approval_id": for_id}))
+
+    async def _raises(*_args: Any, **_kwargs: Any) -> Any:
+        raise _AppendFails("audit append refused")
+
+    def request(for_id: str) -> Any:
+        return store.create_pending_approval(
+            approval_id=for_id,
+            operation="dead_letter_replay",
+            params=json.dumps({"contract": for_id}),
+            requester=_REQUESTER,
+            requester_user_id=_REQUESTER_ID,
+            requested_at=1_000.0,
+            expires_at=None,
+            audit=row("approval.requested", for_id),
+        )
+
+    real_append = store._append_audit_row
+    try:
+        assert await request(approval_id) == approval_id
+        assert len(await _audit_rows_for(store, "approval.requested", approval_id)) == 1
+
+        # A failed append rolls the INSERT back: no request is held without its row.
+        store._append_audit_row = _raises
+        with pytest.raises(_AppendFails):
+            await request(lost_id)
+        # ...and a failed append rolls a transition back: the row is still pending.
+        with pytest.raises(_AppendFails):
+            await store.decide_pending_approval(
+                approval_id,
+                status="executing",
+                approver=_APPROVER,
+                decided_at=1_001.0,
+                audit=row("approval.release_attempted"),
+            )
+        store._append_audit_row = real_append
+        assert await store.get_pending_approval(lost_id) is None
+        assert await _status(store, approval_id) == "pending"
+        assert await _audit_rows_for(store, "approval.release_attempted", approval_id) == []
+
+        # A transition that matches no row writes no row.
+        assert not await store.decide_pending_approval(
+            approval_id,
+            status="approved",
+            approver=_APPROVER,
+            decided_at=1_002.0,
+            from_status="executing",
+            audit=row("approval.approved"),
+        )
+        assert await _audit_rows_for(store, "approval.approved", approval_id) == []
+
+        # The control: one that matches moves the row and writes exactly one.
+        assert await store.decide_pending_approval(
+            approval_id,
+            status="rejected",
+            approver=_APPROVER,
+            decided_at=1_003.0,
+            audit=row("approval.rejected"),
+        )
+        assert await _status(store, approval_id) == "rejected"
+        rejected = await _audit_rows_for(store, "approval.rejected", approval_id)
+        assert len(rejected) == 1 and str(rejected[0]["actor"]) == _APPROVER
+    finally:
+        store._append_audit_row = real_append
+        # Leave the table as it was found; the server legs share one database across tests.
+        await store.decide_pending_approval(
+            approval_id, status="rejected", approver="contract-cleanup", decided_at=1_004.0
+        )
+
+
+# --- vault BACKLOG #2445: a repeat request joins the open one ---------------------------------------
+
+
+async def _assert_repeat_request_contract(store: Any) -> None:
+    """``create_pending_approval(on_repeat=...)`` files ONE request for one requester, operation and
+    params while it is open, on this backend's own SQL, including when the repeats race.
+
+    The params carry a fresh nonce, so rows other tests leave in a shared server table cannot
+    match, and the cleanup rejects every row this body files."""
+    from uuid import uuid4
+
+    from messagefoundry.store.store import AuditAppend
+
+    params = json.dumps({"contract_repeat": uuid4().hex})
+    filed: set[str] = set()
+
+    def requested(for_id: str) -> Any:
+        return AuditAppend(
+            "approval.requested", actor=_REQUESTER, detail=json.dumps({"approval_id": for_id})
+        )
+
+    def repeated(existing: str) -> Any:
+        return AuditAppend(
+            "approval.request_repeated",
+            actor=_REQUESTER,
+            detail=json.dumps({"approval_id": existing}),
+        )
+
+    async def request(*, requester_user_id: str = _REQUESTER_ID, now: float = 1_000.0) -> str:
+        approval_id = uuid4().hex
+        held = str(
+            await store.create_pending_approval(
+                approval_id=approval_id,
+                operation="dead_letter_replay",
+                params=params,
+                requester=_REQUESTER,
+                requester_user_id=requester_user_id,
+                requested_at=now,
+                expires_at=now + 60.0,
+                audit=requested(approval_id),
+                on_repeat=repeated,
+            )
+        )
+        filed.add(held)
+        return held
+
+    try:
+        first = await request()
+        assert await request() == first
+        # The race, within ONE process: every concurrent repeat joins one request. On SQLite and SQL
+        # Server the in-process lock already serializes these calls, so this arm cannot show the
+        # database-level serialization that holds ACROSS processes; that rests on the SQL itself
+        # (one INSERT ... WHERE NOT EXISTS, or a read under the audit lock). Postgres has no
+        # in-process lock here, so on that leg this arm does exercise the database's own.
+        raced = await asyncio.gather(*(request() for _ in range(6)))
+        assert set(raced) == {first}
+        assert len(await _audit_rows_for(store, "approval.requested", first)) == 1
+        assert len(await _audit_rows_for(store, "approval.request_repeated", first)) == 7
+
+        # Another requester, or the same one after the request expired, files a new one.
+        other = await request(requester_user_id="contract-other-requester-id")
+        assert other != first
+        later = await request(now=1_061.0)
+        assert later not in (first, other)
+
+        # Once the open request is decided, a repeat files a new one too.
+        assert await store.decide_pending_approval(
+            later, status="rejected", approver=_APPROVER, decided_at=1_062.0
+        )
+        assert await request(now=1_063.0) not in (first, other, later)
+    finally:
+        for approval_id in filed:
+            await store.decide_pending_approval(
+                approval_id, status="rejected", approver="contract-cleanup", decided_at=1_100.0
+            )
 
 
 # --- BACKLOG #1562: the release outcome ------------------------------------------------------------
@@ -138,8 +315,15 @@ def _gate(store: Any, execute: Callable[[Mapping[str, Any]], Awaitable[dict[str,
 
 
 async def _request(gate: Any) -> str:
+    """A fresh request. The params carry a nonce, so a repeat never joins an open request another
+    test left in a shared server table (vault BACKLOG #2445); the executors ignore it."""
+    from uuid import uuid4
+
     approval_id = await gate.guard(
-        "dead_letter_replay", {}, requester=_REQUESTER, requester_user_id=_REQUESTER_ID
+        "dead_letter_replay",
+        {"contract_nonce": uuid4().hex},
+        requester=_REQUESTER,
+        requester_user_id=_REQUESTER_ID,
     )
     assert approval_id is not None
     return str(approval_id)
@@ -327,6 +511,7 @@ async def _assert_interrupted_resolution_contract(store: Any) -> None:
         assert len(listed) == 1
         assert str(listed[0]["status"]) == "interrupted"
         assert str(listed[0]["approver"]) == _APPROVER
+        assert str(listed[0]["requester_user_id"]) == _REQUESTER_ID  # BACKLOG #2460
         assert listed[0]["decided_at"] is not None
         pending = await store.list_pending_approvals(now=float(listed[0]["requested_at"]))
         assert all(str(r["id"]) != approval_id for r in pending)
@@ -379,12 +564,9 @@ async def _assert_interrupted_resolution_contract(store: Any) -> None:
         assert len(audited) == 1
         assert str(audited[0]["actor"]) == _RESOLVER
         assert json.loads(str(audited[0]["detail"])) == expected
-        # One attempt row, written before the move. The second resolve above is refused on the
-        # status check, before it writes one.
-        attempted = await _resolved_rows(store, approval_id, "approval.resolve_attempted")
-        assert len(attempted) == 1
-        assert str(attempted[0]["actor"]) == _RESOLVER
-        assert json.loads(str(attempted[0]["detail"])) == expected
+        # The move and its row are one write on this backend (vault BACKLOG #2255), so there is
+        # no separate attempt row before it.
+        assert await _resolved_rows(store, approval_id, "approval.resolve_attempted") == []
         # Resolving writes no second outcome row: the trail still says the release was cut off.
         actions = await _audit_actions(store, approval_id)
         assert actions == ["approval.interrupted"]

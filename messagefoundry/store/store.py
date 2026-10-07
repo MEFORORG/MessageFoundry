@@ -3996,6 +3996,17 @@ def seed_notify_email(email: str | None) -> str | None:
     return email.strip() or None if email is not None else None
 
 
+#: The open request a repeat joins (vault BACKLOG #2445): same operation, same captured params, same
+#: requester id, still ``pending`` and unexpired at the repeat's time. Binds four ``?``: operation,
+#: params, requester_user_id, now. The Store protocol's ``create_pending_approval`` says why the
+#: requester is part of the match. SQL Server keeps its own text, because it must name a binary
+#: collation; Postgres keeps its own for its ``$n`` placeholders.
+_SQLITE_OPEN_REPEAT = (
+    "operation = ? AND params = ? AND requester_user_id = ? AND status = 'pending'"
+    " AND (expires_at IS NULL OR expires_at > ?)"
+)
+
+
 @dataclass(frozen=True, slots=True)
 class AuditAppend:
     """One audit row a write appends in its OWN transaction, on all three backends (BACKLOG #2100).
@@ -11077,24 +11088,74 @@ class MessageStore:
         requester_user_id: str,
         requested_at: float,
         expires_at: float | None,
-    ) -> None:
-        """Persist a high-value action awaiting a distinct second approver (dual-control, 2.3.5)."""
-        async with _writer_guard(self._db, self._lock):
-            await self._db.execute(
-                "INSERT INTO pending_approvals "
-                "(id, operation, params, requester, requester_user_id, requested_at, status,"
-                " expires_at) VALUES (?,?,?,?,?,?,'pending',?)",
-                (
-                    approval_id,
-                    operation,
-                    params,
-                    requester,
-                    requester_user_id,
-                    requested_at,
-                    expires_at,
-                ),
+        audit: AuditAppend | None = None,
+        on_repeat: Callable[[str], AuditAppend] | None = None,
+    ) -> str:
+        """Persist a high-value action awaiting a distinct second approver (dual-control, 2.3.5).
+        The Store protocol states the ``audit`` and ``on_repeat`` contract and what is returned."""
+        insert = (
+            "INSERT INTO pending_approvals "
+            "(id, operation, params, requester, requester_user_id, requested_at, status, expires_at)"
+        )
+        args: tuple[Any, ...] = (
+            approval_id,
+            operation,
+            params,
+            requester,
+            requester_user_id,
+            requested_at,
+            expires_at,
+        )
+        match = (operation, params, requester_user_id, requested_at)
+        if on_repeat is None:
+            sql = f"{insert} VALUES (?,?,?,?,?,?,'pending',?)"
+        else:
+            # vault BACKLOG #2445. ONE statement, so its read and its write cannot be split: it
+            # takes SQLite's file-level write lock before it reads, which holds against another
+            # connection to the file too, where the in-process lock does not reach.
+            sql = (
+                f"{insert} SELECT ?,?,?,?,?,?,'pending',? WHERE NOT EXISTS ("
+                f"SELECT 1 FROM pending_approvals WHERE {_SQLITE_OPEN_REPEAT})"
             )
+            args += match
+        now = time.time()
+        held = approval_id
+        append = audit
+        async with _writer_guard(self._db, self._lock):
+            cur = await self._db.execute(sql, args)
+            if on_repeat is not None and cur.rowcount == 0:
+                # The INSERT opened this connection's write transaction, so this read is the
+                # authoritative one. Oldest first: that is the request every earlier caller got.
+                found = await self._db.execute(
+                    f"SELECT id FROM pending_approvals WHERE {_SQLITE_OPEN_REPEAT}"
+                    " ORDER BY requested_at ASC LIMIT 1",
+                    match,
+                )
+                row = await found.fetchone()
+                if row is None:  # the INSERT's own NOT EXISTS matched one, under the write lock
+                    raise RuntimeError("pending_approvals: a repeat matched no open request")
+                held = str(row["id"])
+                append = on_repeat(held)
+            if append is not None:
+                # vault BACKLOG #2255. Before the one commit, so a failed append rolls the request
+                # back and no releasable row is left without its approval.requested row.
+                appended = await self._append_audit(append, now)
             await self._commit()
+        if append is not None:
+            append.tee(ts=now, row=appended)
+        return held
+
+    async def _append_audit(self, audit: AuditAppend, now: float) -> AppendedAuditRow:
+        """:meth:`_append_audit_row` for an :class:`AuditAppend` a write carries into its own
+        transaction (BACKLOG #2100). The caller holds the writer lock, commits, then tees."""
+        return await self._append_audit_row(
+            audit.action,
+            actor=audit.actor,
+            channel_id=None,
+            detail=audit.detail,
+            client=audit.client,
+            now=now,
+        )
 
     async def get_pending_approval(self, approval_id: str) -> aiosqlite.Row | None:
         async with self._read() as db:
@@ -11109,10 +11170,10 @@ class MessageStore:
         """Open (still-``pending``, unexpired) approval requests, newest-first."""
         async with self._read() as db:
             cur = await db.execute(
-                # No requester_user_id here: the approver queue shows the DISPLAY label, and the
-                # authorization key is read through get_pending_approval on the approve path.
-                "SELECT id, operation, params, requester, requested_at, status, approver, decided_at,"
-                " expires_at FROM pending_approvals"
+                # requester_user_id is projected only so the queue can tell a caller a request is
+                # their own (BACKLOG #2460). The refusals still read it through get_pending_approval.
+                "SELECT id, operation, params, requester, requester_user_id, requested_at, status,"
+                " approver, decided_at, expires_at FROM pending_approvals"
                 " WHERE status = 'pending' AND (expires_at IS NULL OR expires_at > ?)"
                 " ORDER BY requested_at DESC LIMIT ?",
                 (now, limit),
@@ -11124,8 +11185,8 @@ class MessageStore:
         order: the Store protocol says why. Same projection as :meth:`list_pending_approvals`."""
         async with self._read() as db:
             cur = await db.execute(
-                "SELECT id, operation, params, requester, requested_at, status, approver, decided_at,"
-                " expires_at FROM pending_approvals"
+                "SELECT id, operation, params, requester, requester_user_id, requested_at, status,"
+                " approver, decided_at, expires_at FROM pending_approvals"
                 " WHERE status = 'interrupted'"
                 " ORDER BY requested_at ASC LIMIT ?",
                 (limit,),
@@ -11140,6 +11201,7 @@ class MessageStore:
         approver: str | None,
         decided_at: float,
         from_status: str = "pending",
+        audit: AuditAppend | None = None,
     ) -> bool:
         """Atomically move a request in ``from_status`` to ``status``.
         Returns ``True`` iff this call made the transition — guards against a double decision.
@@ -11149,15 +11211,24 @@ class MessageStore:
         ``approved``, to ``failed`` (the ASVS 2.3.3 compensation) or to ``interrupted`` (BACKLOG
         #1562) -- none of which may move a row some other caller already rejected or expired, hence
         the guard is a parameter rather than a hardcoded literal. The resolve path moves a row out of
-        ``interrupted`` the same way, so two resolvers cannot both record an outcome."""
+        ``interrupted`` the same way, so two resolvers cannot both record an outcome.
+
+        ``audit``: the Store protocol states the contract (vault BACKLOG #2255)."""
+        now = time.time()
         async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "UPDATE pending_approvals SET status = ?, approver = ?, decided_at = ?"
                 " WHERE id = ? AND status = ?",
                 (status, approver, decided_at, approval_id, from_status),
             )
+            moved = cur.rowcount > 0
+            if moved and audit is not None:
+                # Before the one commit, so a failed append rolls the transition back.
+                appended = await self._append_audit(audit, now)
             await self._commit()
-            return cur.rowcount > 0
+        if moved and audit is not None:
+            audit.tee(ts=now, row=appended)
+        return moved
 
     # --- per-key AES-GCM invocation bound (ASVS 11.3.4) ----------------------
 
@@ -11441,14 +11512,7 @@ class MessageStore:
             )
             if audit is not None:
                 # BACKLOG #2100. Before the one commit, so a failed append rolls the account back.
-                appended = await self._append_audit_row(
-                    audit.action,
-                    actor=audit.actor,
-                    channel_id=None,
-                    detail=audit.detail,
-                    client=audit.client,
-                    now=now,
-                )
+                appended = await self._append_audit(audit, now)
             await self._commit()
         if audit is not None:
             audit.tee(ts=now, row=appended)

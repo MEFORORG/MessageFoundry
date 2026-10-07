@@ -11133,21 +11133,100 @@ class SqlServerStore:
         requester_user_id: str,
         requested_at: float,
         expires_at: float | None,
-    ) -> None:
-        """Persist a high-value action awaiting a distinct second approver (dual-control, 2.3.5)."""
-        await self._execute(
+        audit: AuditAppend | None = None,
+        on_repeat: Callable[[str], AuditAppend] | None = None,
+    ) -> str:
+        """Persist a high-value action awaiting a distinct second approver (dual-control, 2.3.5).
+        The Store protocol states the ``audit`` and ``on_repeat`` contract and what is returned."""
+        sql = (
             "INSERT INTO pending_approvals "
             "(id, operation, params, requester, requester_user_id, requested_at, status, expires_at)"
-            " VALUES (?,?,?,?,?,?,'pending',?)",
-            (
-                approval_id,
-                operation,
-                params,
-                requester,
-                requester_user_id,
-                requested_at,
-                expires_at,
-            ),
+            " VALUES (?,?,?,?,?,?,'pending',?)"
+        )
+        args = (
+            approval_id,
+            operation,
+            params,
+            requester,
+            requester_user_id,
+            requested_at,
+            expires_at,
+        )
+        if audit is None and on_repeat is None:
+            await self._execute(sql, args)
+            return approval_id
+        # vault BACKLOG #2445: the open request a repeat joins. Oldest first: that is the request
+        # every earlier caller got. The three text columns carry no COLLATE, so without one here
+        # they would compare under the database default, which is case-INSENSITIVE on a stock
+        # install: 'OB_ACME' would join a hold for 'OB_Acme'. SQLite and Postgres compare bytes,
+        # and so does this, as BACKLOG #1268 does for the other identifier columns.
+        match = (
+            "SELECT TOP (1) id FROM pending_approvals"
+            " WHERE operation COLLATE Latin1_General_100_BIN2 = ?"
+            " AND params COLLATE Latin1_General_100_BIN2 = CAST(? AS NVARCHAR(MAX))"
+            " COLLATE Latin1_General_100_BIN2"
+            " AND requester_user_id COLLATE Latin1_General_100_BIN2 = ?"
+            " AND status = 'pending' AND (expires_at IS NULL OR expires_at > ?)"
+            " ORDER BY requested_at ASC"
+        )
+        match_args = (operation, params, requester_user_id, requested_at)
+        now = time.time()
+        held = approval_id
+        append = audit
+        # vault BACKLOG #2255. The audit row joins the INSERT's transaction, so a failed append
+        # rolls the request back. Same lock order as `record_audit`: the in-process gate, then the
+        # connection.
+        async with self._audit_lock:  # noqa: SIM117
+            async with self._acquire() as conn:
+                try:
+                    async with self._cursor(conn) as cur:
+                        # The audit applock FIRST, before this transaction locks any
+                        # pending_approvals key, so every approval write takes the applock and
+                        # then the row, never the reverse (no AB/BA deadlock across processes).
+                        await self._open_under_audit_applock(cur)
+                        if on_repeat is not None:
+                            # Under the applock, which every request takes anyway for its own row
+                            # and which is re-entrant per transaction, this read sees every request
+                            # committed before it, so two repeats cannot both find none and insert.
+                            await cur.execute(match, match_args)
+                            found = await cur.fetchone()
+                            if found is not None:
+                                held = str(found[0])
+                                append = on_repeat(held)
+                        if held == approval_id:
+                            await cur.execute(sql, args)
+                        appended = (
+                            None if append is None else await self._append_audit(cur, append, now)
+                        )
+                        await self._commit(conn)
+                except Exception:
+                    # BACKLOG #1940: see _rollback_or_discard.
+                    await self._rollback_or_discard(conn)
+                    raise
+        if append is not None and appended is not None:
+            append.tee(ts=now, row=appended)
+        return held
+
+    async def _open_under_audit_applock(self, cur: Any) -> None:
+        """Open a transaction on ``cur`` and take ``_AUDIT_APPEND_LOCK`` in it, before it locks
+        anything else. The opener is the one-row ``audit_log`` read :meth:`record_audit` uses,
+        because the applock needs a transaction and a SELECT with no FROM begins none."""
+        await cur.execute("SELECT TOP (1) seq FROM audit_log ORDER BY seq DESC")
+        await cur.fetchall()
+        await self._applock(cur, _AUDIT_APPEND_LOCK)
+
+    async def _append_audit(self, cur: Any, audit: AuditAppend, now: float) -> AppendedAuditRow:
+        """:meth:`_append_audit_row` for an :class:`AuditAppend` a write carries into its own
+        transaction on ``cur`` (BACKLOG #2100). The caller holds ``_audit_lock``, commits, then
+        tees."""
+        return await self._append_audit_row(
+            cur,
+            audit.action,
+            actor=audit.actor,
+            channel_id=None,
+            detail=audit.detail,
+            client=audit.client,
+            now=now,
         )
 
     async def get_pending_approval(self, approval_id: str) -> dict[str, Any] | None:
@@ -11160,9 +11239,9 @@ class SqlServerStore:
     async def list_pending_approvals(self, *, now: float, limit: int = 100) -> list[dict[str, Any]]:
         """Open (still-``pending``, unexpired) approval requests, newest-first."""
         return await self._fetchall(
-            # No requester_user_id here — see the SQLite twin.
-            "SELECT TOP (?) id, operation, params, requester, requested_at, status, approver,"
-            " decided_at, expires_at FROM pending_approvals"
+            # requester_user_id: see the SQLite twin (BACKLOG #2460).
+            "SELECT TOP (?) id, operation, params, requester, requester_user_id, requested_at,"
+            " status, approver, decided_at, expires_at FROM pending_approvals"
             " WHERE status = 'pending' AND (expires_at IS NULL OR expires_at > ?)"
             " ORDER BY requested_at DESC",
             (limit, now),
@@ -11172,8 +11251,8 @@ class SqlServerStore:
         """Released requests cut off mid-run, oldest-first (BACKLOG #1562). No expiry filter, and the
         order: the Store protocol says why."""
         return await self._fetchall(
-            "SELECT TOP (?) id, operation, params, requester, requested_at, status, approver,"
-            " decided_at, expires_at FROM pending_approvals"
+            "SELECT TOP (?) id, operation, params, requester, requester_user_id, requested_at,"
+            " status, approver, decided_at, expires_at FROM pending_approvals"
             " WHERE status = 'interrupted'"
             " ORDER BY requested_at ASC",
             (limit,),
@@ -11187,23 +11266,49 @@ class SqlServerStore:
         approver: str | None,
         decided_at: float,
         from_status: str = "pending",
+        audit: AuditAppend | None = None,
     ) -> bool:
         """Atomically move a request in ``from_status`` to ``status``.
         Returns ``True`` iff this call made the transition — guards against a double decision.
-        The SQLite twin documents why the guard is a parameter (ASVS 2.3.3)."""
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                await cur.execute(
-                    "UPDATE pending_approvals SET status = ?, approver = ?, decided_at = ?"
-                    " WHERE id = ? AND status = ?",
-                    (status, approver, decided_at, approval_id, from_status),
-                )
-                count = cur.rowcount
-                await self._commit(conn)
-            except Exception:
-                await conn.rollback()
-                raise
-        return int(count) > 0
+        The SQLite twin documents why the guard is a parameter (ASVS 2.3.3); the Store protocol
+        states the ``audit`` contract (vault BACKLOG #2255)."""
+        sql = (
+            "UPDATE pending_approvals SET status = ?, approver = ?, decided_at = ?"
+            " WHERE id = ? AND status = ?"
+        )
+        args = (status, approver, decided_at, approval_id, from_status)
+        if audit is None:
+            async with self._acquire() as conn, self._cursor(conn) as cur:
+                try:
+                    await cur.execute(sql, args)
+                    count = cur.rowcount
+                    await self._commit(conn)
+                except Exception:
+                    await conn.rollback()
+                    raise
+            return int(count) > 0
+        now = time.time()
+        appended: AppendedAuditRow | None = None
+        # Same lock order as `record_audit`: the in-process gate, then the connection. Then the
+        # audit applock BEFORE the UPDATE locks the row, the order create_pending_approval uses.
+        async with self._audit_lock:  # noqa: SIM117
+            async with self._acquire() as conn:
+                try:
+                    async with self._cursor(conn) as cur:
+                        await self._open_under_audit_applock(cur)
+                        await cur.execute(sql, args)
+                        moved = int(cur.rowcount) > 0
+                        if moved:
+                            # Before the one commit, so a failed append rolls the transition back.
+                            appended = await self._append_audit(cur, audit, now)
+                        await self._commit(conn)
+                except Exception:
+                    # BACKLOG #1940: see _rollback_or_discard.
+                    await self._rollback_or_discard(conn)
+                    raise
+        if appended is not None:
+            audit.tee(ts=now, row=appended)
+        return moved
 
     async def create_user(
         self,
@@ -11257,15 +11362,7 @@ class SqlServerStore:
                 try:
                     async with self._cursor(conn) as cur:
                         await cur.execute(sql, params)
-                        appended = await self._append_audit_row(
-                            cur,
-                            audit.action,
-                            actor=audit.actor,
-                            channel_id=None,
-                            detail=audit.detail,
-                            client=audit.client,
-                            now=now,
-                        )
+                        appended = await self._append_audit(cur, audit, now)
                         await self._commit(conn)
                 except Exception:
                     # BACKLOG #1940: see _rollback_or_discard. It runs after the cursor block, so a

@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-38fa09968bb962eb
+466e64e6321e35f6
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -76,6 +76,7 @@ set_connection_flag
 list_approvals
 approve_action
 reject_action
+resolve_action
 
 ## dataclass messagefoundry.api._ui_seam.AdminHandlers
 list_roles
@@ -230,6 +231,7 @@ messagefoundry.api.models.AlertSuspendRequest: minutes
 messagefoundry.api.models.AlertsConfig: email_body_template_configured, email_configured, email_html_template_configured, email_recipient_count, email_smtp_port, email_subject_template_configured, email_use_tls, realert_seconds, rules, smtp_allowed_hosts, webhook_allowed_hosts, webhook_configured, webhook_timeout
 messagefoundry.api.models.ApprovalDecisionResult: approved_by, operation, rejected_by, requested_by, result
 messagefoundry.api.models.ApprovalList: approvals
+messagefoundry.api.models.ApprovalResolveRequest: outcome
 messagefoundry.api.models.AttachmentInfo: content_type, id, total_bytes
 messagefoundry.api.models.ClaimPoolInfo: discarded_total, idle, open, opened_total
 messagefoundry.api.models.ClaimProcInfo: degraded_reason, effective, head_forms
@@ -267,7 +269,7 @@ messagefoundry.api.models.MessageSummary: channel_id, control_id, error, event, 
 messagefoundry.api.models.MetricsHistoryResponse: capacity, samples
 messagefoundry.api.models.MetricsHistorySample: outbox_by_status, ts
 messagefoundry.api.models.OutboxInfo: attempts, destination_name, id, last_error, next_attempt_at, status
-messagefoundry.api.models.PendingApprovalInfo: approver, decided_at, expires_at, id, label, operation, requested_at, requester, status
+messagefoundry.api.models.PendingApprovalInfo: approver, caller_is_requester, decided_at, expires_at, gated, id, label, operation, params, requested_at, requester, status
 messagefoundry.api.models.PendingApprovalResponse: approval_id, detail, operation, status
 messagefoundry.api.models.PoolInfo: acquire_wait, backend, claim_pool, idle, max_size, size
 messagefoundry.api.models.PoolWaitInfo: count, max_ms, mean_ms, p50_ms, p95_ms, p99_ms
@@ -298,6 +300,7 @@ messagefoundry.config.ai_policy.SecurityEnforcement: ENFORCE, WARN
 
 ## Literal value sets on those DTOs
 messagefoundry.api.auth_models.ChannelScope.expected_source: ad, manual
+messagefoundry.api.models.ApprovalResolveRequest.outcome: effects_applied, effects_not_applied
 messagefoundry.api.models.ConnectionFlagRequest.direction: inbound, outbound
 messagefoundry.api.models.PendingApprovalInfo.status: interrupted, pending
 messagefoundry.api.models.SearchPresetCriteria.target: both, raw, summary

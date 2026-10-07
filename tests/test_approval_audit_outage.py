@@ -66,10 +66,21 @@ class _Faulty(_StandingStore):
             raise sqlite3.OperationalError(_FAULT)
         await self._store.record_audit(action, **kw)
 
+    def _audit_refused(self, kw: Mapping[str, Any]) -> bool:
+        audit = kw.get("audit")
+        return audit is not None and audit.action in self.audit_fails
+
     async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
-        if kw["status"] in self.decide_fails:
+        # A status write that carries a refused audit row fails whole, as the store's own rollback
+        # would make it (vault BACKLOG #2255).
+        if kw["status"] in self.decide_fails or self._audit_refused(kw):
             raise sqlite3.OperationalError(_FAULT)
         return bool(await self._store.decide_pending_approval(approval_id, **kw))
+
+    async def create_pending_approval(self, **kw: Any) -> str:
+        if self._audit_refused(kw):
+            raise sqlite3.OperationalError(_FAULT)
+        return str(await self._store.create_pending_approval(**kw))
 
     async def get_user(self, user_id: str) -> Any:
         if self.requester_gone and user_id == _REQUESTER_ID:
@@ -203,16 +214,18 @@ async def test_a_rejection_the_store_refuses_answers_503_and_stays_pending(
     assert await _status(store, approval_id) == "pending"
 
 
-async def test_a_rejection_whose_audit_row_fails_still_rejects_and_pages(
+async def test_a_rejection_whose_audit_row_fails_answers_503_and_pages(
     store: MessageStore,
 ) -> None:
-    """The row has moved, so a raw 500 would report a rejection that happened as a failure."""
+    """The move and its approval.rejected row are one write, so a refused row stops the move: the
+    request stays pending rather than reading rejected with nobody recorded as rejecting it."""
     sink = _Sink()
     gate = _gate(_Faulty(store, audit_fails=("approval.rejected",)), sink)
     approval_id = await _request(gate)
-    out = await gate.reject(approval_id, approver="checker")
-    assert out["rejected_by"] == "checker"
-    assert await _status(store, approval_id) == "rejected"
+    with pytest.raises(ApprovalError) as caught:
+        await gate.reject(approval_id, approver="checker")
+    assert caught.value.status == 503
+    assert await _status(store, approval_id) == "pending"
     assert sink.lost == [(f"approval:{approval_id}", "approval.rejected")]
 
 
@@ -255,6 +268,51 @@ async def test_a_lost_approval_approved_row_pages(store: MessageStore) -> None:
     assert sink.lost == [(f"approval:{approval_id}", "approval.approved")]
 
 
+async def test_a_combined_outcome_write_whose_reply_is_lost_writes_no_second_row(
+    store: MessageStore,
+) -> None:
+    """The combined status and approval.approved write COMMITS and then reports a fault, as a lost
+    commit reply does. The status-only fallback then moves nothing, and the gate must not write a
+    second approval.approved row on top of the one that landed."""
+
+    class _ReplyLost(_StandingStore):
+        async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
+            moved = bool(await self._store.decide_pending_approval(approval_id, **kw))
+            audit = kw.get("audit")
+            if audit is not None and audit.action == "approval.approved":
+                raise sqlite3.OperationalError("connection reset after COMMIT")
+            return moved
+
+    sink = _Sink()
+    runs: list[str] = []
+    gate = _gate(_ReplyLost(store), sink, runs=runs)
+    approval_id = await _request(gate)
+    await gate.approve(approval_id, approver="checker", approver_user_id=_APPROVER_ID)
+    assert runs == ["ran"] and await _status(store, approval_id) == "approved"
+    assert len(await store.list_audit(action="approval.approved")) == 1
+
+
+async def test_an_unencodable_result_still_settles_the_release(store: MessageStore) -> None:
+    """The operation ran. A result json cannot encode used to raise before the status moved,
+    stranding the row 'executing' and answering 500."""
+    import datetime
+
+    settings = ApprovalsSettings(
+        enabled=True, operations=["dead_letter_replay"], min_dwell_seconds=0.0
+    )
+    gate = ApprovalGate(_StandingStore(store), settings, resolve_identity=_resolve)
+
+    async def _execute(_p: Mapping[str, Any]) -> dict[str, Any]:
+        return {"at": datetime.datetime(2026, 1, 1)}
+
+    gate.register("dead_letter_replay", "op", _execute, permission=Permission.MESSAGES_REPLAY)
+    approval_id = await _request(gate)
+    await gate.approve(approval_id, approver="checker", approver_user_id=_APPROVER_ID)
+    assert await _status(store, approval_id) == "approved"
+    rows = await store.list_audit(action="approval.approved")
+    assert len(rows) == 1 and "2026-01-01" in str(rows[0]["detail"])
+
+
 async def test_a_refused_release_row_pages_as_well_as_answering_503(store: MessageStore) -> None:
     sink = _Sink()
     gate = _gate(_Faulty(store, audit_fails=("approval.release_attempted",)), sink)
@@ -278,11 +336,12 @@ async def test_a_failed_compensation_still_writes_its_audit_row(store: MessageSt
     assert json.loads(str(rows[0]["detail"]))["compensated"] is None
 
 
-async def test_an_unaudited_request_is_withdrawn_paged_and_still_raised(
+async def test_an_unaudited_request_is_never_held_paged_and_still_raised(
     store: MessageStore,
 ) -> None:
-    """The guard used to leave a releasable pending row with no approval.requested row. The caller
-    got an error and no id, so a retry left two releasable copies of one operation."""
+    """The guard used to write the request, then withdraw it when approval.requested failed. The
+    two are one write now, so nothing is held at all. The caller still gets the error, and the
+    loss still pages."""
     sink = _Sink()
     gate = _gate(_Faulty(store, audit_fails=("approval.requested",)), sink)
     with pytest.raises(sqlite3.OperationalError):
@@ -291,7 +350,7 @@ async def test_an_unaudited_request_is_withdrawn_paged_and_still_raised(
         )
     assert len(sink.lost) == 1 and sink.lost[0][1] == "approval.requested"
     approval_id = sink.lost[0][0].removeprefix("approval:")
-    assert await _status(store, approval_id) == "failed"
+    assert await store.get_pending_approval(approval_id) is None
     assert await store.list_pending_approvals(now=0.0) == []
 
 

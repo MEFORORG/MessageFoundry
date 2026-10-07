@@ -986,7 +986,7 @@ under `create_app()` (they sum to 99, not 96, because BOTH `/messages/export` ro
 | `FILES_BROWSE` | `files:browse` | **PHI** | 4 | `GET /uploads` (metadata), `GET /uploads/{id}/messages` (bulk decrypt+split), `POST /uploads/{id}/resend` |
 | `FILES_DELETE` | `files:delete` | | 1 | `DELETE /uploads/{id}` — destructive, audited cleanup |
 | `FILES_ACCESS_ANY` | `files:access_any` | **PHI** | 0 | no route — an **object-level** override (ASVS 8.2.2), enforced in the uploaded-files handler bodies rather than at a gate (the console calls those handlers directly over the seam, so a gate would not cover it). Uploaded files are **owner-only**: without this, `files:browse`/`files:delete` reach only what the caller uploaded; with it, every uploader's. It is not a capability of its own — the holder still needs `files:browse` / `files:delete` for the route. Never assignable to a custom role |
-| `APPROVALS_APPROVE` | `approvals:approve` | | 4 | `GET /approvals`, `POST /approvals/{id}/approve`, `/reject`, `/resolve` (dual control, ASVS 2.3.5). The console's Approvals page, `/ui/approvals`, reaches the first three (BACKLOG #1982). Never assignable to a custom role |
+| `APPROVALS_APPROVE` | `approvals:approve` | | 4 | `GET /approvals`, `POST /approvals/{id}/approve`, `/reject`, `/resolve` (dual control, ASVS 2.3.5). The console's Approvals page, `/ui/approvals`, reaches all four (BACKLOG #1982, #2460). Never assignable to a custom role |
 
 `config:validate` and `code:edit` have **no API endpoint yet**; they are defined so
 the Deployment/Coding roles are complete and those endpoints can be gated the moment they land, without
@@ -1330,14 +1330,14 @@ rather than shown a body its permission set does not authorize.
 
 #### The `/ui` console plane (`serve_ui=True`)
 
-When the console is served, the `/ui` plane adds **123 routes + one `/ui/static` mount** (federation off,
+When the console is served, the `/ui` plane adds **124 routes + one `/ui/static` mount** (federation off,
 the default — the three `/ui/oidc/*` routes, `GET`/`POST /ui/oidc/start` and `GET /ui/oidc/callback`,
 and the IdP step-up start `POST /ui/reauth/oidc` are registered only when `[auth].oidc_enabled`). They are
 functions too, and they gate on the **same 29-permission catalogue** through parallel wrappers —
 `require_ui`, `require_ui_step_up`, `require_ui_reauth_only`, `require_ui_step_up_action`,
 `require_ui_reauth_only_action` — but authenticate by the `SameSite=Strict` **session cookie**
 rather than a bearer token, and refuse cross-site state changes on `Sec-Fetch-Site`/`Origin`.
-**Route → permission map (`/ui` plane).** 110 of the 120 carry a gate; the 10 that do not are the
+**Route → permission map (`/ui` plane).** 111 of the 121 carry a gate; the 10 that do not are the
 sign-in and re-auth entry points, listed after the table. Where the console is served it is the
 *sole* operator UI, so ~20 of these have no JSON counterpart from which their authorization could be
 inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bulk`, the
@@ -1375,6 +1375,7 @@ inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bu
 | `GET` | `/ui/approvals` | `approvals:approve` | `require_ui` |
 | `POST` | `/ui/approvals/{approval_id}/approve` | `approvals:approve` | `require_ui` — paces the write like `require_paced`; the requester can never approve their own request |
 | `POST` | `/ui/approvals/{approval_id}/reject` | `approvals:approve` | `require_ui` |
+| `POST` | `/ui/approvals/{approval_id}/resolve/{outcome}` | `approvals:approve` | `require_ui_step_up` — the fresh step-up the JSON resolve asks for; the requester can never resolve their own request (BACKLOG #2460) |
 | `GET` | `/ui/audit` | `audit:read` | `require_ui` |
 | `GET` | `/ui/cluster` | `monitoring:read` | `require_ui` |
 | `POST` | `/ui/cluster/force-stepdown` | `cluster:control` | `require_ui_step_up` |
@@ -1603,7 +1604,8 @@ else would need its own authorization rule stated here.
    (BACKLOG #1982), which mirror `POST /approvals/{approval_id}/approve` and `/reject`
    (`require_paced`, a floor `require_ui` charges too). They are flagged because
    `POST /approvals/{approval_id}/resolve`, same method and permission, carries `require_step_up`.
-   The console does not offer the resolve, so that step-up has no console route to be missing from.
+   The console's own resolve route, `POST /ui/approvals/{approval_id}/resolve/{outcome}` (BACKLOG
+   #2460), takes `require_ui_step_up`, so that step-up is not missing from it.
 
 Differences 4 and 5 are derived and pinned: a `/ui` route that is weaker than **any** JSON route holding
 the same permission set on the same method reds CI until it is listed here.
@@ -1706,19 +1708,47 @@ server-side, not a client confirmation). On release the captured operation is **
 `approval.approved` by the checker); `POST /approvals/{id}/reject` declines it (`approval.rejected`), and
 a request older than `[approvals].expiry_hours` can no longer be approved. Approvers see the open queue
 at `GET /approvals`, or on the console's **Approvals** page (`/ui/approvals`, BACKLOG #1982), which
-offers Approve and Reject on each pending request and lists `interrupted` releases read-only.
+offers Approve and Reject on each pending request and the resolve on each `interrupted` release.
+Each queued request carries `caller_is_requester`, compared on the user id as the refusals are
+(BACKLOG #2460). On the requester's own pending request the page offers only Withdraw, a reject;
+on their own interrupted release it offers nothing. Each queued request also carries the `params`
+its hold captured (BACKLOG #2458), so an approver sees what a release would re-run. What they may
+carry is stated on `PendingApprovalInfo` in `api/models.py`; only an Administrator holds
+`approvals:approve`, so no channel scope masks them.
 
-**The audit log must accept a release before the operation runs.** Before it claims a request, the
-gate writes an `approval.release_attempted` row against the approver, naming the requester. If the
-audit log refuses that write, the approve returns **503**, nothing runs, and the request stays
-pending. `approval.approved` is written after the operation, with its result. If only that later
-audit write fails, the error is logged and the release still succeeds, because the operation has
-already run. At least a release that loses a race with another approve or a reject, or is
-cancelled before its claim lands, leaves an `approval.release_attempted` row with no outcome row
-after it; the request's status says what won.
+**A repeat of an open request files nothing (vault BACKLOG #2445).** When the same requester asks
+for the same operation with identical captured parameters while their earlier request is still
+pending and unexpired, the endpoint answers the same **202** with the earlier `approval_id`, and the
+gate writes an `approval.request_repeated` row against the requester naming that request. A retried
+promote, a double click, a retrying API client and two such calls racing all land on one request.
+The store makes the check and the insert one serialized step on all three backends. A **different**
+requester always gets a request of their own: the release re-checks the requester's authority, so
+one person's ask must not ride on another person's standing.
 
-The 503 means the release row is absent, not merely unconfirmed. When a COMMIT fails, no later
-write can commit the row. SQLite's writer guard rolls it back. SQL Server's audit appends roll it
+**A held request cannot be released once dual control stops applying to it.** If an operator turns
+`[approvals].enabled` off, or removes the operation from `[approvals].operations`, a request held
+before the change is refused at release with **409** and an `approval.no_longer_gated` row against
+the approver, whose `reason` says which (`approvals_disabled` or `operation_not_gated`). Nothing
+runs. The request stays pending until an approver rejects it or it expires. The refusal's wording
+tells the approver to reject it and, if the operation is still needed, to run it again, which now
+runs it without a second approver. `GET /approvals` marks such a request `gated: false`, read from
+the same settings test at listing time, and the console's Approvals page offers it only Reject,
+with that advice beside it.
+
+**Each state change and its audit row are one write (vault BACKLOG #2255).** The store
+moves the request and appends its audit row in one transaction, so the two commit or roll back
+together. That holds for the request itself (`approval.requested`), the claim, the rejection, each
+outcome below and the resolve. A change that matches no row, such as a claim that lost the race,
+moves nothing and writes no row.
+
+**The audit log must accept a release before the operation runs.** The gate claims a request with
+an `approval.release_attempted` row against the approver, naming the requester, in that one write.
+If it fails, the approve returns **503**, nothing runs, and the request stays pending.
+`approval.approved` is written after the operation, with its result. If that later write fails,
+the release still succeeds, because the operation has already run; see the outcome table below.
+
+The 503 means the claim and its row are absent, not merely unconfirmed. When a COMMIT fails, no
+later write can commit them. SQLite's writer guard rolls it back. SQL Server's audit appends roll it
 back explicitly, and discard the connection if that rollback fails too. Postgres ends the
 transaction itself, and its pool rolls a connection back before lending it again. There are at
 least two exceptions, where the row may have committed after all:
@@ -1735,30 +1765,32 @@ reload carries that into its `approval.approved` row.
 **An audit or store outage that refuses writes answers a mapped status on at least these approval
 paths (vault BACKLOG #2255).** A refusal runs nothing, so a refusal whose own audit row fails still
 answers **409**: that is `approval.too_early` and `approval.stale_requester`. A claim, a rejection or
-a resolution whose status write the store refuses answers **503**, and nothing runs. After a
-rejection's status write, a failed `approval.rejected` row is logged and the rejection stands. A
-request whose `approval.requested` row fails is withdrawn (moved to `failed`) before the error is
+a resolution that the store cannot write with its audit row answers **503**, and the request does
+not move. A request whose `approval.requested` row fails is not held at all, and the error is
 returned, so a retry cannot leave two releasable copies. Every audit row the gate fails to write is
 logged at ERROR with its detail, and raises an `audit_write_failed` alert keyed `approval:<id>`,
 carrying the lost row's action name.
 
 What this does not cover: a store that refuses READS still answers a raw 500, since the request
-row and the requester's account are read before any of this. The status move and its audit row
-are still two writes, not one transaction, so a status write whose COMMIT landed before a fault
-was reported can leave a row moved with no audit row.
+row and the requester's account are read before any of this.
 
 **A release records what happened to it (BACKLOG #1562).** The gate claims the request as
 `executing` before it runs the operation, so two approvers cannot both release it. It then settles
-the row to one of three outcomes, each with its own audit row after the `approval.release_attempted`
-row:
+the row to one of three outcomes. Each move carries its own audit row, after the
+`approval.release_attempted` row:
 
 | Status | Meaning | Audit row (against the approver) |
 |---|---|---|
 | `approved` | The operation ran and returned | `approval.approved` |
 | `failed` | The operation raised, or the release was cancelled before it started. It did not complete | `approval.failed` |
 | `interrupted` | The release was cancelled while the operation ran, for example by the request timeout. It may have done none, some or all of its work | `approval.interrupted` |
-| `resolved_applied` | An operator checked an `interrupted` release and recorded that its effects were applied | `approval.resolve_attempted`, then `approval.resolved` (against the resolver) |
-| `resolved_not_applied` | An operator checked an `interrupted` release and recorded that its effects were not applied | `approval.resolve_attempted`, then `approval.resolved` (against the resolver) |
+| `resolved_applied` | An operator checked an `interrupted` release and recorded that its effects were applied | `approval.resolved` (against the resolver) |
+| `resolved_not_applied` | An operator checked an `interrupted` release and recorded that its effects were not applied | `approval.resolved` (against the resolver) |
+
+The operation has run, or its outcome is unknown, by the time one of the first three is written, so
+that write never fails the call. If the move and its row cannot be written together, the gate
+writes the status alone, so an audit outage never leaves the row at `executing`. It then writes the
+audit row alone. If that fails too, the loss is logged at ERROR and pages `audit_write_failed`.
 
 Nothing retries an `interrupted` request. Re-running an operation that may already have run would be
 worse than a stuck row, so an operator has to check the operation's own effects. `GET /approvals`
@@ -1768,20 +1800,17 @@ and when it was cut off. Once the operator has checked, `POST /approvals/{id}/re
 the row to the matching `resolved_*` status (owner ruling 2026-09-26). The resolve:
 
 - needs `approvals:approve` **and a fresh step-up** (`require_step_up`), which approve and reject do
-  not ask for;
+  not ask for. The console's resolve asks for the same (see the /ui route map). A stale window
+  lands the operator back on the page to choose again; the outcome is never re-posted for them;
 - refuses the original requester with **403**, keyed on the user id like the self-approval refusal. The
   approver who released the request may resolve it;
 - **never runs the operation again**, whichever outcome is chosen. If the effects are missing, request
   the operation afresh, through dual control;
 - answers **409** for a row that is not `interrupted`, including one another operator resolved first;
-- writes `approval.resolve_attempted` against the resolver **before** the row moves, naming the
-  requester, the releasing approver, the outcome, the new status and the cut-off time. If the audit
-  log refuses it, the resolve answers **503** and the row stays `interrupted`. After the move it writes
-  `approval.resolved` with the same detail; if only that later row fails, the error is logged and the
-  resolve still succeeds, because the attempt row already records it. The row keeps the releasing
-  approver. One case the audit rows cannot settle alone: two resolvers race with the same outcome and
-  the winner's `approval.resolved` is lost. The logged error, which names the approval id, then says
-  who won.
+- writes `approval.resolved` against the resolver in the same write as the move, naming the
+  requester, the releasing approver, the outcome, the new status and the cut-off time. If that write
+  fails, the resolve answers **503** and the row stays `interrupted`. A resolver who loses a race
+  moves nothing and writes no row. The row keeps the releasing approver.
 
 `GET /approvals` lists at most 100 `interrupted` rows, oldest request first, so the requests that
 have waited longest are never the ones cut off.
@@ -1789,10 +1818,10 @@ have waited longest are never the ones cut off.
 A process that dies mid-operation leaves its row at
 `executing`. The engine does not yet reconcile those rows at startup: engine shards and cluster nodes
 share one store, and each would see the others' live releases as leftovers. If the operation ran but
-the move from `executing` to `approved` fails, the error is logged and the release still succeeds,
-because the operation has already run and an error would invite a new request that runs it twice.
-The row may stay at `executing`, and the gate still tries to write the `approval.approved` audit
-row.
+the move from `executing` to `approved` fails even when written alone, the error is logged and the
+release still succeeds, because the operation has already run and an error would invite a new
+request that runs it twice. The row may stay at `executing`, and the gate still tries to write the
+`approval.approved` audit row.
 
 **A request must also be old enough before it can be approved (ASVS 2.4.2).** The expiry is a
 ceiling. `[approvals].min_dwell_seconds` is the floor, default **2 s**. An approve that arrives sooner
@@ -1818,7 +1847,7 @@ keystroke-level model for user performance time with interactive systems", *Comm
 
 To release a request a person must at least see it and decide (M), pick out that one request (P), and
 submit (K). That is about **2.53 s**, even with the request on screen the instant it exists. The
-console's Approvals page has an Approve button beside each request, and that is exactly this path: see
+console's Approvals page has an Approve button beside each request another user raised, and that is exactly this path: see
 it, point at the button, click. From an HTTP tool, `POST /approvals/{id}/approve`, the person must carry
 the request's 32-character id into the command. Pointing at it costs P, and typing
 it costs 32 K, about 2.56 s, so the bound holds either way. The default sits about 20% below 2.53 s,
@@ -2743,7 +2772,7 @@ slack.
 | Pending federated-login flows, per client IP | the `client_ip` recorded on each staged flow | ≥ **16** pending flows from this address (`DEFAULT_PER_IP_CAP`, no knob), or ≥ `oidc_flow_cache_max` (**512**) engine-wide; 300 s TTL; **reject-when-full, never evict** (evict-oldest would turn a start-leg flood into a login DoS) | **DENY** the start leg — `FlowCacheFullError` → **303** to `/ui/login?e=rate_limited` on the sign-in start, or a **429** that re-renders the step-up page on `POST /ui/reauth/oidc`, whose `begin_oidc_step_up` stages into the same cache; WARNING-logged, deliberately **never** audited so a flood cannot amplify into `audit_log` growth | 16 / 512 / 300 s | `[auth].oidc_flow_cache_max`, `oidc_flow_ttl_seconds` |
 | `Sec-Fetch-Mode` on the federated sign-in legs | the browser fetch-metadata header on `GET /ui/sso`, `POST /ui/oidc/start`, `GET /ui/oidc/callback`, and `GET /ui/oidc/start` when its interstitial is skipped, because that GET then runs the POST leg | header **present** and not `navigate` (absent = allowed, for non-browser clients). Distinct from the `Sec-Fetch-Site` row below: a different header, a different surface, and `assert_same_origin` deliberately does **not** run on the callback leg, whose `Sec-Fetch-Site` is legitimately cross-site | **DENY** — 303 → `/ui/login?e=sso_failed`\|`oidc_failed`, plus an **audited** `auth.login_failed` row carrying the closed-set slug `non_navigation_fetch`. Evaluated **after** the login limiter, so the audit write is itself rate-bounded | on | (no knob) |
 | Instance environment posture × claimed AI data scope | `[ai].derived_posture()` (from `[ai].environment` and `[security].production_instance`; an unresolved posture defaults to the **strictest** ceiling) re-resolved server-side through `resolve_effective_policy` on every `POST /ai/chat` | the effective mode is not `managed_endpoint`, or the request's `data_scope` exceeds the server-enforced ceiling (the engine-broker MVP enforces `code_only` regardless of what the caller claims) | **DENY** — **409** on the mode mismatch, **403** on scope excess; each audited `ai.assist` with PHI-safe metadata only | `mode = byo`, `data_scope = code_only` | `[ai].mode`, `[ai].data_scope`, `[ai].environment`, `[security].production_instance` |
-| Gated operation × requester-vs-approver identity × hold age | the pending-approval record: the operation name, the requesting identity, and the hold's creation time | `[approvals].enabled` **and** the operation is in `[approvals].operations` and has no approved unexpired release; the approver is the requester; the hold is older than `expiry_hours`; the hold is younger than `min_dwell_seconds` | **DENY** the immediate execution — **202** hold + `approval.requested` audit; **403** on self-approval; **409** once expired or already decided; **409** + `approval.too_early` audit while younger than the floor (the hold stays pending) | off; `['connection_purge','dead_letter_replay']`; 72 h; 2 s | `[approvals].enabled`, `operations`, `expiry_hours`, `min_dwell_seconds` |
+| Gated operation × requester-vs-approver identity × hold age | the pending-approval record: the operation name, the requesting identity, and the hold's creation time | `[approvals].enabled` **and** the operation is in `[approvals].operations` and has no approved unexpired release; the approver is the requester; the hold is older than `expiry_hours`; the hold is younger than `min_dwell_seconds` | **DENY** the immediate execution — **202** hold + `approval.requested` audit; the same **202** and id + `approval.request_repeated` audit for the same requester's repeat of an open hold; **403** on self-approval; **409** once expired or already decided; **409** + `approval.too_early` audit while younger than the floor (the hold stays pending); **409** + `approval.no_longer_gated` audit once dual control no longer gates the operation (the hold stays pending) | off; `['connection_purge','dead_letter_replay']`; 72 h; 2 s | `[approvals].enabled`, `operations`, `expiry_hours`, `min_dwell_seconds` |
 | mTLS client-certificate subject | the subject DN of the loaded CA certificate whose key directly signed the peer certificate, and the peer's qualified subject-RDN / SAN names | exact match of the name under the map entry for that verifying CA's DN (BACKLOG #2237), in a deny-by-default map (empty map = feature off). The same subject from another CA matches nothing. A client-sent intermediate, and two loaded CAs sharing one DN with different keys, name no issuer | **ALLOW** — resolve the mapped account **id** (BACKLOG #2238; never a username, which a rename can hand to another account) to its Identity (RBAC then authorizes); an unknown or disabled account grants none. A directory account is also asked about in the directory on every request and fails closed: anything short of a present, enabled account grants none, and the Identity keeps only the stored roles and channels its current groups still map to. One exception: when none of its groups is in the scope map, a scope an administrator set stays as stored (BACKLOG #2316) | `{}` = off | `[api].tls_client_cert_identities` (requires `tls_client_ca_file`) |
 | Operator-listener peer client certificate | the TLS peer certificate presented at the API / `/ui` handshake | `[api].tls_client_ca_file` set (requires `tls_cert_file`) → `ssl.CERT_REQUIRED` plus strict RFC 5280 verify flags (`api/tls.py:47-50`); no client certificate, or one not issued by that CA | **DENY** — the TLS handshake fails, so the request never reaches the ASGI stack at all: no middleware runs, no route matches, no identity is resolved, and no 403 body is produced | unset = off (server-only TLS, no peer-certificate decision on the control plane) | `[api].tls_client_ca_file` |
 | Declared token class of a federated assertion | the `typ` JOSE header, and the presence of an `events` claim, on a **signature-verified** JWS | `typ` present and — normalised `.strip().lower()` then `application/`-stripped — not `jwt`, so `at+jwt` (RFC 9068 access token), `logout+jwt` and `secevent+jwt` are refused while an **absent** `typ` is allowed (RFC 7519 §5.1 makes the header advisory); or the claim set carries `events`, i.e. an RFC 8417 security event token. Every such token is minted by the **same issuer under the same key**, so no signature or key rung distinguishes it | **DENY** the sign-in — `ClaimsError("wrong_token_type")` at the key-selection rung, `ClaimsError("unexpected_events_claim")` ahead of the nonce compare (a logout token carries no nonce, so a later check would misreport it as a browser-binding failure) | on | (no knob) |

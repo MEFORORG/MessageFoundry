@@ -4452,15 +4452,16 @@ def create_app(
 
     @app.get("/approvals", response_model=ApprovalList)
     async def list_approvals(
-        _: Identity = Depends(require(Permission.APPROVALS_APPROVE)),
+        identity: Identity = Depends(require(Permission.APPROVALS_APPROVE)),
         gate: ApprovalGate | None = Depends(_get_gate),
     ) -> ApprovalList:
         """Open high-value actions: ``pending`` ones awaiting a second approver, then ``interrupted``
-        releases awaiting a resolve (BACKLOG #1562). Each row carries its ``status``."""
+        releases awaiting a resolve (BACKLOG #1562). Each row carries its ``status``, and
+        ``caller_is_requester`` marks the caller's own requests (BACKLOG #2460)."""
         if gate is None:
             raise HTTPException(503, "approval workflow is not available")
-        pending = await gate.list_pending()
-        interrupted = await gate.list_interrupted()
+        pending = await gate.list_pending(caller_user_id=identity.user_id)
+        interrupted = await gate.list_interrupted(caller_user_id=identity.user_id)
         # Two reads, so a release cut off between them can appear in both. The interrupted read is
         # the later one and a row never returns to pending, so that status wins. A row released and
         # settled between the reads still shows as pending; approving it then answers 409.
@@ -4521,8 +4522,8 @@ def create_app(
         gate: ApprovalGate | None = Depends(_get_gate),
     ) -> ApprovalResolveResult:
         """Record what an ``interrupted`` release did: ``effects_applied`` or ``effects_not_applied``
-        (BACKLOG #1562 part B). Audited as ``approval.resolve_attempted`` before the row moves and
-        ``approval.resolved`` after; the operation is never re-run. The
+        (BACKLOG #1562 part B). Audited as ``approval.resolved``, written with the move in one
+        transaction (vault BACKLOG #2255); the operation is never re-run. The
         requester cannot resolve their own request, and a row not ``interrupted`` answers 409."""
         if gate is None:
             raise HTTPException(503, "approval workflow is not available")
@@ -7850,6 +7851,7 @@ def create_app(
                 list_approvals=list_approvals,
                 approve_action=approve_action,
                 reject_action=reject_action,
+                resolve_action=resolve_action,
             ),
             admin=admin,
         )
