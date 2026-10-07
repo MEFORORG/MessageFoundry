@@ -29,6 +29,7 @@ from messagefoundry.uploads import (
     UploadRetentionRunner,
     UploadStore,
     UploadTooLargeError,
+    _SweepTally,
     sanitize_filename,
     validate_upload_content,
 )
@@ -519,12 +520,13 @@ async def _stop_stuck_runner(
     paused: threading.Event,
     release: threading.Event,
     caplog: pytest.LogCaptureFixture,
+    audit: Callable[[UploadedFileMeta], Awaitable[None]] | None = None,
 ) -> logging.LogRecord:
     """Start a runner over ``store``, wait for its sweep to park on ``paused``, stop it with a
     0.05 s bound, release the sweep, and return the one record ``stop()`` logged about it."""
     runner = UploadRetentionRunner(
         store,
-        audit=_audited_to([]),
+        audit=audit or _audited_to([]),
         clock=lambda: time.time() + 31 * 86_400,
         stop_timeout_seconds=0.05,
     )
@@ -566,26 +568,58 @@ async def test_a_stuck_sweep_that_deleted_nothing_logs_no_audit_gap(
     it sees the abort and deletes nothing more, so no row is lost: a WARNING, not an ERROR."""
     store = _quota_store(tmp_path, retention_days=30)
     meta = await store.save(data=b"aging\n", filename="a.txt", uploader="op", uploader_id="u-op")
-    paused, release, scanned = threading.Event(), threading.Event(), threading.Event()
+    paused, release, decided = threading.Event(), threading.Event(), threading.Event()
     real_scan = store._scan_metas_sync
+    real_begin = _SweepTally.begin
+    began: list[bool] = []
 
     def _stuck_scan() -> list[UploadedFileMeta]:
         paused.set()
         release.wait(timeout=10)
-        try:
-            return real_scan()
-        finally:
-            scanned.set()
+        return real_scan()
+
+    def _begin(tally: _SweepTally, m: UploadedFileMeta, abort: threading.Event) -> bool:
+        began.append(real_begin(tally, m, abort))
+        decided.set()
+        return began[-1]
 
     monkeypatch.setattr(store, "_scan_metas_sync", _stuck_scan)
+    monkeypatch.setattr(_SweepTally, "begin", _begin)
     record = await _stop_stuck_runner(store, paused, release, caplog)
     assert record.levelno == logging.WARNING, record.getMessage()
     assert "no upload.prune row is lost" in record.getMessage()
-    # The abort was set before the release, so the released thread leaves the pair whole. Nothing
-    # joins a cancelled to_thread job, so give it time to reach the pair before reading the disk.
-    assert await asyncio.to_thread(scanned.wait, 10)
-    await asyncio.sleep(0.2)
+    # Nothing joins a cancelled to_thread job, so wait for the released thread's decision on the
+    # pair. The abort was set before the release, so it declines, and the pair stays whole.
+    assert await asyncio.to_thread(decided.wait, 10), "the released sweep never reached the pair"
+    assert began == [False]
     assert [m.file_id for m in await store.list_files()] == [meta.file_id]
+
+
+async def test_a_sweep_stuck_in_its_audit_writes_names_each_unaudited_file(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #2264, code review. The sweep removed three pairs and its audit write hangs on the
+    second, so two rows are missing. The ERROR names exactly those two files, by ``file_id``."""
+    store = _quota_store(tmp_path, retention_days=30)
+    for i in range(3):
+        await store.save(
+            data=f"aging {i}\n".encode(), filename=f"f{i}.txt", uploader="op", uploader_id="u-op"
+        )
+    paused = threading.Event()
+    written: list[str] = []
+
+    async def _audit(m: UploadedFileMeta) -> None:
+        if written:
+            paused.set()
+            await asyncio.Event().wait()  # hangs until stop() cancels the sweep
+        written.append(m.file_id)
+
+    record = await _stop_stuck_runner(store, paused, threading.Event(), caplog, audit=_audit)
+    assert record.levelno == logging.ERROR, record.getMessage()
+    assert "2 file(s) it removed, or was removing, may have no" in record.getMessage()
+    assert await store.list_files() == []
+    named = set(record.getMessage().rsplit(": ", 1)[1].split(", "))
+    assert len(written) == 1 and written[0] not in named and len(named) == 2
 
 
 async def test_a_refused_unlink_is_not_counted_as_an_audit_gap(

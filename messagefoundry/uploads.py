@@ -1347,27 +1347,22 @@ class UploadStore:
         cutoff = at - days * _SECONDS_PER_DAY
 
         stop = abort if abort is not None else threading.Event()
+        sweep = tally if tally is not None else _SweepTally()
 
         def _prune() -> PruneResult:
-            pruned: list[UploadedFileMeta] = []
             # Checked before the scan too: the scan decrypts every sidecar, which is wasted on a stop.
             metas = [] if stop.is_set() else self._scan_metas_sync()
             for meta in metas:
                 if meta.uploaded_at >= cutoff:
                     continue
-                if tally is None:
-                    if stop.is_set():
-                        break
-                elif not tally.begin(meta, stop):
+                if not sweep.begin(meta, stop):
                     break
                 removed = False
                 try:
                     removed = self._prune_pair_sync(meta)
                 finally:
-                    if tally is not None:
-                        tally.end(removed)
-                if removed:
-                    pruned.append(meta)
+                    sweep.end(removed)
+            pruned = list(sweep.removed)
             if stop.is_set():
                 return PruneResult(pruned=pruned)
             # The orphan sweep runs AFTER the deletions, so a failure in it must not raise out of
@@ -1592,7 +1587,9 @@ class _SweepTally:
     ``removed`` lists each pair the sweep's thread removed, in the order it is audited, and
     ``removing`` is the pair it is removing now. ``audited`` counts audit calls that returned or
     raised; a raised call is counted because :meth:`UploadStore.prune_and_audit` already logs it.
-    So ``unaudited()`` names every removed file whose row has not been written, and only those.
+    So ``unaudited()`` names every removed file whose row has not been written. It also names the
+    pair in progress, which may turn out not to be removed, and a row whose interrupted write may
+    still land, so it can name more than are lost, never fewer.
 
     The abort check and the ``removing`` mark are one step under ``lock``, and so is the stop's
     ``abort.set()``. A thread that passed the check is therefore already visible to the stop.
@@ -1700,8 +1697,10 @@ class UploadRetentionRunner:
         if task is None:
             return
         # Stop the sweep in flight, which holds THIS event, then give the runner a fresh one. Left
-        # set, it made every later run_once() prune nothing, silently.
-        self._tally.abort(self._abort)
+        # set, it made every later run_once() prune nothing, silently. The tally is kept in a local:
+        # a start() during the wait below replaces self._tally with the next sweep's.
+        tally = self._tally
+        tally.abort(self._abort)
         self._abort = threading.Event()
         try:
             # shield: a timeout must not cancel the task mid-audit; the branches below decide that.
@@ -1711,16 +1710,22 @@ class UploadRetentionRunner:
             why = f"did not finish within {self._stop_timeout:g}s of shutdown"
         except asyncio.CancelledError:
             why = "was still running when shutdown itself was cancelled"
-        # Read before the cancel. With no audit callback no row was ever due, so none is lost.
-        lost = self._tally.unaudited() if self._audit is not None else []
-        if lost:
+        # Read before the cancel. Every id is logged, since this line is the only record of them.
+        lost = tally.unaudited()
+        if self._audit is None:
+            _log.warning(
+                "uploaded-logs retention sweep %s; cancelling it. The runner has no audit "
+                "callback, so it owed no upload.prune row",
+                why,
+            )
+        elif lost:
             # An audit write the cancel interrupts may still land, so "may".
             _log.error(
                 "uploaded-logs retention sweep %s; cancelling it. %d file(s) it removed, or was "
                 "removing, may have no upload.prune audit row: %s",
                 why,
                 len(lost),
-                ", ".join(lost[:20]) + (f" and {len(lost) - 20} more" if len(lost) > 20 else ""),
+                ", ".join(lost),
             )
         else:
             _log.warning(
@@ -1839,8 +1844,8 @@ async def _wait_to_completion[T](
     ``cancel_bound`` limits the wait after a cancellation, in seconds; ``None`` waits as long as it
     takes, which the save's thread needs, since a thread cannot be stopped. A ledger call waits on
     the store, which may not be bounded at all. At the bound this raises with ``fut`` still
-    running, and the caller decides what to do with it. Under an anyio scope, the scope cancels again on every loop pass, so the
-    wait costs CPU, and the bound limits that too.
+    running, and the caller decides what to do with it. Under an anyio scope, the scope cancels
+    again on every loop pass, so the wait costs CPU, and the bound limits that too.
 
     **A caller already cancelled at entry gets the bound as well.** That is a ``finally`` running
     after an earlier wait absorbed the cancellation: the release after a cancelled write. Without
