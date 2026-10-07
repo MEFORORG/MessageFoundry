@@ -32,8 +32,10 @@ import base64
 import json
 import logging
 import mimetypes
+import traceback
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -45,6 +47,7 @@ from messagefoundry.api.app import (
     _INERT_ATTACHMENT_TYPES,
     _safe_attachment_content_type,
 )
+from messagefoundry.api.svg_sanitize import SvgRejected
 from messagefoundry.auth import Role
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
@@ -815,9 +818,89 @@ async def test_undecodable_stored_value_is_refused_and_audited_as_a_refusal(
     assert r.status_code == 422
     assert b"synthetic-undecodable-marker" not in r.content
     logged = "\n".join(rec.getMessage() for rec in caplog.records)
-    assert "stored value is not decodable" in logged
+    assert "attachment download refused: undecodable" in logged
     assert "undecodable-marker" not in logged
     await _assert_one_refusal_row(engine, mid, ref, "undecodable")
+
+
+_SVG_PLANTED = "SYNTHETICPLANTEDSVG"
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        f'<!DOCTYPE svg [<!ENTITY {_SVG_PLANTED} "x">]><svg>'.encode(),
+        f'<!DOCTYPE svg [<!ENTITY e SYSTEM "http://{_SVG_PLANTED}/">]><svg>&e;'.encode(),
+        f'<?xml version="1.0" encoding="x-{_SVG_PLANTED}"?><svg>'.encode(),
+    ],
+    ids=["entity-name", "system-id", "encoding-label"],
+)
+async def test_a_failed_refusal_audit_carries_no_svg_text_onto_the_chain_or_the_log(
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    prefix: bytes,
+) -> None:
+    """A store fault on the refusal row turns the 422 into a 500, and nothing sender-controlled rides
+    along (BACKLOG #2387, #1796). The parser's error can quote an entity name, a system id or an
+    encoding label. If the audit write ran inside the ``except``, its error would chain that text and
+    a server would log it in the traceback. The planted value reaches no chain, log record or reply."""
+    mid, ref = await _seed_labelled(
+        engine, "image/svg+xml", marker="failed-audit", prefix=prefix, suffix=b"</svg>"
+    )
+    real = engine.store.record_audit
+    raised: list[BaseException] = []
+
+    async def failing(action: str, **kwargs: Any) -> Any:
+        if action == "attachment_download_refused":
+            exc = RuntimeError("synthetic audit store fault")
+            raised.append(exc)
+            raise exc
+        return await real(action, **kwargs)
+
+    monkeypatch.setattr(engine.store, "record_audit", failing)
+    transport = httpx.ASGITransport(
+        app=create_app(engine, allow_no_auth=True), raise_app_exceptions=False
+    )
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        with caplog.at_level(logging.DEBUG):
+            r = await c.get(f"/messages/{mid}/attachments/{ref}")
+    assert r.status_code == 500
+    assert _SVG_PLANTED.encode() not in r.content
+    (exc,) = raised
+    # The ASGI stack's task groups may chain an ExceptionGroup on the way out; the parser's error
+    # must not be anywhere on it. format_exception also walks the groups' members.
+    chain = _chain(exc)
+    assert not [e for e in chain if isinstance(e, SvgRejected) or _SVG_PLANTED in repr(e)], chain
+    assert _SVG_PLANTED not in "".join(traceback.format_exception(exc, chain=True))
+    formatter = logging.Formatter()
+    assert not [rec for rec in caplog.records if _SVG_PLANTED in formatter.format(rec)]
+
+
+def test_the_chain_walker_finds_a_parser_error_raised_inside_the_handler() -> None:
+    """Control for the test above: the shape it replaced is found, so a clean reading means clean."""
+    try:
+        try:
+            raise SvgRejected("refused") from ValueError(_SVG_PLANTED)
+        except SvgRejected:
+            raise RuntimeError("synthetic audit store fault")  # noqa: B904 - the shape under test
+    except RuntimeError as exc:
+        found = exc
+    assert len(_chain(found)) == 3
+    assert _SVG_PLANTED in "".join(traceback.format_exception(found, chain=True))
+
+
+def _chain(exc: BaseException) -> list[BaseException]:
+    """Every exception reachable from ``exc`` by ``__cause__`` or ``__context__``, ``exc`` first."""
+    seen: list[BaseException] = []
+    stack: list[BaseException | None] = [exc]
+    while stack:
+        cur = stack.pop()
+        if cur is None or any(cur is s for s in seen):
+            continue
+        seen.append(cur)
+        stack += [cur.__cause__, cur.__context__]
+    return seen
 
 
 async def test_svg_label_on_non_markup_bytes_is_served_unchanged(
