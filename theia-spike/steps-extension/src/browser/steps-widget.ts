@@ -60,6 +60,9 @@ export class StepsWidget extends BaseWidget implements SaveableSource {
         return visible[visible.length - 1];
     }
 
+    /** Set by the analyst module only. A developer build keeps the text-editor controls. */
+    static analystBuild = false;
+
     protected touch(): void {
         const list = StepsWidget.instances;
         const at = list.indexOf(this);
@@ -133,8 +136,6 @@ export class StepsWidget extends BaseWidget implements SaveableSource {
         this.messages.setAttribute('aria-live', 'polite');
         this.messages.style.padding = '0 8px';
         this.node.append(this.banner, this.messages, this.frame);
-        this.touch();
-        this.toDispose.push({ dispose: () => this.touch() });
         this.toDispose.push(this.modelDisposables);
         this.toDispose.push({
             dispose: () => {
@@ -167,6 +168,9 @@ export class StepsWidget extends BaseWidget implements SaveableSource {
         this.modelDisposables.push(this.model.onDidChangeContent(() => this.scheduleRender()));
         this.modelDisposables.push(this.model.onDirtyChanged(() => this.updateSummary()));
         await this.render();
+        // Registered only once the widget is whole, so a failed initialize leaves nothing behind.
+        this.touch();
+        this.toDispose.push({ dispose: () => this.touch() });
     }
 
     protected onActivateRequest(msg: Message): void {
@@ -341,7 +345,9 @@ export class StepsWidget extends BaseWidget implements SaveableSource {
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';" />
 <style>${this.themeShim()}</style>
 <style>${this.assets?.style ?? ''}</style>
-<style>/* S-2: the analyst build has no text editor, so the per-row jump-to-line control is hidden (FR-14). */ button.jump { display: none !important; }</style>
+${StepsWidget.analystBuild
+        // S-2: the analyst build has no text editor, so the per-row jump-to-line control is hidden (FR-14).
+        ? '<style>button.jump { display: none !important; }</style>' : ''}
 </head><body>
   <div class="bar">
     <span><input id="stepsFilter" type="search" placeholder="Filter steps" /></span>
@@ -350,7 +356,7 @@ export class StepsWidget extends BaseWidget implements SaveableSource {
     <button id="addAction" disabled>Add</button>
     <button id="pickSample">Pick Sample</button>
     <button id="test">Test</button>
-    <button id="openText" class="link" hidden></button>
+    ${StepsWidget.analystBuild ? '<button id="openText" class="link" hidden></button>' : '<button id="openText" class="link">View as Code</button>'}
   </div>
   ${body}
   ${renderStepsContextMenuHtml()}
@@ -383,11 +389,14 @@ export class StepsWidget extends BaseWidget implements SaveableSource {
                 return;
             case 'openText':
             case 'openSource':
-                // ide/ opens the text editor here. The analyst build has none (FR-14), and the webview
-                // controls that post these are hidden, so this is reached only by a forged message.
-                this.record('unsupported', String(msg.command));
-                this.showPanelMessage('info', 'Routers and Handlers open in the Steps view only. Ask a developer if the change needs code.');
-                return;
+                if (StepsWidget.analystBuild) {
+                    // ide/ opens the text editor here. The analyst build has none (FR-14), and the webview
+                    // controls that post these are hidden, so this is reached only by a forged message.
+                    this.record('unsupported', String(msg.command));
+                    this.showPanelMessage('info', 'Routers and Handlers open in the Steps view only. Ask a developer if the change needs code.');
+                    return;
+                }
+            // falls through: a developer build would open the text editor, which no spike implements yet
             default:
                 // Every other host message (structural ops, Test, pick sample) is outside S-1 and S-2.
                 this.record('unsupported', String(msg.command));

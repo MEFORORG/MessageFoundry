@@ -3,6 +3,9 @@
 // Spike S-2: the analyst build's guard. A `.py` opens only in the Steps view (FR-14, AC-G1), and a
 // message shown while a Steps view is up goes into that view rather than a pop-up (FR-17).
 //
+// A rename or copy that turns another file into a `.py` is refused too, since that writes raw text
+// into a `.py` without the Steps view.
+//
 // It is a separate frontend module so a developer build can leave it out and keep the text editor.
 // It closes the text route at three layers, because no single one sees every caller:
 //   1. the opener: EditorManager.canHandle declines a `.py`, so the Steps handler (500) is the only one;
@@ -34,9 +37,13 @@ import {
     Disposable,
     MenuModelRegistry,
     MenuNode,
+    CancellationToken,
+    Message,
     MessageClient,
     MessageService,
     MessageType,
+    ProgressMessage,
+    ProgressUpdate,
     PreferenceScope,
     PreferenceService,
 } from '@theia/core/lib/common';
@@ -51,6 +58,8 @@ import { EditorWidgetFactory } from '@theia/editor/lib/browser/editor-widget-fac
 import { TextEditorProvider } from '@theia/editor/lib/browser/editor';
 import { MonacoEditorProvider } from '@theia/monaco/lib/browser/monaco-editor-provider';
 import { WorkspaceService } from '@theia/workspace/lib/browser/workspace-service';
+import { FileService } from '@theia/filesystem/lib/browser/file-service';
+import { CopyFileOptions, FileStatWithMetadata, MoveFileOptions } from '@theia/filesystem/lib/common/files';
 import { BLOCKED_COMMANDS, isPythonUri, isStepsUri, textEditorRefusal } from './analyst-routes';
 import { StepsOpenHandler } from './steps-frontend-module';
 import { StepsWidget } from './steps-widget';
@@ -58,7 +67,7 @@ import { StepsWidget } from './steps-widget';
 /** One refused attempt, recorded for the S-2 walk. `layer` names the guard that caught it. */
 export interface AnalystRefusal {
     at: number;
-    layer: 'editor-manager' | 'open-with' | 'text-editor-provider' | 'command-registry';
+    layer: 'editor-manager' | 'open-with' | 'text-editor-provider' | 'command-registry' | 'file-operation';
     reason: string;
     target: string;
 }
@@ -100,7 +109,7 @@ export class AnalystEditorManager extends EditorManager {
         refuse('editor-manager', reason, uri.toString());
         const target = stepsTarget(uri);
         if (target) {
-            const widget = await this.stepsOpener.open(target);
+            const widget = await this.stepsOpener.open(target, options);
             widget.showPanelMessage('info', REFUSED_TEXT);
         } else {
             StepsWidget.panelTarget()?.showPanelMessage('info', REFUSED_TEXT);
@@ -120,8 +129,9 @@ export class AnalystOpenWithService extends OpenWithService {
     }
 
     override async openWith(uri: URI): Promise<object | undefined> {
-        if (textEditorRefusal(uri)) {
-            refuse('open-with', textEditorRefusal(uri) ?? '', uri.toString());
+        const reason = textEditorRefusal(uri);
+        if (reason) {
+            refuse('open-with', reason, uri.toString());
             StepsWidget.panelTarget()?.showPanelMessage('info', REFUSED_TEXT);
             return undefined;
         }
@@ -165,27 +175,68 @@ export class AnalystCommandRegistry extends CommandRegistry {
 }
 
 /**
- * FR-17: while a Steps view is showing, a message goes into it instead of a toast. A message that
- * offers actions gets none here, so its caller sees "dismissed"; that is the spike's known gap.
+ * FR-17: while a Steps view is showing, a message goes into it instead of a toast. The gate sits on
+ * the MessageClient, which every message reaches: MessageService calls, progress, and messages the
+ * backend sends. A message that offers actions gets none here, so its caller sees "dismissed"; that
+ * is the spike's known gap. The client is patched on its instance because @theia/messages binds it
+ * after this module loads, so a rebind here would be overridden.
  */
-@injectable()
-export class AnalystMessageService extends MessageService {
-    constructor(@inject(MessageClient) client: MessageClient) {
-        super(client);
-    }
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    protected override processMessage(type: MessageType, text: string, args?: any[]): Promise<string | undefined> {
+function gateMessageClient(client: MessageClient): void {
+    const routed = new Set<string>();
+    const kindOf = (type: MessageType | undefined): 'info' | 'warning' | 'error' =>
+        type === MessageType.Error ? 'error' : type === MessageType.Warning ? 'warning' : 'info';
+    const showMessage = client.showMessage.bind(client);
+    client.showMessage = (message: Message) => {
         const target = StepsWidget.panelTarget();
-        if (target && type !== MessageType.Log) {
-            const kind = type === MessageType.Error ? 'error' : type === MessageType.Warning ? 'warning' : 'info';
-            target.showPanelMessage(kind, text);
+        if (message.type !== MessageType.Log) {
+            if (target) {
+                target.showPanelMessage(kindOf(message.type), message.text);
+                return Promise.resolve(undefined);
+            }
+            toastPath.push({ at: Date.now(), type: String(message.type), text: String(message.text).slice(0, 200) });
+        }
+        return showMessage(message);
+    };
+    const showProgress = client.showProgress.bind(client);
+    client.showProgress = (id: string, message: ProgressMessage, token: CancellationToken) => {
+        const target = StepsWidget.panelTarget();
+        if (target) {
+            routed.add(id);
+            target.showPanelMessage('info', message.text);
             return Promise.resolve(undefined);
         }
-        if (type !== MessageType.Log) {
-            toastPath.push({ at: Date.now(), type: String(type), text: String(text).slice(0, 200) });
+        toastPath.push({ at: Date.now(), type: 'progress', text: String(message.text).slice(0, 200) });
+        return showProgress(id, message, token);
+    };
+    const reportProgress = client.reportProgress.bind(client);
+    client.reportProgress = (id: string, update: ProgressUpdate, message: ProgressMessage, token: CancellationToken) =>
+        routed.has(id) ? Promise.resolve() : reportProgress(id, update, message, token);
+}
+
+/**
+ * Refuses a move or copy that turns a file that is not a `.py` into one. Without it, New File
+ * `x.txt`, typed in the text editor and renamed to `x.py`, writes raw text into a `.py` (AC-G4).
+ * A rebind, not a FileOperationParticipant: FileService logs a participant's error and carries on.
+ */
+@injectable()
+export class AnalystFileService extends FileService {
+    protected refuseToPython(source: URI, target: URI): void {
+        if (isPythonUri(target) && !isPythonUri(source)) {
+            refuse('file-operation', 'non-.py renamed or copied to .py', `${source.path.base}->${target.path.base}`);
+            StepsWidget.panelTarget()?.showPanelMessage('info',
+                'A file cannot be renamed to a Router or Handler name here. Ask a developer.');
+            throw new Error(`The analyst build does not turn ${source.path.base} into ${target.path.base}.`);
         }
-        return super.processMessage(type, text, args);
+    }
+
+    override async move(source: URI, target: URI, options?: MoveFileOptions): Promise<FileStatWithMetadata> {
+        this.refuseToPython(source, target);
+        return super.move(source, target, options);
+    }
+
+    override async copy(source: URI, target: URI, options?: CopyFileOptions): Promise<FileStatWithMetadata> {
+        this.refuseToPython(source, target);
+        return super.copy(source, target, options);
     }
 }
 
@@ -209,6 +260,8 @@ export class AnalystRoutesContribution implements FrontendApplicationContributio
     @inject(WorkspaceService) protected readonly workspace!: WorkspaceService;
     @inject(TextEditorProvider) protected readonly textEditorProvider!: TextEditorProvider;
     @inject(PreferenceService) protected readonly preferences!: PreferenceService;
+    @inject(MessageClient) protected readonly messageClient!: MessageClient;
+    @inject(FileService) protected readonly files!: FileService;
 
     protected readonly createdEditors: string[] = [];
 
@@ -218,6 +271,7 @@ export class AnalystRoutesContribution implements FrontendApplicationContributio
                 this.createdEditors.push(widget instanceof EditorWidget ? widget.editor.uri.toString() : widget.id);
             }
         });
+        gateMessageClient(this.messageClient);
         this.removeBlocked();
         this.exposeHook();
     }
@@ -318,6 +372,11 @@ export class AnalystRoutesContribution implements FrontendApplicationContributio
             diffUri: (l: string, r: string) => DiffUris.encode(new URI(l), new URI(r)).toString(),
             message: (type: 'info' | 'warn' | 'error', text: string) => self.settle(Promise.resolve(this.messages[type](text)), 2000),
             isPython: (u: string) => isPythonUri(new URI(u)),
+            getPreference: (key: string) => this.preferences.get(key),
+            createFile: (u: string, text: string) => self.settle(this.files.create(new URI(u), text), 5000),
+            move: (from: string, to: string) => self.settle(this.files.move(new URI(from), new URI(to)), 5000),
+            exists: (u: string) => this.files.exists(new URI(u)),
+            progress: (text: string) => self.settle(this.messages.showProgress({ text }).then(p => p.cancel()), 2000),
             // Workspace scope, so the setting lands in the test's temporary workspace copy, never the user's.
             setWorkspacePreference: (key: string, value: unknown) => self.settle(
                 this.preferences.set(key, value, PreferenceScope.Workspace), 5000),
@@ -341,7 +400,8 @@ export default new ContainerModule((bind, unbind, isBound, rebind) => {
         WebSocketConnectionProvider.createHandler(container, commandServicePath, registry);
         return registry;
     });
-    rebind(MessageService).to(AnalystMessageService).inSingletonScope();
+    rebind(FileService).to(AnalystFileService).inSingletonScope();
+    StepsWidget.analystBuild = true;
     rebind(TextEditorProvider).toProvider(ctx => async (uri: URI) => {
         const reason = textEditorRefusal(uri);
         if (reason !== undefined) {

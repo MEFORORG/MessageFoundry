@@ -37,6 +37,11 @@ export interface AnalystHook {
     diffUri(l: string, r: string): string;
     message(type: 'info' | 'warn' | 'error', text: string): Promise<string>;
     setWorkspacePreference(key: string, value: unknown): Promise<string>;
+    getPreference(key: string): unknown;
+    createFile(u: string, text: string): Promise<string>;
+    move(from: string, to: string): Promise<string>;
+    exists(u: string): Promise<boolean>;
+    progress(text: string): Promise<string>;
     activateSteps(u?: string): Promise<string>;
 }
 
@@ -85,8 +90,10 @@ export class AnalystPage {
 
     /** Text editors open on a `.py`, counted two ways: the editor manager, and Monaco DOM in a `.py` tab. */
     async pyTextEditors(): Promise<{ manager: string[]; created: string[]; dom: number }> {
-        const manager = (await this.hook(h => h.textEditors())).filter(u => /\.py$/i.test(u) || /\.py(%|&|$)/i.test(u));
-        const created = (await this.hook(h => h.createdEditors)).filter(u => /\.py/i.test(u));
+        // A `.py` at the end of the path, or before a query, fragment or encoded delimiter (a diff URI).
+        const isPy = (u: string) => /\.py(?=$|[?#%&])/i.test(u);
+        const manager = (await this.hook(h => h.textEditors())).filter(isPy);
+        const created = (await this.hook(h => h.createdEditors)).filter(isPy);
         const dom = await this.page.evaluate(() => Array.from(document.querySelectorAll('.theia-editor .monaco-editor'))
             .filter(el => {
                 const owner = el.closest('[id^="code-editor-opener:"]');
@@ -100,9 +107,12 @@ export class AnalystPage {
         expect(found, `a .py text editor after: ${context}`).toEqual({ manager: [], created: [], dom: 0 });
     }
 
-    /** Toasts currently on screen. Hidden notification-center entries are not toasts. */
+    /**
+     * Notifications on screen: a toast, or an entry in an open notification center. Counting only the
+     * toast container would read 0 for the rest of a walk once some command opened the center.
+     */
     toastCount(): Promise<number> {
-        return this.page.locator('.theia-notification-toasts.open .theia-notification-list-item').count();
+        return this.page.locator('.theia-notification-list-item').filter({ visible: true }).count();
     }
 
     dialogCount(): Promise<number> {

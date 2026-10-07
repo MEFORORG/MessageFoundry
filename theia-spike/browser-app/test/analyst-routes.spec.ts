@@ -30,7 +30,13 @@ test('every named route to a .py ends in the Steps view or a refusal, never a te
     const note = (route: string, outcome: string) => { results.push({ route, outcome }); };
 
     // Double-clicking the empty editor area runs New Text File in stock Theia. Not registered here.
-    await page.locator('#theia-main-content-panel').dblclick({ position: { x: 300, y: 300 } });
+    const main = page.locator('#theia-main-content-panel');
+    // The double-click must land on the dock panel itself, or Theia's handler never runs.
+    expect(await main.evaluate(el => {
+        const r = el.getBoundingClientRect();
+        return document.elementFromPoint(r.left + 300, r.top + 300) === el;
+    })).toBe(true);
+    await main.dblclick({ position: { x: 300, y: 300 } });
     await page.waitForTimeout(500);
     expect(await a.hook(h => h.textEditors())).toEqual([]);
     note('double-click empty editor area (New Text File)', 'nothing opens; command not registered');
@@ -64,7 +70,8 @@ test('every named route to a .py ends in the Steps view or a refusal, never a te
 
     // 5. workbench.editorAssociations set to the text editor ("default") for *.py.
     expect(await a.hook(h => h.setWorkspacePreference('workbench.editorAssociations', { '*.py': 'default' }))).toBe('ok');
-    await page.waitForTimeout(500);
+    // The setting must be live, or the check below passes for the wrong reason.
+    await expect.poll(() => a.hook(h => h.getPreference('workbench.editorAssociations'))).toEqual({ '*.py': 'default' });
     expect((await a.hook((h, u: string) => h.openers(u), pyUri)).map(o => o.id)).toEqual(['mf-steps-spike']);
     await a.hook((h, u: string) => h.openViaOpener(u), pyUri);
     await a.expectSteps('IB_PARTNER_X12.py');
@@ -152,6 +159,8 @@ test('every named route to a .py ends in the Steps view or a refusal, never a te
         document.getElementById('theia-main-content-panel')!.dispatchEvent(new DragEvent('drop', { dataTransfer: dt, bubbles: true }));
     });
     await page.waitForTimeout(1000);
+    expect((await a.hook(h => h.stepsWidgets())).filter(u => u.includes('dropped'))).toEqual([]);
+    await a.expectNoPyTextEditor('an operating-system drop');
     note('drop a .py from the operating system', 'refused (untitled:/dropped.py has no opener)');
 
     // 15. File > Open File...: Theia's own file dialog, then the opener.
@@ -175,14 +184,27 @@ test('every named route to a .py ends in the Steps view or a refusal, never a te
     const frame = page.frameLocator('.mf-steps-widget:visible iframe');
     await expect(frame.locator('#openText')).toBeHidden();
     await expect(frame.locator('button.jump').first()).toBeHidden();
+    const panelMessages = page.locator('.mf-steps-widget:visible .mf-steps-message');
+    // The panel keeps five; clear it so two new ones are countable.
+    while (await panelMessages.count()) {
+        await panelMessages.first().locator('button').click();
+    }
     await frame.locator('body').evaluate(() => {
         parent.postMessage({ mfSteps: { command: 'openText' } }, '*');
         parent.postMessage({ mfSteps: { command: 'openSource', line: 3 } }, '*');
     });
-    await expect(page.locator('.mf-steps-widget:visible .mf-steps-message')).not.toHaveCount(0);
+    await expect(panelMessages).toHaveCount(2);
     note('Steps webview "View as Code" / jump-to-line (forged message)', 'controls hidden; message refused in the panel');
 
-    // 18. Keybindings: none is bound to a blocked command.
+    // 18. Rename a text file to .py: New File x.txt, typed in the text editor, then renamed.
+    const txt = await a.fileUri('notes.txt');
+    expect(await a.hook((h, u: string) => h.createFile(u, 'x = 1\n'), txt)).toBe('ok');
+    const renamed = await a.fileUri('notes.py');
+    expect(await a.hook((h, ft: string[]) => h.move(ft[0], ft[1]), [txt, renamed])).toMatch(/^threw:/);
+    expect(await a.hook((h, u: string) => h.exists(u), renamed)).toBe(false);
+    note('rename a .txt to .py', 'refused by the FileService rebind');
+
+    // 18b. Keybindings: none is bound to a blocked command.
     const blocked = await a.hook(h => h.blocked);
     const bound = (await a.hook(h => h.keybindings())).filter(k => blocked.includes(k.command));
     expect(bound).toEqual([]);
@@ -350,12 +372,13 @@ test('a message raised while the Steps view is up lands in the panel, not a toas
     for (const type of ['info', 'warn', 'error'] as const) {
         await a.hook((h, t: string) => h.message(t as 'info', `S-2 probe ${t}`), type);
     }
-    await expect(a.page.locator('.mf-steps-widget:visible .mf-steps-message')).toHaveCount(3);
+    await a.hook(h => h.progress('S-2 probe progress'));
+    await expect(a.page.locator('.mf-steps-widget:visible .mf-steps-message')).toHaveCount(4);
     expect(await a.toastCount()).toBe(0);
     expect(await a.hook(h => h.toastPath)).toEqual([]);
     // The panel's own Dismiss removes a message: no pop-up is needed to clear one.
     await a.page.locator('.mf-steps-widget:visible .mf-steps-message button').first().click();
-    await expect(a.page.locator('.mf-steps-widget:visible .mf-steps-message')).toHaveCount(2);
+    await expect(a.page.locator('.mf-steps-widget:visible .mf-steps-message')).toHaveCount(3);
 
     // Control: with no Steps view showing, the same call raises a toast. Without this, a toast counter
     // that can never fire would pass the walk's "no toast" check too.
