@@ -735,8 +735,23 @@ def _clean_groups(levels: int) -> Exception:
 
 _POINT = collections.namedtuple("_POINT", "x y")
 
+
+class _NoData(collections.UserDict[str, object]):
+    """Never sets .data, and prints without it."""
+
+    def __init__(self) -> None:
+        pass
+
+    def __len__(self) -> int:
+        return 0  # so LogRecord keeps it as an argument rather than reading it as the mapping
+
+    def __repr__(self) -> str:
+        return "_NoData()"
+
+
 #: Arguments holding no UnicodeError. Each must reach the formatter as the same object.
 _CLEAN_ARGS = [
+    _NoData(),
     _recursive_list(),
     _recursive_dict(),
     _nested("leaf", 9),
@@ -748,6 +763,7 @@ _CLEAN_ARGS = [
     collections.OrderedDict(a=_recursive_list()),
 ]
 _CLEAN_IDS = [
+    "userdict-that-cannot-be-read",
     "recursive-list",
     "recursive-dict",
     "nine-deep",
@@ -789,9 +805,49 @@ class _Set(set[object]):
     pass
 
 
+class _IterDeque(collections.deque[object]):
+    """Its repr lists it through this __iter__, not its storage, as the stdlib's deque repr does."""
+
+    shown: list[object]
+
+    def __iter__(self) -> Iterator[object]:
+        return iter(self.shown)
+
+
+class _Labelled(dict[str, object]):
+    def __repr__(self) -> str:
+        return f"_Labelled{dict.__repr__(self)}"
+
+
+def _shown_through_iter(kind: type[Any], err: UnicodeEncodeError) -> object:
+    held = kind([1])
+    held.shown = [err, 2]  # the storage holds no error; what the repr reads does
+    return held
+
+
+def _cycle_list(err: UnicodeEncodeError) -> list[object]:
+    loop: list[object] = [err]
+    loop.append(loop)
+    return loop
+
+
+def _cycle_mapping(kind: Any, err: UnicodeEncodeError) -> object:
+    loop = kind()
+    loop["e"] = err
+    loop["self"] = loop
+    return loop
+
+
 def _holders(err: UnicodeEncodeError) -> list[object]:
     clean_loop = _recursive_list()
     return [
+        _cycle_list(err),
+        _cycle_mapping(dict, err),
+        _cycle_mapping(collections.OrderedDict, err),
+        _cycle_mapping(lambda: collections.defaultdict(None), err),
+        _shown_through_iter(_IterDeque, err),
+        collections.Counter({err: 1, "ok": 3}),
+        _Labelled(e=err, n=1),
         [err, clean_loop],
         (err,),
         {"e": err, "deep": _nested(1, 8)},
@@ -810,6 +866,13 @@ def _holders(err: UnicodeEncodeError) -> list[object]:
 
 
 _HOLDER_IDS = [
+    "cyclic-list",
+    "cyclic-dict",
+    "cyclic-ordereddict",
+    "cyclic-defaultdict",
+    "deque-printed-through-its-iter",
+    "counter",
+    "dict-subclass-with-its-own-repr",
     "list-beside-a-clean-cycle",
     "tuple",
     "dict-beside-a-deep-list",
@@ -841,6 +904,37 @@ def test_a_container_holding_a_unicode_error_prints_as_it_would_but_for_the_erro
         record = _record(f"{placeholder}", (arg,))
         prepare_log_record(record)
         assert record.getMessage() == expected
+
+
+def test_a_shared_container_prints_whole_where_it_is_met_shallower() -> None:
+    # The first meeting is at the cutoff, where its error becomes the too-deep note. The second,
+    # three levels up, must not reuse that.
+    err = _encode_error()
+    shared: list[object] = [[err]]
+    record = _record("%s", ([_nested(shared, 3), shared],))
+    prepare_log_record(record)
+    out = record.getMessage()
+    assert out.endswith(f", [[{redaction.safe_exc(err)!r}]]]")
+    assert "caf" not in out
+
+
+def test_a_unicode_error_given_as_the_args_themselves_renders_safely() -> None:
+    record = logging.makeLogRecord({"msg": "%s", "args": _encode_error()})
+    prepare_log_record(record)
+    _assert_encode_safe(record.getMessage())
+
+
+def test_a_mapping_argument_holding_a_unicode_error_is_still_a_safe_mapping() -> None:
+    # A later handler may read the args as the mapping the stdlib documents.
+    err = _encode_error()
+    record = _record("%(e)s", {"e": err, "n": 1})
+    prepare_log_record(record)
+    args = record.args
+    assert isinstance(args, collections.abc.Mapping)
+    assert args.get("n") == 1
+    _assert_encode_safe(str(args.get("e")))
+    _assert_encode_safe(repr(list(args.items())))
+    _assert_encode_safe(record.getMessage())
 
 
 # --- path 3: an error rendered into another error's message -----------------------------------------

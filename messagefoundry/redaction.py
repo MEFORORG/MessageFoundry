@@ -77,7 +77,7 @@ from datetime import UTC, datetime
 from functools import lru_cache
 from string import ascii_lowercase, ascii_uppercase, whitespace
 from types import TracebackType
-from typing import Any, cast
+from typing import Any
 
 __all__ = [
     "clamp_untrusted",
@@ -2236,16 +2236,18 @@ def codec_safe_str(exc: BaseException) -> str:
 #: recursive list keeps its ``[...]``, a deep container its depth, a subclass its own ``__repr__``.
 #: So the walk is two passes. :class:`_Scan` only READS, at any depth and round any cycle, and finds
 #: which containers can reach an error. :class:`_Rebuild` then rebuilds only those, from the scan's
-#: snapshot, and prints every other element as the container would have printed it.
+#: snapshot, and prints every other element as the container's own ``repr`` would have printed it.
 #:
-#: IT READS A CONTAINER THROUGH THE BUILTIN'S OWN METHODS (``dict.items(arg)``), and tests the real
-#: type, never ``isinstance``, which a proxy can fake. A log call must never raise because of its
-#: arguments, and any other ``Mapping`` runs its own code to be read: ``ConfigParser.items()``
-#: interpolates and can raise, and the engine's ``CodeSet`` would be walked whole on every record.
-#: Those, a ``ChainMap``, a ``MappingProxyType``, a ``SimpleNamespace``, a dataclass and every other
-#: object are left as they are. The caller's code still runs in at least three places: a
-#: ``UserDict``'s ``.data``, the ``repr()`` of an element beside an error, and a namedtuple's or list
-#: subclass's own ``__repr__``. :func:`prepare_log_record` catches what they raise.
+#: IT READS A CONTAINER THE WAY ITS ``repr`` READS IT, and tests the real type, never
+#: ``isinstance``, which a proxy can fake. For a builtin that is the builtin's own method
+#: (``dict.items(arg)``), which runs none of the caller's code. Any other ``Mapping`` runs its own
+#: code to be read: ``ConfigParser.items()`` interpolates and can raise, and the engine's
+#: ``CodeSet`` would be walked whole on every record. Those, a ``ChainMap``, a ``MappingProxyType``,
+#: a ``SimpleNamespace``, a dataclass and every other object are left as they are. The caller's code
+#: still runs in at least these places: a ``UserDict``'s ``.data`` and a deque subclass's own
+#: ``__iter__`` (each what its ``repr`` reads), the ``repr()`` of an element beside an error, and a
+#: container subclass's own ``__repr__``.
+#: :func:`prepare_log_record` catches what they raise.
 _ARG_SEQUENCES: tuple[type[Any], ...] = (tuple, list, set, frozenset, deque)
 _ARG_VIEWS: tuple[type[Any], ...] = (type({}.keys()), type({}.values()), type({}.items()))
 _ARG_MAPPINGS: tuple[type[Any], ...] = (dict, UserDict)
@@ -2263,8 +2265,6 @@ _ARG_DEPTH = 5
 _ARG_SCALARS = frozenset({str, int, float, bool, bytes, type(None)})
 _TOO_DEEP = "[holds a codec error, nested too deep to render]"
 _CYCLE = "[a cycle back to a container that holds a codec error]"
-#: Marks a container the rebuild is inside, so meeting it again is a cycle.
-_IN_PROGRESS: Any = object()
 #: The builtin descriptors, so a subclass that overrides one cannot run its own code here.
 _EXC_ARGS: Any = BaseException.__dict__["args"]
 _GROUP_MEMBERS: Any = BaseExceptionGroup.__dict__["exceptions"]
@@ -2294,8 +2294,8 @@ class _Rendered:
     """What a container or exception holding a ``UnicodeError`` prints, worked out by the rebuild.
 
     ``repr()`` and ``str()`` return that text, so the formatter's ``%r`` and ``%s``, and the
-    ``repr()`` of an enclosing container, all print it. It hashes by identity, and nothing hashes it
-    here: the rebuild prints a dict or a set from its elements, never by building a new one."""
+    ``repr()`` of an enclosing container, all print it. It hashes and compares by identity, like
+    :class:`_SafeText`, so two that print alike stay two."""
 
     __slots__ = ("_repr", "_str")
 
@@ -2310,19 +2310,24 @@ class _Rendered:
         return self._str
 
 
-class _RenderedMapping(_Rendered):
+class _RenderedMapping(dict[Any, Any]):
     """The record's single mapping argument, when it holds a ``UnicodeError``.
 
     ``"%(name)s"`` asks the caller's own mapping, through its own ``__getitem__``, exactly as it would
     with no filter. So a subclass that masks a key still masks it, and a ``defaultdict``'s default
     still renders. Only what that lookup returns is walked, and it is replaced only if it holds an
-    error. ``"%s"`` of the whole mapping prints the rebuilt text."""
+    error. ``"%s"`` of the whole mapping prints the rebuilt text.
 
-    __slots__ = ("_original",)
+    It is a dict, as the stdlib's own ``LogRecord`` expects of a mapping argument, and its storage is
+    the rebuilt keys and values, so a later handler that reads ``.get()`` or ``.items()`` gets the
+    safe text too. It writes nothing to the caller's mapping."""
 
-    def __init__(self, original: Any, rendered: _Rendered) -> None:
-        super().__init__(rendered._repr, rendered._str)
+    __slots__ = ("_original", "_repr", "_str")
+
+    def __init__(self, original: Any, rendered: _Rendered, pairs: list[tuple[Any, Any]]) -> None:
+        super().__init__(pairs)
         self._original = original
+        self._repr, self._str = rendered._repr, rendered._str
 
     def __getitem__(self, key: Any) -> Any:
         value = self._original[key]  # the caller's own lookup, as "%(key)s" makes it with no filter
@@ -2331,23 +2336,45 @@ class _RenderedMapping(_Rendered):
         except Exception as exc:  # noqa: BLE001 -- fail closed, see prepare_log_record
             return _withheld(type(exc).__name__)
 
+    def __bool__(self) -> bool:
+        return True  # getMessage() applies % only to truthy args; the original was not empty
+
+    def __repr__(self) -> str:
+        return self._repr
+
+    def __str__(self) -> str:
+        return self._str
+
 
 def _children(arg: Any, kind: type[Any]) -> list[Any]:
-    """The objects ``arg`` holds that a render of it could print, read through the builtins' own
-    methods. A mapping's are its keys and values, flattened in order."""
+    """The objects a render of ``arg`` prints, read the way its own ``repr`` reads them. A mapping's
+    are its keys and values, flattened in order.
+
+    A builtin's own method can raise here only when another thread changes the container mid-read,
+    and that propagates, so the scan fails closed. Where the ``repr`` reads through the caller's own
+    code instead, so does this, and an error from it leaves the argument untouched: the formatter
+    runs the same code and fails the same way, as it would with no filter."""
     if issubclass(kind, BaseExceptionGroup):
         # Both: a subclass may print its .args, and the caller's list in .args can differ from them.
         return [*_GROUP_MEMBERS.__get__(arg), *_EXC_ARGS.__get__(arg)]
     if issubclass(kind, BaseException):
         return list(_EXC_ARGS.__get__(arg))  # str() and repr() print .args
-    if issubclass(kind, UserDict):
-        return [arg.data]
+    if issubclass(kind, _ARG_VIEWS):  # an OrderedDict's views subclass these, in C
+        return list(arg)
+    try:
+        if issubclass(kind, UserDict):
+            return [arg.data]  # UserDict prints repr(self.data)
+        own_iter: Any = getattr(kind, "__iter__", None)
+        if issubclass(kind, deque) and own_iter is not deque.__iter__:
+            # The deque repr alone lists it through the subclass's own __iter__ (measured on 3.14;
+            # a list, set, dict or OrderedDict subclass is printed from its storage).
+            return list(arg)
+    except Exception:  # noqa: BLE001 -- the formatter meets the same code; see the docstring
+        return []
     if issubclass(kind, dict):
         # An OrderedDict keeps its own order apart from the dict's storage.
         items = OrderedDict.items if issubclass(kind, OrderedDict) else dict.items
         return [part for pair in items(arg) for part in pair]
-    if issubclass(kind, _ARG_VIEWS):  # an OrderedDict's views subclass these, in C
-        return list(arg)
     for base in _ARG_SEQUENCES:
         if issubclass(kind, base):
             return list(base.__iter__(arg))
@@ -2359,8 +2386,8 @@ class _Scan:
 
     It walks at any depth, without recursion, and visits each container once, so a cycle or a shared
     container costs nothing extra. Each container's elements are kept as read, so the rebuild works
-    from the same objects (a dict view's items are new tuples on every read). A container that
-    cannot be read counts as holding an error: it might."""
+    from the same objects (a dict view's items are new tuples on every read). A container whose read
+    fails counts as holding an error: it might."""
 
     __slots__ = ("holds", "nodes")
 
@@ -2411,20 +2438,20 @@ def _joined(items: list[Any]) -> str:
     return ", ".join(map(repr, items))
 
 
+def _pairs(fresh: list[Any]) -> list[tuple[Any, Any]]:
+    return list(zip(fresh[0::2], fresh[1::2], strict=True))
+
+
 def _builtin_render(arg: Any, kind: type[Any], fresh: list[Any]) -> str | None:
     """What the builtin ``repr`` of ``kind`` prints for these elements, or None when ``kind``
-    prints itself its own way. Written out, so a dict or a set is printed in the original's order
-    and nothing is hashed."""
+    prints itself its own way. Written out, so a dict or a set prints in the original's order and
+    nothing is hashed."""
     own_str: Any = kind.__str__
     if own_str is not object.__str__:
         return None
     own: Any = kind.__repr__
     if issubclass(kind, dict):
-        body = (
-            "{"
-            + ", ".join(f"{k!r}: {v!r}" for k, v in zip(fresh[0::2], fresh[1::2], strict=True))
-            + "}"
-        )
+        body = "{" + ", ".join(f"{k!r}: {v!r}" for k, v in _pairs(fresh)) + "}"
         if own is dict.__repr__:
             return body
         if own is OrderedDict.__repr__:
@@ -2443,16 +2470,16 @@ def _builtin_render(arg: Any, kind: type[Any], fresh: list[Any]) -> str | None:
         return body if kind is set else f"{kind.__name__}({body})"
     if own is deque.__repr__:
         maxlen = _DEQUE_MAXLEN.__get__(arg)
-        return (
-            f"{kind.__name__}([{_joined(fresh)}]{'' if maxlen is None else f', maxlen={maxlen}'})"
-        )
+        bound = "" if maxlen is None else f", maxlen={maxlen}"
+        return f"{kind.__name__}([{_joined(fresh)}]{bound})"
     return None
 
 
-def _own_render(kind: type[Any], fresh: list[Any]) -> _Rendered | None:
-    """A tuple or list subclass that prints itself its own way, as a namedtuple does, printed by
-    its own methods over a bare copy holding the rebuilt elements. None for any other kind, or when
-    those methods need what the bare copy lacks."""
+def _own_render(arg: Any, kind: type[Any], fresh: list[Any]) -> _Rendered | None:
+    """A container subclass that prints itself its own way, as a namedtuple or a ``Counter`` does,
+    printed by its own methods over a bare copy holding the rebuilt elements. The copy is built
+    through the builtin bases, so none of the subclass's constructors or setters run. None for a
+    ``UserDict``, or when those methods need what the bare copy lacks."""
     copy: Any
     try:
         if issubclass(kind, tuple):
@@ -2460,6 +2487,25 @@ def _own_render(kind: type[Any], fresh: list[Any]) -> _Rendered | None:
         elif issubclass(kind, list):
             copy = list.__new__(kind)
             list.__init__(copy, fresh)
+        elif issubclass(kind, deque):
+            copy = deque.__new__(kind)
+            deque.__init__(copy, fresh, _DEQUE_MAXLEN.__get__(arg))
+        elif issubclass(kind, frozenset):
+            copy = frozenset.__new__(kind, fresh)
+        elif issubclass(kind, set):
+            copy = set.__new__(kind)
+            set.__init__(copy, fresh)
+        elif issubclass(kind, OrderedDict):
+            copy = OrderedDict.__new__(kind)
+            OrderedDict.__init__(copy)
+            for key, value in _pairs(fresh):
+                OrderedDict.__setitem__(copy, key, value)
+        elif issubclass(kind, dict):
+            copy = dict.__new__(kind)
+            if issubclass(kind, defaultdict):
+                defaultdict.__init__(copy, _DEFAULT_FACTORY.__get__(arg))
+            for key, value in _pairs(fresh):
+                dict.__setitem__(copy, key, value)
         else:
             return None
         return _Rendered(repr(copy), str(copy))
@@ -2468,23 +2514,30 @@ def _own_render(kind: type[Any], fresh: list[Any]) -> _Rendered | None:
 
 
 def _holder_note(kind: type[Any]) -> _Rendered:
-    """An exception, or a container that prints itself its own way, holding a ``UnicodeError``.
+    """An exception, or a container that cannot be printed its own way, holding a ``UnicodeError``.
 
-    Never its other arguments: an exception class may keep them out of its message, and printing
+    Never an exception's other arguments: its class may keep them out of its message, and printing
     them from ``repr`` would bypass that (the Lander's hold on round 4 of vault BACKLOG #3185)."""
     return _Rendered(f"[{kind.__name__} holding a codec error, not rendered]")
 
 
 class _Rebuild:
     """The rebuild of the paths a :class:`_Scan` found, from its snapshot. Anything off a path is
-    returned as the same object. ``memo`` holds each rebuilt container by ``id``, so a shared one is
-    printed once, and a container met again while it is being printed is a cycle."""
+    returned as the same object.
 
-    __slots__ = ("memo", "scan")
+    ``active`` holds the containers being printed, as the stdlib's own repr guard does, so a
+    container met again inside itself prints the builtin's back-edge mark (``[...]``, ``{...}``).
+    ``memo`` holds each finished container with the depth it was printed at, so a shared one is
+    printed once and reused at that depth or deeper. A result that printed a back edge depends on
+    where it was reached from, so it is not kept."""
+
+    __slots__ = ("active", "back_edges", "memo", "scan")
 
     def __init__(self, scan: _Scan) -> None:
         self.scan = scan
-        self.memo: dict[int, Any] = {}
+        self.memo: dict[int, tuple[int, Any]] = {}
+        self.active: set[int] = set()
+        self.back_edges = 0
 
     def arg(self, arg: Any, depth: int) -> Any:
         kind = type(arg)
@@ -2496,20 +2549,45 @@ class _Rebuild:
         key = id(arg)
         if key not in self.scan.holds:
             return arg  # holds no error: untouched
+        if key in self.active:
+            self.back_edges += 1
+            return self._back_edge(arg, kind)
         if depth > _ARG_DEPTH:
             return _Rendered(_TOO_DEEP)
-        done = self.memo.get(key)
-        if done is _IN_PROGRESS:
-            return _Rendered(_CYCLE)  # the back edge would print the raw original: fail closed
-        if done is not None:
-            return done
-        _, children, failure = self.scan.nodes[key]
+        cached = self.memo.get(key)
+        if cached is not None and cached[0] <= depth:
+            return cached[1]
+        _arg, children, failure = self.scan.nodes[key]
         if children is None:
             return _withheld(failure)
-        self.memo[key] = _IN_PROGRESS
-        result = self._render(arg, kind, children, depth)
-        self.memo[key] = result
+        self.active.add(key)
+        before = self.back_edges
+        try:
+            result = self._render(arg, kind, children, depth)
+        finally:
+            self.active.discard(key)
+        if self.back_edges == before:
+            self.memo[key] = (depth, result)
         return result
+
+    def _back_edge(self, arg: Any, kind: type[Any]) -> _Rendered:
+        """What the builtin ``repr`` prints where a container meets itself again."""
+        own: Any = kind.__repr__
+        if own is list.__repr__ or own is deque.__repr__:
+            return _Rendered("[...]")
+        if own is tuple.__repr__:
+            return _Rendered("(...)")
+        if own is dict.__repr__:
+            return _Rendered("{...}")
+        if own is defaultdict.__repr__:
+            return _Rendered(f"{kind.__name__}({_DEFAULT_FACTORY.__get__(arg)!r}, {{...}})")
+        if own is OrderedDict.__repr__ or issubclass(kind, _ARG_VIEWS):
+            return _Rendered("...")
+        if own is UserDict.__repr__:  # it prints repr(self.data), and the data is a dict
+            children = self.scan.nodes[id(arg)][1]
+            if children and type(children[0]) is dict:
+                return _Rendered("{...}")
+        return _Rendered(_CYCLE)  # its own repr would decide; the raw original must not print
 
     def _render(self, arg: Any, kind: type[Any], children: list[Any], depth: int) -> _Rendered:
         if issubclass(kind, BaseException):
@@ -2525,7 +2603,15 @@ class _Rebuild:
         text = _builtin_render(arg, kind, fresh)
         if text is not None:
             return _Rendered(text)
-        return _own_render(kind, fresh) or _holder_note(kind)
+        return _own_render(arg, kind, fresh) or _holder_note(kind)
+
+    def pairs(self, root: Any) -> list[tuple[Any, Any]]:
+        """The root mapping's keys and values, rebuilt, for :class:`_RenderedMapping`'s storage."""
+        flat = self.scan.nodes[id(root)][1] or []
+        if issubclass(type(root), UserDict):
+            data = self.scan.nodes.get(id(flat[0])) if flat else None
+            flat = (data[1] or []) if data is not None and issubclass(type(data[0]), dict) else []
+        return _pairs([self.arg(child, 1) for child in flat])
 
 
 def _safe_arg(arg: Any, depth: int) -> Any:
@@ -2544,6 +2630,20 @@ def _safe_arg(arg: Any, depth: int) -> Any:
     if not scan.holds:
         return arg
     return _Rebuild(scan).arg(arg, depth)
+
+
+def _safe_mapping_args(args: Any) -> Any:
+    """The stdlib's single-mapping form, whose values are the arguments, at level 1."""
+    if not issubclass(type(args), _ARG_MAPPINGS):
+        return _safe_arg(args, 0)  # a ConfigParser is untouched; a bare UnicodeError is replaced
+    scan = _Scan(args)
+    if not scan.holds:
+        return args
+    rebuild = _Rebuild(scan)
+    rendered = rebuild.arg(args, 0)
+    if not isinstance(rendered, _Rendered):  # pragma: no cover -- a mapping on a path renders
+        rendered = _Rendered(_CYCLE)
+    return _RenderedMapping(args, rendered, rebuild.pairs(args))
 
 
 def _withheld(failure: str) -> _Rendered:
@@ -2593,11 +2693,10 @@ def prepare_log_record(record: logging.LogRecord) -> None:
         if any(new is not old for new, old in zip(fresh, args, strict=True)):
             record.args = tuple(fresh)
         return
-    try:  # the stdlib's single-mapping form: its values are the arguments, at level 1
-        rendered = _safe_arg(args, 0)
-        if isinstance(rendered, _Rendered):
-            # Not a Mapping: getMessage() only applies %, and "%(key)s" needs only __getitem__.
-            record.args = cast(Any, _RenderedMapping(args, rendered))
+    try:
+        safe = _safe_mapping_args(args)
+        if safe is not args:
+            record.args = safe
     except Exception as exc:  # noqa: BLE001 -- fail closed, see the docstring
         # With no args the formatter applies no %, so the template prints as it was written.
         template = record.msg if type(record.msg) is str else "[log message withheld]"
