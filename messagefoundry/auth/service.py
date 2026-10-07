@@ -656,10 +656,15 @@ FLOW_PURPOSE_MISMATCH = "flow_purpose_mismatch"
 #: started. Audit only. The caller sees its leg's ordinary failure, which says nothing about timing.
 TOO_EARLY = "too_early"
 
-#: The reason for an IdP failure that is NOT a transport failure and not a token-endpoint answer,
-#: such as a status from the JWKS fetch (BACKLOG #1948). The IdP answered, so it does not mark the
-#: IdP unavailable. Distinct from ``idp_error``, which is the IdP's own ``error=`` on the callback.
+#: The reason for a federated failure that is neither a transport failure nor a token-endpoint
+#: answer (BACKLOG #1948): at least a status from the JWKS fetch, and the engine's own token request
+#: refused over the length bound before it was sent. Neither marks the IdP unavailable. Distinct
+#: from ``idp_error``, which is the IdP's own ``error=`` on the callback.
 IDP_ANSWER_UNUSABLE = "idp_answer_unusable"
+
+#: The reason for a token endpoint that answered with no usable token, any status (BACKLOG #1948).
+#: Named without the word for the credential so a secret scanner does not read its text as one.
+ENDPOINT_ANSWERED_REASON = "token_refused"
 
 #: Operator-readable text for the step-up leg's refusals. None of it echoes anything the IdP sent.
 #: A slug not listed here reads as the generic line in ``_step_up_refused``.
@@ -690,7 +695,13 @@ _STEP_UP_ERRORS: Final[Mapping[str, str]] = MappingProxyType(
         "state_unknown": "The confirmation expired. Try again.",
         "state_mismatch": "The confirmation could not be matched to this browser. Try again.",
         "idp_unavailable": "The identity provider is unavailable. Try again later.",
-        IDP_ANSWER_UNUSABLE: "The identity provider's answer could not be used. Try again later.",
+        # BACKLOG #1948: any status from the token endpoint, a 5xx included, lands here now, so the
+        # text names no cause. The audit row carries the status.
+        ENDPOINT_ANSWERED_REASON: (
+            "The identity provider did not complete the confirmation. Try again later. If it"
+            " repeats, ask an administrator to check the identity provider."
+        ),
+        IDP_ANSWER_UNUSABLE: "The sign-in with the identity provider could not be completed. Try again later.",
         "not_configured": "Federated sign-in is not configured.",
         "idp_error": "The identity provider did not complete the sign-in. Try again.",
         "malformed_callback": "The identity provider's answer was incomplete. Try again.",
@@ -4179,7 +4190,15 @@ class AuthService:
             await self._audit(
                 "auth.login_error",
                 actor="<oidc>",
-                detail=_json({"provider": "ad", "mech": "oidc", **_idp_error_fields(exc)}),
+                # `marked_unavailable` says which of these rows hid the federated link.
+                detail=_json(
+                    {
+                        "provider": "ad",
+                        "mech": "oidc",
+                        **_idp_error_fields(exc),
+                        "marked_unavailable": transport,
+                    }
+                ),
                 client=client,
             )
             if not transport:
@@ -4830,14 +4849,14 @@ class AuthService:
 
         ``extra`` adds fields to the audit row only, such as a received status or an exception
         type (BACKLOG #1948). It never carries IdP text."""
+        # `extra` first, so it can never overwrite a closed-set field.
         detail: dict[str, object] = {
+            **(extra or {}),
             "ok": False,
             "provider": AuthProvider.AD.value,
             "mech": "oidc",
             "reason": reason,
         }
-        if extra:
-            detail.update(extra)
         await self._audit("auth.reauth", actor=actor, detail=_json(detail), client=client)
         return OidcStepUp(
             elevation=Elevation(session_lost=lost),

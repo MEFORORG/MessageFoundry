@@ -645,18 +645,22 @@ visitor, again and again.
   connection refused or reset, DNS, a timeout, a TLS handshake, or a reply cut short. In code it
   is `TokenEndpointUnreachableError`, an `http.client` exception such as `BadStatusLine`, or an
   `OSError` that is not an `HTTPError` (`_is_idp_transport_failure` in `auth/service.py`). A reply
-  whose header block did not parse arrived, so it is an answer, not a transport failure.
+  that `bounded_read` refused for its header block, such as a bare CR, arrived, so it is an answer.
 - **Any received status means the IdP answered**, a 5xx and a 3xx included, and so does a reply
   the engine cannot read as a token response. `exchange_code` raises `TokenRefusedError` with the
   status. The sign-in fails, audited `auth.login_failed` with `reason=token_refused` and the
   status; a step-up's `auth.reauth` row carries the same. The flag is left as it was, neither set
   nor cleared.
-- **Any other non-transport failure the outage arm sees is an answer too**, such as a status from
-  the JWKS fetch. It is audited `auth.login_error` with the exception type and any status, and
-  the outcome reason is `idp_answer_unusable`. It does not set the flag.
+- **Any other non-transport failure the outage arm sees does not set the flag either.** At least a
+  status from the JWKS fetch, and the engine's own token request refused over the length bound
+  before it was sent. It is audited `auth.login_error` with the exception type, any status, and
+  `marked_unavailable=false`, and the outcome reason is `idp_answer_unusable`.
 
-**AC-8 is unchanged in what it requires.** A real outage is a transport failure, so it still sets
-the flag, and the next success still clears it with no restart.
+**AC-8 is narrowed.** An outage that is a transport failure still sets the flag, and the next
+success still clears it with no restart. An outage behind a reverse proxy, load balancer or web
+application firewall usually arrives as a 502, 503 or 504 from that front end. That is a received
+status, so it no longer hides the link, though local, LDAPS and Kerberos sign-in still work as
+AC-8 requires.
 
 **The costs, stated.** An IdP that is up but answers every request with a 5xx no longer hides the
 link. Visitors keep seeing a federated sign-in that fails each time. The operator sees it on the
@@ -670,6 +674,9 @@ that shows while the IdP is failing, rather than a link any caller can hide.
   balancer in front of the token endpoint may reset a connection whose request body looks
   hostile, and the caller chooses the `code` in that body. At such a site a caller can still hide
   the link. The engine cannot tell that reset from an outage.
-- A JWKS reply that `bounded_read` refuses for its body framing, or cuts short, still marks the
-  IdP. `jwks_fetcher` in `auth/oidc_http.py` retypes it as a plain `http.client` exception, which
-  reads as transport. No caller input reaches the JWKS request.
+- A JWKS reply that `bounded_read` refuses for its body framing or size, or cuts short, still
+  marks the IdP. `jwks_fetcher` in `auth/oidc_http.py` retypes it as a plain `http.client`
+  exception, which reads as transport. No caller input reaches the JWKS request.
+- Any other `http.client` exception also reads as transport, `BadStatusLine` among them, even
+  where a reply did arrive, such as a header line over the length limit. So does a refusal the
+  engine makes before it sends, such as a proxy URL carrying credentials.

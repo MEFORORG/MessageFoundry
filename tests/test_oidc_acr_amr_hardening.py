@@ -175,6 +175,15 @@ def test_a_blank_amr_value_accepts_no_token() -> None:
         claims_mod._check_mfa_gate({"amr": [""]}, policy)
 
 
+def test_a_none_list_from_another_constructor_is_no_values() -> None:
+    """The old falsy check read None as no values; the blank filter must not raise on it."""
+    assert oidc.accepted_claim_values(None) == frozenset()  # type: ignore[arg-type]
+    with pytest.raises(oidc.ClaimsError):
+        claims_mod._check_mfa_gate(
+            {"amr": ["mfa"]}, _policy(mfa_amr_values=None, required_acr_values=["phr"])
+        )
+
+
 def test_a_bare_string_is_one_value_and_a_non_string_matches_nothing() -> None:
     """A bare ``"mfa"`` is one value, never the letters m, f and a, and a non-string item refuses
     through ClaimsError rather than raising outside it."""

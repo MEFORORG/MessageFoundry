@@ -199,5 +199,18 @@ async def test_a_jwks_status_is_audited_with_its_status_on_sign_in(
         [row] = await _audit_rows(store, "auth.login_error")
         detail = json.loads(row["detail"])
         assert detail["error"] == "HTTPError" and detail["status"] == 404
+        # The row says it did not hide the link, so an operator can tell it from an outage's row.
+        assert detail["marked_unavailable"] is False
     finally:
         await store.close()
+
+
+def test_a_token_refusal_survives_copy_and_pickle() -> None:
+    """It is raised on every answered outcome now, so a copy or a pickle must not fail on it."""
+    import copy
+    import pickle
+
+    exc = oidc.TokenRefusedError("token endpoint returned HTTP 503", status=503)
+    for clone in (copy.copy(exc), pickle.loads(pickle.dumps(exc))):  # noqa: S301 - own object
+        assert isinstance(clone, oidc.TokenRefusedError)
+        assert clone.status == 503 and str(clone) == str(exc)

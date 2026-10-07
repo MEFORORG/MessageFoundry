@@ -2755,7 +2755,8 @@ _OIDC_ISSUER_MAX = 256
 
 
 def _normalise_claim_value_list(v: object) -> object:
-    """A list setting compared with a token claim, stripped with blanks dropped (BACKLOG #2325).
+    """An OIDC list setting, stripped with blanks dropped (BACKLOG #2325). Every OIDC list reads its
+    env string through it; only the lists compared with a token claim read a TOML list through it.
 
     An env string is comma-split first. A list or tuple keeps its order. A non-string item is left
     as it is, for the field's own type check to refuse, and anything else passes through."""
@@ -3397,9 +3398,9 @@ class AuthSettings(_Section):
     def _split_oidc_lists(cls, v: object) -> object:
         # Allow env-setting a list key as one comma-separated string (MEFOR_AUTH_OIDC_SCOPES=...);
         # without this the "zero env-plumbing" property holds only for scalars (precedent: egress).
-        if isinstance(v, str):
-            return [item.strip() for item in v.split(",") if item.strip()]
-        return v
+        # The string form only: these lists keep a TOML list as written (BACKLOG #2325 scoped the
+        # list-form cleanup to the claim-value lists below).
+        return _normalise_claim_value_list(v) if isinstance(v, str) else v
 
     @field_validator(
         "oidc_mfa_amr_values",

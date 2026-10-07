@@ -3844,12 +3844,14 @@ client built against the older contract hides its AD password form instead of fa
 `kerberos_available` — enabled **and** the boot-once SPNEGO acceptor preflight having passed, sticky
 until restart (`AuthService.kerberos_available` in `auth/service.py`). `oidc` is `oidc_available` — `oidc_enabled` (which is
 `[auth].oidc_enabled` **and** a directory to resolve roles against, `AuthService.oidc_enabled`) **and** the last IdP
-interaction not having failed; that second term is deliberately **advisory and non-sticky**, set only by a
-TRANSPORT failure, where no answer arrived, and cleared by the next success, and *no login path gates on it* (`AuthService.oidc_available`).
-Any status the token endpoint answers with, a 5xx included, leaves it alone, because a caller's bad
-code can draw one (BACKLOG #1948). [ADR 0142](adr/0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md)
-Amendment E is the source of record for which failures count, what each is audited as, and the
-residuals: at least a firewall reset a caller provokes, and a misframed JWKS reply. Neither
+interaction not having failed. That second term is deliberately **advisory and non-sticky**, and
+*no login path gates on it* (`AuthService.oidc_available`). A transport failure, where no answer
+arrived, sets it, and the next success clears it. Any status the token endpoint answers with, a
+5xx included, leaves it alone, because a caller's bad code can draw one (BACKLOG #1948). So an IdP
+behind a proxy that answers its outage with a 503 keeps the link showing.
+[ADR 0142](adr/0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md)
+Amendment E is the source of record for which failures count and what each is audited as. It also
+names the residuals, at least a firewall reset a caller provokes and a misframed JWKS reply. Neither
 flag consults `settings.api.serve_ui`, so the route can still advertise `oidc: true` on a console-less
 engine that registers no OIDC route. The mTLS plane is deliberately absent from it, because it is not a
 sign-in offer.

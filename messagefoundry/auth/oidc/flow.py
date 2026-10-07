@@ -81,7 +81,9 @@ class TokenRefusedError(FlowError):
     so no status could be read from it.
     """
 
-    def __init__(self, message: str, *, status: int | None) -> None:
+    # `status` has a default so copy and pickle, which rebuild from the message alone and then
+    # restore the instance dict, can rebuild this error.
+    def __init__(self, message: str, *, status: int | None = None) -> None:
         super().__init__(message)
         self.status = status
 

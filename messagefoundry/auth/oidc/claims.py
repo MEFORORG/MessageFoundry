@@ -378,7 +378,8 @@ def accepted_claim_values(configured: Sequence[str]) -> frozenset[str]:
     (the offline verifier, tests, a future caller). A "" in either list would otherwise accept a token
     whose acr is "" or whose amr holds "" as MFA. A bare string is one value, never its characters,
     and a non-string item matches nothing rather than raising outside the ClaimsError path."""
-    items: Sequence[object] = (configured,) if isinstance(configured, str) else configured
+    # `or ()`: a None from another constructor is no values, as the old falsy check read it.
+    items: Sequence[object] = (configured,) if isinstance(configured, str) else (configured or ())
     return frozenset(v for v in items if isinstance(v, str) and v.strip())
 
 
