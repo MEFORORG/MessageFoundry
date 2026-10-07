@@ -1363,10 +1363,12 @@ invariant rather than a property of the moved row):
    generator-shaped too, and no `elif` or `else` body may hold a `code` row or a dynamic row.
 6. Every read of a name stays dominated by that name's bindings: every path from the start of the
    body to the read passes a binding of the name (Manager decision 2026-10-07, after review).
-   Dominance is over the set of the name's bindings. A binding other than a For Each header, earlier
-   in the same suite as the read or earlier in a suite that encloses it, dominates the read. An `if`
-   whose every arm binds the name, with an `else`, dominates a later read; one arm alone does not. A
-   binding inside a `with` body does not dominate a read after the block (Manager decision
+   Dominance is over the set of the name's bindings. A binding other than a loop header or a
+   `with` header, earlier in the same suite as the read or earlier in a suite that encloses it,
+   dominates the read. An `if` whose every arm binds the name, with an `else`, dominates a later
+   read; one arm alone does not. A loop target (`for x in ...`) does not dominate a read after the
+   loop, because a loop may run zero times. A binding inside a `with` body, or a `with ... as x`
+   target, does not dominate a read after the block (Manager decision
    2026-10-07, after review, adopting the R1 code's stricter rule). A For Each header dominates only
    reads inside its own body, so a row that uses its index, such as `occurrence=i`, may not move out
    of the loop (Manager decision 2026-10-07, after review). A move of either end, a binding or a
@@ -1374,18 +1376,22 @@ invariant rather than a property of the moved row):
    undominated. Each of those would leave a read unbound, at least whenever a condition is false. A
    block that holds a Read Field or assigned lookup row is also never moved or deleted; that refusal
    is conservative, and applies even when every read sits inside the block.
-7. A typed row never moves past a `code` row in the same suite, and never moves into a typed block
-   that holds a `code` row (Manager decision 2026-10-07, after review, adopting the R1 code's
-   stricter rule). This answers the Lander's PR 2155 finding 1. An insert at the same place is still
-   allowed; a move is refused because the lens checks that every protected statement keeps the
-   statements before it, and a move past one changes them.
-8. A typed `return` or `raise` keeps its own guard block: lifted out, a filter or a raise would run
-   on every message. A row never moves past the fan-out `return sends`, though it may move past
-   `sends = []` (Manager decision 2026-10-07, after review, adopting the R1 code's stricter rule).
+7. A typed row never moves past a `code` row, a dynamic row, a hand-written header or the fan-out
+   `return sends`, and never moves into or out of a typed block that holds a `code` row (Manager
+   decision 2026-10-07, after review, adopting the R1 code's stricter rule). This answers the
+   Lander's PR 2155 finding 1. An insert at the same place is still allowed; a move is refused
+   because the lens checks that every protected statement keeps the statements before it, and a move
+   past one changes them.
+8. A typed `return` or `raise` keeps its whole suite path, top level included: lifted out of its
+   guard, a filter or a raise would run on every message. R1 still accepts a typed row moved below a
+   typed `return Send(...)`, where it would never run; that is a gap for R1. A row never moves past
+   the fan-out `return sends`, though it may move past `sends = []` (Manager decision 2026-10-07,
+   after review, adopting the R1 code's stricter rule).
 
-A `pass` statement does not count as a `code` row for this rule, so an analyst can delete a block
-whose body is still the generator's `pass` seed. Rule 3 and the `elif` suite path are Manager decisions
-2026-10-07, from spike S-4, which found that the repository check needs them (ADR 0208 spec FR-40).
+A `pass` statement does not count as a `code` row for the structure rule, so an analyst can delete a
+block whose body is still the generator's `pass` seed. Rule 3 and the `elif` suite path are Manager
+decisions 2026-10-07, from spike S-4, which found that the repository check needs them (ADR 0208 spec
+FR-40).
 
 This narrows, in typed-only mode only, at least: §2 Phase 3 and §5 of this ADR; ADR 0106; the
 *Delete* and *Move* verbs of [ADR 0103](0103-steps-view-row-context-menu.md)'s row menu; and the
@@ -1397,14 +1403,15 @@ landed.
 **Where the rule and the R1 code stand.** Read at R1 head `71fe1207f4`, `_refuse_untyped_structure`
 refuses a move or delete of any row that is not wholly typed, and `_refuse_typed_only_result` then
 checks the result with `_refuse_shifted_code` and an unbound-read check.
-`tests/test_lens_typed_only_repair.py` pins rules 6 to 8: the `else` binding moved below its use, the
-`with` binding, a drop past code, a drop into a typed block that holds code, and a raise lifted out
-of its guard. Where the R1 code is stricter than this text, this text adopts the code's rule, because
-the code is tested and fails closed (Manager decision 2026-10-07, after review, adopting the R1
-code's stricter rule). At least two of its refusals are conservative, refusing some edits that would
-be safe:
+`tests/test_lens_typed_only_repair.py` pins rules 6 to 8: the `else` binding moved below its use, an
+insert reading a `with` binding after the block (an insert, not a move), a drop past code, a drop
+into a typed block that holds code, and a raise lifted out of its guard. Where the R1 code is
+stricter than this text, this text adopts the code's rule, because the code is tested and fails
+closed (Manager decision 2026-10-07, after review, adopting the R1 code's stricter rule). At least
+two of its refusals are conservative, refusing some edits that would be safe:
 
-- a whole block moved past another block with the same header is refused;
+- a whole block holding a typed `return` or `raise`, moved past another block with the same header,
+  is refused;
 - a read of a `with` binding after the block is refused, even where the body always runs.
 
 ### G.7 The R1 fix: values a typed edit may write
@@ -1438,15 +1445,19 @@ except a bounded `msg.field(...)` read and the FHIR value objects `FhirToken(...
   non-zero divisor; never `%` or `**`. Arithmetic takes only names bound to a number, never a name
   that may hold text (Manager decision 2026-10-07, after review, adopting the R1 code's stricter
   rule);
-- for an `occurrence` keyword, only a value that is 1 or more on every message: integer arithmetic
-  over literals whose result is 1 or more (so `2 * 3`, but not `1 - 1`), a 1-based loop index (every
-  loop binding it is `range(k, n)` or `range(k, n, step)` with literal `k` and `step` of 1 or more),
-  or that index plus a non-negative literal. `repetition=None` is allowed (Manager decision
+- for an `occurrence` or `repetition` keyword, only a value that is 1 or more on every message:
+  integer arithmetic over literals whose result is 1 or more (so `2 * 3`, but not `1 - 1`), a 1-based
+  loop index (every loop binding it is `range(k, n)` or `range(k, n, step)` with literal `k` and
+  `step` of 1 or more), or that index plus integer-literal arithmetic of 0 or more.
+  `repetition=None` is allowed (Manager decision
   2026-10-07, after review, adopting the R1 code's stricter rule). A name such as `occurrence=OCC`
   bound to a module-level number is refused, conservatively;
 - for the value of Set Field and Add Repetition, only a value that is text: a string literal, a name
-  or read that may hold text, or a template. A number, `None` or a list is refused (Manager decision
-  2026-10-07, after review, adopting the R1 code's stricter rule);
+  or read that may hold text, or a template. A number, `None` or a list is refused. Here this text
+  is stricter than R1 at `71fe1207f4`: its `_refuse_non_text_value` refuses literals and numeric
+  names, but admits any other name, so a module-level `NONE = None`, `FLAG = True` or
+  `TUP = ("a", "b")` passes and writes a `msg.set` that fails on every message. The text is the
+  target, and R1 must close this gap;
 - a plain name other than `msg`, not a dunder, that cannot hold message content:
   - a For Each `range` loop index;
   - a module-level name bound exactly once, to a literal of an immutable type: a `str`, number,
@@ -1517,8 +1528,10 @@ tuple holding a `frozenset`.
 **Limits of a static check.** The predicate reads the source and runs nothing, so code that
 reaches module state by a route the source does not spell out can still defeat it. These remain, at
 least: `getattr(h, "__globals__")`, `from sys import modules as mm`, and
-`importlib.import_module(__name__)`. Each needs a hand-written `code` row. And only `set_params`
-honours a message parameter that is not named `msg`; the other edits assume `msg`.
+`importlib.import_module(__name__)`. Each needs a hand-written `code` row. Separately, only
+`set_params` honours a message parameter that is not named `msg`. The other edits assume `msg`, so
+an `insert_row` into `def h(message)` writes `msg.set(...)`, which raises NameError on every
+message. That needs no hand-written row, and is a gap for R1.
 
 **A gap in the projection, left open for the R1 work.** At `origin/main` (`ddf350e1d0`),
 `_rendered_param_nodes` drops the `msg` positional from a typed row's `params`, and `_callee_name`
@@ -1535,11 +1548,11 @@ change is being built separately and has not landed.
 ### Acceptance Criteria (Amendment G -- proposed, not ratified)
 
 - [ ] **AC-G1** -- WHILE the editor is the ADR 0208 analyst build, THE SYSTEM SHALL offer no command,
-  menu or link that opens a `.py` file in a text editor, and SHALL offer no route that writes a
-  `.py` without opening one. The routes include at least an untitled buffer, *Save As*, *Compare*,
-  a rename or copy into a `.py`, an upload, a drop into the navigator, and a move or copy of one
-  `.py` over another. (Mechanism: ADR 0208 spec section 10. Spike S-2 closed the first three and a
-  move or copy from a file that is not a `.py`, on the browser build; the rest are open. Manager
+  menu or link that opens a `.py` file in a text editor, and SHALL offer no route that writes a `.py`
+  without opening one. The routes include at least an untitled buffer, *Save As*, *Compare*, a rename
+  or copy into a `.py`, an upload, a drop into the navigator, and a move or copy of one `.py` over
+  another. (Mechanism: ADR 0208 spec section 10. Spike S-2 closed the first three and a move or copy
+  from a file that is not a `.py` into a `.py`, on the browser build; the rest are open. Manager
   decision 2026-10-07, from spike S-2.)
 - [ ] **AC-G2** -- WHEN a file fails `lens parse` in the analyst build, THE SYSTEM SHALL show a
   read-only notice that a developer must fix it, and SHALL NOT open a text editor.
