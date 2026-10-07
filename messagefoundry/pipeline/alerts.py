@@ -77,20 +77,23 @@ def config_changed_detail(
 
 #: The words that mark a ``crl_expiry`` date as a held copy's (vault BACKLOG #2319). One spelling,
 #: so the log line, the notifier's ``detail`` and a test all say the same thing.
-HELD_COPY_NOTE = "This date is the nextUpdate of a copy a running TLS hop holds, not of the file."
+HELD_COPY_NOTE = "The date is a copy a running TLS hop holds, not the file's."
 
 
 def crl_expiry_detail(*, held_copy: bool, detail: str, shared_with: tuple[str, ...]) -> str:
     """The PHI-free note both sinks add to a ``crl_expiry`` alert (vault BACKLOG #2319), or ``""``
-    when the date is the file's and no other row names the file.
+    when no hop holds an older copy and no other row names the file.
 
-    ``detail`` is the scan's own account of the held copy and already names any shared rows, so the
-    shared rows are spelled out here only when the scan gave no detail."""
-    parts = [HELD_COPY_NOTE] if held_copy else []
-    if detail:
-        parts.append(detail)
-    elif shared_with:
-        parts.append(f"The same file also serves {', '.join(shared_with)}.")
+    ``detail`` is the scan's remedy and the settings holding the copy. It leads, because the alert
+    instance's reason column keeps only about the first 200 characters."""
+    parts = [detail] if detail else []
+    if shared_with:
+        parts.append(
+            f"The same file also serves {', '.join(shared_with)}; a held copy is matched by its "
+            "file, so each of those rows reports it too."
+        )
+    if held_copy:
+        parts.append(HELD_COPY_NOTE)
     return " ".join(parts)
 
 
@@ -245,8 +248,9 @@ class AlertSink(Protocol):
         **Whose date it is (vault BACKLOG #2319).** ``held_copy`` is True when ``not_after`` is not
         the file's: it is the ``nextUpdate`` of an older copy that a running TLS hop still holds,
         which lapses before the file does. Replacing the file again does not move that date; the
-        reload has to apply the file to the hop, or a restart has to rebuild it. ``detail`` then says
-        which settings hold that copy and what to do, in the words the scan logs. ``shared_with``
+        reload has to apply the file to the hop, or a restart has to rebuild it. ``detail`` says what
+        to do, in the words the scan logs, then which settings hold the older copy; it is set
+        whenever a hop holds a copy that differs from the file, even one that is not the date. ``shared_with``
         names the other monitored settings or connections whose rows name the same file. A held
         copy is matched by its file, not its hop, so it is reported under every row naming that
         file, and ``detail`` says which hop holds it. All three carry config metadata only: no key

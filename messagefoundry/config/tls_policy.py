@@ -452,7 +452,7 @@ def record_ca_bundle_crls(ctx: ssl.SSLContext, ca_file: str | None, *, setting: 
     if ca_file is None or not ctx.verify_flags & _CRL_CHECK_FLAGS:
         return
     from messagefoundry.config.loaded_crls import record_crl_load
-    from messagefoundry.pki import read_soonest_crl_facts
+    from messagefoundry.pki import crl_pem_blocks, read_soonest_crl_facts
 
     where = f"{setting} ({ca_file!r})" if setting else repr(ca_file)
     try:
@@ -466,19 +466,22 @@ def record_ca_bundle_crls(ctx: ssl.SSLContext, ca_file: str | None, *, setting: 
             exc.strerror or type(exc).__name__,
         )
         return
-    if b"-----BEGIN X509 CRL-----" not in pem:
-        return  # the usual CA file: certificates only
     try:
+        # Only the blocks OpenSSL loads: one whose BEGIN does not start a line is skipped by both.
+        if not crl_pem_blocks(pem):
+            return  # the usual CA file: certificates only
         facts = read_soonest_crl_facts(pem, now=time.time())
-    except ValueError as exc:
+        record_crl_load(ctx, ca_file, pem, facts, setting=setting, ca_bundle=True)
+    except Exception as exc:
+        # Any failure, not only a ValueError: this records for the monitor, and a hop that built
+        # before this existed must not stop building because of it.
         logger.warning(
-            "the CA file %s carries a CRL block the expiry monitor cannot judge (%s). The hop "
-            "loaded it, and it will not be alerted on. Move the CRL to the hop's CRL setting",
+            "the CA file %s carries a CRL block the expiry monitor cannot judge (%s: %s), so no "
+            "alert will cover it. Move the CRL to the hop's CRL setting, which judges it at start",
             where,
+            type(exc).__name__,
             exc,
         )
-        return
-    record_crl_load(ctx, ca_file, pem, facts, setting=setting, ca_bundle=True)
 
 
 def crl_scratch_context(crl_file: str, blocks: Sequence[CrlBlock], *, label: str) -> ssl.SSLContext:

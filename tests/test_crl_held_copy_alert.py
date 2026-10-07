@@ -36,9 +36,14 @@ from cryptography.x509.oid import NameOID
 
 from messagefoundry.config.loaded_crls import held_contexts, held_crl_copies
 from messagefoundry.config.settings import CertMonitorSettings
-from messagefoundry.config.tls_policy import TrustAnchor, build_verifying_client_context
+from messagefoundry.config.tls_policy import (
+    TrustAnchor,
+    build_anchored_https_handler,
+    build_verifying_client_context,
+)
+from messagefoundry.logging_setup import SyslogForward, _build_tls_context
 from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
-from messagefoundry.pipeline.alerts import HELD_COPY_NOTE, LoggingAlertSink
+from messagefoundry.pipeline.alerts import HELD_COPY_NOTE, LoggingAlertSink, crl_expiry_detail
 from messagefoundry.pipeline.cert_expiry import (
     CertExpiryRunner,
     MonitoredCert,
@@ -70,8 +75,12 @@ class _Ca:
 
 @pytest.fixture
 def ca() -> _Ca:
+    return _another_ca("mefor-2319-ca")
+
+
+def _another_ca(cn: str = "mefor-2319-other-ca") -> _Ca:
     key = ec.generate_private_key(ec.SECP256R1())
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-2319-ca")])
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
     now = datetime.datetime.now(datetime.UTC)
     cert = (
         x509.CertificateBuilder()
@@ -184,7 +193,7 @@ def test_a_held_copy_that_outlasts_the_file_does_not_take_its_date(ca: _Ca, tmp_
     assert [c[3] for c in sink.crl_calls] == [5]
     held_copy, detail, _ = sink.crl_notes[0]
     assert held_copy is False
-    assert "still holds a copy" in detail
+    assert "Held by: [tls].crl_file" in detail
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
@@ -207,7 +216,7 @@ def test_the_notifier_payload_marks_a_held_copy_and_names_the_shared_rows() -> N
             not_after="2026-06-13T12:00:00+00:00",
             days_remaining=5,
             held_copy=True,
-            detail="A running TLS hop ([tls].crl_file) still holds a copy.",
+            detail="Restart the engine. Held by: [tls].crl_file.",
             shared_with=("logging.forward_tls_crl_file",),
         )
     )
@@ -218,8 +227,10 @@ def test_the_notifier_payload_marks_a_held_copy_and_names_the_shared_rows() -> N
     assert event["connection"] == "tls.crl_file (CRL)"
     assert event["held_copy"] is True
     assert event["shared_with"] == ["logging.forward_tls_crl_file"]
-    assert event["detail"].startswith(HELD_COPY_NOTE)
-    assert "[tls].crl_file" in event["detail"]
+    # The remedy leads: the alert instance's reason keeps only about the first 200 characters.
+    assert event["detail"].startswith("Restart the engine. Held by: [tls].crl_file.")
+    assert "also serves logging.forward_tls_crl_file" in event["detail"]
+    assert event["detail"].endswith(HELD_COPY_NOTE)
 
 
 def test_control_a_plain_crl_alert_payload_is_unchanged() -> None:
@@ -293,9 +304,11 @@ def test_a_stale_copy_of_a_shared_file_names_the_other_rows_and_its_hop(
     (_, tls_detail, tls_shared), (_, fwd_detail, fwd_shared) = sink.crl_notes
     assert tls_shared == ("logging.forward_tls_crl_file",)
     assert fwd_shared == ("tls.crl_file",)
-    assert "([tls].crl_file)" in fwd_detail  # the holder, under the row that is not its own
-    assert "also serves tls.crl_file" in fwd_detail
-    assert "also serves logging.forward_tls_crl_file" in tls_detail
+    assert "Held by: [tls].crl_file" in fwd_detail  # the holder, under the row that is not its own
+    assert "Held by: [tls].crl_file" in tls_detail
+    # Each sink adds the sharing sentence through the one helper both use.
+    fwd_note = crl_expiry_detail(held_copy=True, detail=fwd_detail, shared_with=fwd_shared)
+    assert "also serves tls.crl_file" in fwd_note
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
 
@@ -402,3 +415,117 @@ def test_one_file_as_both_the_crl_setting_and_the_ca_bundle_stays_reloadable(
     assert mine[0].blocks  # known, so a reload can prove it supersedes them
     del hop
     gc.collect()
+
+
+def _bundle_scan(bundle: Path) -> tuple[_RecordingSink, list[int]]:
+    sink = _RecordingSink()
+    runner = CertExpiryRunner(
+        list, CertMonitorSettings(warn_days=30), alert_sink=sink, watch_unlisted_held_crls=True
+    )
+    runner.run_once(now=time.time())
+    return sink, _mine(sink, bundle)
+
+
+def test_a_certificate_added_beside_an_unchanged_bundle_crl_is_not_a_stale_copy(
+    ca: _Ca, tmp_path: Path
+) -> None:
+    # A held copy from a CA file is a copy of its CRLs. Adding a certificate to the file leaves the
+    # CRL the hop holds the same as the file's, so the alert is the file's and says nothing more.
+    crl_pem = ca.crl(days=5.5, number=1)
+    bundle = tmp_path / "ca-bundle.pem"
+    bundle.write_bytes(ca.pem + crl_pem)
+    crl = tmp_path / "crl.pem"
+    crl.write_bytes(ca.crl(days=90, number=2))
+    hop = _hop(bundle, crl)
+    bundle.write_bytes(ca.pem + _another_ca().pem + crl_pem)
+
+    sink, mine = _bundle_scan(bundle)
+
+    assert len(mine) == 1
+    assert sink.crl_notes[mine[0]] == (False, "", ())
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+def test_a_crl_moved_out_of_the_ca_file_asks_for_a_restart(ca: _Ca, tmp_path: Path) -> None:
+    # The operator followed the advice and moved the CRL to the CRL setting. The hop still holds
+    # the bundle's copy, and a CA file with no CRL starts, so a restart is the remedy, not a fix.
+    bundle = tmp_path / "ca-bundle.pem"
+    bundle.write_bytes(ca.pem + ca.crl(days=5.5, number=1))
+    crl = tmp_path / "crl.pem"
+    crl.write_bytes(ca.crl(days=90, number=2))
+    hop = _hop(bundle, crl)
+    bundle.write_bytes(ca.pem)
+
+    sink, mine = _bundle_scan(bundle)
+
+    assert len(mine) == 1
+    held_copy, detail, _ = sink.crl_notes[mine[0]]
+    assert held_copy is True
+    assert detail.startswith("Restart the engine to apply the CA file")
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+def test_an_unreadable_ca_file_asks_for_it_to_be_restored_first(ca: _Ca, tmp_path: Path) -> None:
+    # A restart would refuse a CA file it cannot read, so the remedy names the CA file, not a CRL.
+    bundle = tmp_path / "ca-bundle.pem"
+    bundle.write_bytes(ca.pem + ca.crl(days=5.5, number=1))
+    crl = tmp_path / "crl.pem"
+    crl.write_bytes(ca.crl(days=90, number=2))
+    hop = _hop(bundle, crl)
+    bundle.unlink()
+    sink = _RecordingSink()
+    runner = CertExpiryRunner(
+        lambda: [MonitoredCert("held", str(bundle), kind="crl")],
+        CertMonitorSettings(warn_days=30),
+        alert_sink=sink,
+    )
+
+    runner.run_once(now=time.time())
+
+    assert [c[3] for c in sink.crl_calls] == [5]
+    assert sink.crl_notes[0][1].startswith("Restore a readable CA file before restarting")
+    assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+def test_the_https_augment_arm_records_its_ca_bundle_crl(ca: _Ca, tmp_path: Path) -> None:
+    # The HTTP family's augment arm loads the CA into urllib's own context, then the CRL. It is a
+    # separate call site from build_verifying_client_context, so it is tested on its own.
+    bundle = tmp_path / "ca-bundle.pem"
+    bundle.write_bytes(ca.pem + ca.crl(days=5.5, number=1))
+    crl = tmp_path / "crl.pem"
+    crl.write_bytes(ca.crl(days=90, number=2))
+
+    handler = build_anchored_https_handler(
+        anchor=TrustAnchor(
+            cafile=str(bundle),
+            load_system_roots=True,
+            crl_file=str(crl),
+            cafile_setting="[tls].internal_ca_file",
+        ),
+        connector="REST test",
+    )
+
+    copies = held_crl_copies(bundle)
+    assert [c.ca_bundle for c in copies] == [True]
+    assert handler is not None
+
+
+def test_the_syslog_forwarder_records_its_ca_bundle_crl(ca: _Ca, tmp_path: Path) -> None:
+    # The forwarder builds its own context from forward_tls_ca_file by cafile=, a third call site.
+    bundle = tmp_path / "ca-bundle.pem"
+    bundle.write_bytes(ca.pem + ca.crl(days=5.5, number=1))
+    crl = tmp_path / "crl.pem"
+    crl.write_bytes(ca.crl(days=90, number=2))
+
+    ctx = _build_tls_context(
+        SyslogForward(
+            host="siem.example.test",
+            protocol="tls",
+            tls_ca_file=str(bundle),
+            tls_crl_file=str(crl),
+        )
+    )
+
+    copies = held_crl_copies(bundle)
+    assert [(c.ca_bundle, c.setting) for c in copies] == [(True, "[logging].forward_tls_ca_file")]
+    assert ctx.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF

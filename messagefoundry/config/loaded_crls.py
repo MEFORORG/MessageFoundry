@@ -69,6 +69,7 @@ if TYPE_CHECKING:
 __all__ = [
     "HeldCrl",
     "HeldCrlSnapshot",
+    "ca_bundle_fingerprint",
     "ReloadRefusal",
     "clear_reload_refusal",
     "crl_fingerprint",
@@ -159,6 +160,16 @@ def crl_fingerprint(pem: bytes) -> tuple[int, int]:
     return (len(pem), hash(pem))
 
 
+def ca_bundle_fingerprint(pem: bytes) -> tuple[int, int]:
+    """:func:`crl_fingerprint` of only the CRL blocks in a CA bundle's bytes (vault BACKLOG #2319).
+
+    A held copy from a CA bundle is a copy of its CRLs. Fingerprinting the whole file would read a
+    certificate added beside an unchanged CRL as a stale CRL until the next restart."""
+    from messagefoundry.pki import crl_pem_blocks
+
+    return crl_fingerprint(b"".join(crl_pem_blocks(pem)))
+
+
 def record_crl_load(
     ctx: ssl.SSLContext,
     crl_file: str,
@@ -175,7 +186,7 @@ def record_crl_load(
     ``record_ca_bundle_crls`` for the CRLs a CA file carried."""
     held = HeldCrl(
         path_key=_path_key(crl_file),
-        fingerprint=crl_fingerprint(pem),
+        fingerprint=ca_bundle_fingerprint(pem) if ca_bundle else crl_fingerprint(pem),
         facts=facts,
         file_path=os.path.abspath(crl_file),
         setting=setting,
@@ -227,6 +238,7 @@ def _merged(old: HeldCrl, new: HeldCrl) -> HeldCrl:
         blocks=blocks,
         configured_path=old.configured_path or new.configured_path,
         reloads=old.reloads,
+        ca_bundle=old.ca_bundle,
     )
 
 
