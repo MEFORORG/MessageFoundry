@@ -830,8 +830,8 @@ async function chooseToProvision(): Promise<"provision" | "skip" | undefined> {
   const pick = await vscode.window.showWarningMessage(
     "This engine's store has no enabled administrator, so nobody can manage its users and roles. " +
       "Provision one now? At the shipped settings the engine refuses to start without one. Under " +
-      "[security].enforcement = warn, or with security notices off or waived, it starts and routes " +
-      "HL7, but no account can manage users or roles until you provision one.",
+      "[security].enforcement = warn, or with the security-notice requirement waived, it can start and " +
+      "route HL7, but no account can manage users or roles until you provision one.",
     { modal: true },
     provision,
     skip,

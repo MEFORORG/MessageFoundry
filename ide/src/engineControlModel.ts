@@ -300,9 +300,9 @@ export interface StartPlanEffects {
  *      applies every gate itself, so this weakens nothing; refusing outright would make Start a dead end
  *      the probe itself caused.
  *   3. No Administrator → provision one (the default), or start without one: at the shipped posture
- *      `serve` refuses and names `provision-admin` itself, and under `warn` or with notices off or
- *      waived it starts, routes HL7, and nobody can manage users and roles. `serve` cannot run with
- *      sign-in off.
+ *      `serve` refuses, and its Administrator check names `provision-admin` itself. Under `warn`, or
+ *      with the security-notice requirement waived, it can start and route HL7, and nobody can manage
+ *      users and roles. `serve` cannot run with sign-in off.
  *   4. Provision: ask a username and address, run `provision-admin` in its own terminal, wait for it to
  *      exit, and ALWAYS probe again. An exit code alone is not trusted: on macOS and Linux a Ctrl+C can
  *      surface as exit 0. "Already exists" → serve. Exit 0 and a probe that still cannot answer → serve,

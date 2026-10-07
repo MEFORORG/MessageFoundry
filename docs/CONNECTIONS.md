@@ -709,10 +709,11 @@ refused body, before it would wait for any reply.
 
 Refused at **check time** (`messagefoundry check`) rather than at runtime: a `reply_from` naming no
 deployed outbound; an outbound that does not capture responses; `reply_content_type="passthrough"` against
-an outbound not capturing the content type; and — because either would make N concurrent callers queue
-behind one lane and let a single stuck message time out every caller — an effective `ordering` of **FIFO**
-or an **unset `max_attempts`** (retry forever) on the named outbound. Both are read as effective values,
-so an outbound that inherits FIFO or retry-forever from `[delivery]` is refused too. Setting any `reply_*` knob **without** `reply_from`
+an outbound not capturing the content type; and — because either would let a single stuck message time
+out every caller, not just its own — an effective `ordering` of **FIFO** or an **unset `max_attempts`**
+(retry forever) on the named outbound. A lane sends one message at a time in either ordering mode, so
+this refusal is about failure isolation, not concurrency. Both are read as effective values, so an
+outbound that inherits FIFO or retry-forever from `[delivery]` is refused too. Setting any `reply_*` knob **without** `reply_from`
 is refused at the factory, since the path is off and the knob would never be read.
 
 **Not built.** **Routing metadata** (HTTP method / path / headers as Router inputs) is a defined follow-on

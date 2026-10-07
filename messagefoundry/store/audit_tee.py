@@ -6,10 +6,11 @@ Each store backend's ``record_audit`` (``SqliteStore``, ``PostgresStore``, ``Sql
 :func:`emit_audit_tee` immediately after the row is durably committed. So does a write that
 commits an audit row in its own transaction, through ``AuditAppend.tee`` (BACKLOG #2100). At least
 those paths reach it. So a **metadata** copy of the audit record, with HL7-shaped spans scrubbed
-from its ``detail``, is shipped off-box. That scrub is best-effort and does not make the copy
-PHI-free (BACKLOG #1133). The copy goes via the ``messagefoundry.audit`` logger — which propagates to
-the root stdout + optional syslog/SIEM forwarder configured by :mod:`messagefoundry.logging_setup`.
-So the audit trail survives a host/DB compromise (ASVS 16.x).
+from its ``detail``, is emitted for off-box shipping. That scrub is best-effort and does not make
+the copy PHI-free (BACKLOG #1133). The copy goes via the ``messagefoundry.audit`` logger — which
+propagates to the root stdout + optional syslog/SIEM forwarder configured by
+:mod:`messagefoundry.logging_setup`. So, once that forwarder runs, the audit trail survives a host/DB
+compromise (ASVS 16.x).
 
 One helper means there is exactly **one** place the off-box redaction lives, identical
 across all three backends — not three copies that could drift.
@@ -19,10 +20,10 @@ installed a handler for it to propagate to, which is a property of the *process*
 — so :func:`~messagefoundry.logging_setup.ensure_logger_sink` supplies one when nothing else has
 (BACKLOG #1199; that function states the defect, and this file does not restate it). This module
 transmits nothing itself. The copy leaves the host only through the syslog forwarder that
-:mod:`messagefoundry.logging_setup` installs once ``[logging].forward_host`` names a collector
-(TLS per ADR 0080, with an on-disk spool while the collector is down per ADR 0200). With none set,
-the copy stays on the host, in the process's own log sinks and whatever the service manager
-captures.
+:mod:`messagefoundry.logging_setup` installs when forwarding is configured and the forwarder comes
+up. Its protocol is whatever ``[logging].forward_protocol`` says: TLS is ADR 0080, and the on-disk
+spool for a collector that is down is ADR 0200. With no forwarder, the copy stays on the host, in the
+process's own log sinks and whatever the service manager captures.
 """
 
 from __future__ import annotations
@@ -59,9 +60,10 @@ def emit_audit_tee(
     row_hash: str,
     client: str | None = None,
 ) -> None:
-    """Tee a just-persisted ``audit_log`` record off-box as PHI-safe metadata (sec-offbox-log, ASVS
-    16.x). Emits actor / action / channel / client address / timestamp / chain anchor plus a
-    **redacted** ``detail`` to the ``messagefoundry.audit`` logger.
+    """Tee a just-persisted ``audit_log`` record off-box as metadata (sec-offbox-log, ASVS 16.x).
+    Emits actor / action / channel / client address / timestamp / chain anchor plus a best-effort
+    **redacted** ``detail`` to the ``messagefoundry.audit`` logger; the copy is not PHI-free
+    (BACKLOG #1133).
 
     ``seq`` and ``row_hash`` are the just-committed row's sequence number and its chain hash -- the
     ANCHOR fields (BACKLOG #1198). ``seq`` is the row's position in the chain and is inside its MAC,

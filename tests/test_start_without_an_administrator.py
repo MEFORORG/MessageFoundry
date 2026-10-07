@@ -26,6 +26,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import logging
+import re
 from pathlib import Path
 
 import pytest
@@ -302,6 +303,44 @@ def test_the_provision_admin_help_does_not_say_nobody_can_sign_in(
     text = rejoin_wrapped_hyphens(capsys.readouterr().out)
     assert "creates no account on its own" in text, "control: this is provision-admin's help"
     assert not SIGN_IN_CLAIM.search(text), f"provision-admin's help says nobody can sign in: {text}"
+
+
+#: The IDE files that described a start with no Administrator (vault BACKLOG #3035). The doc guards in
+#: tests/test_docs_security_pathways.py read Markdown only, so these TypeScript strings are read here.
+_IDE_START_FILES = (
+    "ide/src/statusBar.ts",
+    "ide/src/engineControlModel.ts",
+    "ide/src/test/suite/engine-control.test.ts",
+)
+
+
+def _ide_prose(text: str) -> str:
+    """``text`` with split string literals and wrapped ``//`` comments joined, so a claim the source
+    wraps across lines still reads as one clause."""
+    joined = re.sub(r"\"\s*\+\s*\n\s*\"", "", text)
+    joined = re.sub(r"\n\s*(?://|\*)\s*", " ", joined)
+    return " ".join(joined.split())
+
+
+def test_the_ide_start_dialog_does_not_say_nobody_can_sign_in() -> None:
+    """BACKLOG #3035: the IDE Start dialog said a store with no Administrator meant nobody could sign
+    in, and offered a start "only if sign-in is off". A Windows sign-in still creates a directory
+    account with no role, and ``serve`` cannot run with sign-in off (vault BACKLOG #2719)."""
+    texts = {rel: _ide_prose((_REPO / rel).read_text(encoding="utf-8")) for rel in _IDE_START_FILES}
+    assert "no enabled administrator" in texts["ide/src/statusBar.ts"], (
+        "control: this is the dialog"
+    )
+    for rel, text in texts.items():
+        assert not SIGN_IN_CLAIM.search(text), f"{rel} says nobody can sign in again"
+        assert "sign-in is off for this engine" not in text, f"{rel} offers a sign-in-off start"
+    # The control that makes the zeros mean something: the old dialog, wrapped as the source had it.
+    old = (
+        '"so nobody can sign in to it. Provision one now? " +\n      "Start without one only if '
+        'sign-in is off for this engine. At the shipped settings it refuses to " +\n      "start; '
+        'under other settings it starts with nobody able to sign in."'
+    )
+    assert SIGN_IN_CLAIM.search(_ide_prose(old))
+    assert "sign-in is off for this engine" in _ide_prose(old)
 
 
 def test_the_help_reader_survives_a_hyphen_wrap() -> None:
