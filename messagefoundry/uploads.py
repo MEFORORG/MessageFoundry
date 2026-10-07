@@ -707,8 +707,9 @@ class UploadStore:
         coercion and fails every save. Trusting it to keep retention working would trade a bounded
         residual for all of that. The residual is named in ``docs/PHI.md`` §3: a refused upload is
         outside retention and the quota until ``rotate-key`` seals it, and ``serve`` logs the count
-        at startup so the operator knows to run it. The one upload ``rotate-key`` can never seal is
-        brought back by :meth:`_scan_unsealable_sync` instead, without trusting its sidecar.
+        at startup so the operator knows to run it. One kind ``rotate-key`` can never seal is
+        brought back by :meth:`_scan_unsealable_sync` instead, without trusting its sidecar. At least
+        a blank or non-UTF-8 sidecar is still left out.
 
         The cipher's own message is safe to log — every ``CipherError`` carries only key ids,
         marker versions and algorithm names, never a decrypted value. The malformed-shape branch
@@ -779,7 +780,12 @@ class UploadStore:
             modified = sidecar.stat().st_mtime
         except (OSError, UnicodeDecodeError):
             return None  # the listing scan names this one
-        size = self._lost_body_size(sidecar.with_name(f"{fid}{_BLOB_SUFFIX}"))
+        try:
+            # The prune unlinks through the same guard, so anything it refuses is never billed.
+            blob, _ = self._paths(fid)
+        except UploadPathError:
+            return None
+        size = self._lost_body_size(blob)
         if size is None:
             return None
         owner = ""
@@ -809,6 +815,9 @@ class UploadStore:
             return None
         # base64 of max_bytes, plus a generous allowance for the cipher's marker and tag.
         if not S_ISREG(stat.st_mode) or stat.st_size > 2 * self._max_bytes + 4096:
+            _log.warning(
+                "uploaded file %s: not a regular file of a size an upload can be", blob.name
+            )
             return None
         key = (stat.st_mtime_ns, stat.st_size)
         cached = self._body_checks.get(blob.name)
@@ -823,7 +832,8 @@ class UploadStore:
                 return 0
             except UnicodeDecodeError:
                 decodes = False
-            except OSError:
+            except OSError as exc:
+                _log.warning("uploaded file %s: could not check the body: %s", blob.name, exc)
                 return None
             else:
                 decodes = True
@@ -1386,16 +1396,19 @@ class UploadStore:
                     _log.warning("uploaded file %s (%s): skipped, unreadable: %s", fid, kind, exc)
                     continue
                 plaintext = bool(stored) and not stored.startswith(MARKER_PREFIX)
-                if plaintext and pair_skipped:
+                # The body is missing or is not text: the one test the prune and the quota use too.
+                # Asked even when the body pass succeeded, because that pass trusts a body whose
+                # first bytes are the active marker without reading the rest.
+                lost = plaintext and kind == "meta" and self._lost_body_size(blob_path) is not None
+                if plaintext and (pair_skipped or lost):
                     # BACKLOG #2322: the body was not sealed, so a PLAINTEXT sidecar stays as it is.
                     # A keyed store refuses it, so the upload is unlisted; sealing it would list an
                     # upload whose body is unusable, and would seal a planted lone sidecar too. A
                     # sidecar under a retired key is listed already, so it is still re-sealed: left
                     # behind, it would drop out of reach of prune_expired once that key goes.
-                    if self._lost_body_size(blob_path) is not None:
-                        # The body is missing or is not text: the one test the prune and the quota
-                        # use too. No key reads either half and no re-run changes that, so it is not
-                        # a skip. It stays refused, and the prune removes it at expiry.
+                    if lost:
+                        # No key reads either half and no re-run changes that, so it is not a skip.
+                        # It stays refused, and the prune removes it at expiry.
                         pair_skipped = False
                         unsealable += 1
                         _log.warning(
@@ -1529,7 +1542,7 @@ class UploadStore:
 
         Idempotent: a re-run finds the already-deleted pairs gone and returns an empty pass.
         Undecryptable/foreign sidecars are skipped (never pruned — a rotated-away key must not silently
-        destroy data). The one exception is an upload ``rotate-key`` can never seal (BACKLOG #2322):
+        destroy data). One exception is an upload ``rotate-key`` can never seal (BACKLOG #2322):
         it is pruned once its sidecar's mtime passes the cutoff, and is reported with blank owner
         fields (:class:`_UnsealableUpload`). Runs off the event loop; the periodic runner + the
         opportunistic save-time sweep both drive it.

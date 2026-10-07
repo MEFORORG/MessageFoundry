@@ -525,6 +525,22 @@ async def test_a_body_unreadable_for_another_cause_still_waits_for_rotate_key(
         await store.delete(fid)
 
 
+async def test_a_body_behind_a_current_marker_is_still_checked_before_its_sidecar_is_sealed(
+    tmp_path: Path,
+) -> None:
+    """The reseal trusts a body whose first bytes are the active marker without reading the rest.
+    Its sidecar is sealed only once the whole body is known to be text."""
+    root = tmp_path / "uploads"
+    fid = await _plaintext_upload(root)
+    cipher = _keyed(generate_key())
+    sidecar = (root / f"{fid}.meta").read_bytes()
+    (root / f"{fid}.blob").write_bytes(cipher.active_marker_prefix.encode() + b"A" * 9000 + b"\xff")
+    store = UploadStore(root, cipher, max_bytes=1 << 20)
+    assert await store.reseal_to_active() == ResealResult(unsealable=1)
+    assert (root / f"{fid}.meta").read_bytes() == sidecar
+    assert await store.list_files() == []
+
+
 async def test_a_body_the_engine_could_not_have_written_is_never_read(tmp_path: Path) -> None:
     """The quota scan checks bodies under ``_quota_lock``, so a body past any size the engine could
     have written is not read at all. It waits for an operator, like any refused upload."""
