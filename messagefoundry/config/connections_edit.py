@@ -199,7 +199,7 @@ def upsert_connection(
     _validate_input(obj)
     path = _path(config_dir)
     with locked(config_dir):
-        original = path.read_text(encoding="utf-8") if path.is_file() else None
+        original, crlf = atomic_edit.read_text(path) if path.is_file() else (None, False)
         doc = tomlkit.parse(original) if original is not None else tomlkit.document()
 
         direction = obj["direction"]
@@ -221,7 +221,7 @@ def upsert_connection(
         else:
             aot.append(new_table)
 
-        _write_validated(path, tomlkit.dumps(doc), validate)
+        _write_validated(path, atomic_edit.encode_text(tomlkit.dumps(doc), crlf), validate)
     return {"op": "upsert", "direction": direction, "name": obj["name"]}
 
 
@@ -232,7 +232,8 @@ def remove_connection(config_dir: str | Path, name: str, *, validate: Validate) 
     if not path.is_file():
         raise WiringError(f"no {CONNECTIONS_FILE_NAME} in {config_dir}")
     with locked(config_dir):
-        doc = tomlkit.parse(path.read_text(encoding="utf-8"))
+        text, crlf = atomic_edit.read_text(path)
+        doc = tomlkit.parse(text)
 
         removed = False
         for direction in ("inbound", "outbound"):
@@ -252,7 +253,7 @@ def remove_connection(config_dir: str | Path, name: str, *, validate: Validate) 
                 "(a code-authored connection can't be removed here)"
             )
 
-        _write_validated(path, tomlkit.dumps(doc), validate)
+        _write_validated(path, atomic_edit.encode_text(tomlkit.dumps(doc), crlf), validate)
     return {"op": "remove", "name": name}
 
 
@@ -375,14 +376,15 @@ def _toml_value(value: Any) -> Any:
     return value
 
 
-def _write_validated(path: Path, new_text: str, validate: Validate) -> None:
-    """Validate the dir with ``new_text`` as its ``connections.toml``, then replace the live file.
+def _write_validated(path: Path, data: bytes, validate: Validate) -> None:
+    """Validate the dir with ``data`` as its ``connections.toml``, then replace the live file.
 
     ``validate`` still receives the config DIR. While it runs, a ``load_config`` of that dir in this
     thread reads the candidate in place of the live file
     (:func:`~messagefoundry.config.connections_file.validating_candidate`), so the live file is
-    untouched until the candidate loads. Bytes go out verbatim, with no newline translation: Python's
-    default would rewrite every ``\n`` as ``\r\n`` on Windows and turn a one-key edit of an
+    untouched until the candidate loads. Bytes go out verbatim, with the line endings the file
+    already had (:func:`~messagefoundry.config.atomic_edit.encode_text`): Python's default text
+    mode would rewrite every ``\n`` as ``\r\n`` on Windows and turn a one-key edit of an
     LF-committed file into a whole-file diff."""
     config_dir = path.parent
 
@@ -390,4 +392,4 @@ def _write_validated(path: Path, new_text: str, validate: Validate) -> None:
         with validating_candidate(config_dir, candidate):
             validate(config_dir)
 
-    atomic_edit.replace_validated(path, new_text.encode("utf-8"), check)
+    atomic_edit.replace_validated(path, data, check)

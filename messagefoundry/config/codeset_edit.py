@@ -28,16 +28,17 @@ import io
 import ntpath
 import os
 from collections.abc import Callable
+from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any
 
 from messagefoundry.config import atomic_edit
 from messagefoundry.config.code_sets import (
     CODESETS_DIR_NAME,
-    POLICY_SIDECAR_SUFFIX,
     CodeSet,
     CodeSetError,
     UnmappedPolicy,
+    _policy_sidecar_path,
     is_policy_sidecar,
     load_code_set,
     load_code_sets,
@@ -151,7 +152,7 @@ def upsert_code_set(
     codesets_dir.mkdir(parents=True, exist_ok=True)
     # The existence checks sit inside the lock with the write, so a concurrent create of the same stem
     # cannot pass the check between them.
-    with atomic_edit.edit_lock(path, busy_error=WiringError):
+    with _directory_lock(codesets_dir):
         if create and _existing_path_or_none(codesets_dir, name) is not None:
             # A create must not silently overwrite an existing code set — refuse loud (mirrors the
             # wizard/form collision refusal, PR #1081). An edit (create=False) overwrites the .csv.
@@ -186,22 +187,28 @@ def rename_code_set(
     # file in, contents intact. Kept after the empty-argument checks so the `--name is required`
     # wording still wins for an empty name (``_validate_name`` has its own, less specific message).
     _validate_name(codesets_dir, old)
-    src = _existing_path(codesets_dir, old)
+    _existing_path(codesets_dir, old)
     _validate_name(codesets_dir, new)
-    # For a rename, ANY supported file for the new stem is a collision (unlike upsert, which may
-    # overwrite the same-stem .csv).
-    if _existing_path_or_none(codesets_dir, new) is not None:
-        raise WiringError(_collision_message(new, codesets_dir))
+    # One lock for the directory covers both names, so a concurrent upsert or remove of either stem
+    # cannot land between the checks and the move (vault BACKLOG #2782). The source is looked up
+    # again under it, since it may have gone while this waited.
+    with _directory_lock(codesets_dir):
+        src = _existing_path(codesets_dir, old)
+        # For a rename, ANY supported file for the new stem is a collision (unlike upsert, which may
+        # overwrite the same-stem .csv).
+        if _existing_path_or_none(codesets_dir, new) is not None:
+            raise WiringError(_collision_message(new, codesets_dir))
 
-    dest = codesets_dir / f"{new}{src.suffix}"
-    # Referent pre-flight (#152): a code set is named by string literals in the Router/Handler modules
-    # that call code_set("old"). PLAN the referent rewrite BEFORE moving the file — the plan is built
-    # from the loaded graph while "old" still resolves (the loader would otherwise fail on a
-    # code_set("old") capture whose table just vanished). impact.py owns the tokenize-safe rewriter, so
-    # it is never duplicated here. Best-effort + additive: the file rename is the core operation, so a
-    # config that doesn't load leaves the result byte-identical to the pre-#152 shape.
-    plan = _plan_code_set_referents(config_dir, old, new)
-    os.replace(src, dest)
+        dest = codesets_dir / f"{new}{src.suffix}"
+        # Referent pre-flight (#152): a code set is named by string literals in the Router/Handler
+        # modules that call code_set("old"). PLAN the referent rewrite BEFORE moving the file — the
+        # plan is built from the loaded graph while "old" still resolves (the loader would otherwise
+        # fail on a code_set("old") capture whose table just vanished). impact.py owns the
+        # tokenize-safe rewriter, so it is never duplicated here. Best-effort + additive: the file
+        # rename is the core operation, so a config that doesn't load leaves the result
+        # byte-identical to the pre-#152 shape.
+        plan = _plan_code_set_referents(config_dir, old, new)
+        os.replace(src, dest)
     result: dict[str, Any] = {"op": "rename", "name": old, "to": new}
     if plan is not None:
         from messagefoundry.config import impact
@@ -225,14 +232,19 @@ def remove_code_set(config_dir: str | Path, name: str, *, validate: Validate) ->
     # The operator-supplied name is untrusted: a delete path must reject traversal (`../../x`, drive,
     # embedded ext) BEFORE building a filesystem path, or a `remove` could unlink any file on disk.
     _validate_name(codesets_dir, name)
-    path = _existing_path(codesets_dir, name)
-    # Delete pre-flight (#152): surface the live Router/Handler referents that will now dangle (a
-    # code_set("name") that no longer resolves). Computed BEFORE the unlink — while "name" still
-    # resolves — because the reverse index only builds a code_set edge for a *registered* table, so a
-    # reload after the file is gone would find no referrers. Mirrors the rename path (plan-before-move).
-    # Best-effort + additive: the delete is the core op, so an unloadable graph yields no referrers.
-    dangling = _code_set_referrers(config_dir, name)
-    path.unlink()
+    # Under the directory lock, so an upsert of the same stem cannot re-create it mid-remove
+    # (vault BACKLOG #2782).
+    _existing_path(codesets_dir, name)
+    with _directory_lock(codesets_dir):
+        path = _existing_path(codesets_dir, name)
+        # Delete pre-flight (#152): surface the live Router/Handler referents that will now dangle
+        # (a code_set("name") that no longer resolves). Computed BEFORE the unlink — while "name"
+        # still resolves — because the reverse index only builds a code_set edge for a *registered*
+        # table, so a reload after the file is gone would find no referrers. Mirrors the rename path
+        # (plan-before-move). Best-effort + additive: the delete is the core op, so an unloadable
+        # graph yields no referrers.
+        dangling = _code_set_referrers(config_dir, name)
+        path.unlink()
     result: dict[str, Any] = {"op": "remove", "name": name}
     if dangling:
         result["referrers"] = dangling
@@ -371,6 +383,14 @@ def _create_collision_message(name: str, codesets_dir: Path) -> str:
 
 def _codesets_dir(config_dir: str | Path) -> Path:
     return Path(config_dir) / CODESETS_DIR_NAME
+
+
+def _directory_lock(codesets_dir: Path) -> AbstractContextManager[None]:
+    """The cross-process edit lock for every code set in ``codesets_dir`` (vault BACKLOG #2782).
+
+    Keyed on the directory, never on an operator-supplied name, so no name can steer the lock file
+    outside ``codesets/``."""
+    return atomic_edit.edit_lock(codesets_dir / atomic_edit.LOCK_FILE_NAME, busy_error=WiringError)
 
 
 def _iter_code_set_files(codesets_dir: Path) -> list[Path]:
@@ -577,7 +597,7 @@ def _write_validated(path: Path, new_text: str, validate: Validate) -> None:
         path,
         new_text.encode("utf-8"),
         validate,
-        companions=(path.with_name(path.stem + POLICY_SIDECAR_SUFFIX),),
+        companions=(_policy_sidecar_path(path),),
     )
 
 

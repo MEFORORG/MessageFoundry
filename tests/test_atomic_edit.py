@@ -366,6 +366,60 @@ def test_the_lock_is_reentrant_within_a_thread(tmp_path: Path) -> None:
     assert "flagged = true" in path.read_text(encoding="utf-8")
 
 
-def test_the_lock_sidecar_is_hidden_and_beside_the_file(tmp_path: Path) -> None:
+def test_one_hidden_lock_file_per_directory(tmp_path: Path) -> None:
+    """One lock per directory: a renamed or removed code set leaves no lock file of its own behind."""
+    codesets = tmp_path / "codesets"
+    assert atomic_edit.lock_path_for(codesets / "diets.csv") == codesets / ".mefor-edit.lock"
+    assert atomic_edit.lock_path_for(codesets / "meals.csv") == codesets / ".mefor-edit.lock"
+    codeset_edit.upsert_code_set(tmp_path, "diets", ["code", "value"], [["A", "B"]], validate=_noop)
+    codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_noop)
+    assert sorted(p.name for p in codesets.iterdir()) == [".mefor-edit.lock", "meals.csv"]
+
+
+def test_codeset_remove_waits_for_the_directory_lock(tmp_path: Path) -> None:
+    """A remove cannot run in the middle of an upsert of the same stem, which would otherwise
+    re-create the table it just reported removed."""
+    codeset_edit.upsert_code_set(tmp_path, "diets", ["code", "value"], [["A", "B"]], validate=_noop)
     path = tmp_path / "codesets" / "diets.csv"
-    assert atomic_edit.lock_path_for(path) == tmp_path / "codesets" / ".diets.csv.lock"
+    held, release, done = threading.Event(), threading.Event(), threading.Event()
+    holder = _hold_lock(path, held, release)
+
+    def remover() -> None:
+        codeset_edit.remove_code_set(tmp_path, "diets", validate=_noop)
+        done.set()
+
+    thread = threading.Thread(target=remover, daemon=True)
+    thread.start()
+    assert not done.wait(0.5)
+    assert path.exists()
+    release.set()
+    holder.join(_JOIN_S)
+    thread.join(_JOIN_S)
+    assert done.is_set() and not path.exists()
+
+
+@pytest.mark.parametrize("ending", [b"\n", b"\r\n"], ids=["lf", "crlf"])
+def test_an_edit_keeps_the_files_line_endings(tmp_path: Path, ending: bytes) -> None:
+    path = tmp_path / "messagefoundry.toml"
+    path.write_bytes(SETTINGS_TOML.encode("utf-8").replace(b"\n", ending))
+    security_edit.set_security(path, {"require_mfa": False}, validate=_noop)
+    data = path.read_bytes()
+    assert b"require_mfa = false" in data
+    assert data.count(ending) == data.count(b"\n")  # every line ends the same way
+
+
+def test_a_candidate_error_names_the_live_file(tmp_path: Path) -> None:
+    """A connection loaded from the candidate records the live ``connections.toml`` as its source, so
+    an error or an editor link points at a file the operator has, not at a deleted candidate."""
+    (tmp_path / "logic.py").write_text(LOGIC_PY, encoding="utf-8")
+    (tmp_path / "connections.toml").write_text(CONNECTIONS_TOML, encoding="utf-8")
+    sources: list[str] = []
+
+    def check(config_dir: Path) -> None:
+        registry = load_config(config_dir, allow_empty=True)
+        sources.extend(str(c.source_file) for c in registry.outbound.values())
+
+    ob: dict[str, object] = {"direction": "outbound", "name": "OB_NEW", "transport": "mllp"}
+    ob["settings"] = {"host": "127.0.0.1", "port": 2702}
+    connections_edit.upsert_connection(tmp_path, ob, validate=check)
+    assert sources == [str(tmp_path / "connections.toml")] * 2

@@ -78,11 +78,15 @@ from messagefoundry.config.wiring import (
 #: The file an engine config dir may carry alongside its ``*.py`` modules.
 CONNECTIONS_FILE_NAME = "connections.toml"
 
-# The candidate an edit is validating, as (config dir key, candidate file), or None. Set only by
-# :func:`validating_candidate`, for the length of one validation in the editing thread (vault BACKLOG
-# #2782): ``connections_edit`` validates a candidate BEFORE it replaces the live file, and the validate
-# callbacks it is handed load the whole config DIR, which finds this file by its fixed name.
-_CANDIDATE: ContextVar[tuple[str, Path] | None] = ContextVar("connections_candidate", default=None)
+# The candidate an edit is validating, as (config dir key, candidate file, live file), or None.
+# Set only by
+# :func:`validating_candidate`, for the length of one validation in the editing thread (vault
+# BACKLOG #2782): ``connections_edit`` validates a candidate BEFORE it replaces the live file, and
+# the validate callbacks it is handed load the whole config DIR, which finds this file by its
+# fixed name.
+_CANDIDATE: ContextVar[tuple[str, Path, Path] | None] = ContextVar(
+    "connections_candidate", default=None
+)
 
 
 def _dir_key(directory: Path) -> str:
@@ -95,7 +99,7 @@ def validating_candidate(config_dir: Path, candidate: Path) -> Iterator[None]:
 
     Scoped to one directory and one context, so a load of any other directory, or one in another
     thread, still reads the live file."""
-    token = _CANDIDATE.set((_dir_key(config_dir), candidate))
+    token = _CANDIDATE.set((_dir_key(config_dir), candidate, config_dir / CONNECTIONS_FILE_NAME))
     try:
         yield
     finally:
@@ -109,6 +113,16 @@ def connections_file_path(directory: Path) -> Path:
     if pending is not None and pending[0] == _dir_key(directory):
         return pending[1]
     return directory / CONNECTIONS_FILE_NAME
+
+
+def _source_of(path: Path) -> Path:
+    """The path a connection loaded from ``path`` names as its source: the live file it will
+    replace when ``path`` is a candidate under validation, so a message or an editor link points at
+    the file the operator has, not at a candidate that is gone once the edit returns."""
+    pending = _CANDIDATE.get()
+    if pending is not None and pending[1] == path:
+        return pending[2]
+    return path
 
 
 #: ``transport`` value → the transport factory it desugars to. The factory validates its own settings,
@@ -240,7 +254,7 @@ def load_connections_file(path: Path, registry: Registry) -> None:
             "(expected [[inbound]] / [[outbound]] arrays of tables)"
         )
 
-    source = str(path)
+    source = str(_source_of(path))
     for table in _as_tables(data.get("inbound", []), "inbound", path):
         registry.add_inbound(_inbound_from_table(table, source))
     for table in _as_tables(data.get("outbound", []), "outbound", path):

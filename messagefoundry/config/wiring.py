@@ -7716,10 +7716,13 @@ def validate_config(directory: str | Path, *, allow_empty: bool = False) -> list
     # *.py ones and the router/port checks below cover TOML-authored connections. Lazy import (cycle).
     from messagefoundry.config.connections_file import (
         CONNECTIONS_FILE_NAME,
+        connections_file_path,
         load_connections_file,
     )
 
-    conn_file = directory / CONNECTIONS_FILE_NAME
+    # The candidate a `connections_edit` write is validating, when this runs inside one (vault
+    # BACKLOG #2782), as `load_config` does.
+    conn_file = connections_file_path(directory)
     if conn_file.is_file():
         try:
             load_connections_file(conn_file, registry)

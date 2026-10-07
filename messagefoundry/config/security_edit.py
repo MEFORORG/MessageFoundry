@@ -59,7 +59,7 @@ def set_security(
         raise SecurityEditError("security updates must be a JSON object of {key: value}")
     path = Path(service_config)
     with atomic_edit.edit_lock(path, busy_error=SecurityEditError):
-        original = path.read_text(encoding="utf-8") if path.is_file() else None
+        original, crlf = atomic_edit.read_text(path) if path.is_file() else (None, False)
         doc = tomlkit.parse(original) if original is not None else tomlkit.document()
 
         sec = doc.get("security")
@@ -76,15 +76,15 @@ def set_security(
         if not len(sec):
             del doc["security"]
 
-        _write_validated(path, tomlkit.dumps(doc), validate)
+        _write_validated(path, atomic_edit.encode_text(tomlkit.dumps(doc), crlf), validate)
     return {"op": "set", "keys": list(updates.keys())}
 
 
 # --- internals ---------------------------------------------------------------
 
 
-def _write_validated(path: Path, new_text: str, validate: Validate) -> None:
-    """Validate ``new_text`` as a candidate and replace ``path`` with it only if it loads.
+def _write_validated(path: Path, data: bytes, validate: Validate) -> None:
+    """Validate ``data`` as a candidate and replace ``path`` with it only if it loads.
 
     ``validate`` receives the CANDIDATE's path, not the live one (vault BACKLOG #2782), so EVERY
     refusal, a :class:`SecurityEditError` from the callback included, leaves the live file
@@ -105,4 +105,4 @@ def _write_validated(path: Path, new_text: str, validate: Validate) -> None:
         except Exception as exc:
             raise SecurityEditError(str(exc)) from exc
 
-    atomic_edit.replace_validated(path, new_text.encode("utf-8"), checked)
+    atomic_edit.replace_validated(path, data, checked)

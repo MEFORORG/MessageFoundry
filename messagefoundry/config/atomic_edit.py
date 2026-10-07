@@ -9,8 +9,11 @@ length of the validation and rolled it back afterwards, and the rollback skipped
 restriction (vault BACKLOG #2782). One copy here replaces the four.
 
 :func:`replace_validated` writes the new bytes to a CANDIDATE that carries the live file's own name,
-inside a private directory created beside it (unique, owner-only from creation, same filesystem so the
-final ``os.replace`` is atomic). The caller's ``validate`` runs against that candidate. Only a candidate
+inside a private directory created beside it (unique, and on POSIX owner-only from creation: mode
+0700 for the directory and 0600 for the file; same filesystem, so the final ``os.replace`` is atomic).
+On Windows those modes are ignored and the candidate carries the directory's inherited access list
+until ``store._secure_file`` restricts the replaced file, the same window the old ``mkstemp`` writer
+had; the directory's own access list is the control there (``docs/SERVICE.md``). The caller's ``validate`` runs against that candidate. Only a candidate
 that validates replaces the live file, so a refused edit never touches the live file at all: its bytes
 and its permission bits stay exactly as they were, and there is no rollback write to get wrong.
 
@@ -21,8 +24,13 @@ copies sibling files the loader reads beside the candidate, such as a code set's
 :func:`edit_lock` is the cross-process half. The engine serialises its own writers with an
 ``asyncio.Lock``, which the ``connection`` CLI in another process cannot see, so a CLI edit and a
 console edit could each read the same original and the second replace would drop the first. The lock
-is an OS lock on a hidden sidecar, ``.<name>.lock``, held from the read through the replace. It never
+is an OS lock on one hidden file per DIRECTORY, ``.mefor-edit.lock`` beside the edited file, held from
+the read through the replace. One per directory rather than one per file, so a code-set rename or
+remove covers both of its names with one lock and a renamed table leaves no lock file behind. It never
 runs on an event loop: the engine's one caller already moves the whole write to a worker thread.
+
+:func:`read_text` and :func:`encode_text` keep a file's line endings: the editors parse and dump with
+``\n``, and a file that used ``\r\n`` is written back with ``\r\n`` rather than reflowed.
 """
 
 from __future__ import annotations
@@ -39,13 +47,24 @@ import time
 from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 
-__all__ = ["DEFAULT_LOCK_TIMEOUT_S", "edit_lock", "lock_path_for", "replace_validated"]
+__all__ = [
+    "DEFAULT_LOCK_TIMEOUT_S",
+    "LOCK_FILE_NAME",
+    "edit_lock",
+    "encode_text",
+    "lock_path_for",
+    "read_text",
+    "replace_validated",
+]
 
 _log = logging.getLogger(__name__)
 
 #: How long an edit waits for another editor to finish before it gives up. An edit holds the lock for
 #: one parse, one validation and one rename, so a wait this long means a stuck holder, not a busy one.
 DEFAULT_LOCK_TIMEOUT_S = 30.0
+
+#: The lock file, one per directory holding an edited file.
+LOCK_FILE_NAME = ".mefor-edit.lock"
 
 #: The poll interval while another editor holds the lock.
 _LOCK_POLL_S = 0.05
@@ -64,8 +83,19 @@ _held = threading.local()
 
 
 def lock_path_for(path: Path) -> Path:
-    """The sidecar lock file guarding edits to ``path``: ``.<name>.lock`` beside it."""
-    return path.with_name(f".{path.name}.lock")
+    """The lock file guarding edits to ``path``, and to every other file in its directory."""
+    return path.with_name(LOCK_FILE_NAME)
+
+
+def read_text(path: Path) -> tuple[str, bool]:
+    """``path`` as UTF-8 text with ``\n`` line endings, and whether it used ``\r\n``."""
+    raw = path.read_bytes()
+    return raw.decode("utf-8").replace("\r\n", "\n"), b"\r\n" in raw
+
+
+def encode_text(text: str, crlf: bool) -> bytes:
+    """``text`` (``\n`` endings) as the UTF-8 bytes to write, with ``\r\n`` endings when ``crlf``."""
+    return (text.replace("\n", "\r\n") if crlf else text).encode("utf-8")
 
 
 @contextlib.contextmanager
@@ -119,13 +149,15 @@ def replace_validated(
     receives the candidate path and raises to refuse; the refusal propagates unchanged and the live
     file is left byte-for-byte and mode-for-mode as it was. On success the candidate is renamed over
     ``path`` and re-restricted to its owner. The private directory is removed either way."""
-    parent = path.parent
-    private = Path(tempfile.mkdtemp(dir=parent, prefix=f".{path.name}.", suffix=".edit"))
+    private = Path(tempfile.mkdtemp(dir=path.parent, prefix=f".{path.name}.", suffix=".edit"))
     try:
         candidate = private / path.name
         fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY, 0o600)
         with os.fdopen(fd, "wb") as handle:
             handle.write(data)
+            # On disk before the rename, so a crash just after it cannot leave an empty live file.
+            handle.flush()
+            os.fsync(handle.fileno())
         for companion in companions:
             if companion.is_file():
                 shutil.copyfile(companion, private / companion.name)
@@ -133,6 +165,7 @@ def replace_validated(
         os.replace(candidate, path)
     finally:
         _remove_private_dir(private)
+    _fsync_dir(path.parent)
     _secure_file(path)
 
 
@@ -206,6 +239,23 @@ def _release(fd: int) -> None:
             import fcntl
 
             fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+def _fsync_dir(directory: Path) -> None:
+    """Make the rename durable (POSIX). Windows has no directory handle to flush; NTFS journals it."""
+    if sys.platform == "win32":
+        return
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError as exc:
+        _log.warning("could not open %s to flush the edit's rename: %s", directory, exc)
+        return
+    try:
+        os.fsync(fd)
+    except OSError as exc:
+        _log.warning("could not flush the edit's rename in %s: %s", directory, exc)
+    finally:
+        os.close(fd)
 
 
 def _remove_private_dir(private: Path) -> None:

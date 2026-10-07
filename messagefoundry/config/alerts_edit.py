@@ -99,7 +99,7 @@ def add_rule(
     _validate_input(obj)
     path = Path(service_config)
     with atomic_edit.edit_lock(path, busy_error=AlertRuleError):
-        original = path.read_text(encoding="utf-8") if path.is_file() else None
+        original, crlf = atomic_edit.read_text(path) if path.is_file() else (None, False)
         doc = tomlkit.parse(original) if original is not None else tomlkit.document()
 
         alerts = doc.get("alerts")
@@ -112,7 +112,7 @@ def add_rule(
             alerts["rules"] = rules
         rules.append(_build_table(obj))
 
-        _write_validated(path, tomlkit.dumps(doc), validate)
+        _write_validated(path, atomic_edit.encode_text(tomlkit.dumps(doc), crlf), validate)
     return {"op": "add", "index": len(rules) - 1}
 
 
@@ -123,13 +123,14 @@ def remove_rule(service_config: str | Path, index: int, *, validate: Validate) -
     if not path.is_file():
         raise AlertRuleError(f"no settings file at {path}")
     with atomic_edit.edit_lock(path, busy_error=AlertRuleError):
-        doc = tomlkit.parse(path.read_text(encoding="utf-8"))
+        text, crlf = atomic_edit.read_text(path)
+        doc = tomlkit.parse(text)
         rules = _existing_rules(doc)
         if rules is None or not 0 <= index < len(rules):
             raise AlertRuleError(f"no alert rule at index {index}")
         del rules[index]
 
-        _write_validated(path, tomlkit.dumps(doc), validate)
+        _write_validated(path, atomic_edit.encode_text(tomlkit.dumps(doc), crlf), validate)
     return {"op": "remove", "index": index}
 
 
@@ -172,8 +173,8 @@ def _build_table(obj: dict[str, Any]) -> Any:
     return table
 
 
-def _write_validated(path: Path, new_text: str, validate: Validate) -> None:
-    """Validate ``new_text`` as a candidate and replace ``path`` with it only if it loads.
+def _write_validated(path: Path, data: bytes, validate: Validate) -> None:
+    """Validate ``data`` as a candidate and replace ``path`` with it only if it loads.
 
     ``validate`` receives the CANDIDATE's path, not the live one (vault BACKLOG #2782), so a refused
     edit leaves the live file byte-for-byte and mode-for-mode as it was, a new file included: it is
@@ -181,4 +182,4 @@ def _write_validated(path: Path, new_text: str, validate: Validate) -> None:
     whole-file ``load_settings`` failure must leave the callback already rendered, as the ``alert``
     CLI's callback renders it with ``settings_error_detail`` (vault BACKLOG #2760): its caller prints
     the message, and this module stays outside the settings import graph."""
-    atomic_edit.replace_validated(path, new_text.encode("utf-8"), validate)
+    atomic_edit.replace_validated(path, data, validate)

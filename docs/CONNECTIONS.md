@@ -169,7 +169,8 @@ transport = "mllp"
   declared in **both** a `.py` module and `connections.toml` is a hard error (no silent shadowing).
 - **Edit it two ways, same file:** by hand, or via `messagefoundry connection list|upsert|remove`
   (comment/format-preserving; the edit is validated as a candidate and replaces the file only if it
-  loads, under a lock the engine's console writes take too) — which is what the **VS Code
+  loads, under a lock the engine's console writes take too: a hidden `.mefor-edit.lock`
+  beside the file, which stays there and is safe to ignore) — which is what the **VS Code
   connection editor** shells (the gear on a data-authored connection opens the form; a code-authored
   one opens its `.py`). `env()` secrets are never written inline.
 - **A GUI/CLI save preserves every read-schema field** (#234, 2026-07-16): the write schema is

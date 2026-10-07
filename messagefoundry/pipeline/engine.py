@@ -1996,31 +1996,61 @@ class Engine:
 
             connections_edit.upsert_connection(cfg_dir, match, validate=validate)
 
-        def _locked_write() -> None:
-            # The cross-process lock (vault BACKLOG #2782) spans the list as well as the upsert: the
-            # entry is read here and written back whole, so a `connection` CLI edit of the same entry
-            # landing between the two would otherwise be overwritten. Re-entrant, so the upsert's own
-            # acquisition of it nests.
+        loop = asyncio.get_running_loop()
+
+        def _digest() -> dict[str, object] | None:
+            # From the worker thread: ask the loop (free, since it is awaiting this thread) for the
+            # digest, so every digest still goes through `fingerprint_bundle`.
+            digest, _reason = asyncio.run_coroutine_threadsafe(
+                self.fingerprint_bundle(cfg_dir), loop
+            ).result()
+            return digest
+
+        def _locked_write(loaded_fp: object) -> tuple[dict[str, object] | None, bool]:
+            """The write and both digests, all under the cross-process lock (vault BACKLOG #2782).
+
+            The lock spans the list as well as the upsert: the entry is read and written back whole,
+            so a `connection` CLI edit of the same entry landing between the two would otherwise be
+            overwritten. It spans the digests too, so neither can take in a CLI edit this engine
+            never loaded. Re-entrant, so the upsert's own acquisition nests. Returns ``(after,
+            vouched)``; ``vouched`` is False when the toggle was not the one change."""
             with connections_edit.locked(cfg_dir):
+                # vault BACKLOG #2597: whether the directory still holds the bytes the running
+                # graph loaded, read before this write changes it. With no loaded digest there is
+                # nothing to vouch against, so the two reads are skipped.
+                before = _digest() if isinstance(loaded_fp, str) else None
                 _write()
+                # The digest covers the whole directory, so it may vouch for this toggle only when
+                # the toggle is the one change since the load. Otherwise another edit is on disk
+                # that the running graph never loaded, and the row keeps the loaded digest, so the
+                # next start reports it.
+                if (
+                    before is None
+                    or not isinstance(loaded_fp, str)
+                    or not fingerprint_matches(before.get("fingerprint"), loaded_fp)
+                ):
+                    return None, False
+                # The write has landed, so an unexpected failure here is logged and costs the
+                # digest, never the answer: a raise would report a landed write as failed, with
+                # no audit row.
+                try:
+                    after = _digest()
+                except Exception:  # noqa: BLE001 - see the comment above; logged, never silent
+                    log.exception("connection flag written; its config fingerprint was not taken")
+                    after = None
+                return after, True
 
         # Serialize the whole read-modify-write + live reflect under the engine-level TOML-write lock so
         # two concurrent config:deploy flag toggles can't interleave (lost update / racing temp files);
         # the write itself runs off the event loop (file I/O + a full load_config in its validate callback).
         async with self._toml_write_lock:
-            # vault BACKLOG #2597: whether the directory still holds the bytes the running graph
-            # loaded, read before this write changes it. See the return below. With no loaded
-            # digest there is nothing to vouch against, so the two reads are skipped.
             loaded = self.loaded_config_fingerprint
             loaded_fp = loaded.get("fingerprint") if loaded is not None else None
-            before = None
-            if isinstance(loaded_fp, str):
-                before, _reason = await self.fingerprint_bundle(cfg_dir)
             # Vault BACKLOG #2622 item 1: the validate callback reads this from the worker thread, so
             # the runner's listening set is snapshotted here, on the loop. None = the offline test.
             live = self._registry_runner
             binds_listener = live.listener_bind_predicate() if live is not None else None
-            await asyncio.to_thread(_locked_write)
+            after, vouched = await asyncio.to_thread(_locked_write, loaded_fp)
 
             # Reflect it live, in place (cosmetic field only — no connector rebuild, no reload).
             # Best-effort: the durable connections.toml is the source of truth, so a concurrent reload
@@ -2033,23 +2063,8 @@ class Engine:
                     rr.registry.outbound[name] = replace(
                         rr.registry.outbound[name], flagged=flagged
                     )
-            # Still under the lock, so no second toggle lands between the write and its digest. The
-            # digest covers the whole directory, so it may vouch for this toggle only when the toggle
-            # is the one change since the load. Otherwise another edit is on disk that the running
-            # graph never loaded, and the row keeps the loaded digest, so the next start reports it.
-            if (
-                before is None
-                or not isinstance(loaded_fp, str)
-                or not fingerprint_matches(before.get("fingerprint"), loaded_fp)
-            ):
+            if not vouched:
                 return loaded
-            # The write has landed, so an unexpected failure here is logged and costs the digest,
-            # never the answer: a raise would report a landed write as failed, with no audit row.
-            try:
-                after, _reason = await self.fingerprint_bundle(cfg_dir)
-            except Exception:  # noqa: BLE001 - see the comment above; logged, never silent
-                log.exception("connection flag written; its config fingerprint was not taken")
-                after = None
             if after is None:
                 # No digest of what is on disk now. The loaded one would read as a change at the
                 # next start, so the row records none and that start compares nothing.
