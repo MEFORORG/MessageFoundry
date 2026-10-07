@@ -169,16 +169,16 @@ site's ordinary review is what would catch these (D-C):
 - delete a developer-written dynamic row. The analyst build would refuse this (ADR 0076 Amendment
   G, G.6 rule 4), but a change made with another tool would pass the repository check (FR-40 item
   3);
-- leave a read of a binding unbound: delete a binding row (a Read Field or an assigned lookup)
-  while a row reads its variable, move a binding row so it no longer dominates a read, move a reading
-  row out from under its binding, or move or delete a block that holds a binding row. The analyst
-  build would refuse each (G.6 rule 6), but the repository check would not test for an unbound
-  read. Today the lens refuses a delete or move of a Read Field row for this reason (the
-  `read_field` gate in `rewrite_source`, `messagefoundry/lens.py`). That gate keys on `read_field`
-  alone, because it was written for Read Field rows (ADR 0089 row 4, BACKLOG #1505), so it does not
-  yet cover a lookup's `assign_to`. Under typed-only mode, the R1 branch's `_is_typed_stmt` already
-  refuses a moved or deleted block that holds a binding row. The rest of rule 6 is open work for the
-  R1 fix.
+- leave a read of a binding unbound: delete a binding (G.6 defines the kinds) while a row reads
+  its name, move a binding so it no longer dominates a read, or move a reading row out from under
+  its binding. The analyst build would refuse each (G.6 rule 6). It would also refuse, more
+  conservatively, any move or delete of a block that holds a Read Field or assigned lookup row. The
+  repository check would not test for an unbound read. Today the lens refuses a delete or move of
+  a Read Field row for this reason (the `read_field` gate in `rewrite_source`,
+  `messagefoundry/lens.py`). That gate keys on `read_field` alone, because it was written for Read
+  Field rows (ADR 0089 row 4, BACKLOG #1505), so it does not yet cover a lookup's `assign_to`.
+  Under typed-only mode, the R1 branch's `_is_typed_stmt` already refuses a moved or deleted block
+  that holds a Read Field or assigned lookup row. The rest of rule 6 is open work for the R1 fix.
 
 **What already gates what runs, under both:** a change reaches a running engine only when someone with
 `config:deploy` reloads it, under the existing step-up and the site's `[approvals]` dual control. That
@@ -501,9 +501,10 @@ Written in EARS form. Every requirement is for the analyst build unless it says 
      `raise ValueError(os.system("calc"))` read back as recognized today.
   5. Every typed parameter that is new or changed is a literal or an inert value under ADR 0076
      Amendment G, G.7, as the lens's own predicate decides (from spike S-4: For Each writes
-     `occurrence=i`, which is not a literal). A name bound to `code_set("<literal>")` passes only as
-     `code_lookup`'s `table` argument, which `insert_code_lookup` writes, and fails anywhere else
-     (G.7; Manager decision 2026-10-07, after review). The four value params ADR 0076 E.11 rule 4
+     `occurrence=i`, which is not a literal). A module-level `NAME = code_set("<literal>")` binding,
+     in the exact scope G.7 states, passes only as `code_lookup`'s `table` argument, which
+     `insert_code_lookup` writes, and fails anywhere else (Manager decision 2026-10-07, after
+     review). The four value params ADR 0076 E.11 rule 4
      admits (`set_field.value`, `add_repetition.value`, `append_to_field.suffix`,
      `replace_literal.new`) may also be a template. A template anywhere else, such as a `db_lookup`
      statement or a `log_note` operand, is not Steps-only even though it reads back `templated`.
@@ -551,9 +552,10 @@ Written in EARS form. Every requirement is for the analyst build unless it says 
     or msg, "PID-5.1", "X")`; `anything.Send("OB", msg)`; an added `SEEN = []` at module level; and,
     with `SEEN = []` already at base, a new `checkpoint` label or `log_note` template of `{"expr":
     "SEEN"}`;
-  - a name bound to `code_set("<literal>")` used as a `checkpoint` label, in a `log_note` template,
-    as a lookup-params value or in a value param, and `SEEN` as a lookup-params value (G.7; Manager
-    decision 2026-10-07, after review).
+  - with a module-level `NAME = code_set("<literal>")` at base: `NAME` as a `checkpoint` label, in a
+    `log_note` template, as a lookup-params value, as `FhirToken("MRN", NAME)` or in a value param;
+    and `SEEN` as a lookup-params value or as `FhirToken("MRN", SEEN)` (G.7; Manager decision
+    2026-10-07, after review).
 
   It SHALL pass an ordinary Steps edit, an insert above a `code` row, and one of each sanctioned shape
   in items 2 and 3 (spike S-4).
@@ -689,8 +691,9 @@ route work.
   (`stepsModel.ts` to `liveDebugModel` to `editorToolbar`'s `ElementKind`), so the shared package
   moves `ElementKind` into a module free of `vscode`. About 84.1% of the file's bundled bytes is the
   share a full port links; that is not the share that carries over. The whole file carries over,
-  because every line bundles; the rest of the bytes is code that neither host links (Manager
-  decision 2026-10-07, from spike S-1).
+  because every line bundles. The rest is code the VS Code provider (`ide/src/stepsView.ts`) does
+  not import; other `ide/` modules, such as `ide/src/cli.ts`, use some of it (Manager decision
+  2026-10-07, from spike S-1).
 - `ide/media/stepsWebview.js` reaches the host only through `acquireVsCodeApi()`. Spike S-1 rendered
   it unchanged in a sandboxed iframe with a shim that supplies that function. The page shell, toolbar
   and CSS live in `ide/src/stepsView.ts`, so they move to the shared package too.
@@ -718,8 +721,8 @@ route work.
   finding in a runtime dependency of a shipped build is triaged within a release; a finding only in
   build tooling is triaged at the next Theia bump. Spike S-1's `npm audit` found 35 findings in the
   full tree (1 critical, 11 high) and 16 moderate in the runtime tree, all through `@theia`
-  dependencies, which is why the job is non-required and triaged rather than a gate (Manager decision
-  2026-10-07, from spike S-1).
+  dependencies, which is why the job is non-required and triaged rather than a gate (Manager
+  decision 2026-10-07, from spike S-1).
 - **SBOM and updates.** Each installer ships with an SBOM. Dependabot covers the Theia tree.
 - **Installers.** Built in CI, Authenticode-signed, and published as release assets beside the
   engine's (section 13).
