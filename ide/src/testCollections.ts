@@ -265,3 +265,33 @@ export function pickCaseDetail(
 export function releaseRun<T extends { id: number }>(held: T | null, run: unknown): T | null {
   return held && run === held.id ? null : held;
 }
+
+/**
+ * The host-to-webview message types that keep the run view on screen. Every other type replaces it,
+ * so a view type added later releases the held run by default rather than keeping it answerable.
+ */
+export const RUN_VIEW_KEEPERS: readonly string[] = ["caseDetail", "collectionRun"];
+
+/**
+ * The held run after the host posts a message of `type` (BACKLOG #2441). Any view that replaces the
+ * run view releases it, so the host does not depend on the webview reporting the change. Take this at
+ * the moment of the post: the webview renders posts in order, so a run posted after this view still
+ * holds. A `collectionRun` keeps what is held, because the host sets the new run just before posting.
+ */
+export function heldAfterPost<T>(held: T | null, type: string): T | null {
+  return RUN_VIEW_KEEPERS.includes(type) ? held : null;
+}
+
+/**
+ * The held run after a webview-to-host message (BACKLOG #2441). `m` is untrusted. `leaveRun` releases
+ * only an exact id match (see releaseRun); anything else keeps what is held. `ready` is NOT handled
+ * here: the host answers it with dropRun(), which also bumps viewGen so a run in flight across a
+ * webview reload lands nowhere, and a pure release here could not do that.
+ */
+export function heldAfterIncoming<T extends { id: number }>(held: T | null, m: unknown): T | null {
+  if (typeof m !== "object" || m === null) {
+    return held;
+  }
+  const msg = m as { command?: unknown; run?: unknown };
+  return msg.command === "leaveRun" ? releaseRun(held, msg.run) : held;
+}

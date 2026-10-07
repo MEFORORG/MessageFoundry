@@ -383,5 +383,8 @@ export function testBenchScript(token: string): string {
         renderCaseDetail(m);
       }
     });
+    // A fresh page has no run view. Say so, so the host drops a held run even when the page reloaded
+    // without a host render, as "Developer: Reload Webviews" does (BACKLOG #2441).
+    vscode.postMessage({ command: 'ready' });
   `;
 }

@@ -5,7 +5,7 @@ import * as assert from "assert";
 import { hexdump } from "../../hexdump";
 import { diffMessages } from "../../hl7diff";
 import { testBenchScript } from "../../testBenchWebview";
-import { judgeCollectionRun, pickCaseDetail, releaseRun } from "../../testCollections";
+import { heldAfterIncoming, judgeCollectionRun, pickCaseDetail, releaseRun } from "../../testCollections";
 import { buildTraceDetail, type TraceEntry } from "../../traceView";
 import { CHANNEL_FIELD } from "../../webviewMessaging";
 
@@ -104,6 +104,9 @@ function bench(state: Record<string, unknown> | null = null): Bench {
   script.textContent = testBenchScript(TOKEN);
   window.document.body.appendChild(script);
   assert.deepStrictEqual(errors.map(String), [], "the Test Bench script threw while loading");
+  // The page announces each load once (BACKLOG #2441). Taken off here, so each test sees only the
+  // messages its own actions post.
+  assert.deepStrictEqual(posted.splice(0), [{ command: "ready" }], "the page did not post ready once on load");
   const detail = window.document.getElementById("detail");
   const results = window.document.getElementById("results");
   return {
@@ -635,13 +638,11 @@ suite("Test Bench webview — leaving the run view releases the run the host hol
   function leaves(b: Bench): Payload[] {
     return b.posted.filter((m) => m.command === "leaveRun");
   }
-  /** Play the host's half: apply each posted leaveRun to the held run, as testBench.ts does. */
+  /** Play the host's half: apply each posted message to the held run, as testBench.ts onMessage does. */
   function hostAfter(b: Bench): Held {
     let held: Held = { id: RUN_ID, details: JUDGED.details };
     for (const m of b.posted) {
-      if (m.command === "leaveRun") {
-        held = releaseRun(held, m.run);
-      }
+      held = heldAfterIncoming(held, m);
     }
     return held;
   }
