@@ -42,7 +42,7 @@ from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus, Stage
 from messagefoundry.transports import DeliveryError, NegativeAckError, SourceConnector
 from messagefoundry.transports.mllp import MLLPDestination
-from tests.test_encode_wire_body import _escapes
+from tests._content_free import escapes
 
 ADT = (
     "MSH|^~\\&|SENDINGAPP|SENDINGFAC|RECV|RFAC|20260604||ADT^A01|MSG1|P|2.5.1\r"
@@ -1266,7 +1266,7 @@ async def test_an_unguarded_encode_stores_no_character_of_the_message(
     }
     for where, text in stored.items():
         assert "UnicodeEncodeError: 'ascii' codec cannot encode at position" in text, where
-        for form in (*_escapes("\u015a"), "JAN"):
+        for form in (*escapes("\u015a"), "JAN"):
             assert form not in text, f"a character of the message reached {where} as {form!r}"
 
 

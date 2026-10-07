@@ -15,8 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import traceback
-from collections.abc import AsyncIterator, Iterable, Mapping
+from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import cast
 
@@ -35,10 +34,9 @@ from messagefoundry.pipeline.wiring_runner import RegistryRunner, _RefusalLog
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus
 from messagefoundry.transports.base import DestinationConnector, NegativeAckError
 from messagefoundry.transports.mllp import MLLPDestination
+from tests._refusal_log_capture import TOKEN
+from tests._refusal_log_capture import assert_no_token as _assert_no_token
 
-# The planted token. ASCII on purpose: the encoding test puts a non-ASCII character right after it,
-# so the token itself is what an ASCII-safe leak (a repr, an escaped string) would still carry.
-TOKEN = "ZQXPLANTEDTOKEN"
 OUT = "file_out"
 LOGGER = "messagefoundry.pipeline.wiring_runner"
 
@@ -112,26 +110,6 @@ class _Refuses:
 
     async def aclose(self) -> None:
         return None
-
-
-def _record_texts(record: logging.LogRecord) -> Iterable[str]:
-    yield record.getMessage()
-    yield repr(vars(record))  # msg, args and any extra attribute
-    if record.exc_info and record.exc_info[1] is not None:
-        yield "".join(traceback.format_exception(record.exc_info[1]))
-    if record.exc_text:
-        yield record.exc_text
-    if record.stack_info:
-        yield record.stack_info
-
-
-def _assert_no_token(records: Iterable[logging.LogRecord]) -> None:
-    leaks = [
-        f"{r.name}:{r.levelname}:{r.getMessage()}"
-        for r in records
-        if any(TOKEN in text for text in _record_texts(r))
-    ]
-    assert not leaks, f"a log record carries the planted payload token: {leaks}"
 
 
 def _refusal_lines(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
