@@ -1,0 +1,19 @@
+{
+  "private": true,
+  "name": "messagefoundry-theia-spike",
+  "version": "0.0.0",
+  "description": "Spike S-1 (ADR 0208): a native Theia Steps extension in a minimal browser app. Not shipped; not wired into CI.",
+  "license": "AGPL-3.0-or-later",
+  "workspaces": [
+    "steps-extension",
+    "browser-app"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace @messagefoundry/theia-steps-spike && npm run build --workspace messagefoundry-theia-spike-browser-app",
+    "start": "npm run start --workspace messagefoundry-theia-spike-browser-app",
+    "test:e2e": "npm run test:e2e --workspace messagefoundry-theia-spike-browser-app"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}

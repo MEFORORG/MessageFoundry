@@ -1,0 +1,7 @@
+node_modules/
+steps-extension/lib/
+browser-app/lib/
+browser-app/src-gen/
+browser-app/gen-esbuild.*.mjs
+browser-app/test-results/
+browser-app/playwright-report/
