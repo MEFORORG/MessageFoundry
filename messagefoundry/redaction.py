@@ -71,6 +71,7 @@ import logging
 import pkgutil
 import re
 import traceback
+from abc import ABCMeta
 from collections import OrderedDict, UserDict, defaultdict, deque
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -2354,11 +2355,10 @@ def _children(arg: Any, kind: type[Any]) -> list[Any]:
     methods. A mapping's are its keys and values, flattened in order.
 
     Each read is one ``list()`` over a C iterator, so it is short, but it is not atomic: a garbage
-    collection inside it can run other code and switch threads. A dict, set or deque that another
-    thread changes mid-read raises, that propagates, and the scan fails closed, so that argument
-    prints as a withheld note. A list or tuple read does not raise, so an error another thread adds
-    to one during the read can be missed. An error added AFTER the filter ran is out of scope for
-    every argument form. A ``UserDict``'s ``.data`` is the one read that can run the caller's code;
+    collection inside it can run other code and switch threads. A container another thread changes
+    during or after the scan is out of scope. A read that raises because of it propagates and the
+    scan fails closed, so that argument prints as a withheld note; a read that does not raise can
+    miss the change. A ``UserDict``'s ``.data`` is the one read that can run the caller's code;
     an error from it leaves the argument untouched, since its ``repr`` reads the same attribute and
     fails the same way, as it would with no filter.
 
@@ -2452,16 +2452,13 @@ _FACTORY_NOTE = "[a default factory, not rendered]"
 
 
 def _factory_repr(arg: Any) -> str:
-    """A ``defaultdict``'s factory as its ``repr`` prints it, when that is a class or a function and
-    so names code, never data. Any other callable, as a ``partial`` or a bound method, may print
-    what it holds, and it is not walked, so it is a fixed note."""
+    """A ``defaultdict``'s factory as its ``repr`` prints it, when that names code, never data:
+    ``None``, a plain function, a builtin, or a class whose real metaclass is ``type`` or
+    ``ABCMeta``. Anything else is a fixed note: a ``partial`` or a bound method may print what it
+    holds, and any other metaclass (an ``Enum``'s included) runs its own ``__repr__``, which could
+    print what the class holds. None of them is walked."""
     factory = _DEFAULT_FACTORY.__get__(arg)
-    meta: Any = type(factory)
-    # A class, by its real type, whose metaclass prints it as type does (ABCMeta does): a
-    # metaclass's own __repr__ could print what the class holds.
-    if factory is None or (issubclass(meta, type) and meta.__repr__ is type.__repr__):
-        return repr(factory)
-    if type(factory) in (BuiltinFunctionType, FunctionType):
+    if factory is None or type(factory) in (type, ABCMeta, BuiltinFunctionType, FunctionType):
         return repr(factory)
     return _FACTORY_NOTE
 
@@ -2677,6 +2674,25 @@ def _safe_mapping_args(args: Any) -> Any:
     return _RenderedMapping(args, _Rebuild(scan))
 
 
+_TUPLE_DICTOFFSET: Any = type.__dict__["__dictoffset__"]
+
+
+def _same_tuple_type(args: Any, fresh: list[Any]) -> tuple[Any, ...]:
+    """The rebuilt positional args, as the caller's own tuple type where a copy can be faithful.
+
+    A namedtuple stays one, so a later handler can still read its fields and its own ``__bool__``
+    still decides whether ``%`` applies. A subclass whose instances have a ``__dict__`` would lose
+    that state in a copy, and a structseq such as ``struct_time`` refuses ``tuple.__new__``, so
+    either is a plain tuple. It never raises."""
+    kind = type(args)
+    try:
+        if kind is not tuple and _TUPLE_DICTOFFSET.__get__(kind) == 0:
+            return tuple.__new__(kind, fresh)
+    except Exception:  # noqa: BLE001 -- a structseq refuses it; the plain tuple below serves
+        pass
+    return tuple(fresh)
+
+
 def _withheld(failure: str) -> _Rendered:
     return _Rendered(f"[withheld: {failure} while scanning it for a codec error]")
 
@@ -2723,8 +2739,7 @@ def prepare_log_record(record: logging.LogRecord) -> None:
             except Exception as exc:  # noqa: BLE001 -- fail closed, see the docstring
                 fresh.append(_withheld(type(exc).__name__))
         if any(new is not old for new, old in zip(fresh, items, strict=True)):
-            # A plain tuple: a structseq refuses tuple.__new__, and a subclass's copy lacks its state.
-            record.args = tuple(fresh)
+            record.args = _same_tuple_type(args, fresh)
         return
     try:
         safe = _safe_mapping_args(args)

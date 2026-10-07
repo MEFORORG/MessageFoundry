@@ -1002,6 +1002,8 @@ def test_a_deque_whose_iteration_consumes_it_is_not_consumed_by_the_filter() -> 
 
 def test_a_namedtuple_given_as_the_args_formats_field_by_field() -> None:
     record = _record("%s %s", _POINT(_encode_error(), 2))
+    prepare_log_record(record)
+    assert type(record.args) is _POINT  # the same type, so a later handler can still read .y
     RedactionFilter().filter(record)
     out = record.getMessage()
     _assert_encode_safe(out)
@@ -1015,7 +1017,25 @@ def test_a_struct_sequence_given_as_the_args_never_raises() -> None:
     args = time.struct_time((_encode_error(), 2, 3, 4, 5, 6, 7, 8, 9))
     record = _record("%s " * 9, args)
     prepare_log_record(record)
-    _assert_encode_safe(record.getMessage())
+    out = record.getMessage()
+    _assert_encode_safe(out)
+    assert out.endswith(" 2 3 4 5 6 7 8 9 ")
+
+
+class _Falsy(tuple[object, ...]):
+    """A stateless tuple subclass whose own truthiness tells getMessage() not to apply %."""
+
+    __slots__ = ()
+
+    def __bool__(self) -> bool:
+        return False
+
+
+def test_a_stateless_tuple_subclass_given_as_the_args_keeps_its_own_truthiness() -> None:
+    unfiltered = _record("t %s", _Falsy((_encode_error(),))).getMessage()
+    record = _record("t %s", _Falsy((_encode_error(),)))
+    prepare_log_record(record)
+    assert record.getMessage() == unfiltered == "t %s"
 
 
 class _LoudMeta(type):
