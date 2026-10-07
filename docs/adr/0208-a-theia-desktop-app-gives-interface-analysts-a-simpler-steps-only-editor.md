@@ -147,8 +147,8 @@ it, only when the site meets spec section 5.4.**
   build passes it on every `lens rewrite` call and offers no way to turn it off. The analyst build
   does not ship until both land with the R1 payloads as refusal tests.
 - **D7 -- The repository check is optional, and the project ships it.** It decides whether a change is
-  Steps-only, comparing every `code` row and every control header against base by content, allowing
-  only the lens's sanctioned generated shapes, and treating any change outside the def bodies or to
+  Steps-only, comparing every `code` row, every control header and each typed row's full statement
+  against base by content, allowing only the lens's sanctioned generated shapes, and treating any change outside the def bodies or to
   another file as not Steps-only (spec FR-40). A Steps-only change passes; any other passes only when
   a `code:edit` reviewer has approved the head commit, which the check reads itself (ruling 6, D-C).
   It holds against a deliberate change only when its definition, its engine version and its re-run
@@ -204,8 +204,8 @@ promote stays `POST /config/reload` with step-up and the site's dual control unc
   session gate is open (MFA pending, password change required, factor enrolment required, or
   notification address required), including for a token
   stored by an earlier run, THEN THE ANALYST BUILD SHALL treat the user as signed out and name the
-  gate. IF the engine cannot be reached, THEN it SHALL show the read-only banner and SHALL NOT sign
-  the user out.
+  gate. IF the engine cannot be reached, or answers with any other 403, a 429 or a 5xx, THEN it SHALL
+  show the read-only banner and SHALL NOT sign the user out (spec FR-6).
   -> editor test *gated session* (path open)
 - **AC-6** -- THE ANALYST BUILD SHALL pass the row-contract version on every `lens` call, and IF the
   engine command rejects it, THEN it SHALL show the refusal and SHALL NOT retry.
@@ -225,13 +225,14 @@ promote stays `POST /config/reload` with step-up and the site's dual control unc
 - **AC-11** -- WHEN the lens refuses an edit, THE ANALYST BUILD SHALL show the refusal on the step it
   concerns, in the Steps panel.
   -> editor test *refusal on the step* (path open)
-- **AC-12** -- IF a delete or move in the analyst build targets a lone `code` row, or a control block
-  whose body holds a `code` row or whose header is not generator-shaped (ADR 0076 Amendment G, G.6),
-  THEN it SHALL refuse it.
+- **AC-12** -- IF a delete or move in the analyst build would break the structure rule of ADR 0076
+  Amendment G, G.6, THEN it SHALL refuse it.
   -> editor test *block with code is fixed* (path open)
-- **AC-13** -- WHEN the default branch has moved past the review branch's base, THE ANALYST BUILD
-  SHALL update the review branch from it before pushing, and SHALL push nothing only if that update
-  conflicts (AC-14).
+- **AC-13** -- WHEN the default branch's tip is not an ancestor of the review branch's head (spec
+  FR-39), THE ANALYST BUILD SHALL commit first, then update the review branch from the default branch
+  by a merge, then run `messagefoundry check`, before it pushes (spec FR-34). It SHALL push nothing
+  while any of those steps fails, including a conflict (AC-14) or a missing git or credential
+  (AC-15).
   -> editor test *stale base* (path open)
 - **AC-14** -- IF a merge conflicts, THEN THE ANALYST BUILD SHALL push nothing and say "ask a
   developer".

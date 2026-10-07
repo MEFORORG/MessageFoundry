@@ -1241,10 +1241,8 @@ too: at least D.6 (*"No relaxation of the §5 guardrails"*, which names degrade-
 the analyst build.
 
 **The analyst build also narrows one thing.** Today a whole `if`/`for` block can be deleted or moved
-from its header row, nested `code` rows included. In the analyst build a delete or move of a lone
-`code` row, or of a block whose body holds a `code` row or whose header is not generator-shaped (G.6),
-is refused (AC-G5), because it would remove or reorder hand-written Python. The lens would refuse the
-same under typed-only mode (G.6).
+from its header row, nested `code` rows included. In the analyst build a delete or move that breaks
+the structure rule of G.6 is refused (AC-G5), because it would remove or reorder hand-written Python.
 
 **The `ide/` extension and the developer build of ADR 0208 keep all three guardrails unchanged.** The
 developer build applies no per-user limits (ADR 0208, Manager decision D-A); a user without
@@ -1328,15 +1326,41 @@ Send, and Route in a Router; ADR 0106 section 5 item (A)) renders its source and
 
 - `lens rewrite` would gain a flag, working name `--typed-only`, off by default. Under it, the two
   hatches above would be refused with the generic `refused` code, and nothing written.
-- **Also under the flag** (Manager decision 2026-10-07, after adversarial review, part of the R1
-  fix): a move or delete of a lone `code` row, and a move or delete of a block whose body holds a
-  `code` row or whose header is not generator-shaped (AST-equal to what the lens emits from literal
-  inputs), would be refused.
+- **Also under the flag**, a move or delete that breaks the structure rule below would be refused
+  (Manager decision 2026-10-07, after adversarial review, part of the R1 fix).
 - Developers, the `ide/` extension and the ADR 0208 developer build keep the default. The ADR 0208
   analyst build always sets the flag and offers no way to turn it off.
 
-In typed-only mode only, this narrows §2 Phase 3 and §5 of this ADR and ADR 0106. Neither text is
-changed; this amendment is the record. None of it has landed.
+**The structure rule, stated once here.** ADR 0208, its specification and AC-G5 point to it. A
+*generator-shaped* header is one AST-equal to what the lens emits from literal inputs. A
+*hand-written* header is any other. Under the flag, a move or delete is refused unless all of these
+hold after it (Manager decision 2026-10-07, after review, which states it as an invariant rather than
+a property of the moved row):
+
+1. Every `code` row keeps its order relative to the other `code` rows, and its suite path: the chain
+   of control headers above it, compared by content. So swapping a typed row with a `code` row
+   neighbour is refused whichever of the two is the one moved.
+2. Every hand-written header keeps its order relative to `code` rows and other hand-written headers,
+   and its suite path.
+3. A typed, send or route row with a parameter the lens could not have written (a *dynamic* row)
+   keeps its order relative to `code` rows and hand-written headers, and its suite path. It may be
+   deleted.
+4. A deleted block takes no hand-written Python with it. A delete of an `if` covers its whole chain:
+   every `elif` test must be generator-shaped too, and no `elif` or `else` body may hold a `code`
+   row.
+
+A `pass` statement does not count as a `code` row for this rule, so an analyst can delete a block
+whose body is still the generator's `pass` seed. Rules 2 and 3 are Manager decisions 2026-10-07,
+from spike S-4, which found that the classifier needs them (ADR 0208 spec FR-40).
+
+This narrows, in typed-only mode only, at least: §2 Phase 3 and §5 of this ADR; ADR 0106; the
+*Delete* and *Move* verbs of [ADR 0103](0103-steps-view-row-context-menu.md)'s row menu; and the
+[ADR 0089](0089-recognition-first-lens-native-idioms.md) block-cut, the `delete_row` of a whole
+`if`/`for` block from its header row that a Steps cut reuses. None of those texts is changed; this
+amendment is the record. None of it has landed. The R1 branch's `_refuse_untyped_structure`, read at
+`8df2bcf210`, checks the moved row, an up/down neighbour and a drop target's enclosing blocks. Where
+that differs from this rule, the difference is open work for the R1 fix, and the R1 tests are the
+source of record for what the lens refuses.
 
 ### G.7 The R1 fix: values a typed edit may write
 
@@ -1352,14 +1376,25 @@ The R1 fix would change that, in every mode, at least as follows:
 - `set_params` on a `route` row whose base `handlers` is not a literal list would be refused
   (Manager decision 2026-10-07, after adversarial review).
 
-**The inert rule, stated once here.** At least these are inert, and nothing admitted calls
-anything:
+**The inert rule, stated once here.** The lens's own predicate decides what is inert; the list below
+describes it for a reader. **The list is not a gate.** No check, test or requirement may treat it as
+the definition of inert; a checker calls the lens's predicate (Manager decision 2026-10-07, after
+review). The list is a lower bound: the predicate admits at least these. Nothing it admits calls
+anything.
 
-- a literal, or a sign on a number;
-- `+ - / //` over numbers and admitted names, and `* %` over numbers only; never `**`;
-- a non-dunder plain name other than `msg` that cannot hold message content: a module-level binding
-  no function rebinds, or a For Each `range` loop index (in value params, any other non-dunder name
-  except `msg` too);
+- a `str`, `int`, `float`, `bool` or `None` literal, or a sign on a number;
+- `+` and `-` over numbers and admitted names; `*`, `/` and `//` over number literals only, with a
+  non-zero divisor; never `%` or `**`;
+- a plain name other than `msg`, not a dunder, that cannot hold message content:
+  - a For Each `range` loop index;
+  - a module-level name, only when its one binding is to a literal of an immutable type (a `str`,
+    number, `bool`, `None`, or a tuple of those) or to `code_set("<literal>")`, and nothing in the
+    module mutates it. *Mutates* covers at least a second binding (a `global` rebind included), a
+    `del`, an augmented assignment, and an assignment or `del` through an attribute or subscript of
+    it (Manager decision 2026-10-07, after review). A mutable container fails this however it is
+    used: `SEEN = []` plus `SEEN.append(msg["PID-3"])` rebinds nothing, yet `SEEN` then holds
+    message content;
+  - in value params only, any other such name, because a value param may carry message content;
 - a list, tuple, set or dict built only from inert values, with no splat;
 - in value params only, a bounded field read (`msg.field(...)` taking only `occurrence` and
   `repetition` keywords) or a `templated` f-string whose every read is one;
@@ -1369,6 +1404,18 @@ anything:
 **The source of record is the R1 fix's tests** (`tests/test_lens_no_code_injection.py` on the R1
 branch, not yet merged). Where this list and those tests differ, the tests win. `set_params` on
 action, lookup and diagnostic rows already refuses a `dynamic` value (AC-M5).
+
+**The module-level name rule is not yet what the R1 branch does.** Read at `8df2bcf210`, its
+`_message_locals` admits any module-level binding no function rebinds, and a name bound nowhere. The
+R1 code (PR 2155) is being changed to match the rule above.
+
+**A gap in the projection, left open for the R1 work.** At `origin/main` (`ddf350e1d0`),
+`_rendered_param_nodes` drops the `msg` positional from a typed row's `params`, and `_callee_name`
+accepts any `X.attr` callee by its last name. So `set_field(__import__("os").getcwd() or msg,
+"PID-5.1", "X")` and `anything.Send("OB", msg)` read back as ordinary typed rows whose `params` look
+unchanged. The Steps view then shows code that runs as a typed step. ADR 0208's repository check
+closes this for itself by comparing each typed row's full statement (spec FR-40); whether the lens
+should refuse to project such a row as typed is open work for the R1 fix.
 
 That sentence of E.11 is not rewritten; the dated pointer appended to it sends the reader here. The
 change is being built separately and has not landed.
@@ -1384,15 +1431,18 @@ change is being built separately and has not landed.
   SYSTEM SHALL keep *Reopen With: Python*, the text-editor fallback and opt-in entry unchanged.
 - [ ] **AC-G4** -- THE analyst build SHALL write a `.py` only through `lens rewrite` output applied
   to the editor's document, and SHALL store no Steps model.
-- [ ] **AC-G5** -- IF a delete or move in the ADR 0208 analyst build targets a lone `code` row, or a
-  control block whose body holds a `code` row or whose header is not generator-shaped, THEN THE
-  SYSTEM SHALL refuse it.
+- [ ] **AC-G5** -- IF a delete or move in the ADR 0208 analyst build would break the structure rule
+  of G.6, THEN THE SYSTEM SHALL refuse it.
 - [ ] **AC-G6** -- WHILE `lens rewrite` runs in typed-only mode, IF an edit is a `paste_block`, an If
-  `template` or Else If `insert_clause` edit with a `test` key, or a move or delete G.6 lists, THEN
-  THE SYSTEM SHALL refuse it with the generic `refused` code and write nothing. R1 payloads 1 and 2
-  (G.5) are refusal tests. The R1 fix's tests verify this; they land separately.
-- [ ] **AC-G7** -- WHILE typed-only mode is off (the default), THE SYSTEM SHALL accept `paste_block`
-  and a raw `test`, and SHALL accept every typed `template` edit in either mode.
+  `template` or Else If `insert_clause` edit with a `test` key, or a move or delete that breaks the
+  structure rule of G.6, THEN THE SYSTEM SHALL refuse it with the generic `refused` code and write
+  nothing. R1 payloads 1 and 2 (G.5) are refusal tests. The R1 fix's tests verify this; they land
+  separately.
+- [ ] **AC-G7** -- WHILE typed-only mode is off (the default), THE SYSTEM SHALL NOT refuse a
+  `paste_block` or a raw `test` for being one; each still passes the checks the lens applies in every
+  mode. Among those, the R1 branch's `_validated_raw_test` refuses a raw `test` that is not one
+  condition on one line, or that holds a `yield`, or an `await` outside an `async def` element. THE
+  SYSTEM SHALL accept every typed `template` edit in either mode, subject to G.7.
 - [ ] **AC-G8** -- THE ADR 0208 analyst build SHALL pass typed-only mode on every `lens rewrite` call.
 - [ ] **AC-G9** -- IF an edit G.7 covers carries an `{"expr": ...}` that is not inert, an `assign_to`
   G.7 refuses, or a `set_params` on a route row whose base `handlers` is not a literal list, THEN
