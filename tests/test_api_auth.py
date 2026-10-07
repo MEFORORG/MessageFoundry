@@ -403,7 +403,11 @@ async def test_a_confirm_inside_the_login_to_mfa_floor_is_an_ordinary_invalid_co
         _r, tok = await _reauth(c, tok, purpose="mfa_enroll")
         secret = (await c.post("/me/mfa/enroll", headers=_auth(tok))).json()["secret"]
         _r, tok = await _reauth(c, tok, purpose="mfa_confirm")
-        good = fresh_totp(secret)
+        # The TOTP clock is pinned, so one code stays good across the re-proofs below however slow
+        # the runner is. Strict skew 0 would otherwise fail it at a 30 s step boundary.
+        t0 = 1_000_000.0
+        pin_totp_clock(monkeypatch, t0)
+        good = totp.totp(secret, now=t0)
 
         early = await c.post("/me/mfa/confirm", headers=_auth(tok), json={"code": good})
         assert (early.status_code, early.json()) == (400, {"detail": "invalid code"})

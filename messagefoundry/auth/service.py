@@ -9207,18 +9207,20 @@ class AuthService:
         completes the same login-then-MFA pair :meth:`_second_factor_too_early` floors on the verify
         legs. Unlike a verify leg, an enrolment can also run on a session that carries no stamp yet
         owes NO factor. A Kerberos session always mints unstamped, and with ``[security].require_mfa``
-        off it owes nothing while its account has no factor. A local session of an account the
-        ``require_mfa_scope`` dial leaves out is the same. Such a session already passes every gate
-        that reads :meth:`mfa_satisfied`, so a fast enrolment on it gains nothing the floor exists to
-        stop, and the floor is skipped, as the floor's own rule skips a stamped session. "Owes a
-        factor" is :meth:`_unverified_session_owes_factor`, the one rule the access gate reads.
+        off it owes nothing while its account has no factor. A local session reaches the same state
+        only when its roles or the settings change after it was minted, since a local sign-in that
+        owes nothing mints stamped. Such a session already passes every gate that reads
+        :meth:`mfa_satisfied`, so a fast enrolment on it gains nothing the floor exists to stop, and
+        the floor is skipped, as the floor's own rule skips a stamped session. "Owes a factor" is
+        :meth:`_unverified_session_owes_factor`, the one rule the access gate reads.
 
-        The cheap checks run first, so an enrolment that comes after the floor, or on a site with the
-        floor at ``0``, pays one session read and nothing else. A missing or revoked session is not
+        The cheap checks run first, so an enrolment that comes after the floor pays one session read,
+        and one on a site with the floor at ``0`` pays none. A missing or revoked session is not
         refused here: the leg then fails the way it always did. The caller answers a refusal with
-        its ordinary failure and the service charges nothing. The route in front of
-        ``POST /me/mfa/confirm`` has already spent its single-use password step-up, exactly as it
-        has for a wrong code, so a refusal there costs the person one password re-proof."""
+        its ordinary failure and the service charges nothing. Under the default
+        ``[auth].require_action_step_up``, the route in front of ``POST /me/mfa/confirm`` has
+        already spent its single-use password step-up, exactly as it has for a wrong code, so a
+        refusal there costs the person one password re-proof."""
         floor = self._settings.mfa_verify_min_elapsed_seconds
         if floor <= 0:
             return False
@@ -9698,6 +9700,14 @@ class AuthService:
         label = label.strip()
         if not label or len(label) > self._WEBAUTHN_LABEL_MAX:
             raise ValueError("label must be 1-100 characters")
+        # No staged ceremony is answered BEFORE the floor, as confirm_mfa_enrollment answers "no
+        # enrollment in progress" before it: otherwise the same request would get "verification
+        # failed" inside the floor and "ceremony expired" outside it, which tells timing. A peek,
+        # so a floor refusal still leaves the ceremony in flight.
+        staged = self._webauthn_challenges.peek((hash_token(token), "register"))
+        if staged is None or staged.user_id != user.id:
+            self._webauthn_challenges.pop((hash_token(token), "register"))
+            raise ValueError(self._CEREMONY_EXPIRED)
         if await self._enrolment_too_early(
             token, user, arrived_at, event="auth.webauthn_failed", client=client
         ):

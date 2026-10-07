@@ -143,7 +143,8 @@ async def _pending_totp_session(
         # faked clock, and the real clock comes back for the sign-in below.
         enrolling = await store.get_session(hash_token(token))
         assert enrolling is not None
-        _fake_service_wall_clock(monkeypatch, [enrolling.created_at + MFA_FLOOR + 0.001])
+        floor = service._settings.mfa_verify_min_elapsed_seconds
+        _fake_service_wall_clock(monkeypatch, [enrolling.created_at + floor + 0.001])
         assert (await service.confirm_mfa_enrollment(identity, activating, token=token)).ok
         monkeypatch.setattr("messagefoundry.auth.service.time", time)
         t1 = t0 + totp.DEFAULT_PERIOD
@@ -302,12 +303,13 @@ async def _owing_enrolment(
     return service, identity, token, totp.totp(enroll.secret, now=t0), session.created_at
 
 
-async def test_the_pre_fix_control_an_enrolment_satisfies_a_pending_session_at_once(
+async def test_with_the_floor_off_an_enrolment_satisfies_a_pending_session_at_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # CONTROL for the two tests below: with no floor on this leg, which is what shipped before
-    # BACKLOG #2389, a TOTP confirm at the very instant of sign-in turns a session that owes its
-    # factor into a satisfied one. That is the pair the floor exists to hold apart.
+    # The floor-off arm for the tests below: with the floor at 0, a TOTP confirm at the very instant
+    # of sign-in turns a session that owes its factor into a satisfied one. That is the pair the
+    # floor exists to hold apart. This arm cannot detect a revert of BACKLOG #2389, since 0 skips
+    # the floor either way; the floor-on tests below are the ones that go red without the fix.
     store = await MessageStore.open(":memory:")
     try:
         service, identity, token, code, minted = await _owing_enrolment(
@@ -489,6 +491,32 @@ async def test_a_directory_sessions_first_passkey_inside_the_floor_is_refused(
         )
         assert served.ok and served.token is not None
         assert await service.mfa_satisfied(served.token)
+
+        # With NO ceremony staged, inside the floor answers exactly as outside it does. The
+        # ceremony refusal comes first, so its text cannot tell the caller which side it is on,
+        # and no enrolment attempt that could never have succeeded is audited as one.
+        other = await service._complete_ad_login(_principal("adfloor2"), None, mfa_verified=False)
+        assert other.ok and other.token is not None
+        other_session = await store.get_session(hash_token(other.token))
+        assert other_session is not None and other_session.mfa_verified_at is None
+        other_identity = await service.identity_for_user_id(other_session.user_id)
+        assert other_identity is not None
+        audited = len(await _audit_rows(store, "auth.webauthn_failed"))
+        answers = []
+        for offset in (0.0, MFA_FLOOR + 0.001):  # inside the floor, then past it
+            now[0] = other_session.created_at + offset
+            with pytest.raises(ValueError) as refused:
+                await service.finish_webauthn_registration(
+                    other_identity,
+                    response,
+                    label="key",
+                    token=other.token,
+                    rp_id=rp,
+                    origin=origin,
+                )
+            answers.append(str(refused.value))
+        assert answers == [service._CEREMONY_EXPIRED] * 2
+        assert len(await _audit_rows(store, "auth.webauthn_failed")) == audited
     finally:
         await store.close()
 

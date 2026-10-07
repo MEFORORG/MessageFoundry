@@ -343,6 +343,16 @@ class ChallengeCache:
             return None
         return entry
 
+    def peek(self, key: tuple[str, str]) -> PendingCeremony | None:
+        """The pending ceremony for ``key`` WITHOUT consuming it; None if absent or expired.
+
+        For a caller that must answer "no ceremony" the same way whether or not a later check
+        refuses the request first (BACKLOG #2389). :meth:`pop` stays the single-use consume."""
+        entry = self._entries.get(key)
+        if entry is None or entry.deadline <= self._clock():
+            return None
+        return entry
+
     def rekey(self, old_token_hash: str, new_token_hash: str) -> int:
         """Move every pending ceremony from one session token hash to another (ASVS 7.2.4).
 
