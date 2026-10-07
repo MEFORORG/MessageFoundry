@@ -37,6 +37,7 @@ this process never needs its own watchdog.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 import sys
@@ -110,9 +111,19 @@ def _apply_resource_caps(cpu_seconds: float, mem_mb: int | None) -> None:
         import resource
     except ImportError:
         return  # Windows / no rlimit support — wall cap governs
+    with contextlib.suppress(ValueError, OSError):
+        # No core file of a worker that holds message bodies: SIGXCPU's default action dumps one.
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))  # type: ignore[attr-defined,unused-ignore]
     try:
-        cpu = max(1, math.ceil(cpu_seconds))
-        resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu))  # type: ignore[attr-defined,unused-ignore]
+        # RLIMIT_CPU counts the whole process life, and this runs AFTER the config load, so the
+        # budget starts from the CPU the bootstrap already spent; measured 2026-10-06, that was about
+        # 0.6 s on an idle box, and more on a slow runner, where it left a busy loop to hit the CPU
+        # limit before the wall cap. Hard is one second above soft, so the kill arrives as SIGXCPU,
+        # which the parent reports as the CPU cap (at soft == hard Linux sends an anonymous SIGKILL).
+        # The worker cannot raise the hard limit, so code that ignores SIGXCPU is SIGKILLed a second on.
+        usage = resource.getrusage(resource.RUSAGE_SELF)  # type: ignore[attr-defined,unused-ignore]
+        cpu = max(1, math.ceil(usage.ru_utime + usage.ru_stime + cpu_seconds))
+        resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu + 1))  # type: ignore[attr-defined,unused-ignore]
     except (ValueError, OSError):
         pass
     if mem_mb is not None:

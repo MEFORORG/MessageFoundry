@@ -18,6 +18,8 @@ from __future__ import annotations
 import re
 
 from messagefoundry.parsing.x12.delimiters import (
+    _ISA_ELEMENT_WIDTHS,
+    _REPETITION_MIN_VERSION,
     Delimiters,
     discover_delimiters,
     find_isa_start,
@@ -31,6 +33,24 @@ _X12_PATH = re.compile(r"^(?P<seg>[A-Z][A-Z0-9]{1,2})-(?P<elem>\d+)(?:\.(?P<comp
 _WHITESPACE = " \t\r\n\x0b\x0c"
 # Segment ids whose addition/removal would corrupt the interchange envelope.
 _ENVELOPE_SEGMENTS = {"ISA", "IEA"}
+
+# The ISA is fixed-width: X12Peek, the frame reader and every partner read it at fixed BYTE offsets,
+# so a write there has to keep each element at its width, in ASCII (vault BACKLOG #2785). ISA-11 (the
+# repetition separator from 00501) and ISA-16 (the component separator) hold delimiters this model
+# has already split on, so a write to either is refused rather than leaving the cached delimiters out
+# of step. Before 00501 ISA-11 is data (the standards identifier) and may be written; an ISA-12 write
+# that would turn it into a delimiter, or back, is refused below.
+_ISA_REPETITION = 11
+_ISA_COMPONENT = 16
+# Only the free-text ids and authorization/security information (ISA-02/04/06/08) are space-padded.
+# Every other element is a code, date, time, version or number with one exact width, where a padded
+# short value would be malformed data, so a short value there is refused.
+_ISA_PADDED_ELEMENTS = frozenset({2, 4, 6, 8})
+# Date, time, version, control number and acknowledgment flag are digits only.
+_ISA_NUMERIC_ELEMENTS = frozenset({9, 10, 12, 13, 14})
+_ISA_VERSION = 12
+# The interchange control number is numeric (N0): a short one is zero-padded on the left.
+_ISA_CONTROL_NUMBER = 13
 
 
 def _parse_path(path: str) -> tuple[str, int, int | None]:
@@ -110,9 +130,22 @@ class X12Message:
 
         ``value`` may not contain a delimiter (element/component/repetition separator or a segment
         terminator character, incl. CR/LF) — that would inject new structure — and raises ``ValueError``
-        if it does. Raises ``KeyError`` if the target segment occurrence is absent."""
+        if it does. Raises ``KeyError`` if the target segment occurrence is absent.
+
+        An ``ISA`` write keeps the header's fixed width: a short ``ISA-02``/``04``/``06``/``08`` is
+        space-padded on the right and a short all-digit ``ISA-13`` zero-padded on the left, and
+        ``ValueError`` is raised for any other short value, an over-length or non-ASCII value, the
+        component separator, a control character, a non-digit ``ISA-09``/``10``/``12``/``13``/``14``,
+        a component path, an element past ``ISA-16``, a write to ``ISA-16`` or (from 00501) ``ISA-11``
+        (they hold delimiters), or an ``ISA-12`` that would change whether ``ISA-11`` is the
+        repetition separator. ``IEA-02`` is not changed with
+        ``ISA-13``; set both, or the interchange fails its trailer check."""
         seg_id, elem, comp = _parse_path(path)
-        self._reject_delimiters(value, whole_element=comp is None)
+        # An ISA element is simple, so the component separator is refused there as it is in a
+        # component write.
+        self._reject_delimiters(value, whole_element=comp is None and seg_id != "ISA")
+        if seg_id == "ISA":
+            value = self._fit_isa_element(elem, comp, value)
         seg = self._nth_segment(seg_id, occurrence)
         if seg is None:
             where = f"{seg_id!r}" + (f" occurrence {occurrence}" if occurrence > 1 else "")
@@ -201,6 +234,50 @@ class X12Message:
                 if seen == occurrence:
                     return seg
         return None
+
+    def _fit_isa_element(self, elem: int, comp: int | None, value: str) -> str:
+        """``value`` at ``ISA-elem``'s fixed width, or ``ValueError`` if it cannot be written there.
+        The messages name the element and the lengths only, never the value."""
+        name = f"ISA-{elem:02d}"
+        if comp is not None:
+            raise ValueError(
+                f"{name} is a simple element of the fixed-width ISA; it has no components"
+            )
+        if elem > len(_ISA_ELEMENT_WIDTHS):
+            raise ValueError(
+                f"the ISA has {len(_ISA_ELEMENT_WIDTHS)} elements; {name} does not exist"
+            )
+        if elem == _ISA_COMPONENT or (
+            elem == _ISA_REPETITION and self._delims.repetition is not None
+        ):
+            raise ValueError(f"{name} holds an interchange delimiter and cannot be set")
+        if not (value.isascii() and value.isprintable()):
+            # A non-ASCII character is one character but several bytes, so it would move every
+            # byte offset after it; a control character is in no X12 character set.
+            raise ValueError(
+                f"{name} takes printable ASCII only; the fixed-width ISA is read by byte offset"
+            )
+        width = _ISA_ELEMENT_WIDTHS[elem - 1]
+        if len(value) > width:
+            raise ValueError(f"{name} is fixed at {width} characters; the value has {len(value)}")
+        if elem in _ISA_NUMERIC_ELEMENTS and not value.isdigit():
+            raise ValueError(f"{name} is numeric; digits only")
+        if elem == _ISA_CONTROL_NUMBER:
+            value = value.zfill(width)
+        elif len(value) < width:
+            if elem not in _ISA_PADDED_ELEMENTS:
+                raise ValueError(
+                    f"{name} must be exactly {width} characters; the value has {len(value)}"
+                )
+            value = value.ljust(width)
+        if elem == _ISA_VERSION and (value >= _REPETITION_MIN_VERSION) != (
+            self._delims.repetition is not None
+        ):
+            raise ValueError(
+                f"{name} would change whether ISA-11 is the repetition separator "
+                f"(it is from {_REPETITION_MIN_VERSION}); that would put the delimiters out of step"
+            )
+        return value
 
     def _reject_delimiters(self, value: str, *, whole_element: bool) -> None:
         forbidden = {self._delims.element, "\r", "\n"}

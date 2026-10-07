@@ -3748,10 +3748,22 @@ class PostgresStore:
         to a skewed-standby clock across failover. This is correct **only because there is exactly ONE
         serial writer per (stage, lane-key)** (the per-inbound listener/router/transform worker; the
         destination_name fan-in is multi-writer but seq is still DB-assigned in commit order, so the
-        first committer gets the lower seq, and ``FOR UPDATE SKIP LOCKED`` never skips the true locked
-        head). With ``created_at`` no longer an ordering backstop, a future second-writer-per-lane or
-        delete+reinsert-on-retry (re-minting seq) would break FIFO. ``FOR UPDATE SKIP LOCKED`` on the
-        head keeps concurrent pollers non-blocking. ``None`` when nothing is pending or the head isn't due.
+        first committer gets the lower seq). With ``created_at`` no longer an ordering backstop, a future
+        second-writer-per-lane or delete+reinsert-on-retry (re-minting seq) would break FIFO. ``FOR
+        UPDATE SKIP LOCKED`` on the head keeps concurrent pollers non-blocking. ``None`` when nothing is
+        pending or the head isn't due.
+
+        **KNOWN HOLE: ``SKIP LOCKED`` CAN skip the true head (ADR 0066 section 3.4).** The serial-writer
+        argument covers a producer's *uncommitted* row, which is invisible to the scan. It does not cover
+        a *visible, committed* head that another transaction holds locked -- for example a message
+        :meth:`replay` re-stamping a backing-off pending head. ``ORDER BY seq LIMIT 1 FOR UPDATE SKIP
+        LOCKED`` passes over that head, and if seq N+1 is due it is claimed first: a per-lane FIFO
+        reorder, not one empty cycle. The pooled default claims each lane's head through
+        :meth:`claim_fifo_heads`, which carries the ADR 0066 head-pin and turns the same schedule into
+        an EMPTY cycle -- but the pooled path does not avoid this method entirely. Every caller of this
+        single-row claim is exposed: at least the ``per_lane`` claim mode's stage workers, and the
+        outbound batch-coalescing window in EITHER claim mode, which tops up a batch with this method.
+        Whether this path should get the head-pin is a separate, open decision (vault BACKLOG #2769).
 
         FAILOVER FIFO SAFETY (active-passive HA): the claim runs in ONE transaction that FIRST reclaims
         this lane's stranded head — a crashed/fenced prior leader's claimed rows are still ``inflight``
@@ -6192,11 +6204,12 @@ class PostgresStore:
             )
             count = _rowcount(result)
             if count:
+                # RECEIVED only for a pending INGRESS row; a re-pended routed row is ROUTED, or the
+                # finalizer could never settle it (vault BACKLOG #2723; MessageStore.replay says why).
                 pre = await conn.fetchrow(
-                    "SELECT 1 FROM queue WHERE message_id=$1 AND stage = ANY($2::text[])"
-                    " AND status=$3 LIMIT 1",
+                    "SELECT 1 FROM queue WHERE message_id=$1 AND stage=$2 AND status=$3 LIMIT 1",
                     message_id,
-                    [Stage.INGRESS.value, Stage.ROUTED.value],
+                    Stage.INGRESS.value,
                     OutboxStatus.PENDING.value,
                 )
                 status = MessageStatus.RECEIVED.value if pre else MessageStatus.ROUTED.value

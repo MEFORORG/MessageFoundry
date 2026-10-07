@@ -446,6 +446,59 @@ def test_message_set_rejects_delimiter_injection() -> None:
         msg.set("NM1-03", "BAD~VALUE")  # segment terminator would inject a segment
 
 
+def test_an_isa_write_keeps_the_fixed_width_and_re_peeks() -> None:
+    # vault BACKLOG #2785: a short ISA-06 used to shrink the 106-char header, and X12Peek refused it.
+    msg = X12Message.parse(interchange())
+    msg["ISA-06"] = "NEWSENDER"
+    msg.set_data("ISA-08", "PARTNER")
+    msg["ISA-13"] = "42"  # numeric control number: zero-padded, not space-padded
+    msg["IEA-02"] = "000000042"  # the trailer is the caller's to keep in step
+    out = msg.encode()
+    assert out.index("~") == 105  # the ISA keeps its fixed length
+    peek = X12Peek.parse(out)
+    assert peek.sender_id == "NEWSENDER"
+    assert peek.receiver_id == "PARTNER"
+    assert peek.control_number == "000000042"
+    assert msg["ISA-06"] == "NEWSENDER".ljust(15)
+    assert check_integrity(out) == []
+    assert len(list(X12FrameReader().feed(out.encode()))) == 1  # the byte-offset reader frames it
+    # ADR 0012 names ISA-09 as settable; a full-width date still writes and re-peeks.
+    msg["ISA-09"] = "251231"
+    assert X12Message.parse(msg.encode())["ISA-09"] == "251231"
+
+
+def test_an_isa_write_that_cannot_keep_the_layout_is_refused() -> None:
+    msg = X12Message.parse(interchange())
+    before = msg.encode()
+    refused = [
+        ("ISA-06", "X" * 16, "fixed at 15"),  # over-length
+        ("ISA-09", "2512", "exactly 6"),  # a date is never padded
+        ("ISA-13", "ABCDEFGHI", "digits only"),  # numeric at any length
+        ("ISA-05", "Z", "exactly 2"),  # a qualifier is a code, never padded
+        ("ISA-15", "", "exactly 1"),
+        ("ISA-06", "\u00c9" * 15, "printable ASCII only"),  # 15 characters, 30 bytes
+        ("ISA-06", "A\tB", "printable ASCII only"),  # a control character
+        ("ISA-09", "ABCDEF", "digits only"),  # full width, still not a date
+        ("ISA-06", "AB:CD", "delimiter"),  # the component separator in a simple element
+        ("ISA-11", "!", "delimiter"),  # the repetition separator
+        ("ISA-16", ">", "delimiter"),  # the component separator
+        ("ISA-12", "00401", "repetition separator"),  # would turn ISA-11 back into data
+        ("ISA-06.1", "X", "no components"),
+        ("ISA-17", "X", "does not exist"),
+    ]
+    for path, value, why in refused:
+        with pytest.raises(ValueError, match=why):
+            msg.set(path, value)
+    assert msg.encode() == before  # a refused write changes nothing
+    # The same version gate holds from the other side: a pre-00501 header stays pre-00501.
+    old = X12Message.parse(interchange(rep="U", version="00401"))
+    old["ISA-12"] = "00402"
+    old["ISA-11"] = "U"  # before 00501 ISA-11 is data, not a delimiter
+    with pytest.raises(ValueError, match="repetition separator"):
+        old["ISA-12"] = "00501"
+    assert X12Peek.parse(old.encode()).delimiters.repetition is None
+
+
 def test_set_data_is_set_on_an_x12_message_and_keeps_one_component() -> None:
     # The Steps view writes msg.set_data for a template reading a component (ADR 0206).
     body = (

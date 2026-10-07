@@ -562,6 +562,8 @@ async def test_the_reauth_crossing_attempt_audits_account_locked_once_and_notifi
         assert '"session_revoked": true' in str(reauths[0]["detail"])
         assert '"session_revoked": false' in str(reauths[-1]["detail"])
 
+        # The lock notice runs as a background task (BACKLOG #2216); finish it, never sleep.
+        await service.drain_background()
         notices = [e for e in notifier.events if e.event_type == ACCOUNT_LOCKED]
         assert len(notices) == 1
         # ADR 0197: the notice also names the lock and its cycle count, a closed-set detail.

@@ -337,9 +337,14 @@ class AlertSink(Protocol):
         approver is an Administrator, so this is how a second approver gets minted. ``via`` is
         ``account_created`` or ``roles_changed`` with ``name`` = ``user:<username>``, or
         ``ad_group_map`` with ``name`` = ``ad-group:<group>`` when a group newly maps to the role.
+        A directory sign-in whose role sync newly grants the role (vault BACKLOG #2610) raises it
+        with ``name`` = ``user:<username>`` and ``via`` = ``directory_sign_in_negotiate``,
+        ``directory_sign_in_sso`` or ``directory_sign_in_oidc``, naming the route.
         Both keys are outside the connection-name grammar for the same reason as
-        :meth:`approval_approver_provenance`. ``granted_by`` is the acting administrator's username.
-        No PHI. Emitted by the API's user-administration routes, never from ``auth/``."""
+        :meth:`approval_approver_provenance`. ``granted_by`` is the acting administrator's username,
+        or ``<directory>`` on a directory sign-in, where no administrator acted.
+        No PHI. Emitted by the API's user-administration and directory sign-in routes, never from
+        ``auth/``."""
         ...
 
     def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:

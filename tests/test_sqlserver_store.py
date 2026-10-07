@@ -31,6 +31,11 @@ from messagefoundry.store import MessageStatus, OutboxStatus, Stage
 from messagefoundry.store.content_search import make_spec
 from messagefoundry.store.crypto import MARKER_PREFIX, cell_aad, generate_key, make_cipher
 from messagefoundry.store.store import load_audit_chain
+from tests._replay_settle_contract import CASES as REPLAY_SETTLE_CASES
+from tests._replay_settle_contract import (
+    assert_replayed_ingress_row_is_received,
+    assert_replayed_routed_row_settles,
+)
 from tests.audit_chain_cases import CASES, ChainBackend, server_chain_backend
 
 # A synthetic ADT carrying a (fake) MRN + name in PID — never real PHI.
@@ -410,7 +415,7 @@ async def test_enqueue_creates_message_and_outbox(store) -> None:
         channel_id="IB", raw=RAW, deliveries=[("OB1", "p1"), ("OB2", "p2")], control_id="MSG1"
     )
     msg = await store.get_message(mid)
-    assert msg is not None and msg["status"] == MessageStatus.RECEIVED.value
+    assert msg is not None and msg["status"] == MessageStatus.ROUTED.value
     assert msg["control_id"] == "MSG1"
     outbox = await store.outbox_for(mid)
     assert {o["destination_name"] for o in outbox} == {"OB1", "OB2"}
@@ -566,7 +571,7 @@ async def test_replay_requeues(store) -> None:
     assert requeued == 1
     outbox = await store.outbox_for(mid)
     assert outbox[0]["status"] == OutboxStatus.PENDING.value and outbox[0]["attempts"] == 0
-    # Outbound-only replay -> ROUTED (no pending ingress/routed row); staged parity with SQLite/PG.
+    # Outbound-only replay -> ROUTED (no pending ingress row); staged parity with SQLite/PG.
     assert (await store.get_message(mid))["status"] == MessageStatus.ROUTED.value
 
 
@@ -1409,6 +1414,17 @@ async def test_all_declined_finalizes_not_deployed(store) -> None:
     nd = [e["destination"] for e in await store.events_for(mid) if e["event"] == "not_deployed"]
     assert nd == ["OB_OFF"]
     assert await store.outbox_for(mid) == []  # AC-2: not one row in the outbound stage
+
+
+@pytest.mark.parametrize(("declined", "expected"), REPLAY_SETTLE_CASES)
+async def test_replayed_routed_row_that_sends_nothing_settles(store, declined, expected) -> None:
+    """Vault BACKLOG #2723 on SQL Server; ``tests/_replay_settle_contract`` carries the property."""
+    await assert_replayed_routed_row_settles(store, declined, expected)
+
+
+async def test_replayed_ingress_row_is_received(store) -> None:
+    """Vault BACKLOG #2723 on SQL Server: the RECEIVED arm of replay's status pick."""
+    await assert_replayed_ingress_row_is_received(store)
 
 
 async def test_declined_sibling_still_processed_event_retained(store) -> None:

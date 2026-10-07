@@ -288,6 +288,10 @@ from typing import Any
 #: ``api.security``. Every ``require_ui*`` gate carries the mark, and each anonymous console route is
 #: declared public, because the engine now refuses a route that declares neither.
 #:
+#: Vault BACKLOG #2610: the console imports ``alert_directory_administrator_granted`` from
+#: ``api.security``. ``GET /ui/sso`` and the ``/ui/oidc`` callback raise ``administrator_granted``
+#: when a directory sign-in's role sync newly grants Administrator, as ``POST /auth/negotiate`` does.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders

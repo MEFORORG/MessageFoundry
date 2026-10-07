@@ -52,7 +52,6 @@ from messagefoundry.transports.rest import (
     HttpAuthError,
     ProxyConfig,
     _ApprovedDigestMixin,
-    cleartext_acceptance_from_settings,
     enforce_outbound_length_limits,
     http_family_trust_anchor,
     proxy_auth_handler_from_settings,
@@ -60,7 +59,7 @@ from messagefoundry.transports.rest import (
 )
 from messagefoundry.transports.smart import (
     _TokenEndpointProvider,
-    revocation_attestation_from_settings,
+    hop_declarations_from_settings,
     smart_auth_configured,
     token_provider_from_settings,
 )
@@ -257,8 +256,7 @@ def oauth2_cc_provider_from_settings(
     its ``Destination``. ``None`` resolves to the OS trust store, byte-identical."""
     if not oauth2_auth_configured(s):
         return None
-    _accepted = cleartext_acceptance_from_settings(s)
-    revocation = revocation_attestation_from_settings(s)
+    attested, _accepted, revocation = hop_declarations_from_settings(s, HttpAuthError)
     token_url = str(s.get("oauth2_token_url") or "")
     return OAuth2ClientCredentialsProvider(
         token_url=token_url,
@@ -272,7 +270,7 @@ def oauth2_cc_provider_from_settings(
         # #200: the per-connection insecure-hop attestation keys the posture-keyed cleartext refusal in
         # __init__ (read from settings exactly as _dest_config / FhirLookup do). Default False → the hop
         # decides purely on posture.
-        attested=bool(s.get("tls_hop_attested", False)),
+        attested=attested,
         # BACKLOG #2112 (ADR 0173 section 4.3): the revocation attestation `_dest_config` mirrors from
         # the connection's top-level declaration, through the reader the SMART sibling uses.
         revocation_attested=revocation[0],
@@ -359,10 +357,12 @@ def digest_handler_from_settings(
     # ``InsecureHopRefused`` on REFUSE; re-raise as ``HttpAuthError`` to keep this seam's error contract
     # (both are ``ValueError``s → the loader surfaces either identically). Runs at connector construction
     # under the gate's stamped posture (fail-closing to prod-PHI when unstamped).
-    attested = bool(s.get("tls_hop_attested", False))
     # ADR 0153: the sibling cleartext-acceptance declaration, mirrored into these resolved settings by
-    # the runner's _dest_config for exactly this kind of settings-driven seam.
-    accepted, accept_reason, accept_conn = cleartext_acceptance_from_settings(s)
+    # the runner's _dest_config for exactly this kind of settings-driven seam. A non-bool flag raises
+    # HttpAuthError naming the connection, inside this seam's contract (vault BACKLOG #2232).
+    attested, (accepted, accept_reason, accept_conn), _ = hop_declarations_from_settings(
+        s, HttpAuthError
+    )
     try:
         refuse_cleartext_credential_hop(
             scheme,

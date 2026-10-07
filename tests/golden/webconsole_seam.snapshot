@@ -110,6 +110,7 @@ current_user
 federated_identity_view
 
 ## api.security surface (imported directly by the console, outside UiDeps)
+alert_directory_administrator_granted: (state: 'Any', outcome: 'LoginOutcome', *, via: 'str') -> 'None'
 client_ip: (conn: 'Request | WebSocket') -> 'str | None'
 enforce_phi_read_hop: (request: 'Request') -> 'None'
 enforce_phi_read_pacing: (request: 'Request', identity: 'Identity') -> 'None'

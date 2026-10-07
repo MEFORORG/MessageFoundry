@@ -4461,7 +4461,7 @@ def create_app(
         gate: ApprovalGate | None = Depends(_get_gate),
     ) -> DeadLetterReplayResult | PendingApprovalResponse:
         """Re-queue dead-lettered deliveries (optionally scoped). Already-delivered rows are left
-        alone; each affected message reverts from ``error`` to ``received`` and re-drains."""
+        alone; each affected message reverts from ``error`` to ``routed`` and re-drains."""
         # A channel-scoped user must target one of their channels (replay isn't channel-filtered at
         # the engine level, so an unscoped "replay all" would cross channels).
         if not _replay_in_scope(identity, req.channel_id):
@@ -9347,6 +9347,19 @@ def create_managed_app(
                     )
                 # BACKLOG #2087: let approval outcome writes still running land before the store closes.
                 await _drain_approval_gate(app)
+                # BACKLOG #2216: a lock notice still in flight reads and writes the audit log, then
+                # hands its mail to the security notifier, so it drains before engine.stop() closes
+                # the store and before that notifier stops in the finally below. Bounded, and it logs
+                # and cancels what it cannot finish; guarded like the drains above so a failure
+                # cannot skip a later step.
+                if auth is not None:
+                    try:
+                        await auth.close_background()
+                    except Exception:
+                        _log.exception(
+                            "auth: the shutdown drain of background notices failed; continuing the "
+                            "teardown"
+                        )
                 # M-5 (BACKLOG #1640): flush the open summary-access window before the store closes.
                 # `_SummaryAuditCoalescer.flush` documents itself as the engine-shutdown path and NOTHING
                 # called it, so every clean restart dropped the open hour's PHI-summary access audit --

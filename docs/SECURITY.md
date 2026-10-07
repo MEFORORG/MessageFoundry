@@ -1924,7 +1924,7 @@ What the engine does instead is make the cheap routes loud. It refuses none of t
 | Signal | When | Where it goes |
 |---|---|---|
 | `approval.approver_provenance` audit row and `approval_approver_provenance` alert | A release goes ahead and the approver's account was created, had its password changed, or enrolled TOTP **after** the request was made | Audit row against the approver, with their `client` address (ADR 0150). Alert keyed `approval:<id>`, carrying the changed facts only |
-| `administrator_granted` alert | `POST /users` creates an account with the Administrator role, `PUT /users/{id}/roles` adds it, or `PUT /ad-group-map` newly maps a group to it | Alert keyed `user:<username>` or `ad-group:<group>`, naming the granting administrator |
+| `administrator_granted` alert | `POST /users` creates an account with the Administrator role, `PUT /users/{id}/roles` adds it, `PUT /ad-group-map` newly maps a group to it, or a directory sign-in's role sync newly gives an account the role (vault BACKLOG #2610) | Alert keyed `user:<username>` or `ad-group:<group>`, naming the granting administrator, or `<directory>` for a directory sign-in |
 | `client` on the `user.created` audit row | An account created through `POST /users` or `POST /users/directory` (BACKLOG #2021) | The creating administrator's address, like the approval rows |
 | `account_created` notice | An account created through `POST /users` or `POST /users/directory`, neither of which creates one without a notification address (BACKLOG #2018, #2021) | The new account's own notification address |
 
@@ -1945,18 +1945,26 @@ with no page.
   holds no role until the group map gives it one at sign-in. Created after a request, it is still
   flagged at that release, like any new account, and its notification address gets the
   `account_created` notice.
-- **A directory grant.** An account that gets Administrator because the *directory* added it to a
-  group already mapped to Administrator raises no `administrator_granted` alert. The API's
-  user-administration routes raise that alert, and a directory change does not pass through them.
-  The engine does see the grant, in one of the two places below. Neither names the role in an
-  alert, and the route can end with no alert at all. An account with no live session raises none.
-  Nor does one that signs in again before the next reconciler pass. So watch membership of the
-  mapped group in the directory itself.
+- **A directory grant.** An account can get Administrator because the *directory* added it to a
+  group already mapped to Administrator. The engine sees that grant in one of the two places below,
+  whichever comes first. A sign-in that sees it first raises `administrator_granted`, unless that
+  sign-in fails with a server error after the role write; the retry then gains nothing. A reconciler
+  pass that sees it first raises `ad_session_revoked`, which does not name the role. The later
+  sign-in then gains nothing, so it raises no `administrator_granted`. An account that never signs
+  in again and holds no live session raises nothing. So watch membership of the mapped group in the
+  directory itself.
   **CORRECTED 2026-10-01:** this read "raises no alert. The engine never sees that grant."
+  **CORRECTED 2026-10-06:** this read "raises no `administrator_granted` alert", and the sign-in
+  case below read "It raises no alert." Vault BACKLOG #2610 added the sign-in alert.
   - **At the account's next sign-in.** The engine writes an `auth.ad_roles_resynced` audit row
     with the old and new roles. It also sends a best-effort roles-changed notice to that
     account's own notification address, when the account has one and security notices are set
-    up. It raises no alert.
+    up. The sign-in route raises `administrator_granted`, keyed `user:<username>`, with
+    `granted_by` set to `<directory>` and `via` naming the route: `directory_sign_in_negotiate`
+    for `POST /auth/negotiate`, `directory_sign_in_sso` for `GET /ui/sso`, and
+    `directory_sign_in_oidc` for the `/ui/oidc` callback. A sign-in the engine refuses after the
+    sync ran raises it too, because the role was written all the same. An account that already
+    held Administrator raises nothing.
   - **Sooner, when the account holds a live session.** A pass of the
     [directory reconciler](#directory-session-reconciliation--propagating-an-ad-disable-adr-0079-mechanism-2)
     that completes stores the new roles and revokes the session. It writes
@@ -4047,8 +4055,12 @@ session. Each refusal is also audited, so a campaign is visible in the audit log
 writes `auth.account_locked`, but the mail is **throttled by time** (ADR 0197): at most one per lock
 kind per account per 24 hours, and always one for the first lock after a quiet day. Each mail names
 the lock and its cycle count, and writes its own `auth.lock_notice` row, which is what the throttle
-reads. A sign-in lock notice on a TOTP-enrolled local account tells the owner to sign in with the
-password and the code together; a second-step notice says which factor was right and, **if the
+reads. With a relay wired, that read and the mail run in a background task (BACKLOG #2216). The
+refusal writes `auth.account_locked` first and does not wait for the task. So a large audit log would
+not push a refused sign-in past its padded slot. The task is queued per account and lock kind within
+one API process. Two locks of one kind landing together there would send one mail. A sign-in lock
+notice on a TOTP-enrolled local account tells the owner to sign in with the password and the code
+together; a second-step notice says which factor was right and, **if the
 attempts were not the owner's**, to get a password reset or `admin-unlock` and replace that factor.
 **Current lock state is shown to administrators only** (BACKLOG #1131). `GET /users` carries a
 `lock_state` object per account with both locks: whether each is live now, when it ends, its
@@ -4387,6 +4399,13 @@ stays broken, or recovers and breaks again, is reported only by that first line.
 The `auth.lock_notice` row is written when the notice is handed to the relay, as `mailed: true`. So
 when the relay's queue is full, or the send fails, a lock notice is lost with no audit row and, now,
 no log line. The account holder is not told, and nothing says so.
+
+**Residual: the background task adds one way to lose a notice** (BACKLOG #2216). At shutdown the
+engine waits about two seconds for pending notices. A notice still pending then is cut off, and may be
+neither mailed nor recorded. A failed `auth.lock_notice` row write also changes: it used to fail
+the request, and now it is logged instead. The mail goes before its row, so that failure costs at
+most a duplicate mail at the next lock. Each such line names no account and no lock. It still tells
+a `logs:view` reader when some notice failed.
 
 **Client attribution ([ADR 0150](adr/0150-client-address-on-audit-entries.md)).** Every row also
 carries a `client` column — the caller's network address, stamped at write time from the request via
