@@ -1361,15 +1361,18 @@ invariant rather than a property of the moved row):
 5. A deleted or moved block takes no hand-written Python with it: no `code` row, no dynamic row, and
    no hand-written header. A delete of an `if` covers its whole chain: every `elif` test must be
    generator-shaped too, and no `elif` or `else` body may hold a `code` row or a dynamic row.
-6. Every read of a binding stays dominated by that binding: the binding row sits earlier, in the
-   same suite as the read or in a suite that encloses it (Manager decision 2026-10-07, after
-   review). A move of either end, the binding row or the reading row, that breaks this is refused,
-   and so is a delete of a binding row while a row still reads its variable. Each of those would
-   leave a read unbound, at least whenever a condition is false. A block that holds a Read Field or
-   assigned lookup row is also never moved or deleted; that refusal is conservative, and applies
-   even when every read sits inside the block. The R1 branch's `_is_typed_stmt` already refuses
-   that block case; it checks the moved or deleted row itself with `top=True`, so the rest is open
-   work for the R1 fix.
+6. Every read of a name stays dominated by that name's bindings: every path from the start of
+   the body to the read passes a binding of the name (Manager decision 2026-10-07, after review).
+   Dominance is over the set of the name's bindings. A binding earlier in the same suite as the
+   read, or earlier in a suite that encloses it, dominates the read. An `if` whose every arm binds
+   the name, with an `else`, dominates a later read; one arm alone does not. A For Each header
+   dominates only reads inside its own body, so a row that uses its index, such as `occurrence=i`,
+   may not move out of the loop (Manager decision 2026-10-07, after review). A move of either end,
+   a binding or a reading row, that breaks this is refused, and so is a delete of a binding that
+   leaves a read undominated. Each of those would leave a read unbound, at least whenever a
+   condition is false. A block that holds a Read Field or assigned lookup row is also never moved
+   or deleted; that refusal is conservative, and applies even when every read sits inside the
+   block.
 
 A typed row that is not dynamic may move past a `code` row in the same suite, unless rule 6 refuses
 it: rule 2 holds, and the result is the same as inserting the typed row there, which the analyst
@@ -1385,12 +1388,12 @@ editable-kind guard in `rewrite_source` (`messagefoundry/lens.py`) calls the ADR
 Steps cut reuses. None of those texts is changed; this amendment is the record. None of it has
 landed.
 
-**This rule is the target, and the R1 tests are evidence only once they match it.** The R1 branch's
-`_refuse_untyped_structure`, read at `8df2bcf210`, checks the moved row, an up/down neighbour and a
-drop target's enclosing blocks. That is not the same rule: for example, it lets a dynamic row be
-dragged across a `code` row to a typed anchor, which rule 4 refuses. It does match rule 6's block
-case. Where the two differ, the R1 code
-is what has to change.
+**This rule is the target, and the R1 tests are evidence only once they match it.** Read at R1
+head `c172beda9c`, `_refuse_untyped_structure` refuses a move or delete of any row that is not wholly
+typed (`_is_typed_stmt`, which also refuses a block holding a Read Field or assigned lookup row),
+and `_refuse_typed_only_result` then checks the result for shifted `code` rows
+(`_refuse_shifted_code`) and unbound reads (`_unbound_reads`). This review has not checked that
+code line by line against rules 1 to 6. Where the two differ, the R1 code is what has to change.
 
 ### G.7 The R1 fix: values a typed edit may write
 
@@ -1419,24 +1422,30 @@ except a bounded `msg.field(...)` read and the FHIR value objects `FhirToken(...
   non-zero divisor; never `%` or `**`;
 - a plain name other than `msg`, not a dunder, that cannot hold message content:
   - a For Each `range` loop index;
-  - outside value params, a module-level name only when its one binding is to a literal of an
-    immutable type (a `str`, number, `bool`, `None`, or a tuple of those), and nothing in the module
-    mutates it. *Mutates* covers at least a second binding (a `global` rebind included), a `del`, an
-    augmented assignment, an assignment or `del` through an attribute or subscript of it, and a
-    method call on it or on an attribute of it. A mutable container fails this however it is used:
-    `SEEN = []` plus `SEEN.append(msg["PID-3"])` rebinds nothing, yet `SEEN` then holds message
-    content;
+  - a module-level name bound exactly once, to a literal of an immutable type: a `str`, number,
+    `bool` or `None`, a tuple of those, or `frozenset(...)` over a set, tuple or list of those while
+    `frozenset` is the builtin, with nothing in the module mutating it (Manager decision 2026-10-07,
+    after review). So `FROZEN = frozenset({"A", "B"})` is admitted. A name with more than one
+    binding is refused, even when every binding is a literal. *Mutates* covers at least a second
+    binding (a `global` rebind included), a `del`, an augmented assignment, an assignment or `del`
+    through an attribute or subscript of it, and a method call on it or on an attribute of it. A
+    mutable container fails this however it is used: `SEEN = []` plus `SEEN.append(msg["PID-3"])`
+    rebinds nothing, yet `SEEN` then holds message content;
   - a module-level `NAME = code_set("<literal>")` binding, **only** as `code_lookup`'s `table`
-    argument, and refused everywhere else, value params and lookup params included (Manager
-    decision 2026-10-07, after review). The scope is exact: the callee is the bare name `code_set`,
-    the argument is a string literal, and that statement is `NAME`'s only binding in the module,
-    with nothing rebinding or mutating `NAME` as the bullet above defines *mutates*. Any other way
-    of obtaining a `CodeSet`, such as an import from a helper module, `X.code_set(...)`,
-    `code_set(NAME)` with a non-literal argument, an alias, or a rebound name, is not admitted, so
-    it is refused. The rule fails closed rather than missing those. The lens's `_codeset_binding`
-    accepts any `X.code_set(...)` callee through `_callee_name` and stops at the first binding, so
-    an R1 fix cannot reuse it unchanged. Value params refuse a `code_set` name because a code set is
-    a table, not a value (the same Manager decision). No engine change is made for this.
+    argument, and refused everywhere else, value params and lookup params included (Manager decision
+    2026-10-07, after review). The scope is exact: the callee is the bare name `code_set`, and that
+    name is the one imported from `messagefoundry`, not a local `def` or a helper import; the
+    argument is a string literal; the plain form and the annotated form `NAME: CodeSet =
+    code_set("<literal>")` are both admitted; and that statement is `NAME`'s only binding in the
+    module, so a second `code_set` binding is refused too, with nothing rebinding or mutating `NAME`
+    as the bullet above defines *mutates*. Any other way of obtaining a `CodeSet`, such as an import
+    from a helper module, `X.code_set(...)`, `code_set(NAME)` with a non-literal argument, an alias,
+    or a rebound name, is not admitted, so it is refused. The rule fails closed rather than missing
+    those. The lens's `_codeset_binding` accepts any `X.code_set(...)` callee through `_callee_name`,
+    skips bindings that are not a `code_set` capture, returns at the first one that is, and never
+    looks for a later binding, so an R1 fix cannot reuse it unchanged. Value params refuse a
+    `code_set` name because a code set is a table, not a value (the same Manager decision). No engine
+    change is made for this.
     **What the `table` use leaves.** `code_set` returns the shared active `CodeSet`, whose storage is
     a plain dict, so a hand-written `code` row can write into it without naming the bound variable:
     `code_set("lab")._data["k"] = msg["PID-3"]`. A later `code_lookup` could then write one
@@ -1444,10 +1453,14 @@ except a bounded `msg.field(...)` read and the FHIR value objects `FhirToken(...
     The `table` use opens no new write channel, because poisoning the table needs a hand-written
     `code` row; the analyst build neither adds this path nor closes it (Manager decision
     2026-10-07, after review);
-  - **these two bullets are a ceiling: outside value params, the predicate SHALL NOT admit a
-    module-level name beyond them, whatever the R1 tests say;**
-  - in value params, any other non-dunder name except `msg` and a `code_set` name, because a value
-    param may carry message content anyway;
+  - in value params, lookup-params values and `FhirToken`'s second argument, which may also carry
+    message content, a handler local other than `msg` (a name the handler itself binds, such as
+    `pid5`), and nothing beyond what this list admits elsewhere;
+  - **these bullets are a ceiling, on every path, value params included: the predicate SHALL NOT
+    admit a name beyond a handler local, a For Each `range` index, a module-level name the first
+    bullet admits, or a `code_set` name as `code_lookup`'s `table`, whatever the R1 tests say**
+    (Manager decision 2026-10-07, after review, adopting R1 head `c172beda9c`'s rule; this reverses
+    the round-6 decision that scoped the ceiling to non-value params);
 - a list, tuple, set or dict built only from inert values, with no splat;
 - in value params only, a bounded field read (`msg.field(...)` taking only `occurrence` and
   `repetition` keywords) or a `templated` f-string whose every read is one;
@@ -1459,22 +1472,15 @@ branch, not yet merged), except for the module-level name ceiling. Elsewhere, wh
 those tests differ, the tests win. `set_params` on action, lookup and diagnostic rows already
 refuses a `dynamic` value (AC-M5).
 
-**The module-level name ceiling is not yet what the R1 branch does.** Read at `8df2bcf210`, two
-paths admit too much:
-
-1. `_message_locals` admits any module-level binding no function rebinds, and a name bound nowhere.
-   So outside value params, `SEEN` and a `code_set` name pass.
-2. `_is_inert_value` ignores `blocked` when `reads_ok` is true. Value params take that path, and so
-   do lookup-params values (`_is_inert_params_dict`) and the second argument of `FhirToken`
-   (`_is_fhir_value_object`). So any name except `msg` and a dunder passes there.
-
-Applying `blocked` on the second path is **not** the fix. `blocked` holds every name the handler
-binds, so it would refuse a handler local such as `pid5` in a value param, which this section
-admits and the R1 tests pin as accepted, and it would still admit `SEEN` and `NAME`, which are not
-in it. The fix the R1 code (PR 2155) needs on that path: refuse a `code_set` name everywhere; in a
-lookup-params value and in `FhirToken`'s second argument, also refuse any module-level name the
-ceiling refuses; and in a value param, keep admitting handler locals and other module-level names.
-No test covers either path today, and AC-G9 adds refusal tests for both.
+**Where the R1 branch stands on the ceiling.** Read at R1 head `c172beda9c`, `_message_scope` builds
+an allow list: handler locals, For Each `range` indexes, and module-level names
+`_inert_module_literals` admits, with `code_set` captures held apart and admitted only for
+`code_lookup`'s `table` (`_table_scope`). The `reads_ok` path admits only those names and handler
+locals, so `SEEN` and a `code_set` name are refused there too; `tests/test_lens_typed_only_repair.py`
+pins `SEEN` in `set_field.value` as refused. Two differences from the ceiling remain, and R1 is being
+told to match: `_inert_module_literals` admits a name whose every binding is a literal, so a name
+with several literal bindings passes, and a `code_set` name with a second `code_set` binding passes.
+Whether R1 checks that `code_set` is the name imported from `messagefoundry` was not checked here.
 
 **A gap in the projection, left open for the R1 work.** At `origin/main` (`ddf350e1d0`),
 `_rendered_param_nodes` drops the `msg` positional from a typed row's `params`, and `_callee_name`
@@ -1491,8 +1497,10 @@ change is being built separately and has not landed.
 ### Acceptance Criteria (Amendment G -- proposed, not ratified)
 
 - [ ] **AC-G1** -- WHILE the editor is the ADR 0208 analyst build, THE SYSTEM SHALL offer no command,
-  menu or link that opens a `.py` file in a text editor. (Mechanism: Theia's `EditorManager` rebound
-  and *Open With* removed; ADR 0208 spike S-2 tests it.)
+  menu or link that opens a `.py` file in a text editor, and SHALL offer no route that writes a
+  `.py` without opening one: an untitled buffer, *Save As*, *Compare*, or a rename or copy into a
+  `.py`. (Mechanism: the four layers and the `FileService` rebind of ADR 0208 spec section 10;
+  spike S-2 tested them on the browser build, Manager decision 2026-10-07, from spike S-2.)
 - [ ] **AC-G2** -- WHEN a file fails `lens parse` in the analyst build, THE SYSTEM SHALL show a
   read-only notice that a developer must fix it, and SHALL NOT open a text editor.
 - [ ] **AC-G3** -- WHILE the editor is the ADR 0208 developer build or the `ide/` extension, THE
@@ -1517,5 +1525,7 @@ change is being built separately and has not landed.
   `lens rewrite` SHALL refuse it, in every mode. R1 payloads 3 and 4 (G.5) are refusal tests, and
   so are these (the G.7 ceiling), in a module that binds `SEEN = []`, calls `SEEN.append(...)` and
   binds `NAME = code_set("<literal>")`: `SEEN` as a `checkpoint` label, in a `log_note` template,
-  as a lookup-params value and as `FhirToken("MRN", SEEN)`; and `NAME` as a `checkpoint` label, in a
-  `log_note` template, as a lookup-params value, as `FhirToken("MRN", NAME)` and in a value param.
+  as a lookup-params value, as `FhirToken("MRN", SEEN)` and in a value param; and `NAME` as a
+  `checkpoint` label, in a `log_note` template, as a lookup-params value, as
+  `FhirToken("MRN", NAME)` and in a value param. A row using `occurrence=i` moved out of its For
+  Each loop is a refusal test under typed-only mode (G.6 rule 6).

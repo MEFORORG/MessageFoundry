@@ -171,7 +171,8 @@ site's ordinary review is what would catch these (D-C):
   3);
 - leave a read of a binding unbound: delete a binding (G.6 defines the kinds) while a row reads
   its name, move a binding so it no longer dominates a read, or move a reading row out from under
-  its binding. The analyst build would refuse each (G.6 rule 6). It would also refuse, more
+  its bindings, such as a row using `occurrence=i` moved out of its For Each loop. G.6 rule 6
+  defines dominance. The analyst build would refuse each. It would also refuse, more
   conservatively, any move or delete of a block that holds a Read Field or assigned lookup row. The
   repository check would not test for an unbound read. Today the lens refuses a delete or move of
   a Read Field row for this reason (the `read_field` gate in `rewrite_source`,
@@ -340,7 +341,10 @@ Written in EARS form. Every requirement is for the analyst build unless it says 
   was not changed, the plain reason, "ask a developer" where it applies, and the engine's detail
   behind "details". Messages MAY name components: handler, router, connection and code-set names.
   No message SHALL contain "code view", "View as Code", Python source, a traceback, or a function or
-  variable name from the code other than a component name, outside the "details" toggle.
+  variable name from the code other than a component name, outside the "details" toggle. Dialogs
+  count as messages too. Two sit on the Steps path: the save prompt when a dirty tab closes, and the
+  browser's leave-page prompt. A message that offers an action SHALL offer it as a button in the
+  panel (Manager decision 2026-10-07, from spike S-2).
 
 ### 7.3 Steps-level operations
 
@@ -552,9 +556,11 @@ Written in EARS form. Every requirement is for the analyst build unless it says 
     or msg, "PID-5.1", "X")`; `anything.Send("OB", msg)`; an added `SEEN = []` at module level; and,
     with `SEEN = []` already at base, a new `checkpoint` label or `log_note` template of `{"expr":
     "SEEN"}`;
-  - with a module-level `NAME = code_set("<literal>")` at base: `NAME` as a `checkpoint` label, in a
-    `log_note` template, as a lookup-params value, as `FhirToken("MRN", NAME)` or in a value param;
-    and `SEEN` as a lookup-params value or as `FhirToken("MRN", SEEN)` (G.7; Manager decision
+  - with `SEEN = []` (and a `SEEN.append(...)`) and a module-level `NAME = code_set("<literal>")`
+    at base: `NAME` as a `checkpoint` label, in a `log_note` template, as a lookup-params value, as
+    `FhirToken("MRN", NAME)` or in a value param; and `SEEN` as a lookup-params value, as
+    `FhirToken("MRN", SEEN)` or in a value param (G.7; Manager decision 2026-10-07, after review);
+  - a row using `occurrence=i` moved out of its For Each loop (G.6 rule 6; Manager decision
     2026-10-07, after review).
 
   It SHALL pass an ordinary Steps edit, an insert above a `code` row, and one of each sanctioned shape
@@ -655,14 +661,29 @@ Theia applications are assembled from npm packages at build time.
 | Extension installation, Open VSX | No | Vendored at build time, pinned by content hash, transitive packs resolved; no runtime registry access (review R21) |
 | Theia AI | No | No (this phase) |
 | `@theia/preferences` (with `@theia/userstorage`) | **Required.** Without it the app hangs on a missing `PreferenceProvider` binding. It brings in `@theia/markers`, `@theia/outline-view` and `@theia/variable-resolver` | Yes |
-| File explorer | Feeds list only (FR-12) | Yes |
+| File explorer | Feeds list only (FR-12). Upload, and drop into the navigator, are removed or guarded | Yes |
+| `@theia/messages` | Yes | Yes |
+| `@theia/file-search` | **No.** If it shipped, Quick Open would be one more route to test | Yes |
 
 Spike S-1 found the `@theia/preferences` need and its transitive packages (Manager decision
 2026-10-07, from spike S-1).
 
-**How "no `.py` editor" is enforced:** the analyst build rebinds Theia's `EditorManager` so a `.py`
-resource opens only in the Steps view, and removes the *Open With* contribution. Spike S-2 tests
-this (AC-G1).
+**How "no `.py` editor" is enforced** (AC-G1). Spike S-2 built and tested four layers (Manager
+decision 2026-10-07, from spike S-2):
+
+1. **Opener priority.** `EditorManager.canHandle` declines a `.py`, so the Steps view is the only
+   opener. Without this, `workbench.editorAssociations` gives the text editor priority 100000.
+2. **`EditorManager.open` refuses** a `.py`.
+3. **`TextEditorProvider` refuses** a `.py`, because layout restore and reopen-closed-editor skip
+   the opener.
+4. **The blocked commands are never registered:** `navigator.openWith`,
+   `workbench.action.files.newUntitledFile`, `workbench.action.files.pickNewFile`, `file.saveAs`,
+   `file.compare`, `compare:first` and `compare:second`.
+
+The analyst build must also stop a `.py` being **written** without being opened: through an
+untitled buffer, *Save As*, *Compare*, or a rename or copy into a `.py`. It rebinds `FileService`
+for this, because a file-operation participant cannot block a move: Theia logs the participant's
+error and carries on. A shipped build SHALL NOT expose test hooks on `window`.
 
 On a desktop the build split is about simplicity, not a security boundary. Test in either build runs
 config code on the user's machine, as `ide/` does today (review R12). Section 5 says what the controls
@@ -801,7 +822,7 @@ In CI these would start as separate, **non-required** jobs (section 12). Spike S
 | Spike | Question | Pass condition |
 |---|---|---|
 | S-1 | Does a native Theia Steps extension render and edit `samples/config`, and how much of `ide/` does it reuse? | Parse, render, edit, undo and Test work in a pinned Theia build; hot-exit is verified or dropped from FR-26; the shared share of `stepsModel.ts` and the `acquireVsCodeApi` shim are measured; the typed-row versus `code`-row share over `samples/config` is recorded; the Theia version and language server are recorded; @theia/playwright runs at that version (section 16). **Met except the Test and language-server legs**, measured on a browser target: branch `claude/theia-spike-s1` at `cd97e6b1b4`, under `theia-spike/`, not merged, on Theia 1.76.0. Hot-exit was dropped (FR-26). Test is open because it needs the D-B generator-spec engine change, which is not built. No language server was recorded. The Electron build is checked by spike S-3 (Manager decision 2026-10-07, after review) |
-| S-2 | Does the analyst build have no text-editor route for `.py`? | A scripted walk of every command, menu and *Open With* entry opens no `.py` in Monaco, and finds no pop-up notification (FR-17) |
+| S-2 | Does the analyst build have no text-editor route for `.py`? | A scripted walk of every command, menu and *Open With* entry opens no `.py` in Monaco, and finds no pop-up notification (FR-17). **Met on the browser build**: branch `claude/theia-spike-s2` at `d35ae64158`, under `theia-spike/`, not merged. The Electron build still needs the same walk (section 16, layer 4) |
 | S-3 | Does the analyst build install and run on a managed Windows image? | It installs and runs Test without administrator rights, as the Electron build; installer size and memory use are recorded. It is also the first check of the Electron target, which spike S-1 did not run |
 | S-4 | The repository check as a CI step on a sample config repository | It meets FR-41, run from a base-ref workflow per section 5.4. **Classifier half met by the spike**: branch `claude/theia-spike-s4-steps-only` at `673faa7c60`, `scripts/theia_spike/steps_only.py` with 80 tests in `tests/test_theia_steps_only_spike.py`, not merged. The base-ref workflow half is untested |
 
@@ -954,6 +975,7 @@ was checked against `messagefoundry/lens.py` at `origin/main` and on the R1 bran
 | F15. Deleted-lookup residual | Amendment G, G.6 rule 6; section 5.2 keeps the top-level case open for the R1 fix |
 | Spike S-4 findings | FR-40 items 2 to 6, the false-failure and public-surface notes, FR-41, section 17 |
 | Spike S-1 findings | FR-26, sections 8.1, 8.2, 9, 10, 11.2, 12, 16 and 17; ADR D3, D9 and AC-10 |
+| Spike S-2 findings | FR-17, section 10, section 17; Amendment G AC-G1 |
 | Review of `af7f0a73e8`: a `code_set` name is shared mutable storage | Amendment G, G.7 (only as `code_lookup`'s `table`), AC-G9; FR-40 item 5, FR-41 |
 | Review of `af7f0a73e8`: binding rows and dynamic rows under G.6 | Amendment G, G.6 rules 4 to 6; section 5.2 |
 | Review of `af7f0a73e8`: other findings | S-1 and S-3 rows, section 7.7, section 11.2, ADR D3 and AC-14, FR-40 items 3 to 5, this table, README rows |
