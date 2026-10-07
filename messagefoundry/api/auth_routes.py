@@ -292,7 +292,8 @@ def _federated_identity_view(user: UserRecord, service: AuthService) -> Federate
     """Project one account's federated binding for the console (BACKLOG #1143, ADR 0184 slice B).
 
     Sync, like :func:`_user_summary`, so the console never reads a ``UserRecord`` attribute itself.
-    Only the console's users:manage pages call it; no JSON route returns this view."""
+    The console's users:manage pages call it, and so does ``GET /users/{id}/federated-identity``
+    (BACKLOG #2331), so a JSON caller reads the same pair the console shows."""
     return FederatedIdentityView(
         user_id=user.id,
         username=user.username,
@@ -626,12 +627,18 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                 raise HTTPException(status.HTTP_401_UNAUTHORIZED, "session ended; sign in again")
             if elevation.idp_step_up_required:
                 # BACKLOG #296, ADR 0142 Amendment B: a session the federated login minted steps up
-                # at the IdP, which needs a browser redirect this JSON route cannot perform. Nothing
-                # was checked or charged, so the message names the leg that works.
+                # at the IdP, which needs a browser redirect this JSON route cannot perform. No
+                # credential was checked, though the per-actor ceremony budget above was drawn, so
+                # the message names the leg that works. The header is the one the step-up gates
+                # send such a session (BACKLOG #2158), so a client branches on it here too rather
+                # than parsing the detail. No X-Step-Up-Required: this is the step-up itself.
+                # Typed out because api/security.py keeps its constant private; a test pins the
+                # name and the value to what the gates send.
                 raise HTTPException(
                     status.HTTP_403_FORBIDDEN,
                     "this session was signed in through the identity provider; re-authenticate"
                     " there through the web console at /ui/reauth, not with a password",
+                    headers={"X-Step-Up-Via": "idp"},
                 )
             if elevation.directory_unconfirmed:
                 # BACKLOG #2027: the directory could not judge the password, so "failed" would
@@ -1332,10 +1339,33 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     # that refusal, never before it: while login still bound on first presentation, an unbind here
     # would have let the next login bind whatever subject then presented.
     #
-    # Action-bound, single-use and MFA-gated, like the password reset: which IdP identity may sign in
-    # as an account is an attribute that affects authentication (ASVS 7.5.1). The console leg (ADR
-    # 0184 slice B, /ui/users/{id}/federated-identity) calls both handlers BY REFERENCE through
-    # AdminHandlers, which skips the Depends below, so it re-asserts the same action-bound gate.
+    # The PUT and DELETE are action-bound, single-use and MFA-gated, like the password reset: which
+    # IdP identity may sign in as an account is an attribute that affects authentication (ASVS
+    # 7.5.1). The console leg (ADR 0184 slice B, /ui/users/{id}/federated-identity) calls those two
+    # handlers BY REFERENCE through AdminHandlers, which skips the Depends below, so it re-asserts the
+    # same action-bound gate. The GET (BACKLOG #2331) is JSON only; the console reads the same view
+    # through its own page.
+
+    @app.get("/users/{user_id}/federated-identity", response_model=FederatedIdentityView)
+    async def get_user_federated_identity(
+        user_id: ResourceId,
+        service: AuthService = Depends(_service),
+        _: Identity = Depends(require(Permission.USERS_MANAGE)),
+    ) -> FederatedIdentityView:
+        """The account's stored federated pair, as the console's federated-identity screen shows it
+        (BACKLOG #2331). A JSON caller reads it here and sends it back as ``expected_issuer`` and
+        ``expected_subject``. Before this route it had to guess, and each wrong guess was a 409
+        that spent the single-use grant.
+
+        Gated and audited like ``GET /users/{id}/channel-scope``: ``users:manage`` through
+        :func:`require`, whose ``auth.permission_granted`` row is the read's only audit row, and no
+        step-up, so it spends no grant. The console's page of the same pair asks for the step-up
+        window (``require_ui_step_up``) because it offers the link and unlink forms; this read
+        offers neither. 404 for an unknown user."""
+        user = await service.store.get_user(user_id)
+        if user is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
+        return _federated_identity_view(user, service)
 
     @app.put("/users/{user_id}/federated-identity", response_model=SimpleMessage)
     async def bind_user_federated_identity(

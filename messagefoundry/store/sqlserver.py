@@ -130,6 +130,7 @@ from messagefoundry.store.sealed_cache import (
 from messagefoundry.store.store import (
     _ACTIVE_ALERT_STATUS_SQL,
     _ALERT_SEVERITY_RANK_SQL,
+    _IDP_AUTH_TIME_FORWARD_SQL,
     _SESSION_CAP_ORDER_SQL,
     _SESSION_CAP_RANK_NOT_AHEAD_SQL,
     _SESSION_LIVE_SQL,
@@ -2036,7 +2037,8 @@ _SCHEMA: list[str] = [
         token_hash NVARCHAR(64) NOT NULL PRIMARY KEY, user_id NVARCHAR(64) NOT NULL,
         created_at FLOAT NOT NULL, expires_at FLOAT NOT NULL, last_used_at FLOAT NOT NULL,
         revoked_at FLOAT NULL, client NVARCHAR(256) NULL, reauth_at FLOAT NULL,
-        mfa_verified_at FLOAT NULL, auth_mechanism NVARCHAR(32) NULL)""",
+        mfa_verified_at FLOAT NULL, auth_mechanism NVARCHAR(32) NULL,
+        idp_auth_time FLOAT NULL)""",
     """IF COL_LENGTH('sessions','reauth_at') IS NULL
         ALTER TABLE sessions ADD reauth_at FLOAT NULL""",
     """IF COL_LENGTH('sessions','mfa_verified_at') IS NULL
@@ -2045,6 +2047,11 @@ _SCHEMA: list[str] = [
     # written before the column existed, which takes the non-federated step-up.
     """IF COL_LENGTH('sessions','auth_mechanism') IS NULL
         ALTER TABLE sessions ADD auth_mechanism NVARCHAR(32) NULL""",
+    # BACKLOG #2143: the IdP auth_time an oidc session's step-up is compared with. NULL on a row
+    # written before the column existed, which the IdP step-up refuses as
+    # step_up_idp_auth_time_missing.
+    """IF COL_LENGTH('sessions','idp_auth_time') IS NULL
+        ALTER TABLE sessions ADD idp_auth_time FLOAT NULL""",
     """IF INDEXPROPERTY(OBJECT_ID('sessions'),'ix_sessions_user','IndexID') IS NULL
         CREATE INDEX ix_sessions_user ON sessions(user_id)""",
     """IF INDEXPROPERTY(OBJECT_ID('sessions'),'ix_sessions_expires','IndexID') IS NULL
@@ -12219,13 +12226,15 @@ class SqlServerStore:
         now: float | None = None,
         require_federated_subject: tuple[str | None, str | None] | None = None,
         auth_mechanism: str | None = None,
+        idp_auth_time: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
         # reauth_at seeds the step-up window from login (ASVS 7.5.3); seed_reauth=False leaves it
         # NULL for an MFA-PENDING session (WP-14) so a stolen pre-MFA token can't enroll/step-up.
         insert = (
             "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at,"
-            " revoked_at, client, reauth_at, auth_mechanism) VALUES (?,?,?,?,?,NULL,?,?,?)"
+            " revoked_at, client, reauth_at, auth_mechanism, idp_auth_time)"
+            " VALUES (?,?,?,?,?,NULL,?,?,?,?)"
         )
         params = (
             token_hash,
@@ -12236,6 +12245,7 @@ class SqlServerStore:
             client,
             now if seed_reauth else None,
             auth_mechanism,
+            idp_auth_time,
         )
         if require_federated_subject is None:
             await self._execute(insert, params)
@@ -12298,14 +12308,22 @@ class SqlServerStore:
         )
 
     async def mark_session_reauthed(
-        self, token_hash: str, *, now: float | None = None, client: str | None = None
+        self,
+        token_hash: str,
+        *,
+        now: float | None = None,
+        client: str | None = None,
+        idp_auth_time: float | None = None,
     ) -> None:
         now = time.time() if now is None else now
         # COALESCE keeps the stored client when none is supplied; a re-verify carrying the current
-        # address re-anchors the session to it (WP-L3-13 new-client-IP step-up).
+        # address re-anchors the session to it (WP-L3-13 new-client-IP step-up). The IdP auth_time
+        # only moves forward, and a NULL leaves it (BACKLOG #2143): the clause is store.py's, which
+        # says why.
         await self._execute(
-            "UPDATE sessions SET reauth_at=?, client=COALESCE(?, client) WHERE token_hash=?",
-            (now, client, token_hash),
+            "UPDATE sessions SET reauth_at=?, client=COALESCE(?, client),"
+            f" idp_auth_time={_IDP_AUTH_TIME_FORWARD_SQL} WHERE token_hash=?",
+            (now, client, idp_auth_time, idp_auth_time, idp_auth_time, token_hash),
         )
 
     async def mark_session_mfa_verified(self, token_hash: str, *, now: float | None = None) -> None:

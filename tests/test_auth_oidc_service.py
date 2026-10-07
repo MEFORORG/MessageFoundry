@@ -44,6 +44,7 @@ from messagefoundry.auth.notifications import (
     FEDERATED_IDENTITY_UNBOUND,
 )
 from messagefoundry.auth.service import (
+    DIRECTORY_OBJECT_ID_MISSING,
     FEDERATED_BINDING_CHANGED,
     FEDERATED_SUBJECT_NOT_BOUND,
     AuthService,
@@ -297,6 +298,12 @@ def _stub_exchange(monkeypatch: pytest.MonkeyPatch, id_token: str) -> list[dict[
 
 async def _audit_rows(store: MessageStore, action: str) -> list[Row]:
     return [a for a in await store.list_audit() if a["action"] == action]
+
+
+async def _refusal_reasons(store: MessageStore) -> list[str]:
+    """The ``reason`` of each ``auth.federated_bind_refused`` row, oldest first (BACKLOG #2331)."""
+    rows = await _audit_rows(store, "auth.federated_bind_refused")
+    return [json.loads(r["detail"])["reason"] for r in reversed(rows)]
 
 
 async def _oidc_login(
@@ -1679,6 +1686,18 @@ async def test_a_first_bind_losing_to_another_bind_is_the_changed_pair_refusal(
         assert after is not None and after.oidc_subject == "S-1-other", "the other bind was lost"
         for action in ("bound", "rebound", "unbound"):
             assert await _audit_rows(store, f"auth.federated_subject_{action}") == [], action
+        # BACKLOG #2331: the refusal itself is audited, with the pair the caller expected.
+        [refused] = await _audit_rows(store, "auth.federated_bind_refused")
+        assert refused["actor"] == "admin"
+        assert json.loads(refused["detail"]) == {
+            "user_id": user_id,
+            "issuer": "https://idp.example",
+            "subject": "S-1-mine",
+            "username": "jdoe",
+            "expected_issuer": None,
+            "expected_subject": None,
+            "reason": FEDERATED_BINDING_CHANGED,
+        }
         # Nothing written means nothing told and nobody signed out.
         assert notifier.events == []
         session = await store.get_session("t-jdoe")
@@ -1707,7 +1726,9 @@ async def test_a_stale_caller_gets_the_changed_answer_before_any_other_refusal(
             await service.bind_federated_subject(
                 user_id, "S-1-new", expected_issuer=None, expected_subject=None, actor="admin"
             )
-        assert await _audit_rows(store, "auth.federated_bind_refused") == []
+        # BACKLOG #2331: the stale refusal is audited too, under its own reason. What matters here
+        # is that no row carries the directory-id reason the later check would have written.
+        assert await _refusal_reasons(store) == [FEDERATED_BINDING_CHANGED]
 
         with pytest.raises(DirectoryObjectIdMissing):
             await service.bind_federated_subject(
@@ -1717,7 +1738,10 @@ async def test_a_stale_caller_gets_the_changed_answer_before_any_other_refusal(
                 expected_subject="S-1-legacy",
                 actor="admin",
             )
-        assert len(await _audit_rows(store, "auth.federated_bind_refused")) == 1
+        assert await _refusal_reasons(store) == [
+            FEDERATED_BINDING_CHANGED,
+            DIRECTORY_OBJECT_ID_MISSING,
+        ]
     finally:
         await store.close()
 

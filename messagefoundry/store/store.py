@@ -1149,7 +1149,20 @@ class ConnectionEventWrite(TypedDict):
 # The one sessions INSERT, shared by MessageStore.create_session's guarded and unguarded paths.
 _SESSION_INSERT: Final = (
     "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at,"
-    " revoked_at, client, reauth_at, auth_mechanism) VALUES (?,?,?,?,?,NULL,?,?,?)"
+    " revoked_at, client, reauth_at, auth_mechanism, idp_auth_time)"
+    " VALUES (?,?,?,?,?,NULL,?,?,?,?)"
+)
+
+
+# BACKLOG #2143: the IdP step-up's write-back of the auth_time it accepted, in the `?` dialect SQLite
+# and SQL Server share. Bind the new value three times. It only ever moves FORWARD, so two step-ups on
+# one session that land out of order cannot leave the older value behind for a replay to pass. A
+# NULL (every password re-proof) leaves the stored value as it was. Each placeholder is CAST, because
+# inside an expression SQL Server has no column to infer a NULL parameter's type from.
+_IDP_AUTH_TIME_FORWARD_SQL: Final = (
+    "CASE WHEN CAST(? AS FLOAT) IS NOT NULL"
+    " AND (idp_auth_time IS NULL OR CAST(? AS FLOAT) > idp_auth_time)"
+    " THEN CAST(? AS FLOAT) ELSE idp_auth_time END"
 )
 
 
@@ -1692,6 +1705,12 @@ class SessionRecord:
     #: leg runs. Set once at mint and carried forward by ``rotate_session``. NULL on a row written
     #: before the column existed, which takes the non-federated step-up.
     auth_mechanism: str | None = None
+    #: The IdP's ``auth_time`` for this session, as the IdP stated it (BACKLOG #2143): set at an
+    #: ``oidc`` mint and moved forward by each IdP step-up that succeeds. The step-up requires a
+    #: later one, IdP clock against IdP clock. NULL on every other session, and on an ``oidc`` row
+    #: written before the column existed, which the IdP step-up refuses as
+    #: ``step_up_idp_auth_time_missing``.
+    idp_auth_time: float | None = None
 
     @classmethod
     def from_mapping(cls, d: Mapping[str, Any]) -> SessionRecord:
@@ -1706,6 +1725,7 @@ class SessionRecord:
             reauth_at=_opt_float(d.get("reauth_at")),
             mfa_verified_at=_opt_float(d.get("mfa_verified_at")),
             auth_mechanism=d.get("auth_mechanism"),
+            idp_auth_time=_opt_float(d.get("idp_auth_time")),
         )
 
     def is_live(self, *, now: float, idle_seconds: float) -> bool:
@@ -4825,7 +4845,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     client       TEXT,
     reauth_at    REAL,                         -- last credential re-verification (login / /me/reauth)
     mfa_verified_at REAL,                      -- when the 2nd factor was satisfied; NULL = unsatisfied (WP-14)
-    auth_mechanism TEXT                        -- how the session was minted: password/kerberos/oidc (ADR 0184 iv)
+    auth_mechanism TEXT,                       -- how the session was minted: password/kerberos/oidc (ADR 0184 iv)
+    idp_auth_time REAL                         -- the IdP's auth_time for an oidc session (BACKLOG #2143)
 );
 CREATE INDEX IF NOT EXISTS ix_sessions_user    ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS ix_sessions_expires ON sessions(expires_at);
@@ -6460,6 +6481,11 @@ class MessageStore:
         # non-federated step-up; nothing is backfilled, because nothing recorded the mechanism.
         if "auth_mechanism" not in session_cols:
             await db.execute("ALTER TABLE sessions ADD COLUMN auth_mechanism TEXT")
+        # BACKLOG #2143: the IdP auth_time an oidc session's step-up is compared with. Pre-existing
+        # rows get NULL, because nothing recorded the value to backfill. The IdP step-up refuses a
+        # NULL as step_up_idp_auth_time_missing.
+        if "idp_auth_time" not in session_cols:
+            await db.execute("ALTER TABLE sessions ADD COLUMN idp_auth_time REAL")
         # ADR 0021 "Response Sent" rides the response table via a `kind` discriminator. A pre-existing
         # DB's response table predates the three columns — ALTER them in (existing rows backfill
         # kind='response' via the DEFAULT). Metadata-only on SQLite (no table rewrite). Idempotent.
@@ -12429,6 +12455,7 @@ class MessageStore:
         now: float | None = None,
         require_federated_subject: tuple[str | None, str | None] | None = None,
         auth_mechanism: str | None = None,
+        idp_auth_time: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
         # reauth_at = now seeds the step-up window from login (ASVS 7.5.3). seed_reauth=False for an
@@ -12443,6 +12470,7 @@ class MessageStore:
             client,
             now if seed_reauth else None,
             auth_mechanism,
+            idp_auth_time,
         )
         if require_federated_subject is None:
             async with _writer_guard(self._db, self._lock):
@@ -12505,15 +12533,21 @@ class MessageStore:
             await self._commit()
 
     async def mark_session_reauthed(
-        self, token_hash: str, *, now: float | None = None, client: str | None = None
+        self,
+        token_hash: str,
+        *,
+        now: float | None = None,
+        client: str | None = None,
+        idp_auth_time: float | None = None,
     ) -> None:
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
             # COALESCE keeps the stored client when none is supplied; a re-verify carrying the current
             # address re-anchors the session to it (WP-L3-13 new-client-IP step-up).
             await self._db.execute(
-                "UPDATE sessions SET reauth_at=?, client=COALESCE(?, client) WHERE token_hash=?",
-                (now, client, token_hash),
+                "UPDATE sessions SET reauth_at=?, client=COALESCE(?, client),"
+                f" idp_auth_time={_IDP_AUTH_TIME_FORWARD_SQL} WHERE token_hash=?",
+                (now, client, idp_auth_time, idp_auth_time, idp_auth_time, token_hash),
             )
             await self._commit()
 
