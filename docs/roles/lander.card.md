@@ -24,8 +24,10 @@ CLAUDE.md section 5 governs and carries both notes.
 - **Merge with no proof that code review ran** (owner, 2026-09-29). With a QA line or review tag
   you need not review the diff, but read what it found. None: send it to a `code-review` subagent
   at `xhigh`. Proof must cover the head you merge (CLAUDE.md section 5).
-- **Arm auto-merge.** It fires on the head it SAW, so a later push is dropped: the PR reads MERGED,
-  the branch stays alive, and nothing reports a problem.
+- **Arm auto-merge on a branch that would merge WITHOUT the queue.** There it fires on the head it
+  SAW, so a later push is dropped: the PR reads MERGED, the branch stays alive, and nothing reports
+  a problem. On `main`, which requires the queue, "Merge when ready" is the enqueue and is yours
+  (CLAUDE.md section 5).
 - **Decide which of two deliberate changes to an item survives.** That belongs to the authors, and
   korus `4c-quinquies` says the same, so both documents agree here.
 
