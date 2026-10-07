@@ -19,6 +19,7 @@ reset and the host-gated ``messagefoundry admin-unlock`` (ADR 0171).
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -29,7 +30,13 @@ import pytest
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
-from messagefoundry.auth.identity import ALL_CHANNELS
+from messagefoundry.auth.audit_visibility import audit_exclusion_for
+from messagefoundry.auth.identity import ALL_CHANNELS, AuthProvider, Identity
+from messagefoundry.auth.permissions import (
+    BUILTIN_ROLE_PERMISSIONS,
+    CUSTOM_ROLE_FORBIDDEN_PERMISSIONS,
+    Permission,
+)
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
@@ -310,3 +317,53 @@ async def test_live_flips_off_when_the_lock_expires(
     assert after["sign_in_locked"] is False and after["second_step_locked"] is False
     # The stored expiry and counts are still reported after the lock lapses: nothing cleared them.
     assert after["failed_attempts"] == 5 and after["locked_until"] is not None
+
+
+# --- BACKLOG #2292 (ASVS 16.3.2): why the users:read grant row is enough ------------------------
+# list_users records its read as a users:read grant even when lock state goes out. Its comment
+# says that is enough because every users:manage holder can already read each lock in the audit
+# trail. These tests pin that premise and the row. That no custom role carries users:manage, even
+# from storage, is pinned in tests/test_custom_roles.py (test_decode_drops_unknown_and_forbidden).
+
+
+def test_every_users_manage_holder_can_read_the_lock_rows_in_the_trail() -> None:
+    holders = [
+        role for role, perms in BUILTIN_ROLE_PERMISSIONS.items() if Permission.USERS_MANAGE in perms
+    ]
+    assert holders  # a built-in role grants it, so the loop below checks something
+    for role in holders:
+        assert Permission.AUDIT_READ in BUILTIN_ROLE_PERMISSIONS[role], role
+        identity = Identity.build(
+            user_id="u", username="u", auth_provider=AuthProvider.LOCAL, roles=[role]
+        )
+        assert audit_exclusion_for(identity) is None, role
+    assert Permission.USERS_MANAGE in CUSTOM_ROLE_FORBIDDEN_PERMISSIONS
+
+
+async def _users_read_grants(engine: Engine, *, audit_all_authz: bool) -> list[dict[str, Any]]:
+    """An Administrator's GET /users, then the grant rows it wrote for that path."""
+    service = await _service(engine)
+    await _add(service, "root", [Role.ADMINISTRATOR.value])
+    target = await _add(service, "target", [Role.VIEWER.value])
+    app = create_app(engine, auth=service, audit_all_authz=audit_all_authz)
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 123))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        r = await c.get("/users", headers=await _bearer(c, "root"))
+    assert r.status_code == 200
+    assert _row(r.json(), target)["lock_state"] is not None  # lock state did go out
+    rows = await engine.store.list_audit(action="auth.permission_granted", actor="root")
+    details = [json.loads(row["detail"] or "{}") for row in rows]
+    return [d for d in details if d.get("path") == "/users"]
+
+
+async def test_an_administrators_users_read_writes_one_users_read_grant_row(
+    engine: Engine,
+) -> None:
+    grants = await _users_read_grants(engine, audit_all_authz=True)
+    assert grants == [{"permission": "users:read", "path": "/users"}]
+
+
+async def test_with_the_wide_trail_off_the_users_read_writes_no_grant_row(
+    engine: Engine,
+) -> None:
+    assert await _users_read_grants(engine, audit_all_authz=False) == []

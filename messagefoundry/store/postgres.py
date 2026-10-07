@@ -69,7 +69,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from time import perf_counter
 from types import MappingProxyType
-from typing import Any
+from typing import Any, assert_never
 from uuid import uuid4
 
 from messagefoundry.config.models import RetryPolicy
@@ -162,10 +162,12 @@ from messagefoundry.store.store import (
     REINGRESS_TARGET_PREFIX,
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
+    AdminRemoval,
     AlertInstance,
     AlertSummary,
     AppendedAuditRow,
     AuditAppend,
+    AuditedWrite,
     AuditVerdict,
     CapturedResponse,
     ChannelScopeSource,
@@ -184,6 +186,7 @@ from messagefoundry.store.store import (
     MessageSearchResult,
     MessageStatus,
     MessageStore,
+    OperatorAudit,
     OutboxItem,
     OutboxStatus,
     OwnedLanes,
@@ -218,12 +221,15 @@ from messagefoundry.store.store import (
     lockout_escalates,
     next_lockout_state,
     not_deployed_detail,
+    operator_audits,
     owned_lane_scope,
     password_claim_set,
     require_notify_email,
     roll_audit_key_range,
     rotation_factor_term,
     should_record_event,
+    tee_audits,
+    totp_enable_term,
     verify_audit_rows,
 )
 from messagefoundry.support.redact import redact_log_line
@@ -260,7 +266,11 @@ _LOCK_CLASS_FINALIZE = 3
 # per-message finalize lock (lane < finalize is a total order; methods that take only finalize never take
 # a lane lock, so no cycle). Multi-destination writers lock in SORTED order (deadlock-free).
 _LOCK_CLASS_OUTBOUND_LANE = 4
+# Vault BACKLOG #2779: one lock for every last-administrator guarded write, so two of them, from any
+# shard, cannot both read the same two administrators and both remove one.
+_LOCK_CLASS_ADMIN_GUARD = 5
 _AUDIT_LOCK = "mefor_audit_chain"
+_ADMIN_GUARD_LOCK = "mefor_last_admin"
 
 
 def _audit_write_probe(table: str, privilege: str) -> str:
@@ -750,7 +760,8 @@ _SCHEMA: list[str] = [
         client       TEXT,
         reauth_at    DOUBLE PRECISION,
         mfa_verified_at DOUBLE PRECISION,
-        auth_mechanism TEXT
+        auth_mechanism TEXT,
+        idp_auth_time DOUBLE PRECISION
     )""",
     "CREATE INDEX IF NOT EXISTS ix_sessions_user ON sessions(user_id)",
     "CREATE INDEX IF NOT EXISTS ix_sessions_expires ON sessions(expires_at)",
@@ -916,6 +927,11 @@ CLUSTER_SCHEMA: tuple[str, ...] = (
     _gated_add_column("leader_lease", "leader_epoch", "BIGINT NOT NULL DEFAULT 0"),
 )
 _SCHEMA.extend(CLUSTER_SCHEMA)
+# BACKLOG #2143: the IdP auth_time an oidc session's step-up is compared with, for a sessions table
+# created before the column. In _SCHEMA rather than _migrate_lease_columns, so it moves the schema
+# hash itself and its catalog read is scoped to current_schema(). Pre-existing rows get NULL, which
+# the IdP step-up refuses as step_up_idp_auth_time_missing.
+_SCHEMA.append(_gated_add_column("sessions", "idp_auth_time", "DOUBLE PRECISION"))
 
 # Bump when _migrate_lease_columns (the open-path migration code OUTSIDE _SCHEMA) changes behavior:
 # unlike _SCHEMA edits — which change _schema_hash automatically — the migration function's Python
@@ -1664,7 +1680,7 @@ class PostgresStore:
         exc = StoreGrantsMissingError(
             f"the postgres store schema in database {self._settings.database!r} is provisioned and "
             f"current, but this role lacks row access to {len(rows)} object(s): {names}{more}. "
-            "Refusing to start rather than fail mid-pipeline. Grant SELECT, INSERT, UPDATE, DELETE on "
+            "Refusing to start rather than fail mid-pipeline. Grant SELECT/INSERT/UPDATE/DELETE on "
             "the tables, SELECT and INSERT only on audit_log, and USAGE on the "
             "sequences to the runtime role (docs/DEPLOY-SERVER-DB.md section 1.2); provision-schema "
             "cannot grant them"
@@ -2039,7 +2055,7 @@ class PostgresStore:
                 "are Postgres's server-level equivalent and are reported as excess, not as role names; "
                 + (
                     f"schema_management=external, so CREATE on schema {schema!r}, ownership of its "
-                    "objects, and UPDATE, DELETE, TRUNCATE or TRIGGER on audit_log are "
+                    "objects, and UPDATE/DELETE/TRUNCATE/TRIGGER on audit_log are "
                     "excess"
                     if external
                     else "schema_management=auto, so schema DDL rights are expected"
@@ -2852,10 +2868,10 @@ class PostgresStore:
         caller's open transaction** (Postgres twin of :meth:`MessageStore._record_delivered_key`).
 
         Only outbound rows deliver; ingress/routed completions (``destination_name`` NULL) are skipped.
-        ``delivery_seq`` is ``1 + COUNT`` of prior ledger rows for the pair (replay-stable, like
-        ``response_seq``). Stored row carries hashes + ids only — never a body/PHI. One row per outbox
-        row INSTANCE (a double mark_done must not accumulate a second entry); ``ON CONFLICT DO NOTHING``
-        is the belt-and-suspenders backstop on the content hash."""
+        ``delivery_seq`` is ``1 + COUNT`` of prior ledger rows for the pair (a counter, not a unique
+        id; :func:`delivery_key` takes its uniqueness from the ids). Stored row carries hashes + ids
+        only — never a body/PHI. One row per outbox row INSTANCE (a double mark_done must not
+        accumulate a second entry); ``ON CONFLICT DO NOTHING`` is the backstop on the key."""
         if destination_name is None:
             return
         already = await conn.fetchval(
@@ -2872,6 +2888,7 @@ class PostgresStore:
         key = delivery_key(
             control_id=control_id,
             message_id=message_id,
+            outbox_id=outbox_id,
             destination_name=destination_name,
             handler_name=handler_name,
             delivery_seq=int(seq),
@@ -3293,6 +3310,7 @@ class PostgresStore:
         metadata: str | None = None,
         attachment_refs: Sequence[str] | None = None,
         now: float | None = None,
+        audit: OperatorAudit[str] | None = None,
     ) -> str:
         """Durably persist a freshly-received raw message to the **ingress stage** — the staged
         pipeline's ACK-on-receipt boundary (ADR 0001). In one transaction: insert the message
@@ -3310,7 +3328,7 @@ class PostgresStore:
         # Distinct refs only: a skeleton naming the same content-addressed document twice increfs it once
         # (== its live join rows), so a later release decrefs by the same count.
         refs = list(dict.fromkeys(attachment_refs or ()))
-        async with self._timed_acquire() as conn, conn.transaction():
+        async with AuditedWrite(now) as written, self._timed_acquire() as conn, conn.transaction():
             await self._insert_message(
                 conn,
                 mid,
@@ -3362,6 +3380,8 @@ class PostgresStore:
                     mid,
                     ref,
                 )
+            if audit is not None:  # an operator's inject (BACKLOG #2624); a live receipt has none
+                await self._append_operator_audit(conn, written, audit, mid)
         return mid
 
     async def handoff(
@@ -3742,10 +3762,22 @@ class PostgresStore:
         to a skewed-standby clock across failover. This is correct **only because there is exactly ONE
         serial writer per (stage, lane-key)** (the per-inbound listener/router/transform worker; the
         destination_name fan-in is multi-writer but seq is still DB-assigned in commit order, so the
-        first committer gets the lower seq, and ``FOR UPDATE SKIP LOCKED`` never skips the true locked
-        head). With ``created_at`` no longer an ordering backstop, a future second-writer-per-lane or
-        delete+reinsert-on-retry (re-minting seq) would break FIFO. ``FOR UPDATE SKIP LOCKED`` on the
-        head keeps concurrent pollers non-blocking. ``None`` when nothing is pending or the head isn't due.
+        first committer gets the lower seq). With ``created_at`` no longer an ordering backstop, a future
+        second-writer-per-lane or delete+reinsert-on-retry (re-minting seq) would break FIFO. ``FOR
+        UPDATE SKIP LOCKED`` on the head keeps concurrent pollers non-blocking. ``None`` when nothing is
+        pending or the head isn't due.
+
+        **KNOWN HOLE: ``SKIP LOCKED`` CAN skip the true head (ADR 0066 section 3.4).** The serial-writer
+        argument covers a producer's *uncommitted* row, which is invisible to the scan. It does not cover
+        a *visible, committed* head that another transaction holds locked -- for example a message
+        :meth:`replay` re-stamping a backing-off pending head. ``ORDER BY seq LIMIT 1 FOR UPDATE SKIP
+        LOCKED`` passes over that head, and if seq N+1 is due it is claimed first: a per-lane FIFO
+        reorder, not one empty cycle. The pooled default claims each lane's head through
+        :meth:`claim_fifo_heads`, which carries the ADR 0066 head-pin and turns the same schedule into
+        an EMPTY cycle -- but the pooled path does not avoid this method entirely. Every caller of this
+        single-row claim is exposed: at least the ``per_lane`` claim mode's stage workers, and the
+        outbound batch-coalescing window in EITHER claim mode, which tops up a batch with this method.
+        Whether this path should get the head-pin is a separate, open decision (vault BACKLOG #2769).
 
         FAILOVER FIFO SAFETY (active-passive HA): the claim runs in ONE transaction that FIRST reclaims
         this lane's stranded head — a crashed/fenced prior leader's claimed rows are still ``inflight``
@@ -5102,7 +5134,7 @@ class PostgresStore:
         kinds: Sequence[str] | None = None,
         since: float | None = None,
         limit: int = 100,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> list[ConnectionEvent]:
         limit = max(1, min(limit, 1000))  # server-side clamp
         where: list[str] = []
@@ -5197,7 +5229,7 @@ class PostgresStore:
         self,
         *,
         limit: int = 200,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> list[AlertInstance]:
         limit = max(1, min(limit, 1000))  # server-side clamp
         where = [_ACTIVE_ALERT_STATUS_SQL]
@@ -5216,7 +5248,7 @@ class PostgresStore:
         return [self._alert_instance_row(r) for r in rows]
 
     async def summarize_active_alert_instances(
-        self, *, allowed_channels: Sequence[str] | None = None
+        self, *, allowed_channels: Sequence[str] | None
     ) -> AlertSummary:
         # BACKLOG #1564 — see the SQLite twin: same active predicate, same RBAC scope, aggregate over
         # every row in scope rather than over a page. The rank CASE is shared so it cannot drift.
@@ -5237,7 +5269,7 @@ class PostgresStore:
         return _alert_summary(row)
 
     async def get_alert_instance(
-        self, alert_id: int, *, allowed_channels: Sequence[str] | None = None
+        self, alert_id: int, *, allowed_channels: Sequence[str] | None
     ) -> AlertInstance | None:
         where = ["id=$1"]
         params: list[Any] = [alert_id]
@@ -5321,7 +5353,7 @@ class PostgresStore:
         )
         if _rowcount(result) == 0:
             return None
-        return await self.get_alert_instance(alert_id)
+        return await self.get_alert_instance(alert_id, allowed_channels=None)
 
     async def resume_alert_instance(
         self, alert_id: int, *, now: float | None = None
@@ -5333,7 +5365,7 @@ class PostgresStore:
         )
         if _rowcount(result) == 0:
             return None
-        return await self.get_alert_instance(alert_id)
+        return await self.get_alert_instance(alert_id, allowed_channels=None)
 
     async def count_open_alerts_by_connection(self) -> dict[str, int]:
         rows = await self._pool.fetch(
@@ -5371,10 +5403,8 @@ class PostgresStore:
                 if retry.max_attempts is not None and attempts >= retry.max_attempts:
                     status, next_at, event = OutboxStatus.DEAD.value, now, "dead"
                 else:
-                    backoff = min(
-                        retry.max_backoff_seconds,
-                        retry.backoff_seconds * (retry.backoff_multiplier ** max(attempts - 1, 0)),
-                    )
+                    # vault BACKLOG #2761: never overflows, so attempt 1025+ keeps the cap's pace.
+                    backoff = retry.backoff_for(attempts)
                     status, next_at, event = OutboxStatus.PENDING.value, now + backoff, "failed"
                 # ADR 0157 C1 — the epoch fence guards the DEAD branch ONLY. The retry branch returns
                 # the row to PENDING; fencing THAT would leave it INFLIGHT instead — converting a
@@ -5463,11 +5493,8 @@ class PostgresStore:
                 if retry.max_attempts is not None and head_attempts >= retry.max_attempts:
                     status, next_at, event = OutboxStatus.DEAD.value, now, "dead"
                 else:
-                    backoff = min(
-                        retry.max_backoff_seconds,
-                        retry.backoff_seconds
-                        * (retry.backoff_multiplier ** max(head_attempts - 1, 0)),
-                    )
+                    # vault BACKLOG #2761: never overflows, so attempt 1025+ keeps the cap's pace.
+                    backoff = retry.backoff_for(head_attempts)
                     status, next_at, event = OutboxStatus.PENDING.value, now + backoff, "failed"
                 # ADR 0157 C1 — the identical DEAD-branch-only split as mark_failed, decided ONCE from
                 # head_attempts and rendered ONCE for the whole loop: a fence on any member raises out
@@ -5702,23 +5729,31 @@ class PostgresStore:
         sha256 of the VERBATIM concatenated plaintext). Each chunk is AES-GCM-sealed independently (a
         bounded plaintext window per seal). Identical content **dedups** to one copy (a re-put returns the
         same ref and writes nothing). The fresh attachment sits at ``refcount=0`` until increffed."""
-        hasher = hashlib.sha256()
-        total = 0
-        # Cell-bound AAD (ASVS 11.3.3) binds each chunk to (attachment_id, seq), and the attachment_id is
-        # the content hash — known only after the full plaintext is hashed. Buffer the verbatim slices,
-        # hash, then seal each under (ref, seq); the source is an already-materialized OBX-5.5 value, so
-        # this adds no order-of-magnitude memory and each seal still consumes one chunk. Mirrors SQLite.
-        plaintext_chunks: list[str] = []
-        for chunk in chunks:
-            data = chunk.encode("utf-8")
-            hasher.update(data)
-            total += len(data)
-            plaintext_chunks.append(chunk)
-        ref = hasher.hexdigest()
-        sealed: list[str] = [
-            self._cipher.encrypt(c, aad=cell_aad("attachment_chunk", "ciphertext", ref, seq))
-            for seq, c in enumerate(plaintext_chunks)
-        ]
+
+        def _seal() -> tuple[str, int, list[str]]:
+            # Off the event loop (vault BACKLOG #2757): hashing and sealing a large document is CPU
+            # work in proportion to its size, and nothing else would run meanwhile.
+            hasher = hashlib.sha256()
+            total = 0
+            # Cell-bound AAD (ASVS 11.3.3) binds each chunk to (attachment_id, seq), and the
+            # attachment_id is the content hash — known only after the full plaintext is hashed.
+            # Buffer the verbatim slices, hash, then seal each under (ref, seq); the source is an
+            # already-materialized OBX-5.5 value, so this adds no order-of-magnitude memory and each
+            # seal still consumes one chunk. Mirrors SQLite.
+            plaintext_chunks: list[str] = []
+            for chunk in chunks:
+                data = chunk.encode("utf-8")
+                hasher.update(data)
+                total += len(data)
+                plaintext_chunks.append(chunk)
+            ref = hasher.hexdigest()
+            sealed: list[str] = [
+                self._cipher.encrypt(c, aad=cell_aad("attachment_chunk", "ciphertext", ref, seq))
+                for seq, c in enumerate(plaintext_chunks)
+            ]
+            return ref, total, sealed
+
+        ref, total, sealed = await asyncio.to_thread(_seal)
         now = time.time()
         async with self._timed_acquire() as conn, conn.transaction():
             if await conn.fetchval("SELECT 1 FROM attachment WHERE id=$1", ref) is not None:
@@ -6141,7 +6176,13 @@ class PostgresStore:
         )
         return len(orphans)
 
-    async def replay(self, message_id: str, now: float | None = None) -> int:
+    async def replay(
+        self,
+        message_id: str,
+        now: float | None = None,
+        *,
+        audit: OperatorAudit[int] | None = None,
+    ) -> int:
         """Re-queue a message for re-processing/re-delivery (attempts reset). Two modes: **recover**
         any ``dead``/``pending`` row (never a ``done`` sibling — the M-2 hazard), else **re-send** the
         ``done`` rows. ``cancelled`` rows are never touched. Returns rows requeued.
@@ -6150,9 +6191,10 @@ class PostgresStore:
         #1560), and the ``delivered_keys`` DELETE carries the same predicate so it never drops the
         idempotency entry of a row the UPDATE skipped. Mirrors :meth:`MessageStore.replay`, whose
         docstring carries the reasoning — including why the ``stuck`` count deliberately does not.
-        A pass-through completion marker is skipped the same way (:data:`_NOT_PT_MARKER`, #1580)."""
+        A pass-through completion marker is skipped the same way (:data:`_NOT_PT_MARKER`, #1580).
+        ``audit``'s row commits with the replay (BACKLOG #2624)."""
         now = time.time() if now is None else now
-        async with self._timed_acquire() as conn, conn.transaction():
+        async with AuditedWrite(now) as written, self._timed_acquire() as conn, conn.transaction():
             stuck_row = await conn.fetchrow(
                 "SELECT COUNT(*) AS n FROM queue WHERE message_id=$1 AND status = ANY($2::text[])",
                 message_id,
@@ -6186,11 +6228,12 @@ class PostgresStore:
             )
             count = _rowcount(result)
             if count:
+                # RECEIVED only for a pending INGRESS row; a re-pended routed row is ROUTED, or the
+                # finalizer could never settle it (vault BACKLOG #2723; MessageStore.replay says why).
                 pre = await conn.fetchrow(
-                    "SELECT 1 FROM queue WHERE message_id=$1 AND stage = ANY($2::text[])"
-                    " AND status=$3 LIMIT 1",
+                    "SELECT 1 FROM queue WHERE message_id=$1 AND stage=$2 AND status=$3 LIMIT 1",
                     message_id,
-                    [Stage.INGRESS.value, Stage.ROUTED.value],
+                    Stage.INGRESS.value,
                     OutboxStatus.PENDING.value,
                 )
                 status = MessageStatus.RECEIVED.value if pre else MessageStatus.ROUTED.value
@@ -6198,6 +6241,7 @@ class PostgresStore:
                     "UPDATE messages SET status=$1, error=NULL WHERE id=$2", status, message_id
                 )
                 await self._event(conn, message_id, "replayed", None, f"{count} row(s)", now)
+            await self._append_operator_audit(conn, written, audit, count)
         return count
 
     async def resend_to(
@@ -6209,15 +6253,17 @@ class PostgresStore:
         from_: str | None = None,
         body_override: str | None = None,
         now: float | None = None,
+        audit: OperatorAudit[ResendOutcome] | None = None,
     ) -> ResendOutcome:
         """Resend a message's stored transformed body to an ALTERNATE outbound ``to`` (ADR 0090).
         Mirrors :meth:`MessageStore.resend_to`. Strict-FIFO writer-funnel: takes the per-lane advisory
         lock for ``to`` (:meth:`_lock_outbound_lanes`) so the resend commits in seq-order for the lane
         and can't be claimed ahead of an older producer row still uncommitted-and-invisible under
         SKIP-LOCKED/MVCC. Idempotency: the ``resend_log`` INSERT (ON CONFLICT DO NOTHING) runs FIRST and
-        the outbound row is created only when it returned a row (ADR 0090 §4)."""
+        the outbound row is created only when it returned a row (ADR 0090 §4). ``audit``'s row
+        commits with the resend, a duplicate included (BACKLOG #2624)."""
         now = time.time() if now is None else now
-        async with self._timed_acquire() as conn:  # noqa: SIM117
+        async with AuditedWrite(now) as written, self._timed_acquire() as conn:  # noqa: SIM117
             async with conn.transaction():
                 await self._lock_outbound_lanes(conn, (to,))
                 # Idempotency gate FIRST: claim the key; proceed only if we created the row.
@@ -6249,13 +6295,15 @@ class PostgresStore:
                             f" {prior['message_id']!r} to {prior['to_destination']!r}; it cannot be"
                             f" reused for message {message_id!r} to {to!r}"
                         )
-                    return ResendOutcome(
+                    outcome = ResendOutcome(
                         status="duplicate",
                         message_id=message_id,
                         to_destination=prior["to_destination"] if prior else to,
                         from_destination=prior["from_destination"] if prior else (from_ or ""),
                         outbox_id=prior["outbox_id"] if prior else None,
                     )
+                    await self._append_operator_audit(conn, written, audit, outcome)
+                    return outcome
                 if body_override is not None:
                     # Edit-and-resend DIRECT power-path (ADR 0090 §9.1.3, BACKLOG #153): ship the
                     # operator's EDITED body to `to` as a NEW, correlated CHILD delivery. The ORIGIN row
@@ -6388,13 +6436,15 @@ class PostgresStore:
                     outbox_id,
                     idempotency_key,
                 )
-                return ResendOutcome(
+                outcome = ResendOutcome(
                     status="resent",
                     message_id=message_id,
                     to_destination=to,
                     from_destination=src_dest,
                     outbox_id=outbox_id,
                 )
+                await self._append_operator_audit(conn, written, audit, outcome)
+                return outcome
 
     async def reingress(
         self,
@@ -6403,6 +6453,7 @@ class PostgresStore:
         raw: str,
         idempotency_key: str,
         now: float | None = None,
+        audit: OperatorAudit[ReingressOutcome] | None = None,
     ) -> ReingressOutcome:
         """Edit-and-resubmit RE-ROUTE (ADR 0090 §9). Mirrors :meth:`MessageStore.reingress`: injects a
         fresh, correlated ``RECEIVED`` child message at the origin channel's ingress stage; the origin
@@ -6411,9 +6462,10 @@ class PostgresStore:
         created only when it claimed the key. Deterministic child id (content-address of key+channel+body)
         is the defense-in-depth against a partial-rollback double-inject. Like a pass-through child
         (ADR 0013) the fresh INGRESS row lands at the channel's ingress tail — a new logged receipt, not
-        re-inserted into any historical outbound-lane position, so no outbound writer-funnel applies."""
+        re-inserted into any historical outbound-lane position, so no outbound writer-funnel applies.
+        ``audit``'s row commits with the resubmit, a duplicate included (BACKLOG #2624)."""
         now = time.time() if now is None else now
-        async with self._timed_acquire() as conn:  # noqa: SIM117
+        async with AuditedWrite(now) as written, self._timed_acquire() as conn:  # noqa: SIM117
             async with conn.transaction():
                 orow = await conn.fetchrow(
                     "SELECT channel_id, source_type, message_type, metadata FROM messages WHERE id=$1",
@@ -6449,12 +6501,14 @@ class PostgresStore:
                             f" resubmit ({prior['message_id']!r} -> {prior['to_destination']!r}); it"
                             f" cannot be reused for message {origin_message_id!r}"
                         )
-                    return ReingressOutcome(
+                    outcome = ReingressOutcome(
                         status="duplicate",
                         message_id=origin_message_id,
                         new_message_id=(prior["outbox_id"] if prior else "") or "",
                         channel_id=channel_id,
                     )
+                    await self._append_operator_audit(conn, written, audit, outcome)
+                    return outcome
                 raw_meta = self._dec(
                     orow["metadata"], aad=cell_aad("messages", "metadata", origin_message_id)
                 )
@@ -6526,12 +6580,14 @@ class PostgresStore:
                     new_mid,
                     idempotency_key,
                 )
-                return ReingressOutcome(
+                outcome = ReingressOutcome(
                     status="resubmitted",
                     message_id=origin_message_id,
                     new_message_id=new_mid,
                     channel_id=channel_id,
                 )
+                await self._append_operator_audit(conn, written, audit, outcome)
+                return outcome
 
     async def replay_dead(
         self,
@@ -6539,6 +6595,7 @@ class PostgresStore:
         channel_id: str | None = None,
         destination_name: str | None = None,
         now: float | None = None,
+        audit: OperatorAudit[int] | None = None,
     ) -> int:
         """Re-queue dead-lettered **outbound** deliveries only (optionally scoped): set them back to
         ``pending`` with attempts reset, revert each affected message from ``error`` to ``routed``.
@@ -6550,9 +6607,10 @@ class PostgresStore:
         DISTINCT``, and guarding only the UPDATE would revert a purged message from ``ERROR`` to
         ``ROUTED`` with nothing re-queued. ``tests/test_replay_erased_body_scope.py`` pins both. The
         pass-through marker exclusion (:data:`_NOT_PT_MARKER`, BACKLOG #1580) is written twice for the
-        same reason, and the same file pins it."""
+        same reason, and the same file pins it. ``audit``'s row commits with the replay, zero
+        included (BACKLOG #2624)."""
         now = time.time() if now is None else now
-        async with self._timed_acquire() as conn, conn.transaction():
+        async with AuditedWrite(now) as written, self._timed_acquire() as conn, conn.transaction():
             ids = await conn.fetch(
                 "SELECT DISTINCT message_id FROM queue WHERE stage=$1 AND status=$2"
                 " AND ($3::text IS NULL OR channel_id=$3)"
@@ -6565,6 +6623,7 @@ class PostgresStore:
             )
             message_ids = [r["message_id"] for r in ids]
             if not message_ids:
+                await self._append_operator_audit(conn, written, audit, 0)
                 return 0
             result = await conn.execute(
                 "UPDATE queue SET status=$1, attempts=0, next_attempt_at=$2, last_error=NULL,"
@@ -6588,6 +6647,7 @@ class PostgresStore:
                     MessageStatus.ERROR.value,
                 )
                 await self._event(conn, message_id, "replayed", None, "dead-letter replay", now)
+            await self._append_operator_audit(conn, written, audit, count)
         return count
 
     async def cancel_queued(
@@ -6597,24 +6657,39 @@ class PostgresStore:
         *,
         top_only: bool = False,
         now: float | None = None,
+        audit: OperatorAudit[int] | None = None,
     ) -> int:
         """Soft-cancel **pending** deliveries for a destination: mark them ``cancelled``, log a
         ``cancelled`` event each, and finalize any message whose deliveries are now all terminal.
-        ``channel_id=None`` cancels across all producers; ``top_only`` cancels just the head. Returns
-        the number cancelled."""
+        ``channel_id=None`` cancels across all producers; ``top_only`` cancels just the FIFO head --
+        the oldest pending row by ``seq``, the lane predicate and key :meth:`claim_next_fifo` uses --
+        even while it is backing off and not yet due (ADR 0059). With a ``channel_id`` it is the
+        oldest row from that producer, the lane head only when no other inbound feeds the
+        destination. Returns the number cancelled."""
         now = time.time() if now is None else now
-        # `top_only` cancels the true FIFO head, so the tiebreak after next_attempt_at must match the
-        # claim's seq-only order, NOT created_at (no longer the ordering key; ADR 0059).
+        # `top_only` cancels the true FIFO head, so it orders by the claim's seq-only key alone (ADR
+        # 0059). Not next_attempt_at first: mark_failed pushes a failed head's next_attempt_at past the
+        # younger rows behind it, so that key would pick a healthy younger row and leave the
+        # backing-off head blocking the lane (vault BACKLOG #2754).
         query = (
             "SELECT id, message_id FROM queue"
-            " WHERE destination_name=$1 AND status=$2 AND ($3::text IS NULL OR channel_id=$3)"
-            " ORDER BY next_attempt_at, seq"
+            " WHERE stage=$4 AND destination_name=$1 AND status=$2"
+            " AND ($3::text IS NULL OR channel_id=$3)"
+            " ORDER BY seq"
         )
         if top_only:
             query += " LIMIT 1"
-        async with self._timed_acquire() as conn, conn.transaction():
-            rows = await conn.fetch(query, destination_name, OutboxStatus.PENDING.value, channel_id)
+        # BACKLOG #2624: ``audit``'s row commits with the cancel, zero included.
+        async with AuditedWrite(now) as written, self._timed_acquire() as conn, conn.transaction():
+            rows = await conn.fetch(
+                query,
+                destination_name,
+                OutboxStatus.PENDING.value,
+                channel_id,
+                Stage.OUTBOUND.value,
+            )
             if not rows:
+                await self._append_operator_audit(conn, written, audit, 0)
                 return 0
             ids = [r["id"] for r in rows]
             await conn.execute(
@@ -6637,6 +6712,7 @@ class PostgresStore:
             await self._lock_finalize_batch(conn, (r["message_id"] for r in rows))
             for message_id in {r["message_id"] for r in rows}:
                 await self._maybe_finalize_message(conn, message_id, now)
+            await self._append_operator_audit(conn, written, audit, len(ids))
         return len(ids)
 
     # --- read helpers (API / console) ----------------------------------------
@@ -6673,7 +6749,7 @@ class PostgresStore:
         control_id: str | None = None,
         limit: int = 50,
         offset: int = 0,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
         received_from: float | None = None,
         received_to: float | None = None,
     ) -> list[dict[str, Any]]:
@@ -6713,7 +6789,7 @@ class PostgresStore:
         status: str | None = None,
         message_type: str | None = None,
         control_id: str | None = None,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
         received_from: float | None = None,
         received_to: float | None = None,
     ) -> int:
@@ -6738,7 +6814,7 @@ class PostgresStore:
         message_type: str | None = None,
         control_id: str | None = None,
         limit: int = 50,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> MessageSearchResult:
         """Scan-and-decrypt content search (ADR 0046 #51) — see ``MessageStore.search_messages``.
         Pre-filter on the indexed metadata, then decrypt + match each candidate body in memory off the
@@ -6793,7 +6869,7 @@ class PostgresStore:
         destination_name: str | None = None,
         limit: int = 50,
         offset: int = 0,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> list[dict[str, Any]]:
         """Dead-lettered deliveries (one row per failed message→destination), newest first, joined
         with message metadata. Bodies omitted. ``allowed_channels`` restricts to a per-channel scope."""
@@ -6825,7 +6901,7 @@ class PostgresStore:
         *,
         channel_id: str | None = None,
         destination_name: str | None = None,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> int:
         where, params = self._dead_filter(channel_id, destination_name, allowed_channels)
         row = await self._fetchone(f"SELECT COUNT(*) AS n FROM queue o{where}", *params)
@@ -6836,7 +6912,7 @@ class PostgresStore:
         *,
         channel_id: str | None = None,
         destination_name: str | None = None,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> list[tuple[str, str]]:
         """The contract is ``QueueStore.list_replay_targets``: the :meth:`count_dead` predicate
         narrowed by the two clauses :meth:`replay_dead` applies."""
@@ -7095,20 +7171,69 @@ class PostgresStore:
         )
         return AppendedAuditRow(int(new_id or 0), seq, row_hash)
 
-    async def list_audit(
-        self,
+    async def _execute_with_audits(
+        self, sql: str, params: tuple[Any, ...], audits: Sequence[AuditAppend], *, now: float
+    ) -> None:
+        """Run one account write and append its ``audits`` in the same transaction.
+
+        The contract is ``AuthStore.create_user``'s. With no audits it is a plain :meth:`_execute`.
+        `record=False` as `_execute` passes: an account write is not a pipeline borrow.
+
+        THE WRITE HOLDS ITS ``users`` ROW WHILE IT WAITS FOR THE AUDIT ADVISORY LOCK. BACKLOG #2222
+        reviews that scope for a first sign-in's INSERT only; the directory repoint's UPDATE and
+        the administrator's create (BACKLOG #2221) widen it and are not yet in that item."""
+        if not audits:
+            await self._execute(sql, *params)
+            return
+        async with self._timed_acquire(record=False) as conn, conn.transaction():
+            await conn.execute(sql, *params)
+            appended = await self._append_audits(conn, audits, now=now)
+        tee_audits(audits, appended, ts=now)
+
+    async def _append_audits(
+        self, conn: Any, audits: Sequence[AuditAppend], *, now: float
+    ) -> list[AppendedAuditRow]:
+        """Append each of a write's ``audits``, in order, inside its transaction on ``conn``."""
+        return [
+            await self._append_audit_row(
+                conn,
+                a.action,
+                actor=a.actor,
+                channel_id=a.channel_id,
+                detail=a.detail,
+                client=a.client,
+                now=now,
+            )
+            for a in audits
+        ]
+
+    async def _append_operator_audit[R](
+        self, conn: Any, written: AuditedWrite, audit: OperatorAudit[R] | None, result: R
+    ) -> None:
+        """Append an operator mutation's audit row inside its transaction (BACKLOG #2624), so an
+        append that fails rolls the mutation back. ``written`` tees the row once the commit lands.
+
+        The mutation already holds its queue rows and finalize locks; the append then takes the audit
+        advisory lock. No audit-lock holder takes a queue or finalize lock, so the order cannot
+        cycle."""
+        audits = operator_audits(audit, result)
+        written.add(audits, await self._append_audits(conn, audits, now=written.now))
+
+    @staticmethod
+    def _audit_where(
         *,
-        limit: int = 50,
-        actor: str | None = None,
-        action: str | None = None,
-        since: float | None = None,
-        until: float | None = None,
-        exclude: AuditExclusion | None = None,
-    ) -> Sequence[Row]:
-        """Most-recent-first audit entries, optionally filtered (BACKLOG #170).
+        actor: str | None,
+        action: str | None,
+        since: float | None,
+        until: float | None,
+        exclude: AuditExclusion | None,
+        before_id: int | None,
+    ) -> tuple[str, list[Any]]:
+        """The ``WHERE`` text and its bound values for :meth:`list_audit` and :meth:`count_audit`.
 
         Filters are ANDed as bound ``$N`` parameters — only the fixed column/operator template is
-        formatted into the SQL, never a value — so a filter value cannot inject."""
+        formatted into the SQL, never a value — so a filter value cannot inject. The caller binds
+        its ``LIMIT`` value after these, as the next ``$N``."""
         clauses: list[str] = []
         params: list[Any] = []
         if actor is not None:
@@ -7130,10 +7255,65 @@ class PostgresStore:
                 return f"${len(params)}"
 
             clauses.extend(exclude.clauses(bind))
-        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        if before_id is not None:
+            params.append(before_id)
+            clauses.append(f"id < ${len(params)}")
+        return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
+
+    async def list_audit(
+        self,
+        *,
+        limit: int = 50,
+        actor: str | None = None,
+        action: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+        exclude: AuditExclusion | None = None,
+        before_id: int | None = None,
+    ) -> Sequence[Row]:
+        """Most-recent-first audit entries, optionally filtered (BACKLOG #170), and optionally only
+        those older than ``before_id``, the keyset cursor a paged reader passes (vault BACKLOG #2776).
+        Every value is a bound parameter; see :meth:`_audit_where`."""
+        where, params = self._audit_where(
+            actor=actor,
+            action=action,
+            since=since,
+            until=until,
+            exclude=exclude,
+            before_id=before_id,
+        )
         params.append(limit)
         sql = f"SELECT * FROM audit_log{where} ORDER BY id DESC LIMIT ${len(params)}"
         return await self._fetchall(sql, *params)
+
+    async def count_audit(
+        self,
+        *,
+        limit: int,
+        actor: str | None = None,
+        action: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+        exclude: AuditExclusion | None = None,
+        before_id: int | None = None,
+    ) -> int:
+        """How many rows :meth:`list_audit` would return for the same arguments, without reading
+        them (vault BACKLOG #2776). Every value is a bound parameter; see :meth:`_audit_where`."""
+        where, params = self._audit_where(
+            actor=actor,
+            action=action,
+            since=since,
+            until=until,
+            exclude=exclude,
+            before_id=before_id,
+        )
+        params.append(limit)
+        sql = (
+            f"SELECT COUNT(*) AS n FROM (SELECT id FROM audit_log{where}"
+            f" ORDER BY id DESC LIMIT ${len(params)}) t"
+        )
+        row = await self._fetchone(sql, *params)
+        return int(row["n"]) if row is not None else 0
 
     async def recent_audit_of(self, actions: Sequence[str], *, limit: int) -> list[dict[str, Any]]:
         """Up to ``limit`` newest audit rows whose action is one of ``actions``, newest first (vault
@@ -7429,7 +7609,7 @@ class PostgresStore:
         now: float | None = None,
         adopt_notify_email: bool = True,
         notify_email: str | None = None,
-        audit: AuditAppend | None = None,
+        audits: Sequence[AuditAppend] = (),
     ) -> None:
         check_password_generated(password_generated=password_generated, password_hash=password_hash)
         now = time.time() if now is None else now
@@ -7454,23 +7634,7 @@ class PostgresStore:
             directory_object_id,
             password_generated,
         )
-        if audit is None:
-            await self._execute(sql, *params)
-            return
-        # BACKLOG #2100. The audit row joins the INSERT's transaction, so a failed append rolls the
-        # account back. `record=False` as `_execute` passes: a sign-in is not a pipeline borrow.
-        async with self._timed_acquire(record=False) as conn, conn.transaction():
-            await conn.execute(sql, *params)
-            appended = await self._append_audit_row(
-                conn,
-                audit.action,
-                actor=audit.actor,
-                channel_id=None,
-                detail=audit.detail,
-                client=audit.client,
-                now=now,
-            )
-        audit.tee(ts=now, row=appended)
+        await self._execute_with_audits(sql, params, audits, now=now)
 
     async def get_user(self, user_id: str) -> UserRecord | None:
         d = await self._fetchone("SELECT * FROM users WHERE id=$1", user_id)
@@ -7615,15 +7779,65 @@ class PostgresStore:
 
     async def enable_totp(
         self, user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
-    ) -> None:
+    ) -> bool:
         now = time.time() if now is None else now
-        await self._execute(
+        # Conditional, and the count says whether it wrote: see ``totp_enable_term`` (#2224).
+        written = await self._execute(
             "UPDATE users SET totp_enabled=TRUE, totp_enrolled_at=$1, totp_recovery_codes=$2,"
-            " updated_at=$1 WHERE id=$3",
+            f" updated_at=$1 WHERE id=$3{totp_enable_term('FALSE')}",
             now,
             json.dumps(recovery_code_hashes),
             user_id,
         )
+        return written > 0
+
+    async def replace_totp_enrolment(
+        self,
+        user_id: str,
+        *,
+        secret: str,
+        recovery_code_hashes: list[str],
+        step: int,
+        expected_enrolled_at: float | None,
+        audit: AuditAppend,
+        now: float | None = None,
+    ) -> int | None:
+        """See the SQLite twin (ADR 0171 Amendment B). The swap, the session sweep and the audit row
+        share one transaction. This leg is CI-only, so a divergence from the SQLite and SQL Server
+        bodies surfaces first in CI. ``IS NOT DISTINCT FROM`` is the null-safe compare-and-set."""
+        now = time.time() if now is None else now
+        # `record=False` as `create_user` passes: a CLI write is not a pipeline borrow.
+        async with self._timed_acquire(record=False) as conn, conn.transaction():
+            result = await conn.execute(
+                "UPDATE users SET totp_secret=$1, totp_enrolled_at=$2, totp_recovery_codes=$3,"
+                " last_totp_step=$4, updated_at=$2"
+                " WHERE id=$5 AND totp_enabled=TRUE AND totp_secret IS NOT NULL"
+                " AND totp_enrolled_at IS NOT DISTINCT FROM $6",
+                self._enc(secret, aad=cell_aad("users", "totp_secret", user_id)),
+                now,
+                json.dumps(recovery_code_hashes),
+                step,
+                user_id,
+                expected_enrolled_at,
+            )
+            if _rowcount(result) <= 0:
+                return None  # nothing written, so nothing is revoked or audited
+            revoked = await conn.execute(
+                "UPDATE sessions SET revoked_at=$1 WHERE user_id=$2 AND revoked_at IS NULL",
+                now,
+                user_id,
+            )
+            appended = await self._append_audit_row(
+                conn,
+                audit.action,
+                actor=audit.actor,
+                channel_id=audit.channel_id,
+                detail=audit.detail,
+                client=audit.client,
+                now=now,
+            )
+        audit.tee(ts=now, row=appended)
+        return _rowcount(revoked)
 
     async def disable_totp(self, user_id: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
@@ -7698,18 +7912,19 @@ class PostgresStore:
         display_name: str | None,
         email: str | None,
         now: float | None = None,
+        audits: Sequence[AuditAppend] = (),
     ) -> None:
         """Write the account's profile fields. **This is the directory-sync write** — ``_upsert_ad_user``
         calls it on every AD/OIDC login — so it deliberately does NOT name ``notify_email`` (BACKLOG
         #1139). Adding that column to this SET list would hand the directory the notification target
-        back and restore the defect the split removes."""
+        back and restore the defect the split removes. ``audits``: see
+        ``AuthStore.update_user_profile``."""
         now = time.time() if now is None else now
-        await self._execute(
+        await self._execute_with_audits(
             "UPDATE users SET display_name=$1, email=$2, updated_at=$3 WHERE id=$4",
-            display_name,
-            email,
-            now,
-            user_id,
+            (display_name, email, now, user_id),
+            audits,
+            now=now,
         )
 
     async def set_user_notify_email(
@@ -7855,17 +8070,63 @@ class PostgresStore:
 
     async def delete_user(self, user_id: str) -> None:
         async with self._timed_acquire() as conn, conn.transaction():
-            await conn.execute("DELETE FROM user_roles WHERE user_id=$1", user_id)
-            await conn.execute("DELETE FROM sessions WHERE user_id=$1", user_id)
-            await conn.execute("DELETE FROM webauthn_credentials WHERE user_id=$1", user_id)
-            # vault BACKLOG #2145: the account's known sign-in addresses go with it.
-            await conn.execute("DELETE FROM known_login_addresses WHERE user_id=$1", user_id)
-            # BACKLOG #1233, verbatim with the SQLite and SQL Server bodies: presets are owner-scoped
-            # by Identity.user_id (#1225) with no FK cascade, so without this the rows outlive the
-            # account carrying PHI-shaped `criteria` (ADR 0136) that no owner can reach or purge.
-            # This leg is CI-only, so a divergence between the three backends surfaces first in CI.
-            await conn.execute("DELETE FROM search_presets WHERE owner_user_id=$1", user_id)
-            await conn.execute("DELETE FROM users WHERE id=$1", user_id)
+            await self._delete_user_rows(conn, user_id)
+
+    async def remove_unless_last_admin(
+        self,
+        user_id: str,
+        change: AdminRemoval,
+        *,
+        admin_role_id: str,
+        role_ids: Sequence[str] = (),
+        assigned_by: str | None = None,
+        now: float | None = None,
+    ) -> bool:
+        """The last-administrator guard and its write in one transaction (vault BACKLOG #2779); see
+        ``AuthStore``. The advisory lock comes first, so at the default READ COMMITTED the read after
+        it sees whatever an earlier holder committed before releasing it."""
+        now = time.time() if now is None else now
+        async with self._timed_acquire() as conn, conn.transaction():
+            if change.takes_role(admin_role_id, role_ids):
+                # Only a change that can empty the set queues on the lock.
+                await self._advisory_lock(conn, _LOCK_CLASS_ADMIN_GUARD, _ADMIN_GUARD_LOCK)
+                # The ``$n`` twin of the SQLite store's _SQL_ADMIN_GUARD_COUNTS.
+                target, others = await conn.fetchrow(
+                    "SELECT COALESCE(SUM(CASE WHEN u.id = $1 THEN 1 ELSE 0 END), 0),"
+                    " COALESCE(SUM(CASE WHEN u.id <> $1 THEN 1 ELSE 0 END), 0)"
+                    " FROM users u JOIN user_roles r ON r.user_id = u.id"
+                    " WHERE r.role_id = $2 AND NOT u.disabled",
+                    user_id,
+                    admin_role_id,
+                )
+                if target and not others:
+                    return False  # nothing written; the commit releases the lock
+            if change is AdminRemoval.DISABLE:
+                await conn.execute(
+                    "UPDATE users SET disabled=TRUE, updated_at=$1 WHERE id=$2", now, user_id
+                )
+            elif change is AdminRemoval.DELETE:
+                await self._delete_user_rows(conn, user_id)
+            elif change is AdminRemoval.SET_ROLES:
+                await self._replace_user_roles(conn, user_id, role_ids, assigned_by, now)
+            else:
+                assert_never(change)
+        return True
+
+    @staticmethod
+    async def _delete_user_rows(conn: Any, user_id: str) -> None:
+        """Delete the account and every row keyed to it, inside the caller's transaction."""
+        await conn.execute("DELETE FROM user_roles WHERE user_id=$1", user_id)
+        await conn.execute("DELETE FROM sessions WHERE user_id=$1", user_id)
+        await conn.execute("DELETE FROM webauthn_credentials WHERE user_id=$1", user_id)
+        # vault BACKLOG #2145: the account's known sign-in addresses go with it.
+        await conn.execute("DELETE FROM known_login_addresses WHERE user_id=$1", user_id)
+        # BACKLOG #1233, verbatim with the SQLite and SQL Server bodies: presets are owner-scoped
+        # by Identity.user_id (#1225) with no FK cascade, so without this the rows outlive the
+        # account carrying PHI-shaped `criteria` (ADR 0136) that no owner can reach or purge.
+        # This leg is CI-only, so a divergence between the three backends surfaces first in CI.
+        await conn.execute("DELETE FROM search_presets WHERE owner_user_id=$1", user_id)
+        await conn.execute("DELETE FROM users WHERE id=$1", user_id)
 
     async def record_login_success(self, user_id: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
@@ -8016,16 +8277,23 @@ class PostgresStore:
     ) -> None:
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn, conn.transaction():
-            await conn.execute("DELETE FROM user_roles WHERE user_id=$1", user_id)
-            for role_id in role_ids:
-                await conn.execute(
-                    "INSERT INTO user_roles (user_id, role_id, assigned_at, assigned_by)"
-                    " VALUES ($1,$2,$3,$4)",
-                    user_id,
-                    role_id,
-                    now,
-                    assigned_by,
-                )
+            await self._replace_user_roles(conn, user_id, role_ids, assigned_by, now)
+
+    @staticmethod
+    async def _replace_user_roles(
+        conn: Any, user_id: str, role_ids: Sequence[str], assigned_by: str | None, now: float
+    ) -> None:
+        """Replace the account's role rows, inside the caller's transaction."""
+        await conn.execute("DELETE FROM user_roles WHERE user_id=$1", user_id)
+        for role_id in role_ids:
+            await conn.execute(
+                "INSERT INTO user_roles (user_id, role_id, assigned_at, assigned_by)"
+                " VALUES ($1,$2,$3,$4)",
+                user_id,
+                role_id,
+                now,
+                assigned_by,
+            )
 
     async def set_user_channel_scope(
         self,
@@ -8252,14 +8520,15 @@ class PostgresStore:
         now: float | None = None,
         require_federated_subject: tuple[str | None, str | None] | None = None,
         auth_mechanism: str | None = None,
+        idp_auth_time: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
         # reauth_at ($6) seeds the step-up window from login (ASVS 7.5.3); seed_reauth=False leaves
         # it NULL for an MFA-PENDING session (WP-14) so a stolen pre-MFA token can't enroll/step-up.
         insert = (
             "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at,"
-            " revoked_at, client, reauth_at, auth_mechanism)"
-            " VALUES ($1,$2,$3,$4,$3,NULL,$5,$6,$7)"
+            " revoked_at, client, reauth_at, auth_mechanism, idp_auth_time)"
+            " VALUES ($1,$2,$3,$4,$3,NULL,$5,$6,$7,$8)"
         )
         params = (
             token_hash,
@@ -8269,6 +8538,7 @@ class PostgresStore:
             client,
             now if seed_reauth else None,
             auth_mechanism,
+            None if idp_auth_time is None else float(idp_auth_time),
         )
         if require_federated_subject is None:
             await self._execute(insert, *params)
@@ -8326,15 +8596,24 @@ class PostgresStore:
         )
 
     async def mark_session_reauthed(
-        self, token_hash: str, *, now: float | None = None, client: str | None = None
+        self,
+        token_hash: str,
+        *,
+        now: float | None = None,
+        client: str | None = None,
+        idp_auth_time: float | None = None,
     ) -> None:
         now = time.time() if now is None else now
         # COALESCE keeps the stored client when none is supplied; a re-verify carrying the current
-        # address re-anchors the session to it (WP-L3-13 new-client-IP step-up).
+        # address re-anchors the session to it (WP-L3-13 new-client-IP step-up). The IdP auth_time
+        # only moves forward, and a NULL leaves it (BACKLOG #2143; store.py's
+        # _IDP_AUTH_TIME_FORWARD_SQL says why). GREATEST ignores a NULL argument on Postgres.
         await self._execute(
-            "UPDATE sessions SET reauth_at=$1, client=COALESCE($2, client) WHERE token_hash=$3",
+            "UPDATE sessions SET reauth_at=$1, client=COALESCE($2, client),"
+            " idp_auth_time=GREATEST($3::double precision, idp_auth_time) WHERE token_hash=$4",
             now,
             client,
+            None if idp_auth_time is None else float(idp_auth_time),
             token_hash,
         )
 
@@ -8775,7 +9054,7 @@ class PostgresStore:
         from messagefoundry.store.base import DbaDelegatedError
 
         raise DbaDelegatedError(
-            "the postgres store backup is DBA-delegated (pg_dump / PITR, BACKLOG #52); the engine backs "
+            "the postgres store backup is DBA-delegated (pg_dump / PITR; BACKLOG #52); the engine backs "
             "up the config bundle only on a server-DB store (set [backup].config_only_on_server_db)"
         )
 

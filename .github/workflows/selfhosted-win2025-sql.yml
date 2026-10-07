@@ -4,15 +4,68 @@
 # (they exercise SQL Server only on a Linux service container). It is the companion to ci.yml's
 # `sql server (store + connector)` legs — the SAME suites, run on the real OS + driver stack.
 #
-# SECURITY (a self-hosted runner executes repository code — critical on a PUBLIC repo, where a fork PR
-# could otherwise run attacker code on the runner host):
-#   * Gated to `workflow_dispatch` ONLY — never `pull_request`, never a fork, no schedule. Dispatch is
-#     restricted to users with write access, so untrusted fork code never reaches this runner. That
-#     dispatch-only posture (NOT repo privacy) is the control. Run it ON DEMAND when the VM is up.
-#   * NOT a required check, and there is NO scheduled trigger — so the VM never has to be on. Nothing
-#     queues or fails while it is off; a manual run just waits for the runner (and expires after ~24h if
-#     the VM never comes up). It never blocks a PR or a merge.
-#   * The runner (label `mefor-win2025-sql`) lives in a dedicated, isolated Windows Server 2025 VM.
+# SECURITY. A self-hosted runner executes whatever code the job it picks up checks out, and this
+# repository is PUBLIC.
+#
+# DISPATCH-ONLY IS NOT THE CONTROL. This header used to say it was; that was a compensating control
+# resting on a false premise (SDS-3.7, vault BACKLOG #2765). The `workflow_dispatch` trigger below
+# decides only when THIS file runs, and dispatch needs write access. It says nothing about which OTHER
+# jobs can reach the runner, because GitHub picks a runner by the `runs-on:` labels of whatever job is
+# queued, not by which workflow file first named those labels. A fork pull request can edit any
+# `pull_request`-triggered workflow here, or add a new one, to
+# `runs-on: [self-hosted, windows, mefor-win2025-sql]`, and on a registered runner that job would run
+# the fork's code. Forks being denied repository secrets does not help: the SQL password is in the
+# runner's MACHINE environment (CREDENTIALS below), which any job on the box can read.
+#
+# NO RUNNER IS KNOWN TO BE REGISTERED for this label: vault BACKLOG #1003 read the repository's runner
+# list as empty on 2026-09-11. That list shows repository runners only; an organization runner, which
+# item 1 requires, is listed under the organization. Owner ruling 2026-10-06, "Lock down, then
+# register": the registration #1003 plans may happen only after ALL THREE of these are confirmed in
+# place. They are server-side settings, so nothing in this repository can show them; read each one from
+# GitHub before registering. If any one is missing, the runner stays unregistered.
+#   1. An ORGANIZATION runner group holding only this runner, its repository access limited to this
+#      repository, and restricted to SELECTED WORKFLOWS allowing only this file at `refs/heads/main`:
+#      `MEFORORG/MessageFoundry/.github/workflows/selfhosted-win2025-sql.yml@refs/heads/main` (in
+#      whichever spelling of the main-branch ref GitHub's form accepts; it must name main and nothing
+#      wider). GitHub lets a public repository use a group only with the group's "Allow public
+#      repositories" option on; turn that on only together with the selected-workflows restriction.
+#      A runner registered on the repository itself cannot be put in a group, so register it at the
+#      organization. Whether custom runner groups are available can depend on the organization's
+#      GitHub plan; if this group cannot be created, item 1 is unmet. Dispatch this workflow from
+#      `main`: a run from another branch never gets a runner, and it holds this file's concurrency
+#      slot while it waits, so cancel it rather than leave it queued.
+#   2. The repository's fork pull request approval set to require approval for ALL outside
+#      collaborators (Settings, Actions, General; the owner ruling's wording, and GitHub's label for
+#      the option has varied). It is the strictest of the fork-approval options; GitHub's default asks
+#      only for first-time contributors, which does not satisfy this item.
+#   3. An EPHEMERAL or JIT runner on a VM restored to a clean snapshot after every job, so no machine
+#      state (the system Python, the local SQL instance, files) carries from one job to the next. The
+#      `--ephemeral` flag alone only de-registers the runner after one job; it does not wipe the VM.
+#   Items 1 and 2 keep other workflows' code, and forks' code, off the runner. Item 3 stops a job that
+#   does reach the box from tampering with later jobs; it does not undo a password that job already
+#   read, so a failure of item 1 or 2 still means rotating MEFOR_STORE_PASSWORD.
+#   ITEM 1 ADMITS ANY RUN OF THIS FILE AT `main`, so it holds only while two things stay true here.
+#   (a) The trigger stays `workflow_dispatch` alone. Several other triggers, at least
+#   `pull_request_target`, `workflow_run`, `issue_comment`, `issues` and `workflow_call`, would run
+#   this file at main on an event a fork or a stranger can cause, and item 1 would admit that run.
+#   (b) The job checks out only the commit the run was started at: no dispatch `inputs:`, and no
+#   `ref:` or `repository:` on the checkout, either of which could point a main run at fork code.
+#   tests/test_selfhosted_sql_runner_isolation.py pins both, and pins that no other workflow's
+#   `runs-on` asks for a self-hosted runner.
+#   NOT COVERED by these three: the job's own install pulls third-party code from PyPI, at least an
+#   unpinned `pip --upgrade`, a hash-free constraints file, and the build backend that
+#   `pip install -e .` fetches into its isolated build environment. That code runs beside the
+#   password too.
+#
+# OPERATION:
+#   * Run it ON DEMAND. NOT a required check, and there is NO scheduled trigger, so the VM never has to
+#     be on. A dispatched run waits for a runner (and expires after ~24h if none comes up). It never
+#     blocks a PR or a merge.
+#   * Item 3 means each run gets a freshly provisioned runner (VM reset, new JIT configuration or
+#     registration), brought up while the dispatched job waits rather than left idle beforehand. Do
+#     not fall back to a persistent registration to save that step; that silently drops item 3.
+#   * The runner (label `mefor-win2025-sql`), once registered, lives in a dedicated, isolated Windows
+#     Server 2025 VM.
 #
 # CREDENTIALS: the SQL connection comes from the RUNNER's machine environment (set on the box, never in
 # this repo). This workflow sets only the NON-SECRET posture + the agreed instance values; the password

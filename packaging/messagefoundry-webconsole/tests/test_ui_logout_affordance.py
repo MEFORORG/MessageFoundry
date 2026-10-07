@@ -49,11 +49,13 @@ _PAGES_DIR = Path(messagefoundry_webconsole.__file__).parent / "pages"
 
 
 def test_reauth_page_renders_sign_out() -> None:
-    assert LOGOUT_FORM in pages.reauth("/ui/messages/1/replay", mfa_needed=False)
+    assert LOGOUT_FORM in pages.reauth(
+        "/ui/messages/1/replay", label="Replay a message", continues=True, mfa_needed=False
+    )
 
 
 def test_reauth_continue_page_renders_sign_out() -> None:
-    assert LOGOUT_FORM in pages.reauth_continue("/ui/messages/1/replay")
+    assert LOGOUT_FORM in pages.reauth_continue("/ui/messages/1/replay", "Replay a message")
 
 
 def test_forced_password_page_renders_sign_out() -> None:
@@ -88,8 +90,8 @@ def test_minimal_nav_omits_the_permission_gated_status_poll() -> None:
     GET /ui/nav-status (~15s), which needs monitoring:read — on a reauth / must-change / passkey page
     that poll would 303-loop to the login or change-password page."""
     for markup in (
-        pages.reauth("/ui/x", mfa_needed=False),
-        pages.reauth_continue("/ui/x"),
+        pages.reauth("/ui/x", label="Do x", continues=True, mfa_needed=False),
+        pages.reauth_continue("/ui/x", "Do x"),
         pages.password_page(forced=True),
         pages.webauthn_enroll_page("{}"),
         pages.oidc_landing(),

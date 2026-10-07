@@ -1975,6 +1975,9 @@ def test_the_last_sink_dying_does_ask_for_a_stop(tmp_path: Path) -> None:
 #: consumer takes it verbatim, that tail becomes its own physical line and reads as engine output.
 _FORGED_TAIL = "2026-01-01T00:00:00Z CRITICAL messagefoundry: all sinks healthy"
 _FORGED_REASON = f"cannot write\r\n{_FORGED_TAIL}"
+#: The tail without its leading timestamp. The redaction pass (vault BACKLOG #2784) reads an ISO
+#: date-time as a possible date of birth and masks it, so only this part survives verbatim.
+_FORGED_BODY = _FORGED_TAIL.split(" ", 1)[1]
 
 #: A synthetic DSN (never a real credential) inside a failure message. The password must be masked
 #: and the scheme plus user must survive, so an operator still learns WHICH connection failed.
@@ -2030,7 +2033,7 @@ def test_a_stream_error_cannot_forge_a_line_in_the_notice_it_causes(tmp_path: Pa
     assert lines[1] == "ordinary"
     # The text survives in escaped form, so the operator still reads the real cause.
     assert "cannot write\\r\\n" in lines[0]
-    assert _FORGED_TAIL in lines[0]  # …on the notice's own line, not on one of its own
+    assert _FORGED_BODY in lines[0]  # …on the notice's own line, not on one of its own
 
 
 def test_the_ordinary_failure_reason_survives_the_scrub_intact(tmp_path: Path) -> None:
@@ -2084,7 +2087,7 @@ def test_status_and_the_alert_carry_no_raw_newline_from_a_stage_two_break(
     err = capsys.readouterr().err.splitlines()
     unwritable = [line for line in err if "IS UNWRITABLE" in line]
     assert len(unwritable) == 1
-    assert _FORGED_TAIL in unwritable[0]  # on the guard's own line, not on a forged one
+    assert _FORGED_BODY in unwritable[0]  # on the guard's own line, not on a forged one
 
 
 def test_a_credential_in_a_failure_message_is_masked_before_it_reaches_the_notice(

@@ -77,8 +77,10 @@ PHI at rest is protected in **two layers**, and the engine layer is made **fail-
 ## 3. Encryption in transit — no PHI on the wire in cleartext
 
 - **API / WSS:** in-process TLS (`MEFOR_API_TLS_CERT_FILE` / `MEFOR_API_TLS_KEY_FILE`), or an upstream
-  TLS terminator (`tls_terminated_upstream` + `trusted_proxies`). A non-loopback API bind without TLS is
-  **refused at startup**. Behind a terminator with no `tls_cert_file`, the proxy-to-engine hop is
+  TLS terminator (`tls_terminated_upstream` + `trusted_proxies`). A non-loopback API bind with neither is
+  **refused at startup**. The engine's self-signed placeholder certificate does not count
+  ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)).
+  Behind a terminator with no `tls_cert_file`, the proxy-to-engine hop is
   **plaintext** and not encrypted by the engine. Your site must keep it private, and `serve` requires
   `[api].plaintext_upstream_hop_acknowledged` to say so (see `docs/CONFIGURATION.md`).
 - **MLLP data plane:** **MLLP-over-TLS** (`tls=True` per connection). A non-loopback MLLP listener without
@@ -134,8 +136,8 @@ PHI at rest is protected in **two layers**, and the engine layer is made **fail-
 - **Authentication required + MFA.** Sign-in is always on, and `serve` refuses to start without it
   (vault BACKLOG #2719). `MEFOR_SECURITY_REQUIRE_MFA=true`, the default.
   It covers directory accounts too; [SECURITY.md](SECURITY.md#multi-factor-authentication-totp-wp-14)
-  states which accounts owe a factor. An instance is exposed when it has an off-loopback bind or a
-  declared TLS-terminating proxy. An exposed instance with `require_mfa=false` **refuses** to start
+  states which accounts owe a factor. An instance is exposed when it has an off-loopback bind, a
+  declared TLS-terminating proxy, or a set `[api].trusted_proxies` (vault BACKLOG #2251). An exposed instance with `require_mfa=false` **refuses** to start
   under the shipped `enforce`, unless `[security].allow_single_factor_admin_when_exposed` is set.
 - **Deny-by-default egress.** `MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND=true` + the `MEFOR_EGRESS_ALLOWED_*` lists, so a
   transform can only send to approved destinations — a fail-closed exfiltration guard.

@@ -65,6 +65,7 @@ from messagefoundry.store.privilege import (
 )
 from messagefoundry.store.store import (
     UPLOAD_RESERVATION_STALE_AFTER,
+    AdminRemoval,
     AlertInstance,
     AlertSummary,
     AuditAppend,
@@ -84,6 +85,7 @@ from messagefoundry.store.store import (
     MessageSearchResult,
     MessageStatus,
     MessageStore,
+    OperatorAudit,
     OutboxItem,
     OwnedLanes,
     ReingressOriginMissing,
@@ -342,6 +344,7 @@ class QueueStore(StoreLifecycle, Protocol):
         metadata: str | None = None,
         attachment_refs: Sequence[str] | None = None,
         now: float | None = None,
+        audit: OperatorAudit[str] | None = None,
     ) -> str:
         """Durably persist a freshly-received raw message to the ingress stage (status ``RECEIVED`` +
         one ``stage='ingress'`` queue row) in one transaction — the staged pipeline's ACK-on-receipt
@@ -350,7 +353,10 @@ class QueueStore(StoreLifecycle, Protocol):
         ``attachment_refs`` (#149, ADR 0105 Phase 1a) are the content addresses of documents the ingress
         detach lifted into the attachment substrate; each distinct ref is increffed in the SAME
         transaction as the skeleton row (the two-object commit). Only a backend whose
-        :attr:`supports_streaming_attachments` is True ever receives a non-empty value."""
+        :attr:`supports_streaming_attachments` is True ever receives a non-empty value.
+
+        ``audit`` is for an operator's inject only (BACKLOG #2624): its row, built from the new
+        message id, commits in the same transaction. A live receipt passes none."""
         ...
 
     async def handoff(
@@ -1017,7 +1023,15 @@ class QueueStore(StoreLifecycle, Protocol):
         :attr:`supports_streaming_attachments` is ``False``."""
         ...
 
-    async def replay(self, message_id: str, now: float | None = None) -> int: ...
+    # The operator mutations. Each takes an ``audit`` that builds the operator's audit row from the
+    # result, and the row commits in the mutation's own transaction (BACKLOG #2624, OperatorAudit).
+    async def replay(
+        self,
+        message_id: str,
+        now: float | None = None,
+        *,
+        audit: OperatorAudit[int] | None = None,
+    ) -> int: ...
 
     async def resend_to(
         self,
@@ -1028,6 +1042,7 @@ class QueueStore(StoreLifecycle, Protocol):
         from_: str | None = None,
         body_override: str | None = None,
         now: float | None = None,
+        audit: OperatorAudit[ResendOutcome] | None = None,
     ) -> ResendOutcome: ...
 
     async def reingress(
@@ -1037,6 +1052,7 @@ class QueueStore(StoreLifecycle, Protocol):
         raw: str,
         idempotency_key: str,
         now: float | None = None,
+        audit: OperatorAudit[ReingressOutcome] | None = None,
     ) -> ReingressOutcome: ...
 
     async def replay_dead(
@@ -1045,6 +1061,7 @@ class QueueStore(StoreLifecycle, Protocol):
         channel_id: str | None = None,
         destination_name: str | None = None,
         now: float | None = None,
+        audit: OperatorAudit[int] | None = None,
     ) -> int: ...
 
     async def cancel_queued(
@@ -1054,6 +1071,7 @@ class QueueStore(StoreLifecycle, Protocol):
         *,
         top_only: bool = False,
         now: float | None = None,
+        audit: OperatorAudit[int] | None = None,
     ) -> int: ...
 
     # --- read helpers (API / console) ----------------------------------------
@@ -1070,6 +1088,9 @@ class QueueStore(StoreLifecycle, Protocol):
         :func:`~messagefoundry.store.metadata.user_metadata`."""
         ...
 
+    # ``allowed_channels`` is a REQUIRED keyword on every read below that takes it (BACKLOG #2627).
+    # ``None`` still means every channel, but a caller must now write it, so a route that forgets the
+    # scope fails mypy rather than reading the whole estate. Engine-internal callers pass ``None``.
     async def list_messages(
         self,
         *,
@@ -1079,7 +1100,7 @@ class QueueStore(StoreLifecycle, Protocol):
         control_id: str | None = None,
         limit: int = 50,
         offset: int = 0,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
         received_from: float | None = None,
         received_to: float | None = None,
     ) -> Sequence[Row]: ...
@@ -1091,7 +1112,7 @@ class QueueStore(StoreLifecycle, Protocol):
         status: str | None = None,
         message_type: str | None = None,
         control_id: str | None = None,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
         received_from: float | None = None,
         received_to: float | None = None,
     ) -> int: ...
@@ -1105,7 +1126,7 @@ class QueueStore(StoreLifecycle, Protocol):
         message_type: str | None = None,
         control_id: str | None = None,
         limit: int = 50,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> MessageSearchResult:
         """Scan-and-decrypt content search (ADR 0046 #51): metadata pre-filter in SQL, then decrypt +
         match each candidate body in memory off the event loop — the only mechanism that works while the
@@ -1121,7 +1142,7 @@ class QueueStore(StoreLifecycle, Protocol):
         destination_name: str | None = None,
         limit: int = 50,
         offset: int = 0,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> Sequence[Row]: ...
 
     async def count_dead(
@@ -1129,7 +1150,7 @@ class QueueStore(StoreLifecycle, Protocol):
         *,
         channel_id: str | None = None,
         destination_name: str | None = None,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> int: ...
 
     async def list_replay_targets(
@@ -1137,7 +1158,7 @@ class QueueStore(StoreLifecycle, Protocol):
         *,
         channel_id: str | None = None,
         destination_name: str | None = None,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> list[tuple[str, str]]:
         """The distinct ``(channel_id, destination_name)`` pairs for which :meth:`replay_dead`
         would re-queue at least one row, sorted, under the :meth:`count_dead` filters and
@@ -1232,7 +1253,7 @@ class QueueStore(StoreLifecycle, Protocol):
         kinds: Sequence[str] | None = None,
         since: float | None = None,
         limit: int = 100,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> list[ConnectionEvent]:
         """Read connection events newest-first, optionally filtered by ``connection``, an ``kinds``
         allow-set, and a ``since`` timestamp. ``reason`` is decrypted at the boundary. The read accessor
@@ -1276,7 +1297,7 @@ class QueueStore(StoreLifecycle, Protocol):
         self,
         *,
         limit: int = 200,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> list[AlertInstance]:
         """Read **open + acknowledged** alert instances newest-``last_seen`` first — the read accessor for
         the ``GET /alerts/active`` route. Runs on the lockfree read path; ``limit`` clamped server-side.
@@ -1285,7 +1306,7 @@ class QueueStore(StoreLifecycle, Protocol):
         ...
 
     async def summarize_active_alert_instances(
-        self, *, allowed_channels: Sequence[str] | None = None
+        self, *, allowed_channels: Sequence[str] | None
     ) -> AlertSummary:
         """The count + worst severity of **open + acknowledged** instances across the WHOLE of the
         caller's scope (BACKLOG #1564) — the nav alert bell's read, which a page of rows cannot answer.
@@ -1335,7 +1356,7 @@ class QueueStore(StoreLifecycle, Protocol):
         ...
 
     async def get_alert_instance(
-        self, alert_id: int, *, allowed_channels: Sequence[str] | None = None
+        self, alert_id: int, *, allowed_channels: Sequence[str] | None
     ) -> AlertInstance | None:
         """Read one alert instance by id (any status), RBAC-scoped like
         :meth:`list_active_alert_instances` — the API echo after an ack/resolve. ``None`` if unknown or
@@ -1682,6 +1703,7 @@ class AuditStore(Protocol):
         since: float | None = None,
         until: float | None = None,
         exclude: AuditExclusion | None = None,
+        before_id: int | None = None,
     ) -> Sequence[Row]:
         """Most-recent-first audit entries, optionally scoped (BACKLOG #170).
 
@@ -1694,7 +1716,27 @@ class AuditStore(Protocol):
         every backend) — are ANDed. Every value is passed as a bound parameter (never interpolated),
         so an attacker-influenced filter can never inject SQL. Ordering, ``limit``, and the hash-chain
         read semantics are unchanged; passing no filter is byte-identical to the limit-only query.
+
+        ``before_id`` is a keyset cursor (vault BACKLOG #2776): only rows whose ``id`` is below it.
+        A reader pages the trail newest first by passing the last ``id`` of one page as the next
+        page's ``before_id``, so it never holds more than one page; ``GET /audit/export`` does this.
         """
+        ...
+
+    async def count_audit(
+        self,
+        *,
+        limit: int,
+        actor: str | None = None,
+        action: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+        exclude: AuditExclusion | None = None,
+        before_id: int | None = None,
+    ) -> int:
+        """How many rows :meth:`list_audit` would return for the same arguments, counted in the
+        database rather than read (vault BACKLOG #2776). ``GET /audit/export`` records it in its
+        ``audit.export`` row before the body, when its first page alone cannot settle the count."""
         ...
 
     async def security_events_for_user(
@@ -1833,7 +1875,7 @@ class AuthStore(Protocol):
         now: float | None = None,
         adopt_notify_email: bool = True,
         notify_email: str | None = None,
-        audit: AuditAppend | None = None,
+        audits: Sequence[AuditAppend] = (),
     ) -> None:
         """Insert one account row.
 
@@ -1850,8 +1892,9 @@ class AuthStore(Protocol):
         is bound as the notification address instead: an administrator's checked address for a
         directory account created without a sign-in (BACKLOG #2021).
 
-        ``audit``, when given, is appended to the audit chain in the SAME transaction as the INSERT,
-        so the two commit or roll back together, then teed off-box (BACKLOG #2100)."""
+        ``audits`` are appended to the audit chain, in order, in the SAME transaction as the INSERT,
+        so the account and its records commit or roll back together, then teed off-box (BACKLOG
+        #2100, #2221)."""
         ...
 
     async def get_user(self, user_id: str) -> UserRecord | None: ...
@@ -2006,7 +2049,13 @@ class AuthStore(Protocol):
         display_name: str | None,
         email: str | None,
         now: float | None = None,
-    ) -> None: ...
+        audits: Sequence[AuditAppend] = (),
+    ) -> None:
+        """Write the account's profile fields, never ``notify_email`` (BACKLOG #1139).
+
+        ``audits`` commit in the SAME transaction as the UPDATE, as ``create_user``'s do (BACKLOG
+        #2221)."""
+        ...
 
     # The ONLY writer of ``users.notify_email`` after account creation, which seeds it once from the
     # address it was given (BACKLOG #1139, ASVS 6.3.7). Every out-of-band security notice is addressed
@@ -2023,7 +2072,12 @@ class AuthStore(Protocol):
     ) -> None: ...
 
     # Also deletes the account's ``known_login_addresses`` rows (vault BACKLOG #2145).
-    async def delete_user(self, user_id: str) -> None: ...
+    async def delete_user(self, user_id: str) -> None:
+        """Delete an account and every row keyed to it. **Unguarded:** it does not refuse the last
+        enabled administrator. An administrator's delete goes through
+        :meth:`remove_unless_last_admin` with ``DELETE`` (vault BACKLOG #2779); use this only where
+        the account cannot hold Administrator."""
+        ...
 
     # --- The first-seen sign-in address baseline (BACKLOG #288, vault BACKLOG #2145) ---
     # One row per (account id, host key). The caller folds the address to its host key; the store
@@ -2049,9 +2103,35 @@ class AuthStore(Protocol):
 
     async def get_totp_secret(self, user_id: str) -> str | None: ...
 
+    # CONDITIONAL (BACKLOG #2224): writes only where a secret is staged (``totp_secret IS NOT NULL``)
+    # and TOTP is still off, in the same UPDATE, and returns whether a row was written. An
+    # ``admin_reset_mfa`` that clears the secret, or a second confirm that enables first, between
+    # the caller's checks and this write makes it match no row. A caller must refuse on False and
+    # never treat MFA as on, the way ``set_password(require_totp=...)`` callers do. It does not
+    # check that the staged secret is the one the caller verified; a re-stage in the window is
+    # not caught.
     async def enable_totp(
         self, user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
-    ) -> None: ...
+    ) -> bool: ...
+
+    # ADR 0171 Amendment B (BACKLOG #2226), for `admin-reset-totp`: swaps an ENABLED enrolment's
+    # secret, recovery codes and step high-water mark in ONE UPDATE, with TOTP on throughout, so the
+    # account never passes through zero factors. The same transaction ends the account's sessions
+    # and appends `audit`, so the swap is never live unrecorded. Conditional on TOTP being on and
+    # on `totp_enrolled_at` still being `expected_enrolled_at` (compare-and-set against the
+    # caller's read). Returns the sessions ended, or None when nothing was written; a caller must
+    # refuse on None.
+    async def replace_totp_enrolment(
+        self,
+        user_id: str,
+        *,
+        secret: str,
+        recovery_code_hashes: list[str],
+        step: int,
+        expected_enrolled_at: float | None,
+        audit: AuditAppend,
+        now: float | None = None,
+    ) -> int | None: ...
 
     async def disable_totp(self, user_id: str, *, now: float | None = None) -> None: ...
 
@@ -2196,6 +2276,37 @@ class AuthStore(Protocol):
         assigned_by: str | None = None,
         now: float | None = None,
     ) -> None: ...
+
+    async def remove_unless_last_admin(
+        self,
+        user_id: str,
+        change: AdminRemoval,
+        *,
+        admin_role_id: str,
+        role_ids: Sequence[str] = (),
+        assigned_by: str | None = None,
+        now: float | None = None,
+    ) -> bool:
+        """Apply ``change`` to ``user_id`` unless it would leave no enabled administrator (vault
+        BACKLOG #2779).
+
+        One transaction re-reads the enabled accounts holding ``admin_role_id`` and refuses, writing
+        nothing and returning ``False``, when ``user_id`` is one of them, no other is, and the
+        change takes the role away (:meth:`AdminRemoval.takes_role`). The ids are compared in SQL,
+        so the guard matches an id exactly as the write does. Otherwise it writes and returns ``True``:
+        ``DISABLE`` sets ``disabled``, ``DELETE`` is :meth:`delete_user`, ``SET_ROLES`` is
+        :meth:`set_user_roles` with ``role_ids`` and ``assigned_by``.
+
+        **Every call is serialized against every other call on the same database**, not only in
+        this process: the server backends take a transaction-scoped lock before the read, because
+        each engine shard serves its own API over one unified store (ADR 0063). So two removals
+        that each see two administrators cannot both pass, which a check in one await and a write
+        in the next allowed. Writes that only ADD administrators need no lock: they cannot empty
+        the set. The directory-driven role writes (the AD sign-in sync and the session reconciler)
+        do not come through here and were never guarded: they take roles on the directory's word.
+        ``DISABLE`` and ``SET_ROLES`` leave the account's sessions for the caller to revoke after;
+        ``DELETE``, like :meth:`delete_user`, removes them with the account."""
+        ...
 
     async def set_user_channel_scope(
         self,
@@ -2367,6 +2478,7 @@ class AuthStore(Protocol):
         now: float | None = None,
         require_federated_subject: tuple[str | None, str | None] | None = None,
         auth_mechanism: str | None = None,
+        idp_auth_time: float | None = None,
     ) -> bool:
         """Insert a session row. Returns ``True`` when one was written.
 
@@ -2374,6 +2486,11 @@ class AuthStore(Protocol):
         ``oidc``; ADR 0184 item (iv)). It is written once here and never updated, and
         ``rotate_session`` carries it forward with the rest of the row. It decides which step-up leg
         the session takes (ADR 0142 Amendment B), so a caller that mints a session states it.
+
+        ``idp_auth_time`` is the federated sign-in's verified ``auth_time``, as the IdP stated it
+        (BACKLOG #2143). Only an ``oidc`` mint passes one. The IdP step-up compares its own
+        ``auth_time`` with it, IdP clock against IdP clock, and :meth:`mark_session_reauthed` moves
+        it forward when a step-up succeeds. ``rotate_session`` carries it.
 
         ``require_federated_subject`` makes the insert CONDITIONAL on the account still carrying
         that verified ``(issuer, sub)``, checked in the same transaction (BACKLOG #1474): the row is
@@ -2424,7 +2541,8 @@ class AuthStore(Protocol):
         """Re-key a live session to ``new_token_hash``, in place (ASVS 7.2.4).
 
         A pure re-key: every other column — ``user_id``, ``created_at``, ``expires_at``, ``client``,
-        ``reauth_at``, ``mfa_verified_at``, ``auth_mechanism`` — is carried forward byte-identical.
+        ``reauth_at``, ``mfa_verified_at``, ``auth_mechanism``, ``idp_auth_time`` — is carried
+        forward byte-identical.
         It stamps **nothing**, deliberately, so "the session is the same session, under a new name"
         is the whole contract. In particular ``expires_at`` is untouched, so no amount of rotation
         can extend the absolute session lifetime, and ``mfa_verified_at`` survives, so a rotation
@@ -2443,12 +2561,23 @@ class AuthStore(Protocol):
         ...
 
     async def mark_session_reauthed(
-        self, token_hash: str, *, now: float | None = None, client: str | None = None
+        self,
+        token_hash: str,
+        *,
+        now: float | None = None,
+        client: str | None = None,
+        idp_auth_time: float | None = None,
     ) -> None:
         """Refresh the session's step-up freshness (``reauth_at``). When ``client`` is given, also
         re-anchor the session's last-verified client address to it (the new-client-IP risk signal in
         WP-L3-13 uses this so a re-verify from a roamed address clears the forced step-up); a ``None``
-        ``client`` leaves the stored address unchanged."""
+        ``client`` leaves the stored address unchanged.
+
+        ``idp_auth_time``, when given, moves the session's stored IdP ``auth_time`` FORWARD to it in
+        the SAME statement (BACKLOG #2143), and never backwards: a value older than the stored one
+        leaves it. The IdP step-up passes the ``auth_time`` it just accepted, so the next step-up
+        must show a later one, and an IdP that answers again from the same sign-in is refused.
+        ``None`` leaves the stored value unchanged, as the password legs need."""
         ...
 
     async def mark_session_mfa_verified(

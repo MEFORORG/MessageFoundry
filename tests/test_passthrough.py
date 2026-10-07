@@ -210,7 +210,7 @@ async def test_passthrough_handoff_produces_child_and_parent_processed(
     assert pmsg is not None and pmsg["status"] == MessageStatus.PROCESSED.value
 
     # Child: a distinct message on the PT channel, RECEIVED, correlated, with a pending INGRESS row.
-    msgs = await store.list_messages(channel_id="PT_NEXT")
+    msgs = await store.list_messages(channel_id="PT_NEXT", allowed_channels=None)
     assert len(msgs) == 1
     child = msgs[0]
     assert child["id"] != parent
@@ -246,7 +246,7 @@ async def test_passthrough_plus_outbound_in_one_handler(store: MessageStore) -> 
     depth_out, _ = await store.pending_depth("OB_REAL", stage=Stage.OUTBOUND.value)
     assert depth_out == 1
     # PT child produced.
-    assert len(await store.list_messages(channel_id="PT_NEXT")) == 1
+    assert len(await store.list_messages(channel_id="PT_NEXT", allowed_channels=None)) == 1
 
 
 async def test_passthrough_child_routes_onward_to_outbound(store: MessageStore) -> None:
@@ -261,7 +261,7 @@ async def test_passthrough_child_routes_onward_to_outbound(store: MessageStore) 
         pt_deliveries=[("PT_NEXT", "MSH|child")],
         now=101.0,
     )
-    child_id = (await store.list_messages(channel_id="PT_NEXT"))[0]["id"]
+    child_id = (await store.list_messages(channel_id="PT_NEXT", allowed_channels=None))[0]["id"]
     # Simulate the PT inbound's router+transform: consume the child's INGRESS row, route to a handler,
     # then transform_handoff that handler's routed row to a real outbound.
     ingress = await store.claim_next_fifo("PT_NEXT", stage=Stage.INGRESS.value)
@@ -313,7 +313,7 @@ async def test_passthrough_handoff_idempotent_rerun(store: MessageStore) -> None
         )
         is False
     )
-    assert len(await store.list_messages(channel_id="PT_NEXT")) == 1
+    assert len(await store.list_messages(channel_id="PT_NEXT", allowed_channels=None)) == 1
 
 
 async def test_passthrough_child_id_is_content_addressed(store: MessageStore) -> None:
@@ -351,7 +351,7 @@ async def test_passthrough_depth_cap_drops_child_and_errors_parent(
     )
     assert ok is True
     # No child produced.
-    assert await store.list_messages(channel_id="PT_NEXT") == []
+    assert await store.list_messages(channel_id="PT_NEXT", allowed_channels=None) == []
     # Parent ERROR (the dead marker row).
     pmsg = await store.get_message(parent)
     assert pmsg is not None and pmsg["status"] == MessageStatus.ERROR.value
@@ -375,7 +375,7 @@ async def test_passthrough_correlation_root_propagates(store: MessageStore) -> N
         pt_deliveries=[("PT_NEXT", "MSH|child")],
         now=101.0,
     )
-    child_id = (await store.list_messages(channel_id="PT_NEXT"))[0]["id"]
+    child_id = (await store.list_messages(channel_id="PT_NEXT", allowed_channels=None))[0]["id"]
     full = await store.get_message(child_id)
     assert full is not None
     meta = json.loads(full["metadata"])

@@ -39,6 +39,11 @@ from messagefoundry.store import MessageStatus, OutboxStatus, Stage
 from messagefoundry.store.content_search import make_spec
 from messagefoundry.store.crypto import MARKER_PREFIX, cell_aad, generate_key, make_cipher
 from messagefoundry.store.store import load_audit_chain
+from tests._replay_settle_contract import CASES as REPLAY_SETTLE_CASES
+from tests._replay_settle_contract import (
+    assert_replayed_ingress_row_is_received,
+    assert_replayed_routed_row_settles,
+)
 from tests.audit_chain_cases import CASES, ChainBackend, server_chain_backend
 
 # A synthetic ADT carrying a (fake) MRN + name in PID — never real PHI.
@@ -246,10 +251,12 @@ async def test_ingest4_nul_ingress_persists_error_row(store) -> None:
         assert getattr(probe.value, "sqlstate", None) == "22021"
 
     for body in (_INGEST4_DECODE_ERR_NUL, _INGEST4_HAPPY_NUL):
-        before = {m["id"] for m in await store.list_messages(channel_id="IB_HL7")}
+        before = {
+            m["id"] for m in await store.list_messages(channel_id="IB_HL7", allowed_channels=None)
+        }
         ack = await runner._handle_inbound(ic, body)  # must NOT raise / drop the connection
         assert ack is not None and "MSA|AR" in ack  # AR NAK, not a dropped connection
-        after = await store.list_messages(channel_id="IB_HL7")
+        after = await store.list_messages(channel_id="IB_HL7", allowed_channels=None)
         new = [m for m in after if m["id"] not in before]
         assert len(new) == 1  # exactly one ERROR row persisted for this body
         erow = new[0]
@@ -695,15 +702,15 @@ async def _dead(store, channel_id: str, dest: str, *, now: float = 100.0) -> str
 async def test_list_count_and_replay_dead(store) -> None:
     await _dead(store, "IB", "OB1", now=100.0)
     await _dead(store, "IB2", "OB2", now=200.0)
-    assert await store.count_dead() == 2
-    rows = await store.list_dead()
+    assert await store.count_dead(allowed_channels=None) == 2
+    rows = await store.list_dead(allowed_channels=None)
     assert [r["destination_name"] for r in rows] == ["OB2", "OB1"]  # newest-failed first
     assert rows[0]["attempts"] == 1 and rows[0]["last_error"] == "boom"
-    assert await store.count_dead(destination_name="OB1") == 1
+    assert await store.count_dead(destination_name="OB1", allowed_channels=None) == 1
 
     assert await store.replay_dead(destination_name="OB1", now=300.0) == 1
-    assert await store.count_dead() == 1
-    assert (await store.list_dead())[0]["destination_name"] == "OB2"
+    assert await store.count_dead(allowed_channels=None) == 1
+    assert (await store.list_dead(allowed_channels=None))[0]["destination_name"] == "OB2"
 
 
 async def test_content_search_scan_decrypt(store) -> None:
@@ -717,22 +724,27 @@ async def test_content_search_scan_decrypt(store) -> None:
         channel_id="IB_B", raw=RAW, deliveries=[], control_id="MSG2", message_type="ADT^A01"
     )
     # Substring on decrypted raw (a SQL LIKE could never match the at-rest ciphertext).
-    res = await store.search_messages(make_spec(content="JANE", field_path=None, field_value=None))
+    res = await store.search_messages(
+        make_spec(content="JANE", field_path=None, field_value=None), allowed_channels=None
+    )
     assert res.matched == 1 and res.rows[0]["control_id"] == "MSG1"
     assert "raw" not in res.rows[0]  # metadata-only result
     # Field-path resolver against the decrypted body.
     res2 = await store.search_messages(
-        make_spec(content=None, field_path="PID-5.1", field_value="DOE")
+        make_spec(content=None, field_path="PID-5.1", field_value="DOE"), allowed_channels=None
     )
     assert res2.matched == 1 and res2.rows[0]["control_id"] == "MSG1"
     # Metadata pre-filter narrows the candidate set before any decrypt.
     res3 = await store.search_messages(
-        make_spec(content="ADT", field_path=None, field_value=None), channel_id="IB_A"
+        make_spec(content="ADT", field_path=None, field_value=None),
+        channel_id="IB_A",
+        allowed_channels=None,
     )
     assert res3.scanned == 1 and res3.matched == 1
     # Scan cap truncates.
     res4 = await store.search_messages(
-        make_spec(content="zzz-no-match", field_path=None, field_value=None, scan_limit=1)
+        make_spec(content="zzz-no-match", field_path=None, field_value=None, scan_limit=1),
+        allowed_channels=None,
     )
     assert res4.scanned == 1 and res4.truncated is True
 
@@ -794,6 +806,31 @@ async def test_cancel_queued(store) -> None:
     assert (await store.outbox_for(mid))[0]["status"] == OutboxStatus.CANCELLED.value
     # All deliveries terminal (cancelled) → PROCESSED.
     assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
+
+
+async def test_cancel_queued_top_only_cancels_a_backing_off_head(store) -> None:
+    # vault BACKLOG #2754: a backed-off head is later-due than the row behind it; "purge top" must
+    # still cancel the FIFO head (seq order, as claim_next_fifo), not the earliest-due row.
+    m1 = await store.enqueue_message(
+        channel_id="IB", raw=RAW, deliveries=[("OB1", "p1")], now=100.0
+    )
+    m2 = await store.enqueue_message(
+        channel_id="IB", raw=RAW, deliveries=[("OB1", "p2")], now=101.0
+    )
+    head = await store.claim_next_fifo("OB1", now=102.0)
+    assert head is not None and head.message_id == m1
+    await store.mark_failed(
+        head.id, "boom", RetryPolicy(max_attempts=None, backoff_seconds=60.0), now=102.0
+    )
+    assert (await store.outbox_for(m1))[0]["next_attempt_at"] > (await store.outbox_for(m2))[0][
+        "next_attempt_at"
+    ]
+    assert await store.claim_next_fifo("OB1", now=103.0) is None  # the head blocks the lane
+    assert await store.cancel_queued(None, "OB1", top_only=True, now=103.0) == 1
+    assert (await store.outbox_for(m1))[0]["status"] == OutboxStatus.CANCELLED.value
+    assert (await store.outbox_for(m2))[0]["status"] == OutboxStatus.PENDING.value
+    nxt = await store.claim_next_fifo("OB1", now=103.0)
+    assert nxt is not None and nxt.message_id == m2
 
 
 async def test_dead_letter_missing_destinations(store) -> None:
@@ -950,6 +987,21 @@ async def test_auth_users_roles_sessions(store) -> None:
     assert await store.get_user_role_ids("u1") == []
 
 
+async def test_last_admin_guard_contract(store) -> None:
+    """Vault BACKLOG #2779 on Postgres: the guarded removal refuses only the last administrator."""
+    from tests._last_admin_store_contract import assert_last_admin_contract
+
+    await assert_last_admin_contract(store)
+
+
+async def test_concurrent_admin_removals_leave_one(store) -> None:
+    """Vault BACKLOG #2779 on Postgres: two removals on two pooled connections, at once. The
+    advisory lock is what serializes them; one is refused."""
+    from tests._last_admin_store_contract import assert_concurrent_removals_leave_one
+
+    await assert_concurrent_removals_leave_one(store)
+
+
 async def test_roles_permissions_contract(store) -> None:
     """ADR 0045 custom-roles store contract on the real Postgres backend (parity with SQLite):
     the additive ``roles.permissions`` column round-trips a custom role's JSON, ``get_role`` exposes
@@ -1011,6 +1063,14 @@ async def test_pending_approval_store_contract(store) -> None:
     from tests._pending_approval_store_contract import _assert_pending_approval_contract
 
     await _assert_pending_approval_contract(store)
+
+
+async def test_operator_mutations_commit_with_their_audit_rows(store) -> None:
+    """BACKLOG #2624 on the real Postgres backend: each operator mutation appends its audit row
+    under the audit advisory lock inside its own transaction, so a failed append rolls it back."""
+    from tests._operator_audit_atomic_contract import assert_operator_audit_atomic
+
+    await assert_operator_audit_atomic(store)
 
 
 async def test_approval_release_outcome_contract(store) -> None:
@@ -1487,6 +1547,17 @@ async def test_all_declined_finalizes_not_deployed(store) -> None:
     assert await store.outbox_for(mid) == []  # AC-2: not one row in the outbound stage
 
 
+@pytest.mark.parametrize(("declined", "expected"), REPLAY_SETTLE_CASES)
+async def test_replayed_routed_row_that_sends_nothing_settles(store, declined, expected) -> None:
+    """Vault BACKLOG #2723 on Postgres; ``tests/_replay_settle_contract`` carries the property."""
+    await assert_replayed_routed_row_settles(store, declined, expected)
+
+
+async def test_replayed_ingress_row_is_received(store) -> None:
+    """Vault BACKLOG #2723 on Postgres: the RECEIVED arm of replay's status pick."""
+    await assert_replayed_ingress_row_is_received(store)
+
+
 async def test_declined_sibling_still_processed_event_retained(store) -> None:
     """#233 mixed parity: one deployed delivery + one declined leg → the message finalizes PROCESSED
     once the deployed leg delivers (it DID deliver somewhere — not NOT_DEPLOYED), and the
@@ -1894,7 +1965,7 @@ async def test_legacy_plaintext_migrated_on_keyed_reopen(store) -> None:
             fetched = await keyed.get_message(qid)
             assert fetched is not None
             assert fetched["raw"] == RAW
-            assert (await keyed.list_dead())[0]["last_error"] == fail
+            assert (await keyed.list_dead(allowed_channels=None))[0]["last_error"] == fail
             assert keyed.state_view()[("ns", "k")] == {"mrn": "M-LEGACY-STATE"}
             assert keyed.reference_view()["providers"]["P1"] == {"mrn": "M-LEGACY-REF"}
         finally:
@@ -2887,7 +2958,8 @@ async def test_summary_metadata_encrypted_at_rest_and_decrypt(store) -> None:
         assert rec is not None
         assert rec["summary"] == summary and rec["metadata"] == metadata
         assert any(
-            m["summary"] == summary and m["metadata"] == metadata for m in await s.list_messages()
+            m["summary"] == summary and m["metadata"] == metadata
+            for m in await s.list_messages(allowed_channels=None)
         )
     finally:
         await s.close()
@@ -2914,6 +2986,50 @@ async def test_mark_done_writes_one_ledger_row_pg(store) -> None:
     assert "p1" not in str(rows[0].values()) and "MSH" not in str(rows[0].values())
     assert len(rows[0]["delivery_key"]) == 64
     assert mid
+
+
+async def test_two_messages_sharing_a_control_id_each_get_a_ledger_row_pg(store) -> None:
+    # vault BACKLOG #2768: both messages compute delivery_seq=1 (the count is per message id), so a key
+    # that hashed the control id in place of the message id made the second ledger insert a no-op.
+    mids = [
+        await store.enqueue_message(
+            channel_id="IB", raw=RAW, deliveries=[("OB1", f"p{i}")], control_id="MSG1", now=100.0
+        )
+        for i in range(2)
+    ]
+    for t in (200.0, 201.0):
+        item = await store.claim_next_fifo("OB1", now=t)
+        assert item is not None
+        await store.mark_done(item.id, now=t + 50.0)
+    rows = await _pg_ledger(store)
+    assert sorted(r["message_id"] for r in rows) == sorted(mids)
+    assert [r["delivery_seq"] for r in rows] == [1, 1]
+    assert rows[0]["delivery_key"] != rows[1]["delivery_key"]
+
+
+async def test_a_seq_gap_does_not_collide_two_rows_of_one_message_pg(store) -> None:
+    # Mirrors the SQLite test: dropping one row's ledger entry (built directly, not via replay) makes
+    # its re-delivery recompute the sibling's seq; the outbox id in the key keeps the two keys apart.
+    await store.enqueue_message(
+        channel_id="IB", raw=RAW, deliveries=[("OB1", "p1"), ("OB1", "p2")], now=100.0
+    )
+    first = await store.claim_next_fifo("OB1", now=200.0)
+    assert first is not None
+    await store.mark_done(first.id, now=250.0)
+    second = await store.claim_next_fifo("OB1", now=260.0)
+    assert second is not None
+    await store.mark_done(second.id, now=270.0)
+    async with store._pool.acquire() as conn:
+        await conn.execute("DELETE FROM delivered_keys WHERE outbox_id=$1", first.id)
+        await conn.execute(
+            "UPDATE queue SET status=$1 WHERE id=$2", OutboxStatus.PENDING.value, first.id
+        )
+    again = await store.claim_next_fifo("OB1", now=400.0)
+    assert again is not None and again.id == first.id
+    await store.mark_done(again.id, now=450.0)
+    rows = await _pg_ledger(store)
+    assert sorted(r["outbox_id"] for r in rows) == sorted([first.id, second.id])
+    assert len({r["delivery_key"] for r in rows}) == 2
 
 
 async def test_claim_skips_already_delivered_head_no_resend_pg(store) -> None:
@@ -3013,7 +3129,7 @@ async def test_pt_handoff_produces_child_and_parent_processed_pg(store) -> None:
     pmsg = await store.get_message(parent)
     assert pmsg is not None and pmsg["status"] == MessageStatus.PROCESSED.value
     # Child: a distinct message on the PT channel, RECEIVED, correlated, with a pending INGRESS row.
-    msgs = await store.list_messages(channel_id="PT_NEXT")
+    msgs = await store.list_messages(channel_id="PT_NEXT", allowed_channels=None)
     assert len(msgs) == 1
     child = msgs[0]
     assert child["id"] != parent
@@ -3043,7 +3159,9 @@ async def test_pt_child_id_is_content_addressed_pg(store) -> None:
     from messagefoundry.store.store import MessageStore
 
     expected = MessageStore._passthrough_message_id(routed, "PT_NEXT", "MSH|child")
-    assert (await store.list_messages(channel_id="PT_NEXT"))[0]["id"] == expected
+    assert (await store.list_messages(channel_id="PT_NEXT", allowed_channels=None))[0][
+        "id"
+    ] == expected
 
 
 async def test_pt_plus_outbound_in_one_handler_pg(store) -> None:
@@ -3062,7 +3180,7 @@ async def test_pt_plus_outbound_in_one_handler_pg(store) -> None:
     assert depth_out == 1
     assert (await store.get_message(parent))["status"] == MessageStatus.ROUTED.value
     # The PT child exists independently.
-    assert len(await store.list_messages(channel_id="PT_NEXT")) == 1
+    assert len(await store.list_messages(channel_id="PT_NEXT", allowed_channels=None)) == 1
 
 
 async def test_pt_handoff_idempotent_rerun_pg(store) -> None:
@@ -3087,7 +3205,7 @@ async def test_pt_handoff_idempotent_rerun_pg(store) -> None:
         )
         is False
     )
-    assert len(await store.list_messages(channel_id="PT_NEXT")) == 1
+    assert len(await store.list_messages(channel_id="PT_NEXT", allowed_channels=None)) == 1
 
 
 async def test_pt_depth_cap_drops_child_and_errors_parent_pg(store) -> None:
@@ -3110,7 +3228,7 @@ async def test_pt_depth_cap_drops_child_and_errors_parent_pg(store) -> None:
     )
     assert ok is True
     # No child produced; parent finalizes ERROR (the dead PT marker row).
-    assert await store.list_messages(channel_id="PT_NEXT") == []
+    assert await store.list_messages(channel_id="PT_NEXT", allowed_channels=None) == []
     pmsg = await store.get_message(parent)
     assert pmsg is not None and pmsg["status"] == MessageStatus.ERROR.value
 
@@ -3133,7 +3251,7 @@ async def test_pt_correlation_root_propagates_pg(store) -> None:
         pt_deliveries=[("PT_NEXT", "MSH|child")],
         now=110.0,
     )
-    child_id = (await store.list_messages(channel_id="PT_NEXT"))[0]["id"]
+    child_id = (await store.list_messages(channel_id="PT_NEXT", allowed_channels=None))[0]["id"]
     full = await store.get_message(child_id)
     assert full is not None
     meta = json.loads(full["metadata"])
@@ -4249,7 +4367,7 @@ async def test_alert_instance_lifecycle_pg(store) -> None:
     await store.upsert_alert_instance(
         event_type="connection_error", connection="OB_X", severity="critical", now=100.0
     )
-    (a,) = await store.list_active_alert_instances()
+    (a,) = await store.list_active_alert_instances(allowed_channels=None)
     assert a.status == "open" and a.count == 1 and a.first_seen == 100.0 and a.last_seen == 100.0
     assert a.severity == "critical"
 
@@ -4257,17 +4375,17 @@ async def test_alert_instance_lifecycle_pg(store) -> None:
     await store.upsert_alert_instance(
         event_type="connection_error", connection="OB_X", severity="warning", now=150.0
     )
-    (a2,) = await store.list_active_alert_instances()
+    (a2,) = await store.list_active_alert_instances(allowed_channels=None)
     assert a2.id == a.id and a2.count == 2 and a2.last_seen == 150.0 and a2.severity == "warning"
     # a DIFFERENT key opens a distinct instance.
     await store.upsert_alert_instance(
         event_type="connection_error", connection="OB_Y", severity="critical", now=160.0
     )
-    assert len(await store.list_active_alert_instances()) == 2
+    assert len(await store.list_active_alert_instances(allowed_channels=None)) == 2
 
     # ack -> acknowledged + acked_by/at, excluded from the open count; unknown id -> False.
     assert await store.ack_alert_instance(a.id, actor="scott", now=200.0) is True
-    got = await store.get_alert_instance(a.id)
+    got = await store.get_alert_instance(a.id, allowed_channels=None)
     assert got is not None and got.status == "acknowledged"
     assert got.acked_by == "scott" and got.acked_at == 200.0
     assert await store.ack_alert_instance(999999, actor="scott") is False
@@ -4275,7 +4393,7 @@ async def test_alert_instance_lifecycle_pg(store) -> None:
     # BACKLOG #1564: run the scoped aggregate on a REAL server. The generated severity CASE, the
     # `AS n`/`AS worst` aliases, the dialect scope bind and the row unpack never execute under the
     # SQLite suite, so a dialect error in this leg is discoverable nowhere else.
-    assert await store.summarize_active_alert_instances() == AlertSummary(
+    assert await store.summarize_active_alert_instances(allowed_channels=None) == AlertSummary(
         total=2, worst_severity="critical"
     )
     assert await store.summarize_active_alert_instances(allowed_channels=["OB_Y"]) == AlertSummary(
@@ -4288,18 +4406,24 @@ async def test_alert_instance_lifecycle_pg(store) -> None:
     await store.upsert_alert_instance(
         event_type="connection_error", connection="OB_X", severity="critical", now=210.0
     )
-    got = await store.get_alert_instance(a.id)
+    got = await store.get_alert_instance(a.id, allowed_channels=None)
     assert got.status == "acknowledged" and got.count == 3
     assert await store.count_open_alerts_by_connection() == {"OB_Y": 1}
 
     # resolve closes it; the same key re-opens a FRESH distinct instance (partial index frees it).
     assert await store.resolve_alert_instance(a.id, now=300.0) is True
-    assert {r.connection for r in await store.list_active_alert_instances()} == {"OB_Y"}
+    assert {
+        r.connection for r in await store.list_active_alert_instances(allowed_channels=None)
+    } == {"OB_Y"}
     assert await store.resolve_alert_instance(a.id) is False
     await store.upsert_alert_instance(
         event_type="connection_error", connection="OB_X", severity="warning", now=310.0
     )
-    (reopened,) = [r for r in await store.list_active_alert_instances() if r.connection == "OB_X"]
+    (reopened,) = [
+        r
+        for r in await store.list_active_alert_instances(allowed_channels=None)
+        if r.connection == "OB_X"
+    ]
     assert reopened.id != a.id and reopened.status == "open" and reopened.count == 1
 
     # inverse-signal resolver closes only the matching key; a no-match is a no-op (0).
@@ -4309,20 +4433,30 @@ async def test_alert_instance_lifecycle_pg(store) -> None:
         )
         == 1
     )
-    assert {r.connection for r in await store.list_active_alert_instances()} == {"OB_Y"}
+    assert {
+        r.connection for r in await store.list_active_alert_instances(allowed_channels=None)
+    } == {"OB_Y"}
     assert (
         await store.resolve_alert_instances_for(event_type="connection_error", connection="NOPE")
         == 0
     )
 
     # purge: only RESOLVED rows older than the cutoff are pruned (open/ack survive).
-    (y,) = [r for r in await store.list_active_alert_instances() if r.connection == "OB_Y"]
+    (y,) = [
+        r
+        for r in await store.list_active_alert_instances(allowed_channels=None)
+        if r.connection == "OB_Y"
+    ]
     await store.resolve_alert_instance(y.id, now=100.0)  # resolved at 100.0 -> purgeable
     assert await store.purge_alert_instances(older_than=200.0) == 1
     await store.upsert_alert_instance(
         event_type="queue_buildup", connection="OB_R", severity="warning", now=500.0
     )
-    (rr,) = [r for r in await store.list_active_alert_instances() if r.connection == "OB_R"]
+    (rr,) = [
+        r
+        for r in await store.list_active_alert_instances(allowed_channels=None)
+        if r.connection == "OB_R"
+    ]
     await store.resolve_alert_instance(rr.id, now=500.0)  # too recent for older_than=200.0
     assert await store.purge_alert_instances(older_than=200.0) == 0
 
@@ -4350,7 +4484,11 @@ async def test_alert_reason_encrypted_at_rest_pg(store) -> None:
             reason="connect refused to 10.0.0.9",
             now=100.0,
         )
-        (a,) = [r for r in await s2.list_active_alert_instances() if r.connection == "OB_ENC"]
+        (a,) = [
+            r
+            for r in await s2.list_active_alert_instances(allowed_channels=None)
+            if r.connection == "OB_ENC"
+        ]
         assert a.reason == "connect refused to 10.0.0.9"  # decrypted at the boundary
     finally:
         await s2.close()
@@ -4544,7 +4682,7 @@ async def test_rotate_key_cli_reencrypts_server_store(store, capsys, monkeypatch
 
     verify = await PostgresStore.open(settings, cipher=cipher_b)  # key_b alone, no retired
     try:
-        assert len(await verify.list_messages()) == 1
+        assert len(await verify.list_messages(allowed_channels=None)) == 1
         fetched = await verify.get_message(mid)
         assert fetched is not None
         assert fetched["raw"] == RAW  # decrypts under the new key alone
@@ -5103,7 +5241,7 @@ async def test_record_connection_events_writes_a_burst_all_or_nothing(store) -> 
             ),
         ]
     )
-    events = await store.list_connection_events()
+    events = await store.list_connection_events(allowed_channels=None)
     assert [(e.kind, e.reason) for e in events] == [
         ("connection_lost", "connect refused"),
         ("closed", "clean eof"),
@@ -5124,10 +5262,14 @@ async def test_record_connection_events_writes_a_burst_all_or_nothing(store) -> 
         )
     # Asserted on the CONTENT, not the count: what a missing rollback would leave behind is the
     # ts=200.0 row, and naming it is what tells "rolled back" from "never arrived".
-    assert sorted(e.ts for e in await store.list_connection_events()) == [100.0, 101.0, 102.0]
+    assert sorted(e.ts for e in await store.list_connection_events(allowed_channels=None)) == [
+        100.0,
+        101.0,
+        102.0,
+    ]
 
     await store.record_connection_events([])  # an empty burst is a no-op
-    assert len(await store.list_connection_events()) == 3
+    assert len(await store.list_connection_events(allowed_channels=None)) == 3
 
 
 async def test_concurrent_keyed_opens_of_one_database_settle_on_one_store_salt(store) -> None:
@@ -5191,3 +5333,10 @@ async def test_list_audit_exclusion_runs_in_sql_before_limit_pg(store) -> None:
     ]
     assert len(await store.list_audit(actor=who, exclude=ex, limit=2)) == 2
     assert len(await store.list_audit(actor=who, limit=10)) == 5
+    # Vault BACKLOG #2776: the keyset cursor and the count bind after the exclusion's $N values.
+    ids = [r["id"] for r in await store.list_audit(actor=who, exclude=ex, limit=10)]
+    page = await store.list_audit(actor=who, exclude=ex, limit=10, before_id=ids[0])
+    assert [r["id"] for r in page] == ids[1:]
+    assert await store.count_audit(actor=who, exclude=ex, limit=10) == 3
+    assert await store.count_audit(actor=who, exclude=ex, limit=2) == 2
+    assert await store.count_audit(actor=who, exclude=ex, limit=10, before_id=ids[0]) == 2

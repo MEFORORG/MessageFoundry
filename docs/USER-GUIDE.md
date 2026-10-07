@@ -359,7 +359,7 @@ messagefoundry connection upsert --config samples/config --data '{...}'
 messagefoundry connection remove --config samples/config --name IB_ACME_ADT_TCP
 ```
 
-`upsert`/`remove` validate the whole config dir (structure + connector build + the fail-closed `[egress]` allowlist) before persisting and roll back on failure.
+`upsert`/`remove` validate the whole config dir (structure + connector build + the fail-closed `[egress]` allowlist) against a candidate before it replaces the file, so a refused edit never touches it.
 
 ### Try it end-to-end
 
@@ -466,7 +466,7 @@ messagefoundry codeset rename --config samples/config --name old --to new
 messagefoundry codeset remove --config samples/config --name old
 ```
 
-A save is validated against the **same loader the engine uses** (no duplicate keys, no malformed file) and written atomically; a bad edit rolls back, and the change goes live through the usual **promote** (`POST /config/reload`). **After a rename or remove, run `messagefoundry check`** — a handler's `code_set("old_name")` reference resolves at run time, so a plain `validate` won't catch a now-dangling name, but `check`'s dry-run will. Full reference: [CODESETS.md](CODESETS.md) and [CONFIGURATION.md](CONFIGURATION.md#code-sets--reference-lookup-tables-codesets); design record [ADR 0033](adr/0033-gui-manageable-code-sets.md). (For lookup data that lives in an **external** file or database rather than the bundle, see reference sets ([ADR 0006](adr/0006-external-data-lookups.md)) and the live `db_lookup` below.)
+A save is validated against the **same loader the engine uses** (no duplicate keys, no malformed file) and replaces the file only once it loads, so a bad edit never touches it; the change goes live through the usual **promote** (`POST /config/reload`). **After a rename or remove, run `messagefoundry check`** — a handler's `code_set("old_name")` reference resolves at run time, so a plain `validate` won't catch a now-dangling name, but `check`'s dry-run will. Full reference: [CODESETS.md](CODESETS.md) and [CONFIGURATION.md](CONFIGURATION.md#code-sets--reference-lookup-tables-codesets); design record [ADR 0033](adr/0033-gui-manageable-code-sets.md). (For lookup data that lives in an **external** file or database rather than the bundle, see reference sets ([ADR 0006](adr/0006-external-data-lookups.md)) and the live `db_lookup` below.)
 
 ### 5. Purity rule (don't break this)
 
@@ -598,7 +598,7 @@ To recover:
 
 1. **Find the dead-letters.** Console: open the **Dead letters** page (or the message itself from **Messages**) and choose **Reveal** beside its delivery row's masked **Last error**. API: `GET /dead-letters` (optionally `?channel_id=&destination_name=`) lists dead deliveries newest-first; each row's `last_error` is masked as `****`, so read the text with `GET /messages/{message_id}?reveal_errors=true` (needs `messages:view_raw`; audited).
 2. **Fix the cause** (the downstream endpoint, the transform, the config).
-3. **Replay.** `POST /dead-letters/replay` re-queues the dead deliveries (optionally scoped by `channel_id` / `destination_name`); each affected message reverts from `error` to `received` and re-drains. Already-delivered rows are left alone. Replay requires the `messages:replay` permission and is **step-up (re-auth) gated**, and may be held for a second approver when `[approvals]` is configured. (In the console, the **Dead letters** page lists these and offers the per-connection, per-destination, and replay-everything buttons directly; this API path is the equivalent for scripting and automation.)
+3. **Replay.** `POST /dead-letters/replay` re-queues the dead deliveries (optionally scoped by `channel_id` / `destination_name`); each affected message reverts from `error` to `routed` and re-drains. Already-delivered rows are left alone. Replay requires the `messages:replay` permission and is **step-up (re-auth) gated**, and may be held for a second approver when `[approvals]` is configured. (In the console, the **Dead letters** page lists these and offers the per-connection, per-destination, and replay-everything buttons directly; this API path is the equivalent for scripting and automation.)
 
 > Replaying re-transmits real message bodies — it is audited per acting user. Treat it like any PHI action ([PHI.md](PHI.md)).
 

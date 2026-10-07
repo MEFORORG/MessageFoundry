@@ -18,6 +18,7 @@ import ast
 import base64
 import inspect
 import textwrap
+import time
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -28,7 +29,7 @@ import pytest
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
 from messagefoundry.auth.identity import ALL_CHANNELS, SessionMechanism
-from messagefoundry.auth.ldap import AdPrincipal
+from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
@@ -70,8 +71,9 @@ def _principal(username: str = "jdoe") -> AdPrincipal:
 class _FakeLdap:
     """``authenticate`` is the live re-bind ``POST /me/reauth`` makes for a directory account."""
 
-    def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
-        return _principal(username) if password == AD_PW else None
+    def authenticate(self, username: str, password: str, **_: object) -> DirectoryBind:
+        found = _principal(username) if password == AD_PW else None
+        return DirectoryBind(DirectoryAnswer.FOUND, found)
 
     def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
         return _principal(username)
@@ -172,6 +174,8 @@ async def test_a_federated_shaped_login_is_born_without_a_window_even_when_mfa_v
         mfa_verified=True,
         mech="oidc",
         session_mechanism=SessionMechanism.OIDC,
+        # A federated mint must carry the IdP auth_time it verified (BACKLOG #2143).
+        idp_auth_time=time.time(),
     )
     assert out.ok and out.token is not None
     session = await engine.store.get_session(hash_token(out.token))
@@ -179,6 +183,21 @@ async def test_a_federated_shaped_login_is_born_without_a_window_even_when_mfa_v
     assert session.mfa_verified_at is not None  # the grant stands; only the window is withheld
     assert session.reauth_at is None
     assert await service.has_recent_step_up(out.token) is False
+
+
+async def test_a_federated_mint_without_the_idp_auth_time_is_refused(engine: Engine) -> None:
+    """BACKLOG #2143. RED when: ``_complete_ad_login`` mints an OIDC session with no IdP
+    ``auth_time``. That session would store NULL, and every IdP step-up on it would be refused, with
+    nothing failing at the mint. The guard sits beside the mechanism check, and raises."""
+    service = await _service(engine)
+    with pytest.raises(ValueError, match="IdP auth_time"):
+        await service._complete_ad_login(
+            _principal("fed"),
+            None,
+            mfa_verified=True,
+            mech="oidc",
+            session_mechanism=SessionMechanism.OIDC,
+        )
 
 
 def test_no_directory_entry_point_lets_a_caller_choose_the_seeding() -> None:

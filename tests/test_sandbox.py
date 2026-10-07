@@ -206,6 +206,17 @@ def h_busy(msg):
         pass
 
 
+@handler("h_spin")
+def h_spin(msg):
+    # A short, legitimate CPU-bound call: it burns a quarter-second of CPU and returns.
+    import time
+
+    end = time.process_time() + 0.25
+    while time.process_time() < end:
+        pass
+    return Send("OB_T", "SPUN")
+
+
 @handler("h_lookup")
 def h_lookup(msg):
     db_lookup("SOME_DB", "select 1", ())  # live bridge — forbidden in the sandbox
@@ -325,6 +336,31 @@ def test_busy_loop_is_wall_capped_and_recovers(graph: tuple[Registry, str]) -> N
         assert (
             _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())[0][0] == "OB_T"
         )
+    finally:
+        session.close()
+
+
+# Vault BACKLOG #3133 part 1, owner ruling 2026-10-07: the worker sets no RLIMIT_CPU. That limit
+# counts the whole life of a process, and the worker is persistent, so it was a lifetime budget: a
+# reused worker died on its tenth 0.15 s call. The old soft limit was ceil(boot CPU + 2 s), so never
+# more than boot plus 3 s, and its SIGXCPU killed the worker. Seventeen 0.25 s calls spend 4.25 s,
+# past it whatever the boot cost, while each call stays far inside the wall cap. Windows never had
+# the limit, so the test only means something on POSIX.
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="RLIMIT_CPU is POSIX-only")
+def test_a_reused_worker_has_no_lifetime_cpu_budget(graph: tuple[Registry, str]) -> None:
+    registry, config_dir = graph
+    session = _session(config_dir)
+    try:
+        pids: set[int] = set()
+        for _ in range(17):
+            delivered = _deliveries(registry, "h_spin", sandbox=session, run_context=RunContext())
+            assert delivered == [("OB_T", "SPUN")]
+            assert session._proc is not None
+            pids.add(session._proc.pid)
+        # One worker served every call: none was killed and quietly respawned.
+        assert len(pids) == 1
     finally:
         session.close()
 

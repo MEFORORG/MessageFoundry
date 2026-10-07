@@ -30,6 +30,7 @@ import shutil
 import stat
 import sys
 import tempfile
+import threading
 import time
 import traceback
 from collections import OrderedDict
@@ -62,6 +63,7 @@ from messagefoundry.transports.base import (
     SourceStartupError,
     encode_wire_body,
     intake_open,
+    poll_interval,
     positive_cap,
     register_destination,
     register_source,
@@ -633,7 +635,7 @@ class FileSource(SourceConnector):
         # #2507, #2535). resolve() is non-strict, so it's fine that the directory is created later.
         self._root_real = self.directory.resolve()
         self.pattern: str = s.get("pattern", "*")
-        self.poll_seconds: float = float(s.get("poll_seconds", 1.0))
+        self.poll_seconds: float = poll_interval(s, default=1.0, transport="file source")
         self.min_age_seconds: float = float(s.get("min_age_seconds", 0.0))
         self.after_read: str = s.get("after_read", "move")  # "move" | "delete" | "leave" (#142)
         if self.after_read not in ("move", "delete", "leave"):
@@ -1797,13 +1799,51 @@ def _claim_staged(staged: Path, target: Path, dir_fd: int | None = None) -> Path
             _discard(staged, dir_fd)
 
 
+#: The highest ``name-N.ext`` suffix a claim has found taken, per target path, so the next claim of a
+#: recurring name starts above it rather than at 1 (vault BACKLOG #2766). Bounded LRU of
+#: ``_FREE_NAME_HINTS_MAX`` paths. In memory only and never logged: a path can embed an MRN.
+_free_name_hints: OrderedDict[str, int] = OrderedDict()
+_free_name_hints_lock = threading.Lock()
+_FREE_NAME_HINTS_MAX = 4096
+
+
 def _free_names(target: Path) -> Iterator[Path]:
-    """``target``, then ``name-1.ext``, ``name-2.ext``, … — the order every claim walks."""
+    """``target``, then ``name-N.ext`` for N counting up from one above the highest suffix found
+    taken for ``target`` in this process; from 1 the first time. The order every claim walks.
+
+    **Why it does not start at 1 each time (vault BACKLOG #2766).** It did, so a name that recurs (a
+    partner that always drops ``ADT.hl7`` into a ``move`` inbound, or an outbound whose template
+    renders the fallback for every payload) made the Nth claim pay N failed links or renames, and
+    ``.processed`` is never pruned. Now a claim pays at most three tries in the steady state: the
+    bare name, the suffix the previous claim took, and the next one.
+
+    **A suffix is remembered only once it is found taken.** Every consumer asks for the next
+    candidate only after its link, ``O_EXCL`` create or rename was refused because the name exists;
+    any other outcome stops the walk. So resuming this generator is the evidence that the last
+    suffix is taken. Remembering a suffix merely offered would skip one each time the link path
+    gives up and the copy fallback walks again (BACKLOG #1622), leaving gaps in the numbering.
+
+    **The hint is a starting point, never a claim.** Each candidate is still taken by the caller's
+    own refusing call, so a name another process holds, or a stale hint after a restart, costs one
+    more try and never a clobber. A suffix freed below the hint by an operator is left unused, which
+    costs nothing: names only need to be unique. After a restart the first collision walks from 1
+    once. Concurrent claims of one name share the hint under a lock and re-read it before each try,
+    so one that was overtaken jumps ahead rather than walking every suffix the others took; the
+    filesystem call, not the lock, is what keeps each claim unique."""
     yield target
+    key = str(target)
     n = 0
     while True:
-        n += 1
+        with _free_name_hints_lock:
+            n = max(n, _free_name_hints.get(key, 0)) + 1
         yield target.with_name(f"{target.stem}-{n}{target.suffix}")
+        # Resumed, so the caller found ``name-n`` taken.
+        with _free_name_hints_lock:
+            if n > _free_name_hints.get(key, 0):
+                _free_name_hints[key] = n
+            _free_name_hints.move_to_end(key)
+            while len(_free_name_hints) > _FREE_NAME_HINTS_MAX:
+                _free_name_hints.popitem(last=False)
 
 
 def _at(path: Path, dir_fd: int | None) -> Path:

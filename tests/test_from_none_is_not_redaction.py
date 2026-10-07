@@ -231,6 +231,11 @@ _ALLOWED: tuple[_Allowed, ...] = (
         _SAFE + _NOTHING_WITHHELD + "; it carries lane and shard names",
     ),
     _Allowed(
+        f"{_APP}._dual_role_control::DrParkedError" + _HTTP,
+        _SAFE + _NOTHING_WITHHELD + "; it carries an outbound name and fixed text, raised with "
+        "no chain",
+    ),
+    _Allowed(
         f"{_APP}.resend_message::KeyError" + _HTTP,
         _SAFE + "KeyError carries the outbound name, which the 404 detail also quotes",
     ),

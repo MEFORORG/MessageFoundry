@@ -305,6 +305,9 @@ given** — which is exactly AC-6.
    implementing `[engine]` purely to host the anchor adds a section for one key when `[environments].base_dir`
    + `--project-root` already exist; we generalize the existing knob instead and the docs-only follow-up
    (review candidate E) **deletes** the misleading `[engine]` doc.
+   *Corrected 2026-10-07: the "silently drops it" clause no longer holds. The loader now REFUSES an
+   unknown top-level section in the config file, `[engine]` included (2026-10-02 full review, decision
+   10; see `_reject_unknown_file_keys` and docs/CONFIGURATION.md). The rejection above is unchanged.*
 
 3. **Per-member flags only (status quo + add `--db`/`--service-config` to more commands), no single root.**
    Rejected: leaves the operator to keep four roots in sync by hand — the very footgun #33 found. It would

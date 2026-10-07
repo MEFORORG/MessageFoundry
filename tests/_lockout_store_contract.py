@@ -192,13 +192,13 @@ async def _assert_escalation(store: Any) -> None:
         password_generated=False,
     )
     await store.set_totp_secret("lock-totp", secret="JBSWY3DPEHPK3PXP", now=1.0)
-    await store.enable_totp("lock-totp", recovery_code_hashes=[], now=1.0)
+    assert await store.enable_totp("lock-totp", recovery_code_hashes=[], now=1.0)
     # A directory account, with TOTP enrolled too: NEITHER lock escalates (ADR 0197 Decision 5).
     await store.create_user(
         user_id="lock-ad", username="lock-ad", auth_provider="ad", now=1.0, password_generated=False
     )
     await store.set_totp_secret("lock-ad", secret="JBSWY3DPEHPK3PXP", now=1.0)
-    await store.enable_totp("lock-ad", recovery_code_hashes=[], now=1.0)
+    assert await store.enable_totp("lock-ad", recovery_code_hashes=[], now=1.0)
     # A local account with no TOTP: only the second-step lock escalates.
     await store.create_user(
         user_id="lock-plain",
@@ -423,7 +423,7 @@ async def _assert_conditional_rotation(store: Any) -> None:
     )
     # TOTP on: the caller "checks" here and sees it...
     await store.set_totp_secret("rot-u1", secret="JBSWY3DPEHPK3PXP", now=2.0)
-    await store.enable_totp("rot-u1", recovery_code_hashes=[], now=2.0)
+    assert await store.enable_totp("rot-u1", recovery_code_hashes=[], now=2.0)
     user = await store.get_user("rot-u1")
     assert user is not None and user.totp_enabled
     # ... then an administrator's factor reset lands between the check and the write ...
@@ -440,7 +440,7 @@ async def _assert_conditional_rotation(store: Any) -> None:
     assert user is not None and user.password_hash == "h-issued" and user.password_generated
     # With TOTP standing, the same write lands.
     await store.set_totp_secret("rot-u1", secret="JBSWY3DPEHPK3PXP", now=4.0)
-    await store.enable_totp("rot-u1", recovery_code_hashes=[], now=4.0)
+    assert await store.enable_totp("rot-u1", recovery_code_hashes=[], now=4.0)
     assert await store.set_password(
         "rot-u1",
         password_hash="h-chosen",
@@ -455,8 +455,9 @@ async def _assert_conditional_rotation(store: Any) -> None:
         False,
         False,
     )
-    # TOTP flagged on over a NULL secret (a confirm that raced a factor reset) is no way past: the
-    # conditional write refuses it too (review round 2).
+    # TOTP flagged on over a NULL secret is no way past: the conditional write refuses it too
+    # (review round 2). Since BACKLOG #2224 a confirm racing a factor reset cannot produce this
+    # state, because ``enable_totp`` is conditional; ``set_totp_secret(secret=None)`` still can.
     await store.set_totp_secret("rot-u1", secret=None, now=5.0)
     user = await store.get_user("rot-u1")
     assert user is not None and user.totp_enabled

@@ -21,6 +21,7 @@ reliable reconnect-before-first-byte path is exercised instead. The wiring rejec
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Callable
 
 import pytest
@@ -50,13 +51,21 @@ def _dest(port: int, **overrides: object) -> MLLPDestination:
     return MLLPDestination(Destination(name="out", type=ConnectorType.MLLP, settings=settings))
 
 
-async def _until(cond: Callable[[], bool], timeout: float = 2.0) -> None:
-    elapsed = 0.0
+async def _until(cond: Callable[[], bool], timeout: float = 30.0) -> None:
+    """Poll ``cond`` until true, or fail once ``timeout`` seconds of real time have passed.
+
+    A polling bound, not a wait: a met condition returns on the first poll that sees it, so the
+    bound costs a passing test nothing and only sets how long a broken one takes to fail. It is
+    measured by the clock, not by adding 0.01 per sleep, and sized for a loaded hosted runner.
+    A 2 s bound failed merge-group run 37535066947 (windows-2025) in
+    ``test_transports.py::test_file_source_routes_oversized_to_error``. This helper had
+    the same 2 s bound, so it gets the same fix.
+    """
+    deadline = time.monotonic() + timeout
     while not cond():
-        await asyncio.sleep(0.01)
-        elapsed += 0.01
-        if elapsed > timeout:
+        if time.monotonic() > deadline:
             raise AssertionError("condition not met within timeout")
+        await asyncio.sleep(0.01)
 
 
 class _Peer:

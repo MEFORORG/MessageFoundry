@@ -30,7 +30,7 @@ from _totp_clock import fresh_totp, pin_totp_clock
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role, totp
-from messagefoundry.auth.identity import ALL_CHANNELS
+from messagefoundry.auth.identity import ALL_CHANNELS, Identity
 from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.service import STEP_UP_ACTION_SESSION_TERMINATE, AuthService
 from messagefoundry.auth.tokens import hash_token
@@ -149,13 +149,13 @@ async def _add_passkey(service: AuthService, username: str) -> None:
     assert await service.store.has_webauthn_credentials(user.id) is True
 
 
-def _principal(username: str = "aduser") -> AdPrincipal:
+def _principal(username: str = "aduser", groups: frozenset[str] = frozenset()) -> AdPrincipal:
     return AdPrincipal(
         username=username,
         display_name="AD User",
         email=None,
         dn=f"CN={username},DC=x",
-        groups=frozenset(),
+        groups=groups,
         directory_object_id=str(uuid.uuid5(uuid.NAMESPACE_URL, username)),
     )
 
@@ -321,7 +321,7 @@ async def test_an_enrolled_account_cannot_self_promote_by_binding_a_second_facto
     enrollment = await service.begin_mfa_enrollment(identity)
     assert (
         await service.confirm_mfa_enrollment(
-            identity, totp.totp(enrollment.secret), token=setup.token
+            identity, fresh_totp(enrollment.secret), token=setup.token
         )
     ).ok
 
@@ -493,7 +493,13 @@ async def test_a_pending_session_cannot_end_an_enrolled_accounts_sessions(
     """
     service = await _service(
         engine,
-        AuthSettings(login_rate_limit_enabled=False, require_action_step_up=action_step_up),
+        # The floor is off: _enroll_totp_out_of_band confirms at once on the session it signed
+        # in, and the login-to-MFA floor covers that confirm (BACKLOG #2389).
+        AuthSettings(
+            login_rate_limit_enabled=False,
+            mfa_verify_min_elapsed_seconds=0,
+            require_action_step_up=action_step_up,
+        ),
     )
     await _add(service, "vic", Role.VIEWER)
     _secret, victim_token = await _enroll_totp_out_of_band(service, "vic")
@@ -759,7 +765,10 @@ async def test_a_must_change_account_with_no_factor_enrols_before_it_rotates(
     is refused ``POST /me/password`` with the fixed detail, may reach the TOTP enrolment from its
     pending session, and rotates once TOTP is on. RED against the old gate: the first rotation
     returned 200 and the enrolment returned "password change required"."""
-    service = AuthService(engine.store, AuthSettings(login_rate_limit_enabled=False))
+    # The floor is off: the confirm below runs at once on the signed-in session (BACKLOG #2389).
+    service = AuthService(
+        engine.store, AuthSettings(mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False)
+    )
     admin = await create_admin(service)
     created = await service.create_local_user(
         username="newbie",
@@ -1028,6 +1037,98 @@ async def test_scope_administrators_frees_a_local_non_admin_and_no_directory_ses
     assert await service.mfa_satisfied(local.token) is True
 
 
+async def test_the_status_and_last_factor_guards_skip_the_directory_floor_the_gate_applies(
+    engine: Engine,
+) -> None:
+    """RED when: ``mfa_status`` or a last-factor guard starts applying the directory floor, or the
+    access gate stops applying it.
+
+    BACKLOG #2490 asked whether to align the two. The batch 196 Manager decided on 2026-10-06 to
+    keep the split and pin it here. ``_mfa_required_for`` answers "does this person owe a factor"
+    for ``mfa_status.required`` and both last-factor guards, and it reads no provider. The access
+    gate adds the directory floor on top, per unstamped session, because such a session proved
+    nothing to the engine at mint. So under ``require_mfa_scope="administrators"`` a directory
+    non-admin reads as not required and may drop its last factor. The gate still confines it.
+
+    The local non-admin arm is the positive control. The same dial frees it on every path, so the
+    directory arm's confinement comes from the floor. The directory Administrator arm is the
+    negative control. Both guards refuse it, so the directory arm's removals come from the scope.
+    In ``disable_mfa`` the ``_mfa_required_for`` refusal is reached only by an account that is not
+    LOCAL, a directory account here: a covered local account meets the AC-A3a refusal first. Both
+    guards' refusals are matched on "enroll another factor first", which the AC-A3a text lacks."""
+    service = await _service(
+        engine,
+        AuthSettings(
+            mfa_verify_min_elapsed_seconds=0,
+            login_rate_limit_enabled=False,
+            require_mfa_scope="administrators",
+            mfa_recovery_code_count=1,  # this test never spends one; fewer argon2 hashes
+        ),
+    )
+    await service.set_ad_group_map([("CN=MF-Admins,DC=x", "administrator")], actor="test")
+
+    async def enrol_totp(identity: Identity, token: str) -> None:
+        enrollment = await service.begin_mfa_enrollment(identity)
+        confirmed = await service.confirm_mfa_enrollment(
+            identity, fresh_totp(enrollment.secret), token=token
+        )
+        assert confirmed.ok
+
+    # The directory non-admin: the status and the guards say "not owed", the gate says "owed".
+    first = await service._complete_ad_login(_principal("adview"), None, mfa_verified=False)
+    assert first.ok and first.token is not None and first.identity is not None
+    directory = first.identity
+    assert (await service.mfa_status(directory)).required is False
+    assert await service.mfa_satisfied(first.token) is False
+    # Passkey guard: removing the only passkey succeeds.
+    await _add_passkey(service, "adview")
+    assert (await service.mfa_status(directory)).required is True  # enrolled, so owed
+    assert await service.delete_webauthn_credential(directory, "adview-passkey-hash") is True
+    assert (await service.mfa_status(directory)).required is False
+    # TOTP guard: disabling the only TOTP succeeds. AC-A3a covers local accounts only.
+    await enrol_totp(directory, first.token)
+    assert (await service.mfa_status(directory)).required is True
+    await service.disable_mfa(directory)
+    assert (await service.mfa_status(directory)).required is False
+    # The removals left the gate as it was: the floor reads no factor state, so a fresh unstamped
+    # session is refused as the first one was.
+    again = await service._complete_ad_login(_principal("adview"), None, mfa_verified=False)
+    assert again.ok and again.token is not None
+    assert await service.mfa_satisfied(again.token) is False
+
+    # Positive control, the local non-admin: freed by the dial on every path.
+    await _add(service, "lview", Role.VIEWER)
+    local_login = await service.login("lview", PW)
+    assert local_login.ok and local_login.token is not None and local_login.identity is not None
+    local = local_login.identity
+    assert (await service.mfa_status(local)).required is False
+    assert await service.mfa_satisfied(local_login.token) is True
+    await _add_passkey(service, "lview")
+    assert await service.delete_webauthn_credential(local, "lview-passkey-hash") is True
+    assert (await service.mfa_status(local)).required is False
+    await enrol_totp(local, local_login.token)
+    await service.disable_mfa(local)
+    assert (await service.mfa_status(local)).required is False
+
+    # Negative control, the directory Administrator: owed on every path, so both guards refuse.
+    admin_login = await service._complete_ad_login(
+        _principal("adadmin", groups=frozenset({"CN=MF-Admins,DC=x"})), None, mfa_verified=False
+    )
+    assert admin_login.ok and admin_login.token is not None
+    admin = admin_login.identity
+    assert admin is not None and Role.ADMINISTRATOR in admin.roles
+    assert (await service.mfa_status(admin)).required is True
+    assert await service.mfa_satisfied(admin_login.token) is False
+    await _add_passkey(service, "adadmin")
+    with pytest.raises(ValueError, match="enroll another factor first"):
+        await service.delete_webauthn_credential(admin, "adadmin-passkey-hash")
+    # Enrol TOTP, then drop the passkey, so TOTP is the last factor; disabling it must refuse.
+    await enrol_totp(admin, admin_login.token)
+    assert await service.delete_webauthn_credential(admin, "adadmin-passkey-hash") is True
+    with pytest.raises(ValueError, match="enroll another factor first"):
+        await service.disable_mfa(admin)
+
+
 async def test_require_mfa_off_still_holds_an_enrolled_account_to_its_factor(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1119,7 +1220,7 @@ async def test_a_directory_session_minted_at_the_minimum_is_confined_until_it_en
     # The confinement is survivable: the ceremony accepts the directory account.
     enroll = await service.begin_mfa_enrollment(out.identity)
     confirmed = await service.confirm_mfa_enrollment(
-        out.identity, totp.totp(enroll.secret), token=out.token
+        out.identity, fresh_totp(enroll.secret), token=out.token
     )
     assert confirmed.recovery_codes
     # Confirming ROTATES the session (ASVS 7.2.4, BACKLOG #1146): the gate lifts on the NEW token,

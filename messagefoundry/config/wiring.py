@@ -29,7 +29,10 @@ they never do network I/O (the outbox worker delivers, preserving at-least-once)
 
 from __future__ import annotations
 
+import ast
+import builtins
 import hashlib
+import importlib.machinery
 import importlib.util
 import inspect
 import ipaddress
@@ -40,9 +43,10 @@ import sys
 import threading
 import urllib.parse
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import ModuleType
 from typing import Any, Final, Literal, TypeIs
 
 from messagefoundry.config.code_sets import (
@@ -76,6 +80,7 @@ from messagefoundry.config.models import (
     _check_hop_attestation,
     _check_revocation_attestation,
     check_db_connect_timeout,
+    flag_from_settings,
 )
 from messagefoundry.config.send_snapshot import snapshot_on_send_active
 from messagefoundry.connection_names import (
@@ -87,6 +92,7 @@ from messagefoundry.connection_names import (
 from messagefoundry.controlchars import has_control_char
 from messagefoundry.credential import CERT_NAME_PREFIXES
 from messagefoundry.parsing.message import Message, RawMessage, snapshot_payload
+from messagefoundry.redaction import safe_name
 from messagefoundry.secretscrub import (
     CREDENTIAL_PLACEHOLDER,
     credential_query_params,
@@ -152,6 +158,7 @@ __all__ = [
     "HandlerAccepts",
     "message_type_of",
     "MessageTypeError",
+    "config_py_files",
     "load_config",
     "validate_config",
     "accepted_cleartext_hops",
@@ -403,6 +410,34 @@ def _check_tls_ca_file(factory: str, value: Any, *, unread: str | None = None) -
         raise ValueError(f"{factory} tls_ca_file would never be read: {unread}.")
 
 
+def _check_tls_ca_pin(factory: str, pin: Any, ca: Any) -> None:
+    """Refuse a ``tls_ca_pin`` that is malformed or that nothing would check (vault BACKLOG #2371).
+
+    The pin is the SHA-256 of ``tls_ca_file``; ``auth/trust_anchors.py``, module item 9, says when
+    the engine checks it. A literal is refused here if it is blank or not a SHA-256 hex digest, so
+    ``messagefoundry check`` and a dry run catch it; an ``env()`` value is checked once it resolves.
+    With no ``tls_ca_file`` there is nothing to check, so the config would read as pinned while
+    nothing is. :meth:`Registry.dialling_pin_problems` refuses a pin whose hop never reads the CA,
+    once a token hop can no longer be composed on. Raises ``ValueError`` for the reason
+    :func:`_check_tls_ca_file` does."""
+    if pin is None:
+        return
+    if isinstance(pin, str):
+        from messagefoundry.auth.trust_anchors import TrustAnchorError, _normalize_pin
+        from messagefoundry.config.settings import refuse_a_blank_anchor_pin
+
+        refuse_a_blank_anchor_pin(pin, f"{factory} tls_ca_pin")
+        try:
+            _normalize_pin(pin)
+        except TrustAnchorError as exc:
+            raise ValueError(f"{factory} tls_ca_pin: {exc}") from exc
+    if ca is None or (isinstance(ca, str) and not ca.strip()):
+        raise ValueError(
+            f"{factory} tls_ca_pin is set without a tls_ca_file, so nothing would check it. It "
+            "pins the connection's tls_ca_file. Remove it, or set tls_ca_file"
+        )
+
+
 def _reject_envref_headers(factory: str, headers: Any) -> None:
     """Refuse an ``env()`` reference inside a ``headers`` table (BACKLOG #1649).
 
@@ -608,6 +643,50 @@ def _hop_attestation_entries(where: str, attested: bool, reason: str | None) -> 
     except ValueError as exc:
         raise WiringError(f"{where}: {exc}") from exc
     return {"tls_hop_attested": True, "tls_hop_attested_reason": reason} if attested else {}
+
+
+def settings_hop_attestation(settings: Mapping[str, Any], where: str) -> bool:
+    """Validate the attestation pair a settings carrier holds, by the factory's own rule.
+
+    For ``FhirLookupSpec`` and :func:`refuse_unresolved_hop_flags`, since a carrier's ``settings`` stay mutable after the factory ran. The pair is checked together, with the same string-type and control-character
+    rules as :func:`_hop_attestation_entries`, because it IS that function. Absent or ``None`` reads
+    as not attested."""
+    attested = settings.get("tls_hop_attested")
+    attested = False if attested is None else attested
+    _hop_attestation_entries(where, attested, settings.get("tls_hop_attested_reason"))
+    return attested is True
+
+
+#: The hop-policy flags a settings carrier may hold (vault BACKLOG #2232). A ``FhirLookup``,
+#: ``DatabaseLookup`` or ``DatabaseRef`` keeps its settings in a mutable dict, so a config module
+#: can write any of these past the factory.
+HOP_POLICY_FLAGS = ("tls_hop_attested", "cleartext_accepted", "tls_revocation_attested")
+
+
+def refuse_unresolved_hop_flags(settings: Mapping[str, Any], where: str) -> bool:
+    """Refuse a hop-policy flag in a settings carrier that is not ``None`` or a real ``bool``, and an
+    attestation pair the factory would refuse. Returns whether the carrier attests its hop; resolving
+    ``env()`` cannot change that, since the flag it read is already a literal.
+
+    Runs on the RAW settings, before ``env()`` resolves (vault BACKLOG #2232). The factories already
+    refuse an ``env()`` flag. A reference written into the dict after them would resolve through its
+    own cast, and ``env(..., cast=bool)`` turns the string ``"false"`` into ``True``. So the flag is
+    refused while it is still an :class:`EnvRef`. The attestation pair then goes through
+    :func:`settings_hop_attestation`, so a ``DatabaseLookup`` or ``DatabaseRef`` reason is held to
+    the same type and control-character rules as a ``FhirLookup`` one.
+
+    It runs at least where check, start, reload and each reference sync read a carrier: the
+    ``FhirLookup`` settings builder, the ``db_lookup`` executor build, ``build_check_registry`` and
+    the reference sync. ``load_config`` alone does not run it."""
+    for key in HOP_POLICY_FLAGS:
+        try:
+            flag_from_settings(settings, key)
+        except ValueError as exc:
+            raise WiringError(
+                f"{where}: {exc} (write a literal True or False; an env() reference is not "
+                "accepted on a hop-policy flag)"
+            ) from exc
+    return settings_hop_attestation(settings, where)
 
 
 def _refuse_attested_and_accepted(where: str, attested: bool, accepted: bool) -> None:
@@ -916,15 +995,15 @@ class FhirLookupSpec:
             _check_revocation_attestation(
                 self.tls_revocation_attested, self.tls_revocation_attested_reason
             )
-            _check_cleartext_acceptance(self.cleartext_accepted, self.cleartext_reason)
         except ValueError as exc:
             raise WiringError(f"fhir lookup {self.name!r}: {exc}") from exc
+        # The pair, by the factory's own rule, so a spec built directly cannot attest without a
+        # reason or with one that would forge a WARNING line.
+        attested = settings_hop_attestation(self.settings, f"fhir lookup {self.name!r}")
         # The factory refuses both claims at once, and a spec built directly must not hold them either.
         # `wiring_runner._fhir_lookup_settings` checks again, since `settings` is mutable (ADR 0092).
         _refuse_attested_and_accepted(
-            f"fhir lookup {self.name!r}",
-            bool(self.settings.get("tls_hop_attested")),
-            self.cleartext_accepted,
+            f"fhir lookup {self.name!r}", attested, self.cleartext_accepted
         )
 
 
@@ -945,6 +1024,7 @@ def FhirLookup(
     timeout_seconds: float = 30.0,
     verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
+    tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     encoding: str = "utf-8",
     # ADR 0153 decision 2 — the same per-connection cleartext declaration an outbound carries. It must
     # be authorable HERE: the read executor honours the pair, so leaving it to a hand-mutated
@@ -1015,6 +1095,7 @@ def FhirLookup(
     # does for an outbound, so the declaration cannot reach the read executor unvalidated.
     try:
         _check_tls_ca_file("FhirLookup", tls_ca_file)
+        _check_tls_ca_pin("FhirLookup", tls_ca_pin, tls_ca_file)
         _check_cleartext_acceptance(cleartext_accepted, cleartext_reason)
         _check_revocation_attestation(tls_revocation_attested, tls_revocation_attested_reason)
     except ValueError as exc:
@@ -1029,6 +1110,7 @@ def FhirLookup(
         "timeout_seconds": timeout_seconds,
         "verify_tls": verify_tls,
         "tls_ca_file": tls_ca_file,
+        "tls_ca_pin": tls_ca_pin,
         "encoding": encoding,
     }
     # The cleartext and revocation declarations are NOT written into `settings`: they are the spec's
@@ -1680,7 +1762,7 @@ def MLLP(
     tls_ca_file: str
     | None = None,  # trust anchor — inbound: verify client certs (mTLS); outbound: verify server
     tls_ca_pin: str
-    | None = None,  # INBOUND: SHA-256 of tls_ca_file; a mismatch refuses (BACKLOG #1142)
+    | None = None,  # BOTH: SHA-256 of tls_ca_file; a mismatch refuses (BACKLOG #1142, #2371)
     tls_crl_file: str
     | None = None,  # INBOUND: opt-in CRL for mTLS client certs (#1005): a bare PEM CRL (#1890)
     tls_verify: bool = True,  # OUTBOUND: verify the server cert (false is MITM-able → needs MEFOR_ALLOW_INSECURE_TLS)
@@ -2683,6 +2765,7 @@ def Rest(
     verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
     tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain+hostname still verified; #129)
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
+    tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     encoding: str = "utf-8",
     capture_response: bool = False,  # capture the HTTP response body as a reply (ADR 0013)
     capture_response_headers: list[str]
@@ -2718,6 +2801,7 @@ def Rest(
     not, is stated once in ``docs/CONNECTIONS.md``, "Pinning a private CA per connection"."""
     _reject_envref_headers("Rest", headers)
     _check_tls_ca_file("Rest", tls_ca_file)
+    _check_tls_ca_pin("Rest", tls_ca_pin, tls_ca_file)
     _reject_envref_in_lists(
         "Rest",
         capture_response_headers=capture_response_headers,
@@ -2737,6 +2821,7 @@ def Rest(
             "verify_tls": verify_tls,
             "tls_allow_expired": tls_allow_expired,
             "tls_ca_file": tls_ca_file,
+            "tls_ca_pin": tls_ca_pin,
             "encoding": encoding,
             "capture_response": capture_response,
             "capture_response_headers": capture_response_headers,
@@ -2779,6 +2864,7 @@ def FHIR(
     verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
     tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain+hostname still verified; #129)
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
+    tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     encoding: str = "utf-8",
     capture_response: bool = False,  # capture the server reply / OperationOutcome (ADR 0013)
     capture_response_headers: list[str]
@@ -2832,6 +2918,7 @@ def FHIR(
         )
     _reject_envref_headers("FHIR", headers)
     _check_tls_ca_file("FHIR", tls_ca_file)
+    _check_tls_ca_pin("FHIR", tls_ca_pin, tls_ca_file)
     _reject_envref_in_lists(
         "FHIR",
         capture_response_headers=capture_response_headers,
@@ -2855,6 +2942,7 @@ def FHIR(
             "verify_tls": verify_tls,
             "tls_allow_expired": tls_allow_expired,
             "tls_ca_file": tls_ca_file,
+            "tls_ca_pin": tls_ca_pin,
             "encoding": encoding,
             "capture_response": capture_response,
             "capture_response_headers": capture_response_headers,
@@ -2881,6 +2969,7 @@ def Email(
     use_tls: bool = True,  # STARTTLS by default; False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
     tls_verify: bool = True,  # verify the server cert (#323); False (dev only) needs the escape
     tls_ca_file: str | EnvRef | None = None,  # PEM to verify the SMTP server against (not a secret)
+    tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     tls_check_hostname: bool = True,  # match the cert against `host` (leave on)
     timeout_seconds: float = 30.0,
     encoding: str = "utf-8",
@@ -2907,6 +2996,8 @@ def Email(
     re-sends the email — a mailbox has no idempotency key, so a rare duplicate is possible and accepted
     (a duplicate beats a drop). ADR 0029."""
     _reject_envref_in_lists("Email", recipients=recipients)
+    _check_tls_ca_file("Email", tls_ca_file)
+    _check_tls_ca_pin("Email", tls_ca_pin, tls_ca_file)
     return ConnectionSpec(
         ConnectorType.EMAIL,
         {
@@ -2920,6 +3011,7 @@ def Email(
             "use_tls": use_tls,
             "tls_verify": tls_verify,
             "tls_ca_file": tls_ca_file,
+            "tls_ca_pin": tls_ca_pin,
             "tls_check_hostname": tls_check_hostname,
             "timeout_seconds": timeout_seconds,
             "encoding": encoding,
@@ -2950,6 +3042,7 @@ def Direct(
     use_tls: bool = True,  # STARTTLS by default; False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
     tls_verify: bool = True,  # verify the relay's cert (#323); False (dev only) needs the escape
     tls_ca_file: str | EnvRef | None = None,  # PEM to verify the SMTP/HISP relay against
+    tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     tls_check_hostname: bool = True,  # match the cert against `host` (leave on)
     timeout_seconds: float = 30.0,
     encoding: str = "utf-8",
@@ -2982,6 +3075,8 @@ def Direct(
     the pinned ``cryptography`` exposes no OAEP alternative on ``PKCS7EnvelopeBuilder``, so this
     setting does not make the whole message OAEP-clean."""
     _reject_envref_in_lists("Direct", recipients=recipients)
+    _check_tls_ca_file("Direct", tls_ca_file)
+    _check_tls_ca_pin("Direct", tls_ca_pin, tls_ca_file)
     return ConnectionSpec(
         ConnectorType.DIRECT,
         {
@@ -3001,6 +3096,7 @@ def Direct(
             "use_tls": use_tls,
             "tls_verify": tls_verify,
             "tls_ca_file": tls_ca_file,
+            "tls_ca_pin": tls_ca_pin,
             "tls_check_hostname": tls_check_hostname,
             "timeout_seconds": timeout_seconds,
             "encoding": encoding,
@@ -3034,7 +3130,7 @@ def DICOM(
     | None = None,  # opt-in mTLS: require + verify a calling peer's client cert
     tls_ca_pin: str
     | EnvRef
-    | None = None,  # SCP: SHA-256 of tls_ca_file; a mismatch refuses (BACKLOG #1142)
+    | None = None,  # SCP and SCU: SHA-256 of tls_ca_file; a mismatch refuses (#1142, #2371)
     tls_crl_file: str
     | EnvRef
     | None = None,  # opt-in CRL for mTLS client certs (#1005): a bare PEM CRL (#1890)
@@ -3155,6 +3251,7 @@ def DICOMweb(
     timeout_seconds: float = 30.0,
     verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
+    tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     encoding: str = "utf-8",
     capture_response: bool = False,  # capture the STOW-RS dicom+json response as a reply (ADR 0013)
     reingress_to: str
@@ -3196,6 +3293,7 @@ def DICOMweb(
         if verify_tls
         else "verify_tls=False verifies nothing, and DICOMweb has no token hop",
     )
+    _check_tls_ca_pin("DICOMweb", tls_ca_pin, tls_ca_file)
     _reject_envref_in_lists("DICOMweb", proxy_no_proxy=proxy_no_proxy)
     return ConnectionSpec(
         ConnectorType.DICOMWEB,
@@ -3209,6 +3307,7 @@ def DICOMweb(
             "timeout_seconds": timeout_seconds,
             "verify_tls": verify_tls,
             "tls_ca_file": tls_ca_file,
+            "tls_ca_pin": tls_ca_pin,
             "encoding": encoding,
             "capture_response": capture_response,
             "reingress_to": reingress_to,
@@ -3556,6 +3655,7 @@ def Soap(
     verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
     tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain+hostname still verified; #129)
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
+    tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     encoding: str = "utf-8",
     capture_response: bool = False,  # capture the SOAP response envelope as a reply (ADR 0013)
     capture_response_headers: list[str]
@@ -3619,6 +3719,7 @@ def Soap(
     not, is stated once in ``docs/CONNECTIONS.md``, "Pinning a private CA per connection"."""
     _reject_envref_headers("Soap", headers)
     _check_tls_ca_file("Soap", tls_ca_file)
+    _check_tls_ca_pin("Soap", tls_ca_pin, tls_ca_file)
     _reject_envref_in_lists(
         "Soap",
         capture_response_headers=capture_response_headers,
@@ -3638,6 +3739,7 @@ def Soap(
             "verify_tls": verify_tls,
             "tls_allow_expired": tls_allow_expired,
             "tls_ca_file": tls_ca_file,
+            "tls_ca_pin": tls_ca_pin,
             "encoding": encoding,
             "capture_response": capture_response,
             "capture_response_headers": capture_response_headers,
@@ -3743,9 +3845,11 @@ def Ftp(
     port: int | EnvRef = 21,
     tls: bool = False,  # True → FTPS (explicit TLS, PROT P); False → plain ftp
     # FTPS: honour an EXPIRED server cert (#129). The chain is still verified, and the hostname too
-    # unless a hand-built spec sets tls_check_hostname=False.
+    # unless a hand-built spec sets tls_check_hostname=False. That key, and tls_verify=False, are
+    # refused outright when a username or password is set (vault BACKLOG #2636).
     tls_allow_expired: bool = False,
     tls_ca_file: str | EnvRef | None = None,  # FTPS: PEM, trust ONLY this CA for the server (#1180)
+    tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     username: str | EnvRef | None = None,
     password: str | EnvRef | None = None,  # secret — use env()
     remote_dir: str | EnvRef,
@@ -3769,9 +3873,11 @@ def Ftp(
     destination (stdlib ``ftplib`` — no extra). Same poll/upload shape as :func:`Sftp`.
 
     Plain ``ftp`` transmits credentials in **cleartext**: supplying a ``username``/``password`` over
-    plain ``ftp`` is **refused** unless ``MEFOR_ALLOW_INSECURE_TLS`` is set (use ``tls=True`` for FTPS,
-    or :func:`Sftp`). FTPS encrypts the control + data channels, so credentials are fine there. Put
-    secrets (``password``) in ``env()``. The host is gated by ``[egress].allowed_remote`` (both
+    plain ``ftp`` is **refused** outright, with no escape (use ``tls=True`` for FTPS, or
+    :func:`Sftp`). FTPS encrypts the control + data channels, so credentials are fine there while
+    the server certificate is verified, name included: a hand-built spec that sets
+    ``tls_verify=False`` or ``tls_check_hostname=False`` with a ``username`` or ``password`` is
+    refused outright, with no escape (vault BACKLOG #2636). Put secrets (``password``) in ``env()``. The host is gated by ``[egress].allowed_remote`` (both
     directions). At-least-once → downstreams **must be idempotent**. ``validate_directory`` and
     ``poll_max_files`` behave exactly as they do on :func:`Sftp`.
 
@@ -3780,6 +3886,7 @@ def Ftp(
     _check_tls_ca_file(
         "Ftp", tls_ca_file, unread=None if tls else "plain FTP (tls=False) builds no TLS context"
     )
+    _check_tls_ca_pin("Ftp", tls_ca_pin, tls_ca_file)
     return ConnectionSpec(
         ConnectorType.REMOTEFILE,
         {
@@ -3788,6 +3895,7 @@ def Ftp(
             "port": port,
             "tls_allow_expired": tls_allow_expired,
             "tls_ca_file": tls_ca_file,
+            "tls_ca_pin": tls_ca_pin,
             "username": username,
             "password": password,
             "remote_dir": remote_dir,
@@ -4349,6 +4457,7 @@ class OutboundConnection:
 # statically — Registry.port_collisions at validate/check/load (literal ports), inbound_binding_conflicts
 # (env-resolved + reserved-port aware) at the runner's start/reload — and the RegistryRunner also
 # classifies the runtime bind failure, so a conflict always names the connection(s) + the contended port.
+# A configured ``port = 0`` is never compared; see _EPHEMERAL_PORT.
 
 #: Connector types that bind a local listening port (so a port conflict is possible). File/Timer/
 #: Loopback/RemoteFile sources never bind a listening port. A DATABASE poll source carries a ``port``
@@ -4413,12 +4522,27 @@ def _hosts_overlap(a: str | None, b: str | None) -> bool:
     return a == b
 
 
+#: ``port = 0`` asks the OS to choose the port at bind time, so two listeners configured with it do
+#: not contend with each other, and treating the 0 as a concrete port refused a valid graph. Every
+#: comparison below therefore skips it; a non-zero pair is compared exactly as before. What this
+#: does NOT cover: the port the OS hands out is unknown until the bind, so a concrete-port listener
+#: that happens to name it is not caught here, and the runner's bind reports it as an ordinary
+#: EADDRINUSE conflict. This is the one statement of the rule; the docstrings below point here.
+_EPHEMERAL_PORT = 0
+
+
+def _ports_contend(port_a: int, port_b: int) -> bool:
+    """Whether two configured listener ports name the same socket port: equal and not ephemeral."""
+    return port_a == port_b and port_a != _EPHEMERAL_PORT
+
+
 def _binding_conflicts(bindings: list[_Binding]) -> list[tuple[_Binding, _Binding]]:
-    """Every pair of bindings sharing a port on overlapping interfaces, in declaration order."""
+    """Every pair of bindings sharing a non-ephemeral port on overlapping interfaces, in declaration
+    order."""
     out: list[tuple[_Binding, _Binding]] = []
     for i, a in enumerate(bindings):
         for b in bindings[i + 1 :]:
-            if a.port == b.port and _hosts_overlap(a.host, b.host):
+            if _ports_contend(a.port, b.port) and _hosts_overlap(a.host, b.host):
                 out.append((a, b))
     return out
 
@@ -4474,8 +4598,9 @@ def resolve_listener_binding(
 
 def bindings_overlap(host_a: str | None, port_a: int, host_b: str | None, port_b: int) -> bool:
     """Whether two resolved ``(host, port)`` listener bindings contend for the same socket. Hosts are
-    (re-)normalized defensively, so a caller may pass a raw reserved host (e.g. ``"0.0.0.0"``)."""
-    return port_a == port_b and _hosts_overlap(
+    (re-)normalized defensively, so a caller may pass a raw reserved host (e.g. ``"0.0.0.0"``). A
+    configured port 0 is skipped (:data:`_EPHEMERAL_PORT`)."""
+    return _ports_contend(port_a, port_b) and _hosts_overlap(
         _normalize_bind_host(host_a), _normalize_bind_host(host_b)
     )
 
@@ -4494,7 +4619,8 @@ def inbound_binding_conflicts(
     ports and the EFFECTIVE bind host (a connection's ``bind_address`` else the service ``bind_host``),
     and checks each listener against the ``reserved`` service bindings — each a ``(label, host, port)``,
     e.g. the engine's API listener — so an inbound that would steal the API's port is caught here rather
-    than as a bare bind failure. Returns ``[]`` when there is no conflict."""
+    than as a bare bind failure. A ``port = 0`` listener is skipped (:data:`_EPHEMERAL_PORT`).
+    Returns ``[]`` when there is no conflict."""
     listeners: list[_Binding] = []
     for conn in registry.inbound.values():
         binding = resolve_listener_binding(conn, bind_host=bind_host, env_values=env_values)
@@ -4730,6 +4856,15 @@ class Registry:
     # only, for the same reason as `all_loopback_inbound`: every other reader of `inbound` must keep
     # seeing only this shard's, so a map here would re-leak foreign inbounds into filtered-only paths.
     all_inbound: frozenset[str] | None = None
+    # EVERY pass-through (PT) inbound in the deployment, NAME -> its declared `deployed` flag, pinned
+    # beside the shard identity by the same filter (None on an unfiltered graph / single-shard config).
+    # A Handler's `Send` into a PT is a fact about the CONFIG, not about which shard owns the PT: the
+    # transform writes the child INGRESS row to the UNIFIED store and the owning shard's router worker
+    # drains it. Keyed off `inbound` alone, every Send into a sibling shard's PT failed at transform
+    # (vault BACKLOG #2755). The flag rides along because `transform_one` declines a Send to a
+    # not-deployed target (ADR 0111) and must decide that identically on every shard. Names and a
+    # flag only, not the connections, for the same reason as `all_loopback_inbound`.
+    all_pt_inbound: Mapping[str, bool] | None = None
 
     def inbound_names(self) -> frozenset[str]:
         """Every inbound connection NAME in the deployment — the pinned unfiltered set when this is one
@@ -4750,6 +4885,19 @@ class Registry:
         return frozenset(
             name for name, ic in self.inbound.items() if ic.spec.type is ConnectorType.LOOPBACK
         )
+
+    def passthrough_inbounds(self) -> Mapping[str, bool]:
+        """Every pass-through (PT) inbound in the deployment, NAME -> its ``deployed`` flag — the
+        pinned unfiltered map when this is one engine shard's filtered view, else derived from this
+        graph's own inbounds. The source the shard filter pins from, and the key for the PT backend
+        gate: a shard that owns no PT but Sends into a sibling's still writes PT children."""
+        if self.all_pt_inbound is not None:
+            return self.all_pt_inbound
+        return {
+            name: ic.deployed
+            for name, ic in self.inbound.items()
+            if ic.spec.type is ConnectorType.PT
+        }
 
     def add_inbound(self, conn: InboundConnection) -> None:
         _require_connection_name(conn, "inbound connection")
@@ -4851,8 +4999,36 @@ class Registry:
             except WiringError as exc:
                 yield str(exc)
         yield from self.encoding_problems()
+        yield from self.dialling_pin_problems()
         for port, first, second in self.port_collisions():  # low-13
             yield f"inbound connections {first!r} and {second!r} both bind port {port}"
+
+    def dialling_pin_problems(self) -> list[str]:
+        """A ``tls_ca_pin`` on a connection that dials out, whose hop never reads ``tls_ca_file``
+        (vault BACKLOG #2371). Such a pin reads as pinned while nothing checks it.
+
+        Here and not in the factories: a SMART or OAuth2 token hop, which reads the CA, is composed
+        onto a spec after its factory returns. The reasons are those of ``unread_ca_reason`` in
+        ``auth/trust_anchors.py``. Literal values only, as :meth:`encoding_problems`: an ``env()``
+        value reads as unknown, and the check after resolution refuses it then."""
+        from messagefoundry.auth.trust_anchors import unread_ca_reason, unread_pin_message
+
+        dialling = [
+            ("outbound connection", c.name, c.spec.settings) for c in self.outbound.values()
+        ]
+        dialling += [
+            ("inbound connection", c.name, c.spec.settings)
+            for c in self.inbound.values()
+            if c.spec.type is ConnectorType.REMOTEFILE
+        ]
+        dialling += [("fhir lookup", s.name, s.settings) for s in self.fhir_lookups.values()]
+        problems: list[str] = []
+        for kind, name, settings in dialling:
+            if settings.get("tls_ca_pin") is None or not settings.get("tls_ca_file"):
+                continue
+            if (unread := unread_ca_reason(settings)) is not None:
+                problems.append(unread_pin_message(f"{kind} {name!r}:", unread))
+        return problems
 
     def port_collisions(self) -> list[tuple[int, str, str]]:
         """Inbound listeners that bind a shared literal port on overlapping interfaces, as
@@ -4866,7 +5042,8 @@ class Registry:
         port, and only an ``int`` literal is checkable (an ``EnvRef`` port resolves per environment —
         the runner's :func:`inbound_binding_conflicts` covers those, plus the reserved API port, at
         start/reload). A ``deployed=False`` inbound (#233, ADR 0111) is excluded: it never binds, so it
-        cannot collide — see :func:`resolve_listener_binding`, which excludes it on the resolved path."""
+        cannot collide — see :func:`resolve_listener_binding`, which excludes it on the resolved path.
+        A ``port = 0`` listener is skipped too (:data:`_EPHEMERAL_PORT`)."""
         bindings = [
             _Binding(conn.name, _normalize_bind_host(conn.bind_address), port)
             for conn in self.inbound.values()
@@ -5044,20 +5221,28 @@ def attested_secure_hops(registry: Registry) -> list[tuple[str, str]]:
     ``DatabaseLookup`` and a ``DatabaseRef`` reference source, whose executors read those settings. Names
     other than an outbound's are prefixed with their table, because each table is its own namespace.
 
+    It fails toward listing (vault BACKLOG #2232). Every carrier is listed unless its flag is ``None``
+    or ``False``, so a value the report cannot read, such as an ``env()`` reference written into a
+    lookup's settings after its factory ran, is listed rather than missed. The load-time check
+    (:func:`refuse_unresolved_hop_flags`) refuses that value, but this report can run without it.
+
     Pure: it reads the loaded graph and touches nothing else."""
 
     def _reason(value: object) -> str:
         return str(value) if value else "(none recorded)"
 
+    def _listed(flag: object) -> bool:
+        return flag is not None and flag is not False
+
     out = [
         (inbound_record_name(ic.name), _reason(ic.tls_hop_attested_reason))
         for ic in registry.inbound.values()
-        if ic.tls_hop_attested
+        if _listed(ic.tls_hop_attested)
     ]
     out += [
         (oc.name, _reason(oc.tls_hop_attested_reason))
         for oc in registry.outbound.values()
-        if oc.tls_hop_attested
+        if _listed(oc.tls_hop_attested)
     ]
     settings_carriers: list[tuple[str, Mapping[str, Any]]] = [
         *((fhir_lookup_record_name(s.name), s.settings) for s in registry.fhir_lookups.values()),
@@ -5067,7 +5252,7 @@ def attested_secure_hops(registry: Registry) -> list[tuple[str, str]]:
     out += [
         (name, _reason(settings.get("tls_hop_attested_reason")))
         for name, settings in settings_carriers
-        if settings.get("tls_hop_attested")
+        if _listed(settings.get("tls_hop_attested"))
     ]
     return sorted(out)
 
@@ -6730,68 +6915,376 @@ def handler(
 # --- loader ------------------------------------------------------------------
 
 
-class _SiblingHelperFinder:
-    """Resolve a config module's top-level ``import _helpers`` to a sibling ``.py`` in the config dir.
+def config_py_files(directory: Path) -> list[Path]:
+    """Every ``*.py`` in ``directory`` the loader may run or import, sorted: dot-named files excluded.
+
+    ``Path.glob("*.py")`` matches ``.IB_OLD.py`` (an editor or manual backup) and ``._IB_ACME_ADT.py``
+    (a macOS AppleDouble file left by an SMB copy) too, because pathlib has no hidden-file rule. Neither
+    is config, so the loader, both config-source trust checks and the fingerprint skip a dot-named
+    module the same way (vault BACKLOG #2781). The ``_``-helper skip is the loader's own rule on top of
+    this, not part of it: a helper is still run when a sibling imports it, so the trust check and the
+    fingerprint keep it."""
+    return sorted(p for p in directory.glob("*.py") if not p.name.startswith("."))
+
+
+def _config_module_name(path: Path) -> str:
+    # Derive a collision-free module name from the resolved absolute path (not just the stem):
+    # two same-stem files in different dirs must not share __module__ (breaks pickling, dataclass
+    # __module__, get_type_hints). Helpers are named the same way, so a helper is never registered
+    # under the plain name a stdlib or installed module would use (vault BACKLOG #2780).
+    digest = hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()[:12]
+    return f"mefor_config_{path.stem}_{digest}"
+
+
+def _is_helper_name(name: str) -> bool:
+    """A top-level import name the helper convention covers: ``_``-prefixed and not dotted."""
+    return name.startswith("_") and "." not in name and name.isidentifier()
+
+
+def _same_file(origin: str | None, path: Path) -> bool:
+    if not origin:
+        return False
+    try:
+        return os.path.samefile(origin, path)
+    except OSError:
+        return False
+
+
+def _refuse_shadowing_helper(name: str, path: Path) -> None:
+    """Refuse a helper whose name is already a module's: ``_csv.py``, ``_json.py``, ``_pytest.py``.
+
+    Helpers are served only to config modules (see :class:`_HelperImporter`), so such a helper can no
+    longer replace the real module for the rest of the process. But ``import _csv`` in a config module
+    would still mean two different things depending on whether ``_csv.py`` sits beside it, and the
+    reader of the config cannot tell which one runs. So the name is refused, naming the file
+    (vault BACKLOG #2780).
+
+    The standard library has many ``_``-prefixed top-level modules (``_csv``, ``_json``,
+    ``_strptime``, ``_decimal``, ...), and installed packages add more (``_cffi_backend``,
+    ``_pytest``), so the ``_`` prefix alone never separated a helper from a real module. A module
+    found at the helper's own path (the config dir on ``sys.path``, as when the engine runs from it)
+    is the helper itself, not a clash."""
+    if name in sys.stdlib_module_names:
+        clash = "a standard library module"
+    elif name in sys.modules and not _same_file(getattr(sys.modules[name], "__file__", None), path):
+        clash = "a module this process has already imported"
+    else:
+        try:
+            spec = importlib.machinery.PathFinder.find_spec(name)
+        except (ImportError, ValueError):
+            spec = None
+        # A spec with no origin is a namespace package (a plain directory on sys.path), not a module.
+        if spec is None or spec.origin is None or _same_file(spec.origin, path):
+            return
+        clash = "an installed module"
+    raise WiringError(
+        f"config helper {path.name} has the same name as {clash} ({name}); rename the helper, "
+        f"for example to _cfg{name}.py, and update the imports that name it"
+    )
+
+
+# The exception classes an ``except`` clause can name that catch an ImportError. ``*`` stands for a
+# bare ``except:``. ModuleNotFoundError catches only that subclass; see _guard_covers.
+_IMPORT_GUARD_NAMES = frozenset(
+    {"ImportError", "ModuleNotFoundError", "Exception", "BaseException", "*"}
+)
+
+
+def _caught_import_guards(handler: ast.ExceptHandler) -> frozenset[str]:
+    """The names in ``except`` clause ``handler`` that can catch an ImportError (``builtins.X`` too)."""
+    if handler.type is None:
+        return frozenset({"*"})
+    caught = handler.type
+    names = caught.elts if isinstance(caught, ast.Tuple) else [caught]
+    found = {
+        n.id if isinstance(n, ast.Name) else n.attr
+        for n in names
+        if isinstance(n, ast.Name | ast.Attribute)
+    }
+    return frozenset(found & _IMPORT_GUARD_NAMES)
+
+
+def _guard_covers(caught: frozenset[str], exc: ImportError) -> bool:
+    """Whether a guard catching ``caught`` would catch ``exc`` at run time."""
+    if caught - {"ModuleNotFoundError"}:
+        return True
+    return bool(caught) and isinstance(exc, ModuleNotFoundError)
+
+
+def _body_helper_imports(source: bytes, stems: frozenset[str]) -> list[tuple[str, frozenset[str]]]:
+    """The helpers ``source`` imports inside a function body, each with what its ``try`` guards catch.
+
+    Only function bodies: a module's top-level statements already ran, with their real control flow,
+    so a top-level import that was skipped (``if TYPE_CHECKING``, a failed optional import) stays
+    skipped. Inside a body the scan does NOT follow control flow: a helper named under an ``if`` that
+    is never true, or in a function never called, is still loaded with the config. A body import is
+    guarded only when a ``try`` around it has an ``except`` that can catch an ImportError (it names
+    ``ImportError``, ``ModuleNotFoundError``, ``Exception`` or ``BaseException``, or is bare); the
+    caller then lets that helper's own ``ImportError`` stand when the guard would catch it, so the
+    guard decides at run time. ``contextlib.suppress`` is not read as a guard. ``[]`` when the source does not parse: it ran, so a later edit is the next
+    load's to report."""
+    if not any(stem.encode() in source for stem in stems):
+        return []
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError, MemoryError, RecursionError):
+        # MemoryError and RecursionError are the parser's width and depth walls (BACKLOG #1858).
+        return []
+    found: list[tuple[str, frozenset[str]]] = []
+    nothing: frozenset[str] = frozenset()
+
+    def visit(node: ast.AST, in_function: bool, guarded: frozenset[str]) -> None:
+        for child in ast.iter_child_nodes(node):
+            child_guarded = guarded
+            if isinstance(node, ast.Try | ast.TryStar) and any(child is st for st in node.body):
+                for handler in node.handlers:
+                    child_guarded = child_guarded | _caught_import_guards(handler)
+            if in_function and isinstance(child, ast.Import):
+                found.extend((a.name, child_guarded) for a in child.names if a.name in stems)
+            elif (
+                in_function
+                and isinstance(child, ast.ImportFrom)
+                and child.level == 0
+                and child.module is not None
+                and child.module in stems
+            ):
+                found.append((child.module, child_guarded))
+            if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
+                visit(child, True, nothing)  # a try around a def does not guard what its body runs
+            else:
+                visit(child, in_function, child_guarded)
+
+    try:
+        visit(tree, False, nothing)
+    except RecursionError:
+        return found  # a deeply nested module that already ran; the preload covers what it reached
+    return found
+
+
+class _HelperImporter:
+    """Resolve a config module's ``import _helpers`` to a sibling ``_helpers.py``, for one load only.
 
     The loader runs non-``_`` modules under mangled names and skips ``_``-prefixed files as top-level
-    modules, but CLAUDE.md §4 documents importing shared ``_``-prefixed helpers from siblings. Those
-    files aren't on ``sys.path``, so without a finder Python can't locate them and the import fails
-    (review low-10). Installed on ``sys.meta_path`` only while a config dir loads, and resolves **only**
-    ``_``-prefixed top-level names (matching the loader's ``_*``-skip rule) against ``<name>.py`` in
-    that dir. Scoping to ``_``-prefixed names means a config-dir file named after a real module
-    (``os.py``, ``json.py``, ``ssl.py``, ``requests.py`` — none start with ``_``) can no longer
-    shadow the stdlib/installed module for the duration of the load (SEC-019, CWE-427); only the
-    documented ``_``-helper convention is served. :func:`_assert_safe_config_source` already vets every
-    ``*.py`` (including ``_*``), so a helper sits inside the same trust boundary as its importers."""
+    modules, but CLAUDE.md section 4 documents importing shared ``_``-prefixed helpers from siblings.
+    Those files are not on ``sys.path``, so Python cannot find them unaided (review low-10).
 
-    def __init__(self, directory: Path, created: set[str]) -> None:
+    This importer is bound into each config module and each helper as that module's own
+    ``__import__`` (its ``__builtins__``), and nowhere else. Nothing is put on ``sys.meta_path`` and
+    no helper is registered under its plain name, so an import anywhere else in the process -- another
+    thread's first ``import csv`` during a reload, which reaches ``_csv`` -- never sees the config dir
+    (vault BACKLOG #2780; this replaced a process-wide finder whose ``_`` scoping assumed no real
+    top-level module starts with ``_``, which is false). A config-dir file named after a real module
+    without a ``_`` (``os.py``, ``json.py``) is never served either (SEC-019, CWE-427).
+
+    Because the binding lives in the module's globals, a Router or Handler that imports a helper
+    inside its body resolves it at run time too, long after the load (vault BACKLOG #2783). So that
+    the run-time path never reads the config dir or runs a file, every helper a function body imports
+    is loaded during the load, once the config module that started the chain has finished (so an
+    in-body import written to break a cycle still breaks it). An unguarded failure there is a load
+    or ``check`` error rather than a dead-lettered message. After :meth:`close` the importer serves
+    only the helpers already loaded.
+
+    Two limits. Only the ``import`` statement goes through ``__import__``:
+    ``importlib.import_module("_x")`` in a config module does not find a helper. And the module's
+    builtins are a copy taken when the load starts, so a name added to :mod:`builtins` later is not
+    seen by config code; a live view would cost a Python-level lookup on every builtin name a
+    Handler reads, on the per-message path. :func:`_assert_safe_config_source` vets every ``*.py``
+    (including ``_*``), so a helper sits inside the same trust boundary as its importers."""
+
+    def __init__(self, directory: Path) -> None:
         self._dir = directory
-        self._created = created
+        self._modules: dict[str, ModuleType] = {}
+        self._open = True
+        # Helper files whose body imports are not yet loaded, drained by preload().
+        self._pending: list[Path] = []
+        # What this load put in sys.modules, with what each name held before, for discard().
+        self._registered: list[tuple[str, ModuleType, ModuleType | None]] = []
+        # Optional helpers whose ImportError a guard is left to decide, by name.
+        self._failed: dict[str, ImportError] = {}
+        # The helper stems present when the load starts: the only names this importer serves, so an
+        # ordinary ``import json`` in a Handler body costs one set lookup before the real import.
+        self._stems = frozenset(
+            p.stem for p in config_py_files(directory) if _is_helper_name(p.stem)
+        )
+        self.builtins: dict[str, Any] = {**vars(builtins), "__import__": self._import}
 
-    def find_spec(self, fullname: str, path: Any, target: Any = None) -> Any:
-        if path is not None or "." in fullname:
-            return None  # only top-level absolute imports, resolved against the config dir
-        # SEC-019 (CWE-427): only serve the documented ``_``-prefixed helper convention so a config-dir
-        # file named after a real stdlib/installed module (os/json/ssl/requests — none start with ``_``)
-        # cannot pre-empt normal finder resolution and silently shadow it. No stdlib/installed top-level
-        # module name starts with ``_``, and every legitimate sibling helper does, so this is sufficient.
-        if not fullname.startswith("_"):
-            return None
-        candidate = self._dir / f"{fullname}.py"
-        if not candidate.is_file():
-            return None
-        self._created.add(fullname)
-        return importlib.util.spec_from_file_location(fullname, candidate)
+    def close(self) -> None:
+        """End the load: from now on serve only the helpers already loaded, and read no file.
+
+        Also drops the load's bookkeeping. Each module's builtins point at this importer for the life
+        of the graph, so a kept ``previous`` module would hold the generation before it alive, and
+        that one the generation before it, for every reload of the service."""
+        self._open = False
+        self._registered.clear()
+        self._pending.clear()
+
+    def register(self, mod_name: str, module: ModuleType) -> None:
+        """Put ``module`` in ``sys.modules`` as this load's own entry for ``mod_name``.
+
+        The name is path-derived, so an earlier, live load of the same file holds the same name. The
+        entry it replaces is kept so :meth:`unregister` and :meth:`discard` can put it back."""
+        self._registered.append((mod_name, module, sys.modules.get(mod_name)))
+        sys.modules[mod_name] = module
+
+    def unregister(self, mod_name: str, module: ModuleType) -> None:
+        """Undo :meth:`register` for one module that failed to run."""
+        for index in range(len(self._registered) - 1, -1, -1):
+            name, mine, previous = self._registered[index]
+            if name == mod_name and mine is module:
+                del self._registered[index]
+                self._restore(name, mine, previous)
+                return
+
+    def discard(self) -> None:
+        """Undo every :meth:`register` of this load (it failed): each name gets back what it held
+        before, so a live graph loaded earlier from the same files keeps its modules. A name this load
+        no longer owns -- a later load replaced it -- is left alone."""
+        while self._registered:
+            self._restore(*self._registered.pop())
+
+    @staticmethod
+    def _restore(mod_name: str, mine: ModuleType, previous: ModuleType | None) -> None:
+        if sys.modules.get(mod_name) is not mine:
+            return
+        if previous is None:
+            sys.modules.pop(mod_name, None)
+        else:
+            sys.modules[mod_name] = previous
+
+    def drop_pending(self) -> None:
+        """Forget queued body scans: the module that queued them failed (or they all ran)."""
+        self._pending.clear()
+
+    # The parameter names are __import__'s own, so a keyword call (``__import__(n, fromlist=[...])``)
+    # in a config module still works.
+    def _import(
+        self,
+        name: str,
+        globals: Mapping[str, object] | None = None,
+        locals: Mapping[str, object] | None = None,
+        fromlist: Sequence[str] = (),
+        level: int = 0,
+    ) -> ModuleType:
+        if level == 0 and name in self._stems:
+            module = self._modules.get(name)
+            if module is None and self._open:
+                module = self._load(name)
+            if module is not None:
+                return module
+            if not self._open:
+                # Never fall through to the normal import: with the config dir on sys.path it would run
+                # the file at run time and register it under its plain name.
+                failed = self._failed.get(name)
+                if failed is None:
+                    raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+                raise ModuleNotFoundError(
+                    f"No module named {name!r} (config helper failed at load: "
+                    f"{type(failed).__name__})",
+                    name=name,
+                ) from failed
+        return builtins.__import__(name, globals, locals, fromlist, level)
+
+    def _load(self, name: str) -> ModuleType | None:
+        path = self._dir / f"{name}.py"
+        if not path.is_file():
+            return None  # gone since the load started: resolved the normal way
+        _refuse_shadowing_helper(name, path)
+        mod_name = _config_module_name(path)
+        spec = importlib.util.spec_from_file_location(mod_name, path)
+        if spec is None or spec.loader is None:
+            raise WiringError(f"cannot load config helper: {path}")
+        module = self.new_module(spec)
+        # Cached before it runs, as Python's own import does, so a helper cycle sees the partial module.
+        self._modules[name] = module
+        self.register(mod_name, module)
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            del self._modules[name]
+            self.unregister(mod_name, module)
+            raise
+        self._pending.append(path)
+        return module
+
+    def new_module(self, spec: importlib.machinery.ModuleSpec) -> ModuleType:
+        """A module for ``spec`` whose own ``import`` statements resolve helpers through this load."""
+        module = importlib.util.module_from_spec(spec)
+        module.__dict__["__builtins__"] = self.builtins
+        return module
+
+    def preload(self, path: Path) -> None:
+        """Load every helper a function body in ``path`` imports -- and, in turn, every helper those
+        helpers' bodies import -- so an in-body import works after the load. Called once ``path`` has
+        finished running, so nothing it imports at top level is still half-initialized."""
+        self._pending.append(path)
+        while self._pending:
+            self._preload_one(self._pending.pop(0))
+
+    def _preload_one(self, current: Path) -> None:
+        if not self._stems:
+            return
+        try:
+            source = current.read_bytes()
+        except OSError:
+            return  # it already ran; the file going away now is not this pass's to report
+        for name, caught in _body_helper_imports(source, self._stems):
+            if name in self._modules:
+                continue
+            failed = self._failed.get(name)
+            if failed is not None:
+                # Already failed under a guard elsewhere; this import site must be guarded too, or
+                # every message through it would fail.
+                if not _guard_covers(caught, failed):
+                    raise failed
+                continue
+            try:
+                self._load(name)
+            except ImportError as exc:
+                if not _guard_covers(caught, exc):
+                    raise
+                # An optional helper whose own import failed, under a guard that catches it: left
+                # unloaded, so the run-time import raises ModuleNotFoundError (chained to this) and the
+                # guard decides, as it would have. Any other failure is not optional and fails the
+                # load. Kept without its traceback, whose frames would hold the load alive. Names
+                # only, never the exception text (CLAUDE.md section 9).
+                self._failed[name] = exc.with_traceback(None)
+                _logger.warning(
+                    "config helper %s failed to load (%s) and is left to the ImportError guard in %s",
+                    safe_name(f"{name}.py"),
+                    type(exc).__name__,
+                    safe_name(current.name),
+                )
 
 
-# Serializes the shared module-global load state (_active, sys.meta_path/sys.modules mutations) so a
-# reload offloaded to a worker thread can't race a concurrent validate/load (review low-3).
+# Serializes the shared module-global load state (_active, sys.modules mutations) so a reload
+# offloaded to a worker thread can't race a concurrent validate/load (review low-3).
 _load_lock = threading.Lock()
 
 
 @contextmanager
-def _loading(directory: Path, registry: Registry) -> Iterator[None]:
+def _loading(directory: Path, registry: Registry) -> Iterator[_HelperImporter]:
     """Hold the load lock, publish ``registry`` as the active declaration target **and its code sets
-    as the active set** (so a module-top-level ``code_set(...)`` resolves), and install the
-    sibling-helper import finder for ``directory`` — tearing all of it down (including any helper
-    modules registered under their plain name) on exit."""
+    as the active set** (so a module-top-level ``code_set(...)`` resolves), and yield the load's
+    :class:`_HelperImporter`, closed on exit so it serves only what this load imported. A load that
+    raises inside this block gets back, in ``sys.modules``, whatever each of its names held before, so
+    a live graph loaded earlier from the same files keeps its modules. (A failure after the block --
+    graph validation, the connections.toml merge -- leaves this load's entries, as it leaves its config
+    modules'.)"""
     global _active
-    helpers: set[str] = set()
-    finder = _SiblingHelperFinder(directory, helpers)
+    helpers = _HelperImporter(directory)
     with _load_lock:
         _active = registry
-        sys.meta_path.insert(0, finder)
         # Code sets are published BEFORE the modules run so a top-level capture resolves; the registry
         # already holds them (loaded in load_config/validate_config), and activated() restores cleanly.
         try:
             with _code_sets_activated(registry.code_sets):
-                yield
+                yield helpers
+        except BaseException:
+            helpers.discard()
+            raise
         finally:
             _active = None
-            with suppress(ValueError):
-                sys.meta_path.remove(finder)
-            for name in helpers:
-                sys.modules.pop(name, None)
+            helpers.close()
 
 
 def load_config(directory: str | Path, *, allow_empty: bool = False) -> Registry:
@@ -6820,19 +7313,22 @@ def load_config(directory: str | Path, *, allow_empty: bool = False) -> Registry
         registry.code_sets = load_code_sets(directory / CODESETS_DIR_NAME)
     except CodeSetError as exc:
         raise WiringError(str(exc)) from exc
-    with _loading(directory, registry):
-        for path in sorted(p for p in directory.glob("*.py") if not p.name.startswith("_")):
-            _exec_module(path)
+    with _loading(directory, registry) as helpers:
+        for path in config_py_files(directory):
+            if not path.name.startswith("_"):
+                _exec_module(path, helpers)
     # Connections may also be authored as data (ADR 0007): merge connections.toml into the SAME
     # registry the code-first inbound()/outbound() calls populated, before validating the whole graph.
     # Imported lazily to avoid a wiring<->connections_file import cycle. A name in both surfaces is a
     # duplicate WiringError via add_inbound/add_outbound (no silent precedence).
     from messagefoundry.config.connections_file import (
-        CONNECTIONS_FILE_NAME,
+        connections_file_path,
         load_connections_file,
     )
 
-    conn_file = directory / CONNECTIONS_FILE_NAME
+    # The live file, or the candidate a `connections_edit` write is validating before it replaces the
+    # live one (vault BACKLOG #2782).
+    conn_file = connections_file_path(directory)
     if conn_file.is_file():
         load_connections_file(conn_file, registry)
     registry.validate(allow_empty=allow_empty)
@@ -7085,7 +7581,7 @@ def _enforce_windows_config_source(directory: Path, probes: _WinConfigSourceProb
             f"refusing to load config from {directory}: this process's own user SID could not be "
             f"read, so the owner of the config source cannot be vetted; see docs/SERVICE.md"
         )
-    for path in [directory, *directory.glob("*.py")]:
+    for path in [directory, *config_py_files(directory)]:
         sec = probes.read_path(path)
         if sec.status in _WIN_PATH_GONE_ERRORS and path != directory and not os.path.lexists(path):
             continue
@@ -7573,7 +8069,7 @@ def _assert_safe_config_source(directory: Path) -> None:
     trusted_uids = frozenset({0, euid})
     # Include _*.py: the loader skips them as top-level modules, but a sibling can import them, so a
     # writable/foreign-owned helper is just as much an injection vector (review M-21).
-    candidates = [directory, *directory.glob("*.py")]
+    candidates = [directory, *config_py_files(directory)]
     for path in candidates:
         try:
             st = path.stat()
@@ -7596,26 +8092,29 @@ def _assert_safe_config_source(directory: Path) -> None:
             )
 
 
-def _exec_module(path: Path) -> None:
-    # Derive a collision-free module name from the resolved absolute path (not just the stem):
-    # two same-stem files in different dirs must not share __module__ (breaks pickling, dataclass
-    # __module__, get_type_hints). Register it in sys.modules so intra-config imports and anything
-    # relying on sys.modules[__name__] resolve correctly; remove it again on failure.
-    digest = hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()[:12]
-    mod_name = f"mefor_config_{path.stem}_{digest}"
+def _exec_module(path: Path, helpers: _HelperImporter) -> None:
+    # Register the module in sys.modules under its path-derived name so intra-config imports and
+    # anything relying on sys.modules[__name__] resolve correctly; remove it again on failure.
+    mod_name = _config_module_name(path)
     spec = importlib.util.spec_from_file_location(mod_name, path)
     if spec is None or spec.loader is None:
         raise WiringError(f"cannot load config module: {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
+    module = helpers.new_module(spec)
+    helpers.register(mod_name, module)
     try:
         spec.loader.exec_module(module)
+        # The helpers its function bodies import, loaded now that it has run (vault BACKLOG #2783).
+        helpers.preload(path)
     except WiringError:
-        sys.modules.pop(mod_name, None)
+        helpers.unregister(mod_name, module)
         raise
     except Exception as exc:
-        sys.modules.pop(mod_name, None)
+        helpers.unregister(mod_name, module)
         raise WiringError(f"error loading config module {path.name}: {exc}") from exc
+    finally:
+        # Whatever this module queued -- a failure part-way included -- is never drained by the next
+        # module, whose diagnostic would then name the wrong file.
+        helpers.drop_pending()
 
 
 def validate_config(directory: str | Path, *, allow_empty: bool = False) -> list[Diagnostic]:
@@ -7650,10 +8149,12 @@ def validate_config(directory: str | Path, *, allow_empty: bool = False) -> list
         registry.code_sets = load_code_sets(codesets_dir)
     except CodeSetError as exc:
         diagnostics.append(Diagnostic(message=str(exc), file=str(codesets_dir)))
-    with _loading(directory, registry):
-        for path in sorted(p for p in directory.glob("*.py") if not p.name.startswith("_")):
+    with _loading(directory, registry) as helpers:
+        for path in config_py_files(directory):
+            if path.name.startswith("_"):
+                continue
             try:
-                _exec_module(path)
+                _exec_module(path, helpers)
             except WiringError as exc:
                 diagnostics.append(Diagnostic(message=str(exc), file=str(path)))
                 declaring_source_failed = True
@@ -7661,10 +8162,13 @@ def validate_config(directory: str | Path, *, allow_empty: bool = False) -> list
     # *.py ones and the router/port checks below cover TOML-authored connections. Lazy import (cycle).
     from messagefoundry.config.connections_file import (
         CONNECTIONS_FILE_NAME,
+        connections_file_path,
         load_connections_file,
     )
 
-    conn_file = directory / CONNECTIONS_FILE_NAME
+    # The candidate a `connections_edit` write is validating, when this runs inside one (vault
+    # BACKLOG #2782), as `load_config` does.
+    conn_file = connections_file_path(directory)
     if conn_file.is_file():
         try:
             load_connections_file(conn_file, registry)

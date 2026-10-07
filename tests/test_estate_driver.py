@@ -12,13 +12,15 @@ must FAIL on.
 from __future__ import annotations
 
 import asyncio
-import time
+import math
+from typing import Never
 
 import pytest
 
 from harness.config.estate._shape import events_per_msg, hub_flags
 from harness.load.corpus import build_corpus
 from harness.load.correlator import Correlator
+from harness.load.estate import driver as estate_driver
 from harness.load.estate.driver import EstateDriver
 from harness.load.ids import ControlIds
 from harness.load.metrics import Counters, Histogram, LiveMetrics
@@ -76,8 +78,63 @@ def _build_corpus():
     )
 
 
-def test_event_calibration_holds_the_target_event_rate() -> None:
-    # A scaled-up per-connection EVENT budget (the ratios/identity are magnitude-independent) so a short
+class _VirtualTimer:
+    """Stand-in for the driver module's ``asyncio``: a clock the test owns, ticking at ``quantum``.
+
+    WHY THE CALIBRATION RUNS ON IT. This test divided the events the driver offered by the WALL-CLOCK
+    seconds ``asyncio.run`` took, so the denominator carried event-loop setup and teardown, the
+    overshoot past the hold, and every stall the runner imposed -- while the numerator stopped at the
+    driver's last tick before the hold ended. On a loaded windows-2022 merge-queue runner on
+    2026-10-07 that read 8753 events/s against the 10000 target, and it failed 14 of 40 runs locally
+    under 16 CPU hogs, at 8055-8944. Nothing in that gap is calibration: the weights decide how many
+    events each MESSAGE carries, and the token bucket decides how many messages each SECOND of the
+    driver's own clock is owed. So the driver keeps its real token bucket and runs on this clock
+    instead, and "per second" means per second of the schedule it was handed.
+
+    ``run_hold`` reads exactly ``get_running_loop().time()`` and ``sleep()`` through the module; any
+    other attribute it reads that way fails loud here. (A name bound at import time, such as
+    ``from asyncio import sleep``, would bypass this swap altogether -- the two-sided clock check in
+    the test is what notices that.) ``sleep`` advances by whole ``quantum`` ticks and at least one, as
+    a coarse OS timer returns late and never early, so the bucket emits in catch-up BATCHES rather
+    than one send per tick. The batches stay far under ``_BATCH_CAP``, so the stall branch that
+    counts ``deferred`` is not exercised here.
+    """
+
+    def __init__(self, quantum: float) -> None:
+        self.now = 0.0
+        self._quantum = quantum
+
+    def get_running_loop(self) -> _VirtualTimer:
+        return self
+
+    def time(self) -> float:
+        return self.now
+
+    async def sleep(self, delay: float) -> None:
+        self.now += max(1, math.ceil(delay / self._quantum)) * self._quantum
+
+    def __getattr__(self, name: str) -> Never:
+        raise AttributeError(
+            f"the estate driver read asyncio.{name}, which _VirtualTimer does not model; widen the "
+            f"stand-in only if run_hold's clock genuinely changed"
+        )
+
+
+#: How far the realized event rate may sit from the spec target. On the test's own clock the only
+#: error left is where the last tick lands in the final quantum (half of one 1/64 s tick either way
+#: over a 2 s hold, 0.4%), so 2% is room, not slack. It is what lets (c) see a mis-scaled driver at all: against the old wall-clock
+#: band of 10%, an aggregate rate 5% low, 5% high or 8% high passed, and a UNIFORM driver --
+#: 10.08% over the target here -- passed or failed (c) by the width of one runner's stall.
+_EVENT_RATE_REL = 0.02
+
+
+# A 1 ms timer, and Windows' default 1/64 s tick. At this test's 4300 msg/s the finer one emits a
+# handful per tick and the coarser one batches of about 67, and the calibration must hold under both.
+@pytest.mark.parametrize("quantum", [0.001, 1 / 64], ids=["1ms", "win-default"])
+def test_event_calibration_holds_the_target_event_rate(
+    monkeypatch: pytest.MonkeyPatch, quantum: float
+) -> None:
+    # A scaled-up per-connection EVENT budget (the ratios/identity are magnitude-independent) so the
     # hold banks enough sends for statistics.
     count, simple_fraction, hub_fanout, budget = 100, 0.72, 3, 100.0
     driver, sent, flags = _driver_with_fakes(
@@ -87,14 +144,24 @@ def test_event_calibration_holds_the_target_event_rate() -> None:
         per_conn_event_rate=budget,
     )
     corpus = _build_corpus()
-    hold = 0.5
+    # Seconds of the DRIVER'S clock, so a longer hold costs no wall time and shrinks the part-tick.
+    hold = 2.0
+    clock = _VirtualTimer(quantum)
+    monkeypatch.setattr(estate_driver, "asyncio", clock)
 
     async def drive() -> None:
         await driver.run_hold(corpus=corpus, mix=_MIX, hold_seconds=hold)
 
-    t0 = time.perf_counter()
     asyncio.run(drive())
-    elapsed = time.perf_counter() - t0
+    # The seam is live, from both sides: a correct driver stops on the first tick at or past the hold.
+    # One that read its clock anywhere else would leave this clock at zero (it never ran on it) or
+    # carry it far past the hold (it slept on it while timing itself on the wall clock) -- either way
+    # this test would quietly be back on the runner's wall clock.
+    assert hold <= clock.now < hold + 2 * quantum, (clock.now, hold, quantum)
+    # The bucket emits for every due instant up to its LAST tick before the hold, which lands
+    # somewhere in the final quantum; take the middle of it, so the at-most-one-tick error sits
+    # evenly either side of the band instead of all on the low side.
+    elapsed = hold - quantum / 2
 
     total_msgs = sum(sent)
     assert total_msgs > 500, total_msgs  # enough samples for the assertions to mean something
@@ -133,7 +200,7 @@ def test_event_calibration_holds_the_target_event_rate() -> None:
     spec_total_event_rate = (
         budget * count
     )  # = per_conn_event_rate × count, NOT handed to the driver
-    assert realized_event_rate == pytest.approx(spec_total_event_rate, rel=0.10), (
+    assert realized_event_rate == pytest.approx(spec_total_event_rate, rel=_EVENT_RATE_REL), (
         realized_event_rate,
         spec_total_event_rate,
     )
@@ -141,13 +208,13 @@ def test_event_calibration_holds_the_target_event_rate() -> None:
     # (d) …and therefore every connection contributes ≈ the SAME per-connection event rate (the estate
     # invariant): both classes land near ``budget`` events/sec despite very different message rates.
     per_conn_event_rate_realized = realized_event_rate / count
-    assert per_conn_event_rate_realized == pytest.approx(budget, rel=0.10)
+    assert per_conn_event_rate_realized == pytest.approx(budget, rel=_EVENT_RATE_REL)
     # Each class, measured on its own, also lands near the budget (a hub's low msg rate × high fan-out ≈
     # a simple's high msg rate × low fan-out) — this is what a uniform driver would violate.
     simple_ev_rate = sum(simple_counts) * 2 / elapsed / len(simple_idx)
     hub_ev_rate = sum(hub_counts) * (1 + hub_fanout) / elapsed / len(hub_idx)
-    assert simple_ev_rate == pytest.approx(budget, rel=0.12)
-    assert hub_ev_rate == pytest.approx(budget, rel=0.12)
+    assert simple_ev_rate == pytest.approx(budget, rel=_EVENT_RATE_REL)
+    assert hub_ev_rate == pytest.approx(budget, rel=_EVENT_RATE_REL)
 
 
 def test_uniform_message_split_would_fail_the_event_calibration() -> None:

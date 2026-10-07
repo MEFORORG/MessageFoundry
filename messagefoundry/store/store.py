@@ -74,6 +74,7 @@ from typing import (
     Protocol,
     Self,
     TypedDict,
+    assert_never,
     cast,
     runtime_checkable,
 )
@@ -691,7 +692,7 @@ class _GroupCommitter:
 
 class MessageStatus(str, Enum):  # noqa: UP042
     RECEIVED = "received"  # persisted at ingress, awaiting router+transform (staged pipeline)
-    ROUTED = "routed"  # router produced ≥1 delivery; outbound rows queued, awaiting delivery
+    ROUTED = "routed"  # router selected at least one handler; awaiting transform and/or delivery
     PROCESSED = "processed"  # all destinations terminal (done or dead)
     ERROR = "error"  # parse/validation/processing failure (dead-lettered); logged, not routed
     FILTERED = "filtered"  # rejected by the channel filter; logged, intentionally not routed
@@ -1149,7 +1150,20 @@ class ConnectionEventWrite(TypedDict):
 # The one sessions INSERT, shared by MessageStore.create_session's guarded and unguarded paths.
 _SESSION_INSERT: Final = (
     "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at,"
-    " revoked_at, client, reauth_at, auth_mechanism) VALUES (?,?,?,?,?,NULL,?,?,?)"
+    " revoked_at, client, reauth_at, auth_mechanism, idp_auth_time)"
+    " VALUES (?,?,?,?,?,NULL,?,?,?,?)"
+)
+
+
+# BACKLOG #2143: the IdP step-up's write-back of the auth_time it accepted, in the `?` dialect SQLite
+# and SQL Server share. Bind the new value three times. It only ever moves FORWARD, so two step-ups on
+# one session that land out of order cannot leave the older value behind for a replay to pass. A
+# NULL (every password re-proof) leaves the stored value as it was. Each placeholder is CAST, because
+# inside an expression SQL Server has no column to infer a NULL parameter's type from.
+_IDP_AUTH_TIME_FORWARD_SQL: Final = (
+    "CASE WHEN CAST(? AS FLOAT) IS NOT NULL"
+    " AND (idp_auth_time IS NULL OR CAST(? AS FLOAT) > idp_auth_time)"
+    " THEN CAST(? AS FLOAT) ELSE idp_auth_time END"
 )
 
 
@@ -1431,6 +1445,37 @@ ChannelScopeSource = Literal["ad", "manual"]
 SCOPE_SOURCE_AD: Final[ChannelScopeSource] = "ad"
 SCOPE_SOURCE_MANUAL: Final[ChannelScopeSource] = "manual"
 
+
+class AdminRemoval(StrEnum):
+    """A change that can take the Administrator role away from one account (vault BACKLOG #2779).
+
+    ``remove_unless_last_admin`` applies one, on every backend, and refuses it when it would leave
+    no enabled administrator."""
+
+    DISABLE = "disable"
+    DELETE = "delete"
+    SET_ROLES = "set_roles"
+
+    def takes_role(self, admin_role_id: str, role_ids: Sequence[str]) -> bool:
+        """Whether the account lacks ``admin_role_id`` once this change is applied. Disabling and
+        deleting always take it; a role write takes it unless ``role_ids`` names it."""
+        return self is not AdminRemoval.SET_ROLES or admin_role_id not in role_ids
+
+
+#: The last-administrator guard's read (vault BACKLOG #2779): among enabled accounts holding the
+#: role, how many are the target and how many are not. Binds: user id, user id, role id. The ids
+#: are compared in SQL rather than in Python so the guard matches ids exactly as the write's
+#: ``WHERE id=?`` does, under the database's own collation. SQL Server runs it as is; Postgres
+#: carries a ``$n``/boolean twin. One more copy of "enabled administrator" beside the service's
+#: enumerations (``AuthService.has_notifiable_admin`` lists them); a condition added to one belongs
+#: in all.
+_SQL_ADMIN_GUARD_COUNTS = (
+    "SELECT COALESCE(SUM(CASE WHEN u.id = ? THEN 1 ELSE 0 END), 0),"
+    " COALESCE(SUM(CASE WHEN u.id <> ? THEN 1 ELSE 0 END), 0)"
+    " FROM users u JOIN user_roles r ON r.user_id = u.id"
+    " WHERE r.role_id = ? AND u.disabled = 0"
+)
+
 #: The compare-and-set behind ``withdraw_ad_channel_scope`` on SQLite. Postgres carries a ``$n``
 #: twin and SQL Server a collation-pinned one. Binds: new source, now, user id, the expected scope,
 #: the manual marker.
@@ -1692,6 +1737,12 @@ class SessionRecord:
     #: leg runs. Set once at mint and carried forward by ``rotate_session``. NULL on a row written
     #: before the column existed, which takes the non-federated step-up.
     auth_mechanism: str | None = None
+    #: The IdP's ``auth_time`` for this session, as the IdP stated it (BACKLOG #2143): set at an
+    #: ``oidc`` mint and moved forward by each IdP step-up that succeeds. The step-up requires a
+    #: later one, IdP clock against IdP clock. NULL on every other session, and on an ``oidc`` row
+    #: written before the column existed, which the IdP step-up refuses as
+    #: ``step_up_idp_auth_time_missing``.
+    idp_auth_time: float | None = None
 
     @classmethod
     def from_mapping(cls, d: Mapping[str, Any]) -> SessionRecord:
@@ -1706,6 +1757,7 @@ class SessionRecord:
             reauth_at=_opt_float(d.get("reauth_at")),
             mfa_verified_at=_opt_float(d.get("mfa_verified_at")),
             auth_mechanism=d.get("auth_mechanism"),
+            idp_auth_time=_opt_float(d.get("idp_auth_time")),
         )
 
     def is_live(self, *, now: float, idle_seconds: float) -> bool:
@@ -3205,6 +3257,7 @@ def delivery_key(
     *,
     control_id: str | None,
     message_id: str,
+    outbox_id: str,
     destination_name: str,
     handler_name: str | None,
     delivery_seq: int,
@@ -3212,21 +3265,33 @@ def delivery_key(
     """The idempotency-ledger key for one **completed** outbound delivery (H2) — a SHA-256 digest of
     re-run-stable, **non-PHI** identifiers only (ids + a counter; **never a body**).
 
-    Folds in the inbound control id (MSH-10) when present, else the internal ``message_id`` (so two
-    messages that happen to share a control id across channels stay distinct via the destination +
-    seq), the destination, the handler that produced the delivery (NULL → empty), and ``delivery_seq``
-    — ``1 + COUNT(prior ledger rows for this (message_id, destination))``, the same monotonic,
-    replay-stable counter shape as ``response_seq`` (ADR 0013). The seq is what distinguishes an
-    **operator replay** (a fresh, higher-seq delivery → a new key → re-sends, never deduped) from a
-    **crash-re-run** (the same row instance recovered before its completion committed — its prior
-    ledger row, if any, is keyed by ``outbox_id`` and caught at claim time, not by this hash).
+    Folds in the internal ``message_id``, the ``outbox_id`` of the queue row that delivered, the
+    inbound control id (MSH-10, NULL when absent), the destination, the handler that produced the
+    delivery (NULL → empty), and ``delivery_seq`` — ``1 + COUNT(prior ledger rows for this
+    (message_id, destination))``. A crash re-run re-derives every input (its prior completion rolled
+    back, so the COUNT is unchanged), so it re-derives the same key.
 
-    Shared verbatim by all three store backends so the digest is byte-identical across SQLite/Postgres/
-    SQL Server. control_id is a peek-derived MSH field — included as an *operator-facing correlation
-    aid* in the digest input only; it is hashed, never stored or logged in the clear here."""
+    **The ids are what make the key unique, never the control id or the seq** (vault BACKLOG #2768).
+    The callers write at most one ledger row per ``outbox_id`` (they return early when one exists),
+    so with the outbox id in the hash no two ledger rows can share a key. Neither weaker input is
+    unique on its own. A control id is sender-assigned: a retransmit recorded as a new message, or a
+    counter that restarts, gives two messages one control id, and a key that hashed it IN PLACE OF the
+    message id collided at the same destination, handler and seq. The seq is a COUNT, not a MAX: a
+    replay DELETEs the ledger rows of the rows it re-pends, so it can recompute an earlier seq, and a
+    scoped delete that keeps a sibling row's entry can recompute the sibling's seq. Every backend
+    INSERT ignores a key conflict, so a collision silently drops a ledger row rather than failing.
+
+    The claim-time skip looks the ledger up by ``outbox_id``; nothing recomputes this key to find a
+    row. Shared verbatim by all three store backends so the digest is byte-identical across SQLite/
+    Postgres/SQL Server. control_id adds no uniqueness and no correlation (nothing recomputes the key);
+    it stays an input only because #2768 kept it as an extra component. Dropping it would also drop the
+    per-delivery ``SELECT control_id`` its callers run, which the ADR 0071 statement inventory pins.
+    It is hashed, never stored or logged in the clear here."""
     canonical = json.dumps(
         [
-            control_id if control_id is not None else message_id,
+            message_id,
+            outbox_id,
+            control_id,
             destination_name,
             handler_name or "",
             delivery_seq,
@@ -4000,23 +4065,25 @@ def seed_notify_email(email: str | None) -> str | None:
 class AuditAppend:
     """One audit row a write appends in its OWN transaction, on all three backends (BACKLOG #2100).
 
-    For a record that must not outlive, or be outlived by, the row it describes. ``create_user``
-    takes one for a directory birth whose ``mail`` was not adopted. Written as a second call, a
-    crash between the two kept the account and lost the record of why it has no address. The row
-    joins the hash chain :meth:`~MessageStore.record_audit` appends to, and is teed after commit.
+    For a record that must not outlive, or be outlived by, the row it describes. Written as a
+    second call, a crash between the two kept the change and lost its record. ``create_user`` and
+    ``update_user_profile`` take them (BACKLOG #2221), and so do the operator mutations through an
+    :data:`OperatorAudit` (BACKLOG #2624). Each joins the hash chain
+    :meth:`~MessageStore.record_audit` appends to, and is teed after commit.
     """
 
     action: str
     actor: str | None = None
     detail: str | None = None
     client: str | None = None
+    channel_id: str | None = None
 
     def tee(self, *, ts: float, row: AppendedAuditRow) -> None:
         """Forward the committed row off-box, as ``record_audit`` does after its own commit."""
         emit_audit_tee(
             action=self.action,
             actor=self.actor,
-            channel_id=None,
+            channel_id=self.channel_id,
             detail=self.detail,
             client=self.client,
             ts=ts,
@@ -4024,6 +4091,77 @@ class AuditAppend:
             seq=row.seq,
             row_hash=row.row_hash,
         )
+
+
+def tee_audits(
+    audits: Sequence[AuditAppend], rows: Sequence[AppendedAuditRow], *, ts: float
+) -> None:
+    """Tee each committed row of a write's ``audits`` off-box, after its commit (BACKLOG #2221).
+
+    Shared by all three backends. ``rows`` is what the appends returned, one per audit, in order.
+    """
+    for audit, row in zip(audits, rows, strict=True):
+        audit.tee(ts=ts, row=row)
+
+
+type OperatorAudit[R] = Callable[[R], AuditAppend | None]
+"""The audit row an operator mutation commits WITH its change, built from the change's result.
+
+Replay, dead-letter replay, resend, re-ingress and purge take one (BACKLOG #2624). The store calls
+it inside the mutation's own transaction, once the result is known, and appends the row it returns
+before the one commit. So a crash, or a failed append, keeps both or neither. ``None`` means this
+result records nothing, as a replay that re-queued no row records nothing. The row's detail can
+carry the result, such as a count, which is why this is a function and not a row.
+
+It must be pure and quick: it runs inside the mutation's transaction, which holds the mutation's
+row locks (and on SQLite the writer lock). It runs BEFORE the audit chain's lock is taken, so it must
+not read chain state."""
+
+
+def operator_audits[R](audit: OperatorAudit[R] | None, result: R) -> tuple[AuditAppend, ...]:
+    """The rows a mutation appends for ``result``: none, or the one ``audit`` returns (#2624)."""
+    if audit is None:
+        return ()
+    row = audit(result)
+    return () if row is None else (row,)
+
+
+class AuditedWrite:
+    """Tee a write's audit rows off-box once its transaction has committed (BACKLOG #2624).
+
+    The write appends its rows inside its own transaction and hands them to :meth:`add`. Enter this
+    OUTSIDE the transaction and the writer lock, so it exits after both: a clean exit means the rows
+    are durable and tees them, outside the lock, as ``record_audit`` does. An exception tees nothing.
+    That is right for a failed commit. It also drops the tee when the exception comes after the
+    commit, such as a cancellation while the pool takes the connection back; ``record_audit`` has the
+    same window. The tee is the off-box copy, and the committed row stays in the chain. Holding the rows here, not in a local,
+    is what lets a write with several ``return`` paths inside its transaction tee from every one.
+    """
+
+    __slots__ = ("_audits", "_rows", "now")
+
+    def __init__(self, now: float) -> None:
+        self.now = now
+        self._audits: list[AuditAppend] = []
+        self._rows: list[AppendedAuditRow] = []
+
+    def add(self, audits: Sequence[AuditAppend], rows: Sequence[AppendedAuditRow]) -> None:
+        """Hold rows the transaction appended, one per audit, in order, until it commits."""
+        self._audits.extend(audits)
+        self._rows.extend(rows)
+
+    def flush(self) -> None:
+        """Tee the held rows. Call it only once their transaction has committed."""
+        audits, rows = self._audits, self._rows
+        self._audits, self._rows = [], []
+        tee_audits(audits, rows, ts=self.now)
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, exc_type: type[BaseException] | None, *_exc: object) -> None:
+        if exc_type is None:
+            self.flush()
 
 
 def birth_notify_email(email: str | None, *, adopt: bool, typed: str | None) -> str | None:
@@ -4109,10 +4247,22 @@ def check_password_generated(*, password_generated: bool, password_hash: str | N
 #: service's read and this write makes the write match no row, and the caller refuses. Backend
 #: truth literals differ, so each backend passes its own.
 def rotation_factor_term(true_literal: str) -> str:
-    # ``totp_secret IS NOT NULL`` too: an enrolment confirm that raced an administrator's factor
-    # reset can leave ``totp_enabled`` set over a NULL secret, and TOTP with no secret is no way
-    # past the lock.
+    # ``totp_secret IS NOT NULL`` too, because TOTP with no secret is no way past the lock. Since
+    # BACKLOG #2224 ``enable_totp`` no longer writes that state (see ``totp_enable_term``), but at
+    # least ``set_totp_secret(secret=None)`` still can, so the second guard stays.
     return f" AND totp_enabled={true_literal} AND totp_secret IS NOT NULL"
+
+
+#: The WHERE term that makes ``enable_totp`` conditional (BACKLOG #2224). The enrolment confirm
+#: rotates the session BEFORE it enables TOTP (BACKLOG #1902), so an ``admin_reset_mfa`` can clear
+#: the staged secret inside that window, and a second confirm can enable first. Unconditional, the
+#: enable would then set ``totp_enabled`` over a NULL secret, or replace the first confirm's
+#: recovery codes. With this term the write matches no row in either case, and the caller refuses.
+#: It checks that SOME secret is staged, not that it is the one the caller verified: a second
+#: ``set_totp_secret`` landing in the window is not caught here. Backend false literals differ, so
+#: each backend passes its own.
+def totp_enable_term(false_literal: str) -> str:
+    return f" AND totp_secret IS NOT NULL AND totp_enabled={false_literal}"
 
 
 #: Which lockout counter one failed attempt feeds (ADR 0197, BACKLOG #1131). ``"sign_in"`` is the
@@ -4543,7 +4693,7 @@ CREATE INDEX IF NOT EXISTS ix_response_message ON response(message_id);
 -- is stored in the clear (nothing to decrypt; it is not part of the `_cipher` seam). A deliberate
 -- operator `replay` DELETEs the affected rows so the re-send is NOT deduped (replay-distinguishes).
 CREATE TABLE IF NOT EXISTS delivered_keys (
-    delivery_key     TEXT PRIMARY KEY,    -- sha256(control_id|message_id, dest, handler, seq) — no PHI
+    delivery_key     TEXT PRIMARY KEY,    -- sha256 of non-PHI ids, see delivery_key()
     outbox_id        TEXT NOT NULL,       -- the queue row that delivered (claim-time dedup lookup key)
     message_id       TEXT NOT NULL,
     destination_name TEXT NOT NULL,
@@ -4813,7 +4963,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     client       TEXT,
     reauth_at    REAL,                         -- last credential re-verification (login / /me/reauth)
     mfa_verified_at REAL,                      -- when the 2nd factor was satisfied; NULL = unsatisfied (WP-14)
-    auth_mechanism TEXT                        -- how the session was minted: password/kerberos/oidc (ADR 0184 iv)
+    auth_mechanism TEXT,                       -- how the session was minted: password/kerberos/oidc (ADR 0184 iv)
+    idp_auth_time REAL                         -- the IdP's auth_time for an oidc session (BACKLOG #2143)
 );
 CREATE INDEX IF NOT EXISTS ix_sessions_user    ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS ix_sessions_expires ON sessions(expires_at);
@@ -6448,6 +6599,11 @@ class MessageStore:
         # non-federated step-up; nothing is backfilled, because nothing recorded the mechanism.
         if "auth_mechanism" not in session_cols:
             await db.execute("ALTER TABLE sessions ADD COLUMN auth_mechanism TEXT")
+        # BACKLOG #2143: the IdP auth_time an oidc session's step-up is compared with. Pre-existing
+        # rows get NULL, because nothing recorded the value to backfill. The IdP step-up refuses a
+        # NULL as step_up_idp_auth_time_missing.
+        if "idp_auth_time" not in session_cols:
+            await db.execute("ALTER TABLE sessions ADD COLUMN idp_auth_time REAL")
         # ADR 0021 "Response Sent" rides the response table via a `kind` discriminator. A pre-existing
         # DB's response table predates the three columns — ALTER them in (existing rows backfill
         # kind='response' via the DEFAULT). Metadata-only on SQLite (no table rewrite). Idempotent.
@@ -6783,24 +6939,32 @@ class MessageStore:
         attachment therefore sits at ``refcount=0`` until increffed — reclaimable by the **next** startup
         sweep, never mid-run (the sweep is startup-only, like ``reset_stale_inflight``)."""
         self._require_streaming_attachments()
-        hasher = hashlib.sha256()
-        total = 0
-        # Cell-bound AAD (ASVS 11.3.3) binds each chunk to its (attachment_id, seq) cell — but the
-        # attachment_id is the sha256 content address, known only once the full plaintext is hashed. So
-        # buffer the verbatim slices, hash them, then seal each under its (ref, seq). `chunks` is a
-        # slicing of an already-materialized OBX-5.5 value, so this adds no order-of-magnitude memory over
-        # the caller's own copy, and each AES-GCM seal still consumes exactly one chunk (one-chunk seal).
-        plaintext_chunks: list[str] = []
-        for chunk in chunks:
-            data = chunk.encode("utf-8")
-            hasher.update(data)
-            total += len(data)
-            plaintext_chunks.append(chunk)
-        ref = hasher.hexdigest()
-        sealed: list[str] = [
-            self._cipher.encrypt(c, aad=cell_aad("attachment_chunk", "ciphertext", ref, seq))
-            for seq, c in enumerate(plaintext_chunks)
-        ]
+
+        def _seal() -> tuple[str, int, list[str]]:
+            # Off the event loop (vault BACKLOG #2757): hashing and sealing a large document is CPU
+            # work in proportion to its size, and nothing else would run meanwhile.
+            hasher = hashlib.sha256()
+            total = 0
+            # Cell-bound AAD (ASVS 11.3.3) binds each chunk to its (attachment_id, seq) cell — but
+            # the attachment_id is the sha256 content address, known only once the full plaintext is
+            # hashed. So buffer the verbatim slices, hash them, then seal each under its (ref, seq).
+            # `chunks` is a slicing of an already-materialized OBX-5.5 value, so this adds no
+            # order-of-magnitude memory over the caller's own copy, and each AES-GCM seal still
+            # consumes exactly one chunk (one-chunk seal).
+            plaintext_chunks: list[str] = []
+            for chunk in chunks:
+                data = chunk.encode("utf-8")
+                hasher.update(data)
+                total += len(data)
+                plaintext_chunks.append(chunk)
+            ref = hasher.hexdigest()
+            sealed: list[str] = [
+                self._cipher.encrypt(c, aad=cell_aad("attachment_chunk", "ciphertext", ref, seq))
+                for seq, c in enumerate(plaintext_chunks)
+            ]
+            return ref, total, sealed
+
+        ref, total, sealed = await asyncio.to_thread(_seal)
         now = time.time()
         async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute("SELECT 1 FROM attachment WHERE id=?", (ref,))
@@ -7117,6 +7281,7 @@ class MessageStore:
         metadata: str | None = None,
         attachment_refs: Sequence[str] | None = None,
         now: float | None = None,
+        audit: OperatorAudit[str] | None = None,
     ) -> str:
         """Durably persist a freshly-received raw message to the **ingress stage** — the staged
         pipeline's ACK-on-receipt boundary (ADR 0001 Step A).
@@ -7211,12 +7376,19 @@ class MessageStore:
                     "INSERT INTO message_attachment (message_id, attachment_id) VALUES (?,?)",
                     (mid, ref),
                 )
+            if audit is not None:  # an operator's inject (BACKLOG #2624); a live receipt has none
+                await self._append_operator_audit(written, audit, mid)
             return mid
 
+        # BACKLOG #2624: an inject's audit row is teed by on_commit, which runs once the batch has
+        # committed and only then, even if this caller is cancelled while it waits.
+        written = AuditedWrite(now)
         # HAZARD B: the inbound ACK / HTTP-202 is built only after this returns, so under group-commit
         # _run_grouped must not return until the ingress member's batch is durably committed (the
         # committer resolves the future post-commit). We never ACK data a crash could still lose.
-        result = await self._run_grouped(_body)
+        result = await self._run_grouped(
+            _body, on_commit=(lambda _mid: written.flush()) if audit is not None else None
+        )
         assert isinstance(result, str)  # nosec B101 — _body returns mid (str)
         return result
 
@@ -9037,10 +9209,8 @@ class MessageStore:
             if retry.max_attempts is not None and attempts >= retry.max_attempts:
                 status, next_at, event = OutboxStatus.DEAD.value, now, "dead"
             else:
-                backoff = min(
-                    retry.max_backoff_seconds,
-                    retry.backoff_seconds * (retry.backoff_multiplier ** max(attempts - 1, 0)),
-                )
+                # vault BACKLOG #2761: never overflows, so attempt 1025+ keeps the cap's pace.
+                backoff = retry.backoff_for(attempts)
                 status, next_at, event = OutboxStatus.PENDING.value, now + backoff, "failed"
             # ADR 0157 Amendment A (BACKLOG #2078, #2348), widened by owner ruling 2026-09-29: the
             # retry branch re-pends a row that is INFLIGHT or PENDING, so a late worker cannot put a
@@ -9115,10 +9285,8 @@ class MessageStore:
             if retry.max_attempts is not None and head_attempts >= retry.max_attempts:
                 status, next_at, event = OutboxStatus.DEAD.value, now, "dead"
             else:
-                backoff = min(
-                    retry.max_backoff_seconds,
-                    retry.backoff_seconds * (retry.backoff_multiplier ** max(head_attempts - 1, 0)),
-                )
+                # vault BACKLOG #2761: never overflows, so attempt 1025+ keeps the cap's pace.
+                backoff = retry.backoff_for(head_attempts)
                 status, next_at, event = OutboxStatus.PENDING.value, now + backoff, "failed"
                 rescheduled_at = next_at
             # ADR 0157 Amendment A, as mark_failed (widened 2026-09-29): on the retry branch a
@@ -9499,7 +9667,13 @@ class MessageStore:
             )
             return len(orphans)
 
-    async def replay(self, message_id: str, now: float | None = None) -> int:
+    async def replay(
+        self,
+        message_id: str,
+        now: float | None = None,
+        *,
+        audit: OperatorAudit[int] | None = None,
+    ) -> int:
         """Re-queue a message for re-processing/re-delivery (attempts reset) — the message-level
         recovery path. **Two modes, by whether anything is stuck:**
 
@@ -9537,9 +9711,12 @@ class MessageStore:
         ``ERROR``. Replay does not retransmit a pass-through ``Send``: the marker carries no body, and
         the child it produced is its own message, replayable in its own right. The ``stuck`` count
         leaves this predicate out for the same reason as the erased-body one: a depth-capped DEAD
-        marker is a real failure, so the parent stays in RECOVER mode and keeps its ``ERROR``."""
+        marker is a real failure, so the parent stays in RECOVER mode and keeps its ``ERROR``.
+
+        ``audit`` builds the operator's audit row from the count, and the row commits with the
+        replay (BACKLOG #2624, :data:`OperatorAudit`)."""
         now = time.time() if now is None else now
-        async with _writer_guard(self._db, self._lock):
+        async with AuditedWrite(now) as written, _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "SELECT COUNT(*) AS n FROM queue WHERE message_id=? AND status IN (?, ?)",
                 (message_id, OutboxStatus.DEAD.value, OutboxStatus.PENDING.value),
@@ -9574,16 +9751,15 @@ class MessageStore:
                 (OutboxStatus.PENDING.value, now, now, message_id, *replay_from),
             )
             if cur.rowcount:
-                # Status reflects the earliest re-queued stage: a pending ingress/routed row → RECEIVED
-                # (back in the route/transform path); else outbound only → ROUTED (awaiting delivery).
+                # Status reflects the earliest re-queued stage, per ADR 0001's count-and-log flow. A
+                # pending INGRESS row gives RECEIVED: the router has not run, and route_handoff writes
+                # the disposition again. Anything else gives ROUTED: a routed row exists only because
+                # the router already selected its handler, and the router never re-runs for it.
+                # RECEIVED there would strand the message, because the finalizer collapses a no-rows
+                # message to FILTERED / NOT_DEPLOYED only from ROUTED (vault BACKLOG #2723).
                 pre = await self._db.execute(
-                    "SELECT 1 FROM queue WHERE message_id=? AND stage IN (?, ?) AND status=? LIMIT 1",
-                    (
-                        message_id,
-                        Stage.INGRESS.value,
-                        Stage.ROUTED.value,
-                        OutboxStatus.PENDING.value,
-                    ),
+                    "SELECT 1 FROM queue WHERE message_id=? AND stage=? AND status=? LIMIT 1",
+                    (message_id, Stage.INGRESS.value, OutboxStatus.PENDING.value),
                 )
                 status = (
                     MessageStatus.RECEIVED.value
@@ -9595,8 +9771,10 @@ class MessageStore:
                     (status, message_id),
                 )
                 await self._event(message_id, "replayed", None, f"{cur.rowcount} row(s)", now)
+            count = cur.rowcount
+            await self._append_operator_audit(written, audit, count)
             await self._commit()
-            return cur.rowcount
+        return count
 
     async def resend_to(
         self,
@@ -9607,6 +9785,7 @@ class MessageStore:
         from_: str | None = None,
         body_override: str | None = None,
         now: float | None = None,
+        audit: OperatorAudit[ResendOutcome] | None = None,
     ) -> ResendOutcome:
         """Resend a message's **stored transformed body** to an ALTERNATE outbound ``to`` (ADR 0090,
         BACKLOG #123). Ships exactly what we sent — the retained ``done``/``cancelled`` outbound
@@ -9635,9 +9814,12 @@ class MessageStore:
         :class:`ResendSourceEmpty` (retention nulled the source body — must-fix #2),
         :class:`ResendSourceAmbiguous` (``from_`` omitted with >1 delivered destination), or
         :class:`ResendKeyConflict` (the ``idempotency_key`` was already used for a different
-        message/target — review #123-4)."""
+        message/target — review #123-4).
+
+        ``audit`` builds the operator's audit row from the outcome, a duplicate included, and the row
+        commits with the resend (BACKLOG #2624, :data:`OperatorAudit`)."""
         now = time.time() if now is None else now
-        async with _writer_txn(self._db, self._lock):
+        async with AuditedWrite(now) as written, _writer_txn(self._db, self._lock):
             # Idempotency gate FIRST (ADR 0090 §4): claim the key, and only proceed if we created the
             # row. INSERT OR IGNORE + rowcount is the atomic test-and-set on the UNIQUE resend_key.
             ins = await self._db.execute(
@@ -9665,14 +9847,16 @@ class MessageStore:
                         f" {pr['message_id']!r} to {pr['to_destination']!r}; it cannot be reused for"
                         f" message {message_id!r} to {to!r}"
                     )
-                await self._commit()
-                return ResendOutcome(
+                outcome = ResendOutcome(
                     status="duplicate",
                     message_id=message_id,
                     to_destination=pr["to_destination"] if pr else to,
                     from_destination=pr["from_destination"] if pr else (from_ or ""),
                     outbox_id=pr["outbox_id"] if pr else None,
                 )
+                await self._append_operator_audit(written, audit, outcome)
+                await self._commit()
+                return outcome
             if body_override is not None:
                 # Edit-and-resend DIRECT power-path (ADR 0090 §9.1.3, BACKLOG #153): ship the
                 # operator's EDITED body to `to` as a NEW, correlated CHILD delivery. The ORIGIN
@@ -9817,14 +10001,16 @@ class MessageStore:
                 "UPDATE resend_log SET outbox_id=? WHERE resend_key=?",
                 (outbox_id, idempotency_key),
             )
-            await self._commit()
-            return ResendOutcome(
+            outcome = ResendOutcome(
                 status="resent",
                 message_id=message_id,
                 to_destination=to,
                 from_destination=src_dest,
                 outbox_id=outbox_id,
             )
+            await self._append_operator_audit(written, audit, outcome)
+            await self._commit()
+            return outcome
 
     async def reingress(
         self,
@@ -9833,6 +10019,7 @@ class MessageStore:
         raw: str,
         idempotency_key: str,
         now: float | None = None,
+        audit: OperatorAudit[ReingressOutcome] | None = None,
     ) -> ReingressOutcome:
         """Edit-and-resubmit RE-ROUTE (ADR 0090 §9, BACKLOG #153): re-enter an EDITED body onto the
         ORIGIN message's channel as a **fresh, correlated ``RECEIVED`` child message** at the ingress
@@ -9850,9 +10037,12 @@ class MessageStore:
 
         Raises :class:`ReingressOriginMissing` (origin gone — belt-and-suspenders; the API 404s first) or
         :class:`ResendKeyConflict` (the key was already used for a DIFFERENT origin/target). No mutation
-        on a raise (the whole txn rolls back)."""
+        on a raise (the whole txn rolls back).
+
+        ``audit`` builds the operator's audit row from the outcome, a duplicate included, and the row
+        commits with the resubmit (BACKLOG #2624, :data:`OperatorAudit`)."""
         now = time.time() if now is None else now
-        async with _writer_txn(self._db, self._lock):
+        async with AuditedWrite(now) as written, _writer_txn(self._db, self._lock):
             mcur = await self._db.execute(
                 "SELECT channel_id, source_type, message_type, metadata FROM messages WHERE id=?",
                 (origin_message_id,),
@@ -9885,13 +10075,15 @@ class MessageStore:
                         f" resubmit ({pr['message_id']!r} -> {pr['to_destination']!r}); it cannot be"
                         f" reused for message {origin_message_id!r}"
                     )
-                await self._commit()
-                return ReingressOutcome(
+                outcome = ReingressOutcome(
                     status="duplicate",
                     message_id=origin_message_id,
                     new_message_id=(pr["outbox_id"] if pr else "") or "",
                     channel_id=channel_id,
                 )
+                await self._append_operator_audit(written, audit, outcome)
+                await self._commit()
+                return outcome
             # Correlate the child to the origin (mirrors _insert_passthrough_child): correlation_id /
             # _root_id / _depth link the logs, plus an explicit `edited_from` for the edit provenance.
             raw_meta = self._dec(
@@ -9962,13 +10154,15 @@ class MessageStore:
                 "UPDATE resend_log SET outbox_id=? WHERE resend_key=?",
                 (new_mid, idempotency_key),
             )
-            await self._commit()
-            return ReingressOutcome(
+            outcome = ReingressOutcome(
                 status="resubmitted",
                 message_id=origin_message_id,
                 new_message_id=new_mid,
                 channel_id=channel_id,
             )
+            await self._append_operator_audit(written, audit, outcome)
+            await self._commit()
+            return outcome
 
     @staticmethod
     def _edit_resubmit_message_id(idempotency_key: str, channel: str, body: str) -> str:
@@ -9991,6 +10185,7 @@ class MessageStore:
         channel_id: str | None = None,
         destination_name: str | None = None,
         now: float | None = None,
+        audit: OperatorAudit[int] | None = None,
     ) -> int:
         """Re-queue **dead-lettered outbound deliveries** only (optionally scoped to a channel/
         destination): set them back to ``pending`` with attempts reset, revert each affected message
@@ -10021,12 +10216,13 @@ class MessageStore:
             where.append("destination_name=?")
             params.append(destination_name)
         clause = " AND ".join(where)
-        async with _writer_guard(self._db, self._lock):
+        async with AuditedWrite(now) as written, _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 f"SELECT DISTINCT message_id FROM queue WHERE {clause}", tuple(params)
             )
             message_ids = [r["message_id"] for r in await cur.fetchall()]
             if not message_ids:
+                await self._commit_operator_noop(written, audit, 0)
                 return 0
             # All-or-nothing, matching the SQL Server backend's atomicity.
             upd = await self._db.execute(
@@ -10041,6 +10237,7 @@ class MessageStore:
                     (MessageStatus.ROUTED.value, message_id, MessageStatus.ERROR.value),
                 )
                 await self._event(message_id, "replayed", None, "dead-letter replay", now)
+            await self._append_operator_audit(written, audit, upd.rowcount)
             await self._commit()
             return upd.rowcount
 
@@ -10051,31 +10248,46 @@ class MessageStore:
         *,
         top_only: bool = False,
         now: float | None = None,
+        audit: OperatorAudit[int] | None = None,
     ) -> int:
         """Soft-cancel **pending** deliveries for a destination: mark them ``cancelled``, append
         a ``cancelled`` audit event each, and finalize any message whose deliveries are now all
         terminal. ``channel_id=None`` cancels across all producers (a code-first outbound
         connection fed by several inbounds); pass an id to scope to one. ``top_only`` cancels just
-        the head of the queue (next due). Inflight/dead rows are left untouched (dead uses
-        :meth:`replay`). Returns the number cancelled."""
+        the FIFO head -- the oldest pending row by ``rowid``, the lane predicate and key
+        :meth:`claim_next_fifo` uses -- even while it is backing off and not yet due, since a
+        backing-off head blocking the lane is the case "purge top" exists to clear (ADR 0059). With a
+        ``channel_id`` it is the oldest row from that producer, which is the lane head only when no
+        other inbound feeds the destination; the API passes ``None``. On an unordered lane there is no
+        blocking head, and this still cancels the oldest row. Inflight/dead rows are left untouched
+        (dead uses :meth:`replay`). Returns the number cancelled.
+
+        ``audit`` builds the operator's audit row from the count, zero included, and the row commits
+        with the cancel (BACKLOG #2624, :data:`OperatorAudit`)."""
         now = time.time() if now is None else now
-        async with _writer_guard(self._db, self._lock):
-            where = ["destination_name=?", "status=?"]
-            params: list[object] = [destination_name, OutboxStatus.PENDING.value]
+        async with AuditedWrite(now) as written, _writer_guard(self._db, self._lock):
+            # The claim's own lane predicate (stage, destination_name, status), so the head query seeks
+            # ix_queue_fifo_out_seq in rowid order; only outbound rows carry a destination_name anyway.
+            where = ["stage=?", "destination_name=?", "status=?"]
+            params: list[object] = [
+                Stage.OUTBOUND.value,
+                destination_name,
+                OutboxStatus.PENDING.value,
+            ]
             if channel_id is not None:
-                where.insert(0, "channel_id=?")
-                params.insert(0, channel_id)
-            # `top_only` cancels the true FIFO head, so the tiebreak after next_attempt_at must match the
-            # claim's seq-only order (rowid = SQLite seq), NOT created_at (no longer the ordering key; ADR 0059).
-            query = (
-                "SELECT id, message_id FROM queue"
-                f" WHERE {' AND '.join(where)} ORDER BY next_attempt_at, rowid"
-            )
+                where.insert(1, "channel_id=?")
+                params.insert(1, channel_id)
+            # `top_only` cancels the true FIFO head, so it orders by the claim's seq-only key alone
+            # (rowid = SQLite seq; ADR 0059). Not next_attempt_at first: mark_failed pushes a failed
+            # head's next_attempt_at past the younger rows behind it, so that key would pick a healthy
+            # younger row and leave the backing-off head blocking the lane (vault BACKLOG #2754).
+            query = f"SELECT id, message_id FROM queue WHERE {' AND '.join(where)} ORDER BY rowid"
             if top_only:
                 query += " LIMIT 1"
             cur = await self._db.execute(query, tuple(params))
             rows = await cur.fetchall()
             if not rows:
+                await self._commit_operator_noop(written, audit, 0)
                 return 0
             ids = [r["id"] for r in rows]
             placeholders = ",".join("?" * len(ids))
@@ -10089,6 +10301,7 @@ class MessageStore:
                 )
             for message_id in {r["message_id"] for r in rows}:
                 await self._maybe_finalize_message(message_id, now)
+            await self._append_operator_audit(written, audit, len(ids))
             await self._commit()
             return len(ids)
 
@@ -10132,7 +10345,7 @@ class MessageStore:
         control_id: str | None = None,
         limit: int = 50,
         offset: int = 0,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
         received_from: float | None = None,
         received_to: float | None = None,
     ) -> list[dict[str, Any]]:
@@ -10171,7 +10384,7 @@ class MessageStore:
         status: str | None = None,
         message_type: str | None = None,
         control_id: str | None = None,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
         received_from: float | None = None,
         received_to: float | None = None,
     ) -> int:
@@ -10199,7 +10412,7 @@ class MessageStore:
         message_type: str | None = None,
         control_id: str | None = None,
         limit: int = 50,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> MessageSearchResult:
         """Scan-and-decrypt content search (ADR 0046 #51): pre-filter on the indexed metadata, then
         decrypt + match each candidate body **in memory** (a plain SQL ``LIKE`` is impossible while the
@@ -10268,7 +10481,7 @@ class MessageStore:
         destination_name: str | None = None,
         limit: int = 50,
         offset: int = 0,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> list[dict[str, Any]]:
         """Dead-lettered deliveries (one row per failed message→destination), newest first, joined
         with message metadata for the dead-letter view. Bodies (``raw``) are omitted (metadata only,
@@ -10300,7 +10513,7 @@ class MessageStore:
         *,
         channel_id: str | None = None,
         destination_name: str | None = None,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> int:
         """Total dead-lettered deliveries matching the same filters as :meth:`list_dead`."""
         where, params = self._dead_filter(channel_id, destination_name, allowed_channels)
@@ -10314,7 +10527,7 @@ class MessageStore:
         *,
         channel_id: str | None = None,
         destination_name: str | None = None,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> list[tuple[str, str]]:
         """The contract is ``QueueStore.list_replay_targets``: the :meth:`count_dead` predicate
         narrowed by the two clauses :meth:`replay_dead` applies, so every pair names rows a replay
@@ -10516,7 +10729,7 @@ class MessageStore:
         kinds: Sequence[str] | None = None,
         since: float | None = None,
         limit: int = 100,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> list[ConnectionEvent]:
         limit = max(
             1, min(limit, 1000)
@@ -10619,7 +10832,7 @@ class MessageStore:
         self,
         *,
         limit: int = 200,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> list[AlertInstance]:
         # The read accessor for GET /alerts/active: open + acknowledged instances, newest last_seen
         # first. Runs on the lockfree read path. `allowed_channels` applies the SAME per-channel RBAC
@@ -10643,7 +10856,7 @@ class MessageStore:
             return [self._alert_instance_row(r) for r in await cur.fetchall()]
 
     async def summarize_active_alert_instances(
-        self, *, allowed_channels: Sequence[str] | None = None
+        self, *, allowed_channels: Sequence[str] | None
     ) -> AlertSummary:
         # BACKLOG #1564: the nav bell's count + worst severity over EVERY active instance in scope, not
         # over a page of them. Same predicate and same RBAC scope as list_active_alert_instances above —
@@ -10664,7 +10877,7 @@ class MessageStore:
         return _alert_summary(row)
 
     async def get_alert_instance(
-        self, alert_id: int, *, allowed_channels: Sequence[str] | None = None
+        self, alert_id: int, *, allowed_channels: Sequence[str] | None
     ) -> AlertInstance | None:
         # Read one instance by id (any status) — the API echo for ack/resolve. RBAC-scoped exactly like
         # list_active_alert_instances (a scoped caller can't read an instance outside its channels).
@@ -10764,7 +10977,7 @@ class MessageStore:
             await self._commit()
             if cur.rowcount == 0:
                 return None
-        return await self.get_alert_instance(alert_id)
+        return await self.get_alert_instance(alert_id, allowed_channels=None)
 
     async def resume_alert_instance(
         self, alert_id: int, *, now: float | None = None
@@ -10779,7 +10992,7 @@ class MessageStore:
             await self._commit()
             if cur.rowcount == 0:
                 return None
-        return await self.get_alert_instance(alert_id)
+        return await self.get_alert_instance(alert_id, allowed_channels=None)
 
     async def count_open_alerts_by_connection(self) -> dict[str, int]:
         # Back ConnectionRow.alerts_active (ADR 0044 D4): the OPEN (not acknowledged, not resolved)
@@ -10958,17 +11171,50 @@ class MessageStore:
             return AppendedAuditRow(row_id, seq, row_hash)
         raise AssertionError("unreachable: the second attempt returns or raises")
 
-    async def list_audit(
-        self,
+    async def _append_audits(
+        self, audits: Sequence[AuditAppend], *, now: float
+    ) -> list[AppendedAuditRow]:
+        """Append each of a write's ``audits``, in order, inside its writer transaction (#2100)."""
+        return [
+            await self._append_audit_row(
+                a.action,
+                actor=a.actor,
+                channel_id=a.channel_id,
+                detail=a.detail,
+                client=a.client,
+                now=now,
+            )
+            for a in audits
+        ]
+
+    async def _append_operator_audit[R](
+        self, written: AuditedWrite, audit: OperatorAudit[R] | None, result: R
+    ) -> None:
+        """Append an operator mutation's audit row before its commit (BACKLOG #2624), so an append
+        that fails rolls the mutation back with it. ``written`` tees the row once the commit lands."""
+        audits = operator_audits(audit, result)
+        written.add(audits, await self._append_audits(audits, now=written.now))
+
+    async def _commit_operator_noop[R](
+        self, written: AuditedWrite, audit: OperatorAudit[R] | None, result: R
+    ) -> None:
+        """Audit an operator mutation that found nothing to change (BACKLOG #2624). Its row may be
+        the only write, so commit only when there is one: a bare commit would count a transaction."""
+        await self._append_operator_audit(written, audit, result)
+        if self._db.in_transaction:
+            await self._commit()
+
+    @staticmethod
+    def _audit_where(
         *,
-        limit: int = 50,
-        actor: str | None = None,
-        action: str | None = None,
-        since: float | None = None,
-        until: float | None = None,
-        exclude: AuditExclusion | None = None,
-    ) -> list[aiosqlite.Row]:
-        """Most-recent-first audit entries, optionally filtered (BACKLOG #170).
+        actor: str | None,
+        action: str | None,
+        since: float | None,
+        until: float | None,
+        exclude: AuditExclusion | None,
+        before_id: int | None,
+    ) -> tuple[str, list[object]]:
+        """The ``WHERE`` text and its bound values for :meth:`list_audit` and :meth:`count_audit`.
 
         Filters are ANDed and every value is a bound ``?`` parameter — the only thing interpolated
         into the SQL text is the fixed column/operator template built from the argument NAMES, never a
@@ -10994,13 +11240,69 @@ class MessageStore:
                 return "?"
 
             clauses.extend(exclude.clauses(bind))
-        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        if before_id is not None:
+            clauses.append("id < ?")
+            params.append(before_id)
+        return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
+
+    async def list_audit(
+        self,
+        *,
+        limit: int = 50,
+        actor: str | None = None,
+        action: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+        exclude: AuditExclusion | None = None,
+        before_id: int | None = None,
+    ) -> list[aiosqlite.Row]:
+        """Most-recent-first audit entries, optionally filtered (BACKLOG #170), and optionally only
+        those older than ``before_id``, the keyset cursor a paged reader passes (vault BACKLOG #2776).
+        Every value is a bound parameter; see :meth:`_audit_where`."""
+        where, params = self._audit_where(
+            actor=actor,
+            action=action,
+            since=since,
+            until=until,
+            exclude=exclude,
+            before_id=before_id,
+        )
         params.append(limit)
         async with self._read() as db:
             cur = await db.execute(
                 f"SELECT * FROM audit_log{where} ORDER BY id DESC LIMIT ?", params
             )
             return list(await cur.fetchall())
+
+    async def count_audit(
+        self,
+        *,
+        limit: int,
+        actor: str | None = None,
+        action: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+        exclude: AuditExclusion | None = None,
+        before_id: int | None = None,
+    ) -> int:
+        """How many rows :meth:`list_audit` would return for the same arguments, without reading
+        them (vault BACKLOG #2776). Every value is a bound parameter; see :meth:`_audit_where`."""
+        where, params = self._audit_where(
+            actor=actor,
+            action=action,
+            since=since,
+            until=until,
+            exclude=exclude,
+            before_id=before_id,
+        )
+        params.append(limit)
+        async with self._read() as db:
+            cur = await db.execute(
+                f"SELECT COUNT(*) FROM (SELECT id FROM audit_log{where} ORDER BY id DESC LIMIT ?)",
+                params,
+            )
+            row = await cur.fetchone()
+            return int(row[0]) if row is not None else 0
 
     async def recent_audit_of(self, actions: Sequence[str], *, limit: int) -> list[dict[str, Any]]:
         """Up to ``limit`` newest audit rows whose action is one of ``actions``, newest first (vault
@@ -11390,7 +11692,7 @@ class MessageStore:
         now: float | None = None,
         adopt_notify_email: bool = True,
         notify_email: str | None = None,
-        audit: AuditAppend | None = None,
+        audits: Sequence[AuditAppend] = (),
     ) -> None:
         check_password_generated(password_generated=password_generated, password_hash=password_hash)
         now = time.time() if now is None else now
@@ -11417,19 +11719,10 @@ class MessageStore:
                     1 if password_generated else 0,
                 ),
             )
-            if audit is not None:
-                # BACKLOG #2100. Before the one commit, so a failed append rolls the account back.
-                appended = await self._append_audit_row(
-                    audit.action,
-                    actor=audit.actor,
-                    channel_id=None,
-                    detail=audit.detail,
-                    client=audit.client,
-                    now=now,
-                )
+            # BACKLOG #2100. Before the one commit, so a failed append rolls the account back.
+            appended = await self._append_audits(audits, now=now)
             await self._commit()
-        if audit is not None:
-            audit.tee(ts=now, row=appended)
+        tee_audits(audits, appended, ts=now)
 
     async def get_user(self, user_id: str) -> UserRecord | None:
         async with self._read() as db:
@@ -11577,18 +11870,22 @@ class MessageStore:
         display_name: str | None,
         email: str | None,
         now: float | None = None,
+        audits: Sequence[AuditAppend] = (),
     ) -> None:
         """Write the account's profile fields. **This is the directory-sync write** — ``_upsert_ad_user``
         calls it on every AD/OIDC login — so it deliberately does NOT name ``notify_email`` (BACKLOG
         #1139). Adding that column to this SET list would hand the directory the notification target
-        back and restore the defect the split removes."""
+        back and restore the defect the split removes. ``audits``: see
+        ``AuthStore.update_user_profile``."""
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
             await self._db.execute(
                 "UPDATE users SET display_name=?, email=?, updated_at=? WHERE id=?",
                 (display_name, email, now, user_id),
             )
+            appended = await self._append_audits(audits, now=now)
             await self._commit()
+        tee_audits(audits, appended, ts=now)
 
     async def set_user_notify_email(
         self, user_id: str, *, email: str, now: float | None = None
@@ -11637,17 +11934,77 @@ class MessageStore:
 
     async def enable_totp(
         self, user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
-    ) -> None:
+    ) -> bool:
         """Activate TOTP for a user (post-confirm), storing the argon2id hashes of their one-time
-        recovery codes."""
+        recovery codes. Writes only where a secret is staged and TOTP is still off, and returns
+        whether it wrote (BACKLOG #2224, see :func:`totp_enable_term`)."""
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
-            await self._db.execute(
+            cur = await self._db.execute(
                 "UPDATE users SET totp_enabled=1, totp_enrolled_at=?, totp_recovery_codes=?,"
-                " updated_at=? WHERE id=?",
+                f" updated_at=? WHERE id=?{totp_enable_term('0')}",
                 (now, json.dumps(recovery_code_hashes), now, user_id),
             )
+            written = cur.rowcount > 0
             await self._commit()
+        return written
+
+    async def replace_totp_enrolment(
+        self,
+        user_id: str,
+        *,
+        secret: str,
+        recovery_code_hashes: list[str],
+        step: int,
+        expected_enrolled_at: float | None,
+        audit: AuditAppend,
+        now: float | None = None,
+    ) -> int | None:
+        """Swap an ENABLED TOTP enrolment for a new secret, end the account's sessions and append
+        ``audit``, all in ONE transaction (ADR 0171 Amendment B, BACKLOG #2226). Returns the number
+        of sessions ended, or ``None`` when nothing was written.
+
+        The secret, the recovery codes and the step high-water mark change together, and TOTP stays
+        on throughout, so no reader ever sees the account without a factor. ``step`` is the step of
+        the code that proved the new secret, so that code is spent. The write matches only a row
+        where TOTP is on, with a seed, and still enrolled at ``expected_enrolled_at``: a removal or a
+        re-enrolment that landed after the caller read the row is never overwritten, and TOTP can
+        never be turned on for an account that did not have it. The audit row and the session sweep
+        commit or roll back with the swap, so a refused audit append leaves the old seed in place."""
+        now = time.time() if now is None else now
+        async with _writer_txn(self._db, self._lock):
+            cur = await self._db.execute(
+                "UPDATE users SET totp_secret=?, totp_enrolled_at=?, totp_recovery_codes=?,"
+                " last_totp_step=?, updated_at=?"
+                " WHERE id=? AND totp_enabled=1 AND totp_secret IS NOT NULL"
+                " AND totp_enrolled_at IS ?",
+                (
+                    self._enc(secret, aad=cell_aad("users", "totp_secret", user_id)),
+                    now,
+                    json.dumps(recovery_code_hashes),
+                    step,
+                    now,
+                    user_id,
+                    expected_enrolled_at,
+                ),
+            )
+            if int(cur.rowcount) <= 0:
+                # Nothing written, so nothing is revoked or audited. The commit ends the empty
+                # transaction, as set_user_federated_subject does.
+                await self._commit()
+                return None
+            revoked = await self._db.execute(_REVOKE_USER_SESSIONS_SQL, (now, user_id))
+            appended = await self._append_audit_row(
+                audit.action,
+                actor=audit.actor,
+                channel_id=audit.channel_id,
+                detail=audit.detail,
+                client=audit.client,
+                now=now,
+            )
+            await self._commit()
+        audit.tee(ts=now, row=appended)
+        return int(revoked.rowcount)
 
     async def disable_totp(self, user_id: str, *, now: float | None = None) -> None:
         """Clear a user's TOTP enrollment entirely (secret, enabled flag, recovery codes)."""
@@ -11853,19 +12210,60 @@ class MessageStore:
 
     async def delete_user(self, user_id: str) -> None:
         async with _writer_txn(self._db, self._lock):
-            await self._db.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
-            await self._db.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
-            await self._db.execute("DELETE FROM webauthn_credentials WHERE user_id=?", (user_id,))
-            # vault BACKLOG #2145: the account's known sign-in addresses go with it.
-            await self._db.execute("DELETE FROM known_login_addresses WHERE user_id=?", (user_id,))
-            # BACKLOG #1233: presets are owner-scoped by Identity.user_id (#1225) and there is no
-            # FK cascade on this table, so without this DELETE the rows outlive the account —
-            # PHI-shaped `criteria` (ADR 0136) persisting with no owner able to reach or purge it,
-            # and counted by nothing. `owner` holds the user_id, not the username, which is what
-            # makes this a single keyed DELETE rather than a name lookup.
-            await self._db.execute("DELETE FROM search_presets WHERE owner_user_id=?", (user_id,))
-            await self._db.execute("DELETE FROM users WHERE id=?", (user_id,))
+            await self._delete_user_rows(user_id)
             await self._commit()
+
+    async def remove_unless_last_admin(
+        self,
+        user_id: str,
+        change: AdminRemoval,
+        *,
+        admin_role_id: str,
+        role_ids: Sequence[str] = (),
+        assigned_by: str | None = None,
+        now: float | None = None,
+    ) -> bool:
+        """The last-administrator guard and its write in one transaction (vault BACKLOG #2779); see
+        ``AuthStore``. The writer lock serializes it against every other writer in this process,
+        which is every writer this file has."""
+        now = time.time() if now is None else now
+        async with _writer_txn(self._db, self._lock):
+            if change.takes_role(admin_role_id, role_ids):
+                cur = await self._db.execute(
+                    _SQL_ADMIN_GUARD_COUNTS, (user_id, user_id, admin_role_id)
+                )
+                target, others = await cur.fetchone() or (0, 0)
+                if target and not others:
+                    await self._db.rollback()
+                    return False
+            if change is AdminRemoval.DISABLE:
+                await self._db.execute(
+                    "UPDATE users SET disabled=1, updated_at=? WHERE id=?", (now, user_id)
+                )
+            elif change is AdminRemoval.DELETE:
+                await self._delete_user_rows(user_id)
+            elif change is AdminRemoval.SET_ROLES:
+                await self._replace_user_roles(user_id, role_ids, assigned_by=assigned_by, now=now)
+            else:
+                assert_never(change)
+            await self._commit()
+        return True
+
+    async def _delete_user_rows(self, user_id: str) -> None:
+        """Delete the account and every row keyed to it. Commits nothing: the caller holds the
+        writer transaction."""
+        await self._db.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
+        await self._db.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+        await self._db.execute("DELETE FROM webauthn_credentials WHERE user_id=?", (user_id,))
+        # vault BACKLOG #2145: the account's known sign-in addresses go with it.
+        await self._db.execute("DELETE FROM known_login_addresses WHERE user_id=?", (user_id,))
+        # BACKLOG #1233: presets are owner-scoped by Identity.user_id (#1225) and there is no
+        # FK cascade on this table, so without this DELETE the rows outlive the account —
+        # PHI-shaped `criteria` (ADR 0136) persisting with no owner able to reach or purge it,
+        # and counted by nothing. `owner` holds the user_id, not the username, which is what
+        # makes this a single keyed DELETE rather than a name lookup.
+        await self._db.execute("DELETE FROM search_presets WHERE owner_user_id=?", (user_id,))
+        await self._db.execute("DELETE FROM users WHERE id=?", (user_id,))
 
     async def record_login_success(self, user_id: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
@@ -12122,14 +12520,21 @@ class MessageStore:
     ) -> None:
         now = time.time() if now is None else now
         async with _writer_txn(self._db, self._lock):
-            await self._db.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
-            for role_id in role_ids:
-                await self._db.execute(
-                    "INSERT INTO user_roles (user_id, role_id, assigned_at, assigned_by)"
-                    " VALUES (?,?,?,?)",
-                    (user_id, role_id, now, assigned_by),
-                )
+            await self._replace_user_roles(user_id, role_ids, assigned_by=assigned_by, now=now)
             await self._commit()
+
+    async def _replace_user_roles(
+        self, user_id: str, role_ids: Sequence[str], *, assigned_by: str | None, now: float
+    ) -> None:
+        """Replace the account's role rows. Commits nothing: the caller holds the writer
+        transaction."""
+        await self._db.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
+        for role_id in role_ids:
+            await self._db.execute(
+                "INSERT INTO user_roles (user_id, role_id, assigned_at, assigned_by)"
+                " VALUES (?,?,?,?)",
+                (user_id, role_id, now, assigned_by),
+            )
 
     async def set_user_channel_scope(
         self,
@@ -12345,6 +12750,7 @@ class MessageStore:
         now: float | None = None,
         require_federated_subject: tuple[str | None, str | None] | None = None,
         auth_mechanism: str | None = None,
+        idp_auth_time: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
         # reauth_at = now seeds the step-up window from login (ASVS 7.5.3). seed_reauth=False for an
@@ -12359,6 +12765,7 @@ class MessageStore:
             client,
             now if seed_reauth else None,
             auth_mechanism,
+            idp_auth_time,
         )
         if require_federated_subject is None:
             async with _writer_guard(self._db, self._lock):
@@ -12421,15 +12828,21 @@ class MessageStore:
             await self._commit()
 
     async def mark_session_reauthed(
-        self, token_hash: str, *, now: float | None = None, client: str | None = None
+        self,
+        token_hash: str,
+        *,
+        now: float | None = None,
+        client: str | None = None,
+        idp_auth_time: float | None = None,
     ) -> None:
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
             # COALESCE keeps the stored client when none is supplied; a re-verify carrying the current
             # address re-anchors the session to it (WP-L3-13 new-client-IP step-up).
             await self._db.execute(
-                "UPDATE sessions SET reauth_at=?, client=COALESCE(?, client) WHERE token_hash=?",
-                (now, client, token_hash),
+                "UPDATE sessions SET reauth_at=?, client=COALESCE(?, client),"
+                f" idp_auth_time={_IDP_AUTH_TIME_FORWARD_SQL} WHERE token_hash=?",
+                (now, client, idp_auth_time, idp_auth_time, idp_auth_time, token_hash),
             )
             await self._commit()
 
@@ -13446,16 +13859,16 @@ class MessageStore:
 
         Only outbound rows deliver; ingress/routed rows (``destination_name`` NULL) own no external send
         and are skipped. ``delivery_seq`` is ``1 + COUNT`` of this row's prior ledger entries for the
-        ``(message_id, destination_name)`` pair — the same replay-stable counter shape as
-        ``response_seq``. The stored row carries hashes + ids only — never a body/PHI. The INSERT keys on
-        the content hash; a re-run that reaches here only after the prior completion rolled back finds
-        ``COUNT=0`` again and re-derives the same key (idempotent), while the claim-time skip
+        ``(message_id, destination_name)`` pair. It is a counter, not a unique id: a replay's DELETE can
+        make it repeat, and :func:`delivery_key` takes its uniqueness from the ids instead. The stored
+        row carries hashes + ids only — never a body/PHI. A re-run that reaches here only after the
+        prior completion rolled back re-derives the same key (idempotent), while the claim-time skip
         (:meth:`claim_next_fifo`) is what actually prevents the duplicate *send*."""
         if destination_name is None:
             return  # ingress/routed completions own no external delivery — nothing to dedupe
         # One ledger row per outbox row INSTANCE: a double mark_done of the same row (a re-completion, a
         # belt-and-suspenders re-call) must not accumulate a second entry. A deliberate replay re-send
-        # DELETEs this row's entry first, so its re-delivery is recorded fresh (a new, higher seq).
+        # DELETEs this row's entry first, so its re-delivery is recorded fresh (a new ledger row).
         cur = await self._db.execute(
             "SELECT 1 FROM delivered_keys WHERE outbox_id=? LIMIT 1", (outbox_id,)
         )
@@ -13473,6 +13886,7 @@ class MessageStore:
         key = delivery_key(
             control_id=control_id,
             message_id=message_id,
+            outbox_id=outbox_id,
             destination_name=destination_name,
             handler_name=handler_name,
             delivery_seq=seq,

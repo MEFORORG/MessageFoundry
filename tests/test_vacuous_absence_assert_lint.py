@@ -129,7 +129,6 @@ _BASELINE: dict[str, int] = {
     "tests/test_docs_no_first_run_account.py": 1,
     "tests/test_docs_security_pathways.py": 3,
     "tests/test_durability_hook_remote_guard.py": 2,
-    "tests/test_engine_text_survives_the_name_run.py": 1,
     "tests/test_environments.py": 1,
     "tests/test_failure_signal.py": 2,
     "tests/test_feature_map_claims.py": 1,

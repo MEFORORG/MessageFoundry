@@ -7,9 +7,10 @@ Alert rules are **pure data** (a typed :class:`~messagefoundry.config.settings.A
 code/expression), authored by hand **and** by the GUI, so a write must touch only the rule list and
 leave every other section's comments + formatting byte-stable — hence ``tomlkit`` (style-preserving)
 rather than a plain serializer. Each mutation **re-loads the whole settings file** (the same
-``load_settings`` path the engine uses) BEFORE it persists, and writes atomically (temp + replace,
-owner-only perms); if the result wouldn't load, the prior content is restored, so a bad edit never
-lands.
+``load_settings`` path the engine uses) BEFORE it persists: the new text is validated as a candidate
+beside the live file and replaces it only if it loads (temp + replace, owner-only perms), so a bad edit
+never touches the live file. The read-modify-write holds a cross-process lock, so a concurrent edit from
+another process cannot be lost (:mod:`messagefoundry.config.atomic_edit`, vault BACKLOG #2782).
 
 Like ``connections_edit``, the validation is injected as a callback so this module stays free of the
 settings/engine import graph (and is trivially testable); the ``alert`` CLI builds the callback from
@@ -22,12 +23,13 @@ the next engine restart — ``POST /config/reload`` re-runs the ``--config`` gra
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import tomlkit
+
+from messagefoundry.config import atomic_edit
 
 #: Scalar/array fields written (in this order) for one rule. Only keys present in the input are
 #: emitted, and only ``None`` is treated as absent — an empty ``transports = []`` (the "suppress"
@@ -96,20 +98,21 @@ def add_rule(
     so a new rule goes last; reordering/editing is remove + re-add (mirrors a connection rename)."""
     _validate_input(obj)
     path = Path(service_config)
-    original = path.read_text(encoding="utf-8") if path.is_file() else None
-    doc = tomlkit.parse(original) if original is not None else tomlkit.document()
+    with atomic_edit.edit_lock(path, busy_error=AlertRuleError):
+        original, crlf = atomic_edit.read_text(path) if path.is_file() else (None, False)
+        doc = tomlkit.parse(original) if original is not None else tomlkit.document()
 
-    alerts = doc.get("alerts")
-    if alerts is None:
-        alerts = tomlkit.table()
-        doc["alerts"] = alerts
-    rules = alerts.get("rules")
-    if rules is None:
-        rules = tomlkit.aot()
-        alerts["rules"] = rules
-    rules.append(_build_table(obj))
+        alerts = doc.get("alerts")
+        if alerts is None:
+            alerts = tomlkit.table()
+            doc["alerts"] = alerts
+        rules = alerts.get("rules")
+        if rules is None:
+            rules = tomlkit.aot()
+            alerts["rules"] = rules
+        rules.append(_build_table(obj))
 
-    _write_validated(path, tomlkit.dumps(doc), original, validate)
+        _write_validated(path, atomic_edit.encode_text(tomlkit.dumps(doc), crlf), validate)
     return {"op": "add", "index": len(rules) - 1}
 
 
@@ -119,14 +122,15 @@ def remove_rule(service_config: str | Path, index: int, *, validate: Validate) -
     path = Path(service_config)
     if not path.is_file():
         raise AlertRuleError(f"no settings file at {path}")
-    original = path.read_text(encoding="utf-8")
-    doc = tomlkit.parse(original)
-    rules = _existing_rules(doc)
-    if rules is None or not 0 <= index < len(rules):
-        raise AlertRuleError(f"no alert rule at index {index}")
-    del rules[index]
+    with atomic_edit.edit_lock(path, busy_error=AlertRuleError):
+        text, crlf = atomic_edit.read_text(path)
+        doc = tomlkit.parse(text)
+        rules = _existing_rules(doc)
+        if rules is None or not 0 <= index < len(rules):
+            raise AlertRuleError(f"no alert rule at index {index}")
+        del rules[index]
 
-    _write_validated(path, tomlkit.dumps(doc), original, validate)
+        _write_validated(path, atomic_edit.encode_text(tomlkit.dumps(doc), crlf), validate)
     return {"op": "remove", "index": index}
 
 
@@ -169,29 +173,13 @@ def _build_table(obj: dict[str, Any]) -> Any:
     return table
 
 
-def _write_validated(path: Path, new_text: str, original: str | None, validate: Validate) -> None:
-    """Atomically write ``new_text``, validate the file loads, and roll back to ``original`` on
-    failure (delete it if it didn't exist before)."""
-    _atomic_write(path, new_text)
-    try:
-        validate(path)
-    except BaseException:
-        if original is None:
-            path.unlink(missing_ok=True)
-        else:
-            _atomic_write(path, original)
-        raise
-    _secure_file(path)
+def _write_validated(path: Path, data: bytes, validate: Validate) -> None:
+    """Validate ``data`` as a candidate and replace ``path`` with it only if it loads.
 
-
-def _atomic_write(path: Path, text: str) -> None:
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
-
-
-def _secure_file(path: Path) -> None:
-    # Owner-only permissions (defence in depth). Reuse the store's primitive; tolerate its absence.
-    from messagefoundry.store.store import _secure_file as _secure
-
-    _secure(path)
+    ``validate`` receives the CANDIDATE's path, not the live one (vault BACKLOG #2782), so a refused
+    edit leaves the live file byte-for-byte and mode-for-mode as it was, a new file included: it is
+    never created. The callback's error is re-raised unchanged, so the callback owns its wording. A
+    whole-file ``load_settings`` failure must leave the callback already rendered, as the ``alert``
+    CLI's callback renders it with ``settings_error_detail`` (vault BACKLOG #2760): its caller prints
+    the message, and this module stays outside the settings import graph."""
+    atomic_edit.replace_validated(path, data, validate)

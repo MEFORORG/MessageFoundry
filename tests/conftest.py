@@ -37,6 +37,10 @@ from tests._root_logging import root_logging_restored
 if TYPE_CHECKING:
     from messagefoundry.config.wiring import _WinConfigSourceProbes
 
+# A helper module holding the content-free asserts several connector tests share. pytest rewrites
+# asserts only in test modules unless told, and an unrewritten assert vanishes under `python -O`.
+pytest.register_assert_rewrite("tests._content_free")
+
 # ---------------------------------------------------------------------------------------------------
 # Per-PROCESS test slot.
 #
@@ -376,7 +380,7 @@ _ABOVE_CRITICAL = logging.CRITICAL + 10
 class _Baseline:
     """Snapshot of one target logger's natural (caplog-capturing) configuration.
 
-    Captured once per session BEFORE any quiescing, so setup can restore each test body to the exact
+    Captured once per session, at this suite's first test, so setup can restore each test body to the exact
     state caplog-asserting tests expect (e.g. messagefoundry.audit.propagate is True;
     uvicorn.error.handlers == []). We record the raw ``logger.level`` int (NOTSET is ``0``) so restore
     re-applies NOTSET vs an explicit level faithfully.
@@ -385,8 +389,20 @@ class _Baseline:
     __slots__ = ("level", "propagate")
 
     def __init__(self, logger: logging.Logger) -> None:
-        self.level: int = logger.level
-        self.propagate: bool = logger.propagate
+        # A run that collects both the engine suite and the web console suite loads two copies of
+        # this guard (packaging/messagefoundry-webconsole/tests/conftest.py is the other), and each
+        # snapshots lazily, at its own first test. If the other suite's tests ran first, their
+        # teardown has left the target quiesced, and a snapshot of that would make "restore"
+        # re-apply the quiesce before every later test body: caplog then sees nothing from
+        # messagefoundry.* or asyncio (two caplog tests in test_approvals.py failed exactly so).
+        # A quiesced logger carries the sentinel handler, or the sentinel level, and is read as
+        # the logger's natural state instead: NOTSET, and propagating. That guess is right for
+        # every target today; a target given a non-default natural state would need more.
+        quiesced = logger.level == _ABOVE_CRITICAL or any(
+            _QuiesceNullHandler.tags(h) for h in logger.handlers
+        )
+        self.level: int = logging.NOTSET if quiesced else logger.level
+        self.propagate: bool = quiesced or logger.propagate
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -394,7 +410,9 @@ def _quiesce_baseline() -> Iterator[dict[str, _Baseline]]:
     """Snapshot each target logger's natural config ONCE, before any per-test quiescing runs.
 
     Session-scoped so the baseline is the loggers' real configured state — not a state already
-    perturbed by an earlier test's teardown quiesce. The per-test finalizer restores to this baseline
+    perturbed by an earlier test's teardown quiesce. In a run that collects the web console suite
+    too, that suite's tests may have quiesced the targets first; :class:`_Baseline` reads that state
+    as the natural one. The per-test finalizer restores to this baseline
     at setup (pre-yield) so every test body captures exactly as it would without #17 in play.
 
     On session teardown it restores the baseline once more, so the final test's teardown-quiesce does
@@ -411,7 +429,11 @@ def _quiesce_baseline() -> Iterator[dict[str, _Baseline]]:
 # capture stream). We tag instances so setup can remove exactly the ones we added, leaving any
 # application-installed handlers alone.
 class _QuiesceNullHandler(logging.NullHandler):
-    pass
+    @staticmethod
+    def tags(handler: logging.Handler) -> bool:
+        """Whether ``handler`` is a sentinel added by either suite's copy of this guard. Matched by
+        class name, since the web console conftest defines its own class of this name."""
+        return type(handler).__name__ == _QuiesceNullHandler.__name__
 
 
 @pytest.fixture(autouse=True)
@@ -550,8 +572,9 @@ def _restore_baseline(baseline: dict[str, _Baseline]) -> None:
         logger = logging.getLogger(name)
         logger.propagate = snap.propagate
         logger.setLevel(snap.level)
-        # Drop only the sentinel handlers we added during a prior teardown; leave app handlers intact.
-        for handler in [h for h in logger.handlers if isinstance(h, _QuiesceNullHandler)]:
+        # Drop only the sentinel handlers a prior teardown added; leave app handlers intact. Matched
+        # by class NAME, so the web console suite's own copy of this guard's sentinel goes too.
+        for handler in [h for h in logger.handlers if _QuiesceNullHandler.tags(h)]:
             logger.removeHandler(handler)
 
 
@@ -561,7 +584,7 @@ def _quiesce_targets() -> None:
         logger = logging.getLogger(name)
         logger.propagate = False
         logger.setLevel(_ABOVE_CRITICAL)
-        if not any(isinstance(h, _QuiesceNullHandler) for h in logger.handlers):
+        if not any(_QuiesceNullHandler.tags(h) for h in logger.handlers):
             logger.addHandler(_QuiesceNullHandler())
 
 
@@ -797,7 +820,7 @@ def _provision_admin_enrols_a_synthetic_authenticator() -> Iterator[None]:
     import messagefoundry.__main__ as cli
     from tests._admin_account import provision_totp
 
-    def _stub(*, username: str, skew_steps: int) -> tuple[str, str, float]:
+    def _stub(*, username: str, skew_steps: int, **_wording: str) -> tuple[str, str, float]:
         kw = provision_totp()
         return kw["totp_secret"], kw["totp_code"], kw["totp_code_read_at"]
 

@@ -1749,6 +1749,12 @@ def test_the_6_8_4_fallback_statement_names_live_code_and_states_its_minimum() -
     for slug in ("auth_time_missing", "auth_time_stale", "mfa_claim_missing"):
         assert f"`{slug}`" in block and slug in claims_module.REASONS, slug
     assert f"`{service_module.STEP_UP_NOT_FRESH}`" in block
+    # BACKLOG #2143: the OIDC step-up row cites the IdP-clock test's two reasons by slug.
+    for slug in (
+        service_module.STEP_UP_IDP_AUTH_TIME_NOT_LATER,
+        service_module.STEP_UP_IDP_AUTH_TIME_MISSING,
+    ):
+        assert f"`{slug}`" in block, slug
 
     # Kerberos minting at the minimum is pinned by
     # test_the_directory_rows_disclose_what_each_leg_actually_grants. This pins the OIDC half more
@@ -2202,7 +2208,9 @@ def test_the_ninth_sweep_probes_the_amendment_a_order_in_the_code() -> None:
                 "with require_mfa off the account should rotate first"
             )
             # Item 6: once TOTP is on, a covered account cannot remove it, passkey or not ...
-            await store.enable_totp(identity.user_id, recovery_code_hashes=[])
+            # (enable_totp needs a staged secret, BACKLOG #2224.)
+            await store.set_totp_secret(identity.user_id, secret="JBSWY3DPEHPK3PXP")
+            assert await store.enable_totp(identity.user_id, recovery_code_hashes=[])
             await store.add_webauthn_credential(
                 WebAuthnCredential(
                     credential_id_hash="ninth-sweep-hash",

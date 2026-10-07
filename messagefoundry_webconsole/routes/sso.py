@@ -12,7 +12,11 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from messagefoundry.api._ui_seam import UiDeps
-from messagefoundry.api.security import get_auth, public_route
+from messagefoundry.api.security import (
+    alert_directory_administrator_granted,
+    get_auth,
+    public_route,
+)
 
 from .. import pages
 from .._auth import (
@@ -65,12 +69,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # fixation, ADR 0068 §9 threat model).
         mode = request.headers.get("Sec-Fetch-Mode")
         if mode is not None and mode != "navigate":
-            await auth.audit_kerberos_reject("non_navigation_fetch")
+            await auth.audit_kerberos_reject("non_navigation_fetch", client=client)
             return RedirectResponse("/ui/login?e=sso_failed", status_code=303)
         try:
             token_bytes = base64.b64decode(header[len("Negotiate ") :], validate=True)
         except (binascii.Error, ValueError):
-            await auth.audit_kerberos_reject("malformed_token")
+            await auth.audit_kerberos_reject("malformed_token", client=client)
             return RedirectResponse("/ui/login?e=sso_failed", status_code=303)
         # NO STEP-UP WINDOW AT BIRTH: the SSO proof is AMBIENT, so the first window-gated action
         # asks for a step-up at /ui/reauth (a live directory re-bind), unless the holder has already
@@ -91,6 +95,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # carries the cookie and is covered.
         outcome = await auth.authenticate_kerberos(
             token_bytes, client=client, supersedes=session_token(request)
+        )
+        alert_directory_administrator_granted(
+            request.app.state, outcome, via="directory_sign_in_sso"
         )
         if not outcome.ok or outcome.token is None:
             # authenticate_kerberos audited the reject. NEVER a second 401 — no challenge

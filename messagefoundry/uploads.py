@@ -1909,8 +1909,8 @@ def _atomic_write_text(root: Path, path: Path, text: str) -> None:
     write that raises — disk full is the realistic trigger and the blob is the large write — leaves a
     partial, PHI-bearing ciphertext in the uploads root that NO sweep can reach: ``list_files``,
     ``prune_expired`` and ``reseal_to_active`` all walk ``_iter_sidecars``, which yields ``.meta``
-    names only. Catching ``BaseException`` is deliberate and matches ``config/connections_edit.py``'s
-    twin: a cancellation must clean up too, and the original failure is re-raised untouched. The
+    names only. Catching ``BaseException`` is deliberate, as in ``config/atomic_edit.py``'s
+    candidate cleanup: a cancellation must clean up too, and the original failure is re-raised untouched. The
     unlink's own errors are suppressed so a cleanup problem can never mask the real cause.
 
     The name is held in ``_inflight_names`` for the whole window, so a concurrent orphan sweep in this

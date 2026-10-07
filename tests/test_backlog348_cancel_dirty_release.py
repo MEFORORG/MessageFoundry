@@ -283,7 +283,7 @@ async def _create_user_with_audit(store: SqlServerStore) -> None:
         user_id="u-1",
         username="someone",
         auth_provider="local",
-        audit=AuditAppend(action="user.created", actor="test"),
+        audits=(AuditAppend(action="user.created", actor="test"),),
         password_generated=False,
     )
 
@@ -313,6 +313,38 @@ async def test_a_failed_audit_commit_whose_rollback_fails_is_never_lent_again(
             break
         await asyncio.sleep(0.01)
     assert "raw.close" in ops, ops
+
+
+async def test_the_audit_discard_neither_waits_for_the_close_nor_holds_the_audit_lock() -> None:
+    """Engine PR 1722 shipped-open defect 7. The discard after a failed audit rollback must not wait
+    for its raw close: waiting would hold the in-process ``_audit_lock`` for as long as the close
+    takes, stalling every audit append in this process behind one dead connection. The raw close is
+    held open here; the append must still raise, and the lock must already be free, before it lands.
+    The control is the close finishing once released."""
+    import threading
+
+    ops: list[str] = []
+    store, conn = _audit_store(ops, rollback_fails=True)
+    raw = conn._conn
+    assert raw is not None
+    hold = threading.Event()
+    raw.release_close = hold  # the close blocks on its executor thread until released
+    try:
+        with pytest.raises(RuntimeError, match="commit lost"):
+            await asyncio.wait_for(_record_audit(store), timeout=5.0)
+        assert conn.closed and store._pool.free == [], ops  # discarded all the same
+        assert "raw.close" not in ops, "the append returned only after the close; it waited"
+        assert not store._audit_lock.locked(), "the audit lock is still held after the discard"
+        # The lock really is free: a second append gets it at once, with the close still held.
+        await asyncio.wait_for(store._audit_lock.acquire(), timeout=1.0)
+        store._audit_lock.release()
+    finally:
+        hold.set()
+    for _ in range(200):  # the control: the detached close lands once released
+        if raw.closed:
+            break
+        await asyncio.sleep(0.01)
+    assert raw.closed and "raw.close" in ops, ops
 
 
 async def test_an_executor_that_refuses_the_close_does_not_replace_the_commit_error(

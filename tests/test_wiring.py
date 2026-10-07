@@ -253,7 +253,8 @@ def test_loader_skips_underscore_modules(tmp_path: Path) -> None:
 
 def test_config_module_can_import_sibling_helper(tmp_path: Path) -> None:
     # low-10: CLAUDE.md §4 documents sharing `_`-prefixed helpers imported from sibling config
-    # modules. A scoped finder resolves the import against the config dir; it isn't left in sys.modules.
+    # modules. The load's helper importer resolves it against the config dir; it is never registered
+    # under its plain name in sys.modules.
     (tmp_path / "_shared.py").write_text("ROUTER = 'adt_router'\n", encoding="utf-8")
     _write(
         tmp_path,
@@ -420,6 +421,49 @@ def test_inbound_binding_conflicts_reserves_the_api_port() -> None:
         )
         == []
     )
+
+
+@pytest.mark.parametrize(("port", "collides"), [(0, False), (2575, True)])
+def test_only_a_concrete_duplicate_port_collides(port: int, collides: bool) -> None:
+    # Port 0 asks the OS to choose the port at bind, so two listeners configured with it do not
+    # contend with each other or with a reserved binding that is itself ephemeral. Refusing them
+    # was a product defect (merge-queue intermittent, DAST ingress port race, 2026-10-07). Both
+    # arms run on every pass, so the fix cannot also stop refusing a real duplicate: the same
+    # graph on a concrete port must still be refused by each check.
+    reg = Registry()
+    reg.add_inbound(build_inbound_connection("a", MLLP(port=port), router="r"))
+    reg.add_inbound(
+        build_inbound_connection("b", MLLP(port=port), router="r", bind_address="0.0.0.0")
+    )
+    reg.add_router("r", lambda m: [])
+    reserved = ((API_LISTENER_LABEL, "127.0.0.1", port),)
+    conflicts = inbound_binding_conflicts(
+        reg, bind_host="127.0.0.1", env_values={}, reserved=reserved
+    )
+    if collides:
+        assert reg.port_collisions() == [(port, "a", "b")]
+        assert any(f"both bind port {port}" in m for m in conflicts), conflicts
+        assert sum("reserved for" in m for m in conflicts) == 2, conflicts
+    else:
+        assert reg.port_collisions() == []
+        assert conflicts == []
+
+
+def test_two_port_zero_listeners_load(tmp_path: Path) -> None:
+    # The loader path an operator's config takes: two ephemeral listeners load clean.
+    _write(
+        tmp_path,
+        """
+        from messagefoundry import inbound, MLLP, router
+        inbound("a", MLLP(port=0), router="r")
+        inbound("b", MLLP(port=0), router="r")
+
+        @router("r")
+        def route(msg):
+            return []
+        """,
+    )
+    assert load_config(tmp_path).port_collisions() == []
 
 
 def test_build_check_registry_raises_port_conflict_error_on_api_port() -> None:

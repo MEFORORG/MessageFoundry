@@ -155,7 +155,9 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16
+        # Digest-pinned, the same digest as ci.yml's postgres-store; why, and how to move it, is at
+        # ci.yml's sqlserver-store matrix (vault BACKLOG #2793).
+        image: postgres:16@sha256:65b16a8b326e0cfbdf33fa7e783f2a0cb352a61448616ccccfd616ef42aa0f65
         env:
           POSTGRES_PASSWORD: mefor
           POSTGRES_DB: messagefoundry
@@ -329,7 +331,8 @@ jobs:
     runs-on: ubuntu-latest
     services:
       mssql:
-        image: mcr.microsoft.com/mssql/server:2022-latest
+        # Digest-pinned, the same 2022 digest as ci.yml; see ci.yml's sqlserver-store matrix.
+        image: mcr.microsoft.com/mssql/server:2022-latest@sha256:4402d880dd4c34bfa7d8705e56a86cd6c88da80a1f6bbbe741f999e76264a090
         env:
           ACCEPT_EULA: "Y"
           MSSQL_SA_PASSWORD: "Str0ng_P@ssw0rd!"

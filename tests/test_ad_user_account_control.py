@@ -281,11 +281,11 @@ def test_login_refuses_an_account_whose_disabled_bit_is_set_or_undetermined(
     auth = LdapAuthenticator(_settings())
     # The control first, on the same doubles: an enabled account signs in on both paths, so the
     # refusals below are the attribute's doing and not the fixture's.
-    assert auth.authenticate("jdoe", "synthetic-pw") is not None
+    assert auth.authenticate("jdoe", "synthetic-pw").principal is not None
     assert auth.resolve_principal("jdoe") is not None
 
     directory.uac["jdoe"] = uac
-    assert auth.authenticate("jdoe", "synthetic-pw") is None
+    assert auth.authenticate("jdoe", "synthetic-pw").principal is None
     assert auth.resolve_principal("jdoe") is None  # the Kerberos/SSO lookup
     assert auth.resolve_principal("jdoe", object_id=directory.ids["jdoe"]) is None  # id-keyed
     assert ldap_module._uac_shapes_warned == (set() if shape is None else {shape})
@@ -952,13 +952,21 @@ def test_the_inverses_resolve_their_alerts_and_are_not_rule_targetable() -> None
 
 
 async def _settle(sink: NotifierAlertSink) -> None:
-    """Wait for the sink's fire-and-forget alert-state writes, so each pass is read after its own."""
-    while sink._state_tasks:
-        await asyncio.gather(*list(sink._state_tasks))
+    """Wait for the sink's fire-and-forget alert-state writes, so each pass is read after its own.
+
+    Only tasks still running are awaited. A task that has finished leaves the set through a done
+    callback, and awaiting a gather of finished tasks returns without yielding, so that callback
+    never runs. A loop on the set itself then spins forever and grows memory until the worker dies.
+    """
+    while pending := [t for t in sink._state_tasks if not t.done()]:
+        await asyncio.gather(*pending)
 
 
 async def _open_alerts(store: MessageStore) -> set[tuple[str, str]]:
-    return {(i.event_type, i.connection) for i in await store.list_active_alert_instances()}
+    return {
+        (i.event_type, i.connection)
+        for i in await store.list_active_alert_instances(allowed_channels=None)
+    }
 
 
 ABORTED = ("ad_reconcile_aborted", "directory-reconciler")

@@ -26,8 +26,10 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import json
 import logging
 import string
+import threading
 import time
 from collections.abc import AsyncIterator, Callable, Coroutine
 from pathlib import Path
@@ -39,7 +41,11 @@ import pytest
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import service as service_module
-from messagefoundry.auth.service import AuthService, TemporaryPasswordUnavailable
+from messagefoundry.auth.service import (
+    CREDENTIAL_ISSUE_REFUSED_ACTION,
+    AuthService,
+    TemporaryPasswordUnavailable,
+)
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore, WebAuthnCredential
@@ -107,7 +113,7 @@ async def test_create_reset_and_factor_reset_write_nothing_when_no_credential_ca
             actor="test",
         )
         await store.set_totp_secret(target, secret="JBSWY3DPEHPK3PXP")
-        await store.enable_totp(target, recovery_code_hashes=["h"])
+        assert await store.enable_totp(target, recovery_code_hashes=["h"])
         await store.add_webauthn_credential(
             WebAuthnCredential(
                 credential_id_hash="kept-hash",
@@ -128,6 +134,11 @@ async def test_create_reset_and_factor_reset_write_nothing_when_no_credential_ca
         assert session.ok and session.token is not None
         before = await _state(store, target)
         users_before = await store.count_users()
+        issue_rows_before = [
+            r["action"]
+            for r in await store.list_audit(limit=200)
+            if r["action"] in ("user.created", "auth.password_reset")
+        ]
 
         service = AuthService(store, _unissuable())
         with pytest.raises(TemporaryPasswordUnavailable):
@@ -146,8 +157,153 @@ async def test_create_reset_and_factor_reset_write_nothing_when_no_credential_ca
             await service.admin_reset_mfa(target, actor=ADMIN_USERNAME)
         assert await _state(store, target) == before, "a refused issue changed the account"
         assert await seeding.identity_for_token(session.token) is not None, "a session was revoked"
-        audit = [r["action"] for r in await store.list_audit(limit=50)]
+        rows = await store.list_audit(limit=200)
+        audit = [r["action"] for r in rows]
         assert "auth.password_reset" not in audit and "auth.mfa_reset" not in audit
+        # BACKLOG #2359: each refusal leaves ONE row of its own, naming the operation and the actor,
+        # and no row the credential-issuer lookup would read as an issue (`_ISSUE_ROW_KEYS`).
+        refused = [
+            (r["actor"], json.loads(r["detail"]))
+            for r in rows
+            if r["action"] == CREDENTIAL_ISSUE_REFUSED_ACTION
+        ]
+        assert sorted(refused, key=lambda row: row[1]["op"]) == [
+            (ADMIN_USERNAME, {"op": "create", "username": "newbie", "roles": ["viewer"]}),
+            (ADMIN_USERNAME, {"op": "mfa_reset", "username": "holder", "user_id": target}),
+            (ADMIN_USERNAME, {"op": "password_reset", "username": "holder", "user_id": target}),
+        ]
+        issue_rows_after = [
+            r["action"] for r in rows if r["action"] in ("user.created", "auth.password_reset")
+        ]
+        assert issue_rows_after == issue_rows_before
+    finally:
+        await store.close()
+
+
+async def test_the_generator_runs_off_the_event_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """BACKLOG #2359, finding 4. A refusing site list costs up to 128 policy screens, so all three
+    issuing paths run the generator in a worker thread. RED when any caller calls it inline."""
+    loop_thread = threading.get_ident()
+    seen: list[int] = []
+    real = service_module.generate_policy_password
+
+    def recording(*args: Any, **kwargs: Any) -> str:
+        seen.append(threading.get_ident())
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(service_module, "generate_policy_password", recording)
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(require_mfa=False))
+        await service.initialize()
+        created = await service.create_local_user(
+            username="threaded",
+            display_name=None,
+            email="threaded@example.org",
+            roles=["viewer"],
+            actor="test",
+        )
+        await service.admin_reset_password(created.user_id, actor="test")
+        await service.admin_reset_mfa(created.user_id, actor="test")
+        assert len(seen) == 3, "each issuing path generates exactly one credential"
+        assert loop_thread not in seen, "the generator ran on the event loop's thread"
+    finally:
+        await store.close()
+
+
+# --- the restart advice (BACKLOG #2359, finding 9) -------------------------------------------------
+
+#: What the advice must name. The environment variable overrides the TOML key, and every engine
+#: process builds its policy once at start, so a fix needs a restart of each one.
+_ADVICE_TERMS = (
+    "password_extra_context_words",
+    "MEFOR_AUTH_PASSWORD_EXTRA_CONTEXT_WORDS",
+    "restart every engine process",
+    "engine shard",
+    "cluster node",
+    "/config/reload",
+)
+
+
+def test_the_error_log_and_the_refusal_carry_the_same_restart_advice(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from messagefoundry.auth.policy import PasswordPolicy
+
+    policy = PasswordPolicy.from_settings(_unissuable())
+    with (
+        caplog.at_level(logging.ERROR, logger="messagefoundry.auth.service"),
+        pytest.raises(TemporaryPasswordUnavailable) as raised,
+    ):
+        service_module.generate_policy_password(policy, username="someone")
+    logged = " ".join(r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR)
+    for text in (logged, str(raised.value)):
+        assert service_module.SITE_TERMS_FIX_ADVICE in text
+    for term in _ADVICE_TERMS:
+        assert term in service_module.SITE_TERMS_FIX_ADVICE, term
+
+
+def test_the_docs_carry_the_restart_advice() -> None:
+    """The operator reads the advice in SECURITY.md's reset section and the CONFIGURATION.md row too.
+    Each must name the environment variable, every engine shard and every cluster node."""
+    root = Path(__file__).resolve().parents[1]
+    security = (root / "docs" / "SECURITY.md").read_text(encoding="utf-8")
+    start = security.index("### Admin password reset")
+    section = security[start : security.index("\n### ", start + 1)]
+    config = (root / "docs" / "CONFIGURATION.md").read_text(encoding="utf-8")
+    row = next(
+        line for line in config.splitlines() if line.startswith("| `password_extra_context_words`")
+    )
+    for text in (section, row):
+        for term in (
+            "MEFOR_AUTH_PASSWORD_EXTRA_CONTEXT_WORDS",
+            "engine shard",
+            "cluster node",
+            "/config/reload",
+        ):
+            assert term in text, term
+    assert "auth.credential_issue_refused" in section
+
+
+async def test_a_failed_refusal_audit_still_answers_with_the_refusal(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The refusal row is a record, not the answer. A store that cannot write it must not turn the
+    refusal into a different exception, or the route answers 500 and keeps the spent grant."""
+    import sqlite3
+
+    store = await MessageStore.open(":memory:")
+    try:
+        seeding = AuthService(store, AuthSettings(require_mfa=False))
+        await seeding.initialize()
+        target = await create_local_user_chosen(
+            seeding,
+            username="holder",
+            password=PW,
+            display_name=None,
+            email="holder@example.org",
+            roles=["viewer"],
+            actor="test",
+        )
+
+        service = AuthService(store, _unissuable())
+
+        async def failing_audit(*_a: object, **_k: object) -> None:
+            raise sqlite3.OperationalError("synthetic store fault")
+
+        monkeypatch.setattr(service, "_audit", failing_audit)
+        with (
+            caplog.at_level(logging.ERROR, logger="messagefoundry.auth.service"),
+            pytest.raises(TemporaryPasswordUnavailable),
+        ):
+            await service.admin_reset_password(target, actor=ADMIN_USERNAME)
+        logged = [
+            r
+            for r in caplog.records
+            if r.levelno >= logging.ERROR and CREDENTIAL_ISSUE_REFUSED_ACTION in r.getMessage()
+        ]
+        assert len(logged) == 1
+        assert logged[0].exc_info is not None and logged[0].exc_info[0] is sqlite3.OperationalError
     finally:
         await store.close()
 
@@ -202,6 +358,12 @@ async def _grant(c: httpx.AsyncClient, token: str, purpose: str) -> str:
 _NO_ISSUE = SimpleNamespace(token_urlsafe=lambda n=None: "zq-globex-" + "v" * 40)
 
 
+async def _refusal_ops(service: AuthService) -> list[str]:
+    """The ``op`` of every refused-issue audit row, oldest first."""
+    rows = await service.store.list_audit(action=CREDENTIAL_ISSUE_REFUSED_ACTION, limit=50)
+    return [json.loads(r["detail"])["op"] for r in reversed(rows)]
+
+
 def _one_term_settings() -> AuthSettings:
     return AuthSettings(
         require_mfa=False,
@@ -214,14 +376,16 @@ def _one_term_settings() -> AuthSettings:
 
 
 @pytest.mark.parametrize(
-    ("path", "purpose"),
+    ("path", "purpose", "op"),
     [
-        pytest.param("reset-password", "admin_reset_password", id="password-reset"),
-        pytest.param("reset-mfa", "admin_reset_mfa", id="factor-reset"),
+        pytest.param(
+            "reset-password", "admin_reset_password", "password_reset", id="password-reset"
+        ),
+        pytest.param("reset-mfa", "admin_reset_mfa", "mfa_reset", id="factor-reset"),
     ],
 )
 async def test_a_refused_reset_keeps_the_account_and_the_grant(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch, path: str, purpose: str
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, path: str, purpose: str, op: str
 ) -> None:
     service = AuthService(engine.store, _one_term_settings())
     await service.initialize()
@@ -246,6 +410,8 @@ async def test_a_refused_reset_keeps_the_account_and_the_grant(
         assert refused.status_code == 503, refused.text
         assert "password_extra_context_words" in refused.json()["detail"]
         assert await _state(engine.store, target) == before
+        # One refusal row, written by the service, not a second one by the route (BACKLOG #2359).
+        assert await _refusal_ops(service) == [op]
         assert await service.identity_for_token(carol.token) is not None
         # The SAME grant still opens the route, with no second re-authentication.
         again = await c.post(f"/users/{target}/{path}", headers=_auth(token))
@@ -269,6 +435,7 @@ async def test_a_refused_create_writes_no_row(
             refused = await c.post("/users", headers=_auth(token), json=body)
         assert refused.status_code == 503, refused.text
         assert await service.store.get_user_by_username("newbie") is None
+        assert await _refusal_ops(service) == ["create"]
         created = await c.post("/users", headers=_auth(token), json=body)
         assert created.status_code == 201, created.text
 

@@ -22,12 +22,16 @@ import logging
 from collections.abc import Callable
 from typing import Protocol
 
+from messagefoundry.redaction import log_timestamp
+
 __all__ = [
     "INTAKE_DEPTH_REASON",
     "INTAKE_DISK_REASON",
     "AlertSink",
+    "HELD_COPY_NOTE",
     "LoggingAlertSink",
     "config_changed_detail",
+    "crl_expiry_detail",
     "intake_pause_detail",
 ]
 
@@ -71,6 +75,29 @@ def config_changed_detail(
         f"{previous_fingerprint[:12]} (node {baseline_node or 'unknown'}, action "
         f"{baseline_action}, time {baseline_at or 'unknown'})"
     )
+
+
+#: The words that mark a ``crl_expiry`` date as a held copy's (vault BACKLOG #2319). One spelling,
+#: so the log line, the notifier's ``detail`` and a test all say the same thing.
+HELD_COPY_NOTE = "Date is a running hop's held copy, not the file's."
+
+
+def crl_expiry_detail(*, held_copy: bool, detail: str, shared_with: tuple[str, ...]) -> str:
+    """The PHI-free note both sinks add to a ``crl_expiry`` alert (vault BACKLOG #2319), or ``""``
+    when no hop holds an older copy and no other row names the file.
+
+    The alert instance's reason column keeps only about the first 200 characters, so the short
+    held-copy marker leads, then ``detail`` (the scan's remedy and the settings holding the copy),
+    then the other rows that name the file."""
+    parts = [HELD_COPY_NOTE] if held_copy else []
+    if detail:
+        parts.append(detail)
+    if shared_with:
+        also = f"The same file also serves {', '.join(shared_with)}"
+        if held_copy or detail:
+            also += "; a held copy is matched by its file, so each of those rows reports it too"
+        parts.append(f"{also}.")
+    return " ".join(parts)
 
 
 class AlertSink(Protocol):
@@ -205,11 +232,32 @@ class AlertSink(Protocol):
         Emitted by the :class:`~messagefoundry.pipeline.cert_expiry.CertExpiryRunner`."""
         ...
 
-    def crl_expiry(self, name: str, *, path: str, not_after: str, days_remaining: int) -> None:
+    def crl_expiry(
+        self,
+        name: str,
+        *,
+        path: str,
+        not_after: str,
+        days_remaining: int,
+        held_copy: bool = False,
+        detail: str = "",
+        shared_with: tuple[str, ...] = (),
+    ) -> None:
         """A configured CRL is expired or within the warn window (BACKLOG #1005). ``name`` labels
         the inbound connection, or the setting that names the CRL, such as ``"tls.crl_file"`` for
         the CRLs on outbound hops (BACKLOG #299); ``path`` is the PEM; ``not_after`` is the ISO
         ``nextUpdate``; ``days_remaining`` is negative once expired.
+
+        **Whose date it is (vault BACKLOG #2319).** ``held_copy`` is True when ``not_after`` is not
+        the file's: it is the ``nextUpdate`` of an older copy that a running TLS hop still holds,
+        which lapses before the file does. Replacing the file again does not move that date; the
+        reload has to apply the file to the hop, or a restart has to rebuild it. ``detail`` says what
+        to do, in the words the scan logs, then which settings hold the older copy; it is set
+        whenever a hop holds a copy that differs from the file, even one that is not the date. ``shared_with``
+        names the other monitored settings or connections whose rows name the same file. A held
+        copy is matched by its file, not its hop, so it is reported under every row naming that
+        file, and ``detail`` says which hop holds it. All three carry config metadata only: no key
+        material and no message content.
 
         **SEPARATE FROM :meth:`cert_expiry` BECAUSE THE REMEDY AND THE BLAST RADIUS DIFFER.** An
         expiring server certificate degrades one identity and is fixed by reissuing it. An expired
@@ -314,14 +362,39 @@ class AlertSink(Protocol):
         :class:`~messagefoundry.api.approvals.ApprovalGate`."""
         ...
 
+    def audit_write_failed(self, name: str, *, action: str) -> None:
+        """An audit row could not be written (vault BACKLOG #2255). The audit log is the record an
+        incident responder reads, and a store that refuses its writes was otherwise visible only in
+        the engine log, which nobody pages on.
+
+        ``name`` keys the subject the lost row was about. The approval gate uses ``approval:<approval
+        id>``, the key :meth:`approval_too_early` uses. ``POST /config/reload`` uses
+        ``config_reload:inline`` when it loses the ``config_reload_attempted`` row it writes before
+        an ungated reload, and then refuses the reload with 503 (vault BACKLOG #2254). ``action`` is
+        the audit action of the lost row, such as ``approval.approved``. The row's detail is NOT
+        carried: the ERROR log line written beside this alert holds it. It is raised whether the gate
+        then refused the request (an ``approval.release_attempted`` row it could not write answers
+        503) or went ahead (the operation had already run). It is not a connection-scoped event, so no
+        rule's ``control_action`` fires on it (BACKLOG #1898), and the colon keeps ``name`` outside
+        the connection-name grammar. Repeated failures on one request fold into one instance, and
+        every inline reload's into the one ``config_reload:inline`` instance until an operator
+        resolves it. Nothing resolves it automatically. Carries the key and the action name only:
+        no username, no params, no PHI."""
+        ...
+
     def administrator_granted(self, name: str, *, via: str, granted_by: str) -> None:
         """The built-in Administrator role was granted through the console API (BACKLOG #315). Every
         approver is an Administrator, so this is how a second approver gets minted. ``via`` is
         ``account_created`` or ``roles_changed`` with ``name`` = ``user:<username>``, or
         ``ad_group_map`` with ``name`` = ``ad-group:<group>`` when a group newly maps to the role.
+        A directory sign-in whose role sync newly grants the role (vault BACKLOG #2610) raises it
+        with ``name`` = ``user:<username>`` and ``via`` = ``directory_sign_in_negotiate``,
+        ``directory_sign_in_sso`` or ``directory_sign_in_oidc``, naming the route.
         Both keys are outside the connection-name grammar for the same reason as
-        :meth:`approval_approver_provenance`. ``granted_by`` is the acting administrator's username.
-        No PHI. Emitted by the API's user-administration routes, never from ``auth/``."""
+        :meth:`approval_approver_provenance`. ``granted_by`` is the acting administrator's username,
+        or ``<directory>`` on a directory sign-in, where no administrator acted.
+        No PHI. Emitted by the API's user-administration and directory sign-in routes, never from
+        ``auth/``."""
         ...
 
     def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:
@@ -387,7 +460,8 @@ class AlertSink(Protocol):
         narrow its channel scope (ADR 0079 mechanism 2, ADR 0198). The same event as the
         ``auth.ad_session_revoked`` audit row. ``name`` is the account's username, so each revoked
         principal pages on its own; ``reason`` is ``directory_absent``, ``directory_disabled``,
-        ``directory_undetermined``, ``roles_changed`` or ``scope_changed``.
+        ``directory_undetermined``, ``directory_object_id_missing`` (BACKLOG #2434),
+        ``roles_changed`` or ``scope_changed``.
         No PHI. Emitted by the API-lifespan reconciler task, never from ``auth/``."""
         ...
 
@@ -633,7 +707,7 @@ class LoggingAlertSink:
                 name,
                 path,
                 -days_remaining,
-                not_after,
+                log_timestamp(not_after),
             )
         else:
             log.warning(
@@ -641,10 +715,31 @@ class LoggingAlertSink:
                 name,
                 path,
                 days_remaining,
-                not_after,
+                log_timestamp(not_after),
             )
 
-    def crl_expiry(self, name: str, *, path: str, not_after: str, days_remaining: int) -> None:
+    def crl_expiry(
+        self,
+        name: str,
+        *,
+        path: str,
+        not_after: str,
+        days_remaining: int,
+        held_copy: bool = False,
+        detail: str = "",
+        shared_with: tuple[str, ...] = (),
+    ) -> None:
+        # Vault BACKLOG #2319: say whose date this is before the line that gives it, so the line
+        # below is not read as the file's. At the same level, since a held copy's lapse is the
+        # outage just as the file's would be.
+        if note := crl_expiry_detail(held_copy=held_copy, detail=detail, shared_with=shared_with):
+            log.log(
+                logging.ERROR if days_remaining < 0 else logging.WARNING,
+                "crl_expiry: %r CRL %s: %s",
+                name,
+                path,
+                note,
+            )
         # An EXPIRED crl fails every handshake it verifies, so it is an ERROR rather than a warning:
         # the hop is effectively down, not merely approaching a deadline (BACKLOG #1005). The wording
         # names no direction, because the same CRL may guard a listener or an outbound hop (#299):
@@ -660,7 +755,7 @@ class LoggingAlertSink:
                 "its peer). Replace the file, and restart the engine if the scan still reports a running "
                 "hop holding the old copy: %s",
                 name,
-                not_after,
+                log_timestamp(not_after),
                 -days_remaining,
                 path,
             )
@@ -670,7 +765,7 @@ class LoggingAlertSink:
                 "or every TLS handshake it verifies will fail, and restart the engine if the scan "
                 "still reports a running hop holding the old copy: %s",
                 name,
-                not_after,
+                log_timestamp(not_after),
                 days_remaining,
                 path,
             )
@@ -750,6 +845,11 @@ class LoggingAlertSink:
             operation,
             name,
             ", ".join(changed),
+        )
+
+    def audit_write_failed(self, name: str, *, action: str) -> None:
+        log.warning(
+            "ALERT audit_write_failed: the %s audit row for %r was not written", action, name
         )
 
     def administrator_granted(self, name: str, *, via: str, granted_by: str) -> None:

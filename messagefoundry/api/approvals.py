@@ -60,6 +60,13 @@ from messagefoundry.store.base import Store
 log = logging.getLogger(__name__)
 
 #: An executor re-runs a captured operation on approval, returning a small JSON-able result summary.
+#:
+#: **A raise means the operation did not complete.** The gate compensates it to ``failed``. So an
+#: executor raises only BEFORE its effects happen, and after them it reports trouble in its result
+#: instead. In particular, a domain audit row it writes after acting must be fail-soft (BACKLOG
+#: #1940). The gate does not write that row for it: the row is the one the operation's inline route
+#: writes, built from detail only the executor holds, and the inline route shares the writer (vault
+#: BACKLOG #2255, finding 1).
 Executor = Callable[[Mapping[str, Any]], Awaitable[dict[str, Any]]]
 
 #: Resolves a ``users.id`` to its CURRENT :class:`Identity` (roles, custom-role overlay, channel scope),
@@ -137,7 +144,8 @@ class _Operation:
 class ApprovalError(Exception):
     """A pending-approval decision could not be made. ``status`` is the HTTP code the API should map
     to — at least 404 unknown, 409 already-decided/expired/unapprovable, 403 self-approval, and 503
-    when the audit log refuses the release row (the operation is then not run)."""
+    when the store refuses a write the decision needs before anything runs: the release row, the
+    claim, a rejection or a resolution (vault BACKLOG #2255)."""
 
     def __init__(self, status: int, detail: str, *, headers: dict[str, str] | None = None) -> None:
         super().__init__(detail)
@@ -240,6 +248,13 @@ class ApprovalGate:
             key=key, label=label, execute=execute, permission=permission, in_scope=in_scope
         )
 
+    @property
+    def settings(self) -> ApprovalsSettings:
+        """A copy of the ``[approvals]`` this gate was built with. ``GET /security/posture`` names a
+        loosened dwell or expiry from it (BACKLOG #2489). A copy, so a reader cannot change what the
+        gate enforces. A request already pending keeps the deadline stamped when it was made."""
+        return self._settings.model_copy(deep=True)
+
     def _gated(self, operation: str) -> bool:
         return self._settings.enabled and operation in self._settings.operations
 
@@ -282,13 +297,44 @@ class ApprovalGate:
             requested_at=now,
             expires_at=expires_at,
         )
-        await self._store.record_audit(
-            "approval.requested",
-            actor=requester,
-            detail=json.dumps({"approval_id": approval_id, "operation": operation}),
-            client=client,  # ADR 0150: the requester's own address
-        )
+        detail = json.dumps({"approval_id": approval_id, "operation": operation})
+        try:
+            await self._store.record_audit(
+                "approval.requested",
+                actor=requester,
+                detail=detail,
+                client=client,  # ADR 0150: the requester's own address
+            )
+        except Exception:
+            # Still raised, so the caller is told the request was not held. The row it just wrote
+            # is withdrawn first: the caller has no id for it and will request again, and a
+            # second approvable copy could run the operation twice. Logged and paged (vault
+            # BACKLOG #2255), since the error alone reaches only this caller.
+            log.exception(
+                "approval %s: its approval.requested audit row failed, so the request is withdrawn."
+                " Lost detail: actor=%s %s",
+                approval_id,
+                requester,
+                detail,
+            )
+            self._alert_lost_audit(approval_id, "approval.requested")
+            await self._withdraw_unaudited_request(approval_id)
+            raise
         return approval_id
+
+    async def _withdraw_unaudited_request(self, approval_id: str) -> None:
+        """Move a request whose ``approval.requested`` row failed from ``pending`` to ``failed``,
+        so nobody can release it. Best effort: a failure is logged, and the caller still raises."""
+        try:
+            await self._store.decide_pending_approval(
+                approval_id, status="failed", approver=None, decided_at=self._clock()
+            )
+        except Exception:  # noqa: BLE001 - the caller re-raises the audit failure either way
+            log.exception(
+                "approval %s: withdrawing the unaudited request failed; it may still read "
+                "'pending' with no approval.requested row",
+                approval_id,
+            )
 
     async def list_pending(self) -> list[dict[str, Any]]:
         """Requests awaiting a second approver: ``pending`` and unexpired."""
@@ -340,7 +386,20 @@ class ApprovalGate:
         outcome write raises: a failed ``executing`` to ``approved`` status write, or a failed
         ``approval.approved`` audit write, is logged at ERROR and the release still reports success.
         A failed status write may leave the row ``executing``; see
-        :meth:`_record_approved_execution`."""
+        :meth:`_record_approved_execution`.
+
+        **The writes on this path answer a mapped status in a store outage (vault BACKLOG #2255).** A
+        refusal's own audit row (``approval.too_early``, ``approval.stale_requester``) that fails
+        to write is logged and the refusal still answers 409, since it runs nothing. A claim the
+        store cannot record answers 503. Every audit row the gate loses also raises the
+        ``audit_write_failed`` alert. The store READS here (the request row, the requester's
+        account) are not mapped, so a store that refuses reads can still answer a raw 500.
+
+        **Who writes the post-execution audit row.** The gate writes ``approval.approved``; an
+        executor writes the domain row its inline route writes too (``dead_letter_replay``,
+        ``config_reload``), because only it holds that row's detail and the inline route shares the
+        writer. An executor must therefore not raise once its effects have happened, since a raise
+        reads as "did not complete" and is compensated to ``failed``; see :data:`Executor`."""
         row = await self._require_pending(approval_id)
         requester_user_id = row["requester_user_id"]
         if not requester_user_id:
@@ -381,7 +440,10 @@ class ApprovalGate:
         min_dwell = self._settings.min_dwell_seconds
         age = self._clock() - float(row["requested_at"])
         if min_dwell > 0 and age < min_dwell:
-            await self._store.record_audit(
+            # vault BACKLOG #2255: a refusal runs nothing, so an audit log that refuses this row
+            # must not turn the documented 409 into a 500. The loss is logged and paged instead.
+            await self._record_audit_soft(
+                approval_id,
                 "approval.too_early",
                 actor=approver,
                 detail=json.dumps(
@@ -394,6 +456,7 @@ class ApprovalGate:
                     }
                 ),
                 client=client,  # ADR 0150: the approver's address, matching this row's actor
+                context="the release was refused",
             )
             # BACKLOG #287: page on it too. An approve inside the floor is faster than the published
             # human-timing figure, so it may be a script. Best effort, after the durable audit row.
@@ -405,7 +468,7 @@ class ApprovalGate:
                         f"approval:{approval_id}", operation=operation
                     )
                 except Exception:  # noqa: BLE001 - a sink that breaks its never-raise contract
-                    # must not turn the documented 409 into a 500. The audit row is already written.
+                    # must not turn the documented 409 into a 500. The audit row is already attempted.
                     log.exception("approval %s: the too-early alert failed to emit", approval_id)
             # The real remaining wait, not the floor: when this clock is behind the requester's, the
             # wait is longer than the floor, and saying "less than 2 seconds old" would mislead.
@@ -455,25 +518,29 @@ class ApprovalGate:
         # this row with no outcome row (approval.approved, approval.failed or approval.interrupted)
         # after it. That is why it says ATTEMPTED. The request row's status, and the winner's own
         # rows, say what won.
+        attempted = json.dumps(
+            {
+                "approval_id": approval_id,
+                "operation": operation,
+                "requester": requester,
+            }
+        )
         try:
             await self._store.record_audit(
                 "approval.release_attempted",
                 actor=approver,
-                detail=json.dumps(
-                    {
-                        "approval_id": approval_id,
-                        "operation": operation,
-                        "requester": requester,
-                    }
-                ),
+                detail=attempted,
                 client=client,  # ADR 0150: the approver's address, matching this row's actor
             )
         except Exception as exc:  # noqa: BLE001 - every store backend raises its own type
             log.exception(
                 "approval %s: the audit log refused the release row, so the operation was not run "
-                "and the request is still pending",
+                "and the request is still pending. Lost detail: actor=%s %s",
                 approval_id,
+                approver,
+                attempted,
             )
+            self._alert_lost_audit(approval_id, "approval.release_attempted")
             raise ApprovalError(
                 503,
                 "the audit log could not record this release, so the operation did not run and the "
@@ -482,6 +549,10 @@ class ApprovalGate:
         # Claim the row FIRST (atomic, guards a double-approve race); only then execute. The claim
         # moves it to 'executing', not 'approved' (BACKLOG #1562): 'approved' is written only once the
         # executor has returned, so the status never asserts an outcome the gate has not seen.
+        #
+        # A store fault on the claim answers 503 (vault BACKLOG #2255): the executor has not
+        # started. A claim whose COMMIT landed before the fault can still leave the row
+        # 'executing' with nothing run; nothing moves a row out of 'executing' yet (#1562).
         claim = asyncio.ensure_future(
             self._store.decide_pending_approval(
                 approval_id, status="executing", approver=approver, decided_at=self._clock()
@@ -507,6 +578,18 @@ class ApprovalGate:
                 approval_id,
             )
             raise
+        except Exception as exc:  # noqa: BLE001 - every store backend raises its own type
+            # Mapped here rather than inside the claim's future: a cancelled claim's settle logs
+            # its own fault, and the same fault must be logged once (BACKLOG #2087).
+            raise self._store_fault(
+                approval_id,
+                exc,
+                what="claim",
+                retry=(
+                    "The operation did not run. If the request still reads pending, approve it "
+                    "again once the store accepts writes"
+                ),
+            ) from exc
         if not claimed:
             raise ApprovalError(409, "request was already decided")
         try:
@@ -653,24 +736,17 @@ class ApprovalGate:
                 "result": result,
             }
         )
-        try:
-            await self._store.record_audit(
-                "approval.approved",
-                actor=approver,
-                detail=approved_detail,
-                # ADR 0150: the APPROVER's address — matching this row's actor. The requester's own
-                # address is on their earlier approval.requested row, so dual control records both
-                # halves of the ceremony from two independently-attributed hosts.
-                client=client,
-            )
-        except Exception:  # noqa: BLE001 - see above; the operation already ran
-            log.exception(
-                "approval %s: operation '%s' RAN, but its approval.approved audit row failed; the "
-                "approval.release_attempted row still records the release. Lost detail: %s",
-                approval_id,
-                operation,
-                approved_detail,
-            )
+        await self._record_audit_soft(
+            approval_id,
+            "approval.approved",
+            actor=approver,
+            detail=approved_detail,
+            # ADR 0150: the APPROVER's address — matching this row's actor. The requester's own
+            # address is on their earlier approval.requested row, so dual control records both
+            # halves of the ceremony from two independently-attributed hosts.
+            client=client,
+            context=f"operation '{operation}' RAN (approval.release_attempted still records it)",
+        )
 
     async def _settle_cancelled_claim(
         self,
@@ -720,6 +796,7 @@ class ApprovalGate:
         of its effects. The audit row is ``approval.interrupted``, so the trail tells an operation that
         ran (``approval.approved``) apart from one that was cut off. Best effort, like
         :meth:`_compensate_failed_execution`: the caller re-raises the cancellation either way."""
+        moved: bool | None
         try:
             # Guarded on 'executing' so it can only move the row this call claimed.
             moved = await self._store.decide_pending_approval(
@@ -729,25 +806,58 @@ class ApprovalGate:
                 decided_at=self._clock(),
                 from_status="executing",
             )
-            await self._store.record_audit(
-                "approval.interrupted",
-                actor=approver,
-                detail=json.dumps(
-                    {
-                        "approval_id": approval_id,
-                        "operation": operation,
-                        "requester": requester,
-                        "recorded": moved,
-                    }
-                ),
-                client=client,  # ADR 0150: the approver's address, matching this row's actor
-            )
         except Exception:  # noqa: BLE001 - the cancellation is re-raised by the caller either way
             log.exception(
                 "approval %s: execution was cancelled AND recording it failed; the row may still "
                 "read 'executing' for an operation whose outcome is unknown",
                 approval_id,
             )
+            # The audit row is still attempted: it is the only record of the cut-off release.
+            # None, not False: False says another caller moved the row, None says the write failed.
+            moved = None
+        await self._record_audit_soft(
+            approval_id,
+            "approval.interrupted",
+            actor=approver,
+            detail=json.dumps(
+                {
+                    "approval_id": approval_id,
+                    "operation": operation,
+                    "requester": requester,
+                    "recorded": moved,
+                }
+            ),
+            client=client,  # ADR 0150: the approver's address, matching this row's actor
+            context="the release was cut off mid-run",
+        )
+
+    async def _record_audit_soft(
+        self,
+        approval_id: str,
+        action: str,
+        *,
+        actor: str,
+        detail: str,
+        client: str | None,
+        context: str,
+    ) -> None:
+        """Write one of the gate's audit rows without letting a failed write raise.
+
+        For a row whose answer stands whether or not it lands: a refusal, which runs nothing and
+        leaves the request pending, or an outcome the gate has already settled. Before vault
+        BACKLOG #2255 a failed write at the refusals turned a documented 409 into a raw 500. The
+        loss is logged at ERROR with ``context`` and the detail, and paged."""
+        try:
+            await self._store.record_audit(action, actor=actor, detail=detail, client=client)
+        except Exception:  # noqa: BLE001 - every store backend raises its own type
+            log.exception(
+                "approval %s: %s, but its %s audit row failed. Lost detail: %s",
+                approval_id,
+                context,
+                action,
+                detail,
+            )
+            self._alert_lost_audit(approval_id, action)
 
     async def _requester_standing(
         self, requester_user_id: str, op: _Operation, params: Mapping[str, Any]
@@ -785,8 +895,10 @@ class ApprovalGate:
         client: str | None,
     ) -> None:
         """Audit and alert a release refused on the requester's standing. The audit row goes first:
-        it is the durable record, and the alert is best-effort by the sink's own contract."""
-        await self._store.record_audit(
+        it is the durable record, and the alert is best-effort by the sink's own contract. A failed
+        audit write does not stop the refusal or the alert (vault BACKLOG #2255)."""
+        await self._record_audit_soft(
+            approval_id,
             "approval.stale_requester",
             actor=approver,
             detail=json.dumps(
@@ -799,14 +911,25 @@ class ApprovalGate:
                 }
             ),
             client=client,  # ADR 0150: the approver's address, matching this row's actor
+            context="the release was refused",
         )
         try:
             self._alert_sink.approval_stale_requester(
                 approval_id, operation=operation.key, reason=reason
             )
         except Exception:  # noqa: BLE001 - a sink that breaks its never-raise contract must not
-            # turn the documented 409 into a 500. The audit row above is already written.
+            # turn the documented 409 into a 500. The audit row above is already attempted.
             log.exception("approval %s: the stale-requester alert failed to emit", approval_id)
+
+    def _alert_lost_audit(self, approval_id: str, action: str) -> None:
+        """Page on an audit row the gate could not write (vault BACKLOG #2255).
+
+        The caller logs the loss itself, with whatever detail it holds. This only raises the
+        ``audit_write_failed`` alert, and is best effort by the sink's own contract."""
+        try:
+            self._alert_sink.audit_write_failed(f"approval:{approval_id}", action=action)
+        except Exception:  # noqa: BLE001 - a sink that breaks its never-raise contract
+            log.exception("approval %s: the audit_write_failed alert failed to emit", approval_id)
 
     async def _approver_changes(self, approver_user_id: str, requested_at: float) -> list[str]:
         """Which of the approver account's credential facts changed AFTER the request (BACKLOG #315
@@ -857,22 +980,21 @@ class ApprovalGate:
     ) -> None:
         """Audit and alert a release whose approver account changed after the request
         (:meth:`_approver_changes`). Best effort: the release has already happened."""
-        try:
-            await self._store.record_audit(
-                "approval.approver_provenance",
-                actor=approver,
-                detail=json.dumps(
-                    {
-                        "approval_id": approval_id,
-                        "operation": operation,
-                        "requester": requester,
-                        "changed": changed,
-                    }
-                ),
-                client=client,  # ADR 0150: the approver's address, matching this row's actor
-            )
-        except Exception:  # noqa: BLE001 - see the docstring; the release continues
-            log.exception("approval %s: the approver-provenance audit row failed", approval_id)
+        await self._record_audit_soft(
+            approval_id,
+            "approval.approver_provenance",
+            actor=approver,
+            detail=json.dumps(
+                {
+                    "approval_id": approval_id,
+                    "operation": operation,
+                    "requester": requester,
+                    "changed": changed,
+                }
+            ),
+            client=client,  # ADR 0150: the approver's address, matching this row's actor
+            context="the release went ahead",
+        )
         try:
             self._alert_sink.approval_approver_provenance(
                 f"approval:{approval_id}", operation=operation, changed=tuple(changed)
@@ -898,7 +1020,9 @@ class ApprovalGate:
 
         Best effort by construction: the caller re-raises the ORIGINAL error either way, so a store
         that is itself unreachable here must not mask the error that actually explains the failure.
-        A compensation failure is logged loudly rather than swallowed."""
+        A compensation failure is logged loudly rather than swallowed, and a lost audit row is also
+        paged (vault BACKLOG #2255)."""
+        moved: bool | None
         try:
             # Guarded on 'executing' so this can never clobber a row another caller rejected or
             # expired, and so a re-drive of the same failure is idempotent (second call moves 0 rows).
@@ -909,23 +1033,6 @@ class ApprovalGate:
                 decided_at=self._clock(),
                 from_status="executing",
             )
-            await self._store.record_audit(
-                "approval.failed",
-                actor=approver,
-                detail=json.dumps(
-                    {
-                        "approval_id": approval_id,
-                        "operation": operation,
-                        "requester": requester,
-                        # The type, never the message: an executor's exception text can carry
-                        # connection names, paths or params, and the audit log is not a PHI sink.
-                        "error": type(error).__name__,
-                        "stage": stage,
-                        "compensated": moved,
-                    }
-                ),
-                client=client,
-            )
         except Exception:  # noqa: BLE001 - see the docstring; the original error must win
             log.exception(
                 "approval %s: the release did not complete (stage %s) AND the compensating "
@@ -933,19 +1040,51 @@ class ApprovalGate:
                 approval_id,
                 stage,
             )
+            # The audit row is still attempted: it is the only record that the release failed.
+            # None, not False: False says another caller moved the row, None says the write failed.
+            moved = None
+        await self._record_audit_soft(
+            approval_id,
+            "approval.failed",
+            actor=approver,
+            detail=json.dumps(
+                {
+                    "approval_id": approval_id,
+                    "operation": operation,
+                    "requester": requester,
+                    # The type, never the message: an executor's exception text can carry
+                    # connection names, paths or params, and the audit log is not a PHI sink.
+                    "error": type(error).__name__,
+                    "stage": stage,
+                    "compensated": moved,
+                }
+            ),
+            client=client,
+            context="the release did not complete",
+        )
 
     async def reject(
         self, approval_id: str, *, approver: str, client: str | None = None
     ) -> dict[str, Any]:
         """Decline a pending request without executing it (audited). Any ``approvals:approve`` holder
-        may reject — including the requester cancelling their own."""
+        may reject — including the requester cancelling their own.
+
+        A store fault on the status write answers 503 rather than a raw 500 (vault BACKLOG #2255).
+        Once the row has moved, a failed ``approval.rejected`` write is logged at ERROR and paged,
+        and the rejection still succeeds: nothing ran, and the row says what was decided."""
         row = await self._require_pending(approval_id)
-        if not await self._store.decide_pending_approval(
-            approval_id, status="rejected", approver=approver, decided_at=self._clock()
-        ):
+        moved = await self._decide_or_503(
+            approval_id,
+            what="rejection",
+            retry="If the request still reads pending, reject it again once the store accepts writes",
+            status="rejected",
+            approver=approver,
+        )
+        if not moved:
             raise ApprovalError(409, "request was already decided")
         operation = str(row["operation"])
-        await self._store.record_audit(
+        await self._record_audit_soft(
+            approval_id,
             "approval.rejected",
             actor=approver,
             detail=json.dumps(
@@ -956,6 +1095,7 @@ class ApprovalGate:
                 }
             ),
             client=client,  # ADR 0150: the rejecting approver's address
+            context="the request was rejected",
         )
         return {
             "operation": operation,
@@ -1051,9 +1191,12 @@ class ApprovalGate:
         except Exception as exc:  # noqa: BLE001 - every store backend raises its own type
             log.exception(
                 "approval %s: the audit log refused the resolve row, so the request is still "
-                "interrupted",
+                "interrupted. Lost detail: actor=%s %s",
                 approval_id,
+                resolver,
+                detail,
             )
+            self._alert_lost_audit(approval_id, "approval.resolve_attempted")
             raise ApprovalError(
                 503,
                 "the audit log could not record this resolution, so the request is still "
@@ -1092,33 +1235,66 @@ class ApprovalGate:
         """The guarded status write and ``approval.resolved`` for :meth:`resolve_interrupted`."""
         # Guarded on 'interrupted', so two resolvers cannot both record an outcome. The releaser is
         # written back unchanged: the column says who released the request.
-        if not await self._store.decide_pending_approval(
+        moved = await self._decide_or_503(
             approval_id,
+            what="resolution",
+            retry=(
+                "If the request still reads interrupted, resolve it again once the store accepts "
+                "writes"
+            ),
             status=status,
             approver=releaser,
-            decided_at=self._clock(),
             from_status="interrupted",
-        ):
+        )
+        if not moved:
             raise ApprovalError(
                 409, "request is no longer interrupted; another operator resolved it first"
             )
+        # The row has moved, so a lost row must not raise; approval.resolve_attempted records it.
+        await self._record_audit_soft(
+            approval_id,
+            "approval.resolved",
+            actor=resolver,
+            detail=detail,
+            client=client,  # ADR 0150: the resolver's address, matching this row's actor
+            context=(
+                f"resolver {resolver} moved the row to '{status}' "
+                "(approval.resolve_attempted still records it)"
+            ),
+        )
+
+    async def _decide_or_503(
+        self,
+        approval_id: str,
+        *,
+        what: str,
+        retry: str,
+        status: str,
+        approver: str | None,
+        from_status: str = "pending",
+    ) -> bool:
+        """``decide_pending_approval``, with a store fault answered as 503 rather than a raw 500
+        (vault BACKLOG #2255). Used where nothing has run yet, so a refusal is the right answer.
+        ``what`` names the decision in the log and the detail; ``retry`` tells the caller what to
+        do once the store accepts writes."""
         try:
-            await self._store.record_audit(
-                "approval.resolved",
-                actor=resolver,
-                detail=detail,
-                client=client,  # ADR 0150: the resolver's address, matching this row's actor
-            )
-        except Exception:  # noqa: BLE001 - the row has moved; approval.resolve_attempted records it
-            log.exception(
-                "approval %s: resolver %s moved the row to '%s', but its approval.resolved audit "
-                "row failed; the approval.resolve_attempted row still records the resolution. "
-                "Lost detail: %s",
+            return await self._store.decide_pending_approval(
                 approval_id,
-                resolver,
-                status,
-                detail,
+                status=status,
+                approver=approver,
+                decided_at=self._clock(),
+                from_status=from_status,
             )
+        except Exception as exc:  # noqa: BLE001 - every store backend raises its own type
+            raise self._store_fault(approval_id, exc, what=what, retry=retry) from exc
+
+    @staticmethod
+    def _store_fault(approval_id: str, exc: Exception, *, what: str, retry: str) -> ApprovalError:
+        """Log a store fault on a status write made before anything ran, and return the 503 that
+        answers it (vault BACKLOG #2255). ``what`` names the decision in the log and the detail;
+        ``retry`` tells the caller what to do."""
+        log.error("approval %s: the store failed to record the %s", approval_id, what, exc_info=exc)
+        return ApprovalError(503, f"the store could not record this {what}. {retry}")
 
     async def _require_pending(self, approval_id: str) -> Any:
         row = await self._store.get_pending_approval(approval_id)

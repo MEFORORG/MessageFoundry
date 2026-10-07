@@ -149,9 +149,9 @@ async def test_a_listener_start_leaves_down_refuses_no_reload_toggle_or_dr_activ
 ) -> None:
     """Vault BACKLOG #2622 item 1, review round 3. IB_TOML binds 0.0.0.0 in cleartext with no escape.
     With ``auto_start = false`` engine start never binds it, so a dry run, a reload, a flag toggle
-    and a DR activation (a reload of the config dir) must all apply, as they did before the build
-    check ran the exposure gates. With ``auto_start = true`` the listener would be bound, so the
-    build check still refuses all four, naming the listener and the two settings that leave it
+    and a DR activation (a re-apply of the running graph, vault BACKLOG #3067) must all apply, as
+    they did before the build check ran the exposure gates. With ``auto_start = true`` the
+    listener would be bound, so the build check still refuses all four, naming the listener and the two settings that leave it
     down. That is the control: the passes are the predicate, not a gate that never ran."""
     eng = await _exposed_engine(tmp_path, allow=False)
     toml_path = tmp_path / "connections.toml"
@@ -223,7 +223,9 @@ async def test_concurrent_flag_writes_both_land(engine: Engine, tmp_path: Path) 
     reg = load_config(tmp_path)  # the file still parses + loads cleanly
     assert reg.outbound["OB_TOML"].flagged is True  # neither update was lost
     assert reg.inbound["IB_TOML"].flagged is True
-    assert not list(tmp_path.glob("connections.toml.*.tmp"))  # no shared/leftover temp file
+    # No leftover edit candidate, in either the old temp-file shape or the private-directory one.
+    assert not list(tmp_path.glob("connections.toml.*.tmp"))
+    assert not list(tmp_path.glob(".connections.toml.*.edit"))
 
 
 def test_flagged_survives_toml_roundtrip(tmp_path: Path) -> None:
@@ -242,3 +244,43 @@ def test_flagged_survives_toml_roundtrip(tmp_path: Path) -> None:
 
     reg = load_config(tmp_path)
     assert reg.outbound["OB_TOML"].flagged is True
+
+
+async def test_the_toggle_takes_its_digests_under_the_config_edit_lock(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """vault BACKLOG #2782: both config digests are taken while the toggle holds the cross-process
+    edit lock, so a `connection` or `codeset` CLI edit cannot land between them and be vouched for as
+    loaded. Probed from a second thread, which must find the lock taken at each digest."""
+    import threading
+
+    from messagefoundry.config import atomic_edit
+    from messagefoundry.config.fingerprint import config_fingerprint_detail
+
+    engine.loaded_config_fingerprint = config_fingerprint_detail(tmp_path)
+    real = Engine.fingerprint_bundle_blocking
+    held_at_digest: list[bool] = []
+
+    def _probe() -> bool:
+        free: list[bool] = []
+
+        def run() -> None:
+            try:
+                with atomic_edit.edit_lock(tmp_path / "connections.toml", timeout=0):
+                    free.append(True)
+            except TimeoutError:
+                free.append(False)
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        thread.join(20)
+        return free == [False]
+
+    def _recording(self: Engine, path: Path) -> tuple[dict[str, object] | None, str | None]:
+        held_at_digest.append(_probe())
+        return real(self, path)
+
+    monkeypatch.setattr(Engine, "fingerprint_bundle_blocking", _recording)
+    await engine.set_connection_flag("OB_TOML", direction="outbound", flagged=True)
+    assert held_at_digest == [True, True], "control: both digests were taken, each under the lock"
+    assert not _probe(), "control: the probe reads the lock as free once the toggle returns"

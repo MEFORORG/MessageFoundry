@@ -182,8 +182,8 @@ async def _read_back(db: Path, key_b64: str | None) -> tuple[int, str | None]:
     cipher = make_cipher(key_b64) if key_b64 else None
     store = await MessageStore.open(db, cipher=cipher)
     try:
-        count = await store.count_messages()
-        rows = await store.list_messages(limit=10)
+        count = await store.count_messages(allowed_channels=None)
+        rows = await store.list_messages(limit=10, allowed_channels=None)
         raw: str | None = None
         if rows:
             msg = await store.get_message(rows[0]["id"])

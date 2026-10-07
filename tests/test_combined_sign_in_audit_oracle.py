@@ -68,8 +68,13 @@ _LOCK_THRESHOLD = 3
 
 
 def _lock_settings() -> AuthSettings:
+    # The login-to-MFA floor is off: _totp_admin enrols on the session it just signed in, and the
+    # floor covers that enrolment (BACKLOG #2389). These tests are about the combined sign-in.
     return AuthSettings(
-        lockout_threshold=_LOCK_THRESHOLD, lockout_minutes=15, mfa_recovery_code_count=1
+        lockout_threshold=_LOCK_THRESHOLD,
+        lockout_minutes=15,
+        mfa_recovery_code_count=1,
+        mfa_verify_min_elapsed_seconds=0,
     )
 
 
@@ -234,8 +239,8 @@ async def test_counting_is_unchanged_right_password_charges_the_second_step_coun
 
 
 class _FakeNotifier:
-    """Captures out-of-band security events instead of emailing them, so ``_lock_notice_due`` sees a
-    wired notifier and writes its ``auth.lock_notice`` row."""
+    """Captures out-of-band security events instead of emailing them, so the service sees a wired
+    notifier and its lock-notice task writes the ``auth.lock_notice`` row (BACKLOG #2216)."""
 
     def __init__(self) -> None:
         self.events: list[Any] = []
@@ -396,6 +401,9 @@ async def _campaign(world: _World, *, right_password: bool) -> None:
         world.steps.next_code()
         out = await world.service.login(ADMIN_USERNAME, sent, totp_code=world.steps.wrong_code())
         assert not out.ok
+    # The lock notice and its ``auth.lock_notice`` row are written by a background task (BACKLOG
+    # #2216), so the campaign finishes it before anyone reads the trail.
+    await world.service.drain_background()
 
 
 async def _lapse_sign_in_lock_then_probe(world: _World, *, right_password: bool) -> None:
@@ -414,6 +422,7 @@ async def _lapse_sign_in_lock_then_probe(world: _World, *, right_password: bool)
 async def _admin_unlock(world: _World, monkeypatch: pytest.MonkeyPatch) -> _World:
     """Run the real ``admin-unlock`` CLI against the world's database (engine stopped, as ADR 0171
     requires), then reopen the engine on the same file. Returns the reopened world."""
+    await world.service.drain_background()
     await world.engine.stop()
     monkeypatch.chdir(world.db.parent)
     setenv_at_rest_opt_out(monkeypatch)
@@ -666,19 +675,22 @@ async def test_the_hidden_refusal_details_match_what_the_writers_store(
 
 def test_every_api_read_of_the_trail_goes_through_the_one_filtered_helper() -> None:
     """A new route that called ``store.list_audit`` directly would skip the exclusion. The API and
-    the console packages may call it in ONE place, the helper that applies it."""
+    the console packages may call it in ONE place, the helper that applies it. The export's count,
+    ``store.count_audit`` (vault BACKLOG #2776), is held to the same rule by its own helper, so the
+    recorded count can never include a row the caller was not sent."""
     root = Path(__file__).resolve().parents[1]
-    calls: list[str] = []
-    for package in ("messagefoundry/api", "messagefoundry_webconsole"):
-        for path in sorted((root / package).rglob("*.py")):
-            for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-                if "store.list_audit(" in line:
-                    calls.append(f"{path.relative_to(root).as_posix()}:{n}")
-    assert len(calls) == 1 and calls[0].startswith("messagefoundry/api/auth_routes.py:"), calls
     source = (root / "messagefoundry/api/auth_routes.py").read_text(encoding="utf-8")
-    helper = source[source.index("async def _read_audit(") :]
-    helper = helper[: helper.index("\n    async def ", 1)]
-    assert "store.list_audit(" in helper and "exclude=audit_exclusion_for(identity)" in helper
+    for read, helper_name in (("list_audit", "_read_audit"), ("count_audit", "_count_audit")):
+        calls: list[str] = []
+        for package in ("messagefoundry/api", "messagefoundry_webconsole"):
+            for path in sorted((root / package).rglob("*.py")):
+                for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                    if f"store.{read}(" in line:
+                        calls.append(f"{path.relative_to(root).as_posix()}:{n}")
+        assert len(calls) == 1 and calls[0].startswith("messagefoundry/api/auth_routes.py:"), calls
+        helper = source[source.index(f"async def {helper_name}(") :]
+        helper = helper[: helper.index("\n    async def ", 1)]
+        assert f"store.{read}(" in helper and "exclude=audit_exclusion_for(identity)" in helper
 
 
 def test_an_empty_excluded_detail_is_refused() -> None:
@@ -1024,6 +1036,8 @@ async def test_a_failed_throttle_read_names_neither_the_account_nor_the_lock(
                 steps.next_code()
                 sent = await service.login(ADMIN_USERNAME, password, totp_code=steps.wrong_code())
                 assert not sent.ok
+            # The throttle reads in a background task (BACKLOG #2216): finish it inside the capture.
+            await service.drain_background()
         assert [r for r in caplog.records if "throttle read failed" in r.getMessage()], (
             "the control: the failed read was not reported at all"
         )

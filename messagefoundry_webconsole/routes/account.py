@@ -40,6 +40,7 @@ from .._auth import (
     clear_session_cookie,
     login_redirect_response,
     register_ui_action,
+    rekey_continuations,
     require_ui,
     require_ui_reauth_only,
     require_ui_reauth_only_action,
@@ -64,9 +65,18 @@ from ._common import _client, _form_pairs, _rate_limited
 # 7.5.1 (ADR 0077): each factor lane now carries an action= tag, so /ui/reauth mints the matching
 # single-use grant and each bind consumes exactly one fresh proof (closing the /ui window residual).
 register_ui_action(
-    r"^/ui/account/mfa/enroll$", None, step_up=False, action=STEP_UP_ACTION_MFA_ENROLL
+    r"^/ui/account/mfa/enroll$",
+    None,
+    step_up=False,
+    action=STEP_UP_ACTION_MFA_ENROLL,
+    label="Set up an authenticator app",
 )
-register_ui_action(r"^/ui/account/mfa/disable$", None, action=STEP_UP_ACTION_MFA_DISABLE)
+register_ui_action(
+    r"^/ui/account/mfa/disable$",
+    None,
+    action=STEP_UP_ACTION_MFA_DISABLE,
+    label="Turn off your authenticator app",
+)
 register_ui_action(
     r"^/ui/account/mfa/confirm$",
     None,
@@ -74,6 +84,7 @@ register_ui_action(
     auto_retry=False,
     unlock=True,
     action=STEP_UP_ACTION_MFA_CONFIRM,
+    label="Confirm your authenticator app",
 )
 # --- L5a: WebAuthn passkeys (ADR 0068, WP-14b) -------------------------------
 # Self-scoped actions (permission=None — enforcement is each route's require_ui* dep).
@@ -85,10 +96,17 @@ register_ui_action(
 # — NEVER registered as a continuation (hard invariant); its require_ui_reauth_only maps a
 # stale-window 303 to the REGISTERED enroll action (the #745 ui_mfa_verify precedent).
 register_ui_action(
-    r"^/ui/account/webauthn/enroll$", None, step_up=False, action=STEP_UP_ACTION_WEBAUTHN_ENROLL
+    r"^/ui/account/webauthn/enroll$",
+    None,
+    step_up=False,
+    action=STEP_UP_ACTION_WEBAUTHN_ENROLL,
+    label="Add a passkey",
 )
 register_ui_action(
-    r"^/ui/account/webauthn/[^/?#]+/delete$", None, action=STEP_UP_ACTION_WEBAUTHN_DELETE
+    r"^/ui/account/webauthn/[^/?#]+/delete$",
+    None,
+    action=STEP_UP_ACTION_WEBAUTHN_DELETE,
+    label="Remove a passkey",
 )
 # --- L6b: self-service session TERMINATE (ASVS 7.5.2) — password re-proof before revoke ---
 # Both terminate POSTs are body-less (all params in the PATH), so they register as auto_retry
@@ -106,12 +124,14 @@ register_ui_action(
     None,
     step_up=False,
     action=STEP_UP_ACTION_SESSION_TERMINATE,
+    label="Sign out one of your sessions",
 )
 register_ui_action(
     r"^/ui/account/sessions/revoke-others$",
     None,
     step_up=False,
     action=STEP_UP_ACTION_SESSION_TERMINATE,
+    label="Sign out all your other sessions",
 )
 
 
@@ -427,6 +447,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # A correct code on a session revoked mid-enrolment: the rotation failed before MFA was
             # enabled, so MFA stays OFF (BACKLOG #1902) and no codes exist to show. This browser's
             # cookie is dead; land on login, and the operator enrols again from the account page.
+            # The same answer when a reset or a second confirm beat this one to the enable
+            # (BACKLOG #2224): this confirm turned nothing on and its session was ended. After a
+            # second confirm TOTP is already on, so the operator signs in with it, not enrols.
             return login_redirect_response()
         if elevation.token is None:
             return HTMLResponse(pages.mfa_confirm_page(error="Invalid code."), status_code=400)
@@ -434,6 +457,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # session (ASVS 7.2.4), so this response must carry the new cookie or the operator is signed
         # out on the very page showing codes they have not written down yet.
         resp = HTMLResponse(pages.mfa_recovery_page(list(elevation.recovery_codes)))
+        rekey_continuations(token, elevation.token)  # vault BACKLOG #2764
         set_session_cookie(resp, elevation.token, request=request)
         return resp
 
@@ -630,6 +654,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # Enrolling a passkey marks the session MFA-satisfied, so it re-keys (ASVS 7.2.4). The page
         # follows `redirect` immediately, and that GET must carry the new cookie.
         resp = JSONResponse({"ok": True, "redirect": "/ui/account?m=passkey_added"})
+        rekey_continuations(token, elevation.token)  # vault BACKLOG #2764
         set_session_cookie(resp, elevation.token, request=request)
         return resp
 

@@ -1,7 +1,12 @@
 # 0187 — Bound the subprocess sandbox worker count: a shared pool or router-phase-only isolation
 
-- **Status:** Proposed — an options memo, not a decision. The shape is the owner's to choose, and
-  [BACKLOG #1458](../BACKLOG.md) stays open until they do. No code accompanies this ADR.
+- **Status:** **Accepted (2026-10-07) -- option 1, one bounded shared pool over both phases.** The
+  owner chose the shape in session on 2026-10-07; see *Amendment A* below, which also records the
+  design points the shape is accepted with. No code accompanies this ADR yet, and
+  [BACKLOG #1458](../BACKLOG.md) stays open until the pool is built.
+  **This line read** *"Proposed -- an options memo, not a decision. The shape is the owner's to
+  choose"* until 2026-10-07. The memo's body below is unchanged and still recommends option 3; the
+  owner did not take that recommendation, and *Amendment A* says why.
 - **Date:** 2026-09-10
 - **Related:** [BACKLOG #1458](../BACKLOG.md) (the row this memo answers) ·
   [ADR 0087](0087-sandbox-subprocess-isolation.md) (the seam being resized) ·
@@ -259,7 +264,91 @@ process's isolation. An operator cannot sandbox the cheap lanes and exempt the e
 rearchitecture should decide whether that stays true; it is not itself a cardinality fix, and under
 options 1 or 3 a per-connection mode also decides which lanes share a worker.
 
+## Amendment A (2026-10-07) -- option 1 accepted, and what it is accepted with
+
+**The owner chose option 1 on 2026-10-07, in session**, after three adversarial reviews and a
+fourth that checked the three against each other. The question put was *"accept option 1 (one
+bounded pool running both routers and transforms)?"*, and the answer was *"Accept option 1"*.
+
+**Why not option 3, the memo's own recommendation.** Option 3 runs transforms in the engine process
+again. There, nothing bounds a transform's running time: `SandboxSettings` says that at
+`mode="off"` there is no timeout at all, and CPython cannot kill a thread, so a transform stuck in a
+loop holds a default-executor thread for good. That executor also serves strict validation and
+login work. The owner's trust model (2026-10-06: Router and Handler authors are trusted employee
+programmers unless security is breached) puts exactly that buggy code in scope, and transforms are
+where most of it lives. Under option 1 the same bug costs one dead-lettered message after
+`wall_seconds`. Option 3's other two advantages are smaller than the memo priced them: both options
+bound the worker count, and a graph that declares no live lookup can run its transforms sandboxed
+today.
+
+**Why not option 4.** Reviewers measured a worker spawn at about 3 to 5 s warm and 11 to 21 s cold
+at 500 to 1,500 inbounds, on a loaded 20-core Windows box. They are not re-run here. With fewer
+workers than active lanes, most messages would pay a full spawn, which fails ADR 0052 AC-1.
+
+**The 2026-09-09 ruling that kept the default off was about BOTH scale and live lookups.** The
+records disagreed: BACKLOG #1278 named ADR 0052 AC-2, and option 2 above named the live-lookup
+carve-out. The owner settled it on 2026-10-07 (*"Both"*). This session reads that as the default
+flip (#1278) waiting on this pool and its connection-scale measurement, **and** on the ADR 0147
+broker. That is an inference from the ruling, not a separate ruling. This ADR does not decide the
+flip.
+
+### Design points the shape is accepted with
+
+The points below were not each put to the owner. They are the engineering decisions of the session
+that carried the reviews, taken under the owner's standing rule to proceed on a strong
+recommendation, and every one came out of the adversarial reviews. Treat them as the starting design
+for the build, open to the build's own review.
+
+1. **No per-lane kill budget yet.** A shared worker cannot reliably say which lane caused a kill, and
+   nothing records why a worker died today. Build the kill-cause record first (BACKLOG #3135), then
+   measure how often a kill lands on the wrong lane, then decide.
+2. **What bounds harm to sibling lanes instead:**
+   - one in-flight dispatch per lane (k = 1), which keeps today's per-lane order;
+   - the lane whose dispatch caused a kill waits for its own replacement worker;
+   - recycling a worker after a kill, after a run of errors that did not kill it, and after M
+     dispatches;
+   - a check, after each dispatch, for threads or processes the Handler left behind, against a
+     baseline taken after boot;
+   - no automatic stop of a lane, except one making no progress at all.
+3. **One pool by default, with an optional `worker_group` tag** so an operator can keep named feeds
+   apart. **Per-connection `[sandbox]` settings (option 5) are declined.**
+4. **Lanes wait for a worker without holding an executor thread.** Sandbox dispatch gets its own
+   executor, so slow Handlers cannot push strict validation on other lanes past its timeout.
+5. **Infrastructure faults re-queue.** Closing the pool on reload, timing out while waiting for a
+   worker, and a worker that cannot boot each re-queue the row with no attempt spent, and the last
+   raises an alert (BACKLOG #1693, #2772).
+6. **The pool loads one audited config snapshot.** Recycling makes respawn routine, so the respawn
+   must not load unaudited code from disk (BACKLOG #2596, steps 1 and 2). The pool waits on that.
+7. **Sizing.** Per engine process from `os.process_cpu_count()`, plus warm spares, with a host-wide
+   budget when several engine shards share a machine.
+8. **The wall timer starts after the request is written,** as `dispatch` does now, so queueing time
+   never counts against `wall_seconds`.
+9. **Lookups are scoped to the requesting lane** through the dispatch tie ADR 0147's Amendment A
+   adds.
+10. **Until the ADR 0147 broker exists, a graph whose Handlers call a live lookup** keeps today's
+    rule (`mode="off"` for the engine), or uses a per-Handler in-process exemption with a mandatory
+    reason, if one is built first. The broker removes the exemption. Neither is a reason to hold the
+    pool.
+
+### Order of work
+
+1. The worker's lifetime CPU budget goes first (BACKLOG #3133; the owner ruled on 2026-10-07 to drop
+   `RLIMIT_CPU`). It kills innocent dispatches on POSIX, so no POSIX measurement means anything
+   until it is gone.
+2. The connection-scale harness learns a sandbox arm and a delivery check (BACKLOG #3132, steps 1
+   and 2). As built, a sandbox run would pass while delivering nothing.
+3. A baseline of today's per-inbound design, driving K of 1,500 declared inbounds, sizes the pool.
+4. The one-snapshot loader (BACKLOG #2596), then the pool, with fault-injection tests: a busy loop, a crash,
+   a leftover thread, a write to fd 1, `sys.exit`, `os._exit`, a memory leak.
+5. The N=1500 two-arm comparison runs against **the pool**, the shape that would ship, on both
+   Windows and Linux, with N=750 recorded beside it (BACKLOG #3132).
+
 ## Acceptance Criteria
+
+> **Amended 2026-10-07 for option 1.** AC-1, AC-2 and AC-5 stand as written. AC-3 and AC-4 are
+> amended in place: AC-3 now names its mechanism, and AC-4 is approximate, because the relay thread
+> reads stderr on its own schedule and a tag the child writes cannot be trusted. The paragraph below
+> is the memo's original preface.
 
 > Stated for the shape this memo recommends, so that accepting it has a testable meaning. They are
 > **not** satisfiable today and several are deliberately unlinked: per the Context above, AC-2 of
@@ -274,11 +363,15 @@ options 1 or 3 a per-connection mode also decides which lanes share a worker.
   rather than failing it.
   → test to build with the chosen shape
 - **AC-3** — IF one lane repeatedly forces worker kills, THEN THE SYSTEM SHALL bound the effect on
-  sibling lanes sharing that worker (mechanism unspecified; this ADR does not choose one).
+  sibling lanes sharing that worker. *Amended 2026-10-07:* the mechanism is *Amendment A* design
+  points 1 and 2 (k = 1, lane-charged respawn, recycling, the leftover check; no kill budget yet).
   → test to build with the chosen shape
 - **AC-4** — WHEN a shared worker relays child stderr, THE SYSTEM SHALL attribute it to the inbound
-  whose dispatch produced it, preserving the guarantee
-  [ADR 0176](0176-sandbox-child-stderr-is-captured-and-relayed-content-below-info.md) makes.
+  whose dispatch was in flight when the relay read it, and SHALL keep per-(generation, inbound)
+  notice counters. *Amended 2026-10-07:* this read *"to the inbound whose dispatch produced it,
+  preserving the guarantee
+  [ADR 0176](0176-sandbox-child-stderr-is-captured-and-relayed-content-below-info.md) makes"*.
+  Exact attribution is not possible in a shared worker, so the criterion is now approximate.
   → test to build with the chosen shape
 - **AC-5** — THE SYSTEM SHALL preserve every fail-closed refusal ADR 0087 rests on: a value outside
   the closed codec grammar, a desynchronized or forged frame, an unsolicited frame, and a
@@ -306,14 +399,14 @@ BACKLOG #1194.
 
 ## To resolve on acceptance
 
-- [ ] **The shape.** Option 1, 3, 4, or something else. This is the owner's ruling and the reason the
-      status is Proposed.
-- [ ] **The cross-lane denial of service.** Whatever shape shares a worker must say what stops one
-      lane forcing respawns on its siblings. Unanswered here on purpose.
+- [x] **The shape.** Option 1, owner ruling 2026-10-07. See *Amendment A*.
+- [x] **The cross-lane denial of service.** Answered by *Amendment A* design points 1 and 2: no kill
+      budget until kill causes are recorded, and k = 1, lane-charged respawn and recycling meanwhile.
 - [ ] **The discriminating process-count test #1278 names**, run against a live engine rather than
-      against the launcher mechanism in isolation. The probe above makes ADR 0087's figure the one to
-      use; it does not close the test as the row wrote it.
-- [ ] **Whether `[sandbox]` gains per-connection settings** (option 5), which under a pool also
-      decides which lanes may share a worker.
-- [ ] **Whether AC-1 is verifiable before a connection-scale harness exists**, or whether this ADR
-      waits on the work ADR 0052 `:108` records as not built.
+      against the launcher mechanism in isolation. Now part of BACKLOG #3132, whose Windows run
+      waits on #3065.
+- [x] **Whether `[sandbox]` gains per-connection settings** (option 5). Declined; an optional
+      `worker_group` tag instead. See *Amendment A* design point 3.
+- [x] **Whether AC-1 is verifiable before a connection-scale harness exists.** The harness exists
+      (`harness/load/connscale/`), but cannot yet run a sandbox arm; BACKLOG #3132 steps 1 and 2 fix
+      that. AC-1 itself is a pytest at small N and needs no harness.

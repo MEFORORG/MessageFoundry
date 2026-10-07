@@ -54,12 +54,12 @@ async def test_memory_store_has_no_pool_and_reads_still_work() -> None:
     try:
         assert store._read_pool is None
         assert store._read_conns == []
-        assert await store.list_messages() == []
+        assert await store.list_messages(allowed_channels=None) == []
         mid = await _enqueue(store, 1)
         got = await store.get_message(mid)
         assert got is not None
         assert got["control_id"] == "MSG00001"
-        assert await store.count_messages() == 1
+        assert await store.count_messages(allowed_channels=None) == 1
     finally:
         await store.close()
 
@@ -84,7 +84,7 @@ async def test_reads_do_not_block_on_a_held_write_lock(file_store: MessageStore)
     read tried to re-acquire the non-reentrant lock)."""
     mid = await _enqueue(file_store, 1)
     async with file_store._lock:  # simulate a long-running write holding the lock
-        msgs = await asyncio.wait_for(file_store.list_messages(), timeout=5.0)
+        msgs = await asyncio.wait_for(file_store.list_messages(allowed_channels=None), timeout=5.0)
         assert [m["id"] for m in msgs] == [mid]
         status = await asyncio.wait_for(file_store.db_status(), timeout=5.0)
         assert status.journal_mode.lower() == "wal"
@@ -106,28 +106,28 @@ async def test_concurrent_reads_and_writes_do_not_error(file_store: MessageStore
 
     async def reader() -> None:
         # Exercise the de-serialized metrics reads + the message reads together.
-        await file_store.list_messages(limit=100)
+        await file_store.list_messages(limit=100, allowed_channels=None)
         await file_store.db_status()
         await file_store.stats()
         await file_store.in_pipeline_depth()
-        await file_store.count_messages()
+        await file_store.count_messages(allowed_channels=None)
         await file_store.connection_metrics(since=0.0)
 
     tasks = [writer(i) for i in range(n_writes)] + [reader() for _ in range(30)]
     await asyncio.gather(*tasks)
 
-    assert await file_store.count_messages() == n_writes
+    assert await file_store.count_messages(allowed_channels=None) == n_writes
 
 
 async def test_each_pooled_read_sees_the_latest_commit(file_store: MessageStore) -> None:
     """A pooled read must start a fresh snapshot every call — never pin a stale one — so a write is
     visible to the very next read even when both reuse the same pooled connection."""
-    assert await file_store.count_messages() == 0
+    assert await file_store.count_messages(allowed_channels=None) == 0
     mid1 = await _enqueue(file_store, 1)
-    assert await file_store.count_messages() == 1
+    assert await file_store.count_messages(allowed_channels=None) == 1
     assert await file_store.get_message(mid1) is not None
     await _enqueue(file_store, 2)
-    assert await file_store.count_messages() == 2
+    assert await file_store.count_messages(allowed_channels=None) == 2
 
 
 async def _count(conn) -> int:

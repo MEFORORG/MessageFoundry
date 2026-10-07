@@ -1,6 +1,6 @@
 # 0087 — Router/Handler subprocess isolation
 
-- **Status:** Accepted; **Amended (2026-08-04)** — the transform-result parity rule changed shape. The child now materialises a container return with `_partition`'s **own** rule instead of reproducing its exact input container, so a tuple/set/generator **delivers** in both modes (BACKLOG #341). AC-11 and the "Result parity" bullet below are rewritten accordingly; the isolation boundary and the codec grammar are untouched. **Amended (2026-09-05)** — a 74 GiB extrapolation added under the per-worker footprint on 2026-09-04 is **retracted in place**; the measured per-child figures stand, and the surviving constraint is restated as the ADR 0052 AC-2 conflict it always was. No decision, boundary or acceptance criterion of this ADR changes. **Corrected (2026-10-01)** — the "DEK-in-worker" residual said there is no key in the worker to strip. That was false wherever the key arrives by environment variable, because the worker inherited the engine's environment. The correction sits beside that bullet; the worker now gets an allowlisted environment (vault BACKLOG #2587), which is not an isolation boundary by itself.  <!-- opt-in subprocess isolation built (#197, 2026-07-10) -->
+- **Status:** Accepted; **Amended (2026-08-04)** — the transform-result parity rule changed shape. The child now materialises a container return with `_partition`'s **own** rule instead of reproducing its exact input container, so a tuple/set/generator **delivers** in both modes (BACKLOG #341). AC-11 and the "Result parity" bullet below are rewritten accordingly; the isolation boundary and the codec grammar are untouched. **Amended (2026-09-05)** — a 74 GiB extrapolation added under the per-worker footprint on 2026-09-04 is **retracted in place**; the measured per-child figures stand, and the surviving constraint is restated as the ADR 0052 AC-2 conflict it always was. No decision, boundary or acceptance criterion of this ADR changes. **Corrected (2026-10-01)** — the "DEK-in-worker" residual said there is no key in the worker to strip. That was false wherever the key arrives by environment variable, because the worker inherited the engine's environment. The correction sits beside that bullet; the worker now gets an allowlisted environment (vault BACKLOG #2587), which is not an isolation boundary by itself. **Amended (2026-10-07).** The owner ruled to drop the worker's POSIX `RLIMIT_CPU` backstop, so CPU time is bounded only per call, by the wall cap, and `[sandbox].cpu_seconds` is gone (vault BACKLOG #3133 part 1). The Decision bullet that named the backstop is edited, the reasons are under "POSIX CPU limit dropped" below, and what the limit used to bound is a new residual. `RLIMIT_AS` is unchanged.  <!-- opt-in subprocess isolation built (#197, 2026-07-10) -->
 - **Date:** 2026-07-10
 - **Related:** [ADR 0009](0009-run-scoped-context-providers.md) (RunContext providers) · [ADR 0010](0010-handler-callable-db-lookup.md) / [ADR 0043](0043-fhir-read-lookup.md) (`db_lookup`/`fhir_lookup`) · [ADR 0072](0072-traced-dryrun-mode.md) (tracer seam it composes with) · [ADR 0036](0036-windows-config-source-trust.md) / [ADR 0041](0041-load-path-attestation-and-change-attribution.md) (config-source trust) · CLAUDE.md §2 (reliability/purity, count-and-log) · CLAUDE.md §4 (layering) · BACKLOG #197 · ASVS 15.2.5 / `docs/security/ASVS-L3-REMEDIATION-PLAN.md` WP-L3-17
 
@@ -59,8 +59,9 @@ in-process, byte-identically and with zero overhead.
   the process boundary. Defence-in-depth on top: a **forbidden-import guard** (a `sys.meta_path`
   finder that denies `socket`/`ssl`/store/crypto/transports/api, with those already-cached modules
   purged so a cached import re-triggers it), a **parent-enforced wall-clock cap** (the authoritative
-  bound on every platform — the parent kills a worker that overruns it) plus a POSIX
-  `RLIMIT_CPU`/`RLIMIT_AS` backstop inside the child where `resource` exists (a no-op on Windows).
+  bound on every platform — the parent kills a worker that overruns it) plus a POSIX `RLIMIT_AS`
+  memory backstop inside the child where `resource` exists (a no-op on Windows). There is no
+  CPU-time limit beyond the wall cap (see "POSIX CPU limit dropped" below).
   The import guard is **defence-in-depth only** and must never be cited as a compensating control: a
   module imported before the finder goes up keeps a live reference (`urllib.request.socket` is the
   real socket module inside a sandboxed Handler), so the address-space boundary and the codec are the
@@ -91,6 +92,36 @@ in-process, byte-identically and with zero overhead.
   the unchanged `_assert_safe_config_source` DACL gate (ADR 0036); sandboxing import-time exec is a
   chicken-and-egg (the worker itself must load the graph) and out of scope. `_assert_safe_config_source`
   is **not weakened**.
+
+### POSIX CPU limit dropped (amendment, 2026-10-07)
+
+**The owner ruled on 2026-10-07 to drop the worker's POSIX `RLIMIT_CPU` backstop and keep the wall
+cap as the only CPU-time control** (vault BACKLOG #3133 part 1). The `[sandbox].cpu_seconds`
+setting went with it. There is no compatibility alias, because nothing is deployed (CLAUDE.md
+section 0).
+
+**Why.** `RLIMIT_CPU` counts the CPU a process spends over its whole life. The worker is persistent
+and serves many calls, so the limit was a lifetime budget rather than a per-call one. Once many
+short, innocent calls added up past it, the kernel killed the worker in whichever call came next,
+and that message dead-lettered. Engine PR 2084 measured it: a reused worker died on its tenth
+0.15 s call. That PR stopped the bootstrap's own CPU counting against the budget, and named a CPU
+kill as one, but the lifetime shape stayed. The wall cap already bounds every call on every
+platform, a CPU-bound runaway included, so for the case the backstop was there for it added only a
+way to fail. Vault BACKLOG #3133 listed a per-dispatch CPU cap as the alternative to dropping it.
+
+**What this gives up.** The limit counted the whole process, and a child inherits it, so it also
+bounded CPU the wall cap never sees. That CPU now has no bound; it is recorded under "Out of scope /
+honest residuals" below.
+
+**What changed.** The worker no longer sets `RLIMIT_CPU`, and the boot frame no longer carries
+`cpu_seconds`. The parent no longer reads a `SIGXCPU` exit as a CPU-cap kill, because nothing sets
+the limit that sends it. A runaway call is still stopped by the wall cap and reported as the wall
+cap (AC-4). `tests/test_sandbox.py::test_a_reused_worker_has_no_lifetime_cpu_budget` pins the
+change on POSIX.
+
+**What did not change.** `RLIMIT_AS` (`[sandbox].mem_mb`) is untouched and outside this ruling.
+Whether it stays is still open as vault BACKLOG #3133 part 2. `RLIMIT_CORE` stays at zero, so a
+crashing worker that holds message bodies writes no core file.
 
 ### IPC codec (amendment — MFW2, replaces the pickle pipe)
 
@@ -381,6 +412,12 @@ in `sandbox.py` (the seam draws no line between admin functions). Not a defect o
 it is the constraint any proposal to make `subprocess` a *default* has to clear first.
 
 **Out of scope / honest residuals** —
+- **CPU spent outside a call (added 2026-10-07).** The wall cap times one call's reply and nothing
+  else. Since `RLIMIT_CPU` was dropped, nothing bounds CPU that admin code spends outside that
+  window. At least three shapes: a thread a Handler or config module starts and leaves running after
+  the call returns; several threads burning in parallel inside one call, up to about N times
+  `wall_seconds` of CPU; and, on POSIX, a grandchild that leaves the worker's process group
+  (`setsid`, a double fork), which the wall-cap kill does not reap. The old limit bounded all three.
 - **DEK-in-worker:** the child never constructs the store/DEK, so there is no DEK in the worker to
   strip; if a future change loads store state at registry-build time, that must stay out of the
   child.

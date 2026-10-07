@@ -103,7 +103,7 @@ async def test_a_queued_burst_costs_one_commit_and_lands_every_row(
     await _join(runner)
 
     assert store.committed_txns - before == 1, "a burst must cost ONE commit, not one per event"
-    events = await store.list_connection_events(limit=100)
+    events = await store.list_connection_events(limit=100, allowed_channels=None)
     assert len(events) == k
     by_peer = {e.peer_host: e for e in events}
     for i in range(k):
@@ -124,7 +124,7 @@ async def test_a_backlog_is_written_in_bounded_slices(
     _start_drainer(runner)
     await _join(runner)
     assert store.committed_txns - before == 3  # 4 + 4 + 2
-    assert len(await store.list_connection_events(limit=100)) == 10
+    assert len(await store.list_connection_events(limit=100, allowed_channels=None)) == 10
 
 
 async def test_a_single_event_is_written_without_lingering(
@@ -137,7 +137,7 @@ async def test_a_single_event_is_written_without_lingering(
     # No linger window: the lone event is written as soon as the drainer wakes, well inside this bound.
     await asyncio.wait_for(runner._conn_event_q.join(), 0.5)  # type: ignore[union-attr]
     assert store.committed_txns - before == 1
-    [e] = await store.list_connection_events()
+    [e] = await store.list_connection_events(allowed_channels=None)
     assert e.kind == "closed" and e.reason == "clean eof 1"
 
 
@@ -175,7 +175,7 @@ async def test_a_failed_burst_costs_only_its_bad_row_and_the_drainer_keeps_going
         "connection-event burst write failed (IntegrityError);"
         " salvaged 2 of 3 event(s) singly, dropped 1"
     ]
-    kept = await store.list_connection_events()
+    kept = await store.list_connection_events(allowed_channels=None)
     assert sorted(e.peer_host or "" for e in kept) == ["10.0.0.0", "10.0.0.2"]
     # Two salvaged rows commit; the third rolls back and commits nothing.
     assert store.committed_txns - before == 2
@@ -184,7 +184,9 @@ async def test_a_failed_burst_costs_only_its_bad_row_and_the_drainer_keeps_going
 
     _enqueue(runner, _event(4))
     await _join(runner)
-    assert sorted(e.peer_host or "" for e in await store.list_connection_events()) == [
+    assert sorted(
+        e.peer_host or "" for e in await store.list_connection_events(allowed_channels=None)
+    ) == [
         "10.0.0.0",
         "10.0.0.2",
         "10.0.0.4",
@@ -235,7 +237,9 @@ async def test_a_salvage_gives_up_once_the_store_itself_is_refusing(
     # And it recovers: the next burst is written normally once the store is back.
     _enqueue(runner, _event(4))
     await _join(runner)
-    assert [e.peer_host for e in await store.list_connection_events()] == ["10.0.0.4"]
+    assert [e.peer_host for e in await store.list_connection_events(allowed_channels=None)] == [
+        "10.0.0.4"
+    ]
 
 
 async def test_stop_flushes_a_queued_burst(store: MessageStore) -> None:
@@ -248,14 +252,14 @@ async def test_stop_flushes_a_queued_burst(store: MessageStore) -> None:
     finally:
         await asyncio.wait_for(runner.stop(), timeout=5.0)
     assert runner._conn_event_q is None
-    assert len(await store.list_connection_events(limit=100)) == 5
+    assert len(await store.list_connection_events(limit=100, allowed_channels=None)) == 5
 
 
 async def test_the_store_writes_a_burst_in_one_transaction(store: MessageStore) -> None:
     before = store.committed_txns
     await store.record_connection_events([_event(i, now=100.0 + i) for i in range(3)])
     assert store.committed_txns - before == 1
-    events = await store.list_connection_events()
+    events = await store.list_connection_events(allowed_channels=None)
     assert [e.ts for e in events] == [102.0, 101.0, 100.0]
     assert [e.reason for e in events] == [None, "clean eof 1", None]
 
@@ -280,6 +284,6 @@ async def test_the_store_refuses_a_burst_all_or_nothing(store: MessageStore) -> 
         )
     # On the CONTENT: a missing rollback leaves the ts=200.0 row, and naming it is what separates
     # "rolled back" from "never reached the table".
-    assert [e.ts for e in await store.list_connection_events()] == [100.0]
+    assert [e.ts for e in await store.list_connection_events(allowed_channels=None)] == [100.0]
     assert store.committed_txns == before  # a refused burst commits nothing
     assert not store._db.in_transaction  # and leaves no transaction open for the next writer

@@ -223,25 +223,37 @@ def surrogate_phone(rep: str, keyer: Keyer, seps: Seps) -> str:
 
 
 #: What may follow the eight date digits of a date of birth: hours, minutes and seconds, a
-#: fraction and an offset. All optional, and nothing else.
-_DOB_TIME: re.Pattern[str] = re.compile(r"(?:[0-9]{2}){0,3}(?:\.[0-9]{1,4})?(?:[+-][0-9]{4})?")
+#: fraction, then an offset. All optional, and nothing else.
+_DOB_TIME: re.Pattern[str] = re.compile(r"((?:[0-9]{2}){0,3}(?:\.[0-9]{1,4})?)([+-][0-9]{4})?")
+#: One ASCII digit of a kept time, which :func:`surrogate_dob` writes as ``0``.
+_DIGIT: re.Pattern[str] = re.compile(r"[0-9]")
+#: What any real UTC offset becomes, in a date of birth and in a date alike: a placeholder, not a
+#: conversion.
+_OFFSET_FILL = "+0000"
 
 
 def surrogate_dob(rep: str, keyer: Keyer, seps: Seps) -> str:
     """A fabricated date of birth that **preserves the original's precision/width** (HL7 DT/TS allows
     ``YYYY`` / ``YYYYMM`` / ``YYYYMMDD`` and a TS time tail): ``1980`` → ``YYYY``, ``198001`` →
-    ``YYYYMM``, ``YYYYMMDD`` → a full fabricated date, ``YYYYMMDDHHMMSS`` → fabricated date + the
-    original trailing time digits."""
+    ``YYYYMM``, ``YYYYMMDD`` → a full fabricated date, ``YYYYMMDDHHMMSS`` → fabricated date + a
+    zero time of the same width, ``YYYYMMDDHHMM-0500`` becomes a fabricated date + ``0000+0000``.
+
+    **The real time of birth and the real offset are not kept (vault BACKLOG #2767).** A time of
+    birth is a date detail below the day, and an offset shows whether daylight saving time was in
+    effect and can name a region, which is why :func:`surrogate_date` never keeps one either. So the
+    time digits are zero-filled at their width and an offset becomes ``+0000``, the same placeholder
+    :func:`surrogate_date` writes. The shape, and so the precision, survives; none of the value does."""
     rng = keyer.rng("dob", rep)
     date8 = f"{rng.randrange(1920, 2022):04d}{rng.randrange(1, 13):02d}{rng.randrange(1, 29):02d}"
     if len(rep) < 8:
         return date8[: len(rep)]  # match the original's precision/width
-    # Only a time after eight digits is kept. Anything else there (a name, a second identifier, the
-    # year of a ``MM/DD/YYYY``) is dropped: a mapped field is not scanned by the leak-check, so
-    # text kept here would leave unseen (BACKLOG #2330).
+    # Only a time after eight digits is kept, and only as its shape. Anything else there (a name, a
+    # second identifier, the year of a ``MM/DD/YYYY``) is dropped: a mapped field is not scanned by
+    # the leak-check, so text kept here would leave unseen (BACKLOG #2330).
     head, tail = rep[:8], rep[8:]
-    if head.isascii() and head.isdigit() and _DOB_TIME.fullmatch(tail):
-        return date8 + tail
+    if head.isascii() and head.isdigit() and (time := _DOB_TIME.fullmatch(tail)) is not None:
+        clock, offset = time.groups()
+        return date8 + _DIGIT.sub("0", clock) + (_OFFSET_FILL if offset else "")
     return date8
 
 
@@ -307,7 +319,7 @@ def _filled_date(rep: str, seps: Seps) -> str:
     year, rest, offset = match.groups()
     if _YYMMDD.fullmatch(year + (rest or "")):
         return ""
-    return year + _DATE_FILL[: len(rest or "")] + ("+0000" if offset else "") + sep + ts2
+    return year + _DATE_FILL[: len(rest or "")] + (_OFFSET_FILL if offset else "") + sep + ts2
 
 
 def surrogate_provider(rep: str, keyer: Keyer, seps: Seps) -> str:

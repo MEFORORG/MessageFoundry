@@ -15,8 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import traceback
-from collections.abc import AsyncIterator, Iterable, Mapping
+from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import cast
 
@@ -35,10 +34,9 @@ from messagefoundry.pipeline.wiring_runner import RegistryRunner, _RefusalLog
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus
 from messagefoundry.transports.base import DestinationConnector, NegativeAckError
 from messagefoundry.transports.mllp import MLLPDestination
+from tests._refusal_log_capture import TOKEN
+from tests._refusal_log_capture import assert_no_token as _assert_no_token
 
-# The planted token. ASCII on purpose: the encoding test puts a non-ASCII character right after it,
-# so the token itself is what an ASCII-safe leak (a repr, an escaped string) would still carry.
-TOKEN = "ZQXPLANTEDTOKEN"
 OUT = "file_out"
 LOGGER = "messagefoundry.pipeline.wiring_runner"
 
@@ -114,26 +112,6 @@ class _Refuses:
         return None
 
 
-def _record_texts(record: logging.LogRecord) -> Iterable[str]:
-    yield record.getMessage()
-    yield repr(vars(record))  # msg, args and any extra attribute
-    if record.exc_info and record.exc_info[1] is not None:
-        yield "".join(traceback.format_exception(record.exc_info[1]))
-    if record.exc_text:
-        yield record.exc_text
-    if record.stack_info:
-        yield record.stack_info
-
-
-def _assert_no_token(records: Iterable[logging.LogRecord]) -> None:
-    leaks = [
-        f"{r.name}:{r.levelname}:{r.getMessage()}"
-        for r in records
-        if any(TOKEN in text for text in _record_texts(r))
-    ]
-    assert not leaks, f"a log record carries the planted payload token: {leaks}"
-
-
 def _refusal_lines(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
     return [
         r
@@ -172,7 +150,7 @@ async def test_charset_refusal_through_the_real_worker_logs_one_content_free_war
     finally:
         await runner.stop()
 
-    (msg,) = await store.list_messages(channel_id="file_in")
+    (msg,) = await store.list_messages(channel_id="file_in", allowed_channels=None)
     assert msg["status"] == MessageStatus.ERROR.value  # the dead-letter itself is unchanged
     (line,) = _refusal_lines(caplog)
     text = line.getMessage()
@@ -318,7 +296,7 @@ async def test_a_permanently_refused_batch_logs_one_content_free_warning(
     runner = _batch_runner(store, _Refuses())
     head_id = await _run_one_batch(store, runner, [_adt(n) for n in (1, 2, 3)])
 
-    assert await store.count_dead() == 3  # the batch dead-letter is unchanged
+    assert await store.count_dead(allowed_channels=None) == 3  # the batch dead-letter is unchanged
     (line,) = _refusal_lines(caplog)
     text = line.getMessage()
     assert repr(OUT) in text and "a batch of 3" in text and head_id in text
@@ -352,7 +330,7 @@ async def test_a_batch_member_the_frame_refuses_logs_the_same_content_free_warni
     bad = _adt(2, name=TOKEN + chr(0x1C))
     await _run_one_batch(store, runner, [_adt(1, name="DOE"), bad, _adt(3, name="DOE")])
 
-    assert len(rec.sent) == 1 and await store.count_dead() == 1
+    assert len(rec.sent) == 1 and await store.count_dead(allowed_channels=None) == 1
     (line,) = _refusal_lines(caplog)
     text = line.getMessage()
     assert repr(OUT) in text and "batch member" in text and "dead-lettered alone" in text
@@ -389,7 +367,7 @@ async def test_a_refused_member_sent_back_with_its_batch_is_not_logged_as_dead_l
     runner = _batch_runner(store, rec)
     await _run_one_batch(store, runner, [_adt(n) for n in (1, 2, 3)])
 
-    assert rec.sent == [] and await store.count_dead() == 0
+    assert rec.sent == [] and await store.count_dead(allowed_channels=None) == 0
     assert (await store.pending_depth(OUT))[0] == 3  # the whole batch went back, member 2 too
     assert _refusal_lines(caplog) == []
 

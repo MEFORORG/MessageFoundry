@@ -42,8 +42,8 @@ seen:
 * a call made through ``getattr``, ``importlib`` or any other dynamic dispatch, or in a subprocess;
 * a provider passed as a VALUE and called elsewhere, such as the function handed to
   ``asyncio.to_thread``. The reload preflight reaches ``anchor_cadata`` that way (BACKLOG #2025).
-  ``Engine.fingerprint_bundle`` wraps its fold in a lambda instead, so that one is seen (vault
-  BACKLOG #2839);
+  ``Engine.fingerprint_bundle_blocking`` calls its fold directly instead, so that one is seen
+  (vault BACKLOG #2839, #2782);
 * a crypto DECISION that is not a call or a TLS-attribute assignment. ``transports/database.py``
   appends ``Encrypt=`` and ``TrustServerCertificate=`` to a DSN string: a first-party TLS posture
   decision with no crypto-shaped expression for any pattern instrument to match;
@@ -259,9 +259,10 @@ OPAQUE_PROVIDERS: dict[str, str] = {
         "derivation counted once in redaction.py, and its callers (with safe_exc's, about 160) are "
         "logging and error reporting, not hashing"
     ),
-    "messagefoundry.config.wiring._exec_module": (
-        "names a loaded config module after a SHA-256 of its resolved path, so two same-stem files "
-        "cannot collide in sys.modules; naming, and no caller of the loader decides anything by it"
+    "messagefoundry.config.wiring._config_module_name": (
+        "names a loaded config module or helper after a SHA-256 of its resolved path, so two "
+        "same-stem files cannot collide in sys.modules; naming, and no caller of the loader decides "
+        "anything by it"
     ),
     "messagefoundry.pipeline.sharding.owner_shard_of_destination": (
         "rendezvous placement uses SHA-256 as a restart-stable hash with no secret; a caller picks "

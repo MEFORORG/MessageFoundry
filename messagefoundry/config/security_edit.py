@@ -9,8 +9,9 @@ The ``[security]`` switches are **pure data** (booleans/ints/strings and string 
 touches only the ``[security]`` table and leaves every other section's comments + formatting byte-stable,
 hence ``tomlkit`` rather than a plain serializer. Each mutation validates that the whole settings file
 still loads (the same ``load_settings`` path the engine uses — which also **rejects the relocated legacy
-keys**), and writes atomically (temp + replace, owner-only perms) with rollback, so a bad edit never
-lands. Validation is injected as a callback so this module stays free of the settings/engine import graph
+keys**). The new text is validated as a candidate beside the live file and replaces it only if it loads
+(temp + replace, owner-only perms), under a cross-process lock, so a bad edit never touches the live file
+and a concurrent edit is never lost (:mod:`messagefoundry.config.atomic_edit`, vault BACKLOG #2782). Validation is injected as a callback so this module stays free of the settings/engine import graph
 (and is trivially testable); the ``security`` CLI builds the callback from ``load_settings``.
 
 Note: the service-settings TOML is read at engine **startup**, so an edited switch takes effect on the
@@ -19,12 +20,13 @@ next engine restart (``POST /config/reload`` re-runs the ``--config`` graph, not
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
 import tomlkit
+
+from messagefoundry.config import atomic_edit
 
 Validate = Callable[[Path], None]
 
@@ -56,55 +58,51 @@ def set_security(
     if not isinstance(updates, Mapping):
         raise SecurityEditError("security updates must be a JSON object of {key: value}")
     path = Path(service_config)
-    original = path.read_text(encoding="utf-8") if path.is_file() else None
-    doc = tomlkit.parse(original) if original is not None else tomlkit.document()
+    with atomic_edit.edit_lock(path, busy_error=SecurityEditError):
+        original, crlf = atomic_edit.read_text(path) if path.is_file() else (None, False)
+        doc = tomlkit.parse(original) if original is not None else tomlkit.document()
 
-    sec = doc.get("security")
-    if sec is None:
-        sec = tomlkit.table()
-        doc["security"] = sec
-    for key, value in updates.items():
-        if value is None:
-            if key in sec:
-                del sec[key]
-        else:
-            sec[key] = value
-    # Drop an emptied [security] table so a full reset-to-defaults leaves no bare header behind.
-    if not len(sec):
-        del doc["security"]
+        sec = doc.get("security")
+        if sec is None:
+            sec = tomlkit.table()
+            doc["security"] = sec
+        for key, value in updates.items():
+            if value is None:
+                if key in sec:
+                    del sec[key]
+            else:
+                sec[key] = value
+        # Drop an emptied [security] table so a full reset-to-defaults leaves no bare header behind.
+        if not len(sec):
+            del doc["security"]
 
-    _write_validated(path, tomlkit.dumps(doc), original, validate)
+        _write_validated(path, atomic_edit.encode_text(tomlkit.dumps(doc), crlf), validate)
     return {"op": "set", "keys": list(updates.keys())}
 
 
 # --- internals ---------------------------------------------------------------
 
 
-def _write_validated(path: Path, new_text: str, original: str | None, validate: Validate) -> None:
-    """Atomically write ``new_text``, validate the file loads, and roll back to ``original`` on failure
-    (delete it if it didn't exist before)."""
-    _atomic_write(path, new_text)
-    try:
-        validate(path)
-    except SecurityEditError:
-        raise
-    except BaseException as exc:
-        if original is None:
-            path.unlink(missing_ok=True)
-        else:
-            _atomic_write(path, original)
-        raise SecurityEditError(str(exc)) from exc
-    _secure_file(path)
+def _write_validated(path: Path, data: bytes, validate: Validate) -> None:
+    """Validate ``data`` as a candidate and replace ``path`` with it only if it loads.
 
+    ``validate`` receives the CANDIDATE's path, not the live one (vault BACKLOG #2782), so EVERY
+    refusal, a :class:`SecurityEditError` from the callback included, leaves the live file
+    byte-for-byte and mode-for-mode as it was; a file that did not exist is never created. (A
+    callback refusing in this module's own vocabulary once left the refused text on disk, vault
+    BACKLOG #2760; with nothing written before validation there is no rollback to skip.)
 
-def _atomic_write(path: Path, text: str) -> None:
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    The callback owns the wording of its refusal. A whole-file ``load_settings`` failure must reach
+    here already rendered, as the ``security`` CLI's callback renders it with
+    ``settings_error_detail``: this module stays outside the settings import graph, so it cannot
+    render one, and the ``str(exc)`` below is only for an error the callback did not anticipate."""
 
+    def checked(candidate: Path) -> None:
+        try:
+            validate(candidate)
+        except SecurityEditError:
+            raise
+        except Exception as exc:
+            raise SecurityEditError(str(exc)) from exc
 
-def _secure_file(path: Path) -> None:
-    # Owner-only permissions (defence in depth). Reuse the store's primitive; tolerate its absence.
-    from messagefoundry.store.store import _secure_file as _secure
-
-    _secure(path)
+    atomic_edit.replace_validated(path, data, checked)

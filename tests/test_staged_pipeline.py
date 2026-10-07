@@ -30,6 +30,8 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.store.crypto import MARKER_PREFIX, make_cipher
 from messagefoundry.store.store import MessageStatus, MessageStore, OutboxStatus, Stage
+from tests._replay_settle_contract import CASES as REPLAY_SETTLE_CASES
+from tests._replay_settle_contract import assert_replayed_routed_row_settles
 
 RAW = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100||DOE^JANE\r"
 
@@ -632,7 +634,12 @@ async def test_all_declined_finalizes_unrouted(store: MessageStore, tmp_path: Pa
     assert fetched_row is not None
     assert fetched_row["n"] == 0
     # Listable + logged (never accepted-and-dropped), and the disposition is a real logged event.
-    assert mid in {m["id"] for m in await store.list_messages(status=MessageStatus.UNROUTED.value)}
+    assert mid in {
+        m["id"]
+        for m in await store.list_messages(
+            status=MessageStatus.UNROUTED.value, allowed_channels=None
+        )
+    }
     assert "unrouted" in [e["event"] for e in await store.events_for(mid)]
 
     # The finalizer cannot relabel it: FILTERED is reachable ONLY through a prior ROUTED stamp, and
@@ -1035,11 +1042,20 @@ async def test_replay_dead_routed_row_does_not_repend_delivered_sibling(
     # The delivered outbound row stays DONE (not re-pended → not re-delivered).
     ob = {r["destination_name"]: r["status"] for r in await store.outbox_for(mid)}
     assert ob == {"OB_A": OutboxStatus.DONE.value}
-    # Back in the route/transform path (a routed row pending again).
+    # Back in the transform path: a routed row is pending again, and the router already ran, so the
+    # message is ROUTED -- not RECEIVED, which only a re-pended INGRESS row earns (vault BACKLOG #2723).
     fetched = await store.get_message(mid)
     assert fetched is not None
-    assert fetched["status"] == MessageStatus.RECEIVED.value
+    assert fetched["status"] == MessageStatus.ROUTED.value
     assert await _claim_routed(store, "IB") is not None
+
+
+@pytest.mark.parametrize(("declined", "expected"), REPLAY_SETTLE_CASES)
+async def test_replayed_routed_row_that_sends_nothing_settles(
+    store: MessageStore, declined: tuple[str, ...], expected: MessageStatus
+) -> None:
+    """Vault BACKLOG #2723 on SQLite; ``tests/_replay_settle_contract`` carries the property."""
+    await assert_replayed_routed_row_settles(store, declined, expected)
 
 
 # --- outbox→queue migration --------------------------------------------------
@@ -1225,7 +1241,9 @@ async def test_replay_dead_ignores_ingress_rows(store: MessageStore) -> None:
     mid = await store.enqueue_ingress(channel_id="IB", raw=RAW)
     item = await _claim_ingress(store, "IB")
     await store.dead_letter_now(item.id, "router/handler error")
-    assert await store.count_dead() == 0  # the dead ingress row is not in the DLQ view
+    assert (
+        await store.count_dead(allowed_channels=None) == 0
+    )  # the dead ingress row is not in the DLQ view
     assert await store.replay_dead() == 0  # ...and bulk replay leaves it alone
     fetched = await store.get_message(mid)
     assert fetched is not None

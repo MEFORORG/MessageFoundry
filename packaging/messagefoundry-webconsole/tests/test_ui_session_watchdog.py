@@ -394,11 +394,11 @@ async def test_every_authenticated_page_carries_the_watchdog_hook(engine: Engine
             assert "data-mf-session-watchdog" in page.text, path
     # the confinement chrome carries it too — those pages are authenticated
     for markup in (
-        pages.reauth("/ui/x", mfa_needed=False),
+        pages.reauth("/ui/x", label="Do x", continues=True, mfa_needed=False),
         pages.password_page(forced=True),
         pages.webauthn_enroll_page("{}"),
         pages.oidc_landing(),
-        pages.reauth_continue("/ui/x"),
+        pages.reauth_continue("/ui/x", "Do x"),
     ):
         assert "data-mf-session-watchdog" in markup
     assert "data-mf-session-watchdog" not in pages.sso_challenge()
