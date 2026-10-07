@@ -1764,20 +1764,24 @@ reload carries that into its `approval.approved` row.
 
 **An audit or store outage that refuses writes answers a mapped status on at least these approval
 paths (vault BACKLOG #2255).** A refusal runs nothing, so a refusal whose own audit row fails still
-answers **409**: that is `approval.too_early` and `approval.stale_requester`. A claim, a rejection or
-a resolution that the store cannot write with its audit row answers **503**, and the request does
-not move. Every audit row the gate fails to write is logged at ERROR with its detail, and raises an
-`audit_write_failed` alert keyed `approval:<id>`, carrying the lost row's action name.
+answers **409**: that is at least `approval.too_early`, `approval.stale_requester` and
+`approval.no_longer_gated`. A claim, a rejection or a resolution that the store cannot write with
+its audit row answers **503**. The request does not move, except where a COMMIT lands despite the
+error, as listed above. Every audit row write that fails with an error is logged at ERROR with its
+detail, and raises an `audit_write_failed` alert keyed `approval:<id>`, carrying the row's action
+name. A call cancelled mid-write, for example by the request timeout, logs nothing and raises no
+alert.
 
-What this does not cover, at least: a store that refuses READS still answers a raw 500, since the
-request row and the requester's account are read before any of this. A request or a repeat whose
-write fails is not mapped either, and answers a raw 500.
+What this does not cover, at least: a store that refuses READS of the request row or the
+requester's account still answers a raw 500. A request or a repeat whose write fails is not mapped
+either. It answers a raw 500, or the request timeout's 503 when the call is cancelled.
 
 **A failed request write can still hold the request, so a retry may file a second one.** The request
 and its `approval.requested` row are one write, as above, so a write that fails before its COMMIT
 holds neither. At least these cases hold the request while the call still fails:
 
-- the COMMIT exceptions listed above, such as a lost COMMIT reply;
+- a COMMIT that lands despite the error, as listed above, such as a lost reply or a driver
+  timeout. Its `approval.requested` row lands with it, though the ERROR line and alert call it lost;
 - a call cancelled while its COMMIT runs, for example by the request timeout. The gate writes no
   ERROR line and no alert for it;
 - a repeat whose `approval.request_repeated` row fails. The earlier request it named stays held.

@@ -27,19 +27,19 @@ All notable changes to MessageFoundry are documented here. The format follows
   inline route writes. A refused reload's own audit row no longer raises during an audit outage.
   (vault `BACKLOG #2459`)
 - **The approval gate answers a mapped status during an audit or store outage, and pages.** A
-  too-early or stale-requester refusal whose audit row fails still answers 409. A claim, rejection
-  or resolution that cannot be written with its audit row answers 503. A new
-  `audit_write_failed` alert, keyed `approval:<id>`, fires for every audit row the gate loses.
-  Store reads on these routes are not covered, and nor is a failed request write, which still
-  answers 500. (vault `BACKLOG #2255`)
+  too-early, stale-requester or no-longer-gated refusal whose audit row fails still answers 409. A
+  claim, rejection or resolution that cannot be written with its audit row answers 503. A new
+  `audit_write_failed` alert, keyed `approval:<id>`, fires for every audit write that fails with an
+  error; a cancelled call raises none. Store reads on these routes are not covered. Nor is a failed
+  request write, which still answers 500, or 503 if the request times out. (vault `BACKLOG #2255`)
 - **Each approval state change and its audit row are now one write.** The request and
   `approval.requested`, the claim and `approval.release_attempted`, a rejection, each release
   outcome and a resolve each commit or roll back together, on all three store backends. A request
   whose audit row fails is no longer written and then withdrawn; it rolls back with the row. Some
   failures can still hold the request while the call fails, such as a lost COMMIT reply or a
-  cancel during the COMMIT. docs/SECURITY.md lists them, and when a retry then files a second
-  request. A rejection whose
-  `approval.rejected` row fails now answers 503 and stays pending. A claim that loses a race writes
+  cancel during the COMMIT. docs/SECURITY.md names at least these cases. It also says when a retry
+  then files a second request. A rejection whose `approval.rejected` row fails now answers 503 and
+  stays pending. A claim that loses a race writes
   no release row. The resolve no longer writes `approval.resolve_attempted`; its `approval.resolved`
   row goes with the move. After an operation has run, an outcome that cannot be written with its row
   is written alone, so the request never stays `executing` for that reason. (vault `BACKLOG #2255`)

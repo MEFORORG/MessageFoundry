@@ -491,19 +491,20 @@ class ApprovalGate:
             )
         except Exception:
             # Still raised. A write that failed before its COMMIT held nothing, but a COMMIT that
-            # landed before the error (a lost reply, a timeout) holds the request, and a retry the
-            # repeat rule misses files a second one; docs/SECURITY.md lists the cases. Logged and
-            # paged, since the error alone reaches only this caller. A repeat's lost row is keyed
-            # on the request it named, which stays held.
+            # landed before the error (a lost reply, a driver timeout) holds the request and its
+            # row, and a retry the repeat rule misses files a second one; docs/SECURITY.md lists
+            # the cases. Logged and paged, since the error alone reaches only this caller. A
+            # cancel (the request timeout) is a BaseException and skips this block entirely. A
+            # repeat's lost row is keyed on the request it named, which stays held.
             lost_id, action = (
                 (repeat_of[-1], "approval.request_repeated")
                 if repeat_of
                 else (approval_id, "approval.requested")
             )
             log.exception(
-                "approval %s: the write carrying its %s audit row failed. Check GET /approvals: the "
-                "request is still held under this id if this was a repeat, or if the COMMIT landed "
-                "before the error. Lost detail: actor=%s operation=%s",
+                "approval %s: the write carrying its %s audit row failed. The request is still "
+                "held under this id if this was a repeat. It is also held, with that row, if the "
+                "COMMIT landed before the error. Lost detail: actor=%s operation=%s",
                 lost_id,
                 action,
                 requester,
