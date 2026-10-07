@@ -614,7 +614,7 @@ def test_main_reds_on_a_low_margin_and_writes_the_summary(tmp_path: Path) -> Non
 def test_main_is_green_on_a_healthy_margin_and_still_shows_the_controls(tmp_path: Path) -> None:
     """Also the end-to-end mark path: two marks, an elapsed derived from them, one verdict."""
     write_mark("t0", tmp_path, at=1000.0)
-    write_mark("t1", tmp_path, at=1968.0)  # 16:08, this leg's recorded maximum
+    write_mark("t1", tmp_path, at=1968.0)  # 16:08, this leg's recorded maximum until 2026-10-07
     summary = tmp_path / "summary.md"
     rc = main(
         [
@@ -1084,7 +1084,9 @@ def test_every_leg_gives_the_kill_real_headroom_over_the_margin_cap() -> None:
 
     Falsified by lowering windows-2022's kill from 11 to 10 against its cap of 8 (1.250x): RED, naming
     the leg and both numbers. Restored. (The earlier falsification, windows-2025's kill 12 to 11,
-    was measured at a cap of 9; at the cap of 8 it gives 1.375x and no longer reds.)
+    was measured at a cap of 9; at the cap of 8 it gives 1.375x and no longer reds.) Re-falsified at
+    the 2026-10-07 re-measure, on the two kills it moved: windows-2025's 16 to 15 against its cap of
+    12 (1.250x) and ubuntu's 10 to 9 against its cap of 7 (1.286x) each went RED. Restored.
     """
     legs = _matrix_legs()
     names = {leg["os"] for leg in legs}
@@ -1126,6 +1128,9 @@ def test_every_leg_clears_its_own_recorded_maximum_at_its_margin_cap() -> None:
     ceil_minute(1.35x the row) floored at 5:00, as `step_margin.sized_cap_minutes` computes it. An
     integer restatement of the rule beside it fails if that function's arithmetic moves.
 
+    Re-falsified at the 2026-10-07 re-measure: windows-2025's cap set to 11 against its 8:29 row
+    (11:00 / 8:29 = 1.297x) went RED on the floor, and set to 13 went RED on the rule. Restored. The
+    original record, at the 2026-09-30 row:
     Falsified by setting windows-2025's `webconsole_margin_cap` to 7 against its 5:43 row (7:00 /
     5:43 = 1.224x): RED on the floor, naming the leg and both numbers. Falsified by setting it to 9:
     RED on the rule. Restored both times.
@@ -1156,6 +1161,48 @@ def test_every_leg_clears_its_own_recorded_maximum_at_its_margin_cap() -> None:
             f"{format_clock(recorded)} and ceil_minute(1.35x) of that, floored at 5:00, is {sized}m. "
             f"A re-measured row moves its cap in the same change; a cap moved by hand needs a row."
         )
+
+
+def test_every_engine_leg_clears_its_own_recorded_maximum_at_its_step_cap() -> None:
+    """The engine half of the check above.
+
+    The engine row and `step_timeout` drifted apart for two months: the cap moved on 2026-08-12 and
+    the 16:08 row stayed, so nothing related the two until a merge group was ejected on 2026-10-07.
+    This asserts the relation that matters on every leg -- the slowest known green run must not be
+    LOW at the cap the gate divides by. On ubuntu, whose cap has been sized from its row since
+    2026-10-07, it also asserts the sizing rule's equality, so the two cannot drift apart again. The
+    two Windows caps are sized from an anchor in ci.yml's engine note rather than from their rows,
+    so they carry the floor only.
+
+    Falsified by setting ubuntu's `step_timeout` to 31 against its 24:36 row (31:00 / 24:36 =
+    1.260x): RED on the floor, naming the leg and both numbers. Falsified by setting it to 35: RED on
+    the rule. Restored both times.
+    """
+    rows = load_baselines(_BASELINE_FILE)
+    step = _GATED["test"][0]
+    knob = _cap_knob("test")
+    legs = _matrix_legs()
+    assert {leg["os"] for leg in legs} == _EXPECTED_LEGS
+    for leg in legs:
+        cap = leg[knob]
+        recorded = find_baseline(rows, step, leg["os"]).max_passing_seconds
+        ratio = cap * 60 / recorded
+        print(
+            f"[step-margin] {leg['os']}: {knob} {cap}m over recorded maximum "
+            f"{format_clock(recorded)} -> {ratio:.3f}x (floor {DEFAULT_MIN_MARGIN:.2f}x)"
+        )
+        assert ratio >= DEFAULT_MIN_MARGIN, (
+            f"{leg['os']}: {knob} {cap}m is only {ratio:.3f}x the recorded maximum "
+            f"{format_clock(recorded)} in step_margin_baseline.toml, under the gate's "
+            f"{DEFAULT_MIN_MARGIN:.2f}x floor -- the slowest known green run would red this leg. "
+            f"Re-size the cap from the row, or re-measure the row."
+        )
+        if leg["os"] == "ubuntu-latest":
+            assert cap == sized_cap_minutes(recorded), (
+                f"ubuntu-latest: {knob} is {cap}m, but its row records {format_clock(recorded)} "
+                f"and ceil_minute(1.35x) of that, floored at 5:00, is "
+                f"{sized_cap_minutes(recorded)}m. Move the cap and the row together."
+            )
 
 
 def test_the_webconsole_nesting_arithmetic_in_ci_yml_is_read_and_checks_out() -> None:
