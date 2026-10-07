@@ -26,8 +26,9 @@ the control actually computes; a measured elapsed would only be that value plus 
 That holds inside one slot and not across slots. :func:`~messagefoundry.auth.service._failure_deadline`
 QUANTIZES — it reads the measured elapsed and rounds up to the next whole multiple of the budget — so
 a process stall longer than the budget moves the deadline a whole slot without any branch doing extra
-work. The invariance assertions below therefore ARE wall-clock measurements. What keeps them reading
-the code rather than the runner is the sampling in :func:`_least_deadline_offsets`, not the recorder.
+work. The invariance assertions below therefore rest partly on wall-clock measurements. What keeps
+them reading the code rather than the runner is :func:`_deadline_samples` and
+:func:`_assert_one_deadline`, not the recorder.
 """
 
 from __future__ import annotations
@@ -36,7 +37,9 @@ import asyncio
 import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -75,14 +78,22 @@ class _DeadlineRecorder:
 
     It does NOT take these tests off the wall clock, and an earlier version of this docstring said it
     did. The deadline is quantized from a measured elapsed, so a stall still reaches it; see the
-    module docstring and :func:`_least_deadline_offsets`.
+    module docstring and :func:`_assert_one_deadline`.
     """
 
     def __init__(self) -> None:
         self.deadlines: list[float] = []
+        #: When each pad was reached: after the branch's work and its deferred audit writes, so no
+        #: earlier than any clock read the deadline was computed from.
+        self.reached: list[float] = []
 
     async def __call__(self, deadline: float) -> None:
+        self.reached.append(time.monotonic())
         self.deadlines.append(deadline)
+
+    def clear(self) -> None:
+        self.deadlines.clear()
+        self.reached.clear()
 
 
 @pytest.fixture
@@ -95,14 +106,17 @@ def recorder(monkeypatch: pytest.MonkeyPatch) -> _DeadlineRecorder:
     return rec
 
 
-#: Samples per branch for the two invariance assertions. Kept BELOW the lockout threshold, pinned on
-#: the line under it, because the sign-in seam's branches are not all idempotent: repeating a wrong
-#: password against a real account walks it toward lockout, which would silently turn the
-#: `wrong_password` branch into the `locked_account` branch and leave both assertions passing while
-#: measuring four branches instead of five. The per-sample outcome check below is the second guard on
-#: that, and the one that still holds if the threshold ever changes.
-_DEADLINE_SAMPLES = 3
-assert AuthSettings().lockout_threshold > _DEADLINE_SAMPLES
+#: Interleaved rounds for the two invariance assertions: at least the minimum, then more while some
+#: branch has not yet answered on the base slot, up to the maximum. Over that many rounds the
+#: wrong-password branch would walk its account into lockout, so the sign-in seam clears that
+#: account's counter before each of its samples; the per-sample outcome check is the guard that
+#: still holds if that reset ever stops working.
+_MIN_ROUNDS = 3
+_MAX_ROUNDS = 6
+
+#: Covers only the microseconds between two `time.monotonic()` reads that stand for one instant,
+#: never a branch's work, which is on the other side of the deadline.
+_TOLERANCE = 0.001
 
 #: A seam's failure branches: name -> (a callable that drives it, the error it must keep returning).
 #: The call is re-invoked per sample, so it is a factory rather than a coroutine, which can only be
@@ -110,68 +124,155 @@ assert AuthSettings().lockout_threshold > _DEADLINE_SAMPLES
 type _Branches = Mapping[str, tuple[Callable[[], Awaitable[LoginOutcome]], str]]
 
 
-async def _least_deadline_offsets(
-    recorder: _DeadlineRecorder, branches: _Branches
-) -> dict[str, float]:
-    """Drive each branch several times and return its SMALLEST ``deadline - call start``.
+@dataclass(frozen=True)
+class _Sample:
+    """One failed challenge."""
 
-    **Why a minimum and not a single sample (BACKLOG #1140).** The deadline is quantized: a failure
-    whose elapsed outran the budget lands on the next whole slot. That is the control's fail-safe and
-    it is correct, but it means ANY process stall longer than the budget — a garbage-collection pause,
-    CPU starvation on a shared runner, the OS descheduling the interpreter — moves one branch a whole
-    slot with no branch-dependent cause. One sample cannot tell that apart from a real side-channel,
-    and the numbers it prints look identical: one branch at exactly 2x the others.
+    #: The deadline, measured from the test's own call start: what a caller observes.
+    offset: float
+    #: The deadline, measured from the ``started`` the seam handed its equaliser.
+    seam_offset: float
+    #: When the pad was reached, after the branch's work and writes, from that same ``started``.
+    reached: float
+    #: The wait in the account's credential queue the seam reported (0 on a seam with no queue).
+    queued: float
 
-    **The minimum is the reading that survives.** Load can only make a branch read HIGH; nothing makes
-    work finish early. So a branch whose own cost CONSISTENTLY needs two slots has a minimum of two
-    slots and still reds this assertion, at the same 1 ms tolerance, while a branch pushed there by a
-    stall falls back to its true slot on another sample. This is the shape
-    ``test_the_shipped_budget_leaves_room_above_a_real_argon2_verify`` already uses against the same
-    hazard, for the same stated reason.
 
-    **What the minimum costs, stated rather than glossed.** It is biased toward reading clean, so it
-    is weaker than a single sample against a branch that overruns only SOMETIMES — a data-dependent
-    cost that fires on a fraction ``p`` of calls is caught with probability ``p ** _DEADLINE_SAMPLES``,
-    so a 50/50 branch is missed seven times in eight. That is a deliberate trade and not a free one.
-    Two things bound it. A single sample is not the safer alternative: it catches that branch half the
-    time while reporting a stall as a side-channel the rest of the time, which is the failure that
-    evicted PR 1170, and a guard that reds for the wrong reason gets relaxed by whoever is unblocking
-    the queue. And an intermittent branch would have to swing across a whole 500 ms slot to be visible
-    to EITHER form, which against branches costing 0.3-55 ms is a hundredfold regression with louder
-    symptoms than this assertion. Raising ``_DEADLINE_SAMPLES`` is not the lever — it is capped by the
-    lockout threshold above. A statistical test over many samples is, if a branch of that shape is
-    ever suspected; it is not built, because none is.
+async def _deadline_samples(
+    recorder: _DeadlineRecorder,
+    service: AuthService,
+    branches: _Branches,
+    *,
+    before_each: Callable[[str], Awaitable[None]] | None = None,
+    max_rounds: int = _MAX_ROUNDS,
+) -> dict[str, list[_Sample]]:
+    """Drive every branch in interleaved rounds and return each one's samples.
 
-    **Measured 2026-09-16, the eviction this fixes.** ``ad_pathway_retired`` read 1.0000056 against
-    0.5000016-0.5000029 for the other four. It is the CHEAPEST branch on the seam, not the dearest:
-    instrumented in-process at 4 concurrent python processes on the author's box, 12 interleaved
-    samples per branch, it costs 0.30 ms min / 0.47 ms median / 1.29 ms max against 34-55 ms for every
-    local branch, which is dominated by the one argon2id verify. A 0.3 ms branch cannot reliably need
-    a second 500 ms slot, and the 40 ms branch would have crossed first if the cost were the branch's
-    own. The direction of the anomaly is what identifies it as the environment.
+    **Interleaved, because a stall is a stretch of time and not a branch.** Merge-queue intermittent,
+    2026-10-07 (run 37562580245, windows-2025, xdist worker gw2): ``wrong_password`` read 1.0000032
+    against 0.5000019-0.5000033 for the other three. A refusal's row is written at the later of
+    the write point, a quarter second in, and the end of the branch's work, so the gaps between one
+    branch's consecutive rows read its work. ``wrong_password``'s rows were 0.65 s and 0.64 s apart,
+    and the other two local branches' were 0.29-0.50 s apart, against about 0.05 s of work unloaded.
+    The whole worker was starved, every argon2 branch ran close to the budget, and the one that also
+    counts a failure in the store before the pad crossed it. Sampled branch after branch, one
+    starved stretch of about two seconds covered all three of that branch's samples, so their
+    minimum could not recover. Round-robin, the same stretch is spread over every branch's samples,
+    and the further rounds below can outlast it.
 
-    **A uniform stall is deliberately tolerated.** There is no assertion that the minima land in slot
-    1. If every branch is pushed to a later slot together they are still indistinguishable, which is
-    the property; asserting the slot index would put the load sensitivity straight back.
+    **Adaptive, because the minimum is still the reading that survives load.** Load only makes a
+    branch read HIGH, so a branch that answers on the base slot even once has shown that its own
+    cost fits. Sampling stops once every branch has, after at least :data:`_MIN_ROUNDS`, and goes
+    on to ``max_rounds`` otherwise. Measured 2026-09-16, the earlier eviction this keeps fixed:
+    ``ad_pathway_retired``, the CHEAPEST branch on the seam at 0.30 ms min / 0.47 ms median against
+    34-55 ms for every local branch, read one slot late. A 0.3 ms branch cannot reliably need a
+    second 500 ms slot, so the direction of that anomaly identifies the environment.
+
+    **The seam's own ``started`` and ``queued`` are read off its equaliser call**, so the first part
+    of :func:`_assert_one_deadline` judges each sample against the instants the seam computed from,
+    and a pause between the test's clock read and the seam's cannot pass for a defect.
 
     **Every sample re-checks that the branch is still the branch**, so repetition cannot quietly
     collapse two branches into one and leave the invariance assertion trivially satisfied.
+    ``before_each`` gets the branch's name and runs before that sample's clock starts, so it costs
+    no branch any time.
     """
-    offsets: dict[str, float] = {}
-    for name, (call, expected_error) in branches.items():
-        samples: list[float] = []
-        for _ in range(_DEADLINE_SAMPLES):
-            recorder.deadlines.clear()
-            start = time.monotonic()
-            outcome = await call()
-            assert not outcome.ok, f"{name} was expected to fail"
-            assert outcome.error == expected_error, (
-                f"{name} stopped being that branch under repetition: {outcome.error!r}"
+    calls: list[tuple[float, float]] = []
+    equalize = service._equalize_failure
+
+    async def watched(outcome: LoginOutcome, started: float, **kwargs: Any) -> LoginOutcome:
+        calls.append((started, kwargs.get("queued", 0.0)))
+        return await equalize(outcome, started, **kwargs)
+
+    samples: dict[str, list[_Sample]] = {name: [] for name in branches}
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(service, "_equalize_failure", watched)
+        for completed in range(1, max_rounds + 1):
+            for name, (call, expected_error) in branches.items():
+                if before_each is not None:
+                    await before_each(name)
+                recorder.clear()
+                calls.clear()
+                start = time.monotonic()
+                outcome = await call()
+                assert not outcome.ok, f"{name} was expected to fail"
+                assert outcome.error == expected_error, (
+                    f"{name} stopped being that branch under repetition: {outcome.error!r}"
+                )
+                assert len(recorder.deadlines) == 1, f"{name} did not pad exactly once"
+                assert len(calls) == 1, f"{name} did not reach the equaliser exactly once"
+                deadline, (started, queued) = recorder.deadlines[0], calls[0]
+                samples[name].append(
+                    _Sample(
+                        offset=deadline - start,
+                        seam_offset=deadline - started,
+                        reached=recorder.reached[0] - started,
+                        queued=queued,
+                    )
+                )
+            if completed >= _MIN_ROUNDS and not _late_branches(samples):
+                break
+    return samples
+
+
+def _late_branches(samples: Mapping[str, list[_Sample]]) -> dict[str, list[float]]:
+    """The branches that never answered on the base slot, with every deadline each one read."""
+    base = min(sample.offset for branch in samples.values() for sample in branch)
+    return {
+        name: [round(sample.offset, 7) for sample in branch]
+        for name, branch in samples.items()
+        if min(sample.offset for sample in branch) > base + _TOLERANCE
+    }
+
+
+def _assert_one_deadline(samples: Mapping[str, list[_Sample]]) -> None:
+    """THE INVARIANCE ASSERTION, in two parts: one that load cannot reach, and one it can only delay.
+
+    **A late answer from a sample that finished in time is a defect, on any single sample.** The
+    seam fixes its deadline from ``started``, the queue wait, and clock reads taken no later than
+    the pad. A sample that did not wait in the queue and reached its pad before the base slot's
+    boundary had nothing to round up, so if it still answered on a later slot, the deadline depended
+    on something other than the clock, which is the branch. Both are measured from the seam's own
+    ``started``, so load cannot produce this: it only moves the pad later or adds a queue wait, and
+    either excuses the sample. A late sample that waited, or reached its pad at or after the
+    boundary, is the designed fail-safe (:func:`~messagefoundry.auth.service._failure_deadline`
+    rounds an overrun up to a whole slot, and a queued attempt gets a floor). No number of clean
+    samples can hide one that fails this.
+
+    **Every branch must still answer on the base slot at least once, as the caller sees it.** That
+    is the minimum the previous form of this test read, measured from the test's own call start, so
+    it also reds a seam that starts one branch's clock later than another's. It is what reds a
+    branch whose own cost CONSISTENTLY overruns the budget: it never reaches the base slot, in any
+    round. What it costs, stated rather than glossed: a cost that overruns only on a fraction ``p``
+    of calls is caught with probability ``p ** rounds``, up to ``p ** 6``, so this is weaker against
+    an intermittently slow branch than a single sample would be. A single sample is not the safer
+    alternative, because it reds for the environment on a starved runner, and a guard that reds for
+    the wrong reason gets relaxed by whoever is unblocking the queue. An intermittent branch would
+    have to swing across a whole 500 ms slot to be visible to either form, which against branches
+    costing 0.3-55 ms is a hundredfold regression. This part cannot pass on a runner starved for the
+    whole test: then every argon2 branch overruns in every round, the seam really does answer them
+    a slot after the cheap branch, and this reds, as
+    ``test_the_shipped_budget_leaves_room_above_a_real_argon2_verify`` would.
+
+    **A uniform stall is deliberately tolerated.** Nothing asserts that the base is slot 1. If every
+    branch is pushed to a later slot together they are still indistinguishable, which is the
+    property; asserting the slot index would put the load sensitivity straight back.
+    """
+    base = min(sample.seam_offset for branch in samples.values() for sample in branch)
+    for name, branch in samples.items():
+        for sample in branch:
+            late = sample.seam_offset > base + _TOLERANCE
+            clean = sample.queued < _TOLERANCE and sample.reached < base - _TOLERANCE
+            assert not (late and clean), (
+                f"deadline depends on the branch taken: {name} answered at "
+                f"{sample.seam_offset:.7f} past its start, after the base {base:.7f}, although it "
+                f"waited {sample.queued:.7f} and reached its pad at {sample.reached:.7f}"
             )
-            assert len(recorder.deadlines) == 1, f"{name} did not pad exactly once"
-            samples.append(recorder.deadlines[0] - start)
-        offsets[name] = min(samples)
-    return offsets
+    never = _late_branches(samples)
+    assert not never, (
+        f"deadline depends on the branch taken: never on the base slot in "
+        f"{max(len(branch) for branch in samples.values())} interleaved rounds: {never}"
+    )
 
 
 # --- the deadline primitive --------------------------------------------------
@@ -268,11 +369,13 @@ async def test_every_login_failure_branch_answers_at_one_deadline(
 
     Four failure branches whose real costs differed by up to 75x before the pad. A fifth, the
     first-run account's spelling, went with that account (ADR 0183). Each is driven from a
-    call start captured in :func:`_least_deadline_offsets`, and the assertion is that
+    call start captured in :func:`_deadline_samples`, and the assertion is that
     ``deadline - start`` is the same for all of them — not that it equals any particular number, and
     not that it equals a constant the production code also reads.
     """
     service = await _service(engine)
+    jane = await service.store.get_user_by_username("jane")
+    assert jane is not None
     retired = "Directory password sign-in has been retired; use Windows SSO or OIDC"
     branches: _Branches = {
         "unknown_username": (
@@ -292,12 +395,16 @@ async def test_every_login_failure_branch_answers_at_one_deadline(
             retired,
         ),
     }
-    offsets = await _least_deadline_offsets(recorder, branches)
-    spread = max(offsets.values()) - min(offsets.values())
-    # The tolerance covers only the microseconds between this test's `time.monotonic()` and the
-    # seam's own — NOT the branch's work, which is on the other side of the deadline. At the parent
-    # commit these branches spread 49 ms; 1 ms would fail there by 49x.
-    assert spread < 0.001, f"deadline depends on the branch taken: {offsets}"
+
+    async def unlock_jane(branch: str) -> None:
+        # Repetition must not turn `wrong_password` into `locked_account`; see _MIN_ROUNDS.
+        if branch == "wrong_password":
+            await service.store.clear_lockout(jane.id)
+
+    # At the parent commit of BACKLOG #1140 these branches spread 49 ms; _TOLERANCE is 1 ms.
+    _assert_one_deadline(
+        await _deadline_samples(recorder, service, branches, before_each=unlock_jane)
+    )
 
 
 async def test_a_successful_login_is_never_padded(
@@ -424,9 +531,7 @@ async def test_every_kerberos_reject_answers_at_one_deadline(
         "not_in_directory": (_reject("stranger"), "user not found in directory"),
         "local_account_conflict": (_reject("jdoe"), "account conflict"),
     }
-    offsets = await _least_deadline_offsets(recorder, branches)
-    spread = max(offsets.values()) - min(offsets.values())
-    assert spread < 0.001, f"deadline depends on the reject branch: {offsets}"
+    _assert_one_deadline(await _deadline_samples(recorder, service, branches))
 
 
 async def test_a_disabled_sso_seam_pads_like_every_other_reject(
@@ -490,6 +595,102 @@ async def test_route_local_rejects_are_deliberately_not_padded(
         )
         assert r.status_code == 303 and r.headers["location"] == "/ui/login?e=sso_failed"
     assert recorder.deadlines == []
+
+
+# --- the invariance instrument itself ----------------------------------------
+#
+# Driven through the real equaliser with synthetic work, so they run in about a second and each part
+# of `_assert_one_deadline` is shown able to fail, and able to pass, on a shape it has to judge.
+
+#: A budget well above the steady branches' few microseconds of work, and short enough to keep these
+#: tests fast. A "stall" is half as long again, so it lands on the second slot.
+_INSTRUMENT_BUDGET = 0.3
+
+
+def _timed_branches(
+    service: AuthService, work: Mapping[str, Callable[[], float]]
+) -> dict[str, tuple[Callable[[], Awaitable[LoginOutcome]], str]]:
+    """One branch per name, each spending ``work[name]()`` seconds before the equaliser runs."""
+    failed = LoginOutcome(ok=False, error="nope")
+
+    def branch(seconds: Callable[[], float]) -> Callable[[], Awaitable[LoginOutcome]]:
+        async def call() -> LoginOutcome:
+            started = time.monotonic()
+            await asyncio.sleep(seconds())
+            return await service._equalize_failure(failed, started, seam="t")
+
+        return call
+
+    return {name: (branch(cost), "nope") for name, cost in work.items()}
+
+
+async def test_a_stall_over_one_branchs_first_samples_does_not_red(
+    engine: Engine, recorder: _DeadlineRecorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The 2026-10-07 shape, made certain: one branch overruns on its first three calls only.
+
+    Read as the previous form of this test read it, three samples of one branch in a row and then
+    their minimum, this reds exactly as merge-queue run 37562580245 did, one branch a whole slot
+    late. Interleaved and adaptive, the fourth round (or a later one on a loaded runner) brings
+    that branch back to the base slot.
+    """
+    monkeypatch.setattr(svc, "_FAILURE_BUDGET_SECONDS", _INSTRUMENT_BUDGET)
+    service = AuthService(engine.store, AuthSettings(require_mfa=False))
+    stalls = iter([1.5 * _INSTRUMENT_BUDGET] * 3)
+    samples = await _deadline_samples(
+        recorder,
+        service,
+        _timed_branches(service, {"steady": lambda: 0.0, "stalled": lambda: next(stalls, 0.0)}),
+    )
+    # At least the second slot: a loaded runner can only push a stalled sample later still.
+    slots = [round(sample.offset / _INSTRUMENT_BUDGET) for sample in samples["stalled"]]
+    assert min(slots[:3]) >= 2 and slots[-1] == 1, slots
+    _assert_one_deadline(samples)
+
+
+async def test_a_late_answer_from_a_branch_that_finished_in_time_reds_on_one_sample(
+    engine: Engine, recorder: _DeadlineRecorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for the load-proof part: a deadline that depends on the branch, with no overrun.
+
+    The ``shifted`` branch does no work and its recorded deadline is moved one slot later, which is
+    what a seam computing a branch-dependent deadline would record. It must red, and on the first
+    part of the assertion: its pad was reached long before the base deadline.
+    """
+    monkeypatch.setattr(svc, "_FAILURE_BUDGET_SECONDS", _INSTRUMENT_BUDGET)
+    service = AuthService(engine.store, AuthSettings(require_mfa=False))
+    branches = _timed_branches(service, {"steady": lambda: 0.0, "shifted": lambda: 0.0})
+    shifted_call, error = branches["shifted"]
+
+    async def shifted() -> LoginOutcome:
+        outcome = await shifted_call()
+        recorder.deadlines[-1] += _INSTRUMENT_BUDGET
+        return outcome
+
+    branches["shifted"] = (shifted, error)
+    samples = await _deadline_samples(recorder, service, branches, max_rounds=_MIN_ROUNDS)
+    with pytest.raises(AssertionError, match="although it waited"):
+        _assert_one_deadline(samples)
+
+
+async def test_a_branch_that_overruns_every_round_still_reds(
+    engine: Engine, recorder: _DeadlineRecorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for the second part: a branch whose own cost always needs a second slot.
+
+    Every one of its samples is the fail-safe working as designed, so the first part excuses each
+    of them. The branch never reaches the base slot, so the second part must red.
+    """
+    monkeypatch.setattr(svc, "_FAILURE_BUDGET_SECONDS", _INSTRUMENT_BUDGET)
+    service = AuthService(engine.store, AuthSettings(require_mfa=False))
+    samples = await _deadline_samples(
+        recorder,
+        service,
+        _timed_branches(service, {"steady": lambda: 0.0, "slow": lambda: 1.5 * _INSTRUMENT_BUDGET}),
+        max_rounds=_MIN_ROUNDS,
+    )
+    with pytest.raises(AssertionError, match="never on the base slot"):
+        _assert_one_deadline(samples)
 
 
 # --- the equaliser itself ----------------------------------------------------
