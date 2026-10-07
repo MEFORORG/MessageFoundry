@@ -1571,7 +1571,11 @@ public bundle `requests` ships with (BACKLOG #1180; the store KeyProvider's twin
 `HTTP_PROXY`, `ALL_PROXY` and `NO_PROXY`, and on Windows the system proxy. Through an `https://` proxy,
 the TLS leg to the proxy uses the same approved suites as the Vault leg. It is verified against the
 same anchor too: the CA file when one is set, so the proxy's certificate must chain to it, and the
-public bundle otherwise. An `http://` Vault address through an
+public bundle otherwise. There is no separate proxy anchor, on purpose (BACKLOG #2318). The proxy
+leg does not protect the token; the Vault leg's own TLS, end to end inside the tunnel, does. So for
+a proxy whose certificate comes from another CA, use an `http://` proxy in front of the `https://`
+Vault address. **Do not add the proxy's CA to the Vault CA file:** the Vault leg would then accept
+a certificate that CA issued for the Vault host name. An `http://` Vault address through an
 `https://` proxy is **refused**, because that leg could not be verified. Use an `https://` Vault
 address (BACKLOG #300). `NO_PROXY` is not a way around it either: a remote `http://` Vault reached
 directly is refused too, as the next paragraph says.

@@ -23,6 +23,7 @@ from typing import Any
 
 import pytest
 
+from messagefoundry.config.tls_policy import InsecureHopRefused
 from messagefoundry.transports.bounded_read import (
     AmbiguousFramingError,
     EgressReplyError,
@@ -332,7 +333,7 @@ def test_the_transit_cipher_reads_through_the_strict_reader_and_reuses_its_conne
         assert cipher.encrypt("synthetic", aad=b"cell").endswith("vault:v1:c3ludGhldGlj")
         assert cipher.encrypt("synthetic", aad=b"cell").endswith("vault:v1:c3ludGhldGlj")
         assert server.connections == 1
-        with pytest.raises(CipherError, match="AmbiguousFramingError"):
+        with pytest.raises(CipherError, match="framed its response body ambiguously"):
             cipher.encrypt("synthetic", aad=b"cell")
     assert all(r.startswith(b"POST /v1/transit/encrypt/mefor-store-dek ") for r in server.requests)
 
@@ -379,7 +380,7 @@ def test_a_bare_cr_in_a_transit_reply_head_is_refused_and_its_connection_closed(
         client = keyprovider_vault._build_client(f"http://127.0.0.1:{server.port}", _TOKEN)
         cipher = TransitCipher(client, "mefor-store-dek")
         assert cipher.encrypt("synthetic", aad=b"cell").endswith("vault:v1:c3ludGhldGlj")
-        with pytest.raises(CipherError, match="MalformedReplyHeadError"):
+        with pytest.raises(CipherError, match="framed its reply head ambiguously"):
             cipher.encrypt("synthetic", aad=b"cell")
         assert cipher.encrypt("synthetic", aad=b"cell").endswith("vault:v1:c3ludGhldGlj")
     assert server.connections == 2, "the refused reply's connection must not go back to the pool"
@@ -396,7 +397,7 @@ def test_the_kv_secret_provider_fails_closed_on_a_bare_cr_in_the_head(
         monkeypatch.setenv("MEFOR_SECRETS_VAULT_ADDR", f"http://127.0.0.1:{server.port}")
         monkeypatch.setenv("MEFOR_SECRETS_VAULT_TOKEN", _TOKEN)
         monkeypatch.delenv("MEFOR_SECRETS_VAULT_CA_FILE", raising=False)
-        with pytest.raises(SecretProviderError, match="MalformedReplyHeadError"):
+        with pytest.raises(SecretProviderError, match="framed its reply head ambiguously"):
             VaultSecretProvider(SecretsSettings()).resolve("mefor/ad")
 
 
@@ -477,7 +478,7 @@ def test_a_pool_that_would_read_the_head_leniently_is_refused_before_sending() -
         session = _session_with(limit=1000)
         adapter = session.get_adapter("http://")
         adapter.poolmanager.pool_classes_by_scheme = urllib3.poolmanager.pool_classes_by_scheme
-        with pytest.raises(EgressReplyError, match="cannot make strict"):
+        with pytest.raises(InsecureHopRefused, match="cannot make strict"):
             session.get(f"http://127.0.0.1:{server.port}/{_KV_PATH}", timeout=10)
     assert server.requests == []
 
@@ -521,7 +522,7 @@ def test_a_socks_proxy_pool_is_left_alone_and_refused(monkeypatch: pytest.Monkey
         proxy = f"socks5://127.0.0.1:{server.port}"
         manager = session.get_adapter("http://").proxy_manager_for(proxy)
         assert manager.pool_classes_by_scheme is urllib3.poolmanager.pool_classes_by_scheme
-        with pytest.raises(EgressReplyError, match="cannot make strict"):
+        with pytest.raises(InsecureHopRefused, match="cannot make strict"):
             session.get(f"http://vault.example.test:8200/{_KV_PATH}", proxies={"http": proxy})
     assert server.requests == []
 
@@ -540,5 +541,5 @@ def test_the_kv_secret_provider_fails_closed_on_a_misframed_reply(
         monkeypatch.setenv("MEFOR_SECRETS_VAULT_ADDR", f"http://127.0.0.1:{server.port}")
         monkeypatch.setenv("MEFOR_SECRETS_VAULT_TOKEN", _TOKEN)
         monkeypatch.delenv("MEFOR_SECRETS_VAULT_CA_FILE", raising=False)
-        with pytest.raises(SecretProviderError, match="AmbiguousFramingError"):
+        with pytest.raises(SecretProviderError, match="framed its response body ambiguously"):
             VaultSecretProvider(SecretsSettings()).resolve("mefor/ad")
