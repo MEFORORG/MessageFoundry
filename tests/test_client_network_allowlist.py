@@ -34,6 +34,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import (
     AlertsSettings,
     ApiSettings,
+    ApprovalsSettings,
     AuthSettings,
     EgressSettings,
     SecretRotationSettings,
@@ -68,6 +69,7 @@ def _loosenings(sec: SecuritySettings) -> list[tuple[str, str]]:
         attested_hops=(),
         revocation_attested_hops=(),
         api=ApiSettings(),
+        approvals=ApprovalsSettings(),
         store_privilege=None,
         audit_chain_unkeyed=None,
         remote_debug=None,

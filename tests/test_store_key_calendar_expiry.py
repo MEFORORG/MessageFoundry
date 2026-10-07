@@ -39,6 +39,7 @@ from messagefoundry.config.ai_policy import SecurityEnforcement
 from messagefoundry.config.settings import (
     AlertsSettings,
     ApiSettings,
+    ApprovalsSettings,
     AuthSettings,
     EgressSettings,
     SecretRotationSettings,
@@ -250,6 +251,7 @@ def test_the_opt_out_is_a_NAMED_security_loosening() -> None:
             attested_hops=(),
             revocation_attested_hops=(),
             api=ApiSettings(),
+            approvals=ApprovalsSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,
@@ -281,6 +283,7 @@ def test_the_shipped_default_is_not_reported_as_a_loosening() -> None:
             attested_hops=(),
             revocation_attested_hops=(),
             api=ApiSettings(),
+            approvals=ApprovalsSettings(),
             store_privilege=None,
             audit_chain_unkeyed=None,
             remote_debug=None,

@@ -1027,6 +1027,19 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             }
         )
 
+    def audit_write_failed(self, name: str, *, action: str) -> None:
+        # vault BACKLOG #2255: an audit row was lost. `approval:<id>` stands in for "connection", as
+        # for approval_too_early, so each request is its own instance. The action name lands in the
+        # reason column; the lost row's detail stays in the ERROR log line beside it. No PHI.
+        self._emit(
+            {
+                "type": "audit_write_failed",
+                "connection": name,
+                "action": action,
+                "reason": f"the {action} audit row was not written",
+            }
+        )
+
     def administrator_granted(self, name: str, *, via: str, granted_by: str) -> None:
         # BACKLOG #315: the Administrator role was granted. `user:<username>` or `ad-group:<group>`
         # stands in for "connection" (the key's grammar is on AlertSink). `granted_by` is the granting

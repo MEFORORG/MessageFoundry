@@ -219,6 +219,21 @@ def test_show_reports_the_plaintext_upstream_hop_acknowledgement(
     assert "plaintext_upstream_hop_acknowledged" not in [e["switch"] for e in data["loosenings"]]
 
 
+def test_show_reports_a_shortened_approval_dwell(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #2489: [approvals] is resolved from the whole file too, so a shortened dwell is
+    listed. The same floor at its default is the control, so the entry comes from the value."""
+    toml = tmp_path / "mf.toml"
+    toml.write_text("[approvals]\nenabled = true\nmin_dwell_seconds = 0.5\n", encoding="utf-8")
+    data = _show(toml, capsys)
+    assert data["loosenings_partial"] is False
+    assert "min_dwell_seconds" in [e["switch"] for e in data["loosenings"]]
+    toml.write_text("[approvals]\nenabled = true\nmin_dwell_seconds = 2.0\n", encoding="utf-8")
+    data = _show(toml, capsys)
+    assert "min_dwell_seconds" not in [e["switch"] for e in data["loosenings"]]
+
+
 def test_show_declares_a_partial_report_when_the_file_will_not_load(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

@@ -246,13 +246,14 @@ _DIRTY_CLOSE_TIMEOUT = 5.0
 def _drain_detached_close(fut: asyncio.Future[None]) -> None:
     """Retrieve a detached raw close's outcome, so asyncio never logs it as never-retrieved.
 
-    A failure is a WARNING, not DEBUG: the connection it belongs to may still hold an open audit
-    INSERT and the audit applock on the server, and an operator whose audit appends are timing out
-    needs a line that points at it (BACKLOG #1940)."""
+    A failure is a WARNING, not DEBUG: the connection it belongs to may still hold an open
+    transaction and its locks on the server -- after a failed audit rollback, an open audit INSERT
+    and the audit applock -- and an operator whose writes are timing out needs a line that points
+    at it (BACKLOG #1940)."""
     if not fut.cancelled() and fut.exception() is not None:
         log.warning(
             "sqlserver: detached close of a discarded connection failed; the server may hold its"
-            " transaction and audit applock until the session ends: %s",
+            " transaction and locks until the session ends: %s",
             fut.exception(),
         )
 
@@ -370,6 +371,47 @@ def _raw_closer(conn: Any, raw: Any) -> Callable[[], None]:
     so the close runs only between pyodbc calls (BACKLOG #2049)."""
     gate = _call_gate(conn)
     return raw.close if gate is None else partial(gate.close, raw)
+
+
+def _detach_connection(conn: Any) -> asyncio.Future[None] | None:
+    """Take ``conn`` out of the pool for good, and start closing its raw handle off the event loop.
+
+    The one detach sequence both discards use (BACKLOG #1940, engine PR 1722 defect 5): the
+    quarantine of a cancelled call (:meth:`SqlServerStore._release_dirty`, ADR 0159) and the
+    discard after a failed audit rollback (:meth:`SqlServerStore._rollback_or_discard`).
+
+    **The first write is the guarantee, and nothing here awaits.** aioodbc derives
+    ``Connection.closed`` from ``_conn``, and its pool re-lends a connection only when it is not
+    closed, so dropping the handle makes the connection unlendable at once. A second cancellation
+    cannot get in front of a plain attribute write.
+
+    It returns the close's future, or ``None`` when there is nothing to wait for:
+
+    * the connection was already detached;
+    * a pyodbc call is still running on it, so the close is handed to that call (BACKLOG #2049);
+    * the executor refused the work, at loop teardown. That is logged, and pyodbc closes the handle
+      when it is collected.
+
+    The future's outcome is always retrieved by :func:`_drain_detached_close`, so a caller may wait on
+    it or leave it."""
+    raw = getattr(conn, "_conn", None)
+    if raw is None:
+        return None
+    conn._conn = None  # MUST stay first, and MUST stay await-free
+    gate = _call_gate(conn)
+    if gate is not None and gate.close_after_running_call(raw):
+        return None
+    try:
+        closer = asyncio.get_running_loop().run_in_executor(None, _raw_closer(conn, raw))
+    except RuntimeError:  # the executor is shut down; see the docstring
+        log.warning(
+            "sqlserver: could not schedule the close of a discarded connection; it is out of the"
+            " pool and closes when collected",
+            exc_info=True,
+        )
+        return None
+    closer.add_done_callback(_drain_detached_close)
+    return closer
 
 
 # SQL Server native error 1222 = "Lock request time out period exceeded" — raised by SET LOCK_TIMEOUT 0
@@ -4325,15 +4367,12 @@ class SqlServerStore:
         When a call is running, this method hands it the close and does not wait at all: the close
         could only land when the statement returns, and waiting here would stall a shutdown or
         demotion for as long as the statement runs, which ADR 0159 rejected.
+
+        The detach itself is :func:`_detach_connection`, shared with :meth:`_rollback_or_discard`.
         """
-        raw = getattr(conn, "_conn", None)
-        if raw is None:  # already closed/quarantined — nothing lendable to contain
+        closer = _detach_connection(conn)  # first: no await may come before the detach
+        if closer is None:  # already detached, handed to a running call, or the executor refused
             return
-        conn._conn = None  # ← MUST stay first, and MUST stay await-free
-        gate = _call_gate(conn)
-        if gate is not None and gate.close_after_running_call(raw):
-            return
-        closer = asyncio.ensure_future(asyncio.to_thread(_raw_closer(conn, raw)))
         try:
             await asyncio.wait_for(asyncio.shield(closer), _DIRTY_CLOSE_TIMEOUT)
         except (TimeoutError, asyncio.CancelledError):
@@ -4346,7 +4385,8 @@ class SqlServerStore:
                 _DIRTY_CLOSE_TIMEOUT,
             )
         except Exception:  # noqa: BLE001 - a close failure must not mask the cancellation
-            log.debug("sqlserver: quarantined connection close failed", exc_info=True)
+            # Not logged here: _drain_detached_close, on the closer, already logged it at WARNING.
+            return
 
     async def _rollback_or_discard(self, conn: Any) -> None:
         """Roll back a failed audit append; if that rollback fails too, discard the connection.
@@ -4356,7 +4396,8 @@ class SqlServerStore:
         connection on an ordinary error, so the next borrower's COMMIT would make the row durable.
         The rollback's own error is logged, not raised: the caller re-raises its original error.
 
-        The discard takes :meth:`_release_dirty`'s synchronous step and does NOT wait for the close.
+        The discard is :func:`_detach_connection`, the same detach :meth:`_release_dirty` uses, and
+        unlike that method it does NOT wait for the close.
         ``_release_dirty`` swallows a cancellation while it waits, which is safe only where the
         original error IS that cancellation. Not waiting also releases the in-process
         ``_audit_lock`` sooner. **It does not end the stall, only moves it.** The open transaction
@@ -4377,20 +4418,8 @@ class SqlServerStore:
                 "sqlserver: rollback after a failed audit append failed; discarding the connection",
                 exc_info=True,
             )
-            raw = getattr(conn, "_conn", None)
-            if raw is None:
-                return
-            conn._conn = None  # unlendable at once, with no await in front; see _release_dirty
-            try:
-                closer = asyncio.get_running_loop().run_in_executor(None, _raw_closer(conn, raw))
-            except RuntimeError:  # the executor is shut down; see the docstring
-                log.warning(
-                    "sqlserver: could not schedule the close of a discarded connection; it is out"
-                    " of the pool and closes when collected",
-                    exc_info=True,
-                )
-                return
-            closer.add_done_callback(_drain_detached_close)
+            # Its future is deliberately not awaited; see the docstring.
+            _detach_connection(conn)
 
     def pool_status(self) -> PoolStatus | None:
         """The aioodbc pool snapshot (B11): size/idle occupancy + the PRIMARY acquire-wait percentiles.
