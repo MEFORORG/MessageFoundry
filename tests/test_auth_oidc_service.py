@@ -1806,39 +1806,6 @@ async def _callback(
     )
 
 
-@pytest.mark.parametrize("branch", ["state_unknown", "state_mismatch", "bad_signature"])
-async def test_a_callback_refusal_row_carries_the_client_address(
-    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch, branch: str
-) -> None:
-    """BACKLOG #2132. A spray of forged callbacks shows as a run of these rows, so each one records
-    where it came from, as the ``token_refused`` row does. ``bad_signature`` stands for every
-    ``ClaimsError`` reason: they share one arm."""
-    store = await MessageStore.open(":memory:")
-    try:
-        service = await _service(store, rsa_key)
-
-        # Reached only by bad_signature: both state refusals answer before the exchange.
-        def exchange(*_a: object, **_k: object) -> oidc.FederatedPrincipal:
-            raise oidc.ClaimsError("bad_signature")
-
-        monkeypatch.setattr(service, "_exchange_and_validate", exchange)
-        out = await _callback(
-            service,
-            flow_id="no-such-flow" if branch == "state_unknown" else None,
-            state="wrong-state" if branch == "state_mismatch" else None,
-            client="192.0.2.44",
-        )
-        assert not out.ok and out.reason == branch
-        [row] = [
-            r
-            for r in await _audit_rows(store, "auth.login_failed")
-            if f'"reason": "{branch}"' in (r["detail"] or "")
-        ]
-        assert row["client"] == "192.0.2.44"
-    finally:
-        await store.close()
-
-
 @pytest.mark.parametrize(
     ("branch", "reason"),
     [
@@ -1847,6 +1814,7 @@ async def test_a_callback_refusal_row_carries_the_client_address(
         ("not_bound", FEDERATED_SUBJECT_NOT_BOUND),
         ("not_in_directory", "not_in_directory"),
         ("idp_down", "idp_unavailable"),
+        ("claims", "bad_signature"),
     ],
 )
 async def test_every_callback_refusal_is_padded_once_under_the_oidc_seam(
@@ -1855,7 +1823,11 @@ async def test_every_callback_refusal_is_padded_once_under_the_oidc_seam(
     """The branches span both sides of the token exchange, which is the split #1947 is about.
 
     Exactly ONE pad per challenge: the callback's inner leg calls ``_authenticate_oidc`` and not the
-    public wrapper, so a second pad cannot stack inside the first."""
+    public wrapper, so a second pad cannot stack inside the first.
+
+    Every refusal row also records the client address (BACKLOG #2132): a spray of forged callbacks
+    shows as a run of these rows, and the operator needs its source. ``claims`` stands for every
+    ``ClaimsError`` reason, which share one arm."""
     store = await MessageStore.open(":memory:")
     try:
         ldap = _FakeLdap(None if branch == "not_in_directory" else PRINCIPAL)
@@ -1865,6 +1837,8 @@ async def test_every_callback_refusal_is_padded_once_under_the_oidc_seam(
         def exchange(*_a: object, **_k: object) -> oidc.FederatedPrincipal:
             if branch == "idp_down":
                 raise urllib.error.URLError("idp down")
+            if branch == "claims":
+                raise oidc.ClaimsError("bad_signature")
             return _verified("S-1-nobody" if branch == "not_bound" else DEFAULT_SUB)
 
         monkeypatch.setattr(service, "_exchange_and_validate", exchange)
@@ -1872,9 +1846,13 @@ async def test_every_callback_refusal_is_padded_once_under_the_oidc_seam(
             service,
             flow_id="no-such-flow" if branch == "flow_unknown" else None,
             state="wrong-state" if branch == "state_mismatch" else None,
+            client="192.0.2.44",
         )
         assert not out.ok and out.reason == reason
         assert spy.seams == ["oidc"]
+        rows = await _audit_rows(store, "auth.login_failed")
+        rows += await _audit_rows(store, "auth.login_error")
+        assert rows and all(r["client"] == "192.0.2.44" for r in rows), rows
     finally:
         await store.close()
 

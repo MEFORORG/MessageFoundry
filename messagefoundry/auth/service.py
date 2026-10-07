@@ -2545,10 +2545,11 @@ class AuthService:
 
     async def audit_kerberos_reject(self, reason: str) -> None:
         """AUTH-K-AUDIT for route-level SSO rejects that never reach ``authenticate_kerberos``
-        (cross-site hygiene, rate-limit exhaustion, malformed base64) — every reject path of a
-        Windows-SSO attempt must be visible to a defender.
+        (cross-site hygiene, malformed base64) — every reject path of a Windows-SSO attempt must be
+        visible to a defender. Rate-limit exhaustion is a log line at the route, never a row.
 
-        Its row carries no client address: the request is the route's, and this seam takes none."""
+        AN OPEN GAP, NOT A DESIGN: the route holds the client address and this seam does not take
+        it yet, so the row's ``client`` is NULL though a remote caller was present."""
         await self._directory_reject_audit("<kerberos>", "kerberos", reason, client=None)
 
     @property
@@ -2595,10 +2596,12 @@ class AuthService:
 
     async def audit_oidc_reject(self, reason: str) -> None:
         """Route-level federated-login rejects that never reach :meth:`authenticate_oidc` (flow-cookie
-        binding failures, rate-limit exhaustion, a non-navigation fetch). ``reason`` must be a
-        closed-set slug chosen by the route — never IdP-supplied text.
+        binding failures, a malformed callback, a non-navigation fetch). Rate-limit exhaustion is a
+        log line at the route, never a row. ``reason`` must be a closed-set slug chosen by the
+        route — never IdP-supplied text.
 
-        Its row carries no client address: the request is the route's, and this seam takes none."""
+        AN OPEN GAP, NOT A DESIGN: the route holds the client address and this seam does not take
+        it yet, so the row's ``client`` is NULL though a remote caller was present."""
         await self._directory_reject_audit("<oidc>", "oidc", reason, client=None)
 
     # --- lifecycle -----------------------------------------------------------
@@ -4639,8 +4642,9 @@ class AuthService:
         """Audit a rejected directory-SSO attempt. ``mech`` is the mechanism slug ("kerberos" /
         "oidc"); ``reason`` must come from a closed set so no IdP-influenced text is ever stored.
 
-        ``client`` is required, so no caller can drop the address by leaving it out (BACKLOG
-        #2132). A run of refusals is how a spray shows, and the operator needs to see its source."""
+        ``client`` is keyword-only with no default, so every caller must name it (BACKLOG #2132).
+        The type still accepts ``None``, so this forces a decision and does not enforce an address.
+        A run of refusals is how a spray shows, and the operator needs to see its source."""
         await self._audit(
             "auth.login_failed",
             actor=actor,
