@@ -34,8 +34,10 @@ def audit_log(data: AuditList, *, limit: int) -> Markup:
 
     NEWEST FIRST, AND ONLY THE NEWEST — the route asks for ``limit`` rows and this page renders what
     came back (BACKLOG #1743). It cannot say window-of-total the way the messages and dead-letter
-    pagers do, because ``AuditList`` carries no total and the store's ``list_audit`` has neither an
-    offset nor a count; giving this page a pager is a separate row that has to add both.
+    pagers do, because ``AuditList`` carries no total and the seam this page calls passes no cursor.
+    The store has a keyset cursor (``list_audit``'s ``before_id``) and ``count_audit``, which the
+    export uses (vault BACKLOG #2776); giving this page a pager is a separate row that has to carry
+    both through the seam and ``AuditList``.
 
     THE EXPORT DOES NOT HOLD THE WHOLE TRAIL EITHER, so the page does not say it does (BACKLOG
     #1743 residual (c)). ``export_audit`` in ``api/auth_routes.py`` runs this page's store read

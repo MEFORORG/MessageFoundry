@@ -1129,7 +1129,14 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "hash:hashlib.sha256",
         }
     ),
-    "messagefoundry/integrity.py": frozenset({"hash:hashlib.sha256"}),
+    "messagefoundry/integrity.py": frozenset(
+        {
+            "hash:hashlib.sha256",  # record_verdict: one RECORD row, for the start-up code inventory
+            # vault BACKLOG #2763: the attestation classifier streams SHA-256 over each attested file
+            # against its RECORD row, so a module swapped for a link to a huge file is not read whole.
+            "hash:hashlib.file_digest[sha256]",
+        }
+    ),
     # BACKLOG #1352 / #1171: the private-key wrap check every loader calls before it decrypts. It
     # parses the wrap with a stdlib DER reader, then makes the one load_cert_chain call every TLS
     # key site goes through (its import row above is ssl, for that call).

@@ -249,7 +249,8 @@ async def test_unrecognised_handler_return_dead_letters_in_the_live_runner(
     assert await store.replay(mid) == 1
     fetched = await store.get_message(mid)
     assert fetched is not None
-    assert fetched["status"] == MessageStatus.RECEIVED.value
+    # ROUTED, not RECEIVED: the router already ran for a routed row (vault BACKLOG #2723).
+    assert fetched["status"] == MessageStatus.ROUTED.value
 
 
 class _BoomSource(SourceConnector):

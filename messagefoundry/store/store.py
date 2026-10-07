@@ -691,7 +691,7 @@ class _GroupCommitter:
 
 class MessageStatus(str, Enum):  # noqa: UP042
     RECEIVED = "received"  # persisted at ingress, awaiting router+transform (staged pipeline)
-    ROUTED = "routed"  # router produced ≥1 delivery; outbound rows queued, awaiting delivery
+    ROUTED = "routed"  # router selected at least one handler; awaiting transform and/or delivery
     PROCESSED = "processed"  # all destinations terminal (done or dead)
     ERROR = "error"  # parse/validation/processing failure (dead-lettered); logged, not routed
     FILTERED = "filtered"  # rejected by the channel filter; logged, intentionally not routed
@@ -6795,24 +6795,32 @@ class MessageStore:
         attachment therefore sits at ``refcount=0`` until increffed — reclaimable by the **next** startup
         sweep, never mid-run (the sweep is startup-only, like ``reset_stale_inflight``)."""
         self._require_streaming_attachments()
-        hasher = hashlib.sha256()
-        total = 0
-        # Cell-bound AAD (ASVS 11.3.3) binds each chunk to its (attachment_id, seq) cell — but the
-        # attachment_id is the sha256 content address, known only once the full plaintext is hashed. So
-        # buffer the verbatim slices, hash them, then seal each under its (ref, seq). `chunks` is a
-        # slicing of an already-materialized OBX-5.5 value, so this adds no order-of-magnitude memory over
-        # the caller's own copy, and each AES-GCM seal still consumes exactly one chunk (one-chunk seal).
-        plaintext_chunks: list[str] = []
-        for chunk in chunks:
-            data = chunk.encode("utf-8")
-            hasher.update(data)
-            total += len(data)
-            plaintext_chunks.append(chunk)
-        ref = hasher.hexdigest()
-        sealed: list[str] = [
-            self._cipher.encrypt(c, aad=cell_aad("attachment_chunk", "ciphertext", ref, seq))
-            for seq, c in enumerate(plaintext_chunks)
-        ]
+
+        def _seal() -> tuple[str, int, list[str]]:
+            # Off the event loop (vault BACKLOG #2757): hashing and sealing a large document is CPU
+            # work in proportion to its size, and nothing else would run meanwhile.
+            hasher = hashlib.sha256()
+            total = 0
+            # Cell-bound AAD (ASVS 11.3.3) binds each chunk to its (attachment_id, seq) cell — but
+            # the attachment_id is the sha256 content address, known only once the full plaintext is
+            # hashed. So buffer the verbatim slices, hash them, then seal each under its (ref, seq).
+            # `chunks` is a slicing of an already-materialized OBX-5.5 value, so this adds no
+            # order-of-magnitude memory over the caller's own copy, and each AES-GCM seal still
+            # consumes exactly one chunk (one-chunk seal).
+            plaintext_chunks: list[str] = []
+            for chunk in chunks:
+                data = chunk.encode("utf-8")
+                hasher.update(data)
+                total += len(data)
+                plaintext_chunks.append(chunk)
+            ref = hasher.hexdigest()
+            sealed: list[str] = [
+                self._cipher.encrypt(c, aad=cell_aad("attachment_chunk", "ciphertext", ref, seq))
+                for seq, c in enumerate(plaintext_chunks)
+            ]
+            return ref, total, sealed
+
+        ref, total, sealed = await asyncio.to_thread(_seal)
         now = time.time()
         async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute("SELECT 1 FROM attachment WHERE id=?", (ref,))
@@ -9586,16 +9594,15 @@ class MessageStore:
                 (OutboxStatus.PENDING.value, now, now, message_id, *replay_from),
             )
             if cur.rowcount:
-                # Status reflects the earliest re-queued stage: a pending ingress/routed row → RECEIVED
-                # (back in the route/transform path); else outbound only → ROUTED (awaiting delivery).
+                # Status reflects the earliest re-queued stage, per ADR 0001's count-and-log flow. A
+                # pending INGRESS row gives RECEIVED: the router has not run, and route_handoff writes
+                # the disposition again. Anything else gives ROUTED: a routed row exists only because
+                # the router already selected its handler, and the router never re-runs for it.
+                # RECEIVED there would strand the message, because the finalizer collapses a no-rows
+                # message to FILTERED / NOT_DEPLOYED only from ROUTED (vault BACKLOG #2723).
                 pre = await self._db.execute(
-                    "SELECT 1 FROM queue WHERE message_id=? AND stage IN (?, ?) AND status=? LIMIT 1",
-                    (
-                        message_id,
-                        Stage.INGRESS.value,
-                        Stage.ROUTED.value,
-                        OutboxStatus.PENDING.value,
-                    ),
+                    "SELECT 1 FROM queue WHERE message_id=? AND stage=? AND status=? LIMIT 1",
+                    (message_id, Stage.INGRESS.value, OutboxStatus.PENDING.value),
                 )
                 status = (
                     MessageStatus.RECEIVED.value
@@ -10068,21 +10075,31 @@ class MessageStore:
         a ``cancelled`` audit event each, and finalize any message whose deliveries are now all
         terminal. ``channel_id=None`` cancels across all producers (a code-first outbound
         connection fed by several inbounds); pass an id to scope to one. ``top_only`` cancels just
-        the head of the queue (next due). Inflight/dead rows are left untouched (dead uses
-        :meth:`replay`). Returns the number cancelled."""
+        the FIFO head -- the oldest pending row by ``rowid``, the lane predicate and key
+        :meth:`claim_next_fifo` uses -- even while it is backing off and not yet due, since a
+        backing-off head blocking the lane is the case "purge top" exists to clear (ADR 0059). With a
+        ``channel_id`` it is the oldest row from that producer, which is the lane head only when no
+        other inbound feeds the destination; the API passes ``None``. On an unordered lane there is no
+        blocking head, and this still cancels the oldest row. Inflight/dead rows are left untouched
+        (dead uses :meth:`replay`). Returns the number cancelled."""
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
-            where = ["destination_name=?", "status=?"]
-            params: list[object] = [destination_name, OutboxStatus.PENDING.value]
+            # The claim's own lane predicate (stage, destination_name, status), so the head query seeks
+            # ix_queue_fifo_out_seq in rowid order; only outbound rows carry a destination_name anyway.
+            where = ["stage=?", "destination_name=?", "status=?"]
+            params: list[object] = [
+                Stage.OUTBOUND.value,
+                destination_name,
+                OutboxStatus.PENDING.value,
+            ]
             if channel_id is not None:
-                where.insert(0, "channel_id=?")
-                params.insert(0, channel_id)
-            # `top_only` cancels the true FIFO head, so the tiebreak after next_attempt_at must match the
-            # claim's seq-only order (rowid = SQLite seq), NOT created_at (no longer the ordering key; ADR 0059).
-            query = (
-                "SELECT id, message_id FROM queue"
-                f" WHERE {' AND '.join(where)} ORDER BY next_attempt_at, rowid"
-            )
+                where.insert(1, "channel_id=?")
+                params.insert(1, channel_id)
+            # `top_only` cancels the true FIFO head, so it orders by the claim's seq-only key alone
+            # (rowid = SQLite seq; ADR 0059). Not next_attempt_at first: mark_failed pushes a failed
+            # head's next_attempt_at past the younger rows behind it, so that key would pick a healthy
+            # younger row and leave the backing-off head blocking the lane (vault BACKLOG #2754).
+            query = f"SELECT id, message_id FROM queue WHERE {' AND '.join(where)} ORDER BY rowid"
             if top_only:
                 query += " LIMIT 1"
             cur = await self._db.execute(query, tuple(params))
@@ -10970,17 +10987,17 @@ class MessageStore:
             return AppendedAuditRow(row_id, seq, row_hash)
         raise AssertionError("unreachable: the second attempt returns or raises")
 
-    async def list_audit(
-        self,
+    @staticmethod
+    def _audit_where(
         *,
-        limit: int = 50,
-        actor: str | None = None,
-        action: str | None = None,
-        since: float | None = None,
-        until: float | None = None,
-        exclude: AuditExclusion | None = None,
-    ) -> list[aiosqlite.Row]:
-        """Most-recent-first audit entries, optionally filtered (BACKLOG #170).
+        actor: str | None,
+        action: str | None,
+        since: float | None,
+        until: float | None,
+        exclude: AuditExclusion | None,
+        before_id: int | None,
+    ) -> tuple[str, list[object]]:
+        """The ``WHERE`` text and its bound values for :meth:`list_audit` and :meth:`count_audit`.
 
         Filters are ANDed and every value is a bound ``?`` parameter — the only thing interpolated
         into the SQL text is the fixed column/operator template built from the argument NAMES, never a
@@ -11006,13 +11023,69 @@ class MessageStore:
                 return "?"
 
             clauses.extend(exclude.clauses(bind))
-        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        if before_id is not None:
+            clauses.append("id < ?")
+            params.append(before_id)
+        return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
+
+    async def list_audit(
+        self,
+        *,
+        limit: int = 50,
+        actor: str | None = None,
+        action: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+        exclude: AuditExclusion | None = None,
+        before_id: int | None = None,
+    ) -> list[aiosqlite.Row]:
+        """Most-recent-first audit entries, optionally filtered (BACKLOG #170), and optionally only
+        those older than ``before_id``, the keyset cursor a paged reader passes (vault BACKLOG #2776).
+        Every value is a bound parameter; see :meth:`_audit_where`."""
+        where, params = self._audit_where(
+            actor=actor,
+            action=action,
+            since=since,
+            until=until,
+            exclude=exclude,
+            before_id=before_id,
+        )
         params.append(limit)
         async with self._read() as db:
             cur = await db.execute(
                 f"SELECT * FROM audit_log{where} ORDER BY id DESC LIMIT ?", params
             )
             return list(await cur.fetchall())
+
+    async def count_audit(
+        self,
+        *,
+        limit: int,
+        actor: str | None = None,
+        action: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+        exclude: AuditExclusion | None = None,
+        before_id: int | None = None,
+    ) -> int:
+        """How many rows :meth:`list_audit` would return for the same arguments, without reading
+        them (vault BACKLOG #2776). Every value is a bound parameter; see :meth:`_audit_where`."""
+        where, params = self._audit_where(
+            actor=actor,
+            action=action,
+            since=since,
+            until=until,
+            exclude=exclude,
+            before_id=before_id,
+        )
+        params.append(limit)
+        async with self._read() as db:
+            cur = await db.execute(
+                f"SELECT COUNT(*) FROM (SELECT id FROM audit_log{where} ORDER BY id DESC LIMIT ?)",
+                params,
+            )
+            row = await cur.fetchone()
+            return int(row[0]) if row is not None else 0
 
     async def recent_audit_of(self, actions: Sequence[str], *, limit: int) -> list[dict[str, Any]]:
         """Up to ``limit`` newest audit rows whose action is one of ``actions``, newest first (vault

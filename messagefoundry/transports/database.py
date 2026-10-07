@@ -88,6 +88,7 @@ from messagefoundry.transports.base import (
     NegativeAckError,
     SourceConnector,
     intake_open,
+    poll_interval,
     register_destination,
     register_source,
     resolve_poll_ceiling,
@@ -1586,7 +1587,7 @@ class DatabaseSource(SourceConnector):
         self._mark_sql: str | None
         self._mark_sql, self._mark_names = _parse_named_params(str(mark)) if mark else (None, [])
         self._body_column: str | None = s.get("body_column") or None
-        self._poll_seconds = float(s.get("poll_seconds", 5.0))
+        self._poll_seconds = poll_interval(s, default=5.0, transport="DATABASE source")
         # Per-tick row ceiling, SHIPPED ON (DEFAULT_MAX_ITEMS_PER_POLL — the number and the reason a
         # poll source may default this on are stated once, in transports/base.py). Caps how many rows
         # ONE poll takes from poll_statement's result set; the rest stay in the table and the next poll

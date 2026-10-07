@@ -952,9 +952,14 @@ def test_the_inverses_resolve_their_alerts_and_are_not_rule_targetable() -> None
 
 
 async def _settle(sink: NotifierAlertSink) -> None:
-    """Wait for the sink's fire-and-forget alert-state writes, so each pass is read after its own."""
-    while sink._state_tasks:
-        await asyncio.gather(*list(sink._state_tasks))
+    """Wait for the sink's fire-and-forget alert-state writes, so each pass is read after its own.
+
+    Only tasks still running are awaited. A task that has finished leaves the set through a done
+    callback, and awaiting a gather of finished tasks returns without yielding, so that callback
+    never runs. A loop on the set itself then spins forever and grows memory until the worker dies.
+    """
+    while pending := [t for t in sink._state_tasks if not t.done()]:
+        await asyncio.gather(*pending)
 
 
 async def _open_alerts(store: MessageStore) -> set[tuple[str, str]]:

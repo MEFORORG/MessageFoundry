@@ -456,6 +456,12 @@ and listeners are unbound, so there is **no dual-accept window** while the VIP m
 2. DR **drains its staged queue to completion** (all `outbound` rows delivered or dead-lettered) **before
    `POST /dr/release` returns**. *Within DR's single store* the at-least-once + idempotency invariants make this
    safe: any row re-run re-derives identical output, and idempotent outbounds tolerate a duplicate.
+   *Amendment (vault BACKLOG #2752, 2026-10-06):* the wait is bounded (60 s of wall-clock time,
+   `DR_RELEASE_DRAIN_TIMEOUT_SECONDS` in `pipeline/engine.py`), so a row that cannot drain does not
+   hold the release. The hand-back then completes with those rows still queued, and the `dr.release`
+   audit row and the response record `depth_left`, the count left, instead of claiming a drain. The
+   release, like the activation, runs on when the API's request deadline cuts its caller off
+   (`api/outlive.py`), and a release cancelled partway stays active and writes `dr_release_failed`.
 3. Primary resumes against the authoritative store. Because the owner-locked seed is **cold**, DR ran on a
    **separate restored copy** that has since diverged from the primary's recovered store. **Across this cold
    handoff the engine provides NO cross-store guarantee** — at-least-once/idempotency are within-a-store properties

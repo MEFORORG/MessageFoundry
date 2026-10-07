@@ -1029,8 +1029,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
 
     def administrator_granted(self, name: str, *, via: str, granted_by: str) -> None:
         # BACKLOG #315: the Administrator role was granted. `user:<username>` or `ad-group:<group>`
-        # stands in for "connection" (the key's grammar is on AlertSink). The granting administrator
-        # is an operator account name, not message content.
+        # stands in for "connection" (the key's grammar is on AlertSink). `granted_by` is the granting
+        # administrator's operator account name, or the fixed marker `<directory>` when a directory
+        # sign-in's role sync made the grant (vault BACKLOG #2610). Never message content.
         self._emit(
             {
                 "type": "administrator_granted",

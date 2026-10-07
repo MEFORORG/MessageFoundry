@@ -76,6 +76,7 @@ from messagefoundry.config.models import (
     _check_hop_attestation,
     _check_revocation_attestation,
     check_db_connect_timeout,
+    flag_from_settings,
 )
 from messagefoundry.config.send_snapshot import snapshot_on_send_active
 from messagefoundry.connection_names import (
@@ -610,6 +611,50 @@ def _hop_attestation_entries(where: str, attested: bool, reason: str | None) -> 
     return {"tls_hop_attested": True, "tls_hop_attested_reason": reason} if attested else {}
 
 
+def settings_hop_attestation(settings: Mapping[str, Any], where: str) -> bool:
+    """Validate the attestation pair a settings carrier holds, by the factory's own rule.
+
+    For ``FhirLookupSpec`` and :func:`refuse_unresolved_hop_flags`, since a carrier's ``settings`` stay mutable after the factory ran. The pair is checked together, with the same string-type and control-character
+    rules as :func:`_hop_attestation_entries`, because it IS that function. Absent or ``None`` reads
+    as not attested."""
+    attested = settings.get("tls_hop_attested")
+    attested = False if attested is None else attested
+    _hop_attestation_entries(where, attested, settings.get("tls_hop_attested_reason"))
+    return attested is True
+
+
+#: The hop-policy flags a settings carrier may hold (vault BACKLOG #2232). A ``FhirLookup``,
+#: ``DatabaseLookup`` or ``DatabaseRef`` keeps its settings in a mutable dict, so a config module
+#: can write any of these past the factory.
+HOP_POLICY_FLAGS = ("tls_hop_attested", "cleartext_accepted", "tls_revocation_attested")
+
+
+def refuse_unresolved_hop_flags(settings: Mapping[str, Any], where: str) -> bool:
+    """Refuse a hop-policy flag in a settings carrier that is not ``None`` or a real ``bool``, and an
+    attestation pair the factory would refuse. Returns whether the carrier attests its hop; resolving
+    ``env()`` cannot change that, since the flag it read is already a literal.
+
+    Runs on the RAW settings, before ``env()`` resolves (vault BACKLOG #2232). The factories already
+    refuse an ``env()`` flag. A reference written into the dict after them would resolve through its
+    own cast, and ``env(..., cast=bool)`` turns the string ``"false"`` into ``True``. So the flag is
+    refused while it is still an :class:`EnvRef`. The attestation pair then goes through
+    :func:`settings_hop_attestation`, so a ``DatabaseLookup`` or ``DatabaseRef`` reason is held to
+    the same type and control-character rules as a ``FhirLookup`` one.
+
+    It runs at least where check, start, reload and each reference sync read a carrier: the
+    ``FhirLookup`` settings builder, the ``db_lookup`` executor build, ``build_check_registry`` and
+    the reference sync. ``load_config`` alone does not run it."""
+    for key in HOP_POLICY_FLAGS:
+        try:
+            flag_from_settings(settings, key)
+        except ValueError as exc:
+            raise WiringError(
+                f"{where}: {exc} (write a literal True or False; an env() reference is not "
+                "accepted on a hop-policy flag)"
+            ) from exc
+    return settings_hop_attestation(settings, where)
+
+
 def _refuse_attested_and_accepted(where: str, attested: bool, accepted: bool) -> None:
     """Refuse a declaration that claims its hop is both secure and not secure.
 
@@ -916,15 +961,15 @@ class FhirLookupSpec:
             _check_revocation_attestation(
                 self.tls_revocation_attested, self.tls_revocation_attested_reason
             )
-            _check_cleartext_acceptance(self.cleartext_accepted, self.cleartext_reason)
         except ValueError as exc:
             raise WiringError(f"fhir lookup {self.name!r}: {exc}") from exc
+        # The pair, by the factory's own rule, so a spec built directly cannot attest without a
+        # reason or with one that would forge a WARNING line.
+        attested = settings_hop_attestation(self.settings, f"fhir lookup {self.name!r}")
         # The factory refuses both claims at once, and a spec built directly must not hold them either.
         # `wiring_runner._fhir_lookup_settings` checks again, since `settings` is mutable (ADR 0092).
         _refuse_attested_and_accepted(
-            f"fhir lookup {self.name!r}",
-            bool(self.settings.get("tls_hop_attested")),
-            self.cleartext_accepted,
+            f"fhir lookup {self.name!r}", attested, self.cleartext_accepted
         )
 
 
@@ -4730,6 +4775,15 @@ class Registry:
     # only, for the same reason as `all_loopback_inbound`: every other reader of `inbound` must keep
     # seeing only this shard's, so a map here would re-leak foreign inbounds into filtered-only paths.
     all_inbound: frozenset[str] | None = None
+    # EVERY pass-through (PT) inbound in the deployment, NAME -> its declared `deployed` flag, pinned
+    # beside the shard identity by the same filter (None on an unfiltered graph / single-shard config).
+    # A Handler's `Send` into a PT is a fact about the CONFIG, not about which shard owns the PT: the
+    # transform writes the child INGRESS row to the UNIFIED store and the owning shard's router worker
+    # drains it. Keyed off `inbound` alone, every Send into a sibling shard's PT failed at transform
+    # (vault BACKLOG #2755). The flag rides along because `transform_one` declines a Send to a
+    # not-deployed target (ADR 0111) and must decide that identically on every shard. Names and a
+    # flag only, not the connections, for the same reason as `all_loopback_inbound`.
+    all_pt_inbound: Mapping[str, bool] | None = None
 
     def inbound_names(self) -> frozenset[str]:
         """Every inbound connection NAME in the deployment — the pinned unfiltered set when this is one
@@ -4750,6 +4804,19 @@ class Registry:
         return frozenset(
             name for name, ic in self.inbound.items() if ic.spec.type is ConnectorType.LOOPBACK
         )
+
+    def passthrough_inbounds(self) -> Mapping[str, bool]:
+        """Every pass-through (PT) inbound in the deployment, NAME -> its ``deployed`` flag — the
+        pinned unfiltered map when this is one engine shard's filtered view, else derived from this
+        graph's own inbounds. The source the shard filter pins from, and the key for the PT backend
+        gate: a shard that owns no PT but Sends into a sibling's still writes PT children."""
+        if self.all_pt_inbound is not None:
+            return self.all_pt_inbound
+        return {
+            name: ic.deployed
+            for name, ic in self.inbound.items()
+            if ic.spec.type is ConnectorType.PT
+        }
 
     def add_inbound(self, conn: InboundConnection) -> None:
         _require_connection_name(conn, "inbound connection")
@@ -5044,20 +5111,28 @@ def attested_secure_hops(registry: Registry) -> list[tuple[str, str]]:
     ``DatabaseLookup`` and a ``DatabaseRef`` reference source, whose executors read those settings. Names
     other than an outbound's are prefixed with their table, because each table is its own namespace.
 
+    It fails toward listing (vault BACKLOG #2232). Every carrier is listed unless its flag is ``None``
+    or ``False``, so a value the report cannot read, such as an ``env()`` reference written into a
+    lookup's settings after its factory ran, is listed rather than missed. The load-time check
+    (:func:`refuse_unresolved_hop_flags`) refuses that value, but this report can run without it.
+
     Pure: it reads the loaded graph and touches nothing else."""
 
     def _reason(value: object) -> str:
         return str(value) if value else "(none recorded)"
 
+    def _listed(flag: object) -> bool:
+        return flag is not None and flag is not False
+
     out = [
         (inbound_record_name(ic.name), _reason(ic.tls_hop_attested_reason))
         for ic in registry.inbound.values()
-        if ic.tls_hop_attested
+        if _listed(ic.tls_hop_attested)
     ]
     out += [
         (oc.name, _reason(oc.tls_hop_attested_reason))
         for oc in registry.outbound.values()
-        if oc.tls_hop_attested
+        if _listed(oc.tls_hop_attested)
     ]
     settings_carriers: list[tuple[str, Mapping[str, Any]]] = [
         *((fhir_lookup_record_name(s.name), s.settings) for s in registry.fhir_lookups.values()),
@@ -5067,7 +5142,7 @@ def attested_secure_hops(registry: Registry) -> list[tuple[str, str]]:
     out += [
         (name, _reason(settings.get("tls_hop_attested_reason")))
         for name, settings in settings_carriers
-        if settings.get("tls_hop_attested")
+        if _listed(settings.get("tls_hop_attested"))
     ]
     return sorted(out)
 

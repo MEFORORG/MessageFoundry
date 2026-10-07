@@ -42,6 +42,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.config.models import ConnectorType, Destination, SignatureAlgorithm
 from messagefoundry.config.settings import (
     AiSettings,
+    AlertsSettings,
     AuthSettings,
     EgressSettings,
     StoreBackend,
@@ -1557,12 +1558,15 @@ async def test_an_oidc_leg_with_no_host_is_refused_not_treated_as_loopback() -> 
 def _oidc_managed_app(tmp_path: Path, *, host: str) -> FastAPI:
     """A serve-shaped managed app with OIDC on and both legs on ``host``. ``ai_settings`` is what
     makes the lifespan derive a posture at all, and the default enforcement is enforce. The AD
-    server is on loopback so the directory's own hop cannot be the thing that refuses."""
+    server is on loopback so the directory's own hop cannot be the thing that refuses. The notice
+    gate's written waiver is set because that gate now runs before the start too (BACKLOG #2131),
+    and on this empty store it would otherwise refuse first and starve the control arm."""
     settings = _oidc_leg_settings(token_host=host, jwks_host=host, ad_server=f"ldaps://{LOOPBACK}")
     return create_managed_app(
         db_path=tmp_path / "oidc1923.db",
         poll_interval=0.05,
         auth_settings=settings,
+        alerts_settings=AlertsSettings(security_notifications_required=False),
         ai_settings=AiSettings(),
         public_origin="https://ops.example",
         egress_settings=EgressSettings(deny_by_default=False),

@@ -4898,9 +4898,12 @@ class SqlServerStore:
         metadata: str | None = None,
         now: float | None = None,
     ) -> str:
+        """Atomically persist an inbound message and its per-destination outbound rows directly -- the
+        pre-staged-pipeline single-step write, kept for tests. With ``deliveries`` the message is
+        ``ROUTED``, as on SQLite and Postgres (vault BACKLOG #2723); with none it is ``UNROUTED``."""
         now = time.time() if now is None else now
         mid = uuid4().hex
-        status = MessageStatus.RECEIVED.value if deliveries else MessageStatus.UNROUTED.value
+        status = MessageStatus.ROUTED.value if deliveries else MessageStatus.UNROUTED.value
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
@@ -9409,23 +9412,31 @@ class SqlServerStore:
         sha256 of the VERBATIM concatenated plaintext). Each chunk is AES-GCM-sealed independently (a
         bounded plaintext window per seal). Identical content **dedups** to one copy (a re-put returns the
         same ref and writes nothing). The fresh attachment sits at ``refcount=0`` until increffed."""
-        hasher = hashlib.sha256()
-        total = 0
-        # Cell-bound AAD (ASVS 11.3.3) binds each chunk to (attachment_id, seq), and the attachment_id is
-        # the content hash — known only after the full plaintext is hashed. Buffer the verbatim slices,
-        # hash, then seal each under (ref, seq); the source is an already-materialized OBX-5.5 value, so
-        # this adds no order-of-magnitude memory and each seal still consumes one chunk. Mirrors SQLite.
-        plaintext_chunks: list[str] = []
-        for chunk in chunks:
-            data = chunk.encode("utf-8")
-            hasher.update(data)
-            total += len(data)
-            plaintext_chunks.append(chunk)
-        ref = hasher.hexdigest()
-        sealed: list[str] = [
-            self._cipher.encrypt(c, aad=cell_aad("attachment_chunk", "ciphertext", ref, seq))
-            for seq, c in enumerate(plaintext_chunks)
-        ]
+
+        def _seal() -> tuple[str, int, list[str]]:
+            # Off the event loop (vault BACKLOG #2757): hashing and sealing a large document is CPU
+            # work in proportion to its size, and nothing else would run meanwhile.
+            hasher = hashlib.sha256()
+            total = 0
+            # Cell-bound AAD (ASVS 11.3.3) binds each chunk to (attachment_id, seq), and the
+            # attachment_id is the content hash — known only after the full plaintext is hashed.
+            # Buffer the verbatim slices, hash, then seal each under (ref, seq); the source is an
+            # already-materialized OBX-5.5 value, so this adds no order-of-magnitude memory and each
+            # seal still consumes one chunk. Mirrors SQLite.
+            plaintext_chunks: list[str] = []
+            for chunk in chunks:
+                data = chunk.encode("utf-8")
+                hasher.update(data)
+                total += len(data)
+                plaintext_chunks.append(chunk)
+            ref = hasher.hexdigest()
+            sealed: list[str] = [
+                self._cipher.encrypt(c, aad=cell_aad("attachment_chunk", "ciphertext", ref, seq))
+                for seq, c in enumerate(plaintext_chunks)
+            ]
+            return ref, total, sealed
+
+        ref, total, sealed = await asyncio.to_thread(_seal)
         now = time.time()
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
@@ -9789,8 +9800,8 @@ class SqlServerStore:
     async def replay(self, message_id: str, now: float | None = None) -> int:
         """Re-queue a message's stuck/dead deliveries — or, if none are stuck, re-send the delivered
         ones. Two-mode (M-2): if any row is dead/pending, replay ONLY those (never re-fire a DONE
-        sibling); else replay the done rows. messages.status -> RECEIVED if a pending ingress/routed
-        row remains (needs re-routing), else ROUTED.
+        sibling); else replay the done rows. messages.status -> RECEIVED if a pending ingress row
+        remains (needs routing), else ROUTED -- a re-pended routed row included (vault BACKLOG #2723).
 
         A row whose body retention has ERASED is never re-queued (:data:`_REPLAYABLE_BODY`, BACKLOG
         #1560), and the ``delivered_keys`` DELETE carries the same predicate so it never drops the
@@ -9832,14 +9843,11 @@ class SqlServerStore:
                 if (
                     count
                 ):  # no rows => errored/filtered/unrouted: don't falsify it or strand it (M-2)
+                    # RECEIVED only for a pending INGRESS row; a re-pended routed row is ROUTED, or the
+                    # finalizer could never settle it (vault BACKLOG #2723; MessageStore.replay says why).
                     await cur.execute(
-                        "SELECT 1 FROM queue WHERE message_id=? AND stage IN (?, ?) AND status=?",
-                        (
-                            message_id,
-                            Stage.INGRESS.value,
-                            Stage.ROUTED.value,
-                            OutboxStatus.PENDING.value,
-                        ),
+                        "SELECT 1 FROM queue WHERE message_id=? AND stage=? AND status=?",
+                        (message_id, Stage.INGRESS.value, OutboxStatus.PENDING.value),
                     )
                     new_status = (
                         MessageStatus.RECEIVED.value
@@ -10306,11 +10314,14 @@ class SqlServerStore:
         top = "TOP (1) " if top_only else ""
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
-                # `top_only` cancels the true FIFO head, so the tiebreak after next_attempt_at must match
-                # the claim's seq-only order, NOT created_at (no longer the ordering key; ADR 0059).
+                # `top_only` cancels the true FIFO head, so it orders by the claim's seq-only key alone
+                # (ADR 0059), even while that head is backing off. Not next_attempt_at first: mark_failed
+                # pushes a failed head's next_attempt_at past the younger rows behind it, so that key
+                # would pick a healthy younger row and leave the head blocking the lane (vault BACKLOG
+                # #2754).
                 await cur.execute(
                     f"SELECT {top}id, message_id FROM queue WHERE {' AND '.join(where)}"
-                    " ORDER BY next_attempt_at, seq",
+                    " ORDER BY seq",
                     tuple(params),
                 )
                 rows = [(r[0], r[1]) for r in await cur.fetchall()]
@@ -11013,23 +11024,23 @@ class SqlServerStore:
 
     # --- auth: users / roles / sessions --------------------------------------
 
-    async def list_audit(
-        self,
+    @staticmethod
+    def _audit_where(
         *,
-        limit: int = 50,
-        actor: str | None = None,
-        action: str | None = None,
-        since: float | None = None,
-        until: float | None = None,
-        exclude: AuditExclusion | None = None,
-    ) -> list[dict[str, Any]]:
-        """Most-recent-first audit entries, optionally filtered (BACKLOG #170).
+        actor: str | None,
+        action: str | None,
+        since: float | None,
+        until: float | None,
+        exclude: AuditExclusion | None,
+        before_id: int | None,
+    ) -> tuple[str, list[Any]]:
+        """The ``WHERE`` text and its bound values for :meth:`list_audit` and :meth:`count_audit`.
 
-        Filters are ANDed as bound ``?`` parameters (the ``TOP (?)`` limit is the first ``?``, so its
-        value leads the tuple) — only the fixed column/operator template is formatted into the SQL,
-        never a value — so a filter value cannot inject."""
+        Filters are ANDed as bound ``?`` parameters — only the fixed column/operator template is
+        formatted into the SQL, never a value — so a filter value cannot inject. Each caller's
+        ``TOP (?)`` placeholder comes BEFORE this text, so it binds that value ahead of these."""
         clauses: list[str] = []
-        params: list[Any] = [limit]
+        params: list[Any] = []
         if actor is not None:
             clauses.append("actor = ?")
             params.append(actor)
@@ -11043,16 +11054,69 @@ class SqlServerStore:
             clauses.append("ts <= ?")
             params.append(until)
         if exclude is not None:
-            # After TOP (?)'s value in ``params``, which is the order the placeholders appear in.
 
             def bind(value: str) -> str:
                 params.append(value)
                 return "?"
 
             clauses.extend(exclude.clauses(bind))
-        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        if before_id is not None:
+            clauses.append("id < ?")
+            params.append(before_id)
+        return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
+
+    async def list_audit(
+        self,
+        *,
+        limit: int = 50,
+        actor: str | None = None,
+        action: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+        exclude: AuditExclusion | None = None,
+        before_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Most-recent-first audit entries, optionally filtered (BACKLOG #170), and optionally only
+        those older than ``before_id``, the keyset cursor a paged reader passes (vault BACKLOG #2776).
+        Every value is a bound parameter; see :meth:`_audit_where`."""
+        where, params = self._audit_where(
+            actor=actor,
+            action=action,
+            since=since,
+            until=until,
+            exclude=exclude,
+            before_id=before_id,
+        )
         sql = f"SELECT TOP (?) * FROM audit_log{where} ORDER BY id DESC"
-        return await self._fetchall(sql, tuple(params))
+        return await self._fetchall(sql, (limit, *params))
+
+    async def count_audit(
+        self,
+        *,
+        limit: int,
+        actor: str | None = None,
+        action: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+        exclude: AuditExclusion | None = None,
+        before_id: int | None = None,
+    ) -> int:
+        """How many rows :meth:`list_audit` would return for the same arguments, without reading
+        them (vault BACKLOG #2776). Every value is a bound parameter; see :meth:`_audit_where`."""
+        where, params = self._audit_where(
+            actor=actor,
+            action=action,
+            since=since,
+            until=until,
+            exclude=exclude,
+            before_id=before_id,
+        )
+        sql = (
+            f"SELECT COUNT(*) AS n FROM (SELECT TOP (?) id FROM audit_log{where}"
+            " ORDER BY id DESC) t"
+        )
+        row = await self._fetchone(sql, (limit, *params))
+        return int(row["n"]) if row is not None else 0
 
     async def recent_audit_of(self, actions: Sequence[str], *, limit: int) -> list[dict[str, Any]]:
         """Up to ``limit`` newest audit rows whose action is one of ``actions``, newest first (vault

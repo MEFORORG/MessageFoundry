@@ -640,9 +640,32 @@ async def test_cancel_queued_top_only_cancels_the_head(store: MessageStore) -> N
     m2 = await store.enqueue_message(channel_id="c1", raw="y", deliveries=[("d1", "p2")], now=101.0)
     n = await store.cancel_queued("c1", "d1", top_only=True, now=102.0)
     assert n == 1
-    # The head (earliest next_attempt_at) is cancelled; the other stays queued.
+    # The FIFO head (lowest rowid) is cancelled; the other stays queued.
     assert (await store.outbox_for(m1))[0]["status"] == OutboxStatus.CANCELLED.value
     assert (await store.outbox_for(m2))[0]["status"] == OutboxStatus.PENDING.value
+
+
+async def test_cancel_queued_top_only_cancels_a_backing_off_head(store: MessageStore) -> None:
+    # vault BACKLOG #2754: the head failed, so mark_failed pushed its next_attempt_at past the younger
+    # row behind it. "Purge top" must still cancel the FIFO head (the claim's rowid key), not the
+    # earliest-due row -- else it cancels a healthy row and the head keeps blocking the lane.
+    m1 = await store.enqueue_message(channel_id="c1", raw="x", deliveries=[("d1", "p1")], now=100.0)
+    m2 = await store.enqueue_message(channel_id="c1", raw="y", deliveries=[("d1", "p2")], now=101.0)
+    head = await store.claim_next_fifo("d1", now=102.0)
+    assert head is not None and head.message_id == m1
+    retry = RetryPolicy(max_attempts=None, backoff_seconds=60, backoff_multiplier=1)
+    await store.mark_failed(head.id, "boom", retry, now=102.0)
+    head_row = (await store.outbox_for(m1))[0]
+    behind_row = (await store.outbox_for(m2))[0]
+    # The discriminating shape: the head is later-due than the row behind it, and blocks the lane.
+    assert head_row["next_attempt_at"] > behind_row["next_attempt_at"]
+    assert await store.claim_next_fifo("d1", now=103.0) is None
+    assert await store.cancel_queued(None, "d1", top_only=True, now=103.0) == 1
+    assert (await store.outbox_for(m1))[0]["status"] == OutboxStatus.CANCELLED.value
+    assert (await store.outbox_for(m2))[0]["status"] == OutboxStatus.PENDING.value
+    # The lane is unblocked: the row behind the purged head is now the claimable head.
+    nxt = await store.claim_next_fifo("d1", now=103.0)
+    assert nxt is not None and nxt.message_id == m2
 
 
 async def test_cancel_queued_leaves_inflight_untouched(store: MessageStore) -> None:
@@ -808,6 +831,30 @@ async def test_list_audit_filter_is_parameterized_against_injection(store: Messa
     # A DROP-TABLE attempt in the action filter is likewise inert.
     assert await store.list_audit(action="x'; DROP TABLE audit_log; --") == []
     assert len(await store.list_audit()) == 3
+
+
+async def test_list_audit_keyset_pages_and_count_audit(store: MessageStore) -> None:
+    """Vault BACKLOG #2776: ``before_id`` pages the trail newest first with no row lost or repeated,
+    under the filters, and ``count_audit`` counts what ``list_audit`` would return, capped at
+    ``limit``. A ``bob`` row between the ``alice`` rows proves the cursor runs under the filter."""
+    for i in range(7):
+        await store.record_audit("message_view", actor="alice", detail="{}", now=100.0 + i)
+        await store.record_audit("message_view", actor="bob", detail="{}", now=100.5 + i)
+    whole = [r["id"] for r in await store.list_audit(actor="alice", limit=100)]
+    assert len(whole) == 7 and whole == sorted(whole, reverse=True)
+    paged: list[int] = []
+    before: int | None = None
+    while page := await store.list_audit(actor="alice", limit=3, before_id=before):
+        assert len(page) <= 3
+        paged += [r["id"] for r in page]
+        before = page[-1]["id"]
+    assert paged == whole
+    assert [r["id"] for r in await store.list_audit(actor="alice", before_id=whole[2])] == whole[3:]
+    assert await store.count_audit(actor="alice", limit=100) == 7
+    assert await store.count_audit(actor="alice", limit=5) == 5
+    assert await store.count_audit(actor="alice", limit=100, before_id=whole[2]) == 4
+    assert await store.count_audit(actor="alice'; DROP TABLE audit_log; --", limit=100) == 0
+    assert await store.count_audit(limit=100) == 14
 
 
 async def test_connection_metrics_respects_since_window(store: MessageStore) -> None:

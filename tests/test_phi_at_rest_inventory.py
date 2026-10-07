@@ -443,25 +443,39 @@ def test_retired_false_claims_do_not_reappear() -> None:
     )
 
 
-def test_retired_claim_scanner_detects_a_planted_regression() -> None:
-    """Proves the corpus scanner can fail — the property the single-file version did not have."""
+def test_retired_claim_scanner_detects_a_planted_regression(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Proves the corpus scanner can fail — the property the single-file version did not have.
+
+    The plant is added to the victim's disk read in THIS process, and the real file is never
+    written. This test used to write the plant into ``docs/CONFIGURATION.md`` and restore the file
+    in ``finally``. Under ``pytest -n`` another worker reading that file in the window saw the plant,
+    or an empty file between the restore's truncate and its write. That is how
+    ``test_security_doc_rate_limits`` went red on PR 2078 with a heading that was never removed.
+    """
     victim = _ROOT / "docs" / "CONFIGURATION.md"
-    original = victim.read_text(encoding="utf-8")
-    assert not any("CONFIGURATION.md" in hit for hit in _retired_claim_hits()), (
-        "fixture drifted: CONFIGURATION.md already carries a retired claim"
+    real_read_text = Path.read_text
+    planted_line: list[int] = []
+
+    def read_text_with_plant(self: Path, *args: typing.Any, **kwargs: typing.Any) -> str:
+        text = real_read_text(self, *args, **kwargs)
+        if self != victim:
+            return text
+        text += "\n> **SQLite-only.** Retention planted regression, held in memory.\n"
+        planted_line.append(len(text.splitlines()))
+        return text
+
+    monkeypatch.setattr(Path, "read_text", read_text_with_plant)
+    hits = _retired_claim_hits()
+    assert planted_line, "the scan never read docs/CONFIGURATION.md from disk; re-point the plant"
+    victim_hits = [hit for hit in hits if hit.startswith("docs/CONFIGURATION.md:")]
+    assert victim_hits == [
+        f"docs/CONFIGURATION.md:{planted_line[0]}: 'SQLite-only.** Retention'"
+    ], (
+        "the scanner did not report exactly the claim planted in docs/CONFIGURATION.md, at its line "
+        f"— either it is still effectively single-file or the doc already carries one. Hits: {hits}"
     )
-    try:
-        victim.write_text(
-            original + "\n> **SQLite-only.** Retention planted regression, removed by the test.\n",
-            encoding="utf-8",
-        )
-        hits = _retired_claim_hits()
-        assert any("CONFIGURATION.md" in hit for hit in hits), (
-            "the scanner did not see a retired claim planted in docs/CONFIGURATION.md — it is still "
-            f"effectively single-file. Hits: {hits}"
-        )
-    finally:
-        victim.write_text(original, encoding="utf-8")
 
 
 def test_cited_settings_names_resolve() -> None:
