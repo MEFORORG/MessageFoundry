@@ -199,6 +199,20 @@ _AUTH_CASES: dict[str, tuple[dict[str, Any], dict[str, Any], str]] = {
         {},
         "nothing checks the acr",
     ),
+    "acr_requested_gate_off": (
+        _auth(
+            oidc_acr_values="urn:mfa",
+            oidc_required_acr_values=["urn:mfa"],
+            oidc_require_mfa_claim=False,
+        ),
+        {},
+        "the claim gate reads no acr while it is off",
+    ),
+    "floor_exempt_amr_is_an_mfa_amr": (
+        _auth(oidc_callback_floor_exempt_amr=["mfa"]),
+        {},
+        "oidc_mfa_amr_values accepts as MFA",
+    ),
     "redirect_path": (_auth(oidc_redirect_path="/elsewhere"), {}, "oidc_redirect_path is fixed"),
     "strip_domain_unchecked": (
         _auth(oidc_username_strip_domain=True, ad_domain=_DROP),

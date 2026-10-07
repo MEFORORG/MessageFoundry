@@ -437,6 +437,8 @@ _CONTEXTUAL_TOKENS = frozenset(
         "admin_write_min_interval_seconds",
         "mfa_verify_min_elapsed_seconds",
         "oidc_callback_min_elapsed_seconds",
+        # BACKLOG #2388: the verified amr values that skip that federated floor.
+        "oidc_callback_floor_exempt_amr",
         "ad_session_recheck_seconds",
         "ad_session_recheck_strikes",
         "ad_session_recheck_max_users",

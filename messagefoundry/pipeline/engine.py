@@ -99,6 +99,7 @@ from messagefoundry.store.store import (
     ConnectionMetrics,
     DestinationMetrics,
     InboundMetrics,
+    OperatorAudit,
     OwnedLanes,
     ReingressOutcome,
     ResendOutcome,
@@ -2580,22 +2581,32 @@ class Engine:
             raise ConfigReloadDenied("config directory is not an allowed reload root")
         return path
 
-    async def replay(self, message_id: str) -> int:
+    # The operator mutations below take a REQUIRED ``audit``: the operator's audit row commits in the
+    # mutation's own transaction, so a crash cannot keep the change and lose who made it (BACKLOG
+    # #2624). Required, so a caller of these wrappers must say what it records. Purge has no wrapper:
+    # the API calls ``store.cancel_queued`` directly, where ``audit`` is optional.
+    async def replay(self, message_id: str, *, audit: OperatorAudit[int]) -> int:
         """Re-queue every delivery for a message and wake the delivery workers."""
-        requeued = await self.store.replay(message_id)
+        requeued = await self.store.replay(message_id, audit=audit)
         if self._registry_runner is not None and self._registry_runner.running:
             self._registry_runner.notify_work()
         return requeued
 
     async def resend(
-        self, message_id: str, *, to: str, idempotency_key: str, source: str | None = None
+        self,
+        message_id: str,
+        *,
+        to: str,
+        idempotency_key: str,
+        source: str | None = None,
+        audit: OperatorAudit[ResendOutcome],
     ) -> ResendOutcome:
         """Resend a message's stored transformed body to an ALTERNATE outbound ``to`` (ADR 0090), then
         wake the alternate lane's delivery worker. The store performs the FIFO-safe, idempotent insert
         (:meth:`QueueStore.resend_to`); this only adds the ``notify_work`` wake so the new tail row is
         picked up promptly. Target validation (registered/owned/running) + RBAC are the API's job."""
         outcome = await self.store.resend_to(
-            message_id=message_id, to=to, idempotency_key=idempotency_key, from_=source
+            message_id=message_id, to=to, idempotency_key=idempotency_key, from_=source, audit=audit
         )
         if (
             outcome.status == "resent"
@@ -2606,7 +2617,12 @@ class Engine:
         return outcome
 
     async def edit_resend_reroute(
-        self, message_id: str, *, raw: str, idempotency_key: str
+        self,
+        message_id: str,
+        *,
+        raw: str,
+        idempotency_key: str,
+        audit: OperatorAudit[ReingressOutcome],
     ) -> ReingressOutcome:
         """Edit-and-resubmit RE-ROUTE (ADR 0090 §9, BACKLOG #153): re-ingress an EDITED body as a fresh
         correlated ``RECEIVED`` message on the ORIGIN's channel, then wake the workers so the router
@@ -2614,7 +2630,7 @@ class Engine:
         original-immutable, correlated insert; RBAC + step-up are the API's job, and so are the origin
         inbound's ingress guards (BACKLOG #1911). The original message row is never written."""
         outcome = await self.store.reingress(
-            origin_message_id=message_id, raw=raw, idempotency_key=idempotency_key
+            origin_message_id=message_id, raw=raw, idempotency_key=idempotency_key, audit=audit
         )
         if (
             outcome.status == "resubmitted"
@@ -2631,6 +2647,7 @@ class Engine:
         raw: str,
         source_type: str = "upload",
         metadata: str | None = None,
+        audit: OperatorAudit[str],
     ) -> str:
         """Inject a fresh ``RECEIVED`` message onto ``channel_id``'s **ingress** stage — the DISTINCT
         inject path for the offline uploaded-logs resend (BACKLOG #125, ADR 0134). It reuses the exact
@@ -2640,17 +2657,24 @@ class Engine:
         This is deliberately **not** :meth:`edit_resend_reroute`/``reingress``: that presupposes an
         origin ``messages`` row (for its channel + correlation), which an uploaded, never-ingested file
         has none of. ``enqueue_ingress`` takes the target inbound channel **directly**. Target
-        validation (registered/running) + RBAC + audit are the API's job, and so are the target inbound's
-        ingress guards (BACKLOG #1911). Returns the new message id."""
+        validation (registered/running), RBAC and the target inbound's ingress guards (BACKLOG
+        #1911) are the API's job. The API also builds the ``audit`` row that commits with the message
+        (BACKLOG #2624). Returns the new message id."""
         mid = await self.store.enqueue_ingress(
-            channel_id=channel_id, raw=raw, source_type=source_type, metadata=metadata
+            channel_id=channel_id, raw=raw, source_type=source_type, metadata=metadata, audit=audit
         )
         if self._registry_runner is not None and self._registry_runner.running:
             self._registry_runner.notify_work()
         return mid
 
     async def edit_resend_direct(
-        self, message_id: str, *, to: str, raw: str, idempotency_key: str
+        self,
+        message_id: str,
+        *,
+        to: str,
+        raw: str,
+        idempotency_key: str,
+        audit: OperatorAudit[ResendOutcome],
     ) -> ResendOutcome:
         """Edit-and-resubmit DIRECT power-path (ADR 0090 §9, BACKLOG #153): deliver an EDITED body
         straight to a chosen alternate outbound ``to`` (reusing #123's :meth:`QueueStore.resend_to` with
@@ -2658,7 +2682,11 @@ class Engine:
         and so are the engine-wide ingress guards (BACKLOG #1911); the origin row is only read, never
         written."""
         outcome = await self.store.resend_to(
-            message_id=message_id, to=to, idempotency_key=idempotency_key, body_override=raw
+            message_id=message_id,
+            to=to,
+            idempotency_key=idempotency_key,
+            body_override=raw,
+            audit=audit,
         )
         if (
             outcome.status == "resent"
@@ -2669,11 +2697,15 @@ class Engine:
         return outcome
 
     async def replay_dead(
-        self, *, channel_id: str | None = None, destination_name: str | None = None
+        self,
+        *,
+        channel_id: str | None = None,
+        destination_name: str | None = None,
+        audit: OperatorAudit[int],
     ) -> int:
         """Re-queue dead-lettered deliveries (optionally scoped) and wake the delivery workers."""
         requeued = await self.store.replay_dead(
-            channel_id=channel_id, destination_name=destination_name
+            channel_id=channel_id, destination_name=destination_name, audit=audit
         )
         if requeued and self._registry_runner is not None and self._registry_runner.running:
             self._registry_runner.notify_work()

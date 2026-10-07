@@ -377,11 +377,12 @@ def test_a_repeated_chunked_coding_is_named_as_such() -> None:
 # --- the engine's own OIDC relying party reads the same way ---------------------------------------
 #
 # Not an outbound connection, but the same stdlib reader on a reply the engine asked for. The token
-# leg raises FlowError (a ValueError) and the JWKS leg an http.client.HTTPException. Both reach the
-# (OSError, ValueError, HTTPException) arm in auth/service.py's _authenticate_oidc, which records an
-# unavailable IdP. The JWKS leg must NOT raise JwksError: claims.py retypes that as
-# ClaimsError("unknown_kid"), a token-verification reject. These tests pin the types, not the
-# service mapping.
+# leg raises TokenRefusedError, a FlowError: a misframed reply is the endpoint answering, so it
+# does not mark the IdP unavailable (BACKLOG #1948, ADR 0142 Amendment E). The JWKS leg raises an
+# http.client.HTTPException, which reaches the (OSError, ValueError, HTTPException) arm in
+# auth/service.py and, read as transport, still marks the IdP; the amendment names that residual.
+# The JWKS leg must NOT raise JwksError: claims.py retypes that as ClaimsError("unknown_kid"), a
+# token-verification reject. These tests pin the types, not the service mapping.
 
 _TOKEN_JSON = b'{"id_token": "x.y.z"}'
 
@@ -408,8 +409,10 @@ def test_oidc_token_exchange_refuses_ambiguous_framing() -> None:
     from messagefoundry.auth import oidc
 
     raw = _json_reply(b"Content-Length: 3\r\nContent-Length: %d\r\n" % len(_TOKEN_JSON))
-    with _serve(raw) as url, pytest.raises(oidc.FlowError, match="ambiguously"):
+    with _serve(raw) as url, pytest.raises(oidc.TokenRefusedError, match="ambiguously") as raised:
         _exchange(url)
+    # The endpoint answered (BACKLOG #1948): a status arrived, so this is not a transport failure.
+    assert raised.value.status == 200
 
 
 def test_oidc_token_exchange_reads_unambiguous_framing() -> None:
@@ -948,7 +951,11 @@ _OIDC_BAD: dict[str, bytes] = {
 def test_oidc_token_exchange_refuses_malformed_framing(shape: str) -> None:
     from messagefoundry.auth import oidc
 
-    with _serve(_OIDC_BAD[shape]) as url, pytest.raises(oidc.FlowError, match="ambiguously"):
+    # A reply arrived, so the endpoint answered and this must not mark the IdP (BACKLOG #1948).
+    with (
+        _serve(_OIDC_BAD[shape]) as url,
+        pytest.raises(oidc.TokenRefusedError, match="ambiguously"),
+    ):
         _exchange(url)
 
 
@@ -988,7 +995,11 @@ def test_oidc_token_exchange_maps_a_cut_chunked_body_to_flow_error() -> None:
     """Before the fix, http.client's IncompleteRead escaped exchange_code unmapped."""
     from messagefoundry.auth import oidc
 
-    with _serve(_TE + b"50\r\n" + _TOKEN_JSON) as url, pytest.raises(oidc.FlowError):
+    # Cut short is a transport failure, the one outcome that may mark the IdP (BACKLOG #1948).
+    with (
+        _serve(_TE + b"50\r\n" + _TOKEN_JSON) as url,
+        pytest.raises(oidc.TokenEndpointUnreachableError),
+    ):
         _exchange(url)
 
 
@@ -998,7 +1009,7 @@ def test_oidc_token_exchange_refuses_a_body_short_of_its_content_length() -> Non
     from messagefoundry.auth import oidc
 
     raw = _json_reply(b"Content-Length: %d\r\n" % (len(_TOKEN_JSON) + 40))
-    with _serve(raw) as url, pytest.raises(oidc.FlowError, match="part-way"):
+    with _serve(raw) as url, pytest.raises(oidc.TokenEndpointUnreachableError, match="part-way"):
         _exchange(url)
 
 
@@ -1235,7 +1246,8 @@ def test_oidc_token_exchange_refuses_a_bare_cr() -> None:
     from messagefoundry.auth.oidc_http import build_idp_opener
 
     raw = _json_reply(b"X-A: a\rContent-Length: %d\r\n" % len(_TOKEN_JSON))
-    with _serve(raw) as url, pytest.raises(oidc.FlowError, match="ambiguously"):
+    # A reply arrived, so it is an answer and must not mark the IdP (BACKLOG #1948).
+    with _serve(raw) as url, pytest.raises(oidc.TokenRefusedError, match="ambiguously"):
         oidc.exchange_code(
             token_endpoint=url,
             client_id="c",
