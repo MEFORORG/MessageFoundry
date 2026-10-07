@@ -190,7 +190,7 @@ def parse(norm: str) -> ParsedMessage:
     strmsg = norm.strip()
     lines = strmsg.split("\r")
     if lines[0][:3] not in ("MSH", "FHS", "BHS"):
-        raise HL7ParseError("message does not start with an MSH, FHS or BHS segment")
+        raise HL7ParseError("message does not start with an MSH segment or an FHS/BHS batch header")
     # A header too short to hold MSH-1 and one encoding character ("MSH", "MSH|") cannot be read at
     # all. That is bad input, not a parser fault, so it is the same contract error (BACKLOG #1601).
     if len(lines[0]) < 5:

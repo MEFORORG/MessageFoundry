@@ -1676,7 +1676,7 @@ class PostgresStore:
         exc = StoreGrantsMissingError(
             f"the postgres store schema in database {self._settings.database!r} is provisioned and "
             f"current, but this role lacks row access to {len(rows)} object(s): {names}{more}. "
-            "Refusing to start rather than fail mid-pipeline. Grant SELECT, INSERT, UPDATE, DELETE on "
+            "Refusing to start rather than fail mid-pipeline. Grant SELECT/INSERT/UPDATE/DELETE on "
             "the tables, SELECT and INSERT only on audit_log, and USAGE on the "
             "sequences to the runtime role (docs/DEPLOY-SERVER-DB.md section 1.2); provision-schema "
             "cannot grant them"
@@ -2051,7 +2051,7 @@ class PostgresStore:
                 "are Postgres's server-level equivalent and are reported as excess, not as role names; "
                 + (
                     f"schema_management=external, so CREATE on schema {schema!r}, ownership of its "
-                    "objects, and UPDATE, DELETE, TRUNCATE or TRIGGER on audit_log are "
+                    "objects, and UPDATE/DELETE/TRUNCATE/TRIGGER on audit_log are "
                     "excess"
                     if external
                     else "schema_management=auto, so schema DDL rights are expected"
@@ -8938,7 +8938,7 @@ class PostgresStore:
         from messagefoundry.store.base import DbaDelegatedError
 
         raise DbaDelegatedError(
-            "the postgres store backup is DBA-delegated (pg_dump / PITR, BACKLOG #52); the engine backs "
+            "the postgres store backup is DBA-delegated (pg_dump / PITR; BACKLOG #52); the engine backs "
             "up the config bundle only on a server-DB store (set [backup].config_only_on_server_db)"
         )
 
