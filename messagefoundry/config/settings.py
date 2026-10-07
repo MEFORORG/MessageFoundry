@@ -1727,8 +1727,12 @@ class TlsSettings(_Section):
 
     def policy(self) -> TrustAnchorPolicy:
         """The resolved :class:`~messagefoundry.config.tls_policy.TrustAnchorPolicy` threaded onto each
-        outbound so a connector's client-verify context resolves the same anchor at build_check and
-        live construction (the internal-outbound context builders call ``resolve_trust_anchor``)."""
+        outbound, and onto each inbound ``Source`` for the FTPS poll (vault BACKLOG #2370), so a
+        connector's client-verify context resolves the same anchor at build_check and live
+        construction (the client-verify context builders call ``resolve_trust_anchor``). It is not
+        limited to connections: at least the FHIR lookup executor, the alerts SMTP sink and its test
+        send, and the security notifier also resolve it. ``TrustAnchorPolicy``'s own docstring
+        names the module of each."""
         return TrustAnchorPolicy(
             internal_ca_file=self.internal_ca_file,
             mode=self.trust_anchor_mode,
