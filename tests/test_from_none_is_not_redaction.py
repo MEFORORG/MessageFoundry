@@ -205,10 +205,6 @@ _ALLOWED: tuple[_Allowed, ...] = (
         _SAFE + "queue.Empty carries nothing",
     ),
     _Allowed(
-        "messagefoundry/pipeline/sandbox.py::SandboxSession.dispatch::Empty::_cpu_cap_error",
-        _SAFE + "queue.Empty carries nothing; the CPU-cap arm of the same wall-cap handler",
-    ),
-    _Allowed(
         "messagefoundry/store/store.py::parse_audit_anchor::ValueError::AuditAnchorError",
         _SAFE + "int() quotes the anchor's count text, and the new error carries the whole anchor",
     ),

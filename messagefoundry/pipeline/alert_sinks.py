@@ -107,7 +107,9 @@ class _AlertStateStore(Protocol):
         self, *, event_type: str, connection: str, now: float | None = ...
     ) -> int: ...
 
-    async def list_active_alert_instances(self, *, limit: int = ...) -> Sequence[Any]: ...
+    async def list_active_alert_instances(
+        self, *, limit: int = ..., allowed_channels: Sequence[str] | None
+    ) -> Sequence[Any]: ...
 
 
 #: Auto-resolution map (ADR 0044 D2): an inverse lifecycle event type resolves the matching open
@@ -1059,7 +1061,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
 
     def audit_write_failed(self, name: str, *, action: str) -> None:
         # vault BACKLOG #2255: an audit row was lost. `approval:<id>` stands in for "connection", as
-        # for approval_too_early, so each request is its own instance. The action name lands in the
+        # for approval_too_early, so each request is its own instance; an inline config reload uses
+        # `config_reload:inline` (vault BACKLOG #2254). The action name lands in the
         # reason column; the lost row's detail stays in the ERROR log line beside it. No PHI.
         self._emit(
             {
@@ -1312,7 +1315,7 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         if store is None:
             return
         try:
-            rows = await store.list_active_alert_instances(limit=1000)
+            rows = await store.list_active_alert_instances(limit=1000, allowed_channels=None)
         except Exception:
             log.warning("alert suspend-cache prime failed", exc_info=True)
             return

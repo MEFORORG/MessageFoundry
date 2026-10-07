@@ -597,7 +597,9 @@ async def test_reingressed_handler_loses_response_view_after_retention_purge(tmp
             assert calls[0].body == reply
 
             # The child is the loopback message — the one carrying the correlation_id.
-            children = await store.list_messages(channel_id="IB_LOOP", limit=10)
+            children = await store.list_messages(
+                channel_id="IB_LOOP", limit=10, allowed_channels=None
+            )
             assert len(children) == 1
             child_id = str(children[0]["id"])
             assert await store.message_metadata_json(child_id) is not None  # control

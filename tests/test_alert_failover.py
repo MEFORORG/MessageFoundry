@@ -169,7 +169,9 @@ class _RecordingStore:
         self.resolves.append({"event_type": event_type, "connection": connection})
         return 1
 
-    async def list_active_alert_instances(self, *, limit: int = 1000) -> list[Any]:
+    async def list_active_alert_instances(
+        self, *, limit: int = 1000, allowed_channels: object
+    ) -> list[Any]:
         return []
 
 

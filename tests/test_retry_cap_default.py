@@ -164,7 +164,9 @@ async def test_a_dead_lettered_row_stays_replayable(store: MessageStore) -> None
     fetched = await store.get_message(mid)
     assert fetched is not None
     assert fetched["status"] == MessageStatus.ERROR.value
-    assert len(await store.list_dead(channel_id="c1")) == 1  # visible to the operator
+    assert (
+        len(await store.list_dead(channel_id="c1", allowed_channels=None)) == 1
+    )  # visible to the operator
 
     assert await store.replay_dead(channel_id="c1", now=t) == 1
 

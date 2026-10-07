@@ -838,10 +838,12 @@ def test_sweep_reports_truncated_when_a_page_returns_fewer_rows_than_counted() -
     empty-read guard exists for, one page further in."""
 
     class _ShortStore:
-        async def count_messages(self) -> int:
+        async def count_messages(self, *, allowed_channels: object) -> int:
             return 5
 
-        async def list_messages(self, *, limit: int, offset: int) -> list[dict[str, object]]:
+        async def list_messages(
+            self, *, limit: int, offset: int, allowed_channels: object
+        ) -> list[dict[str, object]]:
             return [{"control_id": "A"}] if offset == 0 else []
 
     snap = asyncio.run(sweep_store(_ShortStore(), row_cap=100))

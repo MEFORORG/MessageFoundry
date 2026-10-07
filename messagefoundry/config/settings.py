@@ -2061,8 +2061,7 @@ class SandboxSettings(_Section):
     * **``wall_seconds`` starts being enforced.** At ``mode="off"`` there is no timeout at all; at
       ``mode="subprocess"`` the parent kills a worker that overruns and dead-letters that message
       post-ACK. A busy-loop can no longer wedge intake, **and** a legitimately slow Handler that used
-      to finish now dead-letters. ``startup_seconds`` and the POSIX ``cpu_seconds``/``mem_mb`` arm
-      with it.
+      to finish now dead-letters. ``startup_seconds`` and the POSIX ``mem_mb`` arm with it.
     * **Throughput** ~0.19 ms per dispatch with no reference view; a 20k-entry crosswalk ~4.5 ms
       marshalling and ~6.2 ms end-to-end, ~1.4x a pickle round-trip — inside the pipeline's existing
       per-interface bound. **One message is not one dispatch:** a message routed to one handler with
@@ -2084,10 +2083,8 @@ class SandboxSettings(_Section):
     mode: Literal["off", "subprocess"] = Field(default="off")
     # Authoritative wall-clock cap (seconds) per Router/Handler call on EVERY platform: the parent
     # kills a worker that overruns it, so a pathological busy-loop can never wedge intake. Floor > 0.
+    # There is no RLIMIT_CPU, so CPU spent outside a call has no bound (ADR 0087, 2026-10-07).
     wall_seconds: float = Field(default=5.0, gt=0)
-    # POSIX-only RLIMIT_CPU backstop (seconds) inside the child (a no-op on Windows, where wall_seconds
-    # governs). Kept <= wall_seconds in spirit; the OS reaps a CPU-bound child sooner where supported.
-    cpu_seconds: float = Field(default=2.0, gt=0)
     # POSIX-only RLIMIT_AS address-space cap (MiB) inside the child (no-op on Windows). None disables it.
     mem_mb: int | None = Field(default=512, ge=1)
     # Bound (seconds) on the one-time child bootstrap (config load + guard install) before start fails.
@@ -4355,7 +4352,8 @@ _ALERT_EVENT_TYPES = frozenset(
         "approval_approver_provenance",
         "administrator_granted",
         # vault BACKLOG #2255: the approval gate could not write one of its audit rows. Keyed
-        # `approval:<id>`, which no connection can be named.
+        # `approval:<id>`, which no connection can be named. Since vault BACKLOG #2254 also an
+        # inline config reload's lost config_reload_attempted row, keyed `config_reload:inline`.
         "audit_write_failed",
         # ADR 0079 mechanism 2: the directory reconciler's two audited outcomes, each routable apart:
         # a pass left accounts unrevoked (the breaker tripped, or probes were referred, BACKLOG
@@ -7819,9 +7817,10 @@ def security_loosenings(
         out.append(
             (
                 "ad_allow_insecure_ldap",
-                "AD binds over plain ldap:// -- the service-account password and every signing-in "
-                "user's password cross the network in cleartext, and nothing authenticates the "
-                "domain controller",
+                "AD binds over plain ldap:// -- the service-account password, and the password a "
+                "directory user types to step up a Windows SSO (Kerberos) session, cross the network "
+                "in cleartext, and nothing authenticates the domain controller (an OIDC session steps "
+                "up at the identity provider and sends no password here)",
             )
         )
     # BACKLOG #288: the new-client-IP step-up defaults ON.

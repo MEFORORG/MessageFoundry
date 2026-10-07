@@ -944,7 +944,6 @@ def _boot_round_trip(code_sets: object) -> Any:
         encode_boot(
             config_dir="cfg",
             forbidden=("socket",),
-            cpu_seconds=2.0,
             mem_mb=512,
             code_sets=code_sets,
         )

@@ -193,7 +193,7 @@ async def _until_status(
     store: MessageStore, status: str, *, channel_id: str = "file_in", timeout: float = 4.0
 ) -> None:
     for _ in range(int(timeout / 0.02)):
-        if await store.list_messages(channel_id=channel_id, status=status):
+        if await store.list_messages(channel_id=channel_id, status=status, allowed_channels=None):
             return
         await asyncio.sleep(0.02)
     raise AssertionError(f"no message reached {status} within {timeout}s")

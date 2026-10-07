@@ -1211,9 +1211,23 @@ class ChannelScopeSourceConflict(RuntimeError):
 
     Three causes. The stored scope is the directory's and the caller did not send
     ``expected_source="ad"``, so the write would make it manual without anyone saying so. The
-    caller's ``expected_source`` does not match the stored one. Or an AD sign-in changed the source
-    between this write's read and its compare-and-set. "The directory's" and "the stored one" both
-    mean :func:`_effective_scope_source`, not the raw column (BACKLOG #2252)."""
+    caller's ``expected_source`` does not match the stored one. Or another write changed the source
+    between this write's read and its compare-and-set: at least an AD sign-in, or another
+    administrator's save. "The directory's" and "the stored one" both
+    mean :func:`_effective_scope_source`, not the raw column (BACKLOG #2252).
+
+    Each refusal writes one :data:`CHANNEL_SCOPE_CHANGE_REFUSED_ACTION` row first (BACKLOG #2271)."""
+
+
+#: BACKLOG #2271: the row a refused :meth:`AuthService.set_channel_scope` writes. Its detail names the
+#: account, the caller's ``expected_source``, the raw stored source the write read
+#: (``read_source``), the scope's ``owner`` and a ``reason`` from :data:`ChannelScopeRefusal`. Never
+#: the scope itself. On ``source_changed`` the owner is the one read after the write failed, so it
+#: names whoever took the scope: at least a directory sign-in or another administrator's save. A
+#: legacy AD scope reads ``read_source`` null and ``owner`` ``"ad"`` (BACKLOG #2252). A store that
+#: refuses the row leaves an ERROR log line instead, and the 409 still stands.
+CHANNEL_SCOPE_CHANGE_REFUSED_ACTION: Final = "user.channel_scope_change_refused"
+ChannelScopeRefusal = Literal["directory_owned", "expected_source_mismatch", "source_changed"]
 
 
 def _effective_scope_source(user: UserRecord) -> ChannelScopeSource | None:
@@ -5357,21 +5371,30 @@ class AuthService:
             # unreachable -- only the silent path is closed.
             display_name = principal.display_name or existing.display_name
             email = principal.email or existing.email
-            await self._store.update_user_profile(user_id, display_name=display_name, email=email)
-            if email != existing.email:
-                # BACKLOG #1139, ASVS 6.3.7. The directory owns the attribute, but repointing it
-                # decides where every later security notice on this account is delivered -- so it is
-                # an update to the account's authentication details, and it gets the same two records
-                # the local sibling ``update_user`` emits: an audit row and an out-of-band notice.
-                #
-                # This method sits on the SHARED directory completion path, so this covers the
-                # simple-bind, Kerberos and federated legs alike, not AD alone.
-                await self._audit(
-                    "auth.ad_profile_email_changed",
-                    actor=principal.username,
-                    detail=_json({"user_id": user_id, "source": "directory"}),
-                    client=client,
+            # BACKLOG #1139, ASVS 6.3.7. The directory owns the attribute, but repointing it decides
+            # where every later security notice on this account is delivered -- so it is an update
+            # to the account's authentication details, and it gets the same two records the local
+            # sibling ``update_user`` emits: an audit row and an out-of-band notice.
+            #
+            # This method sits on the SHARED directory completion path, so this covers the
+            # simple-bind, Kerberos and federated legs alike, not AD alone.
+            #
+            # The row commits in the UPDATE's transaction (BACKLOG #2221; ``AuditAppend`` says why).
+            email_changed = email != existing.email
+            repoint: list[AuditAppend] = []
+            if email_changed:
+                repoint.append(
+                    AuditAppend(
+                        "auth.ad_profile_email_changed",
+                        actor=principal.username,
+                        detail=_json({"user_id": user_id, "source": "directory"}),
+                        client=client,
+                    )
                 )
+            await self._store.update_user_profile(
+                user_id, display_name=display_name, email=email, audits=repoint
+            )
+            if email_changed:
                 # ADDRESSED TO THE ENGINE-OWNED ``notify_email`` FIRST (BACKLOG #1139, ADR 0182).
                 # This read used to start at ``existing.email``, the profile mirror, which is the one
                 # column a directory repoint is free to move -- so the notice about a repoint could
@@ -5443,6 +5466,7 @@ class AuthService:
         client: str | None,
         actor: str | None = None,
         typed_notify_email: str | None = None,
+        audits: Sequence[AuditAppend] = (),
     ) -> str:
         """Insert the mirror row for a directory principal the store does not hold, and return its id.
 
@@ -5454,6 +5478,9 @@ class AuthService:
         ``typed_notify_email`` is the administrator's checked address for a row whose ``mail`` is
         not adopted (#2021 only). It is bound in the same INSERT, so no crash leaves that row with
         no address. The profile mirror still gets the directory's ``mail``.
+
+        ``audits`` are the caller's own rows for this birth. They commit in the INSERT's
+        transaction, after any not-adopted row (BACKLOG #2221).
         """
         user_id = uuid4().hex
         # BACKLOG #2014, ASVS 6.3.7. The birth seed is the one time the directory's `mail` can
@@ -5467,18 +5494,18 @@ class AuthService:
         adopt = _adopts_directory_mail(principal)
         # The address stays out of the audit row and the log. It is directory-supplied and may be a
         # lookalike of someone's real one. The row is written IN THE INSERT'S TRANSACTION (BACKLOG
-        # #2100): as a second write, a crash between the two kept the account and lost the record.
-        refusal = (
-            None
-            if adopt
-            else AuditAppend(
-                "auth.ad_notify_email_not_adopted",
-                # The sign-in's own holder, or the administrator whose create this is (#2021).
-                actor=actor or principal.username,
-                detail=_json({"user_id": user_id, "source": "directory"}),
-                client=client,
+        # #2100).
+        rows: list[AuditAppend] = []
+        if not adopt:
+            rows.append(
+                AuditAppend(
+                    "auth.ad_notify_email_not_adopted",
+                    # The sign-in's own holder, or the administrator whose create this is (#2021).
+                    actor=actor or principal.username,
+                    detail=_json({"user_id": user_id, "source": "directory"}),
+                    client=client,
+                )
             )
-        )
         await self._store.create_user(
             user_id=user_id,
             username=principal.username,
@@ -5491,7 +5518,7 @@ class AuthService:
             directory_object_id=principal.directory_object_id,
             adopt_notify_email=adopt,
             notify_email=typed_notify_email,
-            audit=refusal,
+            audits=[*rows, *audits],
             password_generated=False,
         )
         if not adopt:
@@ -5592,18 +5619,8 @@ class AuthService:
                     " give one as notify_email, such as name@example.org"
                 )
             typed = address = _require_single_mailbox(notify_email)
-        try:
-            user_id = await self._create_directory_row(
-                principal, client=client, actor=actor, typed_notify_email=typed
-            )
-        except Exception as exc:
-            if not _is_integrity_refusal(exc):
-                raise
-            # Re-read rather than assume the name index fired, as create_local_user does.
-            if await self._store.get_user_by_username(principal.username) is None:
-                raise
-            raise UsernameTaken(USERNAME_TAKEN) from exc
-        await self._audit(
+        # Committed with the INSERT, not after it (BACKLOG #2221).
+        created = AuditAppend(
             "user.created",
             actor=actor,
             detail=_json(
@@ -5616,6 +5633,17 @@ class AuthService:
             ),
             client=client,
         )
+        try:
+            user_id = await self._create_directory_row(
+                principal, client=client, actor=actor, typed_notify_email=typed, audits=(created,)
+            )
+        except Exception as exc:
+            if not _is_integrity_refusal(exc):
+                raise
+            # Re-read rather than assume the name index fired, as create_local_user does.
+            if await self._store.get_user_by_username(principal.username) is None:
+                raise
+            raise UsernameTaken(USERNAME_TAKEN) from exc
         await self._notify_security(
             ACCOUNT_CREATED, username=principal.username, email=address, detail={"roles": []}
         )
@@ -8955,8 +8983,8 @@ class AuthService:
         _log.warning(
             "no enabled Administrator can sign in without an outside identity service (the "
             "directory or a federated identity provider); each is a directory account or a local "
-            "one with no usable password: %s. If that service is down, nobody can sign in to "
-            "manage this engine, and `messagefoundry provision-admin` will not create a local "
+            "one with no usable password: %s. If that service is down, no Administrator can sign "
+            "in to manage this engine, and `messagefoundry provision-admin` will not create a local "
             "Administrator while these accounts exist. Create a local Administrator now, before "
             "an outage (docs/SECURITY.md, 'Keep a local Administrator').",
             ", ".join(names),
@@ -11325,9 +11353,12 @@ class AuthService:
         re-saving a directory scope pins it. When the stored source is ``"ad"``, the caller must
         pass ``expected_source="ad"``. When ``expected_source`` is given it must match the stored
         source. Either failure raises :class:`ChannelScopeSourceConflict`. The write itself is a
-        compare-and-set against the source read here, so an AD sign-in that changes it before the
-        write lands raises the same error instead of being overwritten. A caller that leaves
-        ``expected_source`` unset on a scope the directory does not own is unaffected.
+        compare-and-set against the source read here, so a write that changes it before this one
+        lands raises the same error instead of being overwritten: at least an AD sign-in, or another
+        administrator's save. A caller that leaves
+        ``expected_source`` unset on a scope the directory does not own is unaffected. Each of the
+        three refusals is audited first (BACKLOG #2271); see
+        :data:`CHANNEL_SCOPE_CHANGE_REFUSED_ACTION`.
 
         "The stored source" in both checks is :func:`_effective_scope_source`, which counts an AD
         account's stored scope with no recorded writer as the directory's (BACKLOG #2252). The
@@ -11340,11 +11371,25 @@ class AuthService:
         stored = user.channel_scope_source
         owner = _effective_scope_source(user)
         if expected_source is None and owner == SCOPE_SOURCE_AD:
+            await self._audit_channel_scope_refusal(
+                user,
+                reason="directory_owned",
+                expected_source=expected_source,
+                read_source=stored,
+                actor=actor,
+            )
             raise ChannelScopeSourceConflict(
                 "the directory owns this channel scope; send expected_source='ad' to confirm "
                 "that saving it makes it manual"
             )
         if expected_source is not None and expected_source != owner:
+            await self._audit_channel_scope_refusal(
+                user,
+                reason="expected_source_mismatch",
+                expected_source=expected_source,
+                read_source=stored,
+                actor=actor,
+            )
             raise ChannelScopeSourceConflict(
                 "expected_source does not match who owns this channel scope; re-read the user and "
                 "retry. Where no writer is recorded, a directory account's stored scope needs "
@@ -11354,8 +11399,17 @@ class AuthService:
         if not await self._store.set_user_channel_scope_if_source(
             user_id, scope_json, source=SCOPE_SOURCE_MANUAL, expected_source=stored
         ):
-            if await self._store.get_user(user_id) is None:
+            now = await self._store.get_user(user_id)
+            if now is None:
                 raise ValueError("no such user")
+            # The re-read row, so ``owner`` names who holds the scope now, not what this write saw.
+            await self._audit_channel_scope_refusal(
+                now,
+                reason="source_changed",
+                expected_source=expected_source,
+                read_source=stored,
+                actor=actor,
+            )
             raise ChannelScopeSourceConflict(
                 "this channel scope changed hands while the write ran; re-read the user and retry"
             )
@@ -11370,6 +11424,43 @@ class AuthService:
                 }
             ),
         )
+
+    async def _audit_channel_scope_refusal(
+        self,
+        user: UserRecord,
+        *,
+        reason: ChannelScopeRefusal,
+        expected_source: ChannelScopeSource | None,
+        read_source: ChannelScopeSource | None,
+        actor: str,
+    ) -> None:
+        """Write the :data:`CHANNEL_SCOPE_CHANGE_REFUSED_ACTION` row for a refused
+        :meth:`set_channel_scope` (BACKLOG #2271). A store that refuses the row is logged at ERROR and
+        the refusal still stands, so the caller gets its 409 rather than a 500. A defect is raised,
+        not passed over (:data:`_AUDIT_WRITE_DEFECTS`)."""
+        try:
+            await self._audit(
+                CHANNEL_SCOPE_CHANGE_REFUSED_ACTION,
+                actor=actor,
+                detail=_json(
+                    {
+                        "user_id": user.id,
+                        "username": user.username,
+                        "reason": reason,
+                        "expected_source": expected_source,
+                        "read_source": read_source,
+                        "owner": _effective_scope_source(user),
+                    }
+                ),
+            )
+        except _AUDIT_WRITE_DEFECTS:
+            raise
+        except _audit_write_errors():
+            _log.exception(
+                "could not write the %s audit row for a refused save by %s",
+                CHANNEL_SCOPE_CHANGE_REFUSED_ACTION,
+                actor,
+            )
 
     async def is_last_enabled_admin(self, user_id: str) -> bool:
         """True iff ``user_id`` is an enabled administrator and the only one remaining.

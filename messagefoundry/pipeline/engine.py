@@ -17,6 +17,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from messagefoundry.auth.trust_anchors import LaneAnchorCheck
 from messagefoundry.config.models import (
     AckAfter,
     BuildupThreshold,
@@ -159,12 +160,18 @@ class ReloadOutcome:
     A dry run applies nothing, so it reports ``applied`` False with no failures.
 
     ``directory`` is the resolved directory this call loaded, applied or not. A dry run's audit row
-    reads it here, because :attr:`Engine.last_reload_dir` moves only on an applied reload."""
+    reads it here, because :attr:`Engine.last_reload_dir` moves only on an applied reload.
+
+    ``fingerprint`` is the ADR 0041 D1 digest an applied reload took of ``directory`` before its
+    swap, or ``None`` when it could not take one (and always for a dry run). The reload's audit row
+    reads it here rather than off :attr:`Engine.loaded_config_fingerprint`: a second reload can swap
+    the graph again before the first one's row is written (vault BACKLOG #2257)."""
 
     registry: Registry
     applied: bool
     directory: Path
     failures: tuple[ReloadStepFailure, ...] = ()
+    fingerprint: Mapping[str, object] | None = None
 
     @property
     def degraded(self) -> bool:
@@ -260,6 +267,7 @@ class Engine:
         log_dir: str | None = None,
         registry_preflight: Callable[[Registry, Mapping[str, Any]], Awaitable[None]] | None = None,
         settings_preflight: Callable[[], Awaitable[None]] | None = None,
+        lane_anchor_check: LaneAnchorCheck | None = None,
     ) -> None:
         self.store = store
         # [sandbox] opt-in Router/Handler subprocess isolation (ADR 0087, #197). None → the
@@ -283,6 +291,10 @@ class Engine:
         # raises WiringError to refuse. `serve` passes the per-connection trust-anchor preflight here
         # (BACKLOG #1142, slice 3); None = no preflight.
         self._registry_preflight = registry_preflight
+        # vault BACKLOG #2371, ADR 0031 as amended 2026-10-06: the dialling-CA check the runner
+        # awaits for each lane it builds, at start, at an operator start and before a reload. `serve`
+        # passes it; None = no check. Not handed to a dry-run checker, which builds nothing live.
+        self._lane_anchor_check = lane_anchor_check
         # An optional async check run first on EVERY real reload, whoever starts it: the reload route,
         # a held reload a second approver releases, cluster convergence, and the DR profile reload.
         # Dry runs skip it, because it writes audit rows. It raises WiringError to refuse. `serve`
@@ -777,7 +789,17 @@ class Engine:
         rest report ``status:"filtered"``). A reload (not a cold start) so a box already serving its
         full graph drops to the critical set in place, with in-flight rows preserved (the reload is
         quiesce-and-swap). The coordinator then reads the ``dr.activate`` row's provenance fields
-        from :meth:`_dr_config_drift`."""
+        from :meth:`_dr_config_drift`.
+
+        It runs :meth:`preflight_registry` over the running graph and never :meth:`guard_registry`
+        (vault BACKLOG #2184, engine PR 2070). The preflight reads anchor files, which can change
+        after the graph loaded. The guard ``serve`` wires, the static-credential guard, judges only
+        the graph and the startup settings, and neither has changed. It already judged this graph
+        when it loaded, through :meth:`reload_detail` or the managed app's first load, over the
+        whole graph and before the shard filter. On an engine-shard process ``rr.registry`` is the
+        filtered graph, so a guard here would judge less than that load did. A graph an embedder
+        hands to :meth:`add_registry` meets neither check at load. That is a fact about embedding,
+        and an activation is not where it changes."""
         was_active = self._dr_active
         rr = self._registry_runner
         # Re-apply the graph the runner holds in memory, not a config dir read from disk. The running
@@ -787,8 +809,8 @@ class Engine:
         # dir, so a dir on a share at the failed site cannot refuse it after the takeover hook moved
         # the VIP. The settings and registry preflights are the trust-anchor checks reload_detail
         # runs before a swap; they read anchor files and write audit rows, and they refuse before
-        # anything changes. The graph guard and the env-values re-read are not repeated: the graph
-        # is unchanged, and the values are the ones the runner holds. rr.reload still runs
+        # anything changes. The graph guard is not repeated; the docstring says why. Nor is the
+        # env-values re-read: the values are the ones the runner holds. rr.reload still runs
         # build_check, so the egress and exposure gates still run. The threshold goes to the runner
         # after the preflights and before the reload, which is where the runner re-evaluates every
         # connection. rr.reload() re-applies whichever graph is current once it holds the reload
@@ -961,7 +983,6 @@ class Engine:
         sandbox_policy = SandboxPolicy(
             mode=SandboxMode(_sb.mode),
             wall_seconds=_sb.wall_seconds,
-            cpu_seconds=_sb.cpu_seconds,
             mem_mb=_sb.mem_mb,
             startup_seconds=_sb.startup_seconds,
             pass_environment=_sb.pass_environment,
@@ -993,6 +1014,7 @@ class Engine:
             egress=self._egress_settings,
             hop_posture=self._hop_posture,
             trust_anchor_policy=self._trust_anchor_policy,
+            lane_anchor_check=self._lane_anchor_check,
             simulate_all=self._shadow_settings.simulate_all_egress,
             env_values=self._env_values,
             active_environment=self._active_environment,
@@ -2500,7 +2522,11 @@ class Engine:
                 ", ".join(f.step for f in failures),
             )
         return ReloadOutcome(
-            registry=registry, applied=True, directory=path, failures=tuple(failures)
+            registry=registry,
+            applied=True,
+            directory=path,
+            failures=tuple(failures),
+            fingerprint=fingerprint,
         )
 
     def _resolve_reload_target(self, config_dir: str | Path | None) -> Path:

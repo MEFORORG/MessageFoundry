@@ -986,7 +986,6 @@ def encode_boot(
     *,
     config_dir: str,
     forbidden: Sequence[str],
-    cpu_seconds: float,
     mem_mb: int | None,
     code_sets: object,
 ) -> bytes:
@@ -999,7 +998,6 @@ def encode_boot(
         {
             "config_dir": config_dir,
             "forbidden": list(forbidden),
-            "cpu_seconds": float(cpu_seconds),
             "mem_mb": None if mem_mb is None else int(mem_mb),
             "code_sets": enc_code_sets(code_sets, blobs),
         },
@@ -1014,7 +1012,6 @@ class Boot:
 
     config_dir: str
     forbidden: tuple[str, ...]
-    cpu_seconds: float
     mem_mb: int | None
     code_sets: dict[str, CodeSet] | None
 
@@ -1025,14 +1022,12 @@ def decode_boot(body: bytes) -> Boot:
     forbidden = tuple(
         _req_str(m, "forbidden module") for m in _req_list(header.get("forbidden"), "forbidden")
     )
-    cpu_seconds = _req_float(header.get("cpu_seconds"), "cpu_seconds")
     mem_mb = None if header.get("mem_mb") is None else _req_int(header.get("mem_mb"), "mem_mb")
     code_sets = dec_code_sets(header.get("code_sets"), reader)
     reader.finish()
     return Boot(
         config_dir=config_dir,
         forbidden=forbidden,
-        cpu_seconds=cpu_seconds,
         mem_mb=mem_mb,
         code_sets=code_sets,
     )

@@ -1672,7 +1672,9 @@ the same permission set on the same method reds CI until it is listed here.
 > scope the directory does not own is unaffected. **An AD account's stored scope with a null
 > source counts as `ad` here (BACKLOG #2252):** it predates the source column, the sync withdraws
 > it like a directory scope, and the GET still reports it as null. The 409 detail names the
-> conflict, never the scope. The web console sends `expected_source` when the administrator ticks "Make this scope
+> conflict, never the scope. Each 409 writes one `user.channel_scope_change_refused` audit row
+> naming the administrator, the account and the conflict, never the scope (BACKLOG #2271). A store
+> that refuses that row leaves an ERROR log line instead, and the 409 stands. The web console sends `expected_source` when the administrator ticks "Make this scope
 > manual", and shows a race as a refused save with the edits kept.
 >
 > **The monitoring plane is narrowed too, and this used to say the opposite.** For a channel-scoped
@@ -1706,6 +1708,29 @@ the same permission set on the same method reds CI until it is listed here.
 > least the Prometheus exposition above and `GET /alerts/rules` list them, and
 > `POST /connections/{name}/flag` has no per-channel check.
 > `tests/test_channel_rbac.py` pins the six routes, not that list.
+
+> **Every route of the default JSON API has a channel-scope class, and a new one fails the build
+> until it gets one (BACKLOG #2627).** `tests/test_route_channel_scope_classification.py` holds the
+> table: scoped, not channel-bearing, administrator-only, or unscoped. It does not cover routes that
+> only the flags in `ROUTE_REGISTERING_FLAGS` (`scripts/security/route_gates.py`) register.
+>
+> The test runs each scoped GET that takes no path parameter twice: as a scoped caller, and as an
+> all-channels caller for control. It also checks the `/messages` and `/dead-letters` totals. Apart
+> from those and the by-id message routes below, no scoped route is executed. That leaves at least
+> `/ws/stats`, the POST search and export, and every other route with a path parameter.
+> `GET /status` gives no signal on its fixture.
+>
+> It aims each by-id message route at another channel's message, which must answer 404. Those
+> routes all open the message through one helper, `messagefoundry/api/message_scope.py`. A test
+> fails if any other API module touches the store's `get_message`. That guard does not cover the
+> other by-id reads, such as `outbox_for`, which today run only after the helper.
+>
+> The store reads that take `allowed_channels` require it, so a caller cannot read every channel by
+> leaving it out. A test refuses a literal `allowed_channels=None` on those reads under
+> `messagefoundry/api/`. The table also lists at least three unscoped routes that no
+> backlog item tracks yet: `GET /security/posture` names connections, `GET /users` returns every
+> account's channel scope to a `users:read` holder, and `POST /config/reload` acts on every
+> connection.
 
 > **`/config/reload` executes Python** from the target directory in-process, so it is constrained
 > beyond the `config:deploy` permission: the directory must resolve **within** an allowed root —
@@ -1758,6 +1783,27 @@ A config reload applies the same rule to its own `config_reload` row, inline or 
 has already swapped when that row is written. So a failed write is logged at ERROR, and the reload
 still answers success. It reports `degraded: true` with `audit` among its `failures`. A released
 reload carries that into its `approval.approved` row.
+
+**An ungated reload proves the audit log works before it swaps (vault BACKLOG #2254).** A reload
+that dual control does not hold has no `approval.release_attempted` row before it. So
+`POST /config/reload` writes its own `config_reload_attempted` row first, naming the requester and
+the requested directory. If the audit log refuses that row, the route answers **503**, nothing
+loads or swaps, and an `audit_write_failed` alert keyed `config_reload:inline` is raised. A dry run
+writes no such row, because it swaps nothing. Like the gate's row, it says *attempted*, and an
+attempt row with no row after it is not proof the reload was refused or cancelled. At least a
+refusal or cancellation whose own row then fails, and an unexpected fault in the reload, leave it
+alone. The 503 has the same two lost-COMMIT exceptions as the gate's, listed above, where the
+attempt row may have committed after all.
+
+**An inline or released reload's `config_reload` row names that reload's own config (vault
+BACKLOG #2257).** It is built from the reload's own result: its directory, connection counts and
+the digest it took before the swap. The row is written after the swap, so a second reload or a
+connection flag toggle can move the engine on first. The row then still names its own config, but
+is marked `superseded` and `baseline_unchecked`, so the next start passes over it and does not
+compare against it. Only a committed reload or a flag toggle that moves the engine's loaded
+fingerprint counts. A later reload that fails and rolls back does not mark the row. The check
+runs just before the write, so a change after it is not caught. A cluster convergence reload's
+row is still read from the engine's live state when it is written.
 
 **An audit or store outage that refuses writes answers a mapped status on at least these approval
 paths (vault BACKLOG #2255).** A refusal runs nothing, so a refusal whose own audit row fails still
@@ -4170,6 +4216,42 @@ as long as an attacker sustains a lock that sign-in cannot pass: the second-step
 lock on any account except a local one with TOTP enrolled. Only the host-gated `admin-unlock`
 remains, which needs access to the engine host itself.
 
+**Replace a sole administrator's authenticator seed from the host.** If you suspect the TOTP seed
+has leaked, or the device holding it is lost, run `messagefoundry admin-reset-totp --username
+<name>` with the engine stopped ([ADR
+0171](adr/0171-offline-administrator-unlock-a-host-gated-cli-recovery-path-for-a-sole-administrator-lockout.md)
+Amendment B, BACKLOG #2226, owner ruling 2026-10-06). A sole administrator whose one factor is
+TOTP has at least this route, which needs neither a second administrator nor
+`[security].require_mfa = false`.
+The administrator reset refuses a self-target, and self-service removal refuses the last factor. It
+uses the same host gate as `admin-unlock`.
+
+1. The command refuses, before showing anything, at least: an unknown account, a non-Administrator,
+   a disabled account, an account with no TOTP enrolled, and an account with TOTP on but no seed
+   stored. It also refuses an Administrator who is not the only enabled one, and names another:
+   that administrator resets the account from the web console (Users, Reset MFA).
+2. It shows a new key and its `otpauth://` URI on the console only, never on stdout or stderr. The
+   URI names the new entry `<name> (replaced <date>-<time>)`, so the app lists it apart from the
+   old one. Add it as a new entry and type the code it shows.
+3. Only after a good code does it write. One transaction swaps the seed and the recovery codes,
+   ends every session of the account and writes the audit row, and it leaves TOTP on throughout.
+   So the account never has no factor, and the swap is never live unrecorded. A wrong code, a lost
+   console or a refused audit row writes nothing, and the old entry keeps working. So does a
+   removal or a new enrolment that lands while you type: the write checks the enrolment it read.
+   Follow what its message says about the new entry when it writes nothing.
+4. It shows the new recovery codes on the console once. The old entry and the old codes stop
+   working. Delete the old entry, the one you signed in with until now, from the app.
+
+The audit row is `auth.admin_totp_reset`, naming the OS user. After it, the command sends the
+account an `mfa_enabled` notice where a relay is configured. It keeps passkeys and says so when the
+account has one; remove one from the web console if its device may be compromised too. It does not
+clear a lockout; run `admin-unlock` for that. An error from the write is read back before the
+command reports it, because on a server store the error can follow the commit. Exit 3 means the
+seed was replaced, or may have been, and the message says which. The exit codes and what each
+message tells you to do are in ADR 0171 Amendment B, under "An error does not say whether the
+commit landed". Another account's authenticator is reset from the web console (Reset MFA),
+because a host-run replacement would leave the new seed with whoever ran it.
+
 > **Binding conditionality — controls 2 and 3 are one switch, not two.**
 > `[auth].login_rate_limit_enabled = false` constructs **neither** limiter: `_login_limiter` and
 > `_reauth_limiter` are both `None` and both accessors then return `True` unconditionally. They share
@@ -4365,7 +4447,7 @@ user: `auth.login_success` / `auth.login_failed` / `auth.login_locked` / `auth.l
 on a directory sign-in the row's `mech` names the leg, `kerberos` or `oidc`) /
 `auth.permission_denied` / `auth.channel_denied`, the 6.3.5 events `auth.account_locked` /
 `auth.login_after_failures`, the re-proof rows `auth.reauth` / `auth.password_change_failed`, plus `user.created` / `user.roles_changed` /
-`user.channel_scope_changed` / `user.deleted`, `ad_group_map.updated` / `ad_group_scope_map.updated`,
+`user.channel_scope_changed` / `user.channel_scope_change_refused` / `user.deleted`, `ad_group_map.updated` / `ad_group_scope_map.updated`,
 and `auth.ad_scope_resynced`. PHI access (viewing a raw message or displaying patient summaries) is recorded
 with the viewer. Read the trail via `GET /audit` (`audit:read`). **Credentials, tokens, and PHI bodies
 are never logged** (only ids/counts land in `detail`).
@@ -4666,6 +4748,16 @@ disables verification** — so it composes with, and never weakens, the existing
 governed by the posture-keyed cleartext refusal (ADR 0092). It is **not** applied to the API server
 context (`build_api_ssl_context`), which verifies **client** certs for opt-in mTLS (ADR 0083) — a
 different trust role. With no `[tls]` block the built SSL context is byte-identical to before.
+
+A connection's own `tls_ca_file` is checked as an inbound listener's CA is (vault BACKLOG #2371): an
+optional `tls_ca_pin`, a refusal under `enforce` for a file another account could replace, and an
+`auth.trust_anchor` row when the file changes. A refused CA fails only its own connection at start,
+or at an operator start of that connection. It refuses a whole reload that builds or keeps that lane running ([ADR 0031](adr/0031-startup-connection-fault-isolation.md),
+amended 2026-10-06). One gap remains. The hop reads the file again by path when it builds its
+context, so a file swapped after the check would be trusted until that connection is built again.
+A matching pin is no escape for a file whose permissions the engine cannot read.
+[CONNECTIONS.md](CONNECTIONS.md#the-engine-checks-the-file-at-every-start-and-reload-tls_ca_pin)
+states the checks once. `[tls].internal_ca_file` takes none of these checks yet.
 
 ### PHI data-plane integrity residuals — scope-outs (#190, ADR 0093)
 

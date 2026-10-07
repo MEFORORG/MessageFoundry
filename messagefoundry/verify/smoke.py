@@ -471,7 +471,7 @@ def newest_message_id(store: StoreSettings, control_id: str) -> str | None:
     async def _newest() -> str | None:
         handle = await open_store(store, keyless_chain_refusal=None)  # read-only (#1916)
         try:
-            rows = await handle.list_messages(control_id=control_id, limit=1)
+            rows = await handle.list_messages(control_id=control_id, limit=1, allowed_channels=None)
             return str(rows[0]["id"]) if rows else None
         finally:
             await handle.close()
@@ -566,7 +566,9 @@ def check_smoke_disposition(
             deadline = loop.time() + timeout
             last: str | None = None
             while True:
-                rows = await handle.list_messages(control_id=control_id, limit=1)
+                rows = await handle.list_messages(
+                    control_id=control_id, limit=1, allowed_channels=None
+                )
                 if rows and str(rows[0]["id"]) != baseline_id:
                     last = str(rows[0]["status"])
                     if last in terminal:

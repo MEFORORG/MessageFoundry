@@ -337,7 +337,7 @@ async def test_an_existing_store_gains_the_index_on_its_next_open(tmp_path: Path
     s = await MessageStore.open(path)
     try:
         assert await _has_index(s)
-        rows = await s.list_messages(limit=500)
+        rows = await s.list_messages(limit=500, allowed_channels=None)
         assert len(rows) == 11
     finally:
         await s.close()

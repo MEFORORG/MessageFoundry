@@ -4065,10 +4065,10 @@ def seed_notify_email(email: str | None) -> str | None:
 class AuditAppend:
     """One audit row a write appends in its OWN transaction, on all three backends (BACKLOG #2100).
 
-    For a record that must not outlive, or be outlived by, the row it describes. ``create_user``
-    takes one for a directory birth whose ``mail`` was not adopted. Written as a second call, a
-    crash between the two kept the account and lost the record of why it has no address. The row
-    joins the hash chain :meth:`~MessageStore.record_audit` appends to, and is teed after commit.
+    For a record that must not outlive, or be outlived by, the row it describes. Written as a
+    second call, a crash between the two kept the change and lost its record. ``create_user`` and
+    ``update_user_profile`` take them (BACKLOG #2221). Each joins the hash chain
+    :meth:`~MessageStore.record_audit` appends to, and is teed after commit.
     """
 
     action: str
@@ -4089,6 +4089,17 @@ class AuditAppend:
             seq=row.seq,
             row_hash=row.row_hash,
         )
+
+
+def tee_audits(
+    audits: Sequence[AuditAppend], rows: Sequence[AppendedAuditRow], *, ts: float
+) -> None:
+    """Tee each committed row of a write's ``audits`` off-box, after its commit (BACKLOG #2221).
+
+    Shared by all three backends. ``rows`` is what the appends returned, one per audit, in order.
+    """
+    for audit, row in zip(audits, rows, strict=True):
+        audit.tee(ts=ts, row=row)
 
 
 def birth_notify_email(email: str | None, *, adopt: bool, typed: str | None) -> str | None:
@@ -10228,7 +10239,7 @@ class MessageStore:
         control_id: str | None = None,
         limit: int = 50,
         offset: int = 0,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
         received_from: float | None = None,
         received_to: float | None = None,
     ) -> list[dict[str, Any]]:
@@ -10267,7 +10278,7 @@ class MessageStore:
         status: str | None = None,
         message_type: str | None = None,
         control_id: str | None = None,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
         received_from: float | None = None,
         received_to: float | None = None,
     ) -> int:
@@ -10295,7 +10306,7 @@ class MessageStore:
         message_type: str | None = None,
         control_id: str | None = None,
         limit: int = 50,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> MessageSearchResult:
         """Scan-and-decrypt content search (ADR 0046 #51): pre-filter on the indexed metadata, then
         decrypt + match each candidate body **in memory** (a plain SQL ``LIKE`` is impossible while the
@@ -10364,7 +10375,7 @@ class MessageStore:
         destination_name: str | None = None,
         limit: int = 50,
         offset: int = 0,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> list[dict[str, Any]]:
         """Dead-lettered deliveries (one row per failed message→destination), newest first, joined
         with message metadata for the dead-letter view. Bodies (``raw``) are omitted (metadata only,
@@ -10396,7 +10407,7 @@ class MessageStore:
         *,
         channel_id: str | None = None,
         destination_name: str | None = None,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> int:
         """Total dead-lettered deliveries matching the same filters as :meth:`list_dead`."""
         where, params = self._dead_filter(channel_id, destination_name, allowed_channels)
@@ -10410,7 +10421,7 @@ class MessageStore:
         *,
         channel_id: str | None = None,
         destination_name: str | None = None,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> list[tuple[str, str]]:
         """The contract is ``QueueStore.list_replay_targets``: the :meth:`count_dead` predicate
         narrowed by the two clauses :meth:`replay_dead` applies, so every pair names rows a replay
@@ -10612,7 +10623,7 @@ class MessageStore:
         kinds: Sequence[str] | None = None,
         since: float | None = None,
         limit: int = 100,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> list[ConnectionEvent]:
         limit = max(
             1, min(limit, 1000)
@@ -10715,7 +10726,7 @@ class MessageStore:
         self,
         *,
         limit: int = 200,
-        allowed_channels: Sequence[str] | None = None,
+        allowed_channels: Sequence[str] | None,
     ) -> list[AlertInstance]:
         # The read accessor for GET /alerts/active: open + acknowledged instances, newest last_seen
         # first. Runs on the lockfree read path. `allowed_channels` applies the SAME per-channel RBAC
@@ -10739,7 +10750,7 @@ class MessageStore:
             return [self._alert_instance_row(r) for r in await cur.fetchall()]
 
     async def summarize_active_alert_instances(
-        self, *, allowed_channels: Sequence[str] | None = None
+        self, *, allowed_channels: Sequence[str] | None
     ) -> AlertSummary:
         # BACKLOG #1564: the nav bell's count + worst severity over EVERY active instance in scope, not
         # over a page of them. Same predicate and same RBAC scope as list_active_alert_instances above —
@@ -10760,7 +10771,7 @@ class MessageStore:
         return _alert_summary(row)
 
     async def get_alert_instance(
-        self, alert_id: int, *, allowed_channels: Sequence[str] | None = None
+        self, alert_id: int, *, allowed_channels: Sequence[str] | None
     ) -> AlertInstance | None:
         # Read one instance by id (any status) — the API echo for ack/resolve. RBAC-scoped exactly like
         # list_active_alert_instances (a scoped caller can't read an instance outside its channels).
@@ -10860,7 +10871,7 @@ class MessageStore:
             await self._commit()
             if cur.rowcount == 0:
                 return None
-        return await self.get_alert_instance(alert_id)
+        return await self.get_alert_instance(alert_id, allowed_channels=None)
 
     async def resume_alert_instance(
         self, alert_id: int, *, now: float | None = None
@@ -10875,7 +10886,7 @@ class MessageStore:
             await self._commit()
             if cur.rowcount == 0:
                 return None
-        return await self.get_alert_instance(alert_id)
+        return await self.get_alert_instance(alert_id, allowed_channels=None)
 
     async def count_open_alerts_by_connection(self) -> dict[str, int]:
         # Back ConnectionRow.alerts_active (ADR 0044 D4): the OPEN (not acknowledged, not resolved)
@@ -11053,6 +11064,17 @@ class MessageStore:
             row_id = int(ins.lastrowid or 0)  # read INSIDE the lock: another append would move it
             return AppendedAuditRow(row_id, seq, row_hash)
         raise AssertionError("unreachable: the second attempt returns or raises")
+
+    async def _append_audits(
+        self, audits: Sequence[AuditAppend], *, now: float
+    ) -> list[AppendedAuditRow]:
+        """Append each of a write's ``audits``, in order, inside its writer transaction (#2100)."""
+        return [
+            await self._append_audit_row(
+                a.action, actor=a.actor, channel_id=None, detail=a.detail, client=a.client, now=now
+            )
+            for a in audits
+        ]
 
     @staticmethod
     def _audit_where(
@@ -11542,7 +11564,7 @@ class MessageStore:
         now: float | None = None,
         adopt_notify_email: bool = True,
         notify_email: str | None = None,
-        audit: AuditAppend | None = None,
+        audits: Sequence[AuditAppend] = (),
     ) -> None:
         check_password_generated(password_generated=password_generated, password_hash=password_hash)
         now = time.time() if now is None else now
@@ -11569,19 +11591,10 @@ class MessageStore:
                     1 if password_generated else 0,
                 ),
             )
-            if audit is not None:
-                # BACKLOG #2100. Before the one commit, so a failed append rolls the account back.
-                appended = await self._append_audit_row(
-                    audit.action,
-                    actor=audit.actor,
-                    channel_id=None,
-                    detail=audit.detail,
-                    client=audit.client,
-                    now=now,
-                )
+            # BACKLOG #2100. Before the one commit, so a failed append rolls the account back.
+            appended = await self._append_audits(audits, now=now)
             await self._commit()
-        if audit is not None:
-            audit.tee(ts=now, row=appended)
+        tee_audits(audits, appended, ts=now)
 
     async def get_user(self, user_id: str) -> UserRecord | None:
         async with self._read() as db:
@@ -11729,18 +11742,22 @@ class MessageStore:
         display_name: str | None,
         email: str | None,
         now: float | None = None,
+        audits: Sequence[AuditAppend] = (),
     ) -> None:
         """Write the account's profile fields. **This is the directory-sync write** — ``_upsert_ad_user``
         calls it on every AD/OIDC login — so it deliberately does NOT name ``notify_email`` (BACKLOG
         #1139). Adding that column to this SET list would hand the directory the notification target
-        back and restore the defect the split removes."""
+        back and restore the defect the split removes. ``audits``: see
+        ``AuthStore.update_user_profile``."""
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
             await self._db.execute(
                 "UPDATE users SET display_name=?, email=?, updated_at=? WHERE id=?",
                 (display_name, email, now, user_id),
             )
+            appended = await self._append_audits(audits, now=now)
             await self._commit()
+        tee_audits(audits, appended, ts=now)
 
     async def set_user_notify_email(
         self, user_id: str, *, email: str, now: float | None = None
@@ -11803,6 +11820,63 @@ class MessageStore:
             written = cur.rowcount > 0
             await self._commit()
         return written
+
+    async def replace_totp_enrolment(
+        self,
+        user_id: str,
+        *,
+        secret: str,
+        recovery_code_hashes: list[str],
+        step: int,
+        expected_enrolled_at: float | None,
+        audit: AuditAppend,
+        now: float | None = None,
+    ) -> int | None:
+        """Swap an ENABLED TOTP enrolment for a new secret, end the account's sessions and append
+        ``audit``, all in ONE transaction (ADR 0171 Amendment B, BACKLOG #2226). Returns the number
+        of sessions ended, or ``None`` when nothing was written.
+
+        The secret, the recovery codes and the step high-water mark change together, and TOTP stays
+        on throughout, so no reader ever sees the account without a factor. ``step`` is the step of
+        the code that proved the new secret, so that code is spent. The write matches only a row
+        where TOTP is on, with a seed, and still enrolled at ``expected_enrolled_at``: a removal or a
+        re-enrolment that landed after the caller read the row is never overwritten, and TOTP can
+        never be turned on for an account that did not have it. The audit row and the session sweep
+        commit or roll back with the swap, so a refused audit append leaves the old seed in place."""
+        now = time.time() if now is None else now
+        async with _writer_txn(self._db, self._lock):
+            cur = await self._db.execute(
+                "UPDATE users SET totp_secret=?, totp_enrolled_at=?, totp_recovery_codes=?,"
+                " last_totp_step=?, updated_at=?"
+                " WHERE id=? AND totp_enabled=1 AND totp_secret IS NOT NULL"
+                " AND totp_enrolled_at IS ?",
+                (
+                    self._enc(secret, aad=cell_aad("users", "totp_secret", user_id)),
+                    now,
+                    json.dumps(recovery_code_hashes),
+                    step,
+                    now,
+                    user_id,
+                    expected_enrolled_at,
+                ),
+            )
+            if int(cur.rowcount) <= 0:
+                # Nothing written, so nothing is revoked or audited. The commit ends the empty
+                # transaction, as set_user_federated_subject does.
+                await self._commit()
+                return None
+            revoked = await self._db.execute(_REVOKE_USER_SESSIONS_SQL, (now, user_id))
+            appended = await self._append_audit_row(
+                audit.action,
+                actor=audit.actor,
+                channel_id=None,
+                detail=audit.detail,
+                client=audit.client,
+                now=now,
+            )
+            await self._commit()
+        audit.tee(ts=now, row=appended)
+        return int(revoked.rowcount)
 
     async def disable_totp(self, user_id: str, *, now: float | None = None) -> None:
         """Clear a user's TOTP enrollment entirely (secret, enabled flag, recovery codes)."""

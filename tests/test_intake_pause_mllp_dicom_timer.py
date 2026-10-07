@@ -218,12 +218,16 @@ async def test_mllp_messages_sent_during_a_pause_are_all_persisted_and_acked(
                     writer.write(frame(_ADT.format(cid=f"P{i}")))
                 await writer.drain()
                 await asyncio.sleep(_PAUSED_WINDOW)
-                assert await store.count_messages() == 0, "a paused listener committed a message"
+                assert await store.count_messages(allowed_channels=None) == 0, (
+                    "a paused listener committed a message"
+                )
                 gate.release(DEPTH_REASON)
                 replies = [await _read_reply(reader) for _ in range(3)]
                 assert all(b"MSA|AA|" in reply for reply in replies), replies
                 # Each ACK follows its commit, so all three are durable once the ACKs are in.
-                assert await store.count_messages() == 3, "a message sent during the pause was lost"
+                assert await store.count_messages(allowed_channels=None) == 3, (
+                    "a message sent during the pause was lost"
+                )
             finally:
                 writer.close()
                 await asyncio.gather(writer.wait_closed(), return_exceptions=True)

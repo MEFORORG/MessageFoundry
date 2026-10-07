@@ -95,6 +95,7 @@ if TYPE_CHECKING:
     from messagefoundry.config.tls_policy import HopPosture
     from messagefoundry.pipeline.security_notify import SecurityEventNotifier
     from messagefoundry.store.base import AdminStore, Store
+    from messagefoundry.store.store import UserRecord
 
 
 class _VersionAction(argparse.Action):
@@ -904,6 +905,34 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "--db", default=None, help="store path (overrides [store].path)"
     )
     admin_set_notify_email.add_argument("--json", action="store_true", help="emit JSON")
+
+    # BACKLOG #2226, ADR 0171 Amendment B (owner ruling 2026-10-06). A sole Administrator whose only
+    # factor is TOTP could not replace a suspect seed: the admin reset refuses a self-target, and
+    # self-service removal refuses the last factor. This replaces the seed in place, on
+    # admin-unlock's gate, and never leaves the account without a factor.
+    admin_reset_totp = sub.add_parser(
+        "admin-reset-totp",
+        help="replace the sole Administrator's authenticator-app (TOTP) seed from the host "
+        "(offline; enrols the new seed at the terminal, so the account never has no factor)",
+        description="Replace the TOTP seed and the recovery codes of the only enabled "
+        "Administrator, from the host. A new seed is shown on the console, never on stdout or "
+        "stderr, and must be proved with a code before anything is written; the old seed, the old "
+        "recovery codes and every session of the account then end in one transaction with the "
+        "audit row. Runs against the store directly, on the same host gate as admin-unlock; run "
+        "it with the engine stopped. It refuses at least an unknown account, a non-Administrator, "
+        "an Administrator with an enabled peer (who resets it from the web console), a disabled "
+        "account and an account with no TOTP enrolled.",
+    )
+    admin_reset_totp.add_argument(
+        "--username", required=True, help="the sole enabled Administrator whose seed to replace"
+    )
+    admin_reset_totp.add_argument(
+        "--service-config",
+        default=None,
+        help="service settings TOML (default: ./messagefoundry.toml if present)",
+    )
+    admin_reset_totp.add_argument("--db", default=None, help="store path (overrides [store].path)")
+    admin_reset_totp.add_argument("--json", action="store_true", help="emit JSON")
 
     audit_verify = sub.add_parser(
         "audit-verify", help="verify the audit-log hash chain (tamper-evidence)"
@@ -5700,8 +5729,8 @@ def _resolve_expected_anchor(args: argparse.Namespace) -> tuple[int, str] | None
 def _host_gated_store_settings(args: argparse.Namespace) -> ServiceSettings | int:
     """The host gate's settings for a command that acts on an EXISTING store, or an exit code.
 
-    Shared by ``admin-unlock`` and ``admin-set-notify-email`` so the gate is stated once (ADR 0171,
-    ADR 0183 Amendment A Wave 1c). ``provision-admin`` does not use it: it legitimately creates the
+    Shared by ``admin-unlock``, ``admin-set-notify-email`` and ``admin-reset-totp`` so the gate is
+    stated once (ADR 0171 and its Amendment B, ADR 0183 Amendment A Wave 1c). ``provision-admin`` does not use it: it legitimately creates the
     store, so it cannot carry the M-31 guard below.
     """
     from pathlib import Path
@@ -5912,9 +5941,52 @@ def _show_during_enrolment(text: str, *, refusal: str) -> None:
         raise _PasswordEntryRefused(f"{refusal} ({exc}); nothing was written") from exc
 
 
-def _enrol_totp_at_terminal(*, username: str, skew_steps: int) -> tuple[str, str, float]:
+def _show_recovery_codes_once(
+    codes: Sequence[str], *, heading: str, which: str, without_them: str
+) -> bool:
+    """Show freshly issued recovery codes on the console device ONCE, and return whether they got
+    there. Shared by ``provision-admin`` and ``admin-reset-totp``.
+
+    Never stdout (the ``--json`` body) and never stderr, which can be redirected into a log (CodeQL
+    alert 228, BACKLOG #1131). The codes are not printed anywhere else when the console fails, so
+    the WARNING names ``which`` codes were lost and says, in ``without_them``, what the account
+    still signs in with; a caller reading only the ``--json`` body learns it from the return
+    value."""
+    try:
+        _show_on_terminal(
+            f"\n{heading} Each signs in once in place of an authenticator code. Store them "
+            "somewhere safe, then clear this terminal's scrollback:\n  " + "\n  ".join(codes) + "\n"
+        )
+    except OSError as exc:
+        print(
+            f"WARNING: {which} could not be shown on the console ({exc}), and they cannot be "
+            f"shown again. {without_them}",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
+#: The first sentence ``provision-admin`` shows above the key, and its no-terminal refusal. The
+#: defaults of :func:`_enrol_totp_at_terminal`; ``admin-reset-totp`` passes its own.
+_PROVISION_ENROL_HEADING = "Enrol an authenticator app for this Administrator now (ADR 0197)."
+_PROVISION_ENROL_NO_TERMINAL = "refusing to provision without a terminal"
+
+
+def _enrol_totp_at_terminal(
+    *,
+    username: str,
+    skew_steps: int,
+    heading: str = _PROVISION_ENROL_HEADING,
+    no_terminal: str = _PROVISION_ENROL_NO_TERMINAL,
+    label: str | None = None,
+) -> tuple[str, str, float]:
     """Generate a TOTP secret in memory, show it, and read back a code that proves it (ADR 0197
-    Amendment A, N-A). Returns ``(secret, code, instant the code was read)``.
+    Amendment A, N-A). Returns ``(secret, code, instant the code was read)``. ``heading`` is the
+    first sentence shown above the key and ``no_terminal`` opens the no-terminal refusal, so
+    ``admin-reset-totp`` (ADR 0171 Amendment B) can name what it is doing. ``label`` is the account
+    name the URI gives the app, ``username`` when unset; a replacement passes its own, so the app
+    lists the new entry apart from the old one.
 
     The key and its URI go to the console device through :func:`_show_on_terminal`, never to stdout
     or stderr: ``--json`` output is stdout, and either stream can be redirected. They are never in
@@ -5930,17 +6002,17 @@ def _enrol_totp_at_terminal(*, username: str, skew_steps: int) -> tuple[str, str
 
     if not sys.stdin.isatty():
         raise _PasswordEntryRefused(
-            "refusing to provision without a terminal: the authenticator app is enrolled "
+            f"{no_terminal}: the authenticator app is enrolled "
             "interactively. Run this from a console."
         )
     secret = totp.generate_secret()
     _show_during_enrolment(
-        "\nEnrol an authenticator app for this Administrator now (ADR 0197). Add this account "
+        f"\n{heading} Add this account "
         "to the app by its URI, which names the algorithm, then type the 6-digit code it shows. "
         "The codes use SHA-256: an app that takes only the key must be set to SHA-256, or its "
         "codes will never match.\n"
         f"  key: {secret}\n"
-        f"  URI: {totp.otpauth_uri(secret, username)}\n",
+        f"  URI: {totp.otpauth_uri(secret, username if label is None else label)}\n",
         refusal="could not open the console to show the authenticator key. Run this from a console",
     )
     went_away = "the console went away during enrolment"
@@ -6887,29 +6959,16 @@ def _provision_admin(args: argparse.Namespace) -> int:
             raise
         return refused_write(exc)
 
-    codes_shown = False  # true only once issued codes actually reached the console
-    if outcome.recovery_codes:
-        # To the console device ONCE, in both output modes: never stdout (the --json body) and never
-        # stderr, which can be redirected into a log (CodeQL alert 228, BACKLOG #1131).
-        try:
-            _show_on_terminal(
-                "\nRecovery codes, shown once. Each signs in once in place of an authenticator "
-                "code. Store them somewhere safe, then clear this terminal's scrollback:\n  "
-                + "\n  ".join(outcome.recovery_codes)
-                + "\n"
-            )
-            codes_shown = True
-        except OSError as exc:
-            # The account is written and signs in with its authenticator app. The codes are not
-            # printed anywhere else, for the reason above; ``recovery_codes_shown`` says so to a
-            # caller reading only the --json body.
-            print(
-                f"WARNING: the recovery codes could not be shown on the console ({exc}), and they "
-                "cannot be shown again. The Administrator signs in with its authenticator app. "
-                "Without the codes, a lost authenticator can be reset only by another "
-                "Administrator, so create a second one soon.",
-                file=sys.stderr,
-            )
+    # True only once issued codes actually reached the console; ``recovery_codes_shown`` says so to
+    # a caller reading only the --json body. The account is written either way.
+    codes_shown = bool(outcome.recovery_codes) and _show_recovery_codes_once(
+        outcome.recovery_codes,
+        heading="Recovery codes, shown once.",
+        which="the recovery codes",
+        without_them="The Administrator signs in with its authenticator app. Without the codes, "
+        "a lost authenticator is replaced by another Administrator, or at the host by "
+        "`admin-reset-totp`, so create a second Administrator soon.",
+    )
     if args.json:
         _print_json(
             {
@@ -7147,6 +7206,477 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
         _safe_print(
             f"OK: {verb} the notification address for Administrator {username!r} in {extra}"
         )
+    return 0
+
+
+#: The audit action ``admin-reset-totp`` writes (ADR 0171 Amendment B). Named like
+#: ``auth.admin_unlocked``: the ``admin_`` prefix marks a host-run command, and the actor is the OS
+#: user. Left visible to every audit reader, unlike the lock rows: it says a seed was replaced, which
+#: is no password oracle.
+ADMIN_TOTP_RESET_ACTION = "auth.admin_totp_reset"
+
+
+class _ResetTarget(NamedTuple):
+    """The account ``admin-reset-totp`` checked before the key was shown, pinned for its write. The
+    write refuses a row whose id or enrolment instant differs (ADR 0171 Amendment B)."""
+
+    user_id: str
+    username: str
+    enrolled_at: float | None
+
+
+def _admin_reset_totp(args: argparse.Namespace) -> int:
+    """Replace the sole Administrator's TOTP seed from the host (BACKLOG #2226, ADR 0171
+    Amendment B).
+
+    **Why it exists.** The TOTP seed has no calendar lifetime (BACKLOG #1931), and the control that
+    stands in for one is revocation. A sole Administrator whose only factor is TOTP had none: the
+    admin reset refuses a self-target, and self-service removal refuses the last factor (AC-A3a). The
+    owner ruled on 2026-10-06 to answer that with this command rather than with a second
+    Administrator or with ``require_mfa`` turned off.
+
+    **The gate is host access**, the one argued on :func:`_admin_unlock` and in ADR 0171, through the
+    same :func:`_host_gated_store_settings`. Run it with the engine stopped.
+
+    **ONLY THE SOLE ENABLED ADMINISTRATOR.** The ruling answers an account with nobody to ask.
+    Where another enabled Administrator exists, that one resets this account's MFA from the web
+    console, which is the ordinary route, so this refuses and names one. The predicate is the one
+    ``AuthService.is_last_enabled_admin`` applies: enabled, and holding the role in ``user_roles``.
+
+    **IT NEVER LEAVES THE ACCOUNT WITHOUT A FACTOR.** The new seed is generated in memory, shown on
+    the console device and proved with a code BEFORE the store is written. One transaction,
+    :meth:`replace_totp_enrolment`, then swaps the seed, the recovery codes and the step high-water
+    mark while TOTP stays on, so no reader ever sees the account with TOTP off. The write is a
+    compare-and-set on the id and the enrolment instant read before the prompt, so a removal or a
+    re-enrolment that lands while the operator types is never overwritten. A wrong code, a lost
+    console or a refusal writes nothing and the old seed still works. The proving code's step is
+    recorded, so that code is spent.
+
+    **It replaces the recovery codes too.** A leaked seed or a stolen device usually means the codes
+    kept beside it are exposed as well, and a seed rotation that left them valid would revoke nothing
+    for whoever holds them. Passkeys are left alone: they are a separate factor, not suspected here.
+    The output says when the account has one, so the operator can remove it if it is suspect too.
+
+    **It ends every session of the account** in the same transaction, because a session elevated
+    with the old seed is what a seed leak buys.
+
+    **THE AUDIT ROW COMMITS WITH THE SWAP, NOT AFTER IT.** ``admin-unlock`` checks the audit refusal
+    before its write and appends its row after it, as a second write
+    (:func:`_refuse_an_unauditable_write`). A failure between the two leaves the change made and
+    unrecorded. For an unlock that is the narrowest change there is, and a re-run repeats it
+    harmlessly. Here the change is a live credential, and the first build of this command hit that
+    window: an append refused after the swap left the new seed in force with no audit row and no
+    codes shown, reported as a store that could not be opened. So the row joins the swap's
+    transaction, the shape ``create_user`` uses for BACKLOG #2100: both land, or neither does. The
+    pre-check still runs before the key is shown, so the ordinary refusal costs no enrolment.
+
+    **After the commit nothing can undo the swap, so nothing may hide it.** The codes are shown
+    first, then the holder gets an ``mfa_enabled`` notice, best effort, after the audit row. A
+    failure after the commit is reported as what it is: the seed WAS replaced, exit 3. An error
+    from the swap itself is read back first, because on a server backend it can follow the COMMIT;
+    the ADR's table gives the three outcomes.
+    """
+    import getpass
+    import time as _time
+
+    from messagefoundry.auth import totp
+    from messagefoundry.auth.notifications import MFA_ENABLED, SecurityEvent
+    from messagefoundry.auth.passwords import hash_password
+    from messagefoundry.auth.permissions import Role
+    from messagefoundry.config.settings import keyless_opt_out_refusal
+    from messagefoundry.last_resort import run_guarded
+    from messagefoundry.store.base import (
+        KeylessAuditChainRefused,
+        StoreNotFoundError,
+        open_store,
+        store_driver_errors,
+    )
+    from messagefoundry.store.crypto import CipherError, StoreKeylessError
+    from messagefoundry.store.store import AuditAppend
+
+    settings = _host_gated_store_settings(args)
+    if isinstance(settings, int):
+        return settings
+    wanted = args.username.strip()
+    # Could not start, so exit 2: as admin-unlock exits on the first three, and provision-admin on
+    # a store key that cannot be resolved (BACKLOG #2081). Each is raised before anything is written.
+    could_not_start: tuple[type[Exception], ...] = (
+        KeylessAuditChainRefused,
+        StoreNotFoundError,
+        _UnauditableWrite,
+        *_key_unresolved(),
+    )
+    open_refusals: tuple[type[Exception], ...] = (
+        StoreKeylessError,
+        CipherError,
+        sqlite3.DatabaseError,
+        *could_not_start,
+    )
+    # A refused write on every backend (BACKLOG #1983), as admin-set-notify-email names them.
+    store_errors: tuple[type[Exception], ...] = (RuntimeError, OSError, *store_driver_errors())
+
+    def open_refused(exc: Exception, *, hint: str = "") -> int:
+        """The exit for a refusal raised while a store was opened or checked: nothing written.
+        ``hint`` follows the message once the key has been shown. The texts of the first two
+        families are the engine's own and name settings, files, tables or key ids, never a value."""
+        if isinstance(exc, could_not_start):
+            _emit_error(f"{_sentence(exc)} Nothing was written.{hint}", as_json=args.json)
+            return 2
+        if isinstance(exc, (StoreKeylessError, CipherError)):
+            return _emit_error(f"{_sentence(exc)} Nothing was written.{hint}", as_json=args.json)
+        if isinstance(exc, sqlite3.DatabaseError) and not hint:  # #1670: not a database
+            return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
+        # After the key was shown the store had already opened once, so this is no "cannot open".
+        # The class only: a driver's message can quote a stored value (ASVS 16.5.4).
+        _emit_error(
+            f"the store failed before the replacement ({type(exc).__name__}); nothing was "
+            f"written.{hint}",
+            as_json=args.json,
+        )
+        return 2
+
+    async def opened() -> Store:
+        return await open_store(
+            settings.store,
+            keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+        )
+
+    async def refusal_for(store: Store, user: UserRecord) -> str | None:
+        """Why this account's seed cannot be replaced here, or ``None``. Asked twice: before the
+        key is shown, and again inside the write's open, so a change during the prompt is caught.
+        A role, disabled or peer change in the moment between the second ask and the UPDATE is
+        not; the engine-stopped rule covers that (ADR 0171 Amendment B, Not addressed)."""
+        if Role.ADMINISTRATOR.value not in await store.get_user_role_ids(user.id):
+            return (
+                f"the account {user.username!r} is not an Administrator; an Administrator resets "
+                "another account's authenticator from the web console (Users, Reset MFA)"
+            )
+        if user.disabled:
+            return f"the Administrator {user.username!r} is disabled; nothing was written"
+        if not user.totp_enabled:
+            return (
+                f"the account {user.username!r} has no authenticator app enrolled, so there is no "
+                "seed to replace; nothing was written. Enrol one from the web console"
+            )
+        if await store.get_totp_secret(user.id) is None:
+            return (
+                f"the account {user.username!r} has TOTP turned on but no seed stored, a state no "
+                "supported path leaves; nothing was written. This command replaces a seed and "
+                "never creates one: restore the store from a backup, or have another "
+                "Administrator reset this account's MFA from the web console"
+            )
+        for other in await store.list_users():
+            if other.id == user.id or other.disabled:
+                continue
+            if Role.ADMINISTRATOR.value in await store.get_user_role_ids(other.id):
+                return (
+                    f"the Administrator {user.username!r} is not the only enabled one, so another "
+                    f"Administrator, for example {other.username!r}, resets its authenticator from "
+                    "the web console (Users, Reset MFA). This command is for a sole "
+                    "Administrator, who has nobody to ask; nothing was written"
+                )
+        return None
+
+    async def check() -> _ResetTarget | str:
+        """The account to replace, pinned, or why not. Read before any key is shown."""
+        store = await opened()
+        try:
+            user = await store.get_user_by_username(wanted)
+            if user is None:
+                return f"no account named {wanted!r}"
+            refusal = await refusal_for(store, user)
+            if refusal is not None:
+                return refusal
+            _refuse_an_unauditable_write(store)  # before the key is shown, not after the write
+            return _ResetTarget(user.id, user.username, user.totp_enrolled_at)
+        finally:
+            await store.close()
+
+    try:
+        checked = run_guarded(check())
+    except open_refusals as exc:
+        return open_refused(exc)
+    if isinstance(checked, str):
+        return _emit_error(checked, as_json=args.json)
+    target = checked
+    username = target.username
+    try:
+        # Before the key is shown: a shell whose OS user cannot be named fails here, not after the
+        # operator has enrolled a seed that would never be stored.
+        actor = f"cli:{getpass.getuser()}"
+    except OSError as exc:
+        return _emit_error(
+            f"cannot name the OS user for the audit row ({exc}); nothing was written",
+            as_json=args.json,
+        )
+
+    # The app lists an entry by this name. The old entry carries the bare username (provision-admin
+    # and the web console label it that way), and the time keeps a second run apart from the first.
+    # No colon in it: the URI's label uses one to separate the issuer from the account.
+    label = f"{username} (replaced {_time.strftime('%Y%m%d-%H%M%S')})"
+    # Every refusal after the key was shown says so, or the app keeps an entry for a seed that was
+    # never stored, under the name the next run's entry will resemble.
+    unused_entry = (
+        f" If you added the new {label!r} entry to the app, delete it: its seed was never stored."
+    )
+    no_terminal = "refusing to replace the authenticator seed without a terminal"
+    try:
+        secret, code, read_at = _enrol_totp_at_terminal(
+            username=username,
+            skew_steps=settings.auth.totp_skew_steps,
+            heading=(
+                f"Enrol a NEW authenticator entry for {username!r} now (ADR 0171). The app lists "
+                f"it as {label!r}. The old entry, the one you sign in with today, keeps working "
+                "until this command succeeds, then stops; delete it from the app afterwards."
+            ),
+            no_terminal=no_terminal,
+            label=label,
+        )
+    except _PasswordEntryRefused as exc:
+        # The two refusals that fire before the key reaches the console get no hint: there is no
+        # entry to delete. Their openings are fixed texts, here and in _enrol_totp_at_terminal.
+        before_key = str(exc).startswith((no_terminal, "could not open the console to show"))
+        return _emit_error(_sentence(exc) + ("" if before_key else unused_entry), as_json=args.json)
+    # The prompt proved the code but returns no step (provision-admin hands the code to the service,
+    # which derives the step the same way). The swap records this step, so the proving code is spent.
+    step = totp.verify_totp_step(secret, code, now=read_at, window=settings.auth.totp_skew_steps)
+    if step is None:  # reachable only through a stubbed prompt; refused rather than asserted
+        return _emit_error(
+            "the authenticator code did not match; nothing was written." + unused_entry,
+            as_json=args.json,
+        )
+    plain_codes = totp.generate_recovery_codes(settings.auth.mfa_recovery_code_count)
+    code_hashes = [hash_password(c) for c in plain_codes]
+    #: Filled the moment the swap is known to have committed. Anything that fails after that is
+    #: reported as a seed that WAS replaced, never as a refusal, and the codes are still shown.
+    swapped: list[tuple[UserRecord, dict[str, Any]]] = []
+    #: Filled when the swap raised and the re-read that would say whether it landed failed too.
+    unknown: list[UserRecord] = []
+
+    async def swap_landed(store: Store, user_id: str) -> bool | None:
+        """After an error from the swap, did its commit land anyway? On a server backend an
+        error can follow the COMMIT, a lost acknowledgment or a failed pool release, so the error
+        alone does not say. ``None`` when the re-read fails too, whatever it raised: its one job
+        is to tell "landed" from "not landed", and anything else is "unknown"."""
+        try:
+            return await store.get_totp_secret(user_id) == secret
+        except Exception:  # noqa: BLE001 - any failure here means only "unknown"
+            return None
+
+    async def run() -> str | None:
+        """The swap, its session sweep and its audit row in one transaction, or why not."""
+        store = await opened()
+        try:
+            user = await store.get_user_by_username(wanted)
+            if user is None or user.id != target.user_id:
+                return (
+                    f"the account {wanted!r} was removed or replaced while this command ran; "
+                    "nothing was written. Run the command again." + unused_entry
+                )
+            again = await refusal_for(store, user)
+            if again is not None:
+                return _sentence(again) + unused_entry
+            _refuse_an_unauditable_write(store)
+            report: dict[str, Any] = {
+                "recovery_codes_issued": len(plain_codes),
+                "passkeys_kept": await store.has_webauthn_credentials(user.id),
+                "provider": user.auth_provider,
+            }
+            # Never the seed or a code: the username, the counts and the provider. The session
+            # count is known only inside the transaction, so the row records that all were ended.
+            detail = json.dumps({"username": user.username, **report, "sessions_ended": "all"})
+            try:
+                ended = await store.replace_totp_enrolment(
+                    user.id,
+                    secret=secret,
+                    recovery_code_hashes=code_hashes,
+                    step=step,
+                    expected_enrolled_at=target.enrolled_at,
+                    audit=AuditAppend(ADMIN_TOTP_RESET_ACTION, actor=actor, detail=detail),
+                )
+            except BaseException as exc:  # noqa: BLE001 - read back, then refused or re-raised
+                # Any error may follow the commit, Ctrl-C included, so every one is read back.
+                # Only a store refusal that the re-read confirms becomes a refusal; anything else
+                # is re-raised, after the re-read has said whether the swap landed.
+                landed = await swap_landed(store, user.id)
+                if landed is False and not isinstance(exc, store_errors):
+                    raise
+                if landed is False:
+                    # One transaction: the seed, the session sweep and the audit row rolled back
+                    # as one, and the re-read confirms the old seed is still there. The class
+                    # only: a driver's message can quote a stored value (ASVS 16.5.4).
+                    return (
+                        f"the store refused the replacement ({type(exc).__name__}). The new seed, "
+                        "its audit row and the session sweep are one write, and the account still "
+                        "holds its old seed: nothing was written, and the old authenticator entry "
+                        "still works. If the engine is running, stop it and run the command again."
+                        + unused_entry
+                    )
+                if landed:
+                    swapped.append((user, {**report, "sessions_ended": "unknown"}))
+                else:
+                    unknown.append(user)
+                raise
+            if ended is None:
+                return (
+                    f"the authenticator of {user.username!r} was removed or enrolled again while "
+                    "this command ran, so nothing was replaced; nothing was written. Stop the "
+                    "engine and run the command again." + unused_entry
+                )
+            swapped.append((user, {**report, "sessions_ended": ended}))
+            return None
+        finally:
+            await store.close()
+
+    failure: BaseException | None = None
+    try:
+        refused = run_guarded(run())
+    except BaseException as exc:  # noqa: BLE001 - re-raised below unless the swap may have landed
+        if not (swapped or unknown):
+            # Before the swap, but after the key was shown: nothing written, and the new entry
+            # in the app has no seed behind it, so the hint goes with every store failure here.
+            if isinstance(exc, Exception) and isinstance(exc, (*open_refusals, *store_errors)):
+                return open_refused(exc, hint=unused_entry)
+            raise  # nothing written; not a store failure, so the dispatch floor reports it
+        # The swap committed, or may have, before this failure: Ctrl-C included, the codes must
+        # still reach the operator and the report must say what happened.
+        failure, refused = exc, None
+    if refused is not None:
+        return _emit_error(refused, as_json=args.json)
+
+    if unknown:
+        # The error and the failed re-read leave the outcome open. The codes are shown, because a
+        # swap that did land has no other copy of them anywhere.
+        codes_shown = bool(plain_codes) and _show_recovery_codes_once(
+            plain_codes,
+            heading="Recovery codes for the NEW entry, shown once. They work only if the "
+            "replacement landed, which this command could not confirm.",
+            which="the new recovery codes",
+            without_them="Run this command again from a console once the store answers.",
+        )
+        unsure = (
+            f"the store reported an error during the replacement for {username!r} "
+            f"({type(failure).__name__}). The account could not be re-read, so whether its seed "
+            "was replaced is UNKNOWN. Keep both authenticator entries. Sign in with the new one: "
+            "if it works the replacement landed, and if it does not the old one still works."
+        )
+        if args.json:
+            _print_json(
+                {
+                    "error": unsure,
+                    "code": "replacement_unknown",
+                    "replaced": None,
+                    "username": username,
+                    "recovery_codes_shown": codes_shown,
+                },
+                compact=True,
+            )
+        else:
+            print(f"error: {unsure}", file=sys.stderr)
+        return 3
+
+    user, report = swapped[0]
+    codes_shown = bool(plain_codes) and _show_recovery_codes_once(
+        plain_codes,
+        heading="New recovery codes, shown once; the old ones no longer work.",
+        which="the new recovery codes",
+        without_them="The new authenticator entry works; run this command again from a console "
+        "to get codes you can keep.",
+    )
+
+    async def notice() -> str:
+        """Best effort, after the audit row: tell the holder a new authenticator was enrolled."""
+        if not settings.auth.notify_security_events:
+            return "notices_off"  # a documented choice, so no warning
+        address = (user.notify_email or "").strip()
+        if not address:
+            return "no_address"
+        notifier = _offline_security_notifier(settings)
+        if notifier is None:
+            return "no_channel"
+        notifier.start()
+        try:
+            await notifier.notify(
+                SecurityEvent(event_type=MFA_ENABLED, username=user.username, email=address)
+            )
+        finally:
+            await notifier.aclose()
+        return "dispatched"
+
+    try:
+        report["holder_notice"] = run_guarded(notice())
+    except BaseException as exc:  # noqa: BLE001 - best effort, after the commit; the swap stands
+        # Ctrl-C on a slow relay included: the report below must still say the seed was replaced.
+        # The class only, as AuthService._notify_security logs it: the text could name the address.
+        print(
+            f"WARNING: the security notice could not be queued ({type(exc).__name__}).",
+            file=sys.stderr,
+        )
+        report["holder_notice"] = "no_channel"
+    report["recovery_codes_shown"] = codes_shown
+    # Diagnostics, so stderr in both modes (BACKLOG #1673): the --json body carries the same facts.
+    if report["passkeys_kept"]:
+        print(
+            "WARNING: the account's passkeys were kept and still sign in. If a device holding one "
+            "may be compromised too, remove that passkey from the web console.",
+            file=sys.stderr,
+        )
+    if report["holder_notice"] == "no_channel":
+        print(
+            "WARNING: no security notice was sent to the account's notification address: no "
+            "[alerts] relay is configured, or a WARNING above says why.",
+            file=sys.stderr,
+        )
+    elif report["holder_notice"] == "no_address":
+        print(
+            "WARNING: the account has no notification address, so no security notice was sent.",
+            file=sys.stderr,
+        )
+    if failure is not None:
+        # EXIT 3, NOT 1: 1 is a refusal that wrote nothing, and a script reading only the code
+        # must not take a replaced seed for one. 2 stays "could not start".
+        message = (
+            f"the authenticator seed of {username!r} WAS replaced, with its audit row, and its "
+            f"sessions were ended, but the command then failed ({type(failure).__name__}). The "
+            "new authenticator entry works and the old one does not; "
+            + (
+                "the new recovery codes were shown on the console"
+                if codes_shown
+                else "run the command again from a console to get recovery codes"
+            )
+        )
+        if args.json:
+            _print_json(
+                {
+                    "error": message,
+                    "code": "replaced_then_failed",
+                    "replaced": True,
+                    "username": username,
+                    **report,
+                },
+                compact=True,
+            )
+        else:
+            print(f"error: {message}", file=sys.stderr)
+        return 3
+    if args.json:
+        _print_json(
+            {
+                "ok": True,
+                "username": username,
+                **report,
+                # Stated, so a script reading only this body knows where the secrets went.
+                "secrets_in_output": False,
+                "secrets_shown_on": "console device only (the new key, its URI and the codes)",
+            },
+            compact=True,
+        )
+        return 0
+    _safe_print(
+        f"OK: replaced the authenticator seed and the recovery codes of {username!r}; ended "
+        f"{report['sessions_ended']} session(s). The old authenticator entry and the old recovery "
+        "codes no longer work."
+    )
     return 0
 
 
@@ -8969,6 +9499,7 @@ _DISPATCH = {
     "support-bundle": _support_bundle,
     "service": _service,
     "admin-set-notify-email": _admin_set_notify_email,
+    "admin-reset-totp": _admin_reset_totp,
 }
 
 

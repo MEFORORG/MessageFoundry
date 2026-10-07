@@ -519,7 +519,7 @@ def test_rotate_key_reencrypts_under_active_key(
     async def read_with_b_only() -> int:
         s = await MessageStore.open(db, cipher=make_cipher(key_b))  # retired key no longer needed
         try:
-            return len(await s.list_messages())
+            return len(await s.list_messages(allowed_channels=None))
         finally:
             await s.close()
 
