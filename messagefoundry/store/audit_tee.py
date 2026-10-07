@@ -17,9 +17,12 @@ across all three backends — not three copies that could drift.
 **Propagation is only half the guarantee.** A record reaches that forwarder only if the process
 installed a handler for it to propagate to, which is a property of the *process*, not of this module
 — so :func:`~messagefoundry.logging_setup.ensure_logger_sink` supplies one when nothing else has
-(BACKLOG #1199; that function states the defect, and this file does not restate it). The copy still
-only reaches an operator and whatever the service manager captures: nothing here transmits off the
-host, and the durable off-box forwarder remains unbuilt.
+(BACKLOG #1199; that function states the defect, and this file does not restate it). This module
+transmits nothing itself. The copy leaves the host only through the syslog forwarder that
+:mod:`messagefoundry.logging_setup` installs once ``[logging].forward_host`` names a collector
+(TLS per ADR 0080, with an on-disk spool while the collector is down per ADR 0200). With none set,
+the copy stays on the host, in the process's own log sinks and whatever the service manager
+captures.
 """
 
 from __future__ import annotations

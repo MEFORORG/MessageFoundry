@@ -711,13 +711,15 @@ Refused at **check time** (`messagefoundry check`) rather than at runtime: a `re
 deployed outbound; an outbound that does not capture responses; `reply_content_type="passthrough"` against
 an outbound not capturing the content type; and — because either would make N concurrent callers queue
 behind one lane and let a single stuck message time out every caller — an effective `ordering` of **FIFO**
-or a **finite `max_attempts`** on the named outbound. Setting any `reply_*` knob **without** `reply_from`
+or an **unset `max_attempts`** (retry forever) on the named outbound. Both are read as effective values,
+so an outbound that inherits FIFO or retry-forever from `[delivery]` is refused too. Setting any `reply_*` knob **without** `reply_from`
 is refused at the factory, since the path is off and the knob would never be read.
 
 **Not built.** **Routing metadata** (HTTP method / path / headers as Router inputs) is a defined follow-on
-— a Handler sees the body only. **`capture_error_responses` is the headline gap:** a partner `4xx`
-dead-letters and the caller receives a fixed-JSON `502`, **not** the partner's own status and body, so a
-proxy API built on `reply_from` is currently correct only when the partner *succeeds*. The inbound **FHIR
+— a Handler sees the body only. **`capture_error_responses` is the headline gap:** most partner `4xx`
+statuses dead-letter the delivery, and the caller then receives a fixed-JSON `502`, **not** the partner's
+own status and body. A reply the outbound captured as a rejection, at least a SOAP fault in a 2xx body,
+is the exception: it comes back as a `502` that carries the partner's body. The inbound **FHIR
 facade** (BACKLOG #20) and **DICOMweb STOW-RS receiver** (#24) are consumers of this listener, each its own
 build. `POST /connections/{name}/test` reports `supported=false` — a bound listener has nothing external to
 probe.
@@ -3723,7 +3725,7 @@ Legend: ✅ native · ~ partial / via extension / via another transport · ❌ n
 | **SMB / network share** | ✅ | ✅ | ✅ | ✅ | `File()` on a UNC path, with an optional **alternate Windows credential** (`credential_*`, ADR 0132) |
 | **S3 / cloud blob** | ✅ | ~ | ✅ | ❌ | not built — the one remaining remote-file scheme |
 | **HTTP/HTTPS** listener + sender (REST) | ✅ | ✅ | ✅ | ✅ | `REST-OUT` (`Rest()`) + `REST-IN` (`Http()`, ADR 0023) both shipped, incl. **intake authentication** on the listen socket (`intake_auth` — API key / bearer / mTLS subject, ADR 0154) |
-| **SOAP / Web Services** | ✅ | ✅ | ✅ | ~ | `SOAP-OUT` shipped incl. WS-\* mTLS/WS-Security (ADR 0015); a SOAP body is **received** via `Http()`, and the *synchronous* envelope reply shipped with ADR 0154 (`reply_from`). Still `~` for one reason: a partner **error** body is not relayed (`capture_error_responses`), so the reply path is correct only when the partner succeeds |
+| **SOAP / Web Services** | ✅ | ✅ | ✅ | ~ | `SOAP-OUT` shipped incl. WS-\* mTLS/WS-Security (ADR 0015); a SOAP body is **received** via `Http()`, and the *synchronous* envelope reply shipped with ADR 0154 (`reply_from`). Still `~` for one reason: a partner **error** that dead-letters the delivery is not relayed (`capture_error_responses`), so the caller gets a fixed-JSON `502` without the partner's body. A SOAP fault in a 2xx body is captured as a rejection instead, and comes back as a `502` that carries the partner's body |
 | **Database** reader/writer | ✅ (JDBC) | ✅ | ✅ (JDBC) | ✅ (ODBC) | `DB-OUT` + `DB-IN` shipped (SQL Server preset, production — a live aioodbc round-trip runs in CI); `dialect='generic'` reaches any DB with an OS-installed ODBC driver. **No JDBC** — MF is pure Python, no JVM |
 | **SMTP** (email send) | ✅ | ✅ | ✅ | ✅ | `SMTP-OUT` shipped — `Email()`/`SMTP()` (ADR 0029); **plus** `Direct()`, Direct-Project S/MIME over SMTP (ADR 0085), which none of the three ships natively |
 | **Email reader** (POP3/IMAP) | ~ | ~ | ✅ | ❌ | `MAIL-IN` planned |

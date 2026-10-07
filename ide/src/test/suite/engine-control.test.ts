@@ -208,7 +208,8 @@ suite("engine control — planActions offers lifecycle only under the right cont
 });
 
 // ADR 0183 Amendment A, Wave 5 (BACKLOG #1136, ASVS 6.3.2). The engine creates no account on its own, so
-// a `serve` the IDE starts would come up with nobody able to sign in. Start therefore provisions an
+// a `serve` the IDE starts would be refused at the shipped posture, or come up with nobody able to manage
+// users and roles. Start therefore provisions an
 // Administrator first, with `provision-admin` in its OWN terminal (the password is typed there, never
 // passed), and treats "an enabled Administrator already exists" as go-ahead.
 
