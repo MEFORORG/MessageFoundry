@@ -385,12 +385,44 @@ class RetryPolicy(BaseModel):
     decision for a partner that must never advance past a message, rather than what you get by saying
     nothing. Under FIFO a forever-retrying head blocks its lane until it succeeds or an operator
     purges it. A permanent ``AR`` reject is the exception to all of this — it fails fast without
-    consuming the budget (see :class:`~messagefoundry.transports.base.NegativeAckError`)."""
+    consuming the budget (see :class:`~messagefoundry.transports.base.NegativeAckError`).
+
+    The three backoff fields are bounded (vault BACKLOG #2761): a positive, finite base and cap, and
+    a finite multiplier of at least 1. A zero or negative base loaded clean and retried a down
+    partner in a tight loop; an infinite cap scheduled a retry that never comes due. ``max_attempts``
+    is deliberately left unfloored here: ``RetryPolicy(max_attempts=0)`` is the internal idiom for a
+    permanent, no-retry failure, and the operator-facing floor lives on the ``[delivery]`` twin."""
+
+    # Assignment is validated too, so a code-first ``policy.backoff_seconds = 0`` cannot step around
+    # the bounds below.
+    model_config = ConfigDict(validate_assignment=True)
 
     max_attempts: int | None = 100
-    backoff_seconds: float = 5.0
-    backoff_multiplier: float = 2.0
-    max_backoff_seconds: float = 300.0
+    backoff_seconds: float = Field(default=5.0, gt=0, allow_inf_nan=False)
+    backoff_multiplier: float = Field(default=2.0, ge=1, allow_inf_nan=False)
+    max_backoff_seconds: float = Field(default=300.0, gt=0, allow_inf_nan=False)
+
+    def backoff_for(self, attempts: int) -> float:
+        """The delay before the next attempt of a row whose post-claim attempt count is ``attempts``:
+        ``min(max_backoff_seconds, backoff_seconds * backoff_multiplier ** (attempts - 1))``, the
+        exponent floored at 0. The one formula every store's ``mark_failed`` and batch head use.
+
+        Computed without ever raising (vault BACKLOG #2761). The power is evaluated before the
+        ``min``, so under retry-forever with the shipped multiplier of 2 it raised ``OverflowError``
+        at attempt 1025, from inside a delivery failure arm. Past that point the delay is the cap, so
+        the lane keeps the cap's pace at any attempt count. Below it the result is the plain formula,
+        bit for bit. An attempt count of 0 (a replay or release reset under a late worker) floors to
+        the base, so a multiplier of 0 reaching here unvalidated cannot raise ``ZeroDivisionError``
+        either (ADR 0157 Amendment A)."""
+        exponent = max(attempts - 1, 0)
+        try:
+            return min(
+                self.max_backoff_seconds, self.backoff_seconds * self.backoff_multiplier**exponent
+            )
+        except OverflowError:
+            # The power left float range (past 1.8e308), so the true delay is at or past the cap: for
+            # any cap under 1e15 seconds the base would have to be below 1e-293 for it not to be.
+            return self.max_backoff_seconds
 
 
 class BuildupThreshold(BaseModel):

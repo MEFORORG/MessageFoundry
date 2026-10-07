@@ -30,7 +30,7 @@ from pydantic import BaseModel
 from messagefoundry.api import auth_models, models
 from messagefoundry.auth import totp
 from messagefoundry.auth.identity import Identity
-from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryProbe
+from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind, DirectoryProbe
 from messagefoundry.auth.notifications import (
     ACCOUNT_LOCKED,
     MFA_DISABLED,
@@ -327,8 +327,10 @@ async def test_a_directory_account_enrolls_and_satisfies_an_engine_factor(
         )
 
         class _FakeLdap:
-            def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
-                return principal if (username == "jdoe" and password == "pw") else None
+            def authenticate(self, username: str, password: str, **_: object) -> DirectoryBind:
+                if username != "jdoe":
+                    return DirectoryBind(DirectoryAnswer.NOT_FOUND)
+                return DirectoryBind(DirectoryAnswer.FOUND, principal if password == "pw" else None)
 
             def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
                 return principal if username == "jdoe" else None

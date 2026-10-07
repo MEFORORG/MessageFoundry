@@ -235,13 +235,17 @@ async def test_a_late_retry_lands_on_a_row_the_operator_replayed(store: MessageS
 
 
 async def test_a_zero_multiplier_on_a_reset_row_does_not_raise(store: MessageStore) -> None:
-    """``backoff_multiplier`` is not validated, so 0 is accepted. On a row a replay reset to
-    ``attempts=0``, an unfloored exponent evaluates ``0.0 ** -1`` and raises ZeroDivisionError from
-    inside the store call. The floor makes it the base backoff instead."""
+    """On a row a replay reset to ``attempts=0``, an unfloored exponent with a multiplier of 0
+    evaluates ``0.0 ** -1`` and raises ZeroDivisionError from inside the store call. The floor makes
+    it the base backoff instead. ``RetryPolicy`` now refuses a multiplier below 1 (vault BACKLOG
+    #2761), so the policy is built around validation: the store's floor is kept as a second line for
+    a policy that reaches it some other way, and this pins it."""
     mid, (oid,) = await _claimed(store, "OB1")
     await store.dead_letter_now(oid, "operator dead-letter", now=101.0)
     await store.replay_dead(now=101.5)
-    policy = RetryPolicy(max_attempts=None, backoff_seconds=5, backoff_multiplier=0)
+    policy = RetryPolicy.model_construct(
+        max_attempts=None, backoff_seconds=5.0, backoff_multiplier=0.0, max_backoff_seconds=300.0
+    )
 
     assert await store.mark_failed(oid, "late failure", policy, now=102.0) == 107.0
     assert await store.mark_batch_failed([oid], "late failure", policy, now=103.0) == 108.0

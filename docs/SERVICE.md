@@ -92,7 +92,7 @@ Defaults:
 Override any of them, e.g.:
 
 ```powershell
-.\scripts\service\install-service.ps1 -Environment prod -Port 9000 -LogLevel DEBUG `
+.\scripts\service\install-service.ps1 -Environment prod -Port 9000 -LogLevel WARNING `
     -Config D:\hl7\config -DataDir D:\MessageFoundry
 ```
 

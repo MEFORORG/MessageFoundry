@@ -4,7 +4,7 @@
 config layout (see docs/CONNECTIONS.md §"Decomposing by role").
 
 This is a ``_``-prefixed **helper** module: the loader skips ``_*`` files as feeds but resolves them
-as sibling imports (``config/wiring.py`` ``_SiblingHelperFinder``), so ``IB_DEMO_ORU_handler.py`` does
+as sibling imports (``config/wiring.py`` ``_HelperImporter``), so ``IB_DEMO_ORU_handler.py`` does
 ``from _demo_oru_transforms import apply_demo_oru_transforms``. Keeping the field-level steps out of the
 Handler is the whole point of the split — a ported Corepoint child's many manipulations live here as
 small, reviewable, unit-testable functions while the Handler stays a thin *filter → delegate → Send*.

@@ -16,9 +16,13 @@ bite and not only to agree with today's tree.
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any
 
+import fastapi
+import fastapi.routing
 import pytest
 from fastapi import APIRouter, Depends, FastAPI, Request, WebSocket
 from fastapi.routing import APIWebSocketRoute
@@ -421,7 +425,7 @@ class _PassThrough:
 
 
 def test_a_mounted_app_beneath_mount_middleware_is_still_the_state_owner() -> None:
-    """``_state_owner`` reads Starlette's private ``Mount._base_app``. This pins that it still
+    """``_mounted_app`` reads Starlette's private ``Mount._base_app``. This pins that it still
     exists and is what the walk reads, so a Starlette rename reds a run here."""
     inner = FastAPI(openapi_url=None)
     inner.add_api_websocket_route("/ws", _hooked)
@@ -581,3 +585,178 @@ def test_the_full_surface_app_walks_the_flag_registered_routes(
     for key in [("GET", "/ui/oidc/callback"), ("GET", "/docs"), ("GET", "/ui/login")]:
         assert key in rows, key
     assert ("GET", "/ui/oidc/callback") not in _rows_by_key(ui_app)
+
+
+# --- FastAPI names the walk reads (vault BACKLOG #3055) ----------------------------------------------
+
+
+async def _plain(request: Request) -> PlainTextResponse:  # pragma: no cover - never called
+    return PlainTextResponse("")
+
+
+def _app_with_an_included_plain_route() -> FastAPI:
+    sub = APIRouter()
+    sub.add_route("/plain", _plain)
+    app = FastAPI(openapi_url=None)
+    app.include_router(sub, prefix="/inc")
+    return app
+
+
+def test_an_included_plain_route_is_walked_under_its_include_prefix() -> None:
+    """THE CONTROL for the two tests below: with the rebuilt route readable, the included plain
+    route reports the include's prefix rather than its own bare path."""
+    rows = _rows_by_key(_app_with_an_included_plain_route())
+    assert ("GET", "/inc/plain") in rows, sorted(rows)
+    assert ("GET", "/plain") not in rows
+
+
+def _route_context_hiding(
+    monkeypatch: pytest.MonkeyPatch, name: str, *, empty: bool = False
+) -> None:
+    """Make every ``RouteContext`` answer ``name`` as a FastAPI that renamed it would, by raising
+    AttributeError, or as one that left it empty, by returning ``None``."""
+    original = fastapi.routing.RouteContext.__getattr__
+
+    def patched(self: Any, attr: str) -> Any:
+        if attr != name:
+            return original(self, attr)
+        if empty:
+            return None
+        raise AttributeError(attr)
+
+    monkeypatch.setattr(fastapi.routing.RouteContext, "__getattr__", patched)
+
+
+def test_a_renamed_rebuilt_route_fails_the_walk_by_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The walk read the rebuilt route with a silent ``None`` default, so a FastAPI that renamed the
+    field would have walked the route under ``/plain`` and passed. Now it names the field and the
+    installed FastAPI."""
+    app = _app_with_an_included_plain_route()
+    _route_context_hiding(monkeypatch, "starlette_route")
+    with pytest.raises(route_gates.MissingFastAPISymbol) as caught:
+        route_gates.route_rows(app)
+    assert "RouteContext.starlette_route" in str(caught.value)
+    assert f"FastAPI {fastapi.__version__}" in str(caught.value)
+
+
+def test_an_empty_rebuilt_route_fails_the_walk(monkeypatch: pytest.MonkeyPatch) -> None:
+    app = _app_with_an_included_plain_route()
+    _route_context_hiding(monkeypatch, "starlette_route", empty=True)
+    with pytest.raises(ValueError, match="no rebuilt route"):
+        route_gates.route_rows(app)
+
+
+def test_a_fastapi_without_iter_route_contexts_fails_the_import_by_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FastAPI 0.137.0 and 0.137.1 have no ``iter_route_contexts``, and the module must refuse to
+    import there rather than walk without it. A fresh copy is loaded under its own name, so the
+    module every other test imported stays as it was."""
+    monkeypatch.delattr(fastapi.routing, "iter_route_contexts")
+    spec = importlib.util.spec_from_file_location(
+        "route_gates_without_iter_route_contexts", route_gates.__file__
+    )
+    assert spec is not None and spec.loader is not None
+    with pytest.raises(ImportError) as caught:
+        spec.loader.exec_module(importlib.util.module_from_spec(spec))
+    assert "fastapi.routing.iter_route_contexts" in str(caught.value)
+    assert f"FastAPI {fastapi.__version__}" in str(caught.value)
+
+
+def _frontend_on_the_app(app: FastAPI, directory: str) -> None:
+    app.frontend("/app", directory=directory, check_dir=False)
+
+
+def _frontend_in_an_include(app: FastAPI, directory: str) -> None:
+    sub = APIRouter()
+    sub.frontend("/", directory=directory, check_dir=False)
+    app.include_router(sub, prefix="/inc")
+
+
+def _frontend_in_a_mounted_app(app: FastAPI, directory: str) -> None:
+    inner = FastAPI(openapi_url=None)
+    inner.add_api_route("/inner", _ok)
+    inner.frontend("/", directory=directory, check_dir=False)
+    app.mount("/mounted", inner)
+
+
+def _frontend_alone_in_a_mounted_app(app: FastAPI, directory: str) -> None:
+    inner = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
+    inner.frontend("/", directory=directory, check_dir=False)
+    app.mount("/spa", inner)
+
+
+def _frontend_alone_in_a_mounted_router(app: FastAPI, directory: str) -> None:
+    inner = APIRouter()
+    inner.frontend("/", directory=directory, check_dir=False)
+    app.router.routes.append(Mount("/spa", app=inner))
+
+
+def _frontend_alone_in_an_included_mount(app: FastAPI, directory: str) -> None:
+    inner = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
+    inner.frontend("/", directory=directory, check_dir=False)
+    sub = APIRouter()
+    sub.mount("/spa", inner)
+    app.include_router(sub, prefix="/inc")
+
+
+@pytest.mark.parametrize(
+    "register",
+    [
+        _frontend_on_the_app,
+        _frontend_in_an_include,
+        _frontend_in_a_mounted_app,
+        # A mount whose only content is the group has no routes, so a walk never descends into it.
+        _frontend_alone_in_a_mounted_app,
+        _frontend_alone_in_a_mounted_router,
+        _frontend_alone_in_an_included_mount,
+    ],
+)
+def test_a_frontend_group_fails_the_walk_rather_than_passing_unvisited(
+    register: Callable[[FastAPI, str], None], tmp_path: Path
+) -> None:
+    """FastAPI keeps a ``frontend`` group in a list ``iter_route_contexts`` never yields, so the walk
+    would serve it unseen. None is registered today; one that is reds every consumer of the walk."""
+    app = FastAPI(openapi_url=None)
+    app.add_api_route("/ordinary", _ok)
+    assert ("GET", "/ordinary") in _rows_by_key(app)  # the control: no group, no refusal
+    register(app, str(tmp_path))
+    with pytest.raises(ValueError, match="low-priority route"):
+        route_gates.route_rows(app)
+
+
+def test_a_renamed_low_priority_list_fails_the_walk_by_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delattr(APIRouter, "_iter_low_priority_routes")
+    with pytest.raises(route_gates.MissingFastAPISymbol, match="_iter_low_priority_routes"):
+        route_gates.route_rows(FastAPI(openapi_url=None))
+
+
+def test_a_route_registered_directly_and_through_an_include_reports_both_paths() -> None:
+    """The rebuilt route is read before the registered-here test, so a shared route object still
+    reports the prefixed path FastAPI serves through the include."""
+    shared = Route("/plain", _plain)
+    sub = APIRouter()
+    sub.routes.append(shared)
+    app = FastAPI(openapi_url=None)
+    app.router.routes.append(shared)
+    app.include_router(sub, prefix="/inc")
+    rows = _rows_by_key(app)
+    assert ("GET", "/plain") in rows and ("GET", "/inc/plain") in rows, sorted(rows)
+
+
+def test_a_shared_route_object_still_fails_by_name_when_the_rebuilt_route_is_renamed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Registered directly once, the shared object is served as it is once. Its include context
+    must still find the rebuilt copy, so a rename fails by name rather than reporting /plain twice."""
+    shared = Route("/plain", _plain)
+    sub = APIRouter()
+    sub.routes.append(shared)
+    app = FastAPI(openapi_url=None)
+    app.router.routes.append(shared)
+    app.include_router(sub, prefix="/inc")
+    _route_context_hiding(monkeypatch, "starlette_route")
+    with pytest.raises(route_gates.MissingFastAPISymbol, match="starlette_route"):
+        route_gates.route_rows(app)

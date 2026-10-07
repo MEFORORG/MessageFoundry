@@ -1333,4 +1333,5 @@ def test_ldap_empty_password_never_binds(monkeypatch: pytest.MonkeyPatch) -> Non
         raise AssertionError("empty password must not reach the service-account bind")
 
     monkeypatch.setattr(auth, "_service_conn", must_not_be_called)
-    assert auth.authenticate("someuser", "") is None
+    bind = auth.authenticate("someuser", "")
+    assert bind.principal is None and bind.answer is None  # no lookup ran (BACKLOG #2434)

@@ -13,7 +13,7 @@ import pytest
 
 from messagefoundry.api.security import ws_token
 from messagefoundry.auth import totp
-from messagefoundry.auth.ldap import AdPrincipal
+from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token, mint_token
 from messagefoundry.config.settings import AuthSettings
@@ -679,8 +679,10 @@ async def test_ad_role_change_on_relogin_revokes_other_sessions() -> None:
         )
 
         class _FakeLdap:
-            def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
-                return principal if username == "jdoe" else None
+            def authenticate(self, username: str, password: str, **_: object) -> DirectoryBind:
+                if username != "jdoe":
+                    return DirectoryBind(DirectoryAnswer.NOT_FOUND)
+                return DirectoryBind(DirectoryAnswer.FOUND, principal)
 
             def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
                 return principal if username == "jdoe" else None
@@ -750,8 +752,10 @@ async def test_local_and_ad_session_expiry_is_unchanged_by_the_cap_seam() -> Non
         )
 
         class _FakeLdap:
-            def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
-                return principal if username == "jdoe" else None
+            def authenticate(self, username: str, password: str, **_: object) -> DirectoryBind:
+                if username != "jdoe":
+                    return DirectoryBind(DirectoryAnswer.NOT_FOUND)
+                return DirectoryBind(DirectoryAnswer.FOUND, principal)
 
             def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
                 return principal if username == "jdoe" else None
@@ -793,8 +797,10 @@ async def test_ad_login_success_audit_detail_is_byte_identical() -> None:
         )
 
         class _FakeLdap:
-            def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
-                return principal if username == "jdoe" else None
+            def authenticate(self, username: str, password: str, **_: object) -> DirectoryBind:
+                if username != "jdoe":
+                    return DirectoryBind(DirectoryAnswer.NOT_FOUND)
+                return DirectoryBind(DirectoryAnswer.FOUND, principal)
 
             def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
                 return principal if username == "jdoe" else None

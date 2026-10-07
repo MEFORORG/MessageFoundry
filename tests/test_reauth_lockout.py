@@ -35,7 +35,7 @@ from _totp_clock import fresh_totp
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
 from messagefoundry.auth.identity import Identity
-from messagefoundry.auth.ldap import AdPrincipal, LdapError
+from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind, LdapError
 from messagefoundry.auth.notifications import (
     ACCOUNT_LOCKED,
     LOGIN_AFTER_FAILURES,
@@ -635,11 +635,13 @@ class _FakeDirectory:
         self.down = False
         self.known = True  # False = the directory has no such principal (renamed, disabled, ...)
 
-    def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
+    def authenticate(self, username: str, password: str, **_: object) -> DirectoryBind:
         self.binds += 1
         if self.down:
             raise LdapError("synthetic: directory unreachable")
-        return _principal() if password == AD_GOOD and self.known else None
+        if not self.known:
+            return DirectoryBind(DirectoryAnswer.NOT_FOUND)
+        return DirectoryBind(DirectoryAnswer.FOUND, _principal() if password == AD_GOOD else None)
 
     def resolve_principal(self, username: str, **_: object) -> AdPrincipal | None:
         return _principal() if self.known else None

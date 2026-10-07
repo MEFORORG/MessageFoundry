@@ -9,7 +9,10 @@ match the attested wheel. An admin with venv-write + restart rights could edit e
 all**. This module closes that gap: at startup it hashes every **loaded** first-party
 ``messagefoundry`` module file against the wheel's ``*.dist-info/RECORD`` baseline (a zero-new-artifact
 manifest already shipped in the wheel) and, on drift, records a hash-chained ``startup_integrity``
-audit row and fires the :class:`~messagefoundry.pipeline.alerts.AlertSink`.
+audit row and fires the :class:`~messagefoundry.pipeline.alerts.AlertSink`. A module file is any file
+the import system loads a module from -- source, a native extension, a ``.pyc`` outside
+``__pycache__`` -- or a linked directory, and a shipped module that is gone is drift too (vault
+BACKLOG #2763).
 
 It also attests a short, explicit list of shipped security **data** assets (:data:`_ATTESTED_ASSETS`,
 BACKLOG #1432) — files that are not ``.py`` but that a control's behaviour depends on. Editing engine
@@ -66,9 +69,9 @@ import hashlib
 import json
 import logging
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from importlib import metadata
+from importlib import machinery, metadata
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -93,10 +96,10 @@ log = logging.getLogger(__name__)
 #: The installed distribution whose wheel ``RECORD`` is the integrity baseline.
 _DIST_NAME = "messagefoundry"
 
-#: Only first-party engine *source* is attested by the module walk. A ``.pyc`` is a build artifact,
-#: not reviewed bytes, and ``RECORD`` lists ``.py`` (not the compiled cache), so attesting ``.py`` is
-#: the right anchor. It also stays the right *probe* in :func:`_record_has_package_rows`: the question
-#: there is "does RECORD carry package source at all", and a data file cannot answer that.
+#: First-party engine *source*: the suffix every shipped engine module has. It is the *probe* in
+#: :func:`_record_has_package_rows`: the question there is "does RECORD carry package source at all",
+#: and a data file cannot answer that. The module walk lists more than this suffix; see
+#: :func:`_import_capable_files` (vault BACKLOG #2763).
 _ATTESTED_SUFFIX = ".py"
 
 #: Shipped **data** files that a control's behaviour depends on, package-relative to
@@ -168,9 +171,10 @@ _CONSOLE_PACKAGE = "messagefoundry_webconsole"
 #: planted beside a ``.py`` is imported in its place, so a suffix filter would hash the untouched
 #: ``.py`` and report clean. Walking everything makes any file with no ``RECORD`` row ``missing`` drift.
 #: The engine declined a whole-package scope because a wheel might one day ship a file an operator edits
-#: in place (BACKLOG #1432); the console ships none. It is not an explicit list like
-#: :data:`_ATTESTED_ASSETS` either: that list would ship in the ENGINE wheel and be compared against the
-#: CONSOLE's ``RECORD``, and the two are versioned apart, so it would go stale.
+#: in place (BACKLOG #1432); the console ships none. The engine closes the two import shapes with a
+#: suffix-limited walk instead (vault BACKLOG #2763, :func:`_import_capable_files`). It is not an
+#: explicit list like :data:`_ATTESTED_ASSETS` either: that list would ship in the ENGINE wheel and be
+#: compared against the CONSOLE's ``RECORD``, and the two are versioned apart, so it would go stale.
 #:
 #: ``__pycache__`` is skipped because ``RECORD`` carries no hash for compiled caches. The residual that
 #: leaves is recorded in ADR 0041's 2026-09-25 amendment.
@@ -210,8 +214,10 @@ class DriftEntry:
     ``RECORD`` baseline.
 
     ``reason`` is ``"hash_mismatch"`` (on-disk bytes differ from the recorded sha256) or ``"missing"``
-    (the file has no ``RECORD`` entry at all — e.g. a module added in place after install — or it
-    could not be read, which is how a *deleted* declared asset surfaces).
+    (the file has no ``RECORD`` entry at all — e.g. a module, native extension or stray ``.pyc`` added
+    in place after install — or it could not be read, which is how a *deleted* declared asset
+    surfaces, or a ``RECORD`` row the arm reads back has no file: a deleted engine module or console
+    file).
     No file content is carried — only the relpath + reason (no PHI, nothing sensitive).
     """
 
@@ -373,28 +379,111 @@ def _record_has_package_rows(record: dict[str, bytes], package: str) -> bool:
 
 
 def _loaded_module_files() -> list[Path]:
-    """The on-disk ``.py`` files of the loaded first-party ``messagefoundry`` package, sorted.
+    """The on-disk files of the loaded first-party ``messagefoundry`` package that the import system
+    can load a module from, sorted. :func:`_import_capable_files` says which files those are.
 
-    Sourced from ``messagefoundry.__path__`` so it attests exactly the bytes Python imported this
-    process from this install (the integrity question is "do the loaded files match the wheel"). A
-    ``.pyc`` cache, vendored ``tee/``, and any non-``.py`` are excluded.
+    Sourced from ``messagefoundry.__path__`` so it attests exactly the install Python imported this
+    process from (the integrity question is "do the loaded files match the wheel"). Vendored ``tee/``
+    sits outside the package and is not walked.
     """
     import messagefoundry
 
+    return _import_capable_files(messagefoundry.__path__)
+
+
+def _import_capable_files(roots: Iterable[str]) -> list[Path]:
+    """The files under ``roots`` that the import system can load a module from, sorted, plus the
+    entries no wheel installs that could stand in for one (vault BACKLOG #2763).
+    :func:`_is_import_capable` says which names count.
+
+    Listing ``.py`` alone left load-path hijacks the walk could not see. CPython's ``FileFinder``
+    tries a package directory, then an extension module, then source, then sourceless bytecode:
+
+    - a native module planted beside a ``.py`` (``redaction.<extension suffix>``) is imported in its
+      place, while the untouched ``.py`` hashes clean;
+    - a ``.pyc`` left beside a deleted ``.py`` is imported when nothing else is there;
+    - a ``redaction/`` package directory planted beside ``redaction.py`` wins over both. A real one is
+      walked, so its ``__init__.py`` has no row.
+
+    Three entries are listed without being read as modules, because a wheel never installs one and
+    each can carry a module the walk would otherwise miss: a symlink or junction that is not a regular
+    file (a linked or dangling directory, or a dangling link), which the walk never descends, so a
+    junction loop cannot stall it; and a directory the walk cannot list, which the import system can
+    still traverse. None has a ``RECORD`` row, so each is ``missing`` drift.
+
+    Each listed file goes through the ``RECORD`` classifier like source: a native module the wheel
+    records is hash-compared, and any file with no row is ``missing`` drift. A deleted file is caught
+    separately, by :func:`attest_engine` reading back the rows nothing matched. A ``.pyc`` beside a
+    ``.py`` that still exists is inert, because source wins, and is drift anyway: no supported install
+    leaves one there, and telling the inert case from the live one would mean re-deriving the loader's
+    order here.
+
+    **Not every file**, which is the scope BACKLOG #1432 declined; ADR 0041's 2026-10-06 amendment
+    says why that ruling does not reach these shapes, and records what this walk still does not see.
+
+    **The root is resolved, the files under it are not.** A file swapped for a symlink keeps its place
+    under the install root, and hashing it reads the bytes the symlink points at, which is what an
+    import would run. Resolving the file itself would move it outside the root, where the comparison
+    skips it. The console arm does the same (:func:`_console_loaded_files`).
+    """
     files: set[Path] = set()
-    for root in messagefoundry.__path__:
-        base = Path(root)
-        for path in base.rglob(f"*{_ATTESTED_SUFFIX}"):
-            if path.is_file():
-                files.add(path.resolve())
+
+    def unlistable(error: OSError) -> None:
+        if error.filename is not None:
+            files.add(Path(error.filename))
+
+    for root in roots:
+        for dirpath, _dirnames, filenames in Path(root).resolve().walk(on_error=unlistable):
+            for name in filenames:
+                path = dirpath / name
+                if path.is_file():
+                    if _is_import_capable(name) and not _is_bytecode_cache(path):
+                        files.add(path)
+                elif path.is_symlink() or path.is_junction():
+                    files.add(path)
     return sorted(files)
+
+
+#: :func:`importlib.machinery.all_suffixes` (source, sourceless bytecode and this interpreter's native
+#: extension suffixes) and the bytecode subset, case-folded once.
+_IMPORT_SUFFIXES = tuple(suffix.casefold() for suffix in machinery.all_suffixes())
+_BYTECODE_SUFFIXES = tuple(suffix.casefold() for suffix in machinery.BYTECODE_SUFFIXES)
+
+
+def _is_import_capable(name: str) -> bool:
+    """Whether a file named ``name`` is one the import system can load a module from. Compared
+    case-folded, so a case-insensitive filesystem cannot hide one behind its spelling; on a
+    case-sensitive one that over-reports a file nothing would import, which no supported install
+    leaves behind."""
+    return name.casefold().endswith(_IMPORT_SUFFIXES)
+
+
+def _is_bytecode_cache(path: Path) -> bool:
+    """Whether ``path`` is compiled bytecode in a ``__pycache__`` directory, which ``RECORD`` carries no
+    hash for and which every bytecode-compiling install writes."""
+    return path.parent.name == _BYTECODE_CACHE_DIR and path.name.casefold().endswith(
+        _BYTECODE_SUFFIXES
+    )
+
+
+def _is_module_row(rel: str) -> bool:
+    """Whether a ``RECORD`` row names a file a module is imported from, by the walk's own name test:
+    the rows :func:`attest_engine` reads back to report a deleted file (vault BACKLOG #2763)."""
+    return _is_import_capable(rel.rsplit("/", 1)[-1])
+
+
+def _any_row(rel: str) -> bool:
+    """Every ``RECORD`` row: the console reads all of its own back (BACKLOG #1802)."""
+    return True
 
 
 def _attested_asset_files() -> list[Path]:
     """The on-disk paths of the shipped security **data** assets in :data:`_ATTESTED_ASSETS`.
 
     Resolved under ``messagefoundry.__path__``, the same anchor the module walk uses, so both halves
-    attest the install this process actually imported from.
+    attest the install this process actually imported from. Like that walk it resolves the root and
+    not the asset, so an asset swapped for a symlink is hashed in its own place rather than skipped as
+    outside the install root (vault BACKLOG #2763).
 
     **A path is returned whether or not it exists.** Deleting a declared asset is tampering too, and a
     caller that filtered on existence would report clean for it; the attestation loop turns the
@@ -404,7 +493,7 @@ def _attested_asset_files() -> list[Path]:
 
     return list(
         dict.fromkeys(
-            (Path(root) / rel).resolve()
+            Path(root).resolve() / rel
             for root in messagefoundry.__path__
             for rel in _ATTESTED_ASSETS
         )
@@ -562,13 +651,22 @@ def attest_engine() -> AttestationResult:
     Pure + offline + synchronous (blocking file reads) — callers on the event loop must wrap it in
     ``asyncio.to_thread``.
 
+    A module file is any file the import system can load one from, not only ``.py`` (vault BACKLOG
+    #2763, :func:`_import_capable_files`), and a ``RECORD`` row for such a file whose file is gone is
+    ``missing`` drift: deleting the source is what lets a sourceless ``.pyc`` beside it run. Only
+    module rows are read back, not every row, for the reason BACKLOG #1432 gives; the console arm reads
+    all of its own.
+
     Never raises for a missing/editable install; it returns a result whose ``unattested_reason`` names
     what stopped it from comparing anything, and :func:`run_startup_attestation` decides what that
     costs. A true I/O failure reading an attested file marks that file as drift (``missing``) rather
     than crashing startup.
     """
     return _attest_distribution(
-        _DIST_NAME, _DIST_NAME, lambda: [*_loaded_module_files(), *_attested_asset_files()]
+        _DIST_NAME,
+        _DIST_NAME,
+        lambda: [*_loaded_module_files(), *_attested_asset_files()],
+        unmatched_rows=_is_module_row,
     )
 
 
@@ -584,9 +682,9 @@ def attest_console() -> AttestationResult | None:
     :func:`run_startup_attestation` treats exactly as it treats the engine's. Same blocking-I/O
     contract as :func:`attest_engine`.
 
-    Unlike the engine arm it also reads every console row in ``RECORD``, so a DELETED console file is
-    ``missing`` drift. The engine arm cannot do that without a list that could go stale; the console's
-    own ``RECORD`` ships in the same wheel as its files, so it can.
+    Unlike the engine arm it reads back EVERY console row in ``RECORD``, not only module rows, so any
+    DELETED console file is ``missing`` drift. The console's own ``RECORD`` ships in the same wheel as
+    its files, and the console ships no file an operator edits in place (BACKLOG #1432).
     """
     files = _console_loaded_files()
     if files is None:
@@ -595,7 +693,7 @@ def attest_console() -> AttestationResult | None:
         )
         return None
     return _attest_distribution(
-        _CONSOLE_DIST_NAME, _CONSOLE_PACKAGE, lambda: files, every_record_row=True
+        _CONSOLE_DIST_NAME, _CONSOLE_PACKAGE, lambda: files, unmatched_rows=_any_row
     )
 
 
@@ -604,17 +702,17 @@ def _attest_distribution(
     package: str,
     attested_files: Callable[[], list[Path]],
     *,
-    every_record_row: bool = False,
+    unmatched_rows: Callable[[str], bool] | None = None,
 ) -> AttestationResult:
     """Compare ``attested_files()`` against the ``RECORD`` of installed distribution ``dist_name``,
     whose source sits under the top-level ``package`` directory. The one classifier both arms share,
     so the engine and the console cannot drift apart on what counts as attested.
 
-    ``attested_files`` is called only once a usable baseline is known to exist. ``every_record_row``
-    additionally reports each hashed ``RECORD`` row under ``package/`` that no attested file matched as
-    ``missing`` drift -- a deleted file. It applies only when at least one attested file sat under the
-    install root, so a package loaded from outside it stays attested-nothing rather than turning into a
-    list of every file it did not load.
+    ``attested_files`` is called only once a usable baseline is known to exist. ``unmatched_rows``
+    additionally reports each hashed ``RECORD`` row under ``package/`` (bytecode caches aside) that no
+    attested file matched, and that the predicate accepts, as ``missing`` drift -- a deleted file. It
+    applies only when at least one attested file sat under the install root, so a package loaded from
+    outside it stays attested-nothing rather than turning into a list of every file it did not load.
     """
     try:
         dist = metadata.distribution(dist_name)
@@ -666,21 +764,30 @@ def _attest_distribution(
             # was dropped from the wheel it is compared against, which is itself worth an alert.
             drift.append(DriftEntry(path=rel, reason="missing"))
             continue
+        if _is_special_file(file):
+            # A FIFO, device or socket at a RECORD path: reading it can block startup forever.
+            drift.append(DriftEntry(path=rel, reason="missing"))
+            continue
         checked += 1
         try:
-            actual = hashlib.sha256(file.read_bytes()).digest()
+            # Streamed: a module swapped for a link to a very large file must not be read into memory.
+            with file.open("rb") as handle:
+                actual = hashlib.file_digest(handle, "sha256").digest()
         except OSError:
             drift.append(DriftEntry(path=rel, reason="missing"))
             continue
         if actual != expected:
             drift.append(DriftEntry(path=rel, reason="hash_mismatch"))
-    if every_record_row and seen:
+    if unmatched_rows is not None and seen:
         prefix = f"{package}/"
         cache = f"/{_BYTECODE_CACHE_DIR}/"
         drift.extend(
             DriftEntry(path=rel, reason="missing")
             for rel in sorted(record)
-            if rel.startswith(prefix) and cache not in rel and rel not in seen
+            if rel.startswith(prefix)
+            and cache not in rel
+            and rel not in seen
+            and unmatched_rows(rel)
         )
     return AttestationResult(
         attested=True,

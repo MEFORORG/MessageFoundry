@@ -216,9 +216,11 @@ async def test_release_hook_failure_is_nonfatal_handback_completes(tmp_path: Pat
         async def act() -> None:
             state["active"] = True
 
-        async def deact() -> int:
+        async def deact() -> dict[str, object]:
             state["active"] = False
-            return 0  # the staged queue drained (the depth left, vault BACKLOG #2752)
+            return {
+                "depth_left": 0
+            }  # the staged queue drained (the depth left, vault BACKLOG #2752)
 
         coord = DrCoordinator(
             store,

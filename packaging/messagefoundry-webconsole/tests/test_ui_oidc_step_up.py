@@ -23,7 +23,7 @@ from _ui_clients import SAME_ORIGIN as _SAME
 from _ui_clients import issue_continuation
 
 from messagefoundry.api import create_app
-from messagefoundry.auth.ldap import AdPrincipal
+from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind
 from messagefoundry.auth.oidc import FederatedPrincipal
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
@@ -52,9 +52,11 @@ class _FakeLdap:
     def __init__(self) -> None:
         self.binds: list[str] = []
 
-    def authenticate(self, username: str, password: str, **_: object) -> AdPrincipal | None:
+    def authenticate(self, username: str, password: str, **_: object) -> DirectoryBind:
         self.binds.append(username)
-        return _PRINCIPAL if username == "jdoe" else None
+        if username != "jdoe":
+            return DirectoryBind(DirectoryAnswer.NOT_FOUND)
+        return DirectoryBind(DirectoryAnswer.FOUND, _PRINCIPAL)
 
     def resolve_principal(
         self, username: str, *, object_id: str | None = None

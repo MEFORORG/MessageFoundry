@@ -7,6 +7,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
+import stat
+import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -176,29 +179,147 @@ def test_compare_end_to_end(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Seed a Corepoint capture, stub the MEFOR API pull, run `tee compare`, and check the summary.
-    from tee import mefor_api
-    from tee.correlate import MeforOutput
-
-    db = str(tmp_path / "tee.db")
-    body = (
-        "MSH|^~\\&|APP|SF|DOWN|DFAC|20260604120000||ADT^A01|C1|P|2.5.1\r"
-        "PID|1||100^^^H^MR||DOE^JANE\r"
-    )
-
-    async def _seed_capture() -> None:
-        store = await RelayStore.open(db)
-        await store.record_capture(direction="corepoint_copy", control_id="C1", raw=body.encode())
-        await store.close()
-
-    asyncio.run(_seed_capture())
-    monkeypatch.setattr(
-        mefor_api,
-        "fetch_mefor_outputs",
-        lambda get, **kw: [MeforOutput("m1", "C1", "OB", body)],
-    )
+    db = _seed_compare(tmp_path, monkeypatch, mefor_name="DOE^JANE")
     rc = main(["compare", "--db", db, "--mefor-api", "http://127.0.0.1:9", "--token", "T"])
     assert rc == 0
     report = json.loads(capsys.readouterr().out)
     assert report["summary"]["exact"] == 1
     assert report["summary"]["matched"] == 1
     assert "diffs" not in report  # PHI diffs off without --show-diffs
+
+
+def _seed_compare(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, mefor_name: str = "DOE^JOAN"
+) -> str:
+    """A capture DB holding one Corepoint message named DOE^JANE, plus a stubbed MEFOR pull of the
+    same message named ``mefor_name``. The default DIFFERS, so a ``--show-diffs`` report carries
+    field values. Synthetic data only."""
+    from tee import mefor_api
+    from tee.correlate import MeforOutput
+
+    db = str(tmp_path / "tee.db")
+    msh = "MSH|^~\\&|APP|SF|DOWN|DFAC|20260604120000||ADT^A01|C1|P|2.5.1\r"
+    corepoint_body = msh + "PID|1||100^^^H^MR||DOE^JANE\r"
+    mefor_body = msh + f"PID|1||100^^^H^MR||{mefor_name}\r"
+
+    async def _seed_capture() -> None:
+        store = await RelayStore.open(db)
+        await store.record_capture(
+            direction="corepoint_copy", control_id="C1", raw=corepoint_body.encode()
+        )
+        await store.close()
+
+    asyncio.run(_seed_capture())
+    monkeypatch.setattr(
+        mefor_api,
+        "fetch_mefor_outputs",
+        lambda get, **kw: [MeforOutput("m1", "C1", "OB", mefor_body)],
+    )
+    return db
+
+
+def _compare_to(db: str, out: Path) -> int:
+    return main(
+        [
+            "compare",
+            "--db",
+            db,
+            "--mefor-api",
+            "http://127.0.0.1:9",
+            "--token",
+            "T",
+            "--show-diffs",
+            "--out",
+            str(out),
+        ]
+    )
+
+
+_POSIX_MODES = pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+
+
+@_POSIX_MODES
+def test_compare_show_diffs_out_is_created_owner_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # vault BACKLOG #2792: under a 022 umask, write_text created this report 0644.
+    db = _seed_compare(tmp_path, monkeypatch)
+    out = tmp_path / "report.json"
+    previous = os.umask(0o022)
+    try:
+        assert _compare_to(db, out) == 0
+    finally:
+        os.umask(previous)
+    assert stat.S_IMODE(out.stat().st_mode) == 0o600
+    # Control: the field values the mode protects really are in the file.
+    assert json.loads(out.read_text(encoding="utf-8"))["diffs"]
+
+
+@_POSIX_MODES
+def test_compare_out_replaces_an_existing_readable_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A mode argument applies only at creation, so writing INTO an existing 0644 file would keep
+    # 0644. The report is a new file renamed over it, so the old file and its mode are gone.
+    db = _seed_compare(tmp_path, monkeypatch)
+    out = tmp_path / "report.json"
+    out.write_text("stale\n", encoding="utf-8")
+    out.chmod(0o644)
+    old_inode = out.stat().st_ino
+    assert _compare_to(db, out) == 0
+    assert stat.S_IMODE(out.stat().st_mode) == 0o600
+    assert out.stat().st_ino != old_inode
+    assert "stale" not in out.read_text(encoding="utf-8")
+    assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")] == []
+
+
+@_POSIX_MODES
+def test_compare_out_replaces_a_link_rather_than_following_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A link at the output name would otherwise send the report to whatever file it points at.
+    db = _seed_compare(tmp_path, monkeypatch)
+    target = tmp_path / "elsewhere.json"
+    target.write_text("untouched\n", encoding="utf-8")
+    out = tmp_path / "report.json"
+    out.symlink_to(target)
+    assert _compare_to(db, out) == 0
+    assert target.read_text(encoding="utf-8") == "untouched\n"
+    assert not out.is_symlink()
+    assert stat.S_IMODE(out.stat().st_mode) == 0o600
+
+
+@_POSIX_MODES
+def test_compare_out_writes_through_a_pipe_this_account_owns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `--out >(jq .)` and `--out /dev/stdout` name a stream on purpose. Replacing it with a file
+    # would break the pipeline, so the report is written into it and nothing is created beside it.
+    import threading
+
+    db = _seed_compare(tmp_path, monkeypatch)
+    fifo = tmp_path / "report.pipe"
+    # Always true here, since the test is skipped on Windows; the check narrows for mypy's win32 leg.
+    if sys.platform != "win32":
+        os.mkfifo(fifo)
+    received: list[str] = []
+    reader = threading.Thread(target=lambda: received.append(fifo.read_text(encoding="utf-8")))
+    reader.start()
+    try:
+        assert _compare_to(db, fifo) == 0
+    finally:
+        reader.join(timeout=10)
+    assert stat.S_ISFIFO(fifo.lstat().st_mode), "the pipe was replaced by a file"
+    assert json.loads(received[0])["diffs"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["report.pipe", "tee.db"]
+
+
+def test_compare_out_that_cannot_be_written_is_an_error_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A write failure reports like every other _compare failure: an `error:` line and exit 1.
+    db = _seed_compare(tmp_path, monkeypatch)
+    out = tmp_path / "no-such-dir" / "report.json"
+    assert _compare_to(db, out) == 1
+    assert "error: could not write the report" in capsys.readouterr().err
+    assert not out.parent.exists()
