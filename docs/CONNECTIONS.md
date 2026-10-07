@@ -406,10 +406,14 @@ RemoteFile, Timer, Loopback, PassThrough — none of them binds an interface).
 > start/reload — naming **both** connections, instead of aborting at the bare OS bind. The check is
 > **interface-aware**: two listeners on the same port but **different** explicit `bind_address`es (a
 > multi-NIC host) don't conflict, while a `0.0.0.0` (all-interfaces) bind conflicts with any specific
-> interface on that port. `env()`-resolved ports and the engine's own **API listener port** (`[api].port`)
-> are included in the start/reload pass. At runtime, a port already held by **another process** (a
-> second instance, an OS service) is reported as a clear, named conflict and the affected inbound is
-> **isolated** (the engine still comes up; see [ADR 0031](adr/0031-startup-connection-fault-isolation.md)).
+> interface on that port. A listener configured with `port = 0` is not compared: the OS chooses
+> the port at bind time, so several such listeners do not refuse each other. That port can change
+> whenever the listener rebinds and the engine does not report it, so a sending system cannot be
+> pointed at it: `port = 0` is for tests and embedding, not for a partner-facing listener.
+> `env()`-resolved ports and the engine's own **API listener port** (`[api].port`) are included in
+> the start/reload pass. At runtime, a port already held by **another process** (a second instance,
+> an OS service) is reported as a clear, named conflict and the affected inbound is **isolated**
+> (the engine still comes up; see [ADR 0031](adr/0031-startup-connection-fault-isolation.md)).
 
 #### Inspecting & testing a connection (API)
 

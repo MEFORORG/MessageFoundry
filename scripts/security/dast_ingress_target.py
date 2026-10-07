@@ -10,6 +10,12 @@ ingress commit and the synchronous NAK -- and whether the engine's own invariant
 So this module builds the same graph an operator would wire, on an engine created over an empty store
 in a temporary directory, and binds every listener to ``127.0.0.1`` on an ephemeral port.
 
+EVERY LISTENER IS CONFIGURED WITH ``port: 0``, AND ITS PORT IS READ BACK FROM THE BOUND SOCKET.
+Picking a free port first and handing its number to the engine is a time-of-check/time-of-use race:
+another process or xdist worker can take the port in between, and the target then comes up without
+that listener (merge-queue intermittent, DAST ingress port race, 2026-10-07). Only the bind itself
+can choose a port nobody else holds.
+
 THE SCANNED POSTURE IS NOT THE SHIPPED DEFAULT, and the receipt prints every difference. The frame
 cap, the idle bound and the frame deadline are all shortened through supported settings so a case
 that must be CLOSED by the listener closes in about a second rather than a minute, and an oversize
@@ -130,28 +136,8 @@ class IngressTarget:
         )
 
 
-def _free_ports(count: int) -> list[int]:
-    """``count`` distinct loopback ports the OS has just handed out.
-
-    Only the FIRST inbound may ask for port 0: the runner's port-conflict guard compares configured
-    port numbers, so a second ``port: 0`` is refused as "already bound" before anything binds. The
-    other listeners therefore take a port picked here. Held open together, so the ports are distinct;
-    released before the engine binds them, so a collision with another process is possible but rare,
-    and it surfaces as IngressTargetUnusable (exit 2), never as a clean run.
-    """
-    held = [socket.socket(socket.AF_INET, socket.SOCK_STREAM) for _ in range(count)]
-    try:
-        for sock in held:
-            sock.bind(("127.0.0.1", 0))
-        return [int(sock.getsockname()[1]) for sock in held]
-    finally:
-        for sock in held:
-            sock.close()
-
-
 def _registry(settings: Mapping[str, Any], *, canary: str | None) -> Registry:
     cap = int(settings["max_frame_bytes"])
-    tcp_port, x12_port = _free_ports(2)
     idle = float(settings["receive_timeout"])
     reg = Registry()
     reg.add_router("dast_router", lambda _message: [])
@@ -179,7 +165,7 @@ def _registry(settings: Mapping[str, Any], *, canary: str | None) -> Registry:
             ConnectionSpec(
                 ConnectorType.TCP,
                 {
-                    "port": tcp_port,
+                    "port": 0,
                     "framing": "stx_etx",
                     "max_frame_bytes": cap,
                     "receive_timeout": idle,
@@ -196,7 +182,7 @@ def _registry(settings: Mapping[str, Any], *, canary: str | None) -> Registry:
             ConnectionSpec(
                 ConnectorType.X12,
                 {
-                    "port": x12_port,
+                    "port": 0,
                     "max_interchange_bytes": cap,
                     "receive_timeout": idle,
                     "max_frame_seconds": float(settings["max_frame_seconds"]),
