@@ -11680,8 +11680,8 @@ class MessageStore:
         """Write the account's profile fields. **This is the directory-sync write** — ``_upsert_ad_user``
         calls it on every AD/OIDC login — so it deliberately does NOT name ``notify_email`` (BACKLOG
         #1139). Adding that column to this SET list would hand the directory the notification target
-        back and restore the defect the split removes. ``audits`` commit with the UPDATE (BACKLOG
-        #2221)."""
+        back and restore the defect the split removes. ``audits``: see
+        ``AuthStore.update_user_profile``."""
         now = time.time() if now is None else now
         async with _writer_guard(self._db, self._lock):
             await self._db.execute(

@@ -7133,11 +7133,14 @@ class PostgresStore:
     async def _execute_with_audits(
         self, sql: str, params: tuple[Any, ...], audits: Sequence[AuditAppend], *, now: float
     ) -> None:
-        """Run one account write with its ``audits`` in the same transaction (BACKLOG #2100, #2221).
+        """Run one account write and append its ``audits`` in the same transaction.
 
-        With none it is a plain :meth:`_execute`. Otherwise a failed append rolls the write back.
-        `record=False` as `_execute` passes: a sign-in is not a pipeline borrow. The write holds its
-        row while it waits for the audit advisory lock; BACKLOG #2222 records that wider scope."""
+        The contract is ``AuthStore.create_user``'s. With no audits it is a plain :meth:`_execute`.
+        `record=False` as `_execute` passes: an account write is not a pipeline borrow.
+
+        THE WRITE HOLDS ITS ``users`` ROW WHILE IT WAITS FOR THE AUDIT ADVISORY LOCK. BACKLOG #2222
+        reviews that scope for a first sign-in's INSERT only; the directory repoint's UPDATE and
+        the administrator's create (BACKLOG #2221) widen it and are not yet in that item."""
         if not audits:
             await self._execute(sql, *params)
             return
@@ -7807,8 +7810,8 @@ class PostgresStore:
         """Write the account's profile fields. **This is the directory-sync write** — ``_upsert_ad_user``
         calls it on every AD/OIDC login — so it deliberately does NOT name ``notify_email`` (BACKLOG
         #1139). Adding that column to this SET list would hand the directory the notification target
-        back and restore the defect the split removes. ``audits`` commit with the UPDATE (BACKLOG
-        #2221)."""
+        back and restore the defect the split removes. ``audits``: see
+        ``AuthStore.update_user_profile``."""
         now = time.time() if now is None else now
         await self._execute_with_audits(
             "UPDATE users SET display_name=$1, email=$2, updated_at=$3 WHERE id=$4",

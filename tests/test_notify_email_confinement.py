@@ -327,10 +327,17 @@ async def test_a_repoint_is_still_announced_to_a_mirror_the_birth_test_would_ado
         await store.close()
 
 
-def _refuse_audit_appends(store: Any) -> None:
-    """Make every later audit append on ``store`` raise (BACKLOG #2100, #2221). Any backend."""
+def _refuse_audit_appends(store: Any, *, after: int = 0) -> None:
+    """Make audit appends on ``store`` raise once ``after`` more have run (BACKLOG #2100, #2221).
+
+    Any backend. Each append reads the chain key once, so the hook counts appends."""
+    allowed = [after]
+    key = store._audit_append_mac
 
     def _refuse() -> Any:
+        if allowed[0] > 0:
+            allowed[0] -= 1
+            return key()
         raise RuntimeError("audit append refused")
 
     store._audit_append_mac = _refuse
@@ -995,6 +1002,35 @@ async def test_every_store_backend_commits_several_audit_rows_with_the_insert_in
         rows = sorted(await backend_store.list_audit(actor=name), key=lambda r: r["seq"])
         assert [r["action"] for r in rows] == ["auth.ad_notify_email_not_adopted", "user.created"]
         assert rows[1]["seq"] == rows[0]["seq"] + 1
+    finally:
+        await backend_store.delete_user(user_id)
+
+
+async def test_every_store_backend_rolls_everything_back_when_the_second_row_fails(
+    backend_store: Any,
+) -> None:
+    """BACKLOG #2221. A refusal on the second of two rows takes the first row and the account with
+    it, so no partial record survives a birth that did not happen."""
+    name = f"secondrow-{uuid4().hex[:12]}"
+    user_id = uuid4().hex
+    _refuse_audit_appends(backend_store, after=1)
+    try:
+        with pytest.raises(RuntimeError, match="audit append refused"):
+            await backend_store.create_user(
+                user_id=user_id,
+                username=name,
+                auth_provider="ad",
+                email=_UNADOPTABLE_DIRECTORY_MAIL[0][1],
+                adopt_notify_email=False,
+                notify_email=ADDRESS,
+                audits=(
+                    AuditAppend("auth.ad_notify_email_not_adopted", actor=name),
+                    AuditAppend("user.created", actor=name),
+                ),
+                password_generated=False,
+            )
+        assert await backend_store.get_user(user_id) is None
+        assert await backend_store.list_audit(actor=name) == []
     finally:
         await backend_store.delete_user(user_id)
 
