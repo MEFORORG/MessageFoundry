@@ -37,9 +37,12 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import glob
 import logging
 import os
+import re
 import shutil
+import stat
 import sys
 import tempfile
 import threading
@@ -48,10 +51,12 @@ from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 
 __all__ = [
+    "CANDIDATE_DIR_SUFFIX",
     "DEFAULT_LOCK_TIMEOUT_S",
     "LOCK_FILE_NAME",
     "edit_lock",
     "encode_text",
+    "is_candidate_dir_name",
     "lock_path_for",
     "read_text",
     "replace_validated",
@@ -65,6 +70,20 @@ DEFAULT_LOCK_TIMEOUT_S = 30.0
 
 #: The lock file, one per directory holding an edited file.
 LOCK_FILE_NAME = ".mefor-edit.lock"
+
+#: The suffix of a candidate's private directory, ``.<name>.<random>.edit`` beside the edited
+#: file. A reader that walks a config directory (the DR backup) skips these and the lock file.
+CANDIDATE_DIR_SUFFIX = ".edit"
+
+#: The exact name ``tempfile.mkdtemp`` gives a candidate directory: the file's name, then its
+#: random part, eight characters with no dot, so an operator's own ``.x.edit`` directory and a
+#: sibling file's candidates (``.<name>.bak.<random>.edit``) never match. A test pins this against
+#: the real ``mkdtemp``, so a change in its naming fails loudly rather than leaking candidates.
+_CANDIDATE_DIR_RE = re.compile(rf"\.(?P<name>.+)\.[a-z0-9_]{{8}}{re.escape(CANDIDATE_DIR_SUFFIX)}")
+
+#: A candidate directory older than this is a leftover from a killed editor, never a live edit:
+#: a live one lasts one validation. Old enough to stay safe on a file system that cannot lock.
+_STALE_CANDIDATE_S = 600.0
 
 #: The poll interval while another editor holds the lock.
 _LOCK_POLL_S = 0.05
@@ -85,6 +104,13 @@ _held = threading.local()
 def lock_path_for(path: Path) -> Path:
     """The lock file guarding edits to ``path``, and to every other file in its directory."""
     return path.with_name(LOCK_FILE_NAME)
+
+
+def is_candidate_dir_name(name: str, *, of: str | None = None) -> bool:
+    """Whether ``name`` is a candidate's private directory, ``.<file>.<random>.edit``, and when
+    ``of`` is given, a candidate of the file named ``of``."""
+    match = _CANDIDATE_DIR_RE.fullmatch(name)
+    return match is not None and (of is None or match.group("name") == of)
 
 
 def read_text(path: Path) -> tuple[str, bool]:
@@ -125,7 +151,19 @@ def edit_lock(
     # Read-only and readable by all: the file holds no data, a lock needs only an open handle,
     # and an editor running as another account (an operator's CLI beside the service) must
     # still be able to open a lock file the other one created.
-    fd = os.open(lock_path, os.O_RDONLY | os.O_CREAT | _O_BINARY, 0o644)
+    # O_NOFOLLOW where the platform has it: a lock path planted as a link is refused, not followed.
+    # O_NONBLOCK so a lock path planted as a FIFO cannot block the open before the timeout runs.
+    flags = os.O_RDONLY | os.O_CREAT | _O_BINARY
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(lock_path, flags, 0o644)
+    except OSError as exc:
+        if exc.errno != errno.ELOOP:
+            raise
+        # In the editor's own refusal type, so its callers catch it as they catch a busy lock.
+        raise busy_error(
+            f"{lock_path} is a link; an edit of {path} will not lock through it -- remove it"
+        ) from exc
     try:
         locked = _acquire(fd, lock_path, path, busy_error, timeout)
         held.add(key)
@@ -155,8 +193,12 @@ def replace_validated(
     ``path``. Each existing file in ``companions`` is copied beside the candidate first. ``validate``
     receives the candidate path and raises to refuse; the refusal propagates unchanged and the live
     file is left byte-for-byte and mode-for-mode as it was. On success the candidate is renamed over
-    ``path`` and re-restricted to its owner. The private directory is removed either way."""
-    private = Path(tempfile.mkdtemp(dir=path.parent, prefix=f".{path.name}.", suffix=".edit"))
+    ``path`` and re-restricted to its owner. The private directory is removed either way, and a
+    stale one a killed editor of ``path`` left behind is removed first."""
+    _remove_stale_candidates(path)
+    private = Path(
+        tempfile.mkdtemp(dir=path.parent, prefix=f".{path.name}.", suffix=CANDIDATE_DIR_SUFFIX)
+    )
     try:
         candidate = private / path.name
         fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY, 0o600)
@@ -263,6 +305,29 @@ def _fsync_dir(directory: Path) -> None:
         _log.warning("could not flush the edit's rename in %s: %s", directory, exc)
     finally:
         os.close(fd)
+
+
+def _remove_stale_candidates(path: Path) -> None:
+    """Remove candidate directories for ``path`` that a killed editor left behind.
+
+    Each caller holds the edit lock, and only a directory older than ``_STALE_CANDIDATE_S`` is
+    touched, so a live candidate is safe even where the file system could not lock. Best-effort:
+    a directory that cannot be listed or removed is logged and the edit goes on."""
+    cutoff = time.time() - _STALE_CANDIDATE_S
+    try:
+        entries = list(path.parent.glob(f".{glob.escape(path.name)}.*{CANDIDATE_DIR_SUFFIX}"))
+    except OSError as exc:
+        _log.warning("could not list %s for stale edit candidates: %s", path.parent, exc)
+        return
+    for entry in entries:
+        if not is_candidate_dir_name(entry.name, of=path.name):
+            continue
+        try:
+            st = entry.lstat()
+        except OSError:
+            continue
+        if stat.S_ISDIR(st.st_mode) and st.st_mtime < cutoff:
+            _remove_private_dir(entry)
 
 
 def _remove_private_dir(private: Path) -> None:
