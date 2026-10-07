@@ -7861,16 +7861,8 @@ class PostgresStore:
                 now,
                 user_id,
             )
-            appended = await self._append_audit_row(
-                conn,
-                audit.action,
-                actor=audit.actor,
-                channel_id=None,
-                detail=audit.detail,
-                client=audit.client,
-                now=now,
-            )
-        audit.tee(ts=now, row=appended)
+            appended = await self._append_audits(conn, (audit,), now=now)
+        tee_audits((audit,), appended, ts=now)
         return _rowcount(revoked)
 
     async def disable_totp(self, user_id: str, *, now: float | None = None) -> None:

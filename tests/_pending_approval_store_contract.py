@@ -103,6 +103,37 @@ async def _audit_rows_for(store: Any, action: str, approval_id: str) -> list[Any
     ]
 
 
+class _TeeTap:
+    """Record each :class:`AuditAppend` a store tees off-box, without the logging tee itself.
+
+    Patched on the class, because a store holds no reference to the tee: each backend calls
+    ``tee_audits`` after its own commit. Only teed rows land here, so a row that rolled back must
+    not appear, and a committed one must appear exactly once."""
+
+    def __init__(self) -> None:
+        from messagefoundry.store.store import AppendedAuditRow, AuditAppend
+
+        self._cls = AuditAppend
+        self._real = AuditAppend.tee
+        self.teed: list[tuple[str, str | None, int]] = []
+        teed = self.teed
+
+        def tap(audit: AuditAppend, *, ts: float, row: AppendedAuditRow) -> None:
+            teed.append((audit.action, audit.detail, int(row.row_id)))
+
+        AuditAppend.tee = tap  # type: ignore[method-assign, assignment]
+
+    def stop(self) -> None:
+        self._cls.tee = self._real  # type: ignore[method-assign]
+
+    def ids(self, action: str, approval_id: str) -> list[int]:
+        return [
+            row_id
+            for teed_action, detail, row_id in self.teed
+            if teed_action == action and json.loads(str(detail)).get("approval_id") == approval_id
+        ]
+
+
 async def _assert_transition_audit_contract(store: Any) -> None:
     """``create_pending_approval`` and ``decide_pending_approval`` append their ``audit`` row in the
     SAME transaction, on this backend's own SQL.
@@ -135,6 +166,7 @@ async def _assert_transition_audit_contract(store: Any) -> None:
         )
 
     real_append = store._append_audit_row
+    tap = _TeeTap()
     try:
         assert await request(approval_id) == approval_id
         assert len(await _audit_rows_for(store, "approval.requested", approval_id)) == 1
@@ -179,7 +211,17 @@ async def _assert_transition_audit_contract(store: Any) -> None:
         assert await _status(store, approval_id) == "rejected"
         rejected = await _audit_rows_for(store, "approval.rejected", approval_id)
         assert len(rejected) == 1 and str(rejected[0]["actor"]) == _APPROVER
+
+        # Each committed row is teed off-box once, after its commit, as the row the chain holds.
+        # A rolled-back row and a transition that matched nothing tee nothing.
+        requested = await _audit_rows_for(store, "approval.requested", approval_id)
+        assert tap.ids("approval.requested", approval_id) == [int(requested[0]["id"])]
+        assert tap.ids("approval.requested", lost_id) == []
+        assert tap.ids("approval.release_attempted", approval_id) == []
+        assert tap.ids("approval.approved", approval_id) == []
+        assert tap.ids("approval.rejected", approval_id) == [int(rejected[0]["id"])]
     finally:
+        tap.stop()
         store._append_audit_row = real_append
         # Leave the table as it was found; the server legs share one database across tests.
         await store.decide_pending_approval(
@@ -233,6 +275,7 @@ async def _assert_repeat_request_contract(store: Any) -> None:
         filed.add(held)
         return held
 
+    tap = _TeeTap()
     try:
         first = await request()
         assert await request() == first
@@ -244,7 +287,13 @@ async def _assert_repeat_request_contract(store: Any) -> None:
         raced = await asyncio.gather(*(request() for _ in range(6)))
         assert set(raced) == {first}
         assert len(await _audit_rows_for(store, "approval.requested", first)) == 1
-        assert len(await _audit_rows_for(store, "approval.request_repeated", first)) == 7
+        repeats = await _audit_rows_for(store, "approval.request_repeated", first)
+        assert len(repeats) == 7
+        # The repeat row on_repeat swapped in is the one teed, once per committed row.
+        assert sorted(tap.ids("approval.request_repeated", first)) == sorted(
+            int(r["id"]) for r in repeats
+        )
+        assert len(tap.ids("approval.requested", first)) == 1
 
         # Another requester, or the same one after the request expired, files a new one.
         other = await request(requester_user_id="contract-other-requester-id")
@@ -258,6 +307,7 @@ async def _assert_repeat_request_contract(store: Any) -> None:
         )
         assert await request(now=1_063.0) not in (first, other, later)
     finally:
+        tap.stop()
         for approval_id in filed:
             await store.decide_pending_approval(
                 approval_id, status="rejected", approver="contract-cleanup", decided_at=1_100.0

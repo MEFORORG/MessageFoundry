@@ -11959,16 +11959,9 @@ class MessageStore:
                 await self._commit()
                 return None
             revoked = await self._db.execute(_REVOKE_USER_SESSIONS_SQL, (now, user_id))
-            appended = await self._append_audit_row(
-                audit.action,
-                actor=audit.actor,
-                channel_id=None,
-                detail=audit.detail,
-                client=audit.client,
-                now=now,
-            )
+            appended = await self._append_audits((audit,), now=now)
             await self._commit()
-        audit.tee(ts=now, row=appended)
+        tee_audits((audit,), appended, ts=now)
         return int(revoked.rowcount)
 
     async def disable_totp(self, user_id: str, *, now: float | None = None) -> None:

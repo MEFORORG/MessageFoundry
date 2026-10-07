@@ -11663,22 +11663,14 @@ class SqlServerStore:
                             (now, user_id),
                         )
                         revoked = len(await cur.fetchall())
-                        appended = await self._append_audit_row(
-                            cur,
-                            audit.action,
-                            actor=audit.actor,
-                            channel_id=None,
-                            detail=audit.detail,
-                            client=audit.client,
-                            now=now,
-                        )
+                        appended = await self._append_audits(cur, (audit,), now=now)
                         await self._commit(conn)
                 except Exception:
                     # BACKLOG #1940: see _rollback_or_discard. It runs after the cursor block, so a
                     # detached close of the raw connection cannot race the cursor's own close.
                     await self._rollback_or_discard(conn)
                     raise
-        audit.tee(ts=now, row=appended)
+        tee_audits((audit,), appended, ts=now)
         return revoked
 
     async def disable_totp(self, user_id: str, *, now: float | None = None) -> None:
